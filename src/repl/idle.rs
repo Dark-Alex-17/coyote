@@ -53,7 +53,8 @@ pub(crate) const IDLE_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 /// supervisor's spawn budget, which is the model's.
 pub(crate) const IDLE_MAX_CHILDREN: usize = 1;
 /// Model notes held back while a turn owns the context. One short of the queue's own
-/// mesh cap so the held notes plus the drop summary fit in an empty queue.
+/// mesh cap so the held notes fit in an empty queue without evicting each other; the
+/// drop summary that follows them is pushed outside the cap.
 pub(crate) const IDLE_PENDING_NOTES_MAX: usize = MESH_NOTIFICATION_QUEUE_CAPACITY - 1;
 /// Characters of a child's output shown under its completion line.
 pub(crate) const IDLE_RESULT_PREVIEW_CHARS: usize = 200;
@@ -598,18 +599,14 @@ impl DriverLoop {
         }
         if self.dropped_model_notes > 0 {
             let dropped = std::mem::take(&mut self.dropped_model_notes);
-            deliver_model_note(
-                ctx,
-                PendingNote {
-                    note: mesh_events_dropped(
-                        dropped,
-                        "idle-driver",
-                        "while a turn held the context",
-                    ),
-                    reapable: false,
-                },
-                &mut self.reapable_ids,
-            );
+            // The summary is the model's only word about the notes it stands for, so it
+            // goes in outside the mesh cap: pushed under it, it could evict one more
+            // genuine event and need a summary of its own.
+            ctx.notification_queue.push(mesh_events_dropped(
+                dropped,
+                "idle-driver",
+                "while a turn held the context",
+            ));
         }
     }
 
@@ -728,13 +725,25 @@ fn deliver_model_note(
 }
 
 /// The driver only ever registers unmetered handles, so a metered one is the model's to
-/// collect whatever note names it.
+/// collect whatever note names it. The handle is the only path to the child's supervisor
+/// and whatever the child parked under it, so its tree is signalled before the handle is
+/// dropped, with the parent's lock already released.
 fn reap(ctx: &RequestContext, id: &str) {
-    if let Some(supervisor) = ctx.supervisor.as_ref() {
+    let Some(supervisor) = ctx.supervisor.as_ref() else {
+        return;
+    };
+    let handle = {
         let mut sup = supervisor.write();
-        if sup.is_unmetered(id) {
-            sup.take(id);
+        if !sup.is_unmetered(id) {
+            return;
         }
+        sup.take(id)
+    };
+    if let Some(handle) = handle {
+        if let Some(child) = handle.child_supervisor.as_ref() {
+            child.read().cancel_recursive();
+        }
+        handle.abort_signal.set_ctrlc();
     }
 }
 
@@ -1291,6 +1300,68 @@ mod tests {
             child_sup.read().max_concurrent_jobs(),
             3,
             "the jobs cap the spawn carries is the one the child's supervisor gets"
+        );
+        driver.stop().await;
+    }
+
+    /// Reaping a completion drops the only path to the child's supervisor, so whatever
+    /// the child left running under it is signalled first: a grandchild parked there is
+    /// aborted along with the reap, not detached where no cancel can find it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reaping_a_completion_cancels_the_tree_under_its_handle() {
+        let ctx = test_ctx(Some(Supervisor::new(4, 3)));
+        assert!(
+            ctx.try_read().unwrap().declared_function_names.is_empty(),
+            "a fresh top-level context declares no tools, so the completion is reaped"
+        );
+        let driver = start_driver(&ctx);
+
+        let grandchild_abort = create_abort_signal();
+        let spawn = IdleSpawn {
+            agent_name: "envoy".to_string(),
+            max_concurrent_jobs: None,
+            work: {
+                let grandchild_abort = grandchild_abort.clone();
+                Box::new(move |mut child_ctx, _abort| {
+                    Box::pin(async move {
+                        child_ctx
+                            .ensure_supervisor()
+                            .write()
+                            .register_unmetered(AgentHandle {
+                                id: "grandchild".to_string(),
+                                agent_name: "envoy".to_string(),
+                                depth: 2,
+                                inbox: Arc::new(Inbox::new()),
+                                abort_signal: grandchild_abort,
+                                join_handle: tokio::spawn(std::future::pending()),
+                                child_supervisor: None,
+                            });
+                        Ok("done".to_string())
+                    })
+                })
+            },
+        };
+        driver.handle().spawn(spawn).ok().expect("queued");
+
+        let completed = wait_for_note(&ctx, |note| note.event == AGENT_COMPLETED_EVENT).await;
+        assert_eq!(completed.next_action, UNCOLLECTABLE_NEXT_ACTION);
+        assert!(
+            grandchild_abort.aborted_ctrlc(),
+            "reaping the handle must signal the grandchild parked under it"
+        );
+        assert!(
+            !ctx.try_read()
+                .unwrap()
+                .supervisor
+                .as_ref()
+                .unwrap()
+                .read()
+                .has_agent(&completed.id),
+            "the uncollectable handle is reaped with its note"
+        );
+        assert!(
+            !has_active_tasks(&ctx),
+            "nothing the child parked may stay registered once its handle is gone"
         );
         driver.stop().await;
     }
