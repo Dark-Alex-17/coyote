@@ -14,7 +14,7 @@
 //! supervisor's tree, as Ctrl-C does; their completion notes still land in the queue the
 //! switch installed.
 
-use crate::config::{AppState, RequestContext, effective_max_concurrent_jobs};
+use crate::config::{AppState, RequestContext};
 use crate::function::agents::child_app_state;
 use crate::mesh::idle::{
     Coalescer, IDLE_COALESCE_MAX_PEERS, IDLE_COALESCE_TICK, IDLE_QUEUE_CAPACITY, IdleNotify,
@@ -25,13 +25,13 @@ use crate::supervisor::mailbox::Inbox;
 use crate::supervisor::notification::{
     MESH_NOTIFICATION_QUEUE_CAPACITY, SystemNotification, mesh_events_dropped, mesh_notification,
 };
-use crate::supervisor::{AgentExitStatus, AgentHandle, AgentResult, Supervisor};
+use crate::supervisor::{AgentExitStatus, AgentHandle, AgentResult};
 use crate::utils::{AbortSignal, create_abort_signal};
 
 use anyhow::Result;
 use log::{debug, warn};
 use parking_lot::RwLock;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -72,11 +72,12 @@ const AT_CAPACITY: &str = "at capacity";
 /// context and nothing more, so the closure owns agent set-up and hook parity with the
 /// in-turn spawn path (AgentStarted and the result hooks).
 ///
-/// Two things the closure must not do. It must not install a supervisor on the child
-/// context: the driver registers the child with `child_supervisor: None`, so grandchildren
-/// under one would escape `cancel_recursive` and `has_active_tasks`. And it must be built
-/// only after `agent_name` has been checked against the configured agents: the name flows
-/// into the agent id and the log lines unsanitised.
+/// The child context arrives with its supervisor installed and registered as the
+/// `child_supervisor` of the parent's handle, so grandchildren and jobs parked under it
+/// are reached by `cancel_recursive` and seen by `has_active_tasks`. The closure must not
+/// replace it: anything registered on a replacement would escape both. And it must be
+/// built only after `agent_name` has been checked against the configured agents: the
+/// name flows into the agent id and the log lines unsanitised.
 pub(crate) type SpawnWork = Box<
     dyn FnOnce(RequestContext, AbortSignal) -> Pin<Box<dyn Future<Output = Result<String>> + Send>>
         + Send,
@@ -302,6 +303,14 @@ struct DriverLoop {
     /// waiting when the driver stops is dropped with it.
     pending_model_notes: VecDeque<PendingNote>,
     dropped_model_notes: usize,
+    /// Ids of the driver's own completions left in the queue for the model to collect.
+    /// A completion later evicted from the queue is reaped only if its id is here: the
+    /// evicted note's own id and event name are not trusted, since a peer may have
+    /// forged them.
+    reapable_ids: HashSet<String>,
+    /// Reapable completions pushed out of `pending_model_notes` before any flush. The
+    /// model will never see them, so their handles are taken with the next flush.
+    orphaned_completions: Vec<String>,
     pending_spawns: VecDeque<IdleSpawn>,
     refusals: Refusals,
     coalesce_at: Option<tokio::time::Instant>,
@@ -319,8 +328,9 @@ impl Drop for DriverLoop {
 
 /// A model note on its way to the context's queue. `reapable` marks the completions the
 /// driver itself produced: only those may take their handle off the supervisor when the
-/// model will never be told to collect it. A peer's note is never trusted that far,
-/// whatever event name and id it carries.
+/// model will never be told to collect it, whether at delivery or, through the driver's
+/// record of what it delivered, on a later eviction. A peer's note is never trusted that
+/// far, whatever event name and id it carries.
 struct PendingNote {
     note: SystemNotification,
     reapable: bool,
@@ -415,6 +425,8 @@ impl DriverLoop {
             coalescer: Coalescer::default(),
             pending_model_notes: VecDeque::new(),
             dropped_model_notes: 0,
+            reapable_ids: HashSet::new(),
+            orphaned_completions: Vec::new(),
             pending_spawns: VecDeque::new(),
             refusals: Refusals::default(),
             coalesce_at: None,
@@ -483,9 +495,13 @@ impl DriverLoop {
     fn deliver(&mut self, source: Source, text: String, model_note: Option<PendingNote>) {
         self.app.mesh.notify(Notification::new(source, text));
         if let Some(model_note) = model_note {
-            if self.pending_model_notes.len() >= IDLE_PENDING_NOTES_MAX {
-                self.pending_model_notes.pop_front();
+            if self.pending_model_notes.len() >= IDLE_PENDING_NOTES_MAX
+                && let Some(popped) = self.pending_model_notes.pop_front()
+            {
                 self.dropped_model_notes += 1;
+                if popped.reapable {
+                    self.orphaned_completions.push(popped.note.id);
+                }
             }
             self.pending_model_notes.push_back(model_note);
         }
@@ -561,8 +577,18 @@ impl DriverLoop {
     }
 
     fn flush_model_notes(&mut self, ctx: &RequestContext) {
+        for id in self.orphaned_completions.drain(..) {
+            reap(ctx, &id);
+        }
+        match ctx.supervisor.as_ref() {
+            Some(sup) => {
+                let sup = sup.read();
+                self.reapable_ids.retain(|id| sup.has_agent(id));
+            }
+            None => self.reapable_ids.clear(),
+        }
         for note in self.pending_model_notes.drain(..) {
-            deliver_model_note(ctx, note);
+            deliver_model_note(ctx, note, &mut self.reapable_ids);
         }
         if self.dropped_model_notes > 0 {
             let dropped = std::mem::take(&mut self.dropped_model_notes);
@@ -576,31 +602,25 @@ impl DriverLoop {
                     ),
                     reapable: false,
                 },
+                &mut self.reapable_ids,
             );
         }
     }
 
     /// Mints an owned child context and registers the child with the current supervisor
     /// outside its spawn budget, installing a budget-less one when the top level has none
-    /// so the model's own `agent__spawn` stays as disabled as it was. The work runs on its
-    /// own task, so the guard the caller holds is released as soon as this returns.
+    /// so the model's own `agent__spawn` stays as disabled as it was. The child gets a
+    /// supervisor of the same budget-less shape up front, registered as the handle's
+    /// `child_supervisor`: a lazily installed one, as `job__start` would otherwise add,
+    /// would hold jobs and grandchildren the parent's tree never reaches. The work runs
+    /// on its own task, so the guard the caller holds is released as soon as this returns.
     fn start_child(&mut self, ctx: &mut RequestContext, spawn: IdleSpawn) {
         let IdleSpawn { agent_name, work } = spawn;
         if self.in_flight.running() >= IDLE_MAX_CHILDREN {
             self.record_refusal(agent_name, AT_CAPACITY);
             return;
         }
-        let supervisor = match ctx.supervisor.as_ref() {
-            Some(sup) => Arc::clone(sup),
-            None => {
-                let max_jobs = effective_max_concurrent_jobs(ctx.agent.as_ref(), &ctx.app.config);
-                let sup = Arc::new(RwLock::new(
-                    Supervisor::new(0, 0).with_max_concurrent_jobs(max_jobs),
-                ));
-                ctx.supervisor = Some(Arc::clone(&sup));
-                sup
-            }
-        };
+        let supervisor = ctx.ensure_supervisor();
         let depth = ctx.current_depth + 1;
 
         let agent_id = format!("agent_{agent_name}_{}", &Uuid::new_v4().to_string()[..8]);
@@ -608,13 +628,14 @@ impl DriverLoop {
         let child_abort = create_abort_signal();
         ctx.ensure_root_escalation_queue();
         ctx.ensure_inbox();
-        let child_ctx = RequestContext::new_for_child(
+        let mut child_ctx = RequestContext::new_for_child(
             child_app_state(&ctx.app),
             ctx,
             depth,
             Arc::clone(&child_inbox),
             agent_id.clone(),
         );
+        let child_supervisor = child_ctx.ensure_supervisor();
 
         debug!("Idle driver spawning child agent '{agent_name}' as '{agent_id}' at depth {depth}");
 
@@ -637,7 +658,7 @@ impl DriverLoop {
             inbox: child_inbox,
             abort_signal: child_abort,
             join_handle: task,
-            child_supervisor: None,
+            child_supervisor: Some(child_supervisor),
         });
     }
 
@@ -656,9 +677,14 @@ fn is_completion(note: &SystemNotification) -> bool {
 /// now still has the handle; an agent switch mid-flight leaves the handle on a supervisor
 /// nobody can reach. Elsewhere the output shown at the prompt is all the model gets, and
 /// a reapable handle is taken so a long idle session does not pile up results nobody can
-/// collect. A completion the push evicts from a full queue is reaped on the same grounds,
-/// provided the handle is one the driver registered.
-fn deliver_model_note(ctx: &RequestContext, pending: PendingNote) {
+/// collect. A reapable completion left for the model is remembered in `reapable_ids`, and
+/// a completion the push evicts from a full queue is reaped only if it is remembered
+/// there: the evicted note's id alone is no proof of who produced it.
+fn deliver_model_note(
+    ctx: &RequestContext,
+    pending: PendingNote,
+    reapable_ids: &mut HashSet<String>,
+) {
     let PendingNote { mut note, reapable } = pending;
     if is_completion(&note) {
         let collectable = ctx.declared_function_names.contains(COLLECT_TOOL);
@@ -667,7 +693,11 @@ fn deliver_model_note(ctx: &RequestContext, pending: PendingNote) {
             .as_ref()
             .is_some_and(|sup| sup.read().has_agent(&note.id));
         match (collectable, registered) {
-            (true, true) => {}
+            (true, true) => {
+                if reapable {
+                    reapable_ids.insert(note.id.clone());
+                }
+            }
             (true, false) => note.next_action = UNREGISTERED_NEXT_ACTION.to_string(),
             (false, _) => {
                 note.next_action = UNCOLLECTABLE_NEXT_ACTION.to_string();
@@ -677,20 +707,22 @@ fn deliver_model_note(ctx: &RequestContext, pending: PendingNote) {
             }
         }
     }
-    if let Some(evicted) = ctx.notification_queue.push(note)
+    if let Some(evicted) = ctx.notification_queue.push_mesh(note)
         && is_completion(&evicted)
-        && ctx
-            .supervisor
-            .as_ref()
-            .is_some_and(|sup| sup.read().is_unmetered(&evicted.id))
+        && reapable_ids.remove(&evicted.id)
     {
         reap(ctx, &evicted.id);
     }
 }
 
+/// The driver only ever registers unmetered handles, so a metered one is the model's to
+/// collect whatever note names it.
 fn reap(ctx: &RequestContext, id: &str) {
     if let Some(supervisor) = ctx.supervisor.as_ref() {
-        supervisor.write().take(id);
+        let mut sup = supervisor.write();
+        if sup.is_unmetered(id) {
+            sup.take(id);
+        }
     }
 }
 
@@ -783,6 +815,7 @@ mod tests {
     };
     use crate::mesh::notify::{NotificationSink, RenderedNotification};
     use crate::repl::latch_prompt_interrupt;
+    use crate::supervisor::Supervisor;
     use crate::supervisor::notification::{Channel, MESH_EVENTS_DROPPED_EVENT, NotificationQueue};
     use anyhow::anyhow;
     use serde_json::json;
@@ -1141,6 +1174,104 @@ mod tests {
         rt.block_on(driver.stop());
     }
 
+    /// The child's supervisor is installed by the driver and hung on the parent's handle,
+    /// so anything the child parks under it (a grandchild here; a job just as well) stays
+    /// in the tree with no help from the child's own abort signal: `has_active_tasks`
+    /// sees it after the child itself has finished, and `cancel_recursive` reaches it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_grandchild_parked_under_the_child_supervisor_is_reached_through_the_handle() {
+        let ctx = test_ctx(Some(Supervisor::new(4, 3)));
+        ctx.try_write()
+            .unwrap()
+            .declared_function_names
+            .insert(COLLECT_TOOL.to_string());
+        let driver = start_driver(&ctx);
+
+        let seen: Arc<parking_lot::Mutex<Option<Arc<RwLock<Supervisor>>>>> = Default::default();
+        let grandchild_abort = create_abort_signal();
+        let spawn = IdleSpawn {
+            agent_name: "envoy".to_string(),
+            work: {
+                let seen = Arc::clone(&seen);
+                let grandchild_abort = grandchild_abort.clone();
+                Box::new(move |mut child_ctx, _abort| {
+                    Box::pin(async move {
+                        let sup = child_ctx.ensure_supervisor();
+                        sup.write().register_unmetered(AgentHandle {
+                            id: "grandchild".to_string(),
+                            agent_name: "envoy".to_string(),
+                            depth: 2,
+                            inbox: Arc::new(Inbox::new()),
+                            abort_signal: grandchild_abort,
+                            join_handle: tokio::spawn(std::future::pending()),
+                            child_supervisor: None,
+                        });
+                        *seen.lock() = Some(sup);
+                        Ok("done".to_string())
+                    })
+                })
+            },
+        };
+        driver.handle().spawn(spawn).ok().expect("queued");
+
+        let landed = wait_for_note(&ctx, |note| note.event == AGENT_COMPLETED_EVENT).await;
+        let child_id = landed.id;
+        wait_until("the child task to finish", || {
+            ctx.try_read().is_some_and(|guard| {
+                guard
+                    .supervisor
+                    .as_ref()
+                    .unwrap()
+                    .read()
+                    .is_finished(&child_id)
+                    == Some(true)
+            })
+        })
+        .await;
+        assert!(
+            has_active_tasks(&ctx),
+            "the parked grandchild is the only activity and must be seen through the handle"
+        );
+
+        ctx.try_read()
+            .unwrap()
+            .supervisor
+            .as_ref()
+            .unwrap()
+            .read()
+            .cancel_recursive();
+        assert!(
+            grandchild_abort.aborted_ctrlc(),
+            "cancelling the tree must reach the grandchild"
+        );
+
+        let handle = ctx
+            .try_read()
+            .unwrap()
+            .supervisor
+            .as_ref()
+            .unwrap()
+            .write()
+            .take(&child_id)
+            .expect("a collectable completion leaves its handle registered");
+        let child_sup = handle
+            .child_supervisor
+            .as_ref()
+            .expect("the child's supervisor is registered on its handle");
+        let seen = seen.lock().clone().expect("the work ran");
+        assert!(
+            Arc::ptr_eq(child_sup, &seen),
+            "the closure's lazy install must find the driver's supervisor, not add one"
+        );
+        assert!(child_sup.read().has_agent("grandchild"));
+        assert_eq!(
+            child_sup.read().max_concurrent(),
+            0,
+            "the child gets the same zero spawn budget as the top level"
+        );
+        driver.stop().await;
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn spawn_is_refused_past_the_driver_child_cap() {
         let ctx = test_ctx(Some(Supervisor::new(4, 3)));
@@ -1307,6 +1438,58 @@ mod tests {
         assert_eq!(
             summary.next_action,
             format!("{EXCESS} older mesh events were dropped while a turn held the context")
+        );
+        driver.stop().await;
+    }
+
+    /// A completion pushed out of the held-back notes is one the model will never read,
+    /// so its handle goes with it at the next flush rather than lingering uncollected.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_completion_pushed_out_of_the_pending_deque_reaps_its_handle() {
+        let ctx = test_ctx(Some(Supervisor::new(4, 3)));
+        register_handle(&ctx, "u1", true);
+        let sink = install_sink(&ctx);
+        let driver = start_driver(&ctx);
+        let (release, holder) = hold_write_lock(&ctx);
+
+        driver
+            .handle()
+            .push(note(
+                "envoy finished",
+                Some(mesh_notification(
+                    AGENT_COMPLETED_EVENT,
+                    "u1",
+                    "envoy",
+                    true,
+                    String::new(),
+                )),
+            ))
+            .expect("queued");
+        for i in 0..IDLE_PENDING_NOTES_MAX {
+            driver
+                .handle()
+                .push(note(
+                    &format!("note {i}"),
+                    Some(model_note(&format!("n{i}"))),
+                ))
+                .expect("queued");
+        }
+        wait_until("every human line to reach the sink", || {
+            sink.lines().len() == IDLE_PENDING_NOTES_MAX + 1
+        })
+        .await;
+
+        drop(release);
+        holder.join().unwrap();
+        wait_until("the pushed-out completion to reap its handle", || {
+            ctx.try_read()
+                .is_some_and(|guard| !guard.supervisor.as_ref().unwrap().read().has_agent("u1"))
+        })
+        .await;
+        let landed = wait_for_note(&ctx, |note| note.event == MESH_EVENTS_DROPPED_EVENT).await;
+        assert_eq!(
+            landed.next_action,
+            "1 older mesh event was dropped while a turn held the context"
         );
         driver.stop().await;
     }
@@ -2353,8 +2536,8 @@ mod tests {
     }
 
     /// A completion the queue evicts to make room is one the model will never be told
-    /// to collect, so its handle is reaped with it, but only a handle the driver itself
-    /// registered.
+    /// to collect, so its handle is reaped with it, but only an unmetered one: a metered
+    /// handle is the model's to collect whatever the queue drops.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_evicted_completion_reaps_a_driver_handle_and_no_other() {
         let ctx = test_ctx(Some(Supervisor::new(4, 3)));
@@ -2364,6 +2547,7 @@ mod tests {
             .insert(COLLECT_TOOL.to_string());
         register_handle(&ctx, "u1", true);
         register_handle(&ctx, "a1", false);
+        let mut reapable_ids = HashSet::new();
         let completion = |id: &str| PendingNote {
             note: mesh_notification(AGENT_COMPLETED_EVENT, id, "envoy", true, String::new()),
             reapable: true,
@@ -2371,11 +2555,16 @@ mod tests {
 
         {
             let guard = ctx.try_read().unwrap();
-            deliver_model_note(&guard, completion("u1"));
-            deliver_model_note(&guard, completion("a1"));
+            deliver_model_note(&guard, completion("u1"), &mut reapable_ids);
+            deliver_model_note(&guard, completion("a1"), &mut reapable_ids);
         }
         assert!(has_agent(&ctx, "u1"), "a collectable completion is kept");
         assert!(has_agent(&ctx, "a1"));
+        assert_eq!(
+            reapable_ids,
+            HashSet::from(["u1".to_string(), "a1".to_string()]),
+            "both were left registered and collectable"
+        );
 
         {
             let guard = ctx.try_read().unwrap();
@@ -2386,6 +2575,7 @@ mod tests {
                         note: model_note(&format!("m{i}")),
                         reapable: false,
                     },
+                    &mut reapable_ids,
                 );
             }
         }
@@ -2398,11 +2588,63 @@ mod tests {
             has_agent(&ctx, "a1"),
             "a metered handle is the model's to collect, whatever was evicted"
         );
+        assert!(reapable_ids.is_empty(), "a reaped id is forgotten");
         let drained = ctx.try_read().unwrap().notification_queue.drain();
         assert!(
             drained
                 .iter()
                 .all(|note| note.id != "u1" && note.id != "a1")
+        );
+        assert_eq!(drained.last().unwrap().event, MESH_EVENTS_DROPPED_EVENT);
+    }
+
+    /// A peer note shaped like a completion and naming a live unmetered handle is not the
+    /// driver's word about that handle, so its eviction reaps nothing even though the id
+    /// would pass a supervisor lookup.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_evicted_peer_note_carrying_a_live_unmetered_handle_id_reaps_nothing() {
+        let ctx = test_ctx(Some(Supervisor::new(4, 3)));
+        assert!(ctx.try_read().unwrap().declared_function_names.is_empty());
+        register_handle(&ctx, "u1", true);
+        let mut reapable_ids = HashSet::new();
+
+        {
+            let guard = ctx.try_read().unwrap();
+            deliver_model_note(
+                &guard,
+                PendingNote {
+                    note: mesh_notification(
+                        AGENT_COMPLETED_EVENT,
+                        "u1",
+                        "envoy",
+                        true,
+                        String::new(),
+                    ),
+                    reapable: false,
+                },
+                &mut reapable_ids,
+            );
+            for i in 0..MESH_NOTIFICATION_QUEUE_CAPACITY {
+                deliver_model_note(
+                    &guard,
+                    PendingNote {
+                        note: model_note(&format!("m{i}")),
+                        reapable: false,
+                    },
+                    &mut reapable_ids,
+                );
+            }
+        }
+
+        assert!(reapable_ids.is_empty());
+        assert!(
+            has_agent(&ctx, "u1"),
+            "an evicted peer note must not reap the handle it names"
+        );
+        let drained = ctx.try_read().unwrap().notification_queue.drain();
+        assert!(
+            drained.iter().all(|note| note.id != "u1"),
+            "the peer note was evicted"
         );
         assert_eq!(drained.last().unwrap().event, MESH_EVENTS_DROPPED_EVENT);
     }

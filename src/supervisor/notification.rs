@@ -137,9 +137,15 @@ impl NotificationQueue {
         }
     }
 
-    /// Queues the event. Returns the mesh event evicted to make room, if any, so the
-    /// caller can finish whatever that event was the model's only word about.
-    pub fn push(&self, notification: SystemNotification) -> Option<SystemNotification> {
+    pub fn push(&self, notification: SystemNotification) {
+        self.pending.lock().notifications.push(notification);
+    }
+
+    /// Queues a mesh event under the mesh cap: once `MESH_NOTIFICATION_QUEUE_CAPACITY`
+    /// mesh events are held, the oldest of them is evicted and handed back so the caller
+    /// can finish whatever that event was the model's only word about. Supervisor events
+    /// are never evicted, reordered or summarised; one given here is simply pushed.
+    pub fn push_mesh(&self, notification: SystemNotification) -> Option<SystemNotification> {
         let mut pending = self.pending.lock();
         let mut evicted = None;
         if notification.channel == Channel::Mesh {
@@ -354,10 +360,10 @@ mod tests {
         let queue = NotificationQueue::new();
         let pushed = MESH_NOTIFICATION_QUEUE_CAPACITY + 6;
         for i in 0..MESH_NOTIFICATION_QUEUE_CAPACITY {
-            assert!(queue.push(mesh_event(i)).is_none());
+            assert!(queue.push_mesh(mesh_event(i)).is_none());
         }
         for i in MESH_NOTIFICATION_QUEUE_CAPACITY..pushed {
-            let evicted = queue.push(mesh_event(i)).expect("a full queue evicts");
+            let evicted = queue.push_mesh(mesh_event(i)).expect("a full queue evicts");
             assert_eq!(
                 evicted.id,
                 format!("m{}", i - MESH_NOTIFICATION_QUEUE_CAPACITY)
@@ -393,15 +399,15 @@ mod tests {
         let queue = NotificationQueue::new();
         assert!(
             queue
-                .push(job_notification("job_first", "execute_command", true))
+                .push_mesh(job_notification("job_first", "execute_command", true))
                 .is_none()
         );
         for i in 0..MESH_NOTIFICATION_QUEUE_CAPACITY + 1 {
-            queue.push(mesh_event(i));
+            queue.push_mesh(mesh_event(i));
         }
         assert!(
             queue
-                .push(job_notification("job_last", "execute_command", true))
+                .push_mesh(job_notification("job_last", "execute_command", true))
                 .is_none(),
             "a supervisor event evicts nothing even from a full mesh queue"
         );
@@ -416,6 +422,104 @@ mod tests {
         assert_eq!(
             drained.last().unwrap().next_action,
             "1 older mesh event was dropped before this drain"
+        );
+    }
+
+    /// `push` is unbounded: a mesh event pushed that way never evicts, however many are
+    /// held. Only `push_mesh` applies the cap.
+    #[test]
+    fn plain_push_never_evicts_a_mesh_event() {
+        let queue = NotificationQueue::new();
+        let pushed = MESH_NOTIFICATION_QUEUE_CAPACITY + 3;
+        for i in 0..pushed {
+            queue.push(mesh_event(i));
+        }
+
+        let drained = queue.drain();
+
+        assert_eq!(drained.len(), pushed);
+        assert_eq!(drained[0].id, "m0");
+        assert!(
+            drained
+                .iter()
+                .all(|event| event.event != MESH_EVENTS_DROPPED_EVENT)
+        );
+    }
+
+    #[test]
+    fn supervisor_entries_survive_mesh_eviction_unchanged_and_in_order() {
+        const EXCESS: usize = 5;
+        let queue = NotificationQueue::new();
+        let pushed = MESH_NOTIFICATION_QUEUE_CAPACITY + EXCESS;
+        let mut supervisor_entries = Vec::new();
+        for i in 0..pushed {
+            if i % 7 == 0 {
+                let entry = if i % 2 == 0 {
+                    job_notification(&format!("job_{i}"), "execute_command", true)
+                } else {
+                    agent_notification(&format!("agent_{i}"), "explore", false)
+                };
+                supervisor_entries.push(entry.to_value());
+                queue.push(entry);
+            }
+            queue.push_mesh(mesh_event(i));
+        }
+
+        let drained = queue.drain();
+
+        let survivors_supervisor: Vec<Value> = drained
+            .iter()
+            .filter(|event| event.channel == Channel::Supervisor)
+            .map(SystemNotification::to_value)
+            .collect();
+        assert_eq!(survivors_supervisor, supervisor_entries);
+        let survivors_mesh: Vec<&str> = drained
+            .iter()
+            .filter(|event| {
+                event.channel == Channel::Mesh && event.event != MESH_EVENTS_DROPPED_EVENT
+            })
+            .map(|event| event.id.as_str())
+            .collect();
+        let expected: Vec<String> = (EXCESS..pushed).map(|i| format!("m{i}")).collect();
+        assert_eq!(
+            survivors_mesh, expected,
+            "exactly the oldest mesh events are gone"
+        );
+        assert_eq!(
+            drained.len(),
+            supervisor_entries.len() + MESH_NOTIFICATION_QUEUE_CAPACITY + 1
+        );
+    }
+
+    #[test]
+    fn drain_appends_one_mesh_channel_drop_summary_with_the_exact_count() {
+        const EVICTED: usize = 9;
+        let queue = NotificationQueue::new();
+        for i in 0..MESH_NOTIFICATION_QUEUE_CAPACITY + EVICTED {
+            queue.push_mesh(mesh_event(i));
+        }
+
+        let drained = queue.drain();
+
+        let summaries: Vec<&SystemNotification> = drained
+            .iter()
+            .filter(|event| event.event == MESH_EVENTS_DROPPED_EVENT)
+            .collect();
+        assert_eq!(summaries.len(), 1);
+        let summary = summaries[0];
+        assert_eq!(summary.channel, Channel::Mesh);
+        assert_eq!(
+            summary.next_action,
+            format!("{EVICTED} older mesh events were dropped before this drain")
+        );
+        assert!(std::ptr::eq(summary, drained.last().unwrap()));
+
+        queue.push_mesh(mesh_event(0));
+        let drained = queue.drain();
+        assert_eq!(drained.len(), 1);
+        assert_ne!(
+            drained[0].event, MESH_EVENTS_DROPPED_EVENT,
+            "the count resets with the drain"
         );
     }
 }

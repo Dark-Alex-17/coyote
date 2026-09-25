@@ -671,6 +671,22 @@ impl RequestContext {
             .clone()
     }
 
+    /// The supervisor this context holds, installing a budget-less one when it has none:
+    /// no agent spawns, jobs capped as the config for this context allows. That is the
+    /// shape a top-level context gets the first time it backgrounds a job, so installing
+    /// it early changes nothing the model can observe.
+    pub fn ensure_supervisor(&mut self) -> Arc<RwLock<Supervisor>> {
+        if let Some(sup) = self.supervisor.as_ref() {
+            return Arc::clone(sup);
+        }
+        let max_jobs = effective_max_concurrent_jobs(self.agent.as_ref(), &self.app.config);
+        let sup = Arc::new(RwLock::new(
+            Supervisor::new(0, 0).with_max_concurrent_jobs(max_jobs),
+        ));
+        self.supervisor = Some(Arc::clone(&sup));
+        sup
+    }
+
     pub fn rag_cache(&self) -> &Arc<RagCache> {
         &self.app.rag_cache
     }

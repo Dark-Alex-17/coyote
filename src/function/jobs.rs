@@ -471,17 +471,7 @@ async fn handle_start(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
         }));
     }
 
-    let supervisor = match ctx.supervisor.as_ref() {
-        Some(sup) => Arc::clone(sup),
-        None => {
-            let max_jobs = effective_max_concurrent_jobs(ctx.agent.as_ref(), &ctx.app.config);
-            let sup = Arc::new(RwLock::new(
-                Supervisor::new(0, 0).with_max_concurrent_jobs(max_jobs),
-            ));
-            ctx.supervisor = Some(Arc::clone(&sup));
-            sup
-        }
-    };
+    let supervisor = ctx.ensure_supervisor();
 
     {
         let sup = supervisor.read();
