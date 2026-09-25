@@ -12,9 +12,11 @@ mod server;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use client::{R3Client, RequestOptions, RequestOutcome};
+pub(crate) use client::{
+    DEFAULT_LINK_TIMEOUT, Deadline, R3Client, RequestOptions, RequestOutcome, SizeBranch, open_link,
+};
 pub(crate) use dispatch::{Dispatcher, LoggingKnockSink};
-pub(crate) use error::R3Error;
+pub(crate) use error::{R3Error, RefusalCode};
 pub(crate) use frame::{Envelope, NAME_HASH_LEN, OriginName};
 pub(crate) use receipt::RequestReceipt;
 pub(crate) use server::R3Server;

@@ -66,17 +66,21 @@ impl Deadline {
         }
     }
 
-    fn remaining(self) -> Duration {
+    pub(crate) fn remaining(self) -> Duration {
         self.at.saturating_duration_since(Instant::now())
     }
 
-    async fn bound<T>(self, path: &str, wait: impl Future<Output = T>) -> Result<T, R3Error> {
+    pub(crate) async fn bound<T>(
+        self,
+        path: &str,
+        wait: impl Future<Output = T>,
+    ) -> Result<T, R3Error> {
         timeout_at(self.at, wait)
             .await
             .map_err(|_| self.expired(path))
     }
 
-    fn expired(self, path: &str) -> R3Error {
+    pub(crate) fn expired(self, path: &str) -> R3Error {
         R3Error::Timeout {
             path: path.to_string(),
             after: self.after,

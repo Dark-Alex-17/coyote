@@ -6,6 +6,7 @@ pub(crate) mod knocks;
 mod lock;
 mod node;
 mod peers;
+mod propagation;
 mod r3;
 pub(crate) mod trust;
 
