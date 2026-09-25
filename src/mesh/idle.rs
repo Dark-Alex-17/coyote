@@ -55,7 +55,8 @@ pub(crate) trait IdleSink: Send + Sync {
 }
 
 /// Per-source token bucket. The clock is a parameter so admission is a pure function of
-/// the calls made so far and the instants passed in.
+/// the calls made so far and the instants passed in. The driver consults it only for
+/// sources that are not exempt from folding.
 pub(crate) struct RateLimiter {
     buckets: [Bucket; Source::ALL.len()],
 }
@@ -217,12 +218,12 @@ mod tests {
         let mut limiter = RateLimiter::new();
         let now = Instant::now();
         for _ in 0..IDLE_NOTIFY_BURST {
-            assert!(limiter.admit(Source::Knock, now));
+            assert!(limiter.admit(Source::Message, now));
         }
-        assert!(!limiter.admit(Source::Knock, now));
+        assert!(!limiter.admit(Source::Message, now));
         let later = now + IDLE_NOTIFY_REFILL_INTERVAL;
-        assert!(limiter.admit(Source::Knock, later));
-        assert!(!limiter.admit(Source::Knock, later));
+        assert!(limiter.admit(Source::Message, later));
+        assert!(!limiter.admit(Source::Message, later));
     }
 
     /// The half interval left over after the first credit still counts towards the

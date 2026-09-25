@@ -4,7 +4,7 @@ use crate::mesh::announce::{
     AnnounceAppData, HEARTBEAT_SECS, REANNOUNCE_FLOOR_SECS, announce_app_data,
 };
 use crate::mesh::card::{CardSource, StatusHandler};
-use crate::mesh::idle::{IdleNotify, IdleSink};
+use crate::mesh::idle::{IdleNotify, IdleSink, Origin};
 use crate::mesh::knock::{
     ChannelKnockSink, KNOCK_LINK_TIMEOUT, KNOCK_QUEUE_CAPACITY, KNOCK_REQUEST_TIMEOUT, KnockError,
     KnockGate, KnockIntro, KnockOutcome, KnockRouting, KnockSurface, KnockVia, drain_knocks,
@@ -12,20 +12,28 @@ use crate::mesh::knock::{
 };
 use crate::mesh::knocks::KnockCache;
 use crate::mesh::lock::InstanceLock;
-use crate::mesh::notify::{Notification, NotificationSink};
+use crate::mesh::message::{
+    CHECK_INBOX_NEXT_ACTION, ModelNotes, PeerInbox, PeerKind, PeerMessage, PeerMessageHandler,
+    PeerRouting, PeerSurface, collect_next_action,
+};
+use crate::mesh::notify::{Notification, NotificationSink, Source};
 use crate::mesh::peers::{PeerChange, PeerSighting, PeerTable};
-use crate::mesh::propagation::{self, PropagationError, PropagationOptions};
+use crate::mesh::pending::{Correlations, PendingRecord, PendingStore};
+use crate::mesh::propagation::{
+    self, OutboundMessage, PropagationError, PropagationNode, PropagationOptions,
+};
 use crate::mesh::propagation_fetch::{self, FetchError, FetchOptions, FetchReport, InboundSink};
 use crate::mesh::propagation_nodes::PropagationNodeTable;
 #[cfg(test)]
 use crate::mesh::r3::RequestHandler;
 use crate::mesh::r3::{
-    Dispatcher, Envelope, KNOCK_PATH, OriginName, R3Client, R3Error, R3Server, RefusalCode,
-    RequestOptions, RequestOutcome, RequestReceipt, STATUS_PATH, short,
+    Dispatcher, Envelope, KNOCK_PATH, MESSAGE_PATH, OriginName, R3Client, R3Error, R3Server,
+    RefusalCode, RequestOptions, RequestOutcome, RequestReceipt, STATUS_PATH, short,
 };
 use crate::mesh::snapshot::MeshSnapshot;
 use crate::mesh::trust::TrustStore;
 use crate::mesh::{hex_lower, identity, mesh_cache_dir};
+use crate::supervisor::notification::{SystemNotification, mesh_notification};
 
 use anyhow::{Context, Result, anyhow, bail};
 use arc_swap::ArcSwapOption;
@@ -34,6 +42,7 @@ use rand_core::OsRng;
 use rns_transport::destination::DestinationDesc;
 use rns_transport::destination::{DestinationName, SingleInputDestination};
 use rns_transport::hash::AddressHash;
+use rns_transport::identity::Identity;
 use rns_transport::identity::PrivateIdentity as TransportIdentity;
 use rns_transport::identity_bridge::{to_core_private_identity, to_transport_private_identity};
 use rns_transport::iface::auto::{AutoInterfaceConfig, AutoInterfaceDeviceFilter};
@@ -43,7 +52,7 @@ use rns_transport::iface::auto_runtime::{
 use rns_transport::iface::tcp_client::TcpClient;
 use rns_transport::iface::{IfaceRole, InterfaceMode};
 use rns_transport::transport::{AnnounceEvent, Transport, TransportConfig};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{Mutex, broadcast};
@@ -178,6 +187,14 @@ struct DestinationState {
     last_announce: Option<Instant>,
 }
 
+/// The instance and destination the node speaks for, readable without waiting on the
+/// `destination` mutex: the peer surface and the pending store are asked for them on
+/// paths that cannot `.await`.
+struct CurrentIds {
+    instance_id: String,
+    destination_hash: String,
+}
+
 /// One in-process Reticulum node: a transport over the configured interfaces, one destination
 /// derived from the session's mesh instance id, and the tasks that announce it and track peers.
 pub(crate) struct MeshRuntime {
@@ -194,6 +211,7 @@ pub(crate) struct MeshRuntime {
     transport: Mutex<Option<Arc<Transport>>>,
     interfaces: Mutex<Vec<JoinedInterface>>,
     destination: Mutex<DestinationState>,
+    ids: RwLock<CurrentIds>,
     peers: Arc<PeerTable>,
     propagation_nodes: Arc<PropagationNodeTable>,
     trust: Arc<TrustStore>,
@@ -202,11 +220,14 @@ pub(crate) struct MeshRuntime {
     dispatcher: Arc<Dispatcher>,
     knock_gate: Arc<KnockGate>,
     knock_sink: Arc<ChannelKnockSink>,
+    /// Where fetched peer messages go; attached by the slot the node is installed into.
+    peer_surface: parking_lot::Mutex<Option<Weak<dyn PeerSurface>>>,
     /// Held for the length of one propagation fetch; a second caller is refused, never
     /// queued behind the first.
     fetching: Mutex<()>,
-    /// Held across one knock's propagation-node post. `propagate` needs calls for the same
-    /// node serialised, so a second knocker waits here rather than sharing the out-link.
+    /// Held across one knock's or message's propagation-node post. `propagate` needs calls
+    /// for the same node serialised, so a second poster waits here rather than sharing
+    /// the out-link.
     posting: Mutex<()>,
     cancel: CancellationToken,
     tasks: parking_lot::Mutex<Vec<JoinHandle<()>>>,
@@ -334,9 +355,13 @@ impl MeshRuntime {
                 dest,
                 hash,
                 origin,
-                instance_id,
+                instance_id: instance_id.clone(),
                 lock: Some(lock),
                 last_announce,
+            }),
+            ids: RwLock::new(CurrentIds {
+                instance_id,
+                destination_hash: hash.to_hex_string(),
             }),
             peers,
             propagation_nodes: Arc::new(PropagationNodeTable::new()),
@@ -346,6 +371,7 @@ impl MeshRuntime {
             dispatcher,
             knock_gate,
             knock_sink,
+            peer_surface: parking_lot::Mutex::new(None),
             fetching: Mutex::new(()),
             posting: Mutex::new(()),
             cancel: CancellationToken::new(),
@@ -394,6 +420,20 @@ impl MeshRuntime {
     #[allow(dead_code)]
     pub(crate) async fn instance_id(&self) -> String {
         self.destination.lock().await.instance_id.clone()
+    }
+
+    /// `instance_id` without the wait, from the cache `start` fills and `rekey` moves.
+    pub(crate) fn current_instance_id(&self) -> String {
+        self.ids.read().instance_id.clone()
+    }
+
+    /// `destination_hash` without the wait, from the cache `start` fills and `rekey` moves.
+    pub(crate) fn current_destination_hash(&self) -> String {
+        self.ids.read().destination_hash.clone()
+    }
+
+    pub(crate) fn cache_dir(&self) -> &Path {
+        &self.cache_dir
     }
 
     // Reached by the REPL mesh commands once they land.
@@ -451,6 +491,12 @@ impl MeshRuntime {
         self.knock_gate.clone()
     }
 
+    /// Where peer messages fetched from a propagation node land. Held weakly: the slot
+    /// owns the runtime.
+    pub(crate) fn attach_peer_surface(&self, surface: Weak<dyn PeerSurface>) {
+        *self.peer_surface.lock() = Some(surface);
+    }
+
     /// Knocks the dispatcher had to drop because the gate's queue was full.
     // Reached by the REPL mesh commands once they land.
     #[allow(dead_code)]
@@ -495,6 +541,42 @@ impl MeshRuntime {
     /// Adopts a task so `stop` waits for it to finish.
     pub(crate) fn register_task(&self, handle: JoinHandle<()>) {
         self.tasks.lock().push(handle);
+    }
+
+    /// A handle on the running transport, `None` once the node has stopped. Taken so the
+    /// `transport` guard is not held across the caller's waits.
+    pub(super) async fn transport_handle(&self) -> Option<Arc<Transport>> {
+        self.transport.lock().await.clone()
+    }
+
+    /// Hands `build(origin)` to `node` for `recipient`, queued behind `posting` since
+    /// `propagate` needs one caller per node at a time. `build` gets this node's current
+    /// origin so the stored message names the instance sending it.
+    pub(super) async fn post_to_node(
+        &self,
+        recipient: &Identity,
+        node: &PropagationNode,
+        build: impl FnOnce(&OriginName) -> OutboundMessage,
+        options: &PropagationOptions,
+    ) -> Result<(), PropagationError> {
+        let _posting = self.posting.lock().await;
+        let transport = self
+            .transport_handle()
+            .await
+            .ok_or(PropagationError::Link(R3Error::NotRunning))?;
+        let sender = to_core_private_identity(&self.transport_identity);
+        let origin = self.destination.lock().await.origin;
+        propagation::propagate(
+            &transport,
+            &sender,
+            recipient,
+            node,
+            &build(&origin),
+            self.cancellation_token(),
+            options,
+        )
+        .await?;
+        Ok(())
     }
 
     /// Sends one request to `destination` over a link, proving this node's identity first
@@ -619,29 +701,17 @@ impl MeshRuntime {
         // back on is told so at once rather than after someone else's transfer.
         let node = self
             .propagation_nodes
-            .select()
+            .select_for_posting()
             .map_err(|_| KnockError::NoPropagationNode)?;
-        let _posting = self.posting.lock().await;
         let node_hex = node.destination.address_hash.to_hex_string();
         debug!(
             "Mesh knock to {dest8} could not be delivered over a link ({unreachable}); storing it with propagation node {}",
             short(&node_hex)
         );
-        let transport = self
-            .transport
-            .lock()
-            .await
-            .clone()
-            .ok_or(KnockError::NotRunning)?;
-        let sender = to_core_private_identity(&self.transport_identity);
-        let origin = self.destination.lock().await.origin;
-        propagation::propagate(
-            &transport,
-            &sender,
+        self.post_to_node(
             &destination.identity,
             &node,
-            &knock_message(intro, &origin),
-            self.cancellation_token(),
+            |origin| knock_message(intro, origin),
             &options.propagation,
         )
         .await
@@ -658,8 +728,9 @@ impl MeshRuntime {
     }
 
     /// Fetches the messages the nearest announced propagation node holds for this node,
-    /// handing the ones that pass every check to `sink`, knocks excepted: those go to the
-    /// knock gate and never reach `sink`. The dedup store is read from disk
+    /// handing the ones that pass every check to `sink`, knocks and peer messages
+    /// excepted: those go to the knock gate and the peer surface and never reach `sink`.
+    /// The dedup store is read from disk
     /// for each fetch and written back before the node is told to delete anything, so a
     /// message survives a restart between the two as a remembered id rather than a second
     /// delivery. One fetch runs at a time across every Coyote process of this identity;
@@ -683,9 +754,14 @@ impl MeshRuntime {
             .ok_or(FetchError::Link(R3Error::NotRunning))?;
         let node = self.propagation_nodes.select()?;
         let mut store = propagation_fetch::FetchStore::load(store_path, SystemTime::now())?;
+        let peers = PeerRouting {
+            trust: &self.trust,
+            surface: self.peer_surface.lock().as_ref().and_then(Weak::upgrade),
+            inner: sink,
+        };
         let routing = KnockRouting {
             gate: &self.knock_gate,
-            inner: sink,
+            inner: &peers,
         };
         propagation_fetch::fetch(
             &transport,
@@ -813,6 +889,10 @@ impl MeshRuntime {
             instance_id: rekey.fork_instance_id,
             lock: Some(lock),
             last_announce: None,
+        };
+        *self.ids.write() = CurrentIds {
+            instance_id: state.instance_id.clone(),
+            destination_hash: hash.to_hex_string(),
         };
         if self.announce {
             // With `last_announce` still `None`, the next heartbeat tick announces the fork.
@@ -1273,6 +1353,10 @@ async fn announce_periodically(runtime: Arc<MeshRuntime>, cancel: CancellationTo
 /// The idle slot is where events that also concern the model go; the interactive REPL's
 /// idle-time driver fills it. Without one, `push_idle` keeps the human line and drops the
 /// model's copy, since a headless run has no transcript for it to reach.
+///
+/// Peer messages land in `peer_inbox` for the model to read on its next `mesh__check_inbox`,
+/// with a note in `model_notes` so it knows to look; replies to questions this node asked
+/// are matched in `correlations` first.
 #[derive(Default)]
 pub(crate) struct MeshSlot {
     inner: RwLock<Option<Arc<MeshRuntime>>>,
@@ -1281,6 +1365,9 @@ pub(crate) struct MeshSlot {
     brief_text: ArcSwapOption<String>,
     notifier: ArcSwapOption<Arc<dyn NotificationSink>>,
     idle: ArcSwapOption<Arc<dyn IdleSink>>,
+    peer_inbox: PeerInbox,
+    correlations: Correlations,
+    model_notes: ModelNotes,
 }
 
 impl MeshSlot {
@@ -1290,25 +1377,43 @@ impl MeshSlot {
 
     /// Refuses while a node is already running: two nodes in one process would fight over
     /// the same instance lock and identity. Installing also puts this slot behind the
-    /// node's `/status` provider and knock gate, held weakly since the slot owns the node.
+    /// node's `/status` and `/message` providers, knock gate and peer surface, held weakly
+    /// since the slot owns the node, and reopens the questions the node's instance left
+    /// pending on disk, adopting them before the `/message` provider is registered so a
+    /// reply admitted in between still finds its question. A pending file this Coyote
+    /// cannot read is logged with its remedy and the node serves with no questions
+    /// pending: a late reply to one of them lands as an ordinary message. So this fails
+    /// only for a node already on.
     /// A knock the gate admits between `MeshRuntime::start` and this call is cached but
     /// not surfaced, and not marked as surfaced either, so a repeat from that identity
-    /// still earns its one line.
+    /// still earns its one line. The caller refreshes the session's tool catalog once
+    /// this returns, since the `mesh__*` tools are declared only while a node is on.
     // Reached by the REPL mesh commands once they land.
     #[allow(dead_code)]
     pub(crate) fn install(self: &Arc<Self>, runtime: Arc<MeshRuntime>) -> Result<()> {
+        let already_on = "Mesh is already on in this process. Run `.mesh off` first, then `.mesh on` to start it again with the current settings.";
+        if self.get().is_some() {
+            bail!(already_on);
+        }
+        let store = PendingStore::new(runtime.cache_dir(), &runtime.current_instance_id());
+        let pending = reopen_pending(&store);
         // Nothing may `.await` while this guard is held: the status handler reads the same
         // lock for the display name.
         let mut slot = self.inner.write();
         if slot.is_some() {
-            bail!(
-                "Mesh is already on in this process. Run `.mesh off` first, then `.mesh on` to start it again with the current settings."
-            );
+            bail!(already_on);
         }
+        self.correlations.adopt(store, pending);
         let source = Arc::downgrade(self) as Weak<dyn CardSource>;
         runtime
             .dispatcher()
             .register(STATUS_PATH, Arc::new(StatusHandler::new(source)))?;
+        let surface = Arc::downgrade(self) as Weak<dyn PeerSurface>;
+        runtime.dispatcher().register(
+            MESSAGE_PATH,
+            Arc::new(PeerMessageHandler::new(surface.clone())),
+        )?;
+        runtime.attach_peer_surface(surface);
         runtime
             .knock_gate()
             .attach(Arc::downgrade(self) as Weak<dyn KnockSurface>);
@@ -1316,13 +1421,20 @@ impl MeshSlot {
         Ok(())
     }
 
-    /// Takes the node out of the slot and shuts it down. `Ok(false)` when nothing was running.
+    /// Takes the node out of the slot and shuts it down, letting go of its pending
+    /// questions with it: they stay on disk for the next install of that instance.
+    /// Detaching before the shutdown grace means a reply served during the grace lands as
+    /// an ordinary message and its question stays open on disk, which is the price of
+    /// never writing a stopped node's file. `Ok(false)` when nothing was running. The
+    /// caller refreshes the session's tool catalog afterwards so the `mesh__*` tools go
+    /// with the node.
     // Reached by the REPL mesh commands once they land.
     #[allow(dead_code)]
     pub(crate) async fn stop(&self) -> Result<bool> {
         let taken = self.inner.write().take();
         match taken {
             Some(runtime) => {
+                self.correlations.detach_store();
                 runtime.shutdown().await?;
                 Ok(true)
             }
@@ -1330,12 +1442,28 @@ impl MeshSlot {
         }
     }
 
-    /// Re-keys the running node for a forked session; a no-op while the mesh is off.
+    /// Re-keys the running node for a forked session and binds the pending questions to
+    /// the fork's own file, since a fork asks its own questions and must not collect the
+    /// original's; a no-op while the mesh is off. The fork's questions are adopted before
+    /// the node re-keys so a reply the fork's destination serves at once finds them, and
+    /// a re-key that fails puts the original's back, since the original is what stays
+    /// served. A fork file this Coyote cannot read is logged and the fork starts with no
+    /// questions pending, as `install` does: the node must not be reported as failed for
+    /// a cache file.
     pub(crate) async fn rekey(&self, rekey: ForkRekey) -> Result<()> {
-        match self.get() {
-            Some(runtime) => runtime.rekey(rekey).await,
-            None => Ok(()),
+        let Some(runtime) = self.get() else {
+            return Ok(());
+        };
+        let fork_store = PendingStore::new(runtime.cache_dir(), &rekey.fork_instance_id);
+        let pending = reopen_pending(&fork_store);
+        self.correlations.adopt(fork_store, pending);
+        let rekeyed = runtime.rekey(rekey).await;
+        if rekeyed.is_err() {
+            let original = PendingStore::new(runtime.cache_dir(), &runtime.current_instance_id());
+            let pending = reopen_pending(&original);
+            self.correlations.adopt(original, pending);
         }
+        rekeyed
     }
 
     pub(crate) fn publish(&self, snapshot: MeshSnapshot) {
@@ -1432,6 +1560,83 @@ impl MeshSlot {
             }
         }
     }
+
+    pub(crate) fn peer_inbox(&self) -> &PeerInbox {
+        &self.peer_inbox
+    }
+
+    pub(crate) fn correlations(&self) -> &Correlations {
+        &self.correlations
+    }
+
+    /// The notes queued since the last take, for the model's next tool batch.
+    pub(crate) fn take_model_notes(&self) -> Vec<SystemNotification> {
+        self.model_notes.take()
+    }
+
+    /// Where every inbound peer message ends up, from a link or a propagation node. A
+    /// reply to a question this node asked answers its correlation; everything lands in
+    /// the inbox; the model is told what arrived and what to call, and the person at
+    /// the keyboard gets one line. The id in the model's note is minted here from the
+    /// sending instance, never the peer's own: an answered question is named by our
+    /// correlation id, anything else (a message, an ask or a bulletin, each its own
+    /// event) by `peer:<instance>`, so no peer-chosen text reaches the note. Runs on a
+    /// blocking thread off the server's request path or on the fetch task, so nothing
+    /// here awaits.
+    pub(crate) fn deliver_peer(&self, mut message: PeerMessage) {
+        let id8 = short(&message.source_identity).to_string();
+        let answered = message.kind == PeerKind::Reply
+            && message
+                .in_reply_to
+                .as_deref()
+                .is_some_and(|id| self.correlations.answer(id, message.clone()));
+        if message.kind == PeerKind::Reply && !answered {
+            debug!(
+                "Mesh reply {} from {} answers no open question of ours; delivering it as a message",
+                message.message_id,
+                short(&message.source_identity)
+            );
+            message.kind = PeerKind::Message;
+        }
+        let display_name = self
+            .get()
+            .and_then(|runtime| runtime.peers().get(&message.source_destination))
+            .and_then(|peer| peer.display_name);
+        let text = message.summary_line(display_name.as_deref());
+        let local_id = format!("peer:{}", short(&message.source_destination));
+        let (event, id, next_action) = match (answered, message.kind) {
+            (true, _) => {
+                let id = message.in_reply_to.clone().unwrap_or_default();
+                let next_action = collect_next_action(&id);
+                ("peer_reply", id, next_action)
+            }
+            (false, PeerKind::Bulletin) => (
+                "peer_bulletin",
+                local_id,
+                CHECK_INBOX_NEXT_ACTION.to_string(),
+            ),
+            (false, PeerKind::Ask) => ("peer_ask", local_id, CHECK_INBOX_NEXT_ACTION.to_string()),
+            (false, _) => (
+                "peer_message",
+                local_id,
+                CHECK_INBOX_NEXT_ACTION.to_string(),
+            ),
+        };
+        self.peer_inbox.deliver(message);
+        self.model_notes
+            .push(mesh_notification(event, &id, "mesh", true, next_action));
+        let source = if answered {
+            Source::Reply
+        } else {
+            Source::Message
+        };
+        self.push_idle(IdleNotify {
+            source,
+            origin: Origin::Peer(id8),
+            text,
+            model_note: None,
+        });
+    }
 }
 
 fn non_blank(value: Option<String>) -> Option<Arc<String>> {
@@ -1441,9 +1646,39 @@ fn non_blank(value: Option<String>) -> Option<Arc<String>> {
         .map(Arc::new)
 }
 
+/// The questions `store` holds open or answered and uncollected. A file this Coyote
+/// cannot read is logged with its remedy and read as empty, so the node serves either
+/// way; a late reply to one of the forgotten questions lands as an ordinary message.
+fn reopen_pending(store: &PendingStore) -> Vec<PendingRecord> {
+    match store.load_pending(SystemTime::now()) {
+        Ok(pending) => {
+            if !pending.is_empty() {
+                debug!("Reopened {} pending mesh questions", pending.len());
+            }
+            pending
+        }
+        Err(err) => {
+            warn!(
+                "Mesh pending questions could not be reopened, so none are waiting on a reply: {err:#}"
+            );
+            Vec::new()
+        }
+    }
+}
+
 impl KnockSurface for MeshSlot {
     fn surface(&self, note: IdleNotify) -> bool {
         self.push_idle(note)
+    }
+}
+
+impl PeerSurface for MeshSlot {
+    fn deliver_peer(&self, message: PeerMessage) {
+        MeshSlot::deliver_peer(self, message);
+    }
+
+    fn local_destination(&self) -> Option<String> {
+        self.get().map(|runtime| runtime.current_destination_hash())
     }
 }
 
@@ -1452,15 +1687,18 @@ impl KnockSurface for MeshSlot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mesh::idle::Origin;
-    use crate::mesh::notify::{RenderedNotification, Source};
+    use crate::mesh::message::{PEER_ID_MAX_CHARS, PeerVia, RawPeerMessage};
+    use crate::mesh::notify::RenderedNotification;
     use crate::mesh::peers::PEER_TTL;
     #[cfg(unix)]
     use crate::mesh::peers::PeerRecord;
+    use crate::mesh::pending::{DEFAULT_COLLECT_TIMEOUT, PENDING_RECORD_VERSION, PendingState};
+    use crate::mesh::rfc3339_utc;
     use crate::mesh::test_support::{TempDir, mesh_paths, private_config, snapshot_fixture};
     #[cfg(unix)]
     use crate::mesh::test_support::{loopback_relay, started_runtime};
-    use crate::testing::{debug_snapshot, install_log_collector};
+    use crate::supervisor::mailbox::EnvelopePayload;
+    use crate::testing::{debug_snapshot, install_log_collector, warn_snapshot};
     #[cfg(unix)]
     use rns_transport::iface::tcp_server::TcpServer;
     #[cfg(unix)]
@@ -1728,6 +1966,274 @@ mod tests {
         slot.push_idle(idle_note("hello"));
         assert!(idle.pushed.lock().is_empty());
         assert_eq!(notifier.0.lock().len(), 1);
+    }
+
+    const PEER_IDENTITY: [u8; 16] = [0xcd; 16];
+    const PEER_INSTANCE: [u8; 16] = [0xab; 16];
+
+    fn peer_message(kind: PeerKind, id: &str, in_reply_to: Option<&str>) -> PeerMessage {
+        PeerMessage {
+            source_identity: hex_lower(&PEER_IDENTITY),
+            source_destination: hex_lower(&PEER_INSTANCE),
+            destination: hex_lower(&[0x01; 16]),
+            title: None,
+            content: format!("words of {id}"),
+            fields: None,
+            timestamp: 1_700_000_000.0,
+            message_id: id.to_string(),
+            in_reply_to: in_reply_to.map(str::to_string),
+            kind,
+            via: PeerVia::Direct,
+        }
+    }
+
+    fn pending(id: &str) -> PendingRecord {
+        let now = SystemTime::now();
+        PendingRecord {
+            version: PENDING_RECORD_VERSION,
+            id: id.to_string(),
+            peer_destination: hex_lower(&PEER_INSTANCE),
+            peer_identity: hex_lower(&PEER_IDENTITY),
+            question: "what now".to_string(),
+            sent_at: rfc3339_utc(now),
+            timeout_at: rfc3339_utc(now + DEFAULT_COLLECT_TIMEOUT),
+            state: PendingState::Open,
+            reply: None,
+        }
+    }
+
+    fn peer_ids(envelopes: &[crate::supervisor::mailbox::Envelope]) -> Vec<&str> {
+        envelopes
+            .iter()
+            .map(|envelope| match &envelope.payload {
+                EnvelopePayload::Peer(message) => message.message_id.as_str(),
+                other => panic!("not a peer envelope: {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn deliver_peer_on_a_bare_slot_lands_in_the_inbox_and_queues_a_model_note_and_a_line() {
+        let slot = MeshSlot::default();
+        let idle = RecordingIdleSink::new(true);
+        slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+        slot.correlations().open(pending("q-1")).unwrap();
+
+        slot.deliver_peer(peer_message(PeerKind::Message, "m-1", None));
+        slot.deliver_peer(peer_message(PeerKind::Bulletin, "b-1", None));
+        slot.deliver_peer(peer_message(PeerKind::Ask, "a-1", None));
+        slot.deliver_peer(peer_message(PeerKind::Reply, "r-1", Some("q-1")));
+        slot.deliver_peer(peer_message(PeerKind::Reply, "r-2", Some("q-unknown")));
+
+        let (envelopes, dropped) = slot.peer_inbox().drain();
+        assert_eq!(dropped, 0);
+        assert_eq!(peer_ids(&envelopes), ["m-1", "b-1", "a-1", "r-1", "r-2"]);
+        assert_eq!(envelopes[0].from, hex_lower(&PEER_INSTANCE));
+        assert_eq!(envelopes[0].to, hex_lower(&[0x01; 16]));
+
+        let notes = slot.take_model_notes();
+        let summary: Vec<(&str, &str, &str)> = notes
+            .iter()
+            .map(|note| (note.event, note.id.as_str(), note.next_action.as_str()))
+            .collect();
+        let peer_id = format!("peer:{}", &hex_lower(&PEER_INSTANCE)[..8]);
+        assert_eq!(
+            summary,
+            [
+                ("peer_message", peer_id.as_str(), "mesh__check_inbox"),
+                ("peer_bulletin", peer_id.as_str(), "mesh__check_inbox"),
+                ("peer_ask", peer_id.as_str(), "mesh__check_inbox"),
+                ("peer_reply", "q-1", "mesh__collect --id q-1"),
+                ("peer_message", peer_id.as_str(), "mesh__check_inbox"),
+            ],
+            "a reply to nothing this node asked is an ordinary message"
+        );
+        assert!(
+            notes
+                .iter()
+                .all(|note| note.tool_or_agent == "mesh" && note.status == "success")
+        );
+        assert!(slot.take_model_notes().is_empty());
+
+        let pushed = idle.pushed.lock();
+        assert_eq!(pushed.len(), 5);
+        let dest8 = &hex_lower(&PEER_INSTANCE)[..8];
+        for note in pushed.iter() {
+            assert_eq!(
+                note.origin,
+                Origin::Peer(hex_lower(&PEER_IDENTITY)[..8].to_string())
+            );
+            assert!(
+                note.model_note.is_none(),
+                "the model's copy waits in the slot's notes, not on the idle line"
+            );
+        }
+        let sources: Vec<Source> = pushed.iter().map(|note| note.source).collect();
+        assert_eq!(
+            sources,
+            [
+                Source::Message,
+                Source::Message,
+                Source::Message,
+                Source::Reply,
+                Source::Message
+            ],
+            "only a reply that answers an open question is a reply line"
+        );
+        assert_eq!(pushed[0].text, format!("{dest8} says: words of m-1"));
+        assert_eq!(pushed[1].text, format!("{dest8} announces: words of b-1"));
+        assert_eq!(pushed[2].text, format!("{dest8} asks: words of a-1"));
+        assert_eq!(pushed[3].text, format!("{dest8} replies: words of r-1"));
+        drop(pushed);
+        assert_eq!(
+            slot.correlations()
+                .take_answer("q-1")
+                .map(|reply| reply.message_id),
+            Some("r-1".to_string())
+        );
+    }
+
+    fn peer_payload(envelope: &crate::supervisor::mailbox::Envelope) -> &PeerMessage {
+        match &envelope.payload {
+            EnvelopePayload::Peer(message) => message,
+            other => panic!("not a peer envelope: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_reply_that_answers_nothing_lands_in_the_inbox_as_a_message_keeping_in_reply_to() {
+        install_log_collector();
+        let slot = MeshSlot::default();
+
+        slot.deliver_peer(peer_message(PeerKind::Reply, "r-1", Some("q-unknown")));
+
+        let (envelopes, _) = slot.peer_inbox().drain();
+        let delivered = peer_payload(&envelopes[0]);
+        assert_eq!(delivered.kind, PeerKind::Message);
+        assert_eq!(delivered.in_reply_to.as_deref(), Some("q-unknown"));
+        assert_eq!(delivered.message_id, "r-1");
+        let notes = slot.take_model_notes();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].event, "peer_message");
+        let id8 = &hex_lower(&PEER_IDENTITY)[..8];
+        assert_logged(
+            &debug_snapshot(),
+            &format!(
+                "Mesh reply r-1 from {id8} answers no open question of ours; delivering it as a message"
+            ),
+        );
+    }
+
+    #[test]
+    fn a_reply_that_answers_an_open_question_keeps_its_kind_in_the_inbox() {
+        let slot = MeshSlot::default();
+        slot.correlations().open(pending("q-1")).unwrap();
+
+        slot.deliver_peer(peer_message(PeerKind::Reply, "r-1", Some("q-1")));
+
+        let (envelopes, _) = slot.peer_inbox().drain();
+        let delivered = peer_payload(&envelopes[0]);
+        assert_eq!(delivered.kind, PeerKind::Reply);
+        assert_eq!(delivered.in_reply_to.as_deref(), Some("q-1"));
+        assert_eq!(slot.take_model_notes()[0].event, "peer_reply");
+    }
+
+    #[test]
+    fn a_reply_in_a_later_process_resolves_the_persisted_correlation() {
+        let tmp = TempDir::new("slot-pending-carry");
+        let slot_a = MeshSlot::default();
+        slot_a
+            .correlations()
+            .attach_store(PendingStore::new(&tmp.path, "inst"), SystemTime::now())
+            .unwrap();
+        slot_a.correlations().open(pending("q-1")).unwrap();
+        drop(slot_a);
+
+        let slot_b = MeshSlot::default();
+        let notifier = Arc::new(RecordingSink::default());
+        slot_b.set_notifier(Arc::clone(&notifier) as Arc<dyn NotificationSink>);
+        assert_eq!(
+            slot_b
+                .correlations()
+                .attach_store(PendingStore::new(&tmp.path, "inst"), SystemTime::now())
+                .unwrap(),
+            1
+        );
+        assert!(slot_b.correlations().is_open("q-1"));
+
+        slot_b.deliver_peer(peer_message(PeerKind::Reply, "r-1", Some("q-1")));
+
+        let (envelopes, dropped) = slot_b.peer_inbox().drain();
+        assert_eq!(dropped, 0);
+        assert_eq!(peer_ids(&envelopes), ["r-1"]);
+        let notes = slot_b.take_model_notes();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].event, "peer_reply");
+        assert_eq!(notes[0].id, "q-1");
+        assert_eq!(notes[0].next_action, "mesh__collect --id q-1");
+        assert_eq!(
+            notifier.0.lock().len(),
+            1,
+            "the person at the keyboard gets one line"
+        );
+        assert_eq!(
+            slot_b
+                .correlations()
+                .take_answer("q-1")
+                .map(|reply| reply.content),
+            Some("words of r-1".to_string())
+        );
+        assert!(
+            PendingStore::new(&tmp.path, "inst")
+                .list(SystemTime::now())
+                .unwrap()
+                .is_empty(),
+            "collecting the answer removes the question from disk"
+        );
+    }
+
+    #[test]
+    fn an_uncollected_reply_survives_a_restart() {
+        let tmp = TempDir::new("slot-pending-uncollected");
+        let slot_a = MeshSlot::default();
+        slot_a.set_notifier(Arc::new(RecordingSink::default()) as Arc<dyn NotificationSink>);
+        slot_a
+            .correlations()
+            .attach_store(PendingStore::new(&tmp.path, "inst"), SystemTime::now())
+            .unwrap();
+        slot_a.correlations().open(pending("q-1")).unwrap();
+        slot_a.deliver_peer(peer_message(PeerKind::Reply, "r-1", Some("q-1")));
+        assert!(!slot_a.correlations().is_open("q-1"));
+        drop(slot_a);
+
+        let slot_b = MeshSlot::default();
+        assert_eq!(
+            slot_b
+                .correlations()
+                .attach_store(PendingStore::new(&tmp.path, "inst"), SystemTime::now())
+                .unwrap(),
+            1
+        );
+        let listed = slot_b.correlations().list();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].record.state, PendingState::Answered);
+        assert!(
+            listed[0].reply.is_some(),
+            "the answer waits to be collected"
+        );
+        assert_eq!(
+            slot_b
+                .correlations()
+                .take_answer("q-1")
+                .map(|reply| reply.content),
+            Some("words of r-1".to_string())
+        );
+        assert!(
+            PendingStore::new(&tmp.path, "inst")
+                .list(SystemTime::now())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[cfg(unix)]
@@ -2324,6 +2830,162 @@ mod tests {
         assert!(err.contains(".mesh off"), "{err}");
         assert!(slot.stop().await.unwrap());
         started.relay_handle.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_detaches_the_pending_store_and_leaves_the_file_for_the_next_install() {
+        let started = started_runtime("node-stop-pending").await;
+        let cache_dir = started.runtime.cache_dir().to_path_buf();
+        let instance_id = started.runtime.current_instance_id();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(started.runtime.clone()).unwrap();
+        slot.correlations().open(pending("q-1")).unwrap();
+
+        assert!(slot.stop().await.unwrap());
+
+        assert!(slot.correlations().list().is_empty());
+        assert_eq!(
+            PendingStore::new(&cache_dir, &instance_id)
+                .list(SystemTime::now())
+                .unwrap()
+                .len(),
+            1,
+            "the question waits on disk for the next install"
+        );
+        started.relay_handle.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn install_with_an_unreadable_pending_file_still_serves_and_warns() {
+        install_log_collector();
+        let started = started_runtime("node-install-unreadable").await;
+        let cache_dir = started.runtime.cache_dir().to_path_buf();
+        let instance_id = started.runtime.current_instance_id();
+        let store = PendingStore::new(&cache_dir, &instance_id);
+        std::fs::create_dir_all(store.path().parent().unwrap()).unwrap();
+        std::fs::write(store.path(), "not a record\n").unwrap();
+        let slot = Arc::new(MeshSlot::default());
+
+        slot.install(started.runtime.clone()).unwrap();
+
+        assert!(slot.get().is_some(), "the node serves");
+        assert!(slot.correlations().list().is_empty());
+        let warned = warn_snapshot();
+        let path = store.path().display().to_string();
+        assert!(
+            warned.iter().any(|message| {
+                message.contains("could not be reopened")
+                    && message.contains(&path)
+                    && message.contains("move the file aside")
+            }),
+            "{warned:#?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(store.path()).unwrap(),
+            "not a record\n",
+            "the unreadable file is left for the person to move aside"
+        );
+        assert!(slot.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rekey_rebinds_the_pending_store_to_the_fork_instance() {
+        install_log_collector();
+        let started = started_runtime("node-rekey-pending").await;
+        let cache_dir = started.runtime.cache_dir().to_path_buf();
+        let original_id = started.runtime.current_instance_id();
+        let fork_id = fresh_instance_id();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(started.runtime.clone()).unwrap();
+        slot.correlations().open(pending("q-original")).unwrap();
+        let fork_store = PendingStore::new(&cache_dir, &fork_id);
+        fork_store
+            .upsert(pending("q-fork-earlier"), SystemTime::now())
+            .unwrap();
+
+        slot.rekey(ForkRekey {
+            original_instance_id: Some(original_id.clone()),
+            fork_instance_id: fork_id.clone(),
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            slot.correlations().get("q-original").is_none(),
+            "the fork does not collect the original's questions"
+        );
+        assert!(
+            slot.correlations().is_open("q-fork-earlier"),
+            "the fork's own file is reopened"
+        );
+        slot.correlations().open(pending("q-fork")).unwrap();
+        let now = SystemTime::now();
+        let ids = |instance: &str| -> Vec<String> {
+            PendingStore::new(&cache_dir, instance)
+                .list(now)
+                .unwrap()
+                .into_iter()
+                .map(|record| record.id)
+                .collect()
+        };
+        assert_eq!(ids(&original_id), ["q-original"]);
+        assert_eq!(ids(&fork_id), ["q-fork", "q-fork-earlier"]);
+
+        let second_fork_id = fresh_instance_id();
+        let second_store = PendingStore::new(&cache_dir, &second_fork_id);
+        std::fs::write(second_store.path(), "not a record\n").unwrap();
+        slot.rekey(ForkRekey {
+            original_instance_id: Some(fork_id.clone()),
+            fork_instance_id: second_fork_id.clone(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(started.runtime.current_instance_id(), second_fork_id);
+        assert!(
+            slot.correlations().list().is_empty(),
+            "an unreadable fork file leaves nothing pending"
+        );
+        let path = second_store.path().display().to_string();
+        assert!(
+            warn_snapshot()
+                .iter()
+                .any(|message| message.contains("could not be reopened") && message.contains(&path)),
+            "{:#?}",
+            warn_snapshot()
+        );
+        assert!(slot.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    #[test]
+    fn deliver_peer_notes_name_the_sending_instance_never_the_peers_own_id() {
+        let slot = MeshSlot::default();
+        let message = PeerMessage::new(RawPeerMessage {
+            source_identity: hex_lower(&PEER_IDENTITY),
+            source_destination: hex_lower(&PEER_INSTANCE),
+            destination: hex_lower(&[0x01; 16]),
+            title: None,
+            content: "hello".to_string(),
+            fields: None,
+            timestamp: 1_700_000_000.0,
+            message_id: format!("\u{1b}[2J{}", "i".repeat(PEER_ID_MAX_CHARS + 5)),
+            in_reply_to: None,
+            kind: PeerKind::Message,
+            via: PeerVia::Direct,
+        });
+
+        slot.deliver_peer(message);
+
+        let notes = slot.take_model_notes();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(
+            notes[0].id,
+            format!("peer:{}", &hex_lower(&PEER_INSTANCE)[..8])
+        );
     }
 
     #[cfg(unix)]

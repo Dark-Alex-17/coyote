@@ -16,9 +16,11 @@ pub(crate) use client::{
     DEFAULT_LINK_TIMEOUT, Deadline, R3Client, RequestOptions, RequestOutcome, SizeBranch, link_to,
     open_link,
 };
+#[cfg(test)]
+pub(crate) use dispatch::LoggingKnockSink;
 pub(crate) use dispatch::{
     AdmittedRequest, DispatchError, Dispatcher, Handler, KNOCK_PATH, KnockEvent, KnockSink,
-    STATUS_PATH, describe_path,
+    MESSAGE_PATH, STATUS_PATH, describe_path,
 };
 pub(crate) use error::{R3Error, RefusalCode};
 pub(crate) use frame::{Envelope, MAX_R3_PAYLOAD_BYTES, NAME_HASH_LEN, OriginName};

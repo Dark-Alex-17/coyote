@@ -18,15 +18,18 @@ pub(crate) enum Source {
     Knock,
     /// Messages a trusted peer addressed to this node.
     Message,
+    /// Replies to questions this node asked, matched to an open correlation.
+    Reply,
     /// Propagation fetch and post activity against a propagation node.
     Propagation,
 }
 
 impl Source {
-    pub(crate) const ALL: [Source; 4] = [
+    pub(crate) const ALL: [Source; 5] = [
         Source::Mesh,
         Source::Knock,
         Source::Message,
+        Source::Reply,
         Source::Propagation,
     ];
 
@@ -35,6 +38,7 @@ impl Source {
             Source::Mesh => "[mesh]",
             Source::Knock => "[mesh:knock]",
             Source::Message => "[mesh:message]",
+            Source::Reply => "[mesh:reply]",
             Source::Propagation => "[mesh:propagation]",
         }
     }
@@ -130,20 +134,26 @@ mod tests {
             Source::Mesh,
             Source::Knock,
             Source::Message,
+            Source::Reply,
             Source::Propagation,
         ] {
             match source {
-                Source::Mesh | Source::Knock | Source::Message | Source::Propagation => {}
+                Source::Mesh
+                | Source::Knock
+                | Source::Message
+                | Source::Reply
+                | Source::Propagation => {}
             }
             assert!(Source::ALL.contains(&source), "{source:?} missing from ALL");
         }
-        assert_eq!(Source::ALL.len(), 4);
+        assert_eq!(Source::ALL.len(), 5);
         for source in Source::ALL {
             assert!(source.prefix().starts_with("[mesh"), "{source:?}");
         }
         assert_eq!(Source::Mesh.prefix(), "[mesh]");
         assert_eq!(Source::Knock.prefix(), "[mesh:knock]");
         assert_eq!(Source::Message.prefix(), "[mesh:message]");
+        assert_eq!(Source::Reply.prefix(), "[mesh:reply]");
         assert_eq!(Source::Propagation.prefix(), "[mesh:propagation]");
     }
 

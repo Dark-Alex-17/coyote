@@ -7,9 +7,11 @@ pub(crate) mod idle;
 pub(crate) mod knock;
 pub(crate) mod knocks;
 mod lock;
+pub(crate) mod message;
 mod node;
 pub(crate) mod notify;
 mod peers;
+pub(crate) mod pending;
 mod propagation;
 mod propagation_fetch;
 mod propagation_nodes;
@@ -17,7 +19,8 @@ mod r3;
 pub(crate) mod snapshot;
 pub(crate) mod trust;
 
-pub(crate) use node::MeshSlot;
+pub(crate) use node::{MeshRuntime, MeshSlot};
+pub(crate) use r3::RequestOptions;
 
 use crate::config::sanitize_display_text;
 use anyhow::{Context, Result};
@@ -52,6 +55,17 @@ pub(crate) fn parse_rfc3339(text: &str) -> Option<SystemTime> {
 
 pub(crate) fn hex_lower(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+pub(crate) fn decode_hex(text: &str) -> Option<Vec<u8>> {
+    // `from_str_radix` would take a sign, so the digits are checked first.
+    if !text.len().is_multiple_of(2) || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(text.get(i..i + 2)?, 16).ok())
+        .collect()
 }
 
 /// Reticulum's destination derivation: the address hash is the truncated SHA-256 of the
@@ -116,11 +130,22 @@ pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
 
 #[cfg(test)]
 pub(crate) mod test_support {
+    #[cfg(unix)]
+    use super::announce::AnnounceAppData;
+    #[cfg(unix)]
+    use super::hex_lower;
+    #[cfg(unix)]
+    use super::message::{PeerBody, from_r3_body, received_reply};
     use super::node::MeshPaths;
     #[cfg(unix)]
     use super::node::{MeshRuntime, NodeOptions};
     #[cfg(unix)]
-    use super::r3::{R3Client, R3Server, RequestHandler};
+    pub(crate) use super::peers::PeerSighting;
+    #[cfg(unix)]
+    use super::r3::{
+        AdmittedRequest, Dispatcher, Handler, LoggingKnockSink, MESSAGE_PATH, R3Client, R3Server,
+        RefusalCode, Reply, RequestHandler,
+    };
     use super::snapshot::{BriefState, MeshSnapshot, SessionInfo, TurnState};
     use super::trust::TrustStore;
     use super::{mesh_config_dir, rfc3339_utc};
@@ -130,6 +155,10 @@ pub(crate) mod test_support {
     use crate::config::mesh_config::{MeshBrief, MeshInterface};
     use crate::config::todo::TodoList;
 
+    #[cfg(unix)]
+    use async_trait::async_trait;
+    #[cfg(unix)]
+    use parking_lot::Mutex;
     #[cfg(unix)]
     use rand_core::OsRng;
     #[cfg(unix)]
@@ -424,6 +453,138 @@ pub(crate) mod test_support {
         }
     }
 
+    /// Serves `/message` the way a peer's slot does, minus the slot: each body is decoded,
+    /// kept, and acknowledged by id.
+    #[cfg(unix)]
+    #[derive(Default)]
+    struct MessageRecorder {
+        seen: Mutex<Vec<PeerBody>>,
+    }
+
+    #[cfg(unix)]
+    #[async_trait]
+    impl Handler for MessageRecorder {
+        async fn handle(&self, request: AdmittedRequest) -> Reply {
+            match from_r3_body(&request.body) {
+                Ok(body) => {
+                    let reply = received_reply(&body.id);
+                    self.seen.lock().push(body);
+                    Reply::Value(reply)
+                }
+                Err(_) => Reply::Code(RefusalCode::InvalidData),
+            }
+        }
+    }
+
+    /// A trusted, reachable peer as a `MeshRuntime` sees one: a `Listener` behind the real
+    /// dispatcher over its own trust list, recording every peer message it is sent. Trust is
+    /// granted after the fact with `trust`, since the runtime that will be trusted needs
+    /// this stub's port before it can start.
+    #[cfg(unix)]
+    pub(crate) struct PeerStub {
+        listener: Listener,
+        identity: TransportIdentity,
+        recorder: Arc<MessageRecorder>,
+        trust_dir: TempDir,
+    }
+
+    #[cfg(unix)]
+    impl PeerStub {
+        pub(crate) async fn listen(tag: &str, client_mtu: usize) -> Self {
+            let identity = TransportIdentity::new_from_rand(OsRng);
+            let recorder = Arc::new(MessageRecorder::default());
+            let trust_dir = TempDir::new(tag);
+            let handler = Self::gate(&TrustList::default(), &trust_dir, recorder.clone());
+            let listener = Listener::listen(
+                Arc::new(R3Server::new()),
+                handler,
+                client_mtu,
+                identity.clone(),
+                DestinationName::new("coyote", &format!("mesh.{tag}")),
+            )
+            .await;
+            Self {
+                listener,
+                identity,
+                recorder,
+                trust_dir,
+            }
+        }
+
+        fn gate(
+            list: &TrustList,
+            trust_dir: &TempDir,
+            recorder: Arc<MessageRecorder>,
+        ) -> Arc<dyn RequestHandler> {
+            list.write(&trust_dir.path);
+            let trust = Arc::new(TrustStore::open(&trust_dir.path).unwrap());
+            let dispatcher = Dispatcher::new(trust, Arc::new(LoggingKnockSink));
+            dispatcher.register(MESSAGE_PATH, recorder).unwrap();
+            Arc::new(dispatcher)
+        }
+
+        /// Trusts the instance at `destination_hex` bound to `identity_hex`, so its requests
+        /// reach the recorder instead of knocking.
+        pub(crate) fn trust(&self, destination_hex: &str, identity_hex: &str) {
+            let list = TrustList::default().destination(destination_hex, identity_hex);
+            self.listener.server.set_handler(Self::gate(
+                &list,
+                &self.trust_dir,
+                self.recorder.clone(),
+            ));
+        }
+
+        /// Announces as a Coyote node, which is what gets this stub into a runtime's peer
+        /// table with a path.
+        pub(crate) async fn announce(&self, display_name: Option<&str>) {
+            let app_data = AnnounceAppData {
+                version: 1,
+                display_name: display_name.map(str::to_string),
+            }
+            .encode()
+            .unwrap();
+            self.listener.announce(Some(&app_data)).await;
+        }
+
+        pub(crate) fn port(&self) -> u16 {
+            self.listener.port
+        }
+
+        pub(crate) fn destination_hex(&self) -> String {
+            self.listener.desc.address_hash.to_hex_string()
+        }
+
+        pub(crate) fn identity_hex(&self) -> String {
+            self.identity.address_hash().to_hex_string()
+        }
+
+        /// Every well-formed `/message` body received so far, in arrival order.
+        pub(crate) fn seen(&self) -> Vec<PeerBody> {
+            self.recorder.seen.lock().clone()
+        }
+
+        pub(crate) async fn stop(self) {
+            self.listener.stop().await;
+        }
+    }
+
+    /// A sighting whose destination really derives from its identity and name hash, as
+    /// `trust_destination` requires, for a peer that never announces on the wire.
+    #[cfg(unix)]
+    pub(crate) fn derived_sighting(aspect: &str, display_name: Option<&str>) -> PeerSighting {
+        let identity = TransportIdentity::new_from_rand(OsRng);
+        let name = DestinationName::new("coyote", &format!("mesh.{aspect}"));
+        let desc = SingleInputDestination::new(identity, name).desc;
+        PeerSighting {
+            destination_hash: desc.address_hash.to_hex_string(),
+            identity_hash: desc.identity.address_hash.to_hex_string(),
+            name_hash: hex_lower(name.as_name_hash_slice()),
+            display_name: display_name.map(str::to_string),
+            protocol_version: 1,
+            hops: 1,
+        }
+    }
+
     /// A connecting node: a bare transport with a `TcpClient` and an `R3Client`, and an
     /// identity to prove on links.
     #[cfg(unix)]
@@ -571,10 +732,27 @@ pub(crate) mod test_support {
     #[cfg(unix)]
     pub(crate) async fn started_runtime(tag: &str) -> StartedRuntime {
         let (addr, relay_handle, _) = loopback_relay().await;
+        started_runtime_at(tag, addr.port(), relay_handle).await
+    }
+
+    /// A runtime joined to whatever listens on `port`, such as a `PeerStub`. There is no
+    /// relay task, so `relay_handle` is a task already finished and aborting it does
+    /// nothing.
+    #[cfg(unix)]
+    pub(crate) async fn started_runtime_on(tag: &str, port: u16) -> StartedRuntime {
+        started_runtime_at(tag, port, tokio::spawn(std::future::ready(()))).await
+    }
+
+    #[cfg(unix)]
+    async fn started_runtime_at(
+        tag: &str,
+        port: u16,
+        relay_handle: JoinHandle<()>,
+    ) -> StartedRuntime {
         let tmp = TempDir::new(tag);
         let mut session = Session::default();
         let runtime = MeshRuntime::start(
-            &private_config(addr.port()),
+            &private_config(port),
             true,
             &mut session,
             mesh_paths(&tmp),
@@ -625,6 +803,15 @@ mod tests {
     fn hex_lower_is_lowercase_zero_padded() {
         assert_eq!(hex_lower(&[0x00, 0xab, 0xff]), "00abff");
         assert_eq!(hex_lower(&[]), "");
+    }
+
+    #[test]
+    fn decode_hex_takes_hex_digit_pairs_and_nothing_else() {
+        assert_eq!(decode_hex("00abFF"), Some(vec![0x00, 0xab, 0xff]));
+        assert_eq!(decode_hex(""), Some(vec![]));
+        for text in ["abc", "+1", "-1", "0x", "zz", "a b", "é1"] {
+            assert_eq!(decode_hex(text), None, "{text:?}");
+        }
     }
 
     #[test]

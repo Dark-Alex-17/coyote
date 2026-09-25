@@ -205,11 +205,15 @@ fn dispatch_errors_round_trip_as_maps_and_never_read_as_refusal_codes() {
 /// sent us, so they may name the code only inside an `R3Error::Refused(..)` pattern and
 /// must never build one. A match arm ends in `) =>` (or `)) =>` when the pattern is nested
 /// in an `Err(..)`); a constructed value ends in `);`, so the two never look alike.
+/// The peer message module is a client too: `SendError::Refused` carries the code a peer
+/// answered with, and its `Display` arm reads it the same way. Its handler refuses a
+/// malformed body with `InvalidData`, the one `Reply::Code` it may build.
 #[test]
 fn no_access_is_named_at_exactly_one_site_outside_the_error_module() {
     let needle = ["RefusalCode::", "NoAccess"].concat();
     let refused = ["R3Error::Refused(", &needle, ")"].concat();
     let arms = [[&refused, " =>"].concat(), [&refused, ") =>"].concat()];
+    let send_error_arm = ["Self::Refused(", &needle, ") =>"].concat();
     let constructed = [&refused, ");"].concat();
     let markers = [
         ["#[cfg(test)]", "\nmod tests"].concat(),
@@ -239,18 +243,29 @@ fn no_access_is_named_at_exactly_one_site_outside_the_error_module() {
             !production.contains(&constructed),
             "{name} must never build a refusal outside the dispatcher"
         );
-        if name == "propagation_fetch.rs" || name == "node.rs" {
+        if name == "propagation_fetch.rs" || name == "node.rs" || name == "message.rs" {
             assert!(
                 count > 0,
                 "{name} must read the peer's access refusal to act on it"
             );
-            let consumed: usize = arms.iter().map(|arm| production.matches(arm).count()).sum();
+            let mut consumed: usize = arms.iter().map(|arm| production.matches(arm).count()).sum();
+            if name == "message.rs" {
+                consumed += production.matches(&send_error_arm).count();
+                assert_eq!(
+                    production.matches("Reply::Code(").count(),
+                    production
+                        .matches("Reply::Code(RefusalCode::InvalidData)")
+                        .count(),
+                    "{name} may refuse a malformed body and nothing else"
+                );
+            } else {
+                assert!(!production.contains("Reply::Code"));
+            }
             assert_eq!(
                 count, consumed,
                 "{name} may only match a received refusal, never name the code elsewhere"
             );
             assert!(!production.contains("to_wire"));
-            assert!(!production.contains("Reply::Code"));
             continue;
         }
         if count > 0 {
@@ -344,25 +359,31 @@ mod network {
     };
     use crate::config::mesh_config::MeshInterface;
     use crate::config::{ForkRekey, MeshConfig, Session};
+    use crate::function::mesh::outbound_from_args;
     use crate::mesh::announce::AnnounceAppData;
     use crate::mesh::card::{
         BRANCH_MAX_CHARS, CardSource, DISPLAY_NAME_MAX_CHARS, OBJECTIVE_MAX_CHARS,
         PLAN_TITLE_MAX_CHARS, REPO_NAME_MAX_CHARS, STATE_IDLE, StatusCard, StatusError,
         StatusHandler, TODO_GOAL_MAX_CHARS, build_card,
     };
-    use crate::mesh::idle::{IdleNotify, Origin};
+    use crate::mesh::idle::{IdleNotify, IdleSink, Origin};
     use crate::mesh::knock::{
         ChannelKnockSink, KNOCK_QUEUE_CAPACITY, KnockError, KnockGate, KnockIntro, KnockMessage,
         KnockOutcome, KnockSurface, KnockVia, decode_knock_message, drain_knocks,
     };
     use crate::mesh::knocks::KnockCache;
+    use crate::mesh::message::{
+        OutboundPeer, PeerKind, PeerLxmf, PeerSendOptions, PeerVia, RecipientOutcome, SendError,
+        SendOutcome, decode_peer_lxmf, is_received_reply, received_reply, to_r3_body,
+    };
     use crate::mesh::node::{
         KnockOptions, MeshRuntime, MeshSlot, NodeOptions, REKEY_GRACE, SHUTDOWN_GRACE,
     };
     use crate::mesh::notify::Source;
     use crate::mesh::peers::PeerTable;
+    use crate::mesh::pending::{PENDING_RECORD_VERSION, PendingRecord, PendingState, WaitOutcome};
     use crate::mesh::propagation::test_support::{FakeNode, stored_message};
-    use crate::mesh::propagation::{PropagationOptions, pn_announce_app_data};
+    use crate::mesh::propagation::{PropagationNode, PropagationOptions, pn_announce_app_data};
     use crate::mesh::propagation_fetch::InboundMessage;
     use crate::mesh::snapshot::{MeshSnapshot, PlanRef, RepoInfo, TurnState};
     use crate::mesh::test_support::{
@@ -370,7 +391,8 @@ mod network {
         loopback_relay, mesh_paths, private_config, snapshot_fixture, started_runtime, wait_until,
     };
     use crate::mesh::trust::{IdentityStanding, Rule, TrustChange, TrustOptions};
-    use crate::mesh::{destination_address, mesh_config_dir};
+    use crate::mesh::{destination_address, mesh_config_dir, rfc3339_utc};
+    use crate::supervisor::mailbox::EnvelopePayload;
     use crate::testing::{debug_snapshot, install_log_collector, warn_snapshot};
 
     use async_trait::async_trait;
@@ -609,6 +631,7 @@ mod network {
         server: Arc<R3Server>,
         dest: Arc<tokio::sync::Mutex<SingleInputDestination>>,
         desc: DestinationDesc,
+        identity: TransportIdentity,
         iface: AddressHash,
         cancel: CancellationToken,
         port: u16,
@@ -624,6 +647,7 @@ mod network {
             handler: Arc<dyn RequestHandler>,
             client_mtu: usize,
         ) -> Self {
+            let identity = TransportIdentity::new_from_rand(OsRng);
             let Listener {
                 transport,
                 server,
@@ -636,7 +660,7 @@ mod network {
                 server,
                 handler,
                 client_mtu,
-                TransportIdentity::new_from_rand(OsRng),
+                identity.clone(),
                 fresh_destination_name(),
             )
             .await;
@@ -645,6 +669,7 @@ mod network {
                 server,
                 dest,
                 desc,
+                identity,
                 iface,
                 cancel,
                 port,
@@ -2994,30 +3019,37 @@ mod network {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mesh_runtime_dispatcher_takes_a_provider_after_start() {
-        let pair = NodePair::start_as_started("r3-runtime-register").await;
         let peer = TransportIdentity::new_from_rand(OsRng);
-        let slot = Arc::new(MeshSlot::default());
-        slot.install(pair.node_a.clone()).unwrap();
-        pair.node_a
-            .trust()
-            .trust_identity(
-                slot.as_ref(),
-                &peer.as_identity().address_hash.to_hex_string(),
-                TrustOptions::default(),
-                SystemTime::now(),
-            )
-            .unwrap();
-        let ask = || {
+        let peer_hex = peer.as_identity().address_hash.to_hex_string();
+        let pair = NodePair::start_with(
+            "r3-runtime-register",
+            |_| {},
+            |_| TrustList::default().identity(&peer_hex, true),
+        )
+        .await;
+        let ask = |body: Value| {
             pair.client_b.request(
                 &pair.responder.transport,
                 &peer,
                 &pair.a_desc,
                 MESSAGE_PATH,
-                pair.responder.envelope(Value::from("ping")),
+                pair.responder.envelope(body),
                 short_options(),
             )
         };
 
+        let outcome = ask(Value::from("ping")).await.unwrap();
+        assert_eq!(
+            DispatchError::from_value(&outcome.value),
+            Some(DispatchError::NoProvider {
+                path: MESSAGE_PATH.to_string(),
+            }),
+            "{MESSAGE_PATH} is a placeholder until the node is installed into a slot"
+        );
+        assert_eq!(pair.recorder_a.seen_count(), 0);
+
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(pair.node_a.clone()).unwrap();
         assert!(
             pair.node_a
                 .dispatcher()
@@ -3026,14 +3058,30 @@ mod network {
                 .is_some(),
             "installing the node into a slot registered the {STATUS_PATH} provider"
         );
-        let outcome = ask().await.unwrap();
         assert_eq!(
-            DispatchError::from_value(&outcome.value),
-            Some(DispatchError::NoProvider {
-                path: MESSAGE_PATH.to_string(),
-            }),
-            "{MESSAGE_PATH} is a placeholder until a provider registers"
+            ask(Value::from("ping")).await.unwrap_err(),
+            R3Error::Refused(RefusalCode::InvalidData),
+            "the installed peer handler refuses a body that is not a message"
         );
+        let message = OutboundPeer::new(PeerKind::Message, "ping", None, None, None).unwrap();
+        let outcome = ask(to_r3_body(&message, 1_700_000_000.0)).await.unwrap();
+        assert!(
+            is_received_reply(&outcome.value, &message.id),
+            "{:?}",
+            outcome.value
+        );
+        assert_eq!(slot.peer_inbox().len(), 1);
+        let punctuated = OutboundPeer {
+            id: "Abc-1.2:x".to_string(),
+            ..message.clone()
+        };
+        let outcome = ask(to_r3_body(&punctuated, 1_700_000_000.0)).await.unwrap();
+        assert!(
+            is_received_reply(&outcome.value, "Abc-1.2:x"),
+            "the raw wire id is acknowledged: {:?}",
+            outcome.value
+        );
+        assert_eq!(slot.peer_inbox().len(), 2);
         assert_eq!(pair.recorder_a.seen_count(), 0);
 
         assert!(
@@ -3041,11 +3089,11 @@ mod network {
                 .dispatcher()
                 .register(MESSAGE_PATH, pair.recorder_a.clone())
                 .unwrap()
-                .is_none(),
-            "registering over the {MESSAGE_PATH} placeholder displaces nothing"
+                .is_some(),
+            "registering over {MESSAGE_PATH} displaces the slot's peer handler"
         );
 
-        let outcome = ask().await.unwrap();
+        let outcome = ask(Value::from("ping")).await.unwrap();
         assert_eq!(outcome.value, Value::from("ping"));
         assert_eq!(pair.recorder_a.seen_count(), 1);
         let seen = pair.recorder_a.last();
@@ -3577,13 +3625,13 @@ mod network {
     /// nothing on the request path waits for it.
     struct BlockingSurface {
         barrier: Barrier,
-        entered: AtomicBool,
+        entered: AtomicUsize,
         released: AtomicBool,
     }
 
     impl KnockSurface for BlockingSurface {
         fn surface(&self, _note: IdleNotify) -> bool {
-            self.entered.store(true, Ordering::SeqCst);
+            self.entered.fetch_add(1, Ordering::SeqCst);
             self.barrier.wait();
             self.released.store(true, Ordering::SeqCst);
             true
@@ -3706,6 +3754,61 @@ mod network {
         pair.stop_node_a().await;
     }
 
+    /// Node B knocks node A, where A is a started runtime with a slot installed over it:
+    /// the dispatcher `start` wired, the gate `start` built and the surface `install`
+    /// attached. B's identity is on A's list but its instance is not, so the knock is
+    /// refused `NoAccess` and the one line it earns reaches the slot's idle sink.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_knock_at_a_started_node_surfaces_through_its_installed_slot() {
+        let pair = NodePair::start_with(
+            "r3-knock-installed-slot",
+            |_| {},
+            |responder| {
+                TrustList::default()
+                    .identity(&responder.desc.identity.address_hash.to_hex_string(), false)
+            },
+        )
+        .await;
+        let (_slot, idle) = installed_slot(&pair);
+        let b_identity = pair.responder.desc.identity.address_hash.to_hex_string();
+        let b_instance = pair.responder.desc.address_hash.to_hex_string();
+
+        let err = pair
+            .client_b
+            .request(
+                &pair.responder.transport,
+                &pair.responder.identity,
+                &pair.a_desc,
+                KNOCK_PATH,
+                pair.responder
+                    .envelope(KnockIntro::new("hello").unwrap().to_r3_body()),
+                short_options(),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(err, R3Error::Refused(RefusalCode::NoAccess));
+        wait_until("the knock to surface", || !idle.0.lock().is_empty()).await;
+        {
+            let notes = idle.0.lock();
+            assert_eq!(notes.len(), 1);
+            assert_eq!(notes[0].source, Source::Knock);
+            assert_eq!(notes[0].origin, Origin::Peer(b_identity[..8].to_string()));
+            assert!(notes[0].model_note.is_none());
+            let text = &notes[0].text;
+            assert!(text.contains(&format!("(identity {b_identity})")), "{text}");
+            assert!(
+                text.contains(&format!("knocks from instance {b_instance}: \"hello\"")),
+                "{text}"
+            );
+            assert!(
+                text.contains(&format!(".mesh trust {b_instance}")),
+                "{text}"
+            );
+        }
+        pair.stop_node_a().await;
+    }
+
     /// Node A is already trusted from the instance it knocks from. `/knock` still answers
     /// nil, but B's dispatcher hands nothing to its knock sink: no line, no cache file, no
     /// gate state.
@@ -3820,6 +3923,14 @@ mod network {
     /// with a zero stamp cost and already filed by A, so an unreachable knock has
     /// somewhere to fall back to.
     async fn pair_with_propagation_node(tag: &str) -> (NodePair, FakeNode) {
+        pair_with_propagation_node_trusting(tag, |_| TrustList::default()).await
+    }
+
+    /// `pair_with_propagation_node` with node A's trust list built from the responder.
+    async fn pair_with_propagation_node_trusting(
+        tag: &str,
+        trust: impl FnOnce(&Responder) -> TrustList,
+    ) -> (NodePair, FakeNode) {
         let node = FakeNode::listen(TcpServer::DEFAULT_CLIENT_MTU).await;
         let port = node.port;
         let pair = NodePair::start_with(
@@ -3830,7 +3941,7 @@ mod network {
                     port,
                 });
             },
-            |_| TrustList::default(),
+            trust,
         )
         .await;
         node.announce(&pn_announce_app_data(true, 0, 256)).await;
@@ -3863,11 +3974,29 @@ mod network {
 
     /// Node A knocks a destination it has no path to, with a propagation node learned:
     /// the knock is stored there, signed by A, decryptable by the ghost alone, and names
-    /// A's origin so the ghost recomputes A's instance from it.
+    /// A's origin so the ghost recomputes A's instance from it. A nearer node that takes
+    /// no posts is passed over, as it is for a peer message.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unreachable_knock_falls_back_to_the_propagation_node() {
         let (pair, mut node) = pair_with_propagation_node("r3-knock-fallback").await;
         let (ghost, ghost_desc) = ghost_destination();
+        let (_, decoy_desc) = ghost_destination();
+        let table = pair.node_a.propagation_nodes();
+        table.observe(
+            PropagationNode {
+                destination: decoy_desc,
+                stamp_cost: 0,
+                per_transfer_limit_kb: 256,
+                propagation_enabled: false,
+            },
+            0,
+            SystemTime::now(),
+        );
+        assert_eq!(
+            table.select().unwrap().destination.address_hash,
+            decoy_desc.address_hash,
+            "the fetch picker would take the decoy"
+        );
 
         let outcome = pair
             .node_a
@@ -4014,28 +4143,33 @@ mod network {
         started.relay_handle.abort();
     }
 
-    /// The requester is refused before the gate has even looked at its knock: the surface
-    /// behind the gate is held on a barrier for the whole request.
+    /// A knock is refused without waiting for the gate: X's knock holds the surface behind
+    /// the gate on a barrier, and Y's knock, timed while X's is still stalled there, is
+    /// refused within the request timeout all the same.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_stalled_knock_surface_never_delays_the_refusal() {
         let recorder = Arc::new(Recorder::default());
-        let (responder, requester, desc) = pair(recorder.clone()).await;
+        let (responder, requester_x, desc) = pair(recorder.clone()).await;
+        let mut requester_y = Requester::connect(responder.port, LEGACY_LINK_MTU).await;
+        responder.announce(None).await;
+        requester_y.learn(&responder.desc.address_hash).await;
         let surface = Arc::new(BlockingSurface {
             barrier: Barrier::new(2),
-            entered: AtomicBool::new(false),
+            entered: AtomicUsize::new(0),
             released: AtomicBool::new(false),
         });
         let rig = knock_rig(
             &responder,
-            &TrustList::default().identity(&identity_hex(&requester), false),
+            &TrustList::default()
+                .identity(&identity_hex(&requester_x), false)
+                .identity(&identity_hex(&requester_y), false),
             "r3-knock-stalled-surface",
             Arc::downgrade(&surface) as Weak<dyn KnockSurface>,
         );
-        let link = identified_link(&requester, &responder, &desc).await;
+        let link = identified_link(&requester_x, &responder, &desc).await;
 
-        let started = Instant::now();
         let err = request_on(
-            &requester,
+            &requester_x,
             &link,
             KNOCK_PATH,
             KnockIntro::new("knock knock").unwrap().to_r3_body(),
@@ -4043,18 +4177,34 @@ mod network {
         )
         .await
         .unwrap_err();
+        assert_eq!(err, R3Error::Refused(RefusalCode::NoAccess));
+        wait_until("the gate to reach the stalled surface", || {
+            surface.entered.load(Ordering::SeqCst) == 1
+        })
+        .await;
+
+        let started = Instant::now();
+        let err = requester_y
+            .client
+            .request(
+                &requester_y.transport,
+                &requester_y.identity,
+                &desc,
+                KNOCK_PATH,
+                requester_y.envelope(KnockIntro::new("anyone home").unwrap().to_r3_body()),
+                short_options(),
+            )
+            .await
+            .unwrap_err();
 
         assert_eq!(err, R3Error::Refused(RefusalCode::NoAccess));
         assert!(started.elapsed() < SHORT_REQUEST_TIMEOUT);
-        wait_until("the gate to reach the stalled surface", || {
-            surface.entered.load(Ordering::SeqCst)
-        })
-        .await;
         assert!(!surface.released.load(Ordering::SeqCst));
+        assert_eq!(surface.entered.load(Ordering::SeqCst), 1);
         assert_eq!(
             rig.gate.cache().list(SystemTime::now()).unwrap().len(),
             1,
-            "the knock was filed before the surface was asked to show it"
+            "X's knock was filed before the surface was asked to show it; Y's waits behind it"
         );
         assert_eq!(
             rig.gate.tracked_identities().len(),
@@ -4066,8 +4216,16 @@ mod network {
             surface.released.load(Ordering::SeqCst)
         })
         .await;
+        wait_until("the gate to reach the surface with Y's knock", || {
+            surface.entered.load(Ordering::SeqCst) == 2
+        })
+        .await;
+        assert_eq!(rig.gate.cache().list(SystemTime::now()).unwrap().len(), 2);
+        assert_eq!(rig.gate.tracked_identities().len(), 2);
+        surface.barrier.wait();
         rig.cancel.cancel();
-        requester.stop().await;
+        requester_x.stop().await;
+        requester_y.stop().await;
         responder.stop().await;
     }
 
@@ -4705,5 +4863,487 @@ mod network {
         assert!(slot.stop().await.unwrap());
         pair.cancel_b.cancel();
         pair.responder.stop().await;
+    }
+
+    /// Node A's trust list with node B's own instance on it, which is what B's requests
+    /// derive to when B asks as itself, and what A's sends to B check.
+    fn trusting_b(responder: &Responder) -> TrustList {
+        TrustList::default().destination(
+            &responder.desc.address_hash.to_hex_string(),
+            &responder.desc.identity.address_hash.to_hex_string(),
+        )
+    }
+
+    /// An idle sink that keeps every line it is given.
+    #[derive(Default)]
+    struct RecordingIdle(Mutex<Vec<IdleNotify>>);
+
+    impl IdleSink for RecordingIdle {
+        fn push(&self, note: IdleNotify) -> Result<(), IdleNotify> {
+            self.0.lock().push(note);
+            Ok(())
+        }
+    }
+
+    /// Node A installed into a slot with a recording idle sink in front of it.
+    fn installed_slot(pair: &NodePair) -> (Arc<MeshSlot>, Arc<RecordingIdle>) {
+        let slot = Arc::new(MeshSlot::default());
+        let idle = Arc::new(RecordingIdle::default());
+        slot.set_idle(idle.clone() as Arc<dyn IdleSink>);
+        slot.install(pair.node_a.clone()).unwrap();
+        (slot, idle)
+    }
+
+    /// `short_options` for the direct attempt and a short fallback window, as
+    /// `fallback_knock_options` shortens a knock's.
+    fn peer_send_options() -> PeerSendOptions {
+        PeerSendOptions {
+            request: short_options(),
+            propagation: PropagationOptions {
+                reject_window: Duration::from_millis(300),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Node B sends `message` to node A's `/message` as itself, naming its own instance.
+    async fn b_sends_to_a(
+        pair: &NodePair,
+        message: &OutboundPeer,
+    ) -> Result<RequestOutcome, R3Error> {
+        pair.client_b
+            .request(
+                &pair.responder.transport,
+                &pair.responder.identity,
+                &pair.a_desc,
+                MESSAGE_PATH,
+                pair.responder
+                    .envelope(to_r3_body(message, 1_700_000_000.5)),
+                short_options(),
+            )
+            .await
+    }
+
+    fn only_peer(
+        envelopes: &[crate::supervisor::mailbox::Envelope],
+    ) -> &crate::mesh::message::PeerMessage {
+        assert_eq!(envelopes.len(), 1, "exactly one envelope: {envelopes:?}");
+        match &envelopes[0].payload {
+            EnvelopePayload::Peer(message) => message,
+            other => panic!("not a peer envelope: {other:?}"),
+        }
+    }
+
+    /// The question `ask` opens with node B, filed as the asking tool files it: before
+    /// the send, so a reply that beats the acknowledgement still matches.
+    fn pending_for(ask: &OutboundPeer, responder: &Responder) -> PendingRecord {
+        let now = SystemTime::now();
+        PendingRecord {
+            version: PENDING_RECORD_VERSION,
+            id: ask.id.clone(),
+            peer_destination: responder.desc.address_hash.to_hex_string(),
+            peer_identity: responder.desc.identity.address_hash.to_hex_string(),
+            question: ask.content.clone(),
+            sent_at: rfc3339_utc(now),
+            timeout_at: rfc3339_utc(now + Duration::from_secs(30)),
+            state: PendingState::Open,
+            reply: None,
+        }
+    }
+
+    /// The peer message the fake node was handed, read as `recipient` would read it off
+    /// a fetch: decrypted with its key, checked against `sender`'s signature and decoded
+    /// as the fetch path decodes it.
+    fn stored_peer(bytes: &[u8], recipient: &TransportIdentity, sender: &Identity) -> PeerLxmf {
+        let wire = stored_message(bytes, &to_core_private_identity(recipient));
+        assert_eq!(wire.verify(&to_core_identity(sender)), Ok(true));
+        decode_peer_lxmf(&InboundMessage {
+            transient_id: [0u8; 32],
+            message_id: [0u8; 32],
+            source_identity_hash: sender.address_hash.to_hex_string(),
+            source_delivery_hash: String::new(),
+            timestamp: wire.payload.timestamp,
+            title: wire.payload.title.map(|bytes| bytes.into_vec()),
+            content: wire.payload.content.map(|bytes| bytes.into_vec()),
+            fields: wire.payload.fields,
+            stamp_value: None,
+        })
+    }
+
+    /// Node B sends node A a message over a link. A's dispatcher admits B's instance, the
+    /// slot's handler acknowledges by id, and the message lands in the slot's inbox with
+    /// its routing recomputed from what B proved, a note for the model and one line for
+    /// the person at the keyboard.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_peer_message_over_a_link_lands_in_the_installed_slots_inbox() {
+        let pair = NodePair::start_with("r3-peer-direct", |_| {}, trusting_b).await;
+        let (slot, idle) = installed_slot(&pair);
+        let message = OutboundPeer::new(
+            PeerKind::Message,
+            "hello from B",
+            Some("Hi"),
+            None,
+            Some(serde_json::json!({ "k": "v" })),
+        )
+        .unwrap();
+
+        let outcome = b_sends_to_a(&pair, &message).await.unwrap();
+
+        assert!(
+            is_received_reply(&outcome.value, &message.id),
+            "{:?}",
+            outcome.value
+        );
+        let (envelopes, dropped) = slot.peer_inbox().drain();
+        assert_eq!(dropped, 0);
+        let received = only_peer(&envelopes);
+        let b_identity = pair.responder.desc.identity.address_hash.to_hex_string();
+        let b_instance = pair.responder.desc.address_hash.to_hex_string();
+        assert_eq!(received.source_identity, b_identity);
+        assert_eq!(received.source_destination, b_instance);
+        assert_eq!(
+            received.source_destination,
+            destination_address(
+                &pair.responder.origin().0,
+                &pair.responder.identity.as_identity().address_hash
+            )
+            .to_hex_string(),
+            "the source instance is derived from the origin and the proven identity"
+        );
+        assert_eq!(received.destination, pair.node_a.current_destination_hash());
+        assert_eq!(received.via, PeerVia::Direct);
+        assert_eq!(received.kind, PeerKind::Message);
+        assert_eq!(received.message_id, message.id);
+        assert_eq!(received.title.as_deref(), Some("Hi"));
+        assert_eq!(received.content, "hello from B");
+        assert_eq!(received.fields, Some(serde_json::json!({ "k": "v" })));
+        assert_eq!(received.timestamp, 1_700_000_000.5);
+        assert_eq!(envelopes[0].from, b_instance);
+
+        let notes = slot.take_model_notes();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].event, "peer_message");
+        assert_eq!(notes[0].id, format!("peer:{}", &b_instance[..8]));
+        assert_eq!(notes[0].next_action, "mesh__check_inbox");
+
+        {
+            let lines = idle.0.lock();
+            assert_eq!(lines.len(), 1);
+            assert_eq!(lines[0].source, Source::Message);
+            assert_eq!(lines[0].origin, Origin::Peer(b_identity[..8].to_string()));
+            assert_eq!(
+                lines[0].text,
+                format!("{} says: hello from B", &b_instance[..8]),
+                "B never announced a name, so its instance names it"
+            );
+        }
+        pair.stop_node_a().await;
+    }
+
+    /// Node A asks node B a question and files it; B answers the way the send tool builds
+    /// an answer, a message with the question's id as `in_reply_to`, so the slot answers
+    /// the correlation, wakes the waiter and hands the answer over once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_ask_is_answered_by_a_reply_that_resolves_the_correlation() {
+        let pair = NodePair::start_with("r3-peer-ask-reply", |_| {}, trusting_b).await;
+        pair.introduce_b_to_a().await;
+        let (slot, _idle) = installed_slot(&pair);
+        let b_instance = pair.responder.desc.address_hash.to_hex_string();
+        let ask = OutboundPeer::new(PeerKind::Ask, "what is up", None, None, None).unwrap();
+        pair.recorder_b
+            .queue(Script::Reply(Reply::Value(received_reply(&ask.id))));
+        slot.correlations()
+            .open(pending_for(&ask, &pair.responder))
+            .unwrap();
+
+        let sent = pair
+            .node_a
+            .send_peer_with(&b_instance, &ask, peer_send_options())
+            .await
+            .unwrap();
+        assert_eq!(
+            sent,
+            SendOutcome {
+                id: ask.id.clone(),
+                via: PeerVia::Direct,
+            }
+        );
+        assert_eq!(pair.recorder_b.last().path_hash, PathHash::of(MESSAGE_PATH));
+        assert!(slot.correlations().is_open(&ask.id));
+
+        let reply = outbound_from_args(
+            PeerKind::Message,
+            "all good here",
+            &serde_json::json!({ "in_reply_to": ask.id }),
+        )
+        .unwrap();
+        assert_eq!(reply.kind, PeerKind::Reply);
+        let outcome = b_sends_to_a(&pair, &reply).await.unwrap();
+        assert!(is_received_reply(&outcome.value, &reply.id));
+
+        let waited = slot
+            .correlations()
+            .wait(&ask.id, Duration::from_secs(5))
+            .await;
+        let WaitOutcome::Replied(answer) = waited else {
+            panic!("the reply must answer the question: {waited:?}");
+        };
+        assert_eq!(answer.message_id, reply.id);
+        assert_eq!(answer.in_reply_to.as_deref(), Some(ask.id.as_str()));
+        assert_eq!(answer.content, "all good here");
+        assert_eq!(answer.source_destination, b_instance);
+
+        let (envelopes, _) = slot.peer_inbox().drain();
+        assert_eq!(only_peer(&envelopes).message_id, reply.id);
+        let notes = slot.take_model_notes();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].event, "peer_reply");
+        assert_eq!(notes[0].id, ask.id);
+        assert_eq!(
+            notes[0].next_action,
+            format!("mesh__collect --id {}", ask.id)
+        );
+        assert_eq!(
+            slot.correlations()
+                .take_answer(&ask.id)
+                .map(|answer| answer.message_id),
+            Some(reply.id.clone())
+        );
+        assert_eq!(
+            slot.correlations().take_answer(&ask.id),
+            None,
+            "an answer is handed over once"
+        );
+        pair.stop_node_a().await;
+    }
+
+    /// Trust is checked before anything touches the wire: a destination node A has heard
+    /// but does not trust, or has never heard at all, gets the same refusal and node B
+    /// sees no request.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_send_to_an_untrusted_destination_never_touches_the_wire() {
+        let pair = NodePair::start_as_started("r3-peer-untrusted-send").await;
+        pair.introduce_b_to_a().await;
+        let b_instance = pair.responder.desc.address_hash.to_hex_string();
+        let message = OutboundPeer::new(PeerKind::Message, "hi", None, None, None).unwrap();
+
+        let err = pair
+            .node_a
+            .send_peer_with(&b_instance, &message, peer_send_options())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            SendError::NotTrusted {
+                destination: b_instance.clone(),
+            }
+        );
+        assert!(
+            err.to_string()
+                .contains(&format!(".mesh trust {b_instance}")),
+            "{err}"
+        );
+
+        let stranger = "5e".repeat(16);
+        let err = pair
+            .node_a
+            .send_peer_with(&stranger, &message, peer_send_options())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            SendError::NotTrusted {
+                destination: stranger,
+            }
+        );
+        assert_eq!(pair.recorder_b.seen_count(), 0, "nothing reached node B");
+        pair.stop_node_a().await;
+    }
+
+    /// Node B has a path but never answers, so the direct attempt times out and node A
+    /// stores the message with the propagation node: typed as a peer message, signed by
+    /// A, decryptable by B alone, and naming A's origin so B recomputes A's instance.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unreachable_peer_message_is_stored_with_the_propagation_node_as_coyote_peer() {
+        let (pair, mut node) =
+            pair_with_propagation_node_trusting("r3-peer-fallback", trusting_b).await;
+        pair.introduce_b_to_a().await;
+        let b_instance = pair.responder.desc.address_hash.to_hex_string();
+        pair.recorder_b.queue(Script::Hang);
+        let message = OutboundPeer::new(
+            PeerKind::Message,
+            "are you there",
+            Some("ping"),
+            None,
+            Some(serde_json::json!({ "n": 1 })),
+        )
+        .unwrap();
+
+        let sent = pair
+            .node_a
+            .send_peer_with(&b_instance, &message, peer_send_options())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            sent,
+            SendOutcome {
+                id: message.id.clone(),
+                via: PeerVia::StoreAndForward,
+            }
+        );
+        let received = node.next_received().await;
+        let stored = stored_peer(
+            received.bytes(),
+            &pair.responder.identity,
+            &pair.a_desc.identity,
+        );
+        assert_eq!(
+            stored,
+            PeerLxmf::Peer {
+                name_hash: OriginName::of(&pair.a_desc.name).0,
+                kind: PeerKind::Message,
+                id: message.id.clone(),
+                in_reply_to: None,
+                title: Some("ping".to_string()),
+                content: "are you there".to_string(),
+                fields: Some(serde_json::json!({ "n": 1 })),
+            }
+        );
+        node.nothing_else_received();
+        pair.stop_node_a().await;
+        node.stop().await;
+    }
+
+    /// Node B's dispatcher knows node A's identity but trusts none of its instances, so
+    /// the message is refused over the link; a refusal is the peer saying no, and nothing
+    /// is stored behind its back even with a propagation node known. The refused request
+    /// is itself A's knock on B, surfaced there without an intro.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_peer_message_is_never_stored() {
+        let (pair, mut node) =
+            pair_with_propagation_node_trusting("r3-peer-refused", trusting_b).await;
+        pair.introduce_b_to_a().await;
+        let a_identity = pair.a_desc.identity.address_hash.to_hex_string();
+        let surface = Arc::new(RecordingSurface::default());
+        let rig = knock_rig(
+            &pair.responder,
+            &TrustList::default().identity(&a_identity, false),
+            "r3-peer-refused-gate",
+            Arc::downgrade(&surface) as Weak<dyn KnockSurface>,
+        );
+        let b_instance = pair.responder.desc.address_hash.to_hex_string();
+        let message = OutboundPeer::new(PeerKind::Message, "let me in", None, None, None).unwrap();
+
+        let err = pair
+            .node_a
+            .send_peer_with(&b_instance, &message, peer_send_options())
+            .await
+            .unwrap_err();
+
+        assert_eq!(err, SendError::Refused(RefusalCode::NoAccess));
+        assert!(err.to_string().contains(".mesh knock"), "{err}");
+        sleep(Duration::from_millis(500)).await;
+        node.nothing_else_received();
+        wait_until("node B to surface the refused request as a knock", || {
+            surface.count() == 1
+        })
+        .await;
+        let (source, origin, text) = surface.only();
+        assert_eq!(source, Source::Knock);
+        assert_eq!(origin, Origin::Peer(a_identity[..8].to_string()));
+        assert!(
+            !text.contains("let me in"),
+            "the message body never reaches the knock gate: {text}"
+        );
+        rig.cancel.cancel();
+        pair.stop_node_a().await;
+        node.stop().await;
+    }
+
+    /// A broadcast goes to every trusted peer node A has a path to. Node B acknowledges;
+    /// node C has a path but never answers and no propagation node is known, so its
+    /// report says unreachable while B's says delivered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_broadcast_reaches_the_reachable_peer_and_reports_the_unreachable_one() {
+        let recorder_c = Arc::new(Recorder::default());
+        let responder_c =
+            Responder::listen(recorder_c.clone(), TcpServer::DEFAULT_CLIENT_MTU).await;
+        let c_port = responder_c.port;
+        let c_instance = responder_c.desc.address_hash.to_hex_string();
+        let c_identity = responder_c.desc.identity.address_hash.to_hex_string();
+        let pair = NodePair::start_with(
+            "r3-peer-broadcast",
+            |config| {
+                config.interfaces.push(MeshInterface::Private {
+                    host: "127.0.0.1".to_string(),
+                    port: c_port,
+                });
+            },
+            |responder| trusting_b(responder).destination(&c_instance, &c_identity),
+        )
+        .await;
+        pair.introduce_b_to_a().await;
+        let c_app_data = AnnounceAppData {
+            version: 1,
+            display_name: Some("Cy".to_string()),
+        }
+        .encode()
+        .unwrap();
+        responder_c.announce(Some(&c_app_data)).await;
+        let peers = pair.node_a.peers();
+        wait_until("node A to file node C as a peer", || {
+            peers
+                .snapshot()
+                .iter()
+                .any(|peer| peer.destination_hash == c_instance)
+        })
+        .await;
+        assert!(
+            pair.node_a
+                .propagation_nodes()
+                .select_for_posting()
+                .is_err()
+        );
+        let b_instance = pair.responder.desc.address_hash.to_hex_string();
+        let message = OutboundPeer::new(PeerKind::Bulletin, "all hands", None, None, None).unwrap();
+        pair.recorder_b
+            .queue(Script::Reply(Reply::Value(received_reply(&message.id))));
+        recorder_c.queue(Script::Hang);
+
+        let outcome = pair
+            .node_a
+            .broadcast_with(&message, peer_send_options())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.id, message.id);
+        assert_eq!(outcome.recipients.len(), 2, "{:?}", outcome.recipients);
+        let report = |instance: &str| {
+            outcome
+                .recipients
+                .iter()
+                .find(|report| report.destination == instance)
+                .unwrap_or_else(|| panic!("no report for {instance}: {:?}", outcome.recipients))
+        };
+        let b_report = report(&b_instance);
+        assert_eq!(b_report.outcome, RecipientOutcome::Delivered);
+        assert_eq!(b_report.display_name.as_deref(), Some("Bea"));
+        let c_report = report(&c_instance);
+        assert_eq!(
+            c_report.outcome,
+            RecipientOutcome::Unreachable {
+                reason: SendError::NoPropagationNode.to_string(),
+            }
+        );
+        assert_eq!(c_report.display_name.as_deref(), Some("Cy"));
+        assert_eq!(pair.recorder_b.last().path_hash, PathHash::of(MESSAGE_PATH));
+        assert_eq!(
+            recorder_c.seen_count(),
+            1,
+            "C heard the request it never answered"
+        );
+        pair.stop_node_a().await;
+        responder_c.stop().await;
     }
 }

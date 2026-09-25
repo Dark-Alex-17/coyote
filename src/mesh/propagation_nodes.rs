@@ -4,7 +4,7 @@
 //! were already fetched) lives in the fetch store instead.
 
 use crate::mesh::peers::PeerChange;
-use crate::mesh::propagation::{PropagationNode, PropagationNodeError};
+use crate::mesh::propagation::{MAX_ACCEPTED_STAMP_COST, PropagationNode, PropagationNodeError};
 use crate::mesh::propagation_fetch::FetchError;
 use crate::mesh::r3::short;
 
@@ -118,6 +118,22 @@ impl PropagationNodeTable {
             .ok_or(FetchError::NoPropagationNode)
     }
 
+    /// The node a post should go to: nearest by hops and most recently heard, as `select`,
+    /// but only among nodes that take posted messages at a cost this node will mine.
+    /// `propagate` refuses a node over the ceiling anyway; choosing around it means a
+    /// dear node nearby does not hide an affordable one further off.
+    pub(crate) fn select_for_posting(&self) -> Result<PropagationNode, FetchError> {
+        self.inner
+            .lock()
+            .values()
+            .filter(|record| {
+                record.node.propagation_enabled && record.node.stamp_cost <= MAX_ACCEPTED_STAMP_COST
+            })
+            .min_by_key(|record| (record.hops, Reverse(record.last_seen)))
+            .map(|record| record.node.clone())
+            .ok_or(FetchError::NoPropagationNode)
+    }
+
     #[cfg(test)]
     pub(crate) fn snapshot(&self) -> Vec<PropagationNodeRecord> {
         self.inner.lock().values().cloned().collect()
@@ -213,6 +229,40 @@ mod tests {
 
         table.observe(stale.clone(), 2, t(300));
         assert_eq!(hex(&table.select().unwrap()), hex(&stale));
+    }
+
+    #[test]
+    fn select_for_posting_skips_disabled_and_expensive_nodes() {
+        let table = PropagationNodeTable::new();
+        assert!(matches!(
+            table.select_for_posting(),
+            Err(FetchError::NoPropagationNode)
+        ));
+        let disabled_near = node(false);
+        let mut dear_near = node(true);
+        dear_near.stamp_cost = MAX_ACCEPTED_STAMP_COST + 1;
+        let mut affordable_far = node(true);
+        affordable_far.stamp_cost = MAX_ACCEPTED_STAMP_COST;
+        table.observe(disabled_near.clone(), 1, t(30));
+        table.observe(dear_near.clone(), 1, t(20));
+        table.observe(affordable_far.clone(), 4, t(10));
+
+        assert_eq!(
+            hex(&table.select_for_posting().unwrap()),
+            hex(&affordable_far)
+        );
+        assert_eq!(
+            hex(&table.select().unwrap()),
+            hex(&disabled_near),
+            "the fetch picker is unchanged"
+        );
+
+        let affordable_near = node(true);
+        table.observe(affordable_near.clone(), 1, t(5));
+        assert_eq!(
+            hex(&table.select_for_posting().unwrap()),
+            hex(&affordable_near)
+        );
     }
 
     #[test]

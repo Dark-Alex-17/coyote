@@ -288,9 +288,9 @@ impl KnockSink for ChannelKnockSink {
 }
 
 /// Where the gate puts the one line a knock earns. Held weakly by the gate: the slot owns
-/// the runtime that owns the gate. `surface` runs on the gate's drain task with no lock
-/// held and must not block; `false` means the line was dropped, and the gate then offers
-/// the identity's next knock instead.
+/// the runtime that owns the gate. `surface` runs off the request path with no lock held
+/// and must not block; `false` means the line was dropped, and the gate then offers the
+/// identity's next knock instead.
 pub(crate) trait KnockSurface: Send + Sync {
     fn surface(&self, note: IdleNotify) -> bool;
 }
@@ -556,7 +556,10 @@ fn knock_text(knock: &InboundKnock, display_name: Option<&str>) -> String {
     )
 }
 
-/// Feeds the dispatcher's knocks to the gate until the node stops.
+/// Feeds the dispatcher's knocks to the gate until the node stops. `admit` rewrites the
+/// knock cache under a file lock, so each call runs on a blocking thread rather than a
+/// worker; the LXMF fetch path calls `admit` inline because `InboundSink::deliver` is
+/// synchronous.
 pub(crate) async fn drain_knocks(
     mut rx: Receiver<KnockEvent>,
     gate: Arc<KnockGate>,
@@ -570,16 +573,21 @@ pub(crate) async fn drain_knocks(
                 None => return,
             },
         };
-        gate.admit(
-            InboundKnock {
-                identity_hash: event.identity_hash,
-                destination_hash: event.destination_hash,
-                via: KnockVia::Direct,
-                intro: intro_from_r3_body(event.data.as_ref()),
-            },
-            Instant::now(),
-            SystemTime::now(),
-        );
+        let id8 = short(&event.identity_hash).to_string();
+        let knock = InboundKnock {
+            identity_hash: event.identity_hash,
+            destination_hash: event.destination_hash,
+            via: KnockVia::Direct,
+            intro: intro_from_r3_body(event.data.as_ref()),
+        };
+        let gate = Arc::clone(&gate);
+        let admitted = tokio::task::spawn_blocking(move || {
+            gate.admit(knock, Instant::now(), SystemTime::now());
+        })
+        .await;
+        if let Err(err) = admitted {
+            warn!("Mesh knock gate task for {id8} did not finish: {err}");
+        }
     }
 }
 

@@ -2,7 +2,7 @@ use crate::mesh::announce::is_control_or_invisible;
 use crate::mesh::node::MeshSlot;
 use crate::mesh::peers::{PeerRecord, PeerTable};
 use crate::mesh::{
-    canonical_hash, destination_address, mesh_config_dir, parse_rfc3339, rfc3339_utc,
+    canonical_hash, decode_hex, destination_address, mesh_config_dir, parse_rfc3339, rfc3339_utc,
     write_atomically,
 };
 
@@ -1100,16 +1100,6 @@ fn verified_identity(record: &PeerRecord) -> Result<AddressHash> {
         );
     }
     Ok(identity)
-}
-
-fn decode_hex(text: &str) -> Option<Vec<u8>> {
-    if !text.len().is_multiple_of(2) {
-        return None;
-    }
-    (0..text.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(text.get(i..i + 2)?, 16).ok())
-        .collect()
 }
 
 #[cfg(test)]
