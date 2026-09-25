@@ -252,9 +252,11 @@ impl R3Client {
     }
 
     /// Sends `data` as the request body verbatim, with no envelope, over an already active
-    /// link. Production requests never take this path; tests use it to put a body of their
-    /// own choosing, malformed ones included, in front of the responder.
-    #[cfg(test)]
+    /// link. Coyote-to-Coyote requests never take this path. The LXMF `/get` conversation
+    /// does: a propagation node reads the body as the bare `[wants, haves, limit]` arrays
+    /// of `LXMRouter.message_get_request` (`LXMRouter.py:1436-1475`), so wrapping it in the
+    /// envelope would make every round unreadable to it. Tests use the same path to put a
+    /// body of their own choosing, malformed ones included, in front of a responder.
     pub(crate) async fn request_on_link(
         &self,
         transport: &Transport,
@@ -596,8 +598,9 @@ impl R3Client {
 }
 
 /// Opens (or reuses) the link to `destination` and proves `identity` on it, both within
-/// `link_timeout`.
-async fn link_to(
+/// `link_timeout`. Exposed so a multi-round exchange can identify once and run every round
+/// on the one link, as `LXMRouter` does with `request_receipt.link` (`LXMRouter.py:1535`).
+pub(crate) async fn link_to(
     transport: &Transport,
     identity: &TransportIdentity,
     destination: &DestinationDesc,

@@ -5,6 +5,8 @@ use crate::mesh::announce::{
 };
 use crate::mesh::lock::InstanceLock;
 use crate::mesh::peers::{PeerChange, PeerSighting, PeerTable};
+use crate::mesh::propagation_fetch::{self, FetchError, FetchOptions, FetchReport, InboundSink};
+use crate::mesh::propagation_nodes::PropagationNodeTable;
 #[cfg(test)]
 use crate::mesh::r3::RequestHandler;
 use crate::mesh::r3::{
@@ -161,10 +163,14 @@ pub(crate) struct MeshRuntime {
     interfaces: Mutex<Vec<JoinedInterface>>,
     destination: Mutex<DestinationState>,
     peers: Arc<PeerTable>,
+    propagation_nodes: Arc<PropagationNodeTable>,
     trust: Arc<TrustStore>,
     r3_client: Arc<R3Client>,
     r3_server: Arc<R3Server>,
     dispatcher: Arc<Dispatcher>,
+    /// Held for the length of one propagation fetch; a second caller is refused, never
+    /// queued behind the first.
+    fetching: Mutex<()>,
     cancel: CancellationToken,
     tasks: parking_lot::Mutex<Vec<JoinHandle<()>>>,
 }
@@ -289,10 +295,12 @@ impl MeshRuntime {
                 last_announce,
             }),
             peers,
+            propagation_nodes: Arc::new(PropagationNodeTable::new()),
             trust,
             r3_client: Arc::new(R3Client::new()),
             r3_server,
             dispatcher,
+            fetching: Mutex::new(()),
             cancel: CancellationToken::new(),
             tasks: parking_lot::Mutex::new(Vec::new()),
         });
@@ -310,6 +318,7 @@ impl MeshRuntime {
         runtime.register_task(tokio::spawn(receive_announces(
             announces,
             runtime.peers.clone(),
+            runtime.propagation_nodes.clone(),
             runtime.cancellation_token(),
         )));
         runtime.register_task(tokio::spawn(sweep_peers(
@@ -356,6 +365,13 @@ impl MeshRuntime {
 
     pub(crate) fn peers(&self) -> Arc<PeerTable> {
         self.peers.clone()
+    }
+
+    /// The LXMF propagation nodes heard so far, as `fetch_propagated` chooses among them.
+    // Reached by the REPL mesh commands once they land.
+    #[allow(dead_code)]
+    pub(crate) fn propagation_nodes(&self) -> Arc<PropagationNodeTable> {
+        self.propagation_nodes.clone()
     }
 
     // Reached by the REPL mesh commands once they land.
@@ -481,6 +497,46 @@ impl MeshRuntime {
             origin: self.destination.lock().await.origin,
             body,
         }
+    }
+
+    /// Fetches the messages the nearest announced propagation node holds for this node,
+    /// handing the ones that pass every check to `sink`. The dedup store is read from disk
+    /// for each fetch and written back before the node is told to delete anything, so a
+    /// message survives a restart between the two as a remembered id rather than a second
+    /// delivery. One fetch runs at a time across every Coyote process of this identity;
+    /// stopping the node cancels it.
+    // Reached by the REPL mesh commands once they land.
+    #[allow(dead_code)]
+    pub(crate) async fn fetch_propagated(
+        &self,
+        sink: &dyn InboundSink,
+    ) -> Result<FetchReport, FetchError> {
+        let Ok(_fetching) = self.fetching.try_lock() else {
+            return Err(FetchError::AlreadyRunning);
+        };
+        let store_path = mesh_cache_dir(&self.cache_dir).join("propagation.json");
+        let _lock = propagation_fetch::FetchLock::acquire(&store_path)?;
+        let transport = self
+            .transport
+            .lock()
+            .await
+            .clone()
+            .ok_or(FetchError::Link(R3Error::NotRunning))?;
+        let node = self.propagation_nodes.select()?;
+        let mut store = propagation_fetch::FetchStore::load(store_path, SystemTime::now())?;
+        propagation_fetch::fetch(
+            &transport,
+            &self.r3_client,
+            &self.transport_identity,
+            &node,
+            &self.peers,
+            &self.trust,
+            &mut store,
+            sink,
+            &FetchOptions::default(),
+            self.cancellation_token(),
+        )
+        .await
     }
 
     /// Replaces the dispatcher `start` installed, so a test can watch requests directly.
@@ -949,6 +1005,7 @@ fn record_announce(
 async fn receive_announces(
     mut announces: broadcast::Receiver<AnnounceEvent>,
     peers: Arc<PeerTable>,
+    propagation_nodes: Arc<PropagationNodeTable>,
     cancel: CancellationToken,
 ) {
     loop {
@@ -963,21 +1020,19 @@ async fn receive_announces(
                 Err(broadcast::error::RecvError::Closed) => break,
             },
         };
-        let (destination_hash, identity_hash) = {
-            let destination = event.destination.lock().await;
-            (
-                destination.desc.address_hash.to_hex_string(),
-                destination.desc.identity.address_hash.to_hex_string(),
-            )
-        };
+        let desc = event.destination.lock().await.desc;
+        let now = SystemTime::now();
+        if propagation_nodes.observe_announce(&desc, event.app_data.as_slice(), event.hops, now) {
+            continue;
+        }
         record_announce(
             &peers,
-            destination_hash,
-            identity_hash,
+            desc.address_hash.to_hex_string(),
+            desc.identity.address_hash.to_hex_string(),
             hex_lower(&event.name_hash),
             event.app_data.as_slice(),
             event.hops,
-            SystemTime::now(),
+            now,
         );
     }
 }

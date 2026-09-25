@@ -200,9 +200,13 @@ fn dispatch_errors_round_trip_as_maps_and_never_read_as_refusal_codes() {
 /// needle and the test-module markers are assembled at runtime so this test's own text
 /// never matches them. Only the trailing test module is stripped: a `#[cfg(test)]` on an
 /// import or a helper method must not end the scan early.
+///
+/// The propagation fetch is the client half: it decodes a refusal a node sent us, so it may
+/// name the code only inside an `R3Error::Refused(..)` pattern and must never build one.
 #[test]
 fn no_access_is_named_at_exactly_one_site_outside_the_error_module() {
     let needle = ["RefusalCode::", "NoAccess"].concat();
+    let consumed = ["R3Error::Refused(", &needle, ") =>"].concat();
     let markers = [
         ["#[cfg(test)]", "\nmod tests"].concat(),
         ["#[cfg(test)]", "\npub(crate) mod test_support"].concat(),
@@ -227,6 +231,20 @@ fn no_access_is_named_at_exactly_one_site_outside_the_error_module() {
             assert!(production.contains("impl MeshRuntime"));
         }
         let count = production.matches(&needle).count();
+        if name == "propagation_fetch.rs" {
+            assert!(
+                count > 0,
+                "the fetch must map the node's access refusal to a remedy"
+            );
+            assert_eq!(
+                count,
+                production.matches(&consumed).count(),
+                "the fetch may only decode a received refusal, never name the code elsewhere"
+            );
+            assert!(!production.contains("to_wire"));
+            assert!(!production.contains("Reply::Code"));
+            continue;
+        }
         if count > 0 {
             sites.push((name, count));
         }
@@ -319,9 +337,12 @@ mod network {
     use crate::config::{ForkRekey, Session};
     use crate::mesh::announce::AnnounceAppData;
     use crate::mesh::node::{MeshRuntime, MeshSlot, NodeOptions, REKEY_GRACE, SHUTDOWN_GRACE};
-    use crate::mesh::test_support::{TempDir, loopback_relay, mesh_paths, private_config};
-    use crate::mesh::trust::{IdentityStanding, Rule, TrustChange, TrustOptions, TrustStore};
-    use crate::mesh::{destination_address, mesh_config_dir, rfc3339_utc};
+    use crate::mesh::test_support::{
+        Connector, INTEROP_TIMEOUT, LEGACY_LINK_MTU, Listener, TempDir, TrustList, loopback_relay,
+        mesh_paths, private_config, wait_until,
+    };
+    use crate::mesh::trust::{IdentityStanding, Rule, TrustChange, TrustOptions};
+    use crate::mesh::{destination_address, mesh_config_dir};
     use crate::testing::{debug_snapshot, install_log_collector, warn_snapshot};
 
     use async_trait::async_trait;
@@ -338,25 +359,17 @@ mod network {
     use rns_transport::iface::tcp_client::TcpClient;
     use rns_transport::iface::tcp_server::TcpServer;
     use rns_transport::resource::{LINK_PACKET_MDU, ResourceEvent, ResourceEventKind};
-    use rns_transport::transport::{AnnounceEvent, Transport, TransportConfig};
+    use rns_transport::transport::{AnnounceEvent, Transport};
     use std::collections::VecDeque;
     use std::fs;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant, SystemTime};
-    use tokio::net::TcpListener;
     use tokio::sync::broadcast;
     use tokio::task::JoinHandle;
-    use tokio::time::{sleep, timeout};
+    use tokio::time::timeout;
     use tokio_util::sync::CancellationToken;
 
-    const POLL: Duration = Duration::from_millis(100);
-    const INTEROP_TIMEOUT: Duration = Duration::from_secs(15);
-    /// Reticulum's original 500-byte MTU. TCP interfaces default to `TcpClient::DEFAULT_MTU`
-    /// (262144), which makes every card-sized frame a single packet; the legacy MTU puts the
-    /// packet/resource boundary where small test payloads can reach it, and is what
-    /// constrained interfaces still negotiate.
-    const LEGACY_LINK_MTU: usize = 500;
     /// How long a dropped `Script::Hang` handler takes to go away; see `Abandoned`.
     const ABANDON_DELAY: Duration = Duration::from_millis(250);
     /// How long a request these tests never answer waits before it gives up.
@@ -365,24 +378,6 @@ mod network {
     const RESPONSE_FRAME_OVERHEAD: usize = 24;
     /// Bytes of array header, time, path hash and bin32 header around a request frame's body.
     const REQUEST_FRAME_OVERHEAD: usize = 33;
-
-    async fn closed_port() -> u16 {
-        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = probe.local_addr().unwrap().port();
-        drop(probe);
-        port
-    }
-
-    async fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
-        let deadline = tokio::time::Instant::now() + INTEROP_TIMEOUT;
-        while !condition() {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "timed out waiting for {what}"
-            );
-            sleep(POLL).await;
-        }
-    }
 
     fn link_deadline() -> Deadline {
         Deadline::after(DEFAULT_LINK_TIMEOUT)
@@ -531,81 +526,6 @@ mod network {
         }
     }
 
-    /// A trust list in the file's own format, so a test starts from any state without the
-    /// mutators, which need a live peer table to prove a destination's identity.
-    #[derive(Default)]
-    struct TrustList {
-        identities: Vec<(String, bool)>,
-        destinations: Vec<(String, String)>,
-        denied: Vec<String>,
-        blocked: Vec<String>,
-    }
-
-    impl TrustList {
-        fn identity(mut self, hash: &str, all_destinations: bool) -> Self {
-            self.identities.push((hash.to_string(), all_destinations));
-            self
-        }
-
-        /// A destination bound to `identity`, which gets the identity record the file
-        /// requires (without `all_destinations`) if it has none yet.
-        fn destination(mut self, hash: &str, identity: &str) -> Self {
-            if !self.identities.iter().any(|(known, _)| known == identity) {
-                self.identities.push((identity.to_string(), false));
-            }
-            self.destinations
-                .push((hash.to_string(), identity.to_string()));
-            self
-        }
-
-        fn deny(mut self, hash: &str) -> Self {
-            self.denied.push(hash.to_string());
-            self
-        }
-
-        fn block(mut self, hash: &str) -> Self {
-            self.blocked.push(hash.to_string());
-            self
-        }
-
-        fn open(&self, tag: &str) -> (Arc<TrustStore>, TempDir) {
-            let tmp = TempDir::new(tag);
-            let ts = rfc3339_utc(std::time::UNIX_EPOCH + Duration::from_secs(1_790_000_000));
-            let mut text = String::from("version: 1\n");
-            if !self.identities.is_empty() {
-                text.push_str("identities:\n");
-                for (hash, all_destinations) in &self.identities {
-                    text.push_str(&format!(
-                        "  {hash}:\n    added_at: {ts}\n    last_seen_at: {ts}\n    label: null\n    note: null\n    all_destinations: {all_destinations}\n"
-                    ));
-                }
-            }
-            if !self.destinations.is_empty() {
-                text.push_str("destinations:\n");
-                for (hash, identity) in &self.destinations {
-                    text.push_str(&format!(
-                        "  {hash}:\n    identity: {identity}\n    added_at: {ts}\n    last_seen_at: {ts}\n    label: null\n    note: null\n"
-                    ));
-                }
-            }
-            for (section, hashes) in [
-                ("denied_destinations", &self.denied),
-                ("blocked_identities", &self.blocked),
-            ] {
-                if !hashes.is_empty() {
-                    text.push_str(&format!("{section}:\n"));
-                    for hash in hashes {
-                        text.push_str(&format!("  {hash}:\n    added_at: {ts}\n    note: null\n"));
-                    }
-                }
-            }
-            let path = mesh_config_dir(&tmp.path).join("trust.yaml");
-            fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(&path, text).unwrap();
-            (Arc::new(TrustStore::open(&tmp.path).unwrap()), tmp)
-        }
-    }
-
     #[derive(Default)]
     struct SpySink {
         knocks: Mutex<Vec<KnockEvent>>,
@@ -653,8 +573,7 @@ mod network {
         _tmp: TempDir,
     }
 
-    /// The listening node: a bare transport with a `TcpServer`, one destination and an
-    /// `R3Server`, the shape `MeshConfig` cannot express since it only connects outward.
+    /// A `Listener` serving a fresh Coyote destination.
     struct Responder {
         transport: Arc<Transport>,
         server: Arc<R3Server>,
@@ -675,39 +594,22 @@ mod network {
             handler: Arc<dyn RequestHandler>,
             client_mtu: usize,
         ) -> Self {
-            let port = closed_port().await;
-            let transport = Arc::new(Transport::new(TransportConfig::new(
-                "b",
-                &TransportIdentity::new_from_rand(OsRng),
-                false,
-            )));
-            server.set_handler(handler);
-            let cancel = CancellationToken::new();
-            tokio::spawn(server.clone().run(
-                transport.clone(),
-                transport.in_link_events(),
-                transport.resource_events(),
-                cancel.clone(),
-            ));
-            let tcp = TcpServer::new(format!("127.0.0.1:{port}"), transport.iface_manager())
-                .with_client_mtu(client_mtu);
-            let status = tcp.runtime_status_handle();
-            let iface = transport
-                .iface_manager()
-                .lock()
-                .await
-                .spawn(tcp, TcpServer::spawn);
-            wait_until("the responder to listen", || {
-                status.to_json()["listener_state"].as_str() == Some("listening")
-            })
+            let Listener {
+                transport,
+                server,
+                dest,
+                desc,
+                iface,
+                cancel,
+                port,
+            } = Listener::listen(
+                server,
+                handler,
+                client_mtu,
+                TransportIdentity::new_from_rand(OsRng),
+                fresh_destination_name(),
+            )
             .await;
-            let dest = transport
-                .add_destination(
-                    TransportIdentity::new_from_rand(OsRng),
-                    fresh_destination_name(),
-                )
-                .await;
-            let desc = dest.lock().await.desc;
             Self {
                 transport,
                 server,
@@ -746,8 +648,8 @@ mod network {
         }
     }
 
-    /// The connecting node: a bare transport with a `TcpClient` and an `R3Client`. It has
-    /// no destination of its own; `origin` is the instance it claims in every request.
+    /// A `Connector` with no destination of its own; `origin` is the instance it claims
+    /// in every request.
     struct Requester {
         transport: Arc<Transport>,
         identity: TransportIdentity,
@@ -762,25 +664,16 @@ mod network {
 
     impl Requester {
         async fn connect(port: u16, mtu: usize) -> Self {
-            let identity = TransportIdentity::new_from_rand(OsRng);
-            let transport = Arc::new(Transport::new(TransportConfig::new("a", &identity, false)));
-            let announces = transport.recv_announces().await;
-            let client = Arc::new(R3Client::new());
-            let cancel = CancellationToken::new();
-            let client_task = tokio::spawn(client.clone().run(
-                transport.out_link_events(),
-                transport.resource_events(),
-                cancel.clone(),
-            ));
-            let tcp = TcpClient::new(format!("127.0.0.1:{port}")).with_mtu(mtu);
-            let status = tcp.runtime_status_handle();
-            let context = transport.iface_manager().lock().await.new_context(tcp);
-            let iface = *context.channel.address();
-            let iface_task = tokio::spawn(TcpClient::spawn(context));
-            wait_until("the requester to connect", || {
-                status.to_json()["stream_state"].as_str() == Some("connected")
-            })
-            .await;
+            let Connector {
+                transport,
+                identity,
+                client,
+                client_task,
+                announces,
+                iface,
+                iface_task,
+                cancel,
+            } = Connector::connect(port, mtu).await;
             Self {
                 transport,
                 identity,

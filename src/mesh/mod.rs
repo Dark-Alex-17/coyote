@@ -7,6 +7,8 @@ mod lock;
 mod node;
 mod peers;
 mod propagation;
+mod propagation_fetch;
+mod propagation_nodes;
 mod r3;
 pub(crate) mod trust;
 
@@ -20,8 +22,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-/// Where mesh state that is safe to lose lives: instance locks, the peer table and the
-/// knock cache.
+/// Where mesh state that is safe to lose lives: instance locks, the peer table, the knock
+/// cache and the propagation fetch store.
 pub(crate) fn mesh_cache_dir(cache_dir: &Path) -> PathBuf {
     cache_dir.join("mesh")
 }
@@ -90,11 +92,29 @@ pub(crate) mod test_support {
     use super::node::MeshPaths;
     #[cfg(unix)]
     use super::node::{MeshRuntime, NodeOptions};
+    #[cfg(unix)]
+    use super::r3::{R3Client, R3Server, RequestHandler};
+    use super::trust::TrustStore;
+    use super::{mesh_config_dir, rfc3339_utc};
     use crate::config::MeshConfig;
     #[cfg(unix)]
     use crate::config::Session;
     use crate::config::mesh_config::MeshInterface;
 
+    #[cfg(unix)]
+    use rand_core::OsRng;
+    #[cfg(unix)]
+    use rns_transport::destination::{DestinationDesc, DestinationName, SingleInputDestination};
+    #[cfg(unix)]
+    use rns_transport::hash::AddressHash;
+    #[cfg(unix)]
+    use rns_transport::identity::PrivateIdentity as TransportIdentity;
+    #[cfg(unix)]
+    use rns_transport::iface::tcp_client::TcpClient;
+    #[cfg(unix)]
+    use rns_transport::iface::tcp_server::TcpServer;
+    #[cfg(unix)]
+    use rns_transport::transport::{AnnounceEvent, Transport, TransportConfig};
     #[cfg(unix)]
     use std::net::SocketAddr;
     use std::path::{Path, PathBuf};
@@ -103,6 +123,7 @@ pub(crate) mod test_support {
     #[cfg(unix)]
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
     use std::{env, fs};
     #[cfg(unix)]
@@ -110,7 +131,26 @@ pub(crate) mod test_support {
     #[cfg(unix)]
     use tokio::net::TcpListener;
     #[cfg(unix)]
+    use tokio::sync::broadcast;
+    #[cfg(unix)]
     use tokio::task::JoinHandle;
+    #[cfg(unix)]
+    use tokio::time::{sleep, timeout};
+    #[cfg(unix)]
+    use tokio_util::sync::CancellationToken;
+
+    /// How often `wait_until` polls.
+    #[cfg(unix)]
+    pub(crate) const POLL: Duration = Duration::from_millis(100);
+    /// Ceiling on any one wait in a loopback network test.
+    #[cfg(unix)]
+    pub(crate) const INTEROP_TIMEOUT: Duration = Duration::from_secs(15);
+    /// Reticulum's original 500-byte MTU. TCP interfaces default to `TcpClient::DEFAULT_MTU`
+    /// (262144), which makes every card-sized frame a single packet; the legacy MTU puts the
+    /// packet/resource boundary (link MDU 431) where small test payloads can reach it, and
+    /// is what constrained interfaces still negotiate.
+    #[cfg(unix)]
+    pub(crate) const LEGACY_LINK_MTU: usize = 500;
 
     pub(crate) struct TempDir {
         pub(crate) path: PathBuf,
@@ -171,6 +211,258 @@ pub(crate) mod test_support {
                 port,
             }],
             ..MeshConfig::default()
+        }
+    }
+
+    /// A trust list in the file's own format, so a test starts from any state without the
+    /// mutators, which need a live peer table to prove a destination's identity.
+    #[derive(Default)]
+    pub(crate) struct TrustList {
+        identities: Vec<(String, bool)>,
+        destinations: Vec<(String, String)>,
+        denied: Vec<String>,
+        blocked: Vec<String>,
+    }
+
+    impl TrustList {
+        pub(crate) fn identity(mut self, hash: &str, all_destinations: bool) -> Self {
+            self.identities.push((hash.to_string(), all_destinations));
+            self
+        }
+
+        /// A destination bound to `identity`, which gets the identity record the file
+        /// requires (without `all_destinations`) if it has none yet.
+        pub(crate) fn destination(mut self, hash: &str, identity: &str) -> Self {
+            if !self.identities.iter().any(|(known, _)| known == identity) {
+                self.identities.push((identity.to_string(), false));
+            }
+            self.destinations
+                .push((hash.to_string(), identity.to_string()));
+            self
+        }
+
+        pub(crate) fn deny(mut self, hash: &str) -> Self {
+            self.denied.push(hash.to_string());
+            self
+        }
+
+        pub(crate) fn block(mut self, hash: &str) -> Self {
+            self.blocked.push(hash.to_string());
+            self
+        }
+
+        pub(crate) fn open(&self, tag: &str) -> (std::sync::Arc<TrustStore>, TempDir) {
+            let tmp = TempDir::new(tag);
+            let ts = rfc3339_utc(UNIX_EPOCH + Duration::from_secs(1_790_000_000));
+            let mut text = String::from("version: 1\n");
+            if !self.identities.is_empty() {
+                text.push_str("identities:\n");
+                for (hash, all_destinations) in &self.identities {
+                    text.push_str(&format!(
+                        "  {hash}:\n    added_at: {ts}\n    last_seen_at: {ts}\n    label: null\n    note: null\n    all_destinations: {all_destinations}\n"
+                    ));
+                }
+            }
+            if !self.destinations.is_empty() {
+                text.push_str("destinations:\n");
+                for (hash, identity) in &self.destinations {
+                    text.push_str(&format!(
+                        "  {hash}:\n    identity: {identity}\n    added_at: {ts}\n    last_seen_at: {ts}\n    label: null\n    note: null\n"
+                    ));
+                }
+            }
+            for (section, hashes) in [
+                ("denied_destinations", &self.denied),
+                ("blocked_identities", &self.blocked),
+            ] {
+                if !hashes.is_empty() {
+                    text.push_str(&format!("{section}:\n"));
+                    for hash in hashes {
+                        text.push_str(&format!("  {hash}:\n    added_at: {ts}\n    note: null\n"));
+                    }
+                }
+            }
+            let path = mesh_config_dir(&tmp.path).join("trust.yaml");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, text).unwrap();
+            (
+                std::sync::Arc::new(TrustStore::open(&tmp.path).unwrap()),
+                tmp,
+            )
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) async fn closed_port() -> u16 {
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        port
+    }
+
+    #[cfg(unix)]
+    pub(crate) async fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
+        let deadline = tokio::time::Instant::now() + INTEROP_TIMEOUT;
+        while !condition() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            sleep(POLL).await;
+        }
+    }
+
+    /// A listening node: a bare transport with a `TcpServer`, one destination and an
+    /// `R3Server` answering on it, the shape `MeshConfig` cannot express since it only
+    /// connects outward.
+    #[cfg(unix)]
+    pub(crate) struct Listener {
+        pub(crate) transport: Arc<Transport>,
+        pub(crate) server: Arc<R3Server>,
+        pub(crate) dest: Arc<tokio::sync::Mutex<SingleInputDestination>>,
+        pub(crate) desc: DestinationDesc,
+        pub(crate) iface: AddressHash,
+        pub(crate) cancel: CancellationToken,
+        pub(crate) port: u16,
+    }
+
+    #[cfg(unix)]
+    impl Listener {
+        pub(crate) async fn listen(
+            server: Arc<R3Server>,
+            handler: Arc<dyn RequestHandler>,
+            client_mtu: usize,
+            identity: TransportIdentity,
+            name: DestinationName,
+        ) -> Self {
+            let port = closed_port().await;
+            let transport = Arc::new(Transport::new(TransportConfig::new(
+                "b",
+                &TransportIdentity::new_from_rand(OsRng),
+                false,
+            )));
+            server.set_handler(handler);
+            let cancel = CancellationToken::new();
+            tokio::spawn(server.clone().run(
+                transport.clone(),
+                transport.in_link_events(),
+                transport.resource_events(),
+                cancel.clone(),
+            ));
+            let tcp = TcpServer::new(format!("127.0.0.1:{port}"), transport.iface_manager())
+                .with_client_mtu(client_mtu);
+            let status = tcp.runtime_status_handle();
+            let iface = transport
+                .iface_manager()
+                .lock()
+                .await
+                .spawn(tcp, TcpServer::spawn);
+            wait_until("the listener to listen", || {
+                status.to_json()["listener_state"].as_str() == Some("listening")
+            })
+            .await;
+            let dest = transport.add_destination(identity, name).await;
+            let desc = dest.lock().await.desc;
+            Self {
+                transport,
+                server,
+                dest,
+                desc,
+                iface,
+                cancel,
+                port,
+            }
+        }
+
+        pub(crate) async fn announce(&self, app_data: Option<&[u8]>) {
+            let packet = self.dest.lock().await.announce(OsRng, app_data).unwrap();
+            self.transport.send_packet(packet).await;
+        }
+
+        pub(crate) async fn stop(self) {
+            self.cancel.cancel();
+            self.transport
+                .iface_manager()
+                .lock()
+                .await
+                .stop_interface(self.iface);
+        }
+    }
+
+    /// A connecting node: a bare transport with a `TcpClient` and an `R3Client`, and an
+    /// identity to prove on links.
+    #[cfg(unix)]
+    pub(crate) struct Connector {
+        pub(crate) transport: Arc<Transport>,
+        pub(crate) identity: TransportIdentity,
+        pub(crate) client: Arc<R3Client>,
+        pub(crate) client_task: JoinHandle<()>,
+        pub(crate) announces: broadcast::Receiver<AnnounceEvent>,
+        pub(crate) iface: AddressHash,
+        pub(crate) iface_task: JoinHandle<()>,
+        pub(crate) cancel: CancellationToken,
+    }
+
+    #[cfg(unix)]
+    impl Connector {
+        pub(crate) async fn connect(port: u16, mtu: usize) -> Self {
+            let identity = TransportIdentity::new_from_rand(OsRng);
+            let transport = Arc::new(Transport::new(TransportConfig::new("a", &identity, false)));
+            let announces = transport.recv_announces().await;
+            let client = Arc::new(R3Client::new());
+            let cancel = CancellationToken::new();
+            let client_task = tokio::spawn(client.clone().run(
+                transport.out_link_events(),
+                transport.resource_events(),
+                cancel.clone(),
+            ));
+            let tcp = TcpClient::new(format!("127.0.0.1:{port}")).with_mtu(mtu);
+            let status = tcp.runtime_status_handle();
+            let context = transport.iface_manager().lock().await.new_context(tcp);
+            let iface = *context.channel.address();
+            let iface_task = tokio::spawn(TcpClient::spawn(context));
+            wait_until("the connector to connect", || {
+                status.to_json()["stream_state"].as_str() == Some("connected")
+            })
+            .await;
+            Self {
+                transport,
+                identity,
+                client,
+                client_task,
+                announces,
+                iface,
+                iface_task,
+                cancel,
+            }
+        }
+
+        /// Consumes announces until the one for `hash` arrives and returns its description
+        /// and app_data as the transport delivered them.
+        pub(crate) async fn learn(&mut self, hash: &AddressHash) -> (DestinationDesc, Vec<u8>) {
+            let deadline = tokio::time::Instant::now() + INTEROP_TIMEOUT;
+            loop {
+                let event = tokio::time::timeout_at(deadline, self.announces.recv())
+                    .await
+                    .expect("the connector must hear the announce")
+                    .unwrap();
+                let desc = event.destination.lock().await.desc;
+                if desc.address_hash == *hash {
+                    return (desc, event.app_data.as_slice().to_vec());
+                }
+            }
+        }
+
+        pub(crate) async fn stop(self) {
+            self.cancel.cancel();
+            // Bounded because a connector a test has wedged with a response-size limit has
+            // its transport's handler lock held for good.
+            let _ = timeout(
+                super::node::SHUTDOWN_GRACE,
+                self.transport.stop_interface(self.iface),
+            )
+            .await;
+            self.iface_task.abort();
         }
     }
 

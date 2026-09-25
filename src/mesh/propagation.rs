@@ -37,7 +37,10 @@ use tokio::sync::broadcast;
 use tokio::time::{Instant, sleep_until, timeout};
 use tokio_util::sync::CancellationToken;
 
-/// The highest announced stamp cost this node will mine for. The reference clamps an
+/// The highest announced stamp cost this node will mine for when posting; `prepare_envelope`
+/// refuses a node above it. Announces above it are still parsed and filed, because
+/// fetching mines nothing: fetched bodies carry no propagation stamp (`LXMRouter.py:1494`),
+/// so a node too dear to post to is still worth fetching from. The reference clamps an
 /// operator's configured cost only from below (`PROPAGATION_COST_MIN = 13`, default
 /// `PROPAGATION_COST = 16`, `LXMRouter.py:50-54`; `lxmd.py:166-178`), so an announce may
 /// demand anything, and each extra bit doubles the expected 2^cost hashes. The reference
@@ -89,8 +92,6 @@ pub(crate) enum PropagationNodeError {
     InvalidAnnounce(String),
     /// The announced target cost is below zero.
     NegativeStampCost(i64),
-    /// The announced target cost is above `MAX_ACCEPTED_STAMP_COST`.
-    StampCostAboveCeiling { cost: i64, max: u32 },
 }
 
 impl fmt::Display for PropagationNodeError {
@@ -111,10 +112,6 @@ impl fmt::Display for PropagationNodeError {
                     "The propagation node announces a negative stamp cost ({cost})"
                 )
             }
-            Self::StampCostAboveCeiling { cost, max } => write!(
-                f,
-                "The propagation node demands stamp cost {cost}, above the {max} this node will mine"
-            ),
         }
     }
 }
@@ -133,9 +130,12 @@ pub(crate) struct PropagationNode {
     pub stamp_cost: u32,
     /// The node's per-transfer limit in its kilobytes, slot `[3]` (`LXMRouter.py:314`).
     pub per_transfer_limit_kb: u64,
-    /// Slot `[2]`: whether the node is taking messages from clients at all
-    /// (`LXMRouter.py:309-313`).
-    // Read by the caller that picks a node, which arrives with the outbound message path.
+    /// Slot `[2]`, `propagation_node and not from_static_only` (`LXMRouter.py:309`):
+    /// whether the node takes posted messages from anyone. It does not gate fetching:
+    /// `from_static_only` only guards inbound propagation resources (`LXMRouter.py:2089,
+    /// 2157`) and `message_get_request` never reads it (`LXMRouter.py:1427-1429`), so a
+    /// node announcing `false` here still serves `/get`.
+    // The posting picker's input; nothing on the fetch path reads it.
     #[allow(dead_code)]
     pub propagation_enabled: bool,
 }
@@ -143,9 +143,8 @@ pub(crate) struct PropagationNode {
 impl PropagationNode {
     /// Reads a node out of its announce. `app_data` must have the reference layout
     /// `[False, timebase, enabled, per_transfer_kb, per_sync_kb, [cost, flex, peering], {}]`
-    /// (`LXMRouter.py:307-319`); the layout check is upstream's, the cost bounds are ours.
-    // Reached by the node discovery that arrives with the outbound message path.
-    #[allow(dead_code)]
+    /// (`LXMRouter.py:307-319`); the layout check is upstream's, the sign check on the cost
+    /// is ours. No ceiling is applied here: that belongs to posting, in `prepare_envelope`.
     pub(crate) fn from_announce(
         destination: &DestinationDesc,
         app_data: &[u8],
@@ -163,12 +162,9 @@ impl PropagationNode {
         if cost < 0 {
             return Err(PropagationNodeError::NegativeStampCost(cost));
         }
-        if cost > i64::from(MAX_ACCEPTED_STAMP_COST) {
-            return Err(PropagationNodeError::StampCostAboveCeiling {
-                cost,
-                max: MAX_ACCEPTED_STAMP_COST,
-            });
-        }
+        let stamp_cost = u32::try_from(cost).map_err(|_| {
+            PropagationNodeError::InvalidAnnounce("stamp cost does not fit a u32".to_string())
+        })?;
         let slots = match rmpv::decode::read_value(&mut Cursor::new(app_data)) {
             Ok(rmpv::Value::Array(slots)) => slots,
             _ => {
@@ -188,7 +184,7 @@ impl PropagationNode {
             })?;
         Ok(Self {
             destination: *destination,
-            stamp_cost: u32::try_from(cost).expect("a cost within the ceiling fits u32"),
+            stamp_cost,
             per_transfer_limit_kb,
             propagation_enabled,
         })
@@ -203,6 +199,9 @@ pub(crate) enum PropagationError {
     Cancelled,
     /// The stamp search ran out of nonces, which no attainable cost does.
     StampExhausted,
+    /// The node's announced cost is above `MAX_ACCEPTED_STAMP_COST`; nothing was mined or
+    /// sent.
+    StampCostAboveCeiling { cost: u32, max: u32 },
     /// The envelope would exceed the node's announced per-transfer limit; nothing was mined
     /// or sent. The node itself refuses an incoming resource above its per-sync limit
     /// (`LXMRouter.py:2102-2106`), which is never below the per-transfer one
@@ -233,6 +232,10 @@ impl fmt::Display for PropagationError {
         match self {
             Self::Cancelled => write!(f, "The propagation attempt was cancelled"),
             Self::StampExhausted => write!(f, "No propagation stamp could be found"),
+            Self::StampCostAboveCeiling { cost, max } => write!(
+                f,
+                "The propagation node demands stamp cost {cost}, above the {max} this node will mine"
+            ),
             Self::Oversize { len, max } => write!(
                 f,
                 "The propagation envelope is {len} bytes, above the node's {max}-byte limit"
@@ -434,8 +437,9 @@ pub(crate) async fn mine_propagation_stamp(
 /// order is fixed by the wire format: the transient id is the hash of the encrypted message
 /// (`LXMessage.py:429-433`), the stamp is mined over that id, and the envelope carries both
 /// (`LXMRouter.py:2110-2120`). Encrypting again would mint a fresh ephemeral key and a
-/// different id, so the encrypted bytes are made once and reused. The size check runs
-/// before any mining so an envelope the node would refuse costs no work.
+/// different id, so the encrypted bytes are made once and reused. The cost ceiling and the
+/// size check run before any mining so an envelope this node would not stamp, or the node
+/// would refuse, costs no work.
 pub(crate) async fn prepare_envelope(
     sender: &PrivateIdentity,
     recipient: &Identity,
@@ -443,6 +447,12 @@ pub(crate) async fn prepare_envelope(
     message: &OutboundMessage,
     cancel: CancellationToken,
 ) -> Result<PreparedEnvelope, PropagationError> {
+    if node.stamp_cost > MAX_ACCEPTED_STAMP_COST {
+        return Err(PropagationError::StampCostAboveCeiling {
+            cost: node.stamp_cost,
+            max: MAX_ACCEPTED_STAMP_COST,
+        });
+    }
     let timestamp = unix_now()?;
     let wire = build_signed_message(sender, &lxmf_delivery_hash(recipient), message, timestamp)?;
     let (lxmf_data, transient_id) =
@@ -758,6 +768,40 @@ fn unix_now() -> Result<f64, PropagationError> {
         .map_err(|_| PropagationError::Encode("system clock is before the UNIX epoch".to_string()))
 }
 
+/// `LXMRouter.get_propagation_node_app_data` (`LXMRouter.py:307-319`), slot for slot, for
+/// every test that needs a node's announce.
+#[cfg(test)]
+pub(crate) fn pn_announce_slots(
+    enabled: bool,
+    cost: i64,
+    per_transfer_kb: i64,
+) -> Vec<rmpv::Value> {
+    vec![
+        rmpv::Value::Boolean(false),
+        rmpv::Value::from(1_700_000_000i64),
+        rmpv::Value::Boolean(enabled),
+        rmpv::Value::from(per_transfer_kb),
+        rmpv::Value::from(per_transfer_kb * 40),
+        rmpv::Value::Array(vec![
+            rmpv::Value::from(cost),
+            rmpv::Value::from(3),
+            rmpv::Value::from(18),
+        ]),
+        rmpv::Value::Map(vec![]),
+    ]
+}
+
+#[cfg(test)]
+pub(crate) fn pn_announce_app_data(enabled: bool, cost: i64, per_transfer_kb: i64) -> Vec<u8> {
+    let mut out = Vec::new();
+    rmpv::encode::write_value(
+        &mut out,
+        &rmpv::Value::Array(pn_announce_slots(enabled, cost, per_transfer_kb)),
+    )
+    .unwrap();
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -788,21 +832,8 @@ mod tests {
         out
     }
 
-    /// `LXMRouter.get_propagation_node_app_data` (`LXMRouter.py:307-319`), slot for slot.
     fn pn_slots(cost: i64, per_transfer_kb: i64) -> Vec<rmpv::Value> {
-        vec![
-            rmpv::Value::Boolean(false),
-            rmpv::Value::from(1_700_000_000i64),
-            rmpv::Value::Boolean(true),
-            rmpv::Value::from(per_transfer_kb),
-            rmpv::Value::from(per_transfer_kb * 40),
-            rmpv::Value::Array(vec![
-                rmpv::Value::from(cost),
-                rmpv::Value::from(3),
-                rmpv::Value::from(18),
-            ]),
-            rmpv::Value::Map(vec![]),
-        ]
+        pn_announce_slots(true, cost, per_transfer_kb)
     }
 
     fn pn_app_data(cost: i64, per_transfer_kb: i64) -> Vec<u8> {
@@ -1004,24 +1035,29 @@ mod tests {
     }
 
     #[test]
-    fn from_announce_refuses_costs_outside_the_accepted_range() {
+    fn from_announce_refuses_negative_costs_and_files_any_other() {
         let desc = propagation_desc();
         assert_eq!(
             parse_error(&desc, &pn_app_data(-1, DEFAULT_LIMIT_KB)),
             PropagationNodeError::NegativeStampCost(-1)
         );
-        let above = parse_error(&desc, &pn_app_data(27, DEFAULT_LIMIT_KB));
-        assert_eq!(
-            above,
-            PropagationNodeError::StampCostAboveCeiling { cost: 27, max: 26 }
-        );
-        assert!(above.to_string().contains("26"), "{above}");
+        let above_ceiling =
+            PropagationNode::from_announce(&desc, &pn_app_data(27, DEFAULT_LIMIT_KB)).unwrap();
+        assert_eq!(above_ceiling.stamp_cost, 27);
         let at_ceiling =
             PropagationNode::from_announce(&desc, &pn_app_data(26, DEFAULT_LIMIT_KB)).unwrap();
         assert_eq!(at_ceiling.stamp_cost, MAX_ACCEPTED_STAMP_COST);
         let below_reference_minimum =
             PropagationNode::from_announce(&desc, &pn_app_data(0, DEFAULT_LIMIT_KB)).unwrap();
         assert_eq!(below_reference_minimum.stamp_cost, 0);
+        let overflowing = parse_error(
+            &desc,
+            &pn_app_data(i64::from(u32::MAX) + 1, DEFAULT_LIMIT_KB),
+        );
+        assert_eq!(
+            overflowing,
+            PropagationNodeError::InvalidAnnounce("stamp cost does not fit a u32".to_string())
+        );
     }
 
     #[test]
@@ -1268,7 +1304,9 @@ mod tests {
         install_log_collector();
         let sender = PrivateIdentity::new_from_rand(OsRng);
         let recipient = PrivateIdentity::new_from_rand(OsRng);
-        let node = node_with(ENDLESS_COST, 1);
+        // The dearest cost the ceiling lets through: 2^26 expected hashes, well past the
+        // bound below, so mining before the size check would still fail the test.
+        let node = node_with(MAX_ACCEPTED_STAMP_COST, 1);
 
         let started = StdInstant::now();
         let outcome = prepare_envelope(
@@ -1292,6 +1330,34 @@ mod tests {
         assert!(
             !debug_snapshot().iter().any(|line| line.contains(&needle)),
             "no stamp may be demanded for an envelope the node would refuse"
+        );
+    }
+
+    #[tokio::test]
+    async fn costs_above_the_ceiling_are_refused_before_any_mining() {
+        install_log_collector();
+        let sender = PrivateIdentity::new_from_rand(OsRng);
+        let recipient = PrivateIdentity::new_from_rand(OsRng);
+        let node = node_with(MAX_ACCEPTED_STAMP_COST + 1, 256);
+
+        let started = StdInstant::now();
+        let outcome = prepare_envelope(
+            &sender,
+            &recipient_of(&recipient),
+            &node,
+            &message(b"hi"),
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(
+            outcome.err(),
+            Some(PropagationError::StampCostAboveCeiling { cost: 27, max: 26 })
+        );
+        let needle = logged_node(&node);
+        assert!(
+            !debug_snapshot().iter().any(|line| line.contains(&needle)),
+            "no stamp may be demanded at a cost this node will not mine"
         );
     }
 

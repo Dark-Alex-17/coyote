@@ -13,15 +13,18 @@ mod server;
 mod tests;
 
 pub(crate) use client::{
-    DEFAULT_LINK_TIMEOUT, Deadline, R3Client, RequestOptions, RequestOutcome, SizeBranch, open_link,
+    DEFAULT_LINK_TIMEOUT, Deadline, R3Client, RequestOptions, RequestOutcome, SizeBranch, link_to,
+    open_link,
 };
 pub(crate) use dispatch::{Dispatcher, LoggingKnockSink};
 pub(crate) use error::{R3Error, RefusalCode};
-pub(crate) use frame::{Envelope, NAME_HASH_LEN, OriginName};
+#[cfg(test)]
+pub(crate) use frame::RequestFrame;
+pub(crate) use frame::{Envelope, MAX_R3_PAYLOAD_BYTES, NAME_HASH_LEN, OriginName};
 pub(crate) use receipt::RequestReceipt;
 pub(crate) use server::R3Server;
 #[cfg(test)]
-pub(crate) use server::RequestHandler;
+pub(crate) use server::{Admission, InboundRequest, Reply, RequestHandler};
 
 /// How much of a hash the logs show.
 pub(crate) const LOGGED_HASH_CHARS: usize = 8;
