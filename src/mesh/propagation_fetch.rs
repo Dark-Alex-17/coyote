@@ -9,6 +9,7 @@
 //! neither recorded nor acknowledged, so the node keeps it for a later fetch, a bounded
 //! number of times.
 
+use crate::mesh::lock::{read_holder_pid, write_holder_pid};
 use crate::mesh::peers::PeerTable;
 use crate::mesh::propagation::{PropagationNode, lxmf_delivery_hash};
 use crate::mesh::r3::{
@@ -132,9 +133,14 @@ impl Default for FetchOptions {
 pub(crate) enum FetchError {
     /// No propagation node has announced itself since the node started.
     NoPropagationNode,
-    /// Another fetch is in progress, in this process or another one sharing the store;
-    /// calls are refused rather than queued.
+    /// Another fetch is in progress on this runtime; calls are refused rather than queued.
     AlreadyRunning,
+    /// Another Coyote process sharing the store holds the fetch lock at `path`; `pid` is
+    /// what that holder wrote into the lock file, when it could be read back.
+    HeldByOtherProcess {
+        path: PathBuf,
+        pid: Option<u32>,
+    },
     Cancelled,
     /// Link establishment, a send, a bounded wait or the request client itself failed.
     Link(R3Error),
@@ -173,9 +179,22 @@ impl fmt::Display for FetchError {
             Self::AlreadyRunning => {
                 write!(
                     f,
-                    "A propagation fetch is already running in this or another Coyote session of this identity; wait for it to finish"
+                    "A propagation fetch is already running in this Coyote session; wait for it to finish"
                 )
             }
+            Self::HeldByOtherProcess {
+                path,
+                pid: Some(pid),
+            } => write!(
+                f,
+                "A propagation fetch is already running in another Coyote process (pid {pid}) holding '{}'; wait for it to finish",
+                path.display()
+            ),
+            Self::HeldByOtherProcess { path, pid: None } => write!(
+                f,
+                "A propagation fetch is already running in another Coyote process holding '{}'; wait for it to finish",
+                path.display()
+            ),
             Self::Cancelled => write!(f, "The propagation fetch was cancelled"),
             Self::Link(err) => write!(f, "{err}"),
             Self::NodeSawNoIdentity { node } => write!(
@@ -222,7 +241,8 @@ impl std::error::Error for FetchError {}
 /// identity share `<cache_dir>/mesh/propagation.json`, and the store is read at the start
 /// of a fetch and written back at the end, so without this a concurrent fetch would
 /// overwrite the other's remembered ids. Released when the `File` drops; the file itself
-/// is never removed, for the reason `InstanceLock` gives.
+/// is never removed, for the reason `InstanceLock` gives. The holder's pid is written into
+/// the file to word a refusal; `try_lock` alone decides who holds it.
 pub(crate) struct FetchLock {
     _file: File,
 }
@@ -236,7 +256,7 @@ impl FetchLock {
             })?;
         }
         let path = store_path.with_added_extension("lock");
-        let file = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
@@ -244,8 +264,16 @@ impl FetchLock {
             .open(&path)
             .map_err(|err| FetchError::Store(format!("open '{}': {err}", path.display())))?;
         match file.try_lock() {
-            Ok(()) => Ok(Self { _file: file }),
-            Err(TryLockError::WouldBlock) => Err(FetchError::AlreadyRunning),
+            Ok(()) => {
+                write_holder_pid(&mut file).map_err(|err| {
+                    FetchError::Store(format!("write '{}': {err}", path.display()))
+                })?;
+                Ok(Self { _file: file })
+            }
+            Err(TryLockError::WouldBlock) => Err(FetchError::HeldByOtherProcess {
+                path,
+                pid: read_holder_pid(&mut file),
+            }),
             Err(TryLockError::Error(err)) => Err(FetchError::Store(format!(
                 "lock '{}': {err}",
                 path.display()
@@ -1129,7 +1157,13 @@ impl BodyPipeline<'_> {
                     Ok(BodyOutcome::Deferred { attempts })
                 }
                 Deferral::BudgetSpent => {
-                    Ok(self.discard(transient_id, Discard::UnknownSourceBudgetSpent, store, now))
+                    store.insert(transient_id, now);
+                    warn!(
+                        "Propagation fetch from {}: giving up on transient {} after {MAX_UNKNOWN_SOURCE_DEFERRALS} deferrals; no key for its claimed source",
+                        self.node,
+                        short(&hex_lower(&transient_id))
+                    );
+                    Ok(BodyOutcome::Discarded(Discard::UnknownSourceBudgetSpent))
                 }
             },
             Err(discard) => Ok(self.discard(transient_id, discard, store, now)),
@@ -1401,7 +1435,9 @@ pub(crate) async fn fetch(
 /// persists the store before the outcome is looked at, so what the loop recorded survives
 /// a transport error inside it; the sync is only recorded when the loop completed. Returns
 /// the ids round 3 tells the node to delete: every body but the deferred ones, which the
-/// node keeps for a later fetch, each id once however often it was served.
+/// node keeps for a later fetch, each id once however often it was served. The body loop
+/// is non-cancellable by design, so cancellation is not a loop exit path; aborting the
+/// `fetch_propagated` future mid-loop skips the persist.
 async fn process_and_persist(
     pipeline: &BodyPipeline<'_>,
     bodies: &[Vec<u8>],
@@ -2005,6 +2041,18 @@ mod tests {
         assert!(bench.store.contains(&id), "the fourth sighting is recorded");
         assert_eq!(bench.store.deferral_of(&id), None);
         assert_eq!(bench.sink.count(), 0);
+        let gave_up_line = format!(
+            "Propagation fetch from fake: giving up on transient {} after {MAX_UNKNOWN_SOURCE_DEFERRALS} deferrals; no key for its claimed source",
+            short(&hex_lower(&id))
+        );
+        assert_eq!(
+            warn_snapshot()
+                .iter()
+                .filter(|line| *line == &gave_up_line)
+                .count(),
+            1,
+            "only the sighting that spends the budget warns: {gave_up_line:?}"
+        );
         // Once recorded, the key arriving no longer helps: the id is a duplicate.
         bench.keys.know(&sender_id);
         assert_eq!(discarded(bench.process(&body).await), Discard::Duplicate);
@@ -2176,16 +2224,46 @@ mod tests {
     fn fetch_lock_refuses_a_second_holder_until_the_first_drops() {
         let tmp = TempDir::new("fetch-lock");
         let store_path = tmp.path.join("mesh").join("propagation.json");
+        let lock_path = store_path.with_added_extension("lock");
         let first = FetchLock::acquire(&store_path).unwrap();
-        assert!(store_path.with_added_extension("lock").is_file());
+        assert!(lock_path.is_file());
 
-        let contended = FetchLock::acquire(&store_path).err();
-        assert_eq!(contended, Some(FetchError::AlreadyRunning));
-        let text = contended.unwrap().to_string();
-        assert!(text.contains("another Coyote session"), "{text}");
+        let contended = FetchLock::acquire(&store_path).err().unwrap();
+        let FetchError::HeldByOtherProcess { path, .. } = &contended else {
+            panic!("{contended:?}");
+        };
+        assert_eq!(path, &lock_path);
+        let text = contended.to_string();
+        assert!(text.contains("another Coyote process"), "{text}");
+        assert!(text.contains(&lock_path.display().to_string()), "{text}");
+        assert_ne!(text, FetchError::AlreadyRunning.to_string());
 
         drop(first);
         FetchLock::acquire(&store_path).unwrap();
+    }
+
+    // LockFileEx is mandatory: on Windows a second handle cannot read the locked region, so
+    // the refusal there cannot name the holder.
+    #[cfg(unix)]
+    #[test]
+    fn fetch_lock_refusal_names_the_holder_pid() {
+        let tmp = TempDir::new("fetch-lock-pid");
+        let store_path = tmp.path.join("mesh").join("propagation.json");
+        let _first = FetchLock::acquire(&store_path).unwrap();
+
+        let contended = FetchLock::acquire(&store_path).err().unwrap();
+        assert_eq!(
+            contended,
+            FetchError::HeldByOtherProcess {
+                path: store_path.with_added_extension("lock"),
+                pid: Some(std::process::id()),
+            }
+        );
+        let text = contended.to_string();
+        assert!(
+            text.contains(&format!("(pid {})", std::process::id())),
+            "{text}"
+        );
     }
 
     #[test]

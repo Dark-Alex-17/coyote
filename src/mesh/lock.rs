@@ -60,8 +60,7 @@ impl InstanceLock {
             }
         }
 
-        file.set_len(0)
-            .and_then(|()| file.write_all(std::process::id().to_string().as_bytes()))
+        write_holder_pid(&mut file)
             .with_context(|| format!("Failed to write mesh instance lock '{}'", path.display()))?;
         Ok(Self { file })
     }
@@ -80,13 +79,20 @@ impl Drop for InstanceLock {
     }
 }
 
+/// Replaces the file's content with this process's pid, for `read_holder_pid` in a
+/// process that finds the lock taken.
+pub(super) fn write_holder_pid(file: &mut File) -> std::io::Result<()> {
+    file.set_len(0)?;
+    file.write_all(std::process::id().to_string().as_bytes())
+}
+
 /// The pid the holder wrote, if it is readable. Reads from the start regardless of where the
 /// handle's cursor was left. The content may be empty or partial while the holder is between
 /// `try_lock` and finishing its write, so `None` covers that window as well as unparseable
 /// leftovers and Windows, where reading a region another handle has locked fails. A killed
 /// holder never reaches this path: its death released the kernel lock. The pid is only ever
 /// used to word the refusal, so a stale or reused pid costs nothing but a misleading hint.
-fn read_holder_pid(file: &mut File) -> Option<u32> {
+pub(super) fn read_holder_pid(file: &mut File) -> Option<u32> {
     let mut content = String::new();
     file.rewind().ok()?;
     file.read_to_string(&mut content).ok()?;
