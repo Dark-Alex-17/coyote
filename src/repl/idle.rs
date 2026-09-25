@@ -85,6 +85,12 @@ pub(crate) type SpawnWork = Box<
 
 pub(crate) struct IdleSpawn {
     pub(crate) agent_name: String,
+    /// The agent's own jobs cap as its config resolves it, supplied by whoever validated
+    /// `agent_name`: the driver's child context carries no agent, so it cannot resolve
+    /// the cap itself. `None` gives the child the cap the context's config allows, the
+    /// same one a top-level context gets when it first backgrounds a job. Agent spawning
+    /// stays disabled for the child either way.
+    pub(crate) max_concurrent_jobs: Option<usize>,
     pub(crate) work: SpawnWork,
 }
 
@@ -610,12 +616,18 @@ impl DriverLoop {
     /// Mints an owned child context and registers the child with the current supervisor
     /// outside its spawn budget, installing a budget-less one when the top level has none
     /// so the model's own `agent__spawn` stays as disabled as it was. The child gets a
-    /// supervisor of the same budget-less shape up front, registered as the handle's
-    /// `child_supervisor`: a lazily installed one, as `job__start` would otherwise add,
-    /// would hold jobs and grandchildren the parent's tree never reaches. The work runs
-    /// on its own task, so the guard the caller holds is released as soon as this returns.
+    /// supervisor of the same budget-less shape up front, with the jobs cap the spawn
+    /// carries when it has one and the context's config cap otherwise, registered as the
+    /// handle's `child_supervisor`: a lazily installed one, as `job__start` would
+    /// otherwise add, would hold jobs and grandchildren the parent's tree never reaches.
+    /// The work runs on its own task, so the guard the caller holds is released as soon
+    /// as this returns.
     fn start_child(&mut self, ctx: &mut RequestContext, spawn: IdleSpawn) {
-        let IdleSpawn { agent_name, work } = spawn;
+        let IdleSpawn {
+            agent_name,
+            max_concurrent_jobs,
+            work,
+        } = spawn;
         if self.in_flight.running() >= IDLE_MAX_CHILDREN {
             self.record_refusal(agent_name, AT_CAPACITY);
             return;
@@ -635,7 +647,7 @@ impl DriverLoop {
             Arc::clone(&child_inbox),
             agent_id.clone(),
         );
-        let child_supervisor = child_ctx.ensure_supervisor();
+        let child_supervisor = child_ctx.ensure_supervisor_with_jobs_cap(max_concurrent_jobs);
 
         debug!("Idle driver spawning child agent '{agent_name}' as '{agent_id}' at depth {depth}");
 
@@ -805,7 +817,7 @@ impl ChildRun {
 mod tests {
     use super::*;
 
-    use crate::config::WorkingMode;
+    use crate::config::{WorkingMode, effective_max_concurrent_jobs};
     use crate::function::agents::{
         GuardrailAction, check_pending_tasks_guardrail, handle_agent_tool,
     };
@@ -956,6 +968,7 @@ mod tests {
         let (go_tx, go_rx) = oneshot::channel::<()>();
         let spawn = IdleSpawn {
             agent_name: name.to_string(),
+            max_concurrent_jobs: None,
             work: Box::new(move |_ctx, _abort| {
                 Box::pin(async move {
                     let _ = go_rx.await;
@@ -972,6 +985,7 @@ mod tests {
         let flag = Arc::clone(&observed);
         let spawn = IdleSpawn {
             agent_name: name.to_string(),
+            max_concurrent_jobs: None,
             work: Box::new(move |_ctx, abort| {
                 Box::pin(async move {
                     while !abort.aborted_ctrlc() {
@@ -991,6 +1005,7 @@ mod tests {
         let flag = Arc::clone(&ran);
         let spawn = IdleSpawn {
             agent_name: name.to_string(),
+            max_concurrent_jobs: None,
             work: Box::new(move |_ctx, _abort| {
                 Box::pin(async move {
                     flag.store(true, Ordering::SeqCst);
@@ -1048,6 +1063,7 @@ mod tests {
             .handle()
             .spawn(IdleSpawn {
                 agent_name: "envoy".into(),
+                max_concurrent_jobs: None,
                 work: Box::new(|_ctx, _abort| Box::pin(async { Err(anyhow!("relay gone")) })),
             })
             .ok()
@@ -1078,6 +1094,7 @@ mod tests {
             .handle()
             .spawn(IdleSpawn {
                 agent_name: "envoy".into(),
+                max_concurrent_jobs: None,
                 work: Box::new(move |child_ctx, _abort| {
                     Box::pin(async move {
                         *capture.lock() = Some(Arc::clone(&child_ctx.app));
@@ -1191,6 +1208,7 @@ mod tests {
         let grandchild_abort = create_abort_signal();
         let spawn = IdleSpawn {
             agent_name: "envoy".to_string(),
+            max_concurrent_jobs: Some(3),
             work: {
                 let seen = Arc::clone(&seen);
                 let grandchild_abort = grandchild_abort.clone();
@@ -1269,6 +1287,48 @@ mod tests {
             0,
             "the child gets the same zero spawn budget as the top level"
         );
+        assert_eq!(
+            child_sup.read().max_concurrent_jobs(),
+            3,
+            "the jobs cap the spawn carries is the one the child's supervisor gets"
+        );
+        driver.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_spawn_without_a_jobs_cap_gives_the_child_the_context_cap() {
+        let ctx = test_ctx(None);
+        ctx.try_write()
+            .unwrap()
+            .declared_function_names
+            .insert(COLLECT_TOOL.to_string());
+        let app = Arc::clone(&ctx.try_read().unwrap().app);
+        let driver = start_driver(&ctx);
+
+        let (spawn, go) = parked_spawn("envoy");
+        driver.handle().spawn(spawn).ok().expect("queued");
+        go.send(()).unwrap();
+
+        let landed = wait_for_note(&ctx, |note| note.event == AGENT_COMPLETED_EVENT).await;
+        let handle = ctx
+            .try_read()
+            .unwrap()
+            .supervisor
+            .as_ref()
+            .unwrap()
+            .write()
+            .take(&landed.id)
+            .expect("a collectable completion leaves its handle registered");
+        let child_sup = handle
+            .child_supervisor
+            .as_ref()
+            .expect("the child's supervisor is registered on its handle");
+        assert_eq!(
+            child_sup.read().max_concurrent_jobs(),
+            effective_max_concurrent_jobs(None, &app.config),
+            "with no cap on the spawn the child gets the one the context's config allows"
+        );
+        assert_eq!(child_sup.read().max_concurrent(), 0);
         driver.stop().await;
     }
 
@@ -1718,6 +1778,7 @@ mod tests {
             .handle()
             .spawn(IdleSpawn {
                 agent_name: "stubborn".into(),
+                max_concurrent_jobs: None,
                 work: Box::new(move |_ctx, _abort| {
                     Box::pin(async move {
                         let _flag = FlagOnDrop(flag);
@@ -2065,6 +2126,7 @@ mod tests {
             .handle()
             .spawn(IdleSpawn {
                 agent_name: "envoy".into(),
+                max_concurrent_jobs: None,
                 work: Box::new(move |child_ctx, _abort| {
                     Box::pin(async move {
                         *capture.lock() = Some((

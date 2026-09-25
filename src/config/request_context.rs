@@ -673,13 +673,24 @@ impl RequestContext {
 
     /// The supervisor this context holds, installing a budget-less one when it has none:
     /// no agent spawns, jobs capped as the config for this context allows. That is the
-    /// shape a top-level context gets the first time it backgrounds a job, so installing
-    /// it early changes nothing the model can observe.
+    /// shape a top-level context gets the first time it backgrounds a job.
     pub fn ensure_supervisor(&mut self) -> Arc<RwLock<Supervisor>> {
+        self.ensure_supervisor_with_jobs_cap(None)
+    }
+
+    /// As `ensure_supervisor`, but a caller that knows the jobs cap this context should
+    /// get, as the driver does for a child whose agent config it has already resolved,
+    /// supplies it; `None` falls back to the cap this context's own config allows.
+    pub fn ensure_supervisor_with_jobs_cap(
+        &mut self,
+        max_jobs: Option<usize>,
+    ) -> Arc<RwLock<Supervisor>> {
         if let Some(sup) = self.supervisor.as_ref() {
             return Arc::clone(sup);
         }
-        let max_jobs = effective_max_concurrent_jobs(self.agent.as_ref(), &self.app.config);
+        let max_jobs = max_jobs.unwrap_or_else(|| {
+            effective_max_concurrent_jobs(self.agent.as_ref(), &self.app.config)
+        });
         let sup = Arc::new(RwLock::new(
             Supervisor::new(0, 0).with_max_concurrent_jobs(max_jobs),
         ));
