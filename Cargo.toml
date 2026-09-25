@@ -118,6 +118,7 @@ self_update = { version = "0.44", default-features = false, features = [
 ] }
 qrcode = "0.14"
 tokio-util = "0.7"
+arc-swap = "1.9.2"
 # Pinned to the rand_core generation `reticulum-rs-transport` is built on: its announce
 # builder takes a `CryptoRngCore` from this version and re-exports none, so `rand` 0.10's
 # `OsRng` cannot be passed. Moves together with the transport pin below.

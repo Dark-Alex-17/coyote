@@ -13,6 +13,7 @@ mod mcp_factory;
 mod mcp_tool_policy;
 pub(crate) mod memory;
 pub(crate) mod mesh_config;
+pub(crate) mod mesh_snapshot;
 pub(crate) mod paths;
 pub(crate) mod prompts;
 mod rag_cache;
@@ -52,6 +53,7 @@ pub(crate) use self::mcp_tool_policy::expand_mcp_server_alias;
 #[cfg(test)]
 pub(crate) use self::mcp_tool_policy::{LayerSource, ToolFilter};
 pub use self::mesh_config::MeshConfig;
+pub use self::mesh_snapshot::{publish_mesh_snapshot, refresh_mesh_snapshot};
 #[allow(unused_imports)]
 pub use self::request_context::{
     ForkedSession, PendingFork, RenderMode, RequestContext, effective_max_concurrent_jobs,

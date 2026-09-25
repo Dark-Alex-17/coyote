@@ -32,11 +32,12 @@ use crate::config::{
     Agent, AppConfig, AppState, CODE_ROLE, Config, EXPLAIN_SHELL_ROLE, Input, MemoryScope,
     RenderMode, RequestContext, SHELL_ROLE, TEMP_SESSION_NAME, WorkingMode, ensure_parent_exists,
     install_builtins, list_agents, load_env_file, macro_execute, maybe_spawn_models_refresh,
-    sync_models,
+    publish_mesh_snapshot, sync_models,
 };
 use crate::config::{memory, paths};
 use crate::function::agents::{GuardrailAction, check_pending_tasks_guardrail};
 use crate::mcp::McpServersConfig;
+use crate::mesh::snapshot::TurnState;
 use crate::render::{prompt_theme, render_error};
 use crate::repl::{EXIT_HOOK_DRAIN_TIMEOUT, Repl, TurnBracket};
 use crate::utils::*;
@@ -600,7 +601,9 @@ async fn run(
     }
     if let Some(name) = &cli.macro_name {
         ctx.top_level_agent_started();
+        publish_mesh_snapshot(&ctx, TurnState::working_now());
         let result = macro_execute(&mut ctx, name, text.as_deref(), abort_signal.clone()).await;
+        publish_mesh_snapshot(&ctx, TurnState::idle_now());
         ctx.top_level_agent_finished(result.as_ref().err(), Some(&abort_signal));
         hooks::drain_pending(EXIT_HOOK_DRAIN_TIMEOUT).await;
         return result;
@@ -609,11 +612,13 @@ async fn run(
         // Dispatch committed: open the top-level agent bracket only now,
         // past every inspection-flag early return above.
         ctx.top_level_agent_started();
+        publish_mesh_snapshot(&ctx, TurnState::working_now());
         let result = async {
             let input = create_input(&ctx, text, &cli.file, abort_signal.clone()).await?;
             shell_execute(&mut ctx, &SHELL, input, abort_signal.clone()).await
         }
         .await;
+        publish_mesh_snapshot(&ctx, TurnState::idle_now());
         ctx.top_level_agent_finished(result.as_ref().err(), Some(&abort_signal));
         hooks::drain_pending(EXIT_HOOK_DRAIN_TIMEOUT).await;
         return result;
@@ -642,12 +647,14 @@ async fn run(
     ctx.top_level_agent_started();
     match is_repl {
         false => {
+            publish_mesh_snapshot(&ctx, TurnState::working_now());
             let result = async {
                 let mut input = create_input(&ctx, text, &cli.file, abort_signal.clone()).await?;
                 input.use_embeddings(abort_signal.clone()).await?;
                 start_directive(&mut ctx, input, cli.code, abort_signal.clone()).await
             }
             .await;
+            publish_mesh_snapshot(&ctx, TurnState::idle_now());
             ctx.top_level_agent_finished(result.as_ref().err(), Some(&abort_signal));
             hooks::drain_pending(EXIT_HOOK_DRAIN_TIMEOUT).await;
             result

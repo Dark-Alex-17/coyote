@@ -1734,6 +1734,7 @@ dependencies = [
  "ansi_colours",
  "anyhow",
  "arboard",
+ "arc-swap",
  "argc",
  "async-recursion",
  "async-trait",

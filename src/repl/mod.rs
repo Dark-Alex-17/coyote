@@ -13,11 +13,13 @@ use crate::client::{
 };
 use crate::config::{
     AgentVariables, AppConfig, AssertState, Input, LastMessage, MacroState, RequestContext,
-    StateFlags, flatten_prompt_messages, macro_execute, resolve_prompt_args, sanitize_display_text,
+    StateFlags, flatten_prompt_messages, macro_execute, publish_mesh_snapshot, resolve_prompt_args,
+    sanitize_display_text,
 };
 use crate::config::{AssetCategory, paths};
 use crate::function::agents::{GuardrailAction, check_pending_tasks_guardrail};
 use crate::hooks::{self, HookEvent};
+use crate::mesh::snapshot::TurnState;
 use crate::render::render_error;
 use crate::supervisor::Supervisor;
 use crate::utils::{
@@ -418,6 +420,7 @@ pub struct Repl {
 impl Repl {
     pub fn init(ctx: RequestContext) -> Result<Self> {
         let app = Arc::clone(&ctx.app.config);
+        publish_mesh_snapshot(&ctx, TurnState::idle_now());
         let ctx = Arc::new(RwLock::new(ctx));
         let editor = Self::create_editor(Arc::clone(&ctx), app.as_ref())?;
         let prompt = ReplPrompt::new(Arc::clone(&ctx));
@@ -503,7 +506,11 @@ Type ".help" for additional help.
                     self.abort_signal.reset();
                     let result = {
                         let mut ctx = self.ctx.write();
-                        run_repl_command(&mut ctx, self.abort_signal.clone(), &line).await
+                        publish_mesh_snapshot(&ctx, TurnState::working_now());
+                        let result =
+                            run_repl_command(&mut ctx, self.abort_signal.clone(), &line).await;
+                        publish_mesh_snapshot(&ctx, TurnState::idle_now());
+                        result
                     };
                     match result {
                         Ok(exit) => {

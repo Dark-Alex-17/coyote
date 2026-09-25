@@ -1,5 +1,5 @@
 use crate::config::paths;
-use crate::config::{RequestContext, RoleLike, ensure_parent_exists};
+use crate::config::{RequestContext, RoleLike, ensure_parent_exists, refresh_mesh_snapshot};
 use crate::repl::{run_repl_command, split_args_text};
 use crate::utils::{AbortSignal, multiline_text};
 use anyhow::{Context, Result, anyhow, bail};
@@ -44,6 +44,7 @@ pub async fn macro_execute(
             let command = Macro::interpolate_command(step, &variables);
             println!(">> {}", multiline_text(&command));
             run_repl_command(&mut live, abort_signal.clone(), &command).await?;
+            refresh_mesh_snapshot(&live);
         }
 
         return Ok(());
@@ -88,6 +89,7 @@ pub async fn macro_execute(
             let command = Macro::interpolate_command(step, &variables);
             println!(">> {}", multiline_text(&command));
             run_repl_command(&mut macro_ctx, abort_signal.clone(), &command).await?;
+            refresh_mesh_snapshot(ctx);
         }
         Ok(())
     }

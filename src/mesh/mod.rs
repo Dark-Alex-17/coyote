@@ -10,6 +10,7 @@ mod propagation;
 mod propagation_fetch;
 mod propagation_nodes;
 mod r3;
+pub(crate) mod snapshot;
 pub(crate) mod trust;
 
 pub(crate) use node::MeshSlot;
@@ -94,12 +95,14 @@ pub(crate) mod test_support {
     use super::node::{MeshRuntime, NodeOptions};
     #[cfg(unix)]
     use super::r3::{R3Client, R3Server, RequestHandler};
+    use super::snapshot::{BriefState, MeshSnapshot, SessionInfo, TurnState};
     use super::trust::TrustStore;
     use super::{mesh_config_dir, rfc3339_utc};
     use crate::config::MeshConfig;
     #[cfg(unix)]
     use crate::config::Session;
-    use crate::config::mesh_config::MeshInterface;
+    use crate::config::mesh_config::{MeshBrief, MeshInterface};
+    use crate::config::todo::TodoList;
 
     #[cfg(unix)]
     use rand_core::OsRng;
@@ -474,6 +477,27 @@ pub(crate) mod test_support {
         }
     }
 
+    pub(crate) fn snapshot_fixture() -> MeshSnapshot {
+        MeshSnapshot {
+            objective: Some("ship it".into()),
+            state: TurnState::idle_now(),
+            repo: None,
+            plan: None,
+            todo: TodoList::default(),
+            brief: BriefState {
+                mode: MeshBrief::Auto,
+                text: None,
+            },
+            cwd: PathBuf::new(),
+            captured_at: SystemTime::now(),
+            session: SessionInfo {
+                name: None,
+                model: "test".into(),
+                role: None,
+            },
+        }
+    }
+
     /// Every `.rs` file under `src/mesh`, for the tests that grep the module's own source.
     pub(crate) fn rust_sources() -> Vec<PathBuf> {
         fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -591,6 +615,7 @@ mod tests {
         let needles = [
             ["Request", "Context"].concat(),
             ["request", "_context"].concat(),
+            ["crate::config::", "request", "_context"].concat(),
         ];
         for path in &sources {
             let source = fs::read_to_string(path).unwrap();
@@ -603,9 +628,17 @@ mod tests {
             }
         }
         assert!(
-            sources.len() >= 5,
+            sources.len() >= 6,
             "expected the mesh sources, found {}",
             sources.len()
         );
+        for name in ["snapshot.rs", "node.rs"] {
+            assert!(
+                sources
+                    .iter()
+                    .any(|path| path.file_name().is_some_and(|file| file == name)),
+                "{name} must be among the scanned mesh sources"
+            );
+        }
     }
 }

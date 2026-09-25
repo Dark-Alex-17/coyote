@@ -13,10 +13,12 @@ use crate::mesh::r3::{
     Dispatcher, Envelope, LoggingKnockSink, OriginName, R3Client, R3Error, R3Server,
     RequestOptions, RequestOutcome, RequestReceipt,
 };
+use crate::mesh::snapshot::MeshSnapshot;
 use crate::mesh::trust::TrustStore;
 use crate::mesh::{hex_lower, identity, mesh_cache_dir};
 
 use anyhow::{Context, Result, anyhow, bail};
+use arc_swap::ArcSwapOption;
 use parking_lot::RwLock;
 use rand_core::OsRng;
 use rns_transport::destination::DestinationDesc;
@@ -1091,9 +1093,23 @@ async fn announce_periodically(runtime: Arc<MeshRuntime>, cancel: CancellationTo
 
 /// The process-wide home of the running node. Empty until the mesh is turned on; shared by
 /// every `AppState` clone so replacing the config never detaches the runtime.
+///
+/// The snapshot, objective override and brief live in lock-free slots: the REPL holds the
+/// session context write-locked for a whole turn, so anything that serves peers must be
+/// readable without it.
+///
+/// `snapshot()` is the picture taken at the last turn boundary. `brief_text()` and
+/// `objective_override()` are live and may be newer than the snapshot's `brief.text` and
+/// `objective`. Consumers overlay `objective_override()` on `snapshot().objective` when it is
+/// `Some`. The live `brief_text()` is authoritative, including `None`: a cleared brief must
+/// not fall back to the snapshot's copy. `snapshot().brief.text` is the value at capture,
+/// kept so a snapshot is self-describing.
 #[derive(Default)]
 pub(crate) struct MeshSlot {
     inner: RwLock<Option<Arc<MeshRuntime>>>,
+    snapshot: ArcSwapOption<MeshSnapshot>,
+    objective_override: ArcSwapOption<String>,
+    brief_text: ArcSwapOption<String>,
 }
 
 impl MeshSlot {
@@ -1137,6 +1153,55 @@ impl MeshSlot {
             None => Ok(()),
         }
     }
+
+    pub(crate) fn publish(&self, snapshot: MeshSnapshot) {
+        self.snapshot.store(Some(Arc::new(snapshot)));
+    }
+
+    pub(crate) fn snapshot(&self) -> Option<Arc<MeshSnapshot>> {
+        self.snapshot.load_full()
+    }
+
+    /// Errors only when nothing was ever published. Whether a published snapshot is too old
+    /// to serve is the caller's decision, via `MeshSnapshot::age`.
+    // Reached by the envoy request handlers once they land.
+    #[allow(dead_code)]
+    pub(crate) fn snapshot_or_stale_error(&self) -> Result<Arc<MeshSnapshot>> {
+        self.snapshot().ok_or_else(|| {
+            anyhow!(
+                "No session snapshot has been published yet, so there is nothing to serve. A snapshot is published at every turn boundary (each REPL line, headless run, or ACP prompt); if the mesh was just turned on with `.mesh on`, wait for the current turn to finish or send one more line, then try again."
+            )
+        })
+    }
+
+    // Reached by the REPL mesh commands once they land.
+    #[allow(dead_code)]
+    pub(crate) fn set_objective_override(&self, objective: Option<String>) {
+        self.objective_override.store(non_blank(objective));
+    }
+
+    // Reached by the envoy request handlers once they land.
+    #[allow(dead_code)]
+    pub(crate) fn objective_override(&self) -> Option<Arc<String>> {
+        self.objective_override.load_full()
+    }
+
+    // Reached by the brief generator once it lands.
+    #[allow(dead_code)]
+    pub(crate) fn publish_brief(&self, text: Option<String>) {
+        self.brief_text.store(non_blank(text));
+    }
+
+    pub(crate) fn brief_text(&self) -> Option<Arc<String>> {
+        self.brief_text.load_full()
+    }
+}
+
+fn non_blank(value: Option<String>) -> Option<Arc<String>> {
+    value
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .map(Arc::new)
 }
 
 // Tests that start a runtime are unix-only because identity minting writes an owner-only
@@ -1147,7 +1212,7 @@ mod tests {
     use crate::mesh::peers::PEER_TTL;
     #[cfg(unix)]
     use crate::mesh::peers::PeerRecord;
-    use crate::mesh::test_support::{TempDir, mesh_paths, private_config};
+    use crate::mesh::test_support::{TempDir, mesh_paths, private_config, snapshot_fixture};
     #[cfg(unix)]
     use crate::mesh::test_support::{loopback_relay, started_runtime};
     use crate::testing::{debug_snapshot, install_log_collector};
@@ -1162,6 +1227,83 @@ mod tests {
     const POLL: Duration = Duration::from_millis(100);
     #[cfg(unix)]
     const INTEROP_TIMEOUT: Duration = Duration::from_secs(15);
+
+    #[test]
+    fn slot_publish_then_read_returns_the_latest_snapshot() {
+        let slot = MeshSlot::default();
+        assert!(slot.snapshot().is_none());
+
+        let first = snapshot_fixture();
+        let first_at = first.captured_at;
+        slot.publish(first);
+        assert_eq!(slot.snapshot().unwrap().captured_at, first_at);
+
+        let mut second = snapshot_fixture();
+        second.captured_at = first_at + Duration::from_secs(1);
+        slot.publish(second);
+        assert_eq!(
+            slot.snapshot().unwrap().captured_at,
+            first_at + Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    fn slot_stale_error_names_the_remedy_until_a_snapshot_lands() {
+        let slot = MeshSlot::default();
+        let err = slot.snapshot_or_stale_error().unwrap_err().to_string();
+        assert!(err.contains(".mesh"), "{err}");
+        slot.publish(snapshot_fixture());
+        assert!(slot.snapshot_or_stale_error().is_ok());
+    }
+
+    #[test]
+    fn slot_override_and_brief_round_trip_and_clear() {
+        let slot = MeshSlot::default();
+        assert!(slot.objective_override().is_none());
+        assert!(slot.brief_text().is_none());
+
+        slot.set_objective_override(Some("review the mesh".into()));
+        assert_eq!(
+            slot.objective_override().unwrap().as_str(),
+            "review the mesh"
+        );
+        slot.set_objective_override(None);
+        assert!(slot.objective_override().is_none());
+
+        slot.publish_brief(Some("Working on the mesh".into()));
+        assert_eq!(slot.brief_text().unwrap().as_str(), "Working on the mesh");
+        slot.publish_brief(None);
+        assert!(slot.brief_text().is_none());
+    }
+
+    #[test]
+    fn slot_setters_trim_and_treat_blank_as_cleared() {
+        let slot = MeshSlot::default();
+
+        slot.set_objective_override(Some("  review the mesh \n".into()));
+        assert_eq!(
+            slot.objective_override().unwrap().as_str(),
+            "review the mesh"
+        );
+        slot.set_objective_override(Some("  ".into()));
+        assert!(slot.objective_override().is_none());
+
+        slot.publish_brief(Some("\tWorking on the mesh  ".into()));
+        assert_eq!(slot.brief_text().unwrap().as_str(), "Working on the mesh");
+        slot.publish_brief(Some(" \n".into()));
+        assert!(slot.brief_text().is_none());
+    }
+
+    #[test]
+    fn slot_consumer_reports_snapshot_age() {
+        let slot = MeshSlot::default();
+        slot.publish(snapshot_fixture());
+        let snap = slot.snapshot().unwrap();
+        assert_eq!(
+            snap.age(snap.captured_at + Duration::from_secs(5)),
+            Duration::from_secs(5)
+        );
+    }
 
     #[cfg(unix)]
     fn fresh_instance_id() -> String {
