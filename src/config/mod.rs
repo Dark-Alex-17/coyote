@@ -57,7 +57,7 @@ pub use self::mesh_snapshot::{publish_mesh_snapshot, refresh_mesh_snapshot};
 #[allow(unused_imports)]
 pub use self::request_context::{
     ForkedSession, PendingFork, RenderMode, RequestContext, effective_max_concurrent_jobs,
-    jobs_enabled, should_inject_skill_instructions,
+    jobs_enabled, mesh_tools_available, should_inject_skill_instructions,
 };
 pub use self::role::{
     CODE_ROLE, CREATE_TITLE_ROLE, EXPLAIN_SHELL_ROLE, Role, RoleLike, SHELL_ROLE,

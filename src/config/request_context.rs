@@ -25,6 +25,7 @@ use crate::function::{
     agents::AGENT_FUNCTION_PREFIX,
     jobs::{DEFAULT_MAX_CONCURRENT_JOBS, JOB_FUNCTION_PREFIX, is_backgroundable_tool},
     memory::MEMORY_FUNCTION_PREFIX,
+    mesh::MESH_FUNCTION_PREFIX,
     rag_query::RAG_FUNCTION_PREFIX,
     skill::SKILL_FUNCTION_PREFIX,
     todo::TODO_FUNCTION_PREFIX,
@@ -35,6 +36,7 @@ use crate::mcp::{
     McpServerFeatures, McpServersConfig, McpTransportType, is_auth_required_error,
     is_mcp_meta_function, mcp_meta_function_names,
 };
+use crate::mesh::MeshSlot;
 use crate::rag::Rag;
 use crate::supervisor::Supervisor;
 use crate::supervisor::escalation::EscalationQueue;
@@ -162,6 +164,12 @@ pub fn effective_max_concurrent_jobs(agent: Option<&Agent>, app: &AppConfig) -> 
 
 pub fn jobs_enabled(agent: Option<&Agent>, app: &AppConfig) -> bool {
     app.function_calling_support && effective_max_concurrent_jobs(agent, app) > 0
+}
+
+/// Whether the `mesh__*` tools belong in a catalog built over `mesh`. A spawned child
+/// gets a fresh, empty slot, so this is false for every child even when the parent's is on.
+pub fn mesh_tools_available(app: &AppConfig, mesh: &MeshSlot) -> bool {
+    app.function_calling_support && app.mesh.enabled && mesh.get().is_some()
 }
 
 fn print_asset_names(kind: &str, names: &[String]) -> Result<()> {
@@ -1753,6 +1761,7 @@ impl RequestContext {
                     && !v.name.starts_with("skill__")
                     && !v.name.starts_with("rag__")
                     && !v.name.starts_with("job__")
+                    && !v.name.starts_with(MESH_FUNCTION_PREFIX)
             })
             .map(|v| v.name.clone())
             .collect()
@@ -2612,7 +2621,9 @@ impl RequestContext {
                     .declarations()
                     .iter()
                     .filter_map(|v| {
-                        if tool_names.contains(&v.name) {
+                        if !(self.in_graph_llm_node && v.name.starts_with(MESH_FUNCTION_PREFIX))
+                            && tool_names.contains(&v.name)
+                        {
                             Some(v.clone())
                         } else {
                             None
@@ -2636,7 +2647,9 @@ impl RequestContext {
                                 && self.auto_continue_config().enabled
                                 && v.name.starts_with(TODO_FUNCTION_PREFIX))
                             || v.name.starts_with(RAG_FUNCTION_PREFIX)
-                            || v.name.starts_with(JOB_FUNCTION_PREFIX))
+                            || v.name.starts_with(JOB_FUNCTION_PREFIX)
+                            || (!self.in_graph_llm_node
+                                && v.name.starts_with(MESH_FUNCTION_PREFIX)))
                             && !existing.contains(&v.name)
                     })
                     .cloned()
@@ -2656,6 +2669,7 @@ impl RequestContext {
                 if let Some(ref tool_names) = role_filter {
                     agent_functions.retain(|v| {
                         !(self.in_graph_llm_node && v.name.starts_with(TODO_FUNCTION_PREFIX))
+                            && !(self.in_graph_llm_node && v.name.starts_with(MESH_FUNCTION_PREFIX))
                             && (tool_names.contains(&v.name)
                                 || (!matches!(agent.skills_enabled(), Some(false))
                                     && v.name.starts_with(SKILL_FUNCTION_PREFIX))
@@ -2665,7 +2679,9 @@ impl RequestContext {
                                 || v.name.starts_with(AGENT_FUNCTION_PREFIX)
                                 || v.name.starts_with(MEMORY_FUNCTION_PREFIX)
                                 || v.name.starts_with(RAG_FUNCTION_PREFIX)
-                                || v.name.starts_with(JOB_FUNCTION_PREFIX))
+                                || v.name.starts_with(JOB_FUNCTION_PREFIX)
+                                || (!self.in_graph_llm_node
+                                    && v.name.starts_with(MESH_FUNCTION_PREFIX)))
                     });
                 }
 
@@ -4588,6 +4604,9 @@ impl RequestContext {
         if self.agent.is_none() && jobs_enabled(None, app) {
             functions.append_job_functions();
         }
+        if self.agent.is_none() && mesh_tools_available(app, &self.app.mesh) {
+            functions.append_mesh_functions();
+        }
 
         let tool_tracker = self.tool_scope.tool_tracker.clone();
         self.tool_scope = ToolScope {
@@ -4606,6 +4625,27 @@ impl RequestContext {
     /// detach and unload paths need no layer-removal logic.
     pub fn refresh_mcp_tool_filters(&mut self) {
         self.tool_scope.mcp_runtime.tool_filters = self.compute_mcp_tool_filters();
+    }
+
+    /// Reconciles the catalogs with `mesh_tools_available` after the runtime slot changed
+    /// underneath them. The catalog only consults the predicate when it is built, so
+    /// `.mesh on` / `.mesh off` call this instead of rebuilding. The tools are added to
+    /// the active catalog only, but removed from both: `use_agent` builds the top-level
+    /// one before the agent is set, so it may still carry them while the agent is active.
+    // Reached by the REPL mesh commands once they land.
+    #[allow(dead_code)]
+    pub fn refresh_mesh_tools(&mut self, app: &AppConfig) {
+        let want = mesh_tools_available(app, &self.app.mesh);
+        let functions = match self.agent.as_mut() {
+            Some(agent) => agent.functions_mut(),
+            None => &mut self.tool_scope.functions,
+        };
+        if want && !functions.has_mesh_functions() {
+            functions.append_mesh_functions();
+        } else if !want {
+            functions.remove_mesh_functions();
+            self.tool_scope.functions.remove_mesh_functions();
+        }
     }
 
     fn compute_mcp_tool_filters(&self) -> HashMap<String, ToolFilter> {
@@ -5024,6 +5064,9 @@ impl RequestContext {
         }
         if jobs_enabled(None, app) {
             functions.append_job_functions();
+        }
+        if mesh_tools_available(app, &self.app.mesh) {
+            functions.append_mesh_functions();
         }
         let tool_tracker = self.tool_scope.tool_tracker.clone();
         self.tool_scope = ToolScope {
@@ -7522,6 +7565,28 @@ mod tests {
     }
 
     #[test]
+    fn concrete_tool_names_excludes_mesh_functions() {
+        let mut ctx = create_test_ctx();
+        declare_mesh_tools(&mut ctx);
+
+        assert!(ctx.concrete_tool_names().is_empty());
+    }
+
+    #[test]
+    fn select_enabled_functions_passes_the_mesh_tools_through_by_default() {
+        let mut ctx = create_test_ctx();
+        declare_mesh_tools(&mut ctx);
+
+        let selected: Vec<String> = ctx
+            .select_enabled_functions(&Role::new("r", "p"))
+            .into_iter()
+            .map(|f| f.name)
+            .collect();
+
+        assert_eq!(selected, ALL_MESH_TOOLS);
+    }
+
+    #[test]
     fn before_chat_completion_refreshes_declared_function_names() {
         let mut ctx = create_test_ctx();
         ctx.tool_scope.functions.append_job_functions();
@@ -7991,6 +8056,71 @@ mod tests {
         let fns = ctx.select_functions(&role).unwrap();
         let names: Vec<&str> = fns.iter().map(|f| f.name.as_str()).collect();
         assert!(names.contains(&"todo__init"));
+    }
+
+    #[test]
+    fn select_functions_graph_llm_node_suppresses_mesh_tools_without_agent() {
+        let mut ctx = create_test_ctx();
+        declare_mesh_tools(&mut ctx);
+
+        let mut role = Role::new("r", "p");
+        role.set_enabled_tools(Some(vec!["foo".to_string()]));
+
+        ctx.in_graph_llm_node = true;
+        assert!(
+            ctx.select_functions(&role).is_none(),
+            "mesh__ tools must not leak into a graph llm node without an agent"
+        );
+
+        ctx.in_graph_llm_node = false;
+        let names: Vec<String> = ctx
+            .select_functions(&role)
+            .unwrap()
+            .into_iter()
+            .map(|f| f.name)
+            .collect();
+        assert_eq!(names, ALL_MESH_TOOLS);
+    }
+
+    #[test]
+    #[serial]
+    fn select_functions_graph_llm_node_suppresses_mesh_tools_under_agent_filter() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        let agent_name = format!(
+            "test_node_mesh_agent_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let agent_dir = paths::agent_data_dir(&agent_name);
+        create_dir_all(&agent_dir).unwrap();
+        write(
+            agent_dir.join("config.yaml"),
+            format!("name: {agent_name}\ninstructions: hi\n"),
+        )
+        .unwrap();
+
+        let abort = utils::create_abort_signal();
+        run_async(ctx.use_agent(&app, &agent_name, None, abort)).unwrap();
+        let agent_functions = ctx.agent.as_mut().unwrap().functions_mut();
+        for declaration in crate::function::mesh::mesh_function_declarations() {
+            agent_functions.append_declaration(declaration);
+        }
+
+        let mut role = Role::new("r", "p");
+        role.set_enabled_tools(Some(vec!["foo".to_string()]));
+
+        ctx.in_graph_llm_node = true;
+        assert!(
+            selected_mesh_tools_for(&ctx, &role).is_empty(),
+            "mesh__ tools must not leak into a graph llm node under an agent filter"
+        );
+
+        ctx.in_graph_llm_node = false;
+        assert_eq!(selected_mesh_tools_for(&ctx, &role), ALL_MESH_TOOLS);
     }
 
     #[test]
@@ -9773,6 +9903,582 @@ mod tests {
         assert!(ctx.app.config.save);
         assert!(Arc::ptr_eq(&runtime_before, &ctx.app.mesh.get().unwrap()));
         assert!(Arc::ptr_eq(&slot_before, &ctx.app.mesh));
+        assert!(ctx.app.mesh.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    fn mesh_tool_names(ctx: &RequestContext) -> Vec<&str> {
+        ctx.tool_scope
+            .functions
+            .declarations()
+            .iter()
+            .map(|f| f.name.as_str())
+            .filter(|name| name.starts_with("mesh__"))
+            .collect()
+    }
+
+    const ALL_MESH_TOOLS: [&str; 6] = [
+        "mesh__peers",
+        "mesh__send",
+        "mesh__ask",
+        "mesh__collect",
+        "mesh__check_inbox",
+        "mesh__broadcast",
+    ];
+
+    /// Puts the mesh declarations in the pool the way an installed node would, with no
+    /// node: the tests of what the pool does with them need only the names.
+    fn declare_mesh_tools(ctx: &mut RequestContext) {
+        for declaration in crate::function::mesh::mesh_function_declarations() {
+            ctx.tool_scope.functions.append_declaration(declaration);
+        }
+    }
+
+    fn selected_mesh_tools(ctx: &RequestContext) -> Vec<String> {
+        selected_mesh_tools_for(ctx, &Role::new("r", "p"))
+    }
+
+    fn selected_mesh_tools_for(ctx: &RequestContext, role: &Role) -> Vec<String> {
+        ctx.select_enabled_functions(role)
+            .into_iter()
+            .map(|f| f.name)
+            .filter(|name| name.starts_with("mesh__"))
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn a_spawned_child_declares_no_mesh_tools_while_the_parent_does() {
+        let _guard = TestConfigDirGuard::new();
+        let started = crate::mesh::test_support::started_runtime("rc-child-fence").await;
+        let mut parent = create_test_ctx();
+        parent.update_app_config(|app| app.mesh.enabled = true);
+        parent.app.mesh.install(started.runtime.clone()).unwrap();
+        let app = parent.app.config.clone();
+        let abort = utils::create_abort_signal();
+
+        parent
+            .rebuild_tool_scope(&app, None, abort.clone())
+            .await
+            .unwrap();
+        assert_eq!(mesh_tool_names(&parent), ALL_MESH_TOOLS);
+        assert_eq!(selected_mesh_tools(&parent), ALL_MESH_TOOLS);
+
+        let child_app = crate::function::agents::child_app_state(&parent.app);
+        let mut child = RequestContext::new_for_child(
+            child_app,
+            &parent,
+            1,
+            Arc::new(Inbox::new()),
+            "child".into(),
+        );
+        assert!(
+            child.app.config.mesh.enabled,
+            "the child sees the same config"
+        );
+        assert!(!mesh_tools_available(&app, &child.app.mesh));
+
+        child.rebuild_tool_scope(&app, None, abort).await.unwrap();
+        assert!(
+            mesh_tool_names(&child).is_empty(),
+            "{:?}",
+            mesh_tool_names(&child)
+        );
+        assert!(selected_mesh_tools(&child).is_empty());
+
+        assert!(parent.app.mesh.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    #[test]
+    #[serial]
+    fn a_child_ctx_over_an_enabled_mesh_config_declares_no_mesh_tools() {
+        let _guard = TestConfigDirGuard::new();
+        let mut parent =
+            RequestContext::new(app_state_with_mcp_config(false, &[]), WorkingMode::Cmd);
+        parent.update_app_config(|app| app.mesh.enabled = true);
+        let child_app = crate::function::agents::child_app_state(&parent.app);
+        let mut child = RequestContext::new_for_child(
+            child_app,
+            &parent,
+            1,
+            Arc::new(Inbox::new()),
+            "child".into(),
+        );
+        let app = child.app.config.clone();
+        assert!(app.mesh.enabled);
+        assert!(!mesh_tools_available(&app, &child.app.mesh));
+
+        run_async(child.rebuild_tool_scope(&app, None, utils::create_abort_signal())).unwrap();
+
+        assert!(mesh_tool_names(&child).is_empty());
+        assert!(selected_mesh_tools(&child).is_empty());
+    }
+
+    fn all_tool_names(ctx: &RequestContext) -> Vec<String> {
+        ctx.tool_scope
+            .functions
+            .declarations()
+            .iter()
+            .map(|f| f.name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn refresh_mesh_tools_removes_exactly_the_mesh_tools_over_an_empty_slot() {
+        let mut ctx = create_test_ctx();
+        ctx.update_app_config(|app| app.mesh.enabled = true);
+        ctx.tool_scope.functions.append_job_functions();
+        ctx.tool_scope
+            .functions
+            .append_declaration(test_decl("echo"));
+        let app = ctx.app.config.clone();
+        assert!(!mesh_tools_available(&app, &ctx.app.mesh));
+        let before = all_tool_names(&ctx);
+        declare_mesh_tools(&mut ctx);
+        assert_eq!(mesh_tool_names(&ctx), ALL_MESH_TOOLS);
+
+        ctx.refresh_mesh_tools(&app);
+
+        assert_eq!(all_tool_names(&ctx), before);
+    }
+
+    #[test]
+    fn refresh_mesh_tools_leaves_a_catalog_without_them_unchanged() {
+        let mut ctx = create_test_ctx();
+        ctx.tool_scope.functions.append_job_functions();
+        let app = ctx.app.config.clone();
+        assert!(!mesh_tools_available(&app, &ctx.app.mesh));
+        let before = all_tool_names(&ctx);
+
+        ctx.refresh_mesh_tools(&app);
+
+        assert_eq!(all_tool_names(&ctx), before);
+    }
+
+    #[test]
+    #[serial]
+    fn refresh_mesh_tools_reconciles_the_active_agent_catalog() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        let agent_name = format!(
+            "test_refresh_mesh_agent_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let agent_dir = paths::agent_data_dir(&agent_name);
+        create_dir_all(&agent_dir).unwrap();
+        write(
+            agent_dir.join("config.yaml"),
+            format!("name: {agent_name}\ninstructions: hi\n"),
+        )
+        .unwrap();
+        run_async(ctx.use_agent(&app, &agent_name, None, utils::create_abort_signal())).unwrap();
+        let top_level_before = all_tool_names(&ctx);
+        let agent_functions = ctx.agent.as_mut().unwrap().functions_mut();
+        let agent_before: Vec<String> = agent_functions
+            .declarations()
+            .iter()
+            .map(|f| f.name.clone())
+            .collect();
+        for declaration in crate::function::mesh::mesh_function_declarations() {
+            agent_functions.append_declaration(declaration);
+        }
+        assert!(agent_functions.has_mesh_functions());
+        assert!(!mesh_tools_available(&app, &ctx.app.mesh));
+
+        ctx.refresh_mesh_tools(&app);
+
+        let agent_after: Vec<String> = ctx
+            .agent
+            .as_ref()
+            .unwrap()
+            .functions()
+            .declarations()
+            .iter()
+            .map(|f| f.name.clone())
+            .collect();
+        assert_eq!(agent_after, agent_before);
+        assert_eq!(all_tool_names(&ctx), top_level_before);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn refresh_mesh_tools_follows_a_runtime_installed_and_stopped_after_the_build() {
+        let _guard = TestConfigDirGuard::new();
+        let started = crate::mesh::test_support::started_runtime("rc-refresh").await;
+        let mut ctx = create_test_ctx();
+        ctx.update_app_config(|app| app.mesh.enabled = true);
+        let app = ctx.app.config.clone();
+        ctx.rebuild_tool_scope(&app, None, utils::create_abort_signal())
+            .await
+            .unwrap();
+        assert!(mesh_tool_names(&ctx).is_empty());
+        let before = all_tool_names(&ctx);
+
+        ctx.app.mesh.install(started.runtime.clone()).unwrap();
+        ctx.refresh_mesh_tools(&app);
+        assert_eq!(mesh_tool_names(&ctx), ALL_MESH_TOOLS);
+        assert_eq!(selected_mesh_tools(&ctx), ALL_MESH_TOOLS);
+
+        ctx.refresh_mesh_tools(&app);
+        assert_eq!(mesh_tool_names(&ctx), ALL_MESH_TOOLS, "idempotent");
+
+        assert!(ctx.app.mesh.stop().await.unwrap());
+        ctx.refresh_mesh_tools(&app);
+        assert_eq!(all_tool_names(&ctx), before);
+        started.relay_handle.abort();
+    }
+
+    /// The tool handlers against a running node A with no second node: the peer table is
+    /// seeded with an unheard, untrusted B, so the send and ask paths prove the trust
+    /// refusal shape, the collect path is fed B's reply through the slot, and a
+    /// broadcast finds nobody to send to.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn mesh_tool_handlers_run_against_an_installed_node() {
+        use crate::function::mesh::{PEER_TEXT_IS_DATA, handle_mesh_tool};
+        use crate::mesh::hex_lower;
+        use crate::mesh::message::{PeerKind, PeerMessage, PeerVia, RawPeerMessage};
+        use crate::mesh::pending::{
+            DEFAULT_COLLECT_TIMEOUT, PENDING_RECORD_VERSION, PendingRecord, PendingState,
+        };
+        use crate::mesh::rfc3339_utc;
+        use crate::mesh::test_support::PeerSighting;
+
+        let _guard = TestConfigDirGuard::new();
+        let started = crate::mesh::test_support::started_runtime("rc-mesh-tools").await;
+        let mut ctx = create_test_ctx();
+        ctx.update_app_config(|app| app.mesh.enabled = true);
+        ctx.app.mesh.install(started.runtime.clone()).unwrap();
+        let b_dest = hex_lower(&[0xb0; 16]);
+        let b_identity = hex_lower(&[0xb1; 16]);
+        started.runtime.peers().observe(
+            PeerSighting {
+                destination_hash: b_dest.clone(),
+                identity_hash: b_identity.clone(),
+                name_hash: String::new(),
+                display_name: Some("Bea".into()),
+                protocol_version: 1,
+                hops: 1,
+            },
+            SystemTime::now(),
+        );
+
+        let peers = handle_mesh_tool(&mut ctx, "mesh__peers", &json!({}))
+            .await
+            .unwrap();
+        assert_eq!(peers["count"], 1, "{peers}");
+        assert_eq!(peers["peers"][0]["destination"], b_dest);
+        assert_eq!(peers["peers"][0]["identity"], b_identity);
+        assert_eq!(peers["peers"][0]["display_name"], "Bea");
+        assert_eq!(peers["peers"][0]["trust"], "untrusted");
+        assert_eq!(peers["peers"][0]["reachable"], false);
+
+        for tool in ["mesh__send", "mesh__ask"] {
+            let refused = handle_mesh_tool(&mut ctx, tool, &json!({"to": b_dest, "message": "hi"}))
+                .await
+                .unwrap();
+            assert_eq!(refused["status"], "error", "{tool}: {refused}");
+            assert_eq!(refused["kind"], "not_trusted", "{tool}: {refused}");
+            let text = refused["message"].as_str().unwrap();
+            assert!(
+                text.contains(&format!(".mesh trust {b_dest}")),
+                "{tool}: {text}"
+            );
+            assert!(text.contains(".mesh peers"), "{tool}: {text}");
+        }
+        assert!(
+            ctx.app.mesh.correlations().list().is_empty(),
+            "a refused ask opens no question"
+        );
+
+        let now = SystemTime::now();
+        ctx.app
+            .mesh
+            .correlations()
+            .open(PendingRecord {
+                version: PENDING_RECORD_VERSION,
+                id: "q1".into(),
+                peer_destination: b_dest.clone(),
+                peer_identity: b_identity.clone(),
+                question: "what now?".into(),
+                sent_at: rfc3339_utc(now),
+                timeout_at: rfc3339_utc(now + DEFAULT_COLLECT_TIMEOUT),
+                state: PendingState::Open,
+                reply: None,
+            })
+            .unwrap();
+        ctx.app.mesh.deliver_peer(PeerMessage::new(RawPeerMessage {
+            source_identity: b_identity.clone(),
+            source_destination: b_dest.clone(),
+            destination: started.runtime.current_destination_hash(),
+            title: None,
+            content: "all good here".into(),
+            fields: None,
+            timestamp: 1_700_000_000.0,
+            message_id: "r1".into(),
+            in_reply_to: Some("q1".into()),
+            kind: PeerKind::Reply,
+            via: PeerVia::Direct,
+        }));
+        let replied = handle_mesh_tool(
+            &mut ctx,
+            "mesh__collect",
+            &json!({"id": "q1", "timeout_secs": 5}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(replied["status"], "replied", "{replied}");
+        assert_eq!(replied["from"], b_dest);
+        assert_eq!(replied["reply"]["content"], "all good here");
+        assert_eq!(replied["note"], PEER_TEXT_IS_DATA);
+
+        let inbox = handle_mesh_tool(&mut ctx, "mesh__check_inbox", &json!({}))
+            .await
+            .unwrap();
+        assert_eq!(inbox["count"], 1, "{inbox}");
+        assert_eq!(inbox["messages"][0]["payload"]["message_id"], "r1");
+        assert_eq!(inbox["note"], PEER_TEXT_IS_DATA);
+
+        let broadcast = handle_mesh_tool(
+            &mut ctx,
+            "mesh__broadcast",
+            &json!({"message": "all hands"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(broadcast["status"], "sent", "{broadcast}");
+        assert_eq!(broadcast["count"], 0);
+        assert_eq!(broadcast["recipients"], json!([]));
+        assert!(
+            broadcast["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("No peer this node trusts has a known path right now;"),
+            "{broadcast}"
+        );
+
+        assert!(ctx.app.mesh.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    /// The tool handlers' success paths against a trusted peer node A can reach: a
+    /// `PeerStub` behind the real dispatcher over TCP. Sends and asks land as the kinds the
+    /// tool built, an ask opens a correlation the stub's reply resolves, a waited ask
+    /// with no reply stays open, a broadcast reaches the one peer, and an ask to a trusted
+    /// peer with no path fails and abandons its correlation.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn mesh_ask_and_send_succeed_against_a_trusted_reachable_peer() {
+        use crate::function::mesh::handle_mesh_tool;
+        use crate::mesh::message::{PeerKind, PeerMessage, PeerVia, RawPeerMessage};
+        use crate::mesh::test_support::{
+            PeerStub, derived_sighting, started_runtime_on, wait_until,
+        };
+        use crate::mesh::trust::TrustOptions;
+        use rns_transport::iface::tcp_server::TcpServer;
+
+        let _guard = TestConfigDirGuard::new();
+        let stub = PeerStub::listen("rc-peer-stub", TcpServer::DEFAULT_CLIENT_MTU).await;
+        let started = started_runtime_on("rc-peer-stub-a", stub.port()).await;
+        let runtime = started.runtime.clone();
+        let mut ctx = create_test_ctx();
+        ctx.update_app_config(|app| app.mesh.enabled = true);
+        ctx.app.mesh.install(runtime.clone()).unwrap();
+
+        stub.trust(&runtime.current_destination_hash(), runtime.fingerprint());
+        stub.announce(Some("Stub")).await;
+        let to = stub.destination_hex();
+        let peers = runtime.peers();
+        wait_until("node A to file the stub", || peers.get(&to).is_some()).await;
+        runtime
+            .trust()
+            .trust_destination(
+                ctx.app.mesh.as_ref(),
+                &to,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .unwrap();
+
+        let sent = handle_mesh_tool(&mut ctx, "mesh__send", &json!({"to": to, "message": "hi"}))
+            .await
+            .unwrap();
+        assert_eq!(sent["status"], "sent", "{sent}");
+        assert_eq!(sent["via"], "direct", "{sent}");
+        assert_eq!(sent["to"], to);
+        let seen = stub.seen();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert_eq!(seen[0].kind, PeerKind::Message);
+        assert_eq!(seen[0].content, "hi");
+        assert_eq!(sent["id"], seen[0].id);
+
+        let replied = handle_mesh_tool(
+            &mut ctx,
+            "mesh__send",
+            &json!({"to": to, "message": "yes", "in_reply_to": "q1"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(replied["status"], "sent", "{replied}");
+        assert_eq!(replied["kind"], "reply", "{replied}");
+        let seen = stub.seen();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert_eq!(seen[1].kind, PeerKind::Reply);
+        assert_eq!(seen[1].in_reply_to.as_deref(), Some("q1"));
+
+        let asked = handle_mesh_tool(
+            &mut ctx,
+            "mesh__ask",
+            &json!({"to": to, "message": "when?"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(asked["status"], "asked", "{asked}");
+        assert_eq!(asked["via"], "direct", "{asked}");
+        let id = asked["id"].as_str().unwrap().to_string();
+        assert_eq!(asked["next_action"], format!("mesh__collect --id {id}"));
+        let seen = stub.seen();
+        assert_eq!(seen.len(), 3, "{seen:?}");
+        assert_eq!(seen[2].kind, PeerKind::Ask);
+        assert_eq!(seen[2].id, id);
+        let question = ctx
+            .app
+            .mesh
+            .correlations()
+            .get(&id)
+            .expect("the ask opens a correlation");
+        assert_eq!(question.record.peer_destination, to);
+        assert_eq!(question.record.peer_identity, stub.identity_hex());
+        ctx.app.mesh.deliver_peer(PeerMessage::new(RawPeerMessage {
+            source_identity: stub.identity_hex(),
+            source_destination: to.clone(),
+            destination: runtime.current_destination_hash(),
+            title: None,
+            content: "soon".into(),
+            fields: None,
+            timestamp: 1_700_000_000.0,
+            message_id: "r1".into(),
+            in_reply_to: Some(id.clone()),
+            kind: PeerKind::Reply,
+            via: PeerVia::Direct,
+        }));
+        let collected = handle_mesh_tool(
+            &mut ctx,
+            "mesh__collect",
+            &json!({"id": id, "timeout_secs": 5}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(collected["status"], "replied", "{collected}");
+        assert_eq!(collected["from"], to);
+        assert_eq!(collected["reply"]["content"], "soon");
+        assert!(ctx.app.mesh.correlations().get(&id).is_none());
+
+        let pending = handle_mesh_tool(
+            &mut ctx,
+            "mesh__ask",
+            &json!({"to": to, "message": "still there?", "wait": true, "timeout_secs": 1}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(pending["status"], "pending", "{pending}");
+        let waited_id = pending["id"].as_str().unwrap();
+        assert_eq!(
+            pending["next_action"],
+            format!("mesh__collect --id {waited_id}")
+        );
+        assert_eq!(stub.seen().len(), 4);
+        assert!(
+            ctx.app.mesh.correlations().get(waited_id).is_some(),
+            "an unanswered waited ask stays open"
+        );
+
+        let broadcast = handle_mesh_tool(
+            &mut ctx,
+            "mesh__broadcast",
+            &json!({"message": "all hands"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(broadcast["status"], "sent", "{broadcast}");
+        assert_eq!(broadcast["count"], 1, "{broadcast}");
+        assert_eq!(broadcast["delivered"], 1, "{broadcast}");
+        assert_eq!(broadcast["recipients"][0]["destination"], to);
+        assert_eq!(broadcast["recipients"][0]["outcome"], "delivered");
+        let seen = stub.seen();
+        assert_eq!(seen.len(), 5, "{seen:?}");
+        assert_eq!(seen[4].kind, PeerKind::Bulletin);
+
+        let unheard = derived_sighting("rc-unheard", Some("Ghost"));
+        let ghost = unheard.destination_hash.clone();
+        peers.observe(unheard, SystemTime::now());
+        runtime
+            .trust()
+            .trust_destination(
+                ctx.app.mesh.as_ref(),
+                &ghost,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        let unreachable = handle_mesh_tool(
+            &mut ctx,
+            "mesh__ask",
+            &json!({"to": ghost, "message": "anyone?"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(unreachable["status"], "error", "{unreachable}");
+        assert_eq!(unreachable["kind"], "unknown_destination", "{unreachable}");
+        assert!(
+            ctx.app
+                .mesh
+                .correlations()
+                .list()
+                .iter()
+                .all(|correlation| correlation.record.peer_destination != ghost),
+            "a failed ask abandons its correlation"
+        );
+        assert_eq!(stub.seen().len(), 5, "nothing reached the stub");
+
+        assert!(ctx.app.mesh.stop().await.unwrap());
+        stub.stop().await;
+        started.relay_handle.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn exit_agent_keeps_the_mesh_tools_declared_at_top_level() {
+        let _guard = TestConfigDirGuard::new();
+        let started = crate::mesh::test_support::started_runtime("rc-exit-mesh").await;
+        let mut ctx = create_test_ctx();
+        ctx.update_app_config(|app| app.mesh.enabled = true);
+        ctx.app.mesh.install(started.runtime.clone()).unwrap();
+        let app = ctx.app.config.clone();
+
+        ctx.exit_agent(&app).unwrap();
+        assert_eq!(mesh_tool_names(&ctx), ALL_MESH_TOOLS);
+
+        let mesh_off = AppConfig {
+            mesh: crate::config::MeshConfig {
+                enabled: false,
+                ..app.mesh.clone()
+            },
+            ..(*app).clone()
+        };
+        ctx.exit_agent(&mesh_off).unwrap();
+        assert!(mesh_tool_names(&ctx).is_empty());
+
         assert!(ctx.app.mesh.stop().await.unwrap());
         started.relay_handle.abort();
     }

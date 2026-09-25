@@ -1,5 +1,6 @@
 use super::agents::AGENT_FUNCTION_PREFIX;
 use super::memory::MEMORY_FUNCTION_PREFIX;
+use super::mesh::MESH_FUNCTION_PREFIX;
 use super::rag_query::RAG_FUNCTION_PREFIX;
 use super::skill::SKILL_FUNCTION_PREFIX;
 use super::todo::TODO_FUNCTION_PREFIX;
@@ -394,7 +395,9 @@ fn whitelist_rejection(tool: &str) -> Option<Value> {
         MCP_READ_META_FUNCTION_NAME_PREFIX,
         MCP_PROMPT_META_FUNCTION_NAME_PREFIX,
     ];
-    let reason = if tool.starts_with(AGENT_FUNCTION_PREFIX) || tool.starts_with(JOB_FUNCTION_PREFIX)
+    let reason = if tool.starts_with(AGENT_FUNCTION_PREFIX)
+        || tool.starts_with(JOB_FUNCTION_PREFIX)
+        || tool.starts_with(MESH_FUNCTION_PREFIX)
     {
         Some(format!(
             "'{tool}' is already asynchronous — call it directly. Agents may start jobs, but jobs never start agents or other jobs."
@@ -1570,7 +1573,7 @@ mod tests {
 
     #[test]
     fn whitelist_rejects_async_and_interactive_tools() {
-        for tool in ["agent__spawn", "job__check"] {
+        for tool in ["agent__spawn", "job__check", "mesh__collect"] {
             let message = whitelist_rejection(tool).unwrap()["message"]
                 .as_str()
                 .unwrap()
@@ -1743,6 +1746,7 @@ mod tests {
         assert!(is_backgroundable_tool("mcp_invoke_github"));
         assert!(!is_backgroundable_tool("job__start"));
         assert!(!is_backgroundable_tool("agent__spawn"));
+        assert!(!is_backgroundable_tool("mesh__collect"));
         assert!(!is_backgroundable_tool("user__confirm"));
         assert!(!is_backgroundable_tool("todo__add"));
         assert!(!is_backgroundable_tool("fs_read"));

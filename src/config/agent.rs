@@ -454,6 +454,9 @@ impl Agent {
         {
             functions.append_job_functions();
         }
+        if mesh_tools_available(app, &app_state.mesh) {
+            functions.append_mesh_functions();
+        }
 
         functions.append_teammate_functions();
         functions.append_user_interaction_functions();
@@ -889,7 +892,6 @@ impl Agent {
         }
     }
 
-    #[cfg(test)]
     pub fn functions_mut(&mut self) -> &mut Functions {
         &mut self.functions
     }

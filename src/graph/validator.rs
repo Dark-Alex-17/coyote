@@ -3,6 +3,7 @@ use super::types::{ConcurrencyCap, Graph, NextTargets, Node, NodeType};
 use crate::client::{Model, ModelType};
 use crate::config;
 use crate::config::{Agent, AppConfig, paths};
+use crate::function::mesh::MESH_FUNCTION_PREFIX;
 use crate::function::todo::TODO_FUNCTION_PREFIX;
 use crate::function::user_interaction::USER_FUNCTION_PREFIX;
 use crate::rag::{GraphRagConfig, RagData};
@@ -183,6 +184,7 @@ impl GraphValidator {
         self.validate_output_schema_properties(graph, &mut result);
         self.validate_structured_output_user_tools(graph, &mut result);
         self.validate_llm_node_todo_tools(graph, &mut result);
+        self.validate_llm_node_mesh_tools(graph, &mut result);
         self.validate_max_concurrency(graph, &mut result);
         self.validate_max_concurrency_template(graph, &mut result);
         self.validate_orchestration_limits(graph, &mut result);
@@ -502,6 +504,27 @@ impl GraphValidator {
                      loops (auto_continue), which llm nodes don't have. Node continuation \
                      is owned by the node loop, max_iterations, and graph edges. For driven \
                      multi-step work, use an agent node whose agent sets `auto_continue: true`",
+                ));
+            }
+        }
+    }
+
+    fn validate_llm_node_mesh_tools(&self, graph: &Graph, result: &mut ValidationResult) {
+        for (node_id, node) in &graph.nodes {
+            let NodeType::Llm(llm) = &node.node_type else {
+                continue;
+            };
+            let exposes_mesh_tools = llm.tools.as_ref().is_some_and(|tools| {
+                tools
+                    .iter()
+                    .any(|t| t.trim().starts_with(MESH_FUNCTION_PREFIX))
+            });
+            if exposes_mesh_tools {
+                result.error(ValidationError::with_node(
+                    node_id,
+                    "llm node exposes mesh tools (`mesh__*`): mesh tools are only available \
+                     to the top-level session, never inside a graph llm node. Remove them \
+                     from `tools`",
                 ));
             }
         }
@@ -4857,6 +4880,28 @@ mod tests {
                 .any(|e| e.node_id.as_deref() == Some("l")
                     && e.message.contains("todo tools drive chat turn loops")),
             "expected todo-tool error: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn llm_node_with_mesh_tools_errors() {
+        let mut node = llm_node("l", None, Some("end"));
+        if let NodeType::Llm(ref mut n) = node.node_type {
+            n.tools = Some(vec!["mesh__collect".into()]);
+        }
+        let graph = graph_with(vec![("l", node), ("end", end_node("end"))], "l");
+
+        let result = validator().validate(&graph);
+
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.node_id.as_deref() == Some("l")
+                    && e.message
+                        .contains("mesh tools are only available to the top-level session")),
+            "expected mesh-tool error: {:?}",
             result.errors
         );
     }

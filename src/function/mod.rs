@@ -1,6 +1,7 @@
 pub(crate) mod agents;
 pub(crate) mod jobs;
 pub(crate) mod memory;
+pub(crate) mod mesh;
 pub(crate) mod rag_query;
 pub(crate) mod skill;
 pub(crate) mod todo;
@@ -33,6 +34,7 @@ use indexmap::IndexMap;
 use indoc::formatdoc;
 use jobs::JOB_FUNCTION_PREFIX;
 use memory::MEMORY_FUNCTION_PREFIX;
+use mesh::MESH_FUNCTION_PREFIX;
 use rag_query::RAG_FUNCTION_PREFIX;
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
@@ -403,6 +405,7 @@ pub async fn eval_tool_calls(
         } else {
             vec![]
         };
+        mesh::merge_slot_notes(ctx);
         let notifications = drain_live_notifications(ctx);
         merge_system_channel(last, escalations, notifications);
     }
@@ -463,8 +466,18 @@ fn merge_system_channel(last: &mut ToolResult, escalations: Vec<Value>, notifica
 
     let escalation_instruction = "Child agents are BLOCKED waiting for your reply. \
         Call agent__reply_escalation for each pending escalation to unblock them.";
-    let notification_instruction =
-        "Background tasks have finished; collect each result with its next_action command.";
+    let mut notification_instruction = String::from(
+        "Background tasks have finished; collect each result with its next_action command.",
+    );
+    if notifications
+        .iter()
+        .any(|note| note["channel"] == Channel::Mesh.as_str())
+    {
+        notification_instruction.push_str(
+            " Mesh entries: mesh__collect --id <id> for a peer's reply to your question, \
+             mesh__check_inbox for new peer messages, asks or bulletins.",
+        );
+    }
 
     let map = match &mut last.output {
         Value::Object(map) => map,
@@ -764,6 +777,21 @@ impl Functions {
 
     pub fn append_job_functions(&mut self) {
         self.declarations.extend(jobs::job_function_declarations());
+    }
+
+    pub fn append_mesh_functions(&mut self) {
+        self.declarations.extend(mesh::mesh_function_declarations());
+    }
+
+    pub fn remove_mesh_functions(&mut self) {
+        self.declarations
+            .retain(|f| !f.name.starts_with(MESH_FUNCTION_PREFIX));
+    }
+
+    pub fn has_mesh_functions(&self) -> bool {
+        self.declarations
+            .iter()
+            .any(|f| f.name.starts_with(MESH_FUNCTION_PREFIX))
     }
 
     #[cfg(test)]
@@ -1714,6 +1742,17 @@ impl ToolCall {
                         json!({"tool_call_error": error_msg})
                     })
             }
+            _ if cmd_name.starts_with(MESH_FUNCTION_PREFIX) => {
+                // Boxed so the mesh handlers' futures do not deepen this async body's
+                // layout past rustc's query depth limit.
+                Box::pin(mesh::handle_mesh_tool(ctx, &cmd_name, &json_data))
+                    .await
+                    .unwrap_or_else(|e| {
+                        let error_msg = format!("Mesh tool failed: {e}");
+                        emit_tool_warning(quiet, &format!("⚠️ {error_msg} ⚠️"), &error_msg);
+                        json!({"tool_call_error": error_msg})
+                    })
+            }
             _ => match run_llm_function(
                 cmd_name,
                 cmd_args,
@@ -2587,13 +2626,16 @@ fn polyfill_cmd_name<T: AsRef<Path>>(cmd_name: &str, bin_dir: &[T]) -> String {
 // Polling tools are expected to repeat with identical arguments (status probes,
 // list views, inbox checks); recording them would also let them break up
 // detection of a real loop in the calls they interleave with.
-const LOOP_TRACKER_EXEMPT_TOOLS: [&str; 6] = [
+const LOOP_TRACKER_EXEMPT_TOOLS: [&str; 9] = [
     "job__check",
     "job__list",
     "agent__check",
     "agent__list_running",
     "agent__task_list",
     "agent__check_inbox",
+    "mesh__check_inbox",
+    "mesh__collect",
+    "mesh__peers",
 ];
 
 fn is_loop_tracker_exempt(name: &str) -> bool {
@@ -2949,14 +2991,36 @@ mod tests {
             result.output["system_notifications"],
             json!([{"id": "job_1"}])
         );
+        let instruction = result.output["notification_instruction"].as_str().unwrap();
+        assert!(instruction.contains("next_action"));
         assert!(
-            result.output["notification_instruction"]
-                .as_str()
-                .unwrap()
-                .contains("next_action")
+            !instruction.contains("mesh__"),
+            "no mesh entry, no mesh guidance: {instruction}"
         );
         assert!(result.output.get("pending_escalations").is_none());
         assert!(result.output.get("escalation_instruction").is_none());
+    }
+
+    #[test]
+    fn merge_system_channel_names_the_mesh_tools_only_for_a_mesh_entry() {
+        let mut result = ToolResult::new(call("t", Some("id-1")), json!({"status": "ok"}));
+
+        merge_system_channel(
+            &mut result,
+            vec![],
+            vec![
+                json!({"id": "job_1", "channel": "supervisor"}),
+                json!({"id": "q-1", "channel": "mesh"}),
+            ],
+        );
+
+        let instruction = result.output["notification_instruction"].as_str().unwrap();
+        assert!(instruction.starts_with("Background tasks have finished;"));
+        assert!(
+            instruction.contains("mesh__collect --id <id>"),
+            "{instruction}"
+        );
+        assert!(instruction.contains("mesh__check_inbox"), "{instruction}");
     }
 
     #[test]
@@ -3464,10 +3528,13 @@ mod tests {
             "agent__list_running",
             "agent__task_list",
             "agent__check_inbox",
+            "mesh__check_inbox",
+            "mesh__collect",
+            "mesh__peers",
         ]
         .into_iter()
         .collect();
-        assert_eq!(LOOP_TRACKER_EXEMPT_TOOLS.len(), 6);
+        assert_eq!(LOOP_TRACKER_EXEMPT_TOOLS.len(), 9);
         assert_eq!(actual, expected);
     }
 
@@ -3489,6 +3556,17 @@ mod tests {
             tracker.record_call(other.clone());
             assert!(tracker.check_loop(&other).is_some());
         }
+    }
+
+    #[test]
+    fn tracker_repeated_mesh_collect_for_the_same_question_never_trips() {
+        let mut tracker = ToolCallTracker::default();
+        let poll = call_with_args("mesh__collect", json!({"id": "q1"}));
+        for _ in 0..3 {
+            assert!(tracker.check_loop(&poll).is_none());
+            tracker.record_call(poll.clone());
+        }
+        assert!(tracker.last_calls.is_empty());
     }
 
     #[test]
