@@ -193,6 +193,7 @@ pub struct JobEnvSnapshot {
     display_name: String,
     cmd_args: Vec<String>,
     envs: HashMap<String, String>,
+    env_clear: bool,
     output_file: PathBuf,
     timeout_secs: u64,
 }
@@ -1035,6 +1036,7 @@ fn build_env_snapshot(
     for (key, value) in super::builtin_agent_env(agent.map(|agent| agent.name())) {
         envs.insert(key, value);
     }
+    let env_clear = super::is_builtin_agent(agent.map(|agent| agent.name()));
 
     cmd_args.push(arguments.to_string());
 
@@ -1055,6 +1057,12 @@ fn build_env_snapshot(
         args
     };
 
+    if env_clear {
+        let mut hermetic = super::builtin_agent_child_env(&super::inherited_process_env());
+        hermetic.extend(envs);
+        envs = hermetic;
+    }
+
     let timeout_secs = super::tool_timeout_secs(ctx.app.config.tool_timeout);
 
     Ok(JobEnvSnapshot {
@@ -1062,6 +1070,7 @@ fn build_env_snapshot(
         display_name: tool.to_string(),
         cmd_args,
         envs,
+        env_clear,
         output_file,
         timeout_secs,
     })
@@ -1140,6 +1149,9 @@ async fn run_process_job(
     let _temp_guard = TempFileGuard(temp_files);
 
     let mut command = tokio::process::Command::new(&snapshot.cmd_name);
+    if snapshot.env_clear {
+        command.env_clear();
+    }
     command
         .args(&snapshot.cmd_args)
         .envs(&snapshot.envs)
@@ -1454,6 +1466,7 @@ mod tests {
             display_name: cmd.to_string(),
             cmd_args: args.iter().map(|s| s.to_string()).collect(),
             envs,
+            env_clear: false,
             output_file,
             timeout_secs,
         }
@@ -3439,6 +3452,42 @@ mod tests {
         let snapshot = build_env_snapshot(&plain_ctx(), "execute_command", &json!({})).unwrap();
         assert!(!snapshot.envs.contains_key("ENVOY_DATA_DIR"));
         assert!(!snapshot.envs.contains_key("ENVOY_FUNCTIONS_DIR"));
+        source.remove_dir();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn build_env_snapshot_clears_the_env_only_for_builtin_agents() {
+        use crate::config::envoy::EnvoySource;
+        use crate::config::reserved_agents::BuiltinSourceGuard;
+        use crate::testing::{EnvVarGuard, TestConfigDirGuard};
+
+        let _guard = TestConfigDirGuard::new("jobs-envoy-hermetic");
+        let _leak = EnvVarGuard::set("LEAK_MARKER", "leaked");
+        let _data_dir = EnvVarGuard::set("ENVOY_DATA_DIR", "/evil");
+        let source = Arc::new(EnvoySource::new());
+        let _source = BuiltinSourceGuard::new(source.clone());
+        let mut ctx = plain_ctx();
+        let app = ctx.app.config.clone();
+        run_async(ctx.use_agent(&app, "envoy", None, create_abort_signal())).unwrap();
+        let dir = crate::config::builtin_agent_dir("envoy").unwrap();
+
+        let snapshot = build_env_snapshot(&ctx, "user__input", &json!({})).unwrap();
+        assert!(snapshot.env_clear);
+        assert!(
+            !snapshot.envs.contains_key("LEAK_MARKER"),
+            "{:?}",
+            snapshot.envs
+        );
+        assert_eq!(
+            snapshot.envs.get("ENVOY_DATA_DIR"),
+            Some(&dir.display().to_string())
+        );
+        assert_eq!(snapshot.envs.get("HOME"), env::var("HOME").ok().as_ref());
+
+        let snapshot = build_env_snapshot(&plain_ctx(), "execute_command", &json!({})).unwrap();
+        assert!(!snapshot.env_clear);
+        assert!(!snapshot.envs.contains_key("LEAK_MARKER"));
         source.remove_dir();
     }
 }

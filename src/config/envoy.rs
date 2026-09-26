@@ -168,11 +168,8 @@ fn should_sweep(file_name: &str, age: Duration, pid_alive: impl FnOnce(u32) -> b
 /// Any failure to probe counts as alive: the dir is never deleted on doubt.
 #[cfg(unix)]
 fn pid_alive(pid: u32) -> bool {
-    if cfg!(target_os = "linux") {
-        return match fs::metadata(Path::new("/proc").join(pid.to_string())) {
-            Ok(_) => true,
-            Err(err) => err.kind() != io::ErrorKind::NotFound,
-        };
+    if let Some(alive) = pid_alive_via_proc(Path::new("/proc"), pid) {
+        return alive;
     }
     match std::process::Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "pid="])
@@ -180,6 +177,19 @@ fn pid_alive(pid: u32) -> bool {
     {
         Ok(output) => output.status.success() && !output.stdout.is_empty(),
         Err(_) => true,
+    }
+}
+
+/// `None` unless procfs is mounted at `proc_root` (its `self` entry exists):
+/// in a sandbox without /proc every pid would otherwise look dead.
+#[cfg(unix)]
+fn pid_alive_via_proc(proc_root: &Path, pid: u32) -> Option<bool> {
+    if !cfg!(target_os = "linux") || !proc_root.join("self").exists() {
+        return None;
+    }
+    match fs::metadata(proc_root.join(pid.to_string())) {
+        Ok(_) => Some(true),
+        Err(err) => Some(err.kind() != io::ErrorKind::NotFound),
     }
 }
 
@@ -454,6 +464,21 @@ mod tests {
         assert!(!should_sweep(&stale, old, alive));
         assert!(!should_sweep(&foreign_dir_name("-job-"), old, dead));
         assert!(should_sweep(&stale, old, dead));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proc_probe_is_trusted_only_when_procfs_is_mounted() {
+        let root = temp_file("-envoy-proc-", "");
+        fs::create_dir_all(root.join("123")).unwrap();
+        assert_eq!(pid_alive_via_proc(&root, 123), None);
+        assert_eq!(pid_alive_via_proc(&root, 456), None);
+        if cfg!(target_os = "linux") {
+            fs::create_dir_all(root.join("self")).unwrap();
+            assert_eq!(pid_alive_via_proc(&root, 123), Some(true));
+            assert_eq!(pid_alive_via_proc(&root, 456), Some(false));
+        }
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[cfg(unix)]

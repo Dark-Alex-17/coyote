@@ -101,6 +101,81 @@ pub(crate) fn builtin_agent_env(agent_name: Option<&str>) -> Vec<(String, String
     ]
 }
 
+/// Built-in agents run their tools with a cleared env; everything else
+/// inherits the parent's. Both spawn sites decide through this one check.
+pub(crate) fn is_builtin_agent(agent_name: Option<&str>) -> bool {
+    agent_name.and_then(crate::config::reserved_agent).is_some()
+}
+
+/// The envoy's process-environment boundary. Peer-controlled text reaches
+/// the envoy, so its tools must not see the operator's secrets: only the
+/// keys a tool shim needs to run at all survive from the parent env.
+/// Everything else is dropped, including every `.env`-loaded key,
+/// `*_API_KEY`, the config dir override, other agents' `*_DATA_DIR`,
+/// `GRAPH_STATE*` and the MCP/OAuth vars.
+pub(crate) fn builtin_agent_child_env(
+    inherited: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    inherited
+        .iter()
+        .filter(|(key, _)| builtin_agent_child_env_allows(key))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+/// The parent env as owned strings. A key or value that is not valid
+/// unicode can never match the allow-list, so it is skipped instead of
+/// letting `env::vars()` panic on it.
+pub(crate) fn inherited_process_env() -> HashMap<String, String> {
+    env::vars_os()
+        .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
+        .collect()
+}
+
+const BUILTIN_AGENT_CHILD_ENV_KEYS: &[&str] = &[
+    "PATH",
+    "HOME",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "LANG",
+    "TZ",
+    "TERM",
+    "LLM_OUTPUT",
+    "LLM_TOOL_DATA_FILE",
+    "LLM_DUMP_RESULTS",
+    "COYOTE_CURRENT_MODEL",
+    "ENVOY_DATA_DIR",
+    "ENVOY_FUNCTIONS_DIR",
+];
+
+/// Windows env names are case-insensitive, so the allow-list matches that way.
+#[cfg(windows)]
+fn builtin_agent_child_env_allows(key: &str) -> bool {
+    const WINDOWS_KEYS: &[&str] = &[
+        "SystemRoot",
+        "SYSTEMROOT",
+        "windir",
+        "COMSPEC",
+        "PATHEXT",
+        "USERPROFILE",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "OS",
+    ];
+    key.get(..3)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("LC_"))
+        || BUILTIN_AGENT_CHILD_ENV_KEYS
+            .iter()
+            .chain(WINDOWS_KEYS)
+            .any(|allowed| allowed.eq_ignore_ascii_case(key))
+}
+
+#[cfg(not(windows))]
+fn builtin_agent_child_env_allows(key: &str) -> bool {
+    key.starts_with("LC_") || BUILTIN_AGENT_CHILD_ENV_KEYS.contains(&key)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, AsRefStr)]
 pub enum Language {
     Bash,
@@ -2462,6 +2537,7 @@ pub fn run_llm_function(
 ) -> Result<Option<String>> {
     let mut bin_dirs: Vec<PathBuf> = vec![];
     let mut command_name = cmd_name.clone();
+    let hermetic = is_builtin_agent(agent_name.as_deref());
     if let Some(agent_name) = agent_name {
         command_name = cmd_args[0].clone();
         let dir = paths::agent_bin_dir(&agent_name);
@@ -2508,7 +2584,13 @@ pub fn run_llm_function(
     envs.insert("CLICOLOR_FORCE".into(), "1".into());
     envs.insert("FORCE_COLOR".into(), "1".into());
 
-    let mut child = Command::new(&cmd_name)
+    let mut command = Command::new(&cmd_name);
+    if hermetic {
+        command
+            .env_clear()
+            .envs(builtin_agent_child_env(&inherited_process_env()));
+    }
+    let mut child = command
         .args(&cmd_args)
         .envs(envs)
         .stdin(Stdio::null())
@@ -5204,6 +5286,61 @@ mod tests {
         source.remove_dir();
     }
 
+    #[test]
+    fn builtin_agent_child_env_keeps_only_the_allow_list() {
+        let inherited: HashMap<String, String> = [
+            "OPENAI_API_KEY",
+            "COYOTE_CONFIG_DIR",
+            "LEAK_MARKER",
+            "GRAPH_STATE",
+            "ENVOY_DATA_DIR",
+            "LC_ALL",
+            "PATH",
+            "HOME",
+            "LLM_OUTPUT",
+        ]
+        .into_iter()
+        .map(|key| (key.to_string(), format!("{key}-value")))
+        .collect();
+
+        let child = builtin_agent_child_env(&inherited);
+
+        let mut keys: Vec<&str> = child.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["ENVOY_DATA_DIR", "HOME", "LC_ALL", "LLM_OUTPUT", "PATH"]
+        );
+        assert_eq!(child["PATH"], "PATH-value");
+        assert!(is_builtin_agent(Some("envoy")));
+        assert!(is_builtin_agent(Some("En-Voy")));
+        assert!(!is_builtin_agent(Some("rag")));
+        assert!(!is_builtin_agent(None));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn non_builtin_agent_child_env_is_untouched() {
+        let _leak = crate::testing::EnvVarGuard::set("LEAK_MARKER", "leaked");
+        for agent_name in [Some("rag".to_string()), None] {
+            let output = run_llm_function(
+                "bash".into(),
+                vec![
+                    "-c".into(),
+                    "printf '%s' \"$LEAK_MARKER\" > \"$LLM_OUTPUT\"".into(),
+                ],
+                HashMap::new(),
+                agent_name.clone(),
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+            assert_eq!(output.as_deref(), Some("leaked"), "{agent_name:?}");
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     #[serial]
@@ -5251,71 +5388,70 @@ mod tests {
     #[test]
     #[serial]
     fn builtin_agent_shim_roots_tools_at_the_envoy_dir_not_the_config_dir() {
+        use crate::config::envoy::EnvoySource;
+        use crate::config::reserved_agents::BuiltinSourceGuard;
+        use crate::testing::EnvVarGuard;
+
         if which::which("python3").is_err() {
             eprintln!("skipping: python3 not available");
             return;
         }
         let guard = crate::testing::TestConfigDirGuard::new("builtin-shim-python");
+        let _leak = EnvVarGuard::set("LEAK_MARKER", "leaked");
         fs::write(guard.path.join(".env"), "LEAK_MARKER=leaked\n").unwrap();
-        let envoy_dir = temp_file("-envoy-shim-", "");
-        fs::create_dir_all(envoy_dir.join("bin")).unwrap();
-        fs::write(envoy_dir.join(".env"), "ENVOY_MARKER=ok\n").unwrap();
+        crate::config::load_env_file().unwrap();
+        assert_eq!(env::var("LEAK_MARKER").unwrap(), "leaked");
+        let _data_dir = EnvVarGuard::set("ENVOY_DATA_DIR", "/evil");
+        let _own = EnvVarGuard::unset("ENVOY_MARKER");
+
+        let source = Arc::new(EnvoySource::new());
+        let _source = BuiltinSourceGuard::new(source.clone());
+        let dir = crate::config::builtin_agent_dir("envoy").unwrap();
+        fs::create_dir_all(dir.join("bin")).unwrap();
+        fs::write(dir.join(".env"), "ENVOY_MARKER=ok\n").unwrap();
         fs::write(
-            envoy_dir.join("tools.py"),
-            "import os\n\n\ndef probe():\n    return {\"root\": os.environ[\"LLM_ROOT_DIR\"], \"leak\": os.environ.get(\"LEAK_MARKER\"), \"own\": os.environ.get(\"ENVOY_MARKER\")}\n",
+            dir.join("tools.py"),
+            "import os\n\n\ndef probe():\n    e = os.environ\n    return {\"root\": e[\"LLM_ROOT_DIR\"], \"leak\": e.get(\"LEAK_MARKER\"), \"own\": e.get(\"ENVOY_MARKER\"), \"data_dir\": e.get(\"ENVOY_DATA_DIR\"), \"path\": e.get(\"PATH\"), \"model\": e.get(\"COYOTE_CURRENT_MODEL\")}\n",
         )
         .unwrap();
-        let shim = envoy_dir.join("bin").join("envoy");
+        let shim = dir.join("bin").join("envoy");
         fs::write(&shim, rendered_builtin_agent_shim("scripts/run-agent.py")).unwrap();
 
-        let run = |config_dir_set: bool, data_dir_env: Option<&Path>| {
-            let mut command = Command::new("python3");
-            command
-                .arg(&shim)
-                .arg("probe")
-                .arg("{}")
-                .env_remove("LLM_OUTPUT")
-                .env_remove("LLM_TOOL_DATA_FILE")
-                .env_remove("LEAK_MARKER")
-                .env_remove("ENVOY_MARKER")
-                .env_remove("ENVOY_DATA_DIR");
-            if config_dir_set {
-                command.env(get_env_name("config_dir"), &guard.path);
-            } else {
-                command.env_remove(get_env_name("config_dir"));
-            }
-            if let Some(dir) = data_dir_env {
-                command.env("ENVOY_DATA_DIR", dir);
-            }
-            let output = command.output().unwrap();
-            assert!(
-                output.status.success(),
-                "shim failed: stderr={} stdout={}",
-                String::from_utf8_lossy(&output.stderr),
-                String::from_utf8_lossy(&output.stdout)
-            );
-            serde_json::from_slice::<Value>(&output.stdout).unwrap()
+        let run = || {
+            let output = run_llm_function(
+                "python3".into(),
+                vec![shim.display().to_string(), "probe".into(), "{}".into()],
+                HashMap::from([("COYOTE_CURRENT_MODEL".to_string(), "test-model".to_string())]),
+                Some("envoy".to_string()),
+                None,
+                false,
+                None,
+            )
+            .unwrap()
+            .expect("the probe writes to LLM_OUTPUT");
+            serde_json::from_str::<Value>(&output).unwrap()
         };
 
         for config_dir_set in [true, false] {
-            for data_dir_env in [Some(envoy_dir.as_path()), None] {
-                let probe = run(config_dir_set, data_dir_env);
-                assert_eq!(
-                    probe["root"],
-                    json!(envoy_dir.display().to_string()),
-                    "config_dir_set={config_dir_set} data_dir_env={data_dir_env:?}: {probe}"
-                );
-                assert_eq!(probe["leak"], Value::Null, "{probe}");
-                assert_eq!(probe["own"], json!("ok"), "{probe}");
-            }
+            let _unset = (!config_dir_set).then(|| EnvVarGuard::unset(get_env_name("config_dir")));
+            let probe = run();
+            let expected_dir = json!(dir.display().to_string());
+            assert_eq!(
+                probe["root"], expected_dir,
+                "config_dir_set={config_dir_set}: {probe}"
+            );
+            assert_eq!(probe["leak"], Value::Null, "{probe}");
+            assert_eq!(probe["own"], json!("ok"), "{probe}");
+            assert_eq!(probe["data_dir"], expected_dir, "{probe}");
+            assert_eq!(probe["model"], json!("test-model"), "{probe}");
+            let path = probe["path"].as_str().expect("PATH survives the clear");
+            assert!(
+                path.starts_with(&format!("{}{PATH_SEP}", dir.join("bin").display())),
+                "{path}"
+            );
         }
 
-        let hijacked = run(true, Some(Path::new("/evil")));
-        assert_eq!(hijacked["root"], json!("/evil"), "{hijacked}");
-        assert_eq!(hijacked["leak"], Value::Null, "{hijacked}");
-        assert_eq!(hijacked["own"], Value::Null, "{hijacked}");
-
-        fs::remove_dir_all(&envoy_dir).unwrap();
+        source.remove_dir();
     }
 
     #[test]
