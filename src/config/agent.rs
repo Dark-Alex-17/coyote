@@ -887,6 +887,14 @@ impl Agent {
         self.config.compression_model.as_deref()
     }
 
+    pub fn brief_model(&self) -> Option<&str> {
+        self.config.brief_model.as_deref()
+    }
+
+    pub fn envoy_model(&self) -> Option<&str> {
+        self.config.envoy_model.as_deref()
+    }
+
     pub fn hooks(&self) -> &HooksMap {
         &self.config.hooks
     }
@@ -1093,6 +1101,10 @@ pub struct AgentConfig {
     pub compression_keep_last: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compression_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub brief_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub envoy_model: Option<String>,
     #[serde(default)]
     pub description: String,
     #[serde(default)]

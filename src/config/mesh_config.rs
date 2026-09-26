@@ -63,10 +63,14 @@ impl MeshConfig {
         &self.interfaces
     }
 
-    // Consumed by the envoy's digest step, which has not landed yet.
-    #[allow(dead_code)]
+    /// The configured digest prompt, trimmed; blank counts as unset and yields the
+    /// code-owned default.
     pub fn digest_prompt(&self) -> &str {
-        self.digest_prompt.as_deref().unwrap_or(MESH_DIGEST_PROMPT)
+        self.digest_prompt
+            .as_deref()
+            .map(str::trim)
+            .filter(|prompt| !prompt.is_empty())
+            .unwrap_or(MESH_DIGEST_PROMPT)
     }
 
     pub fn validate(&self, function_calling_support: bool) -> Result<()> {
@@ -225,9 +229,10 @@ impl From<MeshInterface> for RawMeshInterface {
 
 /// The `mesh:` section of `.info`, one row per setting. The digest prompt body is never printed.
 pub fn render_mesh_info(mesh: &MeshConfig) -> String {
-    let digest_prompt = match mesh.digest_prompt {
-        Some(_) => "custom",
-        None => "default",
+    let digest_prompt = if mesh.digest_prompt() == MESH_DIGEST_PROMPT {
+        "default"
+    } else {
+        "custom"
     };
     let mut output = String::new();
     let mut row = |name: &str, value: String| output.push_str(&format!("  {name:<28}{value}\n"));
@@ -491,6 +496,13 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(mesh.digest_prompt(), "x");
+        for blank in ["", "  \n"] {
+            let mesh = MeshConfig {
+                digest_prompt: Some(blank.into()),
+                ..Default::default()
+            };
+            assert_eq!(mesh.digest_prompt(), MESH_DIGEST_PROMPT, "{blank:?}");
+        }
     }
 
     #[test]
@@ -677,6 +689,15 @@ mod tests {
         assert!(
             render_mesh_info(&MeshConfig::default())
                 .contains("  digest_prompt               default\n")
+        );
+        let blank = MeshConfig {
+            digest_prompt: Some("  \n".into()),
+            ..Default::default()
+        };
+        assert!(
+            render_mesh_info(&blank).contains("  digest_prompt               default\n"),
+            "{}",
+            render_mesh_info(&blank)
         );
     }
 

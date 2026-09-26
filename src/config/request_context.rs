@@ -1121,6 +1121,22 @@ impl RequestContext {
             .or_else(|| self.app.config.compression_model.clone())
     }
 
+    pub fn brief_model(&self) -> Option<String> {
+        self.agent
+            .as_ref()
+            .and_then(|a| a.brief_model().map(|s| s.to_string()))
+            .or_else(|| self.app.config.mesh.brief_model.clone())
+    }
+
+    // Reached by the envoy once it lands.
+    #[allow(dead_code)]
+    pub fn envoy_model(&self) -> Option<String> {
+        self.agent
+            .as_ref()
+            .and_then(|a| a.envoy_model().map(|s| s.to_string()))
+            .or_else(|| self.app.config.mesh.envoy_model.clone())
+    }
+
     pub fn role_like_mut(&mut self) -> Option<&mut dyn RoleLike> {
         if let Some(session) = self.session.as_mut() {
             Some(session)
@@ -5756,16 +5772,16 @@ fn fork_base_name(name: &str) -> &str {
 
 /// Assumed summarizer window when neither the compression model nor the
 /// session model declares `max_input_tokens`.
-const SUMMARIZATION_WINDOW_FALLBACK_TOKENS: usize = 200_000;
+pub(super) const SUMMARIZATION_WINDOW_FALLBACK_TOKENS: usize = 200_000;
 /// Share of the summarizer's window a single history chunk may occupy; the
 /// rest is headroom for the summarization prompt, the folded-forward prior
 /// summary, and the response.
-const SUMMARIZATION_CHUNK_BUDGET_RATIO: f32 = 0.6;
+pub(super) const SUMMARIZATION_CHUNK_BUDGET_RATIO: f32 = 0.6;
 
 /// Splits `messages` into consecutive runs whose estimated tokens each stay
 /// within `budget`. A message that alone exceeds the budget forms its own
 /// chunk: messages are the smallest unit summarization can fold.
-fn slice_summarization_chunks<'a>(
+pub(super) fn slice_summarization_chunks<'a>(
     model: &Model,
     messages: &'a [Message],
     budget: usize,
@@ -5791,7 +5807,7 @@ fn slice_summarization_chunks<'a>(
 /// Renders messages as a role-prefixed transcript for the summarizer. Tool
 /// transcripts are serialized whole rather than dropped: their results often
 /// carry the facts the summary must preserve.
-fn render_summarization_chunk(messages: &[Message]) -> String {
+pub(super) fn render_summarization_chunk(messages: &[Message]) -> String {
     messages
         .iter()
         .map(|message| {
@@ -5813,7 +5829,11 @@ fn render_summarization_chunk(messages: &[Message]) -> String {
         .join("\n\n")
 }
 
-fn compose_summarization_request(prompt: &str, prior_summary: &str, chunk: &str) -> String {
+pub(super) fn compose_summarization_request(
+    prompt: &str,
+    prior_summary: &str,
+    chunk: &str,
+) -> String {
     if prior_summary.is_empty() {
         format!("{chunk}\n\n{prompt}")
     } else {
@@ -5831,6 +5851,7 @@ mod tests {
     use crate::config::bundles::BundleStore;
     use crate::config::conflict::InstallMode;
     use crate::config::mcp_tool_policy::LayerSource;
+    use crate::config::mesh_config::MeshConfig;
     use crate::config::reserved_agents::{
         BuiltinAgentUnavailable, BuiltinSourceGuard, FixedDirSource,
     };
@@ -6353,6 +6374,92 @@ mod tests {
             ctx.compression_model(),
             Some("openai:agent-model".to_string())
         );
+    }
+
+    #[test]
+    fn brief_model_none_when_unset() {
+        let ctx = create_test_ctx();
+        assert_eq!(ctx.brief_model(), None);
+    }
+
+    #[test]
+    fn brief_model_uses_app_config_without_agent() {
+        let mut ctx = create_test_ctx();
+        ctx.app = Arc::new(AppState {
+            config: Arc::new(AppConfig {
+                mesh: MeshConfig {
+                    brief_model: Some("openai:app-model".to_string()),
+                    ..MeshConfig::default()
+                },
+                ..(*ctx.app.config).clone()
+            }),
+            ..(*ctx.app).clone()
+        });
+        assert_eq!(ctx.brief_model(), Some("openai:app-model".to_string()));
+    }
+
+    #[test]
+    fn brief_model_agent_overrides_app_config() {
+        let mut ctx = create_test_ctx();
+        ctx.app = Arc::new(AppState {
+            config: Arc::new(AppConfig {
+                mesh: MeshConfig {
+                    brief_model: Some("openai:app-model".to_string()),
+                    ..MeshConfig::default()
+                },
+                ..(*ctx.app.config).clone()
+            }),
+            ..(*ctx.app).clone()
+        });
+        ctx.agent = Some(Agent::test_new(AgentConfig {
+            name: "test-agent".to_string(),
+            brief_model: Some("openai:agent-model".to_string()),
+            ..AgentConfig::default()
+        }));
+        assert_eq!(ctx.brief_model(), Some("openai:agent-model".to_string()));
+    }
+
+    #[test]
+    fn envoy_model_none_when_unset() {
+        let ctx = create_test_ctx();
+        assert_eq!(ctx.envoy_model(), None);
+    }
+
+    #[test]
+    fn envoy_model_uses_app_config_without_agent() {
+        let mut ctx = create_test_ctx();
+        ctx.app = Arc::new(AppState {
+            config: Arc::new(AppConfig {
+                mesh: MeshConfig {
+                    envoy_model: Some("openai:app-model".to_string()),
+                    ..MeshConfig::default()
+                },
+                ..(*ctx.app.config).clone()
+            }),
+            ..(*ctx.app).clone()
+        });
+        assert_eq!(ctx.envoy_model(), Some("openai:app-model".to_string()));
+    }
+
+    #[test]
+    fn envoy_model_agent_overrides_app_config() {
+        let mut ctx = create_test_ctx();
+        ctx.app = Arc::new(AppState {
+            config: Arc::new(AppConfig {
+                mesh: MeshConfig {
+                    envoy_model: Some("openai:app-model".to_string()),
+                    ..MeshConfig::default()
+                },
+                ..(*ctx.app.config).clone()
+            }),
+            ..(*ctx.app).clone()
+        });
+        ctx.agent = Some(Agent::test_new(AgentConfig {
+            name: "test-agent".to_string(),
+            envoy_model: Some("openai:agent-model".to_string()),
+            ..AgentConfig::default()
+        }));
+        assert_eq!(ctx.envoy_model(), Some("openai:agent-model".to_string()));
     }
 
     fn windowed_model(max_input_tokens: usize) -> Model {

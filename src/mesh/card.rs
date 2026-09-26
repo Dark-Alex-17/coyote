@@ -1,3 +1,4 @@
+use crate::mesh::brief::{Digest, digest_objective_for};
 use crate::mesh::display_text;
 use crate::mesh::node::{MeshRuntime, MeshSlot};
 use crate::mesh::r3::{
@@ -343,6 +344,7 @@ pub(crate) fn build_card(
 pub(crate) trait CardSource: Send + Sync {
     fn snapshot(&self) -> Option<Arc<MeshSnapshot>>;
     fn objective_override(&self) -> Option<Arc<String>>;
+    fn digest(&self) -> Option<Arc<Digest>>;
     fn display_name(&self) -> Option<String>;
 }
 
@@ -353,6 +355,10 @@ impl CardSource for MeshSlot {
 
     fn objective_override(&self) -> Option<Arc<String>> {
         MeshSlot::objective_override(self)
+    }
+
+    fn digest(&self) -> Option<Arc<Digest>> {
+        MeshSlot::digest(self)
     }
 
     fn display_name(&self) -> Option<String> {
@@ -374,7 +380,9 @@ impl StatusHandler {
         Self { source }
     }
 
-    fn card(&self, now: SystemTime) -> StatusCard {
+    /// The digest's objective is judged against the one snapshot this card is built from,
+    /// so a mode change between two reads of the slot cannot mix them.
+    pub(crate) fn card(&self, now: SystemTime) -> StatusCard {
         let Some(source) = self.source.upgrade() else {
             debug!(
                 "Mesh /status served the minimal card: the session slot behind the provider is gone"
@@ -383,11 +391,15 @@ impl StatusHandler {
         };
         let snapshot = source.snapshot();
         let objective_override = source.objective_override();
+        let digest = source.digest();
+        let digest_objective = snapshot
+            .as_deref()
+            .and_then(|snapshot| digest_objective_for(snapshot, digest.as_deref()));
         let display_name = source.display_name();
         build_card(
             snapshot.as_deref(),
             objective_override.as_deref().map(String::as_str),
-            None,
+            digest_objective.as_deref(),
             display_name.as_deref(),
             now,
         )
@@ -476,6 +488,7 @@ impl MeshRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::mesh_config::MeshBrief;
     use crate::config::todo::{TodoItem, TodoList};
     use crate::mesh::announce::is_control_or_invisible;
     use crate::mesh::snapshot::{PlanRef, RepoInfo, SessionInfo};
@@ -590,7 +603,10 @@ mod tests {
 
     #[test]
     fn a_dropped_source_is_served_the_minimal_card() {
-        let source = Arc::new(FixtureSource(snapshot_fixture()));
+        let source = Arc::new(FixtureSource {
+            snapshot: snapshot_fixture(),
+            digest: None,
+        });
         let handler = StatusHandler::new(Arc::downgrade(&source) as Weak<dyn CardSource>);
         assert_eq!(handler.card(now()).objective.as_deref(), Some("ship it"));
 
@@ -601,19 +617,74 @@ mod tests {
         );
     }
 
-    struct FixtureSource(MeshSnapshot);
+    struct FixtureSource {
+        snapshot: MeshSnapshot,
+        digest: Option<Digest>,
+    }
 
     impl CardSource for FixtureSource {
         fn snapshot(&self) -> Option<Arc<MeshSnapshot>> {
-            Some(Arc::new(self.0.clone()))
+            Some(Arc::new(self.snapshot.clone()))
         }
 
         fn objective_override(&self) -> Option<Arc<String>> {
             None
         }
 
+        fn digest(&self) -> Option<Arc<Digest>> {
+            self.digest.clone().map(Arc::new)
+        }
+
         fn display_name(&self) -> Option<String> {
             None
+        }
+    }
+
+    #[test]
+    fn status_handler_serves_the_digest_objective_when_nothing_else_names_one() {
+        let mut snapshot = snapshot_fixture();
+        snapshot.objective = None;
+        snapshot.todo = TodoList::default();
+        snapshot.brief.mode = MeshBrief::Auto;
+        let source = Arc::new(FixtureSource {
+            snapshot,
+            digest: Some(Digest {
+                text: "- from the digest".into(),
+                generated_at: now(),
+                covered_messages: 4,
+            }),
+        });
+        let handler = StatusHandler::new(Arc::downgrade(&source) as Weak<dyn CardSource>);
+        assert_eq!(
+            handler.card(now()).objective.as_deref(),
+            Some("from the digest")
+        );
+    }
+
+    #[test]
+    fn the_slot_serves_a_digest_objective_under_auto_only() {
+        for (mode, expected) in [
+            (MeshBrief::Manual, None),
+            (MeshBrief::Off, None),
+            (MeshBrief::Auto, Some("from the digest")),
+        ] {
+            let slot = Arc::new(MeshSlot::default());
+            let mut snapshot = snapshot_fixture();
+            snapshot.objective = None;
+            snapshot.todo = TodoList::default();
+            snapshot.brief.mode = mode;
+            slot.publish(snapshot);
+            slot.publish_digest(Some(Digest {
+                text: "- from the digest".into(),
+                generated_at: now(),
+                covered_messages: 4,
+            }));
+            let handler = StatusHandler::new(Arc::downgrade(&slot) as Weak<dyn CardSource>);
+            assert_eq!(
+                handler.card(now()).objective.as_deref(),
+                expected,
+                "{mode:?}"
+            );
         }
     }
 

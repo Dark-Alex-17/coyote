@@ -3,7 +3,8 @@ use crate::config::{ForkRekey, Session, paths};
 use crate::mesh::announce::{
     AnnounceAppData, HEARTBEAT_SECS, REANNOUNCE_FLOOR_SECS, announce_app_data,
 };
-use crate::mesh::card::{CardSource, StatusHandler};
+use crate::mesh::brief::{Brief, Digest, assemble_brief, digest_objective_for};
+use crate::mesh::card::{CardSource, StatusHandler, build_card};
 use crate::mesh::idle::{IdleNotify, IdleSink, Origin};
 use crate::mesh::knock::{
     ChannelKnockSink, KNOCK_LINK_TIMEOUT, KNOCK_QUEUE_CAPACITY, KNOCK_REQUEST_TIMEOUT, KnockError,
@@ -53,6 +54,7 @@ use rns_transport::iface::tcp_client::TcpClient;
 use rns_transport::iface::{IfaceRole, InterfaceMode};
 use rns_transport::transport::{AnnounceEvent, Transport, TransportConfig};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{Mutex, broadcast};
@@ -1335,16 +1337,23 @@ async fn announce_periodically(runtime: Arc<MeshRuntime>, cancel: CancellationTo
 /// The process-wide home of the running node. Empty until the mesh is turned on; shared by
 /// every `AppState` clone so replacing the config never detaches the runtime.
 ///
-/// The snapshot, objective override and brief live in lock-free slots: the REPL holds the
-/// session context write-locked for a whole turn, so anything that serves peers must be
-/// readable without it.
+/// The snapshot, objective override, digest, user brief and brief live in lock-free slots:
+/// the REPL holds the session context write-locked for a whole turn, so anything that
+/// serves peers must be readable without it.
 ///
-/// `snapshot()` is the picture taken at the last turn boundary. `brief_text()` and
-/// `objective_override()` are live and may be newer than the snapshot's `brief.text` and
-/// `objective`. Consumers overlay `objective_override()` on `snapshot().objective` when it is
-/// `Some`. The live `brief_text()` is authoritative, including `None`: a cleared brief must
+/// `snapshot()` is the picture taken at the last turn boundary. `objective_override()`,
+/// `digest()` and `user_brief()` are live and may be newer than it. Consumers overlay
+/// `objective_override()` on `snapshot().objective` when it is `Some`. `brief()` is
+/// derived: `reassemble_brief` rebuilds it from the snapshot (mode, todo, card fields),
+/// the digest and the user brief whenever any of them changes, so it is never stored
+/// directly. The live `brief()` is authoritative, including `None`: a cleared brief must
 /// not fall back to the snapshot's copy. `snapshot().brief.text` is the value at capture,
 /// kept so a snapshot is self-describing.
+///
+/// `digest_epoch` counts the clears made by `clear_digest_for_new_epoch`. A generation
+/// records the epoch it started under and publishes through `publish_digest_at`, which
+/// refuses once the epoch has moved on, so a digest of one session cannot land after the
+/// switch to another. Both run under `reassembly`, so the check and the store are one step.
 ///
 /// The notifier slot is where lines meant for the person at the keyboard go; it is filled by
 /// whichever front end owns the terminal, so mesh code never needs to know which one is
@@ -1362,7 +1371,11 @@ pub(crate) struct MeshSlot {
     inner: RwLock<Option<Arc<MeshRuntime>>>,
     snapshot: ArcSwapOption<MeshSnapshot>,
     objective_override: ArcSwapOption<String>,
-    brief_text: ArcSwapOption<String>,
+    digest: ArcSwapOption<Digest>,
+    digest_epoch: AtomicU64,
+    user_brief: ArcSwapOption<String>,
+    brief: ArcSwapOption<Brief>,
+    reassembly: parking_lot::Mutex<()>,
     notifier: ArcSwapOption<Arc<dyn NotificationSink>>,
     idle: ArcSwapOption<Arc<dyn IdleSink>>,
     peer_inbox: PeerInbox,
@@ -1468,6 +1481,7 @@ impl MeshSlot {
 
     pub(crate) fn publish(&self, snapshot: MeshSnapshot) {
         self.snapshot.store(Some(Arc::new(snapshot)));
+        self.reassemble_brief();
     }
 
     pub(crate) fn snapshot(&self) -> Option<Arc<MeshSnapshot>> {
@@ -1490,20 +1504,109 @@ impl MeshSlot {
     #[allow(dead_code)]
     pub(crate) fn set_objective_override(&self, objective: Option<String>) {
         self.objective_override.store(non_blank(objective));
+        self.reassemble_brief();
     }
 
     pub(crate) fn objective_override(&self) -> Option<Arc<String>> {
         self.objective_override.load_full()
     }
 
-    // Reached by the brief generator once it lands.
-    #[allow(dead_code)]
-    pub(crate) fn publish_brief(&self, text: Option<String>) {
-        self.brief_text.store(non_blank(text));
+    /// Stores or clears the digest unconditionally and rebuilds the brief. Production
+    /// clears through `clear_digest_for_new_epoch` and stores through `publish_digest_at`,
+    /// so a generation that outlived its session is refused; tests seed a digest directly.
+    #[cfg(test)]
+    pub(crate) fn publish_digest(&self, digest: Option<Digest>) {
+        let rebuilding = self.reassembly.lock();
+        self.digest.store(digest.map(Arc::new));
+        self.reassemble_brief_locked(&rebuilding);
     }
 
-    pub(crate) fn brief_text(&self) -> Option<Arc<String>> {
-        self.brief_text.load_full()
+    pub(crate) fn digest(&self) -> Option<Arc<Digest>> {
+        self.digest.load_full()
+    }
+
+    pub(crate) fn digest_epoch(&self) -> u64 {
+        self.digest_epoch.load(Ordering::Acquire)
+    }
+
+    /// Clears the digest and opens a new epoch in one step, returning it. A generation
+    /// started under the previous epoch is refused by `publish_digest_at` from here on,
+    /// even if it finishes after this call.
+    pub(crate) fn clear_digest_for_new_epoch(&self) -> u64 {
+        let rebuilding = self.reassembly.lock();
+        let epoch = self.digest_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        self.digest.store(None);
+        self.reassemble_brief_locked(&rebuilding);
+        epoch
+    }
+
+    /// Stores `digest` and rebuilds the brief only while `epoch` is still the current one;
+    /// `false` means the session changed while the digest was being generated and it was
+    /// dropped.
+    pub(crate) fn publish_digest_at(&self, epoch: u64, digest: Digest) -> bool {
+        let rebuilding = self.reassembly.lock();
+        if self.digest_epoch.load(Ordering::Acquire) != epoch {
+            return false;
+        }
+        self.digest.store(Some(Arc::new(digest)));
+        self.reassemble_brief_locked(&rebuilding);
+        true
+    }
+
+    // Reached by the REPL mesh commands once they land.
+    #[allow(dead_code)]
+    pub(crate) fn set_user_brief(&self, text: Option<String>) {
+        self.user_brief.store(non_blank(text));
+        self.reassemble_brief();
+    }
+
+    pub(crate) fn user_brief(&self) -> Option<Arc<String>> {
+        self.user_brief.load_full()
+    }
+
+    pub(crate) fn brief(&self) -> Option<Arc<Brief>> {
+        self.brief.load_full()
+    }
+
+    /// Rebuilds the served brief from the current snapshot, digest and user brief. The
+    /// snapshot's `brief.mode` decides what goes in; with no snapshot yet there is no mode
+    /// to honour, so nothing is served. Rebuilds are serialised: the digest task and the
+    /// turn boundary may both store and rebuild at once, and without the lock the later
+    /// store could be overwritten by a rebuild that read before it.
+    pub(crate) fn reassemble_brief(&self) {
+        let rebuilding = self.reassembly.lock();
+        self.reassemble_brief_locked(&rebuilding);
+    }
+
+    /// The rebuild itself; the guard proves the caller holds `reassembly`, which is not
+    /// reentrant.
+    fn reassemble_brief_locked(&self, _rebuilding: &parking_lot::MutexGuard<'_, ()>) {
+        let Some(snapshot) = self.snapshot() else {
+            self.brief.store(None);
+            return;
+        };
+        let now = SystemTime::now();
+        let objective_override = self.objective_override();
+        let digest = self.digest();
+        let digest_objective = digest_objective_for(&snapshot, digest.as_deref());
+        let display_name = CardSource::display_name(self);
+        let card = build_card(
+            Some(&snapshot),
+            objective_override.as_deref().map(String::as_str),
+            digest_objective.as_deref(),
+            display_name.as_deref(),
+            now,
+        );
+        let user_brief = self.user_brief();
+        let brief = assemble_brief(
+            snapshot.brief.mode,
+            Some(&card),
+            digest.as_deref(),
+            user_brief.as_deref().map(String::as_str),
+            &snapshot.todo,
+            now,
+        );
+        self.brief.store(brief.map(Arc::new));
     }
 
     /// Installs where human-facing lines go. The interactive REPL installs its prompt
@@ -1687,6 +1790,7 @@ impl PeerSurface for MeshSlot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::mesh_config::MeshBrief;
     use crate::mesh::message::{PEER_ID_MAX_CHARS, PeerVia, RawPeerMessage};
     use crate::mesh::notify::RenderedNotification;
     use crate::mesh::peers::PEER_TTL;
@@ -1743,7 +1847,9 @@ mod tests {
     fn slot_override_and_brief_round_trip_and_clear() {
         let slot = MeshSlot::default();
         assert!(slot.objective_override().is_none());
-        assert!(slot.brief_text().is_none());
+        assert!(slot.digest().is_none());
+        assert!(slot.user_brief().is_none());
+        assert!(slot.brief().is_none());
 
         slot.set_objective_override(Some("review the mesh".into()));
         assert_eq!(
@@ -1753,10 +1859,81 @@ mod tests {
         slot.set_objective_override(None);
         assert!(slot.objective_override().is_none());
 
-        slot.publish_brief(Some("Working on the mesh".into()));
-        assert_eq!(slot.brief_text().unwrap().as_str(), "Working on the mesh");
-        slot.publish_brief(None);
-        assert!(slot.brief_text().is_none());
+        slot.publish(snapshot_fixture());
+        slot.publish_digest(Some(Digest {
+            text: "- Working on the mesh".into(),
+            generated_at: SystemTime::now(),
+            covered_messages: 4,
+        }));
+        assert_eq!(slot.digest().unwrap().covered_messages, 4);
+        let brief = slot.brief().unwrap();
+        assert!(
+            brief.text.contains("## Digest\n- Working on the mesh"),
+            "{}",
+            brief.text
+        );
+        assert_eq!(
+            brief.digest_generated_at,
+            Some(slot.digest().unwrap().generated_at)
+        );
+
+        slot.set_objective_override(Some("override goal".into()));
+        let brief = slot.brief().unwrap();
+        assert!(
+            brief.text.contains("Objective: override goal"),
+            "{}",
+            brief.text
+        );
+        slot.set_objective_override(None);
+        let brief = slot.brief().unwrap();
+        assert!(brief.text.contains("Objective: ship it"), "{}", brief.text);
+
+        slot.set_user_brief(Some("Ask before merging".into()));
+        assert_eq!(slot.user_brief().unwrap().as_str(), "Ask before merging");
+        let brief = slot.brief().unwrap();
+        assert!(
+            brief
+                .text
+                .contains("## Note from the user\nAsk before merging"),
+            "{}",
+            brief.text
+        );
+
+        slot.publish_digest(None);
+        assert!(slot.digest().is_none());
+        let brief = slot.brief().unwrap();
+        assert!(!brief.text.contains("## Digest"), "{}", brief.text);
+        assert_eq!(brief.digest_generated_at, None);
+        slot.set_user_brief(None);
+        assert!(slot.user_brief().is_none());
+        assert!(!slot.brief().unwrap().text.contains("## Note from the user"));
+    }
+
+    #[test]
+    fn slot_refuses_a_digest_from_a_closed_epoch() {
+        let slot = MeshSlot::default();
+        slot.publish(snapshot_fixture());
+        let digest = Digest {
+            text: "- Working on the mesh".into(),
+            generated_at: SystemTime::now(),
+            covered_messages: 4,
+        };
+        let epoch = slot.digest_epoch();
+        assert!(slot.publish_digest_at(epoch, digest.clone()));
+        assert!(slot.brief().unwrap().text.contains("## Digest"));
+
+        let next = slot.clear_digest_for_new_epoch();
+        assert_eq!(next, epoch + 1);
+        assert_eq!(slot.digest_epoch(), next);
+        assert!(slot.digest().is_none());
+        assert!(!slot.brief().unwrap().text.contains("## Digest"));
+
+        assert!(!slot.publish_digest_at(epoch, digest.clone()));
+        assert!(slot.digest().is_none());
+        assert!(!slot.brief().unwrap().text.contains("## Digest"));
+
+        assert!(slot.publish_digest_at(next, digest));
+        assert_eq!(slot.digest().unwrap().covered_messages, 4);
     }
 
     #[test]
@@ -1771,10 +1948,60 @@ mod tests {
         slot.set_objective_override(Some("  ".into()));
         assert!(slot.objective_override().is_none());
 
-        slot.publish_brief(Some("\tWorking on the mesh  ".into()));
-        assert_eq!(slot.brief_text().unwrap().as_str(), "Working on the mesh");
-        slot.publish_brief(Some(" \n".into()));
-        assert!(slot.brief_text().is_none());
+        slot.set_user_brief(Some("\tWorking on the mesh  ".into()));
+        assert_eq!(slot.user_brief().unwrap().as_str(), "Working on the mesh");
+        slot.set_user_brief(Some(" \n".into()));
+        assert!(slot.user_brief().is_none());
+    }
+
+    #[test]
+    fn publish_reassembles_the_brief() {
+        let slot = MeshSlot::default();
+        slot.set_user_brief(Some("Ask before merging".into()));
+        assert!(
+            slot.brief().is_none(),
+            "no snapshot means no mode to honour, so nothing is served"
+        );
+
+        slot.publish(snapshot_fixture());
+        let brief = slot.brief().unwrap();
+        assert!(
+            brief
+                .text
+                .starts_with("## Status\nObjective: ship it\nState: idle"),
+            "{}",
+            brief.text
+        );
+        assert!(
+            brief
+                .text
+                .contains("## Note from the user\nAsk before merging"),
+            "{}",
+            brief.text
+        );
+
+        let mut manual = snapshot_fixture();
+        manual.brief.mode = MeshBrief::Manual;
+        manual.todo.goal = "ship it".into();
+        manual.todo.add("write the seam");
+        slot.publish_digest(Some(Digest {
+            text: "- from the digest".into(),
+            generated_at: SystemTime::now(),
+            covered_messages: 2,
+        }));
+        slot.publish(manual);
+        let brief = slot.brief().unwrap();
+        assert!(!brief.text.contains("from the digest"), "{}", brief.text);
+        assert!(
+            brief.text.contains("## Todo\nGoal: ship it"),
+            "{}",
+            brief.text
+        );
+
+        let mut off = snapshot_fixture();
+        off.brief.mode = MeshBrief::Off;
+        slot.publish(off);
+        assert!(slot.brief().is_none());
     }
 
     #[test]

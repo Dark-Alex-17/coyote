@@ -237,6 +237,12 @@ impl Session {
         &self.compressed_messages
     }
 
+    /// The system prompt compression carried into the recap message, captured at the
+    /// first compression; `None` before any.
+    pub fn compressed_system_prompt(&self) -> Option<&str> {
+        self.compressed_system_prompt.as_deref()
+    }
+
     pub fn todo_list(&self) -> &TodoList {
         &self.todo_list
     }

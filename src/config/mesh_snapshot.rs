@@ -26,7 +26,7 @@ impl RequestContext {
             todo: self.todo_list.clone(),
             brief: BriefState {
                 mode: self.app.config.mesh.brief,
-                text: self.app.mesh.brief_text().map(|text| text.as_ref().clone()),
+                text: self.app.mesh.brief().map(|brief| brief.text.clone()),
             },
             cwd,
             captured_at: SystemTime::now(),
@@ -226,10 +226,13 @@ mod tests {
     #[test]
     fn publish_folds_in_the_current_brief_text() {
         let ctx = create_test_ctx();
-        ctx.app.mesh.publish_brief(Some("hello".into()));
+        publish_mesh_snapshot(&ctx, TurnState::idle_now());
+        ctx.app.mesh.set_user_brief(Some("hello".into()));
+        let served = ctx.app.mesh.brief().unwrap().text.clone();
+        assert!(served.contains("hello"), "{served}");
         publish_mesh_snapshot(&ctx, TurnState::idle_now());
         let snap = ctx.app.mesh.snapshot().unwrap();
-        assert_eq!(snap.brief.text.as_deref(), Some("hello"));
+        assert_eq!(snap.brief.text.as_deref(), Some(served.as_str()));
     }
 
     /// Spawns a thread that takes and holds the context write lock, the way the REPL does

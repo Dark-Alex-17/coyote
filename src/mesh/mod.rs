@@ -1,6 +1,7 @@
 #![deny(unsafe_code)]
 
 mod announce;
+pub(crate) mod brief;
 pub(crate) mod card;
 mod identity;
 pub(crate) mod idle;

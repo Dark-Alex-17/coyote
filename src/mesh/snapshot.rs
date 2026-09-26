@@ -209,9 +209,8 @@ pub(crate) struct MeshSnapshot {
     pub(crate) repo: Option<RepoInfo>,
     pub(crate) plan: Option<PlanRef>,
     pub(crate) todo: TodoList,
-    // `brief`, `cwd` and `session` wait for the brief and message providers.
-    #[allow(dead_code)]
     pub(crate) brief: BriefState,
+    // `cwd` and `session` wait for the message provider.
     #[allow(dead_code)]
     pub(crate) cwd: PathBuf,
     pub(crate) captured_at: SystemTime,

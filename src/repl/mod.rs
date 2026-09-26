@@ -16,9 +16,9 @@ use crate::client::{
     oauth,
 };
 use crate::config::{
-    AgentVariables, AppConfig, AssertState, Input, LastMessage, MacroState, RequestContext,
-    StateFlags, flatten_prompt_messages, macro_execute, publish_mesh_snapshot, resolve_prompt_args,
-    sanitize_display_text,
+    AgentVariables, AppConfig, AssertState, Input, LastMessage, MacroState, MeshDigestDriver,
+    RequestContext, StateFlags, flatten_prompt_messages, macro_execute, publish_mesh_snapshot,
+    resolve_prompt_args, sanitize_display_text,
 };
 use crate::config::{AssetCategory, paths};
 use crate::function::agents::{GuardrailAction, check_pending_tasks_guardrail};
@@ -421,6 +421,7 @@ pub struct Repl {
     prompt: ReplPrompt,
     abort_signal: AbortSignal,
     idle: Option<IdleDriver>,
+    digest: MeshDigestDriver,
 }
 
 impl Repl {
@@ -445,6 +446,7 @@ impl Repl {
             prompt,
             abort_signal,
             idle: Some(idle),
+            digest: MeshDigestDriver::new(),
         })
     }
 
@@ -523,9 +525,15 @@ Type ".help" for additional help.
                         publish_mesh_snapshot(&ctx, TurnState::working_now());
                         let result =
                             run_repl_command(&mut ctx, self.abort_signal.clone(), &line).await;
+                        self.digest.observe_session(&ctx);
                         publish_mesh_snapshot(&ctx, TurnState::idle_now());
                         result
                     };
+                    // An exiting turn, or one Ctrl-D cut short, spawns nothing: shutdown
+                    // below would only abort it.
+                    if !matches!(result, Ok(true)) && !self.abort_signal.aborted_ctrld() {
+                        self.digest.maybe_refresh(&self.ctx);
+                    }
                     match result {
                         Ok(exit) => {
                             if exit {
@@ -559,6 +567,7 @@ Type ".help" for additional help.
         // Notifier first: lines from children winding down under `stop` then reach
         // stderr instead of a printer the loop above no longer drains.
         self.ctx.read().app.mesh.clear_notifier();
+        self.digest.shutdown().await;
         if let Some(idle) = self.idle.take() {
             idle.stop().await;
         }

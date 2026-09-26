@@ -361,6 +361,7 @@ mod network {
     use crate::config::{ForkRekey, MeshConfig, Session};
     use crate::function::mesh::outbound_from_args;
     use crate::mesh::announce::AnnounceAppData;
+    use crate::mesh::brief::Digest;
     use crate::mesh::card::{
         BRANCH_MAX_CHARS, CardSource, DISPLAY_NAME_MAX_CHARS, OBJECTIVE_MAX_CHARS,
         PLAN_TITLE_MAX_CHARS, REPO_NAME_MAX_CHARS, STATE_IDLE, StatusCard, StatusError,
@@ -4456,6 +4457,10 @@ mod network {
 
         fn objective_override(&self) -> Option<Arc<String>> {
             self.objective_override.clone().map(Arc::new)
+        }
+
+        fn digest(&self) -> Option<Arc<Digest>> {
+            None
         }
 
         fn display_name(&self) -> Option<String> {

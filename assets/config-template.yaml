@@ -263,7 +263,7 @@ mesh:
     #   host: node.example.com
     #   port: 4242
   brief: auto                    # What the envoy serves to trusted peers (default: auto): auto = status card + session digest + user brief; manual = card + user brief only, no model spend; off = card only
-  digest_prompt: null            # Prompt used to build the shareable session digest. If null, uses built-in default
+  digest_prompt: null            # Prompt used to build the shareable session digest. If null or blank, uses built-in default
   brief_model: null              # Model used to build the digest (e.g. 'openai:gpt-4o-mini') (default: null = the session's current model)
   envoy_model: null              # Model the envoy answers peers with (default: null = the session's current model)
   knock_retention_hours: 24      # How long unanswered knocks from known identities are kept (default: 24; must be 1 or more)
