@@ -7,7 +7,7 @@ use super::todo::TODO_FUNCTION_PREFIX;
 use super::user_interaction::USER_FUNCTION_PREFIX;
 use super::{FunctionDeclaration, JsonSchema, PATH_SEP, mcp_error_display, render_tool_result};
 use crate::config::{
-    McpRuntime, RequestContext, effective_max_concurrent_jobs, jobs_enabled, paths,
+    Agent, McpRuntime, RequestContext, effective_max_concurrent_jobs, jobs_enabled, paths,
 };
 use crate::graph;
 use crate::hooks::{self, HookEvent, ResolvedHook};
@@ -351,6 +351,13 @@ pub async fn handle_job_tool(
     let action = cmd_name
         .strip_prefix(JOB_FUNCTION_PREFIX)
         .unwrap_or(cmd_name);
+
+    if ctx.agent.as_ref().is_some_and(Agent::is_builtin) {
+        return Ok(json!({
+            "status": "error",
+            "message": "Job tools are never available to a built-in agent.",
+        }));
+    }
 
     match action {
         "start" => handle_start(ctx, args).await,
@@ -1023,6 +1030,11 @@ fn build_env_snapshot(
     envs.insert("FORCE_COLOR".into(), "1".into());
     envs.entry("COYOTE_CURRENT_MODEL".to_string())
         .or_insert_with(|| ctx.current_model().id());
+    // handle_job_tool already refuses built-ins; this pin guards against a
+    // future relaxation of that gate.
+    for (key, value) in super::builtin_agent_env(agent.map(|agent| agent.name())) {
+        envs.insert(key, value);
+    }
 
     cmd_args.push(arguments.to_string());
 
@@ -3382,5 +3394,51 @@ mod tests {
 
         assert_eq!(result["status"], "error");
         assert!(job_captures(marker).is_empty());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn build_env_snapshot_hands_the_envoy_its_data_dir() {
+        use crate::config::envoy::EnvoySource;
+        use crate::config::reserved_agents::BuiltinSourceGuard;
+        use crate::testing::{EnvVarGuard, TestConfigDirGuard};
+
+        let _guard = TestConfigDirGuard::new("jobs-envoy-env");
+        let _data_dir = EnvVarGuard::unset("ENVOY_DATA_DIR");
+        let _config_file = EnvVarGuard::unset("ENVOY_CONFIG_FILE");
+        let source = Arc::new(EnvoySource::new());
+        let _source = BuiltinSourceGuard::new(source.clone());
+        let mut ctx = plain_ctx();
+        let app = ctx.app.config.clone();
+        run_async(ctx.use_agent(&app, "envoy", None, create_abort_signal())).unwrap();
+        let dir = crate::config::builtin_agent_dir("envoy").unwrap();
+
+        let snapshot = build_env_snapshot(&ctx, "user__input", &json!({})).unwrap();
+        assert_eq!(
+            snapshot.envs.get("ENVOY_DATA_DIR"),
+            Some(&dir.display().to_string())
+        );
+        assert_eq!(
+            snapshot.envs.get("ENVOY_FUNCTIONS_DIR"),
+            Some(&dir.join("functions").display().to_string())
+        );
+        assert!(
+            snapshot.envs["PATH"].starts_with(&format!("{}{PATH_SEP}", dir.join("bin").display())),
+            "{}",
+            snapshot.envs["PATH"]
+        );
+        assert!(
+            !snapshot
+                .envs
+                .values()
+                .any(|v| v.contains(&paths::agents_data_dir().display().to_string())),
+            "{:?}",
+            snapshot.envs
+        );
+
+        let snapshot = build_env_snapshot(&plain_ctx(), "execute_command", &json!({})).unwrap();
+        assert!(!snapshot.envs.contains_key("ENVOY_DATA_DIR"));
+        assert!(!snapshot.envs.contains_key("ENVOY_FUNCTIONS_DIR"));
+        source.remove_dir();
     }
 }

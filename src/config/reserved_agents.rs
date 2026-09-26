@@ -67,8 +67,8 @@ pub fn reserved_agent_refusal(requested: &str, canonical: &str, tail: &str) -> S
 }
 
 /// Resolves a reserved agent name to its built-in definition. Registered by
-/// whichever subsystem materializes the built-in (the mesh, for the envoy);
-/// while nothing is registered the agent is unavailable.
+/// whichever module materializes the built-in (`config::envoy`, for the
+/// envoy); while nothing is registered the agent is unavailable.
 ///
 /// Both methods always receive the CANONICAL name from `RESERVED_AGENT_NAMES`.
 /// The registry is the path seam: `paths::agent_data_dir(name)`,
@@ -84,8 +84,6 @@ pub trait BuiltinAgentSource: Send + Sync {
 static BUILTIN_AGENT_SOURCE: ArcSwapOption<Arc<dyn BuiltinAgentSource>> =
     ArcSwapOption::const_empty();
 
-// Called by the mesh once it materializes the envoy.
-#[cfg_attr(not(test), expect(dead_code))]
 pub fn register_builtin_source(source: Arc<dyn BuiltinAgentSource>) {
     BUILTIN_AGENT_SOURCE.store(Some(Arc::new(source)));
 }
@@ -143,9 +141,10 @@ impl BuiltinAgentSource for FixedDirSource {
     }
 }
 
-/// A reserved agent was requested before its built-in definition was
-/// registered. Callers can `downcast_ref` an `anyhow::Error` to this type to
-/// distinguish it from a missing user agent.
+/// A reserved agent was requested while no built-in source is registered, or
+/// the registered source failed to materialize its files. Callers can
+/// `downcast_ref` an `anyhow::Error` to this type to distinguish it from a
+/// missing user agent.
 #[derive(Debug)]
 pub struct BuiltinAgentUnavailable {
     pub name: String,
@@ -155,7 +154,7 @@ impl fmt::Display for BuiltinAgentUnavailable {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Agent '{}' is built in and is not available yet (enable `mesh:` to materialize it)",
+            "Agent '{}' is built in but is not available: no built-in source is registered, or its files could not be materialized (see the log)",
             self.name
         )
     }
@@ -326,7 +325,7 @@ mod tests {
         assert_eq!(typed.name, "envoy");
         assert_eq!(
             err.to_string(),
-            "Agent 'envoy' is built in and is not available yet (enable `mesh:` to materialize it)"
+            "Agent 'envoy' is built in but is not available: no built-in source is registered, or its files could not be materialized (see the log)"
         );
     }
 }

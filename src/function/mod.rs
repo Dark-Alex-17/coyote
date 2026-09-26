@@ -65,10 +65,40 @@ const PATH_SEP: &str = ";";
 #[cfg(not(windows))]
 const PATH_SEP: &str = ":";
 
-#[derive(AsRefStr)]
 enum BinaryType<'a> {
     Tool(Option<&'a str>),
     Agent,
+    BuiltinAgent,
+}
+
+impl BinaryType<'_> {
+    fn script_kind(&self) -> &'static str {
+        match self {
+            BinaryType::Tool(_) => "tool",
+            BinaryType::Agent | BinaryType::BuiltinAgent => "agent",
+        }
+    }
+}
+
+/// Env the tool shims of a built-in agent need to locate their root and
+/// functions dir. Empty for anything but a registered reserved agent.
+/// `<NAME>_FUNCTIONS_DIR` points inside the envoy dir; nothing creates it
+/// yet, the envoy ships no tool shims.
+pub(crate) fn builtin_agent_env(agent_name: Option<&str>) -> Vec<(String, String)> {
+    let Some(canonical) = agent_name.and_then(crate::config::reserved_agent) else {
+        return Vec::new();
+    };
+    let Some(dir) = crate::config::builtin_agent_dir(canonical) else {
+        return Vec::new();
+    };
+    let name = normalize_env_name(canonical);
+    vec![
+        (format!("{name}_DATA_DIR"), dir.display().to_string()),
+        (
+            format!("{name}_FUNCTIONS_DIR"),
+            dir.join("functions").display().to_string(),
+        ),
+    ]
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, AsRefStr)]
@@ -345,9 +375,10 @@ pub async fn eval_tool_calls(
         }
     }
 
+    let builtin = ctx.agent.as_ref().is_some_and(Agent::is_builtin);
     let (mcp_calls, sequential_calls): (Vec<_>, Vec<_>) = to_execute
         .into_iter()
-        .partition(|(_, call)| is_mcp_meta_function(&call.name));
+        .partition(|(_, call)| is_mcp_meta_function(&call.name) && !builtin);
 
     if !mcp_calls.is_empty() {
         let ctx_ref: &RequestContext = ctx;
@@ -1213,7 +1244,12 @@ impl Functions {
         }
 
         let custom_runtime = extract_shebang_runtime(&tools_file);
-        Self::build_binaries(name, language, BinaryType::Agent, custom_runtime.as_deref())
+        let binary_type = if crate::config::reserved_agent(name).is_some() {
+            BinaryType::BuiltinAgent
+        } else {
+            BinaryType::Agent
+        };
+        Self::build_binaries(name, language, binary_type, custom_runtime.as_deref())
     }
 
     fn render_shim_template(
@@ -1241,6 +1277,18 @@ impl Functions {
                 .replace("{root_dir_env}", &get_env_name("config_dir"))
                 .replace("{root_dir_rel}", "../../..")
                 .replace("{functions_dir_rel}", "../../../functions"),
+            BinaryType::BuiltinAgent => {
+                let data_dir_env = format!("{}_DATA_DIR", normalize_env_name(binary_name));
+                content_template
+                    .replace("{agent_name}", binary_name)
+                    .replace("{root_dir_env}", &data_dir_env)
+                    .replace("{root_dir_rel}", "..")
+                    .replace(
+                        "{functions_dir_env}",
+                        &format!("{}_FUNCTIONS_DIR", normalize_env_name(binary_name)),
+                    )
+                    .replace("{functions_dir_rel}", "../functions")
+            }
         }
         .replace("{functions_dir_env}", &functions_dir_env)
     }
@@ -1264,7 +1312,7 @@ impl Functions {
                 paths::agent_bin_dir(agent_name)
                     .join(format!("run-{binary_name}.{}", language.to_extension())),
             ),
-            BinaryType::Agent => (
+            BinaryType::Agent | BinaryType::BuiltinAgent => (
                 paths::agent_bin_dir(binary_name).join(format!("{binary_name}.cmd")),
                 paths::agent_bin_dir(binary_name)
                     .join(format!("run-{binary_name}.{}", language.to_extension())),
@@ -1277,13 +1325,13 @@ impl Functions {
         );
         let embedded_file = FunctionAssets::get(&format!(
             "scripts/run-{}.{}",
-            binary_type.as_ref().to_lowercase(),
+            binary_type.script_kind(),
             language.to_extension()
         ))
         .ok_or_else(|| {
             anyhow!(
                 "Failed to load embedded script for run-{}.{}",
-                binary_type.as_ref().to_lowercase(),
+                binary_type.script_kind(),
                 language.to_extension()
             )
         })?;
@@ -1364,7 +1412,9 @@ impl Functions {
             BinaryType::Tool(Some(agent_name)) => {
                 paths::agent_bin_dir(agent_name).join(binary_name)
             }
-            BinaryType::Agent => paths::agent_bin_dir(binary_name).join(binary_name),
+            BinaryType::Agent | BinaryType::BuiltinAgent => {
+                paths::agent_bin_dir(binary_name).join(binary_name)
+            }
         };
         info!(
             "Building binary for function: {} ({})",
@@ -1373,13 +1423,13 @@ impl Functions {
         );
         let embedded_file = FunctionAssets::get(&format!(
             "scripts/run-{}.{}",
-            binary_type.as_ref().to_lowercase(),
+            binary_type.script_kind(),
             language.to_extension()
         ))
         .ok_or_else(|| {
             anyhow!(
                 "Failed to load embedded script for run-{}.{}",
-                binary_type.as_ref().to_lowercase(),
+                binary_type.script_kind(),
                 language.to_extension()
             )
         })?;
@@ -1519,6 +1569,9 @@ impl ToolCall {
     }
 
     async fn eval_mcp(&self, ctx: &RequestContext) -> Result<Value> {
+        if ctx.agent.as_ref().is_some_and(Agent::is_builtin) {
+            bail!("Unexpected call: {} {}", self.name, self.arguments)
+        }
         let json_data = self.parse_arguments()?;
         let cmd_name = self.name.as_str();
         let quiet = ctx.current_depth > 0;
@@ -2057,6 +2110,9 @@ impl ToolCall {
                     ))
                 }
             }
+            None if agent.is_builtin() => {
+                bail!("Unexpected call: {function_name} {}", self.arguments)
+            }
             None => self.extract_call_config_from_ctx(functions),
         }
     }
@@ -2414,6 +2470,9 @@ pub fn run_llm_function(
         }
         if graph::agent_has_graph(&agent_name) {
             envs.insert("AUTO_CONFIRM".into(), "true".into());
+        }
+        for (key, value) in builtin_agent_env(Some(&agent_name)) {
+            envs.insert(key, value);
         }
     } else {
         bin_dirs.push(paths::functions_bin_dir());
@@ -5076,6 +5135,189 @@ mod tests {
         fs::remove_dir_all(&root).unwrap();
     }
 
+    fn rendered_builtin_agent_shim(script: &str) -> String {
+        let template = FunctionAssets::get(script).unwrap();
+        let template = std::str::from_utf8(&template.data).unwrap();
+        Functions::render_shim_template(template, "envoy", &BinaryType::BuiltinAgent)
+    }
+
+    fn assert_builtin_shim_roots_at_the_envoy_dir() {
+        let python = rendered_builtin_agent_shim("scripts/run-agent.py");
+        assert!(
+            python.contains(r#"resolve_dir("ENVOY_DATA_DIR", os.path.join(self_dir, ".."))"#),
+            "{python}"
+        );
+        let bash = rendered_builtin_agent_shim("scripts/run-agent.sh");
+        assert!(
+            bash.contains(r#"resolve_dir "ENVOY_DATA_DIR" "$self_dir/..""#),
+            "{bash}"
+        );
+        assert!(
+            bash.contains(r#"resolve_dir "ENVOY_FUNCTIONS_DIR" "$self_dir/../functions""#),
+            "{bash}"
+        );
+        for content in [python, bash] {
+            assert!(!content.contains(&get_env_name("config_dir")), "{content}");
+            assert!(
+                !content.contains(&get_env_name("functions_dir")),
+                "{content}"
+            );
+            assert!(!content.contains("{root_dir_env}"), "{content}");
+            assert!(!content.contains("{agent_name}"), "{content}");
+        }
+    }
+
+    #[test]
+    fn builtin_agent_shim_never_roots_at_the_config_dir() {
+        assert_builtin_shim_roots_at_the_envoy_dir();
+    }
+
+    #[test]
+    #[serial]
+    fn builtin_agent_env_names_only_the_registered_envoy_dir() {
+        use crate::config::envoy::EnvoySource;
+        use crate::config::reserved_agents::BuiltinSourceGuard;
+
+        assert!(builtin_agent_env(None).is_empty());
+        assert!(builtin_agent_env(Some("rag")).is_empty());
+        assert!(builtin_agent_env(Some("envoy")).is_empty());
+
+        let source = Arc::new(EnvoySource::new());
+        let _source = BuiltinSourceGuard::new(source.clone());
+        let dir = crate::config::builtin_agent_dir("envoy").unwrap();
+        let expected = vec![
+            ("ENVOY_DATA_DIR".to_string(), dir.display().to_string()),
+            (
+                "ENVOY_FUNCTIONS_DIR".to_string(),
+                dir.join("functions").display().to_string(),
+            ),
+        ];
+        {
+            let _guard = crate::testing::TestConfigDirGuard::new("builtin-env-set");
+            assert_eq!(builtin_agent_env(Some("En-Voy")), expected);
+        }
+        {
+            let _unset = crate::testing::EnvVarGuard::unset(get_env_name("config_dir"));
+            assert_eq!(builtin_agent_env(Some("envoy")), expected);
+        }
+        assert!(builtin_agent_env(Some("rag")).is_empty());
+        source.remove_dir();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn run_llm_function_pins_the_builtin_agent_env_over_an_inherited_one() {
+        use crate::config::envoy::EnvoySource;
+        use crate::config::reserved_agents::BuiltinSourceGuard;
+
+        let _guard = crate::testing::TestConfigDirGuard::new("builtin-env-pin");
+        let _data_dir = crate::testing::EnvVarGuard::set("ENVOY_DATA_DIR", "/evil");
+        let _functions_dir =
+            crate::testing::EnvVarGuard::set("ENVOY_FUNCTIONS_DIR", "/evil/functions");
+        let source = Arc::new(EnvoySource::new());
+        let _source = BuiltinSourceGuard::new(source.clone());
+        let dir = crate::config::builtin_agent_dir("envoy").unwrap();
+
+        let output = run_llm_function(
+            "bash".into(),
+            vec![
+                "-c".into(),
+                "printf '%s\\n%s' \"$ENVOY_DATA_DIR\" \"$ENVOY_FUNCTIONS_DIR\" > \"$LLM_OUTPUT\""
+                    .into(),
+            ],
+            HashMap::new(),
+            Some("envoy".to_string()),
+            None,
+            false,
+            None,
+        )
+        .unwrap()
+        .expect("the probe writes to LLM_OUTPUT");
+
+        let lines: Vec<&str> = output.lines().collect();
+        assert_eq!(
+            lines,
+            vec![
+                dir.display().to_string(),
+                dir.join("functions").display().to_string()
+            ]
+        );
+        assert!(!output.contains("/evil"), "{output}");
+        source.remove_dir();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn builtin_agent_shim_roots_tools_at_the_envoy_dir_not_the_config_dir() {
+        if which::which("python3").is_err() {
+            eprintln!("skipping: python3 not available");
+            return;
+        }
+        let guard = crate::testing::TestConfigDirGuard::new("builtin-shim-python");
+        fs::write(guard.path.join(".env"), "LEAK_MARKER=leaked\n").unwrap();
+        let envoy_dir = temp_file("-envoy-shim-", "");
+        fs::create_dir_all(envoy_dir.join("bin")).unwrap();
+        fs::write(envoy_dir.join(".env"), "ENVOY_MARKER=ok\n").unwrap();
+        fs::write(
+            envoy_dir.join("tools.py"),
+            "import os\n\n\ndef probe():\n    return {\"root\": os.environ[\"LLM_ROOT_DIR\"], \"leak\": os.environ.get(\"LEAK_MARKER\"), \"own\": os.environ.get(\"ENVOY_MARKER\")}\n",
+        )
+        .unwrap();
+        let shim = envoy_dir.join("bin").join("envoy");
+        fs::write(&shim, rendered_builtin_agent_shim("scripts/run-agent.py")).unwrap();
+
+        let run = |config_dir_set: bool, data_dir_env: Option<&Path>| {
+            let mut command = Command::new("python3");
+            command
+                .arg(&shim)
+                .arg("probe")
+                .arg("{}")
+                .env_remove("LLM_OUTPUT")
+                .env_remove("LLM_TOOL_DATA_FILE")
+                .env_remove("LEAK_MARKER")
+                .env_remove("ENVOY_MARKER")
+                .env_remove("ENVOY_DATA_DIR");
+            if config_dir_set {
+                command.env(get_env_name("config_dir"), &guard.path);
+            } else {
+                command.env_remove(get_env_name("config_dir"));
+            }
+            if let Some(dir) = data_dir_env {
+                command.env("ENVOY_DATA_DIR", dir);
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "shim failed: stderr={} stdout={}",
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout)
+            );
+            serde_json::from_slice::<Value>(&output.stdout).unwrap()
+        };
+
+        for config_dir_set in [true, false] {
+            for data_dir_env in [Some(envoy_dir.as_path()), None] {
+                let probe = run(config_dir_set, data_dir_env);
+                assert_eq!(
+                    probe["root"],
+                    json!(envoy_dir.display().to_string()),
+                    "config_dir_set={config_dir_set} data_dir_env={data_dir_env:?}: {probe}"
+                );
+                assert_eq!(probe["leak"], Value::Null, "{probe}");
+                assert_eq!(probe["own"], json!("ok"), "{probe}");
+            }
+        }
+
+        let hijacked = run(true, Some(Path::new("/evil")));
+        assert_eq!(hijacked["root"], json!("/evil"), "{hijacked}");
+        assert_eq!(hijacked["leak"], Value::Null, "{hijacked}");
+        assert_eq!(hijacked["own"], Value::Null, "{hijacked}");
+
+        fs::remove_dir_all(&envoy_dir).unwrap();
+    }
+
     #[test]
     fn eval_tool_calls_partitions_mcp_and_sequential_then_resorts() {
         let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
@@ -5106,6 +5348,58 @@ mod tests {
         let mcp_err = results[1].output["tool_call_error"].as_str().unwrap();
         assert!(mcp_err.starts_with("MCP search failed"), "{mcp_err}");
         assert!(!mcp_err.contains("use only tools listed in your catalog"));
+    }
+
+    #[test]
+    fn eval_tool_calls_keeps_a_builtin_agents_mcp_meta_calls_out_of_the_mcp_lane() {
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        ctx.agent = Some(Agent::test_new(AgentConfig {
+            name: "envoy".into(),
+            ..Default::default()
+        }));
+        assert!(ctx.tool_scope.mcp_runtime.is_empty());
+        let calls = vec![
+            ToolCall::new(
+                "mcp_search_foo".into(),
+                json!({"query": "q"}),
+                Some("id-1".into()),
+            ),
+            ToolCall::new(
+                "mcp_invoke_nosuch".into(),
+                json!({"tool": "x", "arguments": {}}),
+                Some("id-2".into()),
+            ),
+        ];
+
+        let results = run_async(eval_tool_calls(&mut ctx, calls)).unwrap();
+
+        assert_eq!(results.len(), 2);
+        for result in &results {
+            let err = result.output["tool_call_error"].as_str().unwrap();
+            assert!(err.contains("Unexpected call"), "{err}");
+            assert!(!err.contains("MCP search failed"), "{err}");
+            assert!(!err.contains("MCP invoke failed"), "{err}");
+        }
+        assert!(ctx.tool_scope.mcp_runtime.is_empty());
+    }
+
+    #[test]
+    fn eval_mcp_refuses_a_builtin_agent_before_touching_the_runtime() {
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        ctx.agent = Some(Agent::test_new(AgentConfig {
+            name: "envoy".into(),
+            ..Default::default()
+        }));
+        let call = ToolCall::new(
+            "mcp_invoke_nosuch".into(),
+            json!({"tool": "x", "arguments": {}}),
+            Some("id-1".into()),
+        );
+
+        let err = run_async(call.eval_mcp(&ctx)).unwrap_err().to_string();
+
+        assert!(err.contains("Unexpected call: mcp_invoke_nosuch"), "{err}");
+        assert!(ctx.tool_scope.mcp_runtime.is_empty());
     }
 
     #[test]

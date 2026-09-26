@@ -1,5 +1,5 @@
 use super::{FunctionDeclaration, JsonSchema};
-use crate::config::RequestContext;
+use crate::config::{Agent, RequestContext};
 use crate::mesh::card::{
     DISPLAY_NAME_MAX_CHARS, STATE_IDLE, STATE_UNKNOWN, STATE_WORKING, StatusCard,
 };
@@ -246,6 +246,13 @@ pub async fn handle_mesh_tool(
         return Ok(json!({
             "status": "error",
             "message": "Mesh tools are only available to the top-level session, never inside a graph llm node.",
+        }));
+    }
+
+    if ctx.agent.as_ref().is_some_and(Agent::is_builtin) {
+        return Ok(json!({
+            "status": "error",
+            "message": "Mesh tools are never available to a built-in agent.",
         }));
     }
 
@@ -1016,6 +1023,30 @@ mod tests {
             assert_eq!(
                 result["message"],
                 "Mesh tools are only available to the top-level session, never inside a graph llm node.",
+                "{action}: {result}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn handlers_refuse_a_builtin_agent_before_touching_the_runtime() {
+        let mut ctx = plain_ctx();
+        ctx.agent = Some(Agent::test_new(crate::config::AgentConfig {
+            name: "envoy".into(),
+            ..Default::default()
+        }));
+        assert!(ctx.agent.as_ref().unwrap().is_builtin());
+        for action in ACTIONS {
+            let result = handle_mesh_tool(
+                &mut ctx,
+                &format!("{MESH_FUNCTION_PREFIX}{action}"),
+                &json!({"to": "x", "message": "hi", "id": "q"}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result["status"], "error", "{action}: {result}");
+            assert_eq!(
+                result["message"], "Mesh tools are never available to a built-in agent.",
                 "{action}: {result}"
             );
         }

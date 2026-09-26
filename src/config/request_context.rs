@@ -172,6 +172,19 @@ pub fn mesh_tools_available(app: &AppConfig, mesh: &MeshSlot) -> bool {
     app.function_calling_support && app.mesh.enabled && mesh.get().is_some()
 }
 
+/// A built-in agent's sessions dir sits inside its per-process temp dir, so
+/// anything saved under a real name would vanish on exit.
+fn check_builtin_session_name(agent: &Agent, name: Option<&str>) -> Result<()> {
+    if agent.is_builtin() && name.is_some_and(|n| n != TEMP_SESSION_NAME) {
+        bail!(
+            "Built-in agent '{}' does not keep sessions: its files live in a per-process \
+             temp dir that is removed on exit; re-run without a session name.",
+            agent.name()
+        );
+    }
+    Ok(())
+}
+
 fn print_asset_names(kind: &str, names: &[String]) -> Result<()> {
     if names.is_empty() {
         println!("No {kind} found.");
@@ -847,6 +860,13 @@ impl RequestContext {
         }
     }
 
+    fn refuse_builtin_named_session(&self, name: Option<&str>) -> Result<()> {
+        match &self.agent {
+            Some(agent) => check_builtin_session_name(agent, name),
+            None => Ok(()),
+        }
+    }
+
     pub fn session_file(&self, name: &str) -> PathBuf {
         match name.split_once("/") {
             Some((dir, name)) => self.sessions_dir().join(dir).join(format!("{name}.yaml")),
@@ -1185,8 +1205,13 @@ impl RequestContext {
             );
         }
         if let Some(mut session) = self.session.take() {
-            let sessions_dir = self.sessions_dir();
-            session.exit(&sessions_dir, self.working_mode.is_repl())?;
+            // A built-in's sessions dir is inside its per-process temp dir, so
+            // saving (or asking to) would only produce a file that vanishes
+            // moments later; the session is discarded outright.
+            if !self.agent.as_ref().is_some_and(Agent::is_builtin) {
+                let sessions_dir = self.sessions_dir();
+                session.exit(&sessions_dir, self.working_mode.is_repl())?;
+            }
             self.discontinuous_last_message();
             // Todo state is session-scoped: it was mirrored into the session
             // just saved, and a stale pause left behind would suppress
@@ -1213,6 +1238,7 @@ impl RequestContext {
             },
             None => bail!("No session"),
         };
+        self.refuse_builtin_named_session(Some(&session_name))?;
         let session_path = self.session_file(&session_name);
         if let Some(session) = self.session.as_mut() {
             session.save(&session_name, &session_path, self.working_mode.is_repl())?;
@@ -1241,6 +1267,7 @@ impl RequestContext {
                     .unwrap()
             }
         };
+        self.refuse_builtin_named_session(Some(&fork_name))?;
 
         if fork_name == current_name {
             bail!("Cannot fork '{current_name}' onto its own name; pick a different fork name");
@@ -1505,6 +1532,7 @@ impl RequestContext {
         )?;
 
         if app.workspace_instructions.unwrap_or(true)
+            && !self.agent.as_ref().is_some_and(Agent::is_builtin)
             && let Ok(cwd) = env::current_dir()
         {
             let file_names = app
@@ -1608,7 +1636,7 @@ impl RequestContext {
 
     pub fn memory_config(&self) -> MemoryConfig {
         if let Some(agent) = &self.agent
-            && graph::agent_has_graph(agent.name())
+            && (agent.is_builtin() || graph::agent_has_graph(agent.name()))
         {
             return MemoryConfig::disabled();
         }
@@ -2589,6 +2617,7 @@ impl RequestContext {
 
     pub fn select_enabled_functions(&self, role: &Role) -> Vec<FunctionDeclaration> {
         let app = self.app.config.as_ref();
+        let builtin_agent = self.agent.as_ref().is_some_and(Agent::is_builtin);
         let mut functions = vec![];
         if app.function_calling_support {
             // Compute the set of tool names enabled by the role filter, drawn
@@ -2641,7 +2670,11 @@ impl RequestContext {
                 tool_names
             });
 
-            if let Some(ref tool_names) = role_filter {
+            // A built-in agent's catalog is its whole tool surface; the
+            // top-level pool must never leak into it.
+            if let Some(ref tool_names) = role_filter
+                && !builtin_agent
+            {
                 functions = self
                     .tool_scope
                     .functions
@@ -2737,6 +2770,9 @@ impl RequestContext {
     pub fn select_enabled_mcp_servers(&self, role: &Role) -> Vec<FunctionDeclaration> {
         let app = self.app.config.as_ref();
         let mut mcp_functions = vec![];
+        if self.agent.as_ref().is_some_and(Agent::is_builtin) {
+            return mcp_functions;
+        }
         if app.mcp_server_support {
             let role_filter: Option<HashSet<String>> =
                 role.enabled_mcp_servers().map(|enabled_mcp_servers| {
@@ -4660,7 +4696,8 @@ impl RequestContext {
     // Reached by the REPL mesh commands once they land.
     #[allow(dead_code)]
     pub fn refresh_mesh_tools(&mut self, app: &AppConfig) {
-        let want = mesh_tools_available(app, &self.app.mesh);
+        let want = mesh_tools_available(app, &self.app.mesh)
+            && !self.agent.as_ref().is_some_and(Agent::is_builtin);
         let functions = match self.agent.as_mut() {
             Some(agent) => agent.functions_mut(),
             None => &mut self.tool_scope.functions,
@@ -4817,6 +4854,7 @@ impl RequestContext {
                 "Already in a session, please run '.exit session' first to exit the current session."
             );
         }
+        self.refuse_builtin_named_session(session_name)?;
         let mut session;
         let mut created_new_session = false;
         match session_name {
@@ -4985,6 +5023,7 @@ impl RequestContext {
                 agent.name()
             );
         }
+        check_builtin_session_name(&agent, session_name)?;
 
         let mcp_servers = if app.mcp_server_support {
             (!agent.mcp_server_names().is_empty()).then(|| agent.mcp_server_names().to_vec())
@@ -5013,7 +5052,8 @@ impl RequestContext {
         // context has no session to return to. A non-isolated macro's `.agent`
         // step engages it exactly as if the user had typed the command.
         let session_name = session_name.map(|v| v.to_string()).or_else(|| {
-            if (self.macro_flag && !self.macro_non_isolated) || is_graph_agent {
+            if (self.macro_flag && !self.macro_non_isolated) || is_graph_agent || agent.is_builtin()
+            {
                 None
             } else {
                 agent.agent_session().map(|v| v.to_string())

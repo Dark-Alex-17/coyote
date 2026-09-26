@@ -4,6 +4,7 @@ mod app_state;
 pub(crate) mod builtin_manifest;
 mod bundles;
 pub(crate) mod conflict;
+pub(crate) mod envoy;
 mod input;
 mod install_remote;
 pub(crate) mod instructions;
@@ -44,6 +45,7 @@ pub use self::app_state::AppState;
 pub(crate) use self::bundles::installed_bundle_names;
 pub use self::bundles::list_installed_bundles;
 use self::conflict::{InstallMode, StickyMode};
+pub use self::envoy::{cleanup_envoy_dir, register_envoy_source};
 pub use self::input::Input;
 pub use self::install_remote::{
     DEFAULT_GIT_HOST, install_or_update, install_or_update_from_repl_args, uninstall_bundle,
@@ -64,12 +66,10 @@ pub use self::request_context::{
     jobs_enabled, mesh_tools_available, should_inject_skill_instructions,
 };
 pub use self::reserved_agents::{
-    BuiltinAgentUnavailable, RESERVED_AGENT_NAMES, builtin_agent_description, builtin_agent_dir,
-    builtin_default_description, reserved_agent, reserved_agent_refusal,
+    BuiltinAgentSource, BuiltinAgentUnavailable, RESERVED_AGENT_NAMES, builtin_agent_description,
+    builtin_agent_dir, builtin_default_description, register_builtin_source, reserved_agent,
+    reserved_agent_refusal,
 };
-// Consumed by the mesh once it materializes the envoy.
-#[expect(unused_imports)]
-pub use self::reserved_agents::{BuiltinAgentSource, register_builtin_source};
 pub use self::role::{
     CODE_ROLE, CREATE_TITLE_ROLE, EXPLAIN_SHELL_ROLE, Role, RoleLike, SHELL_ROLE,
 };

@@ -358,31 +358,32 @@ impl Agent {
         abort_signal: AbortSignal,
     ) -> Result<Self> {
         validate_agent_name(name)?;
-        let (name, agent_data_dir, config_path, graph_path) =
-            if let Some(canonical) = reserved_agent(name) {
-                let dir = builtin_agent_dir(canonical).ok_or_else(|| BuiltinAgentUnavailable {
-                    name: canonical.to_string(),
-                })?;
-                let user_agents_dir = paths::agents_data_dir();
-                if dir.starts_with(&user_agents_dir) {
-                    bail!(
-                        "Agent '{canonical}' is built in but its registered dir '{}' is inside \
+        let reserved = reserved_agent(name);
+        let builtin = reserved.is_some();
+        let (name, agent_data_dir, config_path, graph_path) = if let Some(canonical) = reserved {
+            let dir = builtin_agent_dir(canonical).ok_or_else(|| BuiltinAgentUnavailable {
+                name: canonical.to_string(),
+            })?;
+            let user_agents_dir = paths::agents_data_dir();
+            if dir.starts_with(&user_agents_dir) {
+                bail!(
+                    "Agent '{canonical}' is built in but its registered dir '{}' is inside \
                          the user agents dir '{}'",
-                        dir.display(),
-                        user_agents_dir.display()
-                    );
-                }
-                let config_path = dir.join(CONFIG_FILE_NAME);
-                let graph_path = dir.join(AGENT_GRAPH_FILE_NAME);
-                (canonical, dir, config_path, graph_path)
-            } else {
-                (
-                    name,
-                    paths::agent_data_dir(name),
-                    paths::agent_config_file(name),
-                    paths::agent_graph_file(name),
-                )
-            };
+                    dir.display(),
+                    user_agents_dir.display()
+                );
+            }
+            let config_path = dir.join(CONFIG_FILE_NAME);
+            let graph_path = dir.join(AGENT_GRAPH_FILE_NAME);
+            (canonical, dir, config_path, graph_path)
+        } else {
+            (
+                name,
+                paths::agent_data_dir(name),
+                paths::agent_config_file(name),
+                paths::agent_graph_file(name),
+            )
+        };
         let loaders = app.document_loaders.clone();
         let rag_path = paths::agent_rag_file(name, DEFAULT_AGENT_NAME);
         let mut graph_for_rag: Option<Graph> = None;
@@ -409,7 +410,9 @@ impl Agent {
         };
         let mut functions = Functions::init_agent(name, &agent_config.global_tools)?;
 
-        agent_config.load_envs(app);
+        if !builtin {
+            agent_config.load_envs(app);
+        }
 
         let model = match agent_config.model_id.as_ref() {
             Some(model_id) => Model::retrieve_model(app, model_id, ModelType::Chat)?,
@@ -509,11 +512,12 @@ impl Agent {
             functions.append_todo_functions();
         }
 
-        if agent_config.can_spawn_agents {
+        if !builtin && agent_config.can_spawn_agents {
             functions.append_supervisor_functions();
         }
 
-        if app.function_calling_support
+        if !builtin
+            && app.function_calling_support
             && agent_config
                 .max_concurrent_jobs
                 .or(app.max_concurrent_jobs)
@@ -522,21 +526,27 @@ impl Agent {
         {
             functions.append_job_functions();
         }
-        if mesh_tools_available(app, &app_state.mesh) {
+        // A built-in agent is fed peer-controlled text, so it never gets the
+        // mesh tools or the teammate channel, however the top level is set up.
+        if !builtin && mesh_tools_available(app, &app_state.mesh) {
             functions.append_mesh_functions();
         }
 
-        functions.append_teammate_functions();
+        if !builtin {
+            functions.append_teammate_functions();
+        }
         functions.append_user_interaction_functions();
 
-        if app.function_calling_support
+        if !builtin
+            && app.function_calling_support
             && app.skills_enabled
             && !matches!(agent_config.skills_enabled, Some(false))
         {
             functions.append_skill_functions();
         }
 
-        if app.function_calling_support
+        if !builtin
+            && app.function_calling_support
             && !matches!(agent_config.memory, Some(false))
             && !matches!(app.memory, Some(false))
         {
@@ -667,6 +677,10 @@ impl Agent {
         &self.name
     }
 
+    pub fn is_builtin(&self) -> bool {
+        reserved_agent(&self.name).is_some()
+    }
+
     pub fn is_graph(&self) -> bool {
         self.is_graph
     }
@@ -754,7 +768,9 @@ impl Agent {
             output.push_str(DEFAULT_JOB_INSTRUCTIONS);
         }
 
-        output.push_str(DEFAULT_TEAMMATE_INSTRUCTIONS);
+        if !self.is_builtin() {
+            output.push_str(DEFAULT_TEAMMATE_INSTRUCTIONS);
+        }
         output.push_str(DEFAULT_USER_INTERACTION_INSTRUCTIONS);
 
         self.interpolate_text(&output)
