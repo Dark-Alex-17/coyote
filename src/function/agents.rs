@@ -4,7 +4,8 @@ use crate::client::{Model, ModelType, call_chat_completions};
 use crate::config::{
     Agent, AgentVariable, AgentVariables, AppState, Input, RequestContext, Role, RoleLike,
     default_max_agent_depth, effective_max_concurrent_jobs, jobs_enabled,
-    list_agents_with_descriptions, load_agent_variables,
+    list_agents_with_descriptions, load_agent_variables, reserved_agent, reserved_agent_refusal,
+    validate_agent_name,
 };
 use crate::hooks::{self, HookEvent, ResolvedHook};
 use crate::mesh::MeshSlot;
@@ -851,6 +852,10 @@ pub async fn run_agent_for_graph(
     } else {
         None
     };
+    validate_agent_name(agent_name)?;
+    if let Some(canonical) = reserved_agent(agent_name) {
+        bail!("{}", reserved_agent_message(agent_name, canonical));
+    }
     let (agent_id, child_inbox) =
         peer_assignment.unwrap_or_else(|| (graph_agent_id(agent_name), Arc::new(Inbox::new())));
     let current_depth = parent_ctx.current_depth + 1;
@@ -1062,6 +1067,10 @@ impl SpawnResultHooks {
     }
 }
 
+fn reserved_agent_message(requested: &str, canonical: &str) -> String {
+    reserved_agent_refusal(requested, canonical, "it cannot be spawned")
+}
+
 async fn handle_spawn(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
     let agent_name = args
         .get("agent")
@@ -1073,6 +1082,15 @@ async fn handle_spawn(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("'prompt' is required"))?
         .to_string();
+    if let Err(e) = validate_agent_name(&agent_name) {
+        return Ok(json!({"status": "error", "message": e.to_string()}));
+    }
+    if let Some(canonical) = reserved_agent(&agent_name) {
+        return Ok(json!({
+            "status": "error",
+            "message": reserved_agent_message(&agent_name, canonical),
+        }));
+    }
     let _task_id = args.get("task_id").and_then(Value::as_str);
     let variables = match parse_variables_arg(args) {
         Ok(v) => v,
@@ -1834,6 +1852,20 @@ fn handle_task_create(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
         .unwrap_or_default();
     let dispatch_agent = args.get("agent").and_then(Value::as_str).map(String::from);
     let task_prompt = args.get("prompt").and_then(Value::as_str).map(String::from);
+
+    if let Some(agent) = dispatch_agent.as_deref()
+        && let Err(e) = validate_agent_name(agent)
+    {
+        return Ok(json!({"status": "error", "message": e.to_string()}));
+    }
+    if let Some(agent) = dispatch_agent.as_deref()
+        && let Some(canonical) = reserved_agent(agent)
+    {
+        return Ok(json!({
+            "status": "error",
+            "message": reserved_agent_message(agent, canonical),
+        }));
+    }
 
     if dispatch_agent.is_some() && task_prompt.is_none() {
         bail!("'prompt' is required when 'agent' is set");
@@ -2985,12 +3017,55 @@ mod tests {
     #[test]
     #[serial]
     fn handle_list_available_unrestricted_when_no_whitelist() {
+        let _guard = TestConfigDirGuard::new();
+        let other_dir = paths::agents_data_dir().join("other");
+        create_dir_all(&other_dir).unwrap();
+        write(
+            other_dir.join("config.yaml"),
+            "name: other\ninstructions: hi\n",
+        )
+        .unwrap();
         let ctx = ctx_with_supervisor(4, 3);
+
         let result = handle_list_available(&ctx).unwrap();
 
-        let full_count = result["count"].as_u64().unwrap();
+        assert_eq!(result["count"], 1);
+        assert_eq!(list_agents_with_descriptions().len(), 1);
+    }
 
-        assert_eq!(full_count as usize, list_agents_with_descriptions().len());
+    #[test]
+    #[serial]
+    fn handle_list_available_omits_reserved_agent_even_with_shadow_dir() {
+        let _guard = TestConfigDirGuard::new();
+        let shadow_dir = paths::agents_data_dir().join("envoy");
+        create_dir_all(&shadow_dir).unwrap();
+        write(
+            shadow_dir.join("config.yaml"),
+            "name: envoy\ninstructions: hi\ndescription: shadow-desc-XYZ\n",
+        )
+        .unwrap();
+        let other_dir = paths::agents_data_dir().join("other");
+        create_dir_all(&other_dir).unwrap();
+        write(
+            other_dir.join("config.yaml"),
+            "name: other\ninstructions: hi\n",
+        )
+        .unwrap();
+        let ctx = ctx_with_supervisor(4, 3);
+
+        let result = handle_list_available(&ctx).unwrap();
+
+        assert_eq!(result["count"], 1);
+        let names: Vec<&str> = result["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|agent| agent["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["other"]);
+        let serialized = result.to_string();
+        assert!(!serialized.contains("envoy"), "{serialized}");
+        assert!(!serialized.contains("shadow-desc-XYZ"), "{serialized}");
     }
 
     #[test]
@@ -4278,6 +4353,171 @@ mod tests {
                 .unwrap()
                 .contains("spawnable_agents")
         );
+    }
+
+    const ENVOY_RESERVED_MESSAGE: &str =
+        "Agent 'envoy' is reserved: only a human can run it (`.agent envoy`); it cannot be spawned";
+
+    fn assert_reserved_refusal(result: &Value) {
+        assert_eq!(result["status"], "error");
+        let message = result["message"].as_str().unwrap();
+        assert!(message.contains("reserved"), "{message}");
+        assert!(message.contains("`.agent envoy`"), "{message}");
+    }
+
+    #[test]
+    fn handle_spawn_refuses_reserved_agent_without_whitelist() {
+        let mut ctx = ctx_with_supervisor(4, 3);
+
+        let result = run_async(handle_spawn(
+            &mut ctx,
+            &json!({"agent": "envoy", "prompt": "p"}),
+        ))
+        .unwrap();
+
+        assert_eq!(result["status"], "error");
+        assert_eq!(result["message"], ENVOY_RESERVED_MESSAGE);
+    }
+
+    #[test]
+    fn handle_spawn_refuses_path_shaped_agent_names() {
+        for agent in ["./envoy", "x/../envoy"] {
+            let mut ctx = ctx_with_supervisor(4, 3);
+
+            let result = run_async(handle_spawn(
+                &mut ctx,
+                &json!({"agent": agent, "prompt": "p"}),
+            ))
+            .unwrap();
+
+            assert_eq!(result["status"], "error", "{agent}: {result}");
+            let message = result["message"].as_str().unwrap();
+            assert!(message.contains("is invalid"), "{agent}: {message}");
+            assert!(!message.contains("spawnable_agents"), "{agent}: {message}");
+        }
+    }
+
+    #[test]
+    fn handle_spawn_refuses_reserved_agent_case_variants() {
+        for agent in ["Envoy", "en-voy"] {
+            let mut ctx = ctx_with_supervisor(4, 3);
+
+            let result = run_async(handle_spawn(
+                &mut ctx,
+                &json!({"agent": agent, "prompt": "p"}),
+            ))
+            .unwrap();
+
+            assert_reserved_refusal(&result);
+            assert!(
+                result["message"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with(&format!("Agent '{agent}' is reserved")),
+                "{result}"
+            );
+        }
+    }
+
+    #[test]
+    fn handle_spawn_refuses_reserved_agent_before_whitelist_check() {
+        let mut ctx = ctx_with_supervisor(4, 3);
+        ctx.agent = Some(Agent::test_new(AgentConfig {
+            spawnable_agents: Some(vec!["other".into()]),
+            ..Default::default()
+        }));
+
+        let result = run_async(handle_spawn(
+            &mut ctx,
+            &json!({"agent": "envoy", "prompt": "p"}),
+        ))
+        .unwrap();
+
+        assert_reserved_refusal(&result);
+        assert!(
+            !result["message"]
+                .as_str()
+                .unwrap()
+                .contains("spawnable_agents"),
+            "{result}"
+        );
+    }
+
+    #[test]
+    fn handle_spawn_refuses_reserved_agent_even_when_whitelisted() {
+        let mut ctx = ctx_with_supervisor(4, 3);
+        ctx.agent = Some(Agent::test_new(AgentConfig {
+            spawnable_agents: Some(vec!["envoy".into()]),
+            ..Default::default()
+        }));
+
+        let result = run_async(handle_spawn(
+            &mut ctx,
+            &json!({"agent": "envoy", "prompt": "p"}),
+        ))
+        .unwrap();
+
+        assert_reserved_refusal(&result);
+        assert!(
+            !result["message"]
+                .as_str()
+                .unwrap()
+                .contains("spawnable_agents")
+        );
+    }
+
+    #[test]
+    fn run_agent_for_graph_refuses_reserved_agent() {
+        let mut ctx = ctx_with_supervisor(4, 3);
+
+        let err = run_async(run_agent_for_graph(&mut ctx, "envoy", "p", None)).unwrap_err();
+
+        assert!(err.to_string().contains(ENVOY_RESERVED_MESSAGE), "{err}");
+    }
+
+    #[test]
+    fn handle_task_create_refuses_reserved_dispatch_agent() {
+        let mut ctx = ctx_with_supervisor(4, 3);
+
+        let result = handle_task_create(
+            &mut ctx,
+            &json!({"subject": "x", "agent": "envoy", "prompt": "p"}),
+        )
+        .unwrap();
+
+        assert_reserved_refusal(&result);
+        let tasks = handle_task_list(&mut ctx).unwrap();
+        assert!(tasks["tasks"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn run_agent_for_graph_refuses_path_shaped_agent_names() {
+        for agent in ["./envoy", "x/../envoy"] {
+            let mut ctx = ctx_with_supervisor(4, 3);
+
+            let err = run_async(run_agent_for_graph(&mut ctx, agent, "p", None)).unwrap_err();
+
+            assert!(err.to_string().contains("is invalid"), "{agent}: {err}");
+        }
+    }
+
+    #[test]
+    fn handle_task_create_refuses_path_shaped_dispatch_agent() {
+        for agent in ["./envoy", "x/../envoy"] {
+            let mut ctx = ctx_with_supervisor(4, 3);
+
+            let result = handle_task_create(
+                &mut ctx,
+                &json!({"subject": "x", "agent": agent, "prompt": "p"}),
+            )
+            .unwrap();
+
+            assert_eq!(result["status"], "error", "{agent}: {result}");
+            let message = result["message"].as_str().unwrap();
+            assert!(message.contains("is invalid"), "{agent}: {message}");
+            let tasks = handle_task_list(&mut ctx).unwrap();
+            assert!(tasks["tasks"].as_array().unwrap().is_empty(), "{agent}");
+        }
     }
 
     #[test]

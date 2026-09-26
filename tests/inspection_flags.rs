@@ -1,8 +1,9 @@
 //! Binary-level contract for inspection flags on a pristine config dir:
 //! exit 0 and NOTHING written into the config dir (no first-run wizard,
-//! no builtins bootstrap). Only --info guarantees output on stdout; the
-//! list flags legitimately emit an empty listing on a pristine dir, so
-//! their contract is exit 0 + zero writes. Vault-backed flags like
+//! no builtins bootstrap). --info and --list-agents guarantee output on
+//! stdout (the latter always lists the built-in envoy); the other list
+//! flags legitimately emit an empty listing on a pristine dir, so their
+//! contract is exit 0 + zero writes. Vault-backed flags like
 //! --list-secrets depend on host state and are covered by
 //! scripts/usage-probe-inspection.sh instead. Agent runs, by contrast,
 //! must still bootstrap builtins even when combined with --info — see
@@ -31,7 +32,7 @@ fn fresh_config_dir(label: &str) -> PathBuf {
     tmp_dir
 }
 
-fn probe_inspection_flag(flag: &str, require_stdout: bool) {
+fn probe_inspection_flag(flag: &str, require_stdout: bool) -> String {
     let label = flag.trim_start_matches("--");
     let tmp_dir = fresh_config_dir(label);
     let home_dir = fresh_config_dir(&format!("{label}-home"));
@@ -85,6 +86,7 @@ fn probe_inspection_flag(flag: &str, require_stdout: bool) {
         leftover.is_empty(),
         "{flag}: inspection flags must write nothing into the config dir: {leftover:?}"
     );
+    String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
 #[test]
@@ -92,17 +94,24 @@ fn info_on_empty_config_dir_writes_nothing() {
     probe_inspection_flag("--info", true);
 }
 
-// List flags on a pristine dir correctly print an empty listing, so the
-// contract is exit 0 + zero writes only (no stdout assertion).
+// Model and MCP listings on a pristine dir correctly print an empty
+// listing, so their contract is exit 0 + zero writes only (no stdout
+// assertion).
 
 #[test]
 fn list_models_on_empty_config_dir_writes_nothing() {
     probe_inspection_flag("--list-models", false);
 }
 
+// The built-in envoy is listed before any agents dir exists, and listing
+// it must not create one.
 #[test]
-fn list_agents_on_empty_config_dir_writes_nothing() {
-    probe_inspection_flag("--list-agents", false);
+fn list_agents_on_empty_config_dir_lists_builtin_and_writes_nothing() {
+    let stdout = probe_inspection_flag("--list-agents", true);
+    assert!(
+        stdout.contains("envoy  (built-in)"),
+        "--list-agents: expected the built-in envoy in the listing, got: {stdout}"
+    );
 }
 
 #[test]
@@ -156,6 +165,84 @@ fn agent_info_on_empty_config_dir_bootstraps_builtins() {
     assert!(
         stdout.contains("fs_cat.sh"),
         "--agent adversary --info: expected builtin tool fs_cat.sh in the readout\nstdout: {stdout}"
+    );
+}
+
+// A human may ask for the built-in envoy directly, so `-a envoy` is not
+// refused as reserved: it reaches Agent::init and fails only because no
+// mesh has materialized the built-in yet. A shadow agents/envoy/config.yaml
+// must never be read on the way. A minimal config plus vault password file
+// gets the run past model resolution and the vault gate.
+#[test]
+fn agent_envoy_build_tools_reports_unavailable_builtin_without_shadow_config() {
+    let tmp_dir = fresh_config_dir("agent-envoy-build-tools");
+    let home_dir = fresh_config_dir("agent-envoy-build-tools-home");
+    let vault_pass = tmp_dir.join("vault-pass");
+    fs::write(&vault_pass, "test-password\n").unwrap();
+    fs::write(
+        tmp_dir.join("config.yaml"),
+        format!(
+            "model: dryrun:dry-model\n\
+             dry_run: true\n\
+             vault_password_file: '{}'\n\
+             clients:\n\
+             \x20 - type: openai\n\
+             \x20   name: dryrun\n\
+             \x20   auth: none\n\
+             \x20   api_key: unused\n\
+             \x20   models:\n\
+             \x20     - name: dry-model\n\
+             \x20       max_input_tokens: 100000\n\
+             \x20       supports_function_calling: true\n\
+             save: false\n",
+            vault_pass.display()
+        ),
+    )
+    .unwrap();
+    let shadow_dir = tmp_dir.join("agents").join("envoy");
+    fs::create_dir_all(&shadow_dir).unwrap();
+    fs::write(
+        shadow_dir.join("config.yaml"),
+        "name: envoy\ninstructions: hi\nmodel: shadow-model-XYZ\n",
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_coyote"))
+        .args(["--agent", "envoy", "--build-tools"])
+        .env("COYOTE_CONFIG_DIR", &tmp_dir)
+        .env("HOME", &home_dir)
+        .env("USERPROFILE", &home_dir)
+        .env_remove("IS_SANDBOX")
+        .env_remove("COYOTE_PROVIDER")
+        .env_remove("COYOTE_PLATFORM")
+        .env_remove("ENVOY_DATA_DIR")
+        .env_remove("ENVOY_CONFIG_FILE")
+        .current_dir(&home_dir)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let _ = fs::remove_dir_all(&tmp_dir);
+    let _ = fs::remove_dir_all(&home_dir);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "-a envoy --build-tools: expected a non-zero exit, got {:?}\nstdout: {stdout}\nstderr: {stderr}",
+        output.status
+    );
+    assert!(
+        stderr.contains("Agent 'envoy' is built in and is not available yet"),
+        "-a envoy --build-tools: expected the unavailable-builtin error, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("reserved"),
+        "-a envoy --build-tools: a human run must not be refused as reserved: {stderr}"
+    );
+    let combined = format!("{stdout}{stderr}");
+    assert!(
+        !combined.contains("shadow-model-XYZ"),
+        "-a envoy --build-tools: the shadow config leaked into the output: {combined}"
     );
 }
 

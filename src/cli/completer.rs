@@ -1,6 +1,6 @@
 use crate::client::{ModelType, list_models};
 use crate::config::paths;
-use crate::config::{AppConfig, Config, list_agents_with_descriptions, list_sessions};
+use crate::config::{AppConfig, Config, agent_sessions_dir, list_agents_for_humans, list_sessions};
 use crate::utils::list_file_names;
 use crate::vault::Vault;
 use clap_complete::{CompletionCandidate, Shell, generate};
@@ -73,16 +73,12 @@ pub(super) fn role_completer(current: &OsStr) -> Vec<CompletionCandidate> {
 
 pub(super) fn agent_completer(current: &OsStr) -> Vec<CompletionCandidate> {
     let cur = current.to_string_lossy();
-    list_agents_with_descriptions()
+    list_agents_for_humans()
         .into_iter()
-        .filter(|(a, _)| a.starts_with(&*cur))
-        .map(|(name, desc)| {
-            let help = if desc.is_empty() {
-                None
-            } else {
-                Some(desc.into())
-            };
-            CompletionCandidate::new(name).help(help)
+        .filter(|listing| listing.name.starts_with(&*cur))
+        .map(|listing| {
+            let help = listing.help_option().map(Into::into);
+            CompletionCandidate::new(listing.name).help(help)
         })
         .collect()
 }
@@ -134,13 +130,17 @@ fn extract_agent_from_args() -> Option<String> {
 }
 
 pub(super) fn session_completer(current: &OsStr) -> Vec<CompletionCandidate> {
+    session_candidates(extract_agent_from_args().as_deref(), current)
+}
+
+fn session_candidates(agent: Option<&str>, current: &OsStr) -> Vec<CompletionCandidate> {
     let cur = current.to_string_lossy();
 
-    let sessions = if let Some(agent_name) = extract_agent_from_args() {
-        let sessions_dir = paths::agent_data_dir(&agent_name).join("sessions");
-        list_file_names(sessions_dir, ".yaml")
-    } else {
-        list_sessions()
+    let sessions = match agent {
+        Some(agent) => agent_sessions_dir(agent)
+            .map(|dir| list_file_names(dir, ".yaml"))
+            .unwrap_or_default(),
+        None => list_sessions(),
     };
 
     sessions
@@ -192,5 +192,97 @@ pub(super) fn secrets_completer(current: &OsStr) -> Vec<CompletionCandidate> {
             Err(_) => vec![],
         },
         Err(_) => vec![],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::reserved_agents::{BuiltinSourceGuard, FixedDirSource};
+    use crate::testing::TestConfigDirGuard;
+    use serial_test::serial;
+    use std::path::Path;
+    use std::sync::Arc;
+
+    fn candidate_names(candidates: &[CompletionCandidate]) -> Vec<String> {
+        candidates
+            .iter()
+            .map(|c| c.get_value().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn write_session(dir: &Path, name: &str) {
+        let sessions = dir.join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(sessions.join(format!("{name}.yaml")), "").unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn agent_completer_lists_builtin_envoy_with_marker() {
+        let _guard = TestConfigDirGuard::new("completer-envoy");
+
+        let candidates = agent_completer(OsStr::new(""));
+
+        let envoy = candidates
+            .iter()
+            .find(|c| c.get_value() == "envoy")
+            .expect("envoy candidate");
+        let help = envoy.get_help().expect("envoy help").to_string();
+        assert!(help.contains("(built-in)"), "{help}");
+    }
+
+    #[test]
+    #[serial]
+    fn agent_completer_filters_by_prefix() {
+        let _guard = TestConfigDirGuard::new("completer-prefix");
+
+        assert_eq!(
+            candidate_names(&agent_completer(OsStr::new("env"))),
+            vec!["envoy".to_string()]
+        );
+        assert!(agent_completer(OsStr::new("zzz")).is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn session_candidates_never_list_shadow_reserved_dir() {
+        let _guard = TestConfigDirGuard::new("completer-shadow-sessions");
+        write_session(&paths::agents_data_dir().join("envoy"), "leak");
+
+        let names = candidate_names(&session_candidates(Some("envoy"), OsStr::new("")));
+
+        assert!(!names.contains(&"leak".to_string()), "got: {names:?}");
+    }
+
+    #[test]
+    #[serial]
+    fn session_candidates_list_registered_builtin_sessions() {
+        let guard = TestConfigDirGuard::new("completer-builtin-sessions");
+        write_session(&paths::agents_data_dir().join("envoy"), "leak");
+        let dir = guard.path.join("builtin-envoy");
+        write_session(&dir, "real");
+        let _source = BuiltinSourceGuard::new(Arc::new(FixedDirSource(dir)));
+
+        let names = candidate_names(&session_candidates(Some("Envoy"), OsStr::new("")));
+
+        assert_eq!(names, vec!["real".to_string()]);
+    }
+
+    #[test]
+    #[serial]
+    fn session_candidates_list_user_agent_sessions() {
+        let _guard = TestConfigDirGuard::new("completer-user-sessions");
+        write_session(&paths::agents_data_dir().join("other"), "mine");
+        write_session(&paths::agents_data_dir().join("other"), "yours");
+
+        let mut names = candidate_names(&session_candidates(Some("other"), OsStr::new("")));
+        names.sort();
+        assert_eq!(names, vec!["mine".to_string(), "yours".to_string()]);
+
+        assert_eq!(
+            candidate_names(&session_candidates(Some("other"), OsStr::new("m"))),
+            vec!["mine".to_string()]
+        );
     }
 }

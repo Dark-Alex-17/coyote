@@ -20,6 +20,10 @@ use crate::config::prompts::{
     DEFAULT_JOB_INSTRUCTIONS, DEFAULT_SPAWN_INSTRUCTIONS, DEFAULT_TEAMMATE_INSTRUCTIONS,
     DEFAULT_TODO_INSTRUCTIONS, DEFAULT_USER_INTERACTION_INSTRUCTIONS,
 };
+use crate::config::{
+    BuiltinAgentUnavailable, RESERVED_AGENT_NAMES, builtin_agent_description, builtin_agent_dir,
+    builtin_default_description, reserved_agent,
+};
 use crate::function::write_file_atomic;
 use crate::graph::types::RagNode;
 use crate::graph::{Graph, GraphParser, NodeType};
@@ -65,6 +69,42 @@ fn direct_hook_name(rest: &str) -> Option<&str> {
     (!name.is_empty() && !name.contains('/')).then_some(name)
 }
 
+fn bundled_agent_assets() -> Result<Vec<(String, Vec<u8>)>> {
+    AgentAssets::iter()
+        .map(|file| {
+            let embedded = AgentAssets::get(&file)
+                .ok_or_else(|| anyhow!("Failed to load embedded agent file: {}", file.as_ref()))?;
+            Ok((file.as_ref().to_string(), embedded.data.into_owned()))
+        })
+        .collect()
+}
+
+/// Drops every file whose top-level segment is a reserved agent name (both
+/// `<agent>/<rest>` and a bare `<agent>` entry), warning once per canonical
+/// name. The built-in never lives at `agents/<name>`, so no installer may
+/// create or touch that path.
+fn drop_reserved_agent_files(
+    files: impl IntoIterator<Item = (String, Vec<u8>)>,
+) -> Vec<(String, Vec<u8>)> {
+    let mut warned: HashSet<&'static str> = HashSet::new();
+    files
+        .into_iter()
+        .filter(|(file, _)| {
+            let agent = file.split_once('/').map_or(file.as_str(), |(a, _)| a);
+            let Some(canonical) = reserved_agent(agent) else {
+                return true;
+            };
+            if warned.insert(canonical) {
+                warn!(
+                    "Ignoring bundled agent file {file}: the agent name '{agent}' is \
+                     reserved for the built-in agent '{canonical}'"
+                );
+            }
+            false
+        })
+        .collect()
+}
+
 /// Installs one bundled agent's hook scripts under `<agent>/hooks/` and
 /// reconciles that directory through its builtin manifest, mirroring the
 /// role-side hook installer.
@@ -100,6 +140,34 @@ pub(crate) fn install_and_reconcile_agent_hooks(
     if let Err(err) = builtin_manifest::reconcile_builtin_dir(&dir, &names, &written) {
         warn!("Failed to reconcile builtin hooks for agent '{agent}': {err}");
     }
+    Ok(())
+}
+
+/// Installs the `<agent>/hooks/*` files of every bundled agent and
+/// reconciles each hooks directory, including those of hookless agents.
+fn install_agent_hook_files(
+    files: impl IntoIterator<Item = (String, Vec<u8>)>,
+    mode: InstallMode,
+    sticky: &mut StickyMode,
+) -> Result<()> {
+    let mut shipped: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+    for (file, data) in drop_reserved_agent_files(files) {
+        let Some((agent, rest)) = file.split_once('/') else {
+            continue;
+        };
+        let hooks = shipped.entry(agent.to_string()).or_default();
+        let Some(hook) = direct_hook_name(rest) else {
+            continue;
+        };
+        let content =
+            std::str::from_utf8(&data).expect("bundled agent hook asset is not valid UTF-8");
+        hooks.push((hook.to_string(), content.to_string()));
+    }
+
+    for (agent, files) in &shipped {
+        install_and_reconcile_agent_hooks(agent, files, mode, sticky)?;
+    }
+
     Ok(())
 }
 
@@ -160,6 +228,97 @@ fn sweep_removed_agent_hooks(bundled_files: &HashMap<String, HashSet<String>>) {
     }
 }
 
+/// Installs bundled agent files (`<agent>/<rest>` paths) under the agents
+/// data dir and reconciles stale definition files and hook manifests for
+/// every agent in the bundle.
+fn install_agent_files(
+    files: impl IntoIterator<Item = (String, Vec<u8>)>,
+    mode: InstallMode,
+) -> Result<()> {
+    let mut sticky = StickyMode::None;
+    let mut written_hooks: HashMap<String, BTreeSet<String>> = HashMap::new();
+    let mut bundled_files: HashMap<String, HashSet<String>> = HashMap::new();
+    for (file, data) in drop_reserved_agent_files(files) {
+        debug!("Processing agent file: {file}");
+
+        if let Some((agent, rest)) = file.split_once('/') {
+            bundled_files
+                .entry(agent.to_string())
+                .or_default()
+                .insert(rest.to_string());
+        }
+
+        let content = std::str::from_utf8(&data).expect("bundled agent asset is not valid UTF-8");
+        let file_path = paths::agents_data_dir().join(&file);
+
+        if file_path.exists()
+            && !conflict::should_replace_existing(&file_path, content, "agents", mode, &mut sticky)?
+        {
+            debug!(
+                "Agent file already exists, skipping: {}",
+                file_path.display()
+            );
+            continue;
+        }
+
+        ensure_parent_exists(&file_path)?;
+        info!("Creating agent file: {}", file_path.display());
+        let mut agent_file = File::create(&file_path)?;
+        agent_file.write_all(content.as_bytes())?;
+        set_executable_bit_if_script(&file_path)?;
+        if let Some((agent, hook)) = parse_direct_hook_path(&file) {
+            written_hooks
+                .entry(agent.to_string())
+                .or_default()
+                .insert(hook.to_string());
+        }
+    }
+
+    for (agent, files) in &bundled_files {
+        for candidate in AGENT_DEFINITION_FILES {
+            if files.contains(candidate) {
+                continue;
+            }
+            let stale_path = paths::agents_data_dir().join(agent).join(candidate);
+            if stale_path.exists() {
+                info!(
+                    "Removing stale file no longer shipped by built-in agent '{agent}': {}",
+                    stale_path.display()
+                );
+                if let Err(err) = std::fs::remove_file(&stale_path) {
+                    warn!(
+                        "Failed to remove stale agent file {}: {err}",
+                        stale_path.display()
+                    );
+                }
+            }
+        }
+    }
+
+    // Hook filenames are open-ended (unlike AGENT_DEFINITION_FILES), so
+    // each bundled agent's hooks/ directory reconciles through its
+    // builtin manifest: only files the installer previously shipped are
+    // removal candidates, and user-created files in the same directory
+    // are never touched. Only direct children of hooks/ are tracked;
+    // nested shipped files install but are not reconciled.
+    for (agent, files) in &bundled_files {
+        let shipped: BTreeSet<String> = files
+            .iter()
+            .filter_map(|rest| direct_hook_name(rest))
+            .map(str::to_string)
+            .collect();
+        let written = written_hooks.remove(agent.as_str()).unwrap_or_default();
+        let hooks_dir = paths::agents_data_dir().join(agent).join("hooks");
+        if let Err(err) = builtin_manifest::reconcile_builtin_dir(&hooks_dir, &shipped, &written) {
+            warn!("Failed to reconcile builtin hooks for agent '{agent}': {err}");
+        }
+    }
+
+    sweep_removed_agent_hooks(&bundled_files);
+
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct Agent {
     name: String,
@@ -183,125 +342,11 @@ impl Agent {
             "Installing built-in agents in {}",
             paths::agents_data_dir().display()
         );
-
-        let mut sticky = StickyMode::None;
-        let mut written_hooks: HashMap<String, BTreeSet<String>> = HashMap::new();
-        for file in AgentAssets::iter() {
-            debug!("Processing agent file: {}", file.as_ref());
-
-            let embedded_file = AgentAssets::get(&file)
-                .ok_or_else(|| anyhow!("Failed to load embedded agent file: {}", file.as_ref()))?;
-            let content = std::str::from_utf8(&embedded_file.data)
-                .expect("bundled agent asset is not valid UTF-8");
-            let file_path = paths::agents_data_dir().join(file.as_ref());
-
-            if file_path.exists()
-                && !conflict::should_replace_existing(
-                    &file_path,
-                    content,
-                    "agents",
-                    mode,
-                    &mut sticky,
-                )?
-            {
-                debug!(
-                    "Agent file already exists, skipping: {}",
-                    file_path.display()
-                );
-                continue;
-            }
-
-            ensure_parent_exists(&file_path)?;
-            info!("Creating agent file: {}", file_path.display());
-            let mut agent_file = File::create(&file_path)?;
-            agent_file.write_all(content.as_bytes())?;
-            set_executable_bit_if_script(&file_path)?;
-            if let Some((agent, hook)) = parse_direct_hook_path(file.as_ref()) {
-                written_hooks
-                    .entry(agent.to_string())
-                    .or_default()
-                    .insert(hook.to_string());
-            }
-        }
-
-        let mut bundled_files: HashMap<String, HashSet<String>> = HashMap::new();
-        for file in AgentAssets::iter() {
-            if let Some((agent, rest)) = file.as_ref().split_once('/') {
-                bundled_files
-                    .entry(agent.to_string())
-                    .or_default()
-                    .insert(rest.to_string());
-            }
-        }
-        for (agent, files) in &bundled_files {
-            for candidate in AGENT_DEFINITION_FILES {
-                if files.contains(candidate) {
-                    continue;
-                }
-                let stale_path = paths::agents_data_dir().join(agent).join(candidate);
-                if stale_path.exists() {
-                    info!(
-                        "Removing stale file no longer shipped by built-in agent '{agent}': {}",
-                        stale_path.display()
-                    );
-                    if let Err(err) = std::fs::remove_file(&stale_path) {
-                        warn!(
-                            "Failed to remove stale agent file {}: {err}",
-                            stale_path.display()
-                        );
-                    }
-                }
-            }
-        }
-
-        // Hook filenames are open-ended (unlike AGENT_DEFINITION_FILES), so
-        // each bundled agent's hooks/ directory reconciles through its
-        // builtin manifest: only files the installer previously shipped are
-        // removal candidates, and user-created files in the same directory
-        // are never touched. Only direct children of hooks/ are tracked;
-        // nested shipped files install but are not reconciled.
-        for (agent, files) in &bundled_files {
-            let shipped: BTreeSet<String> = files
-                .iter()
-                .filter_map(|rest| direct_hook_name(rest))
-                .map(str::to_string)
-                .collect();
-            let written = written_hooks.remove(agent.as_str()).unwrap_or_default();
-            let hooks_dir = paths::agents_data_dir().join(agent).join("hooks");
-            if let Err(err) =
-                builtin_manifest::reconcile_builtin_dir(&hooks_dir, &shipped, &written)
-            {
-                warn!("Failed to reconcile builtin hooks for agent '{agent}': {err}");
-            }
-        }
-
-        sweep_removed_agent_hooks(&bundled_files);
-
-        Ok(())
+        install_agent_files(bundled_agent_assets()?, mode)
     }
 
     pub fn install_builtin_agent_hooks(mode: InstallMode, sticky: &mut StickyMode) -> Result<()> {
-        let mut shipped: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
-        for file in AgentAssets::iter() {
-            let Some((agent, rest)) = file.as_ref().split_once('/') else {
-                continue;
-            };
-            let hooks = shipped.entry(agent.to_string()).or_default();
-            let Some(hook) = direct_hook_name(rest) else {
-                continue;
-            };
-            let embedded = AgentAssets::get(&file)
-                .ok_or_else(|| anyhow!("Failed to load embedded agent file: {}", file.as_ref()))?;
-            let content = std::str::from_utf8(&embedded.data)
-                .expect("bundled agent hook asset is not valid UTF-8");
-            hooks.push((hook.to_string(), content.to_string()));
-        }
-
-        for (agent, files) in &shipped {
-            install_and_reconcile_agent_hooks(agent, files, mode, sticky)?;
-        }
-
-        Ok(())
+        install_agent_hook_files(bundled_agent_assets()?, mode, sticky)
     }
 
     pub async fn init(
@@ -312,11 +357,55 @@ impl Agent {
         name: &str,
         abort_signal: AbortSignal,
     ) -> Result<Self> {
-        let agent_data_dir = paths::agent_data_dir(name);
+        validate_agent_name(name)?;
+        let (name, agent_data_dir, config_path, graph_path) =
+            if let Some(canonical) = reserved_agent(name) {
+                let dir = builtin_agent_dir(canonical).ok_or_else(|| BuiltinAgentUnavailable {
+                    name: canonical.to_string(),
+                })?;
+                let user_agents_dir = paths::agents_data_dir();
+                if dir.starts_with(&user_agents_dir) {
+                    bail!(
+                        "Agent '{canonical}' is built in but its registered dir '{}' is inside \
+                         the user agents dir '{}'",
+                        dir.display(),
+                        user_agents_dir.display()
+                    );
+                }
+                // Every callee re-derives its paths from the name through
+                // paths::agent_data_dir, so the registered dir must be what that
+                // seam yields; otherwise a shadow under agents/<name> could leak in.
+                let wired_dir = paths::agent_data_dir(canonical);
+                let wired_config = paths::agent_config_file(canonical);
+                let config_path = dir.join(CONFIG_FILE_NAME);
+                if wired_dir != dir {
+                    bail!(
+                        "Agent '{canonical}' is built in but its data dir is not wired to '{}' \
+                         (got '{}')",
+                        dir.display(),
+                        wired_dir.display()
+                    );
+                }
+                if wired_config != config_path {
+                    bail!(
+                        "Agent '{canonical}' is built in but its config file is not wired to '{}' \
+                         (got '{}'); unset the config-file override",
+                        config_path.display(),
+                        wired_config.display()
+                    );
+                }
+                let graph_path = dir.join(AGENT_GRAPH_FILE_NAME);
+                (canonical, dir, config_path, graph_path)
+            } else {
+                (
+                    name,
+                    paths::agent_data_dir(name),
+                    paths::agent_config_file(name),
+                    paths::agent_graph_file(name),
+                )
+            };
         let loaders = app.document_loaders.clone();
         let rag_path = paths::agent_rag_file(name, DEFAULT_AGENT_NAME);
-        let config_path = paths::agent_config_file(name);
-        let graph_path = paths::agent_graph_file(name);
         let mut graph_for_rag: Option<Graph> = None;
         let mut agent_config = match (config_path.exists(), graph_path.exists()) {
             (true, true) => bail!(
@@ -1414,6 +1503,9 @@ async fn init_graph_rags(
     Ok(rags)
 }
 
+/// Lists user agents on disk. Directories carrying a reserved name are
+/// skipped so a shadow `agents/envoy/` never reaches the LLM-facing
+/// listing; the built-in is surfaced to humans by `list_agents_for_humans`.
 pub fn list_agents() -> Vec<String> {
     let agents_data_dir = paths::agents_data_dir();
     if !agents_data_dir.exists() {
@@ -1423,12 +1515,24 @@ pub fn list_agents() -> Vec<String> {
     let mut agents = Vec::new();
     if let Ok(entries) = read_dir(agents_data_dir) {
         for entry in entries.flatten() {
-            if entry.path().is_dir()
-                && let Some(name) = entry.file_name().to_str()
-                && !name.starts_with('.')
-            {
-                agents.push(name.to_string());
+            if !entry.path().is_dir() {
+                continue;
             }
+            let file_name = entry.file_name();
+            let Some(name) = file_name.to_str() else {
+                continue;
+            };
+            if name.starts_with('.') {
+                continue;
+            }
+            if let Some(canonical) = reserved_agent(name) {
+                debug!(
+                    "Skipping agent directory {}: the name is reserved for the built-in agent '{canonical}'",
+                    entry.path().display()
+                );
+                continue;
+            }
+            agents.push(name.to_string());
         }
     }
 
@@ -1445,6 +1549,67 @@ pub fn list_agents_with_descriptions() -> Vec<(String, String)> {
         .collect()
 }
 
+pub struct AgentListing {
+    pub name: String,
+    pub description: String,
+    pub builtin: bool,
+}
+
+impl AgentListing {
+    pub fn help_text(&self) -> String {
+        match (self.builtin, self.description.is_empty()) {
+            (true, true) => "(built-in)".to_string(),
+            (true, false) => format!("(built-in) {}", self.description),
+            (false, _) => self.description.clone(),
+        }
+    }
+
+    pub fn help_option(&self) -> Option<String> {
+        Some(self.help_text()).filter(|help| !help.is_empty())
+    }
+
+    pub fn list_line(&self) -> String {
+        if self.builtin {
+            format!("{}  (built-in)", self.name)
+        } else {
+            self.name.clone()
+        }
+    }
+}
+
+pub fn list_agents_for_humans() -> Vec<AgentListing> {
+    let mut listings: Vec<AgentListing> = list_agents_with_descriptions()
+        .into_iter()
+        .map(|(name, description)| AgentListing {
+            name,
+            description,
+            builtin: false,
+        })
+        .collect();
+    listings.extend(RESERVED_AGENT_NAMES.iter().map(|name| AgentListing {
+        name: name.to_string(),
+        description: load_agent_description(name),
+        builtin: true,
+    }));
+    listings
+}
+
+/// Agent names are joined onto `paths::agents_data_dir()`, so anything that
+/// is not a single normal path component (`./envoy`, `envoy/`, `x/../envoy`)
+/// could escape the directory or slip past `reserved_agent`.
+pub fn validate_agent_name(name: &str) -> Result<()> {
+    let mut components = Path::new(name).components();
+    let single_normal = matches!(components.next(), Some(std::path::Component::Normal(_)))
+        && components.next().is_none();
+    if name.is_empty() || !single_normal || name.contains(['/', '\\']) {
+        bail!(
+            "Agent name '{name}' is invalid: it must be a single path component \
+             (no '/', '\\', '.' or '..')"
+        );
+    }
+    Ok(())
+}
+
 #[derive(Deserialize)]
 struct AgentMetadataStub {
     #[serde(default)]
@@ -1458,6 +1623,11 @@ struct AgentVariablesStub {
 }
 
 fn load_agent_description(name: &str) -> String {
+    if let Some(canonical) = reserved_agent(name) {
+        return builtin_agent_description(canonical)
+            .unwrap_or_else(|| builtin_default_description(canonical).to_string());
+    }
+
     if let Ok(config) = AgentConfig::load(&paths::agent_config_file(name)) {
         return config.description;
     }
@@ -1472,6 +1642,13 @@ fn load_agent_description(name: &str) -> String {
 }
 
 pub fn load_agent_variables(name: &str) -> Vec<AgentVariable> {
+    if let Some(canonical) = reserved_agent(name) {
+        return builtin_agent_dir(canonical)
+            .and_then(|dir| AgentConfig::load(&dir.join(CONFIG_FILE_NAME)).ok())
+            .map(|config| config.variables)
+            .unwrap_or_default();
+    }
+
     if let Ok(config) = AgentConfig::load(&paths::agent_config_file(name)) {
         return config.variables;
     }
@@ -1483,6 +1660,17 @@ pub fn load_agent_variables(name: &str) -> Vec<AgentVariable> {
     }
 
     Vec::new()
+}
+
+/// Sessions dir for a session completer to list. A reserved name resolves
+/// through the registered built-in (or to `None` while unregistered) so a
+/// shadow `agents/<name>/sessions` never surfaces as a completion.
+pub fn agent_sessions_dir(name: &str) -> Option<PathBuf> {
+    let dir = match reserved_agent(name) {
+        Some(canonical) => builtin_agent_dir(canonical)?,
+        None => paths::agent_data_dir(name),
+    };
+    Some(dir.join(SESSIONS_DIR_NAME))
 }
 
 pub fn complete_agent_variables(agent_name: &str) -> Vec<(String, Option<String>)> {
@@ -2223,5 +2411,438 @@ nodes: {}
             "the sweep must never follow a symlinked agent dir"
         );
         assert!(hooks.join(builtin_manifest::BUILTIN_MANIFEST_FILE).exists());
+    }
+
+    use crate::config::reserved_agents::{
+        BuiltinAgentSource, BuiltinSourceGuard, ENVOY_AGENT_NAME, ENVOY_BUILTIN_DESCRIPTION,
+        RESERVED_AGENT_NAMES,
+    };
+    use crate::testing::{EnvVarGuard, install_log_collector, warn_snapshot};
+
+    const SHADOW_MARKER: &str = "shadow-model-XYZ";
+
+    /// Unlike `reserved_agents::FixedDirSource`, this one also answers
+    /// `description`, so tests can tell a source-provided description from
+    /// the built-in default.
+    struct FixedDirSource(PathBuf);
+
+    impl BuiltinAgentSource for FixedDirSource {
+        fn agent_dir(&self, _name: &str) -> Option<PathBuf> {
+            Some(self.0.clone())
+        }
+
+        fn description(&self, _name: &str) -> Option<String> {
+            Some("description from source".to_string())
+        }
+    }
+
+    fn run_async<F: Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
+    fn write_shadow_envoy_config(extra: &str) {
+        let shadow = paths::agents_data_dir().join("envoy");
+        create_dir_all(&shadow).unwrap();
+        fs::write(
+            shadow.join(CONFIG_FILE_NAME),
+            format!("name: envoy\ninstructions: hi\nmodel: {SHADOW_MARKER}\n{extra}"),
+        )
+        .unwrap();
+    }
+
+    fn init_envoy() -> Result<Agent> {
+        init_named("envoy")
+    }
+
+    fn init_named(name: &str) -> Result<Agent> {
+        let ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        let app_config = Arc::clone(&ctx.app.config);
+        let model = ctx.current_model().clone();
+        run_async(Agent::init(
+            app_config.as_ref(),
+            ctx.app.as_ref(),
+            &model,
+            false,
+            name,
+            create_abort_signal(),
+        ))
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn reserved_agent_shadow_config_is_refused() {
+        let _guard = TestConfigDirGuard::new("reserved-shadow");
+        let _data_dir = EnvVarGuard::unset("ENVOY_DATA_DIR");
+        let _config_file = EnvVarGuard::unset("ENVOY_CONFIG_FILE");
+        write_shadow_envoy_config("");
+
+        let err = init_envoy().expect_err("shadow config must not load");
+
+        assert!(err.downcast_ref::<BuiltinAgentUnavailable>().is_some());
+        assert!(err.to_string().contains("built in"), "{err}");
+        assert!(!format!("{err:?}").contains(SHADOW_MARKER));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn path_shaped_agent_names_never_reach_shadow_config() {
+        let _guard = TestConfigDirGuard::new("reserved-path-shaped");
+        let _data_dir = EnvVarGuard::unset("ENVOY_DATA_DIR");
+        let _config_file = EnvVarGuard::unset("ENVOY_CONFIG_FILE");
+        write_shadow_envoy_config("");
+
+        let err = init_named("envoy/").expect_err("trailing separator must be refused");
+        assert!(!format!("{err:?}").contains(SHADOW_MARKER));
+
+        let err = init_named("../evil").expect_err("parent traversal must be refused");
+        assert!(err.to_string().contains("is invalid"), "{err}");
+        assert!(!format!("{err:?}").contains(SHADOW_MARKER));
+    }
+
+    #[test]
+    fn validate_agent_name_accepts_only_single_components() {
+        for name in ["envoy", "my-agent", "agent_2", ".hidden"] {
+            validate_agent_name(name).unwrap_or_else(|e| panic!("{name}: {e}"));
+        }
+        for name in [
+            "",
+            ".",
+            "..",
+            "./envoy",
+            "envoy/",
+            "envoy\\",
+            "x/../envoy",
+            "a/b",
+        ] {
+            assert!(
+                validate_agent_name(name).is_err(),
+                "{name:?} must be invalid"
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn reserved_agent_resolves_through_registered_source() {
+        let guard = TestConfigDirGuard::new("reserved-source");
+        let dir = guard.path.join("builtin-envoy");
+        create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join(CONFIG_FILE_NAME),
+            "name: envoy\ninstructions: from-builtin-source\n",
+        )
+        .unwrap();
+        let _data_dir = EnvVarGuard::set("ENVOY_DATA_DIR", &dir);
+        let _config_file = EnvVarGuard::unset("ENVOY_CONFIG_FILE");
+        let _source = BuiltinSourceGuard::new(Arc::new(FixedDirSource(dir.clone())));
+        write_shadow_envoy_config("");
+
+        let agent = init_envoy().unwrap();
+
+        assert!(agent.config.instructions.contains("from-builtin-source"));
+        assert!(!format!("{:?}", agent.config).contains(SHADOW_MARKER));
+
+        let agent = init_named("En-Voy").unwrap();
+
+        assert_eq!(agent.name(), ENVOY_AGENT_NAME);
+        assert!(agent.config.instructions.contains("from-builtin-source"));
+        assert!(!format!("{:?}", agent.config).contains(SHADOW_MARKER));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn reserved_agent_registered_inside_user_agents_dir_is_refused() {
+        let _guard = TestConfigDirGuard::new("reserved-inside-user-dir");
+        let dir = paths::agents_data_dir().join("envoy");
+        let _data_dir = EnvVarGuard::set("ENVOY_DATA_DIR", &dir);
+        let _config_file = EnvVarGuard::unset("ENVOY_CONFIG_FILE");
+        let _source = BuiltinSourceGuard::new(Arc::new(FixedDirSource(dir)));
+        write_shadow_envoy_config("");
+
+        let err = init_envoy().expect_err("a dir inside the user agents dir must be refused");
+
+        assert!(
+            err.to_string().contains("inside the user agents dir"),
+            "{err}"
+        );
+        assert!(!format!("{err:?}").contains(SHADOW_MARKER));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn reserved_agent_with_unwired_data_dir_is_refused() {
+        let guard = TestConfigDirGuard::new("reserved-unwired");
+        let dir = guard.path.join("builtin-envoy");
+        create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join(CONFIG_FILE_NAME),
+            "name: envoy\ninstructions: from-builtin-source\n",
+        )
+        .unwrap();
+        let _data_dir = EnvVarGuard::unset("ENVOY_DATA_DIR");
+        let _config_file = EnvVarGuard::unset("ENVOY_CONFIG_FILE");
+        let _source = BuiltinSourceGuard::new(Arc::new(FixedDirSource(dir)));
+        write_shadow_envoy_config("");
+
+        let err = init_envoy().expect_err("unwired data dir must be refused");
+
+        assert!(err.to_string().contains("not wired"), "{err}");
+        assert!(!format!("{err:?}").contains(SHADOW_MARKER));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn reserved_agent_with_config_file_override_is_refused() {
+        let guard = TestConfigDirGuard::new("reserved-config-override");
+        let dir = guard.path.join("builtin-envoy");
+        create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join(CONFIG_FILE_NAME),
+            "name: envoy\ninstructions: from-builtin-source\n",
+        )
+        .unwrap();
+        let _data_dir = EnvVarGuard::set("ENVOY_DATA_DIR", &dir);
+        let _config_file = EnvVarGuard::set("ENVOY_CONFIG_FILE", guard.path.join("elsewhere.yaml"));
+        let _source = BuiltinSourceGuard::new(Arc::new(FixedDirSource(dir)));
+        write_shadow_envoy_config("");
+
+        let err = init_envoy().expect_err("config-file override must be refused");
+
+        assert!(
+            err.to_string().contains("config file is not wired"),
+            "{err}"
+        );
+        assert!(!format!("{err:?}").contains(SHADOW_MARKER));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn reserved_agent_description_never_reads_shadow_config() {
+        let _guard = TestConfigDirGuard::new("reserved-description");
+        let _data_dir = EnvVarGuard::unset("ENVOY_DATA_DIR");
+        let _config_file = EnvVarGuard::unset("ENVOY_CONFIG_FILE");
+        write_shadow_envoy_config("description: shadow description\n");
+
+        assert_eq!(load_agent_description("envoy"), ENVOY_BUILTIN_DESCRIPTION);
+
+        let _source = BuiltinSourceGuard::new(Arc::new(FixedDirSource(PathBuf::from("unused"))));
+        assert_eq!(load_agent_description("envoy"), "description from source");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn reserved_agent_variables_never_read_shadow_config() {
+        let guard = TestConfigDirGuard::new("reserved-variables");
+        let _data_dir = EnvVarGuard::unset("ENVOY_DATA_DIR");
+        let _config_file = EnvVarGuard::unset("ENVOY_CONFIG_FILE");
+        write_shadow_envoy_config("variables:\n  - name: leaked\n    description: leaked\n");
+
+        assert!(load_agent_variables("envoy").is_empty());
+
+        let dir = guard.path.join("builtin-envoy");
+        create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join(CONFIG_FILE_NAME),
+            "name: envoy\ninstructions: hi\nvariables:\n  - name: peer\n    description: peer\n",
+        )
+        .unwrap();
+        let _source = BuiltinSourceGuard::new(Arc::new(FixedDirSource(dir)));
+
+        let names: Vec<String> = load_agent_variables("Envoy")
+            .into_iter()
+            .map(|v| v.name)
+            .collect();
+        assert_eq!(names, vec!["peer".to_string()]);
+    }
+
+    fn reserved_envoy_warnings() -> Vec<String> {
+        warn_snapshot()
+            .into_iter()
+            .filter(|m| {
+                m.starts_with("Ignoring bundled agent file")
+                    && m.contains("'envoy'")
+                    && m.contains("reserved")
+            })
+            .collect()
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn install_agent_files_skips_reserved_agent_names() {
+        install_log_collector();
+        let _guard = TestConfigDirGuard::new("install-reserved");
+        let before = reserved_envoy_warnings().len();
+        let files = vec![
+            (
+                "envoy/config.yaml".to_string(),
+                b"name: envoy\ninstructions: hi\n".to_vec(),
+            ),
+            ("Envoy/hooks/pre.sh".to_string(), b"#!/bin/sh\n".to_vec()),
+            ("envoy".to_string(), b"name: envoy\n".to_vec()),
+            (
+                "probe-agent/config.yaml".to_string(),
+                b"name: probe-agent\ninstructions: hi\n".to_vec(),
+            ),
+        ];
+
+        install_agent_files(files, InstallMode::Skip).unwrap();
+
+        assert!(
+            paths::agents_data_dir()
+                .join("probe-agent")
+                .join(CONFIG_FILE_NAME)
+                .exists()
+        );
+        assert!(
+            !paths::agents_data_dir().join("envoy").exists(),
+            "neither an envoy dir nor a bare envoy file may be installed"
+        );
+        assert!(!paths::agents_data_dir().join("Envoy").exists());
+        let warns = reserved_envoy_warnings();
+        assert_eq!(
+            warns.len(),
+            before + 1,
+            "one warning per reserved agent, not per file: {warns:?}"
+        );
+    }
+
+    #[test]
+    fn bundled_agent_assets_contain_no_reserved_names() {
+        assert!(
+            AgentAssets::iter().all(|f| f.split('/').next().and_then(reserved_agent).is_none()),
+            "bundled agent assets must never ship under a reserved agent name"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn install_agent_hook_files_skips_reserved_agent_names() {
+        install_log_collector();
+        let _guard = TestConfigDirGuard::new("install-hooks-reserved");
+        let before = reserved_envoy_warnings().len();
+        let files = vec![
+            ("envoy/hooks/pre.sh".to_string(), b"#!/bin/sh\n".to_vec()),
+            ("Envoy/hooks/post.sh".to_string(), b"#!/bin/sh\n".to_vec()),
+            (
+                "probe-agent/hooks/pre.sh".to_string(),
+                b"#!/bin/sh\n".to_vec(),
+            ),
+        ];
+
+        install_agent_hook_files(files, InstallMode::Skip, &mut StickyMode::None).unwrap();
+
+        assert!(
+            paths::agents_data_dir()
+                .join("probe-agent")
+                .join("hooks")
+                .join("pre.sh")
+                .exists()
+        );
+        assert!(!paths::agents_data_dir().join("envoy").exists());
+        assert!(!paths::agents_data_dir().join("Envoy").exists());
+        let warns = reserved_envoy_warnings();
+        assert_eq!(
+            warns.len(),
+            before + 1,
+            "one warning per reserved agent, not per file: {warns:?}"
+        );
+    }
+
+    fn write_agent_config(name: &str, extra: &str) {
+        let dir = paths::agents_data_dir().join(name);
+        create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join(CONFIG_FILE_NAME),
+            format!("name: {name}\ninstructions: hi\n{extra}"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn list_agents_drops_reserved_directories() {
+        let _guard = TestConfigDirGuard::new("list-reserved");
+        write_agent_config("envoy", "");
+        write_agent_config("Envoy", "");
+        write_agent_config("other", "");
+
+        assert_eq!(list_agents(), vec!["other".to_string()]);
+        let names: Vec<String> = list_agents_with_descriptions()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(names, vec!["other".to_string()]);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn list_agents_for_humans_appends_builtin_without_agents_dir() {
+        let _guard = TestConfigDirGuard::new("humans-fresh");
+        assert!(!paths::agents_data_dir().exists());
+
+        let listings = list_agents_for_humans();
+
+        assert_eq!(listings.len(), RESERVED_AGENT_NAMES.len());
+        let envoy = listings
+            .iter()
+            .find(|l| l.name == ENVOY_AGENT_NAME)
+            .unwrap();
+        assert!(envoy.builtin);
+        assert_eq!(envoy.description, ENVOY_BUILTIN_DESCRIPTION);
+        assert_eq!(
+            envoy.help_text(),
+            format!("(built-in) {ENVOY_BUILTIN_DESCRIPTION}")
+        );
+        assert_eq!(envoy.list_line(), "envoy  (built-in)");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn list_agents_for_humans_uses_registered_source_description() {
+        let _guard = TestConfigDirGuard::new("humans-source");
+        let _source = BuiltinSourceGuard::new(Arc::new(FixedDirSource(PathBuf::from("unused"))));
+
+        let listings = list_agents_for_humans();
+
+        assert_eq!(listings.len(), RESERVED_AGENT_NAMES.len());
+        let envoy = listings
+            .iter()
+            .find(|l| l.name == ENVOY_AGENT_NAME)
+            .unwrap();
+        assert_eq!(envoy.description, "description from source");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn list_agents_for_humans_ignores_shadow_reserved_dir() {
+        let _guard = TestConfigDirGuard::new("humans-shadow");
+        write_agent_config("envoy", "description: shadow-desc-XYZ\n");
+        write_agent_config("other", "description: other-desc\n");
+
+        let listings = list_agents_for_humans();
+
+        let names: Vec<&str> = listings.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(names, vec!["other", "envoy"]);
+        let envoy = listings.iter().find(|l| l.name == "envoy").unwrap();
+        assert!(envoy.builtin);
+        assert!(!envoy.description.contains("shadow-desc-XYZ"));
+        let other = listings.iter().find(|l| l.name == "other").unwrap();
+        assert!(!other.builtin);
+        assert_eq!(other.help_text(), "other-desc");
+        assert_eq!(other.list_line(), "other");
+    }
+
+    #[test]
+    fn agent_listing_help_text_for_builtin_without_description() {
+        let listing = AgentListing {
+            name: "envoy".to_string(),
+            description: String::new(),
+            builtin: true,
+        };
+        assert_eq!(listing.help_text(), "(built-in)");
     }
 }

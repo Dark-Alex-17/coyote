@@ -18,6 +18,7 @@ pub(crate) mod paths;
 pub(crate) mod prompts;
 mod rag_cache;
 mod request_context;
+pub(crate) mod reserved_agents;
 mod role;
 mod session;
 mod skill;
@@ -31,8 +32,9 @@ mod update;
 pub(crate) use self::agent::AgentConfig;
 pub(crate) use self::agent::default_max_agent_depth;
 pub use self::agent::{
-    Agent, AgentVariable, AgentVariables, complete_agent_variables, list_agents,
-    list_agents_with_descriptions, load_agent_variables,
+    Agent, AgentListing, AgentVariable, AgentVariables, agent_sessions_dir,
+    complete_agent_variables, list_agents_for_humans, list_agents_with_descriptions,
+    load_agent_variables, validate_agent_name,
 };
 #[allow(unused_imports)]
 pub use self::app_config::AppConfig;
@@ -59,6 +61,13 @@ pub use self::request_context::{
     ForkedSession, PendingFork, RenderMode, RequestContext, effective_max_concurrent_jobs,
     jobs_enabled, mesh_tools_available, should_inject_skill_instructions,
 };
+pub use self::reserved_agents::{
+    BuiltinAgentUnavailable, RESERVED_AGENT_NAMES, builtin_agent_description, builtin_agent_dir,
+    builtin_default_description, reserved_agent, reserved_agent_refusal,
+};
+// Consumed by the mesh once it materializes the envoy.
+#[expect(unused_imports)]
+pub use self::reserved_agents::{BuiltinAgentSource, register_builtin_source};
 pub use self::role::{
     CODE_ROLE, CREATE_TITLE_ROLE, EXPLAIN_SHELL_ROLE, Role, RoleLike, SHELL_ROLE,
 };

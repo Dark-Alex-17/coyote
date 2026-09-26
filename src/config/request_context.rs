@@ -13,8 +13,8 @@ use super::{
     Input, InstallFilter, LEFT_PROMPT, LastMessage, MESSAGES_FILE_NAME, MacroAllowlistLevel,
     MacroPolicy, MacroSource, MacroState, RESERVED_MACRO_NAMES, RIGHT_PROMPT, ResolvedMacro, Role,
     RoleLike, SESSIONS_DIR_NAME, SUMMARIZATION_PROMPT, SUMMARY_CONTEXT_PROMPT, StateFlags,
-    TEMP_ROLE_NAME, TEMP_SESSION_NAME, WorkingMode, bundles, ensure_parent_exists,
-    list_agents_with_descriptions, memory, paths,
+    TEMP_ROLE_NAME, TEMP_SESSION_NAME, WorkingMode, agent_sessions_dir, bundles,
+    ensure_parent_exists, list_agents_for_humans, memory, paths,
 };
 use super::{MessageContentToolCalls, prompts};
 use crate::client::{
@@ -196,6 +196,17 @@ pub(crate) fn asset_table(header: &[&str]) -> Table {
     table.set_content_arrangement(ContentArrangement::Dynamic);
     table.set_header(header.to_vec());
     table
+}
+
+// Never empty: the built-ins are always listed after the user agents.
+fn agents_table_rows() -> Vec<[String; 2]> {
+    list_agents_for_humans()
+        .into_iter()
+        .map(|listing| {
+            let help = listing.help_text();
+            [listing.name, help]
+        })
+        .collect()
 }
 
 fn mcp_prompt_rows(items: &[CatalogItem]) -> Vec<[String; 4]> {
@@ -3238,15 +3249,9 @@ impl RequestContext {
                 Ok(())
             }
             "agents" => {
-                let entries = list_agents_with_descriptions();
-                if entries.is_empty() {
-                    println!("No agents found.");
-                    return Ok(());
-                }
-
                 let mut table = asset_table(&["name", "description"]);
-                for (name, description) in entries {
-                    table.add_row(vec![name, description]);
+                for row in agents_table_rows() {
+                    table.add_row(row.to_vec());
                 }
 
                 println!("Agents:");
@@ -4000,9 +4005,12 @@ impl RequestContext {
                     }
                 }
                 ".rag" => super::map_completion_values(paths::list_rags()),
-                ".agent" => list_agents_with_descriptions()
+                ".agent" => list_agents_for_humans()
                     .into_iter()
-                    .map(|(name, desc)| (name, if desc.is_empty() { None } else { Some(desc) }))
+                    .map(|listing| {
+                        let help = listing.help_option();
+                        (listing.name, help)
+                    })
                     .collect(),
                 ".install" => {
                     let mut names: Vec<String> =
@@ -4440,8 +4448,9 @@ impl RequestContext {
                 .collect();
         } else if cmd == ".agent" {
             if args.len() == 2 {
-                let dir = paths::agent_data_dir(args[0]).join(SESSIONS_DIR_NAME);
-                values = list_file_names(dir, ".yaml")
+                values = agent_sessions_dir(args[0])
+                    .map(|dir| list_file_names(dir, ".yaml"))
+                    .unwrap_or_default()
                     .into_iter()
                     .map(|v| (v, None))
                     .collect();
@@ -4952,11 +4961,12 @@ impl RequestContext {
             }
         }
 
-        let is_graph_agent = graph::agent_has_graph(agent_name);
+        let is_graph_agent = graph::agent_has_graph(agent.name());
         if is_graph_agent && session_name.is_some() {
             bail!(
-                "Graph-based agent '{agent_name}' does not support sessions. \
-                 The graph manages its own state; re-run without a session."
+                "Graph-based agent '{}' does not support sessions. \
+                 The graph manages its own state; re-run without a session.",
+                agent.name()
             );
         }
 
@@ -5821,6 +5831,9 @@ mod tests {
     use crate::config::bundles::BundleStore;
     use crate::config::conflict::InstallMode;
     use crate::config::mcp_tool_policy::LayerSource;
+    use crate::config::reserved_agents::{
+        BuiltinAgentUnavailable, BuiltinSourceGuard, FixedDirSource,
+    };
     use crate::config::tool_scope::test_fixtures::{FixtureServer, fixture_runtime};
     use crate::function::jobs::RingBuf;
     use crate::function::{ToolCall, skill};
@@ -5829,6 +5842,7 @@ mod tests {
     use crate::supervisor::{
         AgentExitStatus, AgentHandle, AgentResult, JobHandle, JobResult, JobState, JobStatus,
     };
+    use crate::testing::EnvVarGuard;
     use crate::utils;
     use crate::utils::get_env_name;
     use crate::vault::Vault;
@@ -6701,6 +6715,150 @@ mod tests {
                 "missing '{expected}'; got: {values:?}"
             );
         }
+    }
+
+    #[test]
+    #[serial]
+    fn repl_complete_agent_offers_builtin_envoy_with_marker() {
+        let _guard = TestConfigDirGuard::new();
+        let ctx = create_test_ctx();
+
+        let values = ctx.repl_complete(".agent", &[""], "");
+
+        let (_, help) = values
+            .iter()
+            .find(|(name, _)| name == "envoy")
+            .unwrap_or_else(|| panic!("missing envoy; got: {values:?}"));
+        assert!(
+            help.as_deref().is_some_and(|h| h.contains("(built-in)")),
+            "got: {help:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn agents_table_rows_include_builtin_envoy() {
+        let _guard = TestConfigDirGuard::new();
+        let agent_dir = paths::agents_data_dir().join("other");
+        create_dir_all(&agent_dir).unwrap();
+        write(
+            agent_dir.join("config.yaml"),
+            "name: other\ninstructions: hi\ndescription: other-desc\n",
+        )
+        .unwrap();
+
+        let rows = agents_table_rows();
+
+        assert!(rows.contains(&["other".to_string(), "other-desc".to_string()]));
+        let envoy = rows.iter().find(|row| row[0] == "envoy").unwrap();
+        assert!(envoy[1].starts_with("(built-in) "), "got: {envoy:?}");
+    }
+
+    #[test]
+    #[serial]
+    fn repl_complete_agent_session_never_lists_shadow_reserved_dir() {
+        let _guard = TestConfigDirGuard::new();
+        let shadow_sessions = paths::agents_data_dir()
+            .join("envoy")
+            .join(SESSIONS_DIR_NAME);
+        create_dir_all(&shadow_sessions).unwrap();
+        write(shadow_sessions.join("leak.yaml"), "").unwrap();
+        let ctx = create_test_ctx();
+
+        let values = ctx.repl_complete(".agent", &["envoy", ""], "");
+
+        assert!(
+            !values.iter().any(|(name, _)| name == "leak"),
+            "got: {values:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn repl_complete_agent_session_lists_registered_builtin_sessions() {
+        let guard = TestConfigDirGuard::new();
+        let shadow_sessions = paths::agents_data_dir()
+            .join("envoy")
+            .join(SESSIONS_DIR_NAME);
+        create_dir_all(&shadow_sessions).unwrap();
+        write(shadow_sessions.join("leak.yaml"), "").unwrap();
+        let dir = guard.path.join("builtin-envoy");
+        create_dir_all(dir.join(SESSIONS_DIR_NAME)).unwrap();
+        write(dir.join(SESSIONS_DIR_NAME).join("real.yaml"), "").unwrap();
+        let _source = BuiltinSourceGuard::new(Arc::new(FixedDirSource(dir)));
+        let ctx = create_test_ctx();
+
+        let values = ctx.repl_complete(".agent", &["envoy", ""], "");
+
+        let names: Vec<&str> = values.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, vec!["real"]);
+    }
+
+    #[test]
+    #[serial]
+    fn use_agent_surfaces_unavailable_builtin_without_shadow_config() {
+        let _guard = TestConfigDirGuard::new();
+        let _data_dir = EnvVarGuard::unset("ENVOY_DATA_DIR");
+        let _config_file = EnvVarGuard::unset("ENVOY_CONFIG_FILE");
+        let shadow = paths::agents_data_dir().join("envoy");
+        create_dir_all(&shadow).unwrap();
+        write(
+            shadow.join("config.yaml"),
+            "name: envoy\ninstructions: hi\nmodel: shadow-model-XYZ\n",
+        )
+        .unwrap();
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        assert!(app.function_calling_support);
+
+        let err = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(ctx.use_agent(&app, "envoy", None, utils::create_abort_signal()))
+            .expect_err("an unregistered built-in must not load");
+
+        assert!(
+            err.downcast_ref::<BuiltinAgentUnavailable>().is_some(),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("built in"), "{err}");
+        assert!(!err.to_string().contains("reserved"), "{err}");
+        assert!(!format!("{err:?}").contains("shadow-model-XYZ"), "{err:?}");
+        assert!(ctx.agent.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn use_agent_reports_canonical_name_for_aliased_builtin() {
+        let _guard = TestConfigDirGuard::new();
+        let _data_dir = EnvVarGuard::unset("ENVOY_DATA_DIR");
+        let _config_file = EnvVarGuard::unset("ENVOY_CONFIG_FILE");
+        let shadow = paths::agents_data_dir().join("envoy");
+        create_dir_all(&shadow).unwrap();
+        write(
+            shadow.join("config.yaml"),
+            "name: envoy\ninstructions: hi\nmodel: shadow-model-XYZ\n",
+        )
+        .unwrap();
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+
+        let err = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(ctx.use_agent(&app, "En-Voy", None, utils::create_abort_signal()))
+            .expect_err("an unregistered built-in must not load");
+
+        assert!(
+            err.downcast_ref::<BuiltinAgentUnavailable>().is_some(),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("'envoy'"), "{err}");
+        assert!(!err.to_string().contains("En-Voy"), "{err}");
+        assert!(!format!("{err:?}").contains("shadow-model-XYZ"), "{err:?}");
+        assert!(ctx.agent.is_none());
     }
 
     #[test]
@@ -10654,6 +10812,34 @@ mod tests {
             ctx.agent.is_none(),
             "Agent should not be set when the graph-agent session guard fails"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn use_agent_graph_session_error_names_canonical_reserved_agent() {
+        let guard = TestConfigDirGuard::new();
+        let dir = guard.path.join("builtin-envoy");
+        create_dir_all(&dir).unwrap();
+        write(
+            dir.join("graph.yaml"),
+            "name: envoy\nversion: \"1.0\"\nstart: done\nnodes:\n  done:\n    type: end\n    output: ok\n",
+        )
+        .unwrap();
+        let _data_dir = EnvVarGuard::set("ENVOY_DATA_DIR", &dir);
+        let _config_file = EnvVarGuard::unset("ENVOY_CONFIG_FILE");
+        let _source = BuiltinSourceGuard::new(Arc::new(FixedDirSource(dir)));
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+
+        let abort = utils::create_abort_signal();
+        let err = run_async(ctx.use_agent(&app, "En-Voy", Some("sess"), abort))
+            .expect_err("graph agent with explicit session must be refused");
+
+        let msg = err.to_string();
+        assert!(msg.contains("does not support sessions"), "{msg}");
+        assert!(msg.contains("'envoy'"), "{msg}");
+        assert!(!msg.contains("En-Voy"), "{msg}");
+        assert!(ctx.agent.is_none());
     }
 
     #[test]

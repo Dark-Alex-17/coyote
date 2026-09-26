@@ -2,7 +2,9 @@ use super::state::{is_lone_template, template_root_keys};
 use super::types::{ConcurrencyCap, Graph, NextTargets, Node, NodeType};
 use crate::client::{Model, ModelType};
 use crate::config;
-use crate::config::{Agent, AppConfig, paths};
+use crate::config::{
+    Agent, AppConfig, paths, reserved_agent, reserved_agent_refusal, validate_agent_name,
+};
 use crate::function::mesh::MESH_FUNCTION_PREFIX;
 use crate::function::todo::TODO_FUNCTION_PREFIX;
 use crate::function::user_interaction::USER_FUNCTION_PREFIX;
@@ -618,6 +620,17 @@ impl GraphValidator {
     fn validate_agents(&self, graph: &Graph, result: &mut ValidationResult) {
         for (node_id, node) in &graph.nodes {
             if let NodeType::Agent(a) = &node.node_type {
+                if let Err(e) = validate_agent_name(&a.agent) {
+                    result.error(ValidationError::with_node(node_id, e.to_string()));
+                    continue;
+                }
+                if let Some(canonical) = reserved_agent(&a.agent) {
+                    result.error(ValidationError::with_node(
+                        node_id,
+                        reserved_agent_refusal(&a.agent, canonical, "it cannot be a graph node"),
+                    ));
+                    continue;
+                }
                 let agent_dir = paths::agent_data_dir(&a.agent);
                 let has_config = paths::agent_config_file(&a.agent).exists();
                 let has_graph = paths::agent_graph_file(&a.agent).exists();
@@ -2364,6 +2377,52 @@ mod tests {
             e.message
                 .contains("Agent '__definitely_no_such_agent__' not found")
         }));
+    }
+
+    #[test]
+    fn errors_when_referenced_agent_is_reserved() {
+        let agent = agent_node("a", "En-voy", Some("end"));
+        let graph = graph_with(vec![("a", agent), ("end", end_node("end"))], "a");
+
+        let result = validator().validate(&graph);
+
+        assert!(result.errors.iter().any(|e| {
+            e.node_id.as_deref() == Some("a")
+                && e.message
+                    == "Agent 'En-voy' is reserved: only a human can run it (`.agent envoy`); it cannot be a graph node"
+        }));
+        assert!(
+            !result
+                .errors
+                .iter()
+                .any(|e| e.message.contains("not found"))
+        );
+    }
+
+    #[test]
+    fn errors_when_referenced_agent_name_is_path_shaped() {
+        for name in ["./envoy", "x/../envoy"] {
+            let agent = agent_node("a", name, Some("end"));
+            let graph = graph_with(vec![("a", agent), ("end", end_node("end"))], "a");
+
+            let result = validator().validate(&graph);
+
+            let on_a: Vec<&ValidationError> = result
+                .errors
+                .iter()
+                .filter(|e| e.node_id.as_deref() == Some("a"))
+                .collect();
+            assert_eq!(on_a.len(), 1, "{name}: {on_a:?}");
+            assert!(on_a[0].message.contains("is invalid"), "{name}: {on_a:?}");
+            assert!(
+                !result
+                    .errors
+                    .iter()
+                    .any(|e| e.message.contains("not found") || e.message.contains("reserved")),
+                "{name}: {:?}",
+                result.errors
+            );
+        }
     }
 
     #[test]

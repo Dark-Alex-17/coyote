@@ -29,10 +29,10 @@ use crate::client::{
 };
 use crate::config::instructions::WORKSPACE_INSTRUCTIONS_FILE_NAME;
 use crate::config::{
-    Agent, AppConfig, AppState, CODE_ROLE, Config, EXPLAIN_SHELL_ROLE, Input, MemoryScope,
-    RenderMode, RequestContext, SHELL_ROLE, TEMP_SESSION_NAME, WorkingMode, ensure_parent_exists,
-    install_builtins, list_agents, load_env_file, macro_execute, maybe_spawn_models_refresh,
-    publish_mesh_snapshot, sync_models,
+    Agent, AgentListing, AppConfig, AppState, CODE_ROLE, Config, EXPLAIN_SHELL_ROLE, Input,
+    MemoryScope, RenderMode, RequestContext, SHELL_ROLE, TEMP_SESSION_NAME, WorkingMode,
+    ensure_parent_exists, install_builtins, list_agents_for_humans, load_env_file, macro_execute,
+    maybe_spawn_models_refresh, publish_mesh_snapshot, sync_models,
 };
 use crate::config::{memory, paths};
 use crate::function::agents::{GuardrailAction, check_pending_tasks_guardrail};
@@ -390,7 +390,11 @@ async fn run(
         return Ok(());
     }
     if cli.list_agents {
-        let agents = list_agents().join("\n");
+        let agents = list_agents_for_humans()
+            .iter()
+            .map(AgentListing::list_line)
+            .collect::<Vec<_>>()
+            .join("\n");
         println!("{agents}");
         return Ok(());
     }
