@@ -40,7 +40,7 @@ use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use skill::SKILL_FUNCTION_PREFIX;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -103,6 +103,12 @@ pub(crate) fn builtin_agent_env(agent_name: Option<&str>) -> Vec<(String, String
 
 /// Built-in agents run their tools with a cleared env; everything else
 /// inherits the parent's. Both spawn sites decide through this one check.
+///
+/// `None` means "no agent" and is NON-hermetic: the child sees the full
+/// parent env. The name comes from `ctx.agent` at the eval sites, so any
+/// runner that drives a built-in (the mesh envoy runner included) MUST set
+/// `ctx.agent` to that built-in before evaluating tool calls, or the
+/// secrets boundary never engages.
 pub(crate) fn is_builtin_agent(agent_name: Option<&str>) -> bool {
     agent_name.and_then(crate::config::reserved_agent).is_some()
 }
@@ -123,11 +129,18 @@ pub(crate) fn builtin_agent_child_env(
         .collect()
 }
 
-/// The parent env as owned strings. A key or value that is not valid
-/// unicode can never match the allow-list, so it is skipped instead of
-/// letting `env::vars()` panic on it.
+/// The parent env as owned strings; see `filter_unicode_env`.
 pub(crate) fn inherited_process_env() -> HashMap<String, String> {
-    env::vars_os()
+    filter_unicode_env(env::vars_os())
+}
+
+/// Keeps the entries whose key and value are both valid unicode. A key or
+/// value that is not can never match the allow-list, so it is skipped
+/// instead of letting `env::vars()` panic on it.
+fn filter_unicode_env(
+    entries: impl Iterator<Item = (OsString, OsString)>,
+) -> HashMap<String, String> {
+    entries
         .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
         .collect()
 }
@@ -1724,6 +1737,10 @@ impl ToolCall {
         let functions = ctx.tool_scope.functions.clone();
         let current_depth = ctx.current_depth;
         let quiet = current_depth > 0;
+        // `ctx.agent` is what decides whether the tool runs hermetically.
+        // `None` inherits the full parent env, so a runner that drives a
+        // built-in MUST have set `ctx.agent` to it before reaching this
+        // point or the secrets boundary does not engage.
         let agent_name = agent.as_ref().map(|agent| agent.name().to_owned());
         let (call_name, cmd_name, mut cmd_args, mut envs) = match agent.as_ref() {
             Some(agent) => self.extract_call_config_from_agent(&functions, agent)?,
@@ -5288,11 +5305,18 @@ mod tests {
 
     #[test]
     fn builtin_agent_child_env_keeps_only_the_allow_list() {
+        // Unix env names are case-sensitive, so a lowercase twin of an
+        // allowed key must not slip through there.
+        let lowercase_twin: &[&str] = if cfg!(unix) { &["path"] } else { &[] };
         let inherited: HashMap<String, String> = [
             "OPENAI_API_KEY",
             "COYOTE_CONFIG_DIR",
+            "COYOTE_DATA_DIR",
+            "RAG_DATA_DIR",
             "LEAK_MARKER",
             "GRAPH_STATE",
+            "GRAPH_STATE_FILE",
+            "LLM_SOMETHING",
             "ENVOY_DATA_DIR",
             "LC_ALL",
             "PATH",
@@ -5300,6 +5324,7 @@ mod tests {
             "LLM_OUTPUT",
         ]
         .into_iter()
+        .chain(lowercase_twin.iter().copied())
         .map(|key| (key.to_string(), format!("{key}-value")))
         .collect();
 
@@ -5312,6 +5337,18 @@ mod tests {
             vec!["ENVOY_DATA_DIR", "HOME", "LC_ALL", "LLM_OUTPUT", "PATH"]
         );
         assert_eq!(child["PATH"], "PATH-value");
+        for dropped in [
+            "OPENAI_API_KEY",
+            "COYOTE_CONFIG_DIR",
+            "COYOTE_DATA_DIR",
+            "RAG_DATA_DIR",
+            "LEAK_MARKER",
+            "GRAPH_STATE",
+            "GRAPH_STATE_FILE",
+            "LLM_SOMETHING",
+        ] {
+            assert!(!child.contains_key(dropped), "{dropped} leaked");
+        }
         assert!(is_builtin_agent(Some("envoy")));
         assert!(is_builtin_agent(Some("En-Voy")));
         assert!(!is_builtin_agent(Some("rag")));
@@ -5343,38 +5380,37 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    #[serial]
-    fn inherited_process_env_skips_non_unicode_entries() {
-        use std::ffi::OsString;
-        use std::os::unix::ffi::OsStrExt;
+    fn filter_unicode_env_skips_non_unicode_entries() {
+        use std::os::unix::ffi::OsStringExt;
 
-        struct RemoveOnDrop(OsString);
-        impl Drop for RemoveOnDrop {
-            fn drop(&mut self) {
-                unsafe { env::remove_var(&self.0) };
-            }
-        }
+        let bad_key = OsString::from_vec(b"COYOTE_TEST_BAD\xff".to_vec());
+        let bad_value = OsString::from_vec(b"bad\xff".to_vec());
+        assert!(bad_key.to_str().is_none());
+        assert!(bad_value.to_str().is_none());
 
-        let _bad_value = crate::testing::EnvVarGuard::set(
-            "COYOTE_TEST_BAD_VALUE",
-            OsStr::from_bytes(b"bad\xff"),
-        );
-        let bad_key = OsStr::from_bytes(b"COYOTE_TEST_BAD\xff").to_os_string();
-        let _bad_key = RemoveOnDrop(bad_key.clone());
-        unsafe { env::set_var(&bad_key, "x") };
-        assert!(env::var_os(&bad_key).is_some());
+        let entries = vec![
+            (OsString::from("GOOD_KEY"), OsString::from("good-value")),
+            (bad_key, OsString::from("x")),
+            (OsString::from("COYOTE_TEST_BAD_VALUE"), bad_value),
+            (OsString::from("PATH"), OsString::from("/bin")),
+        ];
 
+        let filtered = filter_unicode_env(entries.into_iter());
+
+        let mut keys: Vec<&str> = filtered.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["GOOD_KEY", "PATH"]);
+        assert_eq!(filtered["GOOD_KEY"], "good-value");
+    }
+
+    #[test]
+    fn inherited_process_env_reads_the_real_environment() {
         let inherited = inherited_process_env();
-
-        assert!(!inherited.contains_key("COYOTE_TEST_BAD_VALUE"));
-        assert!(
-            inherited
-                .keys()
-                .all(|key| !key.starts_with("COYOTE_TEST_BAD")),
-            "{:?}",
-            inherited.keys().collect::<Vec<_>>()
-        );
         assert!(inherited.contains_key("PATH"));
+        assert_eq!(
+            inherited.get("PATH").map(String::as_str),
+            env::var("PATH").ok().as_deref()
+        );
     }
 
     #[cfg(unix)]
