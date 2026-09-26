@@ -187,10 +187,15 @@ fn plan_title(path: &Path, head: &str) -> String {
         })
 }
 
+/// The brief as it stood when the snapshot was captured, kept so a snapshot is
+/// self-describing. The live `MeshSlot::brief()` is authoritative, including `None`:
+/// whatever serves peers or shows the brief locally must read the live brief, never this
+/// copy. `digest_generated_at` is the same anchor the live brief carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BriefState {
     pub(crate) mode: MeshBrief,
     pub(crate) text: Option<String>,
+    pub(crate) digest_generated_at: Option<SystemTime>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

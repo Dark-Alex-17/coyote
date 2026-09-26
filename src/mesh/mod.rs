@@ -681,6 +681,7 @@ pub(crate) mod test_support {
             brief: BriefState {
                 mode: MeshBrief::Auto,
                 text: None,
+                digest_generated_at: None,
             },
             cwd: PathBuf::new(),
             captured_at: SystemTime::now(),

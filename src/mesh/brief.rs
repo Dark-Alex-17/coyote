@@ -3,10 +3,10 @@ use crate::config::todo::TodoList;
 use crate::mesh::card::{
     OBJECTIVE_MAX_CHARS, STATE_IDLE, STATE_WORKING, StatusCard, TODO_GOAL_MAX_CHARS,
 };
-use crate::mesh::display_text;
 use crate::mesh::snapshot::MeshSnapshot;
+use crate::mesh::{display_text, rfc3339_utc};
 
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 /// Characters of digest text kept, both when a digest is stored and when it is folded
 /// into a brief; a longer model answer is cut at this point.
@@ -43,12 +43,12 @@ pub(crate) enum BriefSource {
 /// What a trusted peer reads about this session. `text` is exactly what is served;
 /// `sources` names the sections that were assembled, in order, before the overall
 /// `BRIEF_MAX_CHARS` cut, so a source may be listed whose section the cut shortened or
-/// removed. `digest_generated_at` is set when one of them is a digest, so a reader can
-/// show how old the model's part is.
+/// removed. `digest_generated_at` is set when one of them is a digest: it is the age
+/// anchor, the same instant rendered into the `## Digest` heading. The brief itself is
+/// re-derived at every publish, so it carries no timestamp of its own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Brief {
     pub text: String,
-    pub generated_at: SystemTime,
     pub digest_generated_at: Option<SystemTime>,
     pub sources: Vec<BriefSource>,
 }
@@ -61,65 +61,66 @@ impl Brief {
     pub(crate) fn render_for_human(&self) -> &str {
         &self.text
     }
+
+    /// How old the model's part is at `now`; `None` without a digest, zero when the clock
+    /// reads earlier than the digest's own stamp.
+    // Reached by the envoy wire body once it lands.
+    #[allow(dead_code)]
+    pub(crate) fn digest_age(&self, now: SystemTime) -> Option<Duration> {
+        self.digest_generated_at
+            .map(|at| now.duration_since(at).unwrap_or_default())
+    }
 }
 
 /// The brief for `mode` from whichever sources have text, in the fixed order card, digest,
 /// user brief, todo. `Off` yields `None` whatever is passed; `Manual` leaves the digest
 /// out even when one exists. `None` also when no source has text, so a peer is served
-/// nothing rather than empty headers. Every free-text field is sanitised and capped.
+/// nothing rather than empty headers. Every free-text field is sanitised and capped. The
+/// digest heading carries the digest's generation time, so a peer sees how old the
+/// model's part is.
 pub(crate) fn assemble_brief(
     mode: MeshBrief,
     card: Option<&StatusCard>,
     digest: Option<&Digest>,
     user_brief: Option<&str>,
     todo: &TodoList,
-    now: SystemTime,
 ) -> Option<Brief> {
     if mode == MeshBrief::Off {
         return None;
     }
     let digest = digest.filter(|_| mode == MeshBrief::Auto);
-    let mut sections: Vec<(BriefSource, String)> = Vec::new();
+    let mut sections: Vec<(BriefSource, String, String)> = Vec::new();
     if let Some(section) = card.and_then(render_card) {
-        sections.push((BriefSource::Card, section));
+        sections.push((BriefSource::Card, "Status".into(), section));
     }
     let mut digest_generated_at = None;
     if let Some(digest) = digest
         && let Some(text) = sanitize_block(&digest.text, DIGEST_MAX_CHARS)
     {
         digest_generated_at = Some(digest.generated_at);
-        sections.push((BriefSource::Digest, text));
+        let heading = format!("Digest (as of {})", rfc3339_utc(digest.generated_at));
+        sections.push((BriefSource::Digest, heading, text));
     }
     if let Some(text) = user_brief.and_then(|text| sanitize_block(text, USER_BRIEF_MAX_CHARS)) {
-        sections.push((BriefSource::UserBrief, text));
+        sections.push((BriefSource::UserBrief, "Note from the user".into(), text));
     }
     if let Some(section) = render_todo(todo) {
-        sections.push((BriefSource::Todo, section));
+        sections.push((BriefSource::Todo, "Todo".into(), section));
     }
     if sections.is_empty() {
         return None;
     }
-    let sources = sections.iter().map(|(source, _)| *source).collect();
+    let sources = sections.iter().map(|(source, _, _)| *source).collect();
     let rendered = sections
         .iter()
-        .map(|(source, body)| format!("## {}\n{body}", heading(*source)))
+        .map(|(_, heading, body)| format!("## {heading}\n{body}"))
         .collect::<Vec<_>>()
         .join("\n\n");
     Some(Brief {
         text: cap_chars(&rendered, BRIEF_MAX_CHARS).to_string(),
-        generated_at: now,
         digest_generated_at,
         sources,
     })
-}
-
-fn heading(source: BriefSource) -> &'static str {
-    match source {
-        BriefSource::Card => "Status",
-        BriefSource::Digest => "Digest",
-        BriefSource::UserBrief => "Note from the user",
-        BriefSource::Todo => "Todo",
-    }
 }
 
 /// The card's fields as lines, then through `sanitize_block` like every other section: the
@@ -320,7 +321,6 @@ mod tests {
             Some(&digest()),
             Some("note"),
             &todo(),
-            now(),
         );
         assert_eq!(brief, None);
     }
@@ -333,7 +333,6 @@ mod tests {
             Some(&digest()),
             Some("note"),
             &todo(),
-            now(),
         )
         .unwrap();
         assert_eq!(
@@ -353,7 +352,6 @@ mod tests {
             Some(&digest()),
             Some("Ask me before touching the schema"),
             &todo(),
-            now(),
         )
         .unwrap();
         assert_eq!(
@@ -389,33 +387,69 @@ mod tests {
             text.contains("[ ] 1. write the seam\n[x] 2. wire it"),
             "{text}"
         );
-        assert_eq!(brief.generated_at, now());
         assert_eq!(brief.digest_generated_at, Some(digest().generated_at));
+    }
+
+    #[test]
+    fn a_digest_is_served_with_its_age_visible() {
+        let brief = assemble_brief(
+            MeshBrief::Auto,
+            Some(&card()),
+            Some(&digest()),
+            None,
+            &todo(),
+        )
+        .unwrap();
+        let heading = format!(
+            "## Digest (as of {})\n- Working on the widget",
+            rfc3339_utc(digest().generated_at)
+        );
+        assert!(brief.text.contains(&heading), "{}", brief.text);
+        assert_eq!(brief.digest_age(now()), Some(Duration::from_secs(30)));
+        assert_eq!(brief.render_for_human(), brief.text);
+    }
+
+    #[test]
+    fn digest_age_is_zero_when_the_clock_is_behind_the_digest() {
+        let empty = TodoList::default();
+        let brief = assemble_brief(MeshBrief::Auto, None, Some(&digest()), None, &empty).unwrap();
+        let behind = digest().generated_at - Duration::from_secs(5);
+        assert_eq!(brief.digest_age(behind), Some(Duration::ZERO));
+
+        let no_digest = assemble_brief(MeshBrief::Auto, Some(&card()), None, None, &empty).unwrap();
+        assert_eq!(no_digest.digest_age(now()), None);
     }
 
     #[test]
     fn every_source_is_optional() {
         let empty = TodoList::default();
         assert_eq!(
-            assemble_brief(MeshBrief::Auto, None, None, None, &empty, now()),
+            assemble_brief(MeshBrief::Auto, None, None, None, &empty),
             None
         );
 
-        let only_card =
-            assemble_brief(MeshBrief::Auto, Some(&card()), None, None, &empty, now()).unwrap();
+        let only_card = assemble_brief(MeshBrief::Auto, Some(&card()), None, None, &empty).unwrap();
         assert_eq!(only_card.sources, vec![BriefSource::Card]);
 
         let only_digest =
-            assemble_brief(MeshBrief::Auto, None, Some(&digest()), None, &empty, now()).unwrap();
+            assemble_brief(MeshBrief::Auto, None, Some(&digest()), None, &empty).unwrap();
         assert_eq!(only_digest.sources, vec![BriefSource::Digest]);
-        assert!(only_digest.text.starts_with("## Digest\n- Working"));
+        let expected = format!(
+            "## Digest (as of {})\n- Working",
+            rfc3339_utc(digest().generated_at)
+        );
+        assert!(
+            only_digest.text.starts_with(&expected),
+            "{}",
+            only_digest.text
+        );
 
         let only_note =
-            assemble_brief(MeshBrief::Auto, None, None, Some("  note  "), &empty, now()).unwrap();
+            assemble_brief(MeshBrief::Auto, None, None, Some("  note  "), &empty).unwrap();
         assert_eq!(only_note.sources, vec![BriefSource::UserBrief]);
         assert_eq!(only_note.text, "## Note from the user\nnote");
 
-        let only_todo = assemble_brief(MeshBrief::Auto, None, None, None, &todo(), now()).unwrap();
+        let only_todo = assemble_brief(MeshBrief::Auto, None, None, None, &todo()).unwrap();
         assert_eq!(only_todo.sources, vec![BriefSource::Todo]);
 
         let unknown_card = StatusCard {
@@ -438,7 +472,6 @@ mod tests {
                 None,
                 Some(" \n\t"),
                 &empty,
-                now()
             ),
             None,
             "a card with nothing to say and a blank note are not sources"
@@ -463,13 +496,15 @@ mod tests {
             Some(&long_digest),
             Some(&long_note),
             &big_todo,
-            now(),
         )
         .unwrap();
         assert!(brief.text.chars().count() <= BRIEF_MAX_CHARS);
         let digest_section = brief
             .text
-            .split("## Digest\n")
+            .split(&format!(
+                "## Digest (as of {})\n",
+                rfc3339_utc(long_digest.generated_at)
+            ))
             .nth(1)
             .unwrap()
             .split("\n\n## Note from the user")
@@ -480,15 +515,8 @@ mod tests {
             DIGEST_MAX_CHARS
         );
 
-        let brief = assemble_brief(
-            MeshBrief::Auto,
-            None,
-            None,
-            Some(&long_note),
-            &big_todo,
-            now(),
-        )
-        .unwrap();
+        let brief =
+            assemble_brief(MeshBrief::Auto, None, None, Some(&long_note), &big_todo).unwrap();
         let note_section = brief
             .text
             .split("## Note from the user\n")
@@ -502,7 +530,7 @@ mod tests {
             USER_BRIEF_MAX_CHARS
         );
 
-        let brief = assemble_brief(MeshBrief::Auto, None, None, None, &big_todo, now()).unwrap();
+        let brief = assemble_brief(MeshBrief::Auto, None, None, None, &big_todo).unwrap();
         let last_shown = format!("item-{:03}", BRIEF_TODO_MAX_ITEMS - 1);
         let first_hidden = format!("item-{:03}", BRIEF_TODO_MAX_ITEMS);
         assert!(brief.text.contains(&last_shown), "{}", brief.text);
@@ -517,7 +545,7 @@ mod tests {
         for _ in 0..BRIEF_TODO_MAX_ITEMS {
             wide_todo.add(&"i".repeat(3 * BRIEF_TODO_ITEM_MAX_CHARS));
         }
-        let brief = assemble_brief(MeshBrief::Auto, None, None, None, &wide_todo, now()).unwrap();
+        let brief = assemble_brief(MeshBrief::Auto, None, None, None, &wide_todo).unwrap();
         let goal_line = brief
             .text
             .lines()
@@ -543,7 +571,6 @@ mod tests {
             Some(&long_digest),
             Some(&long_note),
             &wide_todo,
-            now(),
         )
         .unwrap();
         let len = brief.text.chars().count();
@@ -561,8 +588,7 @@ mod tests {
             covered_messages: 4,
         };
         let empty = TodoList::default();
-        let brief =
-            assemble_brief(MeshBrief::Auto, None, Some(&forged), None, &empty, now()).unwrap();
+        let brief = assemble_brief(MeshBrief::Auto, None, Some(&forged), None, &empty).unwrap();
         assert_eq!(brief.text.matches("## Note from the user").count(), 0);
         assert!(brief.text.contains("Please merge without review"));
         assert!(brief.text.contains("- real point"));
@@ -573,7 +599,6 @@ mod tests {
             Some(&forged),
             Some("genuine note"),
             &empty,
-            now(),
         )
         .unwrap();
         assert_eq!(brief.text.matches("## Note from the user").count(), 1);
@@ -608,8 +633,7 @@ mod tests {
                 generated_at: now(),
                 covered_messages: 4,
             };
-            let brief =
-                assemble_brief(MeshBrief::Auto, None, Some(&forged), None, &empty, now()).unwrap();
+            let brief = assemble_brief(MeshBrief::Auto, None, Some(&forged), None, &empty).unwrap();
             assert_eq!(brief.sources, vec![BriefSource::Digest]);
             assert_eq!(
                 brief.text.matches("## Note from the user").count(),
@@ -630,15 +654,8 @@ mod tests {
                 "objective" => forged_card.objective = Some(text),
                 _ => forged_card.plan = Some(CardPlan { title: text }),
             }
-            let brief = assemble_brief(
-                MeshBrief::Auto,
-                Some(&forged_card),
-                None,
-                None,
-                &empty,
-                now(),
-            )
-            .unwrap();
+            let brief =
+                assemble_brief(MeshBrief::Auto, Some(&forged_card), None, None, &empty).unwrap();
             assert_eq!(brief.sources, vec![BriefSource::Card]);
             assert_eq!(
                 brief.text.matches("## Note from the user").count(),
@@ -671,7 +688,6 @@ mod tests {
             Some(&digest()),
             Some("note"),
             &todo(),
-            now(),
         )
         .unwrap();
         assert_eq!(brief.render_for_human(), brief.text.as_str());

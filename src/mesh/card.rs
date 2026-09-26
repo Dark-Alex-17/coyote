@@ -554,6 +554,7 @@ mod tests {
             brief: crate::mesh::snapshot::BriefState {
                 mode: crate::config::mesh_config::MeshBrief::Auto,
                 text: Some("BRIEF-SECRET".into()),
+                digest_generated_at: Some(now() - Duration::from_secs(9)),
             },
             cwd: PathBuf::from("/home/u/SECRET-DIR/proj/sub"),
             captured_at: now() - Duration::from_secs(7),

@@ -18,6 +18,7 @@ impl RequestContext {
         let repo = RepoInfo::discover(&cwd);
         let plan_root = repo.as_ref().map(|r| r.root.as_path()).unwrap_or(&cwd);
         let goal = self.todo_list.goal.trim();
+        let brief = self.app.mesh.brief();
         MeshSnapshot {
             objective: (!goal.is_empty()).then(|| goal.to_string()),
             state,
@@ -26,7 +27,8 @@ impl RequestContext {
             todo: self.todo_list.clone(),
             brief: BriefState {
                 mode: self.app.config.mesh.brief,
-                text: self.app.mesh.brief().map(|brief| brief.text.clone()),
+                text: brief.as_ref().map(|brief| brief.text.clone()),
+                digest_generated_at: brief.as_ref().and_then(|brief| brief.digest_generated_at),
             },
             cwd,
             captured_at: SystemTime::now(),
@@ -66,6 +68,7 @@ mod tests {
     use super::*;
     use crate::config::{Agent, AgentConfig, AppState, Role, Session, WorkingMode};
     use crate::mesh::MeshSlot;
+    use crate::mesh::brief::Digest;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -228,11 +231,18 @@ mod tests {
         let ctx = create_test_ctx();
         publish_mesh_snapshot(&ctx, TurnState::idle_now());
         ctx.app.mesh.set_user_brief(Some("hello".into()));
-        let served = ctx.app.mesh.brief().unwrap().text.clone();
-        assert!(served.contains("hello"), "{served}");
+        ctx.app.mesh.publish_digest(Some(Digest {
+            text: "- Working on the widget".into(),
+            generated_at: SystemTime::now() - Duration::from_secs(30),
+            covered_messages: 4,
+        }));
+        let live = ctx.app.mesh.brief().unwrap();
+        assert!(live.text.contains("hello"), "{}", live.text);
+        assert!(live.digest_generated_at.is_some());
         publish_mesh_snapshot(&ctx, TurnState::idle_now());
         let snap = ctx.app.mesh.snapshot().unwrap();
-        assert_eq!(snap.brief.text.as_deref(), Some(served.as_str()));
+        assert_eq!(snap.brief.text.as_deref(), Some(live.text.as_str()));
+        assert_eq!(snap.brief.digest_generated_at, live.digest_generated_at);
     }
 
     /// Spawns a thread that takes and holds the context write lock, the way the REPL does

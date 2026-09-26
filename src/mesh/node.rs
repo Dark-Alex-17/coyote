@@ -1347,8 +1347,8 @@ async fn announce_periodically(runtime: Arc<MeshRuntime>, cancel: CancellationTo
 /// derived: `reassemble_brief` rebuilds it from the snapshot (mode, todo, card fields),
 /// the digest and the user brief whenever any of them changes, so it is never stored
 /// directly. The live `brief()` is authoritative, including `None`: a cleared brief must
-/// not fall back to the snapshot's copy. `snapshot().brief.text` is the value at capture,
-/// kept so a snapshot is self-describing.
+/// not fall back to the snapshot's copy. `snapshot().brief` is the value at capture, kept
+/// so a snapshot is self-describing.
 ///
 /// `digest_epoch` counts the clears made by `clear_digest_for_new_epoch`. A generation
 /// records the epoch it started under and publishes through `publish_digest_at`, which
@@ -1604,7 +1604,6 @@ impl MeshSlot {
             digest.as_deref(),
             user_brief.as_deref().map(String::as_str),
             &snapshot.todo,
-            now,
         );
         self.brief.store(brief.map(Arc::new));
     }
@@ -1867,11 +1866,11 @@ mod tests {
         }));
         assert_eq!(slot.digest().unwrap().covered_messages, 4);
         let brief = slot.brief().unwrap();
-        assert!(
-            brief.text.contains("## Digest\n- Working on the mesh"),
-            "{}",
-            brief.text
+        let heading = format!(
+            "## Digest (as of {})\n- Working on the mesh",
+            rfc3339_utc(slot.digest().unwrap().generated_at)
         );
+        assert!(brief.text.contains(&heading), "{}", brief.text);
         assert_eq!(
             brief.digest_generated_at,
             Some(slot.digest().unwrap().generated_at)
@@ -1920,7 +1919,7 @@ mod tests {
         };
         let epoch = slot.digest_epoch();
         assert!(slot.publish_digest_at(epoch, digest.clone()));
-        assert!(slot.brief().unwrap().text.contains("## Digest"));
+        assert!(slot.brief().unwrap().text.contains("## Digest (as of "));
 
         let next = slot.clear_digest_for_new_epoch();
         assert_eq!(next, epoch + 1);
@@ -1934,6 +1933,30 @@ mod tests {
 
         assert!(slot.publish_digest_at(next, digest));
         assert_eq!(slot.digest().unwrap().covered_messages, 4);
+    }
+
+    #[test]
+    fn an_unchanged_digest_keeps_its_age_anchor_across_publishes() {
+        let slot = MeshSlot::default();
+        slot.publish(snapshot_fixture());
+        slot.publish_digest(Some(Digest {
+            text: "- Working on the mesh".into(),
+            generated_at: SystemTime::now() - Duration::from_secs(30),
+            covered_messages: 4,
+        }));
+        let first = slot.brief().unwrap();
+        let heading_line = |text: &str| {
+            text.lines()
+                .find(|line| line.starts_with("## Digest (as of "))
+                .map(str::to_string)
+                .unwrap_or_else(|| panic!("no digest heading in {text}"))
+        };
+        let first_heading = heading_line(&first.text);
+
+        slot.publish(snapshot_fixture());
+        let second = slot.brief().unwrap();
+        assert_eq!(second.digest_generated_at, first.digest_generated_at);
+        assert_eq!(heading_line(&second.text), first_heading);
     }
 
     #[test]
