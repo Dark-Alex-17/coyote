@@ -5344,6 +5344,42 @@ mod tests {
     #[cfg(unix)]
     #[test]
     #[serial]
+    fn inherited_process_env_skips_non_unicode_entries() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStrExt;
+
+        struct RemoveOnDrop(OsString);
+        impl Drop for RemoveOnDrop {
+            fn drop(&mut self) {
+                unsafe { env::remove_var(&self.0) };
+            }
+        }
+
+        let _bad_value = crate::testing::EnvVarGuard::set(
+            "COYOTE_TEST_BAD_VALUE",
+            OsStr::from_bytes(b"bad\xff"),
+        );
+        let bad_key = OsStr::from_bytes(b"COYOTE_TEST_BAD\xff").to_os_string();
+        let _bad_key = RemoveOnDrop(bad_key.clone());
+        unsafe { env::set_var(&bad_key, "x") };
+        assert!(env::var_os(&bad_key).is_some());
+
+        let inherited = inherited_process_env();
+
+        assert!(!inherited.contains_key("COYOTE_TEST_BAD_VALUE"));
+        assert!(
+            inherited
+                .keys()
+                .all(|key| !key.starts_with("COYOTE_TEST_BAD")),
+            "{:?}",
+            inherited.keys().collect::<Vec<_>>()
+        );
+        assert!(inherited.contains_key("PATH"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
     fn run_llm_function_pins_the_builtin_agent_env_over_an_inherited_one() {
         use crate::config::envoy::EnvoySource;
         use crate::config::reserved_agents::BuiltinSourceGuard;

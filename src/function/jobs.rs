@@ -2656,6 +2656,40 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[serial_test::serial]
+    fn run_process_job_clears_the_env_for_hermetic_snapshots() {
+        let _leak = crate::testing::EnvVarGuard::set("LEAK_MARKER", "leaked");
+        for (env_clear, expected) in [(true, Value::Null), (false, json!({"output": "leaked"}))] {
+            run_async(async {
+                let state = Arc::new(Mutex::new(JobState {
+                    status: JobStatus::Running,
+                    pgid: None,
+                }));
+                let output_buf = Arc::new(Mutex::new(RingBuf::default()));
+                let mut snapshot = test_snapshot(
+                    "bash",
+                    &["-c", "printf %s \"$LEAK_MARKER\" > \"$LLM_OUTPUT\""],
+                    0,
+                );
+                snapshot.env_clear = env_clear;
+                snapshot.envs = crate::function::builtin_agent_child_env(
+                    &crate::function::inherited_process_env(),
+                );
+                snapshot.envs.insert(
+                    "LLM_OUTPUT".to_string(),
+                    snapshot.output_file.display().to_string(),
+                );
+
+                let result = run_process_job(snapshot, state, output_buf).await.unwrap();
+
+                assert_eq!(result.exit_code, Some(0), "env_clear={env_clear}");
+                assert_eq!(result.output, expected, "env_clear={env_clear}");
+            });
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn run_process_job_reports_nonzero_exit_with_partial_output() {
         run_async(async {
             let state = Arc::new(Mutex::new(JobState {
