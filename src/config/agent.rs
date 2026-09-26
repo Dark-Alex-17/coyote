@@ -372,28 +372,7 @@ impl Agent {
                         user_agents_dir.display()
                     );
                 }
-                // Every callee re-derives its paths from the name through
-                // paths::agent_data_dir, so the registered dir must be what that
-                // seam yields; otherwise a shadow under agents/<name> could leak in.
-                let wired_dir = paths::agent_data_dir(canonical);
-                let wired_config = paths::agent_config_file(canonical);
                 let config_path = dir.join(CONFIG_FILE_NAME);
-                if wired_dir != dir {
-                    bail!(
-                        "Agent '{canonical}' is built in but its data dir is not wired to '{}' \
-                         (got '{}')",
-                        dir.display(),
-                        wired_dir.display()
-                    );
-                }
-                if wired_config != config_path {
-                    bail!(
-                        "Agent '{canonical}' is built in but its config file is not wired to '{}' \
-                         (got '{}'); unset the config-file override",
-                        config_path.display(),
-                        wired_config.display()
-                    );
-                }
                 let graph_path = dir.join(AGENT_GRAPH_FILE_NAME);
                 (canonical, dir, config_path, graph_path)
             } else {
@@ -1525,6 +1504,9 @@ pub fn list_agents() -> Vec<String> {
             if name.starts_with('.') {
                 continue;
             }
+            if validate_agent_name(name).is_err() {
+                continue;
+            }
             if let Some(canonical) = reserved_agent(name) {
                 debug!(
                     "Skipping agent directory {}: the name is reserved for the built-in agent '{canonical}'",
@@ -2536,7 +2518,7 @@ nodes: {}
             "name: envoy\ninstructions: from-builtin-source\n",
         )
         .unwrap();
-        let _data_dir = EnvVarGuard::set("ENVOY_DATA_DIR", &dir);
+        let _data_dir = EnvVarGuard::unset("ENVOY_DATA_DIR");
         let _config_file = EnvVarGuard::unset("ENVOY_CONFIG_FILE");
         let _source = BuiltinSourceGuard::new(Arc::new(FixedDirSource(dir.clone())));
         write_shadow_envoy_config("");
@@ -2574,8 +2556,8 @@ nodes: {}
 
     #[test]
     #[serial_test::serial]
-    fn reserved_agent_with_unwired_data_dir_is_refused() {
-        let guard = TestConfigDirGuard::new("reserved-unwired");
+    fn reserved_agent_init_ignores_env_overrides() {
+        let guard = TestConfigDirGuard::new("reserved-env-ignored");
         let dir = guard.path.join("builtin-envoy");
         create_dir_all(&dir).unwrap();
         fs::write(
@@ -2583,40 +2565,16 @@ nodes: {}
             "name: envoy\ninstructions: from-builtin-source\n",
         )
         .unwrap();
-        let _data_dir = EnvVarGuard::unset("ENVOY_DATA_DIR");
-        let _config_file = EnvVarGuard::unset("ENVOY_CONFIG_FILE");
+        let shadow = paths::agents_data_dir().join("envoy");
+        let _data_dir = EnvVarGuard::set("ENVOY_DATA_DIR", &shadow);
+        let _config_file = EnvVarGuard::set("ENVOY_CONFIG_FILE", shadow.join(CONFIG_FILE_NAME));
         let _source = BuiltinSourceGuard::new(Arc::new(FixedDirSource(dir)));
         write_shadow_envoy_config("");
 
-        let err = init_envoy().expect_err("unwired data dir must be refused");
+        let agent = init_envoy().unwrap();
 
-        assert!(err.to_string().contains("not wired"), "{err}");
-        assert!(!format!("{err:?}").contains(SHADOW_MARKER));
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn reserved_agent_with_config_file_override_is_refused() {
-        let guard = TestConfigDirGuard::new("reserved-config-override");
-        let dir = guard.path.join("builtin-envoy");
-        create_dir_all(&dir).unwrap();
-        fs::write(
-            dir.join(CONFIG_FILE_NAME),
-            "name: envoy\ninstructions: from-builtin-source\n",
-        )
-        .unwrap();
-        let _data_dir = EnvVarGuard::set("ENVOY_DATA_DIR", &dir);
-        let _config_file = EnvVarGuard::set("ENVOY_CONFIG_FILE", guard.path.join("elsewhere.yaml"));
-        let _source = BuiltinSourceGuard::new(Arc::new(FixedDirSource(dir)));
-        write_shadow_envoy_config("");
-
-        let err = init_envoy().expect_err("config-file override must be refused");
-
-        assert!(
-            err.to_string().contains("config file is not wired"),
-            "{err}"
-        );
-        assert!(!format!("{err:?}").contains(SHADOW_MARKER));
+        assert!(agent.config.instructions.contains("from-builtin-source"));
+        assert!(!format!("{:?}", agent.config).contains(SHADOW_MARKER));
     }
 
     #[test]
@@ -2776,6 +2734,18 @@ nodes: {}
             .map(|(name, _)| name)
             .collect();
         assert_eq!(names, vec!["other".to_string()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn list_agents_skips_names_validate_agent_name_rejects() {
+        let _guard = TestConfigDirGuard::new("list-invalid-names");
+        let agents_dir = paths::agents_data_dir();
+        create_dir_all(agents_dir.join("good")).unwrap();
+        create_dir_all(agents_dir.join("bad\\name")).unwrap();
+
+        assert_eq!(list_agents(), vec!["good".to_string()]);
     }
 
     #[test]

@@ -71,14 +71,11 @@ pub fn reserved_agent_refusal(requested: &str, canonical: &str, tail: &str) -> S
 /// while nothing is registered the agent is unavailable.
 ///
 /// Both methods always receive the CANONICAL name from `RESERVED_AGENT_NAMES`.
-/// `Agent::init` refuses to load unless the returned dir lives OUTSIDE
-/// `paths::agents_data_dir()`, then checks the wiring in two halves and
-/// refuses on any mismatch: `agent_dir` must equal
-/// `paths::agent_data_dir(name)` byte for byte, and `agent_dir/config.yaml`
-/// must equal
-/// `paths::agent_config_file(name)`. So the registrar exports
-/// `<NAME>_DATA_DIR` as the returned path and leaves `<NAME>_CONFIG_FILE`
-/// unset (or equal to `<dir>/config.yaml`).
+/// The registry is the path seam: `paths::agent_data_dir(name)`,
+/// `paths::agent_config_file(name)` and everything derived from them resolve
+/// a reserved name through the registered source, and `<NAME>_DATA_DIR` /
+/// `<NAME>_CONFIG_FILE` are ignored for reserved names. `Agent::init`
+/// refuses a returned dir that lives inside `paths::agents_data_dir()`.
 pub trait BuiltinAgentSource: Send + Sync {
     fn agent_dir(&self, name: &str) -> Option<PathBuf>;
     fn description(&self, name: &str) -> Option<String>;

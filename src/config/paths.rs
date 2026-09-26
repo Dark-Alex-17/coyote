@@ -1,3 +1,4 @@
+use super::reserved_agents::{builtin_agent_dir, reserved_agent};
 use super::role::Role;
 use super::{
     AGENT_GRAPH_FILE_NAME, AGENTS_DIR_NAME, BASH_PROMPT_UTILS_FILE_NAME, CONFIG_FILE_NAME,
@@ -326,10 +327,21 @@ pub fn agents_data_dir() -> PathBuf {
 }
 
 pub fn agent_data_dir(name: &str) -> PathBuf {
+    if let Some(canonical) = reserved_agent(name) {
+        return builtin_agent_dir(canonical).unwrap_or_else(|| unregistered_builtin_dir(canonical));
+    }
     match env::var(format!("{}_DATA_DIR", normalize_env_name(name))) {
         Ok(value) => PathBuf::from(value),
         Err(_) => agents_data_dir().join(name),
     }
+}
+
+/// Fail-closed placeholder for a reserved agent while no built-in source is
+/// registered. The interior NUL bytes make the path unrepresentable on every
+/// platform, so nothing can be planted there; `Agent::init` returns
+/// `BuiltinAgentUnavailable` before it ever touches this path.
+fn unregistered_builtin_dir(canonical: &str) -> PathBuf {
+    PathBuf::from(format!("\0unregistered-builtin\0/{canonical}"))
 }
 
 pub fn agent_graph_file(agent_name: &str) -> PathBuf {
@@ -337,6 +349,9 @@ pub fn agent_graph_file(agent_name: &str) -> PathBuf {
 }
 
 pub fn agent_config_file(name: &str) -> PathBuf {
+    if reserved_agent(name).is_some() {
+        return agent_data_dir(name).join(CONFIG_FILE_NAME);
+    }
     match env::var(format!("{}_CONFIG_FILE", normalize_env_name(name))) {
         Ok(value) => PathBuf::from(value),
         Err(_) => agent_data_dir(name).join(CONFIG_FILE_NAME),
@@ -545,6 +560,10 @@ pub fn local_models_override() -> Result<Vec<ProviderModels>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::reserved_agents::{BuiltinSourceGuard, FixedDirSource};
+    use crate::testing::{EnvVarGuard, TestConfigDirGuard};
+    use serial_test::serial;
+    use std::sync::Arc;
     use std::{fs, time};
 
     #[test]
@@ -1076,5 +1095,70 @@ mod tests {
             "the .yaml must survive a sidecar-removal failure so the delete is retryable"
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[serial]
+    fn reserved_agent_paths_ignore_env_overrides() {
+        let guard = TestConfigDirGuard::new("paths-reserved-env");
+        let dir = guard.path.join("builtin-envoy");
+        let _source = BuiltinSourceGuard::new(Arc::new(FixedDirSource(dir.clone())));
+        let _data_dir = EnvVarGuard::set("ENVOY_DATA_DIR", "/evil");
+        let _config_file = EnvVarGuard::set("ENVOY_CONFIG_FILE", "/evil/config.yaml");
+
+        for name in ["envoy", "En-Voy"] {
+            assert_eq!(agent_data_dir(name), dir, "{name}");
+            assert_eq!(
+                agent_config_file(name),
+                dir.join(CONFIG_FILE_NAME),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn reserved_agent_derived_paths_resolve_under_registered_dir() {
+        let guard = TestConfigDirGuard::new("paths-reserved-derived");
+        let dir = guard.path.join("builtin-envoy");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("tools.sh"), "").unwrap();
+        let _source = BuiltinSourceGuard::new(Arc::new(FixedDirSource(dir.clone())));
+        let _data_dir = EnvVarGuard::set("ENVOY_DATA_DIR", "/evil");
+        let _config_file = EnvVarGuard::set("ENVOY_CONFIG_FILE", "/evil/config.yaml");
+
+        assert_eq!(agent_functions_file("envoy").unwrap(), dir.join("tools.sh"));
+        assert_eq!(agent_bin_dir("envoy"), dir.join(FUNCTIONS_BIN_DIR_NAME));
+        assert_eq!(agent_rag_file("envoy", "rag"), dir.join("rag.yaml"));
+        assert_eq!(agent_graph_file("envoy"), dir.join(AGENT_GRAPH_FILE_NAME));
+    }
+
+    #[test]
+    #[serial]
+    fn user_agent_paths_honour_env_overrides() {
+        let _guard = TestConfigDirGuard::new("paths-user-env");
+        let _data_dir = EnvVarGuard::set("MY_AGENT_DATA_DIR", "/custom/dir");
+        let _config_file = EnvVarGuard::set("MY_AGENT_CONFIG_FILE", "/custom/cfg.yaml");
+
+        assert_eq!(agent_data_dir("my-agent"), PathBuf::from("/custom/dir"));
+        assert_eq!(
+            agent_config_file("my-agent"),
+            PathBuf::from("/custom/cfg.yaml")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn unregistered_reserved_agent_paths_cannot_exist() {
+        let _guard = TestConfigDirGuard::new("paths-reserved-unregistered");
+        let _data_dir = EnvVarGuard::set("ENVOY_DATA_DIR", "/evil");
+
+        let dir = agent_data_dir("envoy");
+
+        assert!(!dir.exists());
+        assert!(!dir.starts_with(agents_data_dir()));
+        assert_ne!(dir, PathBuf::from("/evil"));
+        assert!(fs::create_dir_all(&dir).is_err());
+        assert!(agent_config_file("envoy").starts_with(&dir));
     }
 }
