@@ -144,6 +144,13 @@ docker run --rm -it \
   darkalex17/coyote
 ```
 
+Arguments are passed to `coyote`. If the first argument is `sh`, `bash`, or an absolute path, that command runs instead,
+e.g. to get a shell inside the image:
+
+```bash
+docker run --rm -it darkalex17/coyote bash
+```
+
 ### Scripts
 #### Linux/MacOS (`bash`)
 You can use the following command to run a bash script that downloads and installs the latest version of `coyote` for your
