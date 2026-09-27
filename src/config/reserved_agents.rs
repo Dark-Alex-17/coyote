@@ -70,7 +70,7 @@ pub fn reserved_agent_refusal(requested: &str, canonical: &str, tail: &str) -> S
 /// whichever module materializes the built-in (`config::envoy`, for the
 /// envoy); while nothing is registered the agent is unavailable.
 ///
-/// Both methods always receive the CANONICAL name from `RESERVED_AGENT_NAMES`.
+/// Every method always receives the CANONICAL name from `RESERVED_AGENT_NAMES`.
 /// The registry is the path seam: `paths::agent_data_dir(name)`,
 /// `paths::agent_config_file(name)` and everything derived from them resolve
 /// a reserved name through the registered source, and `<NAME>_DATA_DIR` /
@@ -79,6 +79,16 @@ pub fn reserved_agent_refusal(requested: &str, canonical: &str, tail: &str) -> S
 pub trait BuiltinAgentSource: Send + Sync {
     fn agent_dir(&self, name: &str) -> Option<PathBuf>;
     fn description(&self, name: &str) -> Option<String>;
+    /// Why `agent_dir` returned `None`, once it has; reports, never probes.
+    fn unavailable_reason(&self, _name: &str) -> Option<UnavailableReason> {
+        None
+    }
+    /// The interpreter the built-in's tool shims must run under. A built-in
+    /// never picks its runtime from a shebang, a cwd `.venv` or `PATH` at
+    /// shim-build time. Known only once `agent_dir` has run.
+    fn tool_runtime(&self, _name: &str) -> Option<PathBuf> {
+        None
+    }
 }
 
 static BUILTIN_AGENT_SOURCE: ArcSwapOption<Arc<dyn BuiltinAgentSource>> =
@@ -102,6 +112,22 @@ pub fn builtin_agent_description(name: &str) -> Option<String> {
         .load()
         .as_ref()
         .and_then(|source| source.description(canonical))
+}
+
+pub fn builtin_agent_unavailable_reason(name: &str) -> Option<UnavailableReason> {
+    let canonical = reserved_agent(name)?;
+    BUILTIN_AGENT_SOURCE
+        .load()
+        .as_ref()
+        .and_then(|source| source.unavailable_reason(canonical))
+}
+
+pub fn builtin_agent_tool_runtime(name: &str) -> Option<PathBuf> {
+    let canonical = reserved_agent(name)?;
+    BUILTIN_AGENT_SOURCE
+        .load()
+        .as_ref()
+        .and_then(|source| source.tool_runtime(canonical))
 }
 
 /// Registers a source for the guard's lifetime and clears the registry on
@@ -141,21 +167,63 @@ impl BuiltinAgentSource for FixedDirSource {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnavailableReason {
+    NoSource,
+    Materialize(String),
+    RuntimeMissing { candidates: Vec<String> },
+    RuntimeUnusable { tried: Vec<(String, String)> },
+    NoExecutableDir { primary: String, fallback: String },
+}
+
+impl fmt::Display for UnavailableReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            UnavailableReason::NoSource => f.write_str(
+                "no built-in source is registered, or its files could not be materialized (see the log)",
+            ),
+            UnavailableReason::Materialize(err) => {
+                write!(f, "its files could not be materialized: {err}")
+            }
+            UnavailableReason::RuntimeMissing { candidates } => write!(
+                f,
+                "no Python interpreter found on PATH (tried {})",
+                candidates.join(", ")
+            ),
+            UnavailableReason::RuntimeUnusable { tried } => {
+                f.write_str("no usable Python 3.9+ interpreter on PATH (")?;
+                for (index, (path, detail)) in tried.iter().enumerate() {
+                    if index > 0 {
+                        f.write_str("; ")?;
+                    }
+                    write!(f, "{path}: {detail}")?;
+                }
+                f.write_str(")")
+            }
+            UnavailableReason::NoExecutableDir { primary, fallback } => write!(
+                f,
+                "no directory allows running its tool shims (temp dir: {primary}; cache dir: {fallback})"
+            ),
+        }
+    }
+}
+
 /// A reserved agent was requested while no built-in source is registered, or
-/// the registered source failed to materialize its files. Callers can
+/// the registered source could not make the agent runnable. Callers can
 /// `downcast_ref` an `anyhow::Error` to this type to distinguish it from a
 /// missing user agent.
 #[derive(Debug)]
 pub struct BuiltinAgentUnavailable {
     pub name: String,
+    pub reason: UnavailableReason,
 }
 
 impl fmt::Display for BuiltinAgentUnavailable {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Agent '{}' is built in but is not available: no built-in source is registered, or its files could not be materialized (see the log)",
-            self.name
+            "Agent '{}' is built in but is not available: {}",
+            self.name, self.reason
         )
     }
 }
@@ -319,6 +387,7 @@ mod tests {
     fn unavailable_error_downcasts_through_anyhow() {
         let err: anyhow::Error = BuiltinAgentUnavailable {
             name: "envoy".to_string(),
+            reason: UnavailableReason::NoSource,
         }
         .into();
         let typed = err.downcast_ref::<BuiltinAgentUnavailable>().unwrap();
@@ -327,5 +396,52 @@ mod tests {
             err.to_string(),
             "Agent 'envoy' is built in but is not available: no built-in source is registered, or its files could not be materialized (see the log)"
         );
+    }
+
+    #[test]
+    fn unavailable_error_names_the_missing_interpreter_and_the_unusable_dirs() {
+        let err = BuiltinAgentUnavailable {
+            name: "envoy".to_string(),
+            reason: UnavailableReason::RuntimeMissing {
+                candidates: vec!["python3".to_string(), "python".to_string()],
+            },
+        };
+        assert_eq!(
+            err.to_string(),
+            "Agent 'envoy' is built in but is not available: no Python interpreter found on PATH (tried python3, python)"
+        );
+        let err = BuiltinAgentUnavailable {
+            name: "envoy".to_string(),
+            reason: UnavailableReason::RuntimeUnusable {
+                tried: vec![
+                    ("/usr/bin/python3".to_string(), "exited with 3".to_string()),
+                    ("/opt/python".to_string(), "No such file".to_string()),
+                ],
+            },
+        };
+        assert_eq!(
+            err.to_string(),
+            "Agent 'envoy' is built in but is not available: no usable Python 3.9+ interpreter on PATH (/usr/bin/python3: exited with 3; /opt/python: No such file)"
+        );
+        let err = BuiltinAgentUnavailable {
+            name: "envoy".to_string(),
+            reason: UnavailableReason::NoExecutableDir {
+                primary: "noexec".to_string(),
+                fallback: "read-only".to_string(),
+            },
+        };
+        let text = err.to_string();
+        assert!(text.contains("temp dir: noexec"), "{text}");
+        assert!(text.contains("cache dir: read-only"), "{text}");
+    }
+
+    #[test]
+    #[serial]
+    fn default_source_methods_report_no_reason_and_no_runtime() {
+        let _guard = BuiltinSourceGuard::new(Arc::new(FixedDirSource(PathBuf::from("/x"))));
+        assert_eq!(builtin_agent_unavailable_reason(ENVOY_AGENT_NAME), None);
+        assert_eq!(builtin_agent_tool_runtime(ENVOY_AGENT_NAME), None);
+        assert_eq!(builtin_agent_unavailable_reason("rag"), None);
+        assert_eq!(builtin_agent_tool_runtime("rag"), None);
     }
 }

@@ -141,6 +141,17 @@ pub fn log_file() -> PathBuf {
     cache_dir().join(format!("{}.log", env!("CARGO_CRATE_NAME")))
 }
 
+/// How many rotated generations the logger keeps next to the live file.
+pub const LOG_ARCHIVE_COUNT: u32 = 5;
+
+/// The rotated siblings the logger writes for `log`, in the roller's
+/// naming: `<stem>.archived.<n>.log`.
+pub fn log_archive_files(log: &Path) -> Vec<PathBuf> {
+    (0..LOG_ARCHIVE_COUNT)
+        .map(|index| log.with_extension(format!("archived.{index}.log")))
+        .collect()
+}
+
 pub fn sbx_kit_dir() -> PathBuf {
     cache_dir().join(SBX_KIT_DIR_NAME)
 }

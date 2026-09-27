@@ -9,3 +9,4 @@
 .sisyphus/**
 .coyote-project.json
 .coyote/memory/
+__pycache__/

@@ -4656,9 +4656,14 @@ impl RequestContext {
         if self.should_register_memory_tools() {
             functions.append_memory_functions();
         }
+        // `select_enabled_functions` is the authoritative barrier for
+        // built-ins; this gate covers the later scope refreshes.
         if self.rag.is_some()
             && app.function_calling_support
-            && !self.agent.as_ref().is_some_and(|a| a.is_graph())
+            && !self
+                .agent
+                .as_ref()
+                .is_some_and(|a| a.is_graph() || a.is_builtin())
         {
             functions.append_rag_query_functions();
         }
@@ -7956,6 +7961,51 @@ mod tests {
                 .iter()
                 .any(|f| f.name.starts_with("job__"))
         );
+    }
+
+    fn yaml_rag(label: &str) -> Arc<Rag> {
+        let dir = std::env::temp_dir().join(format!(
+            "coyote-{label}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("kb.yaml");
+        std::fs::write(
+            &path,
+            "driver: yaml\nembedding_model: test-seeded:test-embedder\nchunk_size: 1000\nchunk_overlap: 100\ntop_k: 5\n",
+        )
+        .unwrap();
+        let rag = run_async(Rag::load(&AppConfig::default(), "kb", &path)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        Arc::new(rag)
+    }
+
+    #[test]
+    #[serial]
+    fn rebuild_tool_scope_withholds_the_rag_tools_from_a_builtin_agent() {
+        let _guard = TestConfigDirGuard::new();
+        let app_state = app_state_with_mcp_config(false, &[]);
+        let mut ctx = RequestContext::new(app_state, WorkingMode::Cmd);
+        let app = ctx.app.config.clone();
+        ctx.rag = Some(yaml_rag("rag-gate"));
+
+        for (name, expected) in [("plain", true), ("envoy", false)] {
+            ctx.agent = Some(Agent::test_new(AgentConfig {
+                name: name.into(),
+                ..Default::default()
+            }));
+            run_async(ctx.rebuild_tool_scope(&app, None, utils::create_abort_signal())).unwrap();
+            let has_rag = ctx
+                .tool_scope
+                .functions
+                .declarations()
+                .iter()
+                .any(|f| f.name.starts_with(RAG_FUNCTION_PREFIX));
+            assert_eq!(has_rag, expected, "{name}");
+        }
     }
 
     #[test]

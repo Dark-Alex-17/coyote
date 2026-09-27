@@ -9,6 +9,7 @@ import sys
 import importlib.util
 from pathlib import Path
 
+# cwd-venv-begin
 def _ensure_cwd_venv():
     cwd = Path.cwd()
     venv_dir = cwd / ".venv"
@@ -25,6 +26,7 @@ def _ensure_cwd_venv():
     os.execv(str(py), [str(py)] + sys.argv)
 
 _ensure_cwd_venv()
+# cwd-venv-end
 
 
 def resolve_dir(env_name, default_path):

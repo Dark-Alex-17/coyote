@@ -105,11 +105,13 @@ impl Probe {
             .env("TMPDIR", &self.temp_root)
             .env("TMP", &self.temp_root)
             .env("TEMP", &self.temp_root)
+            .env("XDG_CACHE_HOME", &self.temp_root)
             .env("TERM", "xterm-256color")
             .env_remove("IS_SANDBOX")
             .env_remove("COYOTE_PROVIDER")
             .env_remove("COYOTE_PLATFORM")
             .env_remove("COYOTE_ENV_FILE")
+            .env_remove("COYOTE_CACHE_DIR")
             .env_remove("COYOTE_LEFT_PROMPT")
             .env_remove("COYOTE_RIGHT_PROMPT")
             .env_remove("ENVOY_DATA_DIR")
@@ -211,10 +213,12 @@ fn strip_escapes(bytes: &[u8]) -> String {
 /// set and leaves. Expected: the switch is accepted (the reservation refuses
 /// `agent__spawn`, not a human at the prompt), the embedded agent is materialized
 /// into exactly one owner-only dir under the process temp dir and never under
-/// `<config_dir>/agents/`, the tool catalog contains no execute, write,
-/// spawn, memory, job, skill or mesh tool, and `.exit` removes the temp dir.
+/// `<config_dir>/agents/`, the tool catalog holds exactly the bundled
+/// read-only file tools and the user escalation tools (no execute, write,
+/// spawn, memory, job, skill or mesh tool), and `.exit` removes the temp dir.
 #[test]
-fn repl_agent_envoy_materializes_privately_shows_only_escalation_tools_and_exits_clean() {
+fn repl_agent_envoy_materializes_privately_shows_only_read_only_and_escalation_tools_and_exits_clean()
+ {
     let probe = Probe::new("switch");
     let mut session = spawn_repl(probe.command());
 
@@ -283,17 +287,21 @@ fn repl_agent_envoy_materializes_privately_shows_only_escalation_tools_and_exits
         !tools.is_empty(),
         ".info tools: expected at least the user escalation tools, got nothing\n{listing:?}"
     );
+    let read_only = ["fs_read", "fs_grep", "fs_glob"];
     for tool in &tools {
         for forbidden in [
             "execute_command",
             "fs_write",
             "fs_patch",
+            "fs_mkdir",
+            "fs_rm",
             "agent__",
             "memory__",
             "mesh__",
             "job__",
             "skill__",
             "todo__",
+            "rag__",
         ] {
             assert!(
                 !tool.starts_with(forbidden),
@@ -301,8 +309,14 @@ fn repl_agent_envoy_materializes_privately_shows_only_escalation_tools_and_exits
             );
         }
         assert!(
-            tool.starts_with("user__"),
-            ".info tools: the envoy catalog holds `{tool}`, which is not a user escalation tool\nall tools: {tools:?}"
+            tool.starts_with("user__") || read_only.contains(&tool.as_str()),
+            ".info tools: the envoy catalog holds `{tool}`, which is neither a user escalation tool nor a bundled read-only tool\nall tools: {tools:?}"
+        );
+    }
+    for tool in read_only {
+        assert!(
+            tools.iter().any(|t| t == tool),
+            ".info tools: the bundled read-only tool `{tool}` is missing\nall tools: {tools:?}"
         );
     }
 
@@ -652,6 +666,9 @@ fn repl_leaving_the_envoy_restores_the_top_level_tools_and_reentry_is_idempotent
         "agent__",
         "mesh__",
         "memory__",
+        "rag__",
+        "fs_mkdir",
+        "fs_rm",
     ] {
         assert!(
             !envoy_listing.contains(forbidden),

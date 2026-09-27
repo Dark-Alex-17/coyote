@@ -4435,13 +4435,20 @@ mod tests {
         "fs_rm",
     ];
     #[cfg(unix)]
-    const FORBIDDEN_ENVOY_PREFIXES: [&str; 4] = [
+    const FORBIDDEN_ENVOY_PREFIXES: [&str; 7] = [
         AGENT_FUNCTION_PREFIX,
         crate::function::memory::MEMORY_FUNCTION_PREFIX,
         crate::function::jobs::JOB_FUNCTION_PREFIX,
         crate::function::mesh::MESH_FUNCTION_PREFIX,
+        crate::function::rag_query::RAG_FUNCTION_PREFIX,
+        crate::function::skill::SKILL_FUNCTION_PREFIX,
+        TODO_FUNCTION_PREFIX,
     ];
+    #[cfg(unix)]
+    const ENVOY_BUNDLED_TOOLS: [&str; 3] = ["fs_read", "fs_grep", "fs_glob"];
 
+    /// The envoy's catalog is exactly the user tools plus its bundled
+    /// read-only file tools; nothing else may appear.
     #[cfg(unix)]
     fn assert_no_forbidden_envoy_tools(names: &[String], via: &str) {
         for name in names {
@@ -4453,10 +4460,20 @@ mod tests {
                 "{via}: the envoy must not see '{name}': {names:?}"
             );
             assert!(
-                name.starts_with("user__"),
-                "{via}: the envoy only gets the user tools, found '{name}': {names:?}"
+                name.starts_with("user__") || ENVOY_BUNDLED_TOOLS.contains(&name.as_str()),
+                "{via}: the envoy only gets the user and bundled tools, found '{name}': {names:?}"
             );
         }
+        let mut expected: Vec<String> =
+            crate::function::user_interaction::user_interaction_function_declarations()
+                .into_iter()
+                .map(|f| f.name)
+                .chain(ENVOY_BUNDLED_TOOLS.iter().map(|s| s.to_string()))
+                .collect();
+        expected.sort();
+        let mut actual = names.to_vec();
+        actual.sort();
+        assert_eq!(actual, expected, "{via}");
     }
 
     // The envoy runs as a human-selected top-level agent while the mesh is
@@ -4474,7 +4491,7 @@ mod tests {
         let guard = TestConfigDirGuard::new();
         let _data_dir = EnvVarGuard::unset("ENVOY_DATA_DIR");
         let _config_file = EnvVarGuard::unset("ENVOY_CONFIG_FILE");
-        let source = Arc::new(EnvoySource::new());
+        let source = Arc::new(EnvoySource::with_stub_probes());
         let _source = BuiltinSourceGuard::new(source.clone());
         let shadow_dir = paths::agents_data_dir().join("envoy");
         create_dir_all(&shadow_dir).unwrap();
@@ -4627,6 +4644,25 @@ mod tests {
         assert!(!selected.is_empty(), "{selected:?}");
         assert_no_forbidden_envoy_tools(&selected, "request-time selection with enabled_tools all");
         assert!(ctx.select_enabled_mcp_servers(&role).is_empty());
+
+        // A RAG on the context must not surface `rag__*` to the envoy either.
+        let rag_dir = guard.path.join("rag");
+        create_dir_all(&rag_dir).unwrap();
+        let rag_file = rag_dir.join("kb.yaml");
+        write(
+            &rag_file,
+            "driver: yaml\nembedding_model: test-seeded:test-embedder\nchunk_size: 1000\nchunk_overlap: 100\ntop_k: 5\n",
+        )
+        .unwrap();
+        ctx.rag = Some(Arc::new(
+            crate::rag::Rag::load(&app, "kb", &rag_file).await.unwrap(),
+        ));
+        let model_facing: Vec<String> = ctx
+            .select_enabled_functions(&crate::config::Role::new("r", "p"))
+            .into_iter()
+            .map(|f| f.name)
+            .collect();
+        assert_no_forbidden_envoy_tools(&model_facing, "select_enabled_functions with a rag");
 
         let result = handle_spawn(&mut ctx, &json!({"agent": "envoy", "prompt": "p"}))
             .await

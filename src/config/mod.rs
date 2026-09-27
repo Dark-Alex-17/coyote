@@ -5,6 +5,8 @@ pub(crate) mod builtin_manifest;
 mod bundles;
 pub(crate) mod conflict;
 pub(crate) mod envoy;
+#[cfg(test)]
+mod envoy_tools_tests;
 mod input;
 mod install_remote;
 pub(crate) mod instructions;
@@ -66,9 +68,10 @@ pub use self::request_context::{
     jobs_enabled, mesh_tools_available, should_inject_skill_instructions,
 };
 pub use self::reserved_agents::{
-    BuiltinAgentSource, BuiltinAgentUnavailable, RESERVED_AGENT_NAMES, builtin_agent_description,
-    builtin_agent_dir, builtin_default_description, register_builtin_source, reserved_agent,
-    reserved_agent_refusal,
+    BuiltinAgentSource, BuiltinAgentUnavailable, RESERVED_AGENT_NAMES, UnavailableReason,
+    builtin_agent_description, builtin_agent_dir, builtin_agent_tool_runtime,
+    builtin_agent_unavailable_reason, builtin_default_description, register_builtin_source,
+    reserved_agent, reserved_agent_refusal,
 };
 pub use self::role::{
     CODE_ROLE, CREATE_TITLE_ROLE, EXPLAIN_SHELL_ROLE, Role, RoleLike, SHELL_ROLE,
@@ -437,6 +440,14 @@ impl Default for Config {
 
             clients: vec![],
         }
+    }
+}
+
+/// The top-level session's transcript file, honouring its env override.
+pub fn default_messages_file() -> PathBuf {
+    match env::var(get_env_name("messages_file")) {
+        Ok(value) => PathBuf::from(value),
+        Err(_) => paths::cache_dir().join(MESSAGES_FILE_NAME),
     }
 }
 

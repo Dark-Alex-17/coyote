@@ -80,10 +80,21 @@ impl BinaryType<'_> {
     }
 }
 
-/// Env the tool shims of a built-in agent need to locate their root and
-/// functions dir. Empty for anything but a registered reserved agent.
-/// `<NAME>_FUNCTIONS_DIR` points inside the envoy dir; nothing creates it
-/// yet, the envoy ships no tool shims.
+/// Env the tool shims of a built-in agent need to locate their root,
+/// functions dir, the directory their read-only tools are confined to and
+/// the directories those tools must never read. Empty for anything but a
+/// registered reserved agent.
+/// `<NAME>_FUNCTIONS_DIR` points inside the envoy dir; nothing creates it.
+/// `<NAME>_ROOT_DIR` is the canonical process cwd; when that cannot be
+/// resolved it is emitted empty so an inherited value is still overridden
+/// and `tools.py` refuses every path.
+/// `<NAME>_DENY_DIRS` names Coyote's own config, cache, workspace config,
+/// functions, rags, macros, roles, hooks, skills and sessions dirs plus the
+/// config, env, messages and log files and the log's rotated generations
+/// (each relocatable through its own env var, so it may sit inside the cwd
+/// outside every denied dir), joined with the platform path-list
+/// separator. An entry that cannot be canonicalized is passed as
+/// configured, so `tools.py` still sees it.
 pub(crate) fn builtin_agent_env(agent_name: Option<&str>) -> Vec<(String, String)> {
     let Some(canonical) = agent_name.and_then(crate::config::reserved_agent) else {
         return Vec::new();
@@ -92,12 +103,44 @@ pub(crate) fn builtin_agent_env(agent_name: Option<&str>) -> Vec<(String, String
         return Vec::new();
     };
     let name = normalize_env_name(canonical);
+    let root = env::current_dir()
+        .and_then(dunce::canonicalize)
+        .map(|path| path.display().to_string())
+        .unwrap_or_default();
+    let log_path = paths::log_config().ok().and_then(|(_, path)| path);
+    let mut deny_paths = vec![
+        paths::config_dir(),
+        paths::cache_dir(),
+        paths::workspace_config_dir(),
+        paths::config_file(),
+        paths::env_file(),
+        paths::functions_dir(),
+        paths::rags_dir(),
+        paths::macros_dir(),
+        paths::roles_dir(),
+        paths::hooks_dir(),
+        paths::skills_dir(),
+        crate::config::default_sessions_dir(),
+        crate::config::default_messages_file(),
+    ];
+    if let Some(log) = log_path {
+        deny_paths.extend(paths::log_archive_files(&log));
+        deny_paths.push(log);
+    }
+    let deny_dirs = deny_paths
+        .iter()
+        .map(|path| dunce::canonicalize(path).unwrap_or_else(|_| path.clone()))
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(PATH_SEP);
     vec![
         (format!("{name}_DATA_DIR"), dir.display().to_string()),
         (
             format!("{name}_FUNCTIONS_DIR"),
             dir.join("functions").display().to_string(),
         ),
+        (format!("{name}_ROOT_DIR"), root),
+        (format!("{name}_DENY_DIRS"), deny_dirs),
     ]
 }
 
@@ -160,6 +203,8 @@ const BUILTIN_AGENT_CHILD_ENV_KEYS: &[&str] = &[
     "COYOTE_CURRENT_MODEL",
     "ENVOY_DATA_DIR",
     "ENVOY_FUNCTIONS_DIR",
+    "ENVOY_ROOT_DIR",
+    "ENVOY_DENY_DIRS",
 ];
 
 /// Windows env names are case-insensitive, so the allow-list matches that way.
@@ -803,6 +848,11 @@ impl Functions {
     pub fn init_agent(name: &str, global_tools: &[String]) -> Result<Self> {
         Self::remove_stale_agent_bin_entries(name)?;
 
+        let builtin = crate::config::reserved_agent(name).is_some();
+        if builtin && !global_tools.is_empty() {
+            warn!("Ignoring global tools declared for built-in agent {name}: {global_tools:?}");
+        }
+        let global_tools: &[String] = if builtin { &[] } else { global_tools };
         let global_tools_declarations = if !global_tools.is_empty() {
             info!("Loading global tools for agent: {name}: {global_tools:?}");
             let tools_declarations = Self::build_global_tool_declarations(global_tools, false)?;
@@ -1331,22 +1381,73 @@ impl Functions {
             bail!("Unsupported tool file extension: {}", language.as_ref());
         }
 
-        let custom_runtime = extract_shebang_runtime(&tools_file);
-        let binary_type = if crate::config::reserved_agent(name).is_some() {
-            BinaryType::BuiltinAgent
-        } else {
-            BinaryType::Agent
+        // A built-in never takes its interpreter from the tools file or the
+        // cwd; only the one its source probed.
+        let (binary_type, custom_runtime) = match crate::config::reserved_agent(name) {
+            Some(canonical) => {
+                if language != Language::Python {
+                    bail!(
+                        "Built-in agent '{canonical}' ships {} tools; only Python is supported",
+                        language.as_ref()
+                    );
+                }
+                let runtime =
+                    crate::config::builtin_agent_tool_runtime(canonical).ok_or_else(|| {
+                        anyhow!("Built-in agent '{canonical}' has no probed tool runtime")
+                    })?;
+                (
+                    BinaryType::BuiltinAgent,
+                    Some(runtime.display().to_string()),
+                )
+            }
+            None => (BinaryType::Agent, extract_shebang_runtime(&tools_file)),
         };
         Self::build_binaries(name, language, binary_type, custom_runtime.as_deref())
+    }
+
+    const CWD_VENV_BEGIN: &str = "# cwd-venv-begin\n";
+    const CWD_VENV_END: &str = "# cwd-venv-end\n";
+
+    /// A built-in's shim must never re-exec into the user's project venv, so
+    /// its render drops the marked block and refuses a template without one;
+    /// every other render keeps the block and loses only the marker lines.
+    fn strip_cwd_venv_block(content: &str, drop_block: bool) -> Result<String> {
+        let markers = match (
+            content.find(Self::CWD_VENV_BEGIN),
+            content.find(Self::CWD_VENV_END),
+        ) {
+            (Some(begin), Some(end)) if begin < end => Some((begin, end)),
+            _ => None,
+        };
+        match (markers, drop_block) {
+            (Some((begin, end)), true) => Ok(format!(
+                "{}{}",
+                &content[..begin],
+                &content[end + Self::CWD_VENV_END.len()..]
+            )),
+            (None, true) => bail!(
+                "The shim template lacks the cwd-venv markers a built-in agent's render requires"
+            ),
+            (Some(_), false) => Ok(content.replacen(Self::CWD_VENV_BEGIN, "", 1).replacen(
+                Self::CWD_VENV_END,
+                "",
+                1,
+            )),
+            (None, false) => Ok(content.to_string()),
+        }
     }
 
     fn render_shim_template(
         content_template: &str,
         binary_name: &str,
         binary_type: &BinaryType,
-    ) -> String {
+    ) -> Result<String> {
         let functions_dir_env = get_env_name("functions_dir");
-        match binary_type {
+        let content_template = Self::strip_cwd_venv_block(
+            content_template,
+            matches!(binary_type, BinaryType::BuiltinAgent),
+        )?;
+        let rendered = match binary_type {
             BinaryType::Tool(None) => content_template
                 .replace("{function_name}", binary_name)
                 .replace("{root_dir_env}", &functions_dir_env)
@@ -1378,7 +1479,8 @@ impl Functions {
                     .replace("{functions_dir_rel}", "../functions")
             }
         }
-        .replace("{functions_dir_env}", &functions_dir_env)
+        .replace("{functions_dir_env}", &functions_dir_env);
+        Ok(rendered)
     }
 
     #[cfg(windows)]
@@ -1424,7 +1526,7 @@ impl Functions {
             )
         })?;
         let content_template = unsafe { std::str::from_utf8_unchecked(&embedded_file.data) };
-        let content = Self::render_shim_template(content_template, binary_name, &binary_type);
+        let content = Self::render_shim_template(content_template, binary_name, &binary_type)?;
         write_file_atomic(&binary_script_file, &content, None)?;
 
         info!(
@@ -1473,6 +1575,10 @@ impl Functions {
         // %~dp0 (the .cmd's own directory) keeps the launcher relocatable: no
         // absolute paths may be baked into it (see render_shim_template).
         let script_name = format!("run-{binary_name}.{}", language.to_extension());
+        let launch = match binary_type {
+            BinaryType::BuiltinAgent => format!("\"{run}\" -I -B \"%~dp0{script_name}\" %*"),
+            _ => format!("{run} \"%~dp0{script_name}\" %*"),
+        };
         let content = formatdoc!(
             r#"
 						@echo off
@@ -1480,7 +1586,7 @@ impl Functions {
 
 						set "bin_dir=%~dp0"
 
-						{run} "%~dp0{script_name}" %*"#,
+						{launch}"#,
         );
 
         write_file_atomic(&binary_file, &content, None)?;
@@ -1522,7 +1628,32 @@ impl Functions {
             )
         })?;
         let content_template = unsafe { std::str::from_utf8_unchecked(&embedded_file.data) };
-        let mut content = Self::render_shim_template(content_template, binary_name, &binary_type);
+        let mut content = Self::render_shim_template(content_template, binary_name, &binary_type)?;
+        let bin_dir = binary_file
+            .parent()
+            .expect("Failed to get parent directory of binary file");
+
+        if matches!(binary_type, BinaryType::BuiltinAgent) {
+            let runtime = custom_runtime.ok_or_else(|| {
+                anyhow!("Built-in agent '{binary_name}' has no probed tool runtime")
+            })?;
+            // The interpreter is named once, quoted, in a wrapper: shebangs
+            // split on spaces and have a length limit, so the script itself
+            // carries none. `-I` keeps user site-packages and PYTHON*
+            // variables out; `-B` keeps the tool child from writing a
+            // `__pycache__` next to the script.
+            let script_file = bin_dir.join(format!("run-{binary_name}.py"));
+            if content.starts_with("#!") {
+                content = content[content.find('\n').unwrap_or(content.len())..].to_string();
+            }
+            write_file_atomic(&script_file, &content, Some(0o600))?;
+            let wrapper = format!(
+                "#!/bin/sh\nexec {} -I -B \"$(dirname \"$0\")/run-{binary_name}.py\" \"$@\"\n",
+                sh_double_quote(runtime)
+            );
+            write_file_atomic(&binary_file, &wrapper, Some(0o700))?;
+            return Ok(());
+        }
 
         if let Some(rt) = custom_runtime
             && let Some(newline_pos) = content.find('\n')
@@ -1531,9 +1662,6 @@ impl Functions {
         }
 
         if language == Language::TypeScript {
-            let bin_dir = binary_file
-                .parent()
-                .expect("Failed to get parent directory of binary file");
             let script_file = bin_dir.join(format!("run-{binary_name}.ts"));
             write_file_atomic(&script_file, &content, Some(0o755))?;
 
@@ -1550,6 +1678,21 @@ impl Functions {
 
         Ok(())
     }
+}
+
+/// POSIX double-quoting: only `\`, `"`, `$` and a backtick are special.
+#[cfg(not(windows))]
+fn sh_double_quote(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('"');
+    for ch in value.chars() {
+        if matches!(ch, '\\' | '"' | '$' | '`') {
+            quoted.push('\\');
+        }
+        quoted.push(ch);
+    }
+    quoted.push('"');
+    quoted
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2543,6 +2686,28 @@ pub(crate) fn tool_timeout_secs(config_value: Option<u64>) -> u64 {
         .unwrap_or(1800)
 }
 
+/// Built-in agents' tool children are never unlimited: peer-controlled text
+/// reaches them, and a regex search in CPython cannot be interrupted from
+/// inside the tool, so the kill from this side is the only reliable bound.
+pub(crate) const BUILTIN_TOOL_TIMEOUT_SECS: u64 = 30;
+
+pub(crate) fn builtin_tool_timeout_secs(configured: Option<u64>, cap: u64) -> u64 {
+    let t = tool_timeout_secs(configured);
+    if t == 0 { cap } else { t.min(cap) }
+}
+
+/// Parenthetical for a timed-out tool call; a hermetic (built-in) child can
+/// never be made unlimited.
+pub(crate) fn timeout_hint(hermetic: bool) -> String {
+    if hermetic {
+        format!(
+            "set tool_timeout in config or COYOTE_TOOL_TIMEOUT to adjust; built-in agent tools are capped at {BUILTIN_TOOL_TIMEOUT_SECS}s"
+        )
+    } else {
+        "set tool_timeout in config or COYOTE_TOOL_TIMEOUT to adjust; 0 = unlimited".to_string()
+    }
+}
+
 pub fn run_llm_function(
     cmd_name: String,
     cmd_args: Vec<String>,
@@ -2679,7 +2844,11 @@ pub fn run_llm_function(
         buf
     });
 
-    let timeout_secs = tool_timeout_secs(tool_timeout);
+    let timeout_secs = if hermetic {
+        builtin_tool_timeout_secs(tool_timeout, BUILTIN_TOOL_TIMEOUT_SECS)
+    } else {
+        tool_timeout_secs(tool_timeout)
+    };
     let deadline = (timeout_secs > 0).then(|| Instant::now() + Duration::from_secs(timeout_secs));
     let status = loop {
         match child.try_wait() {
@@ -2694,8 +2863,9 @@ pub fn run_llm_function(
             let _ = child.wait();
             drop(stdout_thread);
             drop(stderr_thread);
+            let hint = timeout_hint(hermetic);
             let tool_error_message = format!(
-                "Tool call '{command_name}' timed out after {timeout_secs}s and was killed (set tool_timeout in config or COYOTE_TOOL_TIMEOUT to adjust; 0 = unlimited)"
+                "Tool call '{command_name}' timed out after {timeout_secs}s and was killed ({hint})"
             );
             emit_tool_warning(
                 quiet,
@@ -5080,6 +5250,28 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn builtin_tool_timeout_secs_caps_and_never_goes_unlimited() {
+        let _env = crate::testing::EnvVarGuard::unset(get_env_name("tool_timeout"));
+
+        assert_eq!(builtin_tool_timeout_secs(None, 30), 30);
+        assert_eq!(builtin_tool_timeout_secs(Some(0), 30), 30);
+        assert_eq!(builtin_tool_timeout_secs(Some(5), 30), 5);
+        assert_eq!(builtin_tool_timeout_secs(Some(1800), 30), 30);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn sh_double_quote_escapes_what_double_quotes_do_not() {
+        assert_eq!(sh_double_quote("/usr/bin/python3"), "\"/usr/bin/python3\"");
+        assert_eq!(sh_double_quote("a b"), "\"a b\"");
+        assert_eq!(sh_double_quote(r"a\b"), r#""a\\b""#);
+        assert_eq!(sh_double_quote(r#"a"b"#), r#""a\"b""#);
+        assert_eq!(sh_double_quote("$HOME"), r#""\$HOME""#);
+        assert_eq!(sh_double_quote("`id`"), r#""\`id\`""#);
+    }
+
+    #[test]
     fn bin_entry_stem_strips_run_prefix_and_extension() {
         assert_eq!(bin_entry_stem("fs_grep"), "fs_grep");
         assert_eq!(bin_entry_stem("fs_grep.cmd"), "fs_grep");
@@ -5237,7 +5429,7 @@ mod tests {
     fn rendered_builtin_agent_shim(script: &str) -> String {
         let template = FunctionAssets::get(script).unwrap();
         let template = std::str::from_utf8(&template.data).unwrap();
-        Functions::render_shim_template(template, "envoy", &BinaryType::BuiltinAgent)
+        Functions::render_shim_template(template, "envoy", &BinaryType::BuiltinAgent).unwrap()
     }
 
     fn assert_builtin_shim_roots_at_the_envoy_dir() {
@@ -5246,29 +5438,90 @@ mod tests {
             python.contains(r#"resolve_dir("ENVOY_DATA_DIR", os.path.join(self_dir, ".."))"#),
             "{python}"
         );
-        let bash = rendered_builtin_agent_shim("scripts/run-agent.sh");
-        assert!(
-            bash.contains(r#"resolve_dir "ENVOY_DATA_DIR" "$self_dir/..""#),
-            "{bash}"
-        );
-        assert!(
-            bash.contains(r#"resolve_dir "ENVOY_FUNCTIONS_DIR" "$self_dir/../functions""#),
-            "{bash}"
-        );
-        for content in [python, bash] {
-            assert!(!content.contains(&get_env_name("config_dir")), "{content}");
-            assert!(
-                !content.contains(&get_env_name("functions_dir")),
-                "{content}"
-            );
-            assert!(!content.contains("{root_dir_env}"), "{content}");
-            assert!(!content.contains("{agent_name}"), "{content}");
-        }
+        assert!(!python.contains(&get_env_name("config_dir")), "{python}");
+        assert!(!python.contains(&get_env_name("functions_dir")), "{python}");
+        assert!(!python.contains("{root_dir_env}"), "{python}");
+        assert!(!python.contains("{agent_name}"), "{python}");
+        // The bash template carries no cwd-venv block to drop, and a
+        // built-in ships Python tools only: its render is refused.
+        let bash = FunctionAssets::get("scripts/run-agent.sh").unwrap();
+        let bash = std::str::from_utf8(&bash.data).unwrap();
+        let err =
+            Functions::render_shim_template(bash, "envoy", &BinaryType::BuiltinAgent).unwrap_err();
+        assert!(err.to_string().contains("cwd-venv markers"), "{err}");
     }
 
     #[test]
     fn builtin_agent_shim_never_roots_at_the_config_dir() {
         assert_builtin_shim_roots_at_the_envoy_dir();
+    }
+
+    fn run_agent_py_template() -> String {
+        let template = FunctionAssets::get("scripts/run-agent.py").unwrap();
+        std::str::from_utf8(&template.data).unwrap().to_string()
+    }
+
+    #[test]
+    fn run_agent_py_marks_its_cwd_venv_block_exactly_once() {
+        let template = run_agent_py_template();
+        assert_eq!(template.matches(Functions::CWD_VENV_BEGIN).count(), 1);
+        assert_eq!(template.matches(Functions::CWD_VENV_END).count(), 1);
+        assert!(template.find(Functions::CWD_VENV_BEGIN) < template.find(Functions::CWD_VENV_END));
+        let block = &template[template.find(Functions::CWD_VENV_BEGIN).unwrap()
+            ..template.find(Functions::CWD_VENV_END).unwrap()];
+        assert!(block.contains("def _ensure_cwd_venv():"), "{block}");
+        assert!(block.contains("\n_ensure_cwd_venv()\n"), "{block}");
+        assert!(block.contains("os.execv("), "{block}");
+    }
+
+    #[test]
+    fn builtin_agent_shim_never_re_execs_into_a_cwd_venv() {
+        let builtin = rendered_builtin_agent_shim("scripts/run-agent.py");
+        for hazard in [".venv", "activate", "execv", "_ensure_cwd_venv", "cwd-venv"] {
+            assert!(!builtin.contains(hazard), "{hazard}: {builtin}");
+        }
+        assert!(builtin.contains("def main():"), "{builtin}");
+    }
+
+    #[test]
+    fn user_agent_shim_keeps_the_cwd_venv_block_and_loses_only_the_markers() {
+        let template = run_agent_py_template();
+        let agent = Functions::render_shim_template(&template, "demo", &BinaryType::Agent).unwrap();
+        assert!(agent.contains("def _ensure_cwd_venv():"), "{agent}");
+        assert!(agent.contains("\n_ensure_cwd_venv()\n"), "{agent}");
+        assert!(!agent.contains("cwd-venv"), "{agent}");
+        let unmarked = template
+            .replacen(Functions::CWD_VENV_BEGIN, "", 1)
+            .replacen(Functions::CWD_VENV_END, "", 1);
+        assert_eq!(
+            agent,
+            Functions::render_shim_template(&unmarked, "demo", &BinaryType::Agent).unwrap()
+        );
+        let tool =
+            Functions::render_shim_template(&template, "t", &BinaryType::Tool(None)).unwrap();
+        assert!(tool.contains("_ensure_cwd_venv()"), "{tool}");
+        assert!(!tool.contains("cwd-venv"), "{tool}");
+    }
+
+    #[test]
+    fn builtin_agent_render_refuses_a_template_without_the_cwd_venv_markers() {
+        let template = run_agent_py_template();
+        let unmarked = template
+            .replacen(Functions::CWD_VENV_BEGIN, "", 1)
+            .replacen(Functions::CWD_VENV_END, "", 1);
+        let reversed = template
+            .replacen(Functions::CWD_VENV_BEGIN, "# swap\n", 1)
+            .replacen(Functions::CWD_VENV_END, Functions::CWD_VENV_BEGIN, 1)
+            .replacen("# swap\n", Functions::CWD_VENV_END, 1);
+        for broken in [&unmarked, &reversed] {
+            let err = Functions::render_shim_template(broken, "envoy", &BinaryType::BuiltinAgent)
+                .unwrap_err();
+            assert!(err.to_string().contains("cwd-venv markers"), "{err}");
+            assert!(
+                Functions::render_shim_template(broken, "demo", &BinaryType::Agent).is_ok(),
+                "a user render keeps passing a marker-less template through"
+            );
+        }
     }
 
     #[test]
@@ -5281,23 +5534,153 @@ mod tests {
         assert!(builtin_agent_env(Some("rag")).is_empty());
         assert!(builtin_agent_env(Some("envoy")).is_empty());
 
-        let source = Arc::new(EnvoySource::new());
+        let source = Arc::new(EnvoySource::with_stub_probes());
         let _source = BuiltinSourceGuard::new(source.clone());
         let dir = crate::config::builtin_agent_dir("envoy").unwrap();
-        let expected = vec![
+        let root = dunce::canonicalize(env::current_dir().unwrap()).unwrap();
+        assert!(root.is_absolute());
+        let pinned = vec![
             ("ENVOY_DATA_DIR".to_string(), dir.display().to_string()),
             (
                 "ENVOY_FUNCTIONS_DIR".to_string(),
                 dir.join("functions").display().to_string(),
             ),
+            ("ENVOY_ROOT_DIR".to_string(), root.display().to_string()),
         ];
         {
-            let _guard = crate::testing::TestConfigDirGuard::new("builtin-env-set");
+            let guard = crate::testing::TestConfigDirGuard::new("builtin-env-set");
+            let cache = temp_file("-builtin-env-cache-", "");
+            fs::create_dir_all(&cache).unwrap();
+            let _cache = crate::testing::EnvVarGuard::set(get_env_name("cache_dir"), &cache);
+            let workspace = temp_file("-builtin-env-workspace-", "");
+            fs::create_dir_all(&workspace).unwrap();
+            let _workspace =
+                crate::testing::EnvVarGuard::set(get_env_name("workspace_config_dir"), &workspace);
+            let config_file = temp_file("-builtin-env-config-", ".yaml");
+            fs::write(&config_file, "").unwrap();
+            let _config_file =
+                crate::testing::EnvVarGuard::set(get_env_name("config_file"), &config_file);
+            let env_file = temp_file("-builtin-env-env-", ".env");
+            fs::write(&env_file, "").unwrap();
+            let _env_file = crate::testing::EnvVarGuard::set(get_env_name("env_file"), &env_file);
+            let functions = temp_file("-builtin-env-functions-", "");
+            fs::create_dir_all(&functions).unwrap();
+            let _functions =
+                crate::testing::EnvVarGuard::set(get_env_name("functions_dir"), &functions);
+            let rags = temp_file("-builtin-env-rags-", "");
+            fs::create_dir_all(&rags).unwrap();
+            let _rags = crate::testing::EnvVarGuard::set(get_env_name("rags_dir"), &rags);
+            let macros = temp_file("-builtin-env-macros-", "");
+            fs::create_dir_all(&macros).unwrap();
+            let _macros = crate::testing::EnvVarGuard::set(get_env_name("macros_dir"), &macros);
+            let roles = temp_file("-builtin-env-roles-", "");
+            fs::create_dir_all(&roles).unwrap();
+            let _roles = crate::testing::EnvVarGuard::set(get_env_name("roles_dir"), &roles);
+            let hooks = temp_file("-builtin-env-hooks-", "");
+            fs::create_dir_all(&hooks).unwrap();
+            let _hooks = crate::testing::EnvVarGuard::set(get_env_name("hooks_dir"), &hooks);
+            let skills = temp_file("-builtin-env-skills-", "");
+            fs::create_dir_all(&skills).unwrap();
+            let _skills = crate::testing::EnvVarGuard::set(get_env_name("skills_dir"), &skills);
+            let log_path = temp_file("-builtin-env-log-", ".log");
+            fs::write(&log_path, "").unwrap();
+            let _log_path = crate::testing::EnvVarGuard::set(get_env_name("log_path"), &log_path);
+            let sessions = temp_file("-builtin-env-sessions-", "");
+            fs::create_dir_all(&sessions).unwrap();
+            let _sessions =
+                crate::testing::EnvVarGuard::set(get_env_name("sessions_dir"), &sessions);
+            let messages = temp_file("-builtin-env-messages-", ".md");
+            fs::write(&messages, "").unwrap();
+            let _messages =
+                crate::testing::EnvVarGuard::set(get_env_name("messages_file"), &messages);
+            let archives = paths::log_archive_files(&log_path);
+            assert_eq!(paths::workspace_config_dir(), workspace);
+            let mut deny_paths = vec![
+                &guard.path,
+                &cache,
+                &workspace,
+                &config_file,
+                &env_file,
+                &functions,
+                &rags,
+                &macros,
+                &roles,
+                &hooks,
+                &skills,
+                &sessions,
+                &messages,
+            ];
+            deny_paths.extend(archives.iter());
+            deny_paths.push(&log_path);
+            let deny = deny_paths
+                .iter()
+                .map(|path| {
+                    let canonical =
+                        dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+                    canonical.display().to_string()
+                })
+                .collect::<Vec<_>>()
+                .join(PATH_SEP);
+            let mut expected = pinned.clone();
+            expected.push(("ENVOY_DENY_DIRS".to_string(), deny));
             assert_eq!(builtin_agent_env(Some("En-Voy")), expected);
+            fs::remove_dir_all(&cache).unwrap();
+            fs::remove_dir_all(&workspace).unwrap();
+            fs::remove_file(&config_file).unwrap();
+            fs::remove_file(&env_file).unwrap();
+            fs::remove_dir_all(&functions).unwrap();
+            fs::remove_dir_all(&rags).unwrap();
+            fs::remove_dir_all(&macros).unwrap();
+            fs::remove_dir_all(&roles).unwrap();
+            fs::remove_dir_all(&hooks).unwrap();
+            fs::remove_dir_all(&skills).unwrap();
+            fs::remove_file(&log_path).unwrap();
+            fs::remove_dir_all(&sessions).unwrap();
+            fs::remove_file(&messages).unwrap();
+            let _missing_cache = crate::testing::EnvVarGuard::set(
+                get_env_name("cache_dir"),
+                cache.join("never-created"),
+            );
+            let env = builtin_agent_env(Some("envoy"));
+            assert_eq!(
+                env[3],
+                (
+                    "ENVOY_DENY_DIRS".to_string(),
+                    vec![
+                        dunce::canonicalize(&guard.path).unwrap(),
+                        paths::cache_dir(),
+                        workspace,
+                        config_file,
+                        env_file,
+                        functions,
+                        rags,
+                        macros,
+                        roles,
+                        hooks,
+                        skills,
+                        sessions,
+                        messages,
+                    ]
+                    .into_iter()
+                    .chain(archives.iter().cloned())
+                    .chain(std::iter::once(log_path))
+                    .collect::<Vec<_>>()
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(PATH_SEP)
+                ),
+                "a deny entry that does not exist is passed as configured"
+            );
         }
         {
             let _unset = crate::testing::EnvVarGuard::unset(get_env_name("config_dir"));
-            assert_eq!(builtin_agent_env(Some("envoy")), expected);
+            let env = builtin_agent_env(Some("envoy"));
+            assert_eq!(env[..3], pinned);
+            assert_eq!(env[3].0, "ENVOY_DENY_DIRS");
+            for deny in env[3].1.split(PATH_SEP).filter(|s| !s.is_empty()) {
+                assert!(Path::new(deny).is_absolute(), "{deny}");
+            }
         }
         assert!(builtin_agent_env(Some("rag")).is_empty());
         source.remove_dir();
@@ -5318,6 +5701,8 @@ mod tests {
             "GRAPH_STATE_FILE",
             "LLM_SOMETHING",
             "ENVOY_DATA_DIR",
+            "ENVOY_ROOT_DIR",
+            "ENVOY_DENY_DIRS",
             "LC_ALL",
             "PATH",
             "HOME",
@@ -5334,7 +5719,15 @@ mod tests {
         keys.sort_unstable();
         assert_eq!(
             keys,
-            vec!["ENVOY_DATA_DIR", "HOME", "LC_ALL", "LLM_OUTPUT", "PATH"]
+            vec![
+                "ENVOY_DATA_DIR",
+                "ENVOY_DENY_DIRS",
+                "ENVOY_ROOT_DIR",
+                "HOME",
+                "LC_ALL",
+                "LLM_OUTPUT",
+                "PATH"
+            ]
         );
         assert_eq!(child["PATH"], "PATH-value");
         for dropped in [
@@ -5420,11 +5813,13 @@ mod tests {
         use crate::config::envoy::EnvoySource;
         use crate::config::reserved_agents::BuiltinSourceGuard;
 
-        let _guard = crate::testing::TestConfigDirGuard::new("builtin-env-pin");
+        let guard = crate::testing::TestConfigDirGuard::new("builtin-env-pin");
         let _data_dir = crate::testing::EnvVarGuard::set("ENVOY_DATA_DIR", "/evil");
         let _functions_dir =
             crate::testing::EnvVarGuard::set("ENVOY_FUNCTIONS_DIR", "/evil/functions");
-        let source = Arc::new(EnvoySource::new());
+        let _root_dir = crate::testing::EnvVarGuard::set("ENVOY_ROOT_DIR", "/evil");
+        let _deny_dirs = crate::testing::EnvVarGuard::set("ENVOY_DENY_DIRS", "/evil");
+        let source = Arc::new(EnvoySource::with_stub_probes());
         let _source = BuiltinSourceGuard::new(source.clone());
         let dir = crate::config::builtin_agent_dir("envoy").unwrap();
 
@@ -5432,7 +5827,7 @@ mod tests {
             "bash".into(),
             vec![
                 "-c".into(),
-                "printf '%s\\n%s' \"$ENVOY_DATA_DIR\" \"$ENVOY_FUNCTIONS_DIR\" > \"$LLM_OUTPUT\""
+                "printf '%s\\n%s\\n%s\\n%s' \"$ENVOY_DATA_DIR\" \"$ENVOY_FUNCTIONS_DIR\" \"$ENVOY_ROOT_DIR\" \"$ENVOY_DENY_DIRS\" > \"$LLM_OUTPUT\""
                     .into(),
             ],
             HashMap::new(),
@@ -5446,11 +5841,21 @@ mod tests {
 
         let lines: Vec<&str> = output.lines().collect();
         assert_eq!(
-            lines,
+            lines[..3],
             vec![
                 dir.display().to_string(),
-                dir.join("functions").display().to_string()
+                dir.join("functions").display().to_string(),
+                dunce::canonicalize(env::current_dir().unwrap())
+                    .unwrap()
+                    .display()
+                    .to_string(),
             ]
+        );
+        assert_eq!(lines.len(), 4, "{output}");
+        let config_dir = dunce::canonicalize(&guard.path).unwrap();
+        assert!(
+            lines[3].split(PATH_SEP).any(|d| Path::new(d) == config_dir),
+            "{output}"
         );
         assert!(!output.contains("/evil"), "{output}");
         source.remove_dir();
@@ -5522,6 +5927,61 @@ mod tests {
                 "{path}"
             );
         }
+
+        source.remove_dir();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn builtin_agent_tool_child_is_killed_at_the_capped_timeout() {
+        use crate::config::envoy::{EnvoySource, exec_probe};
+        use crate::config::reserved_agents::BuiltinSourceGuard;
+
+        let _guard = crate::testing::TestConfigDirGuard::new("builtin-shim-timeout");
+        let _env = crate::testing::EnvVarGuard::unset(get_env_name("tool_timeout"));
+        // The real exec probe, so a noexec temp dir falls back to the cache
+        // dir as in production instead of failing to spawn the shim below.
+        let source = Arc::new(EnvoySource::with_probes(
+            Box::new(|| Ok(PathBuf::from("/usr/bin/python3"))),
+            Box::new(exec_probe),
+        ));
+        let _source = BuiltinSourceGuard::new(source.clone());
+        let dir = crate::config::builtin_agent_dir("envoy").unwrap();
+        fs::create_dir_all(dir.join("bin")).unwrap();
+        write_file_atomic(
+            &dir.join("bin").join("envoy"),
+            "#!/bin/sh\nexec sleep 60\n",
+            Some(0o755),
+        )
+        .unwrap();
+
+        let started = Instant::now();
+        let output = run_llm_function(
+            "envoy".into(),
+            vec!["probe".into(), "{}".into()],
+            HashMap::new(),
+            Some("envoy".to_string()),
+            Some(1),
+            false,
+            None,
+        )
+        .unwrap()
+        .expect("a killed tool reports an error");
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(output.contains("tool_call_error"), "{output}");
+        assert!(output.contains("timed out after 1s"), "{output}");
+        assert!(
+            output.contains(&format!(
+                "built-in agent tools are capped at {BUILTIN_TOOL_TIMEOUT_SECS}s"
+            )),
+            "{output}"
+        );
+        assert!(!output.contains("0 = unlimited"), "{output}");
 
         source.remove_dir();
     }

@@ -21,8 +21,9 @@ use crate::config::prompts::{
     DEFAULT_TODO_INSTRUCTIONS, DEFAULT_USER_INTERACTION_INSTRUCTIONS,
 };
 use crate::config::{
-    BuiltinAgentUnavailable, RESERVED_AGENT_NAMES, builtin_agent_description, builtin_agent_dir,
-    builtin_default_description, reserved_agent,
+    BuiltinAgentUnavailable, RESERVED_AGENT_NAMES, UnavailableReason, builtin_agent_description,
+    builtin_agent_dir, builtin_agent_unavailable_reason, builtin_default_description,
+    reserved_agent,
 };
 use crate::function::write_file_atomic;
 use crate::graph::types::RagNode;
@@ -36,6 +37,7 @@ use inquire::{Text, validator::Validation};
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::LazyLock;
 use std::{env, path::Path};
 
 const DEFAULT_AGENT_NAME: &str = "rag";
@@ -363,6 +365,8 @@ impl Agent {
         let (name, agent_data_dir, config_path, graph_path) = if let Some(canonical) = reserved {
             let dir = builtin_agent_dir(canonical).ok_or_else(|| BuiltinAgentUnavailable {
                 name: canonical.to_string(),
+                reason: builtin_agent_unavailable_reason(canonical)
+                    .unwrap_or(UnavailableReason::NoSource),
             })?;
             let user_agents_dir = paths::agents_data_dir();
             if dir.starts_with(&user_agents_dir) {
@@ -508,7 +512,7 @@ impl Agent {
             None => HashMap::new(),
         };
 
-        if agent_config.auto_continue {
+        if !builtin && agent_config.auto_continue {
             functions.append_todo_functions();
         }
 
@@ -560,7 +564,7 @@ impl Agent {
             }
         }
 
-        if rag.is_some() && app.function_calling_support && graph_for_rag.is_none() {
+        if !builtin && rag.is_some() && app.function_calling_support && graph_for_rag.is_none() {
             functions.append_rag_query_functions();
         }
 
@@ -702,6 +706,9 @@ impl Agent {
     }
 
     pub fn mcp_server_names(&self) -> &[String] {
+        if self.is_builtin() {
+            return &[];
+        }
         &self.config.mcp_servers
     }
 
@@ -710,6 +717,9 @@ impl Agent {
     }
 
     pub fn skills_enabled(&self) -> Option<bool> {
+        if self.is_builtin() {
+            return Some(false);
+        }
         self.config.skills_enabled
     }
 
@@ -722,6 +732,9 @@ impl Agent {
     }
 
     pub fn memory(&self) -> Option<bool> {
+        if self.is_builtin() {
+            return Some(false);
+        }
         self.config.memory
     }
 
@@ -748,11 +761,11 @@ impl Agent {
             .or_else(|| self.shared_dynamic_instructions.clone())
             .unwrap_or_else(|| self.config.instructions.clone());
 
-        if self.config.auto_continue && self.config.inject_todo_instructions {
+        if self.auto_continue_enabled() && self.inject_todo_instructions() {
             output.push_str(DEFAULT_TODO_INSTRUCTIONS);
         }
 
-        if self.config.can_spawn_agents && self.config.inject_spawn_instructions {
+        if self.can_spawn_agents() && self.config.inject_spawn_instructions {
             output.push_str(DEFAULT_SPAWN_INSTRUCTIONS);
         }
 
@@ -836,7 +849,7 @@ impl Agent {
     }
 
     pub fn auto_continue_enabled(&self) -> bool {
-        self.config.auto_continue
+        !self.is_builtin() && self.config.auto_continue
     }
 
     pub fn max_auto_continues(&self) -> usize {
@@ -844,7 +857,7 @@ impl Agent {
     }
 
     pub fn inject_todo_instructions(&self) -> bool {
-        self.config.inject_todo_instructions
+        !self.is_builtin() && self.config.inject_todo_instructions
     }
 
     pub fn continuation_prompt_value(&self) -> Option<String> {
@@ -852,7 +865,7 @@ impl Agent {
     }
 
     pub fn inject_skill_instructions(&self) -> bool {
-        self.config.inject_skill_instructions
+        !self.is_builtin() && self.config.inject_skill_instructions
     }
 
     pub fn skill_instructions_value(&self) -> Option<String> {
@@ -860,10 +873,13 @@ impl Agent {
     }
 
     pub fn can_spawn_agents(&self) -> bool {
-        self.config.can_spawn_agents
+        !self.is_builtin() && self.config.can_spawn_agents
     }
 
     pub fn max_concurrent_agents(&self) -> usize {
+        if self.is_builtin() {
+            return 0;
+        }
         self.config.max_concurrent_agents
     }
 
@@ -892,6 +908,9 @@ impl Agent {
     }
 
     pub fn max_concurrent_jobs(&self) -> Option<usize> {
+        if self.is_builtin() {
+            return Some(0);
+        }
         self.config.max_concurrent_jobs
     }
 
@@ -912,15 +931,24 @@ impl Agent {
     }
 
     pub fn hooks(&self) -> &HooksMap {
-        &self.config.hooks
+        static NONE: LazyLock<HooksMap> = LazyLock::new(HooksMap::default);
+        if self.is_builtin() {
+            &NONE
+        } else {
+            &self.config.hooks
+        }
     }
 
     pub fn global_hooks(&self) -> &[String] {
-        &self.config.global_hooks
+        if self.is_builtin() {
+            &[]
+        } else {
+            &self.config.global_hooks
+        }
     }
 
     pub fn is_dynamic_instructions(&self) -> bool {
-        self.config.dynamic_instructions
+        !self.is_builtin() && self.config.dynamic_instructions
     }
 
     pub fn update_shared_dynamic_instructions(
@@ -1018,6 +1046,9 @@ impl RoleLike for Agent {
     }
 
     fn enabled_mcp_servers(&self) -> Option<Vec<String>> {
+        if self.is_builtin() {
+            return None;
+        }
         Some(self.config.mcp_servers.clone())
     }
 

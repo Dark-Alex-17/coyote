@@ -1,5 +1,5 @@
 use super::{FunctionDeclaration, JsonSchema};
-use crate::config::{RequestContext, Skill, SkillPolicy, paths};
+use crate::config::{Agent, RequestContext, Skill, SkillPolicy, paths};
 use crate::utils::create_abort_signal;
 
 use anyhow::{Result, bail};
@@ -82,6 +82,13 @@ pub async fn handle_skill_tool(
     let action = cmd_name
         .strip_prefix(SKILL_FUNCTION_PREFIX)
         .unwrap_or(cmd_name);
+
+    if ctx.agent.as_ref().is_some_and(Agent::is_builtin) {
+        return Ok(json!({
+            "status": "error",
+            "message": "Skill tools are never available to a built-in agent.",
+        }));
+    }
 
     let policy = SkillPolicy::effective(
         &ctx.app.config,
@@ -245,6 +252,8 @@ async fn handle_unload(ctx: &mut RequestContext, args: &Value) -> Result<Value> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{AgentConfig, AppState, WorkingMode};
+    use std::sync::Arc;
 
     #[test]
     fn declarations_have_three_entries() {
@@ -298,5 +307,35 @@ mod tests {
             .unwrap_or(true);
 
         assert!(required, "skill__list should have no required parameters");
+    }
+
+    #[test]
+    fn handle_skill_tool_refuses_a_builtin_agent_before_dispatch() {
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        ctx.agent = Some(Agent::test_new(AgentConfig {
+            name: "envoy".into(),
+            skills_enabled: Some(true),
+            ..Default::default()
+        }));
+        assert!(ctx.agent.as_ref().unwrap().is_builtin());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for action in ["list", "load", "unload", "nosuch"] {
+            let result = runtime
+                .block_on(handle_skill_tool(
+                    &mut ctx,
+                    &format!("{SKILL_FUNCTION_PREFIX}{action}"),
+                    &json!({"name": "code-review"}),
+                ))
+                .unwrap();
+            assert_eq!(result["status"], "error", "{action}: {result}");
+            assert_eq!(
+                result["message"], "Skill tools are never available to a built-in agent.",
+                "{action}: {result}"
+            );
+        }
     }
 }

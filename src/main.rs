@@ -912,7 +912,7 @@ fn setup_logger(acp_mode: bool) -> Result<Option<PathBuf>> {
                 .into_owned();
             let trigger = SizeTrigger::new(10 * 1024 * 1024);
             let roller = FixedWindowRoller::builder()
-                .build(&archive_pattern, 5)
+                .build(&archive_pattern, paths::LOG_ARCHIVE_COUNT)
                 .unwrap();
             let policy = CompoundPolicy::new(Box::new(trigger), Box::new(roller));
 
