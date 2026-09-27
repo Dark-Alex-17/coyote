@@ -1,7 +1,8 @@
 use crate::mesh::destination_address;
+use crate::mesh::protocol::{VersionRefusal, describe_version};
 use crate::mesh::r3::client::SizeBranch;
 use crate::mesh::r3::error::RefusalCode;
-use crate::mesh::r3::frame::{Envelope, PathHash, RequestId};
+use crate::mesh::r3::frame::{Envelope, EnvelopeError, PathHash, RequestId};
 use crate::mesh::r3::server::{Admission, InboundRequest, Reply, RequestHandler};
 use crate::mesh::r3::short;
 use crate::mesh::trust::{Decision, IdentityStanding, Rule, TrustStore};
@@ -170,7 +171,10 @@ enum Route {
 /// a peer the trust list does not name gets no reply and its bytes are never parsed, and
 /// `handle` reads the identity's standing again so a peer untrusted or blocked after
 /// `admit` let it through still gets no reply.
-/// Destination comes second, and it is the requester's own: each request names the
+/// The protocol version comes next, before the body is read: an envelope naming a version
+/// this node does not speak is answered with the version refusal and nothing else is
+/// judged, on every path alike, so a peer on another version learns that and only that.
+/// Destination comes after that, and it is the requester's own: each request names the
 /// instance asking, the destination judged is derived from that name and the identity
 /// proven on the link, and so a peer can only claim instances that are its own. A body
 /// that names no instance is refused without a knock. A known identity asking from an
@@ -300,9 +304,22 @@ impl RequestHandler for Dispatcher {
             log(short(&identity_hex), outcome);
             return Reply::Silent;
         }
-        let Some(envelope) = Envelope::from_value(request.data) else {
-            log(short(&identity_hex), "refused: unverifiable origin");
-            return self.refuse();
+        let envelope = match Envelope::from_value(request.data) {
+            Ok(envelope) => envelope,
+            Err(EnvelopeError::UnsupportedVersion { found }) => {
+                log(
+                    short(&identity_hex),
+                    &format!(
+                        "refused: unsupported protocol version {}",
+                        describe_version(found)
+                    ),
+                );
+                return Reply::Value(VersionRefusal::current(found).to_value());
+            }
+            Err(EnvelopeError::Malformed) => {
+                log(short(&identity_hex), "refused: unverifiable origin");
+                return self.refuse();
+            }
         };
         let destination_hash = destination_address(&envelope.origin.0, &identity.address_hash);
         let destination_hex = destination_hash.to_hex_string();

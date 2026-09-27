@@ -1,4 +1,5 @@
 use crate::mesh::hex_lower;
+use crate::mesh::protocol::{MESH_PROTOCOL_VERSION, protocol_supported};
 use crate::mesh::r3::error::R3Error;
 
 use rmpv::Value;
@@ -20,6 +21,7 @@ pub(crate) const NAME_HASH_LEN: usize = NAME_HASH_LENGTH;
 
 const NAME_HASH_KEY: &str = "name_hash";
 const BODY_KEY: &str = "body";
+const VERSION_KEY: &str = "v";
 
 /// `truncated_hash(path)`: SHA-256 of the UTF-8 path, first 16 bytes. Requests carry this,
 /// never the path itself.
@@ -195,16 +197,39 @@ impl OriginName {
     }
 }
 
-/// What every request body travels in: the requester's origin beside the body, as a
-/// msgpack map with `name_hash` and `body` keys.
+/// What every request body travels in: the protocol version and the requester's origin
+/// beside the body, as a msgpack map with `v`, `name_hash` and `body` keys.
 pub(crate) struct Envelope {
+    pub version: u16,
     pub origin: OriginName,
     pub body: Value,
 }
 
+/// Why a value is not an envelope this node will read. The version is judged first, so a
+/// peer on another version hears that and never a verdict on a body it may have shaped
+/// differently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum EnvelopeError {
+    /// `found` is `None` when the key is missing or not an unsigned 16-bit integer.
+    UnsupportedVersion {
+        found: Option<u16>,
+    },
+    Malformed,
+}
+
 impl Envelope {
+    /// An envelope at the protocol version this node speaks; production code builds no other.
+    pub(crate) fn new(origin: OriginName, body: Value) -> Self {
+        Self {
+            version: MESH_PROTOCOL_VERSION,
+            origin,
+            body,
+        }
+    }
+
     pub(crate) fn into_value(self) -> Value {
         Value::Map(vec![
+            (Value::from(VERSION_KEY), Value::from(self.version)),
             (
                 Value::from(NAME_HASH_KEY),
                 Value::Binary(self.origin.0.to_vec()),
@@ -213,29 +238,44 @@ impl Envelope {
         ])
     }
 
-    /// Both keys are required and the name hash must be binary of exactly `NAME_HASH_LEN`
-    /// bytes; keys this version does not know are ignored.
-    pub(crate) fn from_value(value: Value) -> Option<Self> {
+    /// All three keys are required and the name hash must be binary of exactly
+    /// `NAME_HASH_LEN` bytes; keys this version does not know are ignored. A missing `v`
+    /// is refused, not read as version 1: this is the version-1 rule, and pre-release
+    /// nothing older exists to be lenient toward.
+    pub(crate) fn from_value(value: Value) -> Result<Self, EnvelopeError> {
         let Value::Map(entries) = value else {
-            return None;
+            return Err(EnvelopeError::Malformed);
         };
+        let mut version = None;
         let mut origin = None;
         let mut body = None;
         for (key, value) in entries {
             match key.as_str() {
-                Some(NAME_HASH_KEY) => {
-                    let Value::Binary(bytes) = value else {
-                        return None;
-                    };
-                    origin = Some(OriginName(bytes.as_slice().try_into().ok()?));
+                Some(VERSION_KEY) => {
+                    version = value.as_u64().and_then(|v| u16::try_from(v).ok());
                 }
+                Some(NAME_HASH_KEY) => origin = Some(value),
                 Some(BODY_KEY) => body = Some(value),
                 _ => {}
             }
         }
-        Some(Self {
-            origin: origin?,
-            body: body?,
+        let version = match version {
+            Some(version) if protocol_supported(version) => version,
+            found => return Err(EnvelopeError::UnsupportedVersion { found }),
+        };
+        let Some(Value::Binary(bytes)) = origin else {
+            return Err(EnvelopeError::Malformed);
+        };
+        let origin = OriginName(
+            bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| EnvelopeError::Malformed)?,
+        );
+        Ok(Self {
+            version,
+            origin,
+            body: body.ok_or(EnvelopeError::Malformed)?,
         })
     }
 }

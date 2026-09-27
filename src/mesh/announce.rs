@@ -1,11 +1,11 @@
 use crate::config::MeshConfig;
 use crate::config::mesh_config::MeshInterface;
+use crate::mesh::protocol::MESH_PROTOCOL_VERSION;
 
 use anyhow::{Result, bail};
 
 /// Leading bytes that mark an announce as a Coyote node; anything else is another application.
 pub(crate) const ANNOUNCE_MAGIC: [u8; 4] = *b"COYM";
-pub(crate) const MESH_PROTOCOL_VERSION: u16 = 1;
 pub(crate) const MAX_DISPLAY_NAME_BYTES: usize = 64;
 
 /// This node's own floor between repeated announces of one destination: heartbeats are

@@ -352,6 +352,7 @@ fn send_error_kind(err: &SendError) -> &'static str {
         SendError::InvalidFields(_) => "invalid_fields",
         SendError::Refused(_) => "refused",
         SendError::Direct(_) => "direct",
+        SendError::IncompatibleVersion { .. } => "incompatible_version",
         SendError::NoPropagationNode => "no_propagation_node",
         SendError::Propagation(_) => "propagation",
         SendError::NotAcknowledged => "not_acknowledged",
@@ -1268,6 +1269,16 @@ mod tests {
             send_error(&SendError::NoPropagationNode)["kind"],
             "no_propagation_node"
         );
+        let incompatible = send_error(&SendError::IncompatibleVersion {
+            destination: "ab".repeat(16),
+            found: Some(2),
+            min: 1,
+            max: 1,
+        });
+        assert_eq!(incompatible["kind"], "incompatible_version");
+        let message = incompatible["message"].as_str().unwrap();
+        assert!(message.contains('2'), "{message}");
+        assert!(message.contains("1..=1"), "{message}");
     }
 
     #[test]

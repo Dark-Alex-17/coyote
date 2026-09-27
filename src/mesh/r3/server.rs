@@ -67,7 +67,8 @@ pub(crate) enum Admission {
 /// The single sink every inbound request is handed to. Routing by path, trust and
 /// unknown-path policy live behind this seam, not in the transport. A `Reply::Value` whose
 /// body is a bare integer in `0xf0..=0xfe` reads as a refusal code on the requesting side
-/// (`RefusalCode::from_wire`), so a handler must not return one as a real value.
+/// (`RefusalCode::from_wire`), so a handler must not return one as a real value; the same
+/// goes for a map shaped like the version refusal (`VersionRefusal::from_value`).
 #[async_trait]
 pub(crate) trait RequestHandler: Send + Sync {
     /// Runs before the payload is decoded, with nothing but the link and its proven

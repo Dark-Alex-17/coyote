@@ -13,6 +13,8 @@ use std::fmt;
 use std::sync::{Arc, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// The card's own schema version, evolving under the one mesh protocol version the
+/// envelope carries.
 pub(crate) const STATUS_CARD_VERSION: u64 = 1;
 
 /// `state.code` values. A code point is never renumbered or reused; new ones are only
@@ -424,7 +426,8 @@ pub(crate) enum StatusError {
     NotServed(DispatchError),
     /// The reply is not a card: not a map, or a required key is missing or the wrong type.
     Malformed(String),
-    /// The card was written by a newer Coyote than this one reads.
+    /// The card was written by a newer Coyote than this one reads. This is the card's
+    /// schema version; a mesh protocol mismatch fails as `Transport(UnsupportedVersion)`.
     UnsupportedVersion { found: u64, supported: u64 },
 }
 

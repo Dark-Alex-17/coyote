@@ -18,6 +18,7 @@ pub(crate) mod pending;
 mod propagation;
 mod propagation_fetch;
 mod propagation_nodes;
+mod protocol;
 mod r3;
 pub(crate) mod snapshot;
 pub(crate) mod trust;

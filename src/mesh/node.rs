@@ -30,6 +30,7 @@ use crate::mesh::propagation::{
 };
 use crate::mesh::propagation_fetch::{self, FetchError, FetchOptions, FetchReport, InboundSink};
 use crate::mesh::propagation_nodes::PropagationNodeTable;
+use crate::mesh::protocol::{Compatibility, MESH_PROTOCOL_MIN_SUPPORTED, MESH_PROTOCOL_VERSION};
 #[cfg(test)]
 use crate::mesh::r3::RequestHandler;
 use crate::mesh::r3::{
@@ -604,13 +605,30 @@ impl MeshRuntime {
         data: rmpv::Value,
         options: RequestOptions,
     ) -> Result<RequestOutcome, R3Error> {
+        let envelope = self.envelope(data).await;
+        self.request_envelope(destination, path, envelope, options)
+            .await
+    }
+
+    /// `request` with the envelope already built. Every request to a peer passes here or
+    /// through `request_with_receipt`: a peer the table knows speaks another protocol is
+    /// refused before any link is opened, and a peer that refuses this node's version over
+    /// the wire is marked so the next request is refused here.
+    async fn request_envelope(
+        &self,
+        destination: &DestinationDesc,
+        path: &str,
+        envelope: Envelope,
+        options: RequestOptions,
+    ) -> Result<RequestOutcome, R3Error> {
+        let dest_hex = destination.address_hash.to_hex_string();
+        refuse_incompatible_peer(&self.peers, &dest_hex, path)?;
         let transport = self
             .transport
             .lock()
             .await
             .clone()
             .ok_or(R3Error::NotRunning)?;
-        let envelope = self.envelope(data).await;
         let request = self.r3_client.request(
             &transport,
             &self.transport_identity,
@@ -619,10 +637,12 @@ impl MeshRuntime {
             envelope,
             options,
         );
-        tokio::select! {
+        let outcome = tokio::select! {
             () = self.cancel.cancelled() => Err(R3Error::Shutdown),
             outcome = request => outcome,
-        }
+        };
+        note_version_refusal(&self.peers, &dest_hex, path, &outcome);
+        outcome
     }
 
     /// `request` as a receipt: returns as soon as the request is on its own task and reports
@@ -637,6 +657,8 @@ impl MeshRuntime {
         data: rmpv::Value,
         options: RequestOptions,
     ) -> Result<RequestReceipt, R3Error> {
+        let dest_hex = destination.address_hash.to_hex_string();
+        refuse_incompatible_peer(&self.peers, &dest_hex, path)?;
         let transport = self
             .transport
             .lock()
@@ -644,24 +666,34 @@ impl MeshRuntime {
             .clone()
             .ok_or(R3Error::NotRunning)?;
         let envelope = self.envelope(data).await;
-        Ok(self.r3_client.request_with_receipt(
-            transport,
-            self.transport_identity.clone(),
-            *destination,
-            path.to_string(),
-            envelope,
-            options,
+        let client = self.r3_client.clone();
+        let identity = self.transport_identity.clone();
+        let peers = self.peers.clone();
+        let (destination, path) = (*destination, path.to_string());
+        Ok(RequestReceipt::track(
             self.cancellation_token(),
+            move |delivered| async move {
+                let outcome = client
+                    .request_with(
+                        &transport,
+                        &identity,
+                        &destination,
+                        &path,
+                        envelope,
+                        options,
+                        Some(delivered),
+                    )
+                    .await;
+                note_version_refusal(&peers, &dest_hex, &path, &outcome);
+                outcome
+            },
         ))
     }
 
     /// `body` in the envelope naming the instance this node speaks for right now, read per
     /// request so a rekeyed node claims its new instance and never a cached one.
     async fn envelope(&self, body: rmpv::Value) -> Envelope {
-        Envelope {
-            origin: self.destination.lock().await.origin,
-            body,
-        }
+        Envelope::new(self.destination.lock().await.origin, body)
     }
 
     /// Asks `destination` to trust this node's current instance, with `intro` as the
@@ -681,6 +713,10 @@ impl MeshRuntime {
     /// `knock` with its timeouts chosen. The dispatcher answers a knock with `NoAccess` by
     /// design, so that refusal (or an answer) means the knock landed. Any other refusal
     /// code did not file the knock and is not unreachability, so it is reported as-is.
+    /// So is a peer that knows this identity and refuses this node's protocol version: it
+    /// heard the knock and could not read it, and a stored one would meet the same peer.
+    /// A peer that does not know it stays silent and the knock falls back to
+    /// store-and-forward as before.
     /// Only the peer-unreachable errors fall back to store-and-forward; an oversize or
     /// undecodable frame is this node's fault and storing it would not help. Posts to the
     /// propagation node queue behind `posting`, since `propagate` needs one caller per
@@ -706,6 +742,7 @@ impl MeshRuntime {
                 err
             }
             Err(R3Error::NotRunning | R3Error::Shutdown) => return Err(KnockError::NotRunning),
+            Err(err @ R3Error::UnsupportedVersion { .. }) => return Err(KnockError::Direct(err)),
             Err(err) => {
                 debug!("Mesh knock to {dest8} was not filed over the link: {err}");
                 return Err(KnockError::Direct(err));
@@ -1241,6 +1278,12 @@ fn record_announce(
         "Received mesh announce from {destination_hash} ({hops} hops, protocol version {})",
         decoded.version
     );
+    if let Compatibility::Incompatible { found } = Compatibility::of(decoded.version) {
+        debug!(
+            "Mesh peer {} is incompatible: it speaks protocol {found}, this Coyote supports {MESH_PROTOCOL_MIN_SUPPORTED}..={MESH_PROTOCOL_VERSION}",
+            short(&destination_hash)
+        );
+    }
     let change = peers.observe(
         PeerSighting {
             destination_hash: destination_hash.clone(),
@@ -1257,6 +1300,44 @@ fn record_announce(
         PeerChange::Refreshed => debug!("Refreshed mesh peer {destination_hash}"),
     }
     Some(change)
+}
+
+/// The pre-flight half of the version gate: a peer the table knows speaks a protocol this
+/// node does not is refused before any link is opened. A peer the table does not know
+/// proceeds; the wire decides.
+fn refuse_incompatible_peer(peers: &PeerTable, dest_hex: &str, path: &str) -> Result<(), R3Error> {
+    match peers.get(dest_hex).map(|record| record.compatibility) {
+        Some(Compatibility::Incompatible { found }) => {
+            debug!(
+                "Mesh request for {path} to {} was not sent: the peer speaks protocol {found}, this Coyote supports {MESH_PROTOCOL_MIN_SUPPORTED}..={MESH_PROTOCOL_VERSION}",
+                short(dest_hex)
+            );
+            Err(R3Error::UnsupportedVersion {
+                found: Some(found),
+                min: MESH_PROTOCOL_MIN_SUPPORTED,
+                max: MESH_PROTOCOL_VERSION,
+            })
+        }
+        Some(Compatibility::Compatible) | None => Ok(()),
+    }
+}
+
+/// The other half: a peer that refused this node's version over the wire is marked so the
+/// next request stops at `refuse_incompatible_peer`. The peer's `max` is the newest
+/// protocol it speaks, which is what the record names.
+fn note_version_refusal(
+    peers: &PeerTable,
+    dest_hex: &str,
+    path: &str,
+    outcome: &Result<RequestOutcome, R3Error>,
+) {
+    if let Err(R3Error::UnsupportedVersion { max, .. }) = outcome {
+        peers.mark_incompatible(dest_hex, *max);
+        debug!(
+            "Mesh request for {path} to {} was refused for its protocol version; the peer speaks protocol {max} and is marked incompatible",
+            short(dest_hex)
+        );
+    }
 }
 
 async fn receive_announces(
@@ -4888,5 +4969,211 @@ mod tests {
             .await
             .stop_interface(server_iface);
         drop(node_b);
+    }
+
+    /// The debug lines logged after `mark` that report a link to `destination_hex` coming
+    /// up: `open_link` names the full hash, so the filter is this test's own.
+    #[cfg(unix)]
+    fn links_opened_since(mark: usize, destination_hex: &str) -> Vec<String> {
+        let needle = format!("to destination {destination_hex} is active");
+        debug_snapshot()
+            .into_iter()
+            .skip(mark)
+            .filter(|line| line.contains(&needle))
+            .collect()
+    }
+
+    /// A peer the announce called compatible refuses this node's version over the wire:
+    /// the refusal comes back typed, the peer is marked, and the next send stops at the
+    /// table without a link.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_peer_refusing_our_protocol_version_is_marked_incompatible() {
+        use crate::mesh::message::SendError;
+        use crate::mesh::trust::TrustOptions;
+
+        install_log_collector();
+        let stub = PeerStub::listen("node-version-stub", TcpServer::DEFAULT_CLIENT_MTU).await;
+        let started = started_runtime_on("node-version-refused", stub.port()).await;
+        let runtime = started.runtime.clone();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime.clone()).unwrap();
+        stub.trust(&runtime.current_destination_hash(), runtime.fingerprint());
+        stub.announce(Some("Stub")).await;
+        let to = stub.destination_hex();
+        let peers = runtime.peers();
+        wait_until("the node to file the stub", || peers.get(&to).is_some()).await;
+        assert_eq!(
+            peers.get(&to).unwrap().compatibility,
+            Compatibility::Compatible
+        );
+        runtime
+            .trust()
+            .trust_destination(
+                slot.as_ref(),
+                &to,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        let desc = runtime.resolve_destination(&to).await.unwrap();
+        let newer = MESH_PROTOCOL_VERSION + 1;
+        let mut envelope = runtime.envelope(rmpv::Value::Nil).await;
+        envelope.version = newer;
+
+        let err = runtime
+            .request_envelope(&desc, STATUS_PATH, envelope, RequestOptions::default())
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            err,
+            R3Error::UnsupportedVersion {
+                found: Some(newer),
+                min: MESH_PROTOCOL_MIN_SUPPORTED,
+                max: MESH_PROTOCOL_VERSION,
+            }
+        );
+        assert_eq!(
+            peers.get(&to).unwrap().compatibility,
+            Compatibility::Incompatible {
+                found: MESH_PROTOCOL_VERSION
+            }
+        );
+
+        let mark = debug_snapshot().len();
+        let message = OutboundPeer::new(PeerKind::Message, "hello", None, None, None).unwrap();
+        let err = runtime.send_peer(&to, &message).await.unwrap_err();
+
+        assert_eq!(
+            err,
+            SendError::IncompatibleVersion {
+                destination: to.clone(),
+                found: Some(MESH_PROTOCOL_VERSION),
+                min: MESH_PROTOCOL_MIN_SUPPORTED,
+                max: MESH_PROTOCOL_VERSION,
+            }
+        );
+        let links = links_opened_since(mark, &to);
+        assert!(
+            links.is_empty(),
+            "a marked peer is never linked to: {links:?}"
+        );
+        assert!(stub.seen().is_empty());
+        assert!(slot.stop().await.unwrap());
+        stub.stop().await;
+    }
+
+    /// An announce at a version this node does not speak is filed like any other, marked
+    /// incompatible, and a send to it is refused at the table without a link.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_incompatible_announce_is_recorded_but_refused_outbound() {
+        use crate::mesh::message::SendError;
+        use crate::mesh::trust::TrustOptions;
+
+        install_log_collector();
+        let newer = MESH_PROTOCOL_VERSION + 1;
+        let app_data = AnnounceAppData {
+            version: newer,
+            display_name: Some("Newer".to_string()),
+        }
+        .encode()
+        .unwrap();
+        let now = SystemTime::now();
+        let tmp = TempDir::new("node-incompatible-announce");
+        let table = PeerTable::load(tmp.path.join("peers.json"), now).unwrap();
+        let hash = "ab".repeat(16);
+
+        let change = record_announce(
+            &table,
+            hash.clone(),
+            "cd".repeat(16),
+            "ef".repeat(10),
+            &app_data,
+            1,
+            now,
+        );
+
+        assert_eq!(change, Some(PeerChange::Added));
+        let record = table.get(&hash).unwrap();
+        assert_eq!(record.protocol_version, newer);
+        assert_eq!(
+            record.compatibility,
+            Compatibility::Incompatible { found: newer }
+        );
+        assert_eq!(
+            record.compatibility_line().as_deref(),
+            Some("incompatible: speaks protocol 2, this Coyote supports 1..=1")
+        );
+        let expected = format!(
+            "Mesh peer {} is incompatible: it speaks protocol {newer}, this Coyote supports 1..=1",
+            &hash[..8]
+        );
+        assert!(
+            debug_snapshot().iter().any(|line| line == &expected),
+            "expected {expected:?} in {:#?}",
+            debug_snapshot()
+        );
+
+        // The stub announces at the current version so the transport learns a path to it;
+        // the same announce at the newer version is then what the runtime's table says.
+        let stub = PeerStub::listen("node-incompatible-stub", TcpServer::DEFAULT_CLIENT_MTU).await;
+        let started = started_runtime_on("node-incompatible-outbound", stub.port()).await;
+        let runtime = started.runtime.clone();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime.clone()).unwrap();
+        stub.announce(Some("Stub")).await;
+        let to = stub.destination_hex();
+        let peers = runtime.peers();
+        wait_until("the node to file the stub", || peers.get(&to).is_some()).await;
+        let filed = peers.get(&to).unwrap();
+        assert_eq!(
+            record_announce(
+                peers.as_ref(),
+                to.clone(),
+                filed.identity_hash,
+                filed.name_hash,
+                &app_data,
+                filed.hops,
+                SystemTime::now(),
+            ),
+            Some(PeerChange::Refreshed)
+        );
+        assert_eq!(
+            peers.get(&to).unwrap().compatibility,
+            Compatibility::Incompatible { found: newer }
+        );
+        runtime
+            .trust()
+            .trust_destination(
+                slot.as_ref(),
+                &to,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .unwrap();
+
+        let mark = debug_snapshot().len();
+        let message = OutboundPeer::new(PeerKind::Message, "hello", None, None, None).unwrap();
+        let err = runtime.send_peer(&to, &message).await.unwrap_err();
+
+        assert_eq!(
+            err,
+            SendError::IncompatibleVersion {
+                destination: to.clone(),
+                found: Some(newer),
+                min: MESH_PROTOCOL_MIN_SUPPORTED,
+                max: MESH_PROTOCOL_VERSION,
+            }
+        );
+        let links = links_opened_since(mark, &to);
+        assert!(
+            links.is_empty(),
+            "an incompatible peer is never linked to: {links:?}"
+        );
+        assert!(stub.seen().is_empty());
+        assert!(slot.stop().await.unwrap());
+        stub.stop().await;
     }
 }

@@ -1,4 +1,5 @@
 use crate::mesh::announce::{HEARTBEAT_SECS, PEER_MISSED_HEARTBEATS_BEFORE_AGE_OUT};
+use crate::mesh::protocol::Compatibility;
 use crate::mesh::write_atomically;
 
 use anyhow::{Context, Result};
@@ -28,9 +29,23 @@ pub(crate) struct PeerRecord {
     pub name_hash: String,
     pub display_name: Option<String>,
     pub protocol_version: u16,
+    /// Whether this Coyote speaks `protocol_version`, kept so the outbound gate reads a
+    /// verdict. A table written before the field was kept loads it as compatible and
+    /// `load` reconciles it against `protocol_version`.
+    #[serde(default)]
+    pub compatibility: Compatibility,
     pub hops: u8,
     pub first_seen: SystemTime,
     pub last_seen: SystemTime,
+}
+
+impl PeerRecord {
+    /// One line for a peer listing, `None` when the peer speaks a protocol this Coyote does.
+    // Rendered by the peer listing once it lands.
+    #[allow(dead_code)]
+    pub(crate) fn compatibility_line(&self) -> Option<String> {
+        self.compatibility.line()
+    }
 }
 
 /// What one decoded Coyote announce says about its sender.
@@ -76,6 +91,16 @@ impl PeerTable {
         let inner = records
             .into_iter()
             .filter(|record| !is_expired(record, now))
+            .map(|mut record| {
+                // A record written before the field existed loads as compatible and is
+                // judged from its announced version here. An `Incompatible` written by a
+                // previous run is kept as written until the peer's next announce
+                // re-judges it.
+                if record.compatibility == Compatibility::Compatible {
+                    record.compatibility = Compatibility::of(record.protocol_version);
+                }
+                record
+            })
             .map(|record| (record.destination_hash.clone(), record))
             .collect();
         Ok(Self {
@@ -93,6 +118,7 @@ impl PeerTable {
                 record.name_hash = sighting.name_hash;
                 record.display_name = sighting.display_name;
                 record.protocol_version = sighting.protocol_version;
+                record.compatibility = Compatibility::of(sighting.protocol_version);
                 record.hops = sighting.hops;
                 record.last_seen = now;
                 PeerChange::Refreshed
@@ -106,6 +132,7 @@ impl PeerTable {
                         name_hash: sighting.name_hash,
                         display_name: sighting.display_name,
                         protocol_version: sighting.protocol_version,
+                        compatibility: Compatibility::of(sighting.protocol_version),
                         hops: sighting.hops,
                         first_seen: now,
                         last_seen: now,
@@ -124,6 +151,18 @@ impl PeerTable {
         }
         self.dirty.store(true, Ordering::Release);
         change
+    }
+
+    /// Files that the peer at `destination_hash` refused this node's protocol and speaks
+    /// `found` instead. A peer the table does not know is left unknown; nothing about it
+    /// is worth remembering until it announces.
+    pub(crate) fn mark_incompatible(&self, destination_hash: &str, found: u16) {
+        let mut peers = self.inner.lock();
+        let Some(record) = peers.get_mut(destination_hash) else {
+            return;
+        };
+        record.compatibility = Compatibility::Incompatible { found };
+        self.dirty.store(true, Ordering::Release);
     }
 
     /// Removes every peer expired at `now` and returns their destination hashes.
@@ -199,6 +238,7 @@ fn is_expired(record: &PeerRecord, now: SystemTime) -> bool {
 mod tests {
     use super::super::test_support::TempDir;
     use super::*;
+    use crate::mesh::protocol::MESH_PROTOCOL_VERSION;
     use crate::testing::{install_log_collector, warn_snapshot};
 
     fn sighting(hash: &str, name: Option<&str>) -> PeerSighting {
@@ -340,6 +380,7 @@ mod tests {
             name_hash: "unused".to_string(),
             display_name: None,
             protocol_version: 1,
+            compatibility: Compatibility::Compatible,
             hops: 1,
             first_seen: t0,
             last_seen: t0,
@@ -353,6 +394,131 @@ mod tests {
         let peers = table.snapshot();
         assert_eq!(peers.len(), 1);
         assert_eq!(peers[0].name_hash, "");
+    }
+
+    #[test]
+    fn observe_marks_an_unsupported_announce_version_incompatible() {
+        let (table, _tmp) = table("peers-incompatible");
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let newer = PeerSighting {
+            protocol_version: MESH_PROTOCOL_VERSION + 1,
+            ..sighting("aa", Some("Alex"))
+        };
+
+        assert_eq!(table.observe(newer, t0), PeerChange::Added);
+
+        let peers = table.snapshot();
+        assert_eq!(peers.len(), 1, "the sighting is recorded, not suppressed");
+        assert_eq!(
+            peers[0].compatibility,
+            Compatibility::Incompatible {
+                found: MESH_PROTOCOL_VERSION + 1
+            }
+        );
+        assert_eq!(
+            peers[0].compatibility_line().as_deref(),
+            Some("incompatible: speaks protocol 2, this Coyote supports 1..=1")
+        );
+
+        table.observe(sighting("aa", Some("Alex")), t0 + Duration::from_secs(1));
+
+        let record = table.get("aa").unwrap();
+        assert_eq!(record.compatibility, Compatibility::Compatible);
+        assert_eq!(record.compatibility_line(), None);
+    }
+
+    #[test]
+    fn load_reconciles_compatibility_for_tables_written_before_the_field() {
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let load_without_field = |tag: &str, protocol_version: u16| {
+            let tmp = TempDir::new(tag);
+            let path = tmp.path.join("peers.json");
+            let mut old = serde_json::to_value(vec![PeerRecord {
+                destination_hash: "aa".to_string(),
+                identity_hash: "id-aa".to_string(),
+                name_hash: "name-aa".to_string(),
+                display_name: None,
+                protocol_version,
+                compatibility: Compatibility::Compatible,
+                hops: 1,
+                first_seen: t0,
+                last_seen: t0,
+            }])
+            .unwrap();
+            assert!(
+                old[0]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("compatibility")
+                    .is_some(),
+                "the field must be present to be removed"
+            );
+            fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+            let table = PeerTable::load(path, t0).unwrap();
+            table.get("aa").unwrap().compatibility
+        };
+
+        assert_eq!(
+            load_without_field("peers-reconcile-newer", MESH_PROTOCOL_VERSION + 1),
+            Compatibility::Incompatible {
+                found: MESH_PROTOCOL_VERSION + 1
+            }
+        );
+        assert_eq!(
+            load_without_field("peers-reconcile-current", MESH_PROTOCOL_VERSION),
+            Compatibility::Compatible
+        );
+    }
+
+    #[test]
+    fn mark_incompatible_sets_the_field_and_dirties_the_table() {
+        let tmp = TempDir::new("peers-mark-incompatible");
+        let path = tmp.path.join("mesh").join("peers.json");
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let table = PeerTable::load(path.clone(), t0).unwrap();
+        table.observe(sighting("aa", None), t0);
+        table.persist_if_dirty().unwrap();
+        fs::remove_file(&path).unwrap();
+
+        table.mark_incompatible("nobody", 2);
+        table.persist_if_dirty().unwrap();
+        assert!(!path.exists(), "an unknown hash must not dirty the table");
+        assert_eq!(table.snapshot().len(), 1);
+
+        table.mark_incompatible("aa", 2);
+        assert_eq!(
+            table.get("aa").unwrap().compatibility,
+            Compatibility::Incompatible { found: 2 }
+        );
+        table.persist_if_dirty().unwrap();
+        assert!(path.exists(), "a marked peer must be written");
+
+        let reloaded = PeerTable::load(path, t0).unwrap();
+        assert_eq!(
+            reloaded.get("aa").unwrap().compatibility,
+            Compatibility::Incompatible { found: 2 },
+            "a stored incompatibility survives a load whose announced version looks fine"
+        );
+    }
+
+    #[test]
+    fn an_announce_refresh_rejudges_a_wire_learned_mark() {
+        let (table, _tmp) = table("peers-rejudge-mark");
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        table.observe(sighting("aa", None), t0);
+
+        table.mark_incompatible("aa", 2);
+        assert_eq!(
+            table.get("aa").unwrap().compatibility,
+            Compatibility::Incompatible { found: 2 }
+        );
+
+        table.observe(sighting("aa", None), t0 + Duration::from_secs(1));
+        assert_eq!(
+            table.get("aa").unwrap().compatibility,
+            Compatibility::Compatible,
+            "an announce at a supported version overrides a wire-learned mark"
+        );
     }
 
     #[test]

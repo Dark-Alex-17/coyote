@@ -1,7 +1,9 @@
+use crate::mesh::protocol::VersionRefusal;
 use crate::mesh::r3::error::{R3Error, RefusalCode};
 use crate::mesh::r3::frame::{
     Envelope, MAX_R3_PAYLOAD_BYTES, RequestFrame, RequestId, ResponseFrame,
 };
+#[cfg(test)]
 use crate::mesh::r3::receipt::RequestReceipt;
 use crate::mesh::r3::short;
 
@@ -202,6 +204,31 @@ impl R3Client {
         envelope: Envelope,
         options: RequestOptions,
     ) -> Result<RequestOutcome, R3Error> {
+        self.request_with(
+            transport,
+            identity,
+            destination,
+            path,
+            envelope,
+            options,
+            None,
+        )
+        .await
+    }
+
+    /// `request` with the delivery hook a receipt watches, fired once the far end has
+    /// proven it holds the request; see `request_on_link_with` for when that is.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn request_with(
+        &self,
+        transport: &Transport,
+        identity: &TransportIdentity,
+        destination: &DestinationDesc,
+        path: &str,
+        envelope: Envelope,
+        options: RequestOptions,
+        delivered: Option<oneshot::Sender<()>>,
+    ) -> Result<RequestOutcome, R3Error> {
         let link = link_to(transport, identity, destination, path, options.link_timeout).await?;
         self.request_on_link_with(
             transport,
@@ -209,14 +236,16 @@ impl R3Client {
             path,
             envelope,
             Deadline::after(options.request_timeout),
-            None,
+            delivered,
         )
         .await
     }
 
     /// `request`, returned at once as a receipt that reports progress while the request
     /// runs on its own task. Dropping the receipt abandons the request; `cancel` firing
-    /// fails it with `Shutdown`.
+    /// fails it with `Shutdown`. The runtime builds its receipts itself, around the same
+    /// `request_with`, so it can act on the outcome.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn request_with_receipt(
         self: &Arc<Self>,
@@ -230,21 +259,14 @@ impl R3Client {
     ) -> RequestReceipt {
         let client = self.clone();
         RequestReceipt::track(cancel, move |delivered| async move {
-            let link = link_to(
-                &transport,
-                &identity,
-                &destination,
-                &path,
-                options.link_timeout,
-            )
-            .await?;
             client
-                .request_on_link_with(
+                .request_with(
                     &transport,
-                    &link,
+                    &identity,
+                    &destination,
                     &path,
                     envelope,
-                    Deadline::after(options.request_timeout),
+                    options,
                     Some(delivered),
                 )
                 .await
@@ -383,6 +405,13 @@ impl R3Client {
         let (value, response_branch) = reply?;
         if let Some(code) = RefusalCode::from_wire(&value) {
             return Err(R3Error::Refused(code));
+        }
+        if let Some(refusal) = VersionRefusal::from_value(&value) {
+            return Err(R3Error::UnsupportedVersion {
+                found: refusal.found,
+                min: refusal.min,
+                max: refusal.max,
+            });
         }
         Ok(RequestOutcome {
             value,

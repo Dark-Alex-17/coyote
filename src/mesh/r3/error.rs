@@ -1,3 +1,5 @@
+use crate::mesh::protocol::describe_version;
+
 use std::fmt;
 use std::time::Duration;
 
@@ -19,6 +21,16 @@ pub(crate) enum R3Error {
     Send(String),
     /// The responder answered with one of the LXMF refusal sentinels instead of a body.
     Refused(RefusalCode),
+    /// One side does not speak the other's protocol version. `found` is the version the
+    /// refusing side saw from the other party (`None` when it saw none it could read) and
+    /// `min..=max` is the refusing side's window: from the wire the refusing side is the
+    /// peer, so `max` is the newest protocol it speaks; from this node's own pre-flight
+    /// gate it is this node, and `found` is what the peer announced.
+    UnsupportedVersion {
+        found: Option<u16>,
+        min: u16,
+        max: u16,
+    },
     /// The mesh node has been stopped.
     NotRunning,
     /// The node stopped while the request was pending.
@@ -42,6 +54,11 @@ impl fmt::Display for R3Error {
             Self::Decode(reason) => write!(f, "Malformed mesh request frame: {reason}"),
             Self::Send(reason) => write!(f, "The mesh transport could not send: {reason}"),
             Self::Refused(code) => write!(f, "The mesh peer refused the request: {code}"),
+            Self::UnsupportedVersion { found, min, max } => write!(
+                f,
+                "Protocol version {} is outside the supported range {min}..={max}",
+                describe_version(*found)
+            ),
             Self::NotRunning => write!(
                 f,
                 "The mesh node has been stopped; run `.mesh on` to start it again"

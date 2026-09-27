@@ -12,6 +12,7 @@ use crate::mesh::node::MeshRuntime;
 use crate::mesh::peers::PeerRecord;
 use crate::mesh::propagation::{OutboundMessage, PropagationError, PropagationOptions};
 use crate::mesh::propagation_fetch::{InboundMessage, InboundSink};
+use crate::mesh::protocol::describe_version;
 use crate::mesh::r3::{
     AdmittedRequest, DEFAULT_LINK_TIMEOUT, Handler, MESSAGE_PATH, NAME_HASH_LEN, OriginName,
     R3Error, RefusalCode, Reply, RequestOptions, short,
@@ -39,7 +40,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// The LXMF custom type a stored peer message carries, so a fetch can tell it from a
 /// knock or a plain LXMF message before reading anything else. Versioned in the name.
 pub(crate) const PEER_MESSAGE_TYPE: &str = "coyote.peer/1";
-/// The `v` every R3 `/message` body carries; a body with any other value is refused.
+/// The `v` every R3 `/message` body carries; a body with any other value is refused. It is
+/// the body's own schema version, evolving under the one mesh protocol version the
+/// envelope carries.
 pub(crate) const PEER_WIRE_VERSION: u64 = 1;
 pub(crate) const PEER_TITLE_MAX_CHARS: usize = 120;
 pub(crate) const PEER_CONTENT_MAX_CHARS: usize = 4_000;
@@ -660,6 +663,14 @@ pub(crate) enum SendError {
     /// The direct attempt failed for a reason that is not the peer being unreachable, so
     /// nothing was stored for it.
     Direct(R3Error),
+    /// The peer speaks a protocol this Coyote does not, on record from its announce or said
+    /// over the link. Nothing is stored: a held copy would meet the same peer.
+    IncompatibleVersion {
+        destination: String,
+        found: Option<u16>,
+        min: u16,
+        max: u16,
+    },
     NoPropagationNode,
     Propagation(PropagationError),
     /// The peer answered, but not with the acknowledgement for this id.
@@ -699,6 +710,16 @@ impl fmt::Display for SendError {
             ),
             Self::Refused(code) => write!(f, "The peer refused the message: {code}"),
             Self::Direct(err) => write!(f, "The message could not be sent: {err}"),
+            Self::IncompatibleVersion {
+                destination,
+                found,
+                min,
+                max,
+            } => write!(
+                f,
+                "Destination {destination} and this Coyote speak incompatible mesh protocol versions: version {} was refused by the side that supports {min}..={max}. One of the two needs upgrading before they can talk; the peer listing names which.",
+                describe_version(*found)
+            ),
             Self::NoPropagationNode => write!(
                 f,
                 "The peer is unreachable and no propagation node is known yet to hold the message for it. Run `.mesh peers` to see which nodes this Coyote has heard from."
@@ -846,6 +867,14 @@ impl MeshRuntime {
                 return Err(SendError::Refused(code));
             }
             Err(R3Error::NotRunning | R3Error::Shutdown) => return Err(SendError::NotRunning),
+            Err(R3Error::UnsupportedVersion { found, min, max }) => {
+                return Err(SendError::IncompatibleVersion {
+                    destination: destination.clone(),
+                    found,
+                    min,
+                    max,
+                });
+            }
             Err(err) => {
                 debug!("Mesh {kind} {id} to {dest8} was not sent over the link: {err}");
                 return Err(SendError::Direct(err));
@@ -950,9 +979,11 @@ impl MeshRuntime {
                 via: PeerVia::StoreAndForward,
                 ..
             }) => RecipientOutcome::StoreAndForward,
-            Err(err @ SendError::Refused(_)) => RecipientOutcome::Refused {
-                reason: err.to_string(),
-            },
+            Err(err @ (SendError::Refused(_) | SendError::IncompatibleVersion { .. })) => {
+                RecipientOutcome::Refused {
+                    reason: err.to_string(),
+                }
+            }
             Err(err) => RecipientOutcome::Unreachable {
                 reason: err.to_string(),
             },
@@ -2136,6 +2167,33 @@ mod tests {
             SendError::InvalidFields("too deep")
                 .to_string()
                 .contains("too deep")
+        );
+    }
+
+    #[test]
+    fn incompatible_version_text_names_neither_side_as_the_refuser() {
+        let incompatible = |found: Option<u16>| {
+            SendError::IncompatibleVersion {
+                destination: hash_of("d"),
+                found,
+                min: 1,
+                max: 1,
+            }
+            .to_string()
+        };
+        assert_eq!(
+            incompatible(Some(2)),
+            format!(
+                "Destination {} and this Coyote speak incompatible mesh protocol versions: version 2 was refused by the side that supports 1..=1. One of the two needs upgrading before they can talk; the peer listing names which.",
+                hash_of("d")
+            )
+        );
+        assert_eq!(
+            incompatible(None),
+            format!(
+                "Destination {} and this Coyote speak incompatible mesh protocol versions: version none was refused by the side that supports 1..=1. One of the two needs upgrading before they can talk; the peer listing names which.",
+                hash_of("d")
+            )
         );
     }
 

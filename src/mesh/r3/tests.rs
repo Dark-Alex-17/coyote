@@ -1,8 +1,10 @@
 use super::dispatch::DispatchError;
 use super::error::{R3Error, RefusalCode};
 use super::frame::{
-    Envelope, NAME_HASH_LEN, OriginName, PathHash, RequestFrame, RequestId, ResponseFrame,
+    Envelope, EnvelopeError, NAME_HASH_LEN, OriginName, PathHash, RequestFrame, RequestId,
+    ResponseFrame,
 };
+use crate::mesh::protocol::MESH_PROTOCOL_VERSION;
 
 use rmpv::Value;
 use rns_transport::destination::link::{Link, unpack_response_envelope};
@@ -287,19 +289,17 @@ fn no_access_is_named_at_exactly_one_site_outside_the_error_module() {
 fn envelope_round_trips_and_rejects_anything_that_names_no_origin() {
     let origin = OriginName([7; NAME_HASH_LEN]);
     let body = Value::from("hello");
-    let value = Envelope {
-        origin,
-        body: body.clone(),
-    }
-    .into_value();
+    let value = Envelope::new(origin, body.clone()).into_value();
     assert_eq!(
         value,
         Value::Map(vec![
+            (Value::from("v"), Value::from(MESH_PROTOCOL_VERSION)),
             (Value::from("name_hash"), Value::Binary(vec![7; 10])),
             (Value::from("body"), body.clone()),
         ])
     );
     let decoded = Envelope::from_value(value).unwrap();
+    assert_eq!(decoded.version, MESH_PROTOCOL_VERSION);
     assert_eq!(decoded.origin, origin);
     assert_eq!(decoded.body, body);
 
@@ -307,35 +307,93 @@ fn envelope_round_trips_and_rejects_anything_that_names_no_origin() {
         (Value::from("later"), Value::from(1)),
         (Value::from("body"), Value::Nil),
         (Value::from("name_hash"), Value::Binary(vec![7; 10])),
+        (Value::from("v"), Value::from(MESH_PROTOCOL_VERSION)),
     ]))
     .expect("unknown keys are ignored and order does not matter");
     assert_eq!(with_extra.origin, origin);
     assert_eq!(with_extra.body, Value::Nil);
 
+    let current = (Value::from("v"), Value::from(MESH_PROTOCOL_VERSION));
     let malformed = [
         Value::Nil,
         Value::from("hello"),
         Value::Array(vec![Value::Binary(vec![7; 10]), Value::Nil]),
-        Value::Map(vec![]),
-        Value::Map(vec![(Value::from("body"), Value::Nil)]),
-        Value::Map(vec![(Value::from("name_hash"), Value::Binary(vec![7; 10]))]),
+        Value::Map(vec![current.clone()]),
+        Value::Map(vec![current.clone(), (Value::from("body"), Value::Nil)]),
         Value::Map(vec![
+            current.clone(),
+            (Value::from("name_hash"), Value::Binary(vec![7; 10])),
+        ]),
+        Value::Map(vec![
+            current.clone(),
             (Value::from("name_hash"), Value::Binary(vec![7; 9])),
             (Value::from("body"), Value::Nil),
         ]),
         Value::Map(vec![
+            current.clone(),
             (Value::from("name_hash"), Value::Binary(vec![7; 11])),
             (Value::from("body"), Value::Nil),
         ]),
         Value::Map(vec![
+            current.clone(),
             (Value::from("name_hash"), Value::from("0707070707")),
             (Value::from("body"), Value::Nil),
         ]),
     ];
     for value in malformed {
-        assert!(
-            Envelope::from_value(value.clone()).is_none(),
+        assert_eq!(
+            Envelope::from_value(value.clone()).err(),
+            Some(EnvelopeError::Malformed),
             "{value:?} must not read as an envelope"
+        );
+    }
+}
+
+/// The version is judged before anything else in the map, so a peer on another version
+/// is told that even when the rest of its envelope would not pass either.
+#[test]
+fn envelope_without_a_supported_version_is_refused_before_its_origin_is_read() {
+    let origin = (Value::from("name_hash"), Value::Binary(vec![7; 10]));
+    let body = (Value::from("body"), Value::Nil);
+    let cases = [
+        (Value::Map(vec![origin.clone(), body.clone()]), None),
+        (
+            Value::Map(vec![
+                (Value::from("v"), Value::from(MESH_PROTOCOL_VERSION + 1)),
+                origin.clone(),
+                body.clone(),
+            ]),
+            Some(MESH_PROTOCOL_VERSION + 1),
+        ),
+        (
+            Value::Map(vec![
+                (Value::from("v"), Value::from("1")),
+                origin.clone(),
+                body.clone(),
+            ]),
+            None,
+        ),
+        (
+            Value::Map(vec![
+                (Value::from("v"), Value::from(0)),
+                origin.clone(),
+                body.clone(),
+            ]),
+            Some(0),
+        ),
+        (
+            Value::Map(vec![
+                (Value::from("v"), Value::from(MESH_PROTOCOL_VERSION + 1)),
+                (Value::from("name_hash"), Value::from("not binary")),
+            ]),
+            Some(MESH_PROTOCOL_VERSION + 1),
+        ),
+    ];
+    for (value, found) in cases {
+        assert_eq!(
+            Envelope::from_value(value.clone()).err(),
+            Some(EnvelopeError::UnsupportedVersion { found }),
+            "{value:?}"
         );
     }
 }
@@ -390,6 +448,7 @@ mod network {
     use crate::mesh::propagation::test_support::{FakeNode, stored_message};
     use crate::mesh::propagation::{PropagationNode, PropagationOptions, pn_announce_app_data};
     use crate::mesh::propagation_fetch::InboundMessage;
+    use crate::mesh::protocol::{MESH_PROTOCOL_MIN_SUPPORTED, MESH_PROTOCOL_VERSION};
     use crate::mesh::snapshot::{MeshSnapshot, PlanRef, RepoInfo, TurnState};
     use crate::mesh::test_support::{
         Connector, INTEROP_TIMEOUT, LEGACY_LINK_MTU, Listener, TempDir, TrustList, contains_bytes,
@@ -541,8 +600,8 @@ mod network {
                 branch: request.branch,
             };
             let body = match Envelope::from_value(request.data.clone()) {
-                Some(envelope) => envelope.body,
-                None => request.data,
+                Ok(envelope) => envelope.body,
+                Err(_) => request.data,
             };
             self.record(seen, body).await
         }
@@ -692,10 +751,7 @@ mod network {
 
         /// `body` as this node sends it when it is the one requesting.
         fn envelope(&self, body: Value) -> Envelope {
-            Envelope {
-                origin: self.origin(),
-                body,
-            }
+            Envelope::new(self.origin(), body)
         }
 
         async fn stop(self) {
@@ -764,10 +820,7 @@ mod network {
         }
 
         fn envelope(&self, body: Value) -> Envelope {
-            Envelope {
-                origin: self.origin,
-                body,
-            }
+            Envelope::new(self.origin, body)
         }
 
         async fn request(
@@ -918,11 +971,7 @@ mod network {
         (0..target)
             .map(|n| Value::Binary(vec![0xab; n]))
             .find(|body| {
-                let enveloped = Envelope {
-                    origin,
-                    body: body.clone(),
-                }
-                .into_value();
+                let enveloped = Envelope::new(origin, body.clone()).into_value();
                 RequestFrame::new("/echo", enveloped).encode().len() == target
             })
             .unwrap_or_else(|| panic!("no body encodes a {target}-byte request frame"))
@@ -984,10 +1033,7 @@ mod network {
                     &identity,
                     &desc,
                     "/slow",
-                    Envelope {
-                        origin,
-                        body: Value::Nil,
-                    },
+                    Envelope::new(origin, Value::Nil),
                     RequestOptions {
                         request_timeout: SHORT_REQUEST_TIMEOUT,
                         ..RequestOptions::default()
@@ -1385,10 +1431,7 @@ mod network {
                     &identity,
                     &desc,
                     "/slow",
-                    Envelope {
-                        origin,
-                        body: Value::Nil,
-                    },
+                    Envelope::new(origin, Value::Nil),
                     RequestOptions::default(),
                 )
                 .await
@@ -1986,10 +2029,7 @@ mod network {
                     &identity_b,
                     &a_desc,
                     "/slow",
-                    Envelope {
-                        origin: origin_b,
-                        body: Value::Nil,
-                    },
+                    Envelope::new(origin_b, Value::Nil),
                     RequestOptions::default(),
                 )
                 .await
@@ -2182,11 +2222,7 @@ mod network {
             request_id: RequestId::from([1u8; 16]),
             path_hash: PathHash::of(KNOCK_PATH),
             requested_at: 0.0,
-            data: Envelope {
-                origin,
-                body: Value::Nil,
-            }
-            .into_value(),
+            data: Envelope::new(origin, Value::Nil).into_value(),
             branch: SizeBranch::Packet,
         }
     }
@@ -2531,10 +2567,13 @@ mod network {
 
         let bodies = [
             Value::Nil,
-            Value::Map(vec![(
-                Value::from("name_hash"),
-                Value::Binary(requester.origin.0.to_vec()),
-            )]),
+            Value::Map(vec![
+                (Value::from("v"), Value::from(MESH_PROTOCOL_VERSION)),
+                (
+                    Value::from("name_hash"),
+                    Value::Binary(requester.origin.0.to_vec()),
+                ),
+            ]),
         ];
         for body in bodies {
             let err = requester
@@ -2562,6 +2601,165 @@ mod network {
             &identity_hex(&requester)[..8],
             link_id.to_hex_string()
         ));
+        requester.stop().await;
+        responder.stop().await;
+    }
+
+    /// The real dispatcher over `list` in front of `responder`, with `recorder` on every
+    /// path the dispatcher lets a provider take; `/knock` stays the dispatcher's own.
+    fn gate_all_paths(
+        responder: &Responder,
+        recorder: Arc<Recorder>,
+        list: &TrustList,
+        tag: &str,
+    ) -> Gate {
+        let (trust, tmp) = list.open(tag);
+        let sink = Arc::new(SpySink::default());
+        let dispatcher = Dispatcher::new(trust, sink.clone());
+        for path in [STATUS_PATH, MESSAGE_PATH] {
+            assert!(
+                dispatcher
+                    .register(path, recorder.clone())
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert!(matches!(
+            dispatcher.register(KNOCK_PATH, recorder),
+            Err(ReservedPath(path)) if path == KNOCK_PATH
+        ));
+        responder.server.set_handler(Arc::new(dispatcher));
+        Gate { sink, _tmp: tmp }
+    }
+
+    /// An envelope map built by hand, so a test can name a version this node never sends.
+    fn envelope_at(origin: OriginName, version: Option<u16>) -> Value {
+        let mut entries = vec![
+            (Value::from("name_hash"), Value::Binary(origin.0.to_vec())),
+            (Value::from("body"), Value::Nil),
+        ];
+        if let Some(version) = version {
+            entries.insert(0, (Value::from("v"), Value::from(version)));
+        }
+        Value::Map(entries)
+    }
+
+    /// A fully trusted identity on another protocol version is refused with the version
+    /// refusal on every path, the unknown one included, before any handler or the knock
+    /// sink sees it: the check sits in the one place all paths pass.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wrong_version_requests_are_refused_on_every_path_without_reaching_a_handler() {
+        install_log_collector();
+        let recorder = Arc::new(Recorder::default());
+        let (responder, requester, desc) = pair(recorder.clone()).await;
+        let list = TrustList::default().identity(&identity_hex(&requester), true);
+        let gate = gate_all_paths(&responder, recorder.clone(), &list, "r3-gate-version");
+        let link = identified_link(&requester, &responder, &desc).await;
+        let link_id = *link.lock().await.id();
+        let newer = MESH_PROTOCOL_VERSION + 1;
+
+        for path in [KNOCK_PATH, STATUS_PATH, MESSAGE_PATH, "/nope"] {
+            let err = requester
+                .client
+                .request_on_link(
+                    &requester.transport,
+                    &link,
+                    path,
+                    envelope_at(requester.origin, Some(newer)),
+                    request_deadline(),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err,
+                R3Error::UnsupportedVersion {
+                    found: Some(newer),
+                    min: MESH_PROTOCOL_MIN_SUPPORTED,
+                    max: MESH_PROTOCOL_VERSION,
+                },
+                "{path}"
+            );
+        }
+
+        assert_eq!(recorder.seen_count(), 0, "no handler was entered");
+        assert_eq!(gate.sink.count(), 0, "a version refusal is not a knock");
+        assert_debug_logged(&format!(
+            "for {STATUS_PATH} from {} on link {}: refused: unsupported protocol version {newer}",
+            &identity_hex(&requester)[..8],
+            link_id.to_hex_string()
+        ));
+        requester.stop().await;
+        responder.stop().await;
+    }
+
+    /// An envelope with no `v` at all is refused as an unreadable version, not read as
+    /// version 1: nothing older than the versioned envelope was ever released.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_missing_version_key_is_refused_not_tolerated() {
+        install_log_collector();
+        let recorder = Arc::new(Recorder::default());
+        let (responder, requester, desc) = pair(recorder.clone()).await;
+        let list = TrustList::default().identity(&identity_hex(&requester), true);
+        let gate = gate_all_paths(&responder, recorder.clone(), &list, "r3-gate-no-version");
+        let link = identified_link(&requester, &responder, &desc).await;
+
+        let err = requester
+            .client
+            .request_on_link(
+                &requester.transport,
+                &link,
+                MESSAGE_PATH,
+                envelope_at(requester.origin, None),
+                request_deadline(),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            err,
+            R3Error::UnsupportedVersion {
+                found: None,
+                min: MESH_PROTOCOL_MIN_SUPPORTED,
+                max: MESH_PROTOCOL_VERSION,
+            }
+        );
+        assert_eq!(recorder.seen_count(), 0, "the handler was never entered");
+        assert_eq!(gate.sink.count(), 0);
+        requester.stop().await;
+        responder.stop().await;
+    }
+
+    /// Identity is settled before the version is read: an identity the list does not
+    /// name hears silence on a wrong version too, never the version refusal, so a
+    /// stranger cannot learn what this node speaks by naming a version it does not.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_untrusted_identity_on_a_wrong_version_still_hears_silence() {
+        install_log_collector();
+        let recorder = Arc::new(Recorder::default());
+        let (responder, requester, desc) = pair(recorder.clone()).await;
+        let gate = gate_all_paths(
+            &responder,
+            recorder.clone(),
+            &TrustList::default(),
+            "r3-gate-stranger-version",
+        );
+        let link = identified_link(&requester, &responder, &desc).await;
+
+        let err = requester
+            .client
+            .request_on_link(
+                &requester.transport,
+                &link,
+                MESSAGE_PATH,
+                envelope_at(requester.origin, Some(MESH_PROTOCOL_VERSION + 1)),
+                Deadline::after(SHORT_REQUEST_TIMEOUT),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, R3Error::Timeout { .. }), "{err:?}");
+        assert_eq!(recorder.seen_count(), 0, "the handler was never entered");
+        assert_eq!(gate.sink.count(), 0, "an unknown identity never knocks");
         requester.stop().await;
         responder.stop().await;
     }
@@ -5272,7 +5470,8 @@ mod network {
 
     /// A broadcast goes to every trusted peer node A has a path to. Node B acknowledges;
     /// node C has a path but never answers and no propagation node is known, so its
-    /// report says unreachable while B's says delivered.
+    /// report says unreachable while B's says delivered. Once C is on record as speaking
+    /// another protocol, a second broadcast reports it refused without asking it again.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_broadcast_reaches_the_reachable_peer_and_reports_the_unreachable_one() {
         let recorder_c = Arc::new(Recorder::default());
@@ -5351,6 +5550,34 @@ mod network {
             recorder_c.seen_count(),
             1,
             "C heard the request it never answered"
+        );
+
+        peers.mark_incompatible(&c_instance, 2);
+        pair.recorder_b
+            .queue(Script::Reply(Reply::Value(received_reply(&message.id))));
+        let outcome = pair
+            .node_a
+            .broadcast_with(&message, peer_send_options())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.recipients.len(), 2, "{:?}", outcome.recipients);
+        let report = |instance: &str| {
+            outcome
+                .recipients
+                .iter()
+                .find(|report| report.destination == instance)
+                .unwrap_or_else(|| panic!("no report for {instance}: {:?}", outcome.recipients))
+        };
+        assert_eq!(report(&b_instance).outcome, RecipientOutcome::Delivered);
+        let RecipientOutcome::Refused { reason } = &report(&c_instance).outcome else {
+            panic!("C was not refused: {:?}", report(&c_instance).outcome);
+        };
+        assert!(reason.contains("1..=1"), "{reason}");
+        assert_eq!(
+            recorder_c.seen_count(),
+            1,
+            "the gate refused C before any link was opened"
         );
         pair.stop_node_a().await;
         responder_c.stop().await;
