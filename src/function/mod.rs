@@ -6030,10 +6030,15 @@ mod tests {
     /// `None` when no python is on PATH, in which case the caller skips; CI
     /// must have one, so there the absence is a failure rather than a skip.
     fn test_python() -> Option<PathBuf> {
-        match which::which("python3").or_else(|_| which::which("python")) {
-            Ok(python) => Some(python),
-            Err(_) if env::var_os("CI").is_some() => panic!("python is required on CI"),
-            Err(_) => {
+        let candidates = if cfg!(windows) {
+            ["python", "python3"]
+        } else {
+            ["python3", "python"]
+        };
+        match candidates.iter().find_map(|name| which::which(name).ok()) {
+            Some(python) => Some(python),
+            None if env::var_os("CI").is_some() => panic!("python is required on CI"),
+            None => {
                 eprintln!("skipping: python not available");
                 None
             }
@@ -6099,7 +6104,10 @@ mod tests {
                 thread::sleep(Duration::from_millis(50));
             }
         }
-        wait_for(Duration::from_secs(5), || pid_file.exists());
+        assert!(
+            wait_for(Duration::from_secs(5), || pid_file.exists()),
+            "the tool ran long enough to record its pid"
+        );
         let pid: u32 = fs::read_to_string(&pid_file)
             .expect("the tool ran long enough to record its pid")
             .trim()
@@ -6109,6 +6117,39 @@ mod tests {
             wait_for(Duration::from_secs(5), || !crate::testing::pid_alive(pid)),
             "interpreter pid {pid} survived the timeout kill"
         );
+
+        source.remove_dir();
+    }
+
+    #[test]
+    #[serial]
+    fn builtin_agent_binaries_are_the_script_alone_never_a_cmd_launcher() {
+        use crate::config::envoy::EnvoySource;
+        use crate::config::reserved_agents::BuiltinSourceGuard;
+        use crate::testing::EnvVarGuard;
+
+        let _guard = crate::testing::TestConfigDirGuard::new("builtin-no-cmd-launcher");
+        let _data_dir = EnvVarGuard::unset("ENVOY_DATA_DIR");
+        let _config_file = EnvVarGuard::unset("ENVOY_CONFIG_FILE");
+        let source = Arc::new(EnvoySource::with_stub_probes());
+        let _source = BuiltinSourceGuard::new(source.clone());
+        let dir = crate::config::builtin_agent_dir("envoy").unwrap();
+
+        Functions::init_agent("envoy", &[]).expect("the envoy shim builds");
+
+        let bin = dir.join("bin");
+        assert!(bin.join("run-envoy.py").is_file());
+        assert!(!bin.join("envoy.cmd").exists());
+        let cmd_launchers: Vec<PathBuf> = fs::read_dir(&bin)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "cmd"))
+            .collect();
+        assert!(cmd_launchers.is_empty(), "{cmd_launchers:?}");
+        #[cfg(unix)]
+        assert!(bin.join("envoy").is_file());
+        #[cfg(windows)]
+        assert!(!bin.join("envoy").exists());
 
         source.remove_dir();
     }

@@ -2598,6 +2598,29 @@ nodes: {}
 
     #[test]
     #[serial_test::serial]
+    fn a_builtin_never_loads_or_inits_a_rag() {
+        let guard = TestConfigDirGuard::new("reserved-no-rag");
+        let dir = guard.path.join("builtin-envoy");
+        create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join(CONFIG_FILE_NAME),
+            "name: envoy\ninstructions: from-builtin-source\n",
+        )
+        .unwrap();
+        let _data_dir = EnvVarGuard::unset("ENVOY_DATA_DIR");
+        let _config_file = EnvVarGuard::unset("ENVOY_CONFIG_FILE");
+        let _source = BuiltinSourceGuard::new(Arc::new(FixedDirSource(dir)));
+        let rag_path = paths::agent_rag_file("envoy", DEFAULT_AGENT_NAME);
+        create_dir_all(rag_path.parent().unwrap()).unwrap();
+        fs::write(&rag_path, "not: [valid\n").unwrap();
+
+        let agent = init_envoy().unwrap();
+
+        assert!(agent.rag().is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn reserved_agent_registered_inside_user_agents_dir_is_refused() {
         let _guard = TestConfigDirGuard::new("reserved-inside-user-dir");
         let dir = paths::agents_data_dir().join("envoy");
