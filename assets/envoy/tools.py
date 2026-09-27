@@ -266,8 +266,9 @@ def _is_int(value) -> bool:
 def _budget(now: Callable[[], float] = time.monotonic) -> Callable[[], None]:
     """A check that raises `_BudgetExhausted` once `SEARCH_BUDGET_SECONDS`
     have passed since it was created. Best-effort only: it runs between
-    lines, and a single `re.search` cannot be interrupted, so Coyote kills
-    the tool process after its (capped) tool timeout as the real bound."""
+    lines, and a single `re.search` cannot be interrupted. The real bound is
+    Coyote's capped tool timeout, at which it kills this interpreter process
+    directly on every platform."""
     deadline = now() + SEARCH_BUDGET_SECONDS
 
     def check() -> None:

@@ -176,3 +176,34 @@ impl Drop for TestConfigDirGuard {
         let _ = std::fs::remove_dir_all(&self.path);
     }
 }
+
+/// Whether a process with `pid` still exists. A pid that exists but cannot
+/// be signalled or queried counts as alive.
+#[cfg(unix)]
+pub(crate) fn pid_alive(pid: u32) -> bool {
+    // SAFETY: signal 0 performs only the existence and permission checks.
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(windows)]
+pub(crate) fn pid_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_ACCESS_DENIED, GetLastError, STILL_ACTIVE,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    // SAFETY: plain Win32 calls; the handle is closed before returning.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return GetLastError() == ERROR_ACCESS_DENIED;
+        }
+        let mut code = 0u32;
+        let queried = GetExitCodeProcess(handle, &mut code) != 0;
+        CloseHandle(handle);
+        queried && code == STILL_ACTIVE as u32
+    }
+}

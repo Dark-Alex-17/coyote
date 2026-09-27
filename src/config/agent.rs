@@ -438,7 +438,9 @@ impl Agent {
             name,
         );
 
-        let rag = if rag_path.exists() {
+        let rag = if builtin {
+            None
+        } else if rag_path.exists() {
             let key = RagKey::Agent(name.to_string());
             let app_clone = app.clone();
             let vault_clone = app_state.vault.clone();

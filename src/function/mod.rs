@@ -1529,6 +1529,13 @@ impl Functions {
         let content = Self::render_shim_template(content_template, binary_name, &binary_type)?;
         write_file_atomic(&binary_script_file, &content, None)?;
 
+        // A built-in is spawned as `<python> -I -B run-<name>.py` directly
+        // (see `builtin_agent_launch`); a `.cmd` in front of it would only
+        // give the timeout kill a cmd.exe to hit.
+        if matches!(binary_type, BinaryType::BuiltinAgent) {
+            return Ok(());
+        }
+
         info!(
             "Building binary for function: {} ({})",
             binary_name,
@@ -1575,10 +1582,7 @@ impl Functions {
         // %~dp0 (the .cmd's own directory) keeps the launcher relocatable: no
         // absolute paths may be baked into it (see render_shim_template).
         let script_name = format!("run-{binary_name}.{}", language.to_extension());
-        let launch = match binary_type {
-            BinaryType::BuiltinAgent => format!("\"{run}\" -I -B \"%~dp0{script_name}\" %*"),
-            _ => format!("{run} \"%~dp0{script_name}\" %*"),
-        };
+        let launch = format!("{run} \"%~dp0{script_name}\" %*");
         let content = formatdoc!(
             r#"
 						@echo off
@@ -2688,7 +2692,10 @@ pub(crate) fn tool_timeout_secs(config_value: Option<u64>) -> u64 {
 
 /// Built-in agents' tool children are never unlimited: peer-controlled text
 /// reaches them, and a regex search in CPython cannot be interrupted from
-/// inside the tool, so the kill from this side is the only reliable bound.
+/// inside the tool, so its own budget is best-effort and the kill from this
+/// side is the only reliable bound. The kill lands on the interpreter
+/// process itself on every platform: the built-in is launched as
+/// `<python> -I -B run-<name>.py`, never through a shell or cmd.exe hop.
 pub(crate) const BUILTIN_TOOL_TIMEOUT_SECS: u64 = 30;
 
 pub(crate) fn builtin_tool_timeout_secs(configured: Option<u64>, cap: u64) -> u64 {
@@ -2701,11 +2708,37 @@ pub(crate) fn builtin_tool_timeout_secs(configured: Option<u64>, cap: u64) -> u6
 pub(crate) fn timeout_hint(hermetic: bool) -> String {
     if hermetic {
         format!(
-            "set tool_timeout in config or COYOTE_TOOL_TIMEOUT to adjust; built-in agent tools are capped at {BUILTIN_TOOL_TIMEOUT_SECS}s"
+            "set tool_timeout in config or COYOTE_TOOL_TIMEOUT to adjust; built-in agent tools are capped at {BUILTIN_TOOL_TIMEOUT_SECS}s and the interpreter process is killed at the cap"
         )
     } else {
         "set tool_timeout in config or COYOTE_TOOL_TIMEOUT to adjust; 0 = unlimited".to_string()
     }
+}
+
+/// The direct launch of a built-in's tool child: its probed interpreter plus
+/// `-I -B <agent_bin_dir>/run-<canonical>.py`, to go in front of the tool
+/// args. Spawning the interpreter itself, rather than the launcher file
+/// `build_binaries` writes, is what makes the timeout kill reach the
+/// interpreter: cmd.exe has no `exec`, so killing a `.cmd` hop would leave
+/// python running. `Ok(None)` unless `agent_name` is a built-in and
+/// `cmd_name` names that same built-in.
+pub(crate) fn builtin_agent_launch(
+    agent_name: Option<&str>,
+    cmd_name: &str,
+) -> Result<Option<(PathBuf, Vec<String>)>> {
+    let Some(canonical) = agent_name.and_then(crate::config::reserved_agent) else {
+        return Ok(None);
+    };
+    if crate::config::reserved_agent(cmd_name) != Some(canonical) {
+        return Ok(None);
+    }
+    let interpreter = crate::config::builtin_agent_tool_runtime(canonical)
+        .ok_or_else(|| anyhow!("Built-in agent '{canonical}' has no probed tool runtime"))?;
+    let script = paths::agent_bin_dir(canonical).join(format!("run-{canonical}.py"));
+    Ok(Some((
+        interpreter,
+        vec!["-I".into(), "-B".into(), script.display().to_string()],
+    )))
 }
 
 pub fn run_llm_function(
@@ -2720,6 +2753,7 @@ pub fn run_llm_function(
     let mut bin_dirs: Vec<PathBuf> = vec![];
     let mut command_name = cmd_name.clone();
     let hermetic = is_builtin_agent(agent_name.as_deref());
+    let launch = builtin_agent_launch(agent_name.as_deref(), &cmd_name)?;
     if let Some(agent_name) = agent_name {
         command_name = cmd_args[0].clone();
         let dir = paths::agent_bin_dir(&agent_name);
@@ -2766,7 +2800,13 @@ pub fn run_llm_function(
     envs.insert("CLICOLOR_FORCE".into(), "1".into());
     envs.insert("FORCE_COLOR".into(), "1".into());
 
-    let mut command = Command::new(&cmd_name);
+    let (mut command, cmd_args) = match launch {
+        Some((interpreter, prefix)) => (
+            Command::new(interpreter),
+            prefix.into_iter().chain(cmd_args).collect::<Vec<_>>(),
+        ),
+        None => (Command::new(&cmd_name), cmd_args),
+    };
     if hermetic {
         command
             .env_clear()
@@ -5938,21 +5978,22 @@ mod tests {
         use crate::config::envoy::{EnvoySource, exec_probe};
         use crate::config::reserved_agents::BuiltinSourceGuard;
 
+        let Some(python) = test_python() else {
+            return;
+        };
         let _guard = crate::testing::TestConfigDirGuard::new("builtin-shim-timeout");
         let _env = crate::testing::EnvVarGuard::unset(get_env_name("tool_timeout"));
-        // The real exec probe, so a noexec temp dir falls back to the cache
-        // dir as in production instead of failing to spawn the shim below.
         let source = Arc::new(EnvoySource::with_probes(
-            Box::new(|| Ok(PathBuf::from("/usr/bin/python3"))),
+            Box::new(move || Ok(python.clone())),
             Box::new(exec_probe),
         ));
         let _source = BuiltinSourceGuard::new(source.clone());
         let dir = crate::config::builtin_agent_dir("envoy").unwrap();
         fs::create_dir_all(dir.join("bin")).unwrap();
         write_file_atomic(
-            &dir.join("bin").join("envoy"),
-            "#!/bin/sh\nexec sleep 60\n",
-            Some(0o755),
+            &dir.join("bin").join("run-envoy.py"),
+            "import time\ntime.sleep(60)\n",
+            Some(0o600),
         )
         .unwrap();
 
@@ -5982,6 +6023,92 @@ mod tests {
             "{output}"
         );
         assert!(!output.contains("0 = unlimited"), "{output}");
+
+        source.remove_dir();
+    }
+
+    /// `None` when no python is on PATH, in which case the caller skips; CI
+    /// must have one, so there the absence is a failure rather than a skip.
+    fn test_python() -> Option<PathBuf> {
+        match which::which("python3").or_else(|_| which::which("python")) {
+            Ok(python) => Some(python),
+            Err(_) if env::var_os("CI").is_some() => panic!("python is required on CI"),
+            Err(_) => {
+                eprintln!("skipping: python not available");
+                None
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn builtin_agent_tool_kill_reaches_the_interpreter_on_every_platform() {
+        use crate::config::envoy::{EnvoySource, exec_probe};
+        use crate::config::reserved_agents::BuiltinSourceGuard;
+
+        let Some(python) = test_python() else {
+            return;
+        };
+        let _guard = crate::testing::TestConfigDirGuard::new("builtin-kill-interpreter");
+        let _env = crate::testing::EnvVarGuard::unset(get_env_name("tool_timeout"));
+        let source = Arc::new(EnvoySource::with_probes(
+            Box::new(move || Ok(python.clone())),
+            Box::new(exec_probe),
+        ));
+        let _source = BuiltinSourceGuard::new(source.clone());
+        let dir = crate::config::builtin_agent_dir("envoy").unwrap();
+        fs::create_dir_all(dir.join("bin")).unwrap();
+        // The tool records its own pid, then outlives the timeout by far.
+        write_file_atomic(
+            &dir.join("bin").join("run-envoy.py"),
+            "import os\nimport sys\nimport time\n\nwith open(sys.argv[1], \"w\") as f:\n    f.write(str(os.getpid()))\ntime.sleep(60)\n",
+            Some(0o600),
+        )
+        .unwrap();
+        let pid_file = dir.join("tool.pid");
+
+        let started = Instant::now();
+        let output = run_llm_function(
+            "envoy".into(),
+            vec![pid_file.display().to_string(), "{}".into()],
+            HashMap::new(),
+            Some("envoy".to_string()),
+            Some(3),
+            false,
+            None,
+        )
+        .unwrap()
+        .expect("a killed tool reports an error");
+        assert!(
+            started.elapsed() < Duration::from_secs(15),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(output.contains("tool_call_error"), "{output}");
+        assert!(output.contains("timed out after 3s"), "{output}");
+
+        fn wait_for(deadline: Duration, mut done: impl FnMut() -> bool) -> bool {
+            let started = Instant::now();
+            loop {
+                if done() {
+                    return true;
+                }
+                if started.elapsed() >= deadline {
+                    return false;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+        wait_for(Duration::from_secs(5), || pid_file.exists());
+        let pid: u32 = fs::read_to_string(&pid_file)
+            .expect("the tool ran long enough to record its pid")
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(
+            wait_for(Duration::from_secs(5), || !crate::testing::pid_alive(pid)),
+            "interpreter pid {pid} survived the timeout kill"
+        );
 
         source.remove_dir();
     }

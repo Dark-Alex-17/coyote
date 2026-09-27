@@ -997,7 +997,7 @@ fn build_env_snapshot(
     let (cmd_name, mut cmd_args, mut envs) = match agent {
         Some(agent) => match agent.functions().find(tool) {
             Some(declaration) if declaration.agent => (
-                format!("{}-{tool}", agent.name()),
+                agent.name().to_string(),
                 vec![tool.to_string()],
                 agent.variable_envs(),
             ),
@@ -1039,6 +1039,7 @@ fn build_env_snapshot(
         envs.insert(key, value);
     }
     let env_clear = super::is_builtin_agent(agent.map(|agent| agent.name()));
+    let launch = super::builtin_agent_launch(agent.map(|agent| agent.name()), &cmd_name)?;
 
     cmd_args.push(arguments.to_string());
 
@@ -1057,6 +1058,14 @@ fn build_env_snapshot(
             );
         }
         args
+    };
+
+    let (cmd_name, cmd_args) = match launch {
+        Some((interpreter, prefix)) => (
+            interpreter.display().to_string(),
+            prefix.into_iter().chain(cmd_args).collect::<Vec<_>>(),
+        ),
+        None => (cmd_name, cmd_args),
     };
 
     if env_clear {
@@ -3567,6 +3576,39 @@ mod tests {
         let snapshot = build_env_snapshot(&plain_ctx(), "execute_command", &json!({})).unwrap();
         assert!(!snapshot.env_clear);
         assert!(!snapshot.envs.contains_key("LEAK_MARKER"));
+        source.remove_dir();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn build_env_snapshot_launches_a_builtin_tool_through_its_interpreter() {
+        use crate::config::envoy::EnvoySource;
+        use crate::config::reserved_agents::BuiltinSourceGuard;
+        use crate::testing::{EnvVarGuard, TestConfigDirGuard};
+
+        let _guard = TestConfigDirGuard::new("jobs-envoy-launch");
+        let _timeout = EnvVarGuard::unset(crate::utils::get_env_name("tool_timeout"));
+        let source = Arc::new(EnvoySource::with_stub_probes());
+        let _source = BuiltinSourceGuard::new(source.clone());
+        let mut ctx = plain_ctx();
+        let app = ctx.app.config.clone();
+        run_async(ctx.use_agent(&app, "envoy", None, create_abort_signal())).unwrap();
+        let dir = crate::config::builtin_agent_dir("envoy").unwrap();
+
+        let snapshot = build_env_snapshot(&ctx, "fs_read", &json!({"path": "x"})).unwrap();
+        assert_eq!(snapshot.display_name, "fs_read");
+        assert_eq!(snapshot.cmd_name, "/usr/bin/python3");
+        assert_eq!(
+            &snapshot.cmd_args[..4],
+            [
+                "-I".to_string(),
+                "-B".to_string(),
+                dir.join("bin").join("run-envoy.py").display().to_string(),
+                "fs_read".to_string(),
+            ],
+            "{:?}",
+            snapshot.cmd_args
+        );
         source.remove_dir();
     }
 }
