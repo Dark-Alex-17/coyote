@@ -6123,7 +6123,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn builtin_agent_binaries_are_the_script_alone_never_a_cmd_launcher() {
+    fn builtin_agent_binaries_never_get_a_cmd_launcher_while_user_agents_keep_theirs() {
         use crate::config::envoy::EnvoySource;
         use crate::config::reserved_agents::BuiltinSourceGuard;
         use crate::testing::EnvVarGuard;
@@ -6150,6 +6150,37 @@ mod tests {
         assert!(bin.join("envoy").is_file());
         #[cfg(windows)]
         assert!(!bin.join("envoy").exists());
+
+        // Control: a plain user agent built through the same entry point still
+        // gets its launcher, so the built-in's omission is deliberate, not a
+        // regression in `build_binaries`.
+        let user = "plainuser";
+        let user_dir = paths::agents_data_dir().join(user);
+        fs::create_dir_all(&user_dir).unwrap();
+        write_file_atomic(
+            &user_dir.join("tools.py"),
+            "#!/usr/bin/env python3\n\n\ndef fs_glob(pattern: str) -> dict:\n    \"\"\"List.\n\n    Args:\n        pattern: Glob.\n    \"\"\"\n    return {\"paths\": []}\n",
+            None,
+        )
+        .unwrap();
+        Functions::init_agent(user, &[]).expect("the user agent shim builds");
+        let user_bin = paths::agent_bin_dir(user);
+        #[cfg(windows)]
+        {
+            let launcher = user_bin.join(format!("{user}.cmd"));
+            assert!(launcher.is_file(), "{}", launcher.display());
+            let launcher_text = fs::read_to_string(&launcher).unwrap();
+            assert!(
+                launcher_text.contains(&format!("%~dp0run-{user}.py")),
+                "{launcher_text}"
+            );
+            assert!(user_bin.join(format!("run-{user}.py")).is_file());
+        }
+        #[cfg(unix)]
+        {
+            assert!(user_bin.join(user).is_file());
+            assert!(!user_bin.join(format!("{user}.cmd")).exists());
+        }
 
         source.remove_dir();
     }
