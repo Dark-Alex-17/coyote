@@ -132,11 +132,17 @@ def run(agent_path, agent_func, agent_data):
         raise Exception(f"Not module function '{agent_func}' at '{agent_path}'")
 
     try:
-        inspect.signature(fn).bind(**agent_data)
-    except TypeError as exc:
-        return_to_llm({"tool_call_error": f"invalid arguments for {agent_func}: {exc}"})
-        dump_result('{agent_name}' + f':{agent_func}')
-        return
+        signature = inspect.signature(fn)
+    except ValueError:
+        # Some callables carry no signature; the call itself reports bad arguments.
+        signature = None
+    if signature is not None:
+        try:
+            signature.bind(**agent_data)
+        except TypeError as exc:
+            return_to_llm({"tool_call_error": f"invalid arguments for {agent_func}: {exc}"})
+            dump_result('{agent_name}' + f':{agent_func}')
+            return
 
     value = fn(**agent_data)
     return_to_llm(value)

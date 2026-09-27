@@ -1865,7 +1865,8 @@ impl MeshSlot {
     /// delivers; otherwise it goes to the peer as a reply, leaves the store here and is
     /// recorded for the leader, whose earlier note said to wait for it.
     /// Never touches `correlations`: this answers a peer's question, not one of ours.
-    // Reached by the REPL mesh commands once they land.
+    // Kept ahead of its caller: the `.mesh answer` REPL command that lands next
+    // consumes it; nothing else does yet.
     #[allow(dead_code)]
     pub(crate) async fn answer_inbound(&self, id: &str, text: &str) -> Result<()> {
         let Some(store) = self.inbound_store() else {

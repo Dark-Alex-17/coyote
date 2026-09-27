@@ -274,8 +274,22 @@ impl EnvoyRunner {
         }
     }
 
-    /// Builds the child context, loads the envoy agent and composes its input. The
-    /// hooks are resolved here, before the run, because the context does not survive it.
+    /// Builds the child context, loads the envoy agent and composes its input.
+    ///
+    /// The lifecycle hooks are resolved from the operator's global `agent.*` hooks
+    /// before `use_agent`, while the context has no agent yet: those hooks are how a
+    /// human observes envoy activity, so they apply to the envoy like to any child.
+    /// Resolving after `use_agent` would pass them through the built-in's empty
+    /// `global_hooks()` whitelist, which distrusts the EMBEDDED config as a hook
+    /// source (its `hooks:` and `global_hooks:` are never read), not the operator's
+    /// own hooks. The hooks are resolved here rather than after the run because the
+    /// context does not survive it.
+    ///
+    /// `agent.started` fires only once the load has settled, after `use_agent`. A
+    /// load that fails (the built-in unavailable, no model, a refused agent) still
+    /// fires it, and `deliver` then fires `agent.failed` with `COYOTE_AGENT_ERROR`
+    /// set, so the operator sees the refusal as a started/failed pair rather than
+    /// nothing at all.
     async fn prepare(
         &self,
         message: &PeerMessage,
@@ -283,27 +297,14 @@ impl EnvoyRunner {
         agent_id: &str,
         terminal: &mut TerminalHooks,
     ) -> Result<Prepared, EnvoyOutcome> {
-        let dir = tokio::task::spawn_blocking(|| builtin_agent_dir(ENVOY_AGENT_NAME)).await;
-        if !matches!(dir, Ok(Some(_))) {
-            return Err(EnvoyOutcome::Unavailable(
-                builtin_agent_unavailable_reason(ENVOY_AGENT_NAME)
-                    .unwrap_or(UnavailableReason::NoSource),
-            ));
-        }
         let mut ctx = RequestContext::new(child_app_state(&self.app), WorkingMode::Cmd);
         ctx.render_mode = RenderMode::Silent;
-        // The child agent has no model of its own and inherits the context's, which a
-        // fresh context leaves empty.
-        ctx.model = Model::retrieve_model(
-            self.app.config.as_ref(),
-            &self.app.config.model_id,
-            ModelType::Chat,
-        )
-        .map_err(|err| EnvoyOutcome::Failed(format!("{err:#}")))?;
         let started = ctx.resolved_hooks(HookEvent::AgentStarted);
         terminal.completed = ctx.resolved_hooks(HookEvent::AgentCompleted);
         terminal.failed = ctx.resolved_hooks(HookEvent::AgentFailed);
         terminal.interrupted = ctx.resolved_hooks(HookEvent::AgentInterrupted);
+        let abort = create_abort_signal();
+        let loaded = self.load_envoy(&mut ctx, abort.clone()).await;
         hooks::fire_resolved(
             HookEvent::AgentStarted,
             started,
@@ -314,16 +315,7 @@ impl EnvoyRunner {
             ],
             None,
         );
-        let abort = create_abort_signal();
-        if let Err(err) = ctx
-            .use_agent(&self.app.config, ENVOY_AGENT_NAME, None, abort.clone())
-            .await
-        {
-            return Err(match err.downcast_ref::<BuiltinAgentUnavailable>() {
-                Some(unavailable) => EnvoyOutcome::Unavailable(unavailable.reason.clone()),
-                None => EnvoyOutcome::Failed(format!("{err:#}")),
-            });
-        }
+        loaded?;
         // After `use_agent`, which resets the depth and the queue.
         ctx.current_depth = 1;
         let queue = Arc::new(EscalationQueue::new());
@@ -357,6 +349,36 @@ impl EnvoyRunner {
             abort,
             timeout_secs,
         })
+    }
+
+    /// Checks the built-in is materialized, gives the child the session's model and
+    /// loads the envoy agent into `ctx`.
+    async fn load_envoy(
+        &self,
+        ctx: &mut RequestContext,
+        abort: AbortSignal,
+    ) -> Result<(), EnvoyOutcome> {
+        let dir = tokio::task::spawn_blocking(|| builtin_agent_dir(ENVOY_AGENT_NAME)).await;
+        if !matches!(dir, Ok(Some(_))) {
+            return Err(EnvoyOutcome::Unavailable(
+                builtin_agent_unavailable_reason(ENVOY_AGENT_NAME)
+                    .unwrap_or(UnavailableReason::NoSource),
+            ));
+        }
+        // The child agent has no model of its own and inherits the context's, which a
+        // fresh context leaves empty.
+        ctx.model = Model::retrieve_model(
+            self.app.config.as_ref(),
+            &self.app.config.model_id,
+            ModelType::Chat,
+        )
+        .map_err(|err| EnvoyOutcome::Failed(format!("{err:#}")))?;
+        ctx.use_agent(&self.app.config, ENVOY_AGENT_NAME, None, abort)
+            .await
+            .map_err(|err| match err.downcast_ref::<BuiltinAgentUnavailable>() {
+                Some(unavailable) => EnvoyOutcome::Unavailable(unavailable.reason.clone()),
+                None => EnvoyOutcome::Failed(format!("{err:#}")),
+            })
     }
 
     /// Runs the envoy to an outcome, watching for the run's deadline, a shutdown and the
@@ -749,13 +771,19 @@ mod tests {
     }
 
     fn app_with(hooks: HooksMap, hold_secs: u64) -> Arc<AppState> {
+        app_configured(|config| {
+            config.hooks = hooks;
+            config.mesh.envoy_escalation_timeout = hold_secs;
+        })
+    }
+
+    fn app_configured(tweak: impl FnOnce(&mut AppConfig)) -> Arc<AppState> {
         let mut config = AppConfig {
             model_id: TEST_MODEL_ID.into(),
             function_calling_support: true,
-            hooks,
             ..AppConfig::default()
         };
-        config.mesh.envoy_escalation_timeout = hold_secs;
+        tweak(&mut config);
         Arc::new(AppState {
             config: Arc::new(config),
             ..AppState::test_default()
@@ -1406,6 +1434,217 @@ mod tests {
         assert_eq!(failed.envs["COYOTE_AGENT_ERROR"], "model refused");
         assert!(!failed.envs.values().any(|value| value.contains(secret)));
         source.remove_dir();
+    }
+
+    /// Runs one job through a drive that records the context's model and the
+    /// model of the role the envoy answers with.
+    async fn models_seen_by_the_drive(app: &Arc<AppState>) -> (String, String) {
+        let seen: Arc<Mutex<Option<(String, String)>>> = Arc::new(Mutex::new(None));
+        let runner = EnvoyRunner::start_with(Arc::clone(app), {
+            let seen = Arc::clone(&seen);
+            drive_of(move |ctx, input, _| {
+                let seen = Arc::clone(&seen);
+                async move {
+                    *seen.lock() = Some((ctx.current_model().id(), input.role().model().id()));
+                    Ok("ok".into())
+                }
+            })
+        });
+        runner.attach();
+        app.mesh
+            .deliver_peer(job(PeerKind::Ask, "msg-model", "which model?").message);
+        wait_until("the reply to land in the inbox", || {
+            app.mesh.peer_inbox().len() >= 2
+        })
+        .await;
+        runner.stop().await;
+        let (envelopes, _) = app.mesh.peer_inbox().drain();
+        assert_eq!(peer_of(&envelopes[1]).content, "ok");
+        seen.lock().take().expect("the drive ran")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn the_configured_envoy_model_drives_the_envoy_while_the_context_keeps_the_session_model()
+    {
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-model");
+        let (source, _source) = stub_envoy_source();
+        let envoy_model = "test-seeded:envoy-chat";
+        let app = app_configured(|config| config.mesh.envoy_model = Some(envoy_model.into()));
+        let _idle = RecordingIdleSink::attach(&app);
+
+        let (ctx_model, role_model) = models_seen_by_the_drive(&app).await;
+
+        assert_eq!(ctx_model, TEST_MODEL_ID);
+        assert_eq!(role_model, envoy_model);
+        source.remove_dir();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn an_unresolvable_envoy_model_falls_back_to_the_session_model_without_failing() {
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-model-fallback");
+        let (source, _source) = stub_envoy_source();
+        let app = app_configured(|config| {
+            config.mesh.envoy_model = Some("no-such-client:missing-model".into())
+        });
+        let idle = RecordingIdleSink::attach(&app);
+
+        let (ctx_model, role_model) = models_seen_by_the_drive(&app).await;
+
+        assert_eq!(ctx_model, TEST_MODEL_ID);
+        assert_eq!(role_model, TEST_MODEL_ID);
+        assert!(!idle.has("envoy failed"), "{:?}", idle.texts());
+        source.remove_dir();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn operator_global_hooks_reach_the_envoy_and_its_own_config_is_no_hook_source() {
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-hook-source");
+        let (source, _source) = stub_envoy_source();
+        let _sink = test_sink::install();
+        // The operator's global hook: the only `agent.started` hook the app config
+        // carries, with no agent-level whitelist naming it anywhere.
+        let mut global = HooksMap::default();
+        global.insert(
+            "agent.started".to_string(),
+            vec![HookDef {
+                name: "t083op_started".to_string(),
+                command: "true".to_string(),
+            }],
+        );
+        let app = app_with_hooks(global);
+        let _idle = RecordingIdleSink::attach(&app);
+        // A hook and a whitelist declared only in the envoy's own config, as if the
+        // materialized copy had been tampered with.
+        let dir = builtin_agent_dir(ENVOY_AGENT_NAME).expect("the stub source materializes");
+        {
+            use std::io::Write;
+            let mut config = std::fs::OpenOptions::new()
+                .append(true)
+                .open(dir.join("config.yaml"))
+                .unwrap();
+            config
+                .write_all(
+                    b"global_hooks:\n  - \"*\"\nhooks:\n  agent.started:\n    - name: t083rogue\n      command: \"true\"\n",
+                )
+                .unwrap();
+        }
+        let seen: Arc<Mutex<Option<Vec<String>>>> = Arc::new(Mutex::new(None));
+        let runner = EnvoyRunner::start_with(Arc::clone(&app), {
+            let seen = Arc::clone(&seen);
+            drive_of(move |ctx, _, _| {
+                let seen = Arc::clone(&seen);
+                async move {
+                    let agent = ctx.agent.as_ref().unwrap();
+                    assert!(agent.hooks().is_empty());
+                    assert!(agent.global_hooks().is_empty());
+                    *seen.lock() = Some(
+                        ctx.resolved_hooks(HookEvent::AgentStarted)
+                            .into_iter()
+                            .map(|hook| hook.name)
+                            .collect(),
+                    );
+                    Ok("ok".into())
+                }
+            })
+        });
+        runner.attach();
+        app.mesh
+            .deliver_peer(job(PeerKind::Ask, "msg-hook-source", "hello").message);
+        wait_until("the reply to land in the inbox", || {
+            app.mesh.peer_inbox().len() >= 2
+        })
+        .await;
+        runner.stop().await;
+
+        let loaded = seen.lock().take().expect("the drive ran");
+        assert!(
+            !loaded.iter().any(|name| name == "t083rogue"),
+            "the built-in config is not a hook source: {loaded:?}"
+        );
+        let captures = test_sink::snapshot();
+        let fired: Vec<&str> = captures
+            .iter()
+            .map(|capture| capture.hook_name.as_str())
+            .filter(|name| name.starts_with("t083op_") || name.starts_with("t083rogue"))
+            .collect();
+        assert_eq!(fired, ["t083op_started"], "{captures:?}");
+        let started = captures
+            .iter()
+            .find(|capture| capture.hook_name == "t083op_started")
+            .unwrap();
+        assert_eq!(started.envs["COYOTE_AGENT_NAME"], "envoy");
+        source.remove_dir();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn a_refused_envoy_load_fires_the_started_and_failed_pair() {
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-refused-hooks");
+        // Deliberately no envoy source: the built-in is unavailable and `use_agent`
+        // never succeeds.
+        let _sink = test_sink::install();
+        let marker = "t083refused";
+        let app = app_with_hooks(agent_hooks(marker));
+        let idle = RecordingIdleSink::attach(&app);
+        let drove = Arc::new(AtomicBool::new(false));
+        let runner = EnvoyRunner::start_with(Arc::clone(&app), {
+            let drove = Arc::clone(&drove);
+            drive_of(move |_, _, _| {
+                drove.store(true, Ordering::SeqCst);
+                async { Ok("never".into()) }
+            })
+        });
+        runner.attach();
+        app.mesh
+            .deliver_peer(job(PeerKind::Ask, "msg-refused", "anyone there?").message);
+        wait_until("the failed hook", || {
+            test_sink::snapshot()
+                .iter()
+                .any(|capture| capture.hook_name == "t083refused_failed")
+        })
+        .await;
+        runner.stop().await;
+
+        assert!(!drove.load(Ordering::SeqCst));
+        assert!(idle.has("envoy unavailable:"), "{:?}", idle.texts());
+        let captures = test_sink::snapshot();
+        let fired: Vec<&str> = captures
+            .iter()
+            .map(|capture| capture.hook_name.as_str())
+            .filter(|name| name.starts_with(marker))
+            .collect();
+        assert_eq!(
+            fired,
+            ["t083refused_started", "t083refused_failed"],
+            "{captures:?}"
+        );
+        for capture in captures
+            .iter()
+            .filter(|capture| capture.hook_name.starts_with(marker))
+        {
+            assert_eq!(capture.envs["COYOTE_AGENT_NAME"], "envoy");
+            assert!(capture.envs["COYOTE_AGENT_ID"].starts_with("envoy-"));
+        }
+        let failed = captures
+            .iter()
+            .find(|capture| capture.hook_name == "t083refused_failed")
+            .unwrap();
+        assert!(
+            failed.envs["COYOTE_AGENT_ERROR"].starts_with("unavailable:"),
+            "{:?}",
+            failed.envs
+        );
+        assert_eq!(
+            captures
+                .iter()
+                .find(|capture| capture.hook_name == "t083refused_started")
+                .unwrap()
+                .envs["COYOTE_AGENT_ID"],
+            failed.envs["COYOTE_AGENT_ID"]
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
