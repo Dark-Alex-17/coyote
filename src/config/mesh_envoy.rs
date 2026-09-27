@@ -15,12 +15,13 @@ use super::{
     AppState, BuiltinAgentUnavailable, Input, RenderMode, RequestContext, RoleLike,
     UnavailableReason, WorkingMode, builtin_agent_dir, builtin_agent_unavailable_reason,
 };
-use crate::client::{Model, ModelType};
+use crate::client::{Model, ModelType, RunUsage};
 use crate::function::agents::{child_app_state, run_child_agent};
 use crate::hooks::{self, HookEvent, ResolvedHook};
 use crate::mesh::brief::Brief;
 use crate::mesh::envoy::{EnvoyJob, EnvoySink, fence_peer_text};
 use crate::mesh::idle::{IdleNotify, Origin};
+use crate::mesh::limits::{PeerRefusal, RefusalReason};
 use crate::mesh::message::{
     OutboundPeer, PEER_CONTENT_MAX_CHARS, PEER_LINE_MAX_CHARS, PEER_TITLE_MAX_CHARS, PeerKind,
     PeerMessage, PeerVia,
@@ -35,12 +36,12 @@ use crate::supervisor::escalation::{EscalationQueue, EscalationRequest};
 use crate::utils::{AbortSignal, create_abort_signal};
 
 use anyhow::Result;
-use log::warn;
+use log::{debug, warn};
 use parking_lot::Mutex;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::Sleep;
@@ -118,6 +119,8 @@ pub(crate) enum EnvoyOutcome {
     Interrupted,
     Unavailable(UnavailableReason),
     Failed(String),
+    /// The sender's window was spent between the job being queued and its turn.
+    Refused(PeerRefusal),
 }
 
 /// An escalated question whose run is still open, waiting for the human's answer.
@@ -142,6 +145,10 @@ struct Prepared {
     queue: Arc<EscalationQueue>,
     abort: AbortSignal,
     timeout_secs: u64,
+    /// The child context's usage handle, read once the run is over.
+    usage: Arc<RunUsage>,
+    /// What the prompt is thought to cost, for a run whose provider reported no usage.
+    prompt_estimate: u64,
 }
 
 pub(crate) struct EnvoyRunner {
@@ -190,13 +197,14 @@ impl EnvoyRunner {
             }
             // Closed first so a `try_send` racing this drain is refused and the slot
             // takes the inbox path itself. Every job already here was ACKed to the
-            // peer's slot; the inbox is the only place left for it.
+            // peer's slot, so the peer is told the envoy is stopping and the inbox
+            // keeps the original; dropping the job gives its reservation back.
             queue.close();
             while let Ok(job) = queue.try_recv() {
-                worker
-                    .app
-                    .mesh
-                    .record_envoy_fallback(job.message, "envoy stopping");
+                worker.app.mesh.refuse_for_envoy(
+                    job.message,
+                    PeerRefusal::capacity(RefusalReason::EnvoyStopping),
+                );
             }
         });
         *runner.worker.lock() = Some(handle);
@@ -235,20 +243,38 @@ impl EnvoyRunner {
         }
     }
 
-    /// Where a spend ceiling goes: called before any model work; today every job is
-    /// admitted.
-    fn admit(&self, _job: &EnvoyJob) -> Result<(), String> {
-        Ok(())
+    /// The second look at the sender's window, just before model work: a job queued
+    /// while the window was open is refused here once the runs ahead of it have spent
+    /// it. The runs already past this look may still overshoot a ceiling by at most
+    /// `peer_max_concurrent` runs, each bounded by the run ceiling; a run that ends over
+    /// the ceiling debits in full, so the next is refused.
+    fn admit(&self, job: &EnvoyJob, now: Instant) -> Result<(), PeerRefusal> {
+        self.app
+            .mesh
+            .limits()
+            .admit_reserved(&job.message.source_identity, now)
     }
 
     async fn run_job(self: &Arc<Self>, drive: &EnvoyDrive, job: EnvoyJob) {
-        let admitted = self.admit(&job);
-        let message = job.message;
+        let admitted = self.admit(&job, Instant::now());
+        let EnvoyJob {
+            message,
+            reservation,
+        } = job;
         let card = self.peer_card(&message);
         let agent_id = format!("envoy-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
         let mut terminal = TerminalHooks::default();
         let (outcome, escalated) = match admitted {
-            Err(reason) => (EnvoyOutcome::Failed(reason), false),
+            Err(refusal) => {
+                debug!(
+                    "Mesh {} {} from {} refused at run time: {}",
+                    message.kind,
+                    message.message_id,
+                    short(&message.source_identity),
+                    refusal.reason.as_str()
+                );
+                (EnvoyOutcome::Refused(refusal), false)
+            }
             Ok(()) => match self
                 .prepare(&message, &card, &agent_id, &mut terminal)
                 .await
@@ -259,6 +285,7 @@ impl EnvoyRunner {
         };
         self.deliver(message, &card, outcome, escalated, agent_id, terminal)
             .await;
+        drop(reservation);
     }
 
     fn peer_card(&self, message: &PeerMessage) -> PeerCard {
@@ -341,13 +368,21 @@ impl EnvoyRunner {
         role.append_to_prompt(&tail);
         let input = Input::from_str(&ctx, &user, Some(role))
             .map_err(|err| EnvoyOutcome::Failed(format!("{err:#}")))?;
+        let prompt_estimate = input
+            .build_messages()
+            .map(|messages| input.role().model().total_tokens(&messages) as u64)
+            .unwrap_or(user.len() as u64 / 4)
+            .max(1);
         let timeout_secs = self.app.config.mesh.envoy_escalation_timeout;
+        let usage = Arc::clone(&ctx.run_usage);
         Ok(Prepared {
             ctx,
             input,
             queue,
             abort,
             timeout_secs,
+            usage,
+            prompt_estimate,
         })
     }
 
@@ -385,6 +420,7 @@ impl EnvoyRunner {
     /// first escalation; the flag says whether the run escalated. A run cut off while a
     /// hold is or was open is still a hand-off, so the peer's correlation stays open for
     /// the human's answer. Dropping the run drops the child context and its queue.
+    /// Whatever the outcome, the run is charged to the sender's window before returning.
     async fn drive(
         self: &Arc<Self>,
         drive: &EnvoyDrive,
@@ -398,6 +434,8 @@ impl EnvoyRunner {
             queue,
             abort,
             timeout_secs,
+            usage,
+            prompt_estimate,
         } = prepared;
         *self.current_abort.lock() = Some(abort.clone());
         let started = tokio::time::Instant::now();
@@ -470,7 +508,46 @@ impl EnvoyRunner {
         };
         *self.current_abort.lock() = None;
         self.held.lock().take();
+        self.debit(&message.source_identity, &usage, prompt_estimate, &outcome);
         (outcome, escalated)
+    }
+
+    /// Charges the run to the sender's window: the provider's figures when it reported
+    /// any, else a conservative estimate from the prompt and the answer (a call whose
+    /// buckets are all zero counts as unreported, since the prompt was sent whatever
+    /// the provider said). A run cut off mid-call (the ceiling, a shutdown, a hold cut
+    /// short) is charged the prompt once more, since the aborted call sent at least
+    /// that and reported nothing. Cost is `Some` only when the provider priced the
+    /// calls, so the cost ceiling is enforced only when pricing is known.
+    fn debit(
+        &self,
+        identity: &str,
+        usage: &RunUsage,
+        prompt_estimate: u64,
+        outcome: &EnvoyOutcome,
+    ) {
+        let snapshot = usage.snapshot();
+        let cut_off = matches!(
+            outcome,
+            EnvoyOutcome::TimedOut
+                | EnvoyOutcome::Interrupted
+                | EnvoyOutcome::Escalated { cut_short: true }
+        );
+        let tokens = if snapshot.calls == 0 || snapshot.total_tokens() == 0 {
+            let answer = match outcome {
+                EnvoyOutcome::Answered(text) => text.len() as u64 / 4,
+                _ => 0,
+            };
+            prompt_estimate.saturating_add(answer)
+        } else if cut_off {
+            snapshot.total_tokens().saturating_add(prompt_estimate)
+        } else {
+            snapshot.total_tokens()
+        };
+        self.app
+            .mesh
+            .limits()
+            .debit(identity, tokens, snapshot.cost_usd, Instant::now());
     }
 
     /// Files the question, tells the human, and holds the run open for the answer for
@@ -589,15 +666,23 @@ impl EnvoyRunner {
                     Some(err.clone()),
                 )
             }
+            EnvoyOutcome::Refused(refusal) => (
+                refusal.reason.peer_text().to_string(),
+                Some(format!("refused: {}", refusal.reason.as_str())),
+            ),
         };
         let (kind, reply_text) = match (&outcome, &human_answer) {
             (_, Some(text)) => (PeerKind::Reply, text.clone()),
             (EnvoyOutcome::Escalated { .. }, None) => (PeerKind::Message, reply_text),
             _ => (PeerKind::Reply, reply_text),
         };
+        let fields = match (&outcome, &human_answer) {
+            (EnvoyOutcome::Refused(refusal), None) => Some(refusal.fields()),
+            _ => None,
+        };
         let unsent = match (
             self.app.mesh.get(),
-            OutboundPeer::new(kind, &reply_text, None, Some(&id), None),
+            OutboundPeer::new(kind, &reply_text, None, Some(&id), fields),
         ) {
             (Some(runtime), Ok(out)) => runtime
                 .send_peer(&message.source_destination, &out)
@@ -650,6 +735,9 @@ impl EnvoyRunner {
                 .app
                 .mesh
                 .record_envoy_fallback(message, &format!("envoy failed: {err}")),
+            (EnvoyOutcome::Refused(refusal), None) => {
+                self.app.mesh.record_envoy_refusal(message, refusal)
+            }
         }
         let mut extras = vec![
             ("COYOTE_AGENT_ID", agent_id),
@@ -687,8 +775,21 @@ impl EnvoyRunner {
 }
 
 impl EnvoySink for EnvoyRunner {
-    fn accept(&self, job: EnvoyJob) -> bool {
-        job.message.in_reply_to.is_none() && self.jobs.try_send(job).is_ok()
+    /// The reservation rides in the job from here on: a refused enqueue hands the job
+    /// back and dropping it releases the slot.
+    fn accept(&self, mut job: EnvoyJob) -> Result<(), PeerRefusal> {
+        if job.message.in_reply_to.is_some() {
+            return Err(PeerRefusal::capacity(RefusalReason::LoopGuard));
+        }
+        job.reservation = Some(
+            self.app
+                .mesh
+                .limits()
+                .try_reserve(&job.message.source_identity, Instant::now())?,
+        );
+        self.jobs
+            .try_send(job)
+            .map_err(|_| PeerRefusal::capacity(RefusalReason::EnvoyBusy))
     }
 
     fn answer(&self, id: &str, text: &str) -> bool {
@@ -732,7 +833,7 @@ mod tests {
     use super::*;
     use crate::client::{
         ChatCompletionsData, ChatCompletionsOutput, Client, ExtraConfig, ModelData, RequestPatch,
-        SseHandler, call_chat_completions,
+        SseHandler, TokenUsage, call_chat_completions,
     };
     use crate::config::envoy::EnvoySource;
     use crate::config::reserved_agents::BuiltinSourceGuard;
@@ -741,16 +842,28 @@ mod tests {
     use crate::function::user_interaction::handle_user_tool;
     use crate::hooks::{HookDef, HooksMap, test_sink};
     use crate::mesh::envoy::{PEER_FENCE_BEGIN, PEER_FENCE_END};
-    use crate::mesh::hex_lower;
     use crate::mesh::idle::IdleSink;
-    use crate::mesh::message::RawPeerMessage;
+    use crate::mesh::limits::{PEER_RETRY_AFTER_CAPACITY, PeerLimitConfig};
+    use crate::mesh::message::{
+        PeerBody, PeerMessageHandler, PeerRouting, PeerSurface, RawPeerMessage, is_received_reply,
+        peer_lxmf_message, to_r3_body,
+    };
     use crate::mesh::pending::InboundStore;
-    use crate::mesh::test_support::TempDir;
+    use crate::mesh::test_support::{
+        AdmittedRequest, Handler, InboundMessage, InboundSink, MESSAGE_PATH, NAME_HASH_LEN,
+        OriginName, PathHash, RefusalCode, Reply, RequestId, SizeBranch, TempDir, TrustList,
+    };
+    use crate::mesh::{destination_address, hex_lower};
     use crate::supervisor::mailbox::EnvelopePayload;
     use crate::testing::TestConfigDirGuard;
+    use rand_core::OsRng;
+    use rns_transport::destination::link::LinkId;
+    use rns_transport::hash::AddressHash;
+    use rns_transport::identity::PrivateIdentity;
     use serde_json::json;
     use serial_test::serial;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Weak;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::sync::Semaphore;
 
     const PEER_IDENTITY: [u8; 16] = [0xcd; 16];
@@ -832,6 +945,7 @@ mod tests {
                 kind,
                 via: PeerVia::Direct,
             }),
+            reservation: None,
         }
     }
 
@@ -1068,19 +1182,34 @@ mod tests {
             })
         });
 
+        // The queue bound is under test here, not the per-identity cap.
+        app.mesh.limits().configure(PeerLimitConfig {
+            concurrency: 64,
+            ..PeerLimitConfig::default()
+        });
         assert_eq!(ENVOY_QUEUE_MAX, 8);
-        assert!(runner.accept(job(PeerKind::Message, "msg-q0", "hello")));
+        assert!(
+            runner
+                .accept(job(PeerKind::Message, "msg-q0", "hello"))
+                .is_ok()
+        );
         wait_until("the worker to take the first job", || {
             started.load(Ordering::SeqCst)
         })
         .await;
         for n in 1..=ENVOY_QUEUE_MAX {
             assert!(
-                runner.accept(job(PeerKind::Message, &format!("msg-q{n}"), "hello")),
+                runner
+                    .accept(job(PeerKind::Message, &format!("msg-q{n}"), "hello"))
+                    .is_ok(),
                 "job {n} should be queued"
             );
         }
-        assert!(!runner.accept(job(PeerKind::Message, "msg-q9", "hello")));
+        let refusal = runner
+            .accept(job(PeerKind::Message, "msg-q9", "hello"))
+            .unwrap_err();
+        assert_eq!(refusal.reason, RefusalReason::EnvoyBusy);
+        assert_eq!(refusal.retry_after, PEER_RETRY_AFTER_CAPACITY);
 
         gate.add_permits(ENVOY_QUEUE_MAX + 1);
         wait_until("every queued job to be answered", || {
@@ -1089,6 +1218,15 @@ mod tests {
         .await;
         runner.stop().await;
         assert_eq!(app.mesh.peer_inbox().len(), 2 * (ENVOY_QUEUE_MAX + 1));
+        assert_eq!(
+            app.mesh
+                .limits()
+                .window_of(&hex_lower(&PEER_IDENTITY), Instant::now())
+                .unwrap()
+                .in_flight,
+            0,
+            "every finished run gave its reservation back"
+        );
         source.remove_dir();
     }
 
@@ -1103,11 +1241,21 @@ mod tests {
         );
         let mut wire_reply = job(PeerKind::Message, "msg-wr", "hello");
         wire_reply.message.in_reply_to = Some("whatever".into());
-        assert!(!runner.accept(wire_reply));
+        assert_eq!(
+            runner.accept(wire_reply).unwrap_err().reason,
+            RefusalReason::LoopGuard
+        );
         assert_eq!(
             runner.jobs.capacity(),
             ENVOY_QUEUE_MAX,
             "nothing was queued"
+        );
+        assert_eq!(
+            app.mesh
+                .limits()
+                .window_of(&hex_lower(&PEER_IDENTITY), Instant::now()),
+            None,
+            "nothing was reserved"
         );
         runner.stop().await;
     }
@@ -2399,18 +2547,42 @@ mod tests {
                 }
             })
         });
-        assert!(runner.accept(job(PeerKind::Message, "msg-d0", "hello")));
+        // Three jobs from one identity: the drain on stop is under test, not the cap.
+        app.mesh.limits().configure(PeerLimitConfig {
+            concurrency: 64,
+            ..PeerLimitConfig::default()
+        });
+        assert!(
+            runner
+                .accept(job(PeerKind::Message, "msg-d0", "hello"))
+                .is_ok()
+        );
         wait_until("the worker to take the first job", || {
             started.load(Ordering::SeqCst)
         })
         .await;
-        assert!(runner.accept(job(PeerKind::Message, "msg-d1", "hello")));
-        assert!(runner.accept(job(PeerKind::Ask, "msg-d2", "hello?")));
+        assert!(
+            runner
+                .accept(job(PeerKind::Message, "msg-d1", "hello"))
+                .is_ok()
+        );
+        assert!(
+            runner
+                .accept(job(PeerKind::Ask, "msg-d2", "hello?"))
+                .is_ok()
+        );
 
         runner.stop().await;
 
         assert_eq!(idle.count("envoy interrupted"), 1, "{:?}", idle.texts());
-        assert_eq!(idle.count("envoy stopping"), 2, "{:?}", idle.texts());
+        assert_eq!(
+            idle.count(
+                "the envoy is stopping, filed in the inbox; further envoy_stopping refusals from this peer are folded for the hour"
+            ),
+            1,
+            "{:?}",
+            idle.texts()
+        );
         let (envelopes, _) = app.mesh.peer_inbox().drain();
         let ids: Vec<&str> = envelopes
             .iter()
@@ -2418,6 +2590,15 @@ mod tests {
             .collect();
         assert!(ids.contains(&"msg-d1"), "{ids:?}");
         assert!(ids.contains(&"msg-d2"), "{ids:?}");
+        assert_eq!(
+            app.mesh
+                .limits()
+                .window_of(&hex_lower(&PEER_IDENTITY), Instant::now())
+                .unwrap()
+                .in_flight,
+            0,
+            "the drained jobs gave their reservations back"
+        );
         source.remove_dir();
     }
 
@@ -2438,15 +2619,860 @@ mod tests {
         runner.stop().await;
 
         let job = job(PeerKind::Message, "msg-late", "hello");
-        assert!(!sink.accept(EnvoyJob {
-            message: job.message.clone(),
-        }));
+        let refusal = sink
+            .accept(EnvoyJob {
+                message: job.message.clone(),
+                reservation: None,
+            })
+            .unwrap_err();
+        assert_eq!(refusal.reason, RefusalReason::EnvoyBusy);
         app.mesh.deliver_peer(job.message);
         let (envelopes, _) = app.mesh.peer_inbox().drain();
         assert_eq!(envelopes.len(), 1, "{envelopes:?}");
         assert_eq!(peer_of(&envelopes[0]).message_id, "msg-late");
         assert_eq!(idle.count("envoy stopping"), 0, "{:?}", idle.texts());
         source.remove_dir();
+    }
+
+    /// One `/message` request from `identity` at the instance `destination`, as the
+    /// dispatcher hands it to the handler.
+    fn admitted_request(
+        identity: &PrivateIdentity,
+        destination: &str,
+        message: &OutboundPeer,
+    ) -> AdmittedRequest {
+        AdmittedRequest {
+            link_id: LinkId::new_from_rand(OsRng),
+            identity: *identity.as_identity(),
+            destination_hash: AddressHash::new_from_hex_string(destination).unwrap(),
+            request_id: RequestId::from([1u8; 16]),
+            path_hash: PathHash::of(MESSAGE_PATH),
+            requested_at: 1_700_000_000.0,
+            body: to_r3_body(message, 1_700_000_000.0),
+            branch: SizeBranch::Packet,
+        }
+    }
+
+    /// The same message as a propagation node hands it over, signed by `identity_hex`.
+    fn propagated(
+        message: &OutboundPeer,
+        origin: &OriginName,
+        identity_hex: &str,
+    ) -> InboundMessage {
+        let lxmf = peer_lxmf_message(message, origin);
+        InboundMessage {
+            transient_id: [1u8; 32],
+            message_id: [2u8; 32],
+            source_identity_hash: identity_hex.to_string(),
+            source_delivery_hash: hex_lower(&[0x03; 16]),
+            timestamp: 1_700_000_000.0,
+            title: None,
+            content: Some(lxmf.content),
+            fields: lxmf.fields,
+            stamp_value: None,
+        }
+    }
+
+    struct NullSink;
+
+    impl InboundSink for NullSink {
+        fn deliver(&self, message: InboundMessage) {
+            panic!("a peer message must not fall through to the plain inbox: {message:?}");
+        }
+    }
+
+    /// Counts each run, then parks on `gate` until the test adds a permit.
+    fn counting_parked_drive(gate: &Arc<Semaphore>, runs: &Arc<AtomicUsize>) -> EnvoyDrive {
+        let gate = Arc::clone(gate);
+        let runs = Arc::clone(runs);
+        drive_of(move |_, _, _| {
+            let gate = Arc::clone(&gate);
+            let runs = Arc::clone(&runs);
+            async move {
+                runs.fetch_add(1, Ordering::SeqCst);
+                gate.acquire().await.unwrap().forget();
+                Ok("ok".into())
+            }
+        })
+    }
+
+    fn priced_model() -> Model {
+        let mut data = ModelData::new("priced");
+        data.input_price = Some(10.0);
+        data.output_price = Some(100.0);
+        Model::from_config("provider", &[data]).remove(0)
+    }
+
+    /// Fifty asks from one identity on each inbound path: the hourly message limit
+    /// refuses the wire path with `Throttled` and files the propagated path in the inbox
+    /// without an envoy run (its one typed reply for the hour was already spent on the
+    /// link), the per-identity concurrency cap files the admitted extras in the inbox,
+    /// the envoy runs exactly one, the REPL hears one refusal line per reason, and
+    /// another identity is untouched.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn a_flood_from_one_identity_is_bounded_on_both_inbound_paths() {
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-flood");
+        let (source, _source) = stub_envoy_source();
+        let app = test_app();
+        let idle = RecordingIdleSink::attach(&app);
+        app.mesh.limits().configure(PeerLimitConfig {
+            messages_per_hour: 10,
+            concurrency: 1,
+            ..PeerLimitConfig::default()
+        });
+        let gate = Arc::new(Semaphore::new(0));
+        let runs = Arc::new(AtomicUsize::new(0));
+        let runner = EnvoyRunner::start_with(Arc::clone(&app), counting_parked_drive(&gate, &runs));
+        runner.attach();
+
+        let origin = OriginName([6u8; NAME_HASH_LEN]);
+        let a = PrivateIdentity::new_from_rand(OsRng);
+        let a_hex = a.address_hash().to_hex_string();
+        let a_destination = destination_address(&origin.0, a.address_hash()).to_hex_string();
+        let handler = PeerMessageHandler::new(Arc::downgrade(&app.mesh) as Weak<dyn PeerSurface>);
+
+        let (mut acked, mut throttled) = (0, 0);
+        for n in 0..50 {
+            let out =
+                OutboundPeer::new(PeerKind::Ask, &format!("a {n}"), None, None, None).unwrap();
+            match handler
+                .handle(admitted_request(&a, &a_destination, &out))
+                .await
+            {
+                Reply::Value(value) => {
+                    assert!(is_received_reply(&value, &out.id), "{value}");
+                    acked += 1;
+                }
+                Reply::Code(code) => {
+                    assert_eq!(code, RefusalCode::Throttled, "ask {n}");
+                    throttled += 1;
+                }
+                Reply::Silent => panic!("ask {n} was neither acknowledged nor refused"),
+            }
+        }
+        assert_eq!((acked, throttled), (10, 40));
+        wait_until("the worker to take the first ask", || {
+            runs.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        assert_eq!(
+            app.mesh.peer_inbox().len(),
+            9,
+            "the admitted asks the envoy would not take"
+        );
+        let a8 = short(&a_hex);
+        assert_eq!(
+            idle.count(&format!(
+                "{a8}: over the hourly message limit, refused on its link; further rate_limited refusals from this peer are folded for the hour"
+            )),
+            1,
+            "{:?}",
+            idle.texts()
+        );
+        assert_eq!(
+            idle.count(&format!(
+                "{a8}: already has a message with the envoy, filed in the inbox; further peer_concurrency refusals from this peer are folded for the hour"
+            )),
+            1,
+            "{:?}",
+            idle.texts()
+        );
+        let lines_before = idle.texts().len();
+
+        let (trust, _trust_dir) = TrustList::default()
+            .destination(&a_destination, &a_hex)
+            .open("mesh-envoy-flood-trust");
+        let inner = NullSink;
+        let routing = PeerRouting {
+            trust: &trust,
+            surface: Some(Arc::clone(&app.mesh) as Arc<dyn PeerSurface>),
+            inner: &inner,
+        };
+        for n in 0..50 {
+            let out =
+                OutboundPeer::new(PeerKind::Ask, &format!("stored {n}"), None, None, None).unwrap();
+            routing.deliver(propagated(&out, &origin, &a_hex));
+        }
+        assert_eq!(
+            app.mesh.peer_inbox().len(),
+            59,
+            "every refused propagated ask is filed"
+        );
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            idle.texts().len(),
+            lines_before + 50,
+            "one inbox line per filed ask and no new refusal line: {:?}",
+            idle.texts()
+        );
+        assert_eq!(idle.count("rate_limited refusals"), 1, "{:?}", idle.texts());
+
+        let b = PrivateIdentity::new_from_rand(OsRng);
+        let b_destination = destination_address(&origin.0, b.address_hash()).to_hex_string();
+        let from_b = OutboundPeer::new(PeerKind::Ask, "b 0", None, None, None).unwrap();
+        assert!(matches!(
+            handler
+                .handle(admitted_request(&b, &b_destination, &from_b))
+                .await,
+            Reply::Value(_)
+        ));
+
+        gate.add_permits(2);
+        wait_until("both admitted asks to be answered", || {
+            runs.load(Ordering::SeqCst) == 2 && idle.count("envoy replied: ok") == 2
+        })
+        .await;
+        runner.stop().await;
+        assert_eq!(
+            app.mesh.peer_inbox().len(),
+            63,
+            "nine refused originals, fifty filed propagated asks and two exchanges"
+        );
+        source.remove_dir();
+    }
+
+    /// The window is read again just before model work: a job admitted while the window
+    /// was open, then overtaken by a run that spent it, is refused at run time with the
+    /// typed reply and never drives. Without that second look the second job would
+    /// drive and the run count would read two.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn a_queued_job_is_refused_at_run_time_once_the_window_is_spent() {
+        use crate::mesh::test_support::{PeerStub, started_runtime_on};
+        use crate::mesh::trust::TrustOptions;
+        use rns_transport::iface::tcp_server::TcpServer;
+
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-live-ceiling");
+        let (source, _source) = stub_envoy_source();
+        let stub = PeerStub::listen("envoy-ceiling-stub", TcpServer::DEFAULT_CLIENT_MTU).await;
+        let started = started_runtime_on("envoy-ceiling-node", stub.port()).await;
+        let runtime = started.runtime.clone();
+        let app = test_app();
+        app.mesh.install(runtime.clone()).unwrap();
+        stub.trust(&runtime.current_destination_hash(), runtime.fingerprint());
+        stub.announce(Some("Stub")).await;
+        let to = stub.destination_hex();
+        let peers = runtime.peers();
+        wait_until("the node to file the stub", || peers.get(&to).is_some()).await;
+        runtime
+            .trust()
+            .trust_destination(
+                app.mesh.as_ref(),
+                &to,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        let idle = RecordingIdleSink::attach(&app);
+        app.mesh.limits().configure(PeerLimitConfig {
+            concurrency: 2,
+            tokens_per_hour: 100,
+            ..PeerLimitConfig::default()
+        });
+
+        let gate = Arc::new(Semaphore::new(0));
+        let runs = Arc::new(AtomicUsize::new(0));
+        let runner = EnvoyRunner::start_with(Arc::clone(&app), {
+            let gate = Arc::clone(&gate);
+            let runs = Arc::clone(&runs);
+            drive_of(move |mut ctx, input, _| {
+                let gate = Arc::clone(&gate);
+                let runs = Arc::clone(&runs);
+                async move {
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    ctx.record_token_usage(
+                        Some(TokenUsage {
+                            input_tokens: Some(400),
+                            output_tokens: Some(50),
+                            ..TokenUsage::default()
+                        }),
+                        input.role().model(),
+                    );
+                    gate.acquire().await.unwrap().forget();
+                    Ok("one".into())
+                }
+            })
+        });
+        runner.attach();
+        let identity = stub.identity_hex();
+        app.mesh
+            .deliver_peer(job_from(PeerKind::Ask, "live-c1", "first", &to, &identity).message);
+        wait_until("the first run to start", || {
+            runs.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        // Admitted: the window is empty until the first run debits it.
+        app.mesh
+            .deliver_peer(job_from(PeerKind::Ask, "live-c2", "second", &to, &identity).message);
+        assert_eq!(
+            app.mesh
+                .limits()
+                .window_of(&identity, Instant::now())
+                .unwrap()
+                .in_flight,
+            2
+        );
+        gate.add_permits(1);
+
+        let refused = |body: &PeerBody| body.in_reply_to.as_deref() == Some("live-c2");
+        wait_until("the peer to hear the refusal", || {
+            stub.seen().iter().any(refused)
+        })
+        .await;
+        runner.stop().await;
+        let seen = stub.seen();
+        let refusal = seen.iter().find(|body| refused(body)).unwrap();
+        assert_eq!(refusal.kind, PeerKind::Reply);
+        assert_eq!(refusal.content, RefusalReason::TokenCeiling.peer_text());
+        let fields = refusal.fields.as_ref().expect("a refusal carries fields");
+        assert_eq!(fields["refusal"], "token_ceiling");
+        assert!(
+            fields["retry_after_secs"]
+                .as_u64()
+                .is_some_and(|secs| secs >= 1),
+            "{fields}"
+        );
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            1,
+            "the refused job never drove"
+        );
+        assert_eq!(
+            idle.count("further token_ceiling refusals"),
+            1,
+            "{:?}",
+            idle.texts()
+        );
+        let window = app
+            .mesh
+            .limits()
+            .window_of(&identity, Instant::now())
+            .unwrap();
+        assert_eq!(window.tokens, 450);
+        assert_eq!(window.in_flight, 0);
+        let (envelopes, _) = app.mesh.peer_inbox().drain();
+        let ids: Vec<&str> = envelopes
+            .iter()
+            .map(|envelope| peer_of(envelope).message_id.as_str())
+            .collect();
+        assert!(
+            ids.contains(&"live-c2"),
+            "the refused original is filed: {ids:?}"
+        );
+
+        assert!(app.mesh.stop().await.unwrap());
+        stub.stop().await;
+        started.relay_handle.abort();
+        source.remove_dir();
+    }
+
+    /// A run whose provider reported no usage is charged a conservative estimate: the
+    /// prompt plus a quarter of the answer's length, never nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn an_unpriced_run_debits_the_conservative_estimate() {
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-estimate");
+        let (source, _source) = stub_envoy_source();
+        let app = test_app();
+        let idle = RecordingIdleSink::attach(&app);
+        let runner = EnvoyRunner::start_with(
+            Arc::clone(&app),
+            drive_of(|_, _, _| async { Ok("x".repeat(400)) }),
+        );
+        assert!(
+            runner
+                .accept(job(PeerKind::Ask, "msg-est", "how long?"))
+                .is_ok()
+        );
+        wait_until("the reply to land", || idle.count("envoy replied:") == 1).await;
+        runner.stop().await;
+        let window = app
+            .mesh
+            .limits()
+            .window_of(&hex_lower(&PEER_IDENTITY), Instant::now())
+            .unwrap();
+        assert!(window.tokens >= 100, "{window:?}");
+        assert_eq!(window.cost_usd, 0.0);
+        source.remove_dir();
+    }
+
+    /// A priced call whose buckets are all zero is charged the same estimate: the prompt
+    /// went out whatever the provider reported.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn a_run_reporting_zero_tokens_debits_the_conservative_estimate() {
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-zero-usage");
+        let (source, _source) = stub_envoy_source();
+        let app = test_app();
+        let idle = RecordingIdleSink::attach(&app);
+        let runner = EnvoyRunner::start_with(
+            Arc::clone(&app),
+            drive_of(|mut ctx, _, _| async move {
+                ctx.record_token_usage(
+                    Some(TokenUsage {
+                        input_tokens: Some(0),
+                        output_tokens: Some(0),
+                        ..TokenUsage::default()
+                    }),
+                    &priced_model(),
+                );
+                Ok("x".repeat(400))
+            }),
+        );
+        assert!(
+            runner
+                .accept(job(PeerKind::Ask, "msg-zero", "how long?"))
+                .is_ok()
+        );
+        wait_until("the reply to land", || idle.count("envoy replied:") == 1).await;
+        runner.stop().await;
+        let window = app
+            .mesh
+            .limits()
+            .window_of(&hex_lower(&PEER_IDENTITY), Instant::now())
+            .unwrap();
+        assert!(window.tokens >= 100, "{window:?}");
+        assert_eq!(window.cost_usd, 0.0);
+        source.remove_dir();
+    }
+
+    /// A run the provider priced is charged its cost; the cost ceiling, when one is set,
+    /// refuses the sender's next job, and at 0.0 it is off.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn a_priced_run_debits_cost_and_the_cost_ceiling_refuses_the_next() {
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-cost");
+        let (source, _source) = stub_envoy_source();
+        let app = test_app();
+        let idle = RecordingIdleSink::attach(&app);
+        app.mesh.limits().configure(PeerLimitConfig {
+            cost_usd_per_hour: 0.000_001,
+            ..PeerLimitConfig::default()
+        });
+        let runner = EnvoyRunner::start_with(
+            Arc::clone(&app),
+            drive_of(|mut ctx, _, _| async move {
+                ctx.record_token_usage(
+                    Some(TokenUsage {
+                        input_tokens: Some(400),
+                        output_tokens: Some(50),
+                        ..TokenUsage::default()
+                    }),
+                    &priced_model(),
+                );
+                Ok("ok".into())
+            }),
+        );
+        let identity = hex_lower(&PEER_IDENTITY);
+        assert!(
+            runner
+                .accept(job(PeerKind::Ask, "msg-cost-1", "how much?"))
+                .is_ok()
+        );
+        wait_until("the first run to give its slot back", || {
+            idle.count("envoy replied: ok") == 1
+                && app
+                    .mesh
+                    .limits()
+                    .window_of(&identity, Instant::now())
+                    .is_some_and(|window| window.in_flight == 0)
+        })
+        .await;
+        let window = app
+            .mesh
+            .limits()
+            .window_of(&identity, Instant::now())
+            .unwrap();
+        assert!(window.cost_usd > 0.0, "{window:?}");
+        assert_eq!(window.tokens, 450);
+        assert_eq!(
+            runner
+                .accept(job(PeerKind::Ask, "msg-cost-2", "again?"))
+                .unwrap_err()
+                .reason,
+            RefusalReason::CostCeiling
+        );
+
+        app.mesh.limits().configure(PeerLimitConfig {
+            cost_usd_per_hour: 0.0,
+            ..PeerLimitConfig::default()
+        });
+        assert!(
+            runner
+                .accept(job(PeerKind::Ask, "msg-cost-3", "again?"))
+                .is_ok()
+        );
+        wait_until("the second run to be answered", || {
+            idle.count("envoy replied: ok") == 2
+        })
+        .await;
+        runner.stop().await;
+        source.remove_dir();
+    }
+
+    /// The refusal a peer hears over the link carries the typed fields: the reason and
+    /// how long to wait.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn a_refused_job_carries_typed_fields_on_the_wire() {
+        use crate::mesh::test_support::{PeerStub, started_runtime_on};
+        use crate::mesh::trust::TrustOptions;
+        use rns_transport::iface::tcp_server::TcpServer;
+
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-live-refusal");
+        let (source, _source) = stub_envoy_source();
+        let stub = PeerStub::listen("envoy-refusal-stub", TcpServer::DEFAULT_CLIENT_MTU).await;
+        let started = started_runtime_on("envoy-refusal-node", stub.port()).await;
+        let runtime = started.runtime.clone();
+        let app = test_app();
+        app.mesh.install(runtime.clone()).unwrap();
+        stub.trust(&runtime.current_destination_hash(), runtime.fingerprint());
+        stub.announce(Some("Stub")).await;
+        let to = stub.destination_hex();
+        let peers = runtime.peers();
+        wait_until("the node to file the stub", || peers.get(&to).is_some()).await;
+        runtime
+            .trust()
+            .trust_destination(
+                app.mesh.as_ref(),
+                &to,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        let gate = Arc::new(Semaphore::new(0));
+        let runs = Arc::new(AtomicUsize::new(0));
+        let runner = EnvoyRunner::start_with(Arc::clone(&app), counting_parked_drive(&gate, &runs));
+        runner.attach();
+        let identity = stub.identity_hex();
+        app.mesh
+            .deliver_peer(job_from(PeerKind::Ask, "live-r1", "first", &to, &identity).message);
+        wait_until("the first run to park", || runs.load(Ordering::SeqCst) == 1).await;
+        app.mesh
+            .deliver_peer(job_from(PeerKind::Ask, "live-r2", "second", &to, &identity).message);
+
+        let refused = |body: &PeerBody| body.in_reply_to.as_deref() == Some("live-r2");
+        wait_until("the peer to hear the refusal", || {
+            stub.seen().iter().any(refused)
+        })
+        .await;
+        let seen = stub.seen();
+        let refusal = seen.iter().find(|body| refused(body)).unwrap();
+        assert_eq!(refusal.kind, PeerKind::Reply);
+        assert_eq!(refusal.content, RefusalReason::PeerConcurrency.peer_text());
+        let fields = refusal.fields.as_ref().expect("a refusal carries fields");
+        assert_eq!(fields["refusal"], "peer_concurrency");
+        assert_eq!(
+            fields["retry_after_secs"].as_u64(),
+            Some(PEER_RETRY_AFTER_CAPACITY.as_secs()),
+            "{fields}"
+        );
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+
+        gate.add_permits(1);
+        wait_until("the peer to hear the answer", || {
+            stub.seen()
+                .iter()
+                .any(|body| body.in_reply_to.as_deref() == Some("live-r1"))
+        })
+        .await;
+        runner.stop().await;
+        assert!(app.mesh.stop().await.unwrap());
+        stub.stop().await;
+        started.relay_handle.abort();
+        source.remove_dir();
+    }
+
+    /// Two messages from one identity offered at the same instant, with the cap at one:
+    /// the check and the reservation are one step, so exactly one is queued.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn two_simultaneous_accepts_from_one_identity_take_one_reservation() {
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-race");
+        let (source, _source) = stub_envoy_source();
+        let app = test_app();
+        let gate = Arc::new(Semaphore::new(0));
+        let runs = Arc::new(AtomicUsize::new(0));
+        let runner = EnvoyRunner::start_with(Arc::clone(&app), counting_parked_drive(&gate, &runs));
+        let identity = hex_lower(&PEER_IDENTITY);
+
+        let outcomes: Vec<Result<(), PeerRefusal>> = std::thread::scope(|scope| {
+            let racers: Vec<_> = ["msg-race-a", "msg-race-b"]
+                .into_iter()
+                .map(|id| {
+                    let runner = Arc::clone(&runner);
+                    scope.spawn(move || runner.accept(job(PeerKind::Message, id, "hello")))
+                })
+                .collect();
+            racers
+                .into_iter()
+                .map(|racer| racer.join().unwrap())
+                .collect()
+        });
+        let admitted = outcomes.iter().filter(|outcome| outcome.is_ok()).count();
+        assert_eq!(admitted, 1, "{outcomes:?}");
+        let refusal = outcomes
+            .iter()
+            .find_map(|outcome| outcome.as_ref().err())
+            .unwrap();
+        assert_eq!(refusal.reason, RefusalReason::PeerConcurrency);
+        assert_eq!(
+            app.mesh
+                .limits()
+                .window_of(&identity, Instant::now())
+                .unwrap()
+                .in_flight,
+            1
+        );
+
+        runner.stop().await;
+        assert_eq!(
+            app.mesh
+                .limits()
+                .window_of(&identity, Instant::now())
+                .unwrap()
+                .in_flight,
+            0
+        );
+        source.remove_dir();
+    }
+
+    /// A worker that does not stop within the grace (here, parked in `prepare` on a
+    /// source that never materializes) is aborted; the aborted job never delivers, and
+    /// its reservation still comes back because the job's guard is dropped with it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn an_aborted_worker_still_returns_the_reservation() {
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-abort");
+        let blocked = Arc::new(std::sync::Barrier::new(2));
+        let started = Arc::new(AtomicBool::new(false));
+        let source = Arc::new(EnvoySource::with_probes(
+            Box::new({
+                let blocked = Arc::clone(&blocked);
+                let started = Arc::clone(&started);
+                move || {
+                    started.store(true, Ordering::SeqCst);
+                    blocked.wait();
+                    Ok(std::path::PathBuf::from("/usr/bin/python3"))
+                }
+            }),
+            Box::new(|_| Ok(())),
+        ));
+        let _source = BuiltinSourceGuard::new(source.clone());
+        let app = test_app();
+        let idle = RecordingIdleSink::attach(&app);
+        let runner = EnvoyRunner::start_with(
+            Arc::clone(&app),
+            drive_of(|_, _, _| async { Ok("never delivered".into()) }),
+        );
+        let identity = hex_lower(&PEER_IDENTITY);
+        assert!(
+            runner
+                .accept(job(PeerKind::Message, "msg-abort", "hello"))
+                .is_ok()
+        );
+        wait_until("the worker to park in prepare", || {
+            started.load(Ordering::SeqCst)
+        })
+        .await;
+        assert_eq!(
+            app.mesh
+                .limits()
+                .window_of(&identity, Instant::now())
+                .unwrap()
+                .in_flight,
+            1
+        );
+
+        let stopping = Instant::now();
+        runner.stop().await;
+        assert!(
+            stopping.elapsed() >= ENVOY_STOP_GRACE,
+            "stop waited out the grace before aborting"
+        );
+        blocked.wait();
+        wait_until("the aborted job to drop its reservation", || {
+            app.mesh
+                .limits()
+                .window_of(&identity, Instant::now())
+                .is_some_and(|window| window.in_flight == 0)
+        })
+        .await;
+        assert_eq!(idle.count("envoy replied"), 0, "{:?}", idle.texts());
+        assert_eq!(idle.count("envoy interrupted"), 0, "{:?}", idle.texts());
+        assert_eq!(
+            app.mesh.peer_inbox().len(),
+            0,
+            "the aborted job never reached deliver"
+        );
+        source.remove_dir();
+    }
+
+    /// A run cut off by the stop is charged the usage it reported plus the prompt of the
+    /// call that was in flight when it died.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn an_interrupted_run_is_charged_the_prompt_of_its_aborted_call() {
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-cut-off-debit");
+        let (source, _source) = stub_envoy_source();
+        let app = test_app();
+        let idle = RecordingIdleSink::attach(&app);
+        let gate = Arc::new(Semaphore::new(0));
+        let runs = Arc::new(AtomicUsize::new(0));
+        let runner = EnvoyRunner::start_with(Arc::clone(&app), {
+            let gate = Arc::clone(&gate);
+            let runs = Arc::clone(&runs);
+            drive_of(move |mut ctx, input, _| {
+                let gate = Arc::clone(&gate);
+                let runs = Arc::clone(&runs);
+                async move {
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    ctx.record_token_usage(
+                        Some(TokenUsage {
+                            input_tokens: Some(400),
+                            output_tokens: Some(50),
+                            ..TokenUsage::default()
+                        }),
+                        input.role().model(),
+                    );
+                    gate.acquire().await.unwrap().forget();
+                    Ok("never".into())
+                }
+            })
+        });
+        let identity = hex_lower(&PEER_IDENTITY);
+        assert!(
+            runner
+                .accept(job(PeerKind::Ask, "msg-cut", "how far?"))
+                .is_ok()
+        );
+        wait_until("the run to record its usage and park", || {
+            runs.load(Ordering::SeqCst) == 1
+        })
+        .await;
+
+        runner.stop().await;
+        assert_eq!(idle.count("envoy interrupted"), 1, "{:?}", idle.texts());
+        let window = app
+            .mesh
+            .limits()
+            .window_of(&identity, Instant::now())
+            .unwrap();
+        assert!(
+            window.tokens > 450,
+            "the aborted call's prompt is charged on top of the reported 450: {window:?}"
+        );
+        assert_eq!(window.in_flight, 0);
+        source.remove_dir();
+    }
+
+    /// A sender over its hourly limit on the store-and-forward path hears the typed
+    /// refusal once: the first refused message of the hour is answered, the rest of the
+    /// hour's refusals are folded; the REPL line names the peer as its table does.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn a_store_and_forward_refusal_reaches_the_peer_once_an_hour() {
+        use crate::mesh::message::PeerAdmission;
+        use crate::mesh::test_support::{PeerStub, started_runtime_on};
+        use crate::mesh::trust::TrustOptions;
+        use rns_transport::iface::tcp_server::TcpServer;
+
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-live-stored-refusal");
+        let stub = PeerStub::listen("envoy-stored-stub", TcpServer::DEFAULT_CLIENT_MTU).await;
+        let started = started_runtime_on("envoy-stored-node", stub.port()).await;
+        let runtime = started.runtime.clone();
+        let app = test_app();
+        app.mesh.install(runtime.clone()).unwrap();
+        stub.trust(&runtime.current_destination_hash(), runtime.fingerprint());
+        stub.announce(Some("Stub")).await;
+        let to = stub.destination_hex();
+        let peers = runtime.peers();
+        wait_until("the node to file the stub", || peers.get(&to).is_some()).await;
+        runtime
+            .trust()
+            .trust_destination(
+                app.mesh.as_ref(),
+                &to,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        let idle = RecordingIdleSink::attach(&app);
+        app.mesh.limits().configure(PeerLimitConfig {
+            messages_per_hour: 1,
+            ..PeerLimitConfig::default()
+        });
+        let identity = stub.identity_hex();
+        let admit = |id: &str| {
+            PeerSurface::admit_peer_message(
+                app.mesh.as_ref(),
+                &PeerAdmission {
+                    source_identity: &identity,
+                    source_destination: &to,
+                    message_id: id,
+                    in_reply_to: false,
+                    via: PeerVia::StoreAndForward,
+                },
+            )
+        };
+        assert!(admit("stored-0").is_ok());
+        for id in ["stored-1", "stored-2", "stored-3"] {
+            assert_eq!(
+                admit(id).unwrap_err().reason,
+                RefusalReason::RateLimited,
+                "{id}"
+            );
+        }
+
+        let refused = |body: &PeerBody| {
+            body.fields
+                .as_ref()
+                .is_some_and(|fields| fields["refusal"] == "rate_limited")
+        };
+        wait_until("the peer to hear the refusal", || {
+            stub.seen().iter().any(refused)
+        })
+        .await;
+        let seen = stub.seen();
+        let replies: Vec<&PeerBody> = seen.iter().filter(|body| refused(body)).collect();
+        assert_eq!(replies.len(), 1, "{seen:?}");
+        assert_eq!(replies[0].kind, PeerKind::Reply);
+        assert_eq!(replies[0].in_reply_to.as_deref(), Some("stored-1"));
+        assert_eq!(replies[0].content, RefusalReason::RateLimited.peer_text());
+        assert!(
+            replies[0].fields.as_ref().unwrap()["retry_after_secs"]
+                .as_u64()
+                .is_some_and(|secs| secs >= 1),
+            "{:?}",
+            replies[0].fields
+        );
+
+        assert_eq!(
+            admit("stored-4").unwrap_err().reason,
+            RefusalReason::RateLimited
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            stub.seen().iter().filter(|body| refused(body)).count(),
+            1,
+            "a later refusal in the same hour earns no second reply"
+        );
+        assert_eq!(
+            idle.count(
+                "Stub: over the hourly message limit; arrived store-and-forward, the peer is told once an hour; further rate_limited refusals from this peer are folded for the hour"
+            ),
+            1,
+            "{:?}",
+            idle.texts()
+        );
+
+        assert!(app.mesh.stop().await.unwrap());
+        stub.stop().await;
+        started.relay_handle.abort();
     }
 
     /// A provider that answers from a script and keeps every request it saw, so the

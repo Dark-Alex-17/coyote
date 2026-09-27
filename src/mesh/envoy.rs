@@ -3,21 +3,26 @@
 //! peer text as data before it reaches a model. The runner itself lives under
 //! `src/config/`, where it may touch the session context; nothing here does.
 
+use crate::mesh::limits::{PeerRefusal, Reservation};
 use crate::mesh::message::PeerMessage;
 
 /// One inbound message or question for the envoy to answer, already sanitised by
-/// `PeerMessage::new`.
+/// `PeerMessage::new`. The reservation is the sender's concurrency slot, taken by the
+/// sink's `accept` and released when the job is dropped, however it ends; a job that
+/// never reached the limiter carries none.
 pub(crate) struct EnvoyJob {
     pub message: PeerMessage,
+    pub reservation: Option<Reservation>,
 }
 
 /// Where the slot offers inbound peer traffic before it falls back to the inbox. Held
 /// behind the slot's hook so a runner can come and go while the node stays on.
 pub(crate) trait EnvoySink: Send + Sync {
-    /// Takes ownership of an inbound message or question. `false` means not taken: the
-    /// queue is full, or the job carries `in_reply_to` and is refused as a loop guard;
-    /// the caller delivers it to the inbox instead.
-    fn accept(&self, job: EnvoyJob) -> bool;
+    /// Takes ownership of an inbound message or question. `Err` means not taken, with
+    /// the reason: the queue is full, the sender is over one of its ceilings, or the
+    /// job carries `in_reply_to` and is refused as a loop guard. The caller files it
+    /// in the inbox and tells the peer and the person at the keyboard.
+    fn accept(&self, job: EnvoyJob) -> Result<(), PeerRefusal>;
     /// A human answer for an escalated question that a run may still be holding on.
     /// `true` when a live run consumed it; otherwise the caller sends it to the peer.
     fn answer(&self, id: &str, text: &str) -> bool;

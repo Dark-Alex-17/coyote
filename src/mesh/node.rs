@@ -13,11 +13,12 @@ use crate::mesh::knock::{
     knock_message,
 };
 use crate::mesh::knocks::KnockCache;
+use crate::mesh::limits::{FoldNotice, PeerLimitConfig, PeerLimits, PeerRefusal, RefusalReason};
 use crate::mesh::lock::InstanceLock;
 use crate::mesh::message::{
-    CHECK_INBOX_NEXT_ACTION, ModelNotes, OutboundPeer, PEER_LINE_MAX_CHARS, PeerInbox, PeerKind,
-    PeerMessage, PeerMessageHandler, PeerRouting, PeerSurface, PeerVia, RawPeerMessage,
-    collect_next_action, unix_now,
+    CHECK_INBOX_NEXT_ACTION, ModelNotes, OutboundPeer, PEER_LINE_MAX_CHARS, PeerAdmission,
+    PeerInbox, PeerKind, PeerMessage, PeerMessageHandler, PeerRouting, PeerSurface, PeerVia,
+    RawPeerMessage, collect_next_action, unix_now,
 };
 use crate::mesh::notify::{Notification, NotificationSink, Source};
 use crate::mesh::peers::{PeerChange, PeerSighting, PeerTable};
@@ -209,6 +210,7 @@ pub(crate) struct MeshRuntime {
     app_data: Vec<u8>,
     announce: bool,
     display_name: Option<String>,
+    peer_limits: PeerLimitConfig,
     cache_dir: PathBuf,
     interface_labels: Vec<String>,
     /// `None` once `shutdown` has released this owner. Requests and the server loop hold
@@ -353,6 +355,7 @@ impl MeshRuntime {
             app_data,
             announce: config.announce,
             display_name: config.display_name.clone(),
+            peer_limits: PeerLimitConfig::from(config),
             cache_dir: paths.cache_dir,
             interface_labels: plans.iter().map(InterfacePlan::label).collect(),
             transport: Mutex::new(Some(transport.clone())),
@@ -453,6 +456,11 @@ impl MeshRuntime {
     /// reaches trusted destinations and nobody else.
     pub(crate) fn display_name(&self) -> Option<&str> {
         self.display_name.as_deref()
+    }
+
+    /// The per-peer ceilings the node was started with, for the slot that installs it.
+    pub(crate) fn peer_limits(&self) -> PeerLimitConfig {
+        self.peer_limits
     }
 
     // Reached by the REPL mesh commands once they land.
@@ -1372,6 +1380,10 @@ async fn announce_periodically(runtime: Arc<MeshRuntime>, cancel: CancellationTo
 /// are matched in `correlations` first. With an envoy attached, messages and questions
 /// go to it instead of the inbox; the questions it escalates to the person at the
 /// keyboard wait in `inbound`, a per-instance file like `correlations`' store.
+///
+/// `limits` holds each peer's hourly windows and in-flight envoy runs. It belongs to the
+/// slot rather than the node so a `.mesh off`/`.mesh on` does not hand a flooding peer
+/// a fresh window; `install` configures it from the node's config.
 #[derive(Default)]
 pub(crate) struct MeshSlot {
     inner: RwLock<Option<Arc<MeshRuntime>>>,
@@ -1385,6 +1397,7 @@ pub(crate) struct MeshSlot {
     notifier: ArcSwapOption<Arc<dyn NotificationSink>>,
     idle: ArcSwapOption<Arc<dyn IdleSink>>,
     envoy: ArcSwapOption<Arc<dyn EnvoySink>>,
+    limits: Arc<PeerLimits>,
     peer_inbox: PeerInbox,
     correlations: Correlations,
     model_notes: ModelNotes,
@@ -1394,6 +1407,10 @@ pub(crate) struct MeshSlot {
 impl MeshSlot {
     pub(crate) fn get(&self) -> Option<Arc<MeshRuntime>> {
         self.inner.read().clone()
+    }
+
+    pub(crate) fn limits(&self) -> &Arc<PeerLimits> {
+        &self.limits
     }
 
     /// Refuses while a node is already running: two nodes in one process would fight over
@@ -1427,6 +1444,7 @@ impl MeshSlot {
         }
         self.correlations.adopt(store, pending);
         *self.inbound.lock() = Some(Arc::new(inbound));
+        self.limits.configure(runtime.peer_limits());
         let source = Arc::downgrade(self) as Weak<dyn CardSource>;
         runtime
             .dispatcher()
@@ -1717,18 +1735,22 @@ impl MeshSlot {
         *self.inbound.lock() = Some(store);
     }
 
-    /// Where every inbound peer message ends up, from a link or a propagation node. A
-    /// reply to a question this node asked answers its correlation and goes to the
-    /// inbox. A message or a question is offered to the envoy first when one is
-    /// attached, and the envoy owns it from then on: what it answered comes back through
+    /// Where every admitted inbound peer message ends up, from a link or a propagation
+    /// node (one refused admission is filed by `file_peer` instead). A reply to a
+    /// question this node asked answers its correlation and goes to the inbox. A
+    /// message or a question is offered to the envoy first when one is attached, and
+    /// the envoy owns it from then on: what it answered comes back through
     /// `record_envoy_exchange`, what it could not through `record_envoy_fallback`. An
-    /// envoy that refuses (its queue is full), a bulletin, or no envoy at all means the
-    /// inbox path as ever, and the refusal earns the person at the keyboard one more
-    /// line so they know the envoy is behind. Anything that arrived naming a message in
-    /// `in_reply_to` takes the inbox path too, whatever its kind: a peer's envoy replying
-    /// to our envoy's reply would otherwise keep the two talking forever. Runs on a
-    /// blocking thread off the server's request path or on the fetch task, so nothing
-    /// here awaits.
+    /// envoy that refuses (its queue is full, or the sender is over one of its
+    /// ceilings), a bulletin, or no envoy at all means the inbox path as ever; a
+    /// refusal also goes back to the peer with its typed reason and earns the person at
+    /// the keyboard one refusal line per reason per hour (the inbox summary line still
+    /// prints per message; over-limit store-and-forward messages are filed too, bounded
+    /// by the inbox and idle-sink caps, not by the hourly gate), so a flood cannot flood
+    /// the terminal. Anything that arrived naming a message in `in_reply_to` takes the
+    /// inbox path too, whatever its kind: a peer's envoy replying to our envoy's reply
+    /// would otherwise keep the two talking forever. Runs on a blocking thread off the
+    /// server's request path or on the fetch task, so nothing here awaits.
     pub(crate) fn deliver_peer(&self, mut message: PeerMessage) {
         let wire_reply = message.in_reply_to.is_some();
         let answered = self.answer_correlation(&mut message);
@@ -1740,17 +1762,109 @@ impl MeshSlot {
             Some(sink) => {
                 let (kind, id) = (message.kind, message.message_id.clone());
                 let id8 = short(&message.source_identity).to_string();
-                if sink.accept(EnvoyJob {
+                match sink.accept(EnvoyJob {
                     message: message.clone(),
+                    reservation: None,
                 }) {
-                    debug!("Mesh {kind} {id} from {id8} handed to the envoy");
-                    return;
+                    Ok(()) => debug!("Mesh {kind} {id} from {id8} handed to the envoy"),
+                    Err(refusal) => {
+                        debug!(
+                            "Mesh {kind} {id} from {id8} refused by the envoy: {}; delivering it to the inbox",
+                            refusal.reason.as_str()
+                        );
+                        self.refuse_for_envoy(message, refusal);
+                    }
                 }
-                debug!(
-                    "Mesh {kind} {id} from {id8} refused by the envoy (queue full or stopping); delivering it to the inbox"
-                );
-                self.record_envoy_fallback(message, "envoy busy");
             }
+        }
+    }
+
+    /// The envoy refused `original` with a typed reason: it takes the inbox path and the
+    /// person at the keyboard gets the folded notice. Replaces the per-message busy line,
+    /// which is what a flood would flood the terminal with.
+    pub(crate) fn record_envoy_refusal(&self, original: PeerMessage, refusal: &PeerRefusal) {
+        let who = self.peer_label(&original.source_identity, &original.source_destination);
+        let identity = original.source_identity.clone();
+        let via = original.via;
+        self.deliver_to_inbox(original, false);
+        self.surface_refusal(&identity, refusal, &who, via);
+    }
+
+    /// `record_envoy_refusal` plus the correlated reply that tells the peer why, sent
+    /// off the request path since this runs where nothing may await. A loop-guard
+    /// refusal is never sent: a reply to a reply is the loop it guards against.
+    pub(crate) fn refuse_for_envoy(&self, message: PeerMessage, refusal: PeerRefusal) {
+        let destination = message.source_destination.clone();
+        let id = message.message_id.clone();
+        self.record_envoy_refusal(message, &refusal);
+        if refusal.reason != RefusalReason::LoopGuard {
+            self.send_refusal_reply(&destination, &id, &refusal);
+        }
+    }
+
+    /// Sends the peer at `destination` the typed refusal of its message `id`, off the
+    /// request path since this runs where nothing may await. A reply that cannot go is
+    /// logged; the REPL has its line and the inbox the original.
+    fn send_refusal_reply(&self, destination: &str, id: &str, refusal: &PeerRefusal) {
+        let dest8 = short(destination).to_string();
+        let out = match OutboundPeer::new(
+            PeerKind::Reply,
+            refusal.reason.peer_text(),
+            None,
+            Some(id),
+            Some(refusal.fields()),
+        ) {
+            Ok(out) => out,
+            Err(err) => {
+                warn!("Mesh refusal of {id} to instance {dest8} could not be built: {err}");
+                return;
+            }
+        };
+        match (self.get(), tokio::runtime::Handle::try_current()) {
+            (Some(runtime), Ok(handle)) => {
+                let destination = destination.to_string();
+                let id = id.to_string();
+                handle.spawn(async move {
+                    if let Err(err) = runtime.send_peer(&destination, &out).await {
+                        warn!("Mesh refusal of {id} to instance {dest8} could not be sent: {err}");
+                    }
+                });
+            }
+            (Some(_), Err(_)) => warn!(
+                "Mesh refusal of {id} to instance {dest8} could not be sent: no async runtime to send it with"
+            ),
+            (None, _) => {
+                warn!("Mesh refusal of {id} to instance {dest8} could not be sent: mesh is off")
+            }
+        }
+    }
+
+    /// Notes one refusal of `identity` for folding and prints what the fold says: the
+    /// first refusal of each reason in the hour, and the counts of any window that has
+    /// since rolled over.
+    fn surface_refusal(&self, identity: &str, refusal: &PeerRefusal, who: &str, via: PeerVia) {
+        let notice = self
+            .limits
+            .note_refusal(identity, refusal.reason, Instant::now());
+        self.push_peer_lines(identity, fold_lines(who, refusal.reason, via, &notice));
+    }
+
+    /// Prints the folded counts of a rolled-over window when a message from `identity`
+    /// is admitted, so they surface even once the refusals have stopped.
+    fn surface_fold_reports(&self, identity: &str, who: &str) {
+        let reports = self.limits.take_fold_reports(identity, Instant::now());
+        self.push_peer_lines(identity, fold_report_lines(who, &reports));
+    }
+
+    fn push_peer_lines(&self, identity: &str, lines: Vec<String>) {
+        let id8 = short(identity).to_string();
+        for text in lines {
+            self.push_idle(IdleNotify {
+                source: Source::Message,
+                origin: Origin::Peer(id8.clone()),
+                text,
+                model_note: None,
+            });
         }
     }
 
@@ -1811,7 +1925,7 @@ impl MeshSlot {
         });
     }
 
-    /// The envoy took `original` but did not answer it (busy, timed out, unavailable or
+    /// The envoy took `original` but did not answer it (timed out, unavailable or
     /// failed): it goes down the inbox path as if no envoy were attached, and the person
     /// at the keyboard gets one more line with `reason`, since the summary line alone
     /// would not tell them the envoy was tried.
@@ -1960,10 +2074,14 @@ impl MeshSlot {
         answered
     }
 
-    fn display_name_of(&self, message: &PeerMessage) -> Option<String> {
+    fn display_name_at(&self, destination: &str) -> Option<String> {
         self.get()
-            .and_then(|runtime| runtime.peers().get(&message.source_destination))
+            .and_then(|runtime| runtime.peers().get(destination))
             .and_then(|peer| peer.display_name)
+    }
+
+    fn display_name_of(&self, message: &PeerMessage) -> Option<String> {
+        self.display_name_at(&message.source_destination)
     }
 
     /// The sender as `summary_line` names it: the peer table's display name, cleaned,
@@ -1972,6 +2090,15 @@ impl MeshSlot {
         self.display_name_of(message)
             .and_then(|name| display_text(&name, DISPLAY_NAME_MAX_CHARS))
             .unwrap_or_else(|| short(&message.source_destination).to_string())
+    }
+
+    /// The sender as a refusal line names it, the same on every path a refusal takes:
+    /// the peer table's display name for its instance, cleaned, or the short hash of
+    /// its identity.
+    fn peer_label(&self, identity: &str, destination: &str) -> String {
+        self.display_name_at(destination)
+            .and_then(|name| display_text(&name, DISPLAY_NAME_MAX_CHARS))
+            .unwrap_or_else(|| short(identity).to_string())
     }
 
     /// The inbox path: the message lands in the inbox, the model is told what arrived
@@ -2036,6 +2163,58 @@ fn first_words(message: &PeerMessage, max_chars: usize) -> String {
     display_text(words, max_chars).unwrap_or_default()
 }
 
+/// The REPL lines for one refusal of `reason` from `who`, as `note_refusal` folds it:
+/// the rolled-over counts first, then the one line the first refusal of the hour earns.
+fn fold_lines(who: &str, reason: RefusalReason, via: PeerVia, notice: &FoldNotice) -> Vec<String> {
+    let mut lines = fold_report_lines(who, &notice.reports);
+    if notice.surface {
+        lines.push(format!(
+            "{who}: {}; further {} refusals from this peer are folded for the hour",
+            refusal_phrase(reason, via),
+            reason.as_str()
+        ));
+    }
+    lines
+}
+
+fn fold_report_lines(who: &str, reports: &[(RefusalReason, u32)]) -> Vec<String> {
+    reports
+        .iter()
+        .map(|(reason, count)| {
+            let (plural, verb) = if *count == 1 {
+                ("", "was")
+            } else {
+                ("s", "were")
+            };
+            format!(
+                "{count} more {} refusal{plural} from {who} {verb} folded in the last hour",
+                reason.as_str()
+            )
+        })
+        .collect()
+}
+
+fn refusal_phrase(reason: RefusalReason, via: PeerVia) -> &'static str {
+    match (reason, via) {
+        (RefusalReason::RateLimited, PeerVia::Direct) => {
+            "over the hourly message limit, refused on its link"
+        }
+        (RefusalReason::RateLimited, PeerVia::StoreAndForward) => {
+            "over the hourly message limit; arrived store-and-forward, the peer is told once an hour"
+        }
+        (RefusalReason::EnvoyBusy, _) => "the envoy queue is full, filed in the inbox",
+        (RefusalReason::EnvoyStopping, _) => "the envoy is stopping, filed in the inbox",
+        (RefusalReason::PeerConcurrency, _) => {
+            "already has a message with the envoy, filed in the inbox"
+        }
+        (RefusalReason::TokenCeiling, _) => "over its hourly token ceiling, filed in the inbox",
+        (RefusalReason::CostCeiling, _) => "over its hourly cost ceiling, filed in the inbox",
+        (RefusalReason::LoopGuard, _) => {
+            "sent a reply the envoy will not answer, filed in the inbox"
+        }
+    }
+}
+
 /// The questions `store` holds open or answered and uncollected. A file this Coyote
 /// cannot read is logged with its remedy and read as empty, so the node serves either
 /// way; a late reply to one of the forgotten questions lands as an ordinary message.
@@ -2063,8 +2242,44 @@ impl KnockSurface for MeshSlot {
 }
 
 impl PeerSurface for MeshSlot {
+    /// A refusal on the store-and-forward path also earns the peer one typed reply per
+    /// identity, per reason, per hour, since no link carries a code back; on a link the
+    /// caller's code is the typed refusal. A refused reply neither earns nor spends
+    /// one: a reply to a reply is the loop the envoy guards against. The REPL line is
+    /// folded on its own count, so it prints whether or not the peer is told.
+    fn admit_peer_message(&self, request: &PeerAdmission) -> Result<(), PeerRefusal> {
+        let identity = request.source_identity;
+        let who = self.peer_label(identity, request.source_destination);
+        let now = Instant::now();
+        match self.limits.admit_message(identity, now) {
+            Ok(()) => {
+                self.surface_fold_reports(identity, &who);
+                Ok(())
+            }
+            Err(refusal) => {
+                self.surface_refusal(identity, &refusal, &who, request.via);
+                if request.via == PeerVia::StoreAndForward
+                    && !request.in_reply_to
+                    && self.limits.claim_peer_reply(identity, refusal.reason, now)
+                {
+                    self.send_refusal_reply(
+                        request.source_destination,
+                        request.message_id,
+                        &refusal,
+                    );
+                }
+                Err(refusal)
+            }
+        }
+    }
+
     fn deliver_peer(&self, message: PeerMessage) {
         MeshSlot::deliver_peer(self, message);
+    }
+
+    fn file_peer(&self, mut message: PeerMessage) {
+        let answered = self.answer_correlation(&mut message);
+        self.deliver_to_inbox(message, answered);
     }
 
     fn local_destination(&self) -> Option<String> {
@@ -2660,10 +2875,10 @@ mod tests {
         }
     }
 
-    /// An envoy that keeps every job it is offered, or refuses them all to stand in for
-    /// a full queue; answers are consumed or not as configured.
+    /// An envoy that keeps every job it is offered, or refuses them all with one reason
+    /// (a full queue unless told otherwise); answers are consumed or not as configured.
     struct RecordingEnvoy {
-        accept: bool,
+        refusal: Option<PeerRefusal>,
         consume_answers: bool,
         jobs: parking_lot::Mutex<Vec<PeerMessage>>,
         answers: parking_lot::Mutex<Vec<(String, String)>>,
@@ -2671,8 +2886,17 @@ mod tests {
 
     impl RecordingEnvoy {
         fn new(accept: bool, consume_answers: bool) -> Arc<Self> {
+            let refusal = (!accept).then(|| PeerRefusal::capacity(RefusalReason::EnvoyBusy));
+            Self::with_refusal(refusal, consume_answers)
+        }
+
+        fn refusing(reason: RefusalReason) -> Arc<Self> {
+            Self::with_refusal(Some(PeerRefusal::capacity(reason)), false)
+        }
+
+        fn with_refusal(refusal: Option<PeerRefusal>, consume_answers: bool) -> Arc<Self> {
             Arc::new(Self {
-                accept,
+                refusal,
                 consume_answers,
                 jobs: parking_lot::Mutex::new(Vec::new()),
                 answers: parking_lot::Mutex::new(Vec::new()),
@@ -2689,11 +2913,12 @@ mod tests {
     }
 
     impl EnvoySink for RecordingEnvoy {
-        fn accept(&self, job: EnvoyJob) -> bool {
-            if self.accept {
-                self.jobs.lock().push(job.message);
+        fn accept(&self, job: EnvoyJob) -> Result<(), PeerRefusal> {
+            if let Some(refusal) = &self.refusal {
+                return Err(refusal.clone());
             }
-            self.accept
+            self.jobs.lock().push(job.message);
+            Ok(())
         }
 
         fn answer(&self, id: &str, text: &str) -> bool {
@@ -2812,12 +3037,13 @@ mod tests {
         let pushed = idle.pushed.lock();
         assert_eq!(pushed.len(), 2, "the summary line and one busy line");
         let dest8 = &hex_lower(&PEER_INSTANCE)[..8];
+        let id8 = &hex_lower(&PEER_IDENTITY)[..8];
         assert_eq!(pushed[0].text, format!("{dest8} asks: words of a-1"));
-        assert!(pushed[1].text.contains("envoy busy"), "{}", pushed[1].text);
-        assert!(
-            pushed[1].text.contains("words of a-1"),
-            "{}",
-            pushed[1].text
+        assert_eq!(
+            pushed[1].text,
+            format!(
+                "{id8}: the envoy queue is full, filed in the inbox; further envoy_busy refusals from this peer are folded for the hour"
+            )
         );
         for note in pushed.iter() {
             assert_eq!(note.source, Source::Message);
@@ -2827,6 +3053,105 @@ mod tests {
             );
             assert!(note.model_note.is_none());
         }
+    }
+
+    /// Five refusals of one reason from one identity in an hour earn one REPL line; the
+    /// originals all reach the inbox, and the peer's reply is not attempted with no
+    /// runtime to send it (this test runs with no tokio runtime at all).
+    #[test]
+    fn repeated_envoy_refusals_from_one_peer_fold_to_one_line() {
+        let slot = MeshSlot::default();
+        let idle = RecordingIdleSink::new(true);
+        slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+        let envoy = RecordingEnvoy::refusing(RefusalReason::PeerConcurrency);
+        slot.set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
+
+        for n in 0..5 {
+            slot.deliver_peer(peer_message(PeerKind::Ask, &format!("a-{n}"), None));
+        }
+
+        assert!(envoy.job_ids().is_empty());
+        let (envelopes, _) = slot.peer_inbox().drain();
+        assert_eq!(peer_ids(&envelopes), ["a-0", "a-1", "a-2", "a-3", "a-4"]);
+        let pushed = idle.pushed.lock();
+        let folded: Vec<&str> = pushed
+            .iter()
+            .map(|note| note.text.as_str())
+            .filter(|text| text.contains("already has a message with the envoy"))
+            .collect();
+        assert_eq!(folded.len(), 1, "{pushed:?}");
+        assert_eq!(
+            pushed.len(),
+            6,
+            "five summary lines and one folded refusal line: {pushed:?}"
+        );
+    }
+
+    #[test]
+    fn fold_lines_report_rolled_counts_then_the_first_refusal_of_the_hour() {
+        let surfaced = FoldNotice {
+            surface: true,
+            reports: vec![
+                (RefusalReason::RateLimited, 39),
+                (RefusalReason::TokenCeiling, 1),
+            ],
+        };
+        assert_eq!(
+            fold_lines(
+                "alice",
+                RefusalReason::PeerConcurrency,
+                PeerVia::Direct,
+                &surfaced
+            ),
+            [
+                "39 more rate_limited refusals from alice were folded in the last hour",
+                "1 more token_ceiling refusal from alice was folded in the last hour",
+                "alice: already has a message with the envoy, filed in the inbox; further peer_concurrency refusals from this peer are folded for the hour",
+            ]
+        );
+        assert!(
+            fold_lines(
+                "alice",
+                RefusalReason::RateLimited,
+                PeerVia::Direct,
+                &FoldNotice::default()
+            )
+            .is_empty()
+        );
+        let first = FoldNotice {
+            surface: true,
+            reports: Vec::new(),
+        };
+        for via in [PeerVia::Direct, PeerVia::StoreAndForward] {
+            for reason in RefusalReason::ALL {
+                let lines = fold_lines("cdcdcdcd", reason, via, &first);
+                assert_eq!(lines.len(), 1);
+                assert!(lines[0].starts_with("cdcdcdcd: "), "{}", lines[0]);
+                assert!(
+                    lines[0].contains(&format!("further {} refusals", reason.as_str())),
+                    "{}",
+                    lines[0]
+                );
+                assert!(lines[0].is_ascii(), "{}", lines[0]);
+            }
+        }
+        assert_eq!(
+            fold_lines("alice", RefusalReason::RateLimited, PeerVia::Direct, &first),
+            [
+                "alice: over the hourly message limit, refused on its link; further rate_limited refusals from this peer are folded for the hour"
+            ]
+        );
+        assert_eq!(
+            fold_lines(
+                "alice",
+                RefusalReason::RateLimited,
+                PeerVia::StoreAndForward,
+                &first
+            ),
+            [
+                "alice: over the hourly message limit; arrived store-and-forward, the peer is told once an hour; further rate_limited refusals from this peer are folded for the hour"
+            ]
+        );
     }
 
     /// Both ways a peer message arrives, off a link through the `/message` provider and
@@ -2905,6 +3230,298 @@ mod tests {
         fn deliver(&self, message: InboundMessage) {
             panic!("a peer message must not fall through to the plain inbox: {message:?}");
         }
+    }
+
+    /// An admitted `/message` request from `identity` at the instance `destination`.
+    fn admitted_request(
+        identity: &TransportIdentity,
+        destination: &str,
+        message: &OutboundPeer,
+    ) -> AdmittedRequest {
+        AdmittedRequest {
+            link_id: LinkId::new_from_rand(OsRng),
+            identity: *identity.as_identity(),
+            destination_hash: AddressHash::new_from_hex_string(destination).unwrap(),
+            request_id: RequestId::from([1u8; 16]),
+            path_hash: PathHash::of(MESSAGE_PATH),
+            requested_at: 1_700_000_000.0,
+            body: to_r3_body(message, 1_700_000_000.0),
+            branch: SizeBranch::Packet,
+        }
+    }
+
+    /// A third message in an hour from one identity is refused on its link with
+    /// `Throttled` before the envoy sees it, while another identity's first message is
+    /// acknowledged; the refusal earns one REPL line, folded thereafter.
+    #[tokio::test]
+    async fn the_message_provider_throttles_the_third_message_in_an_hour_per_identity() {
+        let slot = Arc::new(MeshSlot::default());
+        let idle = RecordingIdleSink::new(true);
+        slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+        let envoy = RecordingEnvoy::new(true, false);
+        slot.set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
+        slot.limits().configure(PeerLimitConfig {
+            messages_per_hour: 2,
+            concurrency: 64,
+            ..PeerLimitConfig::default()
+        });
+        let origin = OriginName([7u8; NAME_HASH_LEN]);
+        let a = TransportIdentity::new_from_rand(OsRng);
+        let a_destination = destination_address(&origin.0, a.address_hash()).to_hex_string();
+        let b = TransportIdentity::new_from_rand(OsRng);
+        let b_destination = destination_address(&origin.0, b.address_hash()).to_hex_string();
+        let handler = PeerMessageHandler::new(Arc::downgrade(&slot) as Weak<dyn PeerSurface>);
+
+        let mut acked = Vec::new();
+        let mut throttled = 0;
+        for n in 0..4 {
+            let out =
+                OutboundPeer::new(PeerKind::Ask, &format!("a {n}"), None, None, None).unwrap();
+            match handler
+                .handle(admitted_request(&a, &a_destination, &out))
+                .await
+            {
+                Reply::Value(value) => {
+                    assert!(is_received_reply(&value, &out.id), "{value}");
+                    acked.push(out.id.clone());
+                }
+                Reply::Code(code) => {
+                    assert_eq!(code, RefusalCode::Throttled);
+                    throttled += 1;
+                }
+                Reply::Silent => panic!("message {n} was neither acknowledged nor refused"),
+            }
+        }
+        assert_eq!(acked.len(), 2);
+        assert_eq!(throttled, 2);
+        assert_eq!(
+            envoy.job_ids(),
+            acked,
+            "the refused messages never reach the envoy"
+        );
+
+        let from_b = OutboundPeer::new(PeerKind::Ask, "b 0", None, None, None).unwrap();
+        assert!(matches!(
+            handler
+                .handle(admitted_request(&b, &b_destination, &from_b))
+                .await,
+            Reply::Value(_)
+        ));
+        assert_eq!(envoy.job_ids().len(), 3);
+        assert!(slot.peer_inbox().drain().0.is_empty());
+        let a8 = &a.address_hash().to_hex_string()[..8];
+        let pushed = idle.pushed.lock();
+        assert_eq!(pushed.len(), 1, "{pushed:?}");
+        assert_eq!(
+            pushed[0].text,
+            format!(
+                "{a8}: over the hourly message limit, refused on its link; further rate_limited refusals from this peer are folded for the hour"
+            )
+        );
+        assert_eq!(pushed[0].origin, Origin::Peer(a8.to_string()));
+    }
+
+    /// The same limit on the store-and-forward path: the third propagated message in an
+    /// hour is filed in the inbox and the envoy never sees it; the one typed reply the
+    /// sender is owed has nowhere to go with the mesh off.
+    #[test]
+    fn peer_routing_files_the_third_message_in_an_hour_per_identity() {
+        let slot = Arc::new(MeshSlot::default());
+        let idle = RecordingIdleSink::new(true);
+        slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+        let envoy = RecordingEnvoy::new(true, false);
+        slot.set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
+        slot.limits().configure(PeerLimitConfig {
+            messages_per_hour: 2,
+            concurrency: 64,
+            ..PeerLimitConfig::default()
+        });
+        let origin = OriginName([7u8; NAME_HASH_LEN]);
+        let a = TransportIdentity::new_from_rand(OsRng);
+        let a_hex = a.address_hash().to_hex_string();
+        let a_destination = destination_address(&origin.0, a.address_hash()).to_hex_string();
+        let b = TransportIdentity::new_from_rand(OsRng);
+        let b_hex = b.address_hash().to_hex_string();
+        let b_destination = destination_address(&origin.0, b.address_hash()).to_hex_string();
+        let (trust, _trust_dir) = TrustList::default()
+            .destination(&a_destination, &a_hex)
+            .destination(&b_destination, &b_hex)
+            .open("node-routing-throttle");
+        let inner = NullSink;
+        let routing = PeerRouting {
+            trust: &trust,
+            surface: Some(slot.clone() as Arc<dyn PeerSurface>),
+            inner: &inner,
+        };
+        let propagated = |from: &str, content: &str| {
+            let out = OutboundPeer::new(PeerKind::Message, content, None, None, None).unwrap();
+            let lxmf = peer_lxmf_message(&out, &origin);
+            (
+                out.id,
+                InboundMessage {
+                    transient_id: [1u8; 32],
+                    message_id: [2u8; 32],
+                    source_identity_hash: from.to_string(),
+                    source_delivery_hash: hex_lower(&[0x03; 16]),
+                    timestamp: 1_700_000_000.0,
+                    title: None,
+                    content: Some(lxmf.content),
+                    fields: lxmf.fields,
+                    stamp_value: None,
+                },
+            )
+        };
+
+        let mut sent = Vec::new();
+        for n in 0..3 {
+            let (id, message) = propagated(&a_hex, &format!("a {n}"));
+            routing.deliver(message);
+            sent.push(id);
+        }
+        assert_eq!(
+            envoy.job_ids(),
+            sent[..2],
+            "the third never reaches the envoy"
+        );
+        let (id, message) = propagated(&b_hex, "b 0");
+        routing.deliver(message);
+        assert_eq!(envoy.job_ids().len(), 3);
+        assert_eq!(envoy.job_ids()[2], id);
+        let (filed, dropped) = slot.peer_inbox().drain();
+        assert_eq!(peer_ids(&filed), [sent[2].as_str()]);
+        assert_eq!(dropped, 0);
+        assert_eq!(
+            idle.pushed
+                .lock()
+                .iter()
+                .filter(|note| note.text.contains("over the hourly message limit"))
+                .count(),
+            1
+        );
+    }
+
+    /// The store-and-forward path owes a refused sender one typed reply per identity,
+    /// per reason, per hour; the link path owes none, since its code is the refusal.
+    /// A refused reply is owed none either, since answering it would answer a reply,
+    /// and it does not spend the hour's reply: the refused ask after it is still
+    /// answered. With the mesh off the reply has nowhere to go, and the warning that
+    /// says so is the one observable attempt.
+    #[test]
+    fn a_store_and_forward_refusal_is_answered_once_per_identity_per_reason_per_hour() {
+        install_log_collector();
+        let slot = MeshSlot::default();
+        let idle = RecordingIdleSink::new(true);
+        slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+        slot.limits().configure(PeerLimitConfig {
+            messages_per_hour: 1,
+            ..PeerLimitConfig::default()
+        });
+        let (a, a_instance) = (hex_lower(&[0x1a; 16]), hex_lower(&[0x2a; 16]));
+        let (b, b_instance) = (hex_lower(&[0x1b; 16]), hex_lower(&[0x2b; 16]));
+        let (c, c_instance) = (hex_lower(&[0x1c; 16]), hex_lower(&[0x2c; 16]));
+        let admit = |identity: &str, instance: &str, id: &str, in_reply_to: bool, via: PeerVia| {
+            PeerSurface::admit_peer_message(
+                &slot,
+                &PeerAdmission {
+                    source_identity: identity,
+                    source_destination: instance,
+                    message_id: id,
+                    in_reply_to,
+                    via,
+                },
+            )
+        };
+
+        assert!(
+            admit(
+                &a,
+                &a_instance,
+                "stored-a-0",
+                false,
+                PeerVia::StoreAndForward
+            )
+            .is_ok()
+        );
+        for id in ["stored-a-1", "stored-a-2", "stored-a-3"] {
+            assert_eq!(
+                admit(&a, &a_instance, id, false, PeerVia::StoreAndForward)
+                    .unwrap_err()
+                    .reason,
+                RefusalReason::RateLimited
+            );
+        }
+        assert!(admit(&b, &b_instance, "link-b-0", false, PeerVia::Direct).is_ok());
+        for id in ["link-b-1", "link-b-2"] {
+            assert_eq!(
+                admit(&b, &b_instance, id, false, PeerVia::Direct)
+                    .unwrap_err()
+                    .reason,
+                RefusalReason::RateLimited
+            );
+        }
+        assert!(
+            admit(
+                &c,
+                &c_instance,
+                "stored-c-0",
+                false,
+                PeerVia::StoreAndForward
+            )
+            .is_ok()
+        );
+        for (id, in_reply_to) in [("stored-c-1", true), ("stored-c-2", false)] {
+            assert_eq!(
+                admit(&c, &c_instance, id, in_reply_to, PeerVia::StoreAndForward)
+                    .unwrap_err()
+                    .reason,
+                RefusalReason::RateLimited
+            );
+        }
+
+        let warned = warn_snapshot();
+        let attempts: Vec<&String> = warned
+            .iter()
+            .filter(|line| line.starts_with("Mesh refusal of "))
+            .filter(|line| line.contains("-a-") || line.contains("-b-") || line.contains("-c-"))
+            .collect();
+        assert_eq!(
+            attempts,
+            [
+                &format!(
+                    "Mesh refusal of stored-a-1 to instance {} could not be sent: mesh is off",
+                    short(&a_instance)
+                ),
+                &format!(
+                    "Mesh refusal of stored-c-2 to instance {} could not be sent: mesh is off",
+                    short(&c_instance)
+                ),
+            ],
+            "{warned:#?}"
+        );
+        let texts: Vec<String> = idle
+            .pushed
+            .lock()
+            .iter()
+            .map(|note| note.text.clone())
+            .filter(|text| text.contains("hourly message limit"))
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                format!(
+                    "{}: over the hourly message limit; arrived store-and-forward, the peer is told once an hour; further rate_limited refusals from this peer are folded for the hour",
+                    short(&a)
+                ),
+                format!(
+                    "{}: over the hourly message limit, refused on its link; further rate_limited refusals from this peer are folded for the hour",
+                    short(&b)
+                ),
+                format!(
+                    "{}: over the hourly message limit; arrived store-and-forward, the peer is told once an hour; further rate_limited refusals from this peer are folded for the hour",
+                    short(&c)
+                ),
+            ]
+        );
     }
 
     #[test]
@@ -3736,6 +4353,43 @@ mod tests {
         let records: Vec<PeerRecord> = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].destination_hash, "persisted-on-stop");
+        relay_handle.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn install_configures_the_slot_limits_from_the_node_config() {
+        let (addr, relay_handle, _) = loopback_relay().await;
+        let tmp = TempDir::new("node-install-limits");
+        let mut session = Session::default();
+        let config = MeshConfig {
+            peer_max_messages_per_hour: 3,
+            ..private_config(addr.port())
+        };
+        let runtime = MeshRuntime::start(
+            &config,
+            true,
+            &mut session,
+            mesh_paths(&tmp),
+            NodeOptions::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(runtime.peer_limits().messages_per_hour, 3);
+        let slot = Arc::new(MeshSlot::default());
+        assert_eq!(slot.limits().config(), PeerLimitConfig::default());
+
+        slot.install(runtime).unwrap();
+
+        assert_eq!(slot.limits().config().messages_per_hour, 3);
+        assert_eq!(
+            slot.limits().config(),
+            PeerLimitConfig {
+                messages_per_hour: 3,
+                ..PeerLimitConfig::default()
+            }
+        );
+        assert!(slot.stop().await.unwrap());
         relay_handle.abort();
     }
 

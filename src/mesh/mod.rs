@@ -8,6 +8,7 @@ mod identity;
 pub(crate) mod idle;
 pub(crate) mod knock;
 pub(crate) mod knocks;
+pub(crate) mod limits;
 mod lock;
 pub(crate) mod message;
 mod node;
@@ -147,11 +148,13 @@ pub(crate) mod test_support {
     use super::node::{MeshRuntime, NodeOptions};
     #[cfg(unix)]
     pub(crate) use super::peers::PeerSighting;
-    #[cfg(unix)]
-    use super::r3::{
-        AdmittedRequest, Dispatcher, Handler, LoggingKnockSink, MESSAGE_PATH, R3Client, R3Server,
-        RefusalCode, Reply, RequestHandler,
+    pub(crate) use super::propagation_fetch::{InboundMessage, InboundSink};
+    pub(crate) use super::r3::{
+        AdmittedRequest, Handler, MESSAGE_PATH, NAME_HASH_LEN, OriginName, PathHash, RefusalCode,
+        Reply, RequestId, SizeBranch,
     };
+    #[cfg(unix)]
+    use super::r3::{Dispatcher, LoggingKnockSink, R3Client, R3Server, RequestHandler};
     use super::snapshot::{BriefState, MeshSnapshot, SessionInfo, TurnState};
     use super::trust::TrustStore;
     use super::{mesh_config_dir, rfc3339_utc};

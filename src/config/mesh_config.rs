@@ -6,6 +6,7 @@ pub const DEFAULT_KNOCK_RETENTION_HOURS: u64 = 24;
 pub const DEFAULT_PEER_MAX_CONCURRENT: u32 = 1;
 pub const DEFAULT_PEER_MAX_MESSAGES_PER_HOUR: u32 = 60;
 pub const DEFAULT_PEER_MAX_TOKENS_PER_HOUR: u64 = 100_000;
+pub const DEFAULT_PEER_MAX_COST_USD_PER_HOUR: f64 = 0.0;
 
 pub(crate) const MESH_DIGEST_PROMPT: &str = r#"The session above may be shared with a trusted collaborator's Coyote instance. Write a digest of it that lets that collaborator understand what is happening here without reading the transcript.
 
@@ -36,9 +37,28 @@ pub struct MeshConfig {
     /// off; 0 = hand off at once, the question stays open for `.mesh answer`.
     pub envoy_escalation_timeout: u64,
     pub knock_retention_hours: u64,
+    /// Envoy runs one sending identity may have queued or running at once; further
+    /// messages are refused with a typed reason until one finishes; the message is
+    /// still filed in the inbox for the human.
     pub peer_max_concurrent: u32,
+    /// Messages accepted from one sending identity per hour. Windows are fixed hours
+    /// kept in memory, so a restart opens a fresh window; further messages are refused
+    /// with a typed reason: on a live link in the reply itself, on store-and-forward
+    /// with one reply per identity per reason per hour, and on store-and-forward the
+    /// message is still filed in the inbox for the human, without an envoy run; plus
+    /// one folded REPL line per identity, per reason, per hour, with the folded count
+    /// reported the next time that peer is heard from after the hour rolls over; on a
+    /// live link the refused message is not filed; the peer is told to retry.
     pub peer_max_messages_per_hour: u32,
+    /// Model tokens one sending identity may cost per hour, counted after each envoy
+    /// run, so the runs in flight may overshoot the ceiling by at most
+    /// `peer_max_concurrent` runs before the next is refused; the message is still
+    /// filed in the inbox for the human.
     pub peer_max_tokens_per_hour: u64,
+    /// USD one sending identity may cost per hour, counted like the token ceiling; 0 =
+    /// no cost ceiling. Enforced only when the envoy model's prices are known; the
+    /// message is still filed in the inbox for the human.
+    pub peer_max_cost_usd_per_hour: f64,
 }
 
 impl Default for MeshConfig {
@@ -58,6 +78,7 @@ impl Default for MeshConfig {
             peer_max_concurrent: DEFAULT_PEER_MAX_CONCURRENT,
             peer_max_messages_per_hour: DEFAULT_PEER_MAX_MESSAGES_PER_HOUR,
             peer_max_tokens_per_hour: DEFAULT_PEER_MAX_TOKENS_PER_HOUR,
+            peer_max_cost_usd_per_hour: DEFAULT_PEER_MAX_COST_USD_PER_HOUR,
         }
     }
 }
@@ -113,6 +134,12 @@ impl MeshConfig {
             if value == 0 {
                 bail!("mesh.{name} is 0, which is out of range; use 1 or more");
             }
+        }
+        let cost = self.peer_max_cost_usd_per_hour;
+        if !cost.is_finite() || cost < 0.0 {
+            bail!(
+                "mesh.peer_max_cost_usd_per_hour is {cost}, which is out of range; use 0 (no ceiling) or a positive amount"
+            );
         }
         Ok(())
     }
@@ -274,6 +301,15 @@ pub fn render_mesh_info(mesh: &MeshConfig) -> String {
         "peer_max_tokens_per_hour",
         mesh.peer_max_tokens_per_hour.to_string(),
     );
+    let cost = mesh.peer_max_cost_usd_per_hour;
+    row(
+        "peer_max_cost_usd_per_hour",
+        if cost == 0.0 {
+            "0 (off)".to_string()
+        } else {
+            cost.to_string()
+        },
+    );
     output
 }
 
@@ -305,6 +341,7 @@ mod tests {
         assert_eq!(mesh.peer_max_concurrent, 1);
         assert_eq!(mesh.peer_max_messages_per_hour, 60);
         assert_eq!(mesh.peer_max_tokens_per_hour, 100_000);
+        assert_eq!(mesh.peer_max_cost_usd_per_hour, 0.0);
     }
 
     #[test]
@@ -635,6 +672,50 @@ mod tests {
             let expected = format!("mesh.{key} is 0, which is out of range; use 1 or more");
             assert!(err.contains(&expected), "{key}: {err}");
         }
+    }
+
+    #[test]
+    fn validate_accepts_only_zero_or_a_positive_finite_cost_ceiling() {
+        let enabled = MeshConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        for accepted in [0.0, 1.5] {
+            let mesh = MeshConfig {
+                peer_max_cost_usd_per_hour: accepted,
+                ..enabled.clone()
+            };
+            mesh.validate(true).unwrap();
+        }
+        for (refused, rendered) in [(-0.5, "-0.5"), (f64::NAN, "NaN"), (f64::INFINITY, "inf")] {
+            let mesh = MeshConfig {
+                peer_max_cost_usd_per_hour: refused,
+                ..enabled.clone()
+            };
+            let err = mesh.validate(true).unwrap_err().to_string();
+            let expected = format!(
+                "mesh.peer_max_cost_usd_per_hour is {rendered}, which is out of range; use 0 (no ceiling) or a positive amount"
+            );
+            assert!(err.contains(&expected), "{rendered}: {err}");
+        }
+    }
+
+    #[test]
+    fn render_mesh_info_marks_a_zero_cost_ceiling_as_off() {
+        let info = render_mesh_info(&MeshConfig::default());
+        assert!(
+            info.contains("  peer_max_cost_usd_per_hour  0 (off)\n"),
+            "{info}"
+        );
+        let priced = MeshConfig {
+            peer_max_cost_usd_per_hour: 1.5,
+            ..Default::default()
+        };
+        let info = render_mesh_info(&priced);
+        assert!(
+            info.contains("  peer_max_cost_usd_per_hour  1.5\n"),
+            "{info}"
+        );
     }
 
     #[test]

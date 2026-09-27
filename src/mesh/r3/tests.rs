@@ -207,7 +207,8 @@ fn dispatch_errors_round_trip_as_maps_and_never_read_as_refusal_codes() {
 /// in an `Err(..)`); a constructed value ends in `);`, so the two never look alike.
 /// The peer message module is a client too: `SendError::Refused` carries the code a peer
 /// answered with, and its `Display` arm reads it the same way. Its handler refuses a
-/// malformed body with `InvalidData`, the one `Reply::Code` it may build.
+/// malformed body with `InvalidData` and a sender over its hourly limit with
+/// `Throttled`, the two `Reply::Code`s it may build.
 #[test]
 fn no_access_is_named_at_exactly_one_site_outside_the_error_module() {
     let needle = ["RefusalCode::", "NoAccess"].concat();
@@ -255,8 +256,11 @@ fn no_access_is_named_at_exactly_one_site_outside_the_error_module() {
                     production.matches("Reply::Code(").count(),
                     production
                         .matches("Reply::Code(RefusalCode::InvalidData)")
-                        .count(),
-                    "{name} may refuse a malformed body and nothing else"
+                        .count()
+                        + production
+                            .matches("Reply::Code(RefusalCode::Throttled)")
+                            .count(),
+                    "{name} may refuse a malformed body or a throttled sender and nothing else"
                 );
             } else {
                 assert!(!production.contains("Reply::Code"));

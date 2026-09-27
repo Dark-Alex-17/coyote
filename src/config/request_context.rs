@@ -18,7 +18,7 @@ use super::{
 };
 use super::{MessageContentToolCalls, prompts};
 use crate::client::{
-    Message, MessageContent, MessageRole, Model, ModelType, TokenUsage, list_models,
+    Message, MessageContent, MessageRole, Model, ModelType, RunUsage, TokenUsage, list_models,
 };
 use crate::function::{
     FunctionDeclaration, Functions, ToolCallTracker, ToolResult,
@@ -370,6 +370,10 @@ pub struct RequestContext {
     pub last_token_usage: Option<TokenUsage>,
     pub last_cost: Option<f64>,
 
+    /// Cumulative usage for the whole run, shared with branch forks so a caller holding
+    /// the handle can read the total after every context in the run is gone.
+    pub run_usage: Arc<RunUsage>,
+
     /// Prompt-side tokens from the most recent request that reported usage.
     /// Unlike `last_token_usage`, this is never clobbered by requests that
     /// report nothing (e.g. a stream rejected before `message_start`), so the
@@ -446,6 +450,7 @@ impl RequestContext {
             last_message: None,
             last_token_usage: None,
             last_cost: None,
+            run_usage: Arc::new(RunUsage::default()),
             last_prompt_token_usage: None,
             tool_scope: ToolScope::default(),
             declared_function_names: Default::default(),
@@ -519,6 +524,7 @@ impl RequestContext {
             last_message: None,
             last_token_usage: None,
             last_cost: None,
+            run_usage: Arc::new(RunUsage::default()),
             last_prompt_token_usage: None,
             tool_scope: ToolScope {
                 functions,
@@ -585,6 +591,7 @@ impl RequestContext {
             last_message: self.last_message.clone(),
             last_token_usage: self.last_token_usage.clone(),
             last_cost: self.last_cost,
+            run_usage: Arc::clone(&self.run_usage),
             last_prompt_token_usage: self.last_prompt_token_usage,
             tool_scope: self.tool_scope.clone(),
             declared_function_names: self.declared_function_names.clone(),
@@ -645,6 +652,7 @@ impl RequestContext {
             last_message: None,
             last_token_usage: None,
             last_cost: None,
+            run_usage: Arc::new(RunUsage::default()),
             last_prompt_token_usage: None,
             tool_scope: ToolScope {
                 functions: Functions::default(),
@@ -2456,6 +2464,7 @@ impl RequestContext {
                     session.accumulate_cost(cost);
                 }
             }
+            self.run_usage.record(usage, cost);
             // Partial usage from an aborted stream lands here on purpose:
             // it is a genuine API-reported prompt measurement, not noise.
             // Only usage-less recordings (failed requests) leave the
@@ -6144,6 +6153,81 @@ mod tests {
 
         assert!(ctx.last_token_usage.is_none());
         assert_eq!(ctx.last_prompt_token_usage, Some(200));
+    }
+
+    #[test]
+    fn record_token_usage_feeds_the_run_usage_accumulator() {
+        let mut ctx = create_test_ctx();
+        ctx.record_token_usage(
+            Some(TokenUsage {
+                input_tokens: Some(120),
+                output_tokens: Some(8),
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: Some(100),
+            }),
+            &priced_model(),
+        );
+        ctx.record_token_usage(
+            Some(TokenUsage {
+                input_tokens: Some(30),
+                output_tokens: Some(2),
+                cache_creation_input_tokens: Some(40),
+                cache_read_input_tokens: None,
+            }),
+            &priced_model(),
+        );
+        ctx.record_token_usage(None, &priced_model());
+
+        let snapshot = ctx.run_usage.snapshot();
+        assert_eq!(
+            snapshot.tokens,
+            TokenUsage {
+                input_tokens: Some(150),
+                output_tokens: Some(10),
+                cache_creation_input_tokens: Some(40),
+                cache_read_input_tokens: Some(100),
+            }
+        );
+        assert_eq!(snapshot.total_tokens(), 300);
+        // 0.0021 from the first call plus 0.0013 from the second.
+        assert!((snapshot.cost_usd.unwrap() - 0.0034).abs() < 1e-9);
+        assert_eq!(snapshot.calls, 2);
+        assert_eq!(snapshot.unpriced_calls, 0);
+    }
+
+    #[test]
+    fn record_token_usage_counts_unpriced_calls_in_run_usage() {
+        let mut ctx = create_test_ctx();
+        let unpriced = Model::from_config("provider", &[ModelData::new("test")]).remove(0);
+        ctx.record_token_usage(
+            Some(TokenUsage {
+                input_tokens: Some(5),
+                ..Default::default()
+            }),
+            &unpriced,
+        );
+
+        let snapshot = ctx.run_usage.snapshot();
+        assert_eq!(snapshot.cost_usd, None);
+        assert_eq!(snapshot.calls, 1);
+        assert_eq!(snapshot.unpriced_calls, 1);
+        assert_eq!(snapshot.tokens.input_tokens, Some(5));
+    }
+
+    #[test]
+    fn run_usage_is_shared_with_branches_but_not_children() {
+        let ctx = create_test_ctx();
+        let branch = ctx.fork_for_branch();
+        assert!(Arc::ptr_eq(&ctx.run_usage, &branch.run_usage));
+
+        let child = RequestContext::new_for_child(
+            Arc::clone(&ctx.app),
+            &ctx,
+            1,
+            Arc::new(Inbox::new()),
+            "agent_test_1".to_string(),
+        );
+        assert!(!Arc::ptr_eq(&ctx.run_usage, &child.run_usage));
     }
 
     #[test]

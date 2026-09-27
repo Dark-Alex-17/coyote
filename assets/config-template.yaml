@@ -268,9 +268,10 @@ mesh:
   envoy_model: null              # Model the envoy answers peers with (default: null = the configured model_id; the envoy never follows a `.model` switch)
   envoy_escalation_timeout: 0    # Seconds the envoy holds a peer's question open for the human before handing it off (default: 0 = hand off at once; the question stays open for `.mesh answer`; a hold longer than the 120 s run ceiling is cut to it)
   knock_retention_hours: 24      # How long unanswered knocks from known identities are kept (default: 24; must be 1 or more)
-  peer_max_concurrent: 1         # Envoy invocations allowed at once per peer identity (default: 1; must be 1 or more)
-  peer_max_messages_per_hour: 60 # Peer messages accepted per identity per hour; further messages are refused with an explicit error to the peer, never silently dropped (default: 60; must be 1 or more)
-  peer_max_tokens_per_hour: 100000 # Model tokens one peer identity may cost per hour; further messages are refused with an explicit error to the peer, never silently dropped (default: 100000; must be 1 or more)
+  peer_max_concurrent: 1         # Envoy runs one sending identity may have queued or running at once; further messages are refused with a typed reason until one finishes; the message is still filed in the inbox for the human (default: 1; must be 1 or more)
+  peer_max_messages_per_hour: 60 # Messages accepted from one sending identity per hour, in fixed hourly windows kept in memory (a restart opens a fresh window); further messages are refused with a typed reason: on a live link in the reply itself, on store-and-forward with one reply per identity per reason per hour, and on store-and-forward the message is still filed in the inbox for the human, without an envoy run; plus one folded REPL line per identity, per reason, per hour, with the folded count reported the next time that peer is heard from after the hour rolls over; on a live link the refused message is not filed; the peer is told to retry (default: 60; must be 1 or more)
+  peer_max_tokens_per_hour: 100000 # Model tokens one sending identity may cost per hour, counted after each envoy run, so the runs in flight may overshoot the ceiling by at most peer_max_concurrent runs before the next is refused; the message is still filed in the inbox for the human (default: 100000; must be 1 or more)
+  peer_max_cost_usd_per_hour: 0  # USD one sending identity may cost per hour, counted like the token ceiling and enforced only when the envoy model's prices are known; the message is still filed in the inbox for the human (default: 0 = no cost ceiling; must be 0 or a positive amount)
 
 # ---- Appearance ----
 highlight: true                  # Controls syntax highlighting

@@ -7,6 +7,7 @@
 //! model.
 
 use crate::mesh::card::DISPLAY_NAME_MAX_CHARS;
+use crate::mesh::limits::PeerRefusal;
 use crate::mesh::node::MeshRuntime;
 use crate::mesh::peers::PeerRecord;
 use crate::mesh::propagation::{OutboundMessage, PropagationError, PropagationOptions};
@@ -1010,20 +1011,40 @@ impl MeshRuntime {
     }
 }
 
+/// One inbound message put to the surface for admission: who signed it, the instance a
+/// refusal would be answered to, its id for the correlation, whether it is itself a
+/// reply (a refusal never answers one), and the path it took.
+pub(crate) struct PeerAdmission<'a> {
+    pub source_identity: &'a str,
+    pub source_destination: &'a str,
+    pub message_id: &'a str,
+    pub in_reply_to: bool,
+    pub via: PeerVia,
+}
+
 /// Where inbound peer messages land. Held weakly by the handler and the runtime: the
 /// slot owns the runtime that owns both. `deliver_peer` may write the pending store, so
 /// the request path runs it on a blocking thread; the fetch task calls it in place.
 pub(crate) trait PeerSurface: Send + Sync {
+    /// Counts one message from the sender against its hourly limit; `Err` means the
+    /// message must not reach the envoy: a link caller refuses it, a store-and-forward
+    /// caller files it with `file_peer`.
+    fn admit_peer_message(&self, request: &PeerAdmission) -> Result<(), PeerRefusal>;
     fn deliver_peer(&self, message: PeerMessage);
+    /// The inbox path only, for a message admission refused: the human still sees it,
+    /// the envoy never does.
+    fn file_peer(&self, message: PeerMessage);
     /// Lower-hex of the destination this node receives on right now; `None` while off.
     fn local_destination(&self) -> Option<String>;
 }
 
 /// Serves `/message` to whoever the dispatcher has already let through: decodes and
-/// bounds the body, hands the message to the surface and acknowledges by id. A surface
-/// that is gone means the node is stopping, and a message nobody will read is left
-/// unacknowledged so the sender falls back to storing it; so is one whose delivery
-/// thread failed, since nothing says it landed.
+/// bounds the body, hands the message to the surface and acknowledges by id. A sender
+/// over its hourly limit is refused with `Throttled` before anything is delivered, so
+/// it never earns an acknowledgement. A surface that is gone means the node is
+/// stopping, and a message nobody will read is left unacknowledged so the sender falls
+/// back to storing it; so is one whose delivery thread failed, since nothing says it
+/// landed.
 pub(crate) struct PeerMessageHandler {
     surface: Weak<dyn PeerSurface>,
 }
@@ -1055,6 +1076,23 @@ impl Handler for PeerMessageHandler {
             );
             return Reply::Silent;
         };
+        let admission = PeerAdmission {
+            source_identity: &identity_hex,
+            source_destination: &destination_hex,
+            message_id: &body.id,
+            in_reply_to: body.in_reply_to.is_some(),
+            via: PeerVia::Direct,
+        };
+        if let Err(refusal) = surface.admit_peer_message(&admission) {
+            debug!(
+                "Mesh {} {} from {id8} (instance {dest8}) on link {link} refused with Throttled: {} (retry after {} s)",
+                body.kind,
+                body.id,
+                refusal.reason.as_str(),
+                refusal.retry_after.as_secs()
+            );
+            return Reply::Code(RefusalCode::Throttled);
+        }
         // The sender checks the acknowledgement against the id it sent, so the raw wire
         // id is echoed; the alphabet check in `from_r3_body` has already bounded it.
         let id = body.id.clone();
@@ -1092,6 +1130,11 @@ impl Handler for PeerMessageHandler {
 /// trust list allows the instance they name, everything else to `inner`. A payload typed
 /// as a peer message is never a plain message, so a malformed or untrusted one is dropped
 /// rather than forwarded.
+///
+/// A sender over its hourly limit still has its message filed in the inbox, without an
+/// envoy run. Store-and-forward has no link to carry a refusal code back on, so the
+/// surface answers the first refusal of each reason in the hour with a typed reply and
+/// prints its line for the person at the keyboard.
 pub(crate) struct PeerRouting<'a> {
     pub trust: &'a TrustStore,
     pub surface: Option<Arc<dyn PeerSurface>>,
@@ -1139,6 +1182,14 @@ impl InboundSink for PeerRouting<'_> {
             );
             return;
         };
+        let admission = PeerAdmission {
+            source_identity: &message.source_identity_hash,
+            source_destination: &source_destination,
+            message_id: &id,
+            in_reply_to: in_reply_to.is_some(),
+            via: PeerVia::StoreAndForward,
+        };
+        let admitted = surface.admit_peer_message(&admission);
         let peer = PeerMessage::new(RawPeerMessage {
             source_identity: message.source_identity_hash.clone(),
             source_destination,
@@ -1152,6 +1203,14 @@ impl InboundSink for PeerRouting<'_> {
             kind,
             via: PeerVia::StoreAndForward,
         });
+        if let Err(refusal) = admitted {
+            debug!(
+                "Propagated {kind} {} from {id8} (instance {dest8}) over its limit: {}; filed in the inbox without an envoy run, the surface answers the first refusal of the hour",
+                peer.message_id,
+                refusal.reason.as_str()
+            );
+            return surface.file_peer(peer);
+        }
         debug!(
             "Propagated {kind} {} from {id8} (instance {dest8}) received",
             peer.message_id
@@ -1247,9 +1306,14 @@ impl ModelNotes {
 mod tests {
     use super::*;
     use crate::mesh::knock::{KNOCK_TYPE, KnockIntro, knock_message};
+    use crate::mesh::limits::RefusalReason;
+    use crate::mesh::r3::{PathHash, RequestId, SizeBranch};
     use crate::mesh::test_support::TrustList;
     use crate::supervisor::notification::MESH_EVENTS_DROPPED_EVENT;
 
+    use rand_core::OsRng;
+    use rns_transport::destination::link::LinkId;
+    use rns_transport::identity::PrivateIdentity;
     use std::io::Cursor;
 
     fn hash_of(seed: &str) -> String {
@@ -2111,15 +2175,60 @@ mod tests {
         assert!(matches!(back.payload, EnvelopePayload::Peer(m) if *m == message));
     }
 
-    /// Records what the routing hands over, standing in for the slot.
-    #[derive(Default)]
+    /// Records what the routing asks and hands over, standing in for the slot; admits
+    /// every sender until `admit_up_to` messages have been offered, whoever sent them.
     struct RecordingSurface {
         delivered: Mutex<Vec<PeerMessage>>,
+        filed: Mutex<Vec<PeerMessage>>,
+        offered: Mutex<Vec<(String, String, String, PeerVia)>>,
+        admit_up_to: usize,
+    }
+
+    impl Default for RecordingSurface {
+        fn default() -> Self {
+            Self::admitting(usize::MAX)
+        }
+    }
+
+    impl RecordingSurface {
+        fn admitting(admit_up_to: usize) -> Self {
+            Self {
+                delivered: Mutex::new(Vec::new()),
+                filed: Mutex::new(Vec::new()),
+                offered: Mutex::new(Vec::new()),
+                admit_up_to,
+            }
+        }
+
+        fn offered(&self) -> usize {
+            self.offered.lock().len()
+        }
     }
 
     impl PeerSurface for RecordingSurface {
+        fn admit_peer_message(&self, request: &PeerAdmission) -> Result<(), PeerRefusal> {
+            let mut offered = self.offered.lock();
+            offered.push((
+                request.source_identity.to_string(),
+                request.source_destination.to_string(),
+                request.message_id.to_string(),
+                request.via,
+            ));
+            if offered.len() > self.admit_up_to {
+                return Err(PeerRefusal {
+                    reason: RefusalReason::RateLimited,
+                    retry_after: Duration::from_secs(1),
+                });
+            }
+            Ok(())
+        }
+
         fn deliver_peer(&self, message: PeerMessage) {
             self.delivered.lock().push(message);
+        }
+
+        fn file_peer(&self, message: PeerMessage) {
+            self.filed.lock().push(message);
         }
 
         fn local_destination(&self) -> Option<String> {
@@ -2260,5 +2369,126 @@ mod tests {
             1,
             "a peer message never falls through to the inner sink"
         );
+    }
+
+    /// Admission is asked before a message is delivered on either path, with the
+    /// sender, its instance, the id and the path, so a refused sender never reaches
+    /// `deliver_peer`: over the link it hears `Throttled` instead of the
+    /// acknowledgement and nothing is filed; off a propagation node the message is
+    /// filed with `file_peer` and the surface owes the sender the typed reply.
+    #[tokio::test]
+    async fn both_inbound_paths_ask_admission_before_delivering() {
+        let identity = PrivateIdentity::new_from_rand(OsRng);
+        let identity_hex = identity.address_hash().to_hex_string();
+        let origin = OriginName([6u8; NAME_HASH_LEN]);
+        let destination = destination_address(&origin.0, identity.address_hash()).to_hex_string();
+        let surface = Arc::new(RecordingSurface::admitting(1));
+        let handler = PeerMessageHandler::new(Arc::downgrade(&surface) as Weak<dyn PeerSurface>);
+        let request = |content: &str| {
+            let out = OutboundPeer::new(PeerKind::Ask, content, None, None, None).unwrap();
+            (
+                out.id.clone(),
+                AdmittedRequest {
+                    link_id: LinkId::new_from_rand(OsRng),
+                    identity: *identity.as_identity(),
+                    destination_hash: AddressHash::new_from_hex_string(&destination).unwrap(),
+                    request_id: RequestId::from([1u8; 16]),
+                    path_hash: PathHash::of(MESSAGE_PATH),
+                    requested_at: 1_700_000_000.0,
+                    body: to_r3_body(&out, 1_700_000_000.0),
+                    branch: SizeBranch::Packet,
+                },
+            )
+        };
+
+        let (first_id, first) = request("first");
+        match handler.handle(first).await {
+            Reply::Value(value) => assert!(is_received_reply(&value, &first_id), "{value}"),
+            Reply::Code(code) => panic!("the first message is refused: {code:?}"),
+            Reply::Silent => panic!("the first message is not acknowledged"),
+        }
+        let (second_id, second) = request("second");
+        assert!(matches!(
+            handler.handle(second).await,
+            Reply::Code(RefusalCode::Throttled)
+        ));
+        assert_eq!(
+            *surface.offered.lock(),
+            [
+                (
+                    identity_hex.clone(),
+                    destination.clone(),
+                    first_id,
+                    PeerVia::Direct
+                ),
+                (
+                    identity_hex.clone(),
+                    destination.clone(),
+                    second_id,
+                    PeerVia::Direct
+                ),
+            ]
+        );
+        assert_eq!(surface.delivered.lock().len(), 1);
+        assert_eq!(surface.delivered.lock()[0].content, "first");
+        assert!(surface.filed.lock().is_empty());
+
+        let (trust, _tmp) = TrustList::default()
+            .destination(&destination, &identity_hex)
+            .open("peer-routing-admission");
+        let inner = CountingSink::default();
+        let routing = PeerRouting {
+            trust: &trust,
+            surface: Some(surface.clone() as Arc<dyn PeerSurface>),
+            inner: &inner,
+        };
+        let out = outbound(PeerKind::Message, "stored");
+        let stored = peer_lxmf_message(&out, &origin);
+        routing.deliver(inbound(
+            stored.fields.clone(),
+            None,
+            Some(stored.content.clone()),
+            &identity_hex,
+        ));
+        assert_eq!(surface.offered(), 3);
+        assert_eq!(
+            surface.offered.lock()[2],
+            (
+                identity_hex.clone(),
+                destination.clone(),
+                out.id.clone(),
+                PeerVia::StoreAndForward
+            )
+        );
+        assert_eq!(
+            surface.delivered.lock().len(),
+            1,
+            "a refused propagated message never reaches deliver_peer"
+        );
+        let filed = surface.filed.lock();
+        assert_eq!(filed.len(), 1);
+        assert_eq!(filed[0].message_id, out.id);
+        assert_eq!(filed[0].content, "stored");
+        assert_eq!(filed[0].via, PeerVia::StoreAndForward);
+        drop(filed);
+        assert!(inner.messages.lock().is_empty());
+
+        let fresh = Arc::new(RecordingSurface::admitting(1));
+        let routing = PeerRouting {
+            trust: &trust,
+            surface: Some(fresh.clone() as Arc<dyn PeerSurface>),
+            inner: &inner,
+        };
+        for _ in 0..2 {
+            routing.deliver(inbound(
+                stored.fields.clone(),
+                None,
+                Some(stored.content.clone()),
+                &identity_hex,
+            ));
+        }
+        assert_eq!(fresh.offered(), 2);
+        assert_eq!(fresh.delivered.lock().len(), 1);
+        assert_eq!(fresh.filed.lock().len(), 1);
     }
 }
