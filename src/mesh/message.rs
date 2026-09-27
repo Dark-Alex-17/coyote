@@ -94,7 +94,7 @@ impl PeerKind {
             .find(|kind| kind.wire_name() == name)
     }
 
-    fn verb(self) -> &'static str {
+    pub(crate) fn verb(self) -> &'static str {
         match self {
             Self::Message => "says",
             Self::Ask => "asks",
@@ -764,7 +764,7 @@ pub(crate) struct BroadcastOutcome {
     pub recipients: Vec<RecipientReport>,
 }
 
-fn unix_now() -> f64 {
+pub(crate) fn unix_now() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

@@ -1363,7 +1363,9 @@ fn malformed_requests_never_yield_a_success_shaped_result() {
         ("fs_read", json!({"path": "a.txt", "bogus": 1})),
     ] {
         let (output, value) = call_raw(&fx, Some(&fx.root), func, args.clone());
-        let success_shaped = value.as_ref().is_some_and(|v| v.get("error").is_none());
+        let success_shaped = value
+            .as_ref()
+            .is_some_and(|v| v.get("error").is_none() && v.get("tool_call_error").is_none());
         assert!(
             !(output.status.success() && success_shaped),
             "{func} {args}: answered a malformed request with a success result: {value:?}"
@@ -1438,6 +1440,48 @@ fn type_errors_and_unreadable_files_are_reported_without_a_traceback() {
         );
     }
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+/// A keyword the tool does not take is refused by the shim before the tool
+/// runs, as `{"tool_call_error": ...}` with exit 0 and no traceback, since the
+/// traceback would name the envoy dir and the root.
+#[test]
+#[serial]
+fn unknown_keyword_arguments_are_reported_without_a_traceback() {
+    let Some(fx) = fixture("envoy-tools-unknown-kwarg") else {
+        return;
+    };
+    let (output, value) = call_raw(
+        &fx,
+        Some(&fx.root),
+        "fs_read",
+        json!({"path": "a.txt", "bogus": 1}),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "exit {:?}: {stderr}",
+        output.status.code()
+    );
+    assert!(!stderr.contains("Traceback"), "{stderr}");
+    let value = value.expect("a JSON result");
+    let error = value["tool_call_error"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected a tool_call_error: {value}"))
+        .to_string();
+    assert!(error.contains("bogus"), "{error}");
+    assert!(value.get("content").is_none(), "{value}");
+    for secret in [&fx.root, &fx.parent, &fx.dir] {
+        let secret = secret.display().to_string();
+        assert!(
+            !error.contains(&secret),
+            "refusal names '{secret}': {error}"
+        );
+        assert!(
+            !stderr.contains(&secret),
+            "stderr names '{secret}': {stderr}"
+        );
+    }
 }
 
 /// A FIFO named as `path` must be refused up front rather than opened: a

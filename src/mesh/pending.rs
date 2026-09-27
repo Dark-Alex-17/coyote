@@ -1,7 +1,9 @@
 //! Questions this node has asked peers and is still waiting on. A `PendingRecord` is the
 //! on-disk half, so a question asked in one Coyote process can be answered in the next;
 //! `Correlations` is the in-memory half that matches a reply to its question and wakes
-//! whoever is waiting for it.
+//! whoever is waiting for it. `InboundStore` is the mirror image: questions peers asked
+//! this node that the envoy escalated to the person at the keyboard, kept apart so a
+//! peer's reply can never be matched against one.
 
 use crate::mesh::message::{PEER_ID_MAX_CHARS, PeerMessage};
 use crate::mesh::r3::short;
@@ -9,7 +11,7 @@ use crate::mesh::{canonical_hash, mesh_cache_dir, parse_rfc3339, write_atomicall
 
 use anyhow::{Context, Result, bail};
 use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -27,6 +29,12 @@ pub(crate) const PENDING_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
 pub(crate) const PENDING_QUESTION_MAX_CHARS: usize = 280;
 /// How long a collect waits for a reply before reporting the question still open.
 pub(crate) const DEFAULT_COLLECT_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const INBOUND_RECORD_VERSION: u64 = 1;
+/// Past this many escalated questions the oldest go; expiry reuses `PENDING_TTL`.
+pub(crate) const INBOUND_MAX_ENTRIES: usize = 256;
+/// What the envoy asked the human is kept whole, so a late `.mesh answer` still shows
+/// the question as it was put.
+pub(crate) const INBOUND_ENVOY_QUESTION_MAX_CHARS: usize = 1_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -64,6 +72,18 @@ pub(crate) struct PendingRecord {
 struct VersionProbe {
     version: u64,
 }
+
+/// How a store's errors name itself and one of its lines.
+#[derive(Clone, Copy)]
+struct StoreNames {
+    store: &'static str,
+    record: &'static str,
+}
+
+const PENDING_NAMES: StoreNames = StoreNames {
+    store: "pending store",
+    record: "pending question",
+};
 
 /// Open questions, newest first, in `<cache_dir>/mesh/pending-<instance_id>.jsonl`. Keyed
 /// by instance because a fork asks its own questions and must not collect the original's.
@@ -203,103 +223,26 @@ impl PendingStore {
         Ok(records)
     }
 
-    /// An exclusive lock on `<path>.lock`, held until the returned `File` drops. Every
-    /// Coyote process of one identity shares the cache directory, and `write_atomically`
-    /// renames over the file itself, so the lock lives on a sibling that is never replaced.
     fn file_lock(&self) -> Result<File> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create directory '{}'", parent.display()))?;
-        }
-        let path = self.path.with_added_extension("lock");
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .with_context(|| {
-                format!(
-                    "Failed to open mesh pending store lock '{}'",
-                    path.display()
-                )
-            })?;
-        file.lock().with_context(|| {
-            format!(
-                "Failed to lock mesh pending store lock '{}'",
-                path.display()
-            )
-        })?;
-        Ok(file)
+        file_lock(&self.path, PENDING_NAMES)
     }
 
     fn read_all(&self) -> Result<Vec<PendingRecord>> {
-        let text = match fs::read_to_string(&self.path) {
-            Ok(text) => text,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(err) => {
-                return Err(err).with_context(|| {
-                    format!(
-                        "Failed to read mesh pending store '{}'",
-                        self.path.display()
-                    )
-                });
-            }
-        };
-        let mut records = Vec::new();
-        for (index, line) in text.lines().enumerate() {
-            if line.trim().is_empty() {
-                continue;
-            }
-            let not_a_record = || {
-                format!(
-                    "Mesh pending store '{}' line {} is not a pending question. It is cache: move the file aside to start fresh.",
-                    self.path.display(),
-                    index + 1
-                )
-            };
-            // The version is read on its own first so a record from a newer Coyote is
-            // named as such rather than failing on whatever field the newer layout added.
-            let probe: VersionProbe = serde_json::from_str(line).with_context(not_a_record)?;
-            if probe.version != PENDING_RECORD_VERSION {
-                bail!(
-                    "Mesh pending store '{}' line {} is a version {} record but this Coyote reads version {PENDING_RECORD_VERSION}. Upgrade Coyote if it was written by a newer Coyote; otherwise move the file aside (it is cache) to start fresh.",
-                    self.path.display(),
-                    index + 1,
-                    probe.version
-                );
-            }
-            let record: PendingRecord = serde_json::from_str(line).with_context(not_a_record)?;
-            if parse_rfc3339(&record.sent_at).is_none() {
-                bail!(
-                    "Mesh pending store '{}' line {} has a `sent_at` that is not an RFC 3339 timestamp. It is cache: move the file aside to start fresh.",
-                    self.path.display(),
-                    index + 1
-                );
-            }
-            records.push(record);
-        }
-        Ok(records)
+        read_jsonl(
+            &self.path,
+            PENDING_NAMES,
+            PENDING_RECORD_VERSION,
+            |record: &PendingRecord| ("sent_at", &record.sent_at),
+        )
     }
 
     fn write_all(&self, records: &[PendingRecord]) -> Result<()> {
-        let mut text = String::new();
-        for record in records {
-            text.push_str(
-                &serde_json::to_string(record)
-                    .context("Failed to serialize a mesh pending question")?,
-            );
-            text.push('\n');
-        }
-        write_atomically(&self.path, text.as_bytes())
+        write_jsonl(&self.path, records, PENDING_NAMES)
     }
 }
 
 fn is_expired(record: &PendingRecord, now: SystemTime) -> bool {
-    // `read_all` already refused a `sent_at` that does not parse; a timestamp in the
-    // future (clock stepped back) reads as just sent.
-    parse_rfc3339(&record.sent_at)
-        .is_some_and(|sent_at| now.duration_since(sent_at).unwrap_or_default() >= PENDING_TTL)
+    is_stale(&record.sent_at, now)
 }
 
 /// Expired first, then past `PENDING_MAX_ENTRIES` the oldest answered records, then the
@@ -318,6 +261,262 @@ fn evict(records: &mut Vec<PendingRecord>, now: SystemTime) -> usize {
     }
     records.truncate(records.len() - over);
     before - records.len()
+}
+
+/// One line of `inbound-<instance_id>.jsonl`: a question a peer asked that the envoy
+/// could not answer on its own, waiting on the person at the keyboard. The same on-disk
+/// discipline as `PendingRecord`: fields are only ever added.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct InboundRecord {
+    pub version: u64,
+    /// The peer's message id, which the answer names in `in_reply_to`.
+    pub id: String,
+    /// Lower-hex, the instance that asked.
+    pub peer_destination: String,
+    /// Lower-hex, the identity behind that instance when it asked.
+    pub peer_identity: String,
+    /// The question's first words, at most `PENDING_QUESTION_MAX_CHARS`.
+    pub question: String,
+    /// What the envoy asked the human about the peer's question, empty when it asked
+    /// nothing of its own.
+    pub envoy_question: String,
+    /// RFC 3339 UTC seconds.
+    pub received_at: String,
+}
+
+const INBOUND_NAMES: StoreNames = StoreNames {
+    store: "inbound store",
+    record: "inbound question",
+};
+
+/// Escalated inbound questions, newest first, in
+/// `<cache_dir>/mesh/inbound-<instance_id>.jsonl`. Kept apart from `PendingStore` so
+/// `Correlations` never sees these ids: a peer reply naming one must not read as the
+/// answer to a question of ours. Same file discipline as `PendingStore`.
+pub(crate) struct InboundStore {
+    path: PathBuf,
+    write_lock: Mutex<()>,
+}
+
+impl InboundStore {
+    pub(crate) fn new(cache_dir: &Path, instance_id: &str) -> Self {
+        Self {
+            path: mesh_cache_dir(cache_dir).join(format!("inbound-{instance_id}.jsonl")),
+            write_lock: Mutex::new(()),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Adds `record` or replaces the record with its id in place, evicting the expired and
+    /// the oldest over the cap in the same write. Refuses, with the file untouched,
+    /// anything the reader would refuse on the way back, and a record whose id another
+    /// peer's open question already carries: an answer is routed by id, so a second
+    /// peer reusing one could otherwise have the human's answer sent to it.
+    pub(crate) fn upsert(&self, record: InboundRecord, now: SystemTime) -> Result<()> {
+        if record.version != INBOUND_RECORD_VERSION {
+            bail!(
+                "An inbound question is version {} but this Coyote writes version {INBOUND_RECORD_VERSION}; refusing to store it.",
+                record.version
+            );
+        }
+        if record.id.is_empty() || record.id.chars().count() > PEER_ID_MAX_CHARS {
+            bail!(
+                "An inbound question's id is empty or longer than {PEER_ID_MAX_CHARS} characters; refusing to store it."
+            );
+        }
+        if parse_rfc3339(&record.received_at).is_none() {
+            bail!(
+                "An inbound question's `received_at` is not an RFC 3339 timestamp; refusing to store it."
+            );
+        }
+        for (field, hash) in [
+            ("peer_destination", &record.peer_destination),
+            ("peer_identity", &record.peer_identity),
+        ] {
+            if canonical_hash(hash).as_deref() != Some(hash.as_str()) {
+                bail!(
+                    "An inbound question's {field} is not 32 lowercase hex characters; refusing to store it."
+                );
+            }
+        }
+        if record.question.chars().count() > PENDING_QUESTION_MAX_CHARS {
+            bail!(
+                "An inbound question is longer than {PENDING_QUESTION_MAX_CHARS} characters; refusing to store it."
+            );
+        }
+        if record.envoy_question.chars().count() > INBOUND_ENVOY_QUESTION_MAX_CHARS {
+            bail!(
+                "An inbound question's envoy question is longer than {INBOUND_ENVOY_QUESTION_MAX_CHARS} characters; refusing to store it."
+            );
+        }
+        let _guard = self.write_lock.lock();
+        let _file_lock = file_lock(&self.path, INBOUND_NAMES)?;
+        let mut records = self.read_all()?;
+        records.retain(|record| !is_stale(&record.received_at, now));
+        match records.iter_mut().find(|existing| existing.id == record.id) {
+            Some(existing) if existing.peer_destination != record.peer_destination => bail!(
+                "An open question with id {} belongs to another peer; refusing to store it.",
+                record.id
+            ),
+            Some(existing) => *existing = record,
+            None => records.insert(0, record),
+        }
+        records.truncate(INBOUND_MAX_ENTRIES);
+        write_jsonl(&self.path, &records, INBOUND_NAMES)
+    }
+
+    /// The record with `id`, expired or not; the file is not touched.
+    pub(crate) fn get(&self, id: &str) -> Result<Option<InboundRecord>> {
+        Ok(self.read_all()?.into_iter().find(|record| record.id == id))
+    }
+
+    /// `true` when a record with `id` was there to remove.
+    pub(crate) fn remove(&self, id: &str) -> Result<bool> {
+        if !self.path.exists() {
+            return Ok(false);
+        }
+        let _guard = self.write_lock.lock();
+        let _file_lock = file_lock(&self.path, INBOUND_NAMES)?;
+        let mut records = self.read_all()?;
+        let before = records.len();
+        records.retain(|record| record.id != id);
+        if records.len() == before {
+            return Ok(false);
+        }
+        write_jsonl(&self.path, &records, INBOUND_NAMES)?;
+        Ok(true)
+    }
+
+    /// Newest first, with expired questions left out; the file is not touched.
+    // Reached by the REPL mesh commands once they land.
+    #[allow(dead_code)]
+    pub(crate) fn list(&self, now: SystemTime) -> Result<Vec<InboundRecord>> {
+        let mut records = self.read_all()?;
+        records.retain(|record| !is_stale(&record.received_at, now));
+        Ok(records)
+    }
+
+    fn read_all(&self) -> Result<Vec<InboundRecord>> {
+        read_jsonl(
+            &self.path,
+            INBOUND_NAMES,
+            INBOUND_RECORD_VERSION,
+            |record: &InboundRecord| ("received_at", &record.received_at),
+        )
+    }
+}
+
+/// Whether `stamp`, an RFC 3339 time the reader has already accepted, is `PENDING_TTL`
+/// or more before `now`. A stamp in the future (clock stepped back) reads as just made.
+fn is_stale(stamp: &str, now: SystemTime) -> bool {
+    parse_rfc3339(stamp).is_some_and(|at| now.duration_since(at).unwrap_or_default() >= PENDING_TTL)
+}
+
+/// An exclusive lock on `<path>.lock`, held until the returned `File` drops. Every
+/// Coyote process of one identity shares the cache directory, and `write_atomically`
+/// renames over the file itself, so the lock lives on a sibling that is never replaced.
+fn file_lock(path: &Path, names: StoreNames) -> Result<File> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create directory '{}'", parent.display()))?;
+    }
+    let lock_path = path.with_added_extension("lock");
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| {
+            format!(
+                "Failed to open mesh {} lock '{}'",
+                names.store,
+                lock_path.display()
+            )
+        })?;
+    file.lock().with_context(|| {
+        format!(
+            "Failed to lock mesh {} lock '{}'",
+            names.store,
+            lock_path.display()
+        )
+    })?;
+    Ok(file)
+}
+
+/// Every record in the file, refusing the whole file on the first line that is not one
+/// of `version`. `stamp` names the record's timestamp field and its text, so a record
+/// whose time does not parse is refused here rather than read as never expiring.
+fn read_jsonl<T: DeserializeOwned>(
+    path: &Path,
+    names: StoreNames,
+    version: u64,
+    stamp: impl Fn(&T) -> (&'static str, &str),
+) -> Result<Vec<T>> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!("Failed to read mesh {} '{}'", names.store, path.display())
+            });
+        }
+    };
+    let mut records = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let not_a_record = || {
+            format!(
+                "Mesh {} '{}' line {} is not a {}. It is cache: move the file aside to start fresh.",
+                names.store,
+                path.display(),
+                index + 1,
+                names.record
+            )
+        };
+        // The version is read on its own first so a record from a newer Coyote is
+        // named as such rather than failing on whatever field the newer layout added.
+        let probe: VersionProbe = serde_json::from_str(line).with_context(not_a_record)?;
+        if probe.version != version {
+            bail!(
+                "Mesh {} '{}' line {} is a version {} record but this Coyote reads version {version}. Upgrade Coyote if it was written by a newer Coyote; otherwise move the file aside (it is cache) to start fresh.",
+                names.store,
+                path.display(),
+                index + 1,
+                probe.version
+            );
+        }
+        let record: T = serde_json::from_str(line).with_context(not_a_record)?;
+        let (field, at) = stamp(&record);
+        if parse_rfc3339(at).is_none() {
+            bail!(
+                "Mesh {} '{}' line {} has a `{field}` that is not an RFC 3339 timestamp. It is cache: move the file aside to start fresh.",
+                names.store,
+                path.display(),
+                index + 1
+            );
+        }
+        records.push(record);
+    }
+    Ok(records)
+}
+
+fn write_jsonl<T: Serialize>(path: &Path, records: &[T], names: StoreNames) -> Result<()> {
+    let mut text = String::new();
+    for record in records {
+        text.push_str(
+            &serde_json::to_string(record)
+                .with_context(|| format!("Failed to serialize a mesh {}", names.record))?,
+        );
+        text.push('\n');
+    }
+    write_atomically(path, text.as_bytes())
 }
 
 /// One question and, once it has come, its answer.
@@ -758,6 +957,200 @@ mod tests {
 
         let listed = store.list(t(1_000)).unwrap();
         assert_eq!(listed, vec![record("q1", t(1_000), PendingState::Open)]);
+    }
+
+    fn inbound(id: &str, received_at: SystemTime) -> InboundRecord {
+        InboundRecord {
+            version: INBOUND_RECORD_VERSION,
+            id: id.to_string(),
+            peer_destination: hex_lower(&[0xab; 16]),
+            peer_identity: hex_lower(&[0xcd; 16]),
+            question: format!("question {id}"),
+            envoy_question: format!("proposal {id}"),
+            received_at: rfc3339_utc(received_at),
+        }
+    }
+
+    fn inbound_ids(records: &[InboundRecord]) -> Vec<&str> {
+        records.iter().map(|record| record.id.as_str()).collect()
+    }
+
+    #[test]
+    fn inbound_store_survives_reopen_and_prunes_by_ttl_and_cap() {
+        let tmp = TempDir::new("inbound-reopen");
+        let base = 1_000_000;
+        {
+            let store = InboundStore::new(&tmp.path, "inst-a");
+            assert!(store.list(t(base)).unwrap().is_empty());
+            assert!(store.get("old").unwrap().is_none());
+            assert!(!tmp.path.join("mesh").exists(), "reading creates nothing");
+            store.upsert(inbound("old", t(base - 10)), t(base)).unwrap();
+            store.upsert(inbound("new", t(base)), t(base)).unwrap();
+            let mut proposed = inbound("old", t(base - 10));
+            proposed.envoy_question = "second thoughts".into();
+            store.upsert(proposed, t(base)).unwrap();
+        }
+
+        let store = InboundStore::new(&tmp.path, "inst-a");
+        assert_eq!(
+            store.path(),
+            tmp.path.join("mesh").join("inbound-inst-a.jsonl")
+        );
+        let listed = store.list(t(base)).unwrap();
+        assert_eq!(
+            inbound_ids(&listed),
+            vec!["new", "old"],
+            "an upsert keeps its place"
+        );
+        assert_eq!(listed[1].envoy_question, "second thoughts");
+        assert_eq!(store.get("old").unwrap(), Some(listed[1].clone()));
+        assert!(
+            InboundStore::new(&tmp.path, "inst-b")
+                .list(t(base))
+                .unwrap()
+                .is_empty(),
+            "another instance has its own file"
+        );
+        assert!(
+            PendingStore::new(&tmp.path, "inst-a")
+                .list(t(base))
+                .unwrap()
+                .is_empty(),
+            "the pending store never sees a peer's question"
+        );
+
+        let expiry = t(base - 10) + PENDING_TTL;
+        assert_eq!(inbound_ids(&store.list(expiry).unwrap()), vec!["new"]);
+        store.upsert(inbound("newer", expiry), expiry).unwrap();
+        assert_eq!(
+            inbound_ids(&store.list(t(base)).unwrap()),
+            vec!["newer", "new"],
+            "an upsert drops the expired from the file"
+        );
+        assert!(store.remove("new").unwrap());
+        assert!(!store.remove("new").unwrap());
+        assert!(store.get("new").unwrap().is_none());
+
+        let records: Vec<InboundRecord> = (0..INBOUND_MAX_ENTRIES)
+            .rev()
+            .map(|n| inbound(&format!("q{n}"), t(base + n as u64)))
+            .collect();
+        write_jsonl(store.path(), &records, INBOUND_NAMES).unwrap();
+        store
+            .upsert(inbound("latest", t(base + 10_000)), t(base + 10_000))
+            .unwrap();
+        let listed = store.list(t(base + 10_000)).unwrap();
+        assert_eq!(listed.len(), INBOUND_MAX_ENTRIES);
+        assert_eq!(listed[0].id, "latest");
+        assert!(!inbound_ids(&listed).contains(&"q0"), "the oldest goes");
+        assert!(inbound_ids(&listed).contains(&"q1"));
+    }
+
+    #[test]
+    fn inbound_upsert_refuses_records_the_reader_would_refuse() {
+        let tmp = TempDir::new("inbound-refuse");
+        let store = InboundStore::new(&tmp.path, "inst");
+        let base = inbound("fine", t(1_000));
+        for (what, broken, needle) in [
+            (
+                "version",
+                InboundRecord {
+                    version: INBOUND_RECORD_VERSION + 1,
+                    ..base.clone()
+                },
+                "version",
+            ),
+            (
+                "empty id",
+                InboundRecord {
+                    id: String::new(),
+                    ..base.clone()
+                },
+                "id",
+            ),
+            (
+                "bad received_at",
+                InboundRecord {
+                    received_at: "yesterday".into(),
+                    ..base.clone()
+                },
+                "RFC 3339",
+            ),
+            (
+                "bad identity",
+                InboundRecord {
+                    peer_identity: "CD".repeat(16),
+                    ..base.clone()
+                },
+                "peer_identity",
+            ),
+            (
+                "long question",
+                InboundRecord {
+                    question: "q".repeat(PENDING_QUESTION_MAX_CHARS + 1),
+                    ..base.clone()
+                },
+                "characters",
+            ),
+            (
+                "long envoy question",
+                InboundRecord {
+                    envoy_question: "p".repeat(INBOUND_ENVOY_QUESTION_MAX_CHARS + 1),
+                    ..base.clone()
+                },
+                "envoy question",
+            ),
+        ] {
+            let err = store.upsert(broken, t(1_000)).unwrap_err().to_string();
+            assert!(err.contains("refusing"), "{what}: {err}");
+            assert!(err.contains(needle), "{what}: {err}");
+        }
+        assert!(!store.path().exists());
+
+        store.upsert(base, t(1_000)).unwrap();
+        let mut newer = serde_json::to_value(inbound("future", t(2_000))).unwrap();
+        newer["version"] = serde_json::json!(INBOUND_RECORD_VERSION + 1);
+        let existing = fs::read_to_string(store.path()).unwrap();
+        fs::write(store.path(), format!("{newer}\n{existing}")).unwrap();
+        let err = store.list(t(2_000)).unwrap_err().to_string();
+        assert!(err.contains("inbound store"), "{err}");
+        assert!(err.contains("line 1"), "{err}");
+        assert!(err.contains("move the file aside"), "{err}");
+    }
+
+    #[test]
+    fn inbound_upsert_refuses_an_id_another_peer_holds_open() {
+        let tmp = TempDir::new("inbound-collide");
+        let store = InboundStore::new(&tmp.path, "inst");
+        let first = inbound("shared", t(1_000));
+        store.upsert(first.clone(), t(1_000)).unwrap();
+
+        let mut other_peer = inbound("shared", t(1_001));
+        other_peer.peer_destination = hex_lower(&[0xee; 16]);
+        let err = store.upsert(other_peer, t(1_001)).unwrap_err().to_string();
+        assert!(err.contains("belongs to another peer"), "{err}");
+        assert_eq!(store.get("shared").unwrap(), Some(first.clone()));
+
+        let mut same_peer = inbound("shared", t(1_002));
+        same_peer.envoy_question = "asked again".into();
+        store.upsert(same_peer.clone(), t(1_002)).unwrap();
+        assert_eq!(store.get("shared").unwrap(), Some(same_peer));
+        assert_eq!(store.list(t(1_002)).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn inbound_upsert_lets_a_new_peer_reuse_an_expired_id() {
+        let tmp = TempDir::new("inbound-expired-reuse");
+        let store = InboundStore::new(&tmp.path, "inst");
+        let now = t(1_000_000);
+        let stale = inbound("shared", now - PENDING_TTL - Duration::from_secs(1));
+        store.upsert(stale, now - PENDING_TTL).unwrap();
+
+        let mut other_peer = inbound("shared", now);
+        other_peer.peer_destination = hex_lower(&[0xee; 16]);
+        store.upsert(other_peer.clone(), now).unwrap();
+        assert_eq!(store.get("shared").unwrap(), Some(other_peer));
+        assert_eq!(store.list(now).unwrap().len(), 1);
     }
 
     #[tokio::test]

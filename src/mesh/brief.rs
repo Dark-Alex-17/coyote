@@ -56,8 +56,6 @@ pub(crate) struct Brief {
 impl Brief {
     /// The served text, verbatim: whatever shows the brief locally must not diverge from
     /// what peers receive.
-    // Reached by the REPL mesh commands once they land.
-    #[allow(dead_code)]
     pub(crate) fn render_for_human(&self) -> &str {
         &self.text
     }

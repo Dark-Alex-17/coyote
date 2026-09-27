@@ -338,7 +338,8 @@ mesh:
   brief: auto                    # What the envoy serves to trusted peers (default: auto): auto = status card + session digest + user brief; manual = card + user brief only, no model spend; off = card only
   digest_prompt: null            # Prompt used to build the shareable session digest. If null or blank, uses built-in default
   brief_model: openai:gpt-4o-mini # Model used to build the digest (default: null = the session's current model)
-  envoy_model: null              # Model the envoy answers peers with (default: null = the session's current model)
+  envoy_model: null              # Model the envoy answers peers with (default: null = the configured model_id; the envoy never follows a `.model` switch)
+  envoy_escalation_timeout: 0    # Seconds the envoy holds a peer's question open for the human before handing it off (default: 0 = hand off at once; the question stays open for `.mesh answer`; a hold longer than the 120 s run ceiling is cut to it)
   knock_retention_hours: 24      # How long unanswered knocks from known identities are kept (default: 24; must be 1 or more)
   peer_max_concurrent: 1         # Envoy invocations allowed at once per peer identity (default: 1; must be 1 or more)
   peer_max_messages_per_hour: 60 # Peer messages accepted per identity per hour; further messages are refused with an explicit error to the peer, never silently dropped (default: 60; must be 1 or more)

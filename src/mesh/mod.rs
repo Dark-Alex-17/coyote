@@ -3,6 +3,7 @@
 mod announce;
 pub(crate) mod brief;
 pub(crate) mod card;
+pub(crate) mod envoy;
 mod identity;
 pub(crate) mod idle;
 pub(crate) mod knock;
@@ -21,7 +22,7 @@ pub(crate) mod snapshot;
 pub(crate) mod trust;
 
 pub(crate) use node::{MeshRuntime, MeshSlot};
-pub(crate) use r3::RequestOptions;
+pub(crate) use r3::{RequestOptions, short};
 
 use crate::config::sanitize_display_text;
 use anyhow::{Context, Result};
@@ -92,13 +93,17 @@ pub(crate) fn canonical_hash(text: &str) -> Option<String> {
 }
 
 /// Peer or local text as this node may show or send it: terminal escape sequences stripped,
-/// every other control character a space, the invisible formatting characters and
-/// variation selectors dropped, trimmed, and cut to `max_chars` characters on a character
-/// boundary with no trailing whitespace. Blank text is `None`. Escapes go first so a
-/// sequence's own bytes never survive as spaces.
+/// every other control character and the line and paragraph separators a space, the
+/// invisible formatting characters and variation selectors dropped, trimmed, and cut to
+/// `max_chars` characters on a character boundary with no trailing whitespace. Blank text
+/// is `None`. Escapes go first so a sequence's own bytes never survive as spaces.
 pub(crate) fn display_text(text: &str, max_chars: usize) -> Option<String> {
     let cleaned: String = sanitize_display_text(text)
         .chars()
+        .map(|c| match c {
+            '\u{2028}' | '\u{2029}' => ' ',
+            c => c,
+        })
         .filter(|c| !announce::is_control_or_invisible(*c) && !announce::is_variation_selector(*c))
         .collect();
     let trimmed = cleaned.trim();
@@ -789,6 +794,14 @@ mod tests {
         assert_eq!(
             mesh_config_dir(Path::new("/tmp/config")),
             PathBuf::from("/tmp/config/mesh")
+        );
+    }
+
+    #[test]
+    fn display_text_drops_the_unicode_line_and_paragraph_separators() {
+        assert_eq!(
+            display_text("one\u{2028}two\u{2029}three", 100).as_deref(),
+            Some("one two three")
         );
     }
 

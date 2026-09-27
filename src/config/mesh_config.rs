@@ -32,6 +32,9 @@ pub struct MeshConfig {
     pub digest_prompt: Option<String>,
     pub brief_model: Option<String>,
     pub envoy_model: Option<String>,
+    /// Seconds the envoy holds a peer's question open for the human before handing it
+    /// off; 0 = hand off at once, the question stays open for `.mesh answer`.
+    pub envoy_escalation_timeout: u64,
     pub knock_retention_hours: u64,
     pub peer_max_concurrent: u32,
     pub peer_max_messages_per_hour: u32,
@@ -50,6 +53,7 @@ impl Default for MeshConfig {
             digest_prompt: None,
             brief_model: None,
             envoy_model: None,
+            envoy_escalation_timeout: 0,
             knock_retention_hours: DEFAULT_KNOCK_RETENTION_HOURS,
             peer_max_concurrent: DEFAULT_PEER_MAX_CONCURRENT,
             peer_max_messages_per_hour: DEFAULT_PEER_MAX_MESSAGES_PER_HOUR,
@@ -254,6 +258,10 @@ pub fn render_mesh_info(mesh: &MeshConfig) -> String {
     row("brief_model", super::format_option_value(&mesh.brief_model));
     row("envoy_model", super::format_option_value(&mesh.envoy_model));
     row(
+        "envoy_escalation_timeout",
+        mesh.envoy_escalation_timeout.to_string(),
+    );
+    row(
         "knock_retention_hours",
         mesh.knock_retention_hours.to_string(),
     );
@@ -292,6 +300,7 @@ mod tests {
         assert_eq!(mesh.digest_prompt, None);
         assert_eq!(mesh.brief_model, None);
         assert_eq!(mesh.envoy_model, None);
+        assert_eq!(mesh.envoy_escalation_timeout, 0);
         assert_eq!(mesh.knock_retention_hours, 24);
         assert_eq!(mesh.peer_max_concurrent, 1);
         assert_eq!(mesh.peer_max_messages_per_hour, 60);

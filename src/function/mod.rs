@@ -1804,7 +1804,12 @@ impl ToolCall {
     }
 
     async fn eval_mcp(&self, ctx: &RequestContext) -> Result<Value> {
-        if ctx.agent.as_ref().is_some_and(Agent::is_builtin) {
+        if let Some(agent) = ctx.agent.as_ref().filter(|agent| agent.is_builtin()) {
+            warn!(
+                "Built-in agent {} asked for MCP tool {}, which it may not call",
+                agent.name(),
+                self.name
+            );
             bail!("Unexpected call: {} {}", self.name, self.arguments)
         }
         let json_data = self.parse_arguments()?;
@@ -2350,6 +2355,10 @@ impl ToolCall {
                 }
             }
             None if agent.is_builtin() => {
+                warn!(
+                    "Built-in agent {} asked for tool {function_name}, which it does not declare",
+                    agent.name()
+                );
                 bail!("Unexpected call: {function_name} {}", self.arguments)
             }
             None => self.extract_call_config_from_ctx(functions),

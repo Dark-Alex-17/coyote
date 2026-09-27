@@ -75,11 +75,12 @@ impl AnnounceAppData {
     }
 }
 
-/// Control characters plus every Unicode format (Cf) character: soft hyphen, zero-width,
+/// Control characters, every Unicode format (Cf) character (soft hyphen, zero-width,
 /// bidirectional override, joiner and tag characters, all of which let text render as
-/// something it is not. Announces, trust labels and knock records refuse text containing
-/// one. Variation selectors are not in here: they are nonspacing marks (Mn), not Cf, and a
-/// name like "Alex ❤️" carries one legitimately.
+/// something it is not) and the line and paragraph separators (Zl, Zp), which break a
+/// line where `str::lines` sees none. Announces, trust labels and knock records refuse
+/// text containing one. Variation selectors are not in here: they are nonspacing marks
+/// (Mn), not Cf, and a name like "Alex ❤️" carries one legitimately.
 pub(crate) fn is_control_or_invisible(c: char) -> bool {
     c.is_control()
         || matches!(
@@ -93,6 +94,7 @@ pub(crate) fn is_control_or_invisible(c: char) -> bool {
                 | '\u{08E2}'
                 | '\u{180E}'
                 | '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{2029}'
                 | '\u{202A}'..='\u{202E}'
                 | '\u{2060}'..='\u{206F}'
                 | '\u{FEFF}'
@@ -296,6 +298,7 @@ mod tests {
         ('\u{08E2}'..='\u{08E2}', "Arabic disputed end of ayah"),
         ('\u{180E}'..='\u{180E}', "Mongolian vowel separator"),
         ('\u{200B}'..='\u{200F}', "zero width and bidi marks"),
+        ('\u{2028}'..='\u{2029}', "line and paragraph separators"),
         ('\u{202A}'..='\u{202E}', "bidi embeddings and overrides"),
         (
             '\u{2060}'..='\u{206F}',

@@ -4,7 +4,8 @@ use crate::mesh::announce::{
     AnnounceAppData, HEARTBEAT_SECS, REANNOUNCE_FLOOR_SECS, announce_app_data,
 };
 use crate::mesh::brief::{Brief, Digest, assemble_brief, digest_objective_for};
-use crate::mesh::card::{CardSource, StatusHandler, build_card};
+use crate::mesh::card::{CardSource, DISPLAY_NAME_MAX_CHARS, StatusHandler, build_card};
+use crate::mesh::envoy::{EnvoyJob, EnvoySink};
 use crate::mesh::idle::{IdleNotify, IdleSink, Origin};
 use crate::mesh::knock::{
     ChannelKnockSink, KNOCK_LINK_TIMEOUT, KNOCK_QUEUE_CAPACITY, KNOCK_REQUEST_TIMEOUT, KnockError,
@@ -14,12 +15,15 @@ use crate::mesh::knock::{
 use crate::mesh::knocks::KnockCache;
 use crate::mesh::lock::InstanceLock;
 use crate::mesh::message::{
-    CHECK_INBOX_NEXT_ACTION, ModelNotes, PeerInbox, PeerKind, PeerMessage, PeerMessageHandler,
-    PeerRouting, PeerSurface, collect_next_action,
+    CHECK_INBOX_NEXT_ACTION, ModelNotes, OutboundPeer, PEER_LINE_MAX_CHARS, PeerInbox, PeerKind,
+    PeerMessage, PeerMessageHandler, PeerRouting, PeerSurface, PeerVia, RawPeerMessage,
+    collect_next_action, unix_now,
 };
 use crate::mesh::notify::{Notification, NotificationSink, Source};
 use crate::mesh::peers::{PeerChange, PeerSighting, PeerTable};
-use crate::mesh::pending::{Correlations, PendingRecord, PendingStore};
+use crate::mesh::pending::{
+    Correlations, InboundRecord, InboundStore, PendingRecord, PendingStore,
+};
 use crate::mesh::propagation::{
     self, OutboundMessage, PropagationError, PropagationNode, PropagationOptions,
 };
@@ -33,7 +37,7 @@ use crate::mesh::r3::{
 };
 use crate::mesh::snapshot::MeshSnapshot;
 use crate::mesh::trust::TrustStore;
-use crate::mesh::{hex_lower, identity, mesh_cache_dir};
+use crate::mesh::{display_text, hex_lower, identity, mesh_cache_dir};
 use crate::supervisor::notification::{SystemNotification, mesh_notification};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -1365,7 +1369,9 @@ async fn announce_periodically(runtime: Arc<MeshRuntime>, cancel: CancellationTo
 ///
 /// Peer messages land in `peer_inbox` for the model to read on its next `mesh__check_inbox`,
 /// with a note in `model_notes` so it knows to look; replies to questions this node asked
-/// are matched in `correlations` first.
+/// are matched in `correlations` first. With an envoy attached, messages and questions
+/// go to it instead of the inbox; the questions it escalates to the person at the
+/// keyboard wait in `inbound`, a per-instance file like `correlations`' store.
 #[derive(Default)]
 pub(crate) struct MeshSlot {
     inner: RwLock<Option<Arc<MeshRuntime>>>,
@@ -1378,9 +1384,11 @@ pub(crate) struct MeshSlot {
     reassembly: parking_lot::Mutex<()>,
     notifier: ArcSwapOption<Arc<dyn NotificationSink>>,
     idle: ArcSwapOption<Arc<dyn IdleSink>>,
+    envoy: ArcSwapOption<Arc<dyn EnvoySink>>,
     peer_inbox: PeerInbox,
     correlations: Correlations,
     model_notes: ModelNotes,
+    inbound: parking_lot::Mutex<Option<Arc<InboundStore>>>,
 }
 
 impl MeshSlot {
@@ -1409,6 +1417,7 @@ impl MeshSlot {
             bail!(already_on);
         }
         let store = PendingStore::new(runtime.cache_dir(), &runtime.current_instance_id());
+        let inbound = InboundStore::new(runtime.cache_dir(), &runtime.current_instance_id());
         let pending = reopen_pending(&store);
         // Nothing may `.await` while this guard is held: the status handler reads the same
         // lock for the display name.
@@ -1417,6 +1426,7 @@ impl MeshSlot {
             bail!(already_on);
         }
         self.correlations.adopt(store, pending);
+        *self.inbound.lock() = Some(Arc::new(inbound));
         let source = Arc::downgrade(self) as Weak<dyn CardSource>;
         runtime
             .dispatcher()
@@ -1448,6 +1458,7 @@ impl MeshSlot {
         match taken {
             Some(runtime) => {
                 self.correlations.detach_store();
+                self.inbound.lock().take();
                 runtime.shutdown().await?;
                 Ok(true)
             }
@@ -1470,11 +1481,18 @@ impl MeshSlot {
         let fork_store = PendingStore::new(runtime.cache_dir(), &rekey.fork_instance_id);
         let pending = reopen_pending(&fork_store);
         self.correlations.adopt(fork_store, pending);
+        let fork_inbound = InboundStore::new(runtime.cache_dir(), &rekey.fork_instance_id);
+        *self.inbound.lock() = Some(Arc::new(fork_inbound));
         let rekeyed = runtime.rekey(rekey).await;
         if rekeyed.is_err() {
-            let original = PendingStore::new(runtime.cache_dir(), &runtime.current_instance_id());
+            let instance_id = runtime.current_instance_id();
+            let original = PendingStore::new(runtime.cache_dir(), &instance_id);
             let pending = reopen_pending(&original);
             self.correlations.adopt(original, pending);
+            *self.inbound.lock() = Some(Arc::new(InboundStore::new(
+                runtime.cache_dir(),
+                &instance_id,
+            )));
         }
         rekeyed
     }
@@ -1646,6 +1664,16 @@ impl MeshSlot {
         self.idle.store(None);
     }
 
+    /// Installs the envoy that answers inbound messages and questions. Its owner is the
+    /// session that runs it, so the slot holds it behind a hook it can drop at any time.
+    pub(crate) fn set_envoy(&self, sink: Arc<dyn EnvoySink>) {
+        self.envoy.store(Some(Arc::new(sink)));
+    }
+
+    pub(crate) fn clear_envoy(&self) {
+        self.envoy.store(None);
+    }
+
     /// Hands an event to the idle-time driver. With no driver installed the human line
     /// goes out through `notify` and the model's copy is dropped, since there is no
     /// transcript to deliver it to. With a driver whose queue is full the whole event is
@@ -1676,17 +1704,245 @@ impl MeshSlot {
         self.model_notes.take()
     }
 
+    /// The store of questions peers asked that the envoy escalated; `None` while the
+    /// mesh is off.
+    pub(crate) fn inbound_store(&self) -> Option<Arc<InboundStore>> {
+        self.inbound.lock().clone()
+    }
+
+    /// Gives a slot with no node a store, so an envoy escalation can be tested without
+    /// a runtime to `install`.
+    #[cfg(test)]
+    pub(crate) fn set_inbound_store_for_tests(&self, store: Arc<InboundStore>) {
+        *self.inbound.lock() = Some(store);
+    }
+
     /// Where every inbound peer message ends up, from a link or a propagation node. A
-    /// reply to a question this node asked answers its correlation; everything lands in
-    /// the inbox; the model is told what arrived and what to call, and the person at
-    /// the keyboard gets one line. The id in the model's note is minted here from the
-    /// sending instance, never the peer's own: an answered question is named by our
-    /// correlation id, anything else (a message, an ask or a bulletin, each its own
-    /// event) by `peer:<instance>`, so no peer-chosen text reaches the note. Runs on a
+    /// reply to a question this node asked answers its correlation and goes to the
+    /// inbox. A message or a question is offered to the envoy first when one is
+    /// attached, and the envoy owns it from then on: what it answered comes back through
+    /// `record_envoy_exchange`, what it could not through `record_envoy_fallback`. An
+    /// envoy that refuses (its queue is full), a bulletin, or no envoy at all means the
+    /// inbox path as ever, and the refusal earns the person at the keyboard one more
+    /// line so they know the envoy is behind. Anything that arrived naming a message in
+    /// `in_reply_to` takes the inbox path too, whatever its kind: a peer's envoy replying
+    /// to our envoy's reply would otherwise keep the two talking forever. Runs on a
     /// blocking thread off the server's request path or on the fetch task, so nothing
     /// here awaits.
     pub(crate) fn deliver_peer(&self, mut message: PeerMessage) {
-        let id8 = short(&message.source_identity).to_string();
+        let wire_reply = message.in_reply_to.is_some();
+        let answered = self.answer_correlation(&mut message);
+        let for_envoy =
+            !answered && !wire_reply && matches!(message.kind, PeerKind::Message | PeerKind::Ask);
+        let envoy = for_envoy.then(|| self.envoy.load_full()).flatten();
+        match envoy {
+            None => self.deliver_to_inbox(message, answered),
+            Some(sink) => {
+                let (kind, id) = (message.kind, message.message_id.clone());
+                let id8 = short(&message.source_identity).to_string();
+                if sink.accept(EnvoyJob {
+                    message: message.clone(),
+                }) {
+                    debug!("Mesh {kind} {id} from {id8} handed to the envoy");
+                    return;
+                }
+                debug!(
+                    "Mesh {kind} {id} from {id8} refused by the envoy (queue full or stopping); delivering it to the inbox"
+                );
+                self.record_envoy_fallback(message, "envoy busy");
+            }
+        }
+    }
+
+    /// The envoy answered `original` with `reply_text`. Both land in the inbox, the
+    /// original first, so the model reads the exchange in order on its next
+    /// `mesh__check_inbox`; the model gets one note for the pair and the person at the
+    /// keyboard one line naming both sides. The reply is minted through the one
+    /// sanitiser as a message from this node's destination, so it reads back like any
+    /// other peer message.
+    pub(crate) fn record_envoy_exchange(&self, original: &PeerMessage, reply_text: &str) {
+        let runtime = self.get();
+        let reply = PeerMessage::new(RawPeerMessage {
+            source_identity: runtime
+                .as_ref()
+                .map(|runtime| runtime.fingerprint().to_string())
+                .unwrap_or_default(),
+            source_destination: runtime
+                .as_ref()
+                .map(|runtime| runtime.current_destination_hash())
+                .unwrap_or_default(),
+            destination: original.source_destination.clone(),
+            title: None,
+            content: reply_text.to_string(),
+            fields: None,
+            timestamp: unix_now(),
+            message_id: uuid::Uuid::new_v4().simple().to_string(),
+            in_reply_to: Some(original.message_id.clone()),
+            kind: PeerKind::Reply,
+            via: PeerVia::Direct,
+        });
+        let who = self.peer_name(original);
+        let asked = match original.kind {
+            PeerKind::Ask => "asked",
+            _ => "said",
+        };
+        let half = PEER_LINE_MAX_CHARS / 2;
+        let text = format!(
+            "{who} {asked}: {}; envoy replied: {}",
+            first_words(original, half),
+            first_words(&reply, half)
+        );
+        let local_id = format!("peer:{}", short(&original.source_destination));
+        let id8 = short(&original.source_identity).to_string();
+        self.peer_inbox.deliver(original.clone());
+        self.peer_inbox.deliver(reply);
+        self.model_notes.push(mesh_notification(
+            "peer_message",
+            &local_id,
+            "mesh",
+            true,
+            CHECK_INBOX_NEXT_ACTION.to_string(),
+        ));
+        self.push_idle(IdleNotify {
+            source: Source::Message,
+            origin: Origin::Peer(id8),
+            text,
+            model_note: None,
+        });
+    }
+
+    /// The envoy took `original` but did not answer it (busy, timed out, unavailable or
+    /// failed): it goes down the inbox path as if no envoy were attached, and the person
+    /// at the keyboard gets one more line with `reason`, since the summary line alone
+    /// would not tell them the envoy was tried.
+    pub(crate) fn record_envoy_fallback(&self, original: PeerMessage, reason: &str) {
+        let text = format!(
+            "{reason}; {} is in the inbox",
+            original.summary_line(self.display_name_of(&original).as_deref())
+        );
+        let id8 = short(&original.source_identity).to_string();
+        self.deliver_to_inbox(original, false);
+        self.push_idle(IdleNotify {
+            source: Source::Message,
+            origin: Origin::Peer(id8),
+            text,
+            model_note: None,
+        });
+    }
+
+    /// The envoy asked the human about `original` and the answer will go out through
+    /// `answer_inbound`. The original takes the inbox path so the model can read it,
+    /// but its note tells the model to wait for `.mesh answer {id}` rather than reply to
+    /// a question the human is already being asked; `id` is the peer's message id as
+    /// `PeerMessage::new` cleaned it, the same one the idle line shows. The person at
+    /// the keyboard gets one line saying the envoy escalated.
+    pub(crate) fn record_envoy_escalated(&self, original: PeerMessage, id: &str) {
+        let summary = original.summary_line(self.display_name_of(&original).as_deref());
+        let id8 = short(&original.source_identity).to_string();
+        let local_id = format!("peer:{}", short(&original.source_destination));
+        let event = match original.kind {
+            PeerKind::Ask => "peer_ask",
+            _ => "peer_message",
+        };
+        self.peer_inbox.deliver(original);
+        self.model_notes.push(mesh_notification(
+            event,
+            &local_id,
+            "mesh",
+            true,
+            format!("the human was asked; wait for `.mesh answer {id}` instead of replying"),
+        ));
+        self.push_idle(IdleNotify {
+            source: Source::Message,
+            origin: Origin::Peer(id8),
+            text: format!("envoy escalated to the human; {summary} is in the inbox"),
+            model_note: None,
+        });
+    }
+
+    /// A human answer to the escalated inbound question `id`. A live envoy run still
+    /// holding the question takes it, and the question stays filed until that run
+    /// delivers; otherwise it goes to the peer as a reply, leaves the store here and is
+    /// recorded for the leader, whose earlier note said to wait for it.
+    /// Never touches `correlations`: this answers a peer's question, not one of ours.
+    // Reached by the REPL mesh commands once they land.
+    #[allow(dead_code)]
+    pub(crate) async fn answer_inbound(&self, id: &str, text: &str) -> Result<()> {
+        let Some(store) = self.inbound_store() else {
+            bail!("Mesh is off; turn it on with `.mesh on` before answering {id}");
+        };
+        let Some(record) = store.get(id)? else {
+            bail!("no open question {id}");
+        };
+        if self
+            .envoy
+            .load_full()
+            .is_some_and(|sink| sink.answer(id, text))
+        {
+            return Ok(());
+        }
+        let Some(runtime) = self.get() else {
+            bail!(
+                "Mesh is off, so the answer to {id} cannot be sent to {}",
+                short(&record.peer_destination)
+            );
+        };
+        let reply = OutboundPeer::new(PeerKind::Reply, text, None, Some(id), None)?;
+        runtime.send_peer(&record.peer_destination, &reply).await?;
+        store.remove(id)?;
+        self.record_human_answer(&record, text);
+        Ok(())
+    }
+
+    /// The human's `.mesh answer` to `record` went to the peer with no live run. The
+    /// reply lands in the inbox, minted like the envoy's, so the model reads what the
+    /// peer heard; one note supersedes the "wait for `.mesh answer`" one and the person
+    /// at the keyboard gets one line.
+    fn record_human_answer(&self, record: &InboundRecord, text: &str) {
+        let runtime = self.get();
+        let reply = PeerMessage::new(RawPeerMessage {
+            source_identity: runtime
+                .as_ref()
+                .map(|runtime| runtime.fingerprint().to_string())
+                .unwrap_or_default(),
+            source_destination: runtime
+                .as_ref()
+                .map(|runtime| runtime.current_destination_hash())
+                .unwrap_or_default(),
+            destination: record.peer_destination.clone(),
+            title: None,
+            content: text.to_string(),
+            fields: None,
+            timestamp: unix_now(),
+            message_id: uuid::Uuid::new_v4().simple().to_string(),
+            in_reply_to: Some(record.id.clone()),
+            kind: PeerKind::Reply,
+            via: PeerVia::Direct,
+        });
+        let dest8 = short(&record.peer_destination).to_string();
+        let text = format!(
+            "you answered {dest8}: {}",
+            first_words(&reply, PEER_LINE_MAX_CHARS)
+        );
+        self.peer_inbox.deliver(reply);
+        self.model_notes.push(mesh_notification(
+            "peer_message",
+            &format!("peer:{dest8}"),
+            "mesh",
+            true,
+            "the human answered via `.mesh answer`; nothing to do".to_string(),
+        ));
+        self.push_idle(IdleNotify {
+            source: Source::Message,
+            origin: Origin::Peer(short(&record.peer_identity).to_string()),
+            text,
+            model_note: None,
+        });
+    }
+
+    /// Matches a reply to the question of ours it answers. A reply that answers nothing
+    /// is downgraded to a message, since to this node it is one; `true` when it matched.
+    fn answer_correlation(&self, message: &mut PeerMessage) -> bool {
         let answered = message.kind == PeerKind::Reply
             && message
                 .in_reply_to
@@ -1700,11 +1956,32 @@ impl MeshSlot {
             );
             message.kind = PeerKind::Message;
         }
-        let display_name = self
-            .get()
+        answered
+    }
+
+    fn display_name_of(&self, message: &PeerMessage) -> Option<String> {
+        self.get()
             .and_then(|runtime| runtime.peers().get(&message.source_destination))
-            .and_then(|peer| peer.display_name);
-        let text = message.summary_line(display_name.as_deref());
+            .and_then(|peer| peer.display_name)
+    }
+
+    /// The sender as `summary_line` names it: the peer table's display name, cleaned,
+    /// or the short hash of its instance.
+    pub(crate) fn peer_name(&self, message: &PeerMessage) -> String {
+        self.display_name_of(message)
+            .and_then(|name| display_text(&name, DISPLAY_NAME_MAX_CHARS))
+            .unwrap_or_else(|| short(&message.source_destination).to_string())
+    }
+
+    /// The inbox path: the message lands in the inbox, the model is told what arrived
+    /// and what to call, and the person at the keyboard gets one line. The id in the
+    /// model's note is minted here from the sending instance, never the peer's own: an
+    /// answered question is named by our correlation id, anything else (a message, an
+    /// ask or a bulletin, each its own event) by `peer:<instance>`, so no peer-chosen
+    /// text reaches the note.
+    fn deliver_to_inbox(&self, message: PeerMessage, answered: bool) {
+        let id8 = short(&message.source_identity).to_string();
+        let text = message.summary_line(self.display_name_of(&message).as_deref());
         let local_id = format!("peer:{}", short(&message.source_destination));
         let (event, id, next_action) = match (answered, message.kind) {
             (true, _) => {
@@ -1746,6 +2023,16 @@ fn non_blank(value: Option<String>) -> Option<Arc<String>> {
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
         .map(Arc::new)
+}
+
+/// The words `summary_line` shows for `message`, cut to `max_chars`.
+fn first_words(message: &PeerMessage, max_chars: usize) -> String {
+    let words = if message.content.is_empty() {
+        message.title.as_deref().unwrap_or("(no text)")
+    } else {
+        &message.content
+    };
+    display_text(words, max_chars).unwrap_or_default()
 }
 
 /// The questions `store` holds open or answered and uncollected. A file this Coyote
@@ -1790,18 +2077,33 @@ impl PeerSurface for MeshSlot {
 mod tests {
     use super::*;
     use crate::config::mesh_config::MeshBrief;
-    use crate::mesh::message::{PEER_ID_MAX_CHARS, PeerVia, RawPeerMessage};
+    use crate::mesh::destination_address;
+    use crate::mesh::message::{
+        PEER_ID_MAX_CHARS, is_received_reply, peer_lxmf_message, to_r3_body,
+    };
     use crate::mesh::notify::RenderedNotification;
     use crate::mesh::peers::PEER_TTL;
     #[cfg(unix)]
     use crate::mesh::peers::PeerRecord;
-    use crate::mesh::pending::{DEFAULT_COLLECT_TIMEOUT, PENDING_RECORD_VERSION, PendingState};
+    use crate::mesh::pending::{
+        DEFAULT_COLLECT_TIMEOUT, INBOUND_RECORD_VERSION, InboundRecord, PENDING_RECORD_VERSION,
+        PendingState,
+    };
+    use crate::mesh::propagation_fetch::InboundMessage;
+    use crate::mesh::r3::{
+        AdmittedRequest, Handler, NAME_HASH_LEN, PathHash, Reply, RequestId, SizeBranch,
+    };
     use crate::mesh::rfc3339_utc;
-    use crate::mesh::test_support::{TempDir, mesh_paths, private_config, snapshot_fixture};
     #[cfg(unix)]
-    use crate::mesh::test_support::{loopback_relay, started_runtime};
+    use crate::mesh::test_support::{
+        PeerStub, loopback_relay, started_runtime, started_runtime_on,
+    };
+    use crate::mesh::test_support::{
+        TempDir, TrustList, mesh_paths, private_config, snapshot_fixture,
+    };
     use crate::supervisor::mailbox::EnvelopePayload;
     use crate::testing::{debug_snapshot, install_log_collector, warn_snapshot};
+    use rns_transport::destination::link::LinkId;
     #[cfg(unix)]
     use rns_transport::iface::tcp_server::TcpServer;
     #[cfg(unix)]
@@ -2262,6 +2564,13 @@ mod tests {
             .collect()
     }
 
+    fn peer_of(envelope: &crate::supervisor::mailbox::Envelope) -> &PeerMessage {
+        match &envelope.payload {
+            EnvelopePayload::Peer(message) => message,
+            other => panic!("not a peer envelope: {other:?}"),
+        }
+    }
+
     #[test]
     fn deliver_peer_on_a_bare_slot_lands_in_the_inbox_and_queues_a_model_note_and_a_line() {
         let slot = MeshSlot::default();
@@ -2348,6 +2657,576 @@ mod tests {
             EnvelopePayload::Peer(message) => message,
             other => panic!("not a peer envelope: {other:?}"),
         }
+    }
+
+    /// An envoy that keeps every job it is offered, or refuses them all to stand in for
+    /// a full queue; answers are consumed or not as configured.
+    struct RecordingEnvoy {
+        accept: bool,
+        consume_answers: bool,
+        jobs: parking_lot::Mutex<Vec<PeerMessage>>,
+        answers: parking_lot::Mutex<Vec<(String, String)>>,
+    }
+
+    impl RecordingEnvoy {
+        fn new(accept: bool, consume_answers: bool) -> Arc<Self> {
+            Arc::new(Self {
+                accept,
+                consume_answers,
+                jobs: parking_lot::Mutex::new(Vec::new()),
+                answers: parking_lot::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn job_ids(&self) -> Vec<String> {
+            self.jobs
+                .lock()
+                .iter()
+                .map(|message| message.message_id.clone())
+                .collect()
+        }
+    }
+
+    impl EnvoySink for RecordingEnvoy {
+        fn accept(&self, job: EnvoyJob) -> bool {
+            if self.accept {
+                self.jobs.lock().push(job.message);
+            }
+            self.accept
+        }
+
+        fn answer(&self, id: &str, text: &str) -> bool {
+            self.answers.lock().push((id.to_string(), text.to_string()));
+            self.consume_answers
+        }
+    }
+
+    #[test]
+    fn an_accepting_envoy_takes_messages_and_asks_and_nothing_else() {
+        let slot = MeshSlot::default();
+        let idle = RecordingIdleSink::new(true);
+        slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+        let envoy = RecordingEnvoy::new(true, false);
+        slot.set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
+        slot.correlations().open(pending("q-1")).unwrap();
+
+        slot.deliver_peer(peer_message(PeerKind::Message, "m-1", None));
+        slot.deliver_peer(peer_message(PeerKind::Ask, "a-1", None));
+        slot.deliver_peer(peer_message(PeerKind::Bulletin, "b-1", None));
+        slot.deliver_peer(peer_message(PeerKind::Reply, "r-1", Some("q-1")));
+        slot.deliver_peer(peer_message(PeerKind::Reply, "r-2", Some("q-unknown")));
+
+        assert_eq!(
+            envoy.job_ids(),
+            ["m-1", "a-1"],
+            "a reply to nothing we asked is a message, but one that never reaches the envoy"
+        );
+        let (envelopes, dropped) = slot.peer_inbox().drain();
+        assert_eq!(dropped, 0);
+        assert_eq!(
+            peer_ids(&envelopes),
+            ["b-1", "r-1", "r-2"],
+            "a bulletin, an answer to our question and a stray reply take the inbox path"
+        );
+        assert_eq!(peer_of(&envelopes[2]).kind, PeerKind::Message);
+        let notes = slot.take_model_notes();
+        let events: Vec<&str> = notes.iter().map(|note| note.event).collect();
+        assert_eq!(events, ["peer_bulletin", "peer_reply", "peer_message"]);
+        let pushed = idle.pushed.lock();
+        assert_eq!(pushed.len(), 3);
+        assert!(pushed.iter().all(|note| !note.text.contains("envoy")));
+    }
+
+    #[test]
+    fn a_wire_reply_that_answers_nothing_never_reaches_the_envoy() {
+        let slot = MeshSlot::default();
+        let envoy = RecordingEnvoy::new(true, false);
+        slot.set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
+
+        slot.deliver_peer(peer_message(PeerKind::Message, "m-2", Some("whatever")));
+        slot.deliver_peer(peer_message(PeerKind::Reply, "r-3", Some("unknown")));
+
+        assert!(envoy.job_ids().is_empty(), "{:?}", envoy.job_ids());
+        let (envelopes, dropped) = slot.peer_inbox().drain();
+        assert_eq!(dropped, 0);
+        assert_eq!(peer_ids(&envelopes), ["m-2", "r-3"]);
+    }
+
+    #[test]
+    fn an_interim_message_naming_our_question_leaves_its_correlation_open() {
+        let slot = MeshSlot::default();
+        slot.correlations().open(pending("q-1")).unwrap();
+
+        slot.deliver_peer(peer_message(PeerKind::Message, "n-1", Some("q-1")));
+
+        assert!(slot.correlations().is_open("q-1"));
+        assert!(slot.correlations().take_answer("q-1").is_none());
+        let (envelopes, _) = slot.peer_inbox().drain();
+        assert_eq!(peer_ids(&envelopes), ["n-1"]);
+        assert_eq!(slot.take_model_notes()[0].event, "peer_message");
+
+        slot.deliver_peer(peer_message(PeerKind::Reply, "r-1", Some("q-1")));
+
+        assert!(!slot.correlations().is_open("q-1"));
+        assert_eq!(
+            slot.correlations()
+                .take_answer("q-1")
+                .map(|reply| reply.content),
+            Some("words of r-1".to_string())
+        );
+    }
+
+    #[test]
+    fn clearing_the_envoy_returns_messages_to_the_inbox_path() {
+        let slot = MeshSlot::default();
+        let envoy = RecordingEnvoy::new(true, false);
+        slot.set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
+        slot.clear_envoy();
+
+        slot.deliver_peer(peer_message(PeerKind::Ask, "a-1", None));
+
+        assert!(envoy.job_ids().is_empty());
+        let (envelopes, _) = slot.peer_inbox().drain();
+        assert_eq!(peer_ids(&envelopes), ["a-1"]);
+        assert_eq!(slot.take_model_notes()[0].event, "peer_ask");
+    }
+
+    #[test]
+    fn a_refusing_envoy_leaves_the_inbox_path_as_it_was_plus_one_busy_line() {
+        let slot = MeshSlot::default();
+        let idle = RecordingIdleSink::new(true);
+        slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+        let envoy = RecordingEnvoy::new(false, false);
+        slot.set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
+
+        slot.deliver_peer(peer_message(PeerKind::Ask, "a-1", None));
+
+        assert!(envoy.job_ids().is_empty());
+        let (envelopes, _) = slot.peer_inbox().drain();
+        assert_eq!(peer_ids(&envelopes), ["a-1"]);
+        let notes = slot.take_model_notes();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].event, "peer_ask");
+        assert_eq!(notes[0].next_action, "mesh__check_inbox");
+        let pushed = idle.pushed.lock();
+        assert_eq!(pushed.len(), 2, "the summary line and one busy line");
+        let dest8 = &hex_lower(&PEER_INSTANCE)[..8];
+        assert_eq!(pushed[0].text, format!("{dest8} asks: words of a-1"));
+        assert!(pushed[1].text.contains("envoy busy"), "{}", pushed[1].text);
+        assert!(
+            pushed[1].text.contains("words of a-1"),
+            "{}",
+            pushed[1].text
+        );
+        for note in pushed.iter() {
+            assert_eq!(note.source, Source::Message);
+            assert_eq!(
+                note.origin,
+                Origin::Peer(hex_lower(&PEER_IDENTITY)[..8].to_string())
+            );
+            assert!(note.model_note.is_none());
+        }
+    }
+
+    /// Both ways a peer message arrives, off a link through the `/message` provider and
+    /// off a propagation node through `PeerRouting`, end in the same `deliver_peer`, so
+    /// the envoy sees both.
+    #[tokio::test]
+    async fn both_inbound_entry_points_route_to_the_envoy() {
+        let slot = Arc::new(MeshSlot::default());
+        let envoy = RecordingEnvoy::new(true, false);
+        slot.set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
+        let identity = TransportIdentity::new_from_rand(OsRng);
+        let identity_hex = identity.address_hash().to_hex_string();
+        let origin = OriginName([7u8; NAME_HASH_LEN]);
+        let destination = destination_address(&origin.0, identity.address_hash()).to_hex_string();
+
+        let handler = PeerMessageHandler::new(Arc::downgrade(&slot) as Weak<dyn PeerSurface>);
+        let direct = OutboundPeer::new(PeerKind::Ask, "over the link", None, None, None).unwrap();
+        let reply = handler
+            .handle(AdmittedRequest {
+                link_id: LinkId::new_from_rand(OsRng),
+                identity: *identity.as_identity(),
+                destination_hash: AddressHash::new_from_hex_string(&destination).unwrap(),
+                request_id: RequestId::from([1u8; 16]),
+                path_hash: PathHash::of(MESSAGE_PATH),
+                requested_at: 1_700_000_000.0,
+                body: to_r3_body(&direct, 1_700_000_000.0),
+                branch: SizeBranch::Packet,
+            })
+            .await;
+        match reply {
+            Reply::Value(value) => assert!(is_received_reply(&value, &direct.id), "{value}"),
+            Reply::Code(code) => panic!("refused: {code:?}"),
+            Reply::Silent => panic!("the message was not acknowledged"),
+        }
+
+        let (trust, _trust_dir) = TrustList::default()
+            .destination(&destination, &identity_hex)
+            .open("node-envoy-routing");
+        let stored =
+            OutboundPeer::new(PeerKind::Message, "from the node", None, None, None).unwrap();
+        let lxmf = peer_lxmf_message(&stored, &origin);
+        let inner = NullSink;
+        let routing = PeerRouting {
+            trust: &trust,
+            surface: Some(slot.clone() as Arc<dyn PeerSurface>),
+            inner: &inner,
+        };
+        routing.deliver(InboundMessage {
+            transient_id: [1u8; 32],
+            message_id: [2u8; 32],
+            source_identity_hash: identity_hex.clone(),
+            source_delivery_hash: hex_lower(&[0x03; 16]),
+            timestamp: 1_700_000_000.0,
+            title: None,
+            content: Some(lxmf.content),
+            fields: lxmf.fields,
+            stamp_value: None,
+        });
+
+        assert_eq!(envoy.job_ids(), [direct.id.as_str(), stored.id.as_str()]);
+        let jobs = envoy.jobs.lock();
+        assert_eq!(jobs[0].kind, PeerKind::Ask);
+        assert_eq!(jobs[0].via, PeerVia::Direct);
+        assert_eq!(jobs[0].source_destination, destination);
+        assert_eq!(jobs[1].kind, PeerKind::Message);
+        assert_eq!(jobs[1].via, PeerVia::StoreAndForward);
+        assert_eq!(jobs[1].source_destination, destination);
+        drop(jobs);
+        assert!(slot.peer_inbox().drain().0.is_empty());
+        assert!(slot.take_model_notes().is_empty());
+    }
+
+    struct NullSink;
+
+    impl InboundSink for NullSink {
+        fn deliver(&self, message: InboundMessage) {
+            panic!("a peer message must not fall through to the plain inbox: {message:?}");
+        }
+    }
+
+    #[test]
+    fn record_envoy_exchange_files_both_sides_with_one_note_and_one_line() {
+        let slot = MeshSlot::default();
+        let idle = RecordingIdleSink::new(true);
+        slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+        let original = peer_message(PeerKind::Ask, "a-1", None);
+
+        slot.record_envoy_exchange(&original, "  the envoy's\u{1b}[2J answer ");
+
+        let (envelopes, dropped) = slot.peer_inbox().drain();
+        assert_eq!(dropped, 0);
+        assert_eq!(envelopes.len(), 2);
+        assert_eq!(peer_payload(&envelopes[0]), &original);
+        let reply = peer_payload(&envelopes[1]);
+        assert_eq!(reply.kind, PeerKind::Reply);
+        assert_eq!(reply.in_reply_to.as_deref(), Some("a-1"));
+        assert_eq!(reply.content, "the envoy's answer");
+        assert_eq!(reply.destination, original.source_destination);
+        assert_eq!(reply.via, PeerVia::Direct);
+        assert_eq!(reply.message_id.len(), 32, "a fresh simple-form uuid");
+        assert_ne!(reply.message_id, original.message_id);
+        assert!(reply.timestamp > 1_700_000_000.0);
+        assert_eq!(
+            (envelopes[1].from.as_str(), envelopes[1].to.as_str()),
+            ("", original.source_destination.as_str()),
+            "a bare slot has no destination of its own"
+        );
+
+        let notes = slot.take_model_notes();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].event, "peer_message");
+        assert_eq!(
+            notes[0].id,
+            format!("peer:{}", &hex_lower(&PEER_INSTANCE)[..8])
+        );
+        assert_eq!(notes[0].next_action, "mesh__check_inbox");
+
+        let pushed = idle.pushed.lock();
+        assert_eq!(pushed.len(), 1);
+        let dest8 = &hex_lower(&PEER_INSTANCE)[..8];
+        assert_eq!(
+            pushed[0].text,
+            format!("{dest8} asked: words of a-1; envoy replied: the envoy's answer")
+        );
+        assert_eq!(pushed[0].source, Source::Message);
+        assert_eq!(
+            pushed[0].origin,
+            Origin::Peer(hex_lower(&PEER_IDENTITY)[..8].to_string())
+        );
+        assert!(pushed[0].model_note.is_none());
+    }
+
+    #[test]
+    fn record_envoy_exchange_caps_the_line_like_a_summary() {
+        let slot = MeshSlot::default();
+        let idle = RecordingIdleSink::new(true);
+        slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+        let mut original = peer_message(PeerKind::Message, "m-1", None);
+        original.content = "q".repeat(PEER_LINE_MAX_CHARS * 2);
+
+        slot.record_envoy_exchange(&original, &"r".repeat(PEER_LINE_MAX_CHARS * 2));
+
+        let pushed = idle.pushed.lock();
+        let text = &pushed[0].text;
+        assert!(text.starts_with(&format!(
+            "{} said: {}; envoy replied: {}",
+            &hex_lower(&PEER_INSTANCE)[..8],
+            "q".repeat(PEER_LINE_MAX_CHARS / 2),
+            "r".repeat(PEER_LINE_MAX_CHARS / 2)
+        )));
+        assert!(text.chars().count() < PEER_LINE_MAX_CHARS + 40, "{text}");
+    }
+
+    #[test]
+    fn record_envoy_fallback_takes_the_inbox_path_and_adds_the_reason() {
+        let slot = MeshSlot::default();
+        let idle = RecordingIdleSink::new(true);
+        slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+
+        slot.record_envoy_fallback(
+            peer_message(PeerKind::Message, "m-1", None),
+            "envoy timed out",
+        );
+
+        let (envelopes, _) = slot.peer_inbox().drain();
+        assert_eq!(peer_ids(&envelopes), ["m-1"]);
+        let notes = slot.take_model_notes();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].event, "peer_message");
+        assert_eq!(notes[0].next_action, "mesh__check_inbox");
+        let pushed = idle.pushed.lock();
+        assert_eq!(pushed.len(), 2);
+        let dest8 = &hex_lower(&PEER_INSTANCE)[..8];
+        assert_eq!(pushed[0].text, format!("{dest8} says: words of m-1"));
+        assert_eq!(
+            pushed[1].text,
+            format!("envoy timed out; {dest8} says: words of m-1 is in the inbox")
+        );
+    }
+
+    #[test]
+    fn record_envoy_escalated_points_the_model_at_the_human_answer_not_the_inbox() {
+        let slot = MeshSlot::default();
+        let idle = RecordingIdleSink::new(true);
+        slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+
+        slot.record_envoy_escalated(peer_message(PeerKind::Ask, "a-1", None), "a-1");
+
+        let (envelopes, _) = slot.peer_inbox().drain();
+        assert_eq!(peer_ids(&envelopes), ["a-1"]);
+        let notes = slot.take_model_notes();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].event, "peer_ask");
+        assert!(
+            notes[0].next_action.contains(".mesh answer a-1"),
+            "{}",
+            notes[0].next_action
+        );
+        assert!(!notes[0].next_action.contains("check_inbox"));
+        let pushed = idle.pushed.lock();
+        assert_eq!(pushed.len(), 1);
+        let dest8 = &hex_lower(&PEER_INSTANCE)[..8];
+        assert_eq!(
+            pushed[0].text,
+            format!("envoy escalated to the human; {dest8} asks: words of a-1 is in the inbox")
+        );
+    }
+
+    fn inbound_record(id: &str) -> InboundRecord {
+        InboundRecord {
+            version: INBOUND_RECORD_VERSION,
+            id: id.to_string(),
+            peer_destination: hex_lower(&PEER_INSTANCE),
+            peer_identity: hex_lower(&PEER_IDENTITY),
+            question: format!("words of {id}"),
+            envoy_question: String::new(),
+            received_at: rfc3339_utc(SystemTime::now()),
+        }
+    }
+
+    /// A bare slot with an inbound store, as `install` would leave it.
+    fn slot_with_inbound(tmp: &TempDir) -> MeshSlot {
+        let slot = MeshSlot::default();
+        *slot.inbound.lock() = Some(Arc::new(InboundStore::new(&tmp.path, "inst")));
+        slot
+    }
+
+    #[tokio::test]
+    async fn answer_inbound_refuses_an_unknown_id_and_a_slot_with_no_store() {
+        let bare = MeshSlot::default();
+        let err = bare.answer_inbound("a-1", "yes").await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Mesh is off; turn it on with `.mesh on` before answering a-1"),
+            "{err}"
+        );
+
+        let tmp = TempDir::new("slot-answer-unknown");
+        let slot = slot_with_inbound(&tmp);
+        slot.inbound_store()
+            .unwrap()
+            .upsert(inbound_record("a-1"), SystemTime::now())
+            .unwrap();
+        let err = slot.answer_inbound("a-2", "yes").await.unwrap_err();
+        assert!(err.to_string().contains("no open question a-2"), "{err}");
+        assert!(slot.inbound_store().unwrap().get("a-1").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn answer_inbound_hands_the_answer_to_a_live_run_and_leaves_the_question_filed() {
+        let tmp = TempDir::new("slot-answer-live");
+        let slot = slot_with_inbound(&tmp);
+        let store = slot.inbound_store().unwrap();
+        store
+            .upsert(inbound_record("a-1"), SystemTime::now())
+            .unwrap();
+        let envoy = RecordingEnvoy::new(true, true);
+        slot.set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
+
+        slot.answer_inbound("a-1", "yes, go ahead").await.unwrap();
+
+        assert_eq!(
+            *envoy.answers.lock(),
+            [("a-1".to_string(), "yes, go ahead".to_string())]
+        );
+        assert!(
+            store.get("a-1").unwrap().is_some(),
+            "the run that took the answer forgets the question once it delivers"
+        );
+        assert!(
+            slot.correlations().list().is_empty(),
+            "a peer's question is never one of ours"
+        );
+    }
+
+    #[tokio::test]
+    async fn answer_inbound_with_no_live_run_and_the_mesh_off_keeps_the_question() {
+        let tmp = TempDir::new("slot-answer-off");
+        let slot = slot_with_inbound(&tmp);
+        let store = slot.inbound_store().unwrap();
+        store
+            .upsert(inbound_record("a-1"), SystemTime::now())
+            .unwrap();
+        let envoy = RecordingEnvoy::new(true, false);
+        slot.set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
+
+        let err = slot.answer_inbound("a-1", "yes").await.unwrap_err();
+
+        assert!(err.to_string().contains("Mesh is off"), "{err}");
+        assert_eq!(
+            envoy.answers.lock().len(),
+            1,
+            "the live run was asked first"
+        );
+        assert!(
+            store.get("a-1").unwrap().is_some(),
+            "an answer that went nowhere leaves the question open"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn answer_inbound_sends_the_reply_to_the_peer_when_no_run_holds_it() {
+        use crate::mesh::trust::TrustOptions;
+
+        let stub = PeerStub::listen("node-answer-stub", TcpServer::DEFAULT_CLIENT_MTU).await;
+        let started = started_runtime_on("node-answer-inbound", stub.port()).await;
+        let runtime = started.runtime.clone();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime.clone()).unwrap();
+        stub.trust(&runtime.current_destination_hash(), runtime.fingerprint());
+        stub.announce(Some("Stub")).await;
+        let to = stub.destination_hex();
+        let peers = runtime.peers();
+        wait_until("the node to file the stub", || peers.get(&to).is_some()).await;
+        runtime
+            .trust()
+            .trust_destination(
+                slot.as_ref(),
+                &to,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        let store = slot.inbound_store().unwrap();
+        store
+            .upsert(
+                InboundRecord {
+                    peer_destination: to.clone(),
+                    peer_identity: stub.identity_hex(),
+                    ..inbound_record("a-1")
+                },
+                SystemTime::now(),
+            )
+            .unwrap();
+
+        slot.answer_inbound("a-1", "the human says yes")
+            .await
+            .unwrap();
+
+        let seen = stub.seen();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert_eq!(seen[0].kind, PeerKind::Reply);
+        assert_eq!(seen[0].content, "the human says yes");
+        assert_eq!(seen[0].in_reply_to.as_deref(), Some("a-1"));
+        assert!(store.get("a-1").unwrap().is_none());
+        let (envelopes, _) = slot.peer_inbox().drain();
+        assert_eq!(envelopes.len(), 1, "{envelopes:?}");
+        let recorded = peer_payload(&envelopes[0]);
+        assert_eq!(recorded.kind, PeerKind::Reply);
+        assert_eq!(recorded.in_reply_to.as_deref(), Some("a-1"));
+        assert_eq!(
+            recorded.source_destination,
+            runtime.current_destination_hash()
+        );
+        let notes = slot.take_model_notes();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(
+            notes[0].next_action.contains(".mesh answer"),
+            "{}",
+            notes[0].next_action
+        );
+        assert!(slot.stop().await.unwrap());
+        assert!(
+            slot.inbound_store().is_none(),
+            "stopping lets go of the store"
+        );
+        stub.stop().await;
+    }
+
+    #[test]
+    fn record_human_answer_files_the_reply_with_one_note_and_one_line() {
+        let slot = MeshSlot::default();
+        let idle = RecordingIdleSink::new(true);
+        slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+
+        slot.record_human_answer(&inbound_record("a-1"), "yes, merge it");
+
+        let (envelopes, _) = slot.peer_inbox().drain();
+        assert_eq!(envelopes.len(), 1, "{envelopes:?}");
+        let reply = peer_payload(&envelopes[0]);
+        assert_eq!(reply.kind, PeerKind::Reply);
+        assert_eq!(reply.in_reply_to.as_deref(), Some("a-1"));
+        assert_eq!(reply.content, "yes, merge it");
+        assert_eq!(reply.destination, hex_lower(&PEER_INSTANCE));
+        let notes = slot.take_model_notes();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].event, "peer_message");
+        let dest8 = &hex_lower(&PEER_INSTANCE)[..8];
+        assert_eq!(notes[0].id, format!("peer:{dest8}"));
+        assert!(
+            notes[0].next_action.contains(".mesh answer"),
+            "{}",
+            notes[0].next_action
+        );
+        let pushed = idle.pushed.lock();
+        assert_eq!(pushed.len(), 1);
+        assert_eq!(
+            pushed[0].text,
+            format!("you answered {dest8}: yes, merge it")
+        );
     }
 
     #[test]

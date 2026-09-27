@@ -1148,8 +1148,6 @@ impl RequestContext {
             .or_else(|| self.app.config.mesh.brief_model.clone())
     }
 
-    // Reached by the envoy once it lands.
-    #[allow(dead_code)]
     pub fn envoy_model(&self) -> Option<String> {
         self.agent
             .as_ref()

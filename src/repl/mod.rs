@@ -16,9 +16,9 @@ use crate::client::{
     oauth,
 };
 use crate::config::{
-    AgentVariables, AppConfig, AssertState, Input, LastMessage, MacroState, MeshDigestDriver,
-    RequestContext, StateFlags, flatten_prompt_messages, macro_execute, publish_mesh_snapshot,
-    resolve_prompt_args, sanitize_display_text,
+    AgentVariables, AppConfig, AssertState, EnvoyRunner, Input, LastMessage, MacroState,
+    MeshDigestDriver, RequestContext, StateFlags, flatten_prompt_messages, macro_execute,
+    publish_mesh_snapshot, resolve_prompt_args, sanitize_display_text,
 };
 use crate::config::{AssetCategory, paths};
 use crate::function::agents::{GuardrailAction, check_pending_tasks_guardrail};
@@ -422,6 +422,7 @@ pub struct Repl {
     abort_signal: AbortSignal,
     idle: Option<IdleDriver>,
     digest: MeshDigestDriver,
+    envoy: Arc<EnvoyRunner>,
 }
 
 impl Repl {
@@ -438,7 +439,9 @@ impl Repl {
         let prompt = ReplPrompt::new(Arc::clone(&ctx));
         let abort_signal = create_abort_signal();
         // Last, so a failed editor set-up leaves no loop task behind.
-        let idle = IdleDriver::start(Arc::clone(&ctx), app_state);
+        let idle = IdleDriver::start(Arc::clone(&ctx), Arc::clone(&app_state));
+        let envoy = EnvoyRunner::start(app_state);
+        envoy.attach();
 
         Ok(Self {
             ctx,
@@ -447,6 +450,7 @@ impl Repl {
             abort_signal,
             idle: Some(idle),
             digest: MeshDigestDriver::new(),
+            envoy,
         })
     }
 
@@ -564,13 +568,14 @@ Type ".help" for additional help.
             }
         }
 
-        // Notifier first: lines from children winding down under `stop` then reach
-        // stderr instead of a printer the loop above no longer drains.
+        // Notifier first: lines from children and the envoy winding down under `stop`
+        // then reach stderr instead of a printer the loop above no longer drains.
         self.ctx.read().app.mesh.clear_notifier();
         self.digest.shutdown().await;
         if let Some(idle) = self.idle.take() {
             idle.stop().await;
         }
+        self.envoy.stop().await;
 
         if let Some(supervisor) = self.ctx.read().supervisor.clone() {
             supervisor.read().cancel_recursive();
