@@ -89,6 +89,15 @@ These are review findings that only surface in a diff context, not in a whole-fi
   finding (dead weight or a forgotten wiring step). Used in SOME applicable in-diff sites but
   not others = a finding naming the sites that didn't adopt it — half-adopted artifacts are how
   two mechanisms for the same job end up coexisting forever.
+- **"Ignored / redundant request field" claims need a wire-validation check first** — before
+  calling a request/message field ignored, redundant, or dead on some code path because the
+  handler never reads it there, `fs_grep` the boundary contract for that field: proto validation
+  rules (`(validate.rules)`, `buf.validate`), OpenAPI/JSON-schema `required`, struct-tag
+  `required`/`binding`/serde attributes, or a hand-written validator/interceptor. A field the
+  validator MANDATES is load-bearing at the boundary even when the handler ignores it — the
+  honest finding (if any) is "validator requires `<field>` on the `<path>` path that never reads
+  it (`path:line`); relax with `ignore_empty`/`oneof` or document why", never "`<field>` is
+  ignored". No validation found ⇒ the ignored-field finding stands, citing the grep you ran.
 - **Version-literal consistency and freshness** — when the diff bumps a version (image tag,
   tool version, dependency pin), `fs_grep` the repo for other occurrences of the OLD version
   string (compose files, workflows, docs, sibling Dockerfiles) — stragglers are findings. For
