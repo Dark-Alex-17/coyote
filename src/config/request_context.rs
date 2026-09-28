@@ -4753,8 +4753,8 @@ impl RequestContext {
     }
 
     /// Destinations for `.mesh <verb> <TAB>`, read from the in-memory peer table and, when
-    /// `include_knocks`, the knock cache; nothing here reaches the network. Empty while
-    /// the mesh is off.
+    /// `include_knocks`, followed by the knockers `mesh_completion_knocks` renders that no
+    /// peer row already covers; nothing here reaches the network. Empty while the mesh is off.
     pub(crate) fn mesh_completion_peers(
         &self,
         include_knocks: bool,
@@ -4784,34 +4784,59 @@ impl RequestContext {
         if !include_knocks {
             return values;
         }
+        for (destination, description) in self.mesh_completion_knocks() {
+            if values.iter().any(|(dest, _)| *dest == destination) {
+                continue;
+            }
+            values.push((destination, description));
+        }
+        values
+    }
+
+    /// Knockers for `.mesh <verb> <TAB>`, read from the knock cache alone; nothing here
+    /// reaches the network. Each destination is described as
+    /// `{label} . {identity-short} . {age} . {intro}`: the peer-supplied label and intro
+    /// pass through `display_text` and are left out when absent, so the identity and age
+    /// are the only components always present. Empty while the mesh is off.
+    pub(crate) fn mesh_completion_knocks(&self) -> Vec<(String, Option<String>)> {
+        let Some(runtime) = self.app.mesh.get() else {
+            return Vec::new();
+        };
+        let now = SystemTime::now();
         let knocks = match runtime.knock_gate().cache().list(now) {
             Ok(knocks) => knocks,
             Err(err) => {
-                debug!("knock cache unreadable while completing `.mesh info`: {err:#}");
-                Vec::new()
+                debug!("knock cache unreadable while completing `.mesh`: {err:#}");
+                return Vec::new();
             }
         };
-        for knock in knocks {
-            if values
-                .iter()
-                .any(|(dest, _)| *dest == knock.destination_hash)
-            {
-                continue;
-            }
-            let age = parse_rfc3339(&knock.received_at)
-                .map(|then| age_text(now, then))
-                .unwrap_or_else(|| "unknown".to_string());
-            let who = [knock.display_name.as_deref(), knock.intro.as_deref()]
+        knocks
+            .into_iter()
+            .map(|knock| {
+                let age = parse_rfc3339(&knock.received_at)
+                    .map(|then| age_text(now, then))
+                    .unwrap_or_else(|| "unknown".to_string());
+                let label = knock
+                    .display_name
+                    .as_deref()
+                    .and_then(|name| display_text(name, DISPLAY_NAME_MAX_CHARS));
+                let intro = knock
+                    .intro
+                    .as_deref()
+                    .and_then(|text| display_text(text, DISPLAY_NAME_MAX_CHARS));
+                let description = [
+                    label,
+                    Some(short(&knock.identity_hash).to_string()),
+                    Some(age),
+                    intro,
+                ]
                 .into_iter()
                 .flatten()
-                .find_map(|text| display_text(text, DISPLAY_NAME_MAX_CHARS))
-                .unwrap_or_else(|| short(&knock.identity_hash).to_string());
-            values.push((
-                knock.destination_hash,
-                Some(format!("knocked {age}: {who}")),
-            ));
-        }
-        values
+                .collect::<Vec<_>>()
+                .join(" . ");
+                (knock.destination_hash, Some(description))
+            })
+            .collect()
     }
 
     /// Ids for `.mesh answer <TAB>`: the questions peers escalated, then the ones this
@@ -20408,38 +20433,110 @@ mod tests {
         assert_eq!(brief.len(), 5, "{brief:?}");
         let before = ctx.repl_complete(".mesh", &["info", ""], "");
         assert_eq!(before.len(), ctx.mesh_completion_peers(false).len());
+        assert!(
+            ctx.mesh_completion_knocks().is_empty(),
+            "an empty knock cache offers nothing"
+        );
 
-        let knocker = hex_lower(&[0xdd; 16]);
-        started
-            .runtime
-            .knock_gate()
-            .cache()
-            .append(
-                KnockRecord {
-                    version: KNOCK_RECORD_VERSION,
-                    received_at: rfc3339_utc(SystemTime::now()),
-                    identity_hash: hex_lower(&[0xde; 16]),
-                    destination_hash: knocker.clone(),
-                    display_name: None,
-                    intro: Some("let me in".into()),
-                    hops: 1,
-                },
-                SystemTime::now(),
-            )
-            .unwrap();
+        // Three knockers cover every combination the description composes: intro only,
+        // both a name and an intro, and neither. Each knocked five minutes ago so the age
+        // component reads the same however long the assertions take. The cache already
+        // refuses control characters, so the intro that reaches the completion is the
+        // longest one it accepts, which the description must still cut down.
+        let received_at = rfc3339_utc(SystemTime::now() - Duration::from_secs(5 * 60));
+        let long_intro = "x".repeat(crate::mesh::knocks::KNOCK_INTRO_MAX_CHARS);
+        let intro_only = hex_lower(&[0xdd; 16]);
+        let named = hex_lower(&[0xd1; 16]);
+        let named_identity = hex_lower(&[0xd2; 16]);
+        let bare = hex_lower(&[0xd3; 16]);
+        let bare_identity = hex_lower(&[0xd4; 16]);
+        let records = [
+            (
+                intro_only.clone(),
+                hex_lower(&[0xde; 16]),
+                None,
+                Some("let me in".to_string()),
+            ),
+            (
+                named.clone(),
+                named_identity.clone(),
+                Some("Wanderer Two".to_string()),
+                Some(long_intro.clone()),
+            ),
+            (bare.clone(), bare_identity.clone(), None, None),
+        ];
+        for (destination_hash, identity_hash, display_name, intro) in records {
+            started
+                .runtime
+                .knock_gate()
+                .cache()
+                .append(
+                    KnockRecord {
+                        version: KNOCK_RECORD_VERSION,
+                        received_at: received_at.clone(),
+                        identity_hash,
+                        destination_hash,
+                        display_name,
+                        intro,
+                        hops: 1,
+                    },
+                    SystemTime::now(),
+                )
+                .unwrap();
+        }
 
         let info = ctx.repl_complete(".mesh", &["info", ""], "");
-        let knock = info
-            .iter()
-            .find(|(value, _)| *value == knocker)
-            .unwrap_or_else(|| panic!("the knock is offered, got {info:?}"));
-        let description = knock.1.as_deref().unwrap();
-        assert!(description.starts_with("knocked "), "{description}");
-        assert!(description.ends_with(": let me in"), "{description}");
+        let described = |destination: &str| -> String {
+            info.iter()
+                .find(|(value, _)| value == destination)
+                .unwrap_or_else(|| panic!("the knock {destination} is offered, got {info:?}"))
+                .1
+                .clone()
+                .expect("every knock carries a description")
+        };
+
+        let description = described(&intro_only);
+        assert_eq!(
+            description,
+            format!("{} . 5m ago . let me in", short(&hex_lower(&[0xde; 16]))),
+            "no name: identity-short, age, intro"
+        );
+
+        let description = described(&named);
+        assert_eq!(
+            description,
+            format!(
+                "Wanderer Two . {} . 5m ago . {}",
+                short(&named_identity),
+                &long_intro[..DISPLAY_NAME_MAX_CHARS]
+            ),
+            "name and intro both present: all four components, the intro cut to the cap"
+        );
+
+        let description = described(&bare);
+        assert_eq!(
+            description,
+            format!("{} . 5m ago", short(&bare_identity)),
+            "neither name nor intro: identity-short and age, no dangling separator"
+        );
+
+        let knocks = ctx.mesh_completion_knocks();
+        assert_eq!(knocks.len(), 3, "{knocks:?}");
+        assert!(
+            knocks
+                .iter()
+                .all(|(value, _)| !before.iter().any(|(peer, _)| peer == value)),
+            "the knock helper offers knockers only, never peer rows"
+        );
+        assert_eq!(
+            info.len(),
+            before.len() + knocks.len(),
+            "`info` is the peer table followed by the knock cache"
+        );
         assert!(
             !ctx.repl_complete(".mesh", &["reply", ""], "")
                 .iter()
-                .any(|(value, _)| *value == knocker),
+                .any(|(value, _)| *value == intro_only || *value == named || *value == bare),
             "reply completes peers only, never knockers"
         );
 
