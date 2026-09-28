@@ -759,13 +759,13 @@ pub(crate) fn colour_allowed(stream_is_tty: bool, no_color: bool) -> bool {
     stream_is_tty && !no_color
 }
 
-/// `NO_COLOR` disables colour when present and non-empty, whatever its value.
-fn no_color_from(value: Option<&str>) -> bool {
-    value.is_some_and(|value| !value.is_empty())
-}
-
-fn no_color_env() -> bool {
-    no_color_from(env::var("NO_COLOR").ok().as_deref())
+/// The `NO_COLOR` opt-out is the shared `utils` parse, so `.mesh` output honours the
+/// variable exactly as the rest of the binary does (one parse path).
+fn err_text_coloured() -> bool {
+    colour_allowed(
+        std::io::stderr().is_terminal(),
+        crate::utils::no_color_env_set(),
+    )
 }
 
 pub(crate) fn out_text(text: &str) {
@@ -777,7 +777,7 @@ pub(crate) fn out_text(text: &str) {
 pub(crate) fn err_text(text: &str) {
     #[cfg(test)]
     capture::push(capture::Stream::Err, text);
-    if colour_allowed(std::io::stderr().is_terminal(), no_color_env()) {
+    if err_text_coloured() {
         eprintln!("{}", nu_ansi_term::Color::Yellow.paint(text));
     } else {
         eprintln!("{text}");
@@ -1488,11 +1488,17 @@ mod tests {
     }
 
     #[test]
-    fn no_color_is_any_non_empty_value() {
-        assert!(!no_color_from(None));
-        assert!(!no_color_from(Some("")));
-        assert!(no_color_from(Some("0")));
-        assert!(no_color_from(Some("1")));
+    fn no_color_opt_out_is_the_shared_utils_parse() {
+        // Mesh has no NO_COLOR parser of its own: the stderr decision is the shared
+        // `utils::no_color_env_set` combined with the tty check, nothing else.
+        assert_eq!(
+            err_text_coloured(),
+            std::io::stderr().is_terminal() && !crate::utils::no_color_env_set()
+        );
+        // The shared parse is `parse_bool`: NO_COLOR=0 keeps colour, unlike "any non-empty".
+        assert_eq!(crate::utils::parse_bool("0"), Some(false));
+        assert_eq!(crate::utils::parse_bool("1"), Some(true));
+        assert_eq!(crate::utils::parse_bool(""), None);
     }
 
     #[test]

@@ -20422,6 +20422,7 @@ mod tests {
         use crate::mesh::hex_lower;
         use crate::mesh::knocks::{KNOCK_RECORD_VERSION, KnockRecord};
         use crate::mesh::rfc3339_utc;
+        use crate::mesh::test_support::PeerSighting;
 
         let _guard = TestConfigDirGuard::new();
         let started = crate::mesh::test_support::started_runtime("rc-mesh-complete").await;
@@ -20431,8 +20432,55 @@ mod tests {
 
         let brief = ctx.repl_complete(".mesh", &["brief", ""], "");
         assert_eq!(brief.len(), 5, "{brief:?}");
+        assert!(
+            ctx.repl_complete(".mesh", &["info", ""], "").is_empty(),
+            "an empty peer table and knock cache offer nothing"
+        );
+
+        // Two peers heard on the mesh, each seen minutes ago so the age component reads
+        // the same however long the assertions take: one named, and one without a name
+        // whose destination a knock record below shares, so the peer row must win.
+        let now = SystemTime::now();
+        let named_peer = hex_lower(&[0xa1; 16]);
+        let named_peer_identity = hex_lower(&[0xa2; 16]);
+        let named = hex_lower(&[0xd1; 16]);
+        let named_identity = hex_lower(&[0xd2; 16]);
+        started.runtime.peers().observe(
+            PeerSighting {
+                destination_hash: named_peer.clone(),
+                identity_hash: named_peer_identity.clone(),
+                name_hash: String::new(),
+                display_name: Some("Ann".to_string()),
+                protocol_version: 1,
+                hops: 3,
+            },
+            now - Duration::from_secs(10 * 60),
+        );
+        started.runtime.peers().observe(
+            PeerSighting {
+                destination_hash: named.clone(),
+                identity_hash: named_identity.clone(),
+                name_hash: String::new(),
+                display_name: None,
+                protocol_version: 1,
+                hops: 2,
+            },
+            now - Duration::from_secs(2 * 60),
+        );
+        let peer_description = format!("{} . 2 hops . 2m ago", short(&named_identity));
         let before = ctx.repl_complete(".mesh", &["info", ""], "");
-        assert_eq!(before.len(), ctx.mesh_completion_peers(false).len());
+        assert_eq!(before, ctx.mesh_completion_peers(false));
+        assert_eq!(
+            before,
+            [
+                (named.clone(), Some(peer_description.clone())),
+                (
+                    named_peer.clone(),
+                    Some("Ann . 3 hops . 10m ago".to_string())
+                ),
+            ],
+            "peer rows read `{{who}} . N hops . {{age}}`, most recently seen first"
+        );
         assert!(
             ctx.mesh_completion_knocks().is_empty(),
             "an empty knock cache offers nothing"
@@ -20446,8 +20494,6 @@ mod tests {
         let received_at = rfc3339_utc(SystemTime::now() - Duration::from_secs(5 * 60));
         let long_intro = "x".repeat(crate::mesh::knocks::KNOCK_INTRO_MAX_CHARS);
         let intro_only = hex_lower(&[0xdd; 16]);
-        let named = hex_lower(&[0xd1; 16]);
-        let named_identity = hex_lower(&[0xd2; 16]);
         let bare = hex_lower(&[0xd3; 16]);
         let bare_identity = hex_lower(&[0xd4; 16]);
         let records = [
@@ -20486,57 +20532,87 @@ mod tests {
         }
 
         let info = ctx.repl_complete(".mesh", &["info", ""], "");
-        let described = |destination: &str| -> String {
-            info.iter()
+        let knocks = ctx.mesh_completion_knocks();
+        let described = |rows: &[(String, Option<String>)], destination: &str| -> String {
+            rows.iter()
                 .find(|(value, _)| value == destination)
-                .unwrap_or_else(|| panic!("the knock {destination} is offered, got {info:?}"))
+                .unwrap_or_else(|| panic!("{destination} is offered, got {rows:?}"))
                 .1
                 .clone()
-                .expect("every knock carries a description")
+                .expect("every row carries a description")
         };
 
-        let description = described(&intro_only);
+        let description = described(&info, &intro_only);
         assert_eq!(
             description,
             format!("{} . 5m ago . let me in", short(&hex_lower(&[0xde; 16]))),
             "no name: identity-short, age, intro"
         );
 
-        let description = described(&named);
+        let knock_description = format!(
+            "Wanderer Two . {} . 5m ago . {}",
+            short(&named_identity),
+            &long_intro[..DISPLAY_NAME_MAX_CHARS]
+        );
+        let description = described(&knocks, &named);
         assert_eq!(
-            description,
-            format!(
-                "Wanderer Two . {} . 5m ago . {}",
-                short(&named_identity),
-                &long_intro[..DISPLAY_NAME_MAX_CHARS]
-            ),
+            description, knock_description,
             "name and intro both present: all four components, the intro cut to the cap"
         );
 
-        let description = described(&bare);
+        let description = described(&info, &bare);
         assert_eq!(
             description,
             format!("{} . 5m ago", short(&bare_identity)),
             "neither name nor intro: identity-short and age, no dangling separator"
         );
 
-        let knocks = ctx.mesh_completion_knocks();
+        // The destination both a peer row and a knock record name is offered once, as the
+        // peer: the knock helper still renders its knock row, the peer rows never do.
+        assert_eq!(
+            info.iter().filter(|(value, _)| *value == named).count(),
+            1,
+            "a knocker the peer table already covers is offered once, got {info:?}"
+        );
+        assert_eq!(
+            described(&info, &named),
+            peer_description,
+            "the peer row wins over the knock row for a shared destination"
+        );
+        assert!(
+            !before
+                .iter()
+                .any(|(_, description)| description.as_deref() == Some(&knock_description)),
+            "peer rows never carry a knock description, got {before:?}"
+        );
+
         assert_eq!(knocks.len(), 3, "{knocks:?}");
         assert!(
             knocks
                 .iter()
+                .filter(|(value, _)| *value != named)
                 .all(|(value, _)| !before.iter().any(|(peer, _)| peer == value)),
-            "the knock helper offers knockers only, never peer rows"
+            "the knock helper offers knockers only, never peer rows, got {knocks:?}"
+        );
+        assert_eq!(
+            &info[..before.len()],
+            &before[..],
+            "`info` leads with the peer table unchanged"
         );
         assert_eq!(
             info.len(),
-            before.len() + knocks.len(),
-            "`info` is the peer table followed by the knock cache"
+            before.len() + knocks.len() - 1,
+            "`info` is the peer table followed by the knock cache less the shared destination"
+        );
+        let reply = ctx.repl_complete(".mesh", &["reply", ""], "");
+        assert!(
+            reply.iter().any(|(value, _)| *value == named),
+            "reply offers the shared destination as the peer it is, got {reply:?}"
         );
         assert!(
-            !ctx.repl_complete(".mesh", &["reply", ""], "")
+            !reply
                 .iter()
-                .any(|(value, _)| *value == intro_only || *value == named || *value == bare),
+                .any(|(value, _)| *value == intro_only || *value == bare),
             "reply completes peers only, never knockers"
         );
 
