@@ -81,3 +81,60 @@ jobs:
 
     - name: Format
       run: cargo fmt --all --check
+
+  # Informational: not part of the required `All` matrix or branch protection until it
+  # proves stable, and `continue-on-error` keeps the workflow run and the README badge
+  # green when it fails; the outcome is in the step summary. Linux-only because the
+  # Python reference harness is unix-only; the mesh itself is covered on every OS by the
+  # unit tests and the platform-independent vectors in `All`.
+  mesh-interop:
+    name: Mesh Interop
+
+    runs-on: ubuntu-latest
+
+    continue-on-error: true
+
+    timeout-minutes: 60
+
+    env:
+      RUSTFLAGS: --deny warnings
+      COYOTE_MESH_INTEROP_DIR: ${{ github.workspace }}/.mesh-interop
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Start The Clock
+      run: echo "start=$(date +%s)" >> "$GITHUB_ENV"
+
+    - name: Install Rust Toolchain Components
+      uses: dtolnay/rust-toolchain@stable
+
+    - uses: Swatinem/rust-cache@v2
+      with:
+        cache-on-failure: true
+
+    - uses: actions/setup-python@v5
+      id: python
+      with:
+        python-version: '3.12'
+
+    - name: Cache The Pinned Reference
+      uses: actions/cache@v4
+      with:
+        path: ${{ env.COYOTE_MESH_INTEROP_DIR }}
+        key: mesh-interop-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/mesh-interop/setup.sh') }}-py${{ steps.python.outputs.python-version }}
+
+    - name: Prepare The Reference
+      run: scripts/mesh-interop/setup.sh
+
+    - name: Conformance Including Interop
+      run: COYOTE_MESH_INTEROP=1 cargo test --all mesh::conformance -- --include-ignored
+
+    - name: Record Wall-Clock
+      if: always()
+      run: |
+        end=$(date +%s)
+        {
+          echo "### Mesh interop wall-clock: $((end - ${start:-$end})) s"
+          echo "Outcome: ${{ job.status }}"
+        } >> "$GITHUB_STEP_SUMMARY"
