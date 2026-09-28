@@ -1,6 +1,7 @@
 mod completer;
 mod highlighter;
 mod idle;
+pub(crate) mod mesh;
 mod printer;
 mod prompt;
 mod replay;
@@ -121,7 +122,7 @@ pub const DEFAULT_CONTINUATION_PROMPT: &str = indoc! {"
     5. Otherwise, continue with the next pending item now. Call tools immediately."
 };
 
-static REPL_COMMANDS: LazyLock<[ReplCommand; 63]> = LazyLock::new(|| {
+static REPL_COMMANDS: LazyLock<[ReplCommand; 75]> = LazyLock::new(|| {
     [
         ReplCommand::new(".help", "Show this help guide", AssertState::pass()),
         ReplCommand::new(".info", "Show system info", AssertState::pass()),
@@ -153,6 +154,66 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 63]> = LazyLock::new(|| {
         ReplCommand::new(
             ".mcp disable",
             "Disable a single MCP server in the current context",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh on",
+            "Join the mesh for this session only; config.yaml is not changed",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh off",
+            "Leave the mesh and drop the mesh__* tools",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh peers",
+            "List the nodes heard on the mesh",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh knocks",
+            "List the untrusted nodes that knocked",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh info",
+            "Show the mesh settings and this node, or one peer",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh status",
+            "Show this node's status card, set its objective, or fetch a peer's card",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh brief",
+            "Show the brief peers receive, or set its text or mode",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh inbox",
+            "Drain the peer messages waiting for this node",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh pending",
+            "List the questions this node asked and the ones peers escalated to you",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh answer",
+            "Answer an escalated question, or follow up on one this node asked",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh reply",
+            "Send your own text to one peer, bypassing the model",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh broadcast",
+            "Send a bulletin to every trusted peer with a known path",
             AssertState::pass(),
         ),
         ReplCommand::new(
@@ -481,7 +542,10 @@ Type ".help" for additional help.
             };
             if !compressed.is_empty() || !active.is_empty() {
                 let app = Arc::clone(&self.ctx.read().app.config);
-                replay::render(app.as_ref(), &compressed, &active)?;
+                // Replaying history is best-effort: a render failure must not skip shutdown.
+                if let Err(err) = replay::render(app.as_ref(), &compressed, &active) {
+                    render_error(err);
+                }
                 let last_msgs: &[Message] = if !active.is_empty() {
                     &active
                 } else {
@@ -529,6 +593,7 @@ Type ".help" for additional help.
                         publish_mesh_snapshot(&ctx, TurnState::working_now());
                         let result =
                             run_repl_command(&mut ctx, self.abort_signal.clone(), &line).await;
+                        self.envoy.refresh(&ctx.app);
                         self.digest.observe_session(&ctx);
                         publish_mesh_snapshot(&ctx, TurnState::idle_now());
                         result
@@ -576,6 +641,11 @@ Type ".help" for additional help.
             idle.stop().await;
         }
         self.envoy.stop().await;
+        // Cloned so the context guard is not held across the await.
+        let mesh = Arc::clone(&self.ctx.read().app.mesh);
+        if let Err(err) = mesh.stop().await {
+            render_error(err);
+        }
 
         if let Some(supervisor) = self.ctx.read().supervisor.clone() {
             supervisor.read().cancel_recursive();
@@ -1518,6 +1588,12 @@ pub async fn run_repl_command(
                     println!("Usage: .vault <add|get|update|delete|list> [name]")
                 }
             },
+            ".mesh" => {
+                if ctx.macro_flag {
+                    bail!("Cannot perform this operation because you are in a macro")
+                }
+                mesh::run(ctx, abort_signal.clone(), args).await?;
+            }
             _ => {
                 let name = cmd.strip_prefix('.').unwrap_or(cmd);
                 let policy = ctx.macro_policy();
@@ -3151,8 +3227,82 @@ mod tests {
     }
 
     #[test]
-    fn repl_commands_has_63_entries() {
-        assert_eq!(REPL_COMMANDS.len(), 63);
+    fn repl_commands_has_75_entries() {
+        assert_eq!(REPL_COMMANDS.len(), 75);
+    }
+
+    #[test]
+    fn mesh_verbs_and_repl_commands_never_drift() {
+        let commands: Vec<(&str, &str)> = REPL_COMMANDS
+            .iter()
+            .filter_map(|cmd| {
+                cmd.name
+                    .strip_prefix(".mesh ")
+                    .map(|verb| (verb, cmd.description))
+            })
+            .collect();
+        let verbs: Vec<(&str, &str)> = mesh::VERBS
+            .iter()
+            .map(|(verb, description, _)| (*verb, *description))
+            .collect();
+        assert_eq!(commands.len(), 12);
+        assert_eq!(commands, verbs);
+    }
+
+    #[test]
+    fn the_envoy_sees_the_context_replaced_by_the_command_before_the_digest_observes_it() {
+        // Needles are assembled at runtime so this test's own text does not match.
+        let strip = |s: &str| s.split_whitespace().collect::<String>();
+        let source = strip(include_str!("mod.rs"));
+        let command = strip(
+            &[
+                "run_repl_",
+                "command(&mut ctx, self.abort_signal.clone(), &line)",
+            ]
+            .concat(),
+        );
+        let refresh = strip(&["self.envoy.", "refresh(&ctx.app)"].concat());
+        let observe = strip(&["self.digest.", "observe_session(&ctx)"].concat());
+        let envoy_stop = strip(&["self.envoy.", "stop().await;"].concat());
+        let mesh_stop = strip(&["if let Err(err) = mesh.", "stop().await"].concat());
+        let run_start = strip(&["pub async fn run(", "&mut self)"].concat());
+        let replay_checked = strip(&["if let Err(err) = replay::", "render("].concat());
+        let replay_propagated =
+            strip(&["replay::", "render(app.as_ref(), &compressed, &active)?"].concat());
+
+        let position = |needle: &str| {
+            let first = source
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle} missing"));
+            assert_eq!(source.rfind(needle), Some(first), "{needle} not unique");
+            first
+        };
+        let command_at = position(&command);
+        let refresh_at = position(&refresh);
+        let observe_at = position(&observe);
+        assert!(
+            command_at < refresh_at,
+            "envoy refresh must follow the command"
+        );
+        assert!(
+            refresh_at < observe_at,
+            "digest must observe after the envoy refresh"
+        );
+        let mesh_stop_at = position(&mesh_stop);
+        assert!(
+            position(&envoy_stop) < mesh_stop_at,
+            "the node must stop after the envoy on shutdown"
+        );
+        let run_at = position(&run_start);
+        let replay_at = position(&replay_checked);
+        assert!(
+            run_at < replay_at && replay_at < mesh_stop_at,
+            "the history replay in Repl::run must precede the node's stop"
+        );
+        assert!(
+            !source[run_at..mesh_stop_at].contains(&replay_propagated),
+            "a replay failure in Repl::run must not skip the shutdown"
+        );
     }
 
     #[test]

@@ -134,7 +134,6 @@ impl PropagationNodeTable {
             .ok_or(FetchError::NoPropagationNode)
     }
 
-    #[cfg(test)]
     pub(crate) fn snapshot(&self) -> Vec<PropagationNodeRecord> {
         self.inner.lock().values().cloned().collect()
     }

@@ -259,7 +259,7 @@ pub async fn handle_mesh_tool(
     let Some(runtime) = ctx.app.mesh.get() else {
         return Ok(json!({
             "status": "error",
-            "message": "The mesh is not on in this session. Run `.mesh on` (mesh.enabled must be true in config.yaml).",
+            "message": "The mesh is not on in this session. Run `.mesh on` in the REPL (it is session-scoped; config.yaml is not changed).",
         }));
     };
 
@@ -333,7 +333,7 @@ pub(crate) fn outbound_from_args(
     OutboundPeer::new(kind, message, title, in_reply_to, None)
 }
 
-fn trust_label(verdict: Verdict) -> &'static str {
+pub(crate) fn trust_label(verdict: Verdict) -> &'static str {
     match (verdict.decision, verdict.rule) {
         (Decision::Allow, _) => "trusted",
         (Decision::Refuse, Rule::DestinationDenied) => "denied",
@@ -419,6 +419,7 @@ async fn handle_peers(runtime: &MeshRuntime, args: &Value) -> Result<Value> {
                 .and_then(|name| display_text(name, DISPLAY_NAME_MAX_CHARS)),
             "name_hash": peer.name_hash,
             "trust": trust_label(verdict),
+            "compatibility": peer.compatibility_line(),
             "last_seen_secs_ago": now.duration_since(peer.last_seen).unwrap_or_default().as_secs(),
             "first_seen": rfc3339_utc(peer.first_seen),
             "hops": peer.hops,
@@ -998,12 +999,15 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(result["status"], "error", "{action}: {result}");
+            let message = result["message"].as_str().unwrap();
             assert!(
-                result["message"]
-                    .as_str()
-                    .unwrap()
-                    .contains("The mesh is not on in this session. Run `.mesh on`"),
+                message.contains("The mesh is not on in this session. Run `.mesh on`"),
                 "{action}: {result}"
+            );
+            assert!(message.contains("session-scoped"), "{action}: {result}");
+            assert!(
+                !message.contains("config.yaml must") && !message.contains("must be true"),
+                "the refusal must not send the user to config.yaml: {message}"
             );
         }
     }
@@ -1355,5 +1359,84 @@ mod tests {
         merge_slot_notes(&ctx);
         assert_eq!(drain_live_notifications(&ctx).len(), 1);
         assert!(ctx.app.mesh.take_model_notes().is_empty());
+    }
+
+    /// Spec-first usage probe: every `mesh__peers` row carries `compatibility` next to
+    /// `trust`, worded by `compatibility_line()` so a model reading the JSON sees the same
+    /// warning `.mesh peers` prints (null when the peer speaks a supported protocol).
+    #[cfg(unix)]
+    mod with_a_node {
+        use super::*;
+        use crate::mesh::test_support::{Compatibility, PeerSighting, started_runtime};
+        use crate::testing::TestConfigDirGuard;
+        use serial_test::serial;
+        use std::time::SystemTime;
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial]
+        async fn peers_json_carries_compatibility_next_to_trust() {
+            let _guard = TestConfigDirGuard::new("mesh-tool-peers-compatibility");
+            let started = started_runtime("mesh-tool-peers-compatibility").await;
+            let mut ctx = plain_ctx();
+            ctx.app.mesh.install(started.runtime.clone()).unwrap();
+            let now = SystemTime::now();
+            let supported = hex_lower(&[0x11; 16]);
+            let too_new = hex_lower(&[0x22; 16]);
+            let sighting = |destination: &str, identity: u8, version: u16| PeerSighting {
+                destination_hash: destination.to_string(),
+                identity_hash: hex_lower(&[identity; 16]),
+                name_hash: String::new(),
+                display_name: None,
+                protocol_version: version,
+                hops: 1,
+            };
+            let peers = started.runtime.peers();
+            peers.observe(sighting(&supported, 0x12, 1), now);
+            peers.observe(sighting(&too_new, 0x23, u16::MAX), now);
+            assert_eq!(Compatibility::of(1), Compatibility::Compatible);
+            let expected_warning = Compatibility::of(u16::MAX)
+                .line()
+                .expect("u16::MAX is never a supported protocol");
+
+            let result = handle_mesh_tool(
+                &mut ctx,
+                &format!("{MESH_FUNCTION_PREFIX}peers"),
+                &json!({}),
+            )
+            .await
+            .unwrap();
+
+            let rows = result["peers"].as_array().unwrap();
+            assert_eq!(rows.len(), 2, "{result}");
+            let row = |destination: &str| {
+                rows.iter()
+                    .find(|row| row["destination"] == destination)
+                    .unwrap_or_else(|| panic!("{destination} missing from {result}"))
+            };
+            let ok = row(&supported);
+            assert!(
+                ok.as_object().unwrap().contains_key("compatibility"),
+                "the key is present even when there is nothing to warn about: {ok}"
+            );
+            assert!(ok["compatibility"].is_null(), "{ok}");
+            assert_eq!(ok["trust"], "untrusted", "{ok}");
+            let warned = row(&too_new);
+            assert_eq!(
+                warned["compatibility"].as_str(),
+                Some(expected_warning.as_str()),
+                "{warned}"
+            );
+            assert!(
+                warned["compatibility"]
+                    .as_str()
+                    .unwrap()
+                    .contains("incompatible"),
+                "{warned}"
+            );
+            assert_eq!(warned["trust"], "untrusted", "{warned}");
+
+            assert!(ctx.app.mesh.stop().await.unwrap());
+            started.relay_handle.abort();
+        }
     }
 }

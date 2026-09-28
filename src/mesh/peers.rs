@@ -19,6 +19,10 @@ pub(crate) const PEER_TABLE_MAX_ENTRIES: usize = 1024;
 pub(crate) const PEER_TTL: Duration =
     Duration::from_secs(HEARTBEAT_SECS * (PEER_MISSED_HEARTBEATS_BEFORE_AGE_OUT as u64));
 
+/// A peer silent for this long is flagged in listings as probably gone, one heartbeat
+/// before `PEER_TTL` removes it.
+pub(crate) const PEER_STALE_AFTER: Duration = Duration::from_secs(2 * HEARTBEAT_SECS);
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PeerRecord {
     pub destination_hash: String,
@@ -41,10 +45,13 @@ pub(crate) struct PeerRecord {
 
 impl PeerRecord {
     /// One line for a peer listing, `None` when the peer speaks a protocol this Coyote does.
-    // Rendered by the peer listing once it lands.
-    #[allow(dead_code)]
     pub(crate) fn compatibility_line(&self) -> Option<String> {
         self.compatibility.line()
+    }
+
+    /// A `last_seen` in the future (clock stepped back) reads as just seen.
+    pub(crate) fn is_stale(&self, now: SystemTime) -> bool {
+        now.duration_since(self.last_seen).unwrap_or_default() >= PEER_STALE_AFTER
     }
 }
 
@@ -271,6 +278,19 @@ mod tests {
     fn ttl_is_three_heartbeats() {
         assert_eq!(PEER_TTL, Duration::from_secs(2700));
         assert_eq!(PEER_TABLE_MAX_ENTRIES, 1024);
+    }
+
+    #[test]
+    fn stale_is_two_heartbeats_and_never_for_a_future_sighting() {
+        let (table, _tmp) = table("peers-stale");
+        let seen = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+        table.observe(sighting("a", None), seen);
+        let record = table.get("a").unwrap();
+
+        assert!(!record.is_stale(seen + PEER_STALE_AFTER - Duration::from_secs(1)));
+        assert!(record.is_stale(seen + PEER_STALE_AFTER));
+        assert!(record.is_stale(seen + PEER_TTL));
+        assert!(!record.is_stale(seen - Duration::from_secs(60)));
     }
 
     #[test]

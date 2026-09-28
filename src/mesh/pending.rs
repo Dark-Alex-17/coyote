@@ -392,12 +392,37 @@ impl InboundStore {
     }
 
     /// Newest first, with expired questions left out; the file is not touched.
-    // Reached by the REPL mesh commands once they land.
-    #[allow(dead_code)]
     pub(crate) fn list(&self, now: SystemTime) -> Result<Vec<InboundRecord>> {
         let mut records = self.read_all()?;
         records.retain(|record| !is_stale(&record.received_at, now));
         Ok(records)
+    }
+
+    /// Copies `other`'s unexpired questions into this store under one lock and one write,
+    /// leaving ids already here as they are; `other` is not touched. Returns how many
+    /// were copied.
+    pub(crate) fn adopt_from(&self, other: &InboundStore, now: SystemTime) -> Result<usize> {
+        let incoming = other.list(now)?;
+        if incoming.is_empty() {
+            return Ok(0);
+        }
+        let _guard = self.write_lock.lock();
+        let _file_lock = file_lock(&self.path, INBOUND_NAMES)?;
+        let mut records = self.read_all()?;
+        records.retain(|record| !is_stale(&record.received_at, now));
+        let adopted: Vec<InboundRecord> = incoming
+            .into_iter()
+            .filter(|record| !records.iter().any(|existing| existing.id == record.id))
+            .collect();
+        let count = adopted.len();
+        if count == 0 {
+            return Ok(0);
+        }
+        records.extend(adopted);
+        records.sort_by(|a, b| b.received_at.cmp(&a.received_at));
+        records.truncate(INBOUND_MAX_ENTRIES);
+        write_jsonl(&self.path, &records, INBOUND_NAMES)?;
+        Ok(count)
     }
 
     fn read_all(&self) -> Result<Vec<InboundRecord>> {
@@ -632,6 +657,15 @@ impl Correlations {
             .entries
             .get(id)
             .is_some_and(|entry| entry.record.state == PendingState::Open)
+    }
+
+    /// Whether a reply naming `id` from `identity` is the answer this node is still
+    /// waiting for: the same test `answer` applies, so admission and correlation agree.
+    pub(crate) fn accepts_reply_from(&self, id: &str, identity: &str) -> bool {
+        self.state.lock().entries.get(id).is_some_and(|entry| {
+            entry.record.state == PendingState::Open
+                && entry.record.peer_identity.eq_ignore_ascii_case(identity)
+        })
     }
 
     /// `true` when `in_reply_to` named an open question asked of `reply`'s identity, which
@@ -1044,6 +1078,45 @@ mod tests {
         assert_eq!(listed[0].id, "latest");
         assert!(!inbound_ids(&listed).contains(&"q0"), "the oldest goes");
         assert!(inbound_ids(&listed).contains(&"q1"));
+    }
+
+    #[test]
+    fn inbound_adopt_from_merges_once_skipping_ids_already_held_and_the_expired() {
+        let tmp = TempDir::new("inbound-adopt");
+        let base = 1_000_000;
+        let source = InboundStore::new(&tmp.path, "inst-a");
+        source
+            .upsert(inbound("shared", t(base - 20)), t(base))
+            .unwrap();
+        source
+            .upsert(inbound("fresh", t(base - 5)), t(base))
+            .unwrap();
+        source
+            .upsert(inbound("stale", t(base - 30)), t(base))
+            .unwrap();
+        let target = InboundStore::new(&tmp.path, "inst-b");
+        let mut held = inbound("shared", t(base - 20));
+        held.envoy_question = "the fork's own proposal".into();
+        target.upsert(held, t(base)).unwrap();
+        target
+            .upsert(inbound("own", t(base - 10)), t(base))
+            .unwrap();
+
+        let now = t(base - 30) + PENDING_TTL;
+        assert_eq!(target.adopt_from(&source, now).unwrap(), 1);
+
+        let listed = target.list(now).unwrap();
+        assert_eq!(inbound_ids(&listed), vec!["fresh", "own", "shared"]);
+        assert_eq!(
+            listed[2].envoy_question, "the fork's own proposal",
+            "a colliding id keeps the target's record"
+        );
+        assert_eq!(
+            inbound_ids(&source.list(now).unwrap()),
+            vec!["fresh", "shared"],
+            "the source is not touched"
+        );
+        assert_eq!(target.adopt_from(&source, now).unwrap(), 0);
     }
 
     #[test]

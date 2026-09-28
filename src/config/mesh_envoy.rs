@@ -36,6 +36,7 @@ use crate::supervisor::escalation::{EscalationQueue, EscalationRequest};
 use crate::utils::{AbortSignal, create_abort_signal};
 
 use anyhow::Result;
+use arc_swap::ArcSwap;
 use log::{debug, warn};
 use parking_lot::Mutex;
 use std::future::Future;
@@ -144,6 +145,8 @@ struct Prepared {
     input: Input,
     queue: Arc<EscalationQueue>,
     abort: AbortSignal,
+    /// Cancelled by `interrupt` or `stop`; the run then ends as `Interrupted`.
+    cancel: CancellationToken,
     timeout_secs: u64,
     /// The child context's usage handle, read once the run is over.
     usage: Arc<RunUsage>,
@@ -152,7 +155,7 @@ struct Prepared {
 }
 
 pub(crate) struct EnvoyRunner {
-    app: Arc<AppState>,
+    app: ArcSwap<AppState>,
     jobs: mpsc::Sender<EnvoyJob>,
     held: Mutex<Option<HeldEscalation>>,
     /// The human's answer a held run took, kept so the peer still hears it when that
@@ -160,27 +163,44 @@ pub(crate) struct EnvoyRunner {
     consumed_answer: Mutex<Option<String>>,
     cancel: CancellationToken,
     current_abort: Mutex<Option<AbortSignal>>,
+    current_cancel: Mutex<Option<CancellationToken>>,
     worker: Mutex<Option<JoinHandle<()>>>,
+    /// Whether a job runs only while a node is installed. Always so in production;
+    /// tests that drive the runner without a node lift it.
+    node_required: bool,
 }
 
 impl EnvoyRunner {
     pub(crate) fn start(app: Arc<AppState>) -> Arc<Self> {
-        Self::start_with(
+        Self::start_gated(
             app,
             Arc::new(|ctx, input, abort| run_child_agent(ctx, input, abort)),
+            true,
         )
     }
 
-    pub(crate) fn start_with(app: Arc<AppState>, drive: EnvoyDrive) -> Arc<Self> {
+    #[cfg(test)]
+    fn start_with(app: Arc<AppState>, drive: EnvoyDrive) -> Arc<Self> {
+        Self::start_gated(app, drive, false)
+    }
+
+    #[cfg(all(test, unix))]
+    fn start_with_node_gate(app: Arc<AppState>, drive: EnvoyDrive) -> Arc<Self> {
+        Self::start_gated(app, drive, true)
+    }
+
+    fn start_gated(app: Arc<AppState>, drive: EnvoyDrive, node_required: bool) -> Arc<Self> {
         let (jobs, mut queue) = mpsc::channel(ENVOY_QUEUE_MAX);
         let runner = Arc::new(Self {
-            app,
+            app: ArcSwap::from(app),
             jobs,
             held: Mutex::new(None),
             consumed_answer: Mutex::new(None),
             cancel: CancellationToken::new(),
             current_abort: Mutex::new(None),
+            current_cancel: Mutex::new(None),
             worker: Mutex::new(None),
+            node_required,
         });
         let worker = Arc::clone(&runner);
         let handle = tokio::spawn(async move {
@@ -201,7 +221,7 @@ impl EnvoyRunner {
             // keeps the original; dropping the job gives its reservation back.
             queue.close();
             while let Ok(job) = queue.try_recv() {
-                worker.app.mesh.refuse_for_envoy(
+                worker.app.load().mesh.refuse_for_envoy(
                     job.message,
                     PeerRefusal::capacity(RefusalReason::EnvoyStopping),
                 );
@@ -213,12 +233,26 @@ impl EnvoyRunner {
 
     pub(crate) fn attach(self: &Arc<Self>) {
         self.app
+            .load()
             .mesh
             .set_envoy(Arc::clone(self) as Arc<dyn EnvoySink>);
     }
 
     pub(crate) fn detach(&self) {
-        self.app.mesh.clear_envoy();
+        self.app.load().mesh.clear_envoy();
+    }
+
+    /// Points the runner at the app state the REPL now holds, so the next run reads
+    /// the current config and mesh slot. The one in place is kept when it is the same.
+    pub(crate) fn refresh(&self, app: &Arc<AppState>) {
+        if !Arc::ptr_eq(&self.app.load(), app) {
+            self.app.store(Arc::clone(app));
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn app(&self) -> Arc<AppState> {
+        self.app.load_full()
     }
 
     /// Detaches from the slot, aborts the run in flight and waits for the worker. A
@@ -250,12 +284,44 @@ impl EnvoyRunner {
     /// the ceiling debits in full, so the next is refused.
     fn admit(&self, job: &EnvoyJob, now: Instant) -> Result<(), PeerRefusal> {
         self.app
+            .load()
             .mesh
             .limits()
             .admit_reserved(&job.message.source_identity, now)
     }
 
+    /// A job queued before the node went away is not run: its ACK already told the
+    /// peer's slot to keep the original, and with no node there is nobody to answer
+    /// or refuse through, so it takes the inbox path with one idle line. Dropping the
+    /// job releases its reservation.
     async fn run_job(self: &Arc<Self>, drive: &EnvoyDrive, job: EnvoyJob) {
+        // Installed before anything else so an interrupt landing between the node
+        // check and the run, or while the agent loads, is honoured, not lost. Cancel
+        // first, then abort: the order `interrupt` takes them in.
+        let abort = create_abort_signal();
+        let cancel = self.cancel.child_token();
+        *self.current_cancel.lock() = Some(cancel.clone());
+        *self.current_abort.lock() = Some(abort.clone());
+        if self.node_required && self.app.load().mesh.get().is_none() {
+            *self.current_abort.lock() = None;
+            *self.current_cancel.lock() = None;
+            debug!(
+                "Mesh {} {} from {} not run: the node is off",
+                job.message.kind,
+                job.message.message_id,
+                short(&job.message.source_identity)
+            );
+            let EnvoyJob {
+                message,
+                reservation,
+            } = job;
+            self.app
+                .load()
+                .mesh
+                .record_envoy_fallback(message, "the node went off before the envoy could run");
+            drop(reservation);
+            return;
+        }
         let admitted = self.admit(&job, Instant::now());
         let EnvoyJob {
             message,
@@ -266,6 +332,8 @@ impl EnvoyRunner {
         let mut terminal = TerminalHooks::default();
         let (outcome, escalated) = match admitted {
             Err(refusal) => {
+                *self.current_abort.lock() = None;
+                *self.current_cancel.lock() = None;
                 debug!(
                     "Mesh {} {} from {} refused at run time: {}",
                     message.kind,
@@ -275,13 +343,26 @@ impl EnvoyRunner {
                 );
                 (EnvoyOutcome::Refused(refusal), false)
             }
-            Ok(()) => match self
-                .prepare(&message, &card, &agent_id, &mut terminal)
-                .await
-            {
-                Ok(prepared) => self.drive(drive, prepared, &message, &card).await,
-                Err(outcome) => (outcome, false),
-            },
+            Ok(()) => {
+                let result = match self
+                    .prepare(
+                        &message,
+                        &card,
+                        &agent_id,
+                        &mut terminal,
+                        abort,
+                        cancel.clone(),
+                    )
+                    .await
+                {
+                    Ok(prepared) => self.drive(drive, prepared, &message, &card).await,
+                    Err(_) if cancel.is_cancelled() => (EnvoyOutcome::Interrupted, false),
+                    Err(outcome) => (outcome, false),
+                };
+                *self.current_abort.lock() = None;
+                *self.current_cancel.lock() = None;
+                result
+            }
         };
         self.deliver(message, &card, outcome, escalated, agent_id, terminal)
             .await;
@@ -290,7 +371,7 @@ impl EnvoyRunner {
 
     fn peer_card(&self, message: &PeerMessage) -> PeerCard {
         PeerCard {
-            who: self.app.mesh.peer_name(message),
+            who: self.app.load().mesh.peer_name(message),
             instance: short(&message.source_destination).to_string(),
             verb: message.kind.verb(),
             message_id: message.message_id.clone(),
@@ -323,14 +404,16 @@ impl EnvoyRunner {
         card: &PeerCard,
         agent_id: &str,
         terminal: &mut TerminalHooks,
+        abort: AbortSignal,
+        cancel: CancellationToken,
     ) -> Result<Prepared, EnvoyOutcome> {
-        let mut ctx = RequestContext::new(child_app_state(&self.app), WorkingMode::Cmd);
+        let app = self.app.load_full();
+        let mut ctx = RequestContext::new(child_app_state(&app), WorkingMode::Cmd);
         ctx.render_mode = RenderMode::Silent;
         let started = ctx.resolved_hooks(HookEvent::AgentStarted);
         terminal.completed = ctx.resolved_hooks(HookEvent::AgentCompleted);
         terminal.failed = ctx.resolved_hooks(HookEvent::AgentFailed);
         terminal.interrupted = ctx.resolved_hooks(HookEvent::AgentInterrupted);
-        let abort = create_abort_signal();
         let loaded = self.load_envoy(&mut ctx, abort.clone()).await;
         hooks::fire_resolved(
             HookEvent::AgentStarted,
@@ -351,18 +434,18 @@ impl EnvoyRunner {
         ctx.ensure_supervisor_with_jobs_cap(Some(0));
 
         let mut role = ctx
-            .extract_role(&self.app.config)
+            .extract_role(&app.config)
             .map_err(|err| EnvoyOutcome::Failed(format!("{err:#}")))?;
         let current = ctx.current_model().id();
         if let Some(id) = ctx.envoy_model().filter(|id| *id != current) {
-            match Model::retrieve_model(self.app.config.as_ref(), &id, ModelType::Chat) {
+            match Model::retrieve_model(app.config.as_ref(), &id, ModelType::Chat) {
                 Ok(model) => role.set_model(model),
                 Err(err) => warn!(
                     "Mesh envoy model '{id}' could not be used ({err:#}); the envoy answers with '{current}'"
                 ),
             }
         }
-        let brief = self.app.mesh.brief();
+        let brief = app.mesh.brief();
         let (tail, user) =
             compose_envoy_input(brief.as_deref().map(Brief::render_for_human), card, message);
         role.append_to_prompt(&tail);
@@ -373,13 +456,14 @@ impl EnvoyRunner {
             .map(|messages| input.role().model().total_tokens(&messages) as u64)
             .unwrap_or(user.len() as u64 / 4)
             .max(1);
-        let timeout_secs = self.app.config.mesh.envoy_escalation_timeout;
+        let timeout_secs = app.config.mesh.envoy_escalation_timeout;
         let usage = Arc::clone(&ctx.run_usage);
         Ok(Prepared {
             ctx,
             input,
             queue,
             abort,
+            cancel,
             timeout_secs,
             usage,
             prompt_estimate,
@@ -402,13 +486,11 @@ impl EnvoyRunner {
         }
         // The child agent has no model of its own and inherits the context's, which a
         // fresh context leaves empty.
-        ctx.model = Model::retrieve_model(
-            self.app.config.as_ref(),
-            &self.app.config.model_id,
-            ModelType::Chat,
-        )
-        .map_err(|err| EnvoyOutcome::Failed(format!("{err:#}")))?;
-        ctx.use_agent(&self.app.config, ENVOY_AGENT_NAME, None, abort)
+        let app = self.app.load();
+        ctx.model =
+            Model::retrieve_model(app.config.as_ref(), &app.config.model_id, ModelType::Chat)
+                .map_err(|err| EnvoyOutcome::Failed(format!("{err:#}")))?;
+        ctx.use_agent(&app.config, ENVOY_AGENT_NAME, None, abort)
             .await
             .map_err(|err| match err.downcast_ref::<BuiltinAgentUnavailable>() {
                 Some(unavailable) => EnvoyOutcome::Unavailable(unavailable.reason.clone()),
@@ -416,10 +498,11 @@ impl EnvoyRunner {
             })
     }
 
-    /// Runs the envoy to an outcome, watching for the run's deadline, a shutdown and the
-    /// first escalation; the flag says whether the run escalated. A run cut off while a
-    /// hold is or was open is still a hand-off, so the peer's correlation stays open for
-    /// the human's answer. Dropping the run drops the child context and its queue.
+    /// Runs the envoy to an outcome, watching for the run's deadline, a cancellation
+    /// (`interrupt` or a shutdown) and the first escalation; the flag says whether the
+    /// run escalated. A run cut off while a hold is or was open is still a hand-off, so
+    /// the peer's correlation stays open for the human's answer. Dropping the run drops
+    /// the child context and its queue.
     /// Whatever the outcome, the run is charged to the sender's window before returning.
     async fn drive(
         self: &Arc<Self>,
@@ -433,11 +516,11 @@ impl EnvoyRunner {
             input,
             queue,
             abort,
+            cancel,
             timeout_secs,
             usage,
             prompt_estimate,
         } = prepared;
-        *self.current_abort.lock() = Some(abort.clone());
         let started = tokio::time::Instant::now();
         let ceiling = Duration::from_secs(ENVOY_RUN_TIMEOUT_SECS);
         let run = drive(ctx, input, abort.clone());
@@ -449,9 +532,18 @@ impl EnvoyRunner {
         let mut escalated = false;
         let outcome = loop {
             tokio::select! {
-                // Biased so a hold clamped to the ceiling is read as the ceiling cutting
+                // Biased so a cancellation racing the run's own end is read as the
+                // cancellation, and a hold clamped to the ceiling as the ceiling cutting
                 // it short, not as the wait lapsing.
                 biased;
+                _ = cancel.cancelled() => {
+                    abort.set_ctrlc();
+                    break if escalated {
+                        EnvoyOutcome::Escalated { cut_short: true }
+                    } else {
+                        EnvoyOutcome::Interrupted
+                    };
+                }
                 res = &mut run => break match res {
                     Ok(text) => match display_text(&text, PEER_CONTENT_MAX_CHARS) {
                         Some(text) => EnvoyOutcome::Answered(text),
@@ -465,14 +557,6 @@ impl EnvoyRunner {
                         EnvoyOutcome::Escalated { cut_short: true }
                     } else {
                         EnvoyOutcome::TimedOut
-                    };
-                }
-                _ = self.cancel.cancelled() => {
-                    abort.set_ctrlc();
-                    break if escalated {
-                        EnvoyOutcome::Escalated { cut_short: true }
-                    } else {
-                        EnvoyOutcome::Interrupted
                     };
                 }
                 _ = async {
@@ -506,7 +590,6 @@ impl EnvoyRunner {
                 }
             }
         };
-        *self.current_abort.lock() = None;
         self.held.lock().take();
         self.debit(&message.source_identity, &usage, prompt_estimate, &outcome);
         (outcome, escalated)
@@ -545,6 +628,7 @@ impl EnvoyRunner {
             snapshot.total_tokens()
         };
         self.app
+            .load()
             .mesh
             .limits()
             .debit(identity, tokens, snapshot.cost_usd, Instant::now());
@@ -564,7 +648,7 @@ impl EnvoyRunner {
         hold_until: &mut Option<Pin<Box<Sleep>>>,
     ) -> Result<(), String> {
         let question = strip_tool_tag(&request.question);
-        let Some(store) = self.app.mesh.inbound_store() else {
+        let Some(store) = self.app.load().mesh.inbound_store() else {
             warn!(
                 "Mesh is off, so the escalated question {} from {} cannot be filed",
                 message.message_id,
@@ -593,7 +677,7 @@ impl EnvoyRunner {
             return Err(format!("could not file the escalated question: {err:#}"));
         }
         let line = display_text(question, PEER_LINE_MAX_CHARS).unwrap_or_default();
-        self.app.mesh.push_idle(IdleNotify {
+        self.app.load().mesh.push_idle(IdleNotify {
             source: Source::Message,
             origin: Origin::Peer(short(&message.source_identity).to_string()),
             text: format!(
@@ -630,6 +714,7 @@ impl EnvoyRunner {
         terminal: TerminalHooks,
     ) {
         let id = message.message_id.clone();
+        let app = self.app.load();
         // Always taken, so an answer consumed by this run can never be replayed to the
         // next job's peer.
         let consumed = self.consumed_answer.lock().take();
@@ -681,7 +766,7 @@ impl EnvoyRunner {
             _ => None,
         };
         let unsent = match (
-            self.app.mesh.get(),
+            app.mesh.get(),
             OutboundPeer::new(kind, &reply_text, None, Some(&id), fields),
         ) {
             (Some(runtime), Ok(out)) => runtime
@@ -699,7 +784,7 @@ impl EnvoyRunner {
             } else {
                 String::new()
             };
-            self.app.mesh.push_idle(IdleNotify {
+            app.mesh.push_idle(IdleNotify {
                 source: Source::Message,
                 origin: Origin::Peer(short(&message.source_identity).to_string()),
                 text: format!(
@@ -712,31 +797,23 @@ impl EnvoyRunner {
             self.forget_question(&id);
         }
         match (&outcome, &human_answer) {
-            (EnvoyOutcome::Answered(text), _) => {
-                self.app.mesh.record_envoy_exchange(&message, text)
+            (EnvoyOutcome::Answered(text), _) => app.mesh.record_envoy_exchange(&message, text),
+            (_, Some(text)) => app.mesh.record_envoy_exchange(&message, text),
+            (EnvoyOutcome::Escalated { .. }, None) => app.mesh.record_envoy_escalated(message, &id),
+            (EnvoyOutcome::TimedOut, None) => {
+                app.mesh.record_envoy_fallback(message, "envoy timed out")
             }
-            (_, Some(text)) => self.app.mesh.record_envoy_exchange(&message, text),
-            (EnvoyOutcome::Escalated { .. }, None) => {
-                self.app.mesh.record_envoy_escalated(message, &id)
+            (EnvoyOutcome::Interrupted, None) => {
+                app.mesh.record_envoy_fallback(message, "envoy interrupted")
             }
-            (EnvoyOutcome::TimedOut, None) => self
-                .app
-                .mesh
-                .record_envoy_fallback(message, "envoy timed out"),
-            (EnvoyOutcome::Interrupted, None) => self
-                .app
-                .mesh
-                .record_envoy_fallback(message, "envoy interrupted"),
-            (EnvoyOutcome::Unavailable(reason), None) => self
-                .app
+            (EnvoyOutcome::Unavailable(reason), None) => app
                 .mesh
                 .record_envoy_fallback(message, &format!("envoy unavailable: {reason}")),
-            (EnvoyOutcome::Failed(err), None) => self
-                .app
+            (EnvoyOutcome::Failed(err), None) => app
                 .mesh
                 .record_envoy_fallback(message, &format!("envoy failed: {err}")),
             (EnvoyOutcome::Refused(refusal), None) => {
-                self.app.mesh.record_envoy_refusal(message, refusal)
+                app.mesh.record_envoy_refusal(message, refusal)
             }
         }
         let mut extras = vec![
@@ -766,7 +843,7 @@ impl EnvoyRunner {
     }
 
     fn forget_question(&self, id: &str) {
-        if let Some(store) = self.app.mesh.inbound_store()
+        if let Some(store) = self.app.load().mesh.inbound_store()
             && let Err(err) = store.remove(id)
         {
             warn!("Mesh envoy could not forget the answered question {id}: {err:#}");
@@ -783,6 +860,7 @@ impl EnvoySink for EnvoyRunner {
         }
         job.reservation = Some(
             self.app
+                .load()
                 .mesh
                 .limits()
                 .try_reserve(&job.message.source_identity, Instant::now())?,
@@ -806,6 +884,17 @@ impl EnvoySink for EnvoyRunner {
             *self.consumed_answer.lock() = None;
         }
         taken
+    }
+
+    fn interrupt(&self) {
+        if let Some(cancel) = self.current_cancel.lock().take() {
+            cancel.cancel();
+        }
+        if let Some(abort) = self.current_abort.lock().take() {
+            abort.set_ctrlc();
+        }
+        // Dropping the held reply sender frees the run waiting on the human's answer.
+        self.held.lock().take();
     }
 }
 
@@ -844,8 +933,10 @@ mod tests {
     use crate::mesh::envoy::{PEER_FENCE_BEGIN, PEER_FENCE_END};
     use crate::mesh::idle::IdleSink;
     use crate::mesh::limits::{PEER_RETRY_AFTER_CAPACITY, PeerLimitConfig};
+    #[cfg(unix)]
+    use crate::mesh::message::PeerBody;
     use crate::mesh::message::{
-        PeerBody, PeerMessageHandler, PeerRouting, PeerSurface, RawPeerMessage, is_received_reply,
+        PeerMessageHandler, PeerRouting, PeerSurface, RawPeerMessage, is_received_reply,
         peer_lxmf_message, to_r3_body,
     };
     use crate::mesh::pending::InboundStore;
@@ -1845,6 +1936,7 @@ mod tests {
 
     /// A job whose sender is `source_destination`/`source_identity`, for tests that watch
     /// the reply arrive at a live peer instead of in the mesh-off inbox.
+    #[cfg(unix)]
     fn job_from(
         kind: PeerKind,
         id: &str,
@@ -3369,6 +3461,326 @@ mod tests {
         source.remove_dir();
     }
 
+    /// An operator interrupt is a cancellation, not a failure: the run ends as
+    /// `agent.interrupted` with no `COYOTE_AGENT_ERROR`, as a cancelled spawned agent does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn interrupt_cuts_the_run_in_flight_and_leaves_the_runner_accepting() {
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-interrupt");
+        let (source, _source) = stub_envoy_source();
+        let _sink = test_sink::install();
+        let app = app_with_hooks(agent_hooks("t091"));
+        let idle = RecordingIdleSink::attach(&app);
+        let runs = Arc::new(AtomicUsize::new(0));
+        let runner = EnvoyRunner::start_with(Arc::clone(&app), {
+            let runs = Arc::clone(&runs);
+            drive_of(move |_, _, abort| {
+                let runs = Arc::clone(&runs);
+                async move {
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    while !abort.aborted() {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    Err(anyhow::anyhow!("cut short"))
+                }
+            })
+        });
+        assert!(
+            runner
+                .accept(job(PeerKind::Ask, "msg-first", "how far?"))
+                .is_ok()
+        );
+        wait_until("the first run to park", || runs.load(Ordering::SeqCst) == 1).await;
+
+        runner.interrupt();
+        wait_until("the cut run to be recorded", || {
+            idle.has("envoy interrupted")
+        })
+        .await;
+        assert!(!idle.has("envoy failed"), "{:?}", idle.texts());
+        let captures = test_sink::snapshot();
+        let interrupted = captures
+            .iter()
+            .find(|capture| capture.hook_name == "t091_interrupted")
+            .unwrap_or_else(|| panic!("agent.interrupted did not fire: {captures:?}"));
+        assert!(!interrupted.envs.contains_key("COYOTE_AGENT_ERROR"));
+        assert!(
+            !captures
+                .iter()
+                .any(|capture| capture.hook_name == "t091_failed"),
+            "{captures:?}"
+        );
+
+        assert!(
+            runner
+                .accept(job(PeerKind::Ask, "msg-second", "still there?"))
+                .is_ok()
+        );
+        wait_until("the second run to start", || {
+            runs.load(Ordering::SeqCst) == 2
+        })
+        .await;
+        runner.stop().await;
+        source.remove_dir();
+    }
+
+    /// The production gate: jobs queued behind a run are not run once the node is gone,
+    /// instead of each spending a model turn to fail at delivery; the wire already ACKed
+    /// them, so each lands in the inbox with one idle line.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn queued_envoy_jobs_do_not_run_once_the_node_is_gone() {
+        use crate::mesh::test_support::started_runtime;
+
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-node-gone");
+        let (source, _source) = stub_envoy_source();
+        let started = started_runtime("envoy-node-gone").await;
+        let app = test_app();
+        app.mesh.install(started.runtime.clone()).unwrap();
+        let idle = RecordingIdleSink::attach(&app);
+        let runs = Arc::new(AtomicUsize::new(0));
+        let runner = EnvoyRunner::start_with_node_gate(Arc::clone(&app), {
+            let runs = Arc::clone(&runs);
+            drive_of(move |_, _, abort| {
+                let runs = Arc::clone(&runs);
+                async move {
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    while !abort.aborted() {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    Err(anyhow::anyhow!("cut short"))
+                }
+            })
+        });
+        // The node gate is under test here, not the per-identity cap.
+        app.mesh.limits().configure(PeerLimitConfig {
+            concurrency: 2,
+            ..PeerLimitConfig::default()
+        });
+        assert!(
+            runner
+                .accept(job(PeerKind::Ask, "msg-running", "how far?"))
+                .is_ok()
+        );
+        wait_until("the first run to park", || runs.load(Ordering::SeqCst) == 1).await;
+        assert!(
+            runner
+                .accept(job(PeerKind::Ask, "msg-queued", "and now?"))
+                .is_ok()
+        );
+
+        assert!(app.mesh.stop().await.unwrap());
+        runner.interrupt();
+        wait_until("the cut run to be recorded", || {
+            idle.has("envoy interrupted")
+        })
+        .await;
+        let identity = hex_lower(&PEER_IDENTITY);
+        wait_until("the queued job to give its reservation back", || {
+            app.mesh
+                .limits()
+                .window_of(&identity, Instant::now())
+                .is_some_and(|window| window.in_flight == 0)
+        })
+        .await;
+
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "the queued job never ran");
+        assert_eq!(idle.count("envoy interrupted"), 1, "{:?}", idle.texts());
+        wait_until("the queued job to be filed", || {
+            idle.has("the node went off before the envoy could run")
+        })
+        .await;
+        assert_eq!(
+            idle.count("the node went off before the envoy could run"),
+            1,
+            "{:?}",
+            idle.texts()
+        );
+        let (envelopes, _) = app.mesh.peer_inbox().drain();
+        let mut ids: Vec<&str> = envelopes
+            .iter()
+            .map(|envelope| peer_of(envelope).message_id.as_str())
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, ["msg-queued", "msg-running"], "{envelopes:?}");
+        runner.stop().await;
+        started.relay_handle.abort();
+        source.remove_dir();
+    }
+
+    /// An interrupt that lands before the drive starts, while the run is still being
+    /// prepared, ends it as `agent.interrupted`: the cancel token is installed ahead of
+    /// the node check and the agent load, so nothing in between can lose it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn an_interrupt_during_prepare_ends_the_run_as_interrupted() {
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-interrupt-prepare");
+        let (source, _source) = stub_envoy_source();
+        let _sink = test_sink::install();
+        let app = app_with_hooks(agent_hooks("t092"));
+        let idle = RecordingIdleSink::attach(&app);
+        let runs = Arc::new(AtomicUsize::new(0));
+        let runner = EnvoyRunner::start_with(Arc::clone(&app), {
+            let runs = Arc::clone(&runs);
+            drive_of(move |_, _, abort| {
+                let runs = Arc::clone(&runs);
+                async move {
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    while !abort.aborted() {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    Err(anyhow::anyhow!("cut short"))
+                }
+            })
+        });
+        assert!(
+            runner
+                .accept(job(PeerKind::Ask, "msg-early", "how far?"))
+                .is_ok()
+        );
+        wait_until("the run's cancel token to be installed", || {
+            runner.current_cancel.lock().is_some()
+        })
+        .await;
+        runner.interrupt();
+        wait_until("the cut run to be recorded", || {
+            idle.has("envoy interrupted")
+        })
+        .await;
+
+        assert!(!idle.has("envoy failed"), "{:?}", idle.texts());
+        let captures = test_sink::snapshot();
+        let interrupted = captures
+            .iter()
+            .find(|capture| capture.hook_name == "t092_interrupted")
+            .unwrap_or_else(|| panic!("agent.interrupted did not fire: {captures:?}"));
+        assert!(!interrupted.envs.contains_key("COYOTE_AGENT_ERROR"));
+        assert!(
+            !captures
+                .iter()
+                .any(|capture| capture.hook_name == "t092_failed"),
+            "{captures:?}"
+        );
+        let (envelopes, _) = app.mesh.peer_inbox().drain();
+        assert_eq!(envelopes.len(), 1, "{envelopes:?}");
+        assert_eq!(peer_of(&envelopes[0]).message_id, "msg-early");
+        runner.stop().await;
+        source.remove_dir();
+    }
+
+    /// The production gate end to end: with a node installed the runner runs the job and
+    /// records the reply; `MeshSlot::stop` reaches the attached runner's `interrupt`
+    /// through the slot, cuts the run in flight, and the job queued behind it is
+    /// dropped unrun.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn the_production_runner_runs_jobs_while_a_node_is_installed_and_drops_them_after_stop() {
+        use crate::mesh::test_support::started_runtime;
+
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-production-gate");
+        let (source, _source) = stub_envoy_source();
+        let started = started_runtime("envoy-production-gate").await;
+        let app = test_app();
+        app.mesh.install(started.runtime.clone()).unwrap();
+        let idle = RecordingIdleSink::attach(&app);
+        let runs = Arc::new(AtomicUsize::new(0));
+        let runner = EnvoyRunner::start_with_node_gate(Arc::clone(&app), {
+            let runs = Arc::clone(&runs);
+            drive_of(move |_, _, abort| {
+                let runs = Arc::clone(&runs);
+                async move {
+                    if runs.fetch_add(1, Ordering::SeqCst) == 0 {
+                        return Ok("the answer".into());
+                    }
+                    while !abort.aborted() {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    Err(anyhow::anyhow!("cut short"))
+                }
+            })
+        });
+        runner.attach();
+        app.mesh.limits().configure(PeerLimitConfig {
+            concurrency: 3,
+            ..PeerLimitConfig::default()
+        });
+
+        assert!(
+            runner
+                .accept(job(PeerKind::Ask, "msg-answered", "what is 2+2?"))
+                .is_ok()
+        );
+        wait_until("the first job to be answered", || {
+            idle.has("envoy replied: the answer")
+        })
+        .await;
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        assert!(
+            idle.texts()
+                .iter()
+                .any(|text| text.contains("the envoy's reply to")
+                    && text.contains("could not be sent")),
+            "an unheard peer gets the reply recorded, not delivered: {:?}",
+            idle.texts()
+        );
+
+        assert!(
+            runner
+                .accept(job(PeerKind::Ask, "msg-running", "how far?"))
+                .is_ok()
+        );
+        wait_until("the second run to park", || {
+            runs.load(Ordering::SeqCst) == 2
+        })
+        .await;
+        assert!(
+            runner
+                .accept(job(PeerKind::Ask, "msg-queued", "and now?"))
+                .is_ok()
+        );
+
+        assert!(app.mesh.stop().await.unwrap());
+        wait_until("the slot's stop to interrupt the run", || {
+            idle.has("envoy interrupted")
+        })
+        .await;
+        let identity = hex_lower(&PEER_IDENTITY);
+        wait_until("the queued job to give its reservation back", || {
+            app.mesh
+                .limits()
+                .window_of(&identity, Instant::now())
+                .is_some_and(|window| window.in_flight == 0)
+        })
+        .await;
+
+        assert_eq!(runs.load(Ordering::SeqCst), 2, "the queued job never ran");
+        assert_eq!(idle.count("envoy interrupted"), 1, "{:?}", idle.texts());
+        runner.stop().await;
+        started.relay_handle.abort();
+        source.remove_dir();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn refresh_swaps_in_a_new_app_state_and_keeps_the_same_one() {
+        let first = test_app();
+        let runner = EnvoyRunner::start_with(
+            Arc::clone(&first),
+            drive_of(|_, _, _| async { Ok("unused".into()) }),
+        );
+        assert!(Arc::ptr_eq(&runner.app(), &first));
+
+        runner.refresh(&first);
+        assert!(Arc::ptr_eq(&runner.app(), &first));
+
+        let second = test_app();
+        runner.refresh(&second);
+        assert!(Arc::ptr_eq(&runner.app(), &second));
+        assert!(!Arc::ptr_eq(&runner.app(), &first));
+        runner.stop().await;
+    }
+
     /// A sender over its hourly limit on the store-and-forward path hears the typed
     /// refusal once: the first refused message of the hour is answered, the rest of the
     /// hour's refusals are folded; the REPL line names the peer as its table does.
@@ -3414,7 +3826,8 @@ mod tests {
                     source_identity: &identity,
                     source_destination: &to,
                     message_id: id,
-                    in_reply_to: false,
+                    kind: PeerKind::Message,
+                    in_reply_to: None,
                     via: PeerVia::StoreAndForward,
                 },
             )

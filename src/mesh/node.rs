@@ -84,6 +84,8 @@ const CONNECT_POLL: Duration = Duration::from_millis(50);
 const LAN_CHANNEL_CAPACITY: usize = 128;
 /// How often the peer table is written back if it changed; `stop` writes it regardless.
 const PEER_PERSIST_INTERVAL_SECS: u64 = 30;
+/// Refusal shared by `MeshSlot::install` and the `.mesh on` pre-check.
+pub(crate) const MESH_ALREADY_ON: &str = "Mesh is already on in this process. Run `.mesh off` first, then `.mesh on` to start it again with the current settings.";
 
 /// Where a node keeps its identity, the user's trust list and its disposable state.
 pub(crate) struct MeshPaths {
@@ -93,8 +95,6 @@ pub(crate) struct MeshPaths {
 }
 
 impl MeshPaths {
-    // Reached by the REPL mesh commands once they land.
-    #[allow(dead_code)]
     pub(crate) fn from_env() -> Self {
         Self {
             identity_path: identity::identity_path(),
@@ -247,8 +247,6 @@ impl MeshRuntime {
     /// config touches nothing on disk; the instance lock is taken before the identity is minted
     /// so a refused start never creates a key. A trust list that does not load refuses the
     /// start outright: the node never serves against a partial list.
-    // Reached by the REPL mesh commands once they land.
-    #[allow(dead_code)]
     pub(crate) async fn start(
         config: &MeshConfig,
         function_calling_support: bool,
@@ -446,8 +444,6 @@ impl MeshRuntime {
         &self.cache_dir
     }
 
-    // Reached by the REPL mesh commands once they land.
-    #[allow(dead_code)]
     pub(crate) fn fingerprint(&self) -> &str {
         &self.fingerprint
     }
@@ -471,8 +467,6 @@ impl MeshRuntime {
     }
 
     /// Human labels of the joined interfaces, in config order.
-    // Reached by the REPL mesh commands once they land.
-    #[allow(dead_code)]
     pub(crate) fn interfaces(&self) -> Vec<String> {
         self.interface_labels.clone()
     }
@@ -482,14 +476,10 @@ impl MeshRuntime {
     }
 
     /// The LXMF propagation nodes heard so far, as `fetch_propagated` chooses among them.
-    // Reached by the REPL mesh commands once they land.
-    #[allow(dead_code)]
     pub(crate) fn propagation_nodes(&self) -> Arc<PropagationNodeTable> {
         self.propagation_nodes.clone()
     }
 
-    // Reached by the REPL mesh commands once they land.
-    #[allow(dead_code)]
     pub(crate) fn trust(&self) -> Arc<TrustStore> {
         self.trust.clone()
     }
@@ -1507,12 +1497,9 @@ impl MeshSlot {
     /// not surfaced, and not marked as surfaced either, so a repeat from that identity
     /// still earns its one line. The caller refreshes the session's tool catalog once
     /// this returns, since the `mesh__*` tools are declared only while a node is on.
-    // Reached by the REPL mesh commands once they land.
-    #[allow(dead_code)]
     pub(crate) fn install(self: &Arc<Self>, runtime: Arc<MeshRuntime>) -> Result<()> {
-        let already_on = "Mesh is already on in this process. Run `.mesh off` first, then `.mesh on` to start it again with the current settings.";
         if self.get().is_some() {
-            bail!(already_on);
+            bail!(MESH_ALREADY_ON);
         }
         let store = PendingStore::new(runtime.cache_dir(), &runtime.current_instance_id());
         let inbound = InboundStore::new(runtime.cache_dir(), &runtime.current_instance_id());
@@ -1521,7 +1508,7 @@ impl MeshSlot {
         // lock for the display name.
         let mut slot = self.inner.write();
         if slot.is_some() {
-            bail!(already_on);
+            bail!(MESH_ALREADY_ON);
         }
         self.correlations.adopt(store, pending);
         *self.inbound.lock() = Some(Arc::new(inbound));
@@ -1547,15 +1534,17 @@ impl MeshSlot {
     /// questions with it: they stay on disk for the next install of that instance.
     /// Detaching before the shutdown grace means a reply served during the grace lands as
     /// an ordinary message and its question stays open on disk, which is the price of
-    /// never writing a stopped node's file. `Ok(false)` when nothing was running. The
-    /// caller refreshes the session's tool catalog afterwards so the `mesh__*` tools go
-    /// with the node.
-    // Reached by the REPL mesh commands once they land.
-    #[allow(dead_code)]
+    /// never writing a stopped node's file. An envoy run in flight is cut short first:
+    /// its reply would go out through the node being stopped. `Ok(false)` when nothing
+    /// was running. The caller refreshes the session's tool catalog afterwards so the
+    /// `mesh__*` tools go with the node.
     pub(crate) async fn stop(&self) -> Result<bool> {
         let taken = self.inner.write().take();
         match taken {
             Some(runtime) => {
+                if let Some(envoy) = self.envoy.load_full() {
+                    envoy.interrupt();
+                }
                 self.correlations.detach_store();
                 self.inbound.lock().take();
                 runtime.shutdown().await?;
@@ -1570,9 +1559,10 @@ impl MeshSlot {
     /// original's; a no-op while the mesh is off. The fork's questions are adopted before
     /// the node re-keys so a reply the fork's destination serves at once finds them, and
     /// a re-key that fails puts the original's back, since the original is what stays
-    /// served. A fork file this Coyote cannot read is logged and the fork starts with no
-    /// questions pending, as `install` does: the node must not be reported as failed for
-    /// a cache file.
+    /// served. Questions peers escalated before the fork are copied into the fork's
+    /// inbound file so `.mesh answer` still finds them after the switch. A fork file this
+    /// Coyote cannot read is logged and the fork starts with no questions pending, as
+    /// `install` does: the node must not be reported as failed for a cache file.
     pub(crate) async fn rekey(&self, rekey: ForkRekey) -> Result<()> {
         let Some(runtime) = self.get() else {
             return Ok(());
@@ -1580,8 +1570,25 @@ impl MeshSlot {
         let fork_store = PendingStore::new(runtime.cache_dir(), &rekey.fork_instance_id);
         let pending = reopen_pending(&fork_store);
         self.correlations.adopt(fork_store, pending);
-        let fork_inbound = InboundStore::new(runtime.cache_dir(), &rekey.fork_instance_id);
-        *self.inbound.lock() = Some(Arc::new(fork_inbound));
+        let fork_inbound = Arc::new(InboundStore::new(
+            runtime.cache_dir(),
+            &rekey.fork_instance_id,
+        ));
+        let current_inbound = self.inbound.lock().clone();
+        let carry = || {
+            if let Some(current) = &current_inbound
+                && let Err(err) = fork_inbound.adopt_from(current, SystemTime::now())
+            {
+                warn!(
+                    "Mesh questions escalated before the fork could not be carried into it, so `.mesh answer` will not find them: {err:#}"
+                );
+            }
+        };
+        carry();
+        *self.inbound.lock() = Some(Arc::clone(&fork_inbound));
+        // A record filed into the old store between the first carry and the swap would
+        // otherwise be lost; adoption is by id, so repeating it is harmless.
+        carry();
         let rekeyed = runtime.rekey(rekey).await;
         if rekeyed.is_err() {
             let instance_id = runtime.current_instance_id();
@@ -1617,8 +1624,6 @@ impl MeshSlot {
         })
     }
 
-    // Reached by the REPL mesh commands once they land.
-    #[allow(dead_code)]
     pub(crate) fn set_objective_override(&self, objective: Option<String>) {
         self.objective_override.store(non_blank(objective));
         self.reassemble_brief();
@@ -1670,8 +1675,6 @@ impl MeshSlot {
         true
     }
 
-    // Reached by the REPL mesh commands once they land.
-    #[allow(dead_code)]
     pub(crate) fn set_user_brief(&self, text: Option<String>) {
         self.user_brief.store(non_blank(text));
         self.reassemble_brief();
@@ -1771,6 +1774,11 @@ impl MeshSlot {
 
     pub(crate) fn clear_envoy(&self) {
         self.envoy.store(None);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn envoy_attached(&self) -> bool {
+        self.envoy.load().is_some()
     }
 
     /// Hands an event to the idle-time driver. With no driver installed the human line
@@ -2060,9 +2068,6 @@ impl MeshSlot {
     /// delivers; otherwise it goes to the peer as a reply, leaves the store here and is
     /// recorded for the leader, whose earlier note said to wait for it.
     /// Never touches `correlations`: this answers a peer's question, not one of ours.
-    // Kept ahead of its caller: the `.mesh answer` REPL command that lands next
-    // consumes it; nothing else does yet.
-    #[allow(dead_code)]
     pub(crate) async fn answer_inbound(&self, id: &str, text: &str) -> Result<()> {
         let Some(store) = self.inbound_store() else {
             bail!("Mesh is off; turn it on with `.mesh on` before answering {id}");
@@ -2323,12 +2328,24 @@ impl KnockSurface for MeshSlot {
 }
 
 impl PeerSurface for MeshSlot {
-    /// A refusal on the store-and-forward path also earns the peer one typed reply per
-    /// identity, per reason, per hour, since no link carries a code back; on a link the
-    /// caller's code is the typed refusal. A refused reply neither earns nor spends
-    /// one: a reply to a reply is the loop the envoy guards against. The REPL line is
-    /// folded on its own count, so it prints whether or not the peer is told.
+    /// A reply to a question this Coyote asked is admitted without being counted: a peer
+    /// past its limit must still be able to answer a `mesh__ask`, and the correlation
+    /// only accepts the one reply, from the identity it was asked of, so the exemption
+    /// is spent with it. A refusal on the store-and-forward path also earns the
+    /// peer one typed reply per identity, per reason, per hour, since no link carries a
+    /// code back; on a link the caller's code is the typed refusal. A refused reply
+    /// neither earns nor spends one: a reply to a reply is the loop the envoy guards
+    /// against. The REPL line is folded on its own count, so it prints whether or not the
+    /// peer is told.
     fn admit_peer_message(&self, request: &PeerAdmission) -> Result<(), PeerRefusal> {
+        if request.kind == PeerKind::Reply
+            && let Some(id) = request.in_reply_to
+            && self
+                .correlations
+                .accepts_reply_from(id, request.source_identity)
+        {
+            return Ok(());
+        }
         let identity = request.source_identity;
         let who = self.peer_label(identity, request.source_destination);
         let now = Instant::now();
@@ -2340,7 +2357,7 @@ impl PeerSurface for MeshSlot {
             Err(refusal) => {
                 self.surface_refusal(identity, &refusal, &who, request.via);
                 if request.via == PeerVia::StoreAndForward
-                    && !request.in_reply_to
+                    && request.in_reply_to.is_none()
                     && self.limits.claim_peer_reply(identity, refusal.reason, now)
                 {
                     self.send_refusal_reply(
@@ -2404,7 +2421,8 @@ mod tests {
     #[cfg(unix)]
     use rns_transport::iface::tcp_server::TcpServer;
     #[cfg(unix)]
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     #[cfg(unix)]
     use tokio::net::TcpListener;
 
@@ -2963,6 +2981,7 @@ mod tests {
         consume_answers: bool,
         jobs: parking_lot::Mutex<Vec<PeerMessage>>,
         answers: parking_lot::Mutex<Vec<(String, String)>>,
+        interrupts: AtomicUsize,
     }
 
     impl RecordingEnvoy {
@@ -2981,6 +3000,7 @@ mod tests {
                 consume_answers,
                 jobs: parking_lot::Mutex::new(Vec::new()),
                 answers: parking_lot::Mutex::new(Vec::new()),
+                interrupts: AtomicUsize::new(0),
             })
         }
 
@@ -3005,6 +3025,10 @@ mod tests {
         fn answer(&self, id: &str, text: &str) -> bool {
             self.answers.lock().push((id.to_string(), text.to_string()));
             self.consume_answers
+        }
+
+        fn interrupt(&self) {
+            self.interrupts.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -3507,7 +3531,8 @@ mod tests {
                     source_identity: identity,
                     source_destination: instance,
                     message_id: id,
-                    in_reply_to,
+                    kind: PeerKind::Message,
+                    in_reply_to: in_reply_to.then_some("a-question-nobody-here-asked"),
                     via,
                 },
             )
@@ -3602,6 +3627,88 @@ mod tests {
                     short(&c)
                 ),
             ]
+        );
+    }
+
+    #[test]
+    fn a_reply_to_our_open_question_is_never_throttled() {
+        let slot = MeshSlot::default();
+        slot.limits().configure(PeerLimitConfig {
+            messages_per_hour: 1,
+            ..PeerLimitConfig::default()
+        });
+        slot.correlations().open(pending("q-ours")).unwrap();
+        let identity = hex_lower(&PEER_IDENTITY);
+        let instance = hex_lower(&PEER_INSTANCE);
+        let admit_kind = |identity: &str, kind: PeerKind, id: &str, in_reply_to: Option<&str>| {
+            PeerSurface::admit_peer_message(
+                &slot,
+                &PeerAdmission {
+                    source_identity: identity,
+                    source_destination: &instance,
+                    message_id: id,
+                    kind,
+                    in_reply_to,
+                    via: PeerVia::Direct,
+                },
+            )
+        };
+        let admit_as = |identity: &str, id: &str, in_reply_to: Option<&str>| {
+            let kind = if in_reply_to.is_some() {
+                PeerKind::Reply
+            } else {
+                PeerKind::Ask
+            };
+            admit_kind(identity, kind, id, in_reply_to)
+        };
+        let admit = |id: &str, in_reply_to: Option<&str>| admit_as(&identity, id, in_reply_to);
+
+        assert!(admit("ask-0", None).is_ok());
+        assert_eq!(
+            admit("ask-1", None).unwrap_err().reason,
+            RefusalReason::RateLimited,
+            "the identity is past its limit"
+        );
+        assert_eq!(
+            admit_kind(&identity, PeerKind::Ask, "ask-2", Some("q-ours"))
+                .unwrap_err()
+                .reason,
+            RefusalReason::RateLimited,
+            "an ask naming our open question is not a reply to it and is counted like any message"
+        );
+        assert!(
+            slot.correlations().accepts_reply_from("q-ours", &identity),
+            "the refused ask leaves the question open"
+        );
+        assert!(
+            admit("reply-1", Some("q-ours")).is_ok(),
+            "a reply to a question we asked is admitted regardless"
+        );
+        assert_eq!(
+            admit("reply-2", Some("q-not-ours")).unwrap_err().reason,
+            RefusalReason::RateLimited,
+            "a reply to a question we never asked is counted like any message"
+        );
+        let other = hex_lower(&[0x77; 16]);
+        assert!(admit_as(&other, "other-0", Some("q-ours")).is_ok());
+        assert_eq!(
+            admit_as(&other, "other-1", Some("q-ours"))
+                .unwrap_err()
+                .reason,
+            RefusalReason::RateLimited,
+            "citing our open question from another identity spends that identity's own count"
+        );
+        assert!(
+            slot.correlations().answer(
+                "q-ours",
+                peer_message(PeerKind::Reply, "reply-1", Some("q-ours"))
+            ),
+            "the asked identity's reply closes the question"
+        );
+        assert_eq!(
+            admit("reply-3", Some("q-ours")).unwrap_err().reason,
+            RefusalReason::RateLimited,
+            "once the question is answered a further reply citing it is counted like any message"
         );
     }
 
@@ -4662,6 +4769,31 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_interrupts_the_attached_envoy_once_and_leaves_it_attached() {
+        let started = started_runtime("node-stop-envoy").await;
+        let slot = Arc::new(MeshSlot::default());
+        let envoy = RecordingEnvoy::new(true, false);
+        slot.set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
+        slot.install(started.runtime.clone()).unwrap();
+
+        assert!(slot.stop().await.unwrap());
+
+        assert_eq!(envoy.interrupts.load(Ordering::SeqCst), 1);
+        assert!(
+            slot.envoy.load_full().is_some(),
+            "the envoy belongs to the session, not the node; stop leaves it attached"
+        );
+        assert!(!slot.stop().await.unwrap());
+        assert_eq!(
+            envoy.interrupts.load(Ordering::SeqCst),
+            1,
+            "a stop with no node interrupts nothing"
+        );
+        started.relay_handle.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn request_on_a_stopped_runtime_is_not_running() {
         let started = started_runtime("node-request-stopped").await;
         let runtime = &started.runtime;
@@ -4693,6 +4825,45 @@ mod tests {
             .to_string();
 
         assert!(err.contains(".mesh off"), "{err}");
+        assert!(slot.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rekey_carries_escalated_questions_into_the_fork_store() {
+        let started = started_runtime("node-rekey-inbound").await;
+        let cache_dir = started.runtime.cache_dir().to_path_buf();
+        let original_id = started.runtime.current_instance_id();
+        let fork_id = fresh_instance_id();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(started.runtime.clone()).unwrap();
+        slot.inbound_store()
+            .unwrap()
+            .upsert(inbound_record("q-before-fork"), SystemTime::now())
+            .unwrap();
+
+        slot.rekey(ForkRekey {
+            original_instance_id: Some(original_id.clone()),
+            fork_instance_id: fork_id.clone(),
+        })
+        .await
+        .unwrap();
+
+        let fork_store = slot.inbound_store().unwrap();
+        assert_eq!(
+            fork_store.path(),
+            InboundStore::new(&cache_dir, &fork_id).path(),
+            "the slot serves the fork's inbound file"
+        );
+        assert!(fork_store.get("q-before-fork").unwrap().is_some());
+        assert!(
+            InboundStore::new(&cache_dir, &original_id)
+                .get("q-before-fork")
+                .unwrap()
+                .is_some(),
+            "the original's file is left as it was"
+        );
         assert!(slot.stop().await.unwrap());
         started.relay_handle.abort();
     }

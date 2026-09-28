@@ -23,7 +23,9 @@ mod r3;
 pub(crate) mod snapshot;
 pub(crate) mod trust;
 
-pub(crate) use node::{MeshRuntime, MeshSlot};
+pub(crate) use node::{MESH_ALREADY_ON, MeshPaths, MeshRuntime, MeshSlot, NodeOptions};
+pub(crate) use peers::PeerRecord;
+pub(crate) use propagation_nodes::PropagationNodeRecord;
 pub(crate) use r3::{RequestOptions, short};
 
 use crate::config::sanitize_display_text;
@@ -55,6 +57,18 @@ pub(crate) fn parse_rfc3339(text: &str) -> Option<SystemTime> {
     chrono::DateTime::parse_from_rfc3339(text)
         .ok()
         .map(SystemTime::from)
+}
+
+/// How long ago `then` was, in the coarsest unit that fits: `12s ago`, `3m ago`, `2h ago`,
+/// `5d ago`. A `then` in the future reads as `0s ago`.
+pub(crate) fn age_text(now: SystemTime, then: SystemTime) -> String {
+    let secs = now.duration_since(then).unwrap_or_default().as_secs();
+    match secs {
+        s if s < 60 => format!("{s}s ago"),
+        s if s < 3600 => format!("{}m ago", s / 60),
+        s if s < 86_400 => format!("{}h ago", s / 3600),
+        s => format!("{}d ago", s / 86_400),
+    }
 }
 
 pub(crate) fn hex_lower(bytes: &[u8]) -> String {
@@ -149,7 +163,9 @@ pub(crate) mod test_support {
     use super::node::{MeshRuntime, NodeOptions};
     #[cfg(unix)]
     pub(crate) use super::peers::PeerSighting;
+    pub(crate) use super::propagation::PropagationNode;
     pub(crate) use super::propagation_fetch::{InboundMessage, InboundSink};
+    pub(crate) use super::protocol::Compatibility;
     pub(crate) use super::r3::{
         AdmittedRequest, Handler, MESSAGE_PATH, NAME_HASH_LEN, OriginName, PathHash, RefusalCode,
         Reply, RequestId, SizeBranch,

@@ -1,6 +1,6 @@
 use super::bundles::installed_bundle_names;
 use super::mcp_tool_policy::{McpToolPolicy, SkillMcpLayer, ToolFilter, expand_mcp_server_alias};
-use super::mesh_config::render_mesh_info;
+use super::mesh_config::{MeshBrief, render_mesh_info};
 use super::rag_cache::{RagCache, RagKey};
 use super::session::{ForkRekey, INTERRUPTED_RESPONSE_TEXT, Session};
 use super::skill::{SKILL_SCAFFOLD, Skill};
@@ -36,7 +36,9 @@ use crate::mcp::{
     McpServerFeatures, McpServersConfig, McpTransportType, is_auth_required_error,
     is_mcp_meta_function, mcp_meta_function_names,
 };
-use crate::mesh::MeshSlot;
+use crate::mesh::card::DISPLAY_NAME_MAX_CHARS;
+use crate::mesh::pending::PENDING_QUESTION_MAX_CHARS;
+use crate::mesh::{MeshSlot, age_text, display_text, parse_rfc3339, short};
 use crate::rag::Rag;
 use crate::supervisor::Supervisor;
 use crate::supervisor::escalation::EscalationQueue;
@@ -72,7 +74,7 @@ use std::fs::{File, OpenOptions, read_dir, read_to_string, remove_dir_all, remov
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use std::{env, fs, slice};
 
 pub(crate) fn expand_enabled_mcp_server_ids(
@@ -4211,6 +4213,26 @@ impl RequestContext {
                         .collect(),
                 );
             }
+        } else if cmd == ".mesh"
+            && args.len() == 2
+            && matches!(args[0], "info" | "status" | "reply")
+        {
+            values = self.mesh_completion_peers(args[0] == "info");
+            match args[0] {
+                "status" => values.push(("clear".to_string(), None)),
+                "reply" => values.push(("--yes".to_string(), None)),
+                _ => {}
+            }
+        } else if cmd == ".mesh" && args.len() == 3 && args[0] == "reply" && args[1] == "--yes" {
+            values = self.mesh_completion_peers(false);
+        } else if cmd == ".mesh" && args.first() == Some(&"answer") && args.len() == 2 {
+            values = self.mesh_completion_questions();
+        } else if cmd == ".mesh" && args.first() == Some(&"brief") && args.len() == 2 {
+            values = super::map_completion_values(vec!["set ", "clear", "auto", "manual", "off"]);
+        } else if cmd == ".mesh" && args.first() == Some(&"on") && args.len() == 2 {
+            values = super::map_completion_values(vec!["--yes", "--fresh"]);
+        } else if cmd == ".mesh" && args.len() == 2 && matches!(args[0], "off" | "broadcast") {
+            values = super::map_completion_values(vec!["--yes"]);
         } else if cmd == ".info" && args.first() == Some(&"mcp-server") && args.len() == 2 {
             let mut names: Vec<String> = self
                 .tool_scope
@@ -4705,8 +4727,6 @@ impl RequestContext {
     /// `.mesh on` / `.mesh off` call this instead of rebuilding. The tools are added to
     /// the active catalog only, but removed from both: `use_agent` builds the top-level
     /// one before the agent is set, so it may still carry them while the agent is active.
-    // Reached by the REPL mesh commands once they land.
-    #[allow(dead_code)]
     pub fn refresh_mesh_tools(&mut self, app: &AppConfig) {
         let want = mesh_tools_available(app, &self.app.mesh)
             && !self.agent.as_ref().is_some_and(Agent::is_builtin);
@@ -4720,6 +4740,116 @@ impl RequestContext {
             functions.remove_mesh_functions();
             self.tool_scope.functions.remove_mesh_functions();
         }
+    }
+
+    /// Session-scoped: the in-memory config only, never `config.yaml`.
+    pub(crate) fn set_mesh_enabled_for_session(&mut self, enabled: bool) {
+        self.update_app_config(|app| app.mesh.enabled = enabled);
+    }
+
+    /// Session-scoped: the in-memory config only, never `config.yaml`.
+    pub(crate) fn set_mesh_brief_for_session(&mut self, brief: MeshBrief) {
+        self.update_app_config(|app| app.mesh.brief = brief);
+    }
+
+    /// Destinations for `.mesh <verb> <TAB>`, read from the in-memory peer table and, when
+    /// `include_knocks`, the knock cache; nothing here reaches the network. Empty while
+    /// the mesh is off.
+    pub(crate) fn mesh_completion_peers(
+        &self,
+        include_knocks: bool,
+    ) -> Vec<(String, Option<String>)> {
+        let Some(runtime) = self.app.mesh.get() else {
+            return Vec::new();
+        };
+        let now = SystemTime::now();
+        let mut peers = runtime.peers().snapshot();
+        peers.sort_by_key(|peer| std::cmp::Reverse(peer.last_seen));
+        let mut values: Vec<(String, Option<String>)> = peers
+            .iter()
+            .map(|peer| {
+                let who = peer
+                    .display_name
+                    .as_deref()
+                    .and_then(|name| display_text(name, DISPLAY_NAME_MAX_CHARS))
+                    .unwrap_or_else(|| short(&peer.identity_hash).to_string());
+                let description = format!(
+                    "{who} . {} hops . {}",
+                    peer.hops,
+                    age_text(now, peer.last_seen)
+                );
+                (peer.destination_hash.clone(), Some(description))
+            })
+            .collect();
+        if !include_knocks {
+            return values;
+        }
+        let knocks = match runtime.knock_gate().cache().list(now) {
+            Ok(knocks) => knocks,
+            Err(err) => {
+                debug!("knock cache unreadable while completing `.mesh info`: {err:#}");
+                Vec::new()
+            }
+        };
+        for knock in knocks {
+            if values
+                .iter()
+                .any(|(dest, _)| *dest == knock.destination_hash)
+            {
+                continue;
+            }
+            let age = parse_rfc3339(&knock.received_at)
+                .map(|then| age_text(now, then))
+                .unwrap_or_else(|| "unknown".to_string());
+            let who = [knock.display_name.as_deref(), knock.intro.as_deref()]
+                .into_iter()
+                .flatten()
+                .find_map(|text| display_text(text, DISPLAY_NAME_MAX_CHARS))
+                .unwrap_or_else(|| short(&knock.identity_hash).to_string());
+            values.push((
+                knock.destination_hash,
+                Some(format!("knocked {age}: {who}")),
+            ));
+        }
+        values
+    }
+
+    /// Ids for `.mesh answer <TAB>`: the questions peers escalated, then the ones this
+    /// node asked, each described by its question as `display_text` renders it.
+    fn mesh_completion_questions(&self) -> Vec<(String, Option<String>)> {
+        let inbound = match self.app.mesh.inbound_store() {
+            Some(store) => match store.list(SystemTime::now()) {
+                Ok(records) => records,
+                Err(err) => {
+                    debug!("inbound store unreadable while completing `.mesh answer`: {err:#}");
+                    Vec::new()
+                }
+            },
+            None => Vec::new(),
+        };
+        let mut values: Vec<(String, Option<String>)> = inbound
+            .into_iter()
+            .map(|record| {
+                (
+                    record.id,
+                    display_text(&record.question, PENDING_QUESTION_MAX_CHARS),
+                )
+            })
+            .collect();
+        values.extend(
+            self.app
+                .mesh
+                .correlations()
+                .list()
+                .into_iter()
+                .map(|correlation| {
+                    (
+                        correlation.record.id,
+                        display_text(&correlation.record.question, PENDING_QUESTION_MAX_CHARS),
+                    )
+                }),
+        );
+        values
     }
 
     fn compute_mcp_tool_filters(&self) -> HashMap<String, ToolFilter> {
@@ -10616,6 +10746,12 @@ mod tests {
         assert_eq!(peers["peers"][0]["identity"], b_identity);
         assert_eq!(peers["peers"][0]["display_name"], "Bea");
         assert_eq!(peers["peers"][0]["trust"], "untrusted");
+        assert!(
+            peers["peers"][0]
+                .get("compatibility")
+                .is_some_and(serde_json::Value::is_null),
+            "a compatible peer carries an explicit null, {peers}"
+        );
         assert_eq!(peers["peers"][0]["reachable"], false);
 
         for tool in ["mesh__send", "mesh__ask"] {
@@ -20198,6 +20334,259 @@ mod tests {
             "got:\n{info}"
         );
         assert!(!info.contains('∧'), "got:\n{info}");
+    }
+
+    #[test]
+    fn repl_complete_mesh_offers_words_but_no_peers_while_the_mesh_is_off() {
+        let ctx = create_test_ctx();
+
+        assert!(ctx.repl_complete(".mesh", &["info", ""], "").is_empty());
+        assert!(ctx.repl_complete(".mesh", &["answer", ""], "").is_empty());
+        let brief: Vec<String> = ctx
+            .repl_complete(".mesh", &["brief", ""], "")
+            .into_iter()
+            .map(|(value, _)| value)
+            .collect();
+        assert_eq!(brief, ["set ", "clear", "auto", "manual", "off"]);
+        let status: Vec<String> = ctx
+            .repl_complete(".mesh", &["status", ""], "")
+            .into_iter()
+            .map(|(value, _)| value)
+            .collect();
+        assert_eq!(status, ["clear"]);
+        let on: Vec<String> = ctx
+            .repl_complete(".mesh", &["on", ""], "")
+            .into_iter()
+            .map(|(value, _)| value)
+            .collect();
+        assert_eq!(on, ["--yes", "--fresh"]);
+        for verb in ["off", "broadcast"] {
+            let flags: Vec<String> = ctx
+                .repl_complete(".mesh", &[verb, ""], "")
+                .into_iter()
+                .map(|(value, _)| value)
+                .collect();
+            assert_eq!(flags, ["--yes"], "{verb}");
+            assert!(
+                ctx.repl_complete(".mesh", &[verb, "words", ""], "")
+                    .is_empty(),
+                "{verb}: the flag is only honoured as the leading word"
+            );
+        }
+        let reply: Vec<String> = ctx
+            .repl_complete(".mesh", &["reply", ""], "")
+            .into_iter()
+            .map(|(value, _)| value)
+            .collect();
+        assert_eq!(reply, ["--yes"], "no peers heard, so the flag alone");
+        assert!(
+            ctx.repl_complete(".mesh", &["reply", "--yes", ""], "")
+                .is_empty(),
+            "after the flag come peers, of which there are none, never the flag again"
+        );
+        assert!(
+            ctx.repl_complete(".mesh", &["reply", "words", ""], "")
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_info_reads_the_peer_table_and_the_knock_cache() {
+        use crate::mesh::hex_lower;
+        use crate::mesh::knocks::{KNOCK_RECORD_VERSION, KnockRecord};
+        use crate::mesh::rfc3339_utc;
+
+        let _guard = TestConfigDirGuard::new();
+        let started = crate::mesh::test_support::started_runtime("rc-mesh-complete").await;
+        let mut ctx = create_test_ctx();
+        ctx.update_app_config(|app| app.mesh.enabled = true);
+        ctx.app.mesh.install(started.runtime.clone()).unwrap();
+
+        let brief = ctx.repl_complete(".mesh", &["brief", ""], "");
+        assert_eq!(brief.len(), 5, "{brief:?}");
+        let before = ctx.repl_complete(".mesh", &["info", ""], "");
+        assert_eq!(before.len(), ctx.mesh_completion_peers(false).len());
+
+        let knocker = hex_lower(&[0xdd; 16]);
+        started
+            .runtime
+            .knock_gate()
+            .cache()
+            .append(
+                KnockRecord {
+                    version: KNOCK_RECORD_VERSION,
+                    received_at: rfc3339_utc(SystemTime::now()),
+                    identity_hash: hex_lower(&[0xde; 16]),
+                    destination_hash: knocker.clone(),
+                    display_name: None,
+                    intro: Some("let me in".into()),
+                    hops: 1,
+                },
+                SystemTime::now(),
+            )
+            .unwrap();
+
+        let info = ctx.repl_complete(".mesh", &["info", ""], "");
+        let knock = info
+            .iter()
+            .find(|(value, _)| *value == knocker)
+            .unwrap_or_else(|| panic!("the knock is offered, got {info:?}"));
+        let description = knock.1.as_deref().unwrap();
+        assert!(description.starts_with("knocked "), "{description}");
+        assert!(description.ends_with(": let me in"), "{description}");
+        assert!(
+            !ctx.repl_complete(".mesh", &["reply", ""], "")
+                .iter()
+                .any(|(value, _)| *value == knocker),
+            "reply completes peers only, never knockers"
+        );
+
+        assert!(ctx.app.mesh.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    /// Criterion (c), from the cache and with real entries: a peer heard on the mesh is
+    /// offered for `info`, `status` and `reply` with its name in the description; an
+    /// escalated question and one this node asked are offered for `answer`, inbound first,
+    /// each described by its question text. No network call is involved.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_offers_heard_peers_and_open_questions_from_the_cache() {
+        use crate::mesh::hex_lower;
+        use crate::mesh::pending::{
+            INBOUND_RECORD_VERSION, InboundRecord, PENDING_RECORD_VERSION, PendingRecord,
+            PendingState,
+        };
+        use crate::mesh::rfc3339_utc;
+        use crate::mesh::test_support::PeerSighting;
+
+        let _guard = TestConfigDirGuard::new();
+        let started = crate::mesh::test_support::started_runtime("rc-mesh-complete-2").await;
+        let mut ctx = create_test_ctx();
+        ctx.update_app_config(|app| app.mesh.enabled = true);
+        ctx.app.mesh.install(started.runtime.clone()).unwrap();
+        let now = SystemTime::now();
+
+        let heard = hex_lower(&[0xaa; 16]);
+        started.runtime.peers().observe(
+            PeerSighting {
+                destination_hash: heard.clone(),
+                identity_hash: hex_lower(&[0xab; 16]),
+                name_hash: String::new(),
+                display_name: Some("Ann".to_string()),
+                protocol_version: 1,
+                hops: 3,
+            },
+            now,
+        );
+        for verb in ["info", "status", "reply"] {
+            let offered = ctx.repl_complete(".mesh", &[verb, ""], "");
+            let peer = offered
+                .iter()
+                .find(|(value, _)| *value == heard)
+                .unwrap_or_else(|| panic!("{verb} offers the heard peer, got {offered:?}"));
+            let description = peer.1.as_deref().unwrap();
+            assert!(description.starts_with("Ann"), "{verb}: {description}");
+            assert!(description.contains("3 hops"), "{verb}: {description}");
+        }
+        let after_flag: Vec<String> = ctx
+            .repl_complete(".mesh", &["reply", "--yes", ""], "")
+            .into_iter()
+            .map(|(value, _)| value)
+            .collect();
+        assert_eq!(
+            after_flag,
+            [heard.as_str()],
+            "reply --yes offers peers alone"
+        );
+        // A prefix narrows the offer: the heard destination stays, the fixed word goes.
+        let narrowed = ctx.repl_complete(".mesh", &["status", &heard[..4]], &heard[..4]);
+        assert!(
+            narrowed.iter().any(|(value, _)| *value == heard),
+            "{narrowed:?}"
+        );
+        assert!(
+            !narrowed.iter().any(|(value, _)| value == "clear"),
+            "{narrowed:?}"
+        );
+
+        ctx.app
+            .mesh
+            .correlations()
+            .open(PendingRecord {
+                version: PENDING_RECORD_VERSION,
+                id: "q1".to_string(),
+                peer_destination: heard.clone(),
+                peer_identity: hex_lower(&[0xab; 16]),
+                question: "what now?".to_string(),
+                sent_at: rfc3339_utc(now),
+                timeout_at: rfc3339_utc(now + std::time::Duration::from_secs(600)),
+                state: PendingState::Open,
+                reply: None,
+            })
+            .unwrap();
+        ctx.app
+            .mesh
+            .inbound_store()
+            .expect("install attaches an inbound store")
+            .upsert(
+                InboundRecord {
+                    version: INBOUND_RECORD_VERSION,
+                    id: "p1".to_string(),
+                    peer_destination: hex_lower(&[0x12; 16]),
+                    peer_identity: hex_lower(&[0xef; 16]),
+                    question: "may I read the plan?".to_string(),
+                    envoy_question: String::new(),
+                    received_at: rfc3339_utc(now),
+                },
+                now,
+            )
+            .unwrap();
+        let answers = ctx.repl_complete(".mesh", &["answer", ""], "");
+        assert_eq!(
+            answers,
+            [
+                ("p1".to_string(), Some("may I read the plan?".to_string())),
+                ("q1".to_string(), Some("what now?".to_string())),
+            ],
+            "escalated questions first, then this node's own"
+        );
+
+        ctx.app
+            .mesh
+            .inbound_store()
+            .unwrap()
+            .upsert(
+                InboundRecord {
+                    version: INBOUND_RECORD_VERSION,
+                    id: "p2".to_string(),
+                    peer_destination: hex_lower(&[0x13; 16]),
+                    peer_identity: hex_lower(&[0xee; 16]),
+                    question: "line one\nline two\x1b[31m\x07 tail".to_string(),
+                    envoy_question: String::new(),
+                    received_at: rfc3339_utc(now),
+                },
+                now,
+            )
+            .unwrap();
+        let answers = ctx.repl_complete(".mesh", &["answer", ""], "");
+        let description = answers
+            .iter()
+            .find(|(id, _)| id == "p2")
+            .and_then(|(_, description)| description.clone())
+            .unwrap_or_else(|| panic!("p2 is offered with a description, got {answers:?}"));
+        assert!(
+            !description.chars().any(char::is_control),
+            "the description is one clean line: {description:?}"
+        );
+        assert!(description.starts_with("line one"), "{description:?}");
+        assert!(description.ends_with("tail"), "{description:?}");
+
+        assert!(ctx.app.mesh.stop().await.unwrap());
+        started.relay_handle.abort();
     }
 
     #[test]

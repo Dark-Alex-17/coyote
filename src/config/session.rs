@@ -292,6 +292,27 @@ impl Session {
             .get_or_insert_with(mint_mesh_instance_id)
     }
 
+    /// Replaces the mesh instance id so this session stops sharing a destination with
+    /// another process that still holds the old one. `.mesh on --fresh` calls this on a
+    /// trial clone and copies only the id back, relying on `MeshRuntime::start` touching
+    /// nothing but `mesh_instance_id` on that clone.
+    pub fn remint_mesh_instance_id(&mut self) -> &str {
+        self.dirty = true;
+        self.mesh_instance_id.insert(mint_mesh_instance_id())
+    }
+
+    /// Adopts an id minted on a trial copy of this session once the mesh start it was
+    /// minted for succeeded, so a refused start leaves the live session untouched. This
+    /// is the only field carried back from the trial; see `remint_mesh_instance_id`.
+    pub fn set_mesh_instance_id(&mut self, id: String) {
+        debug_assert!(Session::is_valid_mesh_instance_id(&id));
+        if self.mesh_instance_id.as_deref() == Some(id.as_str()) {
+            return;
+        }
+        self.dirty = true;
+        self.mesh_instance_id = Some(id);
+    }
+
     /// Whether `id` has the shape `mint_mesh_instance_id` produces: 32 lowercase hex chars.
     /// Consumers that build filesystem paths from the id check this before touching disk.
     pub fn is_valid_mesh_instance_id(id: &str) -> bool {
@@ -1348,6 +1369,38 @@ mod tests {
             "a second call must return the same id"
         );
         assert!(!session.dirty(), "returning an existing id must not dirty");
+    }
+
+    #[test]
+    fn remint_mesh_instance_id_changes_the_id_and_dirties() {
+        let mut session = Session::default();
+        let first = session.ensure_mesh_instance_id().to_string();
+        session.dirty = false;
+
+        let second = session.remint_mesh_instance_id().to_string();
+
+        assert_ne!(first, second);
+        assert!(Session::is_valid_mesh_instance_id(&second));
+        assert_eq!(session.mesh_instance_id(), Some(second.as_str()));
+        assert!(session.dirty());
+    }
+
+    #[test]
+    fn set_mesh_instance_id_adopts_a_new_id_and_dirties_only_on_change() {
+        let mut session = Session::default();
+        let first = session.ensure_mesh_instance_id().to_string();
+        session.dirty = false;
+
+        session.set_mesh_instance_id(first.clone());
+        assert_eq!(session.mesh_instance_id(), Some(first.as_str()));
+        assert!(!session.dirty());
+
+        let mut trial = session.clone();
+        let second = trial.remint_mesh_instance_id().to_string();
+        session.set_mesh_instance_id(second.clone());
+        assert_eq!(session.mesh_instance_id(), Some(second.as_str()));
+        assert_ne!(first, second);
+        assert!(session.dirty());
     }
 
     #[test]

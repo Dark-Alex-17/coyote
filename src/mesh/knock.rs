@@ -411,7 +411,6 @@ impl KnockGate {
         *self.surface.lock() = Some(surface);
     }
 
-    #[cfg(test)]
     pub(crate) fn cache(&self) -> &KnockCache {
         &self.cache
     }

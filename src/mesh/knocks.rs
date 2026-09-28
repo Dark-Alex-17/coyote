@@ -70,8 +70,6 @@ pub(crate) struct KnockCache {
     write_lock: Mutex<()>,
 }
 
-// Reached by the knock path and the REPL mesh commands once they land.
-#[allow(dead_code)]
 impl KnockCache {
     pub(crate) fn new(cache_dir: &Path, retention_hours: u64) -> Self {
         Self {
@@ -81,6 +79,7 @@ impl KnockCache {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
@@ -151,6 +150,9 @@ impl KnockCache {
 
     /// Drops expired knocks and any over the per-identity or global cap from the file and
     /// returns how many went; writes only if any did.
+    // `append` evicts on every write and `.mesh knocks` reads without evicting, so nothing
+    // in production calls this yet; it is kept for an explicit cache-maintenance command.
+    #[allow(dead_code)]
     pub(crate) fn prune(&self, now: SystemTime) -> Result<usize> {
         // Nothing to prune means nothing to lock: taking the file lock would create the
         // cache directory for a cache that does not exist yet.

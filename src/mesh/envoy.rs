@@ -26,6 +26,9 @@ pub(crate) trait EnvoySink: Send + Sync {
     /// A human answer for an escalated question that a run may still be holding on.
     /// `true` when a live run consumed it; otherwise the caller sends it to the peer.
     fn answer(&self, id: &str, text: &str) -> bool;
+    /// Cuts the run in flight short, hold included, without taking the sink down: the
+    /// node it was answering for is going away and its reply would have nowhere to go.
+    fn interrupt(&self);
 }
 
 pub(crate) const PEER_FENCE_BEGIN: &str =

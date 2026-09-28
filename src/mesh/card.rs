@@ -11,7 +11,7 @@ use rmpv::Value;
 use rns_transport::destination::DestinationDesc;
 use std::fmt;
 use std::sync::{Arc, Weak};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// The card's own schema version, evolving under the one mesh protocol version the
 /// envelope carries.
@@ -268,6 +268,55 @@ fn count(items: usize) -> u32 {
     u32::try_from(items).unwrap_or(u32::MAX)
 }
 
+/// The card as `.mesh status` shows it, ages in the `age_text` form the rest of `.mesh`
+/// uses. Peer-supplied instants may be anything, clock skew included, so every age
+/// saturates and an unknown state code is shown as such.
+pub(crate) fn render_for_human(card: &StatusCard, now: SystemTime) -> String {
+    let age = |then: u64| {
+        let then = UNIX_EPOCH
+            .checked_add(Duration::from_secs(then))
+            .unwrap_or(now);
+        crate::mesh::age_text(now, then)
+    };
+    let mut lines = vec![
+        format!("name: {}", card.display_name.as_deref().unwrap_or("(none)")),
+        format!(
+            "objective: {}",
+            card.objective.as_deref().unwrap_or("(none)")
+        ),
+    ];
+    let state = match card.state.code {
+        STATE_IDLE => "idle".to_string(),
+        STATE_WORKING => "working".to_string(),
+        STATE_UNKNOWN => "unknown".to_string(),
+        code => format!("unknown ({code})"),
+    };
+    lines.push(format!("state: {state}"));
+    if let Some(since) = card.state.since_secs {
+        lines.push(format!("since: {}", age(since)));
+    }
+    if let Some(repo) = &card.repo {
+        lines.push(match &repo.branch {
+            Some(branch) => format!("repo: {} ({branch})", repo.name),
+            None => format!("repo: {}", repo.name),
+        });
+    }
+    if let Some(plan) = &card.plan {
+        lines.push(format!("plan: {}", plan.title));
+    }
+    if let Some(todo) = &card.todo {
+        lines.push(match &todo.goal {
+            Some(goal) => format!("todo: {}/{} ({goal})", todo.done, todo.total),
+            None => format!("todo: {}/{}", todo.done, todo.total),
+        });
+    }
+    if let Some(snapshot_age) = card.snapshot_age_secs {
+        lines.push(format!("snapshot: {snapshot_age}s old when served"));
+    }
+    lines.push(format!("served: {}", age(card.served_at_secs)));
+    lines.join("\n")
+}
+
 /// The card for `snapshot` as of `now`. The objective is the first of `objective_override`,
 /// the snapshot's own objective and `digest_objective` that has any text once sanitised.
 /// No snapshot, as before the first turn boundary, still yields a card: state unknown and
@@ -434,7 +483,10 @@ pub(crate) enum StatusError {
 impl fmt::Display for StatusError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Transport(err) => write!(f, "{err}"),
+            Self::Transport(err) => write!(
+                f,
+                "{err}. A status request is answered live or not at all; nothing queues it for later."
+            ),
             Self::NotServed(DispatchError::NoProvider { path }) => write!(
                 f,
                 "The mesh peer accepted the request but serves nothing at {path}; it may be running an older Coyote without a status provider"
@@ -458,8 +510,6 @@ impl std::error::Error for StatusError {}
 
 impl MeshRuntime {
     /// Asks `destination` for its status card over a live link with the default timeouts.
-    // Reached by the REPL mesh commands once they land.
-    #[allow(dead_code)]
     pub(crate) async fn request_status(
         &self,
         destination: &DestinationDesc,
@@ -470,8 +520,6 @@ impl MeshRuntime {
 
     /// `request_status` with the caller's timeouts. The request goes to the peer directly
     /// and fails typed when it cannot be answered now; it is never held for later.
-    // Reached by the REPL mesh commands once they land.
-    #[allow(dead_code)]
     pub(crate) async fn request_status_with(
         &self,
         destination: &DestinationDesc,
@@ -499,7 +547,6 @@ mod tests {
     use rns_transport::resource::LINK_PACKET_MDU;
     use std::fs;
     use std::path::PathBuf;
-    use std::time::Duration;
 
     fn now() -> SystemTime {
         UNIX_EPOCH + Duration::from_secs(1_790_000_000)
@@ -1026,6 +1073,92 @@ mod tests {
     }
 
     #[test]
+    fn human_rendering_keeps_unknown_state_codes() {
+        let mut card = build_card(None, None, None, None, now());
+        card.state.code = 7;
+        let text = render_for_human(&card, now());
+        assert!(text.contains("state: unknown (7)"), "{text}");
+        assert!(text.contains("name: (none)"), "{text}");
+        assert!(text.contains("objective: (none)"), "{text}");
+        assert!(!text.contains("since:"), "{text}");
+        assert!(!text.contains("repo:"), "{text}");
+        assert!(text.contains("served: 0s ago"), "{text}");
+    }
+
+    #[test]
+    fn human_rendering_saturates_every_peer_supplied_instant() {
+        let text = render_for_human(&maximal_card(), now());
+        assert!(text.contains("state: working"), "{text}");
+        assert!(
+            text.contains("since: 0s ago"),
+            "an instant past the end of time reads as now: {text}"
+        );
+        assert!(text.contains("served: 0s ago"), "{text}");
+        assert!(
+            text.contains(&format!("todo: {}/{}", u32::MAX, u32::MAX)),
+            "{text}"
+        );
+        let early = render_for_human(&maximal_card(), UNIX_EPOCH);
+        assert!(early.contains("since: 0s ago"), "{early}");
+        let mut aged = build_card(Some(&snapshot_fixture()), None, None, None, now());
+        aged.state.since_secs = Some(unix_secs(now()) - 3 * 3600);
+        let text = render_for_human(&aged, now() + Duration::from_secs(90));
+        assert!(text.contains("since: 3h ago"), "{text}");
+        assert!(text.contains("served: 1m ago"), "{text}");
+    }
+
+    #[test]
+    fn human_rendering_shows_the_repo_plan_and_todo_when_present() {
+        let text = render_for_human(&maximal_card(), now());
+        let repo = "r".repeat(REPO_NAME_MAX_CHARS);
+        let branch = "b".repeat(BRANCH_MAX_CHARS);
+        assert!(text.contains("\nstate: working\n"), "{text}");
+        assert!(
+            text.contains(&format!("\nrepo: {repo} ({branch})\n")),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("\nplan: {}\n", "p".repeat(PLAN_TITLE_MAX_CHARS))),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "\ntodo: {}/{} ({})\n",
+                u32::MAX,
+                u32::MAX,
+                "g".repeat(TODO_GOAL_MAX_CHARS)
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("\nsnapshot: {}s old when served\n", u64::MAX)),
+            "{text}"
+        );
+
+        let card = build_card(Some(&snapshot_fixture()), None, None, Some("Ann"), now());
+        let text = render_for_human(&card, now() + Duration::from_secs(5));
+        assert!(
+            text.starts_with("name: Ann\nobjective: ship it\nstate: idle\n"),
+            "{text}"
+        );
+        assert!(text.contains("served: 5s ago"), "{text}");
+
+        let text = render_for_human(&build_card(None, None, None, None, now()), now());
+        assert!(text.contains("\nstate: unknown\n"), "{text}");
+        let odd = StatusCard {
+            state: CardState {
+                code: 7,
+                since_secs: None,
+            },
+            ..build_card(None, None, None, None, now())
+        };
+        assert!(
+            render_for_human(&odd, now()).contains("\nstate: unknown (7)\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn status_error_display_teaches_the_remedy() {
         let not_served = StatusError::NotServed(DispatchError::NoProvider {
             path: STATUS_PATH.to_string(),
@@ -1034,8 +1167,65 @@ mod tests {
         assert!(not_served.contains("/status"), "{not_served}");
         assert!(not_served.contains("older Coyote"), "{not_served}");
         let transport = StatusError::Transport(R3Error::NotRunning).to_string();
-        assert_eq!(transport, R3Error::NotRunning.to_string());
+        assert!(
+            transport.starts_with(&R3Error::NotRunning.to_string()),
+            "{transport}"
+        );
+        assert!(
+            transport.contains("answered live or not at all"),
+            "{transport}"
+        );
         let malformed = StatusError::Malformed("`v` is 0".into()).to_string();
         assert!(malformed.contains("status card"), "{malformed}");
+    }
+
+    /// Spec-first usage probe: `.mesh status <dest>` surfaces `StatusError` through `?`, so
+    /// the four causes (transport, not served, unsupported card version, malformed) must
+    /// read as four DISTINCT texts, each naming its own cause and remedy.
+    #[test]
+    fn status_error_texts_are_distinct_per_cause() {
+        let transport = StatusError::Transport(R3Error::NotRunning).to_string();
+        let not_served = StatusError::NotServed(DispatchError::NoProvider {
+            path: STATUS_PATH.to_string(),
+        })
+        .to_string();
+        let unsupported = StatusError::UnsupportedVersion {
+            found: 9,
+            supported: 1,
+        }
+        .to_string();
+        let malformed = StatusError::Malformed("`v` is 0".into()).to_string();
+
+        let texts = [&transport, &not_served, &unsupported, &malformed];
+        for (i, a) in texts.iter().enumerate() {
+            for b in texts.iter().skip(i + 1) {
+                assert_ne!(a, b);
+            }
+        }
+        assert!(
+            transport.contains("live or not at all"),
+            "transport is live-only: {transport}"
+        );
+        assert!(
+            !not_served.contains("live or not at all")
+                && !unsupported.contains("live or not at all")
+                && !malformed.contains("live or not at all"),
+            "only the transport cause talks about live delivery"
+        );
+        assert!(not_served.contains(STATUS_PATH), "{not_served}");
+        assert!(
+            unsupported.contains("version 9") && unsupported.contains("version 1"),
+            "both versions are named: {unsupported}"
+        );
+        assert!(
+            unsupported.to_lowercase().contains("upgrade"),
+            "the remedy is named: {unsupported}"
+        );
+        assert!(malformed.contains("`v` is 0"), "{malformed}");
+        assert!(malformed.contains("could not be read"), "{malformed}");
+        assert!(
+            !malformed.contains("version 9") && !not_served.contains("version 9"),
+            "no cause borrows another's detail"
+        );
     }
 }

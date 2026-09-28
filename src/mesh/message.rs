@@ -1043,13 +1043,14 @@ impl MeshRuntime {
 }
 
 /// One inbound message put to the surface for admission: who signed it, the instance a
-/// refusal would be answered to, its id for the correlation, whether it is itself a
-/// reply (a refusal never answers one), and the path it took.
+/// refusal would be answered to, its id for the correlation, its kind, the question it
+/// replies to if it is itself a reply (a refusal never answers one), and the path it took.
 pub(crate) struct PeerAdmission<'a> {
     pub source_identity: &'a str,
     pub source_destination: &'a str,
     pub message_id: &'a str,
-    pub in_reply_to: bool,
+    pub kind: PeerKind,
+    pub in_reply_to: Option<&'a str>,
     pub via: PeerVia,
 }
 
@@ -1111,7 +1112,8 @@ impl Handler for PeerMessageHandler {
             source_identity: &identity_hex,
             source_destination: &destination_hex,
             message_id: &body.id,
-            in_reply_to: body.in_reply_to.is_some(),
+            kind: body.kind,
+            in_reply_to: body.in_reply_to.as_deref(),
             via: PeerVia::Direct,
         };
         if let Err(refusal) = surface.admit_peer_message(&admission) {
@@ -1217,7 +1219,8 @@ impl InboundSink for PeerRouting<'_> {
             source_identity: &message.source_identity_hash,
             source_destination: &source_destination,
             message_id: &id,
-            in_reply_to: in_reply_to.is_some(),
+            kind,
+            in_reply_to: in_reply_to.as_deref(),
             via: PeerVia::StoreAndForward,
         };
         let admitted = surface.admit_peer_message(&admission);

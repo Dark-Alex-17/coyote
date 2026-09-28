@@ -287,16 +287,29 @@ pub(crate) struct MeshDigestDriver {
     pending_covered: Option<usize>,
     last_attempt: Option<Instant>,
     last_session: Option<SessionFingerprint>,
+    /// Whether a node must be installed before tokens are spent. Always so in
+    /// production; tests that never bring a node up lift it.
+    node_required: bool,
 }
 
 impl MeshDigestDriver {
     pub(crate) fn new() -> Self {
+        Self::with_node_required(true)
+    }
+
+    #[cfg(test)]
+    fn without_node_gate() -> Self {
+        Self::with_node_required(false)
+    }
+
+    fn with_node_required(node_required: bool) -> Self {
         Self {
             in_flight: Arc::new(AtomicBool::new(false)),
             task: None,
             pending_covered: None,
             last_attempt: None,
             last_session: None,
+            node_required,
         }
     }
 
@@ -369,7 +382,10 @@ impl MeshDigestDriver {
             return None;
         };
         let app = &ctx.app;
-        if !app.config.mesh.enabled {
+        // Nobody can fetch the brief while the mesh is off, so a digest would only spend
+        // tokens, and one already served or in flight must not outlive the node.
+        if !app.config.mesh.enabled || (self.node_required && app.mesh.get().is_none()) {
+            self.clear(&app.mesh);
             return None;
         }
         self.observe_session(&ctx);
@@ -467,7 +483,11 @@ mod tests {
     use crate::mesh::card::{CardSource, StatusHandler, build_card};
     use crate::mesh::rfc3339_utc;
     use crate::mesh::snapshot::TurnState;
+    #[cfg(unix)]
+    use crate::testing::TestConfigDirGuard;
     use crate::testing::{install_log_collector, warn_snapshot};
+    #[cfg(unix)]
+    use serial_test::serial;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::pin::Pin;
@@ -1079,9 +1099,25 @@ mod tests {
         add_n_turns(&mut ctx, 1);
         let ctx = shared(ctx);
         let model = Arc::new(FakeModel::default());
-        let mut driver = MeshDigestDriver::new();
+        let mut driver = MeshDigestDriver::without_node_gate();
 
         driver.maybe_refresh_with(&ctx, Instant::now(), model.fetch(FIXED_DIGEST));
+        driver.maybe_refresh_with(&ctx, Instant::now(), model.fetch(FIXED_DIGEST));
+
+        assert!(driver.task.is_none());
+        assert_eq!(model.calls(), 0);
+        assert!(ctx.read().app.mesh.digest().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn no_digest_is_requested_while_no_node_is_installed() {
+        let mut ctx = test_ctx(MeshBrief::Auto);
+        add_n_turns(&mut ctx, 4);
+        publish_mesh_snapshot(&ctx, TurnState::idle_now());
+        let ctx = shared(ctx);
+        let model = Arc::new(FakeModel::default());
+        let mut driver = MeshDigestDriver::new();
+
         driver.maybe_refresh_with(&ctx, Instant::now(), model.fetch(FIXED_DIGEST));
 
         assert!(driver.task.is_none());
@@ -1096,7 +1132,7 @@ mod tests {
         publish_mesh_snapshot(&ctx, TurnState::idle_now());
         let ctx = shared(ctx);
         let model = Arc::new(FakeModel::default());
-        let mut driver = MeshDigestDriver::new();
+        let mut driver = MeshDigestDriver::without_node_gate();
 
         driver.maybe_refresh_with(&ctx, Instant::now(), model.fetch(FIXED_DIGEST));
         wait_for_task(&mut driver).await;
@@ -1126,7 +1162,7 @@ mod tests {
         add_n_turns(&mut ctx, 4);
         let ctx = shared(ctx);
         let (model, gate) = FakeModel::gated();
-        let mut driver = MeshDigestDriver::new();
+        let mut driver = MeshDigestDriver::without_node_gate();
 
         driver.maybe_refresh_with(&ctx, Instant::now(), model.fetch(FIXED_DIGEST));
         wait_for_call(&model, 1).await;
@@ -1150,7 +1186,7 @@ mod tests {
         add_n_turns(&mut ctx, 4);
         let ctx = shared(ctx);
         let model = Arc::new(FakeModel::default());
-        let mut driver = MeshDigestDriver::new();
+        let mut driver = MeshDigestDriver::without_node_gate();
         let start = Instant::now();
 
         driver.maybe_refresh_with(&ctx, start, model.fetch(FIXED_DIGEST));
@@ -1182,7 +1218,7 @@ mod tests {
         add_n_turns(&mut ctx, 4);
         let ctx = shared(ctx);
         let model = FakeModel::failing_first();
-        let mut driver = MeshDigestDriver::new();
+        let mut driver = MeshDigestDriver::without_node_gate();
         let start = Instant::now();
 
         driver.maybe_refresh_with(&ctx, start, model.fetch(FIXED_DIGEST));
@@ -1220,7 +1256,7 @@ mod tests {
         let ctx = shared(ctx);
         assert_eq!(message_count(&ctx), 12, "six turns behind a system prompt");
         let model = Arc::new(FakeModel::default());
-        let mut driver = MeshDigestDriver::new();
+        let mut driver = MeshDigestDriver::without_node_gate();
         let start = Instant::now();
         driver.maybe_refresh_with(&ctx, start, model.fetch(FIXED_DIGEST));
         wait_for_task(&mut driver).await;
@@ -1432,7 +1468,7 @@ mod tests {
         add_n_turns(&mut ctx, 6);
         let ctx = shared(ctx);
         let model = Arc::new(FakeModel::default());
-        let mut driver = MeshDigestDriver::new();
+        let mut driver = MeshDigestDriver::without_node_gate();
         let start = Instant::now();
         driver.maybe_refresh_with(&ctx, start, model.fetch(FIXED_DIGEST));
         wait_for_task(&mut driver).await;
@@ -1463,7 +1499,7 @@ mod tests {
         add_n_turns(&mut ctx, 6);
         let ctx = shared(ctx);
         let model = Arc::new(FakeModel::default());
-        let mut driver = MeshDigestDriver::new();
+        let mut driver = MeshDigestDriver::without_node_gate();
         let start = Instant::now();
         driver.maybe_refresh_with(&ctx, start, model.fetch(FIXED_DIGEST));
         wait_for_task(&mut driver).await;
@@ -1527,7 +1563,7 @@ mod tests {
         add_n_turns(&mut ctx, 8);
         let ctx = shared(ctx);
         let (model, gate) = FakeModel::gated();
-        let mut driver = MeshDigestDriver::new();
+        let mut driver = MeshDigestDriver::without_node_gate();
         let start = Instant::now();
         driver.maybe_refresh_with(&ctx, start, model.fetch(FIXED_DIGEST));
         wait_for_call(&model, 1).await;
@@ -1573,7 +1609,7 @@ mod tests {
         add_n_turns(&mut ctx, 4);
         let ctx = shared(ctx);
         let (model, gate) = FakeModel::gated();
-        let mut driver = MeshDigestDriver::new();
+        let mut driver = MeshDigestDriver::without_node_gate();
 
         driver.maybe_refresh_with(&ctx, Instant::now(), model.fetch(FIXED_DIGEST));
         wait_for_call(&model, 1).await;
@@ -1592,7 +1628,7 @@ mod tests {
         add_n_turns(&mut ctx, 4);
         let ctx = shared(ctx);
         let model = Arc::new(FakeModel::default());
-        let mut driver = MeshDigestDriver::new();
+        let mut driver = MeshDigestDriver::without_node_gate();
 
         let held = ctx.write();
         driver.maybe_refresh_with(&ctx, Instant::now(), model.fetch(FIXED_DIGEST));
@@ -1623,7 +1659,7 @@ mod tests {
             add_n_turns(&mut ctx, 6);
             let ctx = shared(ctx);
             let (model, gate) = FakeModel::gated();
-            let mut driver = MeshDigestDriver::new();
+            let mut driver = MeshDigestDriver::without_node_gate();
             driver.maybe_refresh_with(&ctx, Instant::now(), model.fetch(FIXED_DIGEST));
             wait_for_call(&model, 1).await;
             let old_flag = Arc::clone(&driver.in_flight);
@@ -1683,12 +1719,114 @@ mod tests {
         add_n_turns(&mut ctx, 6);
         let ctx = shared(ctx);
         let model = Arc::new(FakeModel::default());
+        let mut driver = MeshDigestDriver::without_node_gate();
+
+        driver.maybe_refresh_with(&ctx, Instant::now(), model.fetch(FIXED_DIGEST));
+
+        assert!(driver.task.is_none());
+        assert_eq!(model.calls(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_empty_node_slot_makes_no_call_and_clears_the_digest() {
+        let mut ctx = test_ctx(MeshBrief::Auto);
+        add_n_turns(&mut ctx, 6);
+        ctx.app
+            .mesh
+            .publish(ctx.mesh_snapshot(TurnState::idle_now()));
+        ctx.app.mesh.publish_digest(Some(Digest {
+            text: FIXED_DIGEST.into(),
+            generated_at: SystemTime::now(),
+            covered_messages: 2,
+        }));
+        let epoch_before = ctx.app.mesh.digest_epoch();
+        let ctx = shared(ctx);
+        let model = Arc::new(FakeModel::default());
         let mut driver = MeshDigestDriver::new();
 
         driver.maybe_refresh_with(&ctx, Instant::now(), model.fetch(FIXED_DIGEST));
 
         assert!(driver.task.is_none());
         assert_eq!(model.calls(), 0);
+        let mesh = &ctx.read().app.mesh;
+        assert!(
+            mesh.digest().is_none(),
+            "a digest nobody can fetch is dropped"
+        );
+        assert!(mesh.digest_epoch() > epoch_before);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn the_production_gate_lets_a_digest_through_once_a_node_is_installed() {
+        use crate::mesh::test_support::started_runtime;
+
+        let _cfg = TestConfigDirGuard::new("mesh-digest-gate");
+        let started = started_runtime("mesh-digest-gate").await;
+        let mut ctx = test_ctx(MeshBrief::Auto);
+        ctx.app.mesh.install(started.runtime.clone()).unwrap();
+        add_n_turns(&mut ctx, 4);
+        publish_mesh_snapshot(&ctx, TurnState::idle_now());
+        let ctx = shared(ctx);
+        let model = Arc::new(FakeModel::default());
+        let mut driver = MeshDigestDriver::new();
+
+        driver.maybe_refresh_with(&ctx, Instant::now(), model.fetch(FIXED_DIGEST));
+        wait_for_task(&mut driver).await;
+
+        assert_eq!(model.calls(), 1);
+        let mesh = Arc::clone(&ctx.read().app.mesh);
+        let digest = mesh.digest().expect("the gate let the digest through");
+        assert_eq!(digest.text, FIXED_DIGEST);
+        assert!(mesh.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    fn set_mesh_enabled(ctx: &Arc<RwLock<RequestContext>>, enabled: bool) {
+        let mut ctx = ctx.write();
+        ctx.app = Arc::new(AppState {
+            config: Arc::new(AppConfig {
+                mesh: MeshConfig {
+                    enabled,
+                    ..ctx.app.config.mesh.clone()
+                },
+                ..(*ctx.app.config).clone()
+            }),
+            ..(*ctx.app).clone()
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn turning_the_mesh_off_clears_the_served_digest_and_aborts_generation() {
+        let mut ctx = test_ctx(MeshBrief::Auto);
+        add_n_turns(&mut ctx, 6);
+        let ctx = shared(ctx);
+        let (model, _gate) = FakeModel::gated();
+        let mut driver = MeshDigestDriver::without_node_gate();
+        driver.maybe_refresh_with(&ctx, Instant::now(), model.fetch(FIXED_DIGEST));
+        wait_for_call(&model, 1).await;
+        let in_flight = Arc::clone(&driver.in_flight);
+        let mesh = Arc::clone(&ctx.read().app.mesh);
+        mesh.publish_digest(Some(Digest {
+            text: "served".into(),
+            generated_at: SystemTime::now(),
+            covered_messages: 2,
+        }));
+        let epoch = mesh.digest_epoch();
+
+        set_mesh_enabled(&ctx, false);
+        driver.maybe_refresh_with(
+            &ctx,
+            Instant::now() + MESH_DIGEST_MIN_INTERVAL,
+            model.fetch(FIXED_DIGEST),
+        );
+
+        assert!(driver.task.is_none(), "the generation was aborted");
+        wait_until_cleared(&in_flight).await;
+        assert_eq!(model.calls(), 1);
+        assert!(mesh.digest().is_none());
+        assert_eq!(mesh.digest_epoch(), epoch + 1);
     }
 
     fn switch_session(ctx: &Arc<RwLock<RequestContext>>) {
@@ -1705,7 +1843,7 @@ mod tests {
         add_n_turns(&mut ctx, 4);
         let ctx = shared(ctx);
         let model = Arc::new(FakeModel::default());
-        let mut driver = MeshDigestDriver::new();
+        let mut driver = MeshDigestDriver::without_node_gate();
         driver.maybe_refresh_with(&ctx, Instant::now(), model.fetch(FIXED_DIGEST));
         wait_for_task(&mut driver).await;
         assert!(ctx.read().app.mesh.digest().is_some());
@@ -1731,7 +1869,7 @@ mod tests {
         add_n_turns(&mut ctx, 4);
         let ctx = shared(ctx);
         let (model, gate) = FakeModel::gated();
-        let mut driver = MeshDigestDriver::new();
+        let mut driver = MeshDigestDriver::without_node_gate();
         driver.maybe_refresh_with(&ctx, Instant::now(), model.fetch(FIXED_DIGEST));
         wait_for_call(&model, 1).await;
         assert!(driver.in_flight.load(Ordering::SeqCst));
@@ -1782,7 +1920,7 @@ mod tests {
         add_n_turns(&mut ctx, 4);
         let ctx = shared(ctx);
         let (model, gate) = FakeModel::gated();
-        let mut driver = MeshDigestDriver::new();
+        let mut driver = MeshDigestDriver::without_node_gate();
         driver.maybe_refresh_with(&ctx, Instant::now(), model.fetch(FIXED_DIGEST));
         wait_for_call(&model, 1).await;
         let old_flag = Arc::clone(&driver.in_flight);
@@ -1816,7 +1954,7 @@ mod tests {
         publish_mesh_snapshot(&ctx, TurnState::idle_now());
         let ctx = shared(ctx);
         let (model, gate) = FakeModel::gated();
-        let mut driver = MeshDigestDriver::new();
+        let mut driver = MeshDigestDriver::without_node_gate();
         driver.maybe_refresh_with(&ctx, Instant::now(), model.fetch(FIXED_DIGEST));
         wait_for_call(&model, 1).await;
         let old_flag = Arc::clone(&driver.in_flight);
@@ -1860,7 +1998,7 @@ mod tests {
         add_n_turns(&mut ctx, 4);
         let ctx = shared(ctx);
         let (model, gate) = FakeModel::gated();
-        let mut driver = MeshDigestDriver::new();
+        let mut driver = MeshDigestDriver::without_node_gate();
         driver.maybe_refresh_with(&ctx, Instant::now(), model.fetch(FIXED_DIGEST));
         wait_for_call(&model, 1).await;
         let old_flag = Arc::clone(&driver.in_flight);
@@ -1907,7 +2045,7 @@ mod tests {
         add_n_turns(&mut ctx, 4);
         let ctx = shared(ctx);
         let (model, _gate) = FakeModel::gated();
-        let mut driver = MeshDigestDriver::new();
+        let mut driver = MeshDigestDriver::without_node_gate();
 
         driver.maybe_refresh_with(&ctx, Instant::now(), model.fetch(FIXED_DIGEST));
         wait_for_call(&model, 1).await;
@@ -1928,7 +2066,7 @@ mod tests {
         add_n_turns(&mut ctx, 4);
         let ctx = shared(ctx);
         let (model, _gate) = FakeModel::gated();
-        let mut driver = MeshDigestDriver::new();
+        let mut driver = MeshDigestDriver::without_node_gate();
         let in_flight = Arc::clone(&driver.in_flight);
 
         driver.maybe_refresh_with(&ctx, Instant::now(), model.fetch(FIXED_DIGEST));
@@ -1955,7 +2093,7 @@ mod tests {
         publish_mesh_snapshot(&ctx, TurnState::idle_now());
         let ctx = shared(ctx);
         let model = Arc::new(FakeModel::default());
-        let mut driver = MeshDigestDriver::new();
+        let mut driver = MeshDigestDriver::without_node_gate();
 
         driver.maybe_refresh_with(&ctx, Instant::now(), model.fetch(FIXED_DIGEST));
         wait_for_task(&mut driver).await;
@@ -2025,7 +2163,7 @@ mod tests {
         publish_mesh_snapshot(&ctx, TurnState::idle_now());
         let ctx = shared(ctx);
         let model = Arc::new(FakeModel::default());
-        let mut driver = MeshDigestDriver::new();
+        let mut driver = MeshDigestDriver::without_node_gate();
 
         driver.maybe_refresh_with(&ctx, Instant::now(), model.fetch(FIXED_DIGEST));
         driver.maybe_refresh_with(
