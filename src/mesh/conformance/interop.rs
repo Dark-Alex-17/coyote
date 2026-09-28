@@ -11,17 +11,18 @@ use crate::mesh::hex_lower;
 use crate::mesh::message::{OutboundPeer, PeerKind, PeerVia};
 use crate::mesh::node::{MeshRuntime, MeshSlot, NodeOptions};
 use crate::mesh::test_support::{
-    Compatibility, OriginName, TempDir, TrustList, mesh_paths, private_config, wait_until,
+    Compatibility, OriginName, TempDir, TrustList, disable_ingress_control, mesh_paths,
+    private_config, wait_until,
 };
 use crate::mesh::trust::TrustOptions;
 use crate::supervisor::mailbox::EnvelopePayload;
 
 use rns_transport::destination::DestinationName;
-use rns_transport::iface::InterfaceSharedConfig;
 use serde_json::{Value, json};
 use std::collections::VecDeque;
+use std::ffi::OsStr;
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -93,44 +94,108 @@ fn interop_dir() -> PathBuf {
         })
 }
 
+/// The interpreter to spawn: `COYOTE_MESH_INTEROP_PYTHON`, else the venv `setup.sh` built
+/// under `dir`, else whatever `python3` is on the path. A bare name is resolved against this
+/// process's `PATH` here: the netns relay is launched under `sudo -n`, whose `secure_path`
+/// would resolve it differently.
+fn interop_python(dir: &Path) -> PathBuf {
+    let python = env::var_os("COYOTE_MESH_INTEROP_PYTHON")
+        .map(PathBuf::from)
+        .or_else(|| {
+            let venv = dir.join("venv").join("bin").join("python");
+            venv.is_file().then_some(venv)
+        })
+        .unwrap_or_else(|| PathBuf::from("python3"));
+    if python.components().count() != 1 {
+        return python;
+    }
+    env::var_os("PATH")
+        .and_then(|path| {
+            env::split_paths(&path)
+                .map(|dir| dir.join(&python))
+                .find(|candidate| candidate.is_file())
+        })
+        .unwrap_or(python)
+}
+
+/// `COYOTE_MESH_INTEROP` read by value: unset, empty, `0` and `false`/`no`/`off` (in any
+/// ASCII case) leave the suites off; anything else switches them on.
+fn interop_switch_is_on(value: Option<&OsStr>) -> bool {
+    let Some(value) = value else { return false };
+    let value = value.to_string_lossy();
+    let value = value.trim();
+    !(value.is_empty()
+        || value == "0"
+        || ["false", "no", "off"]
+            .iter()
+            .any(|off| value.eq_ignore_ascii_case(off)))
+}
+
+pub(super) fn interop_enabled() -> bool {
+    interop_switch_is_on(env::var_os("COYOTE_MESH_INTEROP").as_deref())
+}
+
+/// The `skipping:` line for a suite that is off: with the switch set to an off value, the
+/// value as observed, so a typo in it is not mistaken for an unset variable.
+pub(super) fn off_switch_skip_line(instructions: &str) -> String {
+    match env::var_os("COYOTE_MESH_INTEROP") {
+        Some(value) => format!(
+            "skipping: COYOTE_MESH_INTEROP={value:?} is off; set it to 1 and run {instructions}"
+        ),
+        None => format!("skipping: set COYOTE_MESH_INTEROP=1 and run {instructions}"),
+    }
+}
+
+/// The interop directory and the interpreter, once both clones are present and at their
+/// pins. Every miss is a panic naming `scripts/mesh-interop/setup.sh`, so CI cannot pass
+/// by skipping.
+pub(super) fn require_reference() -> (PathBuf, PathBuf) {
+    let dir = interop_dir();
+    for (name, pin) in [("reticulum", RETICULUM_PIN), ("lxmf", LXMF_PIN)] {
+        let clone = dir.join(name);
+        assert!(
+            clone.is_dir(),
+            "{} is missing; run scripts/mesh-interop/setup.sh",
+            clone.display()
+        );
+        // A root test process verifying a user-owned clone: without this git refuses the
+        // repository as dubiously owned and prints nothing.
+        let clone_path = clone.display().to_string();
+        let out = Command::new("git")
+            .args(["-c", &format!("safe.directory={clone_path}")])
+            .args(["-C", &clone_path, "rev-parse", "HEAD"])
+            .output()
+            .expect("git runs");
+        let head = str::from_utf8(&out.stdout).unwrap().trim().to_string();
+        assert!(
+            out.status.success() && !head.is_empty(),
+            "git rev-parse HEAD in {clone_path} failed ({}): {}; run scripts/mesh-interop/setup.sh",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        assert_eq!(
+            head,
+            pin,
+            "{} is at {head} but the suite pins {pin}; run scripts/mesh-interop/setup.sh",
+            clone.display()
+        );
+    }
+    let python = interop_python(&dir);
+    (dir, python)
+}
+
 impl Reference {
-    /// `None` when the suite is not switched on. Once it is, every missing prerequisite is
-    /// a panic that names `scripts/mesh-interop/setup.sh`, so CI cannot pass by skipping.
+    /// `None` when the suite is not switched on; see `require_reference` for what happens
+    /// once it is.
     async fn spawn() -> Option<Self> {
-        if env::var_os("COYOTE_MESH_INTEROP").is_none() {
-            eprintln!("skipping: set COYOTE_MESH_INTEROP=1 and run scripts/mesh-interop/setup.sh");
+        if !interop_enabled() {
+            eprintln!("{}", off_switch_skip_line("scripts/mesh-interop/setup.sh"));
             return None;
         }
         crate::testing::install_log_collector();
         let debug_mark = env::var_os("COYOTE_MESH_INTEROP_DEBUG")
             .map(|_| crate::testing::debug_snapshot().len());
-        let dir = interop_dir();
-        for (name, pin) in [("reticulum", RETICULUM_PIN), ("lxmf", LXMF_PIN)] {
-            let clone = dir.join(name);
-            assert!(
-                clone.is_dir(),
-                "{} is missing; run scripts/mesh-interop/setup.sh",
-                clone.display()
-            );
-            let head = Command::new("git")
-                .args(["-C", &clone.display().to_string(), "rev-parse", "HEAD"])
-                .output()
-                .expect("git runs");
-            let head = str::from_utf8(&head.stdout).unwrap().trim().to_string();
-            assert_eq!(
-                head,
-                pin,
-                "{} is at {head} but the suite pins {pin}; run scripts/mesh-interop/setup.sh",
-                clone.display()
-            );
-        }
-        let python = env::var_os("COYOTE_MESH_INTEROP_PYTHON")
-            .map(PathBuf::from)
-            .or_else(|| {
-                let venv = dir.join("venv").join("bin").join("python");
-                venv.is_file().then_some(venv)
-            })
-            .unwrap_or_else(|| PathBuf::from("python3"));
+        let (dir, python) = require_reference();
         let pythonpath = format!(
             "{}:{}",
             dir.join("reticulum").display(),
@@ -347,27 +412,7 @@ impl Node {
         )
         .await
         .unwrap();
-        // Reticulum ingress control on an interface younger than two hours holds every
-        // announce for an unknown destination for 360 s once announces arrive faster than
-        // 3.5 a second. The relay echoes our start announce back at us, so the reference's
-        // announce landing in that burst would be held past every wait in the suite.
-        let transport = runtime
-            .transport_handle()
-            .await
-            .expect("the node just started");
-        {
-            let manager = transport.iface_manager();
-            let mut manager = manager.lock().await;
-            for iface in manager.interface_hashes() {
-                manager.set_shared_config(
-                    iface,
-                    InterfaceSharedConfig {
-                        ingress_control: Some(false),
-                        ..InterfaceSharedConfig::default()
-                    },
-                );
-            }
-        }
+        disable_ingress_control(&runtime).await;
         let slot = Arc::new(MeshSlot::default());
         slot.install(runtime.clone()).unwrap();
         Self {
@@ -554,6 +599,23 @@ fn the_pins_agree_with_setup_sh_and_the_harness_readme() {
     );
 }
 
+#[test]
+fn the_interop_switch_reads_its_value() {
+    assert!(!interop_switch_is_on(None));
+    for off in ["", " ", "0", "false", "FALSE", "no", "off", "Off"] {
+        assert!(!interop_switch_is_on(Some(OsStr::new(off))), "{off:?}");
+    }
+    for on in ["1", "yes", "true", "on", "anything"] {
+        assert!(interop_switch_is_on(Some(OsStr::new(on))), "{on:?}");
+    }
+    for off in ["0", "false", "no", "off"] {
+        assert!(
+            HARNESS_README.contains(&format!("`{off}`")),
+            "scripts/mesh-interop/README.md does not list `{off}` as an off value"
+        );
+    }
+}
+
 /// `git <args>` in `cwd`, which must succeed.
 fn git(cwd: &std::path::Path, args: &[&str]) -> String {
     let out = Command::new("git")
@@ -594,8 +656,8 @@ fn run_setup_sh(dir: &std::path::Path) -> (bool, String, String) {
 #[test]
 #[ignore = "needs COYOTE_MESH_INTEROP=1 and scripts/mesh-interop/setup.sh"]
 fn setup_sh_repins_a_drifted_clone_reruns_idempotently_and_refuses_an_unreachable_pin() {
-    if env::var_os("COYOTE_MESH_INTEROP").is_none() {
-        eprintln!("skipping: set COYOTE_MESH_INTEROP=1 and run scripts/mesh-interop/setup.sh");
+    if !interop_enabled() {
+        eprintln!("{}", off_switch_skip_line("scripts/mesh-interop/setup.sh"));
         return;
     }
     let source = interop_dir();

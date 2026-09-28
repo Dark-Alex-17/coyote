@@ -39,7 +39,7 @@ const DEFINITION_OPEN: &str = "**[MESH-";
 const POSITIONAL_TABLE_KEYS: [&str; 4] = ["Field", "Bytes", "Element", "Slot"];
 const POSITIONAL_TABLE_COLUMNS: [&str; 3] =
     ["Type", "Sender puts", "Receiver action on any other value"];
-const CATCH_ALL_ROW_PREFIXES: [&str; 2] = ["any other", "trailing"];
+pub(crate) const CATCH_ALL_ROW_PREFIXES: [&str; 2] = ["any other", "trailing"];
 const CONSTANTS_TABLE_HEADER: &str = "| Constant | Value | Defined in | Pinned by |";
 /// The "Pinned by" cell of a constant that only this module's table check pins.
 const PINNED_BY_THIS_TABLE: &str = "spec_pins (this table)";
@@ -391,7 +391,11 @@ fn check_no_lowercase_keywords(text: &str) -> Vec<String> {
         .collect()
 }
 
-fn is_catch_all_row(row: &str) -> bool {
+/// A table row whose first cell is a catch-all (`any other ...` or `trailing ...`); the
+/// conformance coverage rule derives its required ids from these rows too. Callers pass
+/// table rows; a prose line whose text starts with a prefix is accepted too, so filter to
+/// rows first.
+pub(crate) fn is_catch_all_row(row: &str) -> bool {
     cells(row).first().is_some_and(|cell| {
         CATCH_ALL_ROW_PREFIXES
             .iter()

@@ -15,6 +15,10 @@
 //! - `interop`: the protocol exercised against the pinned Python Reticulum/LXMF reference,
 //!   spawned as a subprocess. Those tests are `#[ignore]`d and gated on `COYOTE_MESH_INTEROP=1`;
 //!   `scripts/mesh-interop/setup.sh` prepares the reference and prints the environment they need.
+//! - `netns`: two of this crate's nodes in separate Linux network namespaces reaching each
+//!   other through an external `rnsd` relay, the two-host topology on one machine. Also
+//!   `#[ignore]`d and gated on `COYOTE_MESH_INTEROP=1`; `scripts/mesh-netns/setup.sh` (root)
+//!   creates the namespaces.
 //!
 //! Every table row names the id it exercises, so `grep MESH-ENV-030 src/mesh/conformance` lands
 //! on its vectors, and the tests at the bottom of this file check the ids against the spec and
@@ -22,10 +26,10 @@
 //!
 //! Platform note: `interop` and `link_vectors::loopback` are `#[cfg(unix)]` because the Python
 //! reference harness and the loopback fixtures they drive are unix-only, not because the mesh
-//! is. Product code under `src/mesh/` is never cfg-gated; those two, and the planned netns
-//! reachability suite, are the only exemption. Windows mesh behaviour is covered by the unit
-//! tests, the platform-independent vectors and manual verification, not by the Python interop
-//! matrix.
+//! is; `netns` is `#[cfg(target_os = "linux")]` because network namespaces are a Linux kernel
+//! feature. Product code under `src/mesh/` is never cfg-gated; those three are the only
+//! exemption. Windows mesh behaviour is covered by the unit tests, the platform-independent
+//! vectors and manual verification, not by the Python interop matrix.
 
 mod env_vectors;
 mod link_vectors;
@@ -33,6 +37,8 @@ mod vectors;
 
 #[cfg(unix)]
 mod interop;
+#[cfg(target_os = "linux")]
+mod netns;
 
 /// Which side of a requirement a vector probes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,7 +61,7 @@ pub(super) struct Listed {
 #[cfg(test)]
 mod tests {
     use super::{Kind, Listed, env_vectors, link_vectors, vectors};
-    use crate::mesh::spec_pins::{SPEC, requirement_ids};
+    use crate::mesh::spec_pins::{CATCH_ALL_ROW_PREFIXES, SPEC, is_catch_all_row, requirement_ids};
 
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -318,26 +324,12 @@ mod tests {
             .collect()
     }
 
-    /// A table row whose first cell is a catch-all (`any other ...` or `trailing ...`).
-    fn is_catch_all_row(line: &str) -> bool {
-        let Some(rest) = line.strip_prefix('|') else {
-            return false;
-        };
-        let first = rest
-            .split('|')
-            .next()
-            .unwrap_or("")
-            .trim()
-            .to_ascii_lowercase();
-        first.starts_with("any other") || first.starts_with("trailing")
-    }
-
     fn required_ids_from_the_spec() -> BTreeSet<String> {
         let mut required: BTreeSet<String> = spec_ids()
             .into_iter()
             .filter(|id| FULLY_COVERED_AREAS.contains(&area(id)))
             .collect();
-        for line in SPEC.lines().filter(|line| is_catch_all_row(line)) {
+        for line in table_rows().filter(|line| is_catch_all_row(line)) {
             for id in ids_on(line) {
                 if CATCH_ALL_AREAS.contains(&area(id)) {
                     required.insert(id.to_string());
@@ -345,6 +337,39 @@ mod tests {
             }
         }
         required
+    }
+
+    fn table_rows() -> impl Iterator<Item = &'static str> {
+        SPEC.lines()
+            .filter(|line| line.trim_start().starts_with('|'))
+    }
+
+    /// `is_catch_all_row` is case-sensitive on purpose (spec_pins asserts an uppercase
+    /// catch-all fails its table check), so a row written `| Any other ... |` would drop
+    /// out of the required set without a sound. This counts the rows by a case-folded
+    /// first cell and holds the predicate to the same number.
+    #[test]
+    fn catch_all_rows_are_lowercase_so_the_shared_predicate_sees_every_one() {
+        let folded = table_rows()
+            .filter(|row| {
+                row.trim()
+                    .trim_start_matches('|')
+                    .split('|')
+                    .next()
+                    .map(|cell| cell.trim().to_ascii_lowercase())
+                    .is_some_and(|cell| {
+                        CATCH_ALL_ROW_PREFIXES
+                            .iter()
+                            .any(|prefix| cell.starts_with(prefix))
+                    })
+            })
+            .count();
+        let accepted = table_rows().filter(|row| is_catch_all_row(row)).count();
+        assert!(folded > 0, "no catch-all rows in the spec");
+        assert_eq!(
+            folded, accepted,
+            "a catch-all row is not lowercase and the shared predicate skips it"
+        );
     }
 
     #[test]
@@ -362,6 +387,14 @@ mod tests {
         assert!(
             derived.contains("MESH-PROP-009"),
             "the `any other element` PN row"
+        );
+        assert!(
+            derived.contains("MESH-KNOCK-018"),
+            "the `any other refusal code` outcome row, in a table without the positional header"
+        );
+        assert!(
+            derived.contains("MESH-MSG-023"),
+            "the `any other reply value` outcome row, in a table without the positional header"
         );
         assert!(derived.iter().all(|id| {
             FULLY_COVERED_AREAS.contains(&area(id)) || CATCH_ALL_AREAS.contains(&area(id))
@@ -404,7 +437,8 @@ mod tests {
     // records its wall-clock in the step summary, and is kept out of every job's `needs`
     // (the `All` gate included) with a comment saying so. Being outside `needs` is the whole
     // of "informational": the job must NOT also be `continue-on-error`, or a red suite would
-    // leave the run and the README badge green.
+    // leave the run and the README badge green. The same job creates the network namespaces
+    // for the `netns` suite before the tests and removes them after, whatever the outcome.
     const CI_YAML: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/.github/workflows/ci.yaml"
@@ -464,8 +498,13 @@ mod tests {
                 && (comment.contains("not part") || comment.contains("needs")),
             "the comment above the job must say it is not in the `All` gate: {comment:?}"
         );
+        assert!(
+            comment.contains("CAP_NET_ADMIN") || comment.contains("sudo"),
+            "the comment above the job must state the privilege the namespaces need: {comment:?}"
+        );
 
-        // setup.sh, then the suite with the interop tests un-ignored and switched on.
+        // The interop setup.sh, then the namespaces, then the suite with the ignored tests
+        // un-ignored and switched on, then the namespaces removed whatever the suite did.
         let steps = job["steps"].as_sequence().expect("steps");
         let runs: Vec<(usize, &str)> = steps
             .iter()
@@ -483,6 +522,44 @@ mod tests {
             .map(|(i, run)| (*i, *run))
             .expect("a step runs cargo test");
         assert!(setup < test, "setup.sh runs before the suite");
+        let (namespaces, namespaces_run) = runs
+            .iter()
+            .find(|(_, run)| run.contains("scripts/mesh-netns/setup.sh"))
+            .map(|(i, run)| (*i, *run))
+            .expect("a step runs scripts/mesh-netns/setup.sh");
+        assert!(
+            namespaces_run.trim_start().starts_with("sudo "),
+            "creating the namespaces needs root: {namespaces_run:?}"
+        );
+        assert!(
+            setup < namespaces && namespaces < test,
+            "the namespaces are created after the reference and before the suite"
+        );
+        let (teardown, teardown_step) = steps
+            .iter()
+            .enumerate()
+            .find(|(_, step)| {
+                step["run"]
+                    .as_str()
+                    .is_some_and(|run| run.contains("scripts/mesh-netns/teardown.sh"))
+            })
+            .expect("a step runs scripts/mesh-netns/teardown.sh");
+        assert!(
+            teardown_step["run"]
+                .as_str()
+                .is_some_and(|run| run.trim_start().starts_with("sudo ")),
+            "removing the namespaces needs root: {:?}",
+            teardown_step["run"]
+        );
+        assert!(
+            teardown > test,
+            "the namespaces are removed after the suite"
+        );
+        assert_eq!(
+            teardown_step["if"].as_str().map(str::trim),
+            Some("always()"),
+            "the namespaces are removed even when the suite fails"
+        );
         for (i, step) in steps.iter().enumerate() {
             assert!(
                 step["continue-on-error"].is_null(),

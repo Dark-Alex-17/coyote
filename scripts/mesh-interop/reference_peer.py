@@ -119,6 +119,13 @@ class AnnounceWatch:
 class ReferencePeer:
     def __init__(self):
         self.tmp = tempfile.mkdtemp(prefix="coyote-mesh-reference-")
+        try:
+            self._start()
+        except Exception:
+            shutil.rmtree(self.tmp, ignore_errors=True)
+            raise
+
+    def _start(self):
         self.relay_port = free_port()
         config_dir = os.path.join(self.tmp, "reticulum")
         os.makedirs(config_dir)
@@ -374,20 +381,22 @@ def serve(peer):
 
 
 def main():
-    peer = ReferencePeer()
-    print("READY " + json.dumps(peer.ready()), flush=True)
+    peer = None
     exit_code = 0
     try:
+        peer = ReferencePeer()
+        print("READY " + json.dumps(peer.ready()), flush=True)
         serve(peer)
     except Exception:
         log(traceback.format_exc())
         exit_code = 1
     finally:
-        try:
-            peer.shutdown()
-        except Exception:
-            log(traceback.format_exc())
-            exit_code = 1
+        if peer is not None:
+            try:
+                peer.shutdown()
+            except Exception:
+                log(traceback.format_exc())
+                exit_code = 1
         # Reticulum leaves non-daemon threads behind; nothing here needs to outlive the
         # command stream.
         os._exit(exit_code)

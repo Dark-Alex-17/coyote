@@ -407,6 +407,25 @@ pub(crate) mod test_support {
         }
     }
 
+    /// Reticulum ingress control on an interface younger than two hours holds every
+    /// announce for an unknown destination for 360 s once announces arrive faster than
+    /// 3.5 a second. The relay echoes a node's start announce back at it, so a fresh peer's
+    /// announce landing in that burst would be held past every wait in the suites.
+    #[cfg(unix)]
+    pub(crate) async fn disable_ingress_control(runtime: &MeshRuntime) {
+        let transport = runtime
+            .transport_handle()
+            .await
+            .expect("the node just started");
+        let manager = transport.iface_manager();
+        let mut manager = manager.lock().await;
+        for iface in manager.interface_hashes() {
+            let mut config = manager.shared_config(&iface).cloned().unwrap_or_default();
+            config.ingress_control = Some(false);
+            manager.set_shared_config(iface, config);
+        }
+    }
+
     /// A listening node: a bare transport with a `TcpServer`, one destination and an
     /// `R3Server` answering on it, the shape `MeshConfig` cannot express since it only
     /// connects outward.

@@ -39,7 +39,7 @@ Reticulum's interfaces and LXMF's router on first import starts late enough to m
 
 | Variable | Meaning |
 |---|---|
-| `COYOTE_MESH_INTEROP` | Set to run the interop tests instead of skipping them. |
+| `COYOTE_MESH_INTEROP` | Read by value: unset, empty or whitespace-only, `0`, and `false`/`no`/`off` (any case) leave the suite off; any other value (for example `1`) switches it on. Shared between the interop and netns suites. |
 | `COYOTE_MESH_INTEROP_DIR` | Where the clones and venv live (default `~/.cache/coyote/mesh-interop`). |
 | `COYOTE_MESH_INTEROP_PYTHON` | The interpreter to spawn (default `<dir>/venv/bin/python`, else `python3`). |
 | `COYOTE_MESH_INTEROP_DEBUG` | Set to have the reference log at `RNS.LOG_DEBUG` on stderr, and to print this crate's captured `mesh` debug log to stderr when each reference shuts down. |
