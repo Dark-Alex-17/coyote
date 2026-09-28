@@ -22,6 +22,8 @@ mod propagation_nodes;
 mod protocol;
 mod r3;
 pub(crate) mod snapshot;
+#[cfg(test)]
+mod spec_pins;
 pub(crate) mod trust;
 
 pub(crate) use node::{MESH_ALREADY_ON, MeshPaths, MeshRuntime, MeshSlot, NodeOptions};

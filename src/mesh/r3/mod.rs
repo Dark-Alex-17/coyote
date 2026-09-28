@@ -12,6 +12,8 @@ mod server;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+pub(crate) use client::DEFAULT_REQUEST_TIMEOUT;
 pub(crate) use client::{
     DEFAULT_LINK_TIMEOUT, Deadline, R3Client, RequestOptions, RequestOutcome, SizeBranch, link_to,
     open_link,
@@ -28,7 +30,10 @@ pub(crate) use frame::{Envelope, MAX_R3_PAYLOAD_BYTES, NAME_HASH_LEN, OriginName
 pub(crate) use frame::{PathHash, RequestFrame, RequestId};
 pub(crate) use receipt::RequestReceipt;
 #[cfg(test)]
-pub(crate) use server::{Admission, InboundRequest, RequestHandler};
+pub(crate) use server::{
+    Admission, DEFAULT_RESPONSE_SEND_TIMEOUT, HANDLER_TIMEOUT, InboundRequest,
+    MAX_CONCURRENT_INBOUND_REQUESTS, PEER_RESOLVE_TIMEOUT, RequestHandler,
+};
 pub(crate) use server::{R3Server, Reply};
 
 /// How much of a hash the logs show.

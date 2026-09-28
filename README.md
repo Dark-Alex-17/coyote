@@ -341,6 +341,8 @@ instances discover and message each other. It is off by default, and setting `me
 `function_calling_support: true`; config loading is refused otherwise. Interface entries under `mesh.interfaces` are
 always checked when config is parsed; the remaining `mesh` keys (rate limits, retention, the function-calling
 requirement) are only checked when `mesh.enabled` is `true`.
+The wire format Coyote instances speak to each other is specified normatively in
+[docs/mesh/PROTOCOL.md](https://github.com/Dark-Alex-17/coyote/blob/main/docs/mesh/PROTOCOL.md).
 
 | Setting                           | Default Value   | Description                                                                                                                                                                  |
 |-----------------------------------|-----------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
