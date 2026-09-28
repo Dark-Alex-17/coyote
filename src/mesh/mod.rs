@@ -4,6 +4,7 @@ mod announce;
 pub(crate) mod brief;
 pub(crate) mod card;
 pub(crate) mod envoy;
+pub(crate) mod events;
 mod identity;
 pub(crate) mod idle;
 pub(crate) mod knock;

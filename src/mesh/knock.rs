@@ -7,6 +7,7 @@
 //! stored knock back into the same gate.
 
 use crate::mesh::announce::MAX_DISPLAY_NAME_BYTES;
+use crate::mesh::events::{MeshEvent, MeshHooks};
 use crate::mesh::idle::{IdleNotify, Origin};
 use crate::mesh::knocks::{KNOCK_INTRO_MAX_CHARS, KNOCK_RECORD_VERSION, KnockCache, KnockRecord};
 use crate::mesh::notify::Source;
@@ -392,16 +393,23 @@ pub(crate) struct KnockGate {
     trust: Arc<TrustStore>,
     peers: Arc<PeerTable>,
     cache: KnockCache,
+    hooks: MeshHooks,
     surface: Mutex<Option<Weak<dyn KnockSurface>>>,
     state: Mutex<GateState>,
 }
 
 impl KnockGate {
-    pub(crate) fn new(trust: Arc<TrustStore>, peers: Arc<PeerTable>, cache: KnockCache) -> Self {
+    pub(crate) fn new(
+        trust: Arc<TrustStore>,
+        peers: Arc<PeerTable>,
+        cache: KnockCache,
+        hooks: MeshHooks,
+    ) -> Self {
         Self {
             trust,
             peers,
             cache,
+            hooks,
             surface: Mutex::new(None),
             state: Mutex::new(GateState::default()),
         }
@@ -474,6 +482,13 @@ impl KnockGate {
         if let Err(err) = self.cache.append(record, received_at) {
             warn!("Mesh knock from {id8} for destination {dest8} was not cached: {err:#}");
         }
+        self.hooks.fire(MeshEvent::KnockReceived {
+            identity: knock.identity_hash.clone(),
+            destination: knock.destination_hash.clone(),
+            name: display_name.clone(),
+            intro: knock.intro.clone(),
+            via: knock.via,
+        });
         let Some(surface) = self.surface.lock().as_ref().and_then(Weak::upgrade) else {
             return Admission::Admitted { surfaced: false };
         };
@@ -662,6 +677,8 @@ impl KnockSurface for RecordingSurface {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hooks::HookEvent;
+    use crate::mesh::events::{RecordingHookSink, env_value, one_fire};
     use crate::mesh::hex_lower;
     use crate::mesh::notify::{NOTIFICATION_LINE_MAX_CHARS, Notification};
     use crate::mesh::peers::PeerSighting;
@@ -687,7 +704,12 @@ mod tests {
             let (trust, tmp) = list.open(tag);
             let peers =
                 Arc::new(PeerTable::load(tmp.path.join("peers.json"), SystemTime::now()).unwrap());
-            let gate = KnockGate::new(trust, peers.clone(), KnockCache::new(&tmp.path, 24));
+            let gate = KnockGate::new(
+                trust,
+                peers.clone(),
+                KnockCache::new(&tmp.path, 24),
+                MeshHooks::default(),
+            );
             let surface = Arc::new(RecordingSurface::default());
             gate.attach(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
             Self {
@@ -1273,7 +1295,12 @@ mod tests {
             .open("knock-gate-no-surface");
         let peers =
             Arc::new(PeerTable::load(tmp.path.join("peers.json"), SystemTime::now()).unwrap());
-        let gate = KnockGate::new(trust, peers, KnockCache::new(&tmp.path, 24));
+        let gate = KnockGate::new(
+            trust,
+            peers,
+            KnockCache::new(&tmp.path, 24),
+            MeshHooks::default(),
+        );
 
         let first = gate.admit(
             knock_from(&identity, &hash_of("inst"), KnockVia::Direct),
@@ -1478,7 +1505,12 @@ mod tests {
             .open("knock-gate-rearm");
         let peers =
             Arc::new(PeerTable::load(tmp.path.join("peers.json"), SystemTime::now()).unwrap());
-        let gate = KnockGate::new(trust, peers, KnockCache::new(&tmp.path, 24));
+        let gate = KnockGate::new(
+            trust,
+            peers,
+            KnockCache::new(&tmp.path, 24),
+            MeshHooks::default(),
+        );
         let rejecting = Arc::new(RejectingSurface::default());
         gate.attach(Arc::downgrade(&rejecting) as Weak<dyn KnockSurface>);
 
@@ -1686,7 +1718,12 @@ mod tests {
             .open("knock-drain");
         let peers =
             Arc::new(PeerTable::load(tmp.path.join("peers.json"), SystemTime::now()).unwrap());
-        let gate = Arc::new(KnockGate::new(trust, peers, KnockCache::new(&tmp.path, 24)));
+        let gate = Arc::new(KnockGate::new(
+            trust,
+            peers,
+            KnockCache::new(&tmp.path, 24),
+            MeshHooks::default(),
+        ));
         let surface = Arc::new(RecordingSurface::default());
         gate.attach(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
         let (sink, rx) = ChannelKnockSink::new(KNOCK_QUEUE_CAPACITY);
@@ -1963,7 +2000,12 @@ mod tests {
             .open("knock-gate-dead-surface");
         let peers =
             Arc::new(PeerTable::load(tmp.path.join("peers.json"), SystemTime::now()).unwrap());
-        let gate = KnockGate::new(trust, peers, KnockCache::new(&tmp.path, 24));
+        let gate = KnockGate::new(
+            trust,
+            peers,
+            KnockCache::new(&tmp.path, 24),
+            MeshHooks::default(),
+        );
         let gone = Arc::new(RecordingSurface::default());
         gate.attach(Arc::downgrade(&gone) as Weak<dyn KnockSurface>);
         drop(gone);
@@ -1994,5 +2036,115 @@ mod tests {
         );
         assert_eq!(third, Admission::Admitted { surfaced: false });
         assert_eq!(live.texts().len(), 1, "one line per identity per session");
+    }
+
+    /// A surfaceless gate over `list` whose hook fires land in the returned sink.
+    fn recorded_gate(tag: &str, list: TrustList) -> (KnockGate, Arc<RecordingHookSink>, TempDir) {
+        let (trust, tmp) = list.open(tag);
+        let peers =
+            Arc::new(PeerTable::load(tmp.path.join("peers.json"), SystemTime::now()).unwrap());
+        let hooks = MeshHooks::default();
+        let sink = RecordingHookSink::attach(&hooks);
+        let gate = KnockGate::new(trust, peers, KnockCache::new(&tmp.path, 24), hooks);
+        (gate, sink, tmp)
+    }
+
+    #[test]
+    fn an_admitted_direct_knock_fires_knock_received_with_its_intro() {
+        let identity = hash_of("id-hook-direct");
+        let (gate, sink, _tmp) = recorded_gate(
+            "knock-hook-direct",
+            TrustList::default().identity(&identity, false),
+        );
+        let mut knock = knock_from(&identity, &hash_of("inst"), KnockVia::Direct);
+        knock.intro = Some("hello there".into());
+
+        let admission = gate.admit(knock, now(), SystemTime::now());
+
+        assert_eq!(admission, Admission::Admitted { surfaced: false });
+        let envs = one_fire(&sink, HookEvent::MeshKnockReceived);
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_PEER_IDENTITY"),
+            Some(identity.as_str())
+        );
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_PEER_DESTINATION"),
+            Some(hash_of("inst").as_str())
+        );
+        assert_eq!(env_value(&envs, "COYOTE_MESH_VIA"), Some("direct"));
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_KNOCK_INTRO"),
+            Some("hello there")
+        );
+    }
+
+    #[test]
+    fn a_store_and_forward_knock_fires_knock_received_naming_its_route() {
+        let identity = hash_of("id-hook-saf");
+        let (gate, sink, _tmp) = recorded_gate(
+            "knock-hook-store-and-forward",
+            TrustList::default().identity(&identity, false),
+        );
+
+        let admission = gate.admit(
+            knock_from(&identity, &hash_of("inst"), KnockVia::StoreAndForward),
+            now(),
+            SystemTime::now(),
+        );
+
+        assert_eq!(admission, Admission::Admitted { surfaced: false });
+        let envs = one_fire(&sink, HookEvent::MeshKnockReceived);
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_VIA"),
+            Some("store-and-forward")
+        );
+    }
+
+    #[test]
+    fn a_blocked_knock_fires_nothing() {
+        let identity = hash_of("id-hook-blocked");
+        let (gate, sink, _tmp) = recorded_gate(
+            "knock-hook-blocked",
+            TrustList::default()
+                .identity(&identity, false)
+                .block(&identity),
+        );
+
+        let admission = gate.admit(
+            knock_from(&identity, &hash_of("inst"), KnockVia::Direct),
+            now(),
+            SystemTime::now(),
+        );
+
+        assert_eq!(admission, Admission::Blocked);
+        assert!(sink.drain().is_empty());
+    }
+
+    #[test]
+    fn a_rate_limited_knock_fires_nothing_more() {
+        let identity = hash_of("id-hook-burst");
+        let (gate, sink, _tmp) = recorded_gate(
+            "knock-hook-burst",
+            TrustList::default().identity(&identity, false),
+        );
+        let start = now();
+        for n in 0..KNOCK_BUCKET_BURST {
+            let admission = gate.admit(
+                knock_from(&identity, &hash_of(&format!("inst-{n}")), KnockVia::Direct),
+                start,
+                SystemTime::now(),
+            );
+            assert_eq!(admission, Admission::Admitted { surfaced: false });
+        }
+        assert_eq!(sink.drain().len(), KNOCK_BUCKET_BURST as usize);
+
+        let admission = gate.admit(
+            knock_from(&identity, &hash_of("inst-late"), KnockVia::Direct),
+            start,
+            SystemTime::now(),
+        );
+
+        assert_eq!(admission, Admission::RateLimited);
+        assert!(sink.drain().is_empty());
     }
 }

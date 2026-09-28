@@ -7,6 +7,7 @@
 //! model.
 
 use crate::mesh::card::DISPLAY_NAME_MAX_CHARS;
+use crate::mesh::events::MeshEvent;
 use crate::mesh::limits::PeerRefusal;
 use crate::mesh::node::MeshRuntime;
 use crate::mesh::peers::PeerRecord;
@@ -738,6 +739,26 @@ impl fmt::Display for SendError {
 
 impl std::error::Error for SendError {}
 
+impl SendError {
+    /// The variant as a stable snake_case token, for hooks.
+    pub(crate) fn class(&self) -> &'static str {
+        match self {
+            Self::NotTrusted { .. } => "not_trusted",
+            Self::UnknownDestination { .. } => "unknown_destination",
+            Self::NotRunning => "not_running",
+            Self::ContentTooLong { .. } => "content_too_long",
+            Self::TitleTooLong { .. } => "title_too_long",
+            Self::InvalidFields(_) => "invalid_fields",
+            Self::Refused(_) => "refused",
+            Self::Direct(_) => "direct",
+            Self::IncompatibleVersion { .. } => "incompatible_version",
+            Self::NoPropagationNode => "no_propagation_node",
+            Self::Propagation(_) => "propagation",
+            Self::NotAcknowledged => "not_acknowledged",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SendOutcome {
     pub id: String,
@@ -786,6 +807,34 @@ pub(crate) struct BroadcastOutcome {
     pub recipients: Vec<RecipientReport>,
 }
 
+/// A broadcast's recipients by outcome.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct BulletinTally {
+    pub recipients: usize,
+    pub delivered: usize,
+    pub stored: usize,
+    pub unreachable: usize,
+    pub refused: usize,
+}
+
+impl BroadcastOutcome {
+    pub(crate) fn tally(&self) -> BulletinTally {
+        let mut tally = BulletinTally {
+            recipients: self.recipients.len(),
+            ..BulletinTally::default()
+        };
+        for report in &self.recipients {
+            match report.outcome {
+                RecipientOutcome::Delivered => tally.delivered += 1,
+                RecipientOutcome::StoreAndForward => tally.stored += 1,
+                RecipientOutcome::Unreachable { .. } => tally.unreachable += 1,
+                RecipientOutcome::Refused { .. } => tally.refused += 1,
+            }
+        }
+        tally
+    }
+}
+
 pub(crate) fn unix_now() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -818,10 +867,47 @@ impl MeshRuntime {
         message: &OutboundPeer,
         options: PeerSendOptions,
     ) -> Result<SendOutcome, SendError> {
-        let not_trusted = || SendError::NotTrusted {
-            destination: destination_hex.to_string(),
+        let outcome = self
+            .send_peer_inner(destination_hex, message, options)
+            .await;
+        // A bulletin's fan-out reports once, through `mesh.bulletin.sent`.
+        if message.kind != PeerKind::Bulletin {
+            let destination = canonical_hash(destination_hex);
+            self.hooks().fire(match &outcome {
+                Ok(sent) => MeshEvent::MessageSent {
+                    kind: message.kind,
+                    id: message.id.clone(),
+                    destination,
+                    via: sent.via,
+                },
+                Err(err) => MeshEvent::MessageFailed {
+                    kind: message.kind,
+                    id: message.id.clone(),
+                    destination,
+                    class: err.class(),
+                    error: err.to_string(),
+                },
+            });
+        }
+        outcome
+    }
+
+    async fn send_peer_inner(
+        &self,
+        destination_hex: &str,
+        message: &OutboundPeer,
+        options: PeerSendOptions,
+    ) -> Result<SendOutcome, SendError> {
+        // The error text names the destination, so a value that is not a hash is
+        // cleaned before it can carry anything into a hook or the model's view.
+        let Some(destination) = canonical_hash(destination_hex) else {
+            return Err(SendError::NotTrusted {
+                destination: display_text(destination_hex, 64).unwrap_or_default(),
+            });
         };
-        let destination = canonical_hash(destination_hex).ok_or_else(not_trusted)?;
+        let not_trusted = || SendError::NotTrusted {
+            destination: destination.clone(),
+        };
         let peer = self.peers().get(&destination).ok_or_else(not_trusted)?;
         if self
             .trust()
@@ -954,10 +1040,15 @@ impl MeshRuntime {
             .collect()
             .await;
         recipients.sort_by(|a, b| a.destination.cmp(&b.destination));
-        Ok(BroadcastOutcome {
+        let outcome = BroadcastOutcome {
             id: message.id.clone(),
             recipients,
-        })
+        };
+        self.hooks().fire(MeshEvent::BulletinSent {
+            id: outcome.id.clone(),
+            tally: outcome.tally(),
+        });
+        Ok(outcome)
     }
 
     /// One broadcast recipient's send as a report.
@@ -1339,6 +1430,7 @@ impl ModelNotes {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mesh::events::env_value;
     use crate::mesh::knock::{KNOCK_TYPE, KnockIntro, knock_message};
     use crate::mesh::limits::RefusalReason;
     use crate::mesh::r3::{PathHash, RequestId, SizeBranch};
@@ -2171,6 +2263,113 @@ mod tests {
                 .to_string()
                 .contains("too deep")
         );
+    }
+
+    #[test]
+    fn send_error_classes_are_stable_snake_case_tokens() {
+        let destination = hash_of("d");
+        let table = [
+            (
+                SendError::NotTrusted {
+                    destination: destination.clone(),
+                },
+                "not_trusted",
+            ),
+            (
+                SendError::UnknownDestination {
+                    destination: destination.clone(),
+                },
+                "unknown_destination",
+            ),
+            (SendError::NotRunning, "not_running"),
+            (
+                SendError::ContentTooLong { chars: 2, max: 1 },
+                "content_too_long",
+            ),
+            (
+                SendError::TitleTooLong { chars: 2, max: 1 },
+                "title_too_long",
+            ),
+            (SendError::InvalidFields("too deep"), "invalid_fields"),
+            (SendError::Refused(RefusalCode::NoAccess), "refused"),
+            (SendError::Direct(R3Error::LinkClosed), "direct"),
+            (
+                SendError::IncompatibleVersion {
+                    destination,
+                    found: Some(9),
+                    min: 1,
+                    max: 2,
+                },
+                "incompatible_version",
+            ),
+            (SendError::NoPropagationNode, "no_propagation_node"),
+            (
+                SendError::Propagation(PropagationError::Cancelled),
+                "propagation",
+            ),
+            (SendError::NotAcknowledged, "not_acknowledged"),
+        ];
+
+        for (error, class) in table {
+            assert_eq!(error.class(), class, "{error:?}");
+            assert!(
+                class.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                "{class}"
+            );
+        }
+    }
+
+    #[test]
+    fn bulletin_tally_counts_each_outcome_and_the_sent_event_carries_the_counts() {
+        let report = |seed: &str, outcome: RecipientOutcome| RecipientReport {
+            destination: hash_of(seed),
+            display_name: None,
+            outcome,
+        };
+        let outcome = BroadcastOutcome {
+            id: "b-1".to_string(),
+            recipients: vec![
+                report("one", RecipientOutcome::Delivered),
+                report("two", RecipientOutcome::StoreAndForward),
+                report("three", RecipientOutcome::StoreAndForward),
+                report(
+                    "four",
+                    RecipientOutcome::Unreachable {
+                        reason: "timed out".to_string(),
+                    },
+                ),
+                report(
+                    "five",
+                    RecipientOutcome::Refused {
+                        reason: "no access".to_string(),
+                    },
+                ),
+            ],
+        };
+
+        let tally = outcome.tally();
+
+        assert_eq!(
+            tally,
+            BulletinTally {
+                recipients: 5,
+                delivered: 1,
+                stored: 2,
+                unreachable: 1,
+                refused: 1,
+            }
+        );
+        let envs = MeshEvent::BulletinSent {
+            id: outcome.id.clone(),
+            tally,
+        }
+        .envs();
+        assert_eq!(env_value(&envs, "COYOTE_MESH_MESSAGE_ID"), Some("b-1"));
+        assert_eq!(env_value(&envs, "COYOTE_MESH_RECIPIENTS"), Some("5"));
+        assert_eq!(env_value(&envs, "COYOTE_MESH_DELIVERED"), Some("1"));
+        assert_eq!(env_value(&envs, "COYOTE_MESH_STORED"), Some("2"));
+        assert_eq!(env_value(&envs, "COYOTE_MESH_UNREACHABLE"), Some("1"));
+        assert_eq!(env_value(&envs, "COYOTE_MESH_REFUSED"), Some("1"));
     }
 
     #[test]

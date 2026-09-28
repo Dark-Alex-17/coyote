@@ -18,12 +18,13 @@ use crate::client::{
 };
 use crate::config::{
     AgentVariables, AppConfig, AssertState, EnvoyRunner, Input, LastMessage, MacroState,
-    MeshDigestDriver, RequestContext, StateFlags, flatten_prompt_messages, macro_execute,
-    publish_mesh_snapshot, resolve_prompt_args, sanitize_display_text,
+    MeshDigestDriver, MeshHookBridge, RequestContext, StateFlags, flatten_prompt_messages,
+    macro_execute, publish_mesh_snapshot, resolve_prompt_args, sanitize_display_text,
 };
 use crate::config::{AssetCategory, paths};
 use crate::function::agents::{GuardrailAction, check_pending_tasks_guardrail};
 use crate::hooks::{self, HookEvent};
+use crate::mesh::events::MeshHookSink;
 use crate::mesh::notify::NotificationSink;
 use crate::mesh::snapshot::TurnState;
 use crate::render::render_error;
@@ -514,6 +515,7 @@ pub struct Repl {
     idle: Option<IdleDriver>,
     digest: MeshDigestDriver,
     envoy: Arc<EnvoyRunner>,
+    mesh_hooks: Arc<MeshHookBridge>,
 }
 
 impl Repl {
@@ -524,6 +526,10 @@ impl Repl {
         ctx.app
             .mesh
             .set_notifier(Arc::clone(&printer) as Arc<dyn NotificationSink>);
+        let mesh_hooks = MeshHookBridge::new(Arc::clone(&ctx.app));
+        ctx.app
+            .mesh
+            .set_hook_sink(Arc::clone(&mesh_hooks) as Arc<dyn MeshHookSink>);
         let app_state = Arc::clone(&ctx.app);
         let ctx = Arc::new(RwLock::new(ctx));
         let editor = Self::create_editor(Arc::clone(&ctx), app.as_ref(), &printer)?;
@@ -542,6 +548,7 @@ impl Repl {
             idle: Some(idle),
             digest: MeshDigestDriver::new(),
             envoy,
+            mesh_hooks,
         })
     }
 
@@ -624,6 +631,7 @@ Type ".help" for additional help.
                         let result =
                             run_repl_command(&mut ctx, self.abort_signal.clone(), &line).await;
                         self.envoy.refresh(&ctx.app);
+                        self.mesh_hooks.refresh(&ctx.app);
                         self.digest.observe_session(&ctx);
                         publish_mesh_snapshot(&ctx, TurnState::idle_now());
                         result
@@ -676,6 +684,9 @@ Type ".help" for additional help.
         if let Err(err) = mesh.stop().await {
             render_error(err);
         }
+        // After the node's own `mesh.stopped`, so nothing left in the slot can run hooks
+        // against a session on its way out.
+        mesh.clear_hook_sink();
 
         if let Some(supervisor) = self.ctx.read().supervisor.clone() {
             supervisor.read().cancel_recursive();

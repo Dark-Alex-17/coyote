@@ -205,7 +205,10 @@ async fn turn_on(ctx: &mut RequestContext, rest: Option<&str>) -> Result<()> {
         function_calling_support,
         &mut trial,
         MeshPaths::from_env(),
-        NodeOptions::default(),
+        NodeOptions {
+            hooks: ctx.app.mesh.hooks(),
+            ..NodeOptions::default()
+        },
     )
     .await?;
     if let Some(id) = trial.mesh_instance_id() {

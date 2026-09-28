@@ -6,6 +6,9 @@ use crate::mesh::announce::{
 use crate::mesh::brief::{Brief, Digest, assemble_brief, digest_objective_for};
 use crate::mesh::card::{CardSource, DISPLAY_NAME_MAX_CHARS, StatusHandler, build_card};
 use crate::mesh::envoy::{EnvoyJob, EnvoySink};
+use crate::mesh::events::{
+    BriefUpdateSource, MeshEvent, MeshHookSink, MeshHooks, NodeFacts, Routed, TrustHookObserver,
+};
 use crate::mesh::idle::{IdleNotify, IdleSink, Origin};
 use crate::mesh::knock::{
     ChannelKnockSink, KNOCK_LINK_TIMEOUT, KNOCK_QUEUE_CAPACITY, KNOCK_REQUEST_TIMEOUT, KnockError,
@@ -21,7 +24,7 @@ use crate::mesh::message::{
     RawPeerMessage, collect_next_action, unix_now,
 };
 use crate::mesh::notify::{Notification, NotificationSink, Source};
-use crate::mesh::peers::{PeerChange, PeerSighting, PeerTable};
+use crate::mesh::peers::{PEER_TABLE_MAX_ENTRIES, PeerChange, PeerSighting, PeerTable};
 use crate::mesh::pending::{
     Correlations, InboundRecord, InboundStore, PendingRecord, PendingStore,
 };
@@ -59,6 +62,7 @@ use rns_transport::iface::auto_runtime::{
 use rns_transport::iface::tcp_client::TcpClient;
 use rns_transport::iface::{IfaceRole, InterfaceMode};
 use rns_transport::transport::{AnnounceEvent, Transport, TransportConfig};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -106,12 +110,16 @@ impl MeshPaths {
 
 pub(crate) struct NodeOptions {
     pub connect_timeout: Duration,
+    /// The handle the node fires its `mesh.*` events through; the slot that installs
+    /// the node shares it, so pass `MeshSlot::hooks`.
+    pub hooks: MeshHooks,
 }
 
 impl Default for NodeOptions {
     fn default() -> Self {
         Self {
             connect_timeout: TcpClient::DEFAULT_CONNECT_TIMEOUT,
+            hooks: MeshHooks::default(),
         }
     }
 }
@@ -150,6 +158,13 @@ impl InterfacePlan {
         match self {
             Self::Lan => "lan".to_string(),
             Self::Tcp { kind, endpoint } => format!("{kind} {endpoint}"),
+        }
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Lan => "lan",
+            Self::Tcp { kind, .. } => kind,
         }
     }
 }
@@ -214,6 +229,8 @@ pub(crate) struct MeshRuntime {
     peer_limits: PeerLimitConfig,
     cache_dir: PathBuf,
     interface_labels: Vec<String>,
+    interface_kinds: Vec<&'static str>,
+    hooks: MeshHooks,
     /// `None` once `shutdown` has released this owner. Requests and the server loop hold
     /// clones, so the upstream `Drop` that cancels the transport's tasks runs when the last
     /// of those finishes, not when this lock is emptied.
@@ -262,6 +279,7 @@ impl MeshRuntime {
         let plans = plan_interfaces(config.interfaces());
         let app_data = announce_app_data(config)?;
         let trust = Arc::new(TrustStore::open(&paths.config_dir)?);
+        trust.set_observer(Arc::new(TrustHookObserver(options.hooks.clone())));
 
         let instance_id = session.ensure_mesh_instance_id().to_string();
         let lock = InstanceLock::acquire(&paths.cache_dir, &instance_id)?;
@@ -347,6 +365,7 @@ impl MeshRuntime {
             trust.clone(),
             peers.clone(),
             KnockCache::new(&paths.cache_dir, config.knock_retention_hours),
+            options.hooks.clone(),
         ));
         let runtime = Arc::new(Self {
             fingerprint,
@@ -357,6 +376,8 @@ impl MeshRuntime {
             peer_limits: PeerLimitConfig::from(config),
             cache_dir: paths.cache_dir,
             interface_labels: plans.iter().map(InterfacePlan::label).collect(),
+            interface_kinds: plans.iter().map(InterfacePlan::kind).collect(),
+            hooks: options.hooks,
             transport: Mutex::new(Some(transport.clone())),
             interfaces: Mutex::new(joined),
             destination: Mutex::new(DestinationState {
@@ -401,6 +422,7 @@ impl MeshRuntime {
             runtime.peers.clone(),
             runtime.trust.clone(),
             runtime.propagation_nodes.clone(),
+            runtime.hooks.clone(),
             runtime.cancellation_token(),
         )));
         runtime.register_task(tokio::spawn(drain_knocks(
@@ -472,6 +494,15 @@ impl MeshRuntime {
         self.interface_labels.clone()
     }
 
+    /// The joined interfaces by kind only (`lan`, `private`, `public`), in config order.
+    pub(crate) fn interface_kinds(&self) -> Vec<&'static str> {
+        self.interface_kinds.clone()
+    }
+
+    pub(crate) fn hooks(&self) -> &MeshHooks {
+        &self.hooks
+    }
+
     pub(crate) fn peers(&self) -> Arc<PeerTable> {
         self.peers.clone()
     }
@@ -523,6 +554,12 @@ impl MeshRuntime {
     pub(crate) async fn max_request_size(&self) -> Option<usize> {
         let state = self.destination.lock().await;
         state.dest.lock().await.max_request_size()
+    }
+
+    /// The node's private key as hex, for tests that prove no hook env carries it.
+    #[cfg(test)]
+    pub(crate) fn private_key_hex(&self) -> String {
+        to_core_private_identity(&self.transport_identity).to_hex_string()
     }
 
     /// Arms the upstream advertisement-time request cap, which production code leaves off
@@ -1253,6 +1290,15 @@ async fn stop_interface(
     }
 }
 
+/// What `record_announce` read off a Coyote announce and did with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FiledAnnounce {
+    change: PeerChange,
+    display_name: Option<String>,
+    protocol_version: u16,
+    compatibility: Compatibility,
+}
+
 /// Files one received announce in the peer table; `None` when it is not a Coyote announce.
 fn record_announce(
     peers: &PeerTable,
@@ -1262,7 +1308,7 @@ fn record_announce(
     app_data: &[u8],
     hops: u8,
     now: SystemTime,
-) -> Option<PeerChange> {
+) -> Option<FiledAnnounce> {
     let Some(decoded) = AnnounceAppData::decode(app_data) else {
         debug!("Ignored announce from {destination_hash} ({hops} hops): not a Coyote node");
         return None;
@@ -1271,7 +1317,8 @@ fn record_announce(
         "Received mesh announce from {destination_hash} ({hops} hops, protocol version {})",
         decoded.version
     );
-    if let Compatibility::Incompatible { found } = Compatibility::of(decoded.version) {
+    let compatibility = Compatibility::of(decoded.version);
+    if let Compatibility::Incompatible { found } = compatibility {
         debug!(
             "Mesh peer {} is incompatible: it speaks protocol {found}, this Coyote supports {MESH_PROTOCOL_MIN_SUPPORTED}..={MESH_PROTOCOL_VERSION}",
             short(&destination_hash)
@@ -1282,7 +1329,7 @@ fn record_announce(
             destination_hash: destination_hash.clone(),
             identity_hash,
             name_hash,
-            display_name: decoded.display_name,
+            display_name: decoded.display_name.clone(),
             protocol_version: decoded.version,
             hops,
         },
@@ -1292,7 +1339,164 @@ fn record_announce(
         PeerChange::Added => debug!("Added mesh peer {destination_hash}"),
         PeerChange::Refreshed => debug!("Refreshed mesh peer {destination_hash}"),
     }
-    Some(change)
+    Some(FiledAnnounce {
+        change,
+        display_name: decoded.display_name,
+        protocol_version: decoded.version,
+        compatibility,
+    })
+}
+
+/// Fires of `mesh.peer.discovered` per second across all peers, and the most the bucket
+/// holds. A filer that has spent its tokens drops the fire rather than queueing it.
+const DISCOVERED_FIRES_PER_SEC: f64 = 16.0;
+
+/// A destination's last `mesh.peer.discovered` fire and the facts it carried.
+struct DiscoveredFire {
+    at: SystemTime,
+    display_name: Option<String>,
+    protocol_version: u16,
+    hops: u8,
+}
+
+/// Which `mesh.peer.discovered` fires get through. A peer's first sighting is always due;
+/// a refresh only when its name, protocol version or hop count differ from what was last
+/// fired for it, or that fire is at least `HEARTBEAT_SECS` old. On top of that a token
+/// bucket caps the rate across all peers and may drop a due fire, in which case the peer's
+/// next refresh fires with `COYOTE_MESH_FIRST_SEEN=false`. The map forgets destinations whose last fire is
+/// older than two heartbeats and is capped at the peer table's size, so a flood of
+/// distinct destinations cannot grow it without bound.
+#[derive(Default)]
+struct DiscoveredThrottle {
+    fired: HashMap<String, DiscoveredFire>,
+    tokens: f64,
+    refilled_at: Option<SystemTime>,
+    dropping: bool,
+}
+
+impl DiscoveredThrottle {
+    fn admits(
+        &mut self,
+        destination: &str,
+        filed: &FiledAnnounce,
+        hops: u8,
+        now: SystemTime,
+    ) -> bool {
+        let due = match (filed.change, self.fired.get(destination)) {
+            (PeerChange::Added, _) | (PeerChange::Refreshed, None) => true,
+            (PeerChange::Refreshed, Some(last)) => {
+                last.display_name != filed.display_name
+                    || last.protocol_version != filed.protocol_version
+                    || last.hops != hops
+                    || now
+                        .duration_since(last.at)
+                        .is_ok_and(|since| since.as_secs() >= HEARTBEAT_SECS)
+            }
+        };
+        if !due {
+            return false;
+        }
+        self.refill(now);
+        if self.tokens < 1.0 {
+            if !self.dropping {
+                debug!(
+                    "Mesh peer discovery is firing hooks faster than {DISCOVERED_FIRES_PER_SEC} a second; dropping fires until the rate falls"
+                );
+                self.dropping = true;
+            }
+            return false;
+        }
+        self.tokens -= 1.0;
+        self.dropping = false;
+        self.remember(destination, filed, hops, now);
+        true
+    }
+
+    fn refill(&mut self, now: SystemTime) {
+        self.tokens = match self.refilled_at {
+            None => DISCOVERED_FIRES_PER_SEC,
+            Some(at) => {
+                let elapsed = now.duration_since(at).unwrap_or_default();
+                (self.tokens + elapsed.as_secs_f64() * DISCOVERED_FIRES_PER_SEC)
+                    .min(DISCOVERED_FIRES_PER_SEC)
+            }
+        };
+        self.refilled_at = Some(now);
+    }
+
+    fn remember(&mut self, destination: &str, filed: &FiledAnnounce, hops: u8, now: SystemTime) {
+        if !self.fired.contains_key(destination) {
+            if let Some(forgotten_before) = now.checked_sub(Duration::from_secs(2 * HEARTBEAT_SECS))
+            {
+                self.fired.retain(|_, last| last.at > forgotten_before);
+            }
+            if self.fired.len() >= PEER_TABLE_MAX_ENTRIES {
+                let oldest = self
+                    .fired
+                    .iter()
+                    .min_by_key(|(_, last)| last.at)
+                    .map(|(hash, _)| hash.clone());
+                if let Some(oldest) = oldest {
+                    self.fired.remove(&oldest);
+                }
+            }
+        }
+        self.fired.insert(
+            destination.to_string(),
+            DiscoveredFire {
+                at: now,
+                display_name: filed.display_name.clone(),
+                protocol_version: filed.protocol_version,
+                hops,
+            },
+        );
+    }
+}
+
+/// Where a heard announce goes: the peer table, the trust list's sightings, and
+/// `mesh.peer.discovered`, trusted or not, compatible or not, as far as the throttle
+/// lets it through.
+struct AnnounceFiler<'a> {
+    peers: &'a PeerTable,
+    trust: &'a TrustStore,
+    hooks: &'a MeshHooks,
+    throttle: DiscoveredThrottle,
+}
+
+impl AnnounceFiler<'_> {
+    fn file(
+        &mut self,
+        destination_hash: String,
+        identity_hash: String,
+        name_hash: String,
+        app_data: &[u8],
+        hops: u8,
+        now: SystemTime,
+    ) -> Option<PeerChange> {
+        let filed = record_announce(
+            self.peers,
+            destination_hash.clone(),
+            identity_hash.clone(),
+            name_hash.clone(),
+            app_data,
+            hops,
+            now,
+        )?;
+        self.trust
+            .mark_seen(&destination_hash, &identity_hash, &name_hash, now);
+        if self.throttle.admits(&destination_hash, &filed, hops, now) {
+            self.hooks.fire(MeshEvent::PeerDiscovered {
+                destination: destination_hash,
+                identity: identity_hash,
+                name: filed.display_name,
+                hops,
+                protocol_version: filed.protocol_version,
+                compatibility: filed.compatibility,
+                change: filed.change,
+            });
+        }
+        Some(filed.change)
+    }
 }
 
 /// The pre-flight half of the version gate: a peer the table knows speaks a protocol this
@@ -1349,8 +1553,15 @@ async fn receive_announces(
     peers: Arc<PeerTable>,
     trust: Arc<TrustStore>,
     propagation_nodes: Arc<PropagationNodeTable>,
+    hooks: MeshHooks,
     cancel: CancellationToken,
 ) {
+    let mut filer = AnnounceFiler {
+        peers: &peers,
+        trust: &trust,
+        hooks: &hooks,
+        throttle: DiscoveredThrottle::default(),
+    };
     loop {
         let event = tokio::select! {
             () = cancel.cancelled() => break,
@@ -1368,21 +1579,14 @@ async fn receive_announces(
         if propagation_nodes.observe_announce(&desc, event.app_data.as_slice(), event.hops, now) {
             continue;
         }
-        let destination_hash = desc.address_hash.to_hex_string();
-        let identity_hash = desc.identity.address_hash.to_hex_string();
-        let name_hash = hex_lower(&event.name_hash);
-        let filed = record_announce(
-            &peers,
-            destination_hash.clone(),
-            identity_hash.clone(),
-            name_hash.clone(),
+        filer.file(
+            desc.address_hash.to_hex_string(),
+            desc.identity.address_hash.to_hex_string(),
+            hex_lower(&event.name_hash),
             event.app_data.as_slice(),
             event.hops,
             now,
         );
-        if filed.is_some() {
-            trust.mark_seen(&destination_hash, &identity_hash, &name_hash, now);
-        }
     }
 }
 
@@ -1489,6 +1693,7 @@ pub(crate) struct MeshSlot {
     notifier: ArcSwapOption<Arc<dyn NotificationSink>>,
     idle: ArcSwapOption<Arc<dyn IdleSink>>,
     envoy: ArcSwapOption<Arc<dyn EnvoySink>>,
+    hooks: MeshHooks,
     limits: Arc<PeerLimits>,
     peer_inbox: PeerInbox,
     correlations: Correlations,
@@ -1547,7 +1752,18 @@ impl MeshSlot {
         runtime
             .knock_gate()
             .attach(Arc::downgrade(self) as Weak<dyn KnockSurface>);
+        // A node started on its own handle takes the slot's sink, so what it fires
+        // reaches the same place as what the slot fires.
+        if !self.hooks.same_handle(runtime.hooks())
+            && let Some(sink) = self.hooks.current()
+        {
+            runtime.hooks().set(sink);
+        }
+        let facts = node_facts(&runtime);
         *slot = Some(runtime);
+        // Fired outside the lock: the sink is not the slot's to trust with it.
+        drop(slot);
+        self.hooks.fire(MeshEvent::Started(facts));
         Ok(())
     }
 
@@ -1568,7 +1784,10 @@ impl MeshSlot {
                 }
                 self.correlations.detach_store();
                 self.inbound.lock().take();
-                runtime.shutdown().await?;
+                let facts = node_facts(&runtime);
+                let shutdown = runtime.shutdown().await;
+                self.hooks.fire(MeshEvent::Stopped(facts));
+                shutdown?;
                 Ok(true)
             }
             None => Ok(false),
@@ -1692,13 +1911,18 @@ impl MeshSlot {
             return false;
         }
         self.digest.store(Some(Arc::new(digest)));
-        self.reassemble_brief_locked(&rebuilding);
+        if self.reassemble_brief_locked(&rebuilding) {
+            self.fire_brief_updated(BriefUpdateSource::Digest);
+        }
         true
     }
 
     pub(crate) fn set_user_brief(&self, text: Option<String>) {
+        let rebuilding = self.reassembly.lock();
         self.user_brief.store(non_blank(text));
-        self.reassemble_brief();
+        if self.reassemble_brief_locked(&rebuilding) {
+            self.fire_brief_updated(BriefUpdateSource::User);
+        }
     }
 
     pub(crate) fn user_brief(&self) -> Option<Arc<String>> {
@@ -1720,33 +1944,39 @@ impl MeshSlot {
     }
 
     /// The rebuild itself; the guard proves the caller holds `reassembly`, which is not
-    /// reentrant.
-    fn reassemble_brief_locked(&self, _rebuilding: &parking_lot::MutexGuard<'_, ()>) {
-        let Some(snapshot) = self.snapshot() else {
-            self.brief.store(None);
-            return;
-        };
-        let now = SystemTime::now();
-        let objective_override = self.objective_override();
-        let digest = self.digest();
-        let digest_objective = digest_objective_for(&snapshot, digest.as_deref());
-        let display_name = CardSource::display_name(self);
-        let card = build_card(
-            Some(&snapshot),
-            objective_override.as_deref().map(String::as_str),
-            digest_objective.as_deref(),
-            display_name.as_deref(),
-            now,
-        );
-        let user_brief = self.user_brief();
-        let brief = assemble_brief(
-            snapshot.brief.mode,
-            Some(&card),
-            digest.as_deref(),
-            user_brief.as_deref().map(String::as_str),
-            &snapshot.todo,
-        );
+    /// reentrant. `true` when the served brief changed.
+    fn reassemble_brief_locked(&self, _rebuilding: &parking_lot::MutexGuard<'_, ()>) -> bool {
+        let brief = self.snapshot().and_then(|snapshot| {
+            let now = SystemTime::now();
+            let objective_override = self.objective_override();
+            let digest = self.digest();
+            let digest_objective = digest_objective_for(&snapshot, digest.as_deref());
+            let display_name = CardSource::display_name(self);
+            let card = build_card(
+                Some(&snapshot),
+                objective_override.as_deref().map(String::as_str),
+                digest_objective.as_deref(),
+                display_name.as_deref(),
+                now,
+            );
+            let user_brief = self.user_brief();
+            assemble_brief(
+                snapshot.brief.mode,
+                Some(&card),
+                digest.as_deref(),
+                user_brief.as_deref().map(String::as_str),
+                &snapshot.todo,
+            )
+        });
+        let changed = self.brief.load().as_deref() != brief.as_ref();
         self.brief.store(brief.map(Arc::new));
+        changed
+    }
+
+    /// `mesh.brief.updated` with the size of what is served now; never the text.
+    fn fire_brief_updated(&self, source: BriefUpdateSource) {
+        let chars = self.brief().map_or(0, |brief| brief.text.chars().count());
+        self.hooks.fire(MeshEvent::BriefUpdated { source, chars });
     }
 
     /// Installs where human-facing lines go. The interactive REPL installs its prompt
@@ -1795,6 +2025,34 @@ impl MeshSlot {
 
     pub(crate) fn clear_envoy(&self) {
         self.envoy.store(None);
+    }
+
+    /// Installs who runs the `mesh.*` hooks, on this slot's handle and on the installed
+    /// node's when that is a separate one, so this may come before or after `install`.
+    pub(crate) fn set_hook_sink(&self, sink: Arc<dyn MeshHookSink>) {
+        self.hooks.set(Arc::clone(&sink));
+        if let Some(hooks) = self.separate_runtime_hooks() {
+            hooks.set(sink);
+        }
+    }
+
+    pub(crate) fn clear_hook_sink(&self) {
+        self.hooks.clear();
+        if let Some(hooks) = self.separate_runtime_hooks() {
+            hooks.clear();
+        }
+    }
+
+    /// The installed node's hook handle when it is not a clone of this slot's.
+    fn separate_runtime_hooks(&self) -> Option<MeshHooks> {
+        self.get()
+            .map(|runtime| runtime.hooks().clone())
+            .filter(|hooks| !hooks.same_handle(&self.hooks))
+    }
+
+    /// The handle to start a node with, so its events reach the sink installed here.
+    pub(crate) fn hooks(&self) -> MeshHooks {
+        self.hooks.clone()
     }
 
     #[cfg(test)]
@@ -1867,8 +2125,12 @@ impl MeshSlot {
         let for_envoy =
             !answered && !wire_reply && matches!(message.kind, PeerKind::Message | PeerKind::Ask);
         let envoy = for_envoy.then(|| self.envoy.load_full()).flatten();
-        match envoy {
-            None => self.deliver_to_inbox(message, answered),
+        let received = ReceivedFacts::of(&message);
+        let routed = match envoy {
+            None => {
+                self.deliver_to_inbox(message, answered);
+                Routed::Inbox
+            }
             Some(sink) => {
                 let (kind, id) = (message.kind, message.message_id.clone());
                 let id8 = short(&message.source_identity).to_string();
@@ -1876,17 +2138,22 @@ impl MeshSlot {
                     message: message.clone(),
                     reservation: None,
                 }) {
-                    Ok(()) => debug!("Mesh {kind} {id} from {id8} handed to the envoy"),
+                    Ok(()) => {
+                        debug!("Mesh {kind} {id} from {id8} handed to the envoy");
+                        Routed::Envoy
+                    }
                     Err(refusal) => {
                         debug!(
                             "Mesh {kind} {id} from {id8} refused by the envoy: {}; delivering it to the inbox",
                             refusal.reason.as_str()
                         );
                         self.refuse_for_envoy(message, refusal);
+                        Routed::Inbox
                     }
                 }
             }
-        }
+        };
+        self.hooks.fire(received.event(routed));
     }
 
     /// The envoy refused `original` with a typed reason: it takes the inbox path and the
@@ -2260,6 +2527,63 @@ fn non_blank(value: Option<String>) -> Option<Arc<String>> {
         .map(Arc::new)
 }
 
+fn node_facts(runtime: &MeshRuntime) -> NodeFacts {
+    NodeFacts {
+        instance_id: runtime.current_instance_id(),
+        destination: runtime.current_destination_hash(),
+        identity: runtime.fingerprint().to_string(),
+        interfaces: runtime.interface_kinds(),
+    }
+}
+
+/// What `mesh.message.received` and `mesh.bulletin.received` say about a message, taken
+/// before it is handed on, since that consumes it. Never its content or fields.
+struct ReceivedFacts {
+    kind: PeerKind,
+    id: String,
+    in_reply_to: Option<String>,
+    identity: String,
+    destination: String,
+    title: Option<String>,
+    via: PeerVia,
+}
+
+impl ReceivedFacts {
+    fn of(message: &PeerMessage) -> Self {
+        Self {
+            kind: message.kind,
+            id: message.message_id.clone(),
+            in_reply_to: message.in_reply_to.clone(),
+            identity: message.source_identity.clone(),
+            destination: message.source_destination.clone(),
+            title: message.title.clone(),
+            via: message.via,
+        }
+    }
+
+    fn event(self, routed: Routed) -> MeshEvent {
+        match self.kind {
+            PeerKind::Bulletin => MeshEvent::BulletinReceived {
+                id: self.id,
+                identity: self.identity,
+                destination: self.destination,
+                title: self.title,
+                via: self.via,
+            },
+            PeerKind::Message | PeerKind::Ask | PeerKind::Reply => MeshEvent::MessageReceived {
+                kind: self.kind,
+                id: self.id,
+                in_reply_to: self.in_reply_to,
+                identity: self.identity,
+                destination: self.destination,
+                title: self.title,
+                via: self.via,
+                routed,
+            },
+        }
+    }
+}
+
 /// The words `summary_line` shows for `message`, cut to `max_chars`.
 fn first_words(message: &PeerMessage, max_chars: usize) -> String {
     let words = if message.content.is_empty() {
@@ -2412,7 +2736,9 @@ impl PeerSurface for MeshSlot {
 mod tests {
     use super::*;
     use crate::config::mesh_config::MeshBrief;
+    use crate::hooks::HookEvent;
     use crate::mesh::destination_address;
+    use crate::mesh::events::{RecordingHookSink, env_value, one_fire};
     use crate::mesh::message::{
         PEER_ID_MAX_CHARS, is_received_reply, peer_lxmf_message, to_r3_body,
     };
@@ -3102,6 +3428,165 @@ mod tests {
         let (envelopes, dropped) = slot.peer_inbox().drain();
         assert_eq!(dropped, 0);
         assert_eq!(peer_ids(&envelopes), ["m-2", "r-3"]);
+    }
+
+    fn assert_no_content(envs: &[(&'static str, String)], message: &PeerMessage) {
+        for (key, value) in envs {
+            assert!(
+                !value.contains(&message.content) && !message.content.contains(value.as_str()),
+                "{key}={value} carries the content"
+            );
+        }
+    }
+
+    #[test]
+    fn deliver_peer_fires_message_received_with_where_it_went_and_never_the_content() {
+        let slot = MeshSlot::default();
+        let sink = RecordingHookSink::attach(&slot.hooks());
+        let mut message = peer_message(PeerKind::Ask, "a-1", None);
+        message.title = Some("plan".to_string());
+        message.content = "the secret words of the peer".to_string();
+        message.via = PeerVia::StoreAndForward;
+
+        slot.deliver_peer(message.clone());
+
+        let envs = one_fire(&sink, HookEvent::MeshMessageReceived);
+        assert_eq!(env_value(&envs, "COYOTE_MESH_MESSAGE_KIND"), Some("ask"));
+        assert_eq!(env_value(&envs, "COYOTE_MESH_MESSAGE_ID"), Some("a-1"));
+        assert_eq!(env_value(&envs, "COYOTE_MESH_IN_REPLY_TO"), None);
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_PEER_IDENTITY"),
+            Some(hex_lower(&PEER_IDENTITY).as_str())
+        );
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_PEER_DESTINATION"),
+            Some(hex_lower(&PEER_INSTANCE).as_str())
+        );
+        assert_eq!(env_value(&envs, "COYOTE_MESH_MESSAGE_TITLE"), Some("plan"));
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_VIA"),
+            Some("store-and-forward")
+        );
+        assert_eq!(env_value(&envs, "COYOTE_MESH_ROUTED"), Some("inbox"));
+        assert_no_content(&envs, &message);
+
+        let envoy = RecordingEnvoy::new(true, false);
+        slot.set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
+        slot.deliver_peer(peer_message(PeerKind::Message, "m-1", None));
+        let envs = one_fire(&sink, HookEvent::MeshMessageReceived);
+        assert_eq!(env_value(&envs, "COYOTE_MESH_ROUTED"), Some("envoy"));
+        assert_eq!(envoy.job_ids(), ["m-1"]);
+
+        slot.correlations().open(pending("q-1")).unwrap();
+        slot.deliver_peer(peer_message(PeerKind::Reply, "r-1", Some("q-1")));
+        let envs = one_fire(&sink, HookEvent::MeshMessageReceived);
+        assert_eq!(env_value(&envs, "COYOTE_MESH_MESSAGE_KIND"), Some("reply"));
+        assert_eq!(env_value(&envs, "COYOTE_MESH_IN_REPLY_TO"), Some("q-1"));
+        assert_eq!(env_value(&envs, "COYOTE_MESH_ROUTED"), Some("inbox"));
+    }
+
+    #[test]
+    fn deliver_peer_fires_bulletin_received_for_a_bulletin() {
+        let slot = MeshSlot::default();
+        let sink = RecordingHookSink::attach(&slot.hooks());
+        let envoy = RecordingEnvoy::new(true, false);
+        slot.set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
+        let mut message = peer_message(PeerKind::Bulletin, "b-1", None);
+        message.content = "the secret words of the peer".to_string();
+
+        slot.deliver_peer(message.clone());
+
+        let envs = one_fire(&sink, HookEvent::MeshBulletinReceived);
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_MESSAGE_KIND"),
+            Some("bulletin")
+        );
+        assert_eq!(env_value(&envs, "COYOTE_MESH_MESSAGE_ID"), Some("b-1"));
+        assert_eq!(env_value(&envs, "COYOTE_MESH_VIA"), Some("direct"));
+        assert_eq!(env_value(&envs, "COYOTE_MESH_ROUTED"), None);
+        assert_no_content(&envs, &message);
+        assert!(envoy.job_ids().is_empty());
+    }
+
+    #[test]
+    fn deliver_peer_with_no_hook_sink_delivers_and_records_nothing() {
+        let slot = MeshSlot::default();
+        slot.deliver_peer(peer_message(PeerKind::Message, "m-1", None));
+        let (envelopes, _) = slot.peer_inbox().drain();
+        assert_eq!(peer_ids(&envelopes), ["m-1"]);
+    }
+
+    #[test]
+    fn set_user_brief_fires_brief_updated_only_when_the_served_brief_changes() {
+        let slot = MeshSlot::default();
+        let sink = RecordingHookSink::attach(&slot.hooks());
+        let note = "Ask before merging";
+
+        slot.set_user_brief(Some(note.to_string()));
+        assert!(
+            sink.drain().is_empty(),
+            "with no snapshot nothing is served, so nothing changed"
+        );
+
+        slot.publish(snapshot_fixture());
+        sink.drain();
+        slot.set_user_brief(Some(note.to_string()));
+        assert!(sink.drain().is_empty(), "the same text changes nothing");
+
+        slot.set_user_brief(Some("Merge freely".to_string()));
+        let envs = one_fire(&sink, HookEvent::MeshBriefUpdated);
+        assert_eq!(env_value(&envs, "COYOTE_MESH_BRIEF_SOURCE"), Some("user"));
+        let served = slot.brief().unwrap().text.chars().count();
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_BRIEF_CHARS"),
+            Some(served.to_string().as_str())
+        );
+        for (key, value) in &envs {
+            assert!(!value.contains("Merge"), "{key}={value} carries the brief");
+        }
+
+        slot.set_user_brief(Some("Merge freely".to_string()));
+        assert!(sink.drain().is_empty());
+    }
+
+    #[test]
+    fn publish_digest_at_fires_brief_updated_from_the_digest_for_the_current_epoch_only() {
+        let slot = MeshSlot::default();
+        slot.publish(snapshot_fixture());
+        let sink = RecordingHookSink::attach(&slot.hooks());
+        let digest = Digest {
+            text: "- Working on the mesh hooks".into(),
+            generated_at: SystemTime::now(),
+            covered_messages: 4,
+        };
+        let epoch = slot.digest_epoch();
+
+        assert!(slot.publish_digest_at(epoch, digest.clone()));
+
+        let envs = one_fire(&sink, HookEvent::MeshBriefUpdated);
+        assert_eq!(env_value(&envs, "COYOTE_MESH_BRIEF_SOURCE"), Some("digest"));
+        let served = slot.brief().unwrap().text.chars().count();
+        assert!(served > 0);
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_BRIEF_CHARS"),
+            Some(served.to_string().as_str())
+        );
+        for (key, value) in &envs {
+            assert!(
+                !value.contains("mesh hooks"),
+                "{key}={value} carries the digest"
+            );
+        }
+
+        assert!(slot.publish_digest_at(epoch, digest.clone()));
+        assert!(sink.drain().is_empty(), "the same digest changes nothing");
+
+        assert!(!slot.publish_digest_at(epoch + 1, digest.clone()));
+        assert!(!slot.publish_digest_at(epoch.wrapping_sub(1), digest));
+        assert!(
+            sink.drain().is_empty(),
+            "a digest from another epoch is dropped"
+        );
     }
 
     #[test]
@@ -4265,7 +4750,7 @@ mod tests {
         let aged_out = peers.sweep(now + PEER_TTL);
         log_aged_out_peers(&aged_out);
 
-        assert_eq!(added, Some(PeerChange::Added));
+        assert_eq!(added.map(|filed| filed.change), Some(PeerChange::Added));
         assert_eq!(ignored, None);
         assert_eq!(aged_out, vec![coyote_hash.to_string()]);
         let debugs = debug_snapshot();
@@ -4304,15 +4789,256 @@ mod tests {
             now,
         );
 
-        assert_eq!(change, Some(PeerChange::Added));
+        assert_eq!(change.map(|filed| filed.change), Some(PeerChange::Added));
         let recorded = peers.snapshot();
         assert_eq!(recorded.len(), 1);
         assert_eq!(recorded[0].display_name.as_deref(), Some(name));
     }
 
+    #[test]
+    fn filing_an_announce_fires_peer_discovered_for_untrusted_and_incompatible_peers_alike() {
+        let tmp = TempDir::new("node-announce-hook");
+        let now = SystemTime::now();
+        let peers = PeerTable::load(tmp.path.join("peers.json"), now).unwrap();
+        let (trust, _trust_dir) = TrustList::default().open("node-announce-hook-trust");
+        let hooks = MeshHooks::default();
+        let sink = RecordingHookSink::attach(&hooks);
+        let mut filer = AnnounceFiler {
+            peers: &peers,
+            trust: &trust,
+            hooks: &hooks,
+            throttle: DiscoveredThrottle::default(),
+        };
+        let newer = MESH_PROTOCOL_VERSION + 1;
+        let app_data = AnnounceAppData {
+            version: newer,
+            display_name: Some("Bea".to_string()),
+        }
+        .encode()
+        .unwrap();
+        let destination = "ab".repeat(16);
+        let identity = "cd".repeat(16);
+
+        let change = filer.file(
+            destination.clone(),
+            identity.clone(),
+            "ef".repeat(10),
+            &app_data,
+            3,
+            now,
+        );
+        assert_eq!(change, Some(PeerChange::Added));
+        let envs = one_fire(&sink, HookEvent::MeshPeerDiscovered);
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_PEER_DESTINATION"),
+            Some(destination.as_str())
+        );
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_PEER_IDENTITY"),
+            Some(identity.as_str())
+        );
+        assert_eq!(env_value(&envs, "COYOTE_MESH_PEER_NAME"), Some("Bea"));
+        assert_eq!(env_value(&envs, "COYOTE_MESH_HOPS"), Some("3"));
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_PEER_PROTOCOL_VERSION"),
+            Some(newer.to_string().as_str())
+        );
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_PEER_COMPATIBLE"),
+            Some("false")
+        );
+        assert_eq!(env_value(&envs, "COYOTE_MESH_FIRST_SEEN"), Some("true"));
+
+        let change = filer.file(
+            destination.clone(),
+            identity.clone(),
+            "ef".repeat(10),
+            &app_data,
+            3,
+            now + Duration::from_secs(1),
+        );
+        assert_eq!(change, Some(PeerChange::Refreshed));
+        assert!(
+            sink.drain().is_empty(),
+            "a refresh that changes nothing visible fires nothing"
+        );
+
+        let change = filer.file(
+            destination.clone(),
+            identity.clone(),
+            "ef".repeat(10),
+            &app_data,
+            2,
+            now + Duration::from_secs(2),
+        );
+        assert_eq!(change, Some(PeerChange::Refreshed));
+        let envs = one_fire(&sink, HookEvent::MeshPeerDiscovered);
+        assert_eq!(env_value(&envs, "COYOTE_MESH_FIRST_SEEN"), Some("false"));
+        assert_eq!(env_value(&envs, "COYOTE_MESH_HOPS"), Some("2"));
+
+        let renamed = AnnounceAppData {
+            version: newer,
+            display_name: Some("Beatrix".to_string()),
+        }
+        .encode()
+        .unwrap();
+        filer.file(
+            destination.clone(),
+            identity.clone(),
+            "ef".repeat(10),
+            &renamed,
+            2,
+            now + Duration::from_secs(3),
+        );
+        let envs = one_fire(&sink, HookEvent::MeshPeerDiscovered);
+        assert_eq!(env_value(&envs, "COYOTE_MESH_PEER_NAME"), Some("Beatrix"));
+
+        filer.file(
+            destination.clone(),
+            identity.clone(),
+            "ef".repeat(10),
+            &renamed,
+            2,
+            now + Duration::from_secs(4),
+        );
+        assert!(sink.drain().is_empty());
+
+        filer.file(
+            destination.clone(),
+            identity.clone(),
+            "ef".repeat(10),
+            &renamed,
+            2,
+            now + Duration::from_secs(3 + HEARTBEAT_SECS),
+        );
+        let envs = one_fire(&sink, HookEvent::MeshPeerDiscovered);
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_FIRST_SEEN"),
+            Some("false"),
+            "a heartbeat after the last fire an unchanged peer fires again"
+        );
+
+        let ignored = filer.file(
+            "12".repeat(16),
+            identity,
+            "ef".repeat(10),
+            b"LXMF\x00\x01",
+            1,
+            now,
+        );
+        assert_eq!(ignored, None);
+        assert!(
+            sink.drain().is_empty(),
+            "a non-Coyote announce fires nothing"
+        );
+    }
+
+    #[test]
+    fn peer_discovered_fires_are_capped_across_peers_and_refill_with_time() {
+        let tmp = TempDir::new("node-announce-hook-bucket");
+        let now = SystemTime::now();
+        let peers = PeerTable::load(tmp.path.join("peers.json"), now).unwrap();
+        let (trust, _trust_dir) = TrustList::default().open("node-announce-hook-bucket-trust");
+        let hooks = MeshHooks::default();
+        let sink = RecordingHookSink::attach(&hooks);
+        let mut filer = AnnounceFiler {
+            peers: &peers,
+            trust: &trust,
+            hooks: &hooks,
+            throttle: DiscoveredThrottle::default(),
+        };
+        let app_data = AnnounceAppData {
+            version: MESH_PROTOCOL_VERSION,
+            display_name: None,
+        }
+        .encode()
+        .unwrap();
+        let file_new = |filer: &mut AnnounceFiler<'_>, n: u32, at: SystemTime| {
+            let change = filer.file(
+                hex_lower(&n.to_be_bytes()).repeat(4),
+                "cd".repeat(16),
+                "ef".repeat(10),
+                &app_data,
+                1,
+                at,
+            );
+            assert_eq!(change, Some(PeerChange::Added));
+        };
+
+        for n in 0..100 {
+            file_new(&mut filer, n, now);
+        }
+
+        let fired = sink.drain();
+        assert_eq!(fired.len(), DISCOVERED_FIRES_PER_SEC as usize, "{fired:?}");
+        assert!(
+            fired
+                .iter()
+                .all(|(event, _)| *event == HookEvent::MeshPeerDiscovered)
+        );
+
+        for n in 100..120 {
+            file_new(&mut filer, n, now + Duration::from_millis(500));
+        }
+        let fired = sink.drain();
+        assert_eq!(
+            fired.len(),
+            (DISCOVERED_FIRES_PER_SEC / 2.0) as usize,
+            "half a second refills half the bucket: {fired:?}"
+        );
+        assert_eq!(
+            env_value(&fired[0].1, "COYOTE_MESH_PEER_DESTINATION"),
+            Some(hex_lower(&100u32.to_be_bytes()).repeat(4).as_str()),
+            "the first peer filed once tokens are back is the first to fire"
+        );
+    }
+
+    #[test]
+    fn peer_discovered_throttle_forgets_stale_destinations_and_caps_its_map() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let mut throttle = DiscoveredThrottle::default();
+        let filed = FiledAnnounce {
+            change: PeerChange::Added,
+            display_name: None,
+            protocol_version: MESH_PROTOCOL_VERSION,
+            compatibility: Compatibility::Compatible,
+        };
+        let destination = |n: usize| hex_lower(&(n as u32).to_be_bytes()).repeat(4);
+        let file_at = |throttle: &mut DiscoveredThrottle, n: usize, at: SystemTime| {
+            // Keep the bucket out of the way: this test is about the map, not the rate.
+            throttle.tokens = DISCOVERED_FIRES_PER_SEC;
+            throttle.refilled_at = Some(at);
+            assert!(throttle.admits(&destination(n), &filed, 1, at));
+        };
+
+        for n in 0..=PEER_TABLE_MAX_ENTRIES {
+            file_at(&mut throttle, n, now);
+        }
+        assert_eq!(
+            throttle.fired.len(),
+            PEER_TABLE_MAX_ENTRIES,
+            "one more destination than the cap evicts the oldest"
+        );
+
+        let later = now + Duration::from_secs(2 * HEARTBEAT_SECS + 1);
+        file_at(&mut throttle, PEER_TABLE_MAX_ENTRIES + 1, later);
+        assert_eq!(
+            throttle.fired.len(),
+            1,
+            "every destination last fired over two heartbeats ago is forgotten"
+        );
+        assert!(
+            throttle
+                .fired
+                .contains_key(&destination(PEER_TABLE_MAX_ENTRIES + 1))
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn start_and_stop_log_node_lifecycle() {
+    async fn start_and_stop_log_node_lifecycle_and_fire_the_mesh_hooks() {
+        use crate::mesh::trust::TrustOptions;
+
         install_log_collector();
         let started = started_runtime("node-log-lifecycle").await;
         let runtime = started.runtime.clone();
@@ -4321,11 +5047,59 @@ mod tests {
         let hash = runtime.destination_hash().await;
         let interface = runtime.interfaces().remove(0);
         assert!(interface.starts_with("private 127.0.0.1:"), "{interface}");
+        let private_hex = runtime.private_key_hex();
         let slot = Arc::new(MeshSlot::default());
-        slot.install(runtime).unwrap();
+        let sink = RecordingHookSink::attach(&slot.hooks());
+        slot.install(runtime.clone()).unwrap();
+
+        let envs = one_fire(&sink, HookEvent::MeshStarted);
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_INSTANCE_ID"),
+            Some(instance_id.as_str())
+        );
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_DESTINATION"),
+            Some(hash.as_str())
+        );
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_IDENTITY"),
+            Some(fingerprint.as_str())
+        );
+        assert_eq!(env_value(&envs, "COYOTE_MESH_INTERFACES"), Some("private"));
+
+        // The node was started on its own handle; installing bound it to the slot's sink.
+        let identity = "ab".repeat(16);
+        runtime
+            .trust()
+            .trust_identity(
+                slot.as_ref(),
+                &identity,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        let granted = one_fire(&sink, HookEvent::MeshTrustGranted);
+        assert_eq!(
+            env_value(&granted, "COYOTE_MESH_PEER_IDENTITY"),
+            Some(identity.as_str())
+        );
 
         assert!(slot.stop().await.unwrap());
         started.relay_handle.abort();
+
+        let stopped = one_fire(&sink, HookEvent::MeshStopped);
+        assert_eq!(stopped, envs);
+        assert_eq!(private_hex.len(), 128);
+        for (key, value) in envs.iter().chain(&stopped) {
+            assert!(!value.contains(&private_hex), "{key} carries the key");
+            for at in 0..=private_hex.len() - 8 {
+                let window = &private_hex[at..at + 8];
+                assert!(
+                    fingerprint.contains(window) || !value.contains(window),
+                    "{key}={value} carries {window} of the private key"
+                );
+            }
+        }
 
         let debugs = debug_snapshot();
         assert_logged(
@@ -4346,6 +5120,215 @@ mod tests {
                 "Stopped mesh node {fingerprint} (instance {instance_id}, destination {hash})"
             ),
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_peer_to_an_untrusted_destination_fires_message_failed_without_the_content() {
+        use crate::mesh::message::SendError;
+
+        let started = started_runtime("node-send-untrusted-hook").await;
+        let runtime = &started.runtime;
+        let sink = RecordingHookSink::attach(runtime.hooks());
+        let destination = "ab".repeat(16);
+        let message = OutboundPeer {
+            kind: PeerKind::Message,
+            id: "m-1".to_string(),
+            in_reply_to: None,
+            title: None,
+            content: "secret body".to_string(),
+            fields: None,
+        };
+
+        let err = runtime.send_peer(&destination, &message).await.unwrap_err();
+
+        assert_eq!(
+            err,
+            SendError::NotTrusted {
+                destination: destination.clone(),
+            }
+        );
+        let envs = one_fire(&sink, HookEvent::MeshMessageFailed);
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_ERROR_CLASS"),
+            Some("not_trusted")
+        );
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_MESSAGE_KIND"),
+            Some("message")
+        );
+        assert_eq!(env_value(&envs, "COYOTE_MESH_MESSAGE_ID"), Some("m-1"));
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_PEER_DESTINATION"),
+            Some(destination.as_str())
+        );
+        for (key, value) in &envs {
+            assert!(
+                !value.contains(&message.content),
+                "{key}={value} carries the content"
+            );
+        }
+
+        let err = runtime
+            .send_peer("\u{1b}[2Jnot-a-hash", &message)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            err,
+            SendError::NotTrusted {
+                destination: "not-a-hash".to_string(),
+            }
+        );
+        let envs = one_fire(&sink, HookEvent::MeshMessageFailed);
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_ERROR_CLASS"),
+            Some("not_trusted")
+        );
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_PEER_DESTINATION"),
+            None,
+            "a destination that is not a hash is not passed on"
+        );
+        assert!(env_value(&envs, "COYOTE_MESH_ERROR").is_some());
+        for (key, value) in &envs {
+            assert!(
+                !value.contains('\u{1b}'),
+                "{key}={value:?} carries an escape"
+            );
+        }
+
+        let bulletin = OutboundPeer {
+            kind: PeerKind::Bulletin,
+            ..message
+        };
+        let err = runtime
+            .send_peer(&destination, &bulletin)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            err,
+            SendError::NotTrusted {
+                destination: destination.clone(),
+            }
+        );
+        assert!(
+            sink.drain().is_empty(),
+            "a bulletin's fan-out reports through mesh.bulletin.sent alone"
+        );
+        runtime.shutdown().await.unwrap();
+        started.relay_handle.abort();
+    }
+
+    #[cfg(unix)]
+    fn fires_of<'a>(
+        fired: &'a [(HookEvent, Vec<(&'static str, String)>)],
+        event: HookEvent,
+    ) -> Vec<&'a Vec<(&'static str, String)>> {
+        fired
+            .iter()
+            .filter(|(fired_event, _)| *fired_event == event)
+            .map(|(_, envs)| envs)
+            .collect()
+    }
+
+    /// A trusted, reachable peer: a message reports once through `mesh.message.sent`, a
+    /// bulletin once through `mesh.bulletin.sent`, and neither carries the content.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_peer_fires_message_sent_and_broadcast_fires_bulletin_sent_alone() {
+        use crate::mesh::trust::TrustOptions;
+
+        let stub = PeerStub::listen("node-sent-hook-stub", TcpServer::DEFAULT_CLIENT_MTU).await;
+        let started = started_runtime_on("node-sent-hook", stub.port()).await;
+        let runtime = started.runtime.clone();
+        let sink = RecordingHookSink::attach(runtime.hooks());
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime.clone()).unwrap();
+        stub.trust(&runtime.current_destination_hash(), runtime.fingerprint());
+        stub.announce(Some("Stub")).await;
+        let to = stub.destination_hex();
+        let peers = runtime.peers();
+        wait_until("the node to file the stub", || peers.get(&to).is_some()).await;
+        runtime
+            .trust()
+            .trust_destination(
+                slot.as_ref(),
+                &to,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        sink.drain();
+        let message = OutboundPeer {
+            kind: PeerKind::Message,
+            id: "m-1".to_string(),
+            in_reply_to: None,
+            title: Some("plan".to_string()),
+            content: "the secret words for the peer".to_string(),
+            fields: None,
+        };
+
+        let sent = runtime.send_peer(&to, &message).await.unwrap();
+
+        assert_eq!(sent.via, PeerVia::Direct);
+        let fired = sink.drain();
+        let sent_fires = fires_of(&fired, HookEvent::MeshMessageSent);
+        assert_eq!(sent_fires.len(), 1, "{fired:?}");
+        assert!(fires_of(&fired, HookEvent::MeshMessageFailed).is_empty());
+        let envs = sent_fires[0];
+        assert_eq!(env_value(envs, "COYOTE_MESH_VIA"), Some("direct"));
+        assert_eq!(env_value(envs, "COYOTE_MESH_MESSAGE_KIND"), Some("message"));
+        assert_eq!(env_value(envs, "COYOTE_MESH_MESSAGE_ID"), Some("m-1"));
+        assert_eq!(
+            env_value(envs, "COYOTE_MESH_PEER_DESTINATION"),
+            Some(to.as_str())
+        );
+        for (key, value) in envs {
+            assert!(
+                !value.contains(&message.content) && !value.contains("plan"),
+                "{key}={value} carries the message"
+            );
+        }
+
+        let bulletin = OutboundPeer {
+            kind: PeerKind::Bulletin,
+            id: "b-1".to_string(),
+            in_reply_to: None,
+            title: None,
+            content: "the bulletin words for everyone".to_string(),
+            fields: None,
+        };
+
+        let outcome = runtime.broadcast(&bulletin).await.unwrap();
+
+        assert_eq!(outcome.recipients.len(), 1, "{:?}", outcome.recipients);
+        let fired = sink.drain();
+        let bulletin_fires = fires_of(&fired, HookEvent::MeshBulletinSent);
+        assert_eq!(bulletin_fires.len(), 1, "{fired:?}");
+        assert!(
+            fires_of(&fired, HookEvent::MeshMessageSent).is_empty()
+                && fires_of(&fired, HookEvent::MeshMessageFailed).is_empty(),
+            "the per-recipient sends of a bulletin report nothing of their own: {fired:?}"
+        );
+        let envs = bulletin_fires[0];
+        assert_eq!(env_value(envs, "COYOTE_MESH_MESSAGE_ID"), Some("b-1"));
+        assert_eq!(env_value(envs, "COYOTE_MESH_RECIPIENTS"), Some("1"));
+        assert_eq!(env_value(envs, "COYOTE_MESH_DELIVERED"), Some("1"));
+        assert_eq!(env_value(envs, "COYOTE_MESH_STORED"), Some("0"));
+        assert_eq!(env_value(envs, "COYOTE_MESH_UNREACHABLE"), Some("0"));
+        assert_eq!(env_value(envs, "COYOTE_MESH_REFUSED"), Some("0"));
+        for (key, value) in envs {
+            assert!(
+                !value.contains(&bulletin.content),
+                "{key}={value} carries the bulletin"
+            );
+        }
+        let seen = stub.seen();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert!(slot.stop().await.unwrap());
+        stub.stop().await;
     }
 
     #[test]
@@ -4465,6 +5448,7 @@ mod tests {
             paths,
             NodeOptions {
                 connect_timeout: Duration::from_millis(300),
+                ..NodeOptions::default()
             },
         )
         .await
@@ -5287,7 +6271,7 @@ mod tests {
             now,
         );
 
-        assert_eq!(change, Some(PeerChange::Added));
+        assert_eq!(change.map(|filed| filed.change), Some(PeerChange::Added));
         let record = table.get(&hash).unwrap();
         assert_eq!(record.protocol_version, newer);
         assert_eq!(
@@ -5329,7 +6313,8 @@ mod tests {
                 &app_data,
                 filed.hops,
                 SystemTime::now(),
-            ),
+            )
+            .map(|filed| filed.change),
             Some(PeerChange::Refreshed)
         );
         assert_eq!(

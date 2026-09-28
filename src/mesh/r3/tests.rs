@@ -429,6 +429,7 @@ mod network {
         PLAN_TITLE_MAX_CHARS, REPO_NAME_MAX_CHARS, STATE_IDLE, StatusCard, StatusError,
         StatusHandler, TODO_GOAL_MAX_CHARS, build_card,
     };
+    use crate::mesh::events::MeshHooks;
     use crate::mesh::idle::{IdleNotify, IdleSink, Origin};
     use crate::mesh::knock::{
         ChannelKnockSink, KNOCK_QUEUE_CAPACITY, KnockError, KnockGate, KnockIntro, KnockMessage,
@@ -3880,7 +3881,12 @@ mod network {
             .set_handler(Arc::new(Dispatcher::new(trust.clone(), sink)));
         let peers =
             Arc::new(PeerTable::load(tmp.path.join("peers.json"), SystemTime::now()).unwrap());
-        let gate = Arc::new(KnockGate::new(trust, peers, KnockCache::new(&tmp.path, 24)));
+        let gate = Arc::new(KnockGate::new(
+            trust,
+            peers,
+            KnockCache::new(&tmp.path, 24),
+            MeshHooks::default(),
+        ));
         gate.attach(surface);
         let cancel = CancellationToken::new();
         tokio::spawn(drain_knocks(rx, gate.clone(), cancel.clone()));
@@ -4048,7 +4054,12 @@ mod network {
             .set_handler(Arc::new(Dispatcher::new(trust.clone(), sink.clone())));
         let peers =
             Arc::new(PeerTable::load(tmp.path.join("peers.json"), SystemTime::now()).unwrap());
-        let gate = KnockGate::new(trust, peers, KnockCache::new(&tmp.path, 24));
+        let gate = KnockGate::new(
+            trust,
+            peers,
+            KnockCache::new(&tmp.path, 24),
+            MeshHooks::default(),
+        );
         let surface = Arc::new(RecordingSurface::default());
         gate.attach(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
 

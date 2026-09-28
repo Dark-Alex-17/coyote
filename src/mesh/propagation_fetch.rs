@@ -1483,6 +1483,7 @@ async fn process_bodies(
 mod tests {
     use super::*;
     use crate::mesh::destination_address;
+    use crate::mesh::events::MeshHooks;
     use crate::mesh::knock::{
         KnockGate, KnockIntro, KnockRouting, KnockSurface, RecordingSurface, knock_message,
     };
@@ -2294,6 +2295,7 @@ mod tests {
             bench.trust.clone(),
             peers,
             KnockCache::new(&bench._tmp.path, 24),
+            MeshHooks::default(),
         );
         let surface = Arc::new(RecordingSurface::default());
         gate.attach(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);

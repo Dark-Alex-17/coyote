@@ -7,10 +7,12 @@ use crate::mesh::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use arc_swap::ArcSwapOption;
 use parking_lot::Mutex;
 use rns_transport::hash::AddressHash;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -164,6 +166,236 @@ pub(crate) enum Tier {
     Destination,
 }
 
+impl Tier {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Identity => "identity",
+            Self::Destination => "destination",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RevokeReason {
+    Untrust,
+    Block,
+    Prune,
+}
+
+impl RevokeReason {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Untrust => "untrust",
+            Self::Block => "block",
+            Self::Prune => "prune",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TrustGranted {
+    pub tier: Tier,
+    pub identity_hash: String,
+    /// Set on the destination tier only.
+    pub destination_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TrustRevoked {
+    pub tier: Tier,
+    /// A pruned destination carries the identity its record was bound to.
+    pub identity_hash: Option<String>,
+    pub destination_hash: Option<String>,
+    pub reason: RevokeReason,
+}
+
+/// Told about every record the store's mutation API adds or removes, once the write
+/// has landed. Called with the store's state mutex held: an implementation must not
+/// block or call back into the store.
+pub(crate) trait TrustObserver: Send + Sync {
+    fn granted(&self, event: TrustGranted);
+    fn revoked(&self, event: TrustRevoked);
+}
+
+/// What one mutation did to the file, for the debug line and the observer.
+enum TrustMutation {
+    TrustDestination {
+        destination: String,
+        identity: String,
+        change: TrustChange,
+    },
+    /// `granted` is whether identity-tier trust was conferred: the record was created
+    /// with `all_destinations`, or an existing binding-only record had the flag set.
+    /// A repeat `trust_identity` reports `Updated` to the caller and fires nothing.
+    TrustIdentity {
+        identity: String,
+        granted: bool,
+    },
+    UntrustDestination {
+        destination: String,
+        identity: String,
+    },
+    /// `was_granting` is whether the removed identity record carried `all_destinations`;
+    /// a binding-only record held no identity-tier trust to revoke.
+    UntrustIdentity {
+        identity: String,
+        was_granting: bool,
+        removed: Vec<String>,
+    },
+    BlockIdentity {
+        identity: String,
+        was_granting: bool,
+        removed: Vec<String>,
+    },
+    UnblockIdentity {
+        identity: String,
+    },
+    Deny {
+        destination: String,
+    },
+    Undeny {
+        destination: String,
+    },
+    /// Each stale destination with the identity its record named.
+    Prune {
+        stale: Vec<(String, String)>,
+    },
+}
+
+impl fmt::Display for TrustMutation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TrustDestination { destination, .. } => {
+                write!(f, "trust destination {destination}")
+            }
+            Self::TrustIdentity { identity, .. } => write!(f, "trust identity {identity}"),
+            Self::UntrustDestination { destination, .. } => {
+                write!(f, "untrust destination {destination}")
+            }
+            Self::UntrustIdentity {
+                identity, removed, ..
+            } => write!(
+                f,
+                "untrust identity {identity} (+{} destinations)",
+                removed.len()
+            ),
+            Self::BlockIdentity {
+                identity, removed, ..
+            } => write!(
+                f,
+                "block identity {identity} (+{} destinations)",
+                removed.len()
+            ),
+            Self::UnblockIdentity { identity } => write!(f, "unblock identity {identity}"),
+            Self::Deny { destination } => write!(f, "deny {destination}"),
+            Self::Undeny { destination } => write!(f, "undeny {destination}"),
+            Self::Prune { stale } => write!(f, "prune {} destinations", stale.len()),
+        }
+    }
+}
+
+impl TrustMutation {
+    fn notify(self, observer: &dyn TrustObserver) {
+        let revoked = |tier, identity_hash, destination_hash, reason| TrustRevoked {
+            tier,
+            identity_hash,
+            destination_hash,
+            reason,
+        };
+        match self {
+            Self::TrustDestination {
+                destination,
+                identity,
+                change: TrustChange::Added,
+            } => observer.granted(TrustGranted {
+                tier: Tier::Destination,
+                identity_hash: identity,
+                destination_hash: Some(destination),
+            }),
+            Self::TrustIdentity {
+                identity,
+                granted: true,
+                ..
+            } => observer.granted(TrustGranted {
+                tier: Tier::Identity,
+                identity_hash: identity,
+                destination_hash: None,
+            }),
+            Self::UntrustDestination {
+                destination,
+                identity,
+            } => observer.revoked(revoked(
+                Tier::Destination,
+                Some(identity),
+                Some(destination),
+                RevokeReason::Untrust,
+            )),
+            Self::UntrustIdentity {
+                identity,
+                was_granting,
+                removed,
+            } => {
+                if was_granting {
+                    observer.revoked(revoked(
+                        Tier::Identity,
+                        Some(identity.clone()),
+                        None,
+                        RevokeReason::Untrust,
+                    ));
+                }
+                for destination in removed {
+                    observer.revoked(revoked(
+                        Tier::Destination,
+                        Some(identity.clone()),
+                        Some(destination),
+                        RevokeReason::Untrust,
+                    ));
+                }
+            }
+            Self::BlockIdentity {
+                identity,
+                was_granting,
+                removed,
+            } => {
+                if was_granting {
+                    observer.revoked(revoked(
+                        Tier::Identity,
+                        Some(identity.clone()),
+                        None,
+                        RevokeReason::Block,
+                    ));
+                }
+                for destination in removed {
+                    observer.revoked(revoked(
+                        Tier::Destination,
+                        Some(identity.clone()),
+                        Some(destination),
+                        RevokeReason::Block,
+                    ));
+                }
+            }
+            Self::Prune { stale } => {
+                for (destination, identity) in stale {
+                    observer.revoked(revoked(
+                        Tier::Destination,
+                        Some(identity),
+                        Some(destination),
+                        RevokeReason::Prune,
+                    ));
+                }
+            }
+            Self::TrustDestination {
+                change: TrustChange::Updated,
+                ..
+            }
+            | Self::TrustIdentity { granted: false, .. }
+            | Self::UnblockIdentity { .. }
+            | Self::Deny { .. }
+            | Self::Undeny { .. } => {}
+        }
+    }
+}
+
 /// One trusted identity or destination as `records` reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TrustRecord {
@@ -267,10 +499,19 @@ fn same_hash(left: &str, right: &str) -> bool {
 ///
 /// Nothing here removes a record on its own: removal is `untrust_*`, `block_identity` and
 /// `prune_destinations`, all at the user's request.
-#[derive(Debug)]
 pub(crate) struct TrustStore {
     path: PathBuf,
     inner: Mutex<State>,
+    observer: ArcSwapOption<Arc<dyn TrustObserver>>,
+}
+
+impl fmt::Debug for TrustStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TrustStore")
+            .field("path", &self.path)
+            .field("observer", &self.observer.load().is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl TrustStore {
@@ -294,7 +535,13 @@ impl TrustStore {
                 file,
                 ..State::default()
             }),
+            observer: ArcSwapOption::empty(),
         })
+    }
+
+    /// Installs who hears about grants and revocations; the one before it is dropped.
+    pub(crate) fn set_observer(&self, observer: Arc<dyn TrustObserver>) {
+        self.observer.store(Some(Arc::new(observer)));
     }
 
     #[cfg(test)]
@@ -562,7 +809,11 @@ impl TrustStore {
         self.commit(
             &mut state,
             file,
-            &format!("trust destination {}", peer.destination_hash),
+            TrustMutation::TrustDestination {
+                destination: peer.destination_hash.clone(),
+                identity: peer.identity_hash.clone(),
+                change,
+            },
         )?;
         // Both now live on disk, so a session twin would list the same hash twice.
         state.session_destinations.remove(&peer.destination_hash);
@@ -651,24 +902,32 @@ impl TrustStore {
         let mut state = self.inner.lock();
         let mut file = state.file.clone();
         refuse_if_blocked(&file, &identity)?;
-        let change = match file.identities.get_mut(&identity) {
+        let (change, granted) = match file.identities.get_mut(&identity) {
             Some(entry) => {
+                let granted = !entry.all_destinations;
                 entry.all_destinations = true;
                 if let Some(seen) = last_seen {
                     entry.last_seen_at = entry.last_seen_at.max(Stamp::new(seen));
                 }
                 apply_options(&mut entry.label, &mut entry.note, opts);
-                TrustChange::Updated
+                (TrustChange::Updated, granted)
             }
             None => {
                 let mut entry = identity_entry(now, last_seen.unwrap_or(now), true);
                 entry.label = opts.label;
                 entry.note = opts.note;
                 file.identities.insert(identity.clone(), entry);
-                TrustChange::Added
+                (TrustChange::Added, true)
             }
         };
-        self.commit(&mut state, file, &format!("trust identity {identity}"))?;
+        self.commit(
+            &mut state,
+            file,
+            TrustMutation::TrustIdentity {
+                identity: identity.clone(),
+                granted,
+            },
+        )?;
         // The identity now lives on disk, so a session twin would list the same hash twice.
         state.session_identities.remove(&identity);
         Ok(change)
@@ -684,18 +943,21 @@ impl TrustStore {
         let destination = normalize_hash(destination_hash);
         let mut state = self.inner.lock();
         let mut file = state.file.clone();
-        let on_disk = file.destinations.remove(&destination).is_some();
+        let on_disk = file.destinations.remove(&destination);
         let in_session = state.session_destinations.contains_key(&destination);
-        if !on_disk && !in_session {
+        if on_disk.is_none() && !in_session {
             bail!(
                 "Destination {destination} is not in the trust list, so there is nothing to untrust."
             );
         }
-        if on_disk {
+        if let Some(entry) = on_disk {
             self.commit(
                 &mut state,
                 file,
-                &format!("untrust destination {destination}"),
+                TrustMutation::UntrustDestination {
+                    destination: destination.clone(),
+                    identity: entry.identity,
+                },
             )?;
         }
         state.forget_destination(&destination);
@@ -713,20 +975,21 @@ impl TrustStore {
         let identity = normalize_hash(identity_hash);
         let mut state = self.inner.lock();
         let mut file = state.file.clone();
-        let on_disk = file.identities.remove(&identity).is_some();
+        let on_disk = file.identities.remove(&identity);
         let in_session = state.session_identities.contains_key(&identity);
-        if !on_disk && !in_session {
+        if on_disk.is_none() && !in_session {
             bail!("Identity {identity} is not in the trust list, so there is nothing to untrust.");
         }
         let removed = remove_destinations_of(&mut file, &identity);
-        if on_disk || !removed.is_empty() {
+        if on_disk.is_some() || !removed.is_empty() {
             self.commit(
                 &mut state,
                 file,
-                &format!(
-                    "untrust identity {identity} (+{} destinations)",
-                    removed.len()
-                ),
+                TrustMutation::UntrustIdentity {
+                    identity: identity.clone(),
+                    was_granting: on_disk.is_some_and(|entry| entry.all_destinations),
+                    removed: removed.clone(),
+                },
             )?;
         }
         state.forget_identity(&identity, &removed);
@@ -748,16 +1011,20 @@ impl TrustStore {
         check_text("note", note.as_deref())?;
         let mut state = self.inner.lock();
         let mut file = state.file.clone();
-        file.identities.remove(&identity);
+        let was_granting = file
+            .identities
+            .remove(&identity)
+            .is_some_and(|entry| entry.all_destinations);
         let removed = remove_destinations_of(&mut file, &identity);
         upsert_overlay(&mut file.blocked_identities, identity.clone(), note, now);
         self.commit(
             &mut state,
             file,
-            &format!(
-                "block identity {identity} (+{} destinations)",
-                removed.len()
-            ),
+            TrustMutation::BlockIdentity {
+                identity: identity.clone(),
+                was_granting,
+                removed: removed.clone(),
+            },
         )?;
         state.forget_identity(&identity, &removed);
         Ok(removed)
@@ -772,7 +1039,11 @@ impl TrustStore {
         if file.blocked_identities.remove(&identity).is_none() {
             bail!("Identity {identity} is not blocked, so there is nothing to unblock.");
         }
-        self.commit(&mut state, file, &format!("unblock identity {identity}"))
+        self.commit(
+            &mut state,
+            file,
+            TrustMutation::UnblockIdentity { identity },
+        )
     }
 
     /// Refuses one destination even when its identity is trusted. The destination's own
@@ -795,7 +1066,7 @@ impl TrustStore {
             note,
             now,
         );
-        self.commit(&mut state, file, &format!("deny {destination}"))
+        self.commit(&mut state, file, TrustMutation::Deny { destination })
     }
 
     pub(crate) fn undeny_destination(
@@ -810,7 +1081,7 @@ impl TrustStore {
         if file.denied_destinations.remove(&destination).is_none() {
             bail!("Destination {destination} is not denied, so there is nothing to undeny.");
         }
-        self.commit(&mut state, file, &format!("undeny {destination}"))
+        self.commit(&mut state, file, TrustMutation::Undeny { destination })
     }
 
     /// Destination records not seen for `older_than`, judged on the freshest of the disk
@@ -843,14 +1114,15 @@ impl TrustStore {
             return Ok(stale);
         }
         let mut file = state.file.clone();
-        for hash in &stale {
-            file.destinations.remove(hash);
-        }
-        self.commit(
-            &mut state,
-            file,
-            &format!("prune {} destinations", stale.len()),
-        )?;
+        let pruned = stale
+            .iter()
+            .filter_map(|hash| {
+                file.destinations
+                    .remove(hash)
+                    .map(|entry| (hash.clone(), entry.identity))
+            })
+            .collect();
+        self.commit(&mut state, file, TrustMutation::Prune { stale: pruned })?;
         for hash in &stale {
             state.seen.remove(hash);
         }
@@ -858,11 +1130,17 @@ impl TrustStore {
     }
 
     /// Writes `file` and only then makes it the current list, so a failed write leaves
-    /// memory and disk agreeing on the previous state.
-    fn commit(&self, state: &mut State, file: TrustFile, what: &str) -> Result<()> {
+    /// memory and disk agreeing on the previous state. The observer hears only about a
+    /// list that is on disk.
+    fn commit(&self, state: &mut State, file: TrustFile, mutation: TrustMutation) -> Result<()> {
         self.persist(&file)?;
         state.file = file;
-        debug!("Mesh trust list updated: {what}");
+        debug!("Mesh trust list updated: {mutation}");
+        // Trust events fire from the store's mutation API so every writer is covered; the
+        // .mesh REPL verbs never fire them directly.
+        if let Some(observer) = self.observer.load_full() {
+            mutation.notify(&**observer);
+        }
         Ok(())
     }
 
@@ -1205,6 +1483,10 @@ fn verify_binding(
 mod tests {
     use super::super::test_support::TempDir;
     use super::*;
+    use crate::hooks::HookEvent;
+    use crate::mesh::events::{
+        MeshHooks, RecordingHookSink, TrustHookObserver, env_value, one_fire,
+    };
     use crate::mesh::hex_lower;
     use crate::mesh::peers::{PEER_TTL, PeerSighting};
 
@@ -1246,7 +1528,10 @@ mod tests {
     }
 
     fn announced(aspect: &str) -> Announced {
-        let identity = PrivateIdentity::new_from_rand(OsRng);
+        announced_as(PrivateIdentity::new_from_rand(OsRng), aspect)
+    }
+
+    fn announced_as(identity: PrivateIdentity, aspect: &str) -> Announced {
         let name = DestinationName::new("coyote", &format!("mesh.{aspect}"));
         let destination = SingleInputDestination::new(identity, name);
         Announced {
@@ -1311,6 +1596,32 @@ mod tests {
 
         fn reopen(&self) -> TrustStore {
             TrustStore::open(&self.tmp.path).unwrap()
+        }
+
+        /// Routes the store's trust events into a recording sink.
+        fn observed(&self) -> Arc<RecordingHookSink> {
+            let hooks = MeshHooks::default();
+            let sink = RecordingHookSink::attach(&hooks);
+            self.store.set_observer(Arc::new(TrustHookObserver(hooks)));
+            sink
+        }
+
+        fn trust_identity(&self, identity_hash: &str, at: SystemTime) -> TrustChange {
+            self.store
+                .trust_identity(&self.mesh, identity_hash, TrustOptions::default(), at)
+                .unwrap()
+        }
+
+        fn trust_destination(&self, peer: &Announced, at: SystemTime) -> TrustChange {
+            self.store
+                .trust_destination(
+                    &self.mesh,
+                    &peer.destination_hash,
+                    TrustOptions::default(),
+                    at,
+                )
+                .unwrap()
+                .change
         }
     }
 
@@ -3196,5 +3507,294 @@ mod tests {
         assert!(store.records().is_empty());
         assert!(!store.path().exists());
         assert!(!tmp.path.join("mesh").exists());
+    }
+
+    /// The observer tests drive the store's mutation API directly; no REPL command is
+    /// involved.
+    #[test]
+    fn trust_identity_fires_granted_once_and_an_update_fires_nothing() {
+        let fx = Fixture::new("trust-hook-identity");
+        let sink = fx.observed();
+        let identity = fake_hash(0xaa);
+
+        assert_eq!(fx.trust_identity(&identity, t(3_000)), TrustChange::Added);
+
+        let envs = one_fire(&sink, HookEvent::MeshTrustGranted);
+        assert_eq!(env_value(&envs, "COYOTE_MESH_TRUST_TIER"), Some("identity"));
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_PEER_IDENTITY"),
+            Some(identity.as_str())
+        );
+        assert_eq!(env_value(&envs, "COYOTE_MESH_PEER_DESTINATION"), None);
+
+        assert_eq!(fx.trust_identity(&identity, t(4_000)), TrustChange::Updated);
+        assert!(sink.drain().is_empty(), "an update grants nothing new");
+    }
+
+    /// `trust_destination` leaves a binding-only identity record behind, so the later
+    /// `trust_identity` reads as an update to the caller while being the actual grant.
+    #[test]
+    fn trust_identity_over_a_binding_only_record_fires_granted_and_untrust_revokes_it() {
+        let fx = Fixture::new("trust-hook-identity-upgrade");
+        let peer = announced("alpha");
+        fx.announce(&peer, t(2_000));
+        fx.trust_destination(&peer, t(3_000));
+        let sink = fx.observed();
+
+        assert_eq!(
+            fx.trust_identity(&peer.identity_hash, t(4_000)),
+            TrustChange::Updated
+        );
+
+        let envs = one_fire(&sink, HookEvent::MeshTrustGranted);
+        assert_eq!(env_value(&envs, "COYOTE_MESH_TRUST_TIER"), Some("identity"));
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_PEER_IDENTITY"),
+            Some(peer.identity_hash.as_str())
+        );
+        assert_eq!(env_value(&envs, "COYOTE_MESH_PEER_DESTINATION"), None);
+
+        fx.store
+            .untrust_identity(&fx.mesh, &peer.identity_hash)
+            .unwrap();
+
+        let fired = sink.drain();
+        let tiers: Vec<Option<&str>> = fired
+            .iter()
+            .map(|(_, envs)| env_value(envs, "COYOTE_MESH_TRUST_TIER"))
+            .collect();
+        assert_eq!(tiers, [Some("identity"), Some("destination")]);
+    }
+
+    #[test]
+    fn untrusting_a_binding_only_identity_revokes_its_destinations_alone() {
+        let fx = Fixture::new("trust-hook-identity-binding-only");
+        let peer = announced("alpha");
+        fx.announce(&peer, t(2_000));
+        fx.trust_destination(&peer, t(3_000));
+        let sink = fx.observed();
+
+        let removed = fx
+            .store
+            .untrust_identity(&fx.mesh, &peer.identity_hash)
+            .unwrap();
+
+        assert_eq!(removed, std::slice::from_ref(&peer.destination_hash));
+        let envs = one_fire(&sink, HookEvent::MeshTrustRevoked);
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_TRUST_TIER"),
+            Some("destination")
+        );
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_PEER_DESTINATION"),
+            Some(peer.destination_hash.as_str())
+        );
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_PEER_IDENTITY"),
+            Some(peer.identity_hash.as_str())
+        );
+    }
+
+    #[test]
+    fn trust_destination_fires_granted_with_both_hashes() {
+        let fx = Fixture::new("trust-hook-destination");
+        let sink = fx.observed();
+        let peer = announced("alpha");
+        fx.announce(&peer, t(2_000));
+
+        assert_eq!(fx.trust_destination(&peer, t(3_000)), TrustChange::Added);
+
+        let envs = one_fire(&sink, HookEvent::MeshTrustGranted);
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_TRUST_TIER"),
+            Some("destination")
+        );
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_PEER_IDENTITY"),
+            Some(peer.identity_hash.as_str())
+        );
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_PEER_DESTINATION"),
+            Some(peer.destination_hash.as_str())
+        );
+    }
+
+    #[test]
+    fn untrust_identity_fires_revoked_for_the_identity_and_each_destination() {
+        let fx = Fixture::new("trust-hook-untrust-identity");
+        let identity = PrivateIdentity::new_from_rand(OsRng);
+        let first = announced_as(identity.clone(), "alpha");
+        let second = announced_as(identity, "beta");
+        assert_eq!(first.identity_hash, second.identity_hash);
+        fx.announce(&first, t(2_000));
+        fx.announce(&second, t(2_000));
+        fx.trust_identity(&first.identity_hash, t(3_000));
+        fx.trust_destination(&first, t(3_000));
+        fx.trust_destination(&second, t(3_000));
+        let sink = fx.observed();
+
+        let removed = fx
+            .store
+            .untrust_identity(&fx.mesh, &first.identity_hash)
+            .unwrap();
+
+        assert_eq!(removed.len(), 2);
+        let fired = sink.drain();
+        assert_eq!(fired.len(), 3, "{fired:?}");
+        for (event, envs) in &fired {
+            assert_eq!(*event, HookEvent::MeshTrustRevoked);
+            assert_eq!(env_value(envs, "COYOTE_MESH_TRUST_REASON"), Some("untrust"));
+            assert_eq!(
+                env_value(envs, "COYOTE_MESH_PEER_IDENTITY"),
+                Some(first.identity_hash.as_str())
+            );
+        }
+        let tiers: Vec<Option<&str>> = fired
+            .iter()
+            .map(|(_, envs)| env_value(envs, "COYOTE_MESH_TRUST_TIER"))
+            .collect();
+        assert_eq!(
+            tiers,
+            [Some("identity"), Some("destination"), Some("destination")]
+        );
+        assert_eq!(env_value(&fired[0].1, "COYOTE_MESH_PEER_DESTINATION"), None);
+        let mut destinations: Vec<&str> = fired[1..]
+            .iter()
+            .filter_map(|(_, envs)| env_value(envs, "COYOTE_MESH_PEER_DESTINATION"))
+            .collect();
+        destinations.sort_unstable();
+        let mut expected = [
+            first.destination_hash.as_str(),
+            second.destination_hash.as_str(),
+        ];
+        expected.sort_unstable();
+        assert_eq!(destinations, expected);
+    }
+
+    #[test]
+    fn block_identity_fires_revoked_only_for_an_identity_on_the_list() {
+        let fx = Fixture::new("trust-hook-block");
+        let listed = fake_hash(0xaa);
+        fx.trust_identity(&listed, t(3_000));
+        let sink = fx.observed();
+
+        fx.store
+            .block_identity(&fx.mesh, &listed, Some("spam".to_string()), t(4_000))
+            .unwrap();
+
+        let envs = one_fire(&sink, HookEvent::MeshTrustRevoked);
+        assert_eq!(env_value(&envs, "COYOTE_MESH_TRUST_TIER"), Some("identity"));
+        assert_eq!(env_value(&envs, "COYOTE_MESH_TRUST_REASON"), Some("block"));
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_PEER_IDENTITY"),
+            Some(listed.as_str())
+        );
+
+        let stranger = fake_hash(0xbb);
+        fx.store
+            .block_identity(&fx.mesh, &stranger, None, t(4_000))
+            .unwrap();
+
+        assert!(fx.store.is_blocked_identity(&stranger));
+        assert!(
+            sink.drain().is_empty(),
+            "blocking an identity the list never trusted revokes nothing"
+        );
+    }
+
+    #[test]
+    fn prune_fires_revoked_per_stale_destination_and_a_dry_run_fires_nothing() {
+        let fx = Fixture::new("trust-hook-prune");
+        let stale = [announced("alpha"), announced("beta")];
+        for peer in &stale {
+            fx.announce(peer, t(1_000));
+            fx.trust_destination(peer, t(1_000));
+        }
+        let sink = fx.observed();
+        let now = t(1_000 + 3_600);
+        let horizon = Duration::from_secs(3_600);
+
+        let dry = fx
+            .store
+            .prune_destinations(&fx.mesh, horizon, now, true)
+            .unwrap();
+        assert_eq!(dry.len(), 2);
+        assert!(sink.drain().is_empty(), "a dry run revokes nothing");
+
+        let removed = fx
+            .store
+            .prune_destinations(&fx.mesh, horizon, now, false)
+            .unwrap();
+        assert_eq!(removed.len(), 2);
+
+        let fired = sink.drain();
+        assert_eq!(fired.len(), 2, "{fired:?}");
+        for (event, envs) in &fired {
+            assert_eq!(*event, HookEvent::MeshTrustRevoked);
+            assert_eq!(
+                env_value(envs, "COYOTE_MESH_TRUST_TIER"),
+                Some("destination")
+            );
+            assert_eq!(env_value(envs, "COYOTE_MESH_TRUST_REASON"), Some("prune"));
+            let destination = env_value(envs, "COYOTE_MESH_PEER_DESTINATION").unwrap();
+            let peer = stale
+                .iter()
+                .find(|peer| peer.destination_hash == destination)
+                .unwrap();
+            assert_eq!(
+                env_value(envs, "COYOTE_MESH_PEER_IDENTITY"),
+                Some(peer.identity_hash.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn deny_undeny_and_unblock_fire_nothing() {
+        let fx = Fixture::new("trust-hook-overlays");
+        let sink = fx.observed();
+        let destination = fake_hash(0xcc);
+        let identity = fake_hash(0xdd);
+
+        fx.store
+            .deny_destination(&fx.mesh, &destination, Some("noisy".to_string()), t(3_000))
+            .unwrap();
+        fx.store.undeny_destination(&fx.mesh, &destination).unwrap();
+        fx.store
+            .block_identity(&fx.mesh, &identity, None, t(3_000))
+            .unwrap();
+        fx.store.unblock_identity(&fx.mesh, &identity).unwrap();
+
+        assert!(sink.drain().is_empty());
+    }
+
+    #[test]
+    fn untrust_destination_fires_one_revoked_for_the_destination_tier() {
+        let fx = Fixture::new("trust-hook-untrust-destination");
+        let peer = announced("alpha");
+        fx.announce(&peer, t(2_000));
+        fx.trust_destination(&peer, t(3_000));
+        let sink = fx.observed();
+
+        fx.store
+            .untrust_destination(&fx.mesh, &peer.destination_hash)
+            .unwrap();
+
+        let envs = one_fire(&sink, HookEvent::MeshTrustRevoked);
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_TRUST_TIER"),
+            Some("destination")
+        );
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_TRUST_REASON"),
+            Some("untrust")
+        );
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_PEER_DESTINATION"),
+            Some(peer.destination_hash.as_str())
+        );
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_PEER_IDENTITY"),
+            Some(peer.identity_hash.as_str())
+        );
     }
 }
