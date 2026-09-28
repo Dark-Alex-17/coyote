@@ -9800,8 +9800,11 @@ mod tests {
         );
     }
 
+    // Windows rejects control characters (0x00-0x1F) in filenames, so a session
+    // file named with an ESC byte cannot exist there; the scenario is Unix-only.
     #[test]
     #[serial]
+    #[cfg(not(windows))]
     fn session_list_rows_strip_terminal_escapes() {
         let _config = TestConfigDirGuard::new();
         let ctx = create_test_ctx();
@@ -9827,6 +9830,7 @@ mod tests {
 
     #[test]
     #[serial]
+    #[cfg(not(windows))]
     fn repl_complete_session_strips_terminal_escapes_from_names() {
         let _config = TestConfigDirGuard::new();
         let ctx = create_test_ctx();
