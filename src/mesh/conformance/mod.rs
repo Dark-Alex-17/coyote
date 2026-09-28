@@ -238,6 +238,8 @@ mod tests {
 
     #[test]
     fn coverage_report() {
+        // Interop ids are folded into `all_listed()` only on unix (the `interop` module is
+        // `#[cfg(unix)]`), so the counts below are lower on other platforms.
         let listed = all_listed();
         let covered: BTreeSet<&str> = listed.iter().map(|listed| listed.id).collect();
         let spec = spec_ids();
@@ -400,7 +402,9 @@ mod tests {
     // `mesh-interop` job prepares the reference with `setup.sh`, then runs the conformance
     // suite with the interop tests un-ignored and switched on, under a `timeout-minutes`,
     // records its wall-clock in the step summary, and is kept out of every job's `needs`
-    // (the `All` gate included) with a comment saying so.
+    // (the `All` gate included) with a comment saying so. Being outside `needs` is the whole
+    // of "informational": the job must NOT also be `continue-on-error`, or a red suite would
+    // leave the run and the README badge green.
     const CI_YAML: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/.github/workflows/ci.yaml"
@@ -420,6 +424,11 @@ mod tests {
             job["timeout-minutes"].as_u64().is_some_and(|m| m > 0),
             "timeout-minutes is set: {:?}",
             job["timeout-minutes"]
+        );
+        assert!(
+            job["continue-on-error"].is_null(),
+            "the job must not be continue-on-error; a red interop suite has to be a red job: {:?}",
+            job["continue-on-error"]
         );
 
         // Not a prerequisite of anything, `all` included.
@@ -474,6 +483,14 @@ mod tests {
             .map(|(i, run)| (*i, *run))
             .expect("a step runs cargo test");
         assert!(setup < test, "setup.sh runs before the suite");
+        for (i, step) in steps.iter().enumerate() {
+            assert!(
+                step["continue-on-error"].is_null(),
+                "step {i} ({:?}) must not be continue-on-error either: {:?}",
+                step["name"].as_str().unwrap_or("?"),
+                step["continue-on-error"]
+            );
+        }
         let words: Vec<&str> = command.split_whitespace().collect();
         assert!(words.contains(&"COYOTE_MESH_INTEROP=1"), "{command}");
         assert!(words.contains(&"mesh::conformance"), "{command}");

@@ -83,16 +83,15 @@ jobs:
       run: cargo fmt --all --check
 
   # Informational: not part of the required `All` matrix or branch protection until it
-  # proves stable, and `continue-on-error` keeps the workflow run and the README badge
-  # green when it fails; the outcome is in the step summary. Linux-only because the
-  # Python reference harness is unix-only; the mesh itself is covered on every OS by the
-  # unit tests and the platform-independent vectors in `All`.
+  # proves stable, so a red run here never blocks a merge. Deliberately NOT
+  # `continue-on-error`: a red interop suite (or a missing reference) must show as a red
+  # job, not vanish into a green run; the wall-clock is in the step summary. Linux-only
+  # because the Python reference harness is unix-only; the mesh itself is covered on every
+  # OS by the unit tests and the platform-independent vectors in `All`.
   mesh-interop:
     name: Mesh Interop
 
     runs-on: ubuntu-latest
-
-    continue-on-error: true
 
     timeout-minutes: 60
 
