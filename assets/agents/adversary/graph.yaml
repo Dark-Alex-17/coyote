@@ -205,7 +205,11 @@ nodes:
       confirm the change makes the criterion true, confirm the test targets
       BEHAVIOR (not implementation echo), use ast_grep for structural claims.
       Watch for gamed evidence: a test weakened/deleted so it passes, hardcoded
-      values shaped to the criterion's example, TODO/stub presented as done —
+      values shaped to the criterion's example, TODO/stub presented as done, a
+      mock expectation whose count is relaxed (`AnyTimes`, `MinTimes`, ignored
+      request body) AND whose matcher is permissive (`gomock.Any()`,
+      `mock.Anything`) — it proves a call happened, never that it carried the
+      criterion's values, so it is not a proving test —
       those are PARTIAL or DIVERGED with the gaming named in the complaint.
 
       Retry / redelivery / idempotency demands: before you mark a criterion PARTIAL

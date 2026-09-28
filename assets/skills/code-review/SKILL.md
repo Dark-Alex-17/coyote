@@ -152,6 +152,21 @@ Named adequacy anti-patterns — each is a finding even when coverage looks gree
 - **Leaky fixture** — an integration test against a shared/persistent database inserts fixture
   rows directly with no paired cleanup (deferred delete/teardown/transaction rollback). The
   test passes today and leaves a primary-key landmine for the next run.
+- **Struct-typed args against an inferred schema** — when a struct drives an inferred wire schema
+  (MCP go-sdk, OpenAPI/JSON-schema generators, serde-derived schemas), every field without
+  `omitempty`/pointer/`Option` becomes schema-REQUIRED. Cross-check the optionality the doc
+  strings promise ("X as an alternative to Y") against the tags — a documented-optional field
+  without the omission marker is a live validation bug, not a style nit. And tests that build the
+  request from the typed struct serialize EVERY field (zero values included), so they can never
+  exercise the required-ness check: demand raw-JSON / map-typed tests that OMIT each
+  documented-optional field.
+- **Relaxed call count with a permissive matcher** — a mock expectation whose COUNT is relaxed
+  (`AnyTimes()`, `MinTimes(1)`, `Maybe()`, "called at least once") leaves the ARGUMENT matcher as
+  the only thing asserted; pair it with `gomock.Any()` / `mock.Anything` / `mock.ANY` /
+  `expect.anything()` / an ignored request body and the expectation proves nothing — a call with
+  the wrong ID, wrong quantity, or wrong principal satisfies it. Flag every relaxed-count
+  expectation whose matcher is permissive; the fix pins the load-bearing fields in the matcher
+  (or exact count + captured args).
 
 ## 3. Clarity
 
