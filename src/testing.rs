@@ -1,7 +1,10 @@
 //! Test-only helpers shared across modules' unit tests.
 
+use crate::config::WORKSPACE_COYOTE_DIR_NAME;
+use crate::utils;
 use log::{Level, LevelFilter, Log, Metadata, Record};
 use std::ffi::{OsStr, OsString};
+use std::path::PathBuf;
 use std::sync::{Mutex, Once, OnceLock};
 
 struct TestLogCollector;
@@ -147,12 +150,19 @@ impl Drop for EnvVarGuard {
     }
 }
 
-/// Points the config dir at a fresh temp directory for the guard's lifetime
-/// and removes it on drop, including on panic. Tests using it must serialize
-/// (`#[serial]`) — the config-dir env var is process-global.
+/// Points the config dir and the workspace config dir at fresh temp
+/// directories for the guard's lifetime and removes them on drop, including
+/// on panic, so the developer's real `./.coyote/` never leaks into a test.
+/// The sessions-dir override is cleared too, so Global-scope session writes
+/// land under the temp config dir rather than the developer's real one.
+/// Tests using it must serialize (`#[serial]`) — the env vars are
+/// process-global.
 pub(crate) struct TestConfigDirGuard {
     _env: EnvVarGuard,
-    pub(crate) path: std::path::PathBuf,
+    _workspace_env: EnvVarGuard,
+    _sessions_env: EnvVarGuard,
+    pub(crate) path: PathBuf,
+    workspace_path: PathBuf,
 }
 
 impl TestConfigDirGuard {
@@ -163,9 +173,19 @@ impl TestConfigDirGuard {
             .as_nanos();
         let path = std::env::temp_dir().join(format!("coyote-{label}-{unique}"));
         std::fs::create_dir_all(&path).unwrap();
+        let workspace_path = std::env::temp_dir()
+            .join(format!("coyote-{label}-ws-{unique}"))
+            .join(WORKSPACE_COYOTE_DIR_NAME);
+        std::fs::create_dir_all(&workspace_path).unwrap();
         Self {
-            _env: EnvVarGuard::set(crate::utils::get_env_name("config_dir"), &path),
+            _env: EnvVarGuard::set(utils::get_env_name("config_dir"), &path),
+            _workspace_env: EnvVarGuard::set(
+                utils::get_env_name("workspace_config_dir"),
+                &workspace_path,
+            ),
+            _sessions_env: EnvVarGuard::unset(utils::get_env_name("sessions_dir")),
             path,
+            workspace_path,
         }
     }
 }
@@ -173,5 +193,8 @@ impl TestConfigDirGuard {
 impl Drop for TestConfigDirGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.path);
+        if let Some(root) = self.workspace_path.parent() {
+            let _ = std::fs::remove_dir_all(root);
+        }
     }
 }

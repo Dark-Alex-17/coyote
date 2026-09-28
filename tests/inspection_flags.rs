@@ -15,11 +15,11 @@
 //! a real ~/.coyote_password or a sandbox shell — cannot mask
 //! virgin-environment regressions.
 
-use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::{env, process};
 
 fn fresh_config_dir(label: &str) -> PathBuf {
     let unique = SystemTime::now()
@@ -436,5 +436,111 @@ fn sync_models_stays_on_bootstrap_path() {
     assert!(
         bootstrapped,
         "--sync-models: expected the builtins bootstrap to populate the config dir"
+    );
+}
+
+fn run_list_sessions(
+    cwd: &Path,
+    config_dir: &Path,
+    global_sessions: &Path,
+    home_dir: &Path,
+) -> process::Output {
+    Command::new(env!("CARGO_BIN_EXE_coyote"))
+        .arg("--list-sessions")
+        .env("COYOTE_CONFIG_DIR", config_dir)
+        .env("COYOTE_SESSIONS_DIR", global_sessions)
+        .env("HOME", home_dir)
+        .env("USERPROFILE", home_dir)
+        .env_remove("IS_SANDBOX")
+        .env_remove("COYOTE_PROVIDER")
+        .env_remove("COYOTE_PLATFORM")
+        .env_remove("COYOTE_WORKSPACE_CONFIG_DIR")
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap()
+}
+
+fn seed_session(dir: &Path, name: &str) {
+    fs::create_dir_all(dir).unwrap();
+    fs::write(dir.join(format!("{name}.yaml")), "messages: []\n").unwrap();
+}
+
+#[test]
+fn usage_probe_list_sessions_merges_cwd_workspace_scope_with_global() {
+    let config_dir = fresh_config_dir("list-sessions-ws");
+    let home_dir = fresh_config_dir("list-sessions-ws-home");
+    let global_sessions = fresh_config_dir("list-sessions-ws-global");
+    let workspace = fresh_config_dir("list-sessions-ws-cwd");
+    let bare_cwd = fresh_config_dir("list-sessions-ws-bare");
+    let workspace_sessions = workspace.join(".coyote").join("sessions");
+
+    seed_session(&global_sessions, "both");
+    seed_session(&global_sessions, "glob-only");
+    seed_session(&workspace_sessions, "both");
+    seed_session(&workspace_sessions, "ws-only");
+
+    let in_workspace = run_list_sessions(&workspace, &config_dir, &global_sessions, &home_dir);
+    let in_bare = run_list_sessions(&bare_cwd, &config_dir, &global_sessions, &home_dir);
+
+    let config_leftover: Vec<_> = fs::read_dir(&config_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    let bare_created_workspace = bare_cwd.join(".coyote").exists();
+    let workspace_entries: Vec<_> = fs::read_dir(&workspace_sessions)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    for dir in [
+        &config_dir,
+        &home_dir,
+        &global_sessions,
+        &workspace,
+        &bare_cwd,
+    ] {
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    for (label, output) in [("workspace", &in_workspace), ("bare", &in_bare)] {
+        assert!(
+            output.status.success(),
+            "--list-sessions ({label}): expected exit 0, got {:?}\nstdout: {}\nstderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let lines = |output: &process::Output| -> Vec<String> {
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    };
+    assert_eq!(
+        lines(&in_workspace),
+        vec!["both", "glob-only", "ws-only"],
+        "workspace CWD: merged, deduplicated, sorted"
+    );
+    assert_eq!(
+        lines(&in_bare),
+        vec!["both", "glob-only"],
+        "CWD without .coyote/: behaviour unchanged (global listing only)"
+    );
+    assert!(
+        !bare_created_workspace,
+        "--list-sessions must never create .coyote/ in the CWD"
+    );
+    assert!(
+        config_leftover.is_empty(),
+        "--list-sessions must write nothing into the config dir: {config_leftover:?}"
+    );
+    let mut workspace_entries = workspace_entries;
+    workspace_entries.sort_unstable();
+    assert_eq!(
+        workspace_entries,
+        vec!["both.yaml", "ws-only.yaml"],
+        "listing is read-only for the workspace sessions dir"
     );
 }

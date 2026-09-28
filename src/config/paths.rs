@@ -5,7 +5,7 @@ use super::{
     GLOBAL_TOOLS_UTILS_DIR_NAME, HIDDEN_MCP_FILE_NAME, HOOKS_DIR_NAME, INSTALLED_BUNDLES_FILE_NAME,
     MACROS_DIR_NAME, MCP_FILE_NAME, MEMORY_DIR_NAME, MEMORY_INDEX_FILE_NAME, ModelsOverride,
     RAGS_DIR_NAME, ROLES_DIR_NAME, SBX_KIT_DIR_NAME, SBX_KIT_HASH_FILE, SBX_MIXIN_FILE_NAME,
-    SBX_MIXIN_KITS_DIR_NAME, SKILLS_DIR_NAME, WORKSPACE_COYOTE_DIR_NAME,
+    SBX_MIXIN_KITS_DIR_NAME, SESSIONS_DIR_NAME, SKILLS_DIR_NAME, WORKSPACE_COYOTE_DIR_NAME,
 };
 use crate::client::ProviderModels;
 use crate::config::REPL_HISTORY_DIR_NAME;
@@ -229,6 +229,17 @@ pub fn workspace_macros_dir() -> PathBuf {
     workspace_config_dir().join(MACROS_DIR_NAME)
 }
 
+pub fn workspace_sessions_dir() -> PathBuf {
+    workspace_config_dir().join(SESSIONS_DIR_NAME)
+}
+
+pub fn workspace_agent_sessions_dir(name: &str) -> PathBuf {
+    workspace_config_dir()
+        .join(AGENTS_DIR_NAME)
+        .join(name)
+        .join(SESSIONS_DIR_NAME)
+}
+
 pub fn workspace_mcp_config_file() -> Option<PathBuf> {
     workspace_mcp_config_file_in(&env::current_dir().unwrap_or_default())
 }
@@ -330,6 +341,10 @@ pub fn agent_data_dir(name: &str) -> PathBuf {
         Ok(value) => PathBuf::from(value),
         Err(_) => agents_data_dir().join(name),
     }
+}
+
+pub fn agent_sessions_dir(name: &str) -> PathBuf {
+    agent_data_dir(name).join(SESSIONS_DIR_NAME)
 }
 
 pub fn agent_graph_file(agent_name: &str) -> PathBuf {
@@ -851,6 +866,21 @@ mod tests {
                 assert_eq!(
                     workspace_mcp_config_file_in(root),
                     Some(ws_dir.join(".mcp.json"))
+                );
+            });
+        }
+
+        #[test]
+        #[serial]
+        fn workspace_session_dirs_live_under_workspace_config_dir() {
+            with_workspace_dir(|_, ws_dir| {
+                assert_eq!(workspace_sessions_dir(), ws_dir.join(SESSIONS_DIR_NAME));
+                assert_eq!(
+                    workspace_agent_sessions_dir("helper"),
+                    ws_dir
+                        .join(AGENTS_DIR_NAME)
+                        .join("helper")
+                        .join(SESSIONS_DIR_NAME)
                 );
             });
         }

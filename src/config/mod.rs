@@ -58,7 +58,7 @@ pub use self::request_context::{
 pub use self::role::{
     CODE_ROLE, CREATE_TITLE_ROLE, EXPLAIN_SHELL_ROLE, Role, RoleLike, SHELL_ROLE,
 };
-pub use self::session::Session;
+pub use self::session::{Session, SessionScope, labeled_session_names, session_scope_dirs};
 #[allow(unused_imports)]
 pub use self::skill::Skill;
 #[allow(unused_imports)]
@@ -183,7 +183,7 @@ const MCP_FILE_NAME: &str = "mcp.json";
 const HIDDEN_MCP_FILE_NAME: &str = ".mcp.json";
 const MEMORY_DIR_NAME: &str = "memory";
 const MEMORY_INDEX_FILE_NAME: &str = "MEMORY.md";
-const WORKSPACE_COYOTE_DIR_NAME: &str = ".coyote";
+pub(crate) const WORKSPACE_COYOTE_DIR_NAME: &str = ".coyote";
 const SBX_KIT_DIR_NAME: &str = "sbx-kit";
 const SBX_KIT_HASH_FILE: &str = "kit.sha256";
 const SBX_MIXIN_FILE_NAME: &str = "sbx-mixin.yaml";
@@ -581,10 +581,6 @@ pub fn default_sessions_dir() -> PathBuf {
         Ok(value) => PathBuf::from(value),
         Err(_) => paths::local_dir(SESSIONS_DIR_NAME),
     }
-}
-
-pub fn list_sessions() -> Vec<String> {
-    list_file_names(default_sessions_dir(), ".yaml")
 }
 
 /// Refreshes the models override. With a URL, mirrors a full models.yaml from
