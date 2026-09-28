@@ -343,6 +343,9 @@ always checked when config is parsed; the remaining `mesh` keys (rate limits, re
 requirement) are only checked when `mesh.enabled` is `true`.
 The wire format Coyote instances speak to each other is specified normatively in
 [docs/mesh/PROTOCOL.md](https://github.com/Dark-Alex-17/coyote/blob/main/docs/mesh/PROTOCOL.md).
+Interoperability is exercised against the reference Reticulum/LXMF implementation by the
+[mesh interop harness](https://github.com/Dark-Alex-17/coyote/blob/main/scripts/mesh-interop/README.md),
+run in the informational `Mesh Interop` CI job.
 
 | Setting                           | Default Value   | Description                                                                                                                                                                  |
 |-----------------------------------|-----------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|

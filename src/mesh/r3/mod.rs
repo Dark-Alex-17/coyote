@@ -27,7 +27,7 @@ pub(crate) use dispatch::{
 pub(crate) use error::{R3Error, RefusalCode};
 pub(crate) use frame::{Envelope, MAX_R3_PAYLOAD_BYTES, NAME_HASH_LEN, OriginName};
 #[cfg(test)]
-pub(crate) use frame::{PathHash, RequestFrame, RequestId};
+pub(crate) use frame::{EnvelopeError, PathHash, RequestFrame, RequestId, ResponseFrame};
 pub(crate) use receipt::RequestReceipt;
 #[cfg(test)]
 pub(crate) use server::{
@@ -35,6 +35,8 @@ pub(crate) use server::{
     MAX_CONCURRENT_INBOUND_REQUESTS, PEER_RESOLVE_TIMEOUT, RequestHandler,
 };
 pub(crate) use server::{R3Server, Reply};
+#[cfg(all(test, unix))]
+pub(crate) use tests::network;
 
 /// How much of a hash the logs show.
 pub(crate) const LOGGED_HASH_CHARS: usize = 8;

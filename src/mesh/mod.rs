@@ -3,6 +3,8 @@
 mod announce;
 pub(crate) mod brief;
 pub(crate) mod card;
+#[cfg(test)]
+mod conformance;
 pub(crate) mod envoy;
 pub(crate) mod events;
 mod identity;

@@ -1874,6 +1874,13 @@ mod tests {
         assert_eq!(decoded.content, "\u{FFFD}hi");
         assert_eq!(decoded.timestamp, 1_700_000_000.0);
 
+        let unknown_key = good(|e| e.push((Value::from("unknown"), Value::from(1))));
+        assert_eq!(
+            from_r3_body(&unknown_key).map(|body| body.content),
+            Ok("hi".to_string()),
+            "an unknown key is ignored"
+        );
+
         let deep = (0..PEER_FIELDS_MAX_DEPTH + 1).fold(Value::from(1), |inner, _| {
             Value::Map(vec![(Value::from("n"), inner)])
         });

@@ -401,7 +401,7 @@ fn envelope_without_a_supported_version_is_refused_before_its_origin_is_read() {
 // Two real nodes over loopback TCP. Unix-only like the node tests: the `MeshRuntime` test
 // mints an owner-only identity file, which only unix implements.
 #[cfg(unix)]
-mod network {
+pub(crate) mod network {
     use super::super::client::{
         DEFAULT_LINK_TIMEOUT, DEFAULT_REQUEST_TIMEOUT, Deadline, R3Client, RequestOptions,
         RequestOutcome, SizeBranch, identify, open_link,
@@ -490,17 +490,17 @@ mod network {
     /// How long a dropped `Script::Hang` handler takes to go away; see `Abandoned`.
     const ABANDON_DELAY: Duration = Duration::from_millis(250);
     /// How long a request these tests never answer waits before it gives up.
-    const SHORT_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
+    pub(crate) const SHORT_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
     /// Bytes of array header, request id and bin32 header around a response frame's body.
     const RESPONSE_FRAME_OVERHEAD: usize = 24;
     /// Bytes of array header, time, path hash and bin32 header around a request frame's body.
-    const REQUEST_FRAME_OVERHEAD: usize = 33;
+    pub(crate) const REQUEST_FRAME_OVERHEAD: usize = 33;
 
-    fn link_deadline() -> Deadline {
+    pub(crate) fn link_deadline() -> Deadline {
         Deadline::after(DEFAULT_LINK_TIMEOUT)
     }
 
-    fn request_deadline() -> Deadline {
+    pub(crate) fn request_deadline() -> Deadline {
         Deadline::after(DEFAULT_REQUEST_TIMEOUT)
     }
 
@@ -511,18 +511,18 @@ mod network {
 
     /// What the handler observed about one request, kept in plain data for assertions.
     #[derive(Debug, Clone, PartialEq, Eq)]
-    struct Seen {
-        link_id: LinkId,
-        request_id: RequestId,
-        identity: Option<AddressHash>,
+    pub(crate) struct Seen {
+        pub(crate) link_id: LinkId,
+        pub(crate) request_id: RequestId,
+        pub(crate) identity: Option<AddressHash>,
         /// The requester's instance as the dispatcher derived it; `None` when the recorder
         /// stands in for the dispatcher and nothing derived one.
-        destination: Option<AddressHash>,
-        path_hash: PathHash,
-        branch: SizeBranch,
+        pub(crate) destination: Option<AddressHash>,
+        pub(crate) path_hash: PathHash,
+        pub(crate) branch: SizeBranch,
     }
 
-    enum Script {
+    pub(crate) enum Script {
         Reply(Reply),
         Hang,
     }
@@ -542,26 +542,26 @@ mod network {
     /// Echoes the request body unless a scripted reply is queued; records every request and
     /// every hung handler that was dropped.
     #[derive(Default)]
-    struct Recorder {
+    pub(crate) struct Recorder {
         seen: Mutex<Vec<Seen>>,
         script: Mutex<VecDeque<Script>>,
         abandoned: AtomicUsize,
     }
 
     impl Recorder {
-        fn queue(&self, script: Script) {
+        pub(crate) fn queue(&self, script: Script) {
             self.script.lock().push_back(script);
         }
 
-        fn seen_count(&self) -> usize {
+        pub(crate) fn seen_count(&self) -> usize {
             self.seen.lock().len()
         }
 
-        fn abandoned_count(&self) -> usize {
+        pub(crate) fn abandoned_count(&self) -> usize {
             self.abandoned.load(Ordering::SeqCst)
         }
 
-        fn last(&self) -> Seen {
+        pub(crate) fn last(&self) -> Seen {
             self.seen
                 .lock()
                 .last()
@@ -627,8 +627,8 @@ mod network {
     /// Never answers and never finishes, without the drop delay `Recorder` adds, for tests
     /// that park many handlers at once.
     #[derive(Default)]
-    struct Stall {
-        entered: AtomicUsize,
+    pub(crate) struct Stall {
+        pub(crate) entered: AtomicUsize,
     }
 
     #[async_trait]
@@ -644,12 +644,12 @@ mod network {
     }
 
     #[derive(Default)]
-    struct SpySink {
+    pub(crate) struct SpySink {
         knocks: Mutex<Vec<KnockEvent>>,
     }
 
     impl SpySink {
-        fn count(&self) -> usize {
+        pub(crate) fn count(&self) -> usize {
             self.knocks.lock().len()
         }
 
@@ -678,11 +678,16 @@ mod network {
         }
     }
 
-    const TEST_PATH: &str = "/test";
+    pub(crate) const TEST_PATH: &str = "/test";
 
     /// Puts the real dispatcher over `list` in front of `responder`, serving `TEST_PATH`
     /// with `recorder` and knocking into the returned spy.
-    fn gate(responder: &Responder, recorder: Arc<Recorder>, list: &TrustList, tag: &str) -> Gate {
+    pub(crate) fn gate(
+        responder: &Responder,
+        recorder: Arc<Recorder>,
+        list: &TrustList,
+        tag: &str,
+    ) -> Gate {
         let (trust, tmp) = list.open(tag);
         let sink = Arc::new(SpySink::default());
         let dispatcher = Dispatcher::new(trust, sink.clone());
@@ -691,29 +696,29 @@ mod network {
         Gate { sink, _tmp: tmp }
     }
 
-    struct Gate {
-        sink: Arc<SpySink>,
+    pub(crate) struct Gate {
+        pub(crate) sink: Arc<SpySink>,
         _tmp: TempDir,
     }
 
     /// A `Listener` serving a fresh Coyote destination.
-    struct Responder {
-        transport: Arc<Transport>,
-        server: Arc<R3Server>,
+    pub(crate) struct Responder {
+        pub(crate) transport: Arc<Transport>,
+        pub(crate) server: Arc<R3Server>,
         dest: Arc<tokio::sync::Mutex<SingleInputDestination>>,
-        desc: DestinationDesc,
+        pub(crate) desc: DestinationDesc,
         identity: TransportIdentity,
         iface: AddressHash,
         cancel: CancellationToken,
-        port: u16,
+        pub(crate) port: u16,
     }
 
     impl Responder {
-        async fn listen(handler: Arc<dyn RequestHandler>, client_mtu: usize) -> Self {
+        pub(crate) async fn listen(handler: Arc<dyn RequestHandler>, client_mtu: usize) -> Self {
             Self::listen_on(Arc::new(R3Server::new()), handler, client_mtu).await
         }
 
-        async fn listen_on(
+        pub(crate) async fn listen_on(
             server: Arc<R3Server>,
             handler: Arc<dyn RequestHandler>,
             client_mtu: usize,
@@ -747,7 +752,7 @@ mod network {
             }
         }
 
-        async fn announce(&self, app_data: Option<&[u8]>) {
+        pub(crate) async fn announce(&self, app_data: Option<&[u8]>) {
             let packet = self.dest.lock().await.announce(OsRng, app_data).unwrap();
             self.transport.send_packet(packet).await;
         }
@@ -761,7 +766,7 @@ mod network {
             Envelope::new(self.origin(), body)
         }
 
-        async fn stop(self) {
+        pub(crate) async fn stop(self) {
             self.cancel.cancel();
             self.transport
                 .iface_manager()
@@ -773,20 +778,20 @@ mod network {
 
     /// A `Connector` with no destination of its own; `origin` is the instance it claims
     /// in every request.
-    struct Requester {
-        transport: Arc<Transport>,
-        identity: TransportIdentity,
-        origin: OriginName,
-        client: Arc<R3Client>,
+    pub(crate) struct Requester {
+        pub(crate) transport: Arc<Transport>,
+        pub(crate) identity: TransportIdentity,
+        pub(crate) origin: OriginName,
+        pub(crate) client: Arc<R3Client>,
         client_task: JoinHandle<()>,
         announces: broadcast::Receiver<AnnounceEvent>,
-        iface: AddressHash,
+        pub(crate) iface: AddressHash,
         iface_task: JoinHandle<()>,
         cancel: CancellationToken,
     }
 
     impl Requester {
-        async fn connect(port: u16, mtu: usize) -> Self {
+        pub(crate) async fn connect(port: u16, mtu: usize) -> Self {
             let Connector {
                 transport,
                 identity,
@@ -812,7 +817,7 @@ mod network {
 
         /// Consumes announces until the one for `hash` arrives and returns its description,
         /// which is what a requester links to.
-        async fn learn(&mut self, hash: &AddressHash) -> DestinationDesc {
+        pub(crate) async fn learn(&mut self, hash: &AddressHash) -> DestinationDesc {
             let deadline = tokio::time::Instant::now() + INTEROP_TIMEOUT;
             loop {
                 let event = tokio::time::timeout_at(deadline, self.announces.recv())
@@ -826,11 +831,11 @@ mod network {
             }
         }
 
-        fn envelope(&self, body: Value) -> Envelope {
+        pub(crate) fn envelope(&self, body: Value) -> Envelope {
             Envelope::new(self.origin, body)
         }
 
-        async fn request(
+        pub(crate) async fn request(
             &self,
             desc: &DestinationDesc,
             path: &str,
@@ -848,7 +853,7 @@ mod network {
                 .await
         }
 
-        async fn stop(self) {
+        pub(crate) async fn stop(self) {
             self.cancel.cancel();
             // Bounded because a requester the test has wedged with a response-size limit has
             // its transport's handler lock held for good.
@@ -858,7 +863,9 @@ mod network {
     }
 
     /// A bare responder and requester joined over a legacy-MTU loopback link.
-    async fn pair(handler: Arc<dyn RequestHandler>) -> (Responder, Requester, DestinationDesc) {
+    pub(crate) async fn pair(
+        handler: Arc<dyn RequestHandler>,
+    ) -> (Responder, Requester, DestinationDesc) {
         let responder = Responder::listen(handler, LEGACY_LINK_MTU).await;
         let mut requester = Requester::connect(responder.port, LEGACY_LINK_MTU).await;
         responder.announce(None).await;
@@ -866,7 +873,7 @@ mod network {
         (responder, requester, desc)
     }
 
-    fn identity_hex(requester: &Requester) -> String {
+    pub(crate) fn identity_hex(requester: &Requester) -> String {
         requester
             .identity
             .as_identity()
@@ -883,18 +890,18 @@ mod network {
         )
     }
 
-    fn requester_destination_hex(requester: &Requester) -> String {
+    pub(crate) fn requester_destination_hex(requester: &Requester) -> String {
         requester_destination(requester).to_hex_string()
     }
 
-    fn short_options() -> RequestOptions {
+    pub(crate) fn short_options() -> RequestOptions {
         RequestOptions {
             request_timeout: SHORT_REQUEST_TIMEOUT,
             ..RequestOptions::default()
         }
     }
 
-    fn timed_out(path: &str) -> R3Error {
+    pub(crate) fn timed_out(path: &str) -> R3Error {
         R3Error::Timeout {
             path: path.to_string(),
             after: SHORT_REQUEST_TIMEOUT,
@@ -902,7 +909,7 @@ mod network {
     }
 
     /// A link the requester has proven its identity on, as the responder sees it.
-    async fn identified_link(
+    pub(crate) async fn identified_link(
         requester: &Requester,
         responder: &Responder,
         desc: &DestinationDesc,
@@ -929,7 +936,7 @@ mod network {
 
     /// One request over `link` from the requester's own instance, as `Requester::request`
     /// sends it but without opening or identifying a link first.
-    async fn request_on(
+    pub(crate) async fn request_on(
         requester: &Requester,
         link: &Arc<tokio::sync::Mutex<Link>>,
         path: &str,
@@ -951,7 +958,9 @@ mod network {
 
     /// The response payloads `events` has carried so far, as the requester's transport
     /// received them.
-    fn response_payloads(events: &mut broadcast::Receiver<LinkEventData>) -> Vec<Vec<u8>> {
+    pub(crate) fn response_payloads(
+        events: &mut broadcast::Receiver<LinkEventData>,
+    ) -> Vec<Vec<u8>> {
         let mut payloads = Vec::new();
         while let Ok(event) = events.try_recv() {
             if let LinkEvent::Data(payload) = event.event
@@ -963,7 +972,7 @@ mod network {
         payloads
     }
 
-    fn assert_debug_logged(needle: &str) {
+    pub(crate) fn assert_debug_logged(needle: &str) {
         let debugs = debug_snapshot();
         assert!(
             debugs.iter().any(|message| message.contains(needle)),
@@ -974,7 +983,7 @@ mod network {
     /// A body whose request frame, envelope included, encodes to exactly `target` bytes;
     /// the bin header grows at 256 bytes so the search is over lengths rather than
     /// arithmetic.
-    fn request_body_of_encoded_len(origin: OriginName, target: usize) -> Value {
+    pub(crate) fn request_body_of_encoded_len(origin: OriginName, target: usize) -> Value {
         (0..target)
             .map(|n| Value::Binary(vec![0xab; n]))
             .find(|body| {
@@ -984,7 +993,7 @@ mod network {
             .unwrap_or_else(|| panic!("no body encodes a {target}-byte request frame"))
     }
 
-    fn response_body_of_encoded_len(target: usize) -> Value {
+    pub(crate) fn response_body_of_encoded_len(target: usize) -> Value {
         (0..target)
             .map(|n| Value::Binary(vec![0xcd; n]))
             .find(|body| {
@@ -1021,7 +1030,7 @@ mod network {
 
     /// Sends a request the responder is scripted to hang on, with `SHORT_REQUEST_TIMEOUT`,
     /// and returns the in-flight request with what the responder saw of it.
-    async fn hanging_request(
+    pub(crate) async fn hanging_request(
         requester: &Requester,
         recorder: &Recorder,
         desc: &DestinationDesc,
@@ -1055,7 +1064,7 @@ mod network {
         (in_flight, recorder.last())
     }
 
-    fn timed_out_slow_request() -> R3Error {
+    pub(crate) fn timed_out_slow_request() -> R3Error {
         R3Error::Timeout {
             path: "/slow".to_string(),
             after: SHORT_REQUEST_TIMEOUT,
@@ -1114,12 +1123,12 @@ mod network {
 
     /// A started `MeshRuntime` (node A) connected to a bare responder (node B) whose
     /// transport also runs an `R3Client`, so either side can request from the other.
-    struct NodePair {
-        responder: Responder,
-        recorder_b: Arc<Recorder>,
+    pub(crate) struct NodePair {
+        pub(crate) responder: Responder,
+        pub(crate) recorder_b: Arc<Recorder>,
         client_b: Arc<R3Client>,
         cancel_b: CancellationToken,
-        node_a: Arc<MeshRuntime>,
+        pub(crate) node_a: Arc<MeshRuntime>,
         recorder_a: Arc<Recorder>,
         a_desc: DestinationDesc,
         _tmp: TempDir,
@@ -1127,7 +1136,7 @@ mod network {
 
     impl NodePair {
         /// Node A with a recorder in place of the dispatcher `start` installs.
-        async fn start(tag: &str) -> Self {
+        pub(crate) async fn start(tag: &str) -> Self {
             let pair = Self::start_as_started(tag).await;
             pair.node_a.set_request_handler(pair.recorder_a.clone());
             pair
@@ -1193,7 +1202,7 @@ mod network {
         }
 
         /// Announces node B so node A has a path to it, waiting until A files B as a peer.
-        async fn introduce_b_to_a(&self) {
+        pub(crate) async fn introduce_b_to_a(&self) {
             let b_app_data = AnnounceAppData {
                 version: 1,
                 display_name: Some("Bea".to_string()),
@@ -1261,7 +1270,7 @@ mod network {
         }
 
         /// Stops node A through a slot, the way the REPL does, and returns how long it took.
-        async fn stop_node_a(self) -> Duration {
+        pub(crate) async fn stop_node_a(self) -> Duration {
             let slot = Arc::new(MeshSlot::default());
             slot.install(self.node_a).unwrap();
             let stopping = Instant::now();

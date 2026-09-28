@@ -6,6 +6,11 @@ use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
 
+pub(crate) const SPEC: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/docs/mesh/PROTOCOL.md"
+));
+
 const EXPECTED_H1: &str = "# Coyote Mesh Protocol, version 1: wire format";
 const SECTION_COUNT: usize = 16;
 const CONSTANTS_HEADING: &str = "## 15. Constants";
@@ -36,6 +41,8 @@ const POSITIONAL_TABLE_COLUMNS: [&str; 3] =
     ["Type", "Sender puts", "Receiver action on any other value"];
 const CATCH_ALL_ROW_PREFIXES: [&str; 2] = ["any other", "trailing"];
 const CONSTANTS_TABLE_HEADER: &str = "| Constant | Value | Defined in | Pinned by |";
+/// The "Pinned by" cell of a constant that only this module's table check pins.
+const PINNED_BY_THIS_TABLE: &str = "spec_pins (this table)";
 const CITED_IDENTIFIER_MIN_LEN: usize = 12;
 const CITED_IDENTIFIER_MIN_UNDERSCORES: usize = 2;
 
@@ -50,6 +57,14 @@ struct Definition {
 struct IndexEntry {
     id: String,
     anchor: String,
+    line: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ConstantRow {
+    name: String,
+    literal: String,
+    pinned_by: String,
     line: usize,
 }
 
@@ -141,13 +156,29 @@ fn slug(heading: &str) -> String {
         .collect()
 }
 
+/// Splits a table row on `|`, leaving a `|` inside a backtick code span in its cell. An
+/// unclosed backtick is literal, as `split_spans` reads it.
 fn cells(row: &str) -> Vec<&str> {
-    row.trim()
-        .trim_start_matches('|')
-        .trim_end_matches('|')
-        .split('|')
-        .map(str::trim)
-        .collect()
+    let row = row.trim().trim_start_matches('|').trim_end_matches('|');
+    let mut cells = Vec::new();
+    let mut start = 0;
+    let mut at = 0;
+    while at < row.len() {
+        match row.as_bytes()[at] {
+            b'`' => match row[at + 1..].find('`') {
+                Some(close) => at += close + 2,
+                None => break,
+            },
+            b'|' => {
+                cells.push(row[start..at].trim());
+                start = at + 1;
+                at += 1;
+            }
+            _ => at += 1,
+        }
+    }
+    cells.push(row[start..].trim());
+    cells
 }
 
 fn tables(text: &str) -> Vec<Table<'_>> {
@@ -466,8 +497,11 @@ fn names_identifier(source: &str, name: &str) -> bool {
     contains_word(source, name)
 }
 
-/// The concatenated contents of every `.rs` file under `dir`.
+/// The concatenated contents of every `.rs` file under `dir`, this file excepted: its
+/// fixtures name identifiers that exist nowhere else, and a citation must not resolve
+/// against the guard that checks it.
 fn rust_sources(dir: &Path) -> std::io::Result<String> {
+    let guard = Path::new(file!()).file_name();
     let mut out = String::new();
     let mut pending = vec![dir.to_path_buf()];
     while let Some(dir) = pending.pop() {
@@ -475,7 +509,7 @@ fn rust_sources(dir: &Path) -> std::io::Result<String> {
             let path = entry?.path();
             if path.is_dir() {
                 pending.push(path);
-            } else if path.extension().is_some_and(|ext| ext == "rs") {
+            } else if path.extension().is_some_and(|ext| ext == "rs") && path.file_name() != guard {
                 out.push_str(&std::fs::read_to_string(path)?);
                 out.push('\n');
             }
@@ -507,7 +541,7 @@ fn source_paths(text: &str) -> BTreeSet<String> {
         .collect()
 }
 
-fn parse_constants_table(text: &str) -> Result<Vec<(String, String)>, String> {
+fn parse_constants_table(text: &str) -> Result<Vec<ConstantRow>, String> {
     let section = section(text, CONSTANTS_HEADING)?;
     let tables = tables(&section.content);
     let [table] = tables.as_slice() else {
@@ -531,13 +565,18 @@ fn parse_constants_table(text: &str) -> Result<Vec<(String, String)>, String> {
         .map(|(offset, row)| {
             let line = section.first_line + table.line + offset - 1;
             let cells = cells(row);
-            let [name, literal, ..] = cells.as_slice() else {
+            let [name, literal, _, pinned_by] = cells.as_slice() else {
                 return Err(format!(
-                    "line {line}: constants row {row:?} has too few cells"
+                    "line {line}: constants row {row:?} does not have four cells"
                 ));
             };
             match (backticked(name), backticked(literal)) {
-                (Some(name), Some(literal)) => Ok((name.to_string(), literal.to_string())),
+                (Some(name), Some(literal)) => Ok(ConstantRow {
+                    name: name.to_string(),
+                    literal: literal.to_string(),
+                    pinned_by: pinned_by.to_string(),
+                    line,
+                }),
                 _ => Err(format!(
                     "line {line}: constants row {row:?} needs a backticked name and literal"
                 )),
@@ -546,16 +585,16 @@ fn parse_constants_table(text: &str) -> Result<Vec<(String, String)>, String> {
         .collect()
 }
 
-fn check_constants(actual: &[(String, String)], expected: &[(&str, String)]) -> Result<(), String> {
+fn check_constants(actual: &[ConstantRow], expected: &[(&str, String)]) -> Result<(), String> {
     for (row, (got, want)) in actual.iter().zip(expected).enumerate() {
-        if (got.0.as_str(), &got.1) != (want.0, &want.1) {
+        if (got.name.as_str(), &got.literal) != (want.0, &want.1) {
             return Err(format!(
                 "constants row {}: expected `{}` = `{}`, found `{}` = `{}`",
                 row + 1,
                 want.0,
                 want.1,
-                got.0,
-                got.1
+                got.name,
+                got.literal
             ));
         }
     }
@@ -566,10 +605,29 @@ fn check_constants(actual: &[(String, String)], expected: &[(&str, String)]) -> 
         )),
         Ordering::Greater => Err(format!(
             "constants table has an extra row `{}`",
-            actual[expected.len()].0
+            actual[expected.len()].name
         )),
         Ordering::Equal => Ok(()),
     }
+}
+
+/// Every "Pinned by" cell names a test or item the sources define as a whole word, or is
+/// the sentinel for a constant only the table itself pins.
+fn check_pinned_by(rows: &[ConstantRow], sources: &str) -> Vec<String> {
+    rows.iter()
+        .filter(|row| {
+            row.pinned_by != PINNED_BY_THIS_TABLE
+                && (row.pinned_by.is_empty()
+                    || row.pinned_by.contains(char::is_whitespace)
+                    || !names_identifier(sources, &row.pinned_by))
+        })
+        .map(|row| {
+            format!(
+                "line {}: `{}` is pinned by {:?}, which is neither {PINNED_BY_THIS_TABLE:?} nor an identifier named under src/",
+                row.line, row.name, row.pinned_by
+            )
+        })
+        .collect()
 }
 
 fn parse_index_line(line: &str) -> Option<(&str, &str)> {
@@ -603,6 +661,11 @@ fn index_entries(text: &str) -> Result<Vec<IndexEntry>, Vec<String>> {
     } else {
         Err(violations)
     }
+}
+
+/// Every requirement id the section 16 index lists, in index order.
+pub(crate) fn requirement_ids(spec: &str) -> Result<Vec<String>, Vec<String>> {
+    index_entries(spec).map(|entries| entries.into_iter().map(|entry| entry.id).collect())
 }
 
 fn check_index_ids(definitions: &[Definition], entries: &[IndexEntry]) -> Result<(), String> {
@@ -664,11 +727,6 @@ mod tests {
     use lxmf_core::constants::{FIELD_CUSTOM_DATA, FIELD_CUSTOM_TYPE};
     use rns_transport::hash::ADDRESS_HASH_SIZE;
     use std::time::Duration;
-
-    const SPEC: &str = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/docs/mesh/PROTOCOL.md"
-    ));
 
     const EXPECTED_LITERALS: &str = r#"1,1,10,16,262144,"/knock","/status","/message",30,10,10,2,20,16,0xf0,0xf1,0xf3,0xf4,0xf5,0xf6,0xfd,0xfe,"COYM",64,300,900,3,2700,1800,1024,"coyote.knock/1",200,15,10,256,3,600,256,16,1,0,1,2,64,280,64,64,120,280,"coyote.peer/1",1,120,4000,64,4096,8,15,10,604800,256,3600,120,256,1,60,100000,120,26,60,2,60,1024,64,240,131072,112,4096,15552000,3,256,0,32,0xfb,0xfc"#;
 
@@ -951,8 +1009,8 @@ Fenced lines may say must and MUST without an id.
 
 | Constant | Value | Defined in | Pinned by |
 |---|---|---|---|
-| `ALPHA` | `1` | a.rs | x |
-| `BETA` | `\"b\"` | b.rs | y |
+| `ALPHA` | `1` | a.rs | spec_pins (this table) |
+| `BETA` | `\"b\"` | b.rs | decode_whole_frame_test |
 
 ## 16. Requirements index
 
@@ -1043,9 +1101,22 @@ Fenced lines may say must and MUST without an id.
         );
         let constants = parse_constants_table(VALID_SPEC).unwrap();
         check_constants(&constants, &valid_expected()).unwrap();
+        assert!(check_pinned_by(&constants, "fn decode_whole_frame_test()").is_empty());
         let entries = index_entries(VALID_SPEC).unwrap();
         check_index_ids(&definitions, &entries).unwrap();
         check_index_anchors(&definitions, &entries).unwrap();
+        assert_eq!(
+            requirement_ids(VALID_SPEC).unwrap(),
+            [
+                "MESH-DEST-001",
+                "MESH-DEST-002",
+                "MESH-DEST-004",
+                "MESH-DEST-003",
+                "MESH-DEST-005",
+                "MESH-ENV-001",
+                "MESH-ENV-002"
+            ]
+        );
     }
 
     #[test]
@@ -1281,8 +1352,22 @@ Fenced lines may say must and MUST without an id.
     fn rust_source_walker_reads_nested_files() {
         let sources =
             rust_sources(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mesh")).unwrap();
-        assert!(sources.contains("fn rust_source_walker_reads_nested_files"));
-        assert!(sources.contains("fn check_field_tables"));
+        assert!(sources.contains("fn destination_address"));
+        assert!(sources.contains("fn refusal_codes_round_trip_the_wire_and_reject_other_values"));
+        assert!(
+            !sources.contains("fn rust_source_walker_reads_nested_files"),
+            "the walk must skip this file so a citation cannot resolve against a fixture"
+        );
+    }
+
+    #[test]
+    fn cells_keep_a_pipe_inside_a_code_span_in_its_cell() {
+        assert_eq!(
+            cells("| `x || y` | concatenation | `a` |"),
+            ["`x || y`", "concatenation", "`a`"]
+        );
+        assert_eq!(cells("| a | `unclosed | b |"), ["a", "`unclosed | b"]);
+        assert_eq!(cells("|---|---|"), ["---", "---"]);
     }
 
     #[test]
@@ -1321,6 +1406,24 @@ Fenced lines may say must and MUST without an id.
 |---|---|---|---|
 | `ALPHA` | 1 | a.rs | x |
 ";
+    const CONSTANTS_THREE_CELLS: &str = "\
+## 15. Constants
+
+| Constant | Value | Defined in | Pinned by |
+|---|---|---|---|
+| `ALPHA` | `1` | a.rs |
+";
+    const CONSTANTS_PINNED_BY: &str = "\
+## 15. Constants
+
+| Constant | Value | Defined in | Pinned by |
+|---|---|---|---|
+| `ALPHA` | `1` | a.rs | spec_pins (this table) |
+| `BETA` | `2` | b.rs | beta_is_pinned_here |
+| `GAMMA` | `3` | c.rs | gamma_test_that_nothing_defines |
+| `DELTA` | `4` | d.rs | some prose instead |
+| `EPS` | `5` | e.rs | |
+";
 
     #[test]
     fn constants_table_parser_wants_one_table_of_backticked_rows() {
@@ -1336,10 +1439,35 @@ Fenced lines may say must and MUST without an id.
         );
         let unbackticked = parse_constants_table(CONSTANTS_UNBACKTICKED).unwrap_err();
         assert!(unbackticked.starts_with("line 5:"), "{unbackticked}");
+        let three_cells = parse_constants_table(CONSTANTS_THREE_CELLS).unwrap_err();
+        assert!(three_cells.contains("four cells"), "{three_cells}");
         assert!(
             parse_constants_table("# nothing\n")
                 .unwrap_err()
                 .contains("no ")
+        );
+    }
+
+    #[test]
+    fn pinned_by_checker_wants_the_sentinel_or_a_defined_identifier() {
+        let rows = parse_constants_table(CONSTANTS_PINNED_BY).unwrap();
+        assert_eq!(rows[1].pinned_by, "beta_is_pinned_here");
+        let violations = check_pinned_by(&rows, "fn beta_is_pinned_here() {}\nfn some() {}");
+        assert_eq!(violations.len(), 3, "{violations:?}");
+        assert!(
+            violations[0].starts_with("line 7: `GAMMA`"),
+            "{}",
+            violations[0]
+        );
+        assert!(
+            violations[1].starts_with("line 8: `DELTA`"),
+            "{}",
+            violations[1]
+        );
+        assert!(
+            violations[2].starts_with("line 9: `EPS`"),
+            "{}",
+            violations[2]
         );
     }
 
@@ -1387,6 +1515,7 @@ Fenced lines may say must and MUST without an id.
         assert_eq!(violations.len(), 4, "{violations:?}");
         assert!(violations[0].starts_with("line 4:"));
         assert!(index_entries("# no index\n").unwrap_err()[0].contains("no "));
+        assert_eq!(requirement_ids(INDEX_BAD_LINES).unwrap_err(), violations);
     }
 
     #[test]
@@ -1491,6 +1620,29 @@ Fenced lines may say must and MUST without an id.
     fn spec_constants_table_matches_the_code() {
         let actual = parse_constants_table(SPEC).unwrap();
         check_constants(&actual, &expected_constants()).unwrap();
+    }
+
+    #[test]
+    fn spec_constants_are_pinned_by_tests_that_exist() {
+        let sources = rust_sources(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src")).unwrap();
+        let rows = parse_constants_table(SPEC).unwrap();
+        assert!(
+            rows.iter().any(|row| row.pinned_by != PINNED_BY_THIS_TABLE),
+            "the table pins nothing by test"
+        );
+        assert_eq!(check_pinned_by(&rows, &sources), Vec::<String>::new());
+    }
+
+    #[test]
+    fn spec_requirement_ids_are_listed_once_each_in_area_order() {
+        let ids = requirement_ids(SPEC).unwrap();
+        assert!(ids.len() > 200, "{} ids", ids.len());
+        let unique: HashSet<&String> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len(), "an id is indexed twice");
+        assert!(
+            ids.iter()
+                .all(|id| parse_id(id).is_some_and(|(_, rest)| rest.is_empty()))
+        );
     }
 
     #[test]
