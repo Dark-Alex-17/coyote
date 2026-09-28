@@ -18,7 +18,7 @@ use crate::mesh::r3::{
     short,
 };
 use crate::mesh::trust::{Decision, IdentityStanding, Rule, TrustStore};
-use crate::mesh::{destination_address, display_text, rfc3339_utc};
+use crate::mesh::{destination_address, display_text, hex_lower, rfc3339_utc};
 
 use lxmf_core::constants::{FIELD_CUSTOM_DATA, FIELD_CUSTOM_TYPE};
 use parking_lot::Mutex;
@@ -300,6 +300,8 @@ pub(crate) trait KnockSurface: Send + Sync {
 pub(crate) struct InboundKnock {
     pub identity_hash: String,
     pub destination_hash: String,
+    /// Lower-hex origin name hash, the other half of what derives `destination_hash`.
+    pub name_hash: String,
     pub via: KnockVia,
     pub intro: Option<String>,
 }
@@ -464,6 +466,7 @@ impl KnockGate {
             received_at: rfc3339_utc(received_at),
             identity_hash: knock.identity_hash.clone(),
             destination_hash: knock.destination_hash.clone(),
+            name_hash: knock.name_hash.clone(),
             display_name: display_name.clone(),
             intro: knock.intro.clone(),
             hops,
@@ -576,6 +579,7 @@ pub(crate) async fn drain_knocks(
         let knock = InboundKnock {
             identity_hash: event.identity_hash,
             destination_hash: event.destination_hash,
+            name_hash: event.name_hash,
             via: KnockVia::Direct,
             intro: intro_from_r3_body(event.data.as_ref()),
         };
@@ -617,6 +621,7 @@ impl InboundSink for KnockRouting<'_> {
                         identity_hash: message.source_identity_hash.clone(),
                         destination_hash: destination_address(&name_hash, &identity)
                             .to_hex_string(),
+                        name_hash: hex_lower(&name_hash),
                         via: KnockVia::StoreAndForward,
                         intro,
                     },
@@ -710,6 +715,7 @@ mod tests {
         InboundKnock {
             identity_hash: identity.to_string(),
             destination_hash: destination.to_string(),
+            name_hash: String::new(),
             via,
             intro: Some("hello".to_string()),
         }
@@ -1557,6 +1563,11 @@ mod tests {
         let cached = rig.cached();
         assert_eq!(cached.len(), 1);
         assert_eq!(cached[0].destination_hash, expected_destination);
+        assert_eq!(
+            cached[0].name_hash,
+            hex_lower(&origin.0),
+            "the cached knock keeps the name hash that derives its destination"
+        );
         assert_eq!(cached[0].intro.as_deref(), Some("stored"));
         let texts = rig.surface.texts();
         assert_eq!(texts.len(), 1);
@@ -1633,6 +1644,7 @@ mod tests {
         KnockEvent {
             identity_hash: identity.to_string(),
             destination_hash: destination.to_string(),
+            name_hash: String::new(),
             link_id: LinkId::new_from_rand(OsRng),
             path_hash: PathHash::of(STATUS_PATH),
             data,

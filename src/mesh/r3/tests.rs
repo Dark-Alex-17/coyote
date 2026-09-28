@@ -412,8 +412,8 @@ mod network {
     };
     use super::super::error::{R3Error, RefusalCode};
     use super::super::frame::{
-        Envelope, MAX_R3_PAYLOAD_BYTES, OriginName, PathHash, RequestFrame, RequestId,
-        ResponseFrame,
+        Envelope, MAX_R3_PAYLOAD_BYTES, NAME_HASH_LEN, OriginName, PathHash, RequestFrame,
+        RequestId, ResponseFrame,
     };
     use super::super::receipt::{ReceiptState, RequestReceipt};
     use super::super::server::{
@@ -662,6 +662,12 @@ mod network {
                 knock.path_hash,
                 knock.data.clone(),
             )
+        }
+
+        fn only_name_hash(&self) -> String {
+            let knocks = self.knocks.lock();
+            assert_eq!(knocks.len(), 1, "exactly one knock");
+            knocks[0].name_hash.clone()
         }
     }
 
@@ -2261,13 +2267,12 @@ mod network {
         identity: &Identity,
         logged: &Mutex<Vec<(String, String)>>,
     ) -> Reply {
+        let origin = OriginName::of(&fresh_destination_name());
         let knock = KnockEvent {
             identity_hash: identity.address_hash.to_hex_string(),
-            destination_hash: destination_address(
-                &OriginName::of(&fresh_destination_name()).0,
-                &identity.address_hash,
-            )
-            .to_hex_string(),
+            destination_hash: destination_address(&origin.0, &identity.address_hash)
+                .to_hex_string(),
+            name_hash: crate::mesh::hex_lower(&origin.0),
             link_id: LinkId::new_from_rand(OsRng),
             path_hash: PathHash::of(KNOCK_PATH),
             data: Some(Value::Nil),
@@ -2433,6 +2438,18 @@ mod network {
         );
         assert_eq!(path_hash, PathHash::of(TEST_PATH));
         assert_eq!(data, None, "only /knock carries the body to the sink");
+        let name_hash = gate.sink.only_name_hash();
+        assert_eq!(name_hash, crate::mesh::hex_lower(&requester.origin.0));
+        let decoded: [u8; NAME_HASH_LEN] = crate::mesh::decode_hex(&name_hash)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        assert_eq!(
+            destination_address(&decoded, &requester.identity.as_identity().address_hash)
+                .to_hex_string(),
+            destination,
+            "the knock carries the name hash that, with the identity, derives its destination"
+        );
         assert_eq!(recorder.seen_count(), 0);
         assert_debug_logged(&format!(
             "from {} on link {}: refused: DefaultClosed (knocked)",

@@ -19,18 +19,55 @@ use subtle::ConstantTimeEq;
 
 pub(crate) const TRUST_FILE_VERSION: u64 = 1;
 
-const MESH_OFF: &str = "Mesh is off, so the trust list cannot be changed. Run `.mesh on` first.";
+pub(crate) const MESH_OFF: &str =
+    "Mesh is off, so the trust list cannot be changed. Run `.mesh on` first.";
 
 /// What a trust mutation needs from a running mesh: proof it is on, and the peer table
-/// that turns a destination into its announced identity.
+/// that turns a destination into its announced identity, with the knock cache as the
+/// fallback for an instance that asked to be trusted before it was heard announcing.
 pub(crate) trait LiveMesh {
     /// `None` while the mesh is off.
     fn peers(&self) -> Option<Arc<PeerTable>>;
+
+    /// The knock the cache holds for `destination_hash`, when the peer table has not heard
+    /// it announce.
+    fn knock(&self, destination_hash: &str, now: SystemTime) -> Option<KnockProof> {
+        let _ = (destination_hash, now);
+        None
+    }
+}
+
+/// The hashes a cached knock carries, which prove its destination the same way an announce
+/// does: the name hash and identity must derive it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct KnockProof {
+    pub identity_hash: String,
+    /// Lower-hex; empty when the knock was cached before the name hash was kept.
+    pub name_hash: String,
+    pub last_seen: SystemTime,
 }
 
 impl LiveMesh for MeshSlot {
     fn peers(&self) -> Option<Arc<PeerTable>> {
         self.get().map(|runtime| runtime.peers())
+    }
+
+    fn knock(&self, destination_hash: &str, now: SystemTime) -> Option<KnockProof> {
+        let knocks = match self.get()?.knock_gate().cache().list(now) {
+            Ok(knocks) => knocks,
+            Err(err) => {
+                debug!("knock cache unreadable while resolving a destination to trust: {err:#}");
+                return None;
+            }
+        };
+        knocks
+            .into_iter()
+            .find(|knock| knock.destination_hash == destination_hash)
+            .map(|knock| KnockProof {
+                identity_hash: knock.identity_hash,
+                name_hash: knock.name_hash,
+                last_seen: parse_rfc3339(&knock.received_at).unwrap_or(now),
+            })
     }
 }
 
@@ -222,10 +259,11 @@ fn same_hash(left: &str, right: &str) -> bool {
 /// The user's trust list, mirrored to `<config_dir>/mesh/trust.yaml`.
 ///
 /// Only the mutation methods write the file, and each of them needs a running mesh: a
-/// destination is trusted by proving, from the peer table's copy of its announce, which
-/// identity derived it. Queries never touch the disk. `mark_seen` and session trust live in
-/// memory only, so `last_seen_at` on disk is as of the last mutation that touched a record
-/// while `records` reports the fresher in-memory value; nothing calls `mark_seen` yet.
+/// destination is trusted by proving, from the peer table's copy of its announce or from
+/// its cached knock, which identity derived it. Queries never touch the disk. `mark_seen`
+/// and session trust live in memory only, so `last_seen_at` on disk is as of the last
+/// mutation that touched a record while `records` reports the fresher in-memory value; the
+/// node calls `mark_seen` for every announce it files.
 ///
 /// Nothing here removes a record on its own: removal is `untrust_*`, `block_identity` and
 /// `prune_destinations`, all at the user's request.
@@ -235,8 +273,6 @@ pub(crate) struct TrustStore {
     inner: Mutex<State>,
 }
 
-// Reached by the REPL mesh commands once they land.
-#[allow(dead_code)]
 impl TrustStore {
     /// Loads `trust.yaml` under `config_dir`. A missing file is an empty list and nothing is
     /// created; a file that cannot be parsed is an error, never a partial list, because the
@@ -261,6 +297,7 @@ impl TrustStore {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
@@ -319,6 +356,7 @@ impl TrustStore {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn is_trusted_destination(
         &self,
         identity_hash: &str,
@@ -330,6 +368,7 @@ impl TrustStore {
     /// The identity-tier gate: known (on disk or for the session) and not blocked, so its
     /// instances may knock. It says nothing about which destinations are allowed; that is
     /// `authorize`.
+    #[cfg(test)]
     pub(crate) fn is_trusted_identity(&self, identity_hash: &str) -> bool {
         matches!(
             self.identity_standing(identity_hash),
@@ -443,14 +482,33 @@ impl TrustStore {
     }
 
     /// Notes a fresh sighting of a trusted destination in memory only; the file keeps the
-    /// value from the last mutation so announces never cause writes. A destination without
-    /// a record is ignored, so announces cannot grow this map either.
-    pub(crate) fn mark_seen(&self, destination_hash: &str, at: SystemTime) {
+    /// value from the last mutation so announces never cause writes. The sighting counts
+    /// only under the proof `records` and `prune_destinations` demand of an announce:
+    /// `identity_hash` and `name_hash` must derive the destination, and that identity must
+    /// be the one the record is bound to. A destination without a record, or an announce
+    /// that fails the proof, is ignored, so a stranger reusing the hash cannot keep the
+    /// record looking alive.
+    pub(crate) fn mark_seen(
+        &self,
+        destination_hash: &str,
+        identity_hash: &str,
+        name_hash: &str,
+        at: SystemTime,
+    ) {
         let destination = destination_hash.to_ascii_lowercase();
         let mut state = self.inner.lock();
-        if !state.file.destinations.contains_key(&destination)
-            && !state.session_destinations.contains_key(&destination)
-        {
+        let Some(bound) = state
+            .file
+            .destinations
+            .get(&destination)
+            .or_else(|| state.session_destinations.get(&destination))
+            .map(|entry| entry.identity.clone())
+        else {
+            return;
+        };
+        let provable = verify_binding(&destination, identity_hash, name_hash, "the announce")
+            .is_ok_and(|identity| same_hash(&identity.to_hex_string(), &bound));
+        if !provable {
             return;
         }
         state
@@ -462,7 +520,8 @@ impl TrustStore {
 
     /// Trusts one destination by proving which identity announced it, and makes sure that
     /// identity has a record (without `all_destinations`, which only `trust_identity` sets).
-    /// The identity comes from the announce's own hashes, never from the caller.
+    /// The identity comes from the announce's or the knock's own hashes, never from the
+    /// caller.
     pub(crate) fn trust_destination(
         &self,
         mesh: &dyn LiveMesh,
@@ -472,7 +531,7 @@ impl TrustStore {
     ) -> Result<TrustOutcome> {
         let peers = live(mesh)?;
         check_options(&opts)?;
-        let peer = resolve_destination(&peers, destination_hash)?;
+        let peer = resolve_destination(mesh, &peers, destination_hash, now)?;
         let mut state = self.inner.lock();
         let mut file = state.file.clone();
         refuse_if_blocked(&file, &peer.identity_hash)?;
@@ -518,6 +577,7 @@ impl TrustStore {
     /// Same proof as `trust_destination`, kept in memory only: the pair is forgotten when
     /// the process ends and never reaches `trust.yaml`. A hash already on disk gets no
     /// session twin: the disk record is the stronger one and lists once.
+    #[cfg(test)]
     pub(crate) fn trust_destination_for_session(
         &self,
         mesh: &dyn LiveMesh,
@@ -525,7 +585,7 @@ impl TrustStore {
         now: SystemTime,
     ) -> Result<TrustOutcome> {
         let peers = live(mesh)?;
-        let peer = resolve_destination(&peers, destination_hash)?;
+        let peer = resolve_destination(mesh, &peers, destination_hash, now)?;
         let mut state = self.inner.lock();
         refuse_if_blocked(&state.file, &peer.identity_hash)?;
         if state.file.destinations.contains_key(&peer.destination_hash) {
@@ -1055,20 +1115,43 @@ struct ResolvedPeer {
     last_seen: SystemTime,
 }
 
-/// Finds the announce behind `destination_hash` in the peer table and proves the identity
-/// it recorded derives that destination.
-fn resolve_destination(peers: &PeerTable, destination_hash: &str) -> Result<ResolvedPeer> {
+/// Finds the announce behind `destination_hash` in the peer table, or failing that its
+/// knock in the cache, and proves the identity it recorded derives that destination.
+fn resolve_destination(
+    mesh: &dyn LiveMesh,
+    peers: &PeerTable,
+    destination_hash: &str,
+    now: SystemTime,
+) -> Result<ResolvedPeer> {
     let destination = normalize_hash(destination_hash);
-    let Some(record) = peers.get(&destination) else {
+    if let Some(record) = peers.get(&destination) {
+        let identity = verified_identity(&record)?;
+        return Ok(ResolvedPeer {
+            destination_hash: destination,
+            identity_hash: identity.to_hex_string(),
+            last_seen: record.last_seen,
+        });
+    }
+    let Some(knock) = mesh.knock(&destination, now) else {
         bail!(
-            "Destination {destination} is not in the peer table. Run `.mesh peers` to see the nodes that have announced, and trust one of those."
+            "Destination {destination} is not in the peer table and has not knocked. Run `.mesh peers` to see the nodes that have announced or `.mesh knocks` to see who asked to be trusted, and trust one of those."
         );
     };
-    let identity = verified_identity(&record)?;
+    if knock.name_hash.is_empty() {
+        bail!(
+            "Instance {destination} knocked before its name hash was kept, so its identity cannot be verified; wait for it to knock again."
+        );
+    }
+    let identity = verify_binding(
+        &destination,
+        &knock.identity_hash,
+        &knock.name_hash,
+        "the knock cache",
+    )?;
     Ok(ResolvedPeer {
         destination_hash: destination,
         identity_hash: identity.to_hex_string(),
-        last_seen: record.last_seen,
+        last_seen: knock.last_seen,
     })
 }
 
@@ -1080,13 +1163,29 @@ fn verified_identity(record: &PeerRecord) -> Result<AddressHash> {
             "Peer {destination} was recorded before its name hash was kept, so its identity cannot be verified yet. Wait for its next announce and try again."
         );
     }
-    let name_hash = decode_hex(&record.name_hash)
+    verify_binding(
+        destination,
+        &record.identity_hash,
+        &record.name_hash,
+        "the peer table",
+    )
+}
+
+/// Reticulum's own derivation, run on the hashes `source` recorded: `identity_hash` is the
+/// destination's owner only if it and `name_hash` derive `destination`.
+fn verify_binding(
+    destination: &str,
+    identity_hash: &str,
+    name_hash: &str,
+    source: &str,
+) -> Result<AddressHash> {
+    let name_hash = decode_hex(name_hash)
         .and_then(|bytes| bytes.try_into().ok())
         .ok_or_else(|| {
-            anyhow!("The peer table holds an unreadable name hash for {destination}; wait for its next announce.")
+            anyhow!("The name hash {source} holds for {destination} is unreadable; wait until it is heard again.")
         })?;
-    let identity = parse_hash(&record.identity_hash).ok_or_else(|| {
-        anyhow!("The peer table holds an unreadable identity hash for {destination}; wait for its next announce.")
+    let identity = parse_hash(identity_hash).ok_or_else(|| {
+        anyhow!("The identity hash {source} holds for {destination} is unreadable; wait until it is heard again.")
     })?;
     let claimed = parse_hash(destination).ok_or_else(|| {
         anyhow!("'{destination}' is not a destination hash: expected 32 hex characters.")
@@ -1094,7 +1193,7 @@ fn verified_identity(record: &PeerRecord) -> Result<AddressHash> {
     let expected = destination_address(&name_hash, &identity);
     if expected != claimed {
         bail!(
-            "Destination {destination} does not match identity {} in the peer table (that identity would announce {}); nothing was trusted.",
+            "Destination {destination} does not match identity {} in {source} (that identity would announce {}); nothing was trusted.",
             identity.to_hex_string(),
             expected.to_hex_string()
         );
@@ -1121,11 +1220,20 @@ mod tests {
         }
     }
 
-    struct MeshOn(Arc<PeerTable>);
+    /// A running mesh: the peer table, and the knocks its cache would hold.
+    struct MeshOn(Arc<PeerTable>, Mutex<Vec<(String, KnockProof)>>);
 
     impl LiveMesh for MeshOn {
         fn peers(&self) -> Option<Arc<PeerTable>> {
             Some(self.0.clone())
+        }
+
+        fn knock(&self, destination_hash: &str, _now: SystemTime) -> Option<KnockProof> {
+            self.1
+                .lock()
+                .iter()
+                .find(|(destination, _)| destination == destination_hash)
+                .map(|(_, proof)| proof.clone())
         }
     }
 
@@ -1176,13 +1284,25 @@ mod tests {
             let peers = PeerTable::load(tmp.path.join("peers.json"), t(1_000)).unwrap();
             Self {
                 store,
-                mesh: MeshOn(Arc::new(peers)),
+                mesh: MeshOn(Arc::new(peers), Mutex::new(Vec::new())),
                 tmp,
             }
         }
 
         fn announce(&self, peer: &Announced, at: SystemTime) {
             self.mesh.0.observe(sighting(peer), at);
+        }
+
+        /// Puts `peer`'s knock in the cache with the hashes it announced, `name_hash` aside.
+        fn knocked(&self, peer: &Announced, name_hash: &str, at: SystemTime) {
+            self.mesh.1.lock().push((
+                peer.destination_hash.clone(),
+                KnockProof {
+                    identity_hash: peer.identity_hash.clone(),
+                    name_hash: name_hash.to_string(),
+                    last_seen: at,
+                },
+            ));
         }
 
         fn file_bytes(&self) -> Option<Vec<u8>> {
@@ -1338,7 +1458,7 @@ mod tests {
     }
 
     #[test]
-    fn trust_destination_of_unknown_peer_points_at_mesh_peers() {
+    fn trust_destination_of_unknown_peer_points_at_mesh_peers_and_knocks() {
         let fx = Fixture::new("trust-unknown");
 
         let err = fx
@@ -1353,8 +1473,123 @@ mod tests {
             .to_string();
 
         assert!(err.contains(".mesh peers"), "{err}");
+        assert!(err.contains(".mesh knocks"), "{err}");
+        assert!(err.contains("has not knocked"), "{err}");
         assert!(err.contains(&fake_hash(0x9f)), "{err}");
         assert_eq!(fx.file_bytes(), None);
+    }
+
+    #[test]
+    fn trust_destination_accepts_a_knock_only_instance_the_formula_proves() {
+        let fx = Fixture::new("trust-knock-only");
+        let peer = announced("alpha");
+        fx.knocked(&peer, &peer.name_hash, t(2_000));
+
+        let outcome = fx
+            .store
+            .trust_destination(
+                &fx.mesh,
+                &peer.destination_hash,
+                TrustOptions::default(),
+                t(3_000),
+            )
+            .unwrap();
+
+        assert_eq!(outcome.change, TrustChange::Added);
+        assert_eq!(outcome.identity_hash, peer.identity_hash);
+        assert_eq!(
+            fx.store
+                .authorize(&peer.identity_hash, &peer.destination_hash),
+            verdict(Decision::Allow, Rule::DestinationTrusted)
+        );
+        let record = fx
+            .store
+            .records()
+            .into_iter()
+            .find(|record| record.hash == peer.destination_hash)
+            .unwrap();
+        assert_eq!(record.last_seen_at, t(2_000), "the knock is the sighting");
+    }
+
+    #[test]
+    fn trust_destination_refuses_a_knock_whose_hashes_do_not_derive_it() {
+        let fx = Fixture::new("trust-knock-forged");
+        let peer = announced("alpha");
+        let other = announced("beta");
+        fx.knocked(&peer, &other.name_hash, t(2_000));
+
+        let err = fx
+            .store
+            .trust_destination(
+                &fx.mesh,
+                &peer.destination_hash,
+                TrustOptions::default(),
+                t(3_000),
+            )
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("does not match identity"), "{err}");
+        assert!(err.contains("knock cache"), "{err}");
+        assert!(fx.store.records().is_empty());
+        assert_eq!(fx.file_bytes(), None);
+    }
+
+    #[test]
+    fn trust_destination_waits_for_a_knock_cached_without_its_name_hash() {
+        let fx = Fixture::new("trust-knock-no-name-hash");
+        let peer = announced("alpha");
+        fx.knocked(&peer, "", t(2_000));
+
+        let err = fx
+            .store
+            .trust_destination(
+                &fx.mesh,
+                &peer.destination_hash,
+                TrustOptions::default(),
+                t(3_000),
+            )
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("knocked before its name hash was kept"),
+            "{err}"
+        );
+        assert!(err.contains("knock again"), "{err}");
+        assert_eq!(fx.file_bytes(), None);
+    }
+
+    #[test]
+    fn the_peer_table_outranks_the_knock_cache_as_the_proof_source() {
+        let fx = Fixture::new("trust-announce-over-knock");
+        let peer = announced("alpha");
+        let other = announced("beta");
+        fx.announce(&peer, t(2_000));
+        fx.knocked(&peer, &other.name_hash, t(2_500));
+
+        let outcome = fx
+            .store
+            .trust_destination(
+                &fx.mesh,
+                &peer.destination_hash,
+                TrustOptions::default(),
+                t(3_000),
+            )
+            .unwrap();
+
+        assert_eq!(outcome.identity_hash, peer.identity_hash);
+        let record = fx
+            .store
+            .records()
+            .into_iter()
+            .find(|record| record.hash == peer.destination_hash)
+            .unwrap();
+        assert_eq!(
+            record.last_seen_at,
+            t(2_000),
+            "the announce is the sighting"
+        );
     }
 
     #[test]
@@ -2511,7 +2746,12 @@ mod tests {
         fx.store
             .trust_destination_for_session(&fx.mesh, &session.destination_hash, t(3_000))
             .unwrap();
-        fx.store.mark_seen(&first.destination_hash, t(9_000));
+        fx.store.mark_seen(
+            &first.destination_hash,
+            &first.identity_hash,
+            &first.name_hash,
+            t(9_000),
+        );
 
         fx.store
             .untrust_destination(&fx.mesh, &format!(" {}", first.destination_hash))
@@ -2560,7 +2800,12 @@ mod tests {
             t(4_000),
             "a re-trust must not inherit the sighting of the removed record"
         );
-        fx.store.mark_seen(&first.destination_hash, t(9_000));
+        fx.store.mark_seen(
+            &first.destination_hash,
+            &first.identity_hash,
+            &first.name_hash,
+            t(9_000),
+        );
 
         let removed = fx
             .store
@@ -2609,7 +2854,12 @@ mod tests {
         let stale = announced("alpha");
         let fresh = announced("beta");
         let revived = announced("gamma");
-        fx.store.mark_seen(&stale.destination_hash, t(9_000));
+        fx.store.mark_seen(
+            &stale.destination_hash,
+            &stale.identity_hash,
+            &stale.name_hash,
+            t(9_000),
+        );
         for peer in [&stale, &fresh, &revived] {
             fx.announce(peer, t(1_000));
             fx.store
@@ -2630,7 +2880,12 @@ mod tests {
                 t(5_000),
             )
             .unwrap();
-        fx.store.mark_seen(&revived.destination_hash, t(5_000));
+        fx.store.mark_seen(
+            &revived.destination_hash,
+            &revived.identity_hash,
+            &revived.name_hash,
+            t(5_000),
+        );
         let now = t(1_000 + 3_600);
         let horizon = Duration::from_secs(3_600);
 
@@ -2679,6 +2934,72 @@ mod tests {
                 .is_empty(),
             "a last_seen_at in the future reads as just seen"
         );
+    }
+
+    #[test]
+    fn mark_seen_refreshes_only_a_provable_sighting_of_the_bound_identity() {
+        let fx = Fixture::new("trust-mark-seen-proof");
+        let peer = announced("alpha");
+        let other = announced("beta");
+        fx.announce(&peer, t(2_000));
+        fx.store
+            .trust_destination(
+                &fx.mesh,
+                &peer.destination_hash,
+                TrustOptions::default(),
+                t(3_000),
+            )
+            .unwrap();
+        let before = fx.file_bytes().unwrap();
+        let last_seen = || {
+            fx.store
+                .records()
+                .into_iter()
+                .find(|record| record.hash == peer.destination_hash)
+                .unwrap()
+                .last_seen_at
+        };
+
+        fx.store.mark_seen(
+            &peer.destination_hash,
+            &peer.identity_hash,
+            &peer.name_hash,
+            t(5_000),
+        );
+        assert_eq!(last_seen(), t(5_000));
+
+        fx.store.mark_seen(
+            &peer.destination_hash,
+            &other.identity_hash,
+            &other.name_hash,
+            t(6_000),
+        );
+        assert_eq!(
+            last_seen(),
+            t(5_000),
+            "a stranger announcing under the trusted hash is not a sighting"
+        );
+
+        fx.store
+            .mark_seen(&peer.destination_hash, &peer.identity_hash, "", t(7_000));
+        assert_eq!(
+            last_seen(),
+            t(5_000),
+            "an announce without a name hash cannot be proved"
+        );
+
+        fx.store.mark_seen(
+            &peer.destination_hash,
+            &peer.identity_hash,
+            &other.name_hash,
+            t(8_000),
+        );
+        assert_eq!(
+            last_seen(),
+            t(5_000),
+            "a name hash that does not derive the destination proves nothing"
+        );
+        assert_eq!(fx.file_bytes().unwrap(), before);
     }
 
     #[test]
@@ -2775,8 +3096,18 @@ mod tests {
         store.is_blocked_identity(&fake_hash(0xbb));
         store.blocked();
         store.denied();
-        store.mark_seen(&peer.destination_hash, t(9_000));
-        store.mark_seen(&peer.destination_hash, t(8_000));
+        store.mark_seen(
+            &peer.destination_hash,
+            &peer.identity_hash,
+            &peer.name_hash,
+            t(9_000),
+        );
+        store.mark_seen(
+            &peer.destination_hash,
+            &peer.identity_hash,
+            &peer.name_hash,
+            t(8_000),
+        );
 
         assert_eq!(fx.file_bytes().unwrap(), before);
         assert_eq!(store.records().len(), count);

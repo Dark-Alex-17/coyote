@@ -1,4 +1,3 @@
-use crate::mesh::destination_address;
 use crate::mesh::protocol::{VersionRefusal, describe_version};
 use crate::mesh::r3::client::SizeBranch;
 use crate::mesh::r3::error::RefusalCode;
@@ -6,6 +5,7 @@ use crate::mesh::r3::frame::{Envelope, EnvelopeError, PathHash, RequestId};
 use crate::mesh::r3::server::{Admission, InboundRequest, Reply, RequestHandler};
 use crate::mesh::r3::short;
 use crate::mesh::trust::{Decision, IdentityStanding, Rule, TrustStore};
+use crate::mesh::{destination_address, hex_lower};
 
 use async_trait::async_trait;
 use parking_lot::RwLock;
@@ -63,6 +63,9 @@ pub(crate) struct KnockEvent {
     pub identity_hash: String,
     /// The knocking instance: the requester's destination, bound to its proven identity.
     pub destination_hash: String,
+    /// Lower-hex, the origin name hash that with `identity_hash` derives
+    /// `destination_hash`; kept so the derivation can be checked again later.
+    pub name_hash: String,
     pub link_id: LinkId,
     pub path_hash: PathHash,
     /// The request body, carried only for `/knock`, where it is the knocker's introduction.
@@ -333,6 +336,7 @@ impl RequestHandler for Dispatcher {
                     KnockEvent {
                         identity_hash: identity_hex,
                         destination_hash: destination_hex,
+                        name_hash: hex_lower(&envelope.origin.0),
                         link_id,
                         path_hash: request.path_hash,
                         data,

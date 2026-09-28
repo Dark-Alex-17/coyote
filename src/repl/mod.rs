@@ -122,7 +122,7 @@ pub const DEFAULT_CONTINUATION_PROMPT: &str = indoc! {"
     5. Otherwise, continue with the next pending item now. Call tools immediately."
 };
 
-static REPL_COMMANDS: LazyLock<[ReplCommand; 75]> = LazyLock::new(|| {
+static REPL_COMMANDS: LazyLock<[ReplCommand; 81]> = LazyLock::new(|| {
     [
         ReplCommand::new(".help", "Show this help guide", AssertState::pass()),
         ReplCommand::new(".info", "Show system info", AssertState::pass()),
@@ -214,6 +214,36 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 75]> = LazyLock::new(|| {
         ReplCommand::new(
             ".mesh broadcast",
             "Send a bulletin to every trusted peer with a known path",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh trust",
+            "Trust one instance, or every instance of an identity, or prune stale trusted instances",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh untrust",
+            "Forget a trusted instance, or an identity together with every instance bound to it",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh block",
+            "Silence a whole identity: its knocks are dropped and its trust removed",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh unblock",
+            "Lift a block so the identity may knock again",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh deny",
+            "Refuse one instance: deny stops one destination being contacted, where block silences a whole identity",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh undeny",
+            "Lift a deny on one instance (the identity-level counterpart is unblock)",
             AssertState::pass(),
         ),
         ReplCommand::new(
@@ -3227,8 +3257,8 @@ mod tests {
     }
 
     #[test]
-    fn repl_commands_has_75_entries() {
-        assert_eq!(REPL_COMMANDS.len(), 75);
+    fn repl_commands_has_81_entries() {
+        assert_eq!(REPL_COMMANDS.len(), 81);
     }
 
     #[test]
@@ -3245,7 +3275,7 @@ mod tests {
             .iter()
             .map(|(verb, description, _)| (*verb, *description))
             .collect();
-        assert_eq!(commands.len(), 12);
+        assert_eq!(commands.len(), 18);
         assert_eq!(commands, verbs);
     }
 

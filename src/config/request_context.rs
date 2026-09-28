@@ -38,6 +38,7 @@ use crate::mcp::{
 };
 use crate::mesh::card::DISPLAY_NAME_MAX_CHARS;
 use crate::mesh::pending::PENDING_QUESTION_MAX_CHARS;
+use crate::mesh::trust::{Tier, TrustRecord};
 use crate::mesh::{MeshSlot, age_text, display_text, parse_rfc3339, short};
 use crate::rag::Rag;
 use crate::supervisor::Supervisor;
@@ -172,6 +173,17 @@ pub fn jobs_enabled(agent: Option<&Agent>, app: &AppConfig) -> bool {
 /// gets a fresh, empty slot, so this is false for every child even when the parent's is on.
 pub fn mesh_tools_available(app: &AppConfig, mesh: &MeshSlot) -> bool {
     app.function_calling_support && app.mesh.enabled && mesh.get().is_some()
+}
+
+/// Appends the `extra` completions whose value `values` does not already offer, so the
+/// row that came first for a shared value is the one kept.
+fn push_missing(values: &mut Vec<(String, Option<String>)>, extra: Vec<(String, Option<String>)>) {
+    for (value, description) in extra {
+        if values.iter().any(|(present, _)| *present == value) {
+            continue;
+        }
+        values.push((value, description));
+    }
 }
 
 /// A built-in agent's sessions dir sits inside its per-process temp dir, so
@@ -4225,6 +4237,37 @@ impl RequestContext {
             }
         } else if cmd == ".mesh" && args.len() == 3 && args[0] == "reply" && args[1] == "--yes" {
             values = self.mesh_completion_peers(false);
+        } else if cmd == ".mesh" && args.len() == 2 && args[0] == "trust" {
+            values = self.mesh_completion_knocks_filtered(true);
+            push_missing(&mut values, self.mesh_completion_peers(false));
+            values.push(("--identity ".to_string(), None));
+            values.push(("--prune".to_string(), None));
+        } else if cmd == ".mesh" && args.len() == 3 && args[0] == "trust" && args[1] == "--identity"
+        {
+            values = self.mesh_completion_identities();
+        } else if cmd == ".mesh" && args.len() == 3 && args[0] == "trust" && args[1] == "--prune" {
+            values = super::map_completion_values(vec!["--older-than ", "--dry-run", "--confirm "]);
+        } else if cmd == ".mesh" && args.len() == 2 && args[0] == "untrust" {
+            values = self.mesh_completion_trusted(false);
+            values.push(("--identity ".to_string(), None));
+        } else if cmd == ".mesh"
+            && args.len() == 3
+            && args[0] == "untrust"
+            && args[1] == "--identity"
+        {
+            values = self.mesh_completion_trusted(true);
+        } else if cmd == ".mesh" && args.len() == 2 && args[0] == "block" {
+            values = self.mesh_completion_identities();
+        } else if cmd == ".mesh" && args.len() == 2 && args[0] == "unblock" {
+            values = self.mesh_completion_blocked();
+        } else if cmd == ".mesh" && args.len() == 2 && matches!(args[0], "deny" | "undeny") {
+            values = if args[0] == "undeny" {
+                self.mesh_completion_denied()
+            } else {
+                Vec::new()
+            };
+            push_missing(&mut values, self.mesh_completion_knocks());
+            push_missing(&mut values, self.mesh_completion_peers(false));
         } else if cmd == ".mesh" && args.first() == Some(&"answer") && args.len() == 2 {
             values = self.mesh_completion_questions();
         } else if cmd == ".mesh" && args.first() == Some(&"brief") && args.len() == 2 {
@@ -4784,12 +4827,7 @@ impl RequestContext {
         if !include_knocks {
             return values;
         }
-        for (destination, description) in self.mesh_completion_knocks() {
-            if values.iter().any(|(dest, _)| *dest == destination) {
-                continue;
-            }
-            values.push((destination, description));
-        }
+        push_missing(&mut values, self.mesh_completion_knocks());
         values
     }
 
@@ -4799,6 +4837,15 @@ impl RequestContext {
     /// pass through `display_text` and are left out when absent, so the identity and age
     /// are the only components always present. Empty while the mesh is off.
     pub(crate) fn mesh_completion_knocks(&self) -> Vec<(String, Option<String>)> {
+        self.mesh_completion_knocks_filtered(false)
+    }
+
+    /// `provable_only` drops knocks cached before their name hash was kept: the trust
+    /// store refuses them, so `.mesh trust <TAB>` should not offer them.
+    fn mesh_completion_knocks_filtered(
+        &self,
+        provable_only: bool,
+    ) -> Vec<(String, Option<String>)> {
         let Some(runtime) = self.app.mesh.get() else {
             return Vec::new();
         };
@@ -4812,6 +4859,7 @@ impl RequestContext {
         };
         knocks
             .into_iter()
+            .filter(|knock| !provable_only || !knock.name_hash.is_empty())
             .map(|knock| {
                 let age = parse_rfc3339(&knock.received_at)
                     .map(|then| age_text(now, then))
@@ -4835,6 +4883,128 @@ impl RequestContext {
                 .collect::<Vec<_>>()
                 .join(" . ");
                 (knock.destination_hash, Some(description))
+            })
+            .collect()
+    }
+
+    /// Identities for `.mesh trust --identity <TAB>` and `.mesh block <TAB>`: each distinct
+    /// identity behind a knock, then behind a peer row, described by its label or short
+    /// hash. Empty while the mesh is off.
+    fn mesh_completion_identities(&self) -> Vec<(String, Option<String>)> {
+        let Some(runtime) = self.app.mesh.get() else {
+            return Vec::new();
+        };
+        let mut values: Vec<(String, Option<String>)> = Vec::new();
+        let knocks = runtime
+            .knock_gate()
+            .cache()
+            .list(SystemTime::now())
+            .unwrap_or_else(|err| {
+                debug!("knock cache unreadable while completing `.mesh`: {err:#}");
+                Vec::new()
+            });
+        let mut peers = runtime.peers().snapshot();
+        peers.sort_by_key(|peer| std::cmp::Reverse(peer.last_seen));
+        let rows = knocks
+            .into_iter()
+            .map(|knock| (knock.identity_hash, knock.display_name))
+            .chain(
+                peers
+                    .into_iter()
+                    .map(|peer| (peer.identity_hash, peer.display_name)),
+            );
+        for (identity, name) in rows {
+            let who = name
+                .as_deref()
+                .and_then(|name| display_text(name, DISPLAY_NAME_MAX_CHARS))
+                .unwrap_or_else(|| short(&identity).to_string());
+            push_missing(&mut values, vec![(identity, Some(who))]);
+        }
+        values
+    }
+
+    /// Trust records for `.mesh untrust <TAB>`: the destination tier less denied ones, or
+    /// with `identities` the identity tier plus each identity a destination is bound to.
+    /// Empty while the mesh is off.
+    fn mesh_completion_trusted(&self, identities: bool) -> Vec<(String, Option<String>)> {
+        let Some(runtime) = self.app.mesh.get() else {
+            return Vec::new();
+        };
+        let now = SystemTime::now();
+        let records = runtime.trust().records();
+        let label = |record: &TrustRecord| {
+            record
+                .label
+                .as_deref()
+                .and_then(|label| display_text(label, DISPLAY_NAME_MAX_CHARS))
+                .or_else(|| record.identity.as_deref().map(|id| short(id).to_string()))
+                .unwrap_or_else(|| short(&record.hash).to_string())
+        };
+        let mut values: Vec<(String, Option<String>)> = Vec::new();
+        for record in &records {
+            match (identities, record.tier) {
+                (false, Tier::Destination) if !record.denied => values.push((
+                    record.hash.clone(),
+                    Some(format!(
+                        "{} . trusted {}",
+                        label(record),
+                        age_text(now, record.added_at)
+                    )),
+                )),
+                (true, Tier::Identity) => values.push((
+                    record.hash.clone(),
+                    Some(format!(
+                        "{} . trusted {}",
+                        label(record),
+                        age_text(now, record.added_at)
+                    )),
+                )),
+                (true, Tier::Destination) => {
+                    if let Some(identity) = &record.identity {
+                        push_missing(
+                            &mut values,
+                            vec![(identity.clone(), Some(short(identity).to_string()))],
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+        values
+    }
+
+    fn mesh_completion_blocked(&self) -> Vec<(String, Option<String>)> {
+        let Some(runtime) = self.app.mesh.get() else {
+            return Vec::new();
+        };
+        let now = SystemTime::now();
+        runtime
+            .trust()
+            .blocked()
+            .into_iter()
+            .map(|record| {
+                (
+                    record.hash,
+                    Some(format!("blocked . {}", age_text(now, record.added_at))),
+                )
+            })
+            .collect()
+    }
+
+    fn mesh_completion_denied(&self) -> Vec<(String, Option<String>)> {
+        let Some(runtime) = self.app.mesh.get() else {
+            return Vec::new();
+        };
+        let now = SystemTime::now();
+        runtime
+            .trust()
+            .denied()
+            .into_iter()
+            .map(|record| {
+                (
+                    record.hash,
+                    Some(format!("denied . {}", age_text(now, record.added_at))),
+                )
             })
             .collect()
     }
@@ -20413,6 +20583,42 @@ mod tests {
             ctx.repl_complete(".mesh", &["reply", "words", ""], "")
                 .is_empty()
         );
+        let trust: Vec<String> = ctx
+            .repl_complete(".mesh", &["trust", ""], "")
+            .into_iter()
+            .map(|(value, _)| value)
+            .collect();
+        assert_eq!(
+            trust,
+            ["--identity ", "--prune"],
+            "no knocks or peers heard"
+        );
+        let untrust: Vec<String> = ctx
+            .repl_complete(".mesh", &["untrust", ""], "")
+            .into_iter()
+            .map(|(value, _)| value)
+            .collect();
+        assert_eq!(untrust, ["--identity "], "no trust store to read");
+        for verb in ["block", "unblock", "deny", "undeny"] {
+            assert!(
+                ctx.repl_complete(".mesh", &[verb, ""], "").is_empty(),
+                "{verb}: nothing to offer while the mesh is off"
+            );
+        }
+        assert!(
+            ctx.repl_complete(".mesh", &["trust", "--identity", ""], "")
+                .is_empty()
+        );
+        assert!(
+            ctx.repl_complete(".mesh", &["untrust", "--identity", ""], "")
+                .is_empty()
+        );
+        let prune: Vec<String> = ctx
+            .repl_complete(".mesh", &["trust", "--prune", ""], "")
+            .into_iter()
+            .map(|(value, _)| value)
+            .collect();
+        assert_eq!(prune, ["--older-than ", "--dry-run", "--confirm "]);
     }
 
     #[cfg(unix)]
@@ -20522,6 +20728,7 @@ mod tests {
                         received_at: received_at.clone(),
                         identity_hash,
                         destination_hash,
+                        name_hash: String::new(),
                         display_name,
                         intro,
                         hops: 1,
@@ -20614,6 +20821,179 @@ mod tests {
                 .iter()
                 .any(|(value, _)| *value == intro_only || *value == bare),
             "reply completes peers only, never knockers"
+        );
+
+        assert!(ctx.app.mesh.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    /// The trust verbs complete from the knock cache, the peer table and the trust store,
+    /// in that order, with the flag words last; nothing here reaches the network.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_trust_verbs_read_knocks_peers_and_the_trust_store() {
+        use crate::mesh::hex_lower;
+        use crate::mesh::knocks::{KNOCK_RECORD_VERSION, KnockRecord};
+        use crate::mesh::rfc3339_utc;
+        use crate::mesh::test_support::derived_sighting;
+        use crate::mesh::trust::TrustOptions;
+
+        let _guard = TestConfigDirGuard::new();
+        let started = crate::mesh::test_support::started_runtime("rc-mesh-trust-complete").await;
+        let mut ctx = create_test_ctx();
+        ctx.update_app_config(|app| app.mesh.enabled = true);
+        ctx.app.mesh.install(started.runtime.clone()).unwrap();
+        let trust = started.runtime.trust();
+        let mesh = ctx.app.mesh.as_ref();
+
+        // Everything is stamped minutes ago so the age components read the same however
+        // long the assertions take. The heard peer really derives from its identity, since
+        // trusting it verifies that binding.
+        let now = SystemTime::now();
+        let peer = derived_sighting("rc-trust-complete", Some("Bea"));
+        let peer_destination = peer.destination_hash.clone();
+        let peer_identity = peer.identity_hash.clone();
+        started
+            .runtime
+            .peers()
+            .observe(peer, now - Duration::from_secs(2 * 60));
+        let knock_destination = hex_lower(&[0xc1; 16]);
+        let knock_identity = hex_lower(&[0xc2; 16]);
+        // The second knock was cached before its name hash was kept, so the trust store
+        // cannot prove it; the same identity keeps the identity rows unchanged.
+        let legacy_destination = hex_lower(&[0xc3; 16]);
+        let knock_gate = started.runtime.knock_gate();
+        for (destination, name_hash, minutes_ago) in [
+            (&knock_destination, hex_lower(&[0xc4; 10]), 5),
+            (&legacy_destination, String::new(), 4),
+        ] {
+            knock_gate
+                .cache()
+                .append(
+                    KnockRecord {
+                        version: KNOCK_RECORD_VERSION,
+                        received_at: rfc3339_utc(now - Duration::from_secs(minutes_ago * 60)),
+                        identity_hash: knock_identity.clone(),
+                        destination_hash: destination.clone(),
+                        name_hash,
+                        display_name: Some("Kip".to_string()),
+                        intro: Some("hello".to_string()),
+                        hops: 1,
+                    },
+                    now,
+                )
+                .unwrap();
+        }
+        let three_minutes_ago = now - Duration::from_secs(3 * 60);
+        trust
+            .trust_destination(
+                mesh,
+                &peer_destination,
+                TrustOptions::default(),
+                three_minutes_ago,
+            )
+            .unwrap();
+        let denied = hex_lower(&[0xdd; 16]);
+        trust
+            .deny_destination(mesh, &denied, None, three_minutes_ago)
+            .unwrap();
+        let blocked = hex_lower(&[0xbb; 16]);
+        trust
+            .block_identity(mesh, &blocked, None, three_minutes_ago)
+            .unwrap();
+
+        let knock_row = (
+            knock_destination.clone(),
+            Some(format!("Kip . {} . 5m ago . hello", short(&knock_identity))),
+        );
+        let legacy_row = (
+            legacy_destination.clone(),
+            Some(format!("Kip . {} . 4m ago . hello", short(&knock_identity))),
+        );
+        let peer_row = (
+            peer_destination.clone(),
+            Some("Bea . 1 hops . 2m ago".to_string()),
+        );
+        let identity_rows = [
+            (knock_identity.clone(), Some("Kip".to_string())),
+            (peer_identity.clone(), Some("Bea".to_string())),
+        ];
+
+        let trust_values = ctx.repl_complete(".mesh", &["trust", ""], "");
+        assert_eq!(
+            trust_values,
+            [
+                knock_row.clone(),
+                peer_row.clone(),
+                ("--identity ".to_string(), None),
+                ("--prune".to_string(), None),
+            ],
+            "trust offers provable knockers, then peers, then the flags"
+        );
+        assert_eq!(
+            ctx.mesh_completion_knocks(),
+            [legacy_row.clone(), knock_row.clone()],
+            "knockers list newest first"
+        );
+        assert_eq!(&trust_values[1..2], &ctx.mesh_completion_peers(false)[..]);
+
+        let trust_identities = ctx.repl_complete(".mesh", &["trust", "--identity", ""], "");
+        assert_eq!(trust_identities, identity_rows);
+        assert_eq!(trust_identities, ctx.mesh_completion_identities());
+        let block = ctx.repl_complete(".mesh", &["block", ""], "");
+        assert_eq!(block, identity_rows, "block offers the same identities");
+
+        let untrust = ctx.repl_complete(".mesh", &["untrust", ""], "");
+        assert_eq!(
+            untrust,
+            [
+                (
+                    peer_destination.clone(),
+                    Some(format!("{} . trusted 3m ago", short(&peer_identity))),
+                ),
+                ("--identity ".to_string(), None),
+            ],
+            "untrust offers the trusted destination, never the denied one, then the flag"
+        );
+        assert_eq!(&untrust[..1], &ctx.mesh_completion_trusted(false)[..]);
+
+        let untrust_identities = ctx.repl_complete(".mesh", &["untrust", "--identity", ""], "");
+        assert_eq!(
+            untrust_identities,
+            [(
+                peer_identity.clone(),
+                Some(format!("{} . trusted 3m ago", short(&peer_identity))),
+            )],
+            "the identity record and the destination bound to it list the identity once"
+        );
+        assert_eq!(untrust_identities, ctx.mesh_completion_trusted(true));
+
+        let unblock = ctx.repl_complete(".mesh", &["unblock", ""], "");
+        assert_eq!(
+            unblock,
+            [(blocked.clone(), Some("blocked . 3m ago".to_string()))]
+        );
+        assert_eq!(unblock, ctx.mesh_completion_blocked());
+
+        let undeny = ctx.repl_complete(".mesh", &["undeny", ""], "");
+        assert_eq!(
+            undeny,
+            [
+                (denied.clone(), Some("denied . 3m ago".to_string())),
+                legacy_row.clone(),
+                knock_row.clone(),
+                peer_row.clone(),
+            ],
+            "undeny leads with the denied destinations"
+        );
+        assert_eq!(&undeny[..1], &ctx.mesh_completion_denied()[..]);
+
+        let deny = ctx.repl_complete(".mesh", &["deny", ""], "");
+        assert_eq!(
+            deny,
+            [legacy_row, knock_row, peer_row],
+            "deny offers every knocker, provable or not, then peers"
         );
 
         assert!(ctx.app.mesh.stop().await.unwrap());

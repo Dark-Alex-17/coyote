@@ -1,4 +1,5 @@
 use crate::mesh::announce::{MAX_DISPLAY_NAME_BYTES, is_control_or_invisible};
+use crate::mesh::r3::NAME_HASH_LEN;
 use crate::mesh::{canonical_hash, mesh_cache_dir, parse_rfc3339, write_atomically};
 
 use anyhow::{Context, Result, bail};
@@ -27,6 +28,15 @@ pub(crate) const KNOCK_CACHE_MAX_ENTRIES: usize = 256;
 /// day; with it, that peer only ever displaces its own older knocks.
 pub(crate) const KNOCK_CACHE_MAX_PER_IDENTITY: usize = 16;
 
+const NAME_HASH_HEX_LEN: usize = NAME_HASH_LEN * 2;
+
+fn is_lower_hex(text: &str, len: usize) -> bool {
+    text.len() == len
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 /// One line of `knocks.jsonl`. The shape is a stable on-disk record other code reads back:
 /// fields are only ever added, never renamed or removed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,6 +49,10 @@ pub(crate) struct KnockRecord {
     pub identity_hash: String,
     /// Lower-hex, the knocking instance.
     pub destination_hash: String,
+    /// Lower-hex origin name hash, the other half of what derives `destination_hash`;
+    /// empty on rows written before it was kept.
+    #[serde(default)]
+    pub name_hash: String,
     pub display_name: Option<String>,
     /// The knocker's text, at most `KNOCK_INTRO_MAX_CHARS`.
     pub intro: Option<String>,
@@ -104,6 +118,11 @@ impl KnockCache {
                 bail!("A knock {field} is not 32 lowercase hex characters; refusing to cache it.");
             }
         }
+        if !record.name_hash.is_empty() && !is_lower_hex(&record.name_hash, NAME_HASH_HEX_LEN) {
+            bail!(
+                "A knock name_hash is neither empty nor {NAME_HASH_HEX_LEN} lowercase hex characters; refusing to cache it."
+            );
+        }
         if record
             .display_name
             .as_deref()
@@ -149,10 +168,9 @@ impl KnockCache {
     }
 
     /// Drops expired knocks and any over the per-identity or global cap from the file and
-    /// returns how many went; writes only if any did.
-    // `append` evicts on every write and `.mesh knocks` reads without evicting, so nothing
-    // in production calls this yet; it is kept for an explicit cache-maintenance command.
-    #[allow(dead_code)]
+    /// returns how many went; writes only if any did. `append` evicts on every write and
+    /// `.mesh knocks` reads without evicting, so this runs when the user prunes the trust
+    /// list and the cache should shed its dead weight alongside.
     pub(crate) fn prune(&self, now: SystemTime) -> Result<usize> {
         // Nothing to prune means nothing to lock: taking the file lock would create the
         // cache directory for a cache that does not exist yet.
@@ -323,6 +341,7 @@ mod tests {
             received_at: rfc3339_utc(received_at),
             identity_hash: hex_lower(&seed),
             destination_hash: hex_lower(&seed.map(|byte| !byte)),
+            name_hash: hex_lower(&seed[..NAME_HASH_LEN]),
             display_name: Some(tag.to_string()),
             intro: Some(format!("hello from {tag}")),
             hops: 3,
@@ -540,6 +559,14 @@ mod tests {
             destination_hash: "abc".to_string(),
             ..knock("dest", t(1_000))
         };
+        let odd_name_hash = KnockRecord {
+            name_hash: "AB".repeat(NAME_HASH_LEN),
+            ..knock("name-hash", t(1_000))
+        };
+        let short_name_hash = KnockRecord {
+            name_hash: "a".repeat(NAME_HASH_HEX_LEN - 1),
+            ..knock("short-name-hash", t(1_000))
+        };
         let long_name = KnockRecord {
             display_name: Some("n".repeat(MAX_DISPLAY_NAME_BYTES + 1)),
             ..knock("name", t(1_000))
@@ -554,6 +581,8 @@ mod tests {
                 short_destination,
                 "destination_hash",
             ),
+            ("upper-case name_hash", odd_name_hash, "name_hash"),
+            ("short name_hash", short_name_hash, "name_hash"),
             ("oversize display_name", long_name, "display_name"),
         ] {
             let err = cache.append(record, t(1_000)).unwrap_err().to_string();
@@ -580,6 +609,31 @@ mod tests {
         assert!(err.contains("refusing"), "{err}");
         assert_eq!(fs::read(cache.path()).unwrap(), bytes_before);
         assert!(!cache.path().with_extension("jsonl.tmp").exists());
+    }
+
+    #[test]
+    fn a_row_without_a_name_hash_loads_as_unknown() {
+        let tmp = TempDir::new("knocks-legacy-row");
+        let cache = KnockCache::new(&tmp.path, 24);
+        let mut legacy = serde_json::to_value(knock("old", t(1_000))).unwrap();
+        legacy.as_object_mut().unwrap().remove("name_hash");
+        cache.write_all(&[]).unwrap();
+        fs::write(cache.path(), format!("{legacy}\n")).unwrap();
+
+        let listed = cache.list(t(1_000)).unwrap();
+
+        assert_eq!(tags(&listed), vec!["old"]);
+        assert_eq!(listed[0].name_hash, "");
+        cache
+            .append(
+                KnockRecord {
+                    name_hash: String::new(),
+                    ..knock("bare", t(1_000))
+                },
+                t(1_000),
+            )
+            .unwrap();
+        assert_eq!(tags(&cache.list(t(1_000)).unwrap()), vec!["bare", "old"]);
     }
 
     #[test]

@@ -399,6 +399,7 @@ impl MeshRuntime {
         runtime.register_task(tokio::spawn(receive_announces(
             announces,
             runtime.peers.clone(),
+            runtime.trust.clone(),
             runtime.propagation_nodes.clone(),
             runtime.cancellation_token(),
         )));
@@ -619,6 +620,7 @@ impl MeshRuntime {
             .await
             .clone()
             .ok_or(R3Error::NotRunning)?;
+        let sent = envelope.version;
         let request = self.r3_client.request(
             &transport,
             &self.transport_identity,
@@ -631,7 +633,7 @@ impl MeshRuntime {
             () = self.cancel.cancelled() => Err(R3Error::Shutdown),
             outcome = request => outcome,
         };
-        note_version_refusal(&self.peers, &dest_hex, path, &outcome);
+        note_version_refusal(&self.peers, &dest_hex, path, sent, &outcome);
         outcome
     }
 
@@ -656,6 +658,7 @@ impl MeshRuntime {
             .clone()
             .ok_or(R3Error::NotRunning)?;
         let envelope = self.envelope(data).await;
+        let sent = envelope.version;
         let client = self.r3_client.clone();
         let identity = self.transport_identity.clone();
         let peers = self.peers.clone();
@@ -674,7 +677,7 @@ impl MeshRuntime {
                         Some(delivered),
                     )
                     .await;
-                note_version_refusal(&peers, &dest_hex, &path, &outcome);
+                note_version_refusal(&peers, &dest_hex, &path, sent, &outcome);
                 outcome
             },
         ))
@@ -1314,25 +1317,37 @@ fn refuse_incompatible_peer(peers: &PeerTable, dest_hex: &str, path: &str) -> Re
 
 /// The other half: a peer that refused this node's version over the wire is marked so the
 /// next request stops at `refuse_incompatible_peer`. The peer's `max` is the newest
-/// protocol it speaks, which is what the record names.
+/// protocol it speaks, which is what the record names. A refusal whose window is empty or
+/// contains the version this node sent is not a version mismatch, and marks nothing: the
+/// peer's word alone does not get to cut a compatible peer off.
 fn note_version_refusal(
     peers: &PeerTable,
     dest_hex: &str,
     path: &str,
+    sent: u16,
     outcome: &Result<RequestOutcome, R3Error>,
 ) {
-    if let Err(R3Error::UnsupportedVersion { max, .. }) = outcome {
-        peers.mark_incompatible(dest_hex, *max);
+    let Err(R3Error::UnsupportedVersion { min, max, .. }) = outcome else {
+        return;
+    };
+    if min > max || (*min..=*max).contains(&sent) {
         debug!(
-            "Mesh request for {path} to {} was refused for its protocol version; the peer speaks protocol {max} and is marked incompatible",
+            "Mesh request for {path} to {} was refused for protocol version {sent} with an inconsistent window {min}..={max}; the peer is not marked",
             short(dest_hex)
         );
+        return;
     }
+    peers.mark_incompatible(dest_hex, *max);
+    debug!(
+        "Mesh request for {path} to {} was refused for its protocol version; the peer speaks protocol {max} and is marked incompatible",
+        short(dest_hex)
+    );
 }
 
 async fn receive_announces(
     mut announces: broadcast::Receiver<AnnounceEvent>,
     peers: Arc<PeerTable>,
+    trust: Arc<TrustStore>,
     propagation_nodes: Arc<PropagationNodeTable>,
     cancel: CancellationToken,
 ) {
@@ -1353,15 +1368,21 @@ async fn receive_announces(
         if propagation_nodes.observe_announce(&desc, event.app_data.as_slice(), event.hops, now) {
             continue;
         }
-        record_announce(
+        let destination_hash = desc.address_hash.to_hex_string();
+        let identity_hash = desc.identity.address_hash.to_hex_string();
+        let name_hash = hex_lower(&event.name_hash);
+        let filed = record_announce(
             &peers,
-            desc.address_hash.to_hex_string(),
-            desc.identity.address_hash.to_hex_string(),
-            hex_lower(&event.name_hash),
+            destination_hash.clone(),
+            identity_hash.clone(),
+            name_hash.clone(),
             event.app_data.as_slice(),
             event.hops,
             now,
         );
+        if filed.is_some() {
+            trust.mark_seen(&destination_hash, &identity_hash, &name_hash, now);
+        }
     }
 }
 
@@ -5344,6 +5365,238 @@ mod tests {
             "an incompatible peer is never linked to: {links:?}"
         );
         assert!(stub.seen().is_empty());
+        assert!(slot.stop().await.unwrap());
+        stub.stop().await;
+    }
+
+    fn compatible_peer_table(tag: &str) -> (TempDir, PeerTable, String) {
+        let tmp = TempDir::new(tag);
+        let now = SystemTime::now();
+        let peers = PeerTable::load(tmp.path.join("peers.json"), now).unwrap();
+        let hash = "ab".repeat(16);
+        peers.observe(
+            PeerSighting {
+                destination_hash: hash.clone(),
+                identity_hash: "cd".repeat(16),
+                name_hash: "ef".repeat(10),
+                display_name: None,
+                protocol_version: MESH_PROTOCOL_VERSION,
+                hops: 1,
+            },
+            now,
+        );
+        (tmp, peers, hash)
+    }
+
+    /// Only a refusal whose window is consistent and excludes the version this node sent
+    /// marks the peer, and it is marked with the peer's `max`; an inverted or containing
+    /// window, and any other outcome, leave the record alone.
+    #[test]
+    fn version_refusal_marks_only_a_consistent_window_that_excludes_our_version() {
+        let refusal = |min, max| {
+            Err(R3Error::UnsupportedVersion {
+                found: Some(2),
+                min,
+                max,
+            })
+        };
+
+        let (_tmp, peers, hash) = compatible_peer_table("node-refusal-excluding");
+        note_version_refusal(&peers, &hash, STATUS_PATH, 1, &refusal(2, 3));
+        assert_eq!(
+            peers.get(&hash).unwrap().compatibility,
+            Compatibility::Incompatible { found: 3 }
+        );
+
+        let (_tmp, peers, hash) = compatible_peer_table("node-refusal-inverted");
+        note_version_refusal(&peers, &hash, STATUS_PATH, 1, &refusal(3, 2));
+        assert_eq!(
+            peers.get(&hash).unwrap().compatibility,
+            Compatibility::Compatible
+        );
+
+        let (_tmp, peers, hash) = compatible_peer_table("node-refusal-containing");
+        note_version_refusal(&peers, &hash, STATUS_PATH, 1, &refusal(1, 2));
+        assert_eq!(
+            peers.get(&hash).unwrap().compatibility,
+            Compatibility::Compatible
+        );
+
+        let (_tmp, peers, hash) = compatible_peer_table("node-refusal-other");
+        note_version_refusal(
+            &peers,
+            &hash,
+            STATUS_PATH,
+            1,
+            &Err(R3Error::Timeout {
+                path: STATUS_PATH.to_string(),
+                after: Duration::from_secs(1),
+            }),
+        );
+        note_version_refusal(&peers, &hash, STATUS_PATH, 1, &Err(R3Error::NotRunning));
+        assert_eq!(
+            peers.get(&hash).unwrap().compatibility,
+            Compatibility::Compatible
+        );
+    }
+
+    /// A stub filed as compatible, then marked incompatible in the table as a wire refusal
+    /// would, with a link mark taken after the marking.
+    #[cfg(unix)]
+    async fn marked_incompatible_stub(
+        tag: &str,
+    ) -> (
+        PeerStub,
+        Arc<MeshRuntime>,
+        Arc<MeshSlot>,
+        DestinationDesc,
+        String,
+        usize,
+    ) {
+        use crate::mesh::trust::TrustOptions;
+
+        install_log_collector();
+        let stub = PeerStub::listen(&format!("{tag}-stub"), TcpServer::DEFAULT_CLIENT_MTU).await;
+        let started = started_runtime_on(tag, stub.port()).await;
+        let runtime = started.runtime.clone();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime.clone()).unwrap();
+        stub.trust(&runtime.current_destination_hash(), runtime.fingerprint());
+        stub.announce(Some("Stub")).await;
+        let to = stub.destination_hex();
+        let peers = runtime.peers();
+        wait_until("the node to file the stub", || peers.get(&to).is_some()).await;
+        runtime
+            .trust()
+            .trust_destination(
+                slot.as_ref(),
+                &to,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        let desc = runtime.resolve_destination(&to).await.unwrap();
+        peers.mark_incompatible(&to, 7);
+        let mark = debug_snapshot().len();
+        (stub, runtime, slot, desc, to, mark)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn knock_with_stops_at_a_peer_already_marked_incompatible() {
+        let (stub, runtime, slot, desc, to, mark) =
+            marked_incompatible_stub("node-knock-incompatible").await;
+
+        let err = runtime
+            .knock_with(
+                &desc,
+                &KnockIntro::new("hi").unwrap(),
+                KnockOptions::default(),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            err,
+            KnockError::Direct(R3Error::UnsupportedVersion {
+                found: Some(7),
+                min: MESH_PROTOCOL_MIN_SUPPORTED,
+                max: MESH_PROTOCOL_VERSION,
+            })
+        );
+        let links = links_opened_since(mark, &to);
+        assert!(
+            links.is_empty(),
+            "a marked peer is never knocked over a link: {links:?}"
+        );
+        assert!(slot.stop().await.unwrap());
+        stub.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn request_status_with_stops_at_a_peer_already_marked_incompatible() {
+        use crate::mesh::card::StatusError;
+
+        let (stub, runtime, slot, desc, to, mark) =
+            marked_incompatible_stub("node-status-incompatible").await;
+
+        let err = runtime
+            .request_status_with(&desc, RequestOptions::default())
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            err,
+            StatusError::Transport(R3Error::UnsupportedVersion {
+                found: Some(7),
+                min: MESH_PROTOCOL_MIN_SUPPORTED,
+                max: MESH_PROTOCOL_VERSION,
+            })
+        );
+        let links = links_opened_since(mark, &to);
+        assert!(
+            links.is_empty(),
+            "a marked peer is never asked for status over a link: {links:?}"
+        );
+        assert!(slot.stop().await.unwrap());
+        stub.stop().await;
+    }
+
+    /// A trusted destination last heard ten days ago announces: the trust record's
+    /// `last_seen_at` moves forward in memory while `trust.yaml` keeps its bytes.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_announce_refreshes_a_trusted_destinations_last_seen_without_writing() {
+        use crate::mesh::trust::TrustOptions;
+
+        let stub = PeerStub::listen("node-seen-stub", TcpServer::DEFAULT_CLIENT_MTU).await;
+        let started = started_runtime_on("node-seen-refresh", stub.port()).await;
+        let runtime = started.runtime.clone();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime.clone()).unwrap();
+        let to = stub.destination_hex();
+        // The trust file keeps whole seconds, so the seeded sighting is a whole second too
+        // and the record reads back equal to it.
+        let since_epoch = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let ten_days_ago = std::time::UNIX_EPOCH + Duration::from_secs(since_epoch - 10 * 86_400);
+        runtime.peers().observe(
+            PeerSighting {
+                destination_hash: to.clone(),
+                identity_hash: stub.identity_hex(),
+                name_hash: hex_lower(
+                    DestinationName::new("coyote", "mesh.node-seen-stub").as_name_hash_slice(),
+                ),
+                display_name: Some("Stub".to_string()),
+                protocol_version: MESH_PROTOCOL_VERSION,
+                hops: 1,
+            },
+            ten_days_ago,
+        );
+        let trust = runtime.trust();
+        trust
+            .trust_destination(slot.as_ref(), &to, TrustOptions::default(), ten_days_ago)
+            .unwrap();
+        let last_seen = |records: Vec<crate::mesh::trust::TrustRecord>| {
+            records
+                .into_iter()
+                .find(|record| record.hash == to)
+                .unwrap()
+                .last_seen_at
+        };
+        assert_eq!(last_seen(trust.records()), ten_days_ago);
+        let bytes_before = std::fs::read(trust.path()).unwrap();
+
+        stub.announce(Some("Stub")).await;
+
+        wait_until("the announce to refresh the trusted destination", || {
+            last_seen(trust.records()) > ten_days_ago
+        })
+        .await;
+        assert_eq!(std::fs::read(trust.path()).unwrap(), bytes_before);
         assert!(slot.stop().await.unwrap());
         stub.stop().await;
     }
