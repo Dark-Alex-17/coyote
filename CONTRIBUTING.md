@@ -124,6 +124,9 @@ then leave the table as history. Figures measured 2026-09-23 on Linux aarch64 wi
 debug profile, populated `target/`. Treat them as an order of magnitude, not a budget: CI runners
 have far fewer cores, so expect several times these numbers there.
 
+The matching functional record, which release of the mesh crates the conformance, interop and fuzz
+suites were last run against and with what result, lives in `scripts/mesh-interop/README.md`.
+
 | Measurement | Before mesh dependencies | After |
 | --- | --- | --- |
 | `cargo test --all`, test execution only, nothing to compile | 12.9s | 13.0s |

@@ -14,6 +14,21 @@ next to it in `vectors.rs`.
 | https://github.com/markqvist/Reticulum | `ea98db4f53dcf0defc0e71a16e60d28b1229c4e6` |
 | https://github.com/markqvist/LXMF | `727830cefda83d9c6e3982b48675425f3f988f9c` |
 
+### Verification record
+
+Last verified 2026-09-29, on Linux, with the Rust side at the crates.io `0.12.0` release of
+`lxmf-wire`, `reticulum-rs-transport` and `reticulum-rs-core`, and the Python side at RNS
+`1.5.2` / LXMF `0.9.6` (the two commits pinned above):
+
+| Invocation | Result |
+|---|---|
+| `COYOTE_MESH_INTEROP=1 cargo test --all mesh::conformance -- --include-ignored` (interop + netns) | 72 passed, 0 ignored |
+| `cargo test --all mesh::fuzz` | 14 passed |
+| `cargo test --all` | 4700 passed, 0 failed |
+
+The macOS and Windows legs are proven by the PR's CI matrix rather than by this record.
+Re-run the three commands and refresh this table whenever either side's pin moves.
+
 The reference is imported straight from the clones via `PYTHONPATH`, never from a `pip
 install rns` or `lxmf`: a wheel would float with whatever PyPI serves that day, while the
 protocol document cites these commits by line number. `setup.sh` refuses to continue when a
