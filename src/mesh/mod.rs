@@ -981,8 +981,25 @@ mod tests {
     const ERROR_WORDS: [&str; 6] = ["err", "e", "error", "why", "cause", "failure"];
     const LOG_MACROS: [&str; 5] = ["debug!(", "trace!(", "info!(", "warn!(", "error!("];
 
+    /// Files the scan reads selectively: a file listed here is scanned only at the log
+    /// invocations whose string literal mentions one of its markers, so a shared file's
+    /// unrelated sinks are not swept in. The REPL completion file under config hosts the
+    /// `.mesh` completion helpers among sinks section 17 does not govern; its name is
+    /// assembled at runtime because the mesh module must not spell it out.
+    fn literal_filtered_sources() -> Vec<(PathBuf, &'static [&'static str])> {
+        let completion_file = Path::new("config").join(["request", "_context.rs"].concat());
+        vec![(completion_file, &[".mesh", "mesh_completion"])]
+    }
+
+    /// The literal-filter markers of `path`, if it is a literal-filtered file.
+    fn literal_markers(path: &Path) -> Option<&'static [&'static str]> {
+        literal_filtered_sources()
+            .into_iter()
+            .find_map(|(suffix, markers)| path.ends_with(&suffix).then_some(markers))
+    }
+
     /// The files section 17 governs: the mesh module without its test-only files, and the
-    /// mesh-facing files under config, function and repl.
+    /// mesh-facing files under config, function and repl, plus the literal-filtered files.
     fn redaction_scan_sources() -> Vec<PathBuf> {
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut sources: Vec<PathBuf> = rust_sources()
@@ -1004,7 +1021,22 @@ mod tests {
         }
         sources.push(src.join("function").join("mesh.rs"));
         sources.push(src.join("repl").join("mesh.rs"));
+        for (suffix, _) in literal_filtered_sources() {
+            sources.push(src.join(suffix));
+        }
         sources
+    }
+
+    /// Whether the scan reads `invocation` found in `path`: every invocation of an
+    /// unfiltered file, and of a literal-filtered file only those whose string literal
+    /// mentions one of the file's markers.
+    fn in_scan(path: &Path, invocation: &str) -> bool {
+        let Some(markers) = literal_markers(path) else {
+            return true;
+        };
+        split_literals(invocation)
+            .iter()
+            .any(|(_, literal)| markers.iter().any(|marker| literal.contains(marker)))
     }
 
     /// `source` line for line, so line numbers hold, with every `#[cfg(test)]`-attributed
@@ -1455,15 +1487,59 @@ mod tests {
     }
 
     #[test]
+    fn redaction_scan_holds_the_completion_file_to_its_mesh_completion_sinks() {
+        let (filtered, _) = literal_filtered_sources().remove(0);
+        let filtered = Path::new("src").join(filtered);
+        let unfiltered = Path::new("src/mesh/node.rs");
+        let source = "fn a() {\n    warn!(\"failed to compute effective role: {err}\");\n    debug!(\"knock cache unreadable while completing `.mesh`: {err:#}\");\n    debug!(\"{}\", mesh_completion_label(err));\n    debug!(\"mesh_completion list unreadable: {}\", err);\n}\n";
+        let invocations = log_invocations(&production_code(source));
+        assert_eq!(invocations.len(), 4);
+        let scanned = |path: &Path| -> Vec<(usize, Vec<String>)> {
+            invocations
+                .iter()
+                .filter(|(_, invocation)| in_scan(path, invocation))
+                .map(|(line, invocation)| (*line, redaction_violations(invocation)))
+                .collect()
+        };
+        // In the completion file the non-mesh `{err}` sink (line 2) and the sink whose
+        // marker sits in code rather than in a literal (line 4) are outside the scan; the
+        // `.mesh` and `mesh_completion` literals (lines 3 and 5) are inside it and flagged.
+        assert_eq!(
+            scanned(&filtered),
+            [
+                (
+                    3,
+                    vec!["interpolates the error `{err}` outside redact_hashes()".to_string()]
+                ),
+                (5, vec!["passes `err` outside redact_hashes()".to_string()]),
+            ]
+        );
+        // An unfiltered file is scanned at every sink.
+        assert_eq!(scanned(unfiltered).len(), 4);
+        assert!(
+            scanned(unfiltered)
+                .iter()
+                .all(|(_, violations)| !violations.is_empty())
+        );
+    }
+
+    #[test]
     fn mesh_log_lines_never_carry_peer_text_or_a_full_hash() {
         let sources = redaction_scan_sources();
         let mut hits = Vec::new();
         let mut repl_invocations = 0;
+        let mut completion_file_invocations = 0;
         for path in &sources {
             let source = fs::read_to_string(path).unwrap();
-            let invocations = log_invocations(&production_code(&source));
+            let invocations: Vec<(usize, String)> = log_invocations(&production_code(&source))
+                .into_iter()
+                .filter(|(_, invocation)| in_scan(path, invocation))
+                .collect();
             if path.ends_with("repl/mesh.rs") {
                 repl_invocations = invocations.len();
+            }
+            if literal_markers(path).is_some() {
+                completion_file_invocations = invocations.len();
             }
             for (line, invocation) in invocations {
                 for violation in redaction_violations(&invocation) {
@@ -1480,6 +1556,10 @@ mod tests {
                 .iter()
                 .any(|path| path.ends_with("config/mesh_envoy.rs")),
             "the scan must reach the mesh-facing config files"
+        );
+        assert!(
+            completion_file_invocations > 0,
+            "the scan must reach the `.mesh` completion sinks in the REPL completion file"
         );
         assert_eq!(hits, Vec::<String>::new(), "log lines violating section 17");
     }

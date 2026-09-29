@@ -39,7 +39,7 @@ use crate::mcp::{
 use crate::mesh::card::DISPLAY_NAME_MAX_CHARS;
 use crate::mesh::pending::PENDING_QUESTION_MAX_CHARS;
 use crate::mesh::trust::{Tier, TrustRecord};
-use crate::mesh::{MeshSlot, age_text, display_text, parse_rfc3339, short};
+use crate::mesh::{MeshSlot, age_text, display_text, parse_rfc3339, redact_hashes, short};
 use crate::rag::Rag;
 use crate::supervisor::Supervisor;
 use crate::supervisor::escalation::EscalationQueue;
@@ -4853,7 +4853,10 @@ impl RequestContext {
         let knocks = match runtime.knock_gate().cache().list(now) {
             Ok(knocks) => knocks,
             Err(err) => {
-                debug!("knock cache unreadable while completing `.mesh`: {err:#}");
+                debug!(
+                    "knock cache unreadable while completing `.mesh`: {}",
+                    redact_hashes(&format!("{err:#}"))
+                );
                 return Vec::new();
             }
         };
@@ -4900,7 +4903,10 @@ impl RequestContext {
             .cache()
             .list(SystemTime::now())
             .unwrap_or_else(|err| {
-                debug!("knock cache unreadable while completing `.mesh`: {err:#}");
+                debug!(
+                    "knock cache unreadable while completing `.mesh`: {}",
+                    redact_hashes(&format!("{err:#}"))
+                );
                 Vec::new()
             });
         let mut peers = runtime.peers().snapshot();
@@ -5016,7 +5022,10 @@ impl RequestContext {
             Some(store) => match store.list(SystemTime::now()) {
                 Ok(records) => records,
                 Err(err) => {
-                    debug!("inbound store unreadable while completing `.mesh answer`: {err:#}");
+                    debug!(
+                        "inbound store unreadable while completing `.mesh answer`: {}",
+                        redact_hashes(&format!("{err:#}"))
+                    );
                     Vec::new()
                 }
             },

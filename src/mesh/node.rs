@@ -5958,11 +5958,17 @@ mod tests {
         let warned = warn_snapshot();
         // The warning passes the error text through `redact_hashes`, which cuts the
         // instance id run in the file name to eight hex digits.
-        let path = redact_hashes(&store.path().display().to_string());
+        let full_path = store.path().display().to_string();
+        let path = redact_hashes(&full_path);
+        assert_ne!(
+            path, full_path,
+            "the store path carries a full instance-id hash"
+        );
         assert!(
             warned.iter().any(|message| {
                 message.contains("could not be reopened")
                     && message.contains(&path)
+                    && !message.contains(&full_path)
                     && message.contains("move the file aside")
             }),
             "{warned:#?}"
@@ -6034,11 +6040,18 @@ mod tests {
             slot.correlations().list().is_empty(),
             "an unreadable fork file leaves nothing pending"
         );
-        let path = redact_hashes(&second_store.path().display().to_string());
+        let full_path = second_store.path().display().to_string();
+        let path = redact_hashes(&full_path);
+        assert_ne!(
+            path, full_path,
+            "the store path carries a full instance-id hash"
+        );
         assert!(
-            warn_snapshot()
-                .iter()
-                .any(|message| message.contains("could not be reopened") && message.contains(&path)),
+            warn_snapshot().iter().any(|message| {
+                message.contains("could not be reopened")
+                    && message.contains(&path)
+                    && !message.contains(&full_path)
+            }),
             "{:#?}",
             warn_snapshot()
         );
