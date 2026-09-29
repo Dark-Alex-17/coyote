@@ -129,6 +129,8 @@ Derivations, from the identity's public keys outward:
 - LXMF delivery hash = `trunc_16(H(trunc_10(H("lxmf.delivery")) || identity_hash(16)))`, 16 bytes.
 - propagation node name hash = `trunc_10(H("lxmf.propagation"))`, 10 bytes.
 
+An instance whose identity key is replaced keeps its instance id, and with it its name hash, so the same instance announces a new destination hash under the new identity while the old destination hash still derives from the old identity alone (section 15.4).
+
 **[MESH-DEST-001]** An identity hash MUST be `trunc_16(H(x25519_public || ed25519_public))` over the two 32-byte public keys in that order (Reticulum's identity address hash).
 
 **[MESH-DEST-002]** A node's instance id MUST be 32 lowercase hex digits, minted once per session lineage and reused by every session of that lineage (`mesh_instance_id`, `is_valid_mesh_instance_id`, src/config/session.rs).
@@ -179,6 +181,8 @@ Examples (`encode_layout_is_magic_version_name`, `decode_reads_version_big_endia
 **[MESH-ANN-010]** For each Coyote announce a receiver MUST record the destination hash, the identity hash, the name hash, the display name (or its absence), the announced version and the hop count.
 
 **[MESH-ANN-011]** Every announce MUST re-judge the peer's compatibility from the announced version, overriding a mark learned from a version refusal on the wire (`observe`, src/mesh/peers.rs; `an_announce_refresh_rejudges_a_wire_learned_mark`).
+
+Filing a Coyote announce whose name hash re-derives a trusted destination under another identity marks that record as MESH-SEC-014 describes (`AnnounceFiler::file`, src/mesh/node.rs). This announce path is the one that detects a genuinely rotated peer: on the link and knock paths an unknown identity is silenced before any verdict, so its name hash is never seen there.
 
 ### 5.3 Timing
 
@@ -309,7 +313,7 @@ Stages run in this order; the first that fires decides the response (src/mesh/r3
 | 7 | the Envelope is not a `map`, or is a `map` whose `name_hash` or `body` is malformed | **[MESH-ENV-030]** The receiver MUST answer `NoAccess`. |
 | 8a | the trust verdict is Refuse by rule identity blocked | **[MESH-ENV-031]** The receiver MUST answer with silence. |
 | 8b | the trust verdict is Refuse by rule default closed | **[MESH-ENV-032]** The receiver MUST file a knock (section 8.3), retaining the body only when the path is `/knock`, and then answer `NoAccess`. |
-| 8c | the trust verdict is Refuse by any other rule (destination denied) | **[MESH-ENV-033]** The receiver MUST answer `NoAccess`. |
+| 8c | the trust verdict is Refuse by any other rule (destination denied, identity changed) | **[MESH-ENV-033]** The receiver MUST answer `NoAccess`. **[MESH-ENV-050]** Under rule identity changed the receiver MUST NOT file a knock and MUST mark every trusted destination record, a denied one excepted (MESH-SEC-014), that the origin name hash re-derives under another identity (MESH-SEC-014; `refusal`, src/mesh/r3/dispatch.rs; `an_identity_changed_refusal_answers_no_access_without_a_knock`, `a_standing_identity_naming_a_foreign_instance_is_refused_as_identity_changed`, src/mesh/r3/tests.rs). |
 | 9a | the verdict is Allow and the path is unknown | **[MESH-ENV-034]** The receiver MUST answer the `unknown_path` map below. |
 | 9b | the verdict is Allow and the path is known but has no provider | **[MESH-ENV-035]** The receiver MUST answer the `no_provider` map below. |
 | 9c | the verdict is Allow and the path has a provider | **[MESH-ENV-036]** The receiver MUST answer with the handler's reply; a `Silent` reply sends nothing. |
@@ -317,7 +321,7 @@ Stages run in this order; the first that fires decides the response (src/mesh/r3
 
 **[MESH-ENV-038]** Every `NoAccess` refusal MUST be byte-identical whichever stage produced it: `92 c4 10 <16> cc f1` (`every_refusal_is_the_same_bytes_on_the_wire`; `NoAccess` is built at one site, `refuse`, `no_access_is_named_at_exactly_one_site_outside_the_error_module`).
 
-**[MESH-ENV-039]** The trust verdict MUST be evaluated in this precedence: destination deny, identity block, destination allow (the identity recorded for that destination equal to the proven identity, compared per MESH-CANON-004), identity allow for all destinations, default closed (`authorize`, src/mesh/trust.rs).
+**[MESH-ENV-039]** The trust verdict MUST be evaluated in this precedence: destination deny, identity block, destination allow (the identity recorded for that destination equal to the proven identity, compared per MESH-CANON-004), identity allow for all destinations, identity changed (the origin name hash re-derives a trusted destination under a different identity, a denied destination not counting: MESH-SEC-014), default closed (`authorize`, `authorize_origin`, src/mesh/trust.rs).
 
 Dispatch error maps (`DispatchError`, src/mesh/r3/dispatch.rs; `dispatch_errors_round_trip_as_maps_and_never_read_as_refusal_codes`, src/mesh/r3/tests.rs):
 
@@ -437,7 +441,7 @@ A knocking node (the knocker) asks a receiver whose trust is default closed to s
 
 ### 8.3 Gate
 
-After the wire, the gate (`KnockGate::admit`, src/mesh/knock.rs) decides in this order: a blocked identity yields nothing; an `Unknown` identity yields nothing and is never a knock; a verdict Allow is already trusted and not a knock; a Refuse by identity block yields nothing; a Refuse by any rule other than default closed (destination denied) is not a knock; a Refuse by default closed proceeds to the rate limit.
+After the wire, the gate (`KnockGate::admit`, src/mesh/knock.rs) decides in this order: a blocked identity yields nothing; an `Unknown` identity yields nothing and is never a knock; a verdict Allow is already trusted and not a knock; a Refuse by identity block yields nothing; a Refuse by any rule other than default closed is not a knock, and under identity changed the gate marks every record the origin re-derives under another identity as MESH-ENV-050 has the dispatcher do (`a_standing_identity_knocking_for_a_foreign_instance_marks_the_record_and_is_not_a_knock`, src/mesh/knock.rs); a Refuse by default closed proceeds to the rate limit.
 
 **[MESH-KNOCK-010]** The receiver MUST rate-limit knocks per identity with a token bucket of burst `KNOCK_BUCKET_BURST` = `3` refilled one token per `KNOCK_BUCKET_REFILL_INTERVAL` = `600` seconds and never past the burst (`one_identity_is_rate_limited_per_identity_and_surfaced_once`, `the_bucket_refills_one_token_per_interval_and_never_past_the_burst`).
 
@@ -954,6 +958,7 @@ The attacker is on the path between two nodes or operates a propagation node. Th
 | Deletion | Out of scope: neither Reticulum nor LXMF guarantees delivery, so a dropped request is a timeout and a dropped spooled message is invisible to both ends | MESH-SEC-004 |
 | Modification | Reticulum's on a Link; in scope for a spooled message, whose signature covers destination, source and payload | MESH-SEC-006 |
 | Man in the middle | In scope at the trust boundary: standing is granted by the proven identity hash alone, which the human verified out of band | MESH-SEC-008 |
+| Key substitution for a trusted instance | In scope: a grant stays with the identity that proved it, a new identity announcing or claiming a trusted instance is refused without a knock, and the human is told once per record | MESH-SEC-014 |
 | Prompt injection through peer text | In scope: peer text is cleaned before display and fenced before the envoy reads it | MESH-SEC-009 |
 | Denial of service | In scope for every resource this document names, each bounded by a stated constant; out of scope for the interfaces, path tables and announce floods beneath, which are Reticulum's | MESH-SEC-010 to MESH-SEC-013 |
 
@@ -986,6 +991,8 @@ A Reticulum Link is established to a destination whose public key the transport 
 **[MESH-SEC-008]** A receiver MUST grant standing by the proven identity hash alone, in its canonical form (MESH-CANON-002, MESH-CANON-004, MESH-ENV-039), and MUST NOT grant it from a display name, an instance id, a destination hash or any other datum a peer claims; the one direct equality against a peer-derived identity, the destination binding (`authorize`, src/mesh/trust.rs), runs in constant time over the canonical 32-hex form, while the trust-store lookups are keyed on values the peer already knows and are not a timing boundary (`same_hash_is_constant_time_shaped`, `trust_destination_refuses_a_forged_name_hash`, `a_claimed_instance_is_bound_to_the_proven_identity`).
 
 **[MESH-SEC-009]** A receiver MUST pass every peer-supplied text through `display_text` at its field's cap before displaying or comparing it (MESH-CANON-005) and MUST fence peer text as data when composing the envoy's input, so a peer's message is never read as an instruction (`compose_envoy_input_fences_the_peer_text_and_carries_the_data_rule`, src/config/mesh_envoy.rs).
+
+**[MESH-SEC-014]** A receiver MUST NOT let a trusted destination's grant follow a new identity that announces or claims the same instance: the grant stays with the identity that proved it, the new identity is refused by rule identity changed rather than default closed (MESH-ENV-039, MESH-ENV-050) so that no knock invites the human to trust it as a stranger, and the record is marked once with the identity seen, the mark surviving restart, and the receiver MUST NOT mark a record when the identity seen is blocked, is trusted for all destinations or already holds the instance, nor a denied record; while the record stands the mark is cleared only by the human trusting either destination again, trusting the identity seen for all destinations, or blocking it (`a_rotated_peer_is_a_stranger_to_its_old_grant`, `identity_changed_is_never_an_allow`, `a_new_identity_on_a_known_instance_marks_the_record_once_and_notifies_once`, `key_change_mark_survives_restart`, `explicit_re_trust_clears_the_key_change_mark`, `trusting_the_new_destination_clears_the_old_records_mark_and_names_it`, `blocking_the_seen_identity_clears_its_marks`, `trusting_the_seen_identity_for_all_destinations_clears_its_marks`, `a_blocked_identity_marks_nothing`, `an_all_destinations_identity_marks_nothing`, `an_identity_tier_grants_rotation_is_fail_closed_but_unmarked`, `a_denied_record_marks_nothing`, src/mesh/trust.rs; `a_standing_identity_knocking_for_a_foreign_instance_marks_the_record_and_is_not_a_knock`, src/mesh/knock.rs; `filing_an_announce_marks_a_trusted_record_seen_under_a_new_identity`, src/mesh/node.rs). An identity trusted for all destinations has no instance binding, so its rotation is not detected: the new key is a stranger and no mark is written; `.mesh trust <destination>` is the grant that carries a key-change notice. On the link and knock paths only an identity already known reaches the verdict; a stranger under a new key is detected on the announce path (section 5.2).
 
 ### 15.5 Denial of service
 
@@ -1328,6 +1335,7 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 | MESH-ENV-031 | Dispatch (Invalid) |
 | MESH-ENV-032 | Dispatch (Invalid), Interop (Invalid) |
 | MESH-ENV-033 | Dispatch (Invalid) |
+| MESH-ENV-050 | Dispatch (Invalid) |
 | MESH-ENV-034 | Dispatch (Valid), Interop (Invalid) |
 | MESH-ENV-035 | Dispatch (Valid) |
 | MESH-ENV-036 | Dispatch (Invalid), Dispatch (Valid) |
@@ -1539,6 +1547,7 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 | MESH-SEC-007 | `dedup_evicts_the_oldest_past_capacity_and_logs_it`, `dedup_forgets_past_the_horizon_on_insert_and_on_load` |
 | MESH-SEC-008 | `same_hash_is_constant_time_shaped`, `trust_destination_refuses_a_forged_name_hash`, `a_claimed_instance_is_bound_to_the_proven_identity` |
 | MESH-SEC-009 | `compose_envoy_input_fences_the_peer_text_and_carries_the_data_rule` |
+| MESH-SEC-014 | `a_rotated_peer_is_a_stranger_to_its_old_grant`, `identity_changed_is_never_an_allow`, `a_new_identity_on_a_known_instance_marks_the_record_once_and_notifies_once`, `key_change_mark_survives_restart`, `explicit_re_trust_clears_the_key_change_mark`, `trusting_the_new_destination_clears_the_old_records_mark_and_names_it`, `blocking_the_seen_identity_clears_its_marks`, `trusting_the_seen_identity_for_all_destinations_clears_its_marks`, `a_blocked_identity_marks_nothing`, `an_all_destinations_identity_marks_nothing`, `an_identity_tier_grants_rotation_is_fail_closed_but_unmarked`, `a_denied_record_marks_nothing`, `a_standing_identity_knocking_for_a_foreign_instance_marks_the_record_and_is_not_a_knock`, `filing_an_announce_marks_a_trusted_record_seen_under_a_new_identity` |
 | MESH-SEC-010 | `oversized_request_resource_is_dropped_before_the_handler_runs`, `requests_beyond_the_handler_slots_are_dropped_silently`, `a_handler_past_its_timeout_answers_nothing_and_frees_its_slot`, `peer_inbox_evicts_the_oldest_peer_at_capacity_and_counts_it`, `inbound_store_survives_reopen_and_prunes_by_ttl_and_cap` |
 | MESH-SEC-011 | `admit_message_refuses_the_sixty_first_in_an_hour_and_resets_after_rollover`, `try_reserve_refuses_while_a_run_is_in_flight_and_admits_once_the_guard_drops`, `try_reserve_refuses_past_the_token_ceiling_until_rollover`, `cost_ceiling_is_off_at_zero_and_ignores_unpriced_debits` |
 | MESH-SEC-012 | `one_identity_is_rate_limited_per_identity_and_surfaced_once`, `the_gate_forgets_the_least_recently_seen_identity_past_its_cap`, `the_channel_sink_never_waits_on_a_reader_and_counts_what_it_drops` |
@@ -1661,6 +1670,7 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 - [MESH-ENV-031](#66-dispatch-order) -- stage 8a, identity blocked
 - [MESH-ENV-032](#66-dispatch-order) -- stage 8b, default closed files a knock
 - [MESH-ENV-033](#66-dispatch-order) -- stage 8c, other refusing rule
+- [MESH-ENV-050](#66-dispatch-order) -- stage 8c, identity changed marks the record and files no knock
 - [MESH-ENV-034](#66-dispatch-order) -- stage 9a, unknown path
 - [MESH-ENV-035](#66-dispatch-order) -- stage 9b, no provider
 - [MESH-ENV-036](#66-dispatch-order) -- stage 9c, handler reply
@@ -1872,6 +1882,7 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 - [MESH-SEC-007](#153-store-and-forward-object-security) -- replay defence: dedup by transient and message id, capacity, horizon, persisted
 - [MESH-SEC-008](#154-trust-boundary) -- standing by the proven identity hash alone, constant time
 - [MESH-SEC-009](#154-trust-boundary) -- peer text cleaned before display and fenced before the envoy
+- [MESH-SEC-014](#154-trust-boundary) -- a grant never follows a new key; identity changed refuses without a knock and marks the record
 - [MESH-SEC-010](#155-denial-of-service) -- every bound enforced, no unbounded per-peer state
 - [MESH-SEC-011](#155-denial-of-service) -- envoy runs only inside the per-identity budget
 - [MESH-SEC-012](#155-denial-of-service) -- knocks cost the gate's bookkeeping and nothing more

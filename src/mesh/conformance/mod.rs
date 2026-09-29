@@ -152,6 +152,25 @@ const ENFORCED_BY: &[(&str, &[&str])] = &[
         "MESH-SEC-013",
         &["costs_above_the_ceiling_are_refused_before_any_mining"],
     ),
+    (
+        "MESH-SEC-014",
+        &[
+            "a_rotated_peer_is_a_stranger_to_its_old_grant",
+            "identity_changed_is_never_an_allow",
+            "a_new_identity_on_a_known_instance_marks_the_record_once_and_notifies_once",
+            "key_change_mark_survives_restart",
+            "explicit_re_trust_clears_the_key_change_mark",
+            "trusting_the_new_destination_clears_the_old_records_mark_and_names_it",
+            "blocking_the_seen_identity_clears_its_marks",
+            "trusting_the_seen_identity_for_all_destinations_clears_its_marks",
+            "a_blocked_identity_marks_nothing",
+            "an_all_destinations_identity_marks_nothing",
+            "an_identity_tier_grants_rotation_is_fail_closed_but_unmarked",
+            "a_denied_record_marks_nothing",
+            "a_standing_identity_knocking_for_a_foreign_instance_marks_the_record_and_is_not_a_knock",
+            "filing_an_announce_marks_a_trusted_record_seen_under_a_new_identity",
+        ],
+    ),
     ("MESH-INV-001", &["mesh_module_never_names_the_request_ctx"]),
     (
         "MESH-INV-002",
@@ -624,6 +643,7 @@ mod tests {
         "MESH-ENV-047",
         "MESH-ENV-048",
         "MESH-ENV-049",
+        "MESH-ENV-050",
         "MESH-VER-001",
         "MESH-VER-002",
         "MESH-VER-003",
@@ -831,9 +851,12 @@ mod tests {
     #[test]
     fn the_spec_derived_required_set_is_the_shape_the_ruling_describes() {
         let derived = required_ids_from_the_spec();
-        // 114 ids across the six fully covered areas (10+33+47+14+8+2) plus the catch-all rows.
+        let fully_covered = spec_ids()
+            .into_iter()
+            .filter(|id| FULLY_COVERED_AREAS.contains(&area(id)))
+            .count();
         assert!(
-            derived.len() > 114,
+            derived.len() > fully_covered,
             "no catch-all rows were found: {derived:?}"
         );
         assert!(

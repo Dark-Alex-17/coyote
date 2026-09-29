@@ -1412,6 +1412,19 @@ fn known_not_trusted(identity: &str, _: &str) -> TrustList {
     TrustList::default().identity(identity, false)
 }
 
+/// The requester is known while another identity holds the destination that `ORIGIN`
+/// derives under the holder's own identity: the requester's instance has been seen under a
+/// new key.
+fn known_while_another_key_holds_the_instance(identity: &str, _: &str) -> TrustList {
+    let holder = PrivateIdentity::new_from_rand(OsRng)
+        .as_identity()
+        .address_hash;
+    TrustList::default().identity(identity, false).destination(
+        &destination_address(&ORIGIN, &holder).to_hex_string(),
+        &holder.to_hex_string(),
+    )
+}
+
 const OTHER_DESTINATION: &str = "d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2";
 
 fn no_access_answer() -> Answer {
@@ -1916,6 +1929,42 @@ fn dispatch_vectors() -> Vec<Vector> {
             Knock::None,
         ),
         dispatch(
+            "MESH-ENV-050",
+            Kind::Invalid,
+            KNOCK_PATH,
+            known_while_another_key_holds_the_instance,
+            envelope_value(),
+            no_access_answer(),
+            Knock::None,
+        ),
+        dispatch(
+            "MESH-ENV-050",
+            Kind::Invalid,
+            STATUS_PATH,
+            known_while_another_key_holds_the_instance,
+            envelope_value(),
+            no_access_answer(),
+            Knock::None,
+        ),
+        dispatch(
+            "MESH-ENV-050",
+            Kind::Invalid,
+            MESSAGE_PATH,
+            known_while_another_key_holds_the_instance,
+            envelope_value(),
+            no_access_answer(),
+            Knock::None,
+        ),
+        dispatch(
+            "MESH-ENV-050",
+            Kind::Invalid,
+            UNKNOWN_PATH,
+            known_while_another_key_holds_the_instance,
+            envelope_value(),
+            no_access_answer(),
+            Knock::None,
+        ),
+        dispatch(
             "MESH-ENV-034",
             Kind::Valid,
             UNKNOWN_PATH,
@@ -2114,6 +2163,29 @@ fn authorize(list: TrustList) -> Verdict {
     store.authorize(IDENTITY, DESTINATION)
 }
 
+/// `TrustStore::authorize_origin` for a fresh identity naming `ORIGIN` while a second fresh
+/// identity holds the destination `ORIGIN` derives under it. `list` receives the requester's
+/// identity and the destination `ORIGIN` derives under it, then the holder's identity and
+/// destination.
+fn authorize_rotated_origin(list: fn(&str, &str, &str, &str) -> TrustList) -> Verdict {
+    let identity = PrivateIdentity::new_from_rand(OsRng)
+        .as_identity()
+        .address_hash;
+    let derived = destination_address(&ORIGIN, &identity).to_hex_string();
+    let holder = PrivateIdentity::new_from_rand(OsRng)
+        .as_identity()
+        .address_hash;
+    let held = destination_address(&ORIGIN, &holder).to_hex_string();
+    let (store, _tmp) = list(
+        &identity.to_hex_string(),
+        &derived,
+        &holder.to_hex_string(),
+        &held,
+    )
+    .open("conformance-env");
+    store.authorize_origin(&identity, &ORIGIN).0
+}
+
 const IDENTITY: &str = "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a";
 const DESTINATION: &str = "d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1";
 
@@ -2290,6 +2362,71 @@ fn custom_vectors() -> Vec<Vector> {
             same(
                 "default closed without all_destinations",
                 authorize(TrustList::default().identity(IDENTITY, false)),
+                verdict(Decision::Refuse, Rule::DefaultClosed),
+            )
+        }),
+        custom("MESH-ENV-039", Kind::Valid, || {
+            same(
+                "deny over identity changed",
+                authorize_rotated_origin(|_, derived, holder, held| {
+                    TrustList::default().deny(derived).destination(held, holder)
+                }),
+                verdict(Decision::Refuse, Rule::DestinationDenied),
+            )
+        }),
+        custom("MESH-ENV-039", Kind::Valid, || {
+            same(
+                "block over identity changed",
+                authorize_rotated_origin(|identity, _, holder, held| {
+                    TrustList::default()
+                        .block(identity)
+                        .destination(held, holder)
+                }),
+                verdict(Decision::Refuse, Rule::IdentityBlocked),
+            )
+        }),
+        custom("MESH-ENV-039", Kind::Valid, || {
+            same(
+                "destination allow over identity changed",
+                authorize_rotated_origin(|identity, derived, holder, held| {
+                    TrustList::default()
+                        .destination(derived, identity)
+                        .destination(held, holder)
+                }),
+                verdict(Decision::Allow, Rule::DestinationTrusted),
+            )
+        }),
+        custom("MESH-ENV-039", Kind::Valid, || {
+            same(
+                "identity allow over identity changed",
+                authorize_rotated_origin(|identity, _, holder, held| {
+                    TrustList::default()
+                        .identity(identity, true)
+                        .destination(held, holder)
+                }),
+                verdict(Decision::Allow, Rule::IdentityTrusted),
+            )
+        }),
+        custom("MESH-ENV-039", Kind::Valid, || {
+            same(
+                "identity changed over default closed",
+                authorize_rotated_origin(|identity, _, holder, held| {
+                    TrustList::default()
+                        .identity(identity, false)
+                        .destination(held, holder)
+                }),
+                verdict(Decision::Refuse, Rule::IdentityChanged),
+            )
+        }),
+        custom("MESH-ENV-039", Kind::Invalid, || {
+            same(
+                "denied held record is default closed",
+                authorize_rotated_origin(|identity, _, holder, held| {
+                    TrustList::default()
+                        .identity(identity, false)
+                        .deny(held)
+                        .destination(held, holder)
+                }),
                 verdict(Decision::Refuse, Rule::DefaultClosed),
             )
         }),
