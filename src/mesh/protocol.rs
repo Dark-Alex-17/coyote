@@ -20,9 +20,10 @@ pub(crate) fn describe_version(found: Option<u16>) -> String {
 }
 
 /// Whether this Coyote speaks the protocol a peer announced. Decided once per announce and
-/// kept on the peer record, so the outbound gate reads a verdict rather than a number.
+/// kept on the peer record, so the outbound gate reads a verdict rather than a number. It
+/// is persisted inside `PeerRecord`, so like every on-disk shape it rejects unknown fields.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum Compatibility {
     #[default]
     Compatible,

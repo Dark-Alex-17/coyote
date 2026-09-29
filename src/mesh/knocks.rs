@@ -1,5 +1,6 @@
 use crate::mesh::announce::{MAX_DISPLAY_NAME_BYTES, is_control_or_invisible};
 use crate::mesh::r3::NAME_HASH_LEN;
+use crate::mesh::schema::{Remedy, VersionProbe, unversioned_refusal, version_refusal};
 use crate::mesh::{canonical_hash, mesh_cache_dir, parse_rfc3339, write_atomically};
 
 use anyhow::{Context, Result, bail};
@@ -37,8 +38,10 @@ fn is_lower_hex(text: &str, len: usize) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// One line of `knocks.jsonl`. The shape is a stable on-disk record other code reads back:
-/// fields are only ever added, never renamed or removed.
+/// One line of `knocks.jsonl`. The shape is a stable on-disk record other code reads back.
+/// It rejects fields it does not know, so any change to the layout, a field added
+/// included, bumps `KNOCK_RECORD_VERSION` and a reader refuses the whole file on a version
+/// it does not write.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct KnockRecord {
@@ -57,11 +60,6 @@ pub(crate) struct KnockRecord {
     /// The knocker's text, at most `KNOCK_INTRO_MAX_CHARS`.
     pub intro: Option<String>,
     pub hops: u8,
-}
-
-#[derive(Deserialize)]
-struct VersionProbe {
-    version: u64,
 }
 
 struct Evicted {
@@ -278,28 +276,40 @@ impl KnockCache {
             }
             let not_a_record = || {
                 format!(
-                    "Mesh knock cache '{}' line {} is not a knock record. It is cache: move the file aside to start fresh.",
+                    "Mesh knock cache '{}' line {} is not a knock record. {}",
                     self.path.display(),
-                    index + 1
+                    index + 1,
+                    Remedy::Cache.sentence()
                 )
             };
             // The version is read on its own first so a record from a newer Coyote is
             // named as such rather than failing on whatever field the newer layout added.
-            let probe: VersionProbe = serde_json::from_str(line).with_context(not_a_record)?;
+            let probe: VersionProbe = serde_json::from_str(line).with_context(|| {
+                unversioned_refusal(
+                    "knock cache",
+                    &self.path,
+                    Some(index + 1),
+                    KNOCK_RECORD_VERSION,
+                    Remedy::Cache,
+                )
+            })?;
             if probe.version != KNOCK_RECORD_VERSION {
-                bail!(
-                    "Mesh knock cache '{}' line {} is a version {} record but this Coyote reads version {KNOCK_RECORD_VERSION}. Upgrade Coyote if it was written by a newer Coyote; otherwise move the file aside (it is cache) to start fresh.",
-                    self.path.display(),
-                    index + 1,
-                    probe.version
-                );
+                bail!(version_refusal(
+                    "knock cache",
+                    &self.path,
+                    Some(index + 1),
+                    probe.version,
+                    KNOCK_RECORD_VERSION,
+                    Remedy::Cache
+                ));
             }
             let record: KnockRecord = serde_json::from_str(line).with_context(not_a_record)?;
             if parse_rfc3339(&record.received_at).is_none() {
                 bail!(
-                    "Mesh knock cache '{}' line {} has a `received_at` that is not an RFC 3339 timestamp. It is cache: move the file aside to start fresh.",
+                    "Mesh knock cache '{}' line {} has a `received_at` that is not an RFC 3339 timestamp. {}",
                     self.path.display(),
-                    index + 1
+                    index + 1,
+                    Remedy::Cache.sentence()
                 );
             }
             records.push(record);
@@ -867,10 +877,51 @@ mod tests {
 
         assert!(err.contains(&cache.path().display().to_string()), "{err}");
         assert!(err.contains("line 1"), "{err}");
-        assert!(err.contains("Upgrade Coyote"), "{err}");
+        assert!(err.contains("version 2"), "{err}");
+        assert!(err.contains("version 1"), "{err}");
+        assert!(err.contains("upgrade Coyote"), "{err}");
         assert!(err.contains("move the file aside"), "{err}");
         assert!(cache.append(knock("more", t(3_000)), t(3_000)).is_err());
         assert!(cache.prune(t(3_000)).is_err());
+    }
+
+    #[test]
+    fn pre_baseline_record_version_refuses_as_having_no_migration() {
+        let tmp = TempDir::new("knocks-older");
+        let cache = KnockCache::new(&tmp.path, 24);
+        cache.append(knock("fine", t(1_000)), t(1_000)).unwrap();
+        let mut older = serde_json::to_value(knock("ancient", t(2_000))).unwrap();
+        older["version"] = serde_json::json!(0);
+        let existing = fs::read_to_string(cache.path()).unwrap();
+        fs::write(cache.path(), format!("{existing}{older}\n")).unwrap();
+
+        let err = cache.list(t(2_000)).unwrap_err().to_string();
+
+        assert!(err.contains(&cache.path().display().to_string()), "{err}");
+        assert!(err.contains("line 2"), "{err}");
+        assert!(err.contains("version 0"), "{err}");
+        assert!(err.contains("no migration"), "{err}");
+        assert!(err.contains("move the file aside"), "{err}");
+        assert!(!err.contains("upgrade Coyote"), "{err}");
+    }
+
+    #[test]
+    fn a_line_without_a_version_refuses_the_whole_cache() {
+        let tmp = TempDir::new("knocks-unversioned");
+        let cache = KnockCache::new(&tmp.path, 24);
+        cache.append(knock("fine", t(1_000)), t(1_000)).unwrap();
+        let mut unversioned = serde_json::to_value(knock("bare", t(2_000))).unwrap();
+        unversioned.as_object_mut().unwrap().remove("version");
+        let existing = fs::read_to_string(cache.path()).unwrap();
+        fs::write(cache.path(), format!("{existing}{unversioned}\n")).unwrap();
+
+        let err = format!("{:#}", cache.list(t(2_000)).unwrap_err());
+
+        assert!(err.contains(&cache.path().display().to_string()), "{err}");
+        assert!(err.contains("line 2"), "{err}");
+        assert!(err.contains("no readable `version` field"), "{err}");
+        assert!(err.contains("move the file aside"), "{err}");
+        assert!(cache.prune(t(2_000)).is_err());
     }
 
     #[test]

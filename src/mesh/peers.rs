@@ -1,8 +1,9 @@
 use crate::mesh::announce::{HEARTBEAT_SECS, PEER_MISSED_HEARTBEATS_BEFORE_AGE_OUT};
 use crate::mesh::protocol::Compatibility;
+use crate::mesh::schema::{Remedy, VersionProbe, unversioned_cause, version_refusal};
 use crate::mesh::{redact_hashes, short, write_atomically};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use log::warn;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -23,7 +24,23 @@ pub(crate) const PEER_TTL: Duration =
 /// before `PEER_TTL` removes it.
 pub(crate) const PEER_STALE_AFTER: Duration = Duration::from_secs(2 * HEARTBEAT_SECS);
 
+pub(crate) const PEER_TABLE_VERSION: u64 = 1;
+
+/// `peers.json` whole: the version first, then the peers. Rejects unknown fields, as does
+/// each `PeerRecord`, so any change to the layout bumps `PEER_TABLE_VERSION`.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PeerTableFile {
+    pub version: u64,
+    pub peers: Vec<PeerRecord>,
+}
+
+/// One remembered peer. A field with a default is one the table did not always keep; a
+/// record without it still loads, but a field this build does not know refuses the record.
+/// The defaults are a tolerance for hand-edited tables inside version 1, not a migration:
+/// a layout change still bumps `PEER_TABLE_VERSION`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct PeerRecord {
     pub destination_hash: String,
     pub identity_hash: String,
@@ -83,14 +100,25 @@ pub(crate) struct PeerTable {
 impl PeerTable {
     /// Loads the table at `path`, dropping entries already expired at `now`. A missing file
     /// is an empty table. A file that cannot be read or parsed (an unclean shutdown can
-    /// leave it truncated or empty) is moved aside to `<path>.corrupt` with a warning and
-    /// the table starts empty: the peer table is disposable cache and must never keep the
-    /// node from starting, but the bytes are kept for a bug report rather than overwritten.
+    /// leave it truncated or empty) or whose version cannot be read is moved aside to
+    /// `<path>.corrupt` with a warning and the table starts empty: the peer table is
+    /// disposable cache and must never keep the node from starting over a shape it cannot
+    /// name, but the bytes are kept for a bug report rather than overwritten. The one
+    /// exception is a readable version other than `PEER_TABLE_VERSION`: that file is
+    /// refused and left in place, since the remedy depends on which Coyote wrote it.
     pub(crate) fn load(path: PathBuf, now: SystemTime) -> Result<Self> {
-        let records: Vec<PeerRecord> = match fs::read(&path) {
-            Ok(bytes) => match serde_json::from_slice(&bytes) {
+        let records = match fs::read(&path) {
+            Ok(bytes) => match parse_peer_file(&bytes) {
                 Ok(records) => records,
-                Err(err) => set_aside_corrupt(&path, format!("is not valid JSON: {err}")),
+                Err(PeerFileParse::Version(found)) => bail!(version_refusal(
+                    "peer table",
+                    &path,
+                    None,
+                    found,
+                    PEER_TABLE_VERSION,
+                    Remedy::Cache
+                )),
+                Err(PeerFileParse::Corrupt(what)) => set_aside_corrupt(&path, what),
             },
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(err) => set_aside_corrupt(&path, format!("could not be read: {err}")),
@@ -222,10 +250,36 @@ impl PeerTable {
     }
 
     fn persist(&self) -> Result<()> {
-        let json = serde_json::to_vec_pretty(&self.snapshot())
-            .context("Failed to serialize the mesh peer table")?;
+        let file = PeerTableFile {
+            version: PEER_TABLE_VERSION,
+            peers: self.snapshot(),
+        };
+        let json =
+            serde_json::to_vec_pretty(&file).context("Failed to serialize the mesh peer table")?;
         write_atomically(&self.path, &json)
     }
+}
+
+enum PeerFileParse {
+    Version(u64),
+    Corrupt(String),
+}
+
+/// Reads the version alone first so a file from another layout is refused by its version
+/// rather than set aside as corrupt for whatever field that layout added or dropped.
+fn parse_peer_file(bytes: &[u8]) -> Result<Vec<PeerRecord>, PeerFileParse> {
+    let probe: VersionProbe = serde_json::from_slice(bytes).map_err(|err| {
+        PeerFileParse::Corrupt(format!("{}: {err}", unversioned_cause(PEER_TABLE_VERSION)))
+    })?;
+    if probe.version != PEER_TABLE_VERSION {
+        return Err(PeerFileParse::Version(probe.version));
+    }
+    let file: PeerTableFile = serde_json::from_slice(bytes).map_err(|err| {
+        PeerFileParse::Corrupt(format!(
+            "is not a version-{PEER_TABLE_VERSION} peer table: {err}"
+        ))
+    })?;
+    Ok(file.peers)
 }
 
 /// Warns about a peer table that cannot be used, renames it to `<path>.corrupt` (replacing
@@ -234,8 +288,9 @@ impl PeerTable {
 fn set_aside_corrupt(path: &Path, what_happened: String) -> Vec<PeerRecord> {
     let aside = path.with_extension("json.corrupt");
     warn!(
-        "Mesh peer table '{}' {what_happened}. Starting with an empty peer table; peers re-appear as they announce. The file is kept at '{}'.",
+        "Mesh peer table '{}' {}. Starting with an empty peer table; peers re-appear as they announce. The file is kept at '{}'.",
         path.display(),
+        redact_hashes(&what_happened),
         aside.display()
     );
     if let Err(err) = fs::rename(path, &aside) {
@@ -285,6 +340,29 @@ mod tests {
             .into_iter()
             .map(|record| record.destination_hash)
             .collect()
+    }
+
+    fn record(destination: &str, protocol_version: u16, at: SystemTime) -> PeerRecord {
+        PeerRecord {
+            destination_hash: destination.to_string(),
+            identity_hash: format!("id-{destination}"),
+            name_hash: format!("name-{destination}"),
+            display_name: None,
+            protocol_version,
+            compatibility: Compatibility::Compatible,
+            hops: 1,
+            first_seen: at,
+            last_seen: at,
+        }
+    }
+
+    /// The file as this build writes it, as JSON to edit before writing.
+    fn file_of(peers: Vec<PeerRecord>) -> serde_json::Value {
+        serde_json::to_value(PeerTableFile {
+            version: PEER_TABLE_VERSION,
+            peers,
+        })
+        .unwrap()
     }
 
     #[test]
@@ -439,19 +517,8 @@ mod tests {
         let tmp = TempDir::new("peers-no-name-hash");
         let path = tmp.path.join("peers.json");
         let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
-        let mut old = serde_json::to_value(vec![PeerRecord {
-            destination_hash: "aa".to_string(),
-            identity_hash: "id-aa".to_string(),
-            name_hash: "unused".to_string(),
-            display_name: None,
-            protocol_version: 1,
-            compatibility: Compatibility::Compatible,
-            hops: 1,
-            first_seen: t0,
-            last_seen: t0,
-        }])
-        .unwrap();
-        old[0].as_object_mut().unwrap().remove("name_hash");
+        let mut old = file_of(vec![record("aa", 1, t0)]);
+        old["peers"][0].as_object_mut().unwrap().remove("name_hash");
         fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
 
         let table = PeerTable::load(path, t0).unwrap();
@@ -498,20 +565,9 @@ mod tests {
         let load_without_field = |tag: &str, protocol_version: u16| {
             let tmp = TempDir::new(tag);
             let path = tmp.path.join("peers.json");
-            let mut old = serde_json::to_value(vec![PeerRecord {
-                destination_hash: "aa".to_string(),
-                identity_hash: "id-aa".to_string(),
-                name_hash: "name-aa".to_string(),
-                display_name: None,
-                protocol_version,
-                compatibility: Compatibility::Compatible,
-                hops: 1,
-                first_seen: t0,
-                last_seen: t0,
-            }])
-            .unwrap();
+            let mut old = file_of(vec![record("aa", protocol_version, t0)]);
             assert!(
-                old[0]
+                old["peers"][0]
                     .as_object_mut()
                     .unwrap()
                     .remove("compatibility")
@@ -630,15 +686,14 @@ mod tests {
         assert!(!tmp.path.join("mesh").exists());
 
         table.persist().unwrap();
-        assert_eq!(
-            serde_json::from_slice::<Vec<PeerRecord>>(&fs::read(&path).unwrap()).unwrap(),
-            Vec::new()
-        );
+        let written: PeerTableFile = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(written.version, PEER_TABLE_VERSION);
+        assert_eq!(written.peers, Vec::new());
     }
 
     /// `bytes` is what a previous unclean run left behind; the load must warn naming the
-    /// path, keep the bytes at `peers.json.corrupt` and start empty.
-    fn assert_corrupt_file_is_set_aside(tag: &str, bytes: &[u8]) {
+    /// path with `what`, keep the bytes at `peers.json.corrupt` and start empty.
+    fn assert_corrupt_file_is_set_aside(tag: &str, bytes: &[u8], what: &str) {
         install_log_collector();
         let tmp = TempDir::new(tag);
         let path = tmp.path.join("peers.json");
@@ -660,7 +715,7 @@ mod tests {
         let warns = warn_snapshot();
         assert!(
             warns.iter().any(|message| message.contains(&path_text)
-                && message.contains("is not valid JSON")
+                && message.contains(what)
                 && message.contains(&aside.display().to_string())),
             "no warning names {path_text}; captured: {warns:#?}"
         );
@@ -668,11 +723,111 @@ mod tests {
 
     #[test]
     fn load_sets_aside_garbage_file_and_starts_empty() {
-        assert_corrupt_file_is_set_aside("peers-corrupt-garbage", b"{not json");
+        assert_corrupt_file_is_set_aside(
+            "peers-corrupt-garbage",
+            b"{not json",
+            &unversioned_cause(PEER_TABLE_VERSION),
+        );
     }
 
     #[test]
     fn load_sets_aside_empty_file_and_starts_empty() {
-        assert_corrupt_file_is_set_aside("peers-corrupt-empty", b"");
+        assert_corrupt_file_is_set_aside(
+            "peers-corrupt-empty",
+            b"",
+            &unversioned_cause(PEER_TABLE_VERSION),
+        );
+    }
+
+    /// A table written before the file carried a version is a bare array: its shape is
+    /// unknown to this build, so it is set aside like any other unreadable file.
+    #[test]
+    fn load_sets_aside_an_unversioned_table_and_starts_empty() {
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let bare = serde_json::to_vec(&vec![record("aa", 1, t0)]).unwrap();
+        assert_corrupt_file_is_set_aside(
+            "peers-corrupt-unversioned",
+            &bare,
+            &unversioned_cause(PEER_TABLE_VERSION),
+        );
+    }
+
+    #[test]
+    fn load_sets_aside_a_current_table_with_an_unknown_field() {
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let mut file = file_of(vec![record("aa", 1, t0)]);
+        file["peers"][0]["later"] = serde_json::json!(true);
+        assert_corrupt_file_is_set_aside(
+            "peers-corrupt-unknown-field",
+            &serde_json::to_vec(&file).unwrap(),
+            "is not a version-1 peer table",
+        );
+        let mut file = file_of(vec![record("aa", 1, t0)]);
+        file["later"] = serde_json::json!(true);
+        assert_corrupt_file_is_set_aside(
+            "peers-corrupt-unknown-envelope-field",
+            &serde_json::to_vec(&file).unwrap(),
+            "is not a version-1 peer table",
+        );
+        let mut file = file_of(vec![record("aa", 1, t0)]);
+        file["peers"][0]["compatibility"] =
+            serde_json::json!({"incompatible": {"found": 2, "later": 1}});
+        assert_corrupt_file_is_set_aside(
+            "peers-corrupt-unknown-compatibility-field",
+            &serde_json::to_vec(&file).unwrap(),
+            "is not a version-1 peer table",
+        );
+    }
+
+    #[test]
+    fn load_round_trips_a_current_table() {
+        let tmp = TempDir::new("peers-current");
+        let path = tmp.path.join("peers.json");
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let file = file_of(vec![record("aa", 1, t0), record("bb", 1, t0)]);
+        fs::write(&path, serde_json::to_vec(&file).unwrap()).unwrap();
+
+        let table = PeerTable::load(path, t0).unwrap();
+
+        assert_eq!(hashes(&table), vec!["aa", "bb"]);
+    }
+
+    /// A version this build does not write is refused outright, the file left in place:
+    /// unlike a corrupt file, its remedy depends on which Coyote wrote it.
+    fn assert_version_is_refused(tag: &str, found: u64, cause: &str) {
+        let tmp = TempDir::new(tag);
+        let path = tmp.path.join("peers.json");
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let mut file = file_of(vec![record("aa", 1, t0)]);
+        file["version"] = serde_json::json!(found);
+        let bytes = serde_json::to_vec(&file).unwrap();
+        fs::write(&path, &bytes).unwrap();
+
+        let err = match PeerTable::load(path.clone(), t0) {
+            Ok(_) => panic!("a version {found} table must be refused"),
+            Err(err) => err.to_string(),
+        };
+
+        assert!(err.contains(&path.display().to_string()), "{err}");
+        assert!(err.contains(&format!("version {found}")), "{err}");
+        assert!(err.contains("version 1"), "{err}");
+        assert!(err.contains(cause), "{err}");
+        assert!(err.contains("move the file aside"), "{err}");
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            bytes,
+            "a refused file is left as it was"
+        );
+        assert!(!tmp.path.join("peers.json.corrupt").exists());
+    }
+
+    #[test]
+    fn load_refuses_a_newer_table_version_naming_the_path() {
+        assert_version_is_refused("peers-newer", PEER_TABLE_VERSION + 1, "upgrade Coyote");
+    }
+
+    #[test]
+    fn load_refuses_a_pre_baseline_table_version_as_having_no_migration() {
+        assert_version_is_refused("peers-older", 0, "no migration");
     }
 }

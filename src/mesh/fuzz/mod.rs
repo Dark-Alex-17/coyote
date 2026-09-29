@@ -732,38 +732,36 @@ fn fuzz_corpus_files_belong_to_the_classes_their_names_claim() {
         body.as_map().is_none(),
         "codecs/MESH-MSG-012-body-not-a-map.bin claims MESH-MSG-012: a body that is not a map, got {body}"
     );
-    let (tag, payload) = codec("MESH-EXT-001-pending-unknown-field.bin");
+    let (tag, payload) = codec("MESH-CODE-005-pending-unknown-field.bin");
     assert_eq!(
         tag, TAG_PENDING,
-        "codecs/MESH-EXT-001-pending-unknown-field.bin must carry the pending tag"
+        "codecs/MESH-CODE-005-pending-unknown-field.bin must carry the pending tag"
     );
     let text = String::from_utf8(payload)
-        .expect("codecs/MESH-EXT-001-pending-unknown-field.bin claims MESH-EXT-001: UTF-8 jsonl");
-    let line = text
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .expect("codecs/MESH-EXT-001-pending-unknown-field.bin claims MESH-EXT-001: a record line");
-    let object: serde_json::Map<String, serde_json::Value> = serde_json::from_str(line)
-        .expect("codecs/MESH-EXT-001-pending-unknown-field.bin claims MESH-EXT-001: a JSON object");
+        .expect("codecs/MESH-CODE-005-pending-unknown-field.bin claims MESH-CODE-005: UTF-8 jsonl");
+    let line = text.lines().find(|line| !line.trim().is_empty()).expect(
+        "codecs/MESH-CODE-005-pending-unknown-field.bin claims MESH-CODE-005: a record line",
+    );
+    let object: serde_json::Map<String, serde_json::Value> = serde_json::from_str(line).expect(
+        "codecs/MESH-CODE-005-pending-unknown-field.bin claims MESH-CODE-005: a JSON object",
+    );
     assert_eq!(
         object.get("version").and_then(serde_json::Value::as_u64),
         Some(1),
-        "codecs/MESH-EXT-001-pending-unknown-field.bin claims MESH-EXT-001: a version-1 record"
+        "codecs/MESH-CODE-005-pending-unknown-field.bin claims MESH-CODE-005: a version-1 record"
     );
-    let record: PendingRecord = serde_json::from_str(line)
-        .expect("codecs/MESH-EXT-001-pending-unknown-field.bin claims MESH-EXT-001: a record the loader accepts");
-    let mut known: Vec<String> = serde_json::to_value(&record)
-        .unwrap()
-        .as_object()
-        .unwrap()
-        .keys()
-        .cloned()
-        .collect();
-    known.push("reply".to_string());
     assert!(
-        object.keys().any(|key| !known.contains(key)),
-        "codecs/MESH-EXT-001-pending-unknown-field.bin claims MESH-EXT-001: a key outside the PendingRecord fields, got {:?}",
+        object.contains_key("later_field"),
+        "codecs/MESH-CODE-005-pending-unknown-field.bin claims MESH-CODE-005: a key the PendingRecord layout does not know, got {:?}",
         object.keys().collect::<Vec<_>>()
+    );
+    let refusal = serde_json::from_str::<PendingRecord>(line)
+        .err()
+        .map(|error| error.to_string())
+        .expect("codecs/MESH-CODE-005-pending-unknown-field.bin claims MESH-CODE-005: a current-version record the `PendingRecord` layout refuses");
+    assert!(
+        refusal.contains("later_field"),
+        "codecs/MESH-CODE-005-pending-unknown-field.bin claims MESH-CODE-005: a refusal naming the unknown key, got {refusal}"
     );
 
     // Receipt bodies (kind 0x00).

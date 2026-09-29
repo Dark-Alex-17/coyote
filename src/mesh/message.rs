@@ -124,8 +124,13 @@ pub(crate) enum PeerVia {
 
 /// One message as it lands, LXMF-shaped: who sent it, where it arrived, the words and the
 /// routing. Every peer-supplied string has been capped and sanitised by `new`, so a
-/// consumer may show or store any field as it is.
+/// consumer may show or store any field as it is. Serde serves two readers: the pending
+/// store, where a reply waits on disk inside a `PendingRecord` (a layout change bumps
+/// `PENDING_RECORD_VERSION`), and `EnvelopePayload::Peer`, whose JSON `agent__check_inbox`
+/// hands the model. Neither is the mesh wire. Like every on-disk shape it rejects unknown
+/// fields.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct PeerMessage {
     /// Lower-hex of the identity that signed the link or the stored message.
     pub source_identity: String,

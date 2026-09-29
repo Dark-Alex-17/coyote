@@ -16,6 +16,7 @@ use crate::mesh::r3::{
     DEFAULT_LINK_TIMEOUT, Deadline, MAX_R3_PAYLOAD_BYTES, R3Client, R3Error, RefusalCode,
     SizeBranch, link_to, redact_hashes, short,
 };
+use crate::mesh::schema::{Remedy, VersionProbe, unversioned_cause, version_refusal};
 use crate::mesh::trust::{IdentityStanding, TrustStore};
 use crate::mesh::{canonical_hash, hex_lower, parse_rfc3339, rfc3339_utc, write_atomically};
 
@@ -219,11 +220,14 @@ impl fmt::Display for FetchError {
                 f,
                 "The propagation node answered the get request with something other than a list of message bodies: {reason}"
             ),
-            Self::StoreVersion { path, found } => write!(
-                f,
-                "Propagation fetch state '{}' is version {found} but this Coyote reads version {PROPAGATION_STORE_VERSION}. If it was written by a newer Coyote, upgrade Coyote; otherwise move the file aside, it is cache and rebuilds itself",
-                path.display()
-            ),
+            Self::StoreVersion { path, found } => f.write_str(&version_refusal(
+                "propagation fetch state",
+                path,
+                None,
+                *found,
+                PROPAGATION_STORE_VERSION,
+                Remedy::Cache,
+            )),
             Self::Store(reason) => {
                 write!(
                     f,
@@ -542,11 +546,6 @@ struct CursorRecord {
     last_received: u64,
 }
 
-#[derive(Deserialize)]
-struct VersionProbe {
-    version: u64,
-}
-
 enum StoreParse {
     Version(u64),
     Corrupt(String),
@@ -838,13 +837,20 @@ fn is_past_horizon(recorded_at: SystemTime, now: SystemTime) -> bool {
 /// Reads the version alone first so a file from a newer Coyote gets a precise refusal
 /// rather than an unknown-field error from whatever the newer layout added.
 fn parse_store_file(bytes: &[u8]) -> Result<Loaded, StoreParse> {
-    let probe: VersionProbe = serde_json::from_slice(bytes)
-        .map_err(|err| StoreParse::Corrupt(format!("has no readable version field: {err}")))?;
+    let probe: VersionProbe = serde_json::from_slice(bytes).map_err(|err| {
+        StoreParse::Corrupt(format!(
+            "{}: {err}",
+            unversioned_cause(PROPAGATION_STORE_VERSION)
+        ))
+    })?;
     if probe.version != PROPAGATION_STORE_VERSION {
         return Err(StoreParse::Version(probe.version));
     }
-    let file: StoreFile = serde_json::from_slice(bytes)
-        .map_err(|err| StoreParse::Corrupt(format!("is not valid JSON: {err}")))?;
+    let file: StoreFile = serde_json::from_slice(bytes).map_err(|err| {
+        StoreParse::Corrupt(format!(
+            "is not a version-{PROPAGATION_STORE_VERSION} propagation fetch state: {err}"
+        ))
+    })?;
     let seen = file
         .seen
         .iter()
@@ -942,8 +948,9 @@ fn excerpt(text: &str) -> String {
 fn set_aside_corrupt(path: &Path, what_happened: String) -> Loaded {
     let aside = path.with_extension("json.corrupt");
     warn!(
-        "Propagation fetch state '{}' {what_happened}. Starting with an empty store; already fetched messages may be delivered again. The file is kept at '{}'.",
+        "Propagation fetch state '{}' {}. Starting with an empty store; already fetched messages may be delivered again. The file is kept at '{}'.",
         path.display(),
+        redact_hashes(&what_happened),
         aside.display()
     );
     if let Err(err) = fs::rename(path, &aside) {
@@ -2523,8 +2530,40 @@ mod tests {
         );
         let text = err.to_string();
         assert!(text.contains(&path.display().to_string()), "{text}");
+        assert!(text.contains("version 2"), "{text}");
+        assert!(text.contains("version 1"), "{text}");
         assert!(text.contains("upgrade Coyote"), "{text}");
         assert!(text.contains("move the file aside"), "{text}");
+        assert!(path.exists(), "a refused file is left where it is");
+    }
+
+    #[test]
+    fn store_from_before_the_baseline_is_refused_as_having_no_migration() {
+        let tmp = TempDir::new("fetch-store-older");
+        let path = tmp.path.join("propagation.json");
+        fs::write(
+            &path,
+            r#"{"version": 0, "seen": [], "delivered": [], "deferred": [], "cursor": null}"#,
+        )
+        .unwrap();
+
+        let err = match FetchStore::load(path.clone(), t(1)) {
+            Ok(_) => panic!("a version 0 file must be refused"),
+            Err(err) => err,
+        };
+
+        assert_eq!(
+            err,
+            FetchError::StoreVersion {
+                path: path.clone(),
+                found: 0
+            }
+        );
+        let text = err.to_string();
+        assert!(text.contains("version 0"), "{text}");
+        assert!(text.contains("no migration"), "{text}");
+        assert!(text.contains("move the file aside"), "{text}");
+        assert!(!text.contains("upgrade Coyote"), "{text}");
         assert!(path.exists(), "a refused file is left where it is");
     }
 
@@ -2555,7 +2594,12 @@ mod tests {
         assert_set_aside(
             "fetch-store-garbage",
             b"{not json",
-            "no readable version field",
+            &unversioned_cause(PROPAGATION_STORE_VERSION),
+        );
+        assert_set_aside(
+            "fetch-store-unversioned",
+            br#"{"seen": [], "delivered": [], "deferred": [], "cursor": null}"#,
+            &unversioned_cause(PROPAGATION_STORE_VERSION),
         );
         assert_set_aside(
             "fetch-store-bad-id",
@@ -2585,7 +2629,7 @@ mod tests {
         assert_set_aside(
             "fetch-store-unknown-field",
             br#"{"version": 1, "seen": [], "delivered": [], "deferred": [], "cursor": null, "later": true}"#,
-            "is not valid JSON",
+            "is not a version-1 propagation fetch state",
         );
     }
 

@@ -25,6 +25,8 @@ mod propagation_fetch;
 mod propagation_nodes;
 mod protocol;
 mod r3;
+// pub(crate): the REPL pins the shared refusal wording in its tests.
+pub(crate) mod schema;
 pub(crate) mod snapshot;
 #[cfg(test)]
 mod spec_pins;
@@ -346,7 +348,7 @@ pub(crate) mod test_support {
         /// that config dir reads it.
         pub(crate) fn write(&self, config_dir: &Path) {
             let ts = rfc3339_utc(UNIX_EPOCH + Duration::from_secs(1_790_000_000));
-            let mut text = String::from("version: 1\n");
+            let mut text = format!("version: {}\n", super::trust::TRUST_FILE_VERSION);
             if !self.identities.is_empty() {
                 text.push_str("identities:\n");
                 for (hash, all_destinations) in &self.identities {

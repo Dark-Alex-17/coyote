@@ -3143,6 +3143,7 @@ mod tests {
         let now = SystemTime::now();
         let raw = "yesterday\u{1b}[31m\nish";
         let all = [Predecessor {
+            version: identity::PREDECESSOR_RECORD_VERSION,
             identity_hash: "ab".repeat(16),
             rotated_at: raw.to_string(),
             reason: "rotate".to_string(),
@@ -5049,6 +5050,12 @@ mod tests {
                     let row = info_row(&out, "identity predecessors");
                     assert!(row.starts_with("unreadable: "), "{out}");
                     assert!(row.contains(identity::PREDECESSORS_FILE), "{out}");
+                    assert!(
+                        row.contains(&crate::mesh::schema::unversioned_cause(
+                            identity::PREDECESSOR_RECORD_VERSION
+                        )),
+                        "{out}"
+                    );
 
                     assert!(ctx.app.mesh.stop().await.unwrap());
                     started.relay_handle.abort();

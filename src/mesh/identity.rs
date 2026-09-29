@@ -1,5 +1,6 @@
 use crate::config::paths;
 use crate::mesh::lock::{read_holder_pid, write_holder_pid};
+use crate::mesh::schema::{Remedy, VersionProbe, unversioned_refusal, version_refusal};
 use crate::mesh::{mesh_config_dir, redact_hashes, rfc3339_utc, short};
 
 use anyhow::{Context, Result, bail};
@@ -15,6 +16,10 @@ const PRIVATE_KEY_LENGTH: usize = 64;
 
 /// Sibling of `identity.key`: one JSON line per rotation, oldest first.
 pub(crate) const PREDECESSORS_FILE: &str = "identity.predecessors.jsonl";
+pub(crate) const PREDECESSOR_RECORD_VERSION: u64 = 1;
+/// The file is the user's history, not cache, but a cheap one: a refusal says so.
+const PREDECESSORS_REMEDY: Remedy =
+    Remedy::UserFile("records only retired public hashes, so nothing secret is lost by editing it");
 
 /// Where this config dir keeps its mesh identity.
 pub(crate) fn identity_path() -> PathBuf {
@@ -128,10 +133,13 @@ fn open_lock_file(identity_path: &Path) -> Result<(PathBuf, File)> {
 }
 
 /// One retired identity, as the predecessors file records it. Only the public hash is kept;
-/// the private key it belonged to is gone. Unknown fields are tolerated so a line a newer
-/// build wrote still reads on an older one.
+/// the private key it belonged to is gone. Unknown fields are refused, so any change to the
+/// line bumps `PREDECESSOR_RECORD_VERSION` and a reader refuses the whole file on a version
+/// it does not write.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct Predecessor {
+    pub version: u64,
     pub identity_hash: String,
     pub rotated_at: String,
     pub reason: String,
@@ -274,6 +282,7 @@ pub(crate) fn rotate_identity(
     append_predecessor(
         &predecessors_path(path),
         &Predecessor {
+            version: PREDECESSOR_RECORD_VERSION,
             identity_hash: old_fingerprint.clone(),
             rotated_at: rfc3339_utc(now),
             reason: "rotate".to_string(),
@@ -334,7 +343,8 @@ fn append_predecessor(path: &Path, predecessor: &Predecessor) -> Result<()> {
 }
 
 /// Every identity `identity_path` has retired, oldest first; none when the file is absent.
-/// A line that does not parse fails the whole read so a truncated or edited file is never
+/// Each line's version is read before anything else, and a line that does not parse or is
+/// not of this build's version fails the whole read, so a truncated or edited file is never
 /// shown as a shorter history.
 pub(crate) fn predecessors(identity_path: &Path) -> Result<Vec<Predecessor>> {
     let path = predecessors_path(identity_path);
@@ -351,11 +361,31 @@ pub(crate) fn predecessors(identity_path: &Path) -> Result<Vec<Predecessor>> {
         if line.trim().is_empty() {
             continue;
         }
+        let probe: VersionProbe = serde_json::from_str(&line).with_context(|| {
+            unversioned_refusal(
+                "identity predecessors file",
+                &path,
+                Some(index + 1),
+                PREDECESSOR_RECORD_VERSION,
+                PREDECESSORS_REMEDY,
+            )
+        })?;
+        if probe.version != PREDECESSOR_RECORD_VERSION {
+            bail!(version_refusal(
+                "identity predecessors file",
+                &path,
+                Some(index + 1),
+                probe.version,
+                PREDECESSOR_RECORD_VERSION,
+                PREDECESSORS_REMEDY
+            ));
+        }
         let predecessor: Predecessor = serde_json::from_str(&line).with_context(|| {
             format!(
-                "Mesh identity predecessors file '{}' is corrupt at line {}. Fix or remove that line; the file records only retired public hashes, so nothing is lost by editing it.",
+                "Mesh identity predecessors file '{}' line {} is not a version-{PREDECESSOR_RECORD_VERSION} record. {}",
                 path.display(),
-                index + 1
+                index + 1,
+                PREDECESSORS_REMEDY.sentence()
             )
         })?;
         out.push(predecessor);
@@ -699,11 +729,13 @@ mod tests {
             predecessors(&path).unwrap(),
             vec![
                 Predecessor {
+                    version: PREDECESSOR_RECORD_VERSION,
                     identity_hash: first,
                     rotated_at: "2026-09-21T14:13:20Z".to_string(),
                     reason: "rotate".to_string(),
                 },
                 Predecessor {
+                    version: PREDECESSOR_RECORD_VERSION,
                     identity_hash: one.new_fingerprint,
                     rotated_at: "2026-09-21T14:14:20Z".to_string(),
                     reason: "rotate".to_string(),
@@ -771,27 +803,28 @@ mod tests {
         assert!(!dir.path.join("identity.key.new").exists());
     }
 
+    /// One current-version history line, with `extra` spliced in as further JSON members.
+    fn history_line(extra: &str) -> String {
+        format!(
+            "{{\"version\":{PREDECESSOR_RECORD_VERSION},\"identity_hash\":\"ab\",\"rotated_at\":\"2026-01-01T00:00:00Z\",\"reason\":\"rotate\"{extra}}}\n"
+        )
+    }
+
     #[test]
     fn predecessors_refuses_a_malformed_line_naming_the_file() {
         let dir = TempDir::new("identity-predecessors-corrupt");
         let path = dir.path.join("identity.key");
         let file = predecessors_path(&path);
-        fs::write(
-            &file,
-            "{\"identity_hash\":\"ab\",\"rotated_at\":\"2026-01-01T00:00:00Z\",\"reason\":\"rotate\"}\nnot json\n",
-        )
-        .unwrap();
+        fs::write(&file, format!("{}not json\n", history_line(""))).unwrap();
 
-        let err = predecessors(&path).unwrap_err().to_string();
+        let err = format!("{:#}", predecessors(&path).unwrap_err());
 
         assert!(err.contains(&file.display().to_string()), "{err}");
         assert!(err.contains("line 2"), "{err}");
-        assert!(err.contains("Fix or remove that line"), "{err}");
-        fs::write(
-            &file,
-            "{\"identity_hash\":\"ab\",\"rotated_at\":\"2026-01-01T00:00:00Z\",\"reason\":\"rotate\"}\n\nnot json\n",
-        )
-        .unwrap();
+        assert!(err.contains("no readable `version` field"), "{err}");
+        assert!(err.contains("move the file aside"), "{err}");
+        assert!(err.contains("retired public hashes"), "{err}");
+        fs::write(&file, format!("{}\nnot json\n", history_line(""))).unwrap();
         let err = predecessors(&path).unwrap_err().to_string();
         assert!(
             err.contains("line 3"),
@@ -805,32 +838,98 @@ mod tests {
     }
 
     #[test]
-    fn predecessors_tolerates_an_unknown_field() {
+    fn predecessors_refuses_an_unknown_field() {
         let dir = TempDir::new("identity-predecessors-unknown-field");
         let path = dir.path.join("identity.key");
         let file = predecessors_path(&path);
-        fs::write(
-            &file,
-            "{\"identity_hash\":\"ab\",\"rotated_at\":\"2026-01-01T00:00:00Z\",\"reason\":\"rotate\",\"note\":\"added by a newer build\"}\n",
-        )
-        .unwrap();
-
+        fs::write(&file, history_line("")).unwrap();
         assert_eq!(
             predecessors(&path).unwrap(),
             vec![Predecessor {
+                version: PREDECESSOR_RECORD_VERSION,
                 identity_hash: "ab".to_string(),
                 rotated_at: "2026-01-01T00:00:00Z".to_string(),
                 reason: "rotate".to_string(),
             }]
         );
 
+        fs::write(&file, history_line(",\"note\":\"added by hand\"")).unwrap();
+        let err = format!("{:#}", predecessors(&path).unwrap_err());
+        assert!(err.contains("line 1"), "{err}");
+        assert!(err.contains("is not a version-1 record"), "{err}");
+        assert!(err.contains("move the file aside"), "{err}");
+        assert!(err.contains("retired public hashes"), "{err}");
+        assert!(err.contains("note"), "{err}");
+
+        fs::write(&file, format!("{{\"version\":{PREDECESSOR_RECORD_VERSION},\"rotated_at\":\"2026-01-01T00:00:00Z\",\"reason\":\"rotate\"}}\n")).unwrap();
+        let err = format!("{:#}", predecessors(&path).unwrap_err());
+        assert!(err.contains("line 1"), "{err}");
+        assert!(err.contains("identity_hash"), "{err}");
+    }
+
+    #[test]
+    fn predecessors_refuses_a_newer_line_and_shows_none_of_the_history() {
+        let dir = TempDir::new("identity-predecessors-newer");
+        let path = dir.path.join("identity.key");
+        let file = predecessors_path(&path);
+        let newer = format!(
+            "{{\"version\":{},\"identity_hash\":\"cd\",\"rotated_at\":\"2026-01-02T00:00:00Z\",\"reason\":\"rotate\",\"later\":1}}\n",
+            PREDECESSOR_RECORD_VERSION + 1
+        );
+        fs::write(&file, format!("{}{newer}", history_line(""))).unwrap();
+
+        let err = predecessors(&path).unwrap_err().to_string();
+
+        assert!(err.contains(&file.display().to_string()), "{err}");
+        assert!(err.contains("line 2"), "{err}");
+        assert!(err.contains("version 2"), "{err}");
+        assert!(err.contains("version 1"), "{err}");
+        assert!(err.contains("upgrade Coyote"), "{err}");
+        assert!(err.contains("move the file aside"), "{err}");
+        assert!(err.contains("retired public hashes"), "{err}");
+        assert!(
+            !err.contains("\"ab\""),
+            "the good line is neither shown nor quoted: {err}"
+        );
+    }
+
+    #[test]
+    fn predecessors_refuses_a_pre_baseline_line_as_having_no_migration() {
+        let dir = TempDir::new("identity-predecessors-older");
+        let path = dir.path.join("identity.key");
+        let file = predecessors_path(&path);
         fs::write(
             &file,
-            "{\"rotated_at\":\"2026-01-01T00:00:00Z\",\"reason\":\"rotate\"}\n",
+            "{\"version\":0,\"identity_hash\":\"ab\",\"rotated_at\":\"2026-01-01T00:00:00Z\",\"reason\":\"rotate\"}\n",
         )
         .unwrap();
+
         let err = predecessors(&path).unwrap_err().to_string();
+
         assert!(err.contains("line 1"), "{err}");
+        assert!(err.contains("version 0"), "{err}");
+        assert!(err.contains("no migration"), "{err}");
+        assert!(err.contains("move the file aside"), "{err}");
+        assert!(!err.contains("upgrade Coyote"), "{err}");
+    }
+
+    #[test]
+    fn predecessors_refuses_a_line_without_a_version() {
+        let dir = TempDir::new("identity-predecessors-unversioned");
+        let path = dir.path.join("identity.key");
+        let file = predecessors_path(&path);
+        fs::write(
+            &file,
+            "{\"identity_hash\":\"ab\",\"rotated_at\":\"2026-01-01T00:00:00Z\",\"reason\":\"rotate\"}\n",
+        )
+        .unwrap();
+
+        let err = format!("{:#}", predecessors(&path).unwrap_err());
+
+        assert!(err.contains(&file.display().to_string()), "{err}");
+        assert!(err.contains("line 1"), "{err}");
+        assert!(err.contains("no readable `version` field"), "{err}");
+        assert!(err.contains("move the file aside"), "{err}");
     }
 
     #[cfg(unix)]
@@ -842,8 +941,8 @@ mod tests {
         let path = dir.path.join("identity.key");
         let old = fingerprint(&load_or_mint_identity(&path).unwrap());
         let pred = predecessors_path(&path);
-        let history = "{\"identity_hash\":\"ab\",\"rotated_at\":\"2026-01-01T00:00:00Z\",\"reason\":\"rotate\"}\n";
-        fs::write(&pred, history).unwrap();
+        let history = history_line("");
+        fs::write(&pred, &history).unwrap();
         fs::set_permissions(&pred, fs::Permissions::from_mode(0o444)).unwrap();
         if fs::OpenOptions::new().append(true).open(&pred).is_ok() {
             return;
@@ -1062,6 +1161,7 @@ mod tests {
         let link = dir.path.join(PREDECESSORS_FILE);
         std::os::unix::fs::symlink(&target, &link).unwrap();
         let predecessor = Predecessor {
+            version: PREDECESSOR_RECORD_VERSION,
             identity_hash: "ab".repeat(16),
             rotated_at: "2026-01-01T00:00:00Z".to_string(),
             reason: "rotate".to_string(),

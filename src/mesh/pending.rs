@@ -7,6 +7,7 @@
 
 use crate::mesh::message::{PEER_ID_MAX_CHARS, PeerMessage};
 use crate::mesh::r3::{redact_hashes, short};
+use crate::mesh::schema::{Remedy, VersionProbe, unversioned_refusal, version_refusal};
 use crate::mesh::{canonical_hash, mesh_cache_dir, parse_rfc3339, write_atomically};
 
 use anyhow::{Context, Result, bail};
@@ -44,9 +45,11 @@ pub(crate) enum PendingState {
 }
 
 /// One line of `pending-<instance_id>.jsonl`. The shape is a stable on-disk record other
-/// code reads back: fields are only ever added, never renamed or removed, and a reader
-/// skips fields it does not know so an older Coyote can read a newer one's file.
+/// code reads back. It rejects fields it does not know, so any change to the layout, a
+/// field added included, bumps `PENDING_RECORD_VERSION` and a reader refuses the whole
+/// file on a version it does not write.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct PendingRecord {
     pub version: u64,
     /// The message id of the question, which the reply names in `in_reply_to`.
@@ -66,11 +69,6 @@ pub(crate) struct PendingRecord {
     /// before the process ended is still there for the next one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply: Option<PeerMessage>,
-}
-
-#[derive(Deserialize)]
-struct VersionProbe {
-    version: u64,
 }
 
 /// How a store's errors name itself and one of its lines.
@@ -265,8 +263,10 @@ fn evict(records: &mut Vec<PendingRecord>, now: SystemTime) -> usize {
 
 /// One line of `inbound-<instance_id>.jsonl`: a question a peer asked that the envoy
 /// could not answer on its own, waiting on the person at the keyboard. The same on-disk
-/// discipline as `PendingRecord`: fields are only ever added.
+/// discipline as `PendingRecord`: unknown fields are rejected and any layout change bumps
+/// `INBOUND_RECORD_VERSION`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct InboundRecord {
     pub version: u64,
     /// The peer's message id, which the answer names in `in_reply_to`.
@@ -498,33 +498,38 @@ fn read_jsonl<T: DeserializeOwned>(
         }
         let not_a_record = || {
             format!(
-                "Mesh {} '{}' line {} is not a {}. It is cache: move the file aside to start fresh.",
+                "Mesh {} '{}' line {} is not a {}. {}",
                 names.store,
                 path.display(),
                 index + 1,
-                names.record
+                names.record,
+                Remedy::Cache.sentence()
             )
         };
         // The version is read on its own first so a record from a newer Coyote is
         // named as such rather than failing on whatever field the newer layout added.
-        let probe: VersionProbe = serde_json::from_str(line).with_context(not_a_record)?;
+        let probe: VersionProbe = serde_json::from_str(line).with_context(|| {
+            unversioned_refusal(names.store, path, Some(index + 1), version, Remedy::Cache)
+        })?;
         if probe.version != version {
-            bail!(
-                "Mesh {} '{}' line {} is a version {} record but this Coyote reads version {version}. Upgrade Coyote if it was written by a newer Coyote; otherwise move the file aside (it is cache) to start fresh.",
+            bail!(version_refusal(
                 names.store,
-                path.display(),
-                index + 1,
-                probe.version
-            );
+                path,
+                Some(index + 1),
+                probe.version,
+                version,
+                Remedy::Cache
+            ));
         }
         let record: T = serde_json::from_str(line).with_context(not_a_record)?;
         let (field, at) = stamp(&record);
         if parse_rfc3339(at).is_none() {
             bail!(
-                "Mesh {} '{}' line {} has a `{field}` that is not an RFC 3339 timestamp. It is cache: move the file aside to start fresh.",
+                "Mesh {} '{}' line {} has a `{field}` that is not an RFC 3339 timestamp. {}",
                 names.store,
                 path.display(),
-                index + 1
+                index + 1,
+                Remedy::Cache.sentence()
             );
         }
         records.push(record);
@@ -975,20 +980,82 @@ mod tests {
             assert!(err.contains(needle), "{what}: {err}");
         }
         assert!(!store.path().exists());
+    }
 
-        store.upsert(base, t(1_000)).unwrap();
+    #[test]
+    fn a_newer_pending_line_refuses_the_whole_store_and_surfaces_no_record() {
+        let tmp = TempDir::new("pending-newer-whole-store");
+        let store = PendingStore::new(&tmp.path, "inst");
+        store
+            .upsert(record("fine", t(1_000), PendingState::Open), t(1_000))
+            .unwrap();
         let mut newer =
             serde_json::to_value(record("future", t(2_000), PendingState::Open)).unwrap();
         newer["version"] = serde_json::json!(PENDING_RECORD_VERSION + 1);
+        newer["future_field"] = serde_json::json!(1);
         let existing = fs::read_to_string(store.path()).unwrap();
-        fs::write(store.path(), format!("{newer}\n{existing}")).unwrap();
+        fs::write(store.path(), format!("{existing}{newer}\n")).unwrap();
+
         let err = store.list(t(2_000)).unwrap_err().to_string();
+
+        assert!(err.contains(&store.path().display().to_string()), "{err}");
+        assert!(err.contains("pending store"), "{err}");
+        assert!(err.contains("line 2"), "{err}");
+        assert!(err.contains("version 2"), "{err}");
+        assert!(err.contains("version 1"), "{err}");
+        assert!(err.contains("upgrade Coyote"), "{err}");
+        assert!(err.contains("move the file aside"), "{err}");
+        assert!(store.load_pending(t(2_000)).is_err());
+        assert!(
+            store
+                .upsert(record("more", t(3_000), PendingState::Open), t(3_000))
+                .is_err()
+        );
+        assert!(
+            fs::read_to_string(store.path())
+                .unwrap()
+                .contains("future_field"),
+            "a refused file is left where it is"
+        );
+    }
+
+    #[test]
+    fn a_pre_baseline_pending_line_refuses_as_having_no_migration() {
+        let tmp = TempDir::new("pending-older");
+        let store = PendingStore::new(&tmp.path, "inst");
+        let mut older = serde_json::to_value(record("q1", t(1_000), PendingState::Open)).unwrap();
+        older["version"] = serde_json::json!(0);
+        fs::create_dir_all(store.path().parent().unwrap()).unwrap();
+        fs::write(store.path(), format!("{older}\n")).unwrap();
+
+        let err = store.list(t(1_000)).unwrap_err().to_string();
+
         assert!(err.contains("line 1"), "{err}");
+        assert!(err.contains("version 0"), "{err}");
+        assert!(err.contains("no migration"), "{err}");
+        assert!(err.contains("move the file aside"), "{err}");
+        assert!(!err.contains("upgrade Coyote"), "{err}");
+    }
+
+    #[test]
+    fn a_pending_line_without_a_version_refuses_the_whole_store() {
+        let tmp = TempDir::new("pending-unversioned");
+        let store = PendingStore::new(&tmp.path, "inst");
+        let mut bare = serde_json::to_value(record("q1", t(1_000), PendingState::Open)).unwrap();
+        bare.as_object_mut().unwrap().remove("version");
+        fs::create_dir_all(store.path().parent().unwrap()).unwrap();
+        fs::write(store.path(), format!("{bare}\n")).unwrap();
+
+        let err = format!("{:#}", store.list(t(1_000)).unwrap_err());
+
+        assert!(err.contains(&store.path().display().to_string()), "{err}");
+        assert!(err.contains("line 1"), "{err}");
+        assert!(err.contains("no readable `version` field"), "{err}");
         assert!(err.contains("move the file aside"), "{err}");
     }
 
     #[test]
-    fn a_record_with_a_field_this_coyote_does_not_know_is_read() {
+    fn a_record_with_a_field_this_coyote_does_not_know_is_refused() {
         let tmp = TempDir::new("pending-unknown-field");
         let store = PendingStore::new(&tmp.path, "inst");
         let mut newer = serde_json::to_value(record("q1", t(1_000), PendingState::Open)).unwrap();
@@ -996,8 +1063,28 @@ mod tests {
         fs::create_dir_all(store.path().parent().unwrap()).unwrap();
         fs::write(store.path(), format!("{newer}\n")).unwrap();
 
-        let listed = store.list(t(1_000)).unwrap();
-        assert_eq!(listed, vec![record("q1", t(1_000), PendingState::Open)]);
+        let err = format!("{:#}", store.list(t(1_000)).unwrap_err());
+        assert!(err.contains("line 1"), "{err}");
+        assert!(err.contains("not a pending question"), "{err}");
+        assert!(err.contains("added_later"), "{err}");
+    }
+
+    #[test]
+    fn a_reply_with_a_field_this_coyote_does_not_know_refuses_the_store() {
+        let tmp = TempDir::new("pending-unknown-reply-field");
+        let store = PendingStore::new(&tmp.path, "inst");
+        let answered = PendingRecord {
+            reply: Some(reply_to("q1")),
+            ..record("q1", t(1_000), PendingState::Answered)
+        };
+        let mut newer = serde_json::to_value(answered).unwrap();
+        newer["reply"]["later"] = serde_json::json!(1);
+        fs::create_dir_all(store.path().parent().unwrap()).unwrap();
+        fs::write(store.path(), format!("{newer}\n")).unwrap();
+
+        let err = format!("{:#}", store.list(t(1_000)).unwrap_err());
+        assert!(err.contains("line 1"), "{err}");
+        assert!(err.contains("later"), "{err}");
     }
 
     fn inbound(id: &str, received_at: SystemTime) -> InboundRecord {
@@ -1186,16 +1273,89 @@ mod tests {
             assert!(err.contains(needle), "{what}: {err}");
         }
         assert!(!store.path().exists());
+    }
 
-        store.upsert(base, t(1_000)).unwrap();
+    #[test]
+    fn a_newer_inbound_line_refuses_the_whole_store_and_surfaces_no_record() {
+        let tmp = TempDir::new("inbound-newer-whole-store");
+        let store = InboundStore::new(&tmp.path, "inst");
+        store.upsert(inbound("fine", t(1_000)), t(1_000)).unwrap();
         let mut newer = serde_json::to_value(inbound("future", t(2_000))).unwrap();
         newer["version"] = serde_json::json!(INBOUND_RECORD_VERSION + 1);
+        newer["future_field"] = serde_json::json!(1);
         let existing = fs::read_to_string(store.path()).unwrap();
-        fs::write(store.path(), format!("{newer}\n{existing}")).unwrap();
+        let written = format!("{newer}\n{existing}");
+        fs::write(store.path(), &written).unwrap();
+
         let err = store.list(t(2_000)).unwrap_err().to_string();
+
+        assert!(err.contains(&store.path().display().to_string()), "{err}");
         assert!(err.contains("inbound store"), "{err}");
         assert!(err.contains("line 1"), "{err}");
+        assert!(err.contains("version 2"), "{err}");
+        assert!(err.contains("version 1"), "{err}");
+        assert!(err.contains("upgrade Coyote"), "{err}");
         assert!(err.contains("move the file aside"), "{err}");
+        assert!(
+            store.get("fine").is_err(),
+            "no record of a refused store is readable"
+        );
+        assert_eq!(
+            fs::read_to_string(store.path()).unwrap(),
+            written,
+            "a refused file is left where it is"
+        );
+    }
+
+    #[test]
+    fn a_pre_baseline_inbound_line_refuses_as_having_no_migration() {
+        let tmp = TempDir::new("inbound-older");
+        let store = InboundStore::new(&tmp.path, "inst");
+        let mut older = serde_json::to_value(inbound("q1", t(1_000))).unwrap();
+        older["version"] = serde_json::json!(0);
+        fs::create_dir_all(store.path().parent().unwrap()).unwrap();
+        fs::write(store.path(), format!("{older}\n")).unwrap();
+
+        let err = store.list(t(1_000)).unwrap_err().to_string();
+
+        assert!(err.contains("inbound store"), "{err}");
+        assert!(err.contains("line 1"), "{err}");
+        assert!(err.contains("version 0"), "{err}");
+        assert!(err.contains("no migration"), "{err}");
+        assert!(err.contains("move the file aside"), "{err}");
+    }
+
+    #[test]
+    fn an_inbound_line_without_a_version_refuses_the_whole_store() {
+        let tmp = TempDir::new("inbound-unversioned");
+        let store = InboundStore::new(&tmp.path, "inst");
+        let mut bare = serde_json::to_value(inbound("q1", t(1_000))).unwrap();
+        bare.as_object_mut().unwrap().remove("version");
+        fs::create_dir_all(store.path().parent().unwrap()).unwrap();
+        fs::write(store.path(), format!("{bare}\n")).unwrap();
+
+        let err = format!("{:#}", store.list(t(1_000)).unwrap_err());
+
+        assert!(err.contains(&store.path().display().to_string()), "{err}");
+        assert!(err.contains("line 1"), "{err}");
+        assert!(err.contains("no readable `version` field"), "{err}");
+        assert!(err.contains("move the file aside"), "{err}");
+    }
+
+    #[test]
+    fn an_inbound_record_with_an_unknown_field_is_refused() {
+        let tmp = TempDir::new("inbound-unknown-field");
+        let store = InboundStore::new(&tmp.path, "inst");
+        let mut current = serde_json::to_value(inbound("q1", t(1_000))).unwrap();
+        current["added_later"] = serde_json::json!(true);
+        fs::create_dir_all(store.path().parent().unwrap()).unwrap();
+        fs::write(store.path(), format!("{current}\n")).unwrap();
+
+        let err = format!("{:#}", store.list(t(1_000)).unwrap_err());
+
+        assert!(err.contains("line 1"), "{err}");
+        assert!(err.contains("inbound question"), "{err}");
+        assert!(err.contains("added_later"), "{err}");
     }
 
     #[test]

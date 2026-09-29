@@ -52,6 +52,7 @@ use crate::mesh::node::MeshSlot;
 use crate::mesh::notify::Source;
 use crate::mesh::peers::{PeerRecord, PeerTable};
 use crate::mesh::r3::NAME_HASH_LEN;
+use crate::mesh::schema::{Remedy, VersionProbe, unversioned_refusal, version_refusal};
 use crate::mesh::{
     canonical_hash, decode_hex, destination_address, mesh_config_dir, parse_rfc3339, redact_hashes,
     rfc3339_utc, short, write_atomically,
@@ -71,6 +72,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 
 pub(crate) const TRUST_FILE_VERSION: u64 = 1;
+/// The trust list is the human's own decisions, so a refusal says what starting fresh costs.
+const TRUST_FILE_REMEDY: Remedy =
+    Remedy::UserFile("is the trust list, and a fresh one trusts nobody");
 
 pub(crate) const MESH_OFF: &str =
     "Mesh is off, so the trust list cannot be changed. Run `.mesh on` first.";
@@ -153,11 +157,6 @@ impl<'de> Deserialize<'de> for Stamp {
             serde::de::Error::custom(format!("'{text}' is not an RFC 3339 timestamp"))
         })
     }
-}
-
-#[derive(Deserialize)]
-struct VersionProbe {
-    version: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1581,22 +1580,29 @@ impl State {
 /// rather than an unknown-field error from whatever the newer layout added.
 fn parse_trust_file(path: &Path, text: &str) -> Result<TrustFile> {
     let probe: VersionProbe = serde_yaml::from_str(text).with_context(|| {
-        format!(
-            "Mesh trust list '{}' has no readable `version` field. Fix the file, or move it aside to start a fresh trust list.",
-            path.display()
+        unversioned_refusal(
+            "trust list",
+            path,
+            None,
+            TRUST_FILE_VERSION,
+            TRUST_FILE_REMEDY,
         )
     })?;
     if probe.version != TRUST_FILE_VERSION {
-        bail!(
-            "Mesh trust list '{}' is version {} but this Coyote reads version {TRUST_FILE_VERSION}. If it was written by a newer Coyote, upgrade Coyote; otherwise move the file aside to start a fresh trust list.",
-            path.display(),
-            probe.version
-        );
+        bail!(version_refusal(
+            "trust list",
+            path,
+            None,
+            probe.version,
+            TRUST_FILE_VERSION,
+            TRUST_FILE_REMEDY
+        ));
     }
     let file: TrustFile = serde_yaml::from_str(text).with_context(|| {
         format!(
-            "Mesh trust list '{}' could not be parsed. Fix the file, or move it aside to start a fresh trust list.",
-            path.display()
+            "Mesh trust list '{}' could not be parsed as version {TRUST_FILE_VERSION}. {}",
+            path.display(),
+            TRUST_FILE_REMEDY.sentence()
         )
     })?;
     refuse_non_canonical_keys(path, &file)?;
@@ -2972,6 +2978,23 @@ mod tests {
     }
 
     #[test]
+    fn open_refuses_a_pre_baseline_file_version_as_having_no_migration() {
+        let tmp = TempDir::new("trust-older");
+        let path = mesh_config_dir(&tmp.path).join("trust.yaml");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "version: 0\nidentities: {}\n").unwrap();
+
+        let err = TrustStore::open(&tmp.path).unwrap_err().to_string();
+
+        assert!(err.contains(&path.display().to_string()), "{err}");
+        assert!(err.contains("version 0"), "{err}");
+        assert!(err.contains("version 1"), "{err}");
+        assert!(err.contains("no migration"), "{err}");
+        assert!(err.contains("move the file aside"), "{err}");
+        assert!(!err.contains("upgrade Coyote"), "{err}");
+    }
+
+    #[test]
     fn open_refuses_a_file_without_a_version() {
         let tmp = TempDir::new("trust-unversioned");
         let path = mesh_config_dir(&tmp.path).join("trust.yaml");
@@ -2982,6 +3005,8 @@ mod tests {
 
         assert!(err.contains(&path.display().to_string()), "{err}");
         assert!(err.contains("`version`"), "{err}");
+        assert!(err.contains("no readable `version` field"), "{err}");
+        assert!(err.contains("move the file aside"), "{err}");
     }
 
     #[test]
@@ -2998,7 +3023,8 @@ mod tests {
 
         fs::write(&path, format!("{good}    tier: identity\n")).unwrap();
         let err = format!("{:#}", TrustStore::open(&tmp.path).unwrap_err());
-        assert!(err.contains("could not be parsed"), "{err}");
+        assert!(err.contains("could not be parsed as version 1"), "{err}");
+        assert!(err.contains("trusts nobody"), "{err}");
         assert!(err.contains("tier"), "{err}");
 
         fs::write(&path, good.replace("2026-01-01T00:00:00Z", "yesterday")).unwrap();

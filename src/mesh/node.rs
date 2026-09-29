@@ -2785,7 +2785,7 @@ mod tests {
     use crate::mesh::notify::RenderedNotification;
     use crate::mesh::peers::PEER_TTL;
     #[cfg(unix)]
-    use crate::mesh::peers::PeerRecord;
+    use crate::mesh::peers::{PEER_TABLE_VERSION, PeerTableFile};
     use crate::mesh::pending::{
         DEFAULT_COLLECT_TIMEOUT, INBOUND_RECORD_VERSION, InboundRecord, PENDING_RECORD_VERSION,
         PendingState,
@@ -5658,9 +5658,10 @@ mod tests {
 
         let bytes = std::fs::read(&peers_path)
             .unwrap_or_else(|err| panic!("{} must exist after stop: {err}", peers_path.display()));
-        let records: Vec<PeerRecord> = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].destination_hash, "persisted-on-stop");
+        let file: PeerTableFile = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(file.version, PEER_TABLE_VERSION);
+        assert_eq!(file.peers.len(), 1);
+        assert_eq!(file.peers[0].destination_hash, "persisted-on-stop");
         relay_handle.abort();
     }
 
