@@ -116,29 +116,13 @@ mesh crates and BSD 3-Clause for the dalek crates and `subtle`, are not in this 
 them, or drop the dependencies, before cutting a release that contains them. The second, settling
 the license expression for the combined work, is the license owner's call and is tracked separately.
 
-### The in-flight mesh pins
-
-Everything in this subsection goes when the pins it describes go. The mesh work carries two:
-`reticulum-rs-transport` and `lxmf-wire`, both at LXMF-rs rev
-`3ed5932da4420e2dd1b9d36283b0e72a364e3ebe`. The published 0.11.0 of those crates is fourteen
-commits behind that revision and lacks the delivery-stamp calls re-exported at
-`lxmf_core::stamp` (`generate_stamp`, `validate_stamp`, `ticket_stamp`), which the mesh work is
-built on; it carries only the propagation-stamp half. Note that the pinned revision also calls
-itself 0.11.0, so the replacement must be a release strictly newer than 0.11.0 that carries those
-calls: pinning `version = "0.11.0"` would satisfy the gate above while silently reverting to the
-release this paragraph rejects. Both crates have to move together, too: they share
-`reticulum-rs-core`, and a registry crate alongside a git one duplicates it. The pins are
-therefore interim, the final state is a crates.io version pin, and that swap is a hard merge gate
-for the mesh pull request. It is tracked internally as TASK-063 in the mesh plan.
-
 ### Dependency build-cost records
 
 A point-in-time record for the LXMF-rs and windows-sys dependency addition of 2026-09, not a
 standing benchmark. Fill the Windows row from the first CI run that includes those dependencies,
-then leave the table as history; if it is still empty when the pins are retired, delete the row.
-Figures measured 2026-09-23 on Linux aarch64 with 18 cores, debug profile, populated
-`target/`. Treat them as an order of magnitude, not a budget: CI runners have far fewer cores, so
-expect several times these numbers there.
+then leave the table as history. Figures measured 2026-09-23 on Linux aarch64 with 18 cores,
+debug profile, populated `target/`. Treat them as an order of magnitude, not a budget: CI runners
+have far fewer cores, so expect several times these numbers there.
 
 | Measurement | Before mesh dependencies | After |
 | --- | --- | --- |

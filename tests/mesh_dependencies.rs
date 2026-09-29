@@ -1,24 +1,24 @@
 //! Smoke coverage for the Reticulum/LXMF dependencies.
 //!
 //! These crates enter the tree ahead of the code that uses them, so nothing else
-//! would notice if the pinned revision stopped resolving, stopped exposing the
-//! identity and wire surface, or lost the `storage` feature that brings bundled
-//! SQLite in. The two captured vectors go further and pin the protocol itself:
-//! Reticulum addresses peers by a truncated hash of their public keys, and LXMF
-//! peers agree on an exact frame layout, so a change to either is an interop
-//! break that should fail here rather than against a live Python node.
+//! would notice if a release stopped exposing the identity, wire and stamp
+//! surface, or lost the `storage` feature that brings bundled SQLite in. The two
+//! captured vectors go further and pin the protocol itself: Reticulum addresses
+//! peers by a truncated hash of their public keys, and LXMF peers agree on an
+//! exact frame layout, so a change to either is an interop break that should fail
+//! here rather than against a live Python node.
 //!
 //! The manifest checks at the bottom pin what no compiler on a unix host can be
 //! asked about: the Win32 feature list, whose call sites nothing here links
-//! against, and the tracked records the pin and the license obligations rest on.
-//! Note what the feature-list check is and is not. It compares manifest text, so
-//! it catches an unaudited addition or a silent drop; it cannot tell whether
-//! windows-sys exposes those features, and does not need to: cargo refuses to
-//! resolve a feature that does not exist upstream, so no build on any platform
-//! reaches this test carrying one. The feature-to-call mapping is checked by
-//! `the_audited_win32_features_expose_the_calls_they_are_carried_for`, which only
-//! compiles on Windows. The three pin checks expire with the git pin; the Win32
-//! and obligation checks outlive it.
+//! against; the no-git-sources gate, whose enforcing step lives in a workflow
+//! file; and the tracked records the dependency cost and the license obligations
+//! rest on. Note what the feature-list check is and is not. It compares manifest
+//! text, so it catches an unaudited addition or a silent drop; it cannot tell
+//! whether windows-sys exposes those features, and does not need to: cargo
+//! refuses to resolve a feature that does not exist upstream, so no build on any
+//! platform reaches this test carrying one. The feature-to-call mapping is
+//! checked by `the_audited_win32_features_expose_the_calls_they_are_carried_for`,
+//! which only compiles on Windows.
 
 use lxmf_core::identity::{Identity, PrivateIdentity, lxmf_sign, lxmf_verify};
 use lxmf_core::stamp::{COST_TICKET, TICKET_LENGTH, generate_stamp, ticket_stamp, validate_stamp};
@@ -31,22 +31,19 @@ use sha2::{Digest, Sha256};
 const SENDER_KEY: [u8; 64] = [0x11; 64];
 const RECIPIENT_KEY: [u8; 64] = [0x22; 64];
 
-/// Address hash `SENDER_KEY` derives to, captured from LXMF-rs at the pinned
-/// revision. Pins the public-key to address-hash derivation, which is protocol.
+/// Address hash `SENDER_KEY` derives to, captured from LXMF-rs at rev 3ed5932 and
+/// unchanged at release 0.12.0. Pins the public-key to address-hash derivation,
+/// which is protocol.
 const SENDER_ADDRESS_HASH: &str = "ef330a1940c70349459fc4401d273cb9";
 
 /// SHA-256 of the packed frame `lxmf_wire_frames_are_byte_stable` builds. The
 /// frame is deterministic: fixed keys, a fixed timestamp, no fields, and Ed25519
 /// signing is deterministic, so any change to the encoding shows up here.
+/// Captured at rev 3ed5932 and unchanged at release 0.12.0.
 const WIRE_FRAME_DIGEST: &str = "9a7be88510c749b17fb240822805e30077412d1ec9a6fd25908ad29329460eed";
 
 /// Timestamp baked into the frame vector. Held constant so the encoding is.
 const FIXED_TIMESTAMP: f64 = 1_700_000_000.0;
-
-/// The revision both mesh crates are pinned to. Anything that moves the pin has to
-/// move it here too, which is the point: the vectors above are only meaningful
-/// against a known revision.
-const PINNED_REV: &str = "3ed5932da4420e2dd1b9d36283b0e72a364e3ebe";
 
 /// The Win32 feature set, one entry per call the identity-key lockdown makes. An
 /// addition here is unaudited surface and a removal breaks a call, so the list is
@@ -116,6 +113,58 @@ fn manifest_section<'a>(manifest: &'a str, section: &str) -> &'a str {
         Some(end) => &rest[..end],
         None => rest,
     }
+}
+
+/// Returns the body of the top-level `merge-gates` job, up to the next job.
+fn merge_gates_job(workflow: &str) -> &str {
+    let header = "\n  merge-gates:\n";
+    let start = workflow
+        .find(header)
+        .expect("ci.yaml has a merge-gates job")
+        + header.len();
+    let rest = &workflow[start..];
+    let end = rest
+        .match_indices("\n  ")
+        .map(|(at, _)| at)
+        .find(|&at| rest[at + 3..].starts_with(|c: char| c != ' ' && c != '\n'))
+        .unwrap_or(rest.len());
+    &rest[..end]
+}
+
+/// Returns the `run:` script of the `merge-gates` step called `name`. Raw rather than
+/// squashed: the gate is a shell block, and its structure is what the caller checks.
+fn merge_gate_script<'a>(workflow: &'a str, name: &str) -> &'a str {
+    let job = merge_gates_job(workflow);
+    let header = format!("    - name: {name}\n");
+    let start = job
+        .find(&header)
+        .unwrap_or_else(|| panic!("the merge-gates job has a step named {name:?}"))
+        + header.len();
+    let step = &job[start..];
+    let step = &step[..step.find("\n    - ").unwrap_or(step.len())];
+    let run = "run: |\n";
+    let start = step
+        .find(run)
+        .unwrap_or_else(|| panic!("the {name:?} step has a literal run block"))
+        + run.len();
+    &step[start..]
+}
+
+/// Returns the lines between the `if … ; then` line `guard` and the `fi` that closes it
+/// at the same indentation.
+fn then_branch<'a>(script: &'a str, guard: &str) -> Vec<&'a str> {
+    let indent = &guard[..guard.len() - guard.trim_start().len()];
+    let close = format!("{indent}fi");
+    let after_guard = script
+        .find(guard)
+        .expect("the guard is a line of the script")
+        + guard.len();
+    let lines: Vec<&str> = script[after_guard..].lines().skip(1).collect();
+    let fi = lines
+        .iter()
+        .position(|line| *line == close)
+        .expect("the guard is closed by a fi at the same indentation");
+    lines[..fi].to_vec()
 }
 
 #[test]
@@ -194,12 +243,12 @@ fn transport_storage_feature_is_enabled() {
     MessagesStore::in_memory().expect("an in-memory message store opens");
 }
 
-/// The stamp API is the whole reason the pin exists, so exercise it rather than
-/// leaving the justification as prose in the manifest. The published release
-/// carries the surrounding `stamp` module without these three calls, so a swap to
-/// any release that still lacks them fails to compile here instead of silently
-/// dropping the feature the mesh work is built on. Note the public path: the
-/// `delivery` module they live in is private, and they are re-exported one level up.
+/// The delivery-stamp API is what the mesh work is built on and what once forced a
+/// git pin: releases before 0.12.0 carry the surrounding `stamp` module without
+/// these three calls. Exercising them keeps a move to any release that lacks them
+/// a compile failure here rather than a silently dropped feature. Note the public
+/// path: the `delivery` module they live in is private, and they are re-exported
+/// one level up.
 #[test]
 fn the_stamp_api_the_pin_exists_for_is_reachable() {
     let message_id = [0x33; 32];
@@ -225,33 +274,6 @@ fn the_stamp_api_the_pin_exists_for_is_reachable() {
     );
 }
 
-#[test]
-fn mesh_crates_are_pinned_to_the_audited_revision() {
-    let manifest = read_tracked("Cargo.toml");
-    let deps = manifest_section(&manifest, "dependencies");
-
-    for crate_name in ["reticulum-rs-transport", "lxmf-wire"] {
-        let line = deps
-            .lines()
-            .find(|line| line.starts_with(&format!("{crate_name} =")))
-            .unwrap_or_else(|| panic!("{crate_name} is declared in [dependencies]"));
-        assert!(
-            line.contains(&format!("rev = \"{PINNED_REV}\"")),
-            "{crate_name} must stay pinned to {PINNED_REV}, found: {line}"
-        );
-    }
-
-    // The manifest is what was declared; the lock is what resolved. Both crates plus
-    // the `reticulum-rs-core` they share must have landed on the audited commit.
-    let resolved = read_tracked("Cargo.lock")
-        .matches(&format!("?rev={PINNED_REV}#{PINNED_REV}"))
-        .count();
-    assert_eq!(
-        resolved, 3,
-        "the lock must resolve all three LXMF-rs crates to {PINNED_REV}"
-    );
-}
-
 /// The mesh crates carry no `cfg` gate, so a break shows up on every platform's CI
 /// leg rather than on whichever one happens to be gated in.
 #[test]
@@ -273,6 +295,43 @@ fn mesh_crates_are_not_target_scoped() {
             "{crate_name} must be an unconditional dependency, found it under {enclosing}"
         );
     }
+}
+
+/// The two mesh crates share `reticulum-rs-core`, and cargo unifies a shared dependency
+/// only within one semver range: resolving them at incompatible versions duplicates the
+/// core, so an identity from one half is a foreign type to the other. The manifest
+/// promises they move together; this holds it to that promise, and to the single core
+/// the promise exists for.
+#[test]
+fn the_mesh_crates_move_together() {
+    let manifest = read_tracked("Cargo.toml");
+    let dependencies = manifest_section(&manifest, "dependencies");
+
+    let version_of = |crate_name: &str| -> &str {
+        let declaration = format!("{crate_name} = ");
+        dependencies
+            .lines()
+            .find_map(|line| line.strip_prefix(&declaration))
+            .unwrap_or_else(|| panic!("{crate_name} is declared under [dependencies]"))
+            .trim()
+            .strip_prefix('"')
+            .and_then(|rest| rest.strip_suffix('"'))
+            .unwrap_or_else(|| panic!("{crate_name} is pinned to a plain version string"))
+    };
+    assert_eq!(
+        version_of("reticulum-rs-transport"),
+        version_of("lxmf-wire"),
+        "reticulum-rs-transport and lxmf-wire must be pinned to the same release"
+    );
+
+    let lock = read_tracked("Cargo.lock");
+    assert_eq!(
+        lock.lines()
+            .filter(|line| *line == "name = \"reticulum-rs-core\"")
+            .count(),
+        1,
+        "the resolved graph must carry exactly one reticulum-rs-core"
+    );
 }
 
 #[test]
@@ -337,21 +396,14 @@ fn the_audited_win32_features_expose_the_calls_they_are_carried_for() {
     );
 }
 
-/// Every git pin is interim, so the manifest has to say so where someone retiring it
-/// will look. The human-facing copy of the gate has to sit at the path GitHub
-/// auto-populates a pull request body from, and stay identical to the guide's copy;
-/// the `.github/PULL_REQUEST_TEMPLATE/` directory form renders only for an explicit
-/// `?template=` link, so a checklist there is a checklist nobody is shown. The gate
-/// that actually holds is the CI job, which is why its mechanism is pinned here too.
+/// Nothing merges with a git source in its resolved graph. The human-facing copy of
+/// that gate has to sit at the path GitHub auto-populates a pull request body from,
+/// and stay identical to the guide's copy; the `.github/PULL_REQUEST_TEMPLATE/`
+/// directory form renders only for an explicit `?template=` link, so a checklist
+/// there is a checklist nobody is shown. The gate that actually holds is the CI job,
+/// which is why its mechanism is pinned here too.
 #[test]
-fn the_git_pin_is_recorded_as_interim() {
-    // Comment markers and hand-wrapping are noise here; the sentence is the contract.
-    let manifest_prose = squash(&read_tracked("Cargo.toml").replace("\n#", "\n"));
-    assert!(
-        manifest_prose.contains("crates.io version pin before merge"),
-        "the manifest must record that the git pin cannot survive a merge"
-    );
-
+fn the_no_git_sources_gate_is_quoted_and_enforced() {
     let gate = squash(
         "meta=$(cargo metadata --format-version 1 --locked) \
          && ! printf '%s' \"$meta\" | grep -q '\"source\":\"git+'",
@@ -365,19 +417,32 @@ fn the_git_pin_is_recorded_as_interim() {
     }
 
     // The checklist is a courtesy; this is the gate. Pinned by mechanism rather than
-    // by wording: the workflow has to resolve the graph and reject a git source in it,
-    // however the surrounding step is phrased.
-    let workflow = read_prose(".github/workflows/ci.yaml");
-    for fragment in [
-        "cargo metadata --format-version 1 --locked",
-        "\"source\":\"git+",
-    ] {
-        assert!(
-            workflow.contains(fragment),
-            "ci.yaml must enforce the no-git-sources gate itself, matching on {fragment:?}, \
-             rather than leaving it to a box a contributor ticks"
-        );
-    }
+    // by wording: the step has to resolve the locked graph, test it for a git source,
+    // and fail the job inside that test's branch, however the messages around it read.
+    // The helpers that walk the script match line structure on bare `\n`, so a CRLF
+    // checkout (the windows-latest leg) is normalised first; the squashed reads need not be.
+    let workflow = read_tracked(".github/workflows/ci.yaml").replace("\r\n", "\n");
+    let script = merge_gate_script(&workflow, "Nothing is pulled from git");
+    assert!(
+        script.contains("cargo metadata --format-version 1 --locked"),
+        "the merge gate must resolve the locked graph itself rather than trust the manifest"
+    );
+    let guard = script
+        .lines()
+        .find(|line| {
+            let line = line.trim();
+            line.starts_with("if ")
+                && line.contains("grep -q '\"source\":\"git+'")
+                && line.ends_with("; then")
+        })
+        .expect("the merge gate tests the resolved graph for a git source in an if … ; then");
+    assert!(
+        then_branch(script, guard)
+            .iter()
+            .any(|line| line.trim() == "exit 1"),
+        "the merge gate must `exit 1` inside the branch that found a git source; a message \
+         without the exit, or an exit outside the branch, leaves the job green or always red"
+    );
 }
 
 /// Two maintained crates were passed over for raw bindings, and the reason is a
@@ -496,6 +561,221 @@ fn the_release_gate_names_every_obligation_notice_records() {
              {obligation:?}, so a recorded obligation cannot slip through unmentioned"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Usage-probe tests for the crates.io pin (TASK-063). Each pins one promise the
+// task made about the tree as a consumer meets it: `cargo build --locked` pulls
+// nothing from git, the release is the one the stamp API needs, the guide no
+// longer describes a pin that is gone, and the merge gate's mechanism check can
+// actually go red.
+// ---------------------------------------------------------------------------
+
+/// The version string both mesh crates are declared at under `[dependencies]`.
+fn declared_mesh_crate_version(manifest: &str, crate_name: &str) -> String {
+    let dependencies = manifest_section(manifest, "dependencies");
+    let declaration = format!("{crate_name} = ");
+    dependencies
+        .lines()
+        .find_map(|line| line.strip_prefix(&declaration))
+        .unwrap_or_else(|| panic!("{crate_name} is declared under [dependencies]"))
+        .trim()
+        .to_string()
+}
+
+/// Returns the `[[package]]` block of `crate_name` in the lockfile, as its lines.
+fn locked_package<'a>(lock: &'a str, crate_name: &str) -> Vec<&'a str> {
+    let name_line = format!("name = \"{crate_name}\"");
+    let lines: Vec<&str> = lock.lines().collect();
+    let at = lines
+        .iter()
+        .position(|line| *line == name_line)
+        .unwrap_or_else(|| panic!("Cargo.lock resolves {crate_name}"));
+    let end = lines[at..]
+        .iter()
+        .position(|line| *line == "[[package]]")
+        .map(|offset| at + offset)
+        .unwrap_or(lines.len());
+    lines[at..end].to_vec()
+}
+
+fn semver_triple(version: &str) -> (u64, u64, u64) {
+    let mut parts = version.split('.').map(|part| {
+        part.parse::<u64>()
+            .unwrap_or_else(|_| panic!("{version:?} is a plain MAJOR.MINOR.PATCH release"))
+    });
+    let triple = (
+        parts.next().expect("major"),
+        parts.next().expect("minor"),
+        parts.next().expect("patch"),
+    );
+    assert!(
+        parts.next().is_none(),
+        "{version:?} has exactly three components"
+    );
+    triple
+}
+
+/// Acceptance (a) and (b), as `cargo build --locked` sees them: the resolved graph the
+/// lockfile records carries no git source at all, and the three LXMF-rs crates it
+/// resolves (the two declared ones plus the `reticulum-rs-core` they share) all come
+/// from the registry at exactly the version the manifest declares. The CI merge gate
+/// asks `cargo metadata` the same question; this asks the tracked file, so the answer is
+/// available on every platform's test leg without a network.
+#[test]
+fn usage_probe_the_lockfile_resolves_the_mesh_crates_from_the_registry_with_no_git_source() {
+    let lock = read_tracked("Cargo.lock");
+    let git_sources: Vec<&str> = lock
+        .lines()
+        .filter(|line| line.starts_with("source = \"git+"))
+        .collect();
+    assert!(
+        git_sources.is_empty(),
+        "Cargo.lock must record no git source; found {git_sources:?}"
+    );
+
+    let manifest = read_tracked("Cargo.toml");
+    let declared = declared_mesh_crate_version(&manifest, "reticulum-rs-transport")
+        .trim_matches('"')
+        .to_string();
+    for crate_name in ["reticulum-rs-transport", "lxmf-wire", "reticulum-rs-core"] {
+        let package = locked_package(&lock, crate_name);
+        assert!(
+            package.contains(&format!("version = \"{declared}\"").as_str()),
+            "{crate_name} must resolve to the declared release {declared}; block was {package:?}"
+        );
+        assert!(
+            package
+                .iter()
+                .any(|line| line.starts_with("source = \"registry+")),
+            "{crate_name} must resolve from the registry, not a git checkout; block was {package:?}"
+        );
+        assert!(
+            package.iter().any(|line| line.starts_with("checksum = \"")),
+            "a registry-sourced {crate_name} carries a checksum, which is what makes the pin \
+             reproducible"
+        );
+    }
+}
+
+/// Acceptance (b) plus the pin-form ruling: a release strictly newer than 0.11.0, because
+/// 0.11.0 is what the retired git revision also called itself and is the release that
+/// lacks the delivery-stamp calls; and a plain caret string, the repo convention, rather
+/// than an `=` requirement or an inline table. `the_mesh_crates_move_together` already
+/// holds the two crates to the same string; this holds that string to the right range.
+#[test]
+fn usage_probe_the_mesh_pin_is_a_plain_release_strictly_newer_than_0_11_0() {
+    let manifest = read_tracked("Cargo.toml");
+
+    for crate_name in ["reticulum-rs-transport", "lxmf-wire"] {
+        let declared = declared_mesh_crate_version(&manifest, crate_name);
+        let version = declared
+            .strip_prefix('"')
+            .and_then(|rest| rest.strip_suffix('"'))
+            .unwrap_or_else(|| {
+                panic!("{crate_name} must be a plain quoted version string, found {declared}")
+            });
+        assert!(
+            !version.starts_with(['=', '^', '~', '>', '<', '*']),
+            "{crate_name} must use the bare caret form the repo uses everywhere else, found \
+             {version:?}"
+        );
+        assert!(
+            semver_triple(version) > (0, 11, 0),
+            "{crate_name} must be strictly newer than 0.11.0, the release without the \
+             delivery-stamp API; found {version}"
+        );
+    }
+}
+
+/// Acceptance (d) as amended: the subsection that described the interim git pin goes with
+/// the pin, and with it every mention of the retired revision in the guide, while the
+/// dependency policy and the two records the ruling kept stay where a contributor looks
+/// for them, Windows row included.
+#[test]
+fn usage_probe_contributing_retired_the_interim_pin_prose_and_kept_the_records() {
+    let raw = read_tracked("CONTRIBUTING.md");
+    let guide = squash(&raw);
+
+    for retired in ["The in-flight mesh pins", "3ed5932", "rev = \""] {
+        assert!(
+            !guide.contains(retired),
+            "CONTRIBUTING.md must not describe the retired git pin; found {retired:?}"
+        );
+    }
+
+    for kept in [
+        "## Dependency policy",
+        "### No git dependencies at merge",
+        "### Dependency build-cost records",
+        "### What was checked for the windows-sys feature list, and what was not",
+    ] {
+        assert!(
+            raw.lines().any(|line| line.trim_end() == kept),
+            "CONTRIBUTING.md must keep the section {kept:?}"
+        );
+    }
+    assert!(
+        raw.lines()
+            .any(|line| { line.starts_with("| `windows-latest` CI leg") && line.contains("TBD") }),
+        "the build-cost table must keep its outstanding windows-latest row until CI fills it"
+    );
+}
+
+/// Acceptance (g), red-capability: the mechanism assertion in
+/// `the_no_git_sources_gate_is_quoted_and_enforced` is only worth having if a neutered
+/// step fails it. Feed the same helpers the tracked workflow with its `exit 1` removed,
+/// and again with the exit moved outside the `if … fi`, and check that neither variant
+/// still shows an exit inside the branch that found a git source. The tracked file is
+/// never modified; the variants are in-memory copies.
+#[test]
+fn usage_probe_the_gate_mechanism_check_goes_red_when_the_exit_is_neutered() {
+    let workflow = read_tracked(".github/workflows/ci.yaml").replace("\r\n", "\n");
+    let script = merge_gate_script(&workflow, "Nothing is pulled from git");
+    let guard = script
+        .lines()
+        .find(|line| line.trim().starts_with("if ") && line.trim().ends_with("; then"))
+        .expect("the gate has an if … ; then guard");
+    let exit_line = script
+        .lines()
+        .find(|line| line.trim() == "exit 1")
+        .expect("the tracked gate carries an exit 1");
+    let indent = &exit_line[..exit_line.len() - exit_line.trim_start().len()];
+    let fi_line = format!("{}fi", &guard[..guard.len() - guard.trim_start().len()]);
+
+    // Positive control: the tracked workflow passes the same check the variants fail.
+    assert!(
+        then_branch(script, guard)
+            .iter()
+            .any(|line| line.trim() == "exit 1"),
+        "the tracked gate exits inside its branch (control)"
+    );
+
+    let without_exit = workflow.replacen(&format!("{exit_line}\n"), "", 1);
+    let script = merge_gate_script(&without_exit, "Nothing is pulled from git");
+    assert!(
+        !then_branch(script, guard)
+            .iter()
+            .any(|line| line.trim() == "exit 1"),
+        "a gate whose exit was deleted must fail the mechanism check"
+    );
+
+    let exit_after_fi = without_exit.replacen(
+        &format!("{fi_line}\n"),
+        &format!("{fi_line}\n{indent}exit 1\n"),
+        1,
+    );
+    let script = merge_gate_script(&exit_after_fi, "Nothing is pulled from git");
+    assert!(
+        script.lines().any(|line| line.trim() == "exit 1"),
+        "the variant still carries an exit 1, just outside the branch (control)"
+    );
+    assert!(
+        !then_branch(script, guard)
+            .iter()
+            .any(|line| line.trim() == "exit 1"),
+        "an exit outside the if … fi (a job that is always red) must fail the mechanism check"
+    );
 }
 
 /// Markdown wraps prose across lines, so compare against a single-spaced copy.
