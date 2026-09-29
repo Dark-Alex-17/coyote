@@ -273,9 +273,10 @@ impl R3Server {
     /// nothing about a request, not even decoding it, runs on the event loop; RNS runs each
     /// in a thread. The size check here is where inbound requests are capped: after
     /// assembly, on our side, since the destination carries no `max_request_size` (the
-    /// upstream reject path deadlocks the transport, rev 3ed5932) and the upstream 32 MiB
-    /// advertisement cap is the only bound before that. The task resolves the peer's
-    /// identity, asks the handler whether to decode at all, and only then decodes.
+    /// upstream reject path deadlocks the transport, rev 3ed5932 and release 0.12.0) and
+    /// the upstream 64 MiB advertisement cap is the only bound before that. The task
+    /// resolves the peer's identity, asks the handler whether to decode at all, and only
+    /// then decodes.
     fn dispatch(
         self: &Arc<Self>,
         transport: &Arc<Transport>,

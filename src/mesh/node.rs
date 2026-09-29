@@ -571,8 +571,8 @@ impl MeshRuntime {
     }
 
     /// Arms the upstream advertisement-time request cap, which production code leaves off
-    /// because rejecting on it deadlocks the transport (rev 3ed5932). Tests use it to wedge a
-    /// node on purpose and prove the node's waits stay bounded.
+    /// because rejecting on it deadlocks the transport (rev 3ed5932 and release 0.12.0).
+    /// Tests use it to wedge a node on purpose and prove the node's waits stay bounded.
     #[cfg(test)]
     pub(crate) async fn arm_request_cap_for_test(&self, cap: usize) {
         let state = self.destination.lock().await;
@@ -1070,8 +1070,8 @@ impl MeshRuntime {
 /// each transport wait gives up at `deadline`. A destination registered but left without
 /// its announce data is deregistered again, best effort, and the error says whether that
 /// worked. The destination carries no `max_request_size`: rejecting an advertisement on it
-/// deadlocks the upstream transport (rev 3ed5932), so oversize requests are dropped after
-/// assembly by `R3Server` instead.
+/// deadlocks the upstream transport (rev 3ed5932 and release 0.12.0), so oversize requests
+/// are dropped after assembly by `R3Server` instead.
 async fn register_destination(
     transport: &Transport,
     identity: &TransportIdentity,

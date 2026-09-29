@@ -4164,8 +4164,9 @@ checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
 
 [[package]]
 name = "lxmf-wire"
-version = "0.11.0"
-source = "git+https://github.com/FreeTAKTeam/LXMF-rs?rev=3ed5932da4420e2dd1b9d36283b0e72a364e3ebe#3ed5932da4420e2dd1b9d36283b0e72a364e3ebe"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f93c56b451460423fdbbe553e21c4aeeb4e627bdd032b8e10164ace82d3033d"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
@@ -4332,7 +4333,7 @@ dependencies = [
  "mio",
  "nix 0.31.3",
  "serialport",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5673,8 +5674,9 @@ dependencies = [
 
 [[package]]
 name = "reticulum-rs-core"
-version = "0.11.0"
-source = "git+https://github.com/FreeTAKTeam/LXMF-rs?rev=3ed5932da4420e2dd1b9d36283b0e72a364e3ebe#3ed5932da4420e2dd1b9d36283b0e72a364e3ebe"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0ee5375536e0d2d4b99df18476c7e59fc369eaa74d3a4065733467f69341d5c8"
 dependencies = [
  "aes",
  "atomicwrites",
@@ -5694,8 +5696,9 @@ dependencies = [
 
 [[package]]
 name = "reticulum-rs-transport"
-version = "0.11.0"
-source = "git+https://github.com/FreeTAKTeam/LXMF-rs?rev=3ed5932da4420e2dd1b9d36283b0e72a364e3ebe#3ed5932da4420e2dd1b9d36283b0e72a364e3ebe"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "19430e45f674c3765dd51feb5f29f21fb2ff75ad0100ac7407b06a8dcc5401ac"
 dependencies = [
  "aes",
  "base64 0.22.1",
@@ -5725,6 +5728,7 @@ dependencies = [
  "tokio-serial",
  "tokio-util",
  "tracing",
+ "windows 0.62.2",
  "x25519-dalek",
 ]
 

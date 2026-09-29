@@ -1152,8 +1152,8 @@ pub(crate) mod network {
     }
 
     /// Waits for the receiver to answer the advertisement of `resource_hash` with a cancel,
-    /// which the sender reports as `OutboundCancelled`.
-    async fn await_outbound_cancelled(
+    /// which the sender reports as `OutboundRejected`.
+    async fn await_outbound_rejected(
         events: &mut broadcast::Receiver<ResourceEvent>,
         resource_hash: Hash,
     ) {
@@ -1164,7 +1164,7 @@ pub(crate) mod network {
                 .expect("the receiver must refuse the oversize advertisement")
                 .unwrap();
             if event.hash == resource_hash
-                && matches!(event.kind, ResourceEventKind::OutboundCancelled)
+                && matches!(event.kind, ResourceEventKind::OutboundRejected)
             {
                 return;
             }
@@ -1290,7 +1290,7 @@ pub(crate) mod network {
 
         /// Arms node A's advertisement-time request cap, which production code leaves off,
         /// and trips it with an oversize request from B. The reject deadlocks A's transport
-        /// (upstream rev 3ed5932), which is what the bounded-wait tests need.
+        /// (upstream rev 3ed5932 and release 0.12.0), which is what the bounded-wait tests need.
         async fn wedge_node_a(&self) {
             self.node_a
                 .arm_request_cap_for_test(MAX_R3_PAYLOAD_BYTES)
@@ -1311,7 +1311,7 @@ pub(crate) mod network {
                 )
                 .await
                 .unwrap();
-            await_outbound_cancelled(&mut resource_events, resource_hash).await;
+            await_outbound_rejected(&mut resource_events, resource_hash).await;
             assert_eq!(
                 self.recorder_a.seen_count(),
                 0,
@@ -1741,7 +1741,7 @@ pub(crate) mod network {
             )
             .await
             .unwrap();
-        await_outbound_cancelled(&mut resource_events, resource_hash).await;
+        await_outbound_rejected(&mut resource_events, resource_hash).await;
         let result = timeout(INTEROP_TIMEOUT, in_flight).await.unwrap().unwrap();
         assert_eq!(result.unwrap_err(), timed_out_slow_request());
 
@@ -1892,7 +1892,7 @@ pub(crate) mod network {
         assert_eq!(
             pair.node_a.max_request_size().await,
             None,
-            "the destination must not carry a max_request_size: rejecting an advertisement on it deadlocks the upstream transport (rev 3ed5932)"
+            "the destination must not carry a max_request_size: rejecting an advertisement on it deadlocks the upstream transport (rev 3ed5932 and release 0.12.0)"
         );
 
         let transport_b = &pair.responder.transport;

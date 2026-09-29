@@ -50,10 +50,10 @@ impl Default for RequestOptions {
 
 /// When one phase of a request gives up, and the option that set it, which the `Timeout`
 /// error reports. Every wait against the transport or a link lock runs under one, since a
-/// transport whose handler lock is held for good (upstream rev 3ed5932 does that to itself
-/// on any advertisement-time reject) would never return from a bare await. We register no
-/// response-size limit that could trip that path; oversize responses are dropped after
-/// assembly in `deliver`.
+/// transport whose handler lock is held for good (upstream rev 3ed5932 and release 0.12.0
+/// do that to themselves on any advertisement-time reject) would never return from a bare
+/// await. We register no response-size limit that could trip that path; oversize
+/// responses are dropped after assembly in `deliver`.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Deadline {
     at: Instant,
@@ -571,9 +571,9 @@ impl R3Client {
 
     /// Resolves the pending request a response answers, provided it arrived on the link the
     /// request went out on. This is where the payload cap is enforced: after assembly, on
-    /// our side. The only bound before assembly is the upstream 32 MiB advertisement cap
+    /// our side. The only bound before assembly is the upstream 64 MiB advertisement cap
     /// (`advertisement_limits.rs`), because the upstream reject path deadlocks the transport
-    /// (rev 3ed5932).
+    /// (rev 3ed5932 and release 0.12.0).
     fn deliver(&self, link_id: LinkId, bytes: &[u8], branch: SizeBranch) {
         if bytes.len() > MAX_R3_PAYLOAD_BYTES {
             debug!(

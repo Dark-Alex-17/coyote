@@ -700,7 +700,9 @@ async fn watch_verdict(
                         *pending = None;
                         until = Instant::now() + reject_window;
                     }
-                    ResourceEventKind::OutboundFailed | ResourceEventKind::OutboundCancelled => {
+                    ResourceEventKind::OutboundFailed
+                    | ResourceEventKind::OutboundRejected
+                    | ResourceEventKind::OutboundCancelled => {
                         return Err(PropagationError::TransferFailed);
                     }
                     _ => {}
@@ -1681,6 +1683,7 @@ mod tests {
                         id,
                         address_hash: AddressHash::new_from_rand(OsRng),
                         event,
+                        close_reason: None,
                     })
                     .is_ok();
                 assert!(sent, "the watch's link receiver is gone");
@@ -1743,9 +1746,10 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn a_failed_or_cancelled_transfer_fails() {
+        async fn a_failed_rejected_or_cancelled_transfer_fails() {
             for kind in [
                 ResourceEventKind::OutboundFailed,
+                ResourceEventKind::OutboundRejected,
                 ResourceEventKind::OutboundCancelled,
             ] {
                 let watch = Watch::new();

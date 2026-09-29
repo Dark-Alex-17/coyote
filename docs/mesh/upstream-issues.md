@@ -17,7 +17,8 @@ what this crate does about it in the meantime.
 
 - Status: Drafted, not yet filed.
 - Repository / revision: FreeTAKTeam/LXMF-rs, crate `reticulum-rs-transport`, rev
-  `3ed5932da4420e2dd1b9d36283b0e72a364e3ebe` (the revision this crate pins).
+  `3ed5932da4420e2dd1b9d36283b0e72a364e3ebe` (where found); re-checked against the 0.12.0
+  release this crate depends on: still present (`resource_wire.rs`, both advertisement branches).
 - Severity: high. A destination with `set_max_request_size` set, or a link with a response size
   limit set, stops processing every link event the first time an advertisement over the cap
   arrives. Nothing recovers it short of dropping the transport.
@@ -55,7 +56,7 @@ well-formed request on the same link and assert it is served.
 
 Production code sets no advertisement-time cap and no response size limit. Inbound requests and
 responses are bounded on this side after assembly instead, at `MAX_R3_PAYLOAD_BYTES`
-(`R3Server::dispatch`, `R3Client::deliver`), with the upstream 32 MiB advertisement cap as the
+(`R3Server::dispatch`, `R3Client::deliver`), with the upstream 64 MiB advertisement cap as the
 only bound before that. The cap setter is reachable from tests only (`arm_request_cap_for_test`).
 Removal condition: when the pinned transport sends the reject outside the lock, re-arm the cap
 and keep the post-assembly bound as the second line.
@@ -64,18 +65,25 @@ and keep the post-assembly bound as the second line.
 
 - Status: Drafted, not yet filed.
 - Repository / revision: FreeTAKTeam/LXMF-rs, crate `reticulum-rs-transport`, rev
-  `3ed5932da4420e2dd1b9d36283b0e72a364e3ebe`.
-- Severity: medium. A client cannot learn that a link packet it sent was proven by the far end;
-  the proof is consumed by the transport and no `LinkEvent` reports it.
+  `3ed5932da4420e2dd1b9d36283b0e72a364e3ebe` (where found); re-checked against the 0.12.0
+  release: still present; `handle_proof_packet.rs` is unchanged between the two — the
+  active-link branch resolves channel-message delivery state only and returns
+  `LinkHandleResult::None` with no event.
+- Severity: medium. A client holding a link cannot learn that a link packet it sent was proven
+  by the far end: no `LinkEvent` reports it and no per-link receipt resolves. The only surface
+  is the transport-global `ReceiptHandler` (`Transport::set_receipt_handler`), keyed by packet
+  hash, which a per-link client cannot scope.
 - Referenced by: `MESH-LEN-002` in `docs/mesh/PROTOCOL.md`.
 
 #### Root cause
 
 The proof handler for an active link (`link_sections/handle_proof_packet.rs`) validates the
-proof against the link and returns without producing an event or resolving any per-packet
-receipt. The Python reference calls the packet's delivery callback at this point
-(`RNS/Link.py`, `Packet.prove` / `PacketReceipt`); the Rust transport has no equivalent for
-link packets, only the resource completion events for resources.
+proof against the link and returns without producing a `LinkEvent` or resolving any
+per-link-packet receipt (it resolves channel-message state only). The Python reference calls
+the packet's delivery callback at this point (`RNS/Link.py`, `Packet.prove` / `PacketReceipt`).
+The Rust transport's counterpart is the single `ReceiptHandler` installed on the whole
+transport (`transport/wire.rs::handle_proof` → `validated_receipt_hash` → `on_receipt`), which
+reports the proven packet hash and nothing else: not the link, not the request it belonged to.
 
 #### Reproduction
 
@@ -97,6 +105,10 @@ When posting to a propagation node, acceptance is inferred: a packet that draws 
 signal inside `PROPAGATION_REJECT_WINDOW` after the transfer completes counts as accepted
 (`MESH-PROP-016`; `a_completed_transfer_is_accepted_one_window_later_not_at_the_deadline`,
 `src/mesh/propagation.rs`). A resource is at least confirmed received by its completion event.
+The transport-global receipt handler is not used for this today: a handler keyed by packet hash
+cannot be scoped to one link or one request without tracking the hash of every packet sent
+through the transport, so reading acceptance from it is a propagation follow-up rather than a
+drop-in.
 Removal condition: when the transport surfaces the proof, read acceptance from it and stop
 inferring it from silence.
 
@@ -104,7 +116,8 @@ inferring it from silence.
 
 - Status: Drafted, not yet filed.
 - Repository / revision: FreeTAKTeam/LXMF-rs, crate `reticulum-rs-transport`, rev
-  `3ed5932da4420e2dd1b9d36283b0e72a364e3ebe`.
+  `3ed5932da4420e2dd1b9d36283b0e72a364e3ebe` (where found); re-checked against the 0.12.0
+  release: still present, `hash.rs` is unchanged between the two.
 - Severity: low for this crate, medium for a caller that hands user text to the parser: a
   panic where an `Err` is documented.
 - Referenced by: `MESH-LEN-006` in `docs/mesh/PROTOCOL.md`.

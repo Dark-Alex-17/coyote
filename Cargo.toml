@@ -121,18 +121,11 @@ tokio-util = "0.7"
 arc-swap = "1.9.2"
 # Pinned to the rand_core generation `reticulum-rs-transport` is built on: its announce
 # builder takes a `CryptoRngCore` from this version and re-exports none, so `rand` 0.10's
-# `OsRng` cannot be passed. Moves together with the transport pin below.
+# `OsRng` cannot be passed. Moves together with the transport dependency below.
 rand_core = { version = "0.6", features = ["getrandom"] }
 
-# Reticulum transport and LXMF wire format, pinned to an exact revision because the
-# published 0.11.0 is fourteen commits behind it and lacks the delivery-stamp calls
-# re-exported at `lxmf_core::stamp` (`generate_stamp`, `validate_stamp`,
-# `ticket_stamp`); it carries only the propagation-stamp half. Note that the pinned
-# revision also calls itself 0.11.0, so retiring this pin needs a release strictly
-# newer than that, carrying those calls, and both crates have to move together: they
-# share `reticulum-rs-core`, and mixing a registry crate with a git one duplicates it.
-# The git pin is development-only: it must be replaced by a crates.io version pin
-# before merge, per the dependency policy in CONTRIBUTING.md.
+# Reticulum transport and LXMF wire format. The two move together: they share
+# `reticulum-rs-core`, and resolving them at incompatible versions duplicates it.
 #
 # Both entries are unconditional on purpose: the mesh runtime in `src/mesh` is not
 # feature-gated, so every CI leg compiles and tests it.
@@ -152,11 +145,11 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 # not use, and it covers only the `rns-*` crates and not `lxmf-wire`, so it cannot
 # replace both entries anyway. Depending on the two directly keeps one mechanism
 # instead of two.
-reticulum-rs-transport = { git = "https://github.com/FreeTAKTeam/LXMF-rs", rev = "3ed5932da4420e2dd1b9d36283b0e72a364e3ebe" }
-lxmf-wire = { git = "https://github.com/FreeTAKTeam/LXMF-rs", rev = "3ed5932da4420e2dd1b9d36283b0e72a364e3ebe" }
+reticulum-rs-transport = "0.12.0"
+lxmf-wire = "0.12.0"
 # Its `Value` appears in `rns_transport`'s `Link::request_payload` and
 # `unpack_response_envelope` signatures, so it must stay semver-unified with the
-# transport's own `rmpv`. Moves together with the transport pin above.
+# transport's own `rmpv`. Moves together with the transport dependency above.
 rmpv = "1.3"
 
 [dependencies.reqwest]

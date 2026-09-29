@@ -12,8 +12,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Frames above this are refused: outbound before anything touches the wire, inbound after
 /// assembly and before decoding. The bound is enforced on our side only; the upstream
-/// 32 MiB advertisement cap (`advertisement_limits.rs`) is the only pre-assembly bound,
-/// because the upstream reject path deadlocks the transport (rev 3ed5932).
+/// 64 MiB advertisement cap (`advertisement_limits.rs`) is the only pre-assembly bound,
+/// because the upstream reject path deadlocks the transport (rev 3ed5932 and release 0.12.0).
 pub(crate) const MAX_R3_PAYLOAD_BYTES: usize = 256 * 1024;
 
 /// The `rmpv` depth budget a frame may spend before it is refused as undecodable. Each
