@@ -3,7 +3,7 @@ use crate::mesh::r3::error::{R3Error, RefusalCode};
 use crate::mesh::r3::frame::{
     Envelope, MAX_R3_PAYLOAD_BYTES, RequestFrame, RequestId, ResponseFrame,
 };
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use crate::mesh::r3::receipt::RequestReceipt;
 use crate::mesh::r3::{redact_hashes, short};
 
@@ -180,7 +180,7 @@ impl R3Client {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn pending_len(&self) -> usize {
         self.pending.lock().by_request.len()
     }
@@ -245,7 +245,7 @@ impl R3Client {
     /// runs on its own task. Dropping the receipt abandons the request; `cancel` firing
     /// fails it with `Shutdown`. The runtime builds its receipts itself, around the same
     /// `request_with`, so it can act on the outcome.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn request_with_receipt(
         self: &Arc<Self>,

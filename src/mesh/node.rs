@@ -35,7 +35,7 @@ use crate::mesh::propagation::{
 use crate::mesh::propagation_fetch::{self, FetchError, FetchOptions, FetchReport, InboundSink};
 use crate::mesh::propagation_nodes::PropagationNodeTable;
 use crate::mesh::protocol::{Compatibility, MESH_PROTOCOL_MIN_SUPPORTED, MESH_PROTOCOL_VERSION};
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use crate::mesh::r3::RequestHandler;
 use crate::mesh::r3::{
     Dispatcher, Envelope, KNOCK_PATH, MESSAGE_PATH, OriginName, R3Client, R3Error, R3Server,
@@ -549,7 +549,7 @@ impl MeshRuntime {
         self.knock_sink.overflow()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) async fn has_destination(&self, hex: &str) -> bool {
         let hash = AddressHash::new_from_hex_string(hex).unwrap();
         match self.transport.lock().await.as_ref() {
@@ -558,14 +558,14 @@ impl MeshRuntime {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) async fn max_request_size(&self) -> Option<usize> {
         let state = self.destination.lock().await;
         state.dest.lock().await.max_request_size()
     }
 
     /// The node's private key as hex, for tests that prove no hook env carries it.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn private_key_hex(&self) -> String {
         to_core_private_identity(&self.transport_identity).to_hex_string()
     }
@@ -573,7 +573,7 @@ impl MeshRuntime {
     /// Arms the upstream advertisement-time request cap, which production code leaves off
     /// because rejecting on it deadlocks the transport (rev 3ed5932 and release 0.12.0).
     /// Tests use it to wedge a node on purpose and prove the node's waits stay bounded.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) async fn arm_request_cap_for_test(&self, cap: usize) {
         let state = self.destination.lock().await;
         state
@@ -872,7 +872,7 @@ impl MeshRuntime {
     }
 
     /// Replaces the dispatcher `start` installed, so a test can watch requests directly.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn set_request_handler(&self, handler: Arc<dyn RequestHandler>) {
         self.r3_server.set_handler(handler);
     }
@@ -2088,7 +2088,7 @@ impl MeshSlot {
         self.hooks.clone()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn envoy_attached(&self) -> bool {
         self.envoy.load().is_some()
     }
@@ -2802,7 +2802,9 @@ mod tests {
     use crate::mesh::test_support::{
         TempDir, TrustList, mesh_paths, private_config, snapshot_fixture,
     };
-    use crate::mesh::trust::{KeyChange, TrustOptions};
+    use crate::mesh::trust::KeyChange;
+    #[cfg(unix)]
+    use crate::mesh::trust::TrustOptions;
     use crate::supervisor::mailbox::EnvelopePayload;
     use crate::testing::{debug_snapshot, install_log_collector, warn_snapshot};
     use rns_transport::destination::link::LinkId;

@@ -101,7 +101,7 @@ impl R3Server {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn with_handler_timeout_for_test(handler_timeout: Duration) -> Self {
         Self {
             handler_timeout,
@@ -113,25 +113,25 @@ impl R3Server {
         *self.handler.write() = Some(handler);
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn identified_peer_count(&self) -> usize {
         self.identified.lock().len()
     }
 
     /// Simulates the identity table falling behind the transport, the way a lost
     /// `PeerIdentified` event would leave it.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn forget_identities_for_test(&self) {
         self.identified.lock().clear();
     }
 
     /// How many request payloads reached `RequestFrame::decode`.
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn decoded_count(&self) -> usize {
         self.decoded.load(Ordering::SeqCst)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn available_permits(&self) -> usize {
         self.permits.available_permits()
     }

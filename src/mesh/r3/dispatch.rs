@@ -76,10 +76,10 @@ pub(crate) struct KnockEvent {
 }
 
 /// Notes each knock in the debug log and nothing more.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) struct LoggingKnockSink;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl KnockSink for LoggingKnockSink {
     fn knock(&self, knock: KnockEvent) {
         debug!(

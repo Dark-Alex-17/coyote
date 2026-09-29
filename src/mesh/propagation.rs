@@ -848,6 +848,7 @@ pub(crate) mod test_support {
 
     /// The one message in a stored envelope, decrypted as `recipient`'s node would on a
     /// fetch. The stamp is split off unchecked.
+    #[cfg(unix)]
     pub(crate) fn stored_message(envelope: &[u8], recipient: &PrivateIdentity) -> WireMessage {
         let (_, elements) = decode_envelope(envelope);
         assert_eq!(elements.len(), 1, "one message per transfer");

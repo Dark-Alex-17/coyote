@@ -38,6 +38,7 @@ enum Mark {
 }
 
 /// A refusal the knock responder sends back instead of filing the knock.
+#[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Clone, Copy, Debug)]
 enum KnockRefusal {
     /// The wire byte of a refusal code other than the one that means "filed".
