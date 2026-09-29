@@ -3900,9 +3900,19 @@ impl RequestContext {
                 self.update_app_config(|app| app.dry_run = value);
             }
             "function_calling_support" => {
-                let value = value.parse().with_context(|| "Invalid value")?;
+                let value: bool = value.parse().with_context(|| "Invalid value")?;
                 if value && self.tool_scope.functions.is_empty() {
                     bail!("Function calling cannot be enabled because no functions are installed.")
+                }
+                if !value && self.app.mesh.get().is_some() {
+                    bail!(
+                        "Cannot disable function calling: the mesh is running and sends and receives messages through tools. Run .mesh off first, then .set function_calling_support false."
+                    );
+                }
+                if !value && self.app.config.mesh.enabled {
+                    bail!(
+                        "Cannot disable function calling: mesh.enabled is true and the mesh needs function calling. Run .mesh off first (or set mesh.enabled: false in config.yaml for the next start), then .set function_calling_support false."
+                    );
                 }
                 self.update_app_config(|app| app.function_calling_support = value);
             }
@@ -10678,6 +10688,99 @@ mod tests {
         assert!(Arc::ptr_eq(&slot_before, &ctx.app.mesh));
         assert!(ctx.app.mesh.stop().await.unwrap());
         started.relay_handle.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn set_function_calling_false_refuses_while_mesh_runtime_is_live() {
+        let _guard = TestConfigDirGuard::new();
+        let started = crate::mesh::test_support::started_runtime("rc-fc-refuse").await;
+        let mut ctx = create_test_ctx();
+        ctx.app.mesh.install(started.runtime.clone()).unwrap();
+        assert!(ctx.app.config.function_calling_support);
+        let app_before = Arc::clone(&ctx.app);
+
+        let err = ctx
+            .update(
+                "function_calling_support false",
+                utils::create_abort_signal(),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("the mesh is running"), "{err}");
+        assert!(err.contains(".mesh off"), "{err}");
+        assert!(ctx.app.config.function_calling_support);
+        assert!(
+            Arc::ptr_eq(&app_before, &ctx.app),
+            "a refused .set must leave the AppState untouched"
+        );
+        assert!(ctx.app.mesh.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    #[test]
+    fn set_function_calling_false_refuses_when_mesh_enabled_in_config_without_a_runtime() {
+        let mut ctx = create_test_ctx();
+        ctx.update_app_config(|app| app.mesh.enabled = true);
+        assert!(ctx.app.mesh.get().is_none());
+        assert!(ctx.app.config.function_calling_support);
+
+        let err = run_async(ctx.update(
+            "function_calling_support false",
+            utils::create_abort_signal(),
+        ))
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("mesh.enabled is true"), "{err}");
+        assert!(err.contains(".mesh off"), "{err}");
+        assert!(ctx.app.config.function_calling_support);
+        assert!(ctx.app.config.mesh.enabled);
+    }
+
+    #[test]
+    fn set_function_calling_false_succeeds_while_mesh_is_off() {
+        let mut ctx = create_test_ctx();
+        assert!(ctx.app.mesh.get().is_none());
+        assert!(!ctx.app.config.mesh.enabled);
+        assert!(ctx.app.config.function_calling_support);
+
+        run_async(ctx.update(
+            "function_calling_support false",
+            utils::create_abort_signal(),
+        ))
+        .unwrap();
+
+        assert!(!ctx.app.config.function_calling_support);
+        assert!(!ctx.app.config.mesh.enabled);
+    }
+
+    #[test]
+    fn set_function_calling_true_is_unaffected_by_the_mesh_guard() {
+        let mut ctx = create_test_ctx();
+        assert!(ctx.tool_scope.functions.is_empty());
+
+        let err = run_async(ctx.update(
+            "function_calling_support true",
+            utils::create_abort_signal(),
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("no functions are installed"), "{err}");
+        assert!(!err.contains(".mesh off"), "{err}");
+
+        ctx.update_app_config(|app| app.mesh.enabled = true);
+        let err = run_async(ctx.update(
+            "function_calling_support true",
+            utils::create_abort_signal(),
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("no functions are installed"), "{err}");
+        assert!(!err.contains(".mesh off"), "{err}");
     }
 
     fn mesh_tool_names(ctx: &RequestContext) -> Vec<&str> {
