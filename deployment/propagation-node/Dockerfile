@@ -23,7 +23,8 @@ COPY --chmod=0644 lxmd.config reticulum.config /opt/coyote-pn/
 
 USER lxmd
 
-# /data/lxmd: config, allowed, identity, storage/; /data/reticulum: config.
+# /data/lxmd: config, allowed, identity, storage/;
+# /data/reticulum: config, storage/ (transport identity, known destinations, path cache).
 VOLUME ["/data"]
 EXPOSE 4242/tcp
 

@@ -2,7 +2,11 @@
 set -eu
 
 case "${1:-}" in
-    lxmd|rnsd|rnstatus|rnpath|rnprobe|rnid|sh|bash)
+    lxmd)
+        shift
+        exec lxmd --config /data/lxmd --rnsconfig /data/reticulum "$@"
+        ;;
+    rnsd|sh|bash)
         exec "$@"
         ;;
 esac

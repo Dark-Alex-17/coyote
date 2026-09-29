@@ -2,7 +2,7 @@
 
 Status: normative. This document specifies the bytes that Coyote instances exchange over Reticulum. The reference implementation is `src/mesh/` in this repository; every value below is the code's value, named by its constant and by the test that pins it. Security considerations are section 15, invariants section 16, log redaction section 17 and the leniency register section 18; the conformance vector suite is the `cfg(test)` module `src/mesh/conformance/`, and section 20 maps every requirement id to what exercises it.
 
-Operator documentation (deployment, configuration, the `.mesh` commands) lives in the wiki at https://github.com/Dark-Alex-17/coyote/wiki/Mesh; this document is the wire format only.
+Operator documentation (deployment, configuration, the `.mesh` commands) lives in [the wiki](https://github.com/Dark-Alex-17/coyote/wiki/Mesh); this document is the wire format only.
 
 ## 1. Introduction and scope
 

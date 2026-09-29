@@ -15,8 +15,11 @@ message parked on the node is not picked up yet.
 
 ```sh
 docker build -t coyote-pn deployment/propagation-node
-docker run -d --name coyote-pn -p 4242:4242 -v coyote-pn-data:/data coyote-pn
+docker run -d --name coyote-pn -p <lan-or-vpn-ip>:4242:4242 -v coyote-pn-data:/data coyote-pn
 ```
+
+Publish the port on the LAN or VPN address the team's Coyote nodes dial, not on every address: the node relays for
+anyone who can reach 4242 (see "Private network").
 
 Behind a proxy that intercepts TLS, pass the CA bundle pip should trust as a build secret; the Dockerfile exports
 it as `PIP_CERT`:
@@ -29,7 +32,7 @@ The image runs as uid 1000. A bind mount instead of a named volume has to be own
 
 ```sh
 mkdir -p /srv/coyote-pn && chown 1000:1000 /srv/coyote-pn
-docker run -d --name coyote-pn -p 4242:4242 -v /srv/coyote-pn:/data coyote-pn
+docker run -d --name coyote-pn -p <lan-or-vpn-ip>:4242:4242 -v /srv/coyote-pn:/data coyote-pn
 ```
 
 Smoke:
@@ -45,22 +48,30 @@ $ docker logs coyote-pn
 The two hashes are the daemon's delivery destination and the propagation node destination; yours will differ.
 The second one is what Coyote lists under `propagation_nodes`.
 
-Any argument that names a program in the image (`lxmd`, `rnsd`, `rnstatus`, `rnpath`, `rnprobe`, `rnid`, `sh`,
-`bash`) runs that program instead of the daemon; anything else is appended to the daemon's command line, which is
-how `--version` above and `--exampleconfig` work.
+A first argument of `lxmd` runs lxmd with the volume's config directories and the remaining arguments, so
+`docker run --rm coyote-pn lxmd --version` and `lxmd --exampleconfig` work and `lxmd --status` looks at this
+node, not at `~/.lxmd`. `rnsd`, `sh` and `bash` run that program instead of the daemon. Anything else is
+appended to the daemon's command line, which is how `--version` above and `--exampleconfig` work. The other RNS
+tools (`rnstatus`, `rnpath`, `rnprobe`, `rnid`) are not passed through: with `share_instance = No` they would
+start an isolated second Reticulum instance and report nothing about the daemon.
 
 ## What is on the volume
 
-| Path                      | Purpose                                                                          |
-|---------------------------|----------------------------------------------------------------------------------|
-| `/data/lxmd/config`       | The daemon config; seeded from `lxmd.config` on first start, never overwritten   |
-| `/data/lxmd/allowed`      | Identity hashes allowed to fetch; created empty on first start                   |
-| `/data/lxmd/identity`     | The node's Reticulum identity; minted on first start, reused on every restart    |
-| `/data/lxmd/storage/`     | Held messages and peer state                                                     |
-| `/data/reticulum/config`  | The Reticulum config; seeded from `reticulum.config` on first start              |
+| Path                       | Purpose                                                                            |
+|----------------------------|------------------------------------------------------------------------------------|
+| `/data/lxmd/config`        | The daemon config; seeded from `lxmd.config` on first start, never overwritten     |
+| `/data/lxmd/allowed`       | Identity hashes allowed to fetch; created empty on first start                     |
+| `/data/lxmd/identity`      | The node's Reticulum identity; minted on first start, reused on every restart      |
+| `/data/lxmd/storage/`      | Held messages and peer state                                                       |
+| `/data/reticulum/config`   | The Reticulum config; seeded from `reticulum.config` on first start                |
+| `/data/reticulum/storage/` | Transport identity (minted for `enable_transport = Yes`), destinations, path cache |
 
 Because the identity lives on the volume the node keeps its destination hashes across restarts and upgrades. A
-fresh volume mints a fresh identity, and Coyote peers then see a different node.
+fresh volume mints a fresh identity, and Coyote peers then see a different node. Copying or moving `/data` (named
+volume or bind mount) to another host makes that host the same node with the same destination hashes. Copy the
+whole directory: `/data/lxmd/identity` alone moves the propagation-node destination but not the relay's
+transport identity under `/data/reticulum/storage/`. Two hosts running from copies of the same `/data` collide as
+one identity, so copy to move, never to duplicate.
 
 ## Private network
 
@@ -68,9 +79,9 @@ The shipped `lxmd.config` sets `enable_node = yes` and `auth_required = yes`, so
 `/data/lxmd/allowed` can fetch from the node (LXMF 0.9.6, `LXMF/Utilities/lxmd.py:103-116`).
 
 The file format, as the loader reads it (`lxmd.py:248-268`): one Reticulum identity hash per line, 32 hex
-characters, LF line endings, no comments, no inline whitespace. Any line that is not exactly 32 bytes is silently
-dropped, which includes a CRLF-terminated line. The file is read once at start, so restart the container after
-editing it.
+characters and nothing else on the line. LF or CRLF line endings both work; the loader splits on either and then
+keeps only lines whose remaining bytes are exactly 32, so a trailing space, inline whitespace, a comment or a
+blank-padded line is silently dropped. The file is read once at start, so restart the container after editing it.
 
 The hash to list is a Coyote node's mesh **identity** hash: the `identity:` line printed by `.mesh on` and the
 `identity` row of `.mesh info`. It is not the destination hash. Example, with two placeholders:
@@ -92,6 +103,16 @@ This fails closed. With `auth_required = yes` and an empty or missing `allowed`,
 `auth_required` gates fetching only. Posting into the node is open to anyone who can reach port 4242 and is
 governed by the node's stamp cost (`propagation_stamp_cost_target`, upstream default 16; Coyote accepts nodes
 with a cost up to 26). Network reachability, a firewall or a VPN, is the boundary for who can post.
+
+Peering is off: `lxmd.config` sets `autopeer = no`, where lxmd's default would peer with any propagation node
+whose announce it hears within four hops and sync it a copy of every held message (`auth_required` does not gate
+peer sync). So `allowed` plus network reachability are the only ways messages leave the node. For a deliberate
+multi-node team, `static_peers = <hashes>` and `from_static_only = yes` are the knobs (`lxmd.py:204-220`; both
+are in `lxmd --exampleconfig`).
+
+`reticulum.config` also turns off Reticulum's announce ingress control (`ingress_control = No`), the
+per-interface burst limiter for announces and path requests, so a new instance's first announce is not held back.
+Keep port 4242 behind a firewall or VPN, and set it back to `Yes` on a host that is reachable from outside.
 
 ## Coyote side
 
@@ -117,9 +138,13 @@ Deployment recipes and the trust model are in the wiki:
 
 - Logs go to stdout; read them with `docker logs coyote-pn`. The daemon is started without `-s`, which would
   send them to a file instead.
-- `lxmd --status` does not work inside this image: it starts a second Reticulum instance, which collides with
-  the daemon's listener because `share_instance = No`, and it needs the caller's identity in `control_allowed`.
-  The log is the status surface.
+- `docker run --rm -v coyote-pn-data:/data coyote-pn lxmd --status` points at the volume but does not work while
+  the daemon runs: it starts a second Reticulum instance, which collides with the daemon's listener because
+  `share_instance = No`, and it needs the caller's identity in `control_allowed`. The log is the status surface.
+- lxmd also registers a delivery destination for the daemon itself (the first hash in the smoke output).
+  Anything sent to it is written under `/data/lxmd/storage/messages` with no count cap;
+  `message_storage_limit` bounds the propagation store only. Size the volume for it, or set `on_inbound` to a
+  discard script, if the node is reachable by strangers.
 - Upgrade by rebuilding with `--build-arg LXMF_VERSION=<version>` (and `RNS_VERSION` if needed) and starting the
   new image against the same volume; identity, config and held messages carry over.
 - `reticulum.config` sets `enable_transport = Yes`, so the container also relays announces and paths between
