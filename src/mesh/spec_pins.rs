@@ -1014,14 +1014,14 @@ mod tests {
     use crate::config::mesh_envoy::ENVOY_RUN_TIMEOUT_SECS;
     use crate::mesh::r3::RefusalCode;
     use crate::mesh::{
-        announce, card, knock, knocks, limits, message, peers, pending, propagation,
-        propagation_fetch, propagation_nodes, protocol, r3,
+        announce, card, identity, knock, knocks, limits, message, peers, pending, propagation,
+        propagation_fetch, propagation_nodes, protocol, r3, trust,
     };
     use lxmf_core::constants::{FIELD_CUSTOM_DATA, FIELD_CUSTOM_TYPE};
     use rns_transport::hash::ADDRESS_HASH_SIZE;
     use std::time::Duration;
 
-    const EXPECTED_LITERALS: &str = r#"1,1,10,16,262144,128,"/knock","/status","/message",30,10,10,2,20,16,0xf0,0xf1,0xf3,0xf4,0xf5,0xf6,0xfd,0xfe,"COYM",64,300,900,3,2700,1800,1024,"coyote.knock/1",200,15,10,256,3,600,256,16,1,0,1,2,64,280,64,64,120,280,"coyote.peer/1",1,120,4000,64,4096,8,15,10,604800,256,3600,120,256,1,60,100000,120,26,60,2,60,1024,64,240,131072,112,4096,15552000,3,256,0,32,0xfb,0xfc,8,64,256,64,8"#;
+    const EXPECTED_LITERALS: &str = r#"1,1,10,16,262144,128,"/knock","/status","/message",30,10,10,2,20,16,0xf0,0xf1,0xf3,0xf4,0xf5,0xf6,0xfd,0xfe,"COYM",64,300,900,3,2700,1800,1024,"coyote.knock/1",200,15,10,256,3,600,256,16,1,0,1,2,64,280,64,64,120,280,"coyote.peer/1",1,120,4000,64,4096,8,15,10,604800,256,3600,120,256,1,60,100000,120,26,60,2,60,1024,64,240,131072,112,4096,15552000,3,256,0,32,0xfb,0xfc,8,64,256,64,8,1,1,1,1,1,1,1"#;
 
     fn expected_constants() -> Vec<(&'static str, String)> {
         let secs = |d: Duration| d.as_secs().to_string();
@@ -1250,6 +1250,28 @@ mod tests {
             (
                 "ENVOY_QUEUE_MAX",
                 crate::config::mesh_envoy::ENVOY_QUEUE_MAX.to_string(),
+            ),
+            ("TRUST_FILE_VERSION", trust::TRUST_FILE_VERSION.to_string()),
+            (
+                "KNOCK_RECORD_VERSION",
+                knocks::KNOCK_RECORD_VERSION.to_string(),
+            ),
+            (
+                "PENDING_RECORD_VERSION",
+                pending::PENDING_RECORD_VERSION.to_string(),
+            ),
+            (
+                "INBOUND_RECORD_VERSION",
+                pending::INBOUND_RECORD_VERSION.to_string(),
+            ),
+            (
+                "PREDECESSOR_RECORD_VERSION",
+                identity::PREDECESSOR_RECORD_VERSION.to_string(),
+            ),
+            ("PEER_TABLE_VERSION", peers::PEER_TABLE_VERSION.to_string()),
+            (
+                "PROPAGATION_STORE_VERSION",
+                propagation_fetch::PROPAGATION_STORE_VERSION.to_string(),
             ),
         ]
     }

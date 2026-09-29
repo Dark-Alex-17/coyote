@@ -23,7 +23,7 @@ This document does not specify:
 
 - Cryptography. Identity keys, Link encryption, signatures and cryptographic agility are Reticulum's and LXMF's; section 15 states what this document relies on them for and specifies no cipher, key size or negotiation of its own.
 - The human-facing `.mesh` REPL surface and its output text, except where a stored or shown value fixes a wire form.
-- On-disk formats, except where a stored form fixes a canonical form (section 3) or a wire value (the knock record, section 8.4).
+- On-disk formats, except where a stored form fixes a canonical form (section 3) or a wire value (the knock record, section 8.4), or where section 14.1 fixes the versioning discipline every on-disk store follows.
 
 Section 19 is the single authoritative listing of constants; every constant named in prose is written as `NAME` with its value and is listed there.
 
@@ -935,10 +935,31 @@ Registry of code points allocated by this document:
 | `1` | protocol version | `MESH_PROTOCOL_VERSION` | 7 |
 | `1` | card schema version | `STATUS_CARD_VERSION` | 9.2 |
 | `1` | message schema version | `PEER_WIRE_VERSION` | 10.1 |
+| `1` | on-disk schema version | `TRUST_FILE_VERSION`, `KNOCK_RECORD_VERSION`, `PENDING_RECORD_VERSION`, `INBOUND_RECORD_VERSION`, `PREDECESSOR_RECORD_VERSION`, `PEER_TABLE_VERSION`, `PROPAGATION_STORE_VERSION` | 14.1 |
 
 ## 14. Requirement-id stability
 
 An id, once published, is never renumbered and never reused. A retired requirement keeps its id; its body text is replaced by `[RETIRED]` and its index entry is kept with the same marker. A new requirement takes the next unused number in its area, wherever it lands in the document. A reference to an id is written plain (`MESH-MSG-007`); the bold-bracket form appears only at the definition.
+
+### 14.1 On-disk schema versioning
+
+The layouts of the stores below are not wire format and stay a section 1 non-goal; what this section fixes is the one versioning discipline every one of them follows, so that a store written by another layout is refused by its version and never misread.
+
+| File | Directory | Versioned per | Constant | Refusal remedy |
+|---|---|---|---|---|
+| `trust.yaml` | config `mesh/` | file | `TRUST_FILE_VERSION` | user file: fix it or move it aside |
+| `knocks.jsonl` | cache `mesh/` | line | `KNOCK_RECORD_VERSION` | cache: move it aside |
+| `pending-<instance_id>.jsonl` | cache `mesh/` | line | `PENDING_RECORD_VERSION` | cache: move it aside |
+| `inbound-<instance_id>.jsonl` | cache `mesh/` | line | `INBOUND_RECORD_VERSION` | cache: move it aside |
+| `identity.predecessors.jsonl` | config `mesh/` | line | `PREDECESSOR_RECORD_VERSION` | user file: fix it or move it aside |
+| `peers.json` | cache `mesh/` | file | `PEER_TABLE_VERSION` | cache: move it aside |
+| `propagation.json` | cache `mesh/` | file | `PROPAGATION_STORE_VERSION` | cache: move it aside |
+
+**[MESH-CODE-003]** Every store in the table MUST carry its schema version, per file or per line as the table says, in a `version` field read before any other, and a writer MUST write the version this build reads: `TRUST_FILE_VERSION`, `KNOCK_RECORD_VERSION`, `PENDING_RECORD_VERSION`, `INBOUND_RECORD_VERSION`, `PREDECESSOR_RECORD_VERSION`, `PEER_TABLE_VERSION` and `PROPAGATION_STORE_VERSION`, all `1` (section 19; `every_on_disk_store_version_is_the_baseline`).
+
+**[MESH-CODE-004]** A reader MUST read the version before any other field and MUST refuse the whole store, never one record and never a shorter list, when the version is not the one this build writes, and the refusal MUST name the file path, the version found, the version this build writes and the remedy: a newer version asks the person to upgrade Coyote, an older one states that no migration exists for versions before the baseline and asks them to move the file aside, and a version that cannot be read at all is an unknown shape, refused with the same remedy and naming the version this build writes. A disposable cache whose whole file is one document (`peers.json`, `propagation.json`) can set an unknown shape aside itself and start empty, but a readable version it does not write is refused under MESH-CODE-004 all the same. The per-store fixtures (`open_refuses_a_newer_file_version_naming_the_path`, `open_refuses_a_pre_baseline_file_version_as_having_no_migration`, `open_refuses_a_file_without_a_version`; src/mesh/trust.rs), (`newer_record_version_refuses_naming_the_file`, `pre_baseline_record_version_refuses_as_having_no_migration`, `a_line_without_a_version_refuses_the_whole_cache`; src/mesh/knocks.rs), (`a_newer_pending_line_refuses_the_whole_store_and_surfaces_no_record`, `a_pre_baseline_pending_line_refuses_as_having_no_migration`, `a_pending_line_without_a_version_refuses_the_whole_store`, `a_newer_inbound_line_refuses_the_whole_store_and_surfaces_no_record`, `a_pre_baseline_inbound_line_refuses_as_having_no_migration`, `an_inbound_line_without_a_version_refuses_the_whole_store`; src/mesh/pending.rs), (`predecessors_refuses_a_newer_line_and_shows_none_of_the_history`, `predecessors_refuses_a_pre_baseline_line_as_having_no_migration`, `predecessors_refuses_a_line_without_a_version`; src/mesh/identity.rs), (`load_refuses_a_newer_table_version_naming_the_path`, `load_refuses_a_pre_baseline_table_version_as_having_no_migration`, `load_sets_aside_an_unversioned_table_and_starts_empty`; src/mesh/peers.rs) and (`store_from_a_newer_coyote_is_refused_by_name`, `store_from_before_the_baseline_is_refused_as_having_no_migration`, `garbage_and_malformed_stores_are_set_aside`; src/mesh/propagation_fetch.rs) pin each store's wording.
+
+**[MESH-CODE-005]** Version `1` is the baseline, and every on-disk struct and enum rejects a field it does not know, so a current-version record carrying such a field is refused, never read, and any change to a layout, a field added included, MUST bump the store's constant and MUST ship either a migration or an explicit refusal of the older version, and a version number MUST NOT be reused (MESH-CODE-001). The scan (`every_on_disk_struct_rejects_unknown_fields`, `every_deserializable_mesh_type_is_classified`; src/mesh/schema.rs) covers every type, and the per-store fixtures (`a_record_with_a_field_this_coyote_does_not_know_is_refused`, `a_reply_with_a_field_this_coyote_does_not_know_refuses_the_store`, `an_inbound_record_with_an_unknown_field_is_refused`; src/mesh/pending.rs), (`predecessors_refuses_an_unknown_field`; src/mesh/identity.rs) and (`load_sets_aside_a_current_table_with_an_unknown_field`; src/mesh/peers.rs) pin the refusal.
 
 ## 15. Security considerations
 
@@ -952,7 +973,7 @@ The attacker is on the path between two nodes or operates a propagation node. Th
 |---|---|---|
 | Eavesdropping on a Link | Reticulum's: every R3 exchange runs inside a Link, whose encryption this document inherits | MESH-SEC-001 |
 | Eavesdropping on an announce | In scope: announce application data is plaintext by design and carries nothing private | MESH-SEC-002 |
-| Eavesdropping at rest | In scope for the mesh log lines of section 17, which carry neither peer text nor a full identity or destination hash; out of scope for the model client's own lines in the same log file (section 17, closing paragraph) and for the on-disk stores (the trust store, the knock cache of section 8.4, the pending and inbound stores), which hold full hashes, and all but the trust store peer text, in plaintext under the config and cache directories and rely on filesystem permissions | section 17, section 15.6 |
+| Eavesdropping at rest | In scope for the mesh log lines of section 17, which carry neither peer text nor a full identity or destination hash; out of scope for the model client's own lines in the same log file (section 17, closing paragraph) and for the on-disk stores of section 14.1, which hold full hashes, and all but the trust store and the identity history peer text, in plaintext under the config and cache directories and rely on filesystem permissions | section 17, section 15.6 |
 | Replay | In scope: identity is bound to the Link, and store-and-forward bodies are deduplicated by id inside a stated window | MESH-SEC-003, MESH-SEC-007 |
 | Insertion | In scope: an unproven or unknown identity hears silence, and a fetched body needs a verifying signature and a trusted signer | MESH-SEC-001, MESH-SEC-005 |
 | Deletion | Out of scope: neither Reticulum nor LXMF guarantees delivery, so a dropped request is a timeout and a dropped spooled message is invisible to both ends | MESH-SEC-004 |
@@ -1031,7 +1052,7 @@ Every resource this document names is bounded by a constant of section 19, with 
 - Traffic analysis: an observer of an interface learns that two destinations exchange traffic, how much and when.
 - Floods below R3: announce floods, path table exhaustion and interface saturation are Reticulum's to bound; this document bounds only what a node keeps from what Reticulum delivers.
 - Resource assembly memory: until the transport's advertisement-time reject path is fixed upstream (docs/mesh/upstream-issues.md, draft A1), the memory a peer can make the node assemble per in-flight resource is bounded by the transport's 32 MiB cap alone, and `MAX_CONCURRENT_INBOUND_REQUESTS` = `16` applies only after assembly.
-- On-disk stores: the trust store (`trust.yaml` under the config directory's `mesh/`) holds full identity and destination hashes with the human's labels and notes; the knock cache (`knocks.jsonl`), the pending store (`pending-<instance_id>.jsonl`) and the inbound store (`inbound-<instance_id>.jsonl`), all under the cache directory's `mesh/`, hold full hashes and peer text (display names, intros, questions and replies) in plaintext. A reader with filesystem access reads them; their protection is the filesystem's and their on-disk formats are a section 1 non-goal.
+- On-disk stores: under the config directory's `mesh/`, the trust store (`trust.yaml`) holds full identity and destination hashes with the human's labels and notes, and the identity history (`identity.predecessors.jsonl`) holds the full identity hash of each retired identity with when and why it was retired; the knock cache (`knocks.jsonl`), the pending store (`pending-<instance_id>.jsonl`), the inbound store (`inbound-<instance_id>.jsonl`), the peer table (`peers.json`) and the propagation store (`propagation.json`), all under the cache directory's `mesh/`, hold full hashes and peer text (display names, intros, questions and replies) in plaintext. A reader with filesystem access reads them; their protection is the filesystem's and their on-disk formats are a section 1 non-goal, section 14.1 fixing only the versioning discipline they share.
 - A propagation node's operator: the node can drop and delay spooled messages, and can replay one beyond the dedup window of section 15.3 (a replay inside it is refused), and can read the destination hash, size and timing of each.
 - The human's own trust decisions: this document does not specify how a human verifies an identity hash before trusting it.
 
@@ -1181,6 +1202,13 @@ A leniency is a place where the reference deliberately does something other than
 | `INBOUND_MAX_ENTRIES` | `256` | src/mesh/pending.rs | inbound_store_survives_reopen_and_prunes_by_ttl_and_cap |
 | `KNOCK_QUEUE_CAPACITY` | `64` | src/mesh/knock.rs | the_channel_sink_never_waits_on_a_reader_and_counts_what_it_drops |
 | `ENVOY_QUEUE_MAX` | `8` | src/config/mesh_envoy.rs | a_ninth_job_is_refused_while_the_worker_is_parked |
+| `TRUST_FILE_VERSION` | `1` | src/mesh/trust.rs | open_refuses_a_newer_file_version_naming_the_path |
+| `KNOCK_RECORD_VERSION` | `1` | src/mesh/knocks.rs | newer_record_version_refuses_naming_the_file |
+| `PENDING_RECORD_VERSION` | `1` | src/mesh/pending.rs | a_newer_pending_line_refuses_the_whole_store_and_surfaces_no_record |
+| `INBOUND_RECORD_VERSION` | `1` | src/mesh/pending.rs | a_newer_inbound_line_refuses_the_whole_store_and_surfaces_no_record |
+| `PREDECESSOR_RECORD_VERSION` | `1` | src/mesh/identity.rs | predecessors_refuses_a_newer_line_and_shows_none_of_the_history |
+| `PEER_TABLE_VERSION` | `1` | src/mesh/peers.rs | load_refuses_a_newer_table_version_naming_the_path |
+| `PROPAGATION_STORE_VERSION` | `1` | src/mesh/propagation_fetch.rs | store_from_a_newer_coyote_is_refused_by_name |
 
 ## 20. Conformance coverage
 
@@ -1538,6 +1566,9 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 | MESH-EXT-008 | Registry (Valid) |
 | MESH-CODE-001 | Registry (Valid) |
 | MESH-CODE-002 | Registry (Valid) |
+| MESH-CODE-003 | Registry (Valid) |
+| MESH-CODE-004 | Registry (Valid) |
+| MESH-CODE-005 | Registry (Valid) |
 | MESH-SEC-001 | `empty_trust_list_admits_nobody_and_never_decodes`, `an_identity_untrusted_before_handle_is_answered_silently` |
 | MESH-SEC-002 | `encode_layout_is_magic_version_name`, `app_data_carries_only_version_and_display_name` |
 | MESH-SEC-003 | `a_claimed_instance_is_bound_to_the_proven_identity`, `identity_is_tracked_only_after_proof_and_forgotten_on_close` |
@@ -1873,6 +1904,9 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 - [MESH-EXT-008](#12-extensibility) -- schema versions bump for incompatible changes
 - [MESH-CODE-001](#13-code-point-immutability) -- code point semantics never change
 - [MESH-CODE-002](#13-code-point-immutability) -- new semantics take a new code point
+- [MESH-CODE-003](#141-on-disk-schema-versioning) -- every on-disk store carries its schema version
+- [MESH-CODE-004](#141-on-disk-schema-versioning) -- a version this build does not write refuses the whole store, naming file, versions and remedy
+- [MESH-CODE-005](#141-on-disk-schema-versioning) -- a layout change bumps the version and ships a migration or a refusal
 - [MESH-SEC-001](#152-channel-security) -- every exchange inside a Link with a proven, trusted identity, else silence
 - [MESH-SEC-002](#152-channel-security) -- announce data carries only magic, version and display name
 - [MESH-SEC-003](#152-channel-security) -- identity bound to the link's proof, forgotten on close

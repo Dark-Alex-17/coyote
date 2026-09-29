@@ -20,11 +20,12 @@ use crate::mesh::card::{
     OBJECTIVE_MAX_CHARS, PLAN_TITLE_MAX_CHARS, REPO_NAME_MAX_CHARS, STATE_IDLE, STATE_UNKNOWN,
     STATE_WORKING, STATUS_CARD_VERSION, StatusCard, StatusError, TODO_GOAL_MAX_CHARS,
 };
+use crate::mesh::identity::{PREDECESSOR_RECORD_VERSION, Predecessor};
 use crate::mesh::knock::{
     KNOCK_TYPE, KnockError, KnockIntro, KnockMessage, decode_knock_message, intro_from_r3_body,
     knock_message,
 };
-use crate::mesh::knocks::KNOCK_INTRO_MAX_CHARS;
+use crate::mesh::knocks::{KNOCK_INTRO_MAX_CHARS, KNOCK_RECORD_VERSION, KnockRecord};
 use crate::mesh::limits::{PEER_RETRY_AFTER_CAPACITY, PeerRefusal, RefusalReason};
 use crate::mesh::message::{
     OutboundPeer, PEER_CONTENT_MAX_CHARS, PEER_FIELDS_MAX_BYTES, PEER_FIELDS_MAX_DEPTH,
@@ -33,7 +34,11 @@ use crate::mesh::message::{
     from_r3_body, is_received_reply, is_wire_id, peer_lxmf_message, received_reply, to_r3_body,
 };
 use crate::mesh::peers::{
-    PEER_STALE_AFTER, PEER_TABLE_MAX_ENTRIES, PEER_TTL, PeerSighting, PeerTable,
+    PEER_STALE_AFTER, PEER_TABLE_MAX_ENTRIES, PEER_TABLE_VERSION, PEER_TTL, PeerRecord,
+    PeerSighting, PeerTable, PeerTableFile,
+};
+use crate::mesh::pending::{
+    INBOUND_RECORD_VERSION, InboundRecord, PENDING_RECORD_VERSION, PendingRecord, PendingState,
 };
 use crate::mesh::propagation::{
     MAX_ACCEPTED_STAMP_COST, OutboundMessage, PropagationError, PropagationNode,
@@ -41,7 +46,8 @@ use crate::mesh::propagation::{
     prepare_envelope,
 };
 use crate::mesh::propagation_fetch::{
-    Discard, InboundMessage, MAX_FETCHED_MESSAGE_BYTES, MIN_FETCHED_MESSAGE_BYTES, check_bounds,
+    Discard, InboundMessage, MAX_FETCHED_MESSAGE_BYTES, MIN_FETCHED_MESSAGE_BYTES,
+    PROPAGATION_STORE_VERSION, check_bounds,
 };
 use crate::mesh::propagation_nodes::{PROPAGATION_NODE_TABLE_MAX_ENTRIES, PropagationNodeTable};
 use crate::mesh::protocol::{
@@ -51,8 +57,11 @@ use crate::mesh::protocol::{
 use crate::mesh::r3::{
     DispatchError, KNOCK_PATH, MESSAGE_PATH, NAME_HASH_LEN, OriginName, RefusalCode, STATUS_PATH,
 };
+use crate::mesh::schema::{Remedy, unversioned_refusal, version_refusal};
 use crate::mesh::test_support::{TempDir, TrustList};
-use crate::mesh::trust::{Decision, LiveMesh, Rule, TrustOptions, TrustStore, Verdict};
+use crate::mesh::trust::{
+    Decision, LiveMesh, Rule, TRUST_FILE_VERSION, TrustOptions, TrustStore, Verdict,
+};
 use crate::mesh::{canonical_hash, destination_address, display_text, hex_lower};
 
 use lxmf_core::constants::{FIELD_CUSTOM_DATA, FIELD_CUSTOM_TYPE};
@@ -64,10 +73,13 @@ use rmpv::Value;
 use rns_transport::destination::{DestinationDesc, DestinationName, SingleOutputDestination};
 use rns_transport::hash::AddressHash;
 use rns_transport::identity::PrivateIdentity;
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
 use std::fmt::Debug;
 use std::future::Future;
 use std::io::Cursor;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
@@ -3459,6 +3471,28 @@ fn ext_vectors() -> Vec<Vector> {
     ]
 }
 
+/// A current-version `record` with one key its layout does not know, fed back through the
+/// same struct the store reads: it has to come back as a refusal that names the key.
+fn refuses_an_unknown_key<T: Serialize + DeserializeOwned>(
+    what: &str,
+    record: &T,
+) -> Result<(), String> {
+    let mut value = serde_json::to_value(record).map_err(|error| format!("{what}: {error}"))?;
+    value
+        .as_object_mut()
+        .ok_or_else(|| format!("{what}: serializes to something other than an object"))?
+        .insert("later_field".to_string(), serde_json::Value::from(1));
+    match serde_json::from_value::<T>(value) {
+        Ok(_) => Err(format!(
+            "{what}: a record with a key the layout does not know was read"
+        )),
+        Err(error) => ensure(
+            error.to_string().contains("later_field"),
+            format!("{what}: the refusal does not name the unknown key: {error}"),
+        ),
+    }
+}
+
 fn code_vectors() -> Vec<Vector> {
     vec![
         row(
@@ -3725,6 +3759,143 @@ fn code_vectors() -> Vec<Vector> {
                     ])),
                     None,
                 )
+            }),
+        ),
+        row(
+            "MESH-CODE-003",
+            Kind::Valid,
+            Case::Registry(|| {
+                same("TRUST_FILE_VERSION", TRUST_FILE_VERSION, 1)?;
+                same("KNOCK_RECORD_VERSION", KNOCK_RECORD_VERSION, 1)?;
+                same("PENDING_RECORD_VERSION", PENDING_RECORD_VERSION, 1)?;
+                same("INBOUND_RECORD_VERSION", INBOUND_RECORD_VERSION, 1)?;
+                same("PREDECESSOR_RECORD_VERSION", PREDECESSOR_RECORD_VERSION, 1)?;
+                same("PEER_TABLE_VERSION", PEER_TABLE_VERSION, 1)?;
+                same("PROPAGATION_STORE_VERSION", PROPAGATION_STORE_VERSION, 1)
+            }),
+        ),
+        row(
+            "MESH-CODE-004",
+            Kind::Valid,
+            Case::Registry(|| {
+                let path = Path::new("knocks.jsonl");
+                let newer = version_refusal("knock cache", path, Some(2), 2, 1, Remedy::Cache);
+                for needle in [
+                    "knocks.jsonl",
+                    "line 2",
+                    "version 2",
+                    "version 1",
+                    "upgrade Coyote",
+                    "move the file aside",
+                ] {
+                    ensure(
+                        newer.contains(needle),
+                        format!("a newer version's refusal lacks {needle:?}: {newer}"),
+                    )?;
+                }
+                let older = version_refusal("knock cache", path, Some(2), 0, 1, Remedy::Cache);
+                ensure(
+                    older.contains("no migration exists for versions before 1"),
+                    format!("an older version's refusal does not say no migration exists: {older}"),
+                )?;
+                let unversioned =
+                    unversioned_refusal("knock cache", path, Some(2), 1, Remedy::Cache);
+                for needle in ["no readable `version` field", "writes version 1"] {
+                    ensure(
+                        unversioned.contains(needle),
+                        format!("an unreadable version's refusal lacks {needle:?}: {unversioned}"),
+                    )?;
+                }
+                Ok(())
+            }),
+        ),
+        row(
+            "MESH-CODE-005",
+            Kind::Valid,
+            Case::Registry(|| {
+                refuses_an_unknown_key(
+                    "KnockRecord",
+                    &KnockRecord {
+                        version: KNOCK_RECORD_VERSION,
+                        received_at: "2027-01-15T05:13:20Z".to_string(),
+                        identity_hash: "0a".repeat(16),
+                        destination_hash: "0b".repeat(16),
+                        name_hash: "0c".repeat(10),
+                        display_name: None,
+                        intro: None,
+                        hops: 1,
+                    },
+                )?;
+                refuses_an_unknown_key(
+                    "PendingRecord",
+                    &PendingRecord {
+                        version: PENDING_RECORD_VERSION,
+                        id: "q1".to_string(),
+                        peer_destination: "0b".repeat(16),
+                        peer_identity: "0a".repeat(16),
+                        question: "what time is it".to_string(),
+                        sent_at: "2027-01-15T05:13:20Z".to_string(),
+                        timeout_at: "2027-01-15T05:23:20Z".to_string(),
+                        state: PendingState::Open,
+                        reply: None,
+                    },
+                )?;
+                refuses_an_unknown_key(
+                    "InboundRecord",
+                    &InboundRecord {
+                        version: INBOUND_RECORD_VERSION,
+                        id: "q1".to_string(),
+                        peer_destination: "0b".repeat(16),
+                        peer_identity: "0a".repeat(16),
+                        question: "what time is it".to_string(),
+                        envoy_question: String::new(),
+                        received_at: "2027-01-15T05:13:20Z".to_string(),
+                    },
+                )?;
+                refuses_an_unknown_key(
+                    "Predecessor",
+                    &Predecessor {
+                        version: PREDECESSOR_RECORD_VERSION,
+                        identity_hash: "0a".repeat(16),
+                        rotated_at: "2027-01-15T05:13:20Z".to_string(),
+                        reason: "rotated".to_string(),
+                    },
+                )?;
+                refuses_an_unknown_key(
+                    "PeerTableFile",
+                    &PeerTableFile {
+                        version: PEER_TABLE_VERSION,
+                        peers: vec![],
+                    },
+                )?;
+                refuses_an_unknown_key(
+                    "PeerRecord",
+                    &PeerRecord {
+                        destination_hash: "0b".repeat(16),
+                        identity_hash: "0a".repeat(16),
+                        name_hash: "0c".repeat(10),
+                        display_name: None,
+                        protocol_version: 1,
+                        compatibility: Compatibility::Compatible,
+                        hops: 1,
+                        first_seen: UNIX_EPOCH,
+                        last_seen: UNIX_EPOCH,
+                    },
+                )?;
+                match serde_json::from_value::<Compatibility>(
+                    serde_json::json!({"incompatible": {"found": 2, "later": 1}}),
+                ) {
+                    Ok(_) => Err(
+                        "Compatibility: a variant with a key the layout does not know was read"
+                            .to_string(),
+                    ),
+                    Err(error) => ensure(
+                        error.to_string().contains("later"),
+                        format!(
+                            "Compatibility: the refusal does not name the unknown key: {error}"
+                        ),
+                    ),
+                }
             }),
         ),
     ]
