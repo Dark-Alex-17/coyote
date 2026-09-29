@@ -832,14 +832,10 @@ impl Validator for ReplValidator {
 pub async fn run_repl_command(
     ctx: &mut RequestContext,
     abort_signal: AbortSignal,
-    mut line: &str,
+    line: &str,
 ) -> Result<bool> {
     ctx.pending_tasks_guardrail_count = 0;
-    if let Ok(Some(captures)) = MULTILINE_RE.captures(line)
-        && let Some(text_match) = captures.get(1)
-    {
-        line = text_match.as_str();
-    }
+    let line = unwrap_multiline(line);
     match parse_command(line) {
         Some((cmd, args)) => match cmd {
             ".help" => {
@@ -2160,6 +2156,22 @@ fn parse_command(line: &str) -> Option<(&str, Option<&str>)> {
         }
         _ => None,
     }
+}
+
+pub(crate) fn unwrap_multiline(line: &str) -> &str {
+    if let Ok(Some(captures)) = MULTILINE_RE.captures(line)
+        && let Some(text_match) = captures.get(1)
+    {
+        return text_match.as_str();
+    }
+    line
+}
+
+/// The command token the REPL would dispatch on for `line`, after
+/// unwrapping a `:::` multiline fence; `None` when the line is not a
+/// command.
+pub(crate) fn command_head(line: &str) -> Option<&str> {
+    parse_command(unwrap_multiline(line)).map(|(cmd, _)| cmd)
 }
 
 fn try_extract_shell_command(line: &str) -> Option<&str> {
@@ -3690,6 +3702,24 @@ mod tests {
     #[test]
     fn parse_command_dot_only() {
         assert_eq!(parse_command("."), Some((".", None)));
+    }
+
+    #[test]
+    fn command_head_unwraps_multiline_fence() {
+        assert_eq!(command_head("::: .mesh trust abc :::"), Some(".mesh"));
+        assert_eq!(command_head(":::\n.mesh status\n:::"), Some(".mesh"));
+    }
+
+    #[test]
+    fn command_head_returns_command_token_without_args() {
+        assert_eq!(command_head(".model x"), Some(".model"));
+        assert_eq!(command_head("  .mesh"), Some(".mesh"));
+    }
+
+    #[test]
+    fn command_head_prose_returns_none() {
+        assert_eq!(command_head("hello world"), None);
+        assert_eq!(command_head("::: echo .mesh :::"), None);
     }
 
     #[test]

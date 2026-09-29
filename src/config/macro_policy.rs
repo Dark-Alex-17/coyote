@@ -200,10 +200,12 @@ fn resolve_state(
         };
     }
 
-    if let Err(reason) = &discovered.definition {
-        return MacroState::Invalid {
-            reason: reason.clone(),
-        };
+    let invalid_reason = match &discovered.definition {
+        Err(reason) => Some(reason.clone()),
+        Ok(definition) => definition.forbidden_mesh_step(),
+    };
+    if let Some(reason) = invalid_reason {
+        return MacroState::Invalid { reason };
     }
 
     if let Some((level, list)) = allowlist
@@ -700,6 +702,49 @@ mod tests {
         );
     }
 
+    fn disc_with_mesh_step(name: &str) -> DiscoveredMacro {
+        DiscoveredMacro {
+            definition: Ok(Macro {
+                steps: vec![".model x".to_string(), "  .mesh trust {{peer}}".to_string()],
+                ..valid_macro()
+            }),
+            ..disc(name, MacroSource::Global)
+        }
+    }
+
+    fn assert_mesh_invalid(state: &MacroState) {
+        let MacroState::Invalid { reason } = state else {
+            panic!("expected Invalid, got {state:?}");
+        };
+        assert!(reason.contains("step 2"), "{reason}");
+        assert!(reason.contains(".mesh trust {{peer}}"), "{reason}");
+    }
+
+    #[test]
+    fn mesh_step_is_invalid_and_keeps_description_and_isolated() {
+        let policy = resolve(vec![disc_with_mesh_step("meshy")], None, None, None, None);
+
+        assert_mesh_invalid(state_of(&policy, "meshy"));
+        let row = policy.macros.iter().find(|m| m.name == "meshy").unwrap();
+        assert_eq!(row.description.as_deref(), Some("a test macro"));
+        assert_eq!(row.isolated, Some(true));
+    }
+
+    #[test]
+    fn mesh_step_invalid_wins_over_allowlist_exclusion() {
+        let l = list(&["other"]);
+
+        let policy = resolve(
+            vec![disc_with_mesh_step("meshy")],
+            Some(&l),
+            None,
+            None,
+            None,
+        );
+
+        assert_mesh_invalid(state_of(&policy, "meshy"));
+    }
+
     #[test]
     fn workspace_shadowing_keeps_both_rows_and_find_returns_workspace() {
         let discovered = vec![
@@ -852,6 +897,25 @@ mod tests {
 
             assert_eq!(discovered.len(), 1);
             assert!(discovered[0].definition.is_err());
+        });
+    }
+
+    #[test]
+    fn discovered_mesh_step_macro_resolves_invalid() {
+        with_macro_dirs(|_, global| {
+            write_macro(
+                global,
+                "meshy",
+                "steps:\n  - \".model x\"\n  - \"  .mesh trust {{peer}}\"\n",
+            );
+
+            let discovered = discover_macros_in(&[(MacroSource::Global, global.to_path_buf())]);
+            assert_eq!(discovered.len(), 1);
+            assert!(discovered[0].definition.is_ok());
+
+            let policy = MacroPolicy::effective_with(discovered, None, None, None, None, &[]);
+
+            assert_mesh_invalid(state_of(&policy, "meshy"));
         });
     }
 

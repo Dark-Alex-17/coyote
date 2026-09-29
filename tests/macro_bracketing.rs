@@ -6,7 +6,8 @@
 //! global agent.* hooks admitted through the agent's `global_hooks: ["*"]`
 //! wildcard, so the fixture also exercises the whitelist grammar
 //! end-to-end — and stays observable even if a failing step leaves the
-//! context without a loaded agent.
+//! context without a loaded agent. A macro refused at load (a literal
+//! `.mesh` step) runs nothing and still closes the bracket with agent.failed.
 
 use std::env;
 use std::fs;
@@ -249,6 +250,119 @@ fn agent_macro_failure_closes_the_bracket_with_exactly_one_failed() {
         "steps:\n  - \".agent no-such-agent-zz\"\n",
         &["--agent", "probe-macro", "--macro", "probe"],
         false,
+    );
+}
+
+#[test]
+fn literal_mesh_step_is_refused_at_load_and_closes_the_bracket() {
+    let dir = fresh_config_dir("mesh-step-refused");
+    let _cleanup = TempDirGuard(dir.clone());
+    write_fixture(
+        &dir,
+        "steps:\n  - \".set temperature 0.5\"\n  - \".mesh trust abc\"\n",
+    );
+
+    let output = run_coyote(&dir, &["--agent", "probe-macro", "--macro", "probe"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "unexpected exit {:?}\nstdout: {stdout}\nstderr: {stderr}",
+        output.status
+    );
+    assert!(
+        stderr.contains(".mesh trust abc") && stderr.contains("step 2"),
+        "stderr: {stderr}"
+    );
+    assert!(stderr.contains("refused at load"), "stderr: {stderr}");
+    assert!(
+        !stdout.contains(">> "),
+        "no step may echo before the refusal\nstdout: {stdout}"
+    );
+
+    wait_for_markers(&dir, &["STARTED", "FAILED"]);
+    assert_started_and_single_terminal(&dir, "FAILED");
+}
+
+/// Usage probe (spec (b)): the bare `coyote --macro` route consults no
+/// policy, so the load-time refusal is the only gate on it — and it must
+/// land BEFORE the first step runs. The first step here is a shell
+/// passthrough that appends a `STEP_RAN` marker, so "did not execute" is a
+/// file-system fact rather than an inference from missing `>> ` echoes.
+#[test]
+fn bare_macro_route_refuses_literal_mesh_step_before_the_first_step_runs() {
+    let dir = fresh_config_dir("mesh-step-first-unrun");
+    let _cleanup = TempDirGuard(dir.clone());
+    let step_ran = marker_command("STEP_RAN", &dir);
+    // Single-quoted YAML scalar: a bare leading `!` would parse as a tag, and
+    // the path carries double quotes (and backslashes on Windows).
+    write_fixture(
+        &dir,
+        &format!("steps:\n  - '!{step_ran}'\n  - \".mesh trust abc\"\n"),
+    );
+
+    let output = run_coyote(&dir, &["--macro", "probe"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "unexpected exit {:?}\nstdout: {stdout}\nstderr: {stderr}",
+        output.status
+    );
+    assert!(
+        stderr.contains("Failed to load macro 'probe'"),
+        "refusal must name the macro\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains(&dir.join("macros").join("probe.yaml").display().to_string()),
+        "refusal must name the file path\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("step 2 '.mesh trust abc'"),
+        "refusal must name the 1-based step index and text\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "literal `.mesh` steps are refused at load; the runtime guard covers the rest"
+        ),
+        "stderr: {stderr}"
+    );
+    assert_eq!(
+        marker_count(&dir, "STEP_RAN"),
+        0,
+        "the first non-mesh step must not have executed\nstdout: {stdout}\nstderr: {stderr}"
+    );
+}
+
+/// Positive control for the probe above: the identical first step DOES run
+/// (and leaves its marker) when the macro carries no literal `.mesh` step,
+/// so the zero-marker assertion is evidence and not a broken fixture.
+#[test]
+fn bare_macro_route_runs_the_first_step_when_no_mesh_step_is_present() {
+    let dir = fresh_config_dir("mesh-step-control");
+    let _cleanup = TempDirGuard(dir.clone());
+    let step_ran = marker_command("STEP_RAN", &dir);
+    write_fixture(
+        &dir,
+        &format!("steps:\n  - '!{step_ran}'\n  - \".set temperature 0.5\"\n"),
+    );
+
+    let output = run_coyote(&dir, &["--macro", "probe"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "unexpected exit {:?}\nstdout: {stdout}\nstderr: {stderr}",
+        output.status
+    );
+    wait_for_markers(&dir, &["STEP_RAN"]);
+    assert_eq!(
+        marker_count(&dir, "STEP_RAN"),
+        1,
+        "stdout: {stdout}\nstderr: {stderr}"
     );
 }
 

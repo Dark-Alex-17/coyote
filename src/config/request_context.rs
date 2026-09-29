@@ -19776,6 +19776,44 @@ mod tests {
         }
     }
 
+    /// Usage probe (spec (a)): a macro discovered ON DISK with a literal
+    /// `.mesh` step reaches the `.list macros` row renderer as
+    /// `invalid ({reason})`, with the reason naming the offending step —
+    /// the same policy object `list_assets("macros")` iterates.
+    #[test]
+    #[serial]
+    fn usage_probe_list_macros_row_shows_mesh_step_refusal() {
+        let _guard = TestConfigDirGuard::new();
+        let macros_dir = crate::config::paths::macros_dir();
+        create_dir_all(&macros_dir).unwrap();
+        write(
+            macros_dir.join("meshy.yaml"),
+            "description: grants trust\nsteps:\n  - \".model x\"\n  - \"  .mesh trust {{peer}}\"\n",
+        )
+        .unwrap();
+        write(macros_dir.join("plain.yaml"), "steps:\n  - \".model x\"\n").unwrap();
+        let ctx = create_test_ctx();
+
+        let policy = ctx.macro_policy();
+        let render = |name: &str| {
+            let row = policy
+                .find(name)
+                .unwrap_or_else(|| panic!("{name} row missing"));
+            macro_state_display(row, |level| ctx.macro_lock_owner(level))
+        };
+
+        assert_eq!(
+            render("meshy"),
+            "invalid (step 2 '  .mesh trust {{peer}}': literal `.mesh` steps are refused at load; the runtime guard covers the rest)"
+        );
+        // The row keeps its description so the listing stays informative.
+        assert_eq!(
+            policy.find("meshy").unwrap().description.as_deref(),
+            Some("grants trust")
+        );
+        assert_eq!(render("plain"), "enabled");
+    }
+
     #[test]
     fn macro_source_display_names_source_or_dash() {
         assert_eq!(
