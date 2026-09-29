@@ -269,7 +269,10 @@ impl EnvoyRunner {
         };
         match tokio::time::timeout(ENVOY_STOP_GRACE, &mut worker).await {
             Ok(Ok(())) => {}
-            Ok(Err(err)) => warn!("Mesh envoy worker did not exit cleanly: {err}"),
+            Ok(Err(err)) => warn!(
+                "Mesh envoy worker did not exit cleanly: {}",
+                redact_hashes(&err.to_string())
+            ),
             Err(_) => {
                 warn!("Mesh envoy worker did not stop in time; aborting it");
                 worker.abort();
@@ -441,7 +444,8 @@ impl EnvoyRunner {
             match Model::retrieve_model(app.config.as_ref(), &id, ModelType::Chat) {
                 Ok(model) => role.set_model(model),
                 Err(err) => warn!(
-                    "Mesh envoy model '{id}' could not be used ({err:#}); the envoy answers with '{current}'"
+                    "Mesh envoy model '{id}' could not be used ({}); the envoy answers with '{current}'",
+                    redact_hashes(&format!("{err:#}"))
                 ),
             }
         }
@@ -670,9 +674,10 @@ impl EnvoyRunner {
         };
         if let Err(err) = store.upsert(record, now) {
             warn!(
-                "Mesh envoy could not file the escalated question {} from {}: {err:#}",
+                "Mesh envoy could not file the escalated question {} from {}: {}",
                 message.message_id,
-                short(&message.source_identity)
+                short(&message.source_identity),
+                redact_hashes(&format!("{err:#}"))
             );
             return Err(format!("could not file the escalated question: {err:#}"));
         }
@@ -849,7 +854,10 @@ impl EnvoyRunner {
         if let Some(store) = self.app.load().mesh.inbound_store()
             && let Err(err) = store.remove(id)
         {
-            warn!("Mesh envoy could not forget the answered question {id}: {err:#}");
+            warn!(
+                "Mesh envoy could not forget the answered question {id}: {}",
+                redact_hashes(&format!("{err:#}"))
+            );
         }
     }
 }

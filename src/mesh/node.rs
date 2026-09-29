@@ -1043,7 +1043,10 @@ impl MeshRuntime {
         drop(transport);
         state.lock = None;
         if let Err(err) = self.peers.persist_if_dirty() {
-            warn!("Failed to persist the mesh peer table on stop: {err:#}");
+            warn!(
+                "Failed to persist the mesh peer table on stop: {}",
+                redact_hashes(&format!("{err:#}"))
+            );
         }
         debug!(
             "Stopped mesh node {} (instance {}, destination {})",
@@ -1630,7 +1633,10 @@ async fn persist_peers_periodically(peers: Arc<PeerTable>, cancel: CancellationT
             () = cancel.cancelled() => break,
             _ = ticks.tick() => {
                 if let Err(err) = peers.persist_if_dirty() {
-                    warn!("Failed to persist the mesh peer table: {err:#}");
+                    warn!(
+                        "Failed to persist the mesh peer table: {}",
+                        redact_hashes(&format!("{err:#}"))
+                    );
                 }
             }
         }
@@ -1834,7 +1840,8 @@ impl MeshSlot {
                 && let Err(err) = fork_inbound.adopt_from(current, SystemTime::now())
             {
                 warn!(
-                    "Mesh questions escalated before the fork could not be carried into it, so `.mesh answer` will not find them: {err:#}"
+                    "Mesh questions escalated before the fork could not be carried into it, so `.mesh answer` will not find them: {}",
+                    redact_hashes(&format!("{err:#}"))
                 );
             }
         };
@@ -2679,7 +2686,8 @@ fn reopen_pending(store: &PendingStore) -> Vec<PendingRecord> {
         }
         Err(err) => {
             warn!(
-                "Mesh pending questions could not be reopened, so none are waiting on a reply: {err:#}"
+                "Mesh pending questions could not be reopened, so none are waiting on a reply: {}",
+                redact_hashes(&format!("{err:#}"))
             );
             Vec::new()
         }
@@ -5948,7 +5956,9 @@ mod tests {
         assert!(slot.get().is_some(), "the node serves");
         assert!(slot.correlations().list().is_empty());
         let warned = warn_snapshot();
-        let path = store.path().display().to_string();
+        // The warning passes the error text through `redact_hashes`, which cuts the
+        // instance id run in the file name to eight hex digits.
+        let path = redact_hashes(&store.path().display().to_string());
         assert!(
             warned.iter().any(|message| {
                 message.contains("could not be reopened")
@@ -6024,7 +6034,7 @@ mod tests {
             slot.correlations().list().is_empty(),
             "an unreadable fork file leaves nothing pending"
         );
-        let path = second_store.path().display().to_string();
+        let path = redact_hashes(&second_store.path().display().to_string());
         assert!(
             warn_snapshot()
                 .iter()

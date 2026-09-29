@@ -6,7 +6,7 @@
 //! peer's reply can never be matched against one.
 
 use crate::mesh::message::{PEER_ID_MAX_CHARS, PeerMessage};
-use crate::mesh::r3::short;
+use crate::mesh::r3::{redact_hashes, short};
 use crate::mesh::{canonical_hash, mesh_cache_dir, parse_rfc3339, write_atomically};
 
 use anyhow::{Context, Result, bail};
@@ -706,7 +706,8 @@ impl Correlations {
             && let Err(err) = store.upsert(entry.record.clone(), SystemTime::now())
         {
             warn!(
-                "Mesh question {in_reply_to} was answered but the answer could not be recorded on disk: {err:#}"
+                "Mesh question {in_reply_to} was answered but the answer could not be recorded on disk: {}",
+                redact_hashes(&format!("{err:#}"))
             );
         }
         drop(state);
@@ -753,7 +754,10 @@ impl Correlations {
         if let Some(store) = store
             && let Err(err) = store.remove(id)
         {
-            warn!("Mesh question {id} was collected but could not be removed from disk: {err:#}");
+            warn!(
+                "Mesh question {id} was collected but could not be removed from disk: {}",
+                redact_hashes(&format!("{err:#}"))
+            );
         }
         drop(state);
         self.changed.notify_waiters();
@@ -776,7 +780,10 @@ impl Correlations {
         if let Some(store) = store
             && let Err(err) = store.remove(id)
         {
-            warn!("Mesh question {id} was abandoned but could not be removed from disk: {err:#}");
+            warn!(
+                "Mesh question {id} was abandoned but could not be removed from disk: {}",
+                redact_hashes(&format!("{err:#}"))
+            );
         }
         drop(state);
         self.changed.notify_waiters();

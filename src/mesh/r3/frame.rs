@@ -1,6 +1,7 @@
 use crate::mesh::hex_lower;
 use crate::mesh::protocol::{MESH_PROTOCOL_VERSION, protocol_supported};
 use crate::mesh::r3::error::R3Error;
+use crate::mesh::r3::redact_hashes;
 
 use rmpv::Value;
 use rns_transport::Packet;
@@ -291,7 +292,10 @@ fn encode_value(value: Value) -> Vec<u8> {
     let mut bytes = Vec::new();
     // The only error source is the writer, and a `Vec` never fails to grow.
     if let Err(err) = rmpv::encode::write_value(&mut bytes, &value) {
-        warn!("Failed to encode a mesh request frame: {err}");
+        warn!(
+            "Failed to encode a mesh request frame: {}",
+            redact_hashes(&err.to_string())
+        );
     }
     bytes
 }

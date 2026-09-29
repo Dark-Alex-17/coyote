@@ -16,7 +16,7 @@ use crate::mesh::propagation::{OutboundMessage, PropagationError};
 use crate::mesh::propagation_fetch::{InboundMessage, InboundSink};
 use crate::mesh::r3::{
     DEFAULT_LINK_TIMEOUT, KnockEvent, KnockSink, NAME_HASH_LEN, OriginName, R3Error, describe_path,
-    short,
+    redact_hashes, short,
 };
 use crate::mesh::trust::{Decision, IdentityStanding, Rule, TrustStore};
 use crate::mesh::{destination_address, display_text, hex_lower, rfc3339_utc};
@@ -480,7 +480,10 @@ impl KnockGate {
             hops,
         };
         if let Err(err) = self.cache.append(record, received_at) {
-            warn!("Mesh knock from {id8} for destination {dest8} was not cached: {err:#}");
+            warn!(
+                "Mesh knock from {id8} for destination {dest8} was not cached: {}",
+                redact_hashes(&format!("{err:#}"))
+            );
         }
         self.hooks.fire(MeshEvent::KnockReceived {
             identity: knock.identity_hash.clone(),
@@ -604,7 +607,10 @@ pub(crate) async fn drain_knocks(
         })
         .await;
         if let Err(err) = admitted {
-            warn!("Mesh knock gate task for {id8} did not finish: {err}");
+            warn!(
+                "Mesh knock gate task for {id8} did not finish: {}",
+                redact_hashes(&err.to_string())
+            );
         }
     }
 }
@@ -623,7 +629,10 @@ impl InboundSink for KnockRouting<'_> {
         match decode_knock_message(&message) {
             KnockMessage::NotAKnock => self.inner.deliver(message),
             KnockMessage::Malformed(why) => {
-                debug!("Propagated knock from {id8} dropped: {why}");
+                debug!(
+                    "Propagated knock from {id8} dropped: {}",
+                    redact_hashes(why)
+                );
             }
             KnockMessage::Knock { name_hash, intro } => {
                 let Ok(identity) = AddressHash::new_from_hex_string(&message.source_identity_hash)

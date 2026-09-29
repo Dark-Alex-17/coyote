@@ -2,8 +2,8 @@ use crate::mesh::announce::is_control_or_invisible;
 use crate::mesh::node::MeshSlot;
 use crate::mesh::peers::{PeerRecord, PeerTable};
 use crate::mesh::{
-    canonical_hash, decode_hex, destination_address, mesh_config_dir, parse_rfc3339, rfc3339_utc,
-    short, write_atomically,
+    canonical_hash, decode_hex, destination_address, mesh_config_dir, parse_rfc3339, redact_hashes,
+    rfc3339_utc, short, write_atomically,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -58,7 +58,10 @@ impl LiveMesh for MeshSlot {
         let knocks = match self.get()?.knock_gate().cache().list(now) {
             Ok(knocks) => knocks,
             Err(err) => {
-                debug!("knock cache unreadable while resolving a destination to trust: {err:#}");
+                debug!(
+                    "knock cache unreadable while resolving a destination to trust: {}",
+                    redact_hashes(&format!("{err:#}"))
+                );
                 return None;
             }
         };

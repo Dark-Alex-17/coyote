@@ -1,6 +1,6 @@
 use crate::mesh::announce::{HEARTBEAT_SECS, PEER_MISSED_HEARTBEATS_BEFORE_AGE_OUT};
 use crate::mesh::protocol::Compatibility;
-use crate::mesh::write_atomically;
+use crate::mesh::{redact_hashes, write_atomically};
 
 use anyhow::{Context, Result};
 use log::warn;
@@ -228,9 +228,10 @@ fn set_aside_corrupt(path: &Path, what_happened: String) -> Vec<PeerRecord> {
     );
     if let Err(err) = fs::rename(path, &aside) {
         warn!(
-            "Failed to move the unusable mesh peer table '{}' to '{}': {err}",
+            "Failed to move the unusable mesh peer table '{}' to '{}': {}",
             path.display(),
-            aside.display()
+            aside.display(),
+            redact_hashes(&err.to_string())
         );
     }
     Vec::new()

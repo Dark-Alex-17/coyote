@@ -141,7 +141,8 @@ pub(crate) fn resolve_digest_model(ctx: &RequestContext) -> Option<Model> {
         Ok(model) => Some(model),
         Err(err) => {
             warn!(
-                "Mesh brief model '{model_id}' could not be used ({err:#}); falling back to the session model '{current}' for the digest"
+                "Mesh brief model '{model_id}' could not be used ({}); falling back to the session model '{current}' for the digest",
+                redact_hashes(&format!("{err:#}"))
             );
             None
         }
@@ -184,8 +185,9 @@ where
                     Ok(summary) => summary,
                     Err(err) => {
                         warn!(
-                            "Mesh brief model '{}' failed: {err:#}; falling back to the session model '{}' for this digest step",
+                            "Mesh brief model '{}' failed: {}; falling back to the session model '{}' for this digest step",
                             model.id(),
+                            redact_hashes(&format!("{err:#}")),
                             template.role().model().id()
                         );
                         fetch(input).await?

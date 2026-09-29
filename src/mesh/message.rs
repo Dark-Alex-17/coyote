@@ -1192,7 +1192,10 @@ impl Handler for PeerMessageHandler {
         let body = match from_r3_body(&request.body) {
             Ok(body) => body,
             Err(why) => {
-                debug!("Mesh message from {id8} (instance {dest8}) on link {link} refused: {why}");
+                debug!(
+                    "Mesh message from {id8} (instance {dest8}) on link {link} refused: {}",
+                    redact_hashes(why)
+                );
                 return Reply::Code(RefusalCode::InvalidData);
             }
         };
@@ -1246,7 +1249,8 @@ impl Handler for PeerMessageHandler {
             Ok(()) => Reply::Value(received_reply(&id)),
             Err(err) => {
                 warn!(
-                    "Mesh message {id} from {id8} (instance {dest8}) was not delivered to the session: {err}; leaving it unacknowledged so the peer stores it instead"
+                    "Mesh message {id} from {id8} (instance {dest8}) was not delivered to the session: {}; leaving it unacknowledged so the peer stores it instead",
+                    redact_hashes(&err.to_string())
                 );
                 Reply::Silent
             }
@@ -1276,7 +1280,10 @@ impl InboundSink for PeerRouting<'_> {
             match decode_peer_lxmf(&message) {
                 PeerLxmf::NotAPeer => return self.inner.deliver(message),
                 PeerLxmf::Malformed(why) => {
-                    debug!("Propagated peer message from {id8} dropped: {why}");
+                    debug!(
+                        "Propagated peer message from {id8} dropped: {}",
+                        redact_hashes(why)
+                    );
                     return;
                 }
                 PeerLxmf::Peer {

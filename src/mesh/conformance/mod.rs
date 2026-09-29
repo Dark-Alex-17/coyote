@@ -127,6 +127,8 @@ const ENFORCED_BY: &[(&str, &[&str])] = &[
             "oversized_request_resource_is_dropped_before_the_handler_runs",
             "requests_beyond_the_handler_slots_are_dropped_silently",
             "a_handler_past_its_timeout_answers_nothing_and_frees_its_slot",
+            "peer_inbox_evicts_the_oldest_peer_at_capacity_and_counts_it",
+            "inbound_store_survives_reopen_and_prunes_by_ttl_and_cap",
         ],
     ),
     (
@@ -143,6 +145,7 @@ const ENFORCED_BY: &[(&str, &[&str])] = &[
         &[
             "one_identity_is_rate_limited_per_identity_and_surfaced_once",
             "the_gate_forgets_the_least_recently_seen_identity_past_its_cap",
+            "the_channel_sink_never_waits_on_a_reader_and_counts_what_it_drops",
         ],
     ),
     (

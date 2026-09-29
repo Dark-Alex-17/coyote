@@ -14,7 +14,7 @@ use crate::mesh::peers::PeerTable;
 use crate::mesh::propagation::{PropagationNode, lxmf_delivery_hash};
 use crate::mesh::r3::{
     DEFAULT_LINK_TIMEOUT, Deadline, MAX_R3_PAYLOAD_BYTES, R3Client, R3Error, RefusalCode,
-    SizeBranch, link_to, short,
+    SizeBranch, link_to, redact_hashes, short,
 };
 use crate::mesh::trust::{IdentityStanding, TrustStore};
 use crate::mesh::{canonical_hash, hex_lower, parse_rfc3339, rfc3339_utc, write_atomically};
@@ -948,9 +948,10 @@ fn set_aside_corrupt(path: &Path, what_happened: String) -> Loaded {
     );
     if let Err(err) = fs::rename(path, &aside) {
         warn!(
-            "Failed to move the unusable propagation fetch state '{}' to '{}': {err}",
+            "Failed to move the unusable propagation fetch state '{}' to '{}': {}",
             path.display(),
-            aside.display()
+            aside.display(),
+            redact_hashes(&err.to_string())
         );
     }
     Loaded::empty()

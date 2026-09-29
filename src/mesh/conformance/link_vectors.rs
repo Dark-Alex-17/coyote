@@ -1046,8 +1046,10 @@ mod loopback {
         let R3Error::LinkFailed(reason) = err else {
             panic!("expected LinkFailed for a destination without a path, got {err:?}");
         };
-        assert!(reason.contains(short(&ghost_hex)), "{reason}");
-        assert!(!reason.contains(&ghost_hex), "{reason}");
+        assert!(
+            reason.contains(&ghost_hex),
+            "the error value keeps the full destination for the human; redaction belongs to the log sinks: {reason}"
+        );
         assert_eq!(recorder.seen_count(), 0);
         requester.stop().await;
         responder.stop().await;

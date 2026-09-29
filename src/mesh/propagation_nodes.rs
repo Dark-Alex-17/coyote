@@ -6,7 +6,7 @@
 use crate::mesh::peers::PeerChange;
 use crate::mesh::propagation::{MAX_ACCEPTED_STAMP_COST, PropagationNode, PropagationNodeError};
 use crate::mesh::propagation_fetch::FetchError;
-use crate::mesh::r3::short;
+use crate::mesh::r3::{redact_hashes, short};
 
 use parking_lot::Mutex;
 use rns_transport::destination::DestinationDesc;
@@ -68,8 +68,9 @@ impl PropagationNodeTable {
             Err(PropagationNodeError::NotAPropagationNode) => false,
             Err(err) => {
                 debug!(
-                    "Ignored propagation node announce from {} ({hops} hops): {err}",
-                    short(&destination_hex)
+                    "Ignored propagation node announce from {} ({hops} hops): {}",
+                    short(&destination_hex),
+                    redact_hashes(&err.to_string())
                 );
                 true
             }

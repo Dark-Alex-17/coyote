@@ -975,6 +975,10 @@ mod tests {
         "transient_id",
         "message_id",
     ];
+    /// Names an error value goes by. The scan cannot look through an error's Display, so
+    /// where one of these is interpolated or passed it must sit inside `redact_hashes(`,
+    /// which is what section 17 promises of every sink that logs an error's text.
+    const ERROR_WORDS: [&str; 6] = ["err", "e", "error", "why", "cause", "failure"];
     const LOG_MACROS: [&str; 5] = ["debug!(", "trace!(", "info!(", "warn!(", "error!("];
 
     /// The files section 17 governs: the mesh module without its test-only files, and the
@@ -1203,15 +1207,15 @@ mod tests {
             .collect()
     }
 
-    /// Whether any unclosed `(` before `at` is a `short(` call.
-    fn inside_short(code: &str, at: usize) -> bool {
+    /// Whether any unclosed `(` before `at` is a call of `callee`.
+    fn inside_call(code: &str, at: usize, callee: &str) -> bool {
         let bytes = code.as_bytes();
         let mut depth = 0;
         for index in (0..at).rev() {
             match bytes[index] {
                 b')' => depth += 1,
                 b'(' if depth > 0 => depth -= 1,
-                b'(' if code[..index].ends_with("short") => return true,
+                b'(' if code[..index].ends_with(callee) => return true,
                 _ => {}
             }
         }
@@ -1244,13 +1248,22 @@ mod tests {
     /// The section 17 violations in one log invocation.
     fn redaction_violations(invocation: &str) -> Vec<String> {
         let mut violations = Vec::new();
+        let mut code_so_far = String::new();
         for (code, literal) in split_literals(invocation) {
+            code_so_far.push_str(&code);
+            let base = code_so_far.len() - code.len();
+            let literal_is_redacted = inside_call(&code_so_far, code_so_far.len(), "redact_hashes");
             for name in placeholders(&literal) {
                 if UNLOGGABLE_WORDS.contains(&name) {
                     violations.push(format!("interpolates `{{{name}}}`"));
                 }
                 if HASH_WORDS.contains(&name) {
                     violations.push(format!("interpolates the full hash `{{{name}}}`"));
+                }
+                if ERROR_WORDS.contains(&name) && !literal_is_redacted {
+                    violations.push(format!(
+                        "interpolates the error `{{{name}}}` outside redact_hashes()"
+                    ));
                 }
             }
             for word in UNLOGGABLE_WORDS {
@@ -1262,15 +1275,25 @@ mod tests {
             }
             for word in HASH_WORDS {
                 for at in word_positions(&code, word) {
-                    if !inside_short(&code, at) {
+                    if !inside_call(&code, at, "short") {
                         violations.push(format!("passes `{word}` outside short()"));
+                    }
+                }
+            }
+            for word in ERROR_WORDS {
+                for at in word_positions(&code, word) {
+                    let is_macro_name = code.as_bytes().get(at + word.len()) == Some(&b'!');
+                    if !is_macro_name && !inside_call(&code_so_far, base + at, "redact_hashes") {
+                        violations.push(format!("passes `{word}` outside redact_hashes()"));
                     }
                 }
             }
             for call in HASH_CALLS {
                 for (at, _) in code.match_indices(call) {
                     let subject = hex_subject(&code, at, call);
-                    if !FULL_HEX_RECEIVERS.contains(&subject.as_str()) && !inside_short(&code, at) {
+                    if !FULL_HEX_RECEIVERS.contains(&subject.as_str())
+                        && !inside_call(&code, at, "short")
+                    {
                         violations
                             .push(format!("renders `{subject}` with `{call}` outside short()"));
                     }
@@ -1282,7 +1305,7 @@ mod tests {
 
     #[test]
     fn redaction_scanner_flags_each_rule_and_passes_the_permitted_forms() {
-        let flagged: [(&str, &[&str]); 14] = [
+        let flagged: [(&str, &[&str]); 19] = [
             ("debug!(\"got {content}\")", &["interpolates `{content}`"]),
             ("debug!(\"{content:?}\")", &["interpolates `{content}`"]),
             ("debug!(\"got {}\", message.title)", &["passes `title`"]),
@@ -1331,6 +1354,26 @@ mod tests {
                 "debug!(\"from {}\", reply.source_identity)",
                 &["passes `source_identity` outside short()"],
             ),
+            (
+                "warn!(\"knock was not cached: {err:#}\")",
+                &["interpolates the error `{err}` outside redact_hashes()"],
+            ),
+            (
+                "debug!(\"unreadable: {e:?}\")",
+                &["interpolates the error `{e}` outside redact_hashes()"],
+            ),
+            (
+                "error!(\"run failed: {why}\")",
+                &["interpolates the error `{why}` outside redact_hashes()"],
+            ),
+            (
+                "warn!(\"could not persist: {}\", err)",
+                &["passes `err` outside redact_hashes()"],
+            ),
+            (
+                "warn!(\"{}: {}\", short(&identity_hex), format!(\"{:#}\", cause))",
+                &["passes `cause` outside redact_hashes()"],
+            ),
         ];
         for (text, violations) in flagged {
             let invocations = log_invocations(&production_code(text));
@@ -1353,6 +1396,12 @@ mod tests {
             "debug!(\"reply {} from {}\", reply.message_id, short(&reply.source_identity))",
             "debug!(\"{} bytes\", message.content.as_ref().map_or(0, Vec::len))",
             "debug!(\"{} chars\", intro.len())",
+            "warn!(\"was not cached: {}\", redact_hashes(&format!(\"{err:#}\")))",
+            "warn!(\"not persisted: {}\", redact_hashes(&err.to_string()))",
+            "error!(\"run for {id} failed: {}\", redact_hashes(err))",
+            "warn!(\"refused: {}\", redact_hashes(&why))",
+            "debug!(\"{} {}\", short(&identity_hex), redact_hashes(&format!(\"{}: {e:?}\", label)))",
+            "warn!(\"{}\", redact_hashes(&format!(\"{}: {}\", label, err)))",
         ];
         for text in permitted {
             let lines = vec![text.to_string()];

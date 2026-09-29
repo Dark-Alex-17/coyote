@@ -1,5 +1,6 @@
 use crate::config::Session;
 use crate::mesh::mesh_cache_dir;
+use crate::mesh::redact_hashes;
 
 use anyhow::{Context, Result, bail};
 use std::fs::{self, File, OpenOptions, TryLockError};
@@ -74,7 +75,10 @@ impl InstanceLock {
 impl Drop for InstanceLock {
     fn drop(&mut self) {
         if let Err(err) = self.file.unlock() {
-            warn!("Failed to release a mesh instance lock: {err}");
+            warn!(
+                "Failed to release a mesh instance lock: {}",
+                redact_hashes(&err.to_string())
+            );
         }
     }
 }

@@ -659,8 +659,7 @@ pub(crate) async fn open_link(
         .await?
     {
         return Err(R3Error::LinkFailed(format!(
-            "no known path to destination {}",
-            short(&destination_hex)
+            "no known path to destination {destination_hex}"
         )));
     }
     let link = deadline.bound(path, transport.link(*destination)).await?;

@@ -13,7 +13,7 @@ use crate::mesh::trust::{
 };
 use crate::mesh::{
     MESH_ALREADY_ON, MeshPaths, MeshRuntime, NodeOptions, PeerRecord, PropagationNodeRecord,
-    age_text, canonical_hash, display_text, parse_rfc3339, short,
+    age_text, canonical_hash, display_text, parse_rfc3339, redact_hashes, short,
 };
 use crate::supervisor::mailbox::EnvelopePayload;
 use crate::utils::{AbortSignal, drain_stale_tty_input, wait_user_interrupt};
@@ -310,7 +310,10 @@ fn info(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             None => KnockLookup::NotKnocked,
         },
         Err(err) if peer.is_some() => {
-            debug!("knock cache unreadable while describing a known peer: {err:#}");
+            debug!(
+                "knock cache unreadable while describing a known peer: {}",
+                redact_hashes(&format!("{err:#}"))
+            );
             KnockLookup::Unreadable
         }
         Err(err) => return Err(err),
