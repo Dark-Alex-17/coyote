@@ -24,13 +24,22 @@
 //!   it is forwarded as the Dockerfile's optional `pip_ca` build secret, and
 //!   `HTTP_PROXY`/`HTTPS_PROXY` are forwarded as build args when set. Every
 //!   container and volume the tests create is named `coyote-pn-test-<pid>-...`
-//!   and labelled `coyote-pn-test=<pid>`, and is removed when the test ends.
+//!   and labelled `coyote-pn-test=<pid>`, and is removed when the test ends. The
+//!   image tag `coyote-pn-test-<pid>:latest` is shared by every test in the
+//!   process and is left behind; sweep it and anything a killed run leaked with
+//!
+//!   ```sh
+//!   docker rm -f $(docker ps -aq -f label=coyote-pn-test); docker volume prune -f --filter label=coyote-pn-test; docker rmi $(docker images -q 'coyote-pn-test-*')
+//!   ```
 
 use std::env;
+use std::ffi::OsStr;
 use std::fs;
+use std::io::{ErrorKind, Read};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -297,34 +306,47 @@ fn readme_allowed_file_rules_match_upstreams_loader() {
     // remaining bytes are not exactly 32 (whitespace, comments, short/long) are
     // dropped. The README must not tell operators otherwise.
     let readme = read(deployment_dir().join("README.md"));
-    let crlf_dropped_claim = readme
-        .lines()
-        .any(|l| l.contains("CRLF") && (l.contains("dropped") || l.contains("drops")));
     assert!(
-        !crlf_dropped_claim,
-        "README claims a CRLF-terminated `allowed` line is dropped; lxmd 0.9.6 accepts it (bytes.splitlines strips the CRLF). Live evidence: crlf_terminated_allowed_lines_are_accepted_by_lxmd"
+        readme.contains("LF or CRLF line endings both work"),
+        "README must say a CRLF-terminated `allowed` line is accepted; lxmd 0.9.6 strips the CRLF in bytes.splitlines. Live evidence: crlf_terminated_allowed_lines_are_accepted_by_lxmd"
     );
 }
 
 #[test]
-fn readme_does_not_cite_upstreams_dockerfile() {
-    let readme = read(deployment_dir().join("README.md"));
-    for line in readme.lines() {
-        let lower = line.to_ascii_lowercase();
-        if !lower.contains("dockerfile") {
-            continue;
+fn operator_docs_do_not_cite_upstreams_dockerfile() {
+    let docs = [
+        ("deployment README", deployment_dir().join("README.md")),
+        ("root README", repo_root().join("README.md")),
+        (
+            "PROTOCOL.md",
+            repo_root().join("docs").join("mesh").join("PROTOCOL.md"),
+        ),
+    ];
+    for (name, path) in docs {
+        let text = read(&path);
+        for citation in ["LXMF/Dockerfile", "Reticulum/Dockerfile"] {
+            assert!(
+                !text.contains(citation),
+                "{name} must not point at upstream's build-only Dockerfile via {citation:?}"
+            );
         }
-        assert!(
-            !lower.contains("markqvist")
-                && !lower.contains("github.com/")
-                && !lower.contains("http"),
-            "README must not point at upstream's build-only Dockerfile: {line:?}"
-        );
+        // Links do not re-wrap, so a URL-ish token naming a Dockerfile is a citation.
+        for token in text.split(|c: char| c.is_whitespace() || c == '(' || c == ')') {
+            if !token.contains("Dockerfile") {
+                continue;
+            }
+            assert!(
+                !token.contains("markqvist")
+                    && !token.contains("github.com/")
+                    && !token.contains("http"),
+                "{name} must not link upstream's build-only Dockerfile: {token:?}"
+            );
+        }
     }
-    // The upstream references that ARE allowed: the LXMF README anchors.
+    let readme = read(deployment_dir().join("README.md"));
     assert!(
         readme.contains("github.com/markqvist/LXMF#"),
-        "README should link the upstream LXMF README for context"
+        "deployment README should link the upstream LXMF README for context"
     );
 }
 
@@ -356,16 +378,45 @@ fn shipped_files_are_ascii_lf_and_carry_no_plan_references() {
             "{name} must not reference plan/task tracking; that belongs in commit messages"
         );
     }
-    let mode = fs::metadata(deployment_dir().join("entrypoint.sh")).unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(deployment_dir().join("entrypoint.sh")).unwrap();
         assert!(
             mode.permissions().mode() & 0o111 != 0,
             "entrypoint.sh should be executable in the tree"
         );
     }
-    let _ = mode;
+}
+
+#[test]
+fn entrypoint_tightens_the_umask_and_seeds_on_every_daemon_path() {
+    let entrypoint = read(deployment_dir().join("entrypoint.sh"));
+    assert!(
+        entrypoint.contains("umask 077"),
+        "RNS writes identities with a plain open(path, \"wb\"); without `umask 077` they are world-readable"
+    );
+    let (_, after_arm) = entrypoint
+        .split_once("lxmd)")
+        .expect("entrypoint.sh has an `lxmd)` arm");
+    let arm = after_arm
+        .split_once(";;")
+        .map(|(arm, _)| arm)
+        .unwrap_or(after_arm);
+    assert!(
+        !arm.contains("exec"),
+        "the `lxmd)` arm must fall through to the seed block, not exec early (a fresh volume would get lxmd's own defaults):{arm}"
+    );
+    let seed = entrypoint
+        .find("/opt/coyote-pn/lxmd.config")
+        .expect("entrypoint.sh seeds lxmd.config");
+    let final_exec = entrypoint
+        .rfind("exec lxmd --config /data/lxmd --rnsconfig /data/reticulum")
+        .expect("entrypoint.sh ends by exec-ing lxmd against the volume");
+    assert!(
+        seed < final_exec,
+        "the seed block must run before the daemon starts"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -374,21 +425,32 @@ fn shipped_files_are_ascii_lf_and_carry_no_plan_references() {
 
 const LIVE_SWITCH: &str = "COYOTE_PN_IMAGE_TESTS";
 
-fn live_switch_is_on() -> bool {
-    matches!(
-        env::var(LIVE_SWITCH).ok().as_deref(),
-        Some("1") | Some("true") | Some("yes")
-    )
+/// Same semantics as `COYOTE_MESH_INTEROP`: unset, blank, `0` and `false`/`no`/`off`
+/// (any ASCII case) are off; anything else is on.
+fn live_switch_is_on(value: Option<&OsStr>) -> bool {
+    let Some(value) = value else { return false };
+    let value = value.to_string_lossy();
+    let value = value.trim();
+    !(value.is_empty()
+        || value == "0"
+        || ["false", "no", "off"]
+            .iter()
+            .any(|off| value.eq_ignore_ascii_case(off)))
 }
 
 /// Print the conventional `skipping:` line and report whether to bail.
 fn skip_unless_live() -> bool {
-    if live_switch_is_on() {
+    let value = env::var_os(LIVE_SWITCH);
+    if live_switch_is_on(value.as_deref()) {
         return false;
     }
-    eprintln!(
-        "skipping: set {LIVE_SWITCH}=1 and run `cargo test --test propagation_node_image -- --include-ignored` with a Docker daemon available"
-    );
+    let instructions = "`cargo test --test propagation_node_image -- --include-ignored` with a Docker daemon available";
+    match value {
+        Some(value) => eprintln!(
+            "skipping: {LIVE_SWITCH}={value:?} is off; set it to 1 and run {instructions}"
+        ),
+        None => eprintln!("skipping: set {LIVE_SWITCH}=1 and run {instructions}"),
+    }
     true
 }
 
@@ -419,32 +481,38 @@ fn label() -> String {
     format!("coyote-pn-test={}", std::process::id())
 }
 
+static IMAGE: OnceLock<String> = OnceLock::new();
+
 /// Build the image once per process (the daemon's layer cache makes repeats cheap)
 /// and return its tag.
 fn build_image() -> String {
-    let tag = format!("{}:latest", run_prefix());
-    let mut args: Vec<String> = vec![
-        "build".into(),
-        "-q".into(),
-        "--label".into(),
-        label(),
-        "-t".into(),
-        tag.clone(),
-    ];
-    for var in ["HTTP_PROXY", "HTTPS_PROXY"] {
-        if let Ok(v) = env::var(var) {
-            args.push("--build-arg".into());
-            args.push(format!("{var}={v}"));
-        }
-    }
-    if let Ok(ca) = env::var("COYOTE_PN_PIP_CA") {
-        args.push("--secret".into());
-        args.push(format!("id=pip_ca,src={ca}"));
-    }
-    args.push(deployment_dir().to_string_lossy().into_owned());
-    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    docker_ok(&refs);
-    tag
+    IMAGE
+        .get_or_init(|| {
+            let tag = format!("{}:latest", run_prefix());
+            let mut args: Vec<String> = vec![
+                "build".into(),
+                "-q".into(),
+                "--label".into(),
+                label(),
+                "-t".into(),
+                tag.clone(),
+            ];
+            for var in ["HTTP_PROXY", "HTTPS_PROXY"] {
+                if let Ok(v) = env::var(var) {
+                    args.push("--build-arg".into());
+                    args.push(format!("{var}={v}"));
+                }
+            }
+            if let Ok(ca) = env::var("COYOTE_PN_PIP_CA") {
+                args.push("--secret".into());
+                args.push(format!("id=pip_ca,src={ca}"));
+            }
+            args.push(deployment_dir().to_string_lossy().into_owned());
+            let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            docker_ok(&refs);
+            tag
+        })
+        .clone()
 }
 
 /// A container plus the volume it runs against, removed on drop (panics unwind, so
@@ -467,8 +535,13 @@ impl Node {
         }
     }
 
-    /// Start the daemon detached. `extra` is spliced before the image (ports etc.).
+    /// Start the daemon detached with no command. `extra` is spliced before the image (ports etc.).
     fn start(&self, extra: &[&str]) {
+        self.start_with(extra, &[]);
+    }
+
+    /// Start detached; `command` follows the image and goes to the entrypoint.
+    fn start_with(&self, extra: &[&str], command: &[&str]) {
         let lbl = label();
         let mount = format!("{}:/data", self.volume);
         let mut args = vec![
@@ -476,6 +549,7 @@ impl Node {
         ];
         args.extend_from_slice(extra);
         args.push(&self.image);
+        args.extend_from_slice(command);
         docker_ok(&args);
     }
 
@@ -490,15 +564,21 @@ impl Node {
 
     /// Poll the logs until `needle` appears (or fail after 60 s with the log so far).
     fn wait_for(&self, needle: &str) -> String {
+        self.wait_for_nth(needle, 1)
+    }
+
+    /// Poll the logs until `needle` has appeared `n` times (or fail after 60 s with the
+    /// log so far).
+    fn wait_for_nth(&self, needle: &str, n: usize) -> String {
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             let logs = self.logs();
-            if logs.contains(needle) {
+            if logs.matches(needle).count() >= n {
                 return logs;
             }
             assert!(
                 Instant::now() < deadline,
-                "{} never logged {needle:?}; log so far:\n{logs}",
+                "{} never logged {needle:?} {n} time(s); log so far:\n{logs}",
                 self.name
             );
             thread::sleep(Duration::from_millis(500));
@@ -667,13 +747,7 @@ fn restart_keeps_the_identity_and_never_overwrites_operator_edits() {
     );
     node.restart();
     // Wait for the second start line, then look only at the post-restart log.
-    let logs = loop {
-        let logs = node.logs();
-        if logs.matches("Started lxmd version").count() >= 2 {
-            break logs;
-        }
-        thread::sleep(Duration::from_millis(500));
-    };
+    let logs = node.wait_for_nth("Started lxmd version", 2);
     let after = logs
         .rsplit_once("Substantiating Reticulum")
         .map(|(_, tail)| tail.to_string())
@@ -770,9 +844,57 @@ fn port_4242_accepts_tcp_connections_when_published() {
         .lines()
         .find(|l| l.starts_with("127.0.0.1:"))
         .unwrap_or_else(|| panic!("no v4 mapping in {mapping:?}"));
-    let stream = TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_secs(5))
+    let mut stream = TcpStream::connect_timeout(&addr.parse().unwrap(), Duration::from_secs(5))
         .unwrap_or_else(|e| panic!("connect {addr}: {e}"));
-    drop(stream);
+    // Docker's userland proxy accepts the connection itself, so connecting proves
+    // nothing; only a backend that holds the socket open (or speaks first) does.
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut byte = [0u8; 1];
+    match stream.read(&mut byte) {
+        Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+        Ok(n) if n > 0 => {}
+        Ok(_) => panic!(
+            "{addr} closed at once: the proxy found nothing listening on 4242 in the container"
+        ),
+        Err(e) => panic!("{addr} read failed instead of holding the connection: {e}"),
+    }
+}
+
+#[test]
+#[ignore = "needs docker and COYOTE_PN_IMAGE_TESTS=1"]
+fn the_lxmd_arm_seeds_a_fresh_volume_before_starting_the_daemon() {
+    if skip_unless_live() {
+        return;
+    }
+    // `docker run -v vol:/data IMG lxmd` must not let lxmd mint its own defaults
+    // (node off, auth off, autopeer on) into a fresh volume, where the seed guards
+    // would then keep them forever.
+    let image = build_image();
+    let node = Node::fresh(&image, "arm");
+    node.start_with(&[], &["lxmd"]);
+    node.wait_started();
+    let listing = node.on_volume(
+        "set -e; \
+         diff /data/lxmd/config /opt/coyote-pn/lxmd.config && echo LXMD_SEEDED; \
+         diff /data/reticulum/config /opt/coyote-pn/reticulum.config && echo RNS_SEEDED; \
+         test -f /data/lxmd/allowed && echo ALLOWED_PRESENT; \
+         stat -c 'MODE=%a %n' /data/lxmd/identity /data/reticulum/storage/transport_identity",
+    );
+    assert!(
+        listing.contains("LXMD_SEEDED") && listing.contains("RNS_SEEDED"),
+        "the `lxmd` arm must reach the seed block before exec-ing the daemon:\n{listing}"
+    );
+    assert!(
+        listing.contains("ALLOWED_PRESENT"),
+        "the `lxmd` arm must create the allowed list too:\n{listing}"
+    );
+    assert!(
+        listing.contains("MODE=600 /data/lxmd/identity")
+            && listing.contains("MODE=600 /data/reticulum/storage/transport_identity"),
+        "both identities must be created mode 600 (umask 077):\n{listing}"
+    );
 }
 
 #[test]
@@ -803,5 +925,381 @@ fn crlf_terminated_allowed_lines_are_accepted_by_lxmd() {
     assert!(
         logs.contains("Clint authentication was enabled"),
         "a line with inline whitespace is not 32 bytes and must be dropped, leaving the list empty:\n{logs}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Usage probe (spec-first, written from the README's promises before the
+// entrypoint was read): the `lxmd` passthrough, the argument fallthrough, the
+// shutdown path and the identity-portability fine print.
+// ---------------------------------------------------------------------------
+
+/// Pinned upstream clones the README's `file:line` citations are checked against.
+/// Set `COYOTE_PN_UPSTREAM_LXMF=/path/to/LXMF` to point elsewhere; when neither the
+/// variable nor `.rns-audit/lxmf` exists the citation test prints `skipping:`.
+fn upstream_lxmf_dir() -> Option<PathBuf> {
+    if let Ok(dir) = env::var("COYOTE_PN_UPSTREAM_LXMF") {
+        return Some(PathBuf::from(dir));
+    }
+    let default = repo_root().join(".rns-audit").join("lxmf");
+    default.join("LXMF").is_dir().then_some(default)
+}
+
+/// Lines `from..=to` (1-based, inclusive) of `path`, joined with `\n`.
+fn cited_lines(path: &Path, from: usize, to: usize) -> String {
+    let text = read(path);
+    let total = text.lines().count();
+    assert!(
+        to <= total,
+        "{}: cited range {from}-{to} runs past the file ({total} lines)",
+        path.display()
+    );
+    text.lines()
+        .skip(from - 1)
+        .take(to - from + 1)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn usage_probe_readme_upstream_citations_resolve_in_the_pinned_lxmf_clone() {
+    let Some(lxmf) = upstream_lxmf_dir() else {
+        eprintln!(
+            "skipping: no pinned LXMF clone at .rns-audit/lxmf (or COYOTE_PN_UPSTREAM_LXMF); cannot check the README's file:line citations"
+        );
+        return;
+    };
+    let version = read(lxmf.join("LXMF").join("_version.py"));
+    assert!(
+        version.contains(&format!("\"{LXMF_VERSION}\"")),
+        "the pinned clone is not LXMF {LXMF_VERSION}: {version:?}"
+    );
+    let lxmd_py = lxmf.join("LXMF").join("Utilities").join("lxmd.py");
+    let router_py = lxmf.join("LXMF").join("LXMRouter.py");
+    let readme = read(deployment_dir().join("README.md"));
+    let entrypoint = read(deployment_dir().join("entrypoint.sh"));
+
+    // Every citation the shipped files make, with what the cited range must contain.
+    // (citing file, `file:from-to` label as written, path, from, to, expected fragments)
+    type Citation<'a> = (&'a str, &'a str, &'a Path, usize, usize, &'a [&'a str]);
+    let citations: [Citation<'_>; 6] = [
+        (
+            "README",
+            "lxmd.py:103-116",
+            &lxmd_py,
+            103,
+            116,
+            &["\"enable_node\"", "\"auth_required\""],
+        ),
+        (
+            "README",
+            "lxmd.py:248-268",
+            &lxmd_py,
+            248,
+            268,
+            &[
+                "allowed_identities",
+                ".splitlines()",
+                "TRUNCATED_HASHLENGTH//8*2",
+            ],
+        ),
+        (
+            "README",
+            "lxmd.py:204-220",
+            &lxmd_py,
+            204,
+            220,
+            &["\"static_peers\"", "\"from_static_only\""],
+        ),
+        (
+            "README",
+            "LXMRouter.py:1417-1429",
+            &router_py,
+            1417,
+            1429,
+            &["def identity_allowed", "ERROR_NO_ACCESS"],
+        ),
+        (
+            "entrypoint.sh",
+            "lxmd.py:307-313",
+            &lxmd_py,
+            307,
+            313,
+            &["/etc/lxmd", "/.config/lxmd", "/.lxmd"],
+        ),
+        (
+            "entrypoint.sh",
+            "lxmd.py:366-371",
+            &lxmd_py,
+            366,
+            371,
+            &[
+                "No Primary Identity file found",
+                "identity.to_file(identitypath)",
+            ],
+        ),
+    ];
+    for (where_, label, path, from, to, needles) in citations {
+        let source = if where_ == "README" {
+            &readme
+        } else {
+            &entrypoint
+        };
+        assert!(
+            source.contains(label),
+            "{where_} no longer cites `{label}`; update this test's citation table"
+        );
+        let cited = cited_lines(path, from, to);
+        for needle in needles {
+            assert!(
+                cited.contains(needle),
+                "{where_} cites `{label}` for {needle:?}, but LXMF {LXMF_VERSION} has there:\n{cited}"
+            );
+        }
+    }
+
+    // README: "written under /data/lxmd/storage/messages" and "within four hops".
+    let lxmd_text = read(&lxmd_py);
+    assert!(
+        lxmd_text.contains("lxmdir       = storagedir+\"/messages\""),
+        "lxmd no longer writes delivered messages to <config>/storage/messages; fix the README's operating note"
+    );
+    let router_text = read(&router_py);
+    assert!(
+        router_text.contains("AUTOPEER_MAXDEPTH     = 4"),
+        "LXMRouter's autopeer depth default is no longer 4; fix the README's 'within four hops'"
+    );
+}
+
+#[test]
+#[ignore = "needs docker and COYOTE_PN_IMAGE_TESTS=1"]
+fn usage_probe_lxmd_passthrough_targets_the_volume_config_dirs() {
+    if skip_unless_live() {
+        return;
+    }
+    // README: "every path seeds the volume first and then runs lxmd against
+    // `/data/lxmd` and `/data/reticulum`, never against `~/.lxmd`." lxmd's remote
+    // commands exit 201 when the config dir is missing and 202 when its identity is
+    // missing, before they touch the network; anything else means both were found.
+    let image = build_image();
+    let lbl = label();
+
+    let empty = Node::fresh(&image, "status-empty");
+    let mount = format!("{}:/data", empty.volume);
+    let out = docker(&[
+        "run", "--rm", "--label", &lbl, "-v", &mount, &image, "lxmd", "--status",
+    ]);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The seed block has created /data/lxmd by now; only the identity, which the
+    // daemon mints on its first real start, is missing.
+    assert_eq!(
+        out.status.code(),
+        Some(202),
+        "on an empty volume `lxmd --status` must fail on the missing /data/lxmd/identity, not fall back to ~/.lxmd:\n{combined}"
+    );
+    assert!(
+        combined.contains("Identity file not found"),
+        "unexpected output:\n{combined}"
+    );
+    let seeded =
+        empty.on_volume("cmp -s /opt/coyote-pn/lxmd.config /data/lxmd/config && echo SEEDED");
+    assert!(
+        seeded.contains("SEEDED"),
+        "`lxmd --status` on an empty volume must have seeded /data/lxmd/config on its way in:\n{seeded}"
+    );
+
+    let node = Node::fresh(&image, "status-seeded");
+    node.start(&[]);
+    node.wait_started();
+    docker_ok(&["stop", &node.name]);
+    let mount = format!("{}:/data", node.volume);
+    let out = docker(&[
+        "run",
+        "--rm",
+        "--label",
+        &lbl,
+        "-v",
+        &mount,
+        &image,
+        "lxmd",
+        "--status",
+        "--timeout",
+        "5",
+    ]);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let code = out.status.code();
+    assert!(
+        code != Some(201) && code != Some(202),
+        "on a cold-started volume `lxmd --status` must find /data/lxmd/config and /data/lxmd/identity (got exit {code:?}):\n{combined}"
+    );
+    assert!(
+        !combined.contains("configuration directory does not exist")
+            && !combined.contains("Identity file not found"),
+        "the passthrough did not point lxmd at the volume:\n{combined}"
+    );
+}
+
+#[test]
+#[ignore = "needs docker and COYOTE_PN_IMAGE_TESTS=1"]
+fn usage_probe_unlisted_arguments_reach_the_daemon_not_a_tool() {
+    if skip_unless_live() {
+        return;
+    }
+    // README: "`rnsd`, `sh` and `bash` run that program instead of the daemon.
+    // Anything else is appended to the daemon's command line ... The other RNS
+    // tools (`rnstatus`, `rnpath`, `rnprobe`, `rnid`) are not passed through."
+    let image = build_image();
+    let lbl = label();
+    for tool in ["rnstatus", "rnpath", "rnprobe", "rnid"] {
+        // Bare tool name: any option after it (e.g. `--version`) would be parsed by
+        // lxmd's argparse first and mask the rejection of the stray positional.
+        let out = docker(&["run", "--rm", "--label", &lbl, &image, tool]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !out.status.success(),
+            "`{tool}` must not run as a program; got exit {:?} with stdout:\n{stdout}",
+            out.status.code()
+        );
+        assert!(
+            stderr.contains("usage: lxmd")
+                && stderr.contains(&format!("unrecognized arguments: {tool}")),
+            "`{tool}` must land on lxmd's command line and be rejected there; stderr:\n{stderr}\nstdout:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains(&format!("{tool} ")),
+            "`{tool}` must not have printed its own version banner:\n{stdout}"
+        );
+    }
+
+    // README: "`static_peers = <hashes>` and `from_static_only = yes` are the knobs
+    // ... both are in `lxmd --exampleconfig`", reached through the `lxmd` passthrough.
+    let example = docker_ok(&[
+        "run",
+        "--rm",
+        "--label",
+        &lbl,
+        &image,
+        "lxmd",
+        "--exampleconfig",
+    ]);
+    for knob in ["static_peers", "from_static_only", "autopeer"] {
+        assert!(
+            example.lines().any(|l| l
+                .trim_start_matches(['#', ' '])
+                .starts_with(&format!("{knob} "))),
+            "`lxmd --exampleconfig` must document `{knob}`:\n{example}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "needs docker and COYOTE_PN_IMAGE_TESTS=1"]
+fn usage_probe_docker_stop_ends_the_daemon_promptly_and_cleanly() {
+    if skip_unless_live() {
+        return;
+    }
+    // The daemon is PID 1 (exec in the entrypoint), so `docker stop`'s SIGTERM must
+    // end it well inside Docker's 10 s grace period and without the SIGKILL fallback
+    // (exit 137) or a signal death (143); an operator's `docker stop`/`restart`
+    // must not lose the identity or the message store to a hard kill.
+    let image = build_image();
+    let node = Node::fresh(&image, "stop");
+    node.start(&[]);
+    node.wait_started();
+    let started = Instant::now();
+    docker_ok(&["stop", &node.name]);
+    let took = started.elapsed();
+    let state = docker_ok(&[
+        "inspect",
+        &node.name,
+        "--format",
+        "{{.State.Status}} {{.State.ExitCode}} {{.State.OOMKilled}}",
+    ]);
+    assert!(
+        took < Duration::from_secs(8),
+        "docker stop took {took:?}; the daemon did not honour SIGTERM before Docker's 10 s SIGKILL fallback"
+    );
+    assert_eq!(
+        state.trim(),
+        "exited 0 false",
+        "the daemon must exit 0 on SIGTERM (137 = SIGKILL fallback, 143 = uncaught SIGTERM)"
+    );
+}
+
+#[test]
+#[ignore = "needs docker and COYOTE_PN_IMAGE_TESTS=1"]
+fn usage_probe_copying_only_the_lxmd_identity_moves_destinations_but_not_the_transport_identity() {
+    if skip_unless_live() {
+        return;
+    }
+    // README: "Copy the whole directory: `/data/lxmd/identity` alone moves the
+    // propagation-node destination but not the relay's transport identity under
+    // `/data/reticulum/storage/`."
+    let image = build_image();
+    let source = Node::fresh(&image, "idsrc");
+    source.start(&[]);
+    let original = destination_hashes(&source.wait_started());
+    assert_eq!(
+        original.len(),
+        2,
+        "expected router + node hashes, got {original:?}"
+    );
+    docker_ok(&["stop", &source.name]);
+    let source_transport = source.on_volume("sha256sum /data/reticulum/storage/transport_identity");
+    assert!(
+        source_transport.contains("/data/reticulum/storage/transport_identity"),
+        "the transport identity must live under /data/reticulum/storage/:\n{source_transport}"
+    );
+
+    let partial = Node::fresh(&image, "idcopy");
+    let lbl = label();
+    let src_mount = format!("{}:/src:ro", source.volume);
+    let dst_mount = format!("{}:/data", partial.volume);
+    docker_ok(&[
+        "run",
+        "--rm",
+        "--label",
+        &lbl,
+        "-v",
+        &src_mount,
+        "-v",
+        &dst_mount,
+        &image,
+        "sh",
+        "-c",
+        "mkdir -p /data/lxmd && cp /src/lxmd/identity /data/lxmd/identity",
+    ]);
+    partial.start(&[]);
+    let logs = partial.wait_started();
+    assert!(
+        logs.contains("Loaded Primary Identity <"),
+        "the copied identity file must be loaded, not replaced:\n{logs}"
+    );
+    assert_eq!(
+        destination_hashes(&logs),
+        original,
+        "identity alone must carry both LXMF destination hashes"
+    );
+    let partial_transport =
+        partial.on_volume("sha256sum /data/reticulum/storage/transport_identity");
+    let digest = |s: &str| s.split_whitespace().next().unwrap_or("").to_string();
+    assert_ne!(
+        digest(&partial_transport),
+        digest(&source_transport),
+        "a volume seeded with only /data/lxmd/identity must mint a NEW transport identity, as the README warns"
+    );
+    assert_eq!(
+        digest(&partial_transport).len(),
+        64,
+        "sha256sum output: {partial_transport:?}"
     );
 }

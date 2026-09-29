@@ -28,10 +28,11 @@ it as `PIP_CERT`:
 docker build --secret id=pip_ca,src=/etc/ssl/certs/ca-certificates.crt -t coyote-pn deployment/propagation-node
 ```
 
-The image runs as uid 1000. A bind mount instead of a named volume has to be owned by that uid:
+The image runs as uid 1000. A bind mount instead of a named volume has to be owned by that uid, and mode 700
+keeps the identity files it will hold from other users on the host:
 
 ```sh
-mkdir -p /srv/coyote-pn && chown 1000:1000 /srv/coyote-pn
+install -d -m 700 -o 1000 -g 1000 /srv/coyote-pn
 docker run -d --name coyote-pn -p <lan-or-vpn-ip>:4242:4242 -v /srv/coyote-pn:/data coyote-pn
 ```
 
@@ -48,12 +49,13 @@ $ docker logs coyote-pn
 The two hashes are the daemon's delivery destination and the propagation node destination; yours will differ.
 The second one is what Coyote lists under `propagation_nodes`.
 
-A first argument of `lxmd` runs lxmd with the volume's config directories and the remaining arguments, so
-`docker run --rm coyote-pn lxmd --version` and `lxmd --exampleconfig` work and `lxmd --status` looks at this
-node, not at `~/.lxmd`. `rnsd`, `sh` and `bash` run that program instead of the daemon. Anything else is
-appended to the daemon's command line, which is how `--version` above and `--exampleconfig` work. The other RNS
-tools (`rnstatus`, `rnpath`, `rnprobe`, `rnid`) are not passed through: with `share_instance = No` they would
-start an isolated second Reticulum instance and report nothing about the daemon.
+A first argument of `lxmd` is dropped and the rest is appended to the daemon's command line, so
+`docker run --rm coyote-pn lxmd --version`, `lxmd --exampleconfig` and a bare `lxmd` all behave exactly like
+the same command without the `lxmd`: every path seeds the volume first and then runs lxmd against
+`/data/lxmd` and `/data/reticulum`, never against `~/.lxmd`. `rnsd`, `sh` and `bash` run that program instead
+of the daemon. The other RNS tools (`rnstatus`, `rnpath`, `rnprobe`, `rnid`) are not passed through: with
+`share_instance = No` they would start an isolated second Reticulum instance and report nothing about the
+daemon.
 
 ## What is on the volume
 
@@ -138,9 +140,13 @@ Deployment recipes and the trust model are in the wiki:
 
 - Logs go to stdout; read them with `docker logs coyote-pn`. The daemon is started without `-s`, which would
   send them to a file instead.
-- `docker run --rm -v coyote-pn-data:/data coyote-pn lxmd --status` points at the volume but does not work while
-  the daemon runs: it starts a second Reticulum instance, which collides with the daemon's listener because
-  `share_instance = No`, and it needs the caller's identity in `control_allowed`. The log is the status surface.
+- `lxmd --status` is not usable from this image. A second `docker run` against the volume has its own network
+  namespace and no Reticulum interface that joins it to the daemon (`reticulum.config` only listens), so the
+  status query never finds a path to the node's control destination and exits 200 at the path wait
+  (`lxmd.py:639-643`, timeout at `lxmd.py:631-635`). A `docker exec` form is no better: with
+  `share_instance = No` it starts a second, isolated Reticulum instance. In both forms the second
+  `RNS.Reticulum(configdir=/data/reticulum)` writes into the daemon's live `/data/reticulum/storage/` on exit.
+  The log is the status surface.
 - lxmd also registers a delivery destination for the daemon itself (the first hash in the smoke output).
   Anything sent to it is written under `/data/lxmd/storage/messages` with no count cap;
   `message_storage_limit` bounds the propagation store only. Size the volume for it, or set `on_inbound` to a

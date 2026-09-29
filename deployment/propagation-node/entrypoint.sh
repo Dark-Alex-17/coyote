@@ -1,10 +1,11 @@
 #!/bin/sh
 set -eu
+# RNS writes identities with a plain open(path, "wb") (RNS/Identity.py:665); mode 600 comes from here.
+umask 077
 
 case "${1:-}" in
     lxmd)
         shift
-        exec lxmd --config /data/lxmd --rnsconfig /data/reticulum "$@"
         ;;
     rnsd|sh|bash)
         exec "$@"

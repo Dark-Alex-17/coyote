@@ -346,8 +346,9 @@ The wire format Coyote instances speak to each other is specified normatively in
 Interoperability is exercised against the reference Reticulum/LXMF implementation by the
 [mesh interop harness](https://github.com/Dark-Alex-17/coyote/blob/main/scripts/mesh-interop/README.md),
 run in the informational `Mesh Interop` CI job.
-A ready-to-run LXMF propagation node image for store-and-forward between your instances lives in
-the [propagation node image](https://github.com/Dark-Alex-17/coyote/blob/main/deployment/propagation-node/README.md) guide.
+The [propagation node image](https://github.com/Dark-Alex-17/coyote/blob/main/deployment/propagation-node/README.md)
+guide covers a ready-to-run LXMF propagation node for store-and-forward between your instances (posting is
+wired in this build; fetching held messages back is not yet).
 
 | Setting                           | Default Value   | Description                                                                                                                                                                  |
 |-----------------------------------|-----------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
