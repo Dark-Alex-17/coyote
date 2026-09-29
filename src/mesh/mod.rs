@@ -9,7 +9,7 @@ pub(crate) mod envoy;
 pub(crate) mod events;
 #[cfg(test)]
 mod fuzz;
-mod identity;
+pub(crate) mod identity;
 pub(crate) mod idle;
 pub(crate) mod knock;
 pub(crate) mod knocks;

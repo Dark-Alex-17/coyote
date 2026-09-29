@@ -1,3 +1,4 @@
+use crate::mesh::hex_lower;
 use crate::mesh::protocol::{VersionRefusal, describe_version};
 use crate::mesh::r3::client::SizeBranch;
 use crate::mesh::r3::error::RefusalCode;
@@ -5,7 +6,6 @@ use crate::mesh::r3::frame::{Envelope, EnvelopeError, PathHash, RequestId};
 use crate::mesh::r3::server::{Admission, InboundRequest, Reply, RequestHandler};
 use crate::mesh::r3::short;
 use crate::mesh::trust::{Decision, IdentityStanding, Rule, TrustStore};
-use crate::mesh::{destination_address, hex_lower};
 
 use async_trait::async_trait;
 use parking_lot::RwLock;
@@ -16,6 +16,7 @@ use rns_transport::identity::Identity;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 pub(crate) const KNOCK_PATH: &str = "/knock";
 pub(crate) const STATUS_PATH: &str = "/status";
@@ -182,8 +183,9 @@ enum Route {
 /// proven on the link, and so a peer can only claim instances that are its own. A body
 /// that names no instance is refused without a knock. A known identity asking from an
 /// instance it is not trusted on is refused, and knocks when that is only because nobody
-/// trusted it there yet. Both verdicts are the store's; nothing here reads the trust file
-/// or ranks rules itself.
+/// trusted it there yet; when the instance it names is one the list binds to another
+/// identity, the store marks that record instead and no knock is filed. Both verdicts are
+/// the store's; nothing here reads the trust file or ranks rules itself.
 pub(crate) struct Dispatcher {
     trust: Arc<TrustStore>,
     knocks: Arc<dyn KnockSink>,
@@ -234,7 +236,9 @@ impl Dispatcher {
     /// Answers a verdict the store refused under `rule`. A default-closed refusal knocks
     /// first, since nobody has trusted the instance yet. A blocked identity hears nothing,
     /// as it would have from `admit`: the block may have landed after `handle` read its
-    /// standing, and the refusal taxonomy promises blocked peers silence either way.
+    /// standing, and the refusal taxonomy promises blocked peers silence either way. An
+    /// identity naming an instance bound to another identity does not knock: the store's
+    /// key-change line to the human replaces the knock.
     pub(super) fn refusal(&self, rule: Rule, knock: KnockEvent, log: &dyn Fn(&str, &str)) -> Reply {
         let id8 = short(&knock.identity_hash).to_string();
         match rule {
@@ -245,6 +249,15 @@ impl Dispatcher {
             Rule::DefaultClosed => {
                 self.knocks.knock(knock);
                 log(&id8, &format!("refused: {rule:?} (knocked)"));
+                self.refuse()
+            }
+            Rule::IdentityChanged => {
+                log(&id8, &format!("refused: {rule:?}"));
+                self.trust.note_key_change(
+                    &knock.identity_hash,
+                    &knock.name_hash,
+                    SystemTime::now(),
+                );
                 self.refuse()
             }
             _ => {
@@ -324,9 +337,9 @@ impl RequestHandler for Dispatcher {
                 return self.refuse();
             }
         };
-        let destination_hash = destination_address(&envelope.origin.0, &identity.address_hash);
-        let destination_hex = destination_hash.to_hex_string();
-        let verdict = self.trust.authorize(&identity_hex, &destination_hex);
+        let (verdict, destination_hash) = self
+            .trust
+            .authorize_origin(&identity.address_hash, &envelope.origin.0);
         let rule = verdict.rule;
         match verdict.decision {
             Decision::Refuse => {
@@ -335,7 +348,7 @@ impl RequestHandler for Dispatcher {
                     rule,
                     KnockEvent {
                         identity_hash: identity_hex,
-                        destination_hash: destination_hex,
+                        destination_hash: destination_hash.to_hex_string(),
                         name_hash: hex_lower(&envelope.origin.0),
                         link_id,
                         path_hash: request.path_hash,

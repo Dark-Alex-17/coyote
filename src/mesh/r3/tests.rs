@@ -2397,6 +2397,87 @@ pub(crate) mod network {
         );
     }
 
+    /// An identity-changed refusal answers `NoAccess` and files no knock: the store's
+    /// key-change line to the human stands in for it.
+    #[test]
+    fn an_identity_changed_refusal_answers_no_access_without_a_knock() {
+        let identity = *TransportIdentity::new_from_rand(OsRng).as_identity();
+        let identity_hex = identity.address_hash.to_hex_string();
+        let (trust, _tmp) = TrustList::default().open("r3-dispatch-identity-changed-refusal");
+        let sink = Arc::new(SpySink::default());
+        let dispatcher = Dispatcher::new(trust, sink.clone());
+        let logged = Mutex::new(Vec::new());
+
+        let reply = refusal_under(&dispatcher, Rule::IdentityChanged, &identity, &logged);
+
+        assert!(matches!(reply, Reply::Code(RefusalCode::NoAccess)));
+        assert_eq!(sink.count(), 0, "identity changed does not knock");
+        assert_eq!(
+            *logged.lock(),
+            vec![(
+                identity_hex[..8].to_string(),
+                "refused: IdentityChanged".to_string()
+            )]
+        );
+    }
+
+    /// Identity I2, trusted for its own instance, names the instance the list binds to I1.
+    /// The verdict is identity changed: `NoAccess`, no knock, and I1's record is marked
+    /// with I2 as the identity it was seen under.
+    #[tokio::test]
+    async fn a_standing_identity_naming_a_foreign_instance_is_refused_as_identity_changed() {
+        install_log_collector();
+        let old_key = *TransportIdentity::new_from_rand(OsRng).as_identity();
+        let new_key = *TransportIdentity::new_from_rand(OsRng).as_identity();
+        let new_key_hex = new_key.address_hash.to_hex_string();
+        let shared_origin = OriginName::of(&fresh_destination_name());
+        let own_origin = OriginName::of(&fresh_destination_name());
+        let bound = destination_address(&shared_origin.0, &old_key.address_hash).to_hex_string();
+        let (trust, _tmp) = TrustList::default()
+            .destination(&bound, &old_key.address_hash.to_hex_string())
+            .destination(
+                &destination_address(&own_origin.0, &new_key.address_hash).to_hex_string(),
+                &new_key_hex,
+            )
+            .open("r3-dispatch-identity-changed");
+        let sink = Arc::new(SpySink::default());
+        let dispatcher = Dispatcher::new(trust.clone(), sink.clone());
+        let request = admitted_knock(new_key, shared_origin);
+        let link_id = request.link_id;
+
+        let reply = RequestHandler::handle(&dispatcher, request).await;
+
+        assert!(matches!(reply, Reply::Code(RefusalCode::NoAccess)));
+        assert_eq!(sink.count(), 0, "no knock is filed for a bound instance");
+        assert_debug_logged(&format!(
+            "for /knock from {} on link {}: refused: IdentityChanged",
+            &new_key_hex[..8],
+            link_id.to_hex_string()
+        ));
+        let marked = trust
+            .records()
+            .into_iter()
+            .find(|record| record.hash == bound)
+            .unwrap();
+        assert_eq!(
+            marked.identity.as_deref(),
+            Some(old_key.address_hash.to_hex_string().as_str()),
+            "the record stays bound to the identity that proved it"
+        );
+        assert_eq!(
+            marked.key_changed.map(|mark| mark.seen_identity),
+            Some(new_key_hex.clone())
+        );
+        assert!(
+            trust
+                .records()
+                .iter()
+                .filter(|record| record.hash != bound)
+                .all(|record| record.key_changed.is_none()),
+            "only the conflicting record is marked"
+        );
+    }
+
     /// `/knock` is the dispatcher's own. Registering over it is refused, and the built-in
     /// handler goes on serving it: nil back, nothing knocked, the usurper never entered.
     #[tokio::test]
@@ -2548,20 +2629,31 @@ pub(crate) mod network {
         responder.stop().await;
     }
 
-    /// Default-closed, a denied instance and a body that names no instance are all refused
-    /// with the same bytes, so a refusal never tells the peer which of the three it hit.
+    /// Default-closed, a denied instance, an instance bound to another identity and a body
+    /// that names no instance are all refused with the same bytes, so a refusal never tells
+    /// the peer which of the four it hit.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn every_refusal_is_the_same_bytes_on_the_wire() {
         let recorder = Arc::new(Recorder::default());
         let (responder, requester, desc) = pair(recorder.clone()).await;
         let identity = identity_hex(&requester);
         let destination = requester_destination_hex(&requester);
+        let foreign = TransportIdentity::new_from_rand(OsRng)
+            .as_identity()
+            .address_hash;
         let states = [
             (TrustList::default().identity(&identity, false), false),
             (
                 TrustList::default()
                     .identity(&identity, true)
                     .deny(&destination),
+                false,
+            ),
+            (
+                TrustList::default().identity(&identity, false).destination(
+                    &destination_address(&requester.origin.0, &foreign).to_hex_string(),
+                    &foreign.to_hex_string(),
+                ),
                 false,
             ),
             (TrustList::default().identity(&identity, true), true),
@@ -2595,7 +2687,7 @@ pub(crate) mod network {
             tails.push((payload.len(), payload[19..].to_vec()));
         }
 
-        assert_eq!(tails.len(), 3);
+        assert_eq!(tails.len(), 4);
         assert!(
             tails.iter().all(|tail| tail == &tails[0]),
             "every refusal must be the same bytes: {tails:?}"
@@ -2844,7 +2936,8 @@ pub(crate) mod network {
     /// The instance a request names is bound to the identity proven on the link. A peer
     /// that names the origin of an instance trusted under another identity is judged as
     /// its own instance of that name, which the list does not know, so the trust the user
-    /// gave identity B cannot be borrowed by identity A.
+    /// gave identity B cannot be borrowed by identity A; and since the list binds that
+    /// instance to B, the refusal is identity changed and no knock is filed.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_claimed_instance_is_bound_to_the_proven_identity() {
         install_log_collector();
@@ -2864,23 +2957,13 @@ pub(crate) mod network {
             .unwrap_err();
 
         assert_eq!(err, R3Error::Refused(RefusalCode::NoAccess));
-        let (identity, destination, path_hash, data) = gate.sink.only();
-        assert_eq!(identity, identity_hex(&requester));
         assert_eq!(
-            destination,
-            requester_destination_hex(&requester),
-            "the knock names the instance under the requester's own identity"
+            gate.sink.count(),
+            0,
+            "an instance the list binds to another identity does not knock"
         );
-        assert_ne!(destination, borrowed.to_hex_string());
-        assert_eq!(path_hash, PathHash::of(TEST_PATH));
-        assert_eq!(data, None);
         assert_eq!(recorder.seen_count(), 0, "the handler was never entered");
-        let link_id = gate.sink.knocks.lock()[0].link_id;
-        assert_debug_logged(&format!(
-            "from {} on link {}: refused: DefaultClosed (knocked)",
-            &identity_hex(&requester)[..8],
-            link_id.to_hex_string()
-        ));
+        link_in_refusal_log(&identity_hex(&requester)[..8], "refused: IdentityChanged");
         requester.stop().await;
         responder.stop().await;
     }

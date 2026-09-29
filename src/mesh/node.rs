@@ -1498,6 +1498,7 @@ impl AnnounceFiler<'_> {
         )?;
         self.trust
             .mark_seen(&destination_hash, &identity_hash, &name_hash, now);
+        self.trust.note_key_change(&identity_hash, &name_hash, now);
         if self.throttle.admits(&destination_hash, &filed, hops, now) {
             self.hooks.fire(MeshEvent::PeerDiscovered {
                 destination: destination_hash,
@@ -1772,6 +1773,9 @@ impl MeshSlot {
         runtime
             .knock_gate()
             .attach(Arc::downgrade(self) as Weak<dyn KnockSurface>);
+        runtime
+            .trust()
+            .attach_surface(Arc::downgrade(self) as Weak<dyn KnockSurface>);
         // A node started on its own handle takes the slot's sink, so what it fires
         // reaches the same place as what the slot fires.
         if !self.hooks.same_handle(runtime.hooks())
@@ -2790,6 +2794,7 @@ mod tests {
     use crate::mesh::test_support::{
         TempDir, TrustList, mesh_paths, private_config, snapshot_fixture,
     };
+    use crate::mesh::trust::{KeyChange, TrustOptions};
     use crate::supervisor::mailbox::EnvelopePayload;
     use crate::testing::{debug_snapshot, install_log_collector, warn_snapshot};
     use rns_transport::destination::link::LinkId;
@@ -4969,6 +4974,66 @@ mod tests {
     }
 
     #[test]
+    fn filing_an_announce_marks_a_trusted_record_seen_under_a_new_identity() {
+        let tmp = TempDir::new("node-announce-key-change");
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_000);
+        let peers = PeerTable::load(tmp.path.join("peers.json"), now).unwrap();
+        let origin = OriginName([9u8; NAME_HASH_LEN]);
+        let name_hex = hex_lower(&origin.0);
+        let old = TransportIdentity::new_from_rand(OsRng);
+        let old_hex = old.address_hash().to_hex_string();
+        let old_destination = destination_address(&origin.0, old.address_hash()).to_hex_string();
+        let new = TransportIdentity::new_from_rand(OsRng);
+        let new_hex = new.address_hash().to_hex_string();
+        let new_destination = destination_address(&origin.0, new.address_hash()).to_hex_string();
+        let (trust, _trust_dir) = TrustList::default()
+            .destination(&old_destination, &old_hex)
+            .open("node-announce-key-change-trust");
+        let hooks = MeshHooks::default();
+        let mut filer = AnnounceFiler {
+            peers: &peers,
+            trust: &trust,
+            hooks: &hooks,
+            throttle: DiscoveredThrottle::default(),
+        };
+        let app_data = AnnounceAppData {
+            version: MESH_PROTOCOL_VERSION,
+            display_name: None,
+        }
+        .encode()
+        .unwrap();
+
+        let change = filer.file(
+            new_destination.clone(),
+            new_hex.clone(),
+            name_hex,
+            &app_data,
+            1,
+            now,
+        );
+
+        assert_eq!(change, Some(PeerChange::Added));
+        let old_record = trust
+            .records()
+            .into_iter()
+            .find(|record| record.hash == old_destination)
+            .expect("the trusted record stays listed");
+        assert_eq!(old_record.identity.as_deref(), Some(old_hex.as_str()));
+        assert_eq!(
+            old_record.key_changed,
+            Some(KeyChange {
+                seen_identity: new_hex.clone(),
+                at: now,
+            })
+        );
+        assert_eq!(
+            peers.get(&new_destination).map(|peer| peer.identity_hash),
+            Some(new_hex),
+            "the announce is filed under the identity that signed it"
+        );
+    }
+
+    #[test]
     fn peer_discovered_fires_are_capped_across_peers_and_refill_with_time() {
         let tmp = TempDir::new("node-announce-hook-bucket");
         let now = SystemTime::now();
@@ -5872,6 +5937,51 @@ mod tests {
             .to_string();
 
         assert!(err.contains(".mesh off"), "{err}");
+        assert!(slot.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    /// `install` attaches the slot to the trust list as well as to the knock gate, so a key
+    /// change the list notes reaches the same sink a knock would.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_key_change_noted_after_install_reaches_the_slots_sink() {
+        let started = started_runtime("node-install-key-change").await;
+        let slot = Arc::new(MeshSlot::default());
+        let notifier = Arc::new(RecordingSink::default());
+        slot.set_notifier(Arc::clone(&notifier) as Arc<dyn NotificationSink>);
+        slot.install(started.runtime.clone()).unwrap();
+        let now = SystemTime::now();
+        let origin = [9u8; NAME_HASH_LEN];
+        let old = TransportIdentity::new_from_rand(OsRng);
+        let old_destination = destination_address(&origin, old.address_hash()).to_hex_string();
+        started.runtime.peers().observe(
+            PeerSighting {
+                destination_hash: old_destination.clone(),
+                identity_hash: old.address_hash().to_hex_string(),
+                name_hash: hex_lower(&origin),
+                display_name: None,
+                protocol_version: MESH_PROTOCOL_VERSION,
+                hops: 1,
+            },
+            now,
+        );
+        let trust = started.runtime.trust();
+        trust
+            .trust_destination(&*slot, &old_destination, TrustOptions::default(), now)
+            .unwrap();
+        let new_hex = TransportIdentity::new_from_rand(OsRng)
+            .address_hash()
+            .to_hex_string();
+
+        let marked = trust.note_key_change(&new_hex, &hex_lower(&origin), now);
+
+        assert_eq!(marked.len(), 1);
+        let received = notifier.0.lock().clone();
+        assert_eq!(received.len(), 1, "{received:#?}");
+        let line = &received[0].lines()[0];
+        assert!(line.contains("announced under"), "{line}");
+        assert!(line.contains(&new_hex), "{line}");
         assert!(slot.stop().await.unwrap());
         started.relay_handle.abort();
     }

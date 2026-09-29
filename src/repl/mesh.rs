@@ -2,6 +2,7 @@ use crate::config::mesh_config::{MeshBrief, MeshInterface, render_mesh_info};
 use crate::config::{MeshConfig, RequestContext};
 use crate::function::mesh::trust_label;
 use crate::mesh::card::{CardSource, DISPLAY_NAME_MAX_CHARS, StatusHandler, render_for_human};
+use crate::mesh::identity::{self, Predecessor, fingerprint};
 use crate::mesh::knocks::KnockRecord;
 use crate::mesh::message::{
     BroadcastOutcome, OutboundPeer, PEER_CONTENT_MAX_CHARS, PeerKind, PeerMessage, PeerVia,
@@ -9,11 +10,13 @@ use crate::mesh::message::{
 };
 use crate::mesh::pending::{Correlation, InboundRecord, PendingState};
 use crate::mesh::trust::{
-    Decision, LiveMesh, Rule, Tier, TrustChange, TrustOptions, TrustRecord, TrustStore, Verdict,
+    Decision, KeyChange, LiveMesh, Rule, Tier, TrustChange, TrustOptions, TrustRecord, TrustStore,
+    Verdict, decode_name_hash, parse_hash,
 };
 use crate::mesh::{
     MESH_ALREADY_ON, MeshPaths, MeshRuntime, NodeOptions, PeerRecord, PropagationNodeRecord,
-    age_text, canonical_hash, display_text, parse_rfc3339, redact_hashes, short,
+    age_text, canonical_hash, destination_address, display_text, parse_rfc3339, redact_hashes,
+    short,
 };
 use crate::supervisor::mailbox::EnvelopePayload;
 use crate::utils::{AbortSignal, drain_stale_tty_input, wait_user_interrupt};
@@ -117,9 +120,15 @@ pub(super) const VERBS: &[(&str, &str, &str)] = &[
         "Lift a deny on one instance (the identity-level counterpart is unblock)",
         ".mesh undeny <destination> [--yes]",
     ),
+    (
+        "rotate",
+        "Mint a new mesh identity while the node is off; peers must re-trust the new one",
+        ".mesh rotate [--dry-run|--confirm rotate-<identity-short>]",
+    ),
 ];
 
 pub(crate) const MESH_OFF: &str = "Mesh is off. Run `.mesh on` first.";
+const ROTATE_NEEDS_OFF: &str = "Mesh is on. Run `.mesh off` first; the identity is rotated only while the node is stopped, then `.mesh on` announces the new one.";
 const BROADCAST_NOTICE: &str = "This sends a bulletin to every peer this node trusts that has a known path right now. Peers you have not trusted receive nothing.";
 const REPLY_REFUSAL_TAIL: &str = "Nothing is sent to a destination this node does not trust.";
 const STATUS_REFUSAL_TAIL: &str = "Status is only requested from trusted destinations.";
@@ -157,6 +166,7 @@ pub(crate) async fn run(
         "unblock" => unblock(ctx, rest),
         "deny" => deny(ctx, rest),
         "undeny" => undeny(ctx, rest),
+        "rotate" => rotate(ctx, rest),
         other => bail!("Unknown .mesh command '{other}'. Type `.mesh` for the list."),
     }
 }
@@ -257,16 +267,56 @@ fn peers(ctx: &RequestContext) -> Result<()> {
         .iter()
         .map(|peer| peer.destination_hash.clone())
         .collect();
+    let trust_records = trust.records();
     let mut rows: Vec<PeerRow> = records
-        .into_iter()
+        .iter()
         .map(|peer| {
             let label = trust_label(trust.authorize(&peer.identity_hash, &peer.destination_hash));
-            PeerRow::Heard(peer, label)
+            let mark = key_change_mark(peer, &trust_records);
+            PeerRow::Heard(peer.clone(), label, mark)
         })
         .collect();
-    rows.extend(deny_only_rows(trust.records(), &heard));
+    let successors: Vec<(String, &PeerRecord)> = records
+        .iter()
+        .filter_map(|peer| {
+            let name_hash = decode_name_hash(&peer.name_hash)?;
+            Some(
+                trust
+                    .binding_conflicts(&peer.identity_hash, &name_hash)
+                    .into_iter()
+                    .map(move |conflict| (conflict.destination_hash, peer)),
+            )
+        })
+        .flatten()
+        .collect();
+    rows.extend(unheard_rows(trust_records, &heard, &successors, |record| {
+        unheard_label(&trust, record)
+    }));
     out_text(&render_peers(&rows, now));
     Ok(())
+}
+
+/// The trust column for a record no heard peer announces from: the store's verdict for the
+/// identity it is bound to, so a stale record of a since-blocked identity reads `blocked`.
+fn unheard_label(trust: &TrustStore, record: &TrustRecord) -> &'static str {
+    trust_label(trust.authorize(record.identity.as_deref().unwrap_or_default(), &record.hash))
+}
+
+/// The key-change mark on `peer`'s trust record, paired with the destination the same
+/// instance derives under the identity that caused the mark.
+fn key_change_mark(peer: &PeerRecord, trust_records: &[TrustRecord]) -> Option<KeyChangeMark> {
+    let change = trust_records
+        .iter()
+        .find(|record| record.hash == peer.destination_hash)?
+        .key_changed
+        .clone()?;
+    let new_destination = decode_name_hash(&peer.name_hash)
+        .zip(parse_hash(&change.seen_identity))
+        .map(|(name_hash, seen)| destination_address(&name_hash, &seen).to_hex_string());
+    Some(KeyChangeMark {
+        change,
+        new_destination,
+    })
 }
 
 fn knocks(ctx: &RequestContext) -> Result<()> {
@@ -286,7 +336,14 @@ fn info(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             reach_line(&ctx.app.config.mesh)
         ));
         match ctx.app.mesh.get() {
-            Some(runtime) => text.push_str(&render_node_facts(&runtime, SystemTime::now())),
+            Some(runtime) => {
+                let predecessors = identity::predecessors(&MeshPaths::from_env().identity_path);
+                text.push_str(&render_node_facts(
+                    &runtime,
+                    predecessors.as_deref(),
+                    SystemTime::now(),
+                ));
+            }
             None => text.push_str("  node                        off\n"),
         }
         out_text(text.trim_end());
@@ -625,17 +682,23 @@ fn trust(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
                 TrustOptions { label, note: None },
                 now,
             )?;
-            out_text(&format!(
+            let mut lines = vec![format!(
                 "Trusted {} (identity {}) - {}.",
                 short(&outcome.destination_hash),
                 short(&outcome.identity_hash),
                 change_text(outcome.change)
-            ));
+            )];
+            lines.extend(outcome.superseded.iter().map(|old| {
+                format!(
+                    "  This instance was trusted before as {old} under another identity; that record's key-change mark is cleared. The old record stays trusted for the old key until you run .mesh untrust {old}."
+                )
+            }));
+            out_text(&lines.join("\n"));
         }
         TrustArg::Identity { target, label, yes } => {
             let identity = identity_hash(&target)?;
             out_text(&format!(
-                "This trusts identity {} and every instance it announces, now or later: each of them can message this node and ask it questions.",
+                "This trusts identity {} and every instance it announces, now or later: each of them can message this node and ask it questions. A rotation of this identity is not detected; trust its instances with .mesh trust <destination> instead if you want a key-change notice.",
                 short(&identity)
             ));
             let question = format!("Trust every instance of {}?", short(&identity));
@@ -695,16 +758,26 @@ fn prune(
         let mut lines = vec![format!(
             "Trusted instances not heard from in the last {threshold_text}:"
         )];
+        let mut key_changed = 0;
         for hash in &stale {
             let who = records
                 .iter()
                 .find(|record| record.hash == *hash)
                 .map(|record| {
-                    format!(
+                    let mut who = format!(
                         "{}  last seen {}",
                         record_label(record),
                         age_text(now, record.last_seen_at)
-                    )
+                    );
+                    if let Some(change) = &record.key_changed {
+                        key_changed += 1;
+                        who.push_str(&format!(
+                            " key changed: announced under identity {} {}",
+                            short(&change.seen_identity),
+                            age_text(now, change.at)
+                        ));
+                    }
+                    who
                 })
                 .unwrap_or_default();
             lines.push(format!("  {hash}  {who}"));
@@ -712,8 +785,12 @@ fn prune(
         let older_than_flag = older_than
             .map(|_| format!(" --older-than {threshold_text}"))
             .unwrap_or_default();
+        let marked = match key_changed {
+            0 => String::new(),
+            n => format!(", {n} of them marked key-changed"),
+        };
         lines.push(format!(
-            "This was a dry run; nothing changed. To remove these {} instance(s), run: .mesh trust --prune{older_than_flag} --confirm prune-{}",
+            "This was a dry run; nothing changed. To remove these {} instance(s){marked}, run: .mesh trust --prune{older_than_flag} --confirm prune-{}",
             stale.len(),
             stale.len()
         ));
@@ -964,6 +1041,64 @@ fn undeny(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     }
     store.undeny_destination(ctx.app.mesh.as_ref(), &destination)?;
     out_text(&format!("Undenied {}.", short(&destination)));
+    Ok(())
+}
+
+/// Like `untrust --identity`, a dry run until the printed token comes back. Bare
+/// `.mesh rotate` is the dry run itself: there is no target to prompt help for.
+fn rotate(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
+    let args = parse_mutation_args(
+        rest.unwrap_or(""),
+        "rotate",
+        &["--dry-run", "--confirm", "--yes"],
+    )?;
+    if args.yes {
+        bail!(
+            "`.mesh rotate` takes `--confirm rotate-<identity-short>` from a dry run, not `--yes`."
+        );
+    }
+    if let Some(token) = args.positional.first() {
+        return Err(unexpected(token, "rotate"));
+    }
+    if args.dry_run && args.confirm.is_some() {
+        return Err(unexpected("--dry-run", "rotate"));
+    }
+    if ctx.app.mesh.get().is_some() {
+        bail!(ROTATE_NEEDS_OFF);
+    }
+    let path = MeshPaths::from_env().identity_path;
+    let old = fingerprint(&identity::current_identity(&path)?);
+    let expected = format!("rotate-{}", short(&old));
+    match args.confirm {
+        None => {
+            let recorded = identity::predecessors(&path)?.len();
+            let lines = [
+                format!("Rotating the mesh identity replaces {old}:"),
+                "  a new identity is minted and written over mesh/identity.key; the old private key is not kept".to_string(),
+                format!(
+                    "  the old identity hash is appended to mesh/{} ({recorded} recorded so far)",
+                    identity::PREDECESSORS_FILE
+                ),
+                "  the instance id is unchanged, so the node announces a new destination hash under the new identity".to_string(),
+                "  every peer that trusted this identity or its instances now sees a stranger and must run .mesh trust again after verifying the new hash out of band; your own trust list is unchanged".to_string(),
+                format!(
+                    "This was a dry run; nothing changed. To rotate, run: .mesh rotate --confirm {expected}"
+                ),
+            ];
+            out_text(&lines.join("\n"));
+        }
+        Some(token) if token != expected => bail!(
+            "'{token}' is not the token for identity {}; run .mesh rotate --confirm {expected}",
+            short(&old)
+        ),
+        Some(_) => {
+            let rotation = identity::rotate_identity(&path, &old, SystemTime::now())?;
+            out_text(&format!(
+                "Rotated the mesh identity: {} -> {}.\nPredecessors recorded: {}. Run .mesh on to announce the new identity; peers must re-trust it.",
+                rotation.old_fingerprint, rotation.new_fingerprint, rotation.predecessors
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -1647,7 +1782,7 @@ pub(crate) mod capture {
 
 fn render_help() -> String {
     let mut lines = vec![
-        "Mesh commands (each is session-scoped; nothing here writes config.yaml):".to_string(),
+        "Mesh commands (nothing here writes config.yaml; trust and rotate persist under the mesh/ directory):".to_string(),
     ];
     for (verb, description, example) in VERBS {
         lines.push(format!("  .mesh {verb:<10} {description}"));
@@ -1803,20 +1938,56 @@ fn name_label(name: Option<&str>) -> String {
         .unwrap_or_else(|| "(no name)".to_string())
 }
 
-/// One `.mesh peers` line: a node heard on the mesh with its trust label, or a denied
-/// destination nothing has announced from yet, listed so the deny is visible.
+/// One `.mesh peers` line: a node heard on the mesh with its trust label and the key-change
+/// mark on its trust record; a denied destination nothing has announced from yet, listed
+/// so the deny (and any mark it carries) is visible; or a marked record whose destination
+/// has aged out of the peer table, listed so the mark outlives the row it was first shown on.
 enum PeerRow {
-    Heard(PeerRecord, &'static str),
-    DenyOnly(TrustRecord),
+    Heard(PeerRecord, &'static str, Option<KeyChangeMark>),
+    DenyOnly(TrustRecord, Option<KeyChangeMark>),
+    MarkedOnly(TrustRecord, &'static str, KeyChangeMark),
 }
 
-fn deny_only_rows(records: Vec<TrustRecord>, heard: &[String]) -> Vec<PeerRow> {
+/// A trust record's key-change mark with, when the peer table has heard it, the destination
+/// the same instance announces under the new identity, so the marker can name what to trust.
+struct KeyChangeMark {
+    change: KeyChange,
+    new_destination: Option<String>,
+}
+
+/// The rows for trust records no heard peer announces from, at most one per record: a
+/// denied destination, with its mark when it carries one, else a marked record labelled by
+/// `label_of`. `successors` pairs a superseded trusted destination with the peer now
+/// announcing the same instance under another identity.
+fn unheard_rows(
+    records: Vec<TrustRecord>,
+    heard: &[String],
+    successors: &[(String, &PeerRecord)],
+    label_of: impl Fn(&TrustRecord) -> &'static str,
+) -> Vec<PeerRow> {
     records
         .into_iter()
-        .filter(|record| {
-            record.denied && record.tier == Tier::Destination && !heard.contains(&record.hash)
+        .filter(|record| !heard.contains(&record.hash))
+        .filter_map(|record| {
+            let mark = record.key_changed.clone().map(|change| {
+                let new_destination = successors
+                    .iter()
+                    .find(|(superseded, peer)| {
+                        *superseded == record.hash && peer.identity_hash == change.seen_identity
+                    })
+                    .map(|(_, peer)| peer.destination_hash.clone());
+                KeyChangeMark {
+                    change,
+                    new_destination,
+                }
+            });
+            if record.denied && record.tier == Tier::Destination {
+                return Some(PeerRow::DenyOnly(record, mark));
+            }
+            let mark = mark?;
+            let label = label_of(&record);
+            Some(PeerRow::MarkedOnly(record, label, mark))
         })
-        .map(PeerRow::DenyOnly)
         .collect()
 }
 
@@ -1830,7 +2001,7 @@ fn render_peers(rows: &[PeerRow], now: SystemTime) -> String {
     )];
     for row in rows {
         match row {
-            PeerRow::Heard(peer, trust) => {
+            PeerRow::Heard(peer, trust, key_changed) => {
                 let stale = if peer.is_stale(now) { " (stale)" } else { "" };
                 lines.push(format!(
                     "{:<20} {:<10} {:<10} {:<10} {:>4}  {}{stale}",
@@ -1844,16 +2015,48 @@ fn render_peers(rows: &[PeerRow], now: SystemTime) -> String {
                 if let Some(line) = peer.compatibility_line() {
                     lines.push(format!("{:<20} {line}", ""));
                 }
+                if let Some(mark) = key_changed {
+                    lines.push(key_change_line(
+                        mark,
+                        &peer.identity_hash,
+                        &peer.destination_hash,
+                        now,
+                    ));
+                }
             }
-            PeerRow::DenyOnly(record) => lines.push(format!(
-                "{:<20} {:<10} {:<10} {:<10} {:>4}  {}",
-                "-",
-                short(&record.hash),
-                record.identity.as_deref().map(short).unwrap_or("-"),
-                "denied",
-                "-",
-                "never"
-            )),
+            PeerRow::DenyOnly(record, key_changed) => {
+                let bound = record.identity.as_deref().unwrap_or("-");
+                lines.push(format!(
+                    "{:<20} {:<10} {:<10} {:<10} {:>4}  {}",
+                    "-",
+                    short(&record.hash),
+                    short(bound),
+                    "denied",
+                    "-",
+                    "never"
+                ));
+                if let Some(mark) = key_changed {
+                    lines.push(key_change_line(mark, bound, &record.hash, now));
+                }
+            }
+            PeerRow::MarkedOnly(record, trust, mark) => {
+                let bound = record.identity.as_deref().unwrap_or("-");
+                let label = record
+                    .label
+                    .as_deref()
+                    .and_then(|label| display_text(label, DISPLAY_NAME_MAX_CHARS))
+                    .unwrap_or_else(|| "(not heard)".to_string());
+                lines.push(format!(
+                    "{:<20} {:<10} {:<10} {:<10} {:>4}  {}",
+                    label,
+                    short(&record.hash),
+                    short(bound),
+                    trust,
+                    "-",
+                    age_text(now, record.last_seen_at),
+                ));
+                lines.push(key_change_line(mark, bound, &record.hash, now));
+            }
         }
     }
     lines.push(format!(
@@ -1861,6 +2064,29 @@ fn render_peers(rows: &[PeerRow], now: SystemTime) -> String {
         rows.len()
     ));
     lines.join("\n")
+}
+
+/// The indented marker under a row whose trust record was marked `key_changed`, ending with
+/// the same exits as the notification: trust the instance under its new key if the peer
+/// rotated, otherwise block the identity that announced it; and forget the old key.
+fn key_change_line(
+    mark: &KeyChangeMark,
+    bound_identity: &str,
+    old_destination: &str,
+    now: SystemTime,
+) -> String {
+    let trust = match &mark.new_destination {
+        Some(destination) => format!(".mesh trust {destination}"),
+        None => ".mesh trust its new destination once heard".to_string(),
+    };
+    format!(
+        "{:<20} key changed: announced under identity {} {}; the grant stays with {}. If the peer rotated, verify out of band, then {trust}; otherwise .mesh block {}; .mesh untrust {old_destination} forgets the old key",
+        "",
+        short(&mark.change.seen_identity),
+        age_text(now, mark.change.at),
+        short(bound_identity),
+        mark.change.seen_identity,
+    )
 }
 
 fn render_knocks(records: &[KnockRecord], now: SystemTime) -> String {
@@ -1892,19 +2118,64 @@ fn render_knocks(records: &[KnockRecord], now: SystemTime) -> String {
     lines.join("\n")
 }
 
-fn render_node_facts(runtime: &MeshRuntime, now: SystemTime) -> String {
+fn render_node_facts(
+    runtime: &MeshRuntime,
+    predecessors: Result<&[Predecessor], &anyhow::Error>,
+    now: SystemTime,
+) -> String {
     let mut output = String::new();
     let mut row = |name: &str, value: String| output.push_str(&format!("  {name:<28}{value}\n"));
     row("node", "on".to_string());
     row("identity", runtime.fingerprint().to_string());
+    row(
+        "identity predecessors",
+        predecessors_text(predecessors, now),
+    );
     row("destination", runtime.current_destination_hash());
     row("instance", runtime.current_instance_id());
     row("joined", runtime.interfaces().join(", "));
+    let key_changes = runtime
+        .trust()
+        .records()
+        .iter()
+        .filter(|record| record.key_changed.is_some())
+        .count();
+    row(
+        "key changes",
+        match key_changes {
+            0 => "none".to_string(),
+            n => {
+                format!("{n} trusted instance(s) announced under another identity; see .mesh peers")
+            }
+        },
+    );
     output.push_str(&render_propagation_nodes(
         runtime.propagation_nodes().snapshot(),
         now,
     ));
     output
+}
+
+fn predecessors_text(
+    predecessors: Result<&[Predecessor], &anyhow::Error>,
+    now: SystemTime,
+) -> String {
+    match predecessors {
+        Err(err) => format!("unreadable: {err:#}"),
+        Ok([]) => "none".to_string(),
+        Ok(all) => {
+            let latest = &all[all.len() - 1];
+            let when = parse_rfc3339(&latest.rotated_at)
+                .map(|then| age_text(now, then))
+                .or_else(|| display_text(&latest.rotated_at, DISPLAY_NAME_MAX_CHARS))
+                .unwrap_or_else(|| "-".to_string());
+            format!(
+                "{} (latest {} rotated {when})",
+                all.len(),
+                short(&latest.identity_hash)
+            )
+        }
+    }
 }
 
 /// Nearest first, the most recently heard breaking ties, so the row the node would
@@ -2565,9 +2836,9 @@ mod tests {
         let mut old = peer(Some("Old"), 3600, now);
         old.compatibility = Compatibility::Incompatible { found: 9 };
         let rows = vec![
-            PeerRow::Heard(peer(Some("Ann"), 5, now), "trusted"),
-            PeerRow::Heard(old, "denied"),
-            PeerRow::Heard(peer(None, 30, now), "untrusted"),
+            PeerRow::Heard(peer(Some("Ann"), 5, now), "trusted", None),
+            PeerRow::Heard(old, "denied", None),
+            PeerRow::Heard(peer(None, 30, now), "untrusted", None),
         ];
         let text = render_peers(&rows, now);
         let lines: Vec<&str> = text.lines().collect();
@@ -2611,6 +2882,7 @@ mod tests {
             all_destinations: false,
             denied: true,
             session: false,
+            key_changed: None,
         }
     }
 
@@ -2626,8 +2898,8 @@ mod tests {
             deny_record(&bound, Some(&"99".repeat(16))),
         ];
         let heard_hashes = vec![heard.destination_hash.clone()];
-        let mut rows = vec![PeerRow::Heard(heard.clone(), "trusted")];
-        rows.extend(deny_only_rows(records, &heard_hashes));
+        let mut rows = vec![PeerRow::Heard(heard.clone(), "trusted", None)];
+        rows.extend(unheard_rows(records, &heard_hashes, &[], |_| "trusted"));
         assert_eq!(
             rows.len(),
             3,
@@ -2651,6 +2923,278 @@ mod tests {
             ),
             "{text}"
         );
+    }
+
+    #[test]
+    fn peers_marks_a_record_whose_instance_was_announced_under_another_identity() {
+        let now = SystemTime::now();
+        let seen_identity = "77".repeat(16);
+        let new_destination = "88".repeat(16);
+        let rows = vec![
+            PeerRow::Heard(
+                peer(Some("Ann"), 5, now),
+                "trusted",
+                Some(KeyChangeMark {
+                    change: KeyChange {
+                        seen_identity: seen_identity.clone(),
+                        at: now - Duration::from_secs(120),
+                    },
+                    new_destination: Some(new_destination.clone()),
+                }),
+            ),
+            PeerRow::Heard(
+                peer(Some("Bob"), 5, now),
+                "trusted",
+                Some(KeyChangeMark {
+                    change: KeyChange {
+                        seen_identity: seen_identity.clone(),
+                        at: now,
+                    },
+                    new_destination: None,
+                }),
+            ),
+            PeerRow::Heard(peer(Some("Cy"), 5, now), "trusted", None),
+        ];
+        let text = render_peers(&rows, now);
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[1].contains("Ann"), "{text}");
+        assert!(lines[2].starts_with(&" ".repeat(20)), "{text}");
+        assert!(
+            lines[2].contains(&format!(
+                "key changed: announced under identity {} 2m ago",
+                short(&seen_identity)
+            )),
+            "{text}"
+        );
+        assert!(
+            lines[2].contains(&format!("the grant stays with {}", "cd".repeat(4))),
+            "{text}"
+        );
+        assert!(
+            lines[2].contains(&format!("then .mesh trust {new_destination}; ")),
+            "{text}"
+        );
+        assert!(
+            lines[2].contains(&format!("; otherwise .mesh block {seen_identity}; ")),
+            "the block exit names the full seen identity: {text}"
+        );
+        assert!(
+            lines[2].ends_with(&format!(
+                ".mesh untrust {} forgets the old key",
+                "ab".repeat(16)
+            )),
+            "{text}"
+        );
+        assert!(lines[3].contains("Bob"), "{text}");
+        assert!(
+            lines[4].contains(&format!(
+                "then .mesh trust its new destination once heard; otherwise .mesh block {seen_identity}; .mesh untrust "
+            )),
+            "a mark without a heard new destination still says what to do: {text}"
+        );
+        assert!(lines[5].contains("Cy"), "{text}");
+        assert!(
+            lines[6].starts_with("3 peer(s)."),
+            "an unmarked row has no marker line: {text}"
+        );
+    }
+
+    #[test]
+    fn peers_lists_a_marked_record_after_its_row_aged_out() {
+        let now = SystemTime::now();
+        let old_destination = "77".repeat(16);
+        let bound_identity = "88".repeat(16);
+        let seen_identity = "99".repeat(16);
+        let mut successor = peer(Some("Tia again"), 5, now);
+        successor.identity_hash = seen_identity.clone();
+        let mut record = deny_record(&old_destination, Some(&bound_identity));
+        record.denied = false;
+        record.label = Some("Tia".to_string());
+        record.last_seen_at = now - Duration::from_secs(7200);
+        record.key_changed = Some(KeyChange {
+            seen_identity: seen_identity.clone(),
+            at: now - Duration::from_secs(3600),
+        });
+        let mut unlabeled = record.clone();
+        unlabeled.hash = "66".repeat(16);
+        unlabeled.label = None;
+        let mut unmarked = deny_record(&"55".repeat(16), None);
+        unmarked.denied = false;
+        let heard = vec![successor.destination_hash.clone()];
+        let successors = vec![(old_destination.clone(), &successor)];
+
+        let mut rows = vec![PeerRow::Heard(successor.clone(), "untrusted", None)];
+        rows.extend(unheard_rows(
+            vec![record.clone(), unlabeled, unmarked],
+            &heard,
+            &successors,
+            |_| "trusted",
+        ));
+        assert_eq!(rows.len(), 3, "a record without a mark is not a row");
+
+        let text = render_peers(&rows, now);
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[2].starts_with("Tia "), "{text}");
+        assert!(lines[2].contains(&"77".repeat(4)), "{text}");
+        assert!(lines[2].contains(&"88".repeat(4)), "{text}");
+        assert!(lines[2].contains("trusted"), "{text}");
+        assert!(
+            lines[2].contains("   -  2h ago"),
+            "no hops for a row nobody heard: {text}"
+        );
+        assert!(lines[3].starts_with(&" ".repeat(20)), "{text}");
+        assert!(
+            lines[3].contains(&format!(
+                "key changed: announced under identity {} 1h ago; the grant stays with {}",
+                short(&seen_identity),
+                short(&bound_identity)
+            )),
+            "{text}"
+        );
+        assert!(
+            lines[3].contains(&format!(
+                "then .mesh trust {}; otherwise .mesh block {seen_identity}; .mesh untrust {old_destination} forgets the old key",
+                successor.destination_hash
+            )),
+            "the exits name the heard successor, the full seen identity and the full old hash: {text}"
+        );
+        assert!(lines[4].starts_with("(not heard) "), "{text}");
+        assert!(
+            lines[5].contains(&format!(
+                "then .mesh trust its new destination once heard; otherwise .mesh block {seen_identity}; .mesh untrust "
+            )),
+            "a mark whose successor is not heard still says what to do: {text}"
+        );
+        assert!(lines[6].starts_with("3 peer(s)."), "{text}");
+
+        let heard_again = vec![old_destination.clone()];
+        assert!(
+            unheard_rows(vec![record], &heard_again, &successors, |_| "trusted").is_empty(),
+            "a heard destination carries its mark on its own row"
+        );
+    }
+
+    #[test]
+    fn an_aged_out_marked_record_of_a_blocked_identity_is_labelled_blocked() {
+        let tmp = crate::mesh::test_support::TempDir::new("repl-peers-marked-blocked");
+        let now = SystemTime::now();
+        let old_destination = "77".repeat(16);
+        let bound_identity = "88".repeat(16);
+        crate::mesh::test_support::TrustList::default()
+            .destination(&old_destination, &bound_identity)
+            .block(&bound_identity)
+            .write(&tmp.path);
+        let trust = TrustStore::open(&tmp.path).unwrap();
+        let mut records = trust.records();
+        let record = records
+            .iter_mut()
+            .find(|record| record.hash == old_destination)
+            .unwrap();
+        record.key_changed = Some(KeyChange {
+            seen_identity: "99".repeat(16),
+            at: now - Duration::from_secs(3600),
+        });
+
+        let rows = unheard_rows(records, &[], &[], |record| unheard_label(&trust, record));
+        assert_eq!(rows.len(), 1);
+
+        let text = render_peers(&rows, now);
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[1].contains(&"77".repeat(4)), "{text}");
+        assert!(lines[1].contains(" blocked "), "{text}");
+        assert!(
+            !lines[1].contains("trusted"),
+            "the row is labelled by the store's verdict, not by the record's existence: {text}"
+        );
+        assert!(lines[2].contains("key changed"), "{text}");
+    }
+
+    #[test]
+    fn a_marked_records_label_is_sanitised_like_any_peer_name() {
+        let now = SystemTime::now();
+        let label = "Tia\u{1b}[31m\nX";
+        let mut record = deny_record(&"77".repeat(16), Some(&"88".repeat(16)));
+        record.denied = false;
+        record.label = Some(label.to_string());
+        record.key_changed = Some(KeyChange {
+            seen_identity: "99".repeat(16),
+            at: now - Duration::from_secs(60),
+        });
+
+        let rows = unheard_rows(vec![record], &[], &[], |_| "trusted");
+        let text = render_peers(&rows, now);
+
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 4, "{text:?}");
+        let shown = display_text(label, DISPLAY_NAME_MAX_CHARS).unwrap();
+        assert!(lines[1].starts_with(&format!("{shown:<20} ")), "{text:?}");
+        assert!(!text.contains('\u{1b}'), "{text:?}");
+        assert!(!text.contains("[31m"), "{text:?}");
+    }
+
+    #[test]
+    fn predecessors_text_sanitises_an_unparsable_rotated_at() {
+        let now = SystemTime::now();
+        let raw = "yesterday\u{1b}[31m\nish";
+        let all = [Predecessor {
+            identity_hash: "ab".repeat(16),
+            rotated_at: raw.to_string(),
+            reason: "rotate".to_string(),
+        }];
+
+        let text = predecessors_text(Ok(&all), now);
+
+        let shown = display_text(raw, DISPLAY_NAME_MAX_CHARS).unwrap();
+        assert_eq!(
+            text,
+            format!(
+                "1 (latest {} rotated {shown})",
+                short(&all[0].identity_hash)
+            )
+        );
+        assert!(!text.contains('\u{1b}'), "{text:?}");
+        assert!(!text.contains('\n'), "{text:?}");
+    }
+
+    #[test]
+    fn peers_lists_a_denied_and_marked_unheard_record_once_as_denied() {
+        let now = SystemTime::now();
+        let old_destination = "77".repeat(16);
+        let seen_identity = "99".repeat(16);
+        let mut record = deny_record(&old_destination, Some(&"88".repeat(16)));
+        record.key_changed = Some(KeyChange {
+            seen_identity: seen_identity.clone(),
+            at: now - Duration::from_secs(120),
+        });
+
+        let rows = unheard_rows(vec![record], &[], &[], |_| "trusted");
+        assert_eq!(
+            rows.len(),
+            1,
+            "a denied record with a mark is one row, not two"
+        );
+
+        let text = render_peers(&rows, now);
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[1].starts_with('-'), "{text}");
+        assert!(lines[1].contains("denied"), "{text}");
+        assert!(!lines[1].contains("trusted"), "{text}");
+        assert!(lines[2].starts_with(&" ".repeat(20)), "{text}");
+        assert!(
+            lines[2].contains(&format!(
+                "key changed: announced under identity {} 2m ago; the grant stays with {}",
+                short(&seen_identity),
+                "88".repeat(4)
+            )),
+            "the deny row still shows the mark: {text}"
+        );
+        assert!(
+            lines[2].ends_with(&format!(
+                "otherwise .mesh block {seen_identity}; .mesh untrust {old_destination} forgets the old key"
+            )),
+            "{text}"
+        );
+        assert!(lines[3].starts_with("1 peer(s)."), "{text}");
     }
 
     #[test]
@@ -3054,8 +3598,8 @@ mod tests {
         let mut old = peer(Some("Old"), 3600, now);
         old.compatibility = Compatibility::Incompatible { found: 9 };
         let rows = vec![
-            PeerRow::Heard(old, "denied"),
-            PeerRow::Heard(peer(Some("Bad"), 5, now), "blocked"),
+            PeerRow::Heard(old, "denied", None),
+            PeerRow::Heard(peer(Some("Bad"), 5, now), "blocked", None),
         ];
         let text = render_peers(&rows, now);
         for marker in ["denied", "blocked", "(stale)", "incompatible"] {
@@ -3351,6 +3895,7 @@ mod tests {
             let _capture = capture::install();
             let mut ctx = off_ctx();
             let hash = "ab".repeat(16);
+            // `.mesh rotate` is gated the other way round and has its own tests.
             for line in [
                 ".mesh peers".to_string(),
                 ".mesh knocks".to_string(),
@@ -3746,6 +4291,182 @@ mod tests {
                 "the slot survives the config swap"
             );
             assert!(!guard.path.join("config.yaml").exists());
+        }
+
+        #[cfg(unix)]
+        fn minted_key(guard: &TestConfigDirGuard) -> (std::path::PathBuf, Vec<u8>, String) {
+            let path = identity::identity_path();
+            assert!(path.starts_with(&guard.path));
+            let minted = identity::load_or_mint_identity(&path).unwrap();
+            let bytes = fs::read(&path).unwrap();
+            (path, bytes, fingerprint(&minted))
+        }
+
+        #[cfg(unix)]
+        fn files_under(dir: &Path) -> Vec<std::path::PathBuf> {
+            let mut out = Vec::new();
+            for entry in fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    out.extend(files_under(&path));
+                } else {
+                    out.push(path);
+                }
+            }
+            out
+        }
+
+        #[cfg(unix)]
+        fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+            haystack
+                .windows(needle.len())
+                .any(|window| window == needle)
+        }
+
+        #[cfg(unix)]
+        #[test]
+        #[serial]
+        fn rotate_dry_run_prints_the_token_and_changes_nothing() {
+            let guard = TestConfigDirGuard::new("repl-mesh-rotate-dry-run");
+            let _capture = capture::install();
+            let (path, before, old) = minted_key(&guard);
+            let mut ctx = off_ctx();
+            let token = format!("rotate-{}", short(&old));
+
+            for line in [".mesh rotate", ".mesh rotate --dry-run"] {
+                let printed = stdout_lines().len();
+                run_async(run(&mut ctx, line)).unwrap();
+                let out = stdout_lines()[printed..].join("\n");
+                assert!(out.contains(&old), "{line}: {out}");
+                assert!(out.contains("This was a dry run"), "{line}: {out}");
+                assert!(out.contains("(0 recorded so far)"), "{line}: {out}");
+                assert!(out.contains("sees a stranger"), "{line}: {out}");
+                assert!(
+                    out.contains(&format!(".mesh rotate --confirm {token}")),
+                    "{line}: {out}"
+                );
+                assert_eq!(fs::read(&path).unwrap(), before, "{line}");
+                assert!(!identity::predecessors_path(&path).exists(), "{line}");
+            }
+        }
+
+        #[cfg(unix)]
+        #[test]
+        #[serial]
+        fn rotate_with_a_wrong_token_refuses_and_changes_nothing() {
+            let guard = TestConfigDirGuard::new("repl-mesh-rotate-wrong-token");
+            let (path, before, old) = minted_key(&guard);
+            let mut ctx = off_ctx();
+
+            let err = err_of(&mut ctx, ".mesh rotate --confirm rotate-nope");
+
+            assert!(err.contains("'rotate-nope' is not the token"), "{err}");
+            assert!(
+                err.contains(&format!("--confirm rotate-{}", short(&old))),
+                "{err}"
+            );
+            assert_eq!(fs::read(&path).unwrap(), before);
+            assert!(!identity::predecessors_path(&path).exists());
+        }
+
+        /// The instance id lives in the session, not the key; rotating one leaves the
+        /// other alone.
+        #[cfg(unix)]
+        #[test]
+        #[serial]
+        fn rotate_replaces_the_key_records_the_predecessor_and_leaves_no_trace_or_instance_change()
+        {
+            let guard = TestConfigDirGuard::new("repl-mesh-rotate-confirm");
+            let _capture = capture::install();
+            let (path, before, old) = minted_key(&guard);
+            assert_eq!(
+                before.len(),
+                64,
+                "the minted key is the 64-byte private key"
+            );
+            let mut ctx = off_ctx();
+            let mut session = Session::default();
+            let id = session.ensure_mesh_instance_id().to_string();
+            ctx.session = Some(session);
+
+            run_async(run(
+                &mut ctx,
+                &format!(".mesh rotate --confirm rotate-{}", short(&old)),
+            ))
+            .unwrap();
+
+            let files = files_under(&guard.path.join("mesh"));
+            assert!(!files.is_empty(), "{files:?}");
+            for file in &files {
+                assert!(
+                    !contains_bytes(&fs::read(file).unwrap(), &before),
+                    "old key material survives in {}",
+                    file.display()
+                );
+            }
+            let now = fingerprint(&identity::load_or_mint_identity(&path).unwrap());
+            assert_ne!(now, old);
+            let predecessors = identity::predecessors(&path).unwrap();
+            assert_eq!(predecessors.len(), 1, "{predecessors:?}");
+            assert_eq!(predecessors[0].identity_hash, old);
+            assert_eq!(
+                ctx.session.as_ref().unwrap().mesh_instance_id(),
+                Some(id.as_str())
+            );
+            let out = stdout_lines().join("\n");
+            assert!(
+                out.contains(&format!("Rotated the mesh identity: {old} -> {now}.")),
+                "{out}"
+            );
+            assert!(out.contains("Predecessors recorded: 1."), "{out}");
+            assert!(out.contains(".mesh on"), "{out}");
+            assert!(out.contains("peers must re-trust it"), "{out}");
+        }
+
+        #[cfg(unix)]
+        #[test]
+        #[serial]
+        fn rotate_refuses_yes_and_positional_and_dry_run_with_confirm() {
+            let guard = TestConfigDirGuard::new("repl-mesh-rotate-flags");
+            let (path, before, old) = minted_key(&guard);
+            let mut ctx = off_ctx();
+            let token = format!("rotate-{}", short(&old));
+
+            let err = err_of(&mut ctx, ".mesh rotate --yes");
+            assert_eq!(
+                err,
+                "`.mesh rotate` takes `--confirm rotate-<identity-short>` from a dry run, not `--yes`."
+            );
+            assert_eq!(fs::read(&path).unwrap(), before);
+
+            for (line, offending) in [
+                (format!(".mesh rotate {token}"), token.as_str()),
+                (
+                    format!(".mesh rotate --dry-run --confirm {token}"),
+                    "--dry-run",
+                ),
+            ] {
+                let err = err_of(&mut ctx, &line);
+                assert!(
+                    err.starts_with(&format!("Unexpected '{offending}'.")),
+                    "{line}: {err}"
+                );
+                assert!(err.contains(".mesh rotate ["), "{line}: {err}");
+                assert_eq!(fs::read(&path).unwrap(), before, "{line}");
+            }
+        }
+
+        #[test]
+        #[serial]
+        fn rotate_with_no_identity_names_mesh_on() {
+            let guard = TestConfigDirGuard::new("repl-mesh-rotate-no-identity");
+            let mut ctx = off_ctx();
+
+            let err = err_of(&mut ctx, ".mesh rotate");
+
+            assert!(err.contains("No mesh identity"), "{err}");
+            assert!(err.contains(".mesh on"), "{err}");
+            assert!(!guard.path.join("mesh").exists());
         }
 
         #[cfg(unix)]
@@ -4195,6 +4916,165 @@ mod tests {
                     }
                     assert_eq!(row("reach"), reach_line(&ctx.app.config.mesh), "{out}");
                     assert!(out.contains("selection: nearest by hops"), "{out}");
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// The row named `name` of the last `.mesh info` printed.
+            fn info_row(out: &str, name: &str) -> String {
+                let head = format!("  {name:<28}");
+                out.lines()
+                    .rev()
+                    .find_map(|line| line.strip_prefix(&head))
+                    .unwrap_or_else(|| panic!("no {name} row in {out}"))
+                    .to_string()
+            }
+
+            #[test]
+            #[serial]
+            fn rotate_is_refused_while_the_mesh_is_on_and_names_mesh_off() {
+                let guard = TestConfigDirGuard::new("repl-mesh-rotate-while-on");
+                run_async(async {
+                    let started = started_runtime("repl-mesh-rotate-while-on").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let path = identity::identity_path();
+                    let minted = identity::load_or_mint_identity(&path).unwrap();
+                    let before = fs::read(&path).unwrap();
+                    let token = format!("rotate-{}", short(&fingerprint(&minted)));
+
+                    for line in [
+                        ".mesh rotate".to_string(),
+                        format!(".mesh rotate --confirm {token}"),
+                    ] {
+                        let err = refusal(&mut ctx, &line).await;
+                        assert_eq!(err, ROTATE_NEEDS_OFF, "{line}");
+                        assert!(err.contains(".mesh off"), "{line}: {err}");
+                    }
+                    assert_eq!(fs::read(&path).unwrap(), before);
+                    assert!(!identity::predecessors_path(&path).exists());
+                    assert!(path.starts_with(&guard.path));
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            #[test]
+            #[serial]
+            fn node_facts_show_predecessors_and_key_changes() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-info-predecessors");
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-info-predecessors").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let runtime = started.runtime.clone();
+
+                    let out = out_of(&mut ctx, ".mesh info").await.unwrap();
+                    assert_eq!(info_row(&out, "identity predecessors"), "none", "{out}");
+                    assert_eq!(info_row(&out, "key changes"), "none", "{out}");
+
+                    let path = identity::identity_path();
+                    let retired = fingerprint(&identity::load_or_mint_identity(&path).unwrap());
+                    identity::rotate_identity(&path, &retired, SystemTime::now()).unwrap();
+                    let old_dest = heard_trusted_peer(&runtime, ctx.app.mesh.as_ref());
+                    let (_, new_identity) = heard_peer(&runtime, "Tia again", SystemTime::now());
+                    let name_hash = runtime.peers().get(&old_dest).unwrap().name_hash;
+                    assert_eq!(
+                        runtime
+                            .trust()
+                            .note_key_change(&new_identity, &name_hash, SystemTime::now())
+                            .len(),
+                        1
+                    );
+
+                    let out = out_of(&mut ctx, ".mesh info").await.unwrap();
+                    assert_eq!(
+                        info_row(&out, "identity predecessors"),
+                        format!("1 (latest {} rotated 0s ago)", short(&retired)),
+                        "{out}"
+                    );
+                    assert_eq!(
+                        info_row(&out, "key changes"),
+                        "1 trusted instance(s) announced under another identity; see .mesh peers",
+                        "{out}"
+                    );
+
+                    fs::write(identity::predecessors_path(&path), "not json\n").unwrap();
+                    let out = out_of(&mut ctx, ".mesh info").await.unwrap();
+                    let row = info_row(&out, "identity predecessors");
+                    assert!(row.starts_with("unreadable: "), "{out}");
+                    assert!(row.contains(identity::PREDECESSORS_FILE), "{out}");
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// The peer table's marker and the trust verb's naming of the superseded
+            /// record are two views of one mark: trusting the instance under its new key
+            /// clears it.
+            #[test]
+            #[serial]
+            fn trusting_the_new_key_of_a_known_instance_names_the_superseded_record() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-trust-superseded");
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-trust-superseded").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let runtime = started.runtime.clone();
+                    let slot: &dyn LiveMesh = ctx.app.mesh.as_ref();
+                    let old_dest = heard_trusted_peer(&runtime, slot);
+                    let old_identity = identity_of(&runtime.trust(), &old_dest);
+                    let (new_dest, new_identity) =
+                        heard_peer(&runtime, "Tia again", SystemTime::now());
+                    let name_hash = runtime.peers().get(&old_dest).unwrap().name_hash;
+                    assert_eq!(
+                        runtime.peers().get(&new_dest).unwrap().name_hash,
+                        name_hash,
+                        "both announces name the same instance"
+                    );
+                    runtime
+                        .trust()
+                        .note_key_change(&new_identity, &name_hash, SystemTime::now());
+
+                    let out = out_of(&mut ctx, ".mesh peers").await.unwrap();
+                    let marker = out
+                        .lines()
+                        .find(|line| line.contains("key changed:"))
+                        .unwrap_or_else(|| panic!("no key-change marker in {out}"));
+                    assert!(marker.starts_with(' '), "{out}");
+                    assert!(marker.contains(short(&new_identity)), "{out}");
+                    assert!(marker.contains(short(&old_identity)), "{out}");
+                    assert!(
+                        marker.contains(&format!("then .mesh trust {new_dest}; ")),
+                        "the marker names the destination heard under the new key: {out}"
+                    );
+                    assert!(
+                        marker.ends_with(&format!(".mesh untrust {old_dest} forgets the old key")),
+                        "{out}"
+                    );
+
+                    let out = out_of(&mut ctx, &format!(".mesh trust {new_dest} --yes"))
+                        .await
+                        .unwrap();
+                    assert!(out.contains("added"), "{out}");
+                    assert!(
+                        out.contains(&format!(
+                            "trusted before as {old_dest} under another identity"
+                        )),
+                        "{out}"
+                    );
+                    assert!(out.contains(&format!(".mesh untrust {old_dest}")), "{out}");
+
+                    let out = out_of(&mut ctx, ".mesh peers").await.unwrap();
+                    assert!(!out.contains("key changed:"), "{out}");
+                    let out = out_of(&mut ctx, ".mesh info").await.unwrap();
+                    assert_eq!(info_row(&out, "key changes"), "none", "{out}");
 
                     assert!(ctx.app.mesh.stop().await.unwrap());
                     started.relay_handle.abort();
@@ -5334,6 +6214,11 @@ mod tests {
                         .unwrap();
                     assert!(out.contains("every instance"), "{out}");
                     assert!(out.contains("added"), "{out}");
+                    assert!(
+                        out.contains("A rotation of this identity is not detected"),
+                        "{out}"
+                    );
+                    assert!(out.contains(".mesh trust <destination>"), "{out}");
                     assert_eq!(prompt_script::prompts_asked(), 1);
                     assert!(
                         trust
@@ -5384,7 +6269,12 @@ mod tests {
                         assert!(out.contains(&old), "{line}: {out}");
                         assert!(!out.contains(&fresh), "{line}: {out}");
                         assert!(out.contains("This was a dry run"), "{line}: {out}");
-                        assert!(out.contains("--confirm prune-1"), "{line}: {out}");
+                        assert!(
+                            out.contains(
+                                "To remove these 1 instance(s), run: .mesh trust --prune --confirm prune-1"
+                            ),
+                            "no key-change count when nothing is marked: {line}: {out}"
+                        );
                         assert_eq!(trust_file(&trust), before, "{line}");
                     }
                     assert_eq!(prompt_script::prompts_asked(), 0);
@@ -5420,6 +6310,72 @@ mod tests {
                         .await
                         .unwrap();
                     assert!(out.contains("nothing to prune"), "{out}");
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            #[test]
+            #[serial]
+            fn prune_dry_run_shows_key_change_marks() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-trust-prune-marked");
+                let _capture = capture::install();
+                let _script = prompt_script::install(&[]);
+                run_async(async {
+                    let started = started_runtime("repl-mesh-trust-prune-marked").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let trust = started.runtime.trust();
+                    let slot: &dyn LiveMesh = ctx.app.mesh.as_ref();
+                    let long_ago = SystemTime::now() - Duration::from_secs(40 * 86_400);
+                    let (marked, _) = heard_peer(&started.runtime, "Old", long_ago);
+                    trust
+                        .trust_destination(slot, &marked, TrustOptions::default(), long_ago)
+                        .unwrap();
+                    let (_, seen) = heard_peer(&started.runtime, "Old again", SystemTime::now());
+                    let name_hash = started.runtime.peers().get(&marked).unwrap().name_hash;
+                    assert_eq!(
+                        trust
+                            .note_key_change(&seen, &name_hash, SystemTime::now())
+                            .len(),
+                        1
+                    );
+                    let before = trust_file(&trust);
+
+                    let out = out_of(&mut ctx, ".mesh trust --prune").await.unwrap();
+
+                    let marked_row = out
+                        .lines()
+                        .find(|line| line.contains(&marked))
+                        .unwrap_or_else(|| panic!("{out}"));
+                    assert!(
+                        marked_row.contains(&format!(
+                            "key changed: announced under identity {} 0s ago",
+                            short(&seen)
+                        )),
+                        "{out}"
+                    );
+                    assert!(
+                        out.contains(
+                            "To remove these 1 instance(s), 1 of them marked key-changed, run: .mesh trust --prune --confirm prune-1"
+                        ),
+                        "{out}"
+                    );
+                    assert_eq!(trust_file(&trust), before);
+
+                    let out = out_of(&mut ctx, ".mesh trust --prune --confirm prune-1")
+                        .await
+                        .unwrap();
+                    assert!(out.contains("Removed 1"), "{out}");
+                    assert!(
+                        trust
+                            .records()
+                            .iter()
+                            .all(|record| record.key_changed.is_none()),
+                        "a confirmed prune removes the marked record with the rest"
+                    );
                     assert_eq!(prompt_script::prompts_asked(), 0);
 
                     assert!(ctx.app.mesh.stop().await.unwrap());

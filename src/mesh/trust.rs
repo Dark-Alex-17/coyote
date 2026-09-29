@@ -1,6 +1,57 @@
+//! The user's trust list and the verdicts it gives.
+//!
+//! # Key changes
+//!
+//! Reticulum binds a destination hash to its identity: `dest = trunc16(H(name_hash(10) ||
+//! identity_hash(16)))` (`destination_address`). Upstream checks that derivation and the
+//! announce signature before an announce reaches this module, and the R3 dispatcher derives
+//! the destination from the envelope's origin name hash plus the identity proven on the
+//! link. A trusted destination hash therefore can never be presented under a different
+//! identity on either path; the `same_hash` branch in `authorize` is defensive only.
+//!
+//! A peer that rotates its identity keeps its instance id (its name hash) and so announces a
+//! new destination hash under the new identity. The detectable signal of a key change is a
+//! name hash that re-derives one of our trusted destination records under a different
+//! identity: record `R` (destination `D`, bound identity `I1`) conflicts with an announce or
+//! request carrying (identity `I2`, name hash `N`) iff `destination_address(N, I1) == D` and
+//! `I1 != I2`.
+//!
+//! Instance ids are public, so anyone who has heard the peer can announce
+//! `coyote.mesh.<instance_id>` under their own identity: the signal is forgeable by any
+//! stranger. Hence the mark never alters the existing grant (`I1` still proves its own key
+//! and stays trusted for `D`); the new identity is a stranger and stays fail-closed; the
+//! human is told once per record while the mark stands; the first conflicting identity is
+//! what the mark records, and later conflicts against an already-marked record write
+//! nothing, so an attacker cannot drive disk churn; the wording says "announced under
+//! another identity", never "rotated"; and nothing is ever re-bound or re-trusted on its
+//! own. While the record stands, only the human clears a mark: by trusting either
+//! destination again, by trusting the identity seen for all destinations, or by blocking
+//! the identity seen. A confirmed `.mesh trust --prune` removes a stale marked record with
+//! the rest, and the dry run shows the mark. Once the new destination is trusted that
+//! identity holds its own record for the instance and marks the old one no more, since both
+//! bindings are the human's; an identity trusted for all destinations marks nothing either,
+//! the human having answered for every instance of it; and a denied record is never marked,
+//! the human having answered it already. The converse holds too: an identity-tier grant has
+//! no instance binding, so a rotation of that identity is fail-closed (the new key is a
+//! stranger) but is neither marked nor surfaced; only a destination record can carry a
+//! key-change notice.
+//!
+//! The store-and-forward peer-MESSAGE path (`src/mesh/message.rs`) authorizes through plain
+//! `authorize`, so a rotated peer fails closed there but is neither marked nor notified;
+//! the announce path is the detector, and detection on the message path is a follow-up.
+//!
+//! On the R3 path a freshly rotated peer has no standing and is silenced before its frame
+//! is decoded, so its name hash is never seen there. `Rule::IdentityChanged` fires at the
+//! verdict stage only when a proven identity that has standing (for another instance, say)
+//! names an instance whose destination is bound to a different identity.
+
 use crate::mesh::announce::is_control_or_invisible;
+use crate::mesh::idle::{IdleNotify, Origin};
+use crate::mesh::knock::KnockSurface;
 use crate::mesh::node::MeshSlot;
+use crate::mesh::notify::Source;
 use crate::mesh::peers::{PeerRecord, PeerTable};
+use crate::mesh::r3::NAME_HASH_LEN;
 use crate::mesh::{
     canonical_hash, decode_hex, destination_address, mesh_config_dir, parse_rfc3339, redact_hashes,
     rfc3339_utc, short, write_atomically,
@@ -15,7 +66,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 
@@ -154,6 +205,17 @@ struct DestinationEntry {
     last_seen_at: Stamp,
     label: Option<String>,
     note: Option<String>,
+    /// Set once this destination's name hash was seen under an identity other than
+    /// `identity`; absent from files written before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    key_changed: Option<KeyChanged>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KeyChanged {
+    seen_identity: String,
+    at: Stamp,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -245,10 +307,13 @@ enum TrustMutation {
         was_granting: bool,
         removed: Vec<String>,
     },
+    /// `marks_cleared` counts the key-change marks that named this identity as the one
+    /// seen, resolved by the block.
     BlockIdentity {
         identity: String,
         was_granting: bool,
         removed: Vec<String>,
+        marks_cleared: usize,
     },
     UnblockIdentity {
         identity: String,
@@ -263,10 +328,16 @@ enum TrustMutation {
     Prune {
         stale: Vec<(String, String)>,
     },
+    /// The destinations whose name hash was announced under `seen_identity`, an identity
+    /// other than the one each is bound to.
+    KeyChanged {
+        destinations: Vec<String>,
+        seen_identity: String,
+    },
 }
 
 /// The log rendering: every hash truncated with `short`, as MESH-LOG-002 requires of a log
-/// line; the only reader is `TrustStore::commit`'s debug line.
+/// line; read by `TrustStore::commit`'s debug line and `note_key_change`'s info line.
 impl fmt::Display for TrustMutation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -288,12 +359,16 @@ impl fmt::Display for TrustMutation {
                 removed.len()
             ),
             Self::BlockIdentity {
-                identity, removed, ..
+                identity,
+                removed,
+                marks_cleared,
+                ..
             } => write!(
                 f,
-                "block identity {} (+{} destinations)",
+                "block identity {} (+{} destinations, {} key-change marks cleared)",
                 short(identity),
-                removed.len()
+                removed.len(),
+                marks_cleared
             ),
             Self::UnblockIdentity { identity } => {
                 write!(f, "unblock identity {}", short(identity))
@@ -301,6 +376,15 @@ impl fmt::Display for TrustMutation {
             Self::Deny { destination } => write!(f, "deny {}", short(destination)),
             Self::Undeny { destination } => write!(f, "undeny {}", short(destination)),
             Self::Prune { stale } => write!(f, "prune {} destinations", stale.len()),
+            Self::KeyChanged {
+                destinations,
+                seen_identity,
+            } => write!(
+                f,
+                "key change marked on {} destinations announced under identity {}",
+                destinations.len(),
+                short(seen_identity)
+            ),
         }
     }
 }
@@ -367,6 +451,7 @@ impl TrustMutation {
                 identity,
                 was_granting,
                 removed,
+                ..
             } => {
                 if was_granting {
                     observer.revoked(revoked(
@@ -402,7 +487,8 @@ impl TrustMutation {
             | Self::TrustIdentity { granted: false, .. }
             | Self::UnblockIdentity { .. }
             | Self::Deny { .. }
-            | Self::Undeny { .. } => {}
+            | Self::Undeny { .. }
+            | Self::KeyChanged { .. } => {}
         }
     }
 }
@@ -421,6 +507,16 @@ pub(crate) struct TrustRecord {
     pub all_destinations: bool,
     pub denied: bool,
     pub session: bool,
+    /// Set on a destination record whose name hash was seen under another identity.
+    pub key_changed: Option<KeyChange>,
+}
+
+/// The key-change mark as `records` reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct KeyChange {
+    /// The first identity other than the bound one the name hash was seen under.
+    pub seen_identity: String,
+    pub at: SystemTime,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -447,6 +543,30 @@ pub(crate) struct TrustOutcome {
     pub identity_hash: String,
     pub destination_hash: String,
     pub change: TrustChange,
+    /// Destinations of other records the trusted instance's name hash re-derives under
+    /// their bound identities: the instance was trusted under another key before. Their
+    /// key-change marks are cleared; the records themselves stay until untrusted.
+    pub superseded: Vec<String>,
+}
+
+/// A trusted destination record whose name hash `binding_conflicts` was asked about
+/// re-derives under its bound identity, which is not the identity asked about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BindingConflict {
+    pub destination_hash: String,
+    pub bound_identity: String,
+    pub label: Option<String>,
+    pub already_marked: bool,
+}
+
+/// One record `note_key_change` marked: the first sighting of its name hash under another
+/// identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MarkedKeyChange {
+    pub destination_hash: String,
+    pub bound_identity: String,
+    pub seen_identity: String,
+    pub label: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -461,6 +581,9 @@ pub(crate) enum Rule {
     IdentityBlocked,
     DestinationTrusted,
     IdentityTrusted,
+    /// The origin name hash re-derives a trusted destination under a different identity;
+    /// always a refusal.
+    IdentityChanged,
     DefaultClosed,
 }
 
@@ -506,7 +629,9 @@ fn same_hash(left: &str, right: &str) -> bool {
 /// its cached knock, which identity derived it. Queries never touch the disk. `mark_seen`
 /// and session trust live in memory only, so `last_seen_at` on disk is as of the last
 /// mutation that touched a record while `records` reports the fresher in-memory value; the
-/// node calls `mark_seen` for every announce it files.
+/// node calls `mark_seen` for every announce it files. The one write an announce or a
+/// request can cause is `note_key_change`, once per record: a mark that is already set is
+/// never written again.
 ///
 /// Nothing here removes a record on its own: removal is `untrust_*`, `block_identity` and
 /// `prune_destinations`, all at the user's request.
@@ -514,6 +639,9 @@ pub(crate) struct TrustStore {
     path: PathBuf,
     inner: Mutex<State>,
     observer: ArcSwapOption<Arc<dyn TrustObserver>>,
+    /// Where a key-change line goes; held weakly because the slot owns the runtime that
+    /// owns this store.
+    surface: Mutex<Option<Weak<dyn KnockSurface>>>,
 }
 
 impl fmt::Debug for TrustStore {
@@ -547,12 +675,19 @@ impl TrustStore {
                 ..State::default()
             }),
             observer: ArcSwapOption::empty(),
+            surface: Mutex::new(None),
         })
     }
 
     /// Installs who hears about grants and revocations; the one before it is dropped.
     pub(crate) fn set_observer(&self, observer: Arc<dyn TrustObserver>) {
         self.observer.store(Some(Arc::new(observer)));
+    }
+
+    /// Installs where `note_key_change` puts its one line per newly marked record. A mark
+    /// made before this is called is on the record but was never surfaced.
+    pub(crate) fn attach_surface(&self, surface: Weak<dyn KnockSurface>) {
+        *self.surface.lock() = Some(surface);
     }
 
     #[cfg(test)]
@@ -563,7 +698,8 @@ impl TrustStore {
     /// The one place the precedence lives: destination deny, then destination allow, then
     /// identity allow, then default-closed. A blocked identity is refused before either
     /// allow and reported under its own rule. A destination record only allows the identity
-    /// it was proven to belong to.
+    /// it was proven to belong to. `authorize_origin` layers the one rule that needs the
+    /// name hash, identity changed, between identity allow and default-closed.
     ///
     /// The map lookups are keyed on values the peer already knows and are not treated as a
     /// timing boundary. The destination binding is the one direct equality against a
@@ -612,6 +748,46 @@ impl TrustStore {
             decision: Decision::Refuse,
             rule: Rule::DefaultClosed,
         }
+    }
+
+    /// `authorize` for a request whose origin is known by name hash: the destination judged
+    /// is the one `name_hash` and `identity` derive, and a default-closed verdict becomes
+    /// `IdentityChanged` when that name hash re-derives a trusted destination under another
+    /// identity. That is the only difference: a refusal stays a refusal, only its rule
+    /// changes, and the conflicting record's grant stays with the identity it is bound to.
+    pub(crate) fn authorize_origin(
+        &self,
+        identity: &AddressHash,
+        name_hash: &[u8; NAME_HASH_LEN],
+    ) -> (Verdict, AddressHash) {
+        let destination = destination_address(name_hash, identity);
+        let identity_hex = identity.to_hex_string();
+        let verdict = self.authorize(&identity_hex, &destination.to_hex_string());
+        if verdict.rule == Rule::DefaultClosed
+            && !self.binding_conflicts(&identity_hex, name_hash).is_empty()
+        {
+            return (
+                Verdict {
+                    decision: Decision::Refuse,
+                    rule: Rule::IdentityChanged,
+                },
+                destination,
+            );
+        }
+        (verdict, destination)
+    }
+
+    /// The trusted destination records, on disk then session, that `name_hash` re-derives
+    /// under their bound identity when that identity is not `identity_hash`: the instance
+    /// they belong to has been seen under another key.
+    pub(crate) fn binding_conflicts(
+        &self,
+        identity_hash: &str,
+        name_hash: &[u8; NAME_HASH_LEN],
+    ) -> Vec<BindingConflict> {
+        self.inner
+            .lock()
+            .binding_conflicts(&identity_hash.to_ascii_lowercase(), name_hash)
     }
 
     #[cfg(test)]
@@ -682,6 +858,7 @@ impl TrustStore {
                     all_destinations: entry.all_destinations,
                     denied: false,
                     session,
+                    key_changed: None,
                 })
                 .collect::<Vec<_>>()
         };
@@ -699,6 +876,10 @@ impl TrustStore {
                     all_destinations: false,
                     denied: state.file.denied_destinations.contains_key(hash),
                     session,
+                    key_changed: entry.key_changed.as_ref().map(|mark| KeyChange {
+                        seen_identity: mark.seen_identity.clone(),
+                        at: mark.at.0,
+                    }),
                 })
                 .collect::<Vec<_>>()
         };
@@ -726,6 +907,7 @@ impl TrustStore {
                     all_destinations: false,
                     denied: true,
                     session: false,
+                    key_changed: None,
                 }),
         );
         records
@@ -776,10 +958,126 @@ impl TrustStore {
             .or_insert(at);
     }
 
+    /// Marks every trusted destination record whose instance `name_hash` names when it is
+    /// seen under `identity_hash` rather than the identity the record is bound to, and
+    /// surfaces one line per record newly marked. A record already marked keeps its first
+    /// sighting and is neither written nor reported again, so a repeated or forged announce
+    /// costs nothing; session records are marked in memory only. The grant is untouched:
+    /// the bound identity still proves its own key. An unreadable hash marks nothing, and
+    /// neither does a blocked `identity_hash`: the human has already answered it. The same
+    /// goes for a denied record and for an `identity_hash` the human has already trusted,
+    /// for the instance or for all destinations (`State::binding_conflicts`).
+    pub(crate) fn note_key_change(
+        &self,
+        identity_hash: &str,
+        name_hash: &str,
+        now: SystemTime,
+    ) -> Vec<MarkedKeyChange> {
+        let (Some(seen), Some(name_hash)) =
+            (parse_hash(identity_hash), decode_name_hash(name_hash))
+        else {
+            return Vec::new();
+        };
+        let seen_identity = seen.to_hex_string();
+        let marked = {
+            let mut state = self.inner.lock();
+            if state.file.blocked_identities.contains_key(&seen_identity) {
+                return Vec::new();
+            }
+            let fresh: Vec<BindingConflict> = state
+                .binding_conflicts(&seen_identity, &name_hash)
+                .into_iter()
+                .filter(|conflict| !conflict.already_marked)
+                .collect();
+            if fresh.is_empty() {
+                return Vec::new();
+            }
+            let mark = KeyChanged {
+                seen_identity: seen_identity.clone(),
+                at: Stamp::new(now),
+            };
+            let mut file = state.file.clone();
+            let on_disk: Vec<String> = fresh
+                .iter()
+                .filter_map(|conflict| {
+                    let entry = file.destinations.get_mut(&conflict.destination_hash)?;
+                    entry.key_changed = Some(mark.clone());
+                    Some(conflict.destination_hash.clone())
+                })
+                .collect();
+            if !on_disk.is_empty() {
+                let mutation = TrustMutation::KeyChanged {
+                    destinations: on_disk,
+                    seen_identity: seen_identity.clone(),
+                };
+                let summary = mutation.to_string();
+                if let Err(err) = self.commit(&mut state, file, mutation) {
+                    warn!(
+                        "Mesh trust list could not record a key change: {}",
+                        redact_hashes(&format!("{err:#}"))
+                    );
+                    return Vec::new();
+                }
+                info!("Mesh {summary}");
+            }
+            for conflict in &fresh {
+                if let Some(entry) = state
+                    .session_destinations
+                    .get_mut(&conflict.destination_hash)
+                {
+                    entry.key_changed = Some(mark.clone());
+                }
+            }
+            fresh
+                .into_iter()
+                .map(|conflict| MarkedKeyChange {
+                    destination_hash: conflict.destination_hash,
+                    bound_identity: conflict.bound_identity,
+                    seen_identity: seen_identity.clone(),
+                    label: conflict.label,
+                })
+                .collect::<Vec<_>>()
+        };
+        let new_destination = destination_address(&name_hash, &seen).to_hex_string();
+        self.surface_key_changes(&marked, &new_destination);
+        marked
+    }
+
+    /// One line per newly marked record, offered after the store lock is released. Nothing
+    /// in the line comes from the peer: the label is the human's own, admitted by
+    /// `check_text`, and the rest is hashes. A dropped line is not offered again; the mark
+    /// stands and `.mesh peers` shows it.
+    fn surface_key_changes(&self, marked: &[MarkedKeyChange], new_destination: &str) {
+        let surface = self.surface.lock().as_ref().and_then(Weak::upgrade);
+        for change in marked {
+            let Some(surface) = &surface else {
+                debug!(
+                    "Mesh key change on destination {} was not surfaced: nothing is attached",
+                    short(&change.destination_hash)
+                );
+                continue;
+            };
+            let shown = surface.surface(IdleNotify {
+                source: Source::Mesh,
+                origin: Origin::Peer(short(&change.seen_identity).to_string()),
+                text: key_change_text(change, new_destination),
+                model_note: None,
+            });
+            if !shown {
+                warn!(
+                    "Mesh key-change notice for {} was dropped; the mark stands and .mesh peers shows it",
+                    short(&change.destination_hash)
+                );
+            }
+        }
+    }
+
     /// Trusts one destination by proving which identity announced it, and makes sure that
     /// identity has a record (without `all_destinations`, which only `trust_identity` sets).
     /// The identity comes from the announce's or the knock's own hashes, never from the
-    /// caller.
+    /// caller. Re-trusting a destination clears its key-change mark, as does trusting the
+    /// new destination of an instance whose old records carry one: the human has affirmed
+    /// the binding.
     pub(crate) fn trust_destination(
         &self,
         mesh: &dyn LiveMesh,
@@ -797,6 +1095,7 @@ impl TrustStore {
             Some(entry) => {
                 entry.identity = peer.identity_hash.clone();
                 entry.last_seen_at = Stamp::new(peer.last_seen);
+                entry.key_changed = None;
                 apply_options(&mut entry.label, &mut entry.note, opts);
                 TrustChange::Updated
             }
@@ -809,11 +1108,23 @@ impl TrustStore {
                         last_seen_at: Stamp::new(peer.last_seen),
                         label: opts.label,
                         note: opts.note,
+                        key_changed: None,
                     },
                 );
                 TrustChange::Added
             }
         };
+        let superseded: Vec<String> = decode_name_hash(&peer.name_hash)
+            .map(|name_hash| state.binding_conflicts(&peer.identity_hash, &name_hash))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|conflict| conflict.destination_hash)
+            .collect();
+        for destination in &superseded {
+            if let Some(entry) = file.destinations.get_mut(destination) {
+                entry.key_changed = None;
+            }
+        }
         file.identities
             .entry(peer.identity_hash.clone())
             .or_insert_with(|| identity_entry(now, peer.last_seen, false));
@@ -826,6 +1137,11 @@ impl TrustStore {
                 change,
             },
         )?;
+        for destination in &superseded {
+            if let Some(entry) = state.session_destinations.get_mut(destination) {
+                entry.key_changed = None;
+            }
+        }
         // Both now live on disk, so a session twin would list the same hash twice.
         state.session_destinations.remove(&peer.destination_hash);
         state.session_identities.remove(&peer.identity_hash);
@@ -833,6 +1149,7 @@ impl TrustStore {
             identity_hash: peer.identity_hash,
             destination_hash: peer.destination_hash,
             change,
+            superseded,
         })
     }
 
@@ -855,12 +1172,14 @@ impl TrustStore {
                 identity_hash: peer.identity_hash,
                 destination_hash: peer.destination_hash,
                 change: TrustChange::Updated,
+                superseded: Vec::new(),
             });
         }
         let change = match state.session_destinations.get_mut(&peer.destination_hash) {
             Some(entry) => {
                 entry.identity = peer.identity_hash.clone();
                 entry.last_seen_at = Stamp::new(peer.last_seen);
+                entry.key_changed = None;
                 TrustChange::Updated
             }
             None => {
@@ -872,6 +1191,7 @@ impl TrustStore {
                         last_seen_at: Stamp::new(peer.last_seen),
                         label: None,
                         note: None,
+                        key_changed: None,
                     },
                 );
                 TrustChange::Added
@@ -887,13 +1207,16 @@ impl TrustStore {
             identity_hash: peer.identity_hash,
             destination_hash: peer.destination_hash,
             change,
+            superseded: Vec::new(),
         })
     }
 
     /// Trusts every destination of an identity (`--identity`): the record's
     /// `all_destinations` flag is set, or the record is created with it set. Only peer rows
     /// whose destination the identity provably derives count towards `last_seen_at`; the
-    /// identity column alone is a claim.
+    /// identity column alone is a claim. Every key-change mark that named this identity as
+    /// the one seen is cleared: the human has answered for every instance of it, and
+    /// `binding_conflicts` would never re-evaluate the mark for an identity trusted for all.
     pub(crate) fn trust_identity(
         &self,
         mesh: &dyn LiveMesh,
@@ -931,6 +1254,7 @@ impl TrustStore {
                 (TrustChange::Added, true)
             }
         };
+        clear_marks_seen_under(file.destinations.values_mut(), &identity);
         self.commit(
             &mut state,
             file,
@@ -941,6 +1265,7 @@ impl TrustStore {
         )?;
         // The identity now lives on disk, so a session twin would list the same hash twice.
         state.session_identities.remove(&identity);
+        clear_marks_seen_under(state.session_destinations.values_mut(), &identity);
         Ok(change)
     }
 
@@ -1009,7 +1334,9 @@ impl TrustStore {
 
     /// Suppresses an identity's knocks and drops its trust records, on disk and for the
     /// session; returns the removed destination hashes. Blocking is the one mutation that
-    /// works on an identity the trust list has never seen.
+    /// works on an identity the trust list has never seen. It also clears every key-change
+    /// mark that named this identity as the one seen: the block is the notice's own remedy,
+    /// and a later sighting under yet another identity can mark the record again.
     pub(crate) fn block_identity(
         &self,
         mesh: &dyn LiveMesh,
@@ -1027,6 +1354,7 @@ impl TrustStore {
             .remove(&identity)
             .is_some_and(|entry| entry.all_destinations);
         let removed = remove_destinations_of(&mut file, &identity);
+        let marks_cleared = clear_marks_seen_under(file.destinations.values_mut(), &identity);
         upsert_overlay(&mut file.blocked_identities, identity.clone(), note, now);
         self.commit(
             &mut state,
@@ -1035,9 +1363,11 @@ impl TrustStore {
                 identity: identity.clone(),
                 was_granting,
                 removed: removed.clone(),
+                marks_cleared,
             },
         )?;
         state.forget_identity(&identity, &removed);
+        clear_marks_seen_under(state.session_destinations.values_mut(), &identity);
         Ok(removed)
     }
 
@@ -1193,6 +1523,58 @@ impl State {
             self.forget_destination(hash);
         }
     }
+
+    /// `identity` is canonical lower hex. An entry whose bound identity does not parse is
+    /// skipped: `open` refuses such a file, so none exists, but nothing here panics. Nothing
+    /// conflicts once `identity` holds its own trusted record for the instance, both
+    /// bindings then being the human's, nor once `identity` is trusted for all
+    /// destinations, the human having answered for every instance of it; a denied record
+    /// is left out, the human having answered it.
+    fn binding_conflicts(
+        &self,
+        identity: &str,
+        name_hash: &[u8; NAME_HASH_LEN],
+    ) -> Vec<BindingConflict> {
+        let trusted_for_all = self
+            .file
+            .identities
+            .get(identity)
+            .is_some_and(|entry| entry.all_destinations);
+        if trusted_for_all || self.holds_instance(identity, name_hash) {
+            return Vec::new();
+        }
+        self.file
+            .destinations
+            .iter()
+            .chain(&self.session_destinations)
+            .filter(|(hash, _)| !self.file.denied_destinations.contains_key(*hash))
+            .filter(|(_, entry)| !same_hash(&entry.identity, identity))
+            .filter(|(hash, entry)| {
+                parse_hash(&entry.identity).is_some_and(|bound| {
+                    parse_hash(hash) == Some(destination_address(name_hash, &bound))
+                })
+            })
+            .map(|(hash, entry)| BindingConflict {
+                destination_hash: hash.clone(),
+                bound_identity: entry.identity.clone(),
+                label: entry.label.clone(),
+                already_marked: entry.key_changed.is_some(),
+            })
+            .collect()
+    }
+
+    /// Whether `identity` is bound, on disk or for the session, to the destination it
+    /// derives from `name_hash`.
+    fn holds_instance(&self, identity: &str, name_hash: &[u8; NAME_HASH_LEN]) -> bool {
+        parse_hash(identity).is_some_and(|seen| {
+            let own = destination_address(name_hash, &seen).to_hex_string();
+            self.file
+                .destinations
+                .get(&own)
+                .or_else(|| self.session_destinations.get(&own))
+                .is_some_and(|entry| same_hash(&entry.identity, identity))
+        })
+    }
 }
 
 /// Reads the version alone first so a file from a newer Coyote gets a precise message
@@ -1234,6 +1616,17 @@ fn refuse_non_canonical_keys(path: &Path, file: &TrustFile) -> Result<()> {
             file.destinations
                 .values()
                 .map(|entry| ("destinations (identity field)", &entry.identity)),
+        )
+        .chain(
+            file.destinations
+                .values()
+                .filter_map(|entry| entry.key_changed.as_ref())
+                .map(|mark| {
+                    (
+                        "destinations (key_changed.seen_identity field)",
+                        &mark.seen_identity,
+                    )
+                }),
         )
         .chain(
             file.denied_destinations
@@ -1301,7 +1694,7 @@ fn valid_hash(what: &str, input: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("'{input}' is not a valid {what} hash: expected 32 hex characters."))
 }
 
-fn parse_hash(text: &str) -> Option<AddressHash> {
+pub(crate) fn parse_hash(text: &str) -> Option<AddressHash> {
     AddressHash::new_from_hex_string(&canonical_hash(text)?).ok()
 }
 
@@ -1387,6 +1780,25 @@ fn remove_destinations_of(file: &mut TrustFile, identity: &str) -> Vec<String> {
     bound
 }
 
+/// Clears the key-change marks that name `identity` as the one seen; returns how many.
+fn clear_marks_seen_under<'a>(
+    entries: impl Iterator<Item = &'a mut DestinationEntry>,
+    identity: &str,
+) -> usize {
+    let mut cleared = 0;
+    for entry in entries {
+        if entry
+            .key_changed
+            .as_ref()
+            .is_some_and(|mark| mark.seen_identity == identity)
+        {
+            entry.key_changed = None;
+            cleared += 1;
+        }
+    }
+    cleared
+}
+
 fn overlay_records(overlay: &BTreeMap<String, OverlayEntry>) -> Vec<OverlayRecord> {
     overlay
         .iter()
@@ -1401,6 +1813,8 @@ fn overlay_records(overlay: &BTreeMap<String, OverlayEntry>) -> Vec<OverlayRecor
 struct ResolvedPeer {
     destination_hash: String,
     identity_hash: String,
+    /// Lower hex, verified to derive `destination_hash` with `identity_hash`.
+    name_hash: String,
     last_seen: SystemTime,
 }
 
@@ -1418,6 +1832,7 @@ fn resolve_destination(
         return Ok(ResolvedPeer {
             destination_hash: destination,
             identity_hash: identity.to_hex_string(),
+            name_hash: record.name_hash.clone(),
             last_seen: record.last_seen,
         });
     }
@@ -1440,6 +1855,7 @@ fn resolve_destination(
     Ok(ResolvedPeer {
         destination_hash: destination,
         identity_hash: identity.to_hex_string(),
+        name_hash: knock.name_hash,
         last_seen: knock.last_seen,
     })
 }
@@ -1468,11 +1884,9 @@ fn verify_binding(
     name_hash: &str,
     source: &str,
 ) -> Result<AddressHash> {
-    let name_hash = decode_hex(name_hash)
-        .and_then(|bytes| bytes.try_into().ok())
-        .ok_or_else(|| {
-            anyhow!("The name hash {source} holds for {destination} is unreadable; wait until it is heard again.")
-        })?;
+    let name_hash = decode_name_hash(name_hash).ok_or_else(|| {
+        anyhow!("The name hash {source} holds for {destination} is unreadable; wait until it is heard again.")
+    })?;
     let identity = parse_hash(identity_hash).ok_or_else(|| {
         anyhow!("The identity hash {source} holds for {destination} is unreadable; wait until it is heard again.")
     })?;
@@ -1490,6 +1904,29 @@ fn verify_binding(
     Ok(identity)
 }
 
+pub(crate) fn decode_name_hash(hex: &str) -> Option<[u8; NAME_HASH_LEN]> {
+    decode_hex(hex)?.try_into().ok()
+}
+
+/// The one line a key change earns. It says "announced under", not "rotated": anyone who
+/// has heard the instance id can announce it under their own key, so the human verifies
+/// out of band before trusting the new destination, or blocks the new identity. Full
+/// hashes, because the human pastes them.
+fn key_change_text(change: &MarkedKeyChange, new_destination: &str) -> String {
+    let instance = change
+        .label
+        .clone()
+        .unwrap_or_else(|| short(&change.destination_hash).to_string());
+    format!(
+        "instance {instance} is bound to identity {bound} but was announced under identity {seen}; \
+         its grant stays with the old key and the new key is a stranger. If the peer rotated, \
+         verify the new identity out of band and run .mesh trust {new_destination} ; \
+         otherwise .mesh block {seen}",
+        bound = change.bound_identity,
+        seen = change.seen_identity,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::test_support::TempDir;
@@ -1499,7 +1936,9 @@ mod tests {
         MeshHooks, RecordingHookSink, TrustHookObserver, env_value, one_fire,
     };
     use crate::mesh::hex_lower;
+    use crate::mesh::knock::RecordingSurface;
     use crate::mesh::peers::{PEER_TTL, PeerSighting};
+    use crate::testing::{install_log_collector, warn_snapshot};
 
     use rand_core::OsRng;
     use rns_transport::destination::{DestinationName, SingleInputDestination};
@@ -1642,6 +2081,34 @@ mod tests {
 
     fn verdict(decision: Decision, rule: Rule) -> Verdict {
         Verdict { decision, rule }
+    }
+
+    /// The verdict the R3 dispatcher asks for: `peer`'s identity naming its own instance.
+    fn origin_verdict(store: &TrustStore, peer: &Announced) -> Verdict {
+        store
+            .authorize_origin(
+                &parse_hash(&peer.identity_hash).unwrap(),
+                &decode_name_hash(&peer.name_hash).unwrap(),
+            )
+            .0
+    }
+
+    fn record(store: &TrustStore, hash: &str) -> TrustRecord {
+        store
+            .records()
+            .into_iter()
+            .find(|record| record.hash == hash)
+            .unwrap_or_else(|| panic!("no record for {hash}"))
+    }
+
+    /// A trusted instance and the same instance announced under a fresh identity.
+    fn trusted_then_rotated(fx: &Fixture) -> (Announced, Announced) {
+        let old = announced("alpha");
+        fx.announce(&old, t(2_000));
+        fx.trust_destination(&old, t(3_000));
+        let new = announced("alpha");
+        assert_eq!(new.name_hash, old.name_hash);
+        (old, new)
     }
 
     #[test]
@@ -1806,6 +2273,7 @@ mod tests {
                 identity: identity.clone(),
                 was_granting: false,
                 removed: vec![destination.clone()],
+                marks_cleared: 1,
             },
             TrustMutation::UnblockIdentity {
                 identity: identity.clone(),
@@ -1818,6 +2286,10 @@ mod tests {
             },
             TrustMutation::Prune {
                 stale: vec![(destination.clone(), identity.clone())],
+            },
+            TrustMutation::KeyChanged {
+                destinations: vec![destination.clone()],
+                seen_identity: identity.clone(),
             },
         ];
         for mutation in &mutations {
@@ -3861,6 +4333,572 @@ mod tests {
         assert_eq!(
             env_value(&envs, "COYOTE_MESH_PEER_IDENTITY"),
             Some(peer.identity_hash.as_str())
+        );
+    }
+
+    #[test]
+    fn a_rotated_peer_is_a_stranger_to_its_old_grant() {
+        let fx = Fixture::new("trust-rotated-stranger");
+        let (old, new) = trusted_then_rotated(&fx);
+
+        assert_eq!(
+            fx.store
+                .authorize(&new.identity_hash, &new.destination_hash),
+            verdict(Decision::Refuse, Rule::DefaultClosed)
+        );
+        assert_eq!(
+            fx.store
+                .authorize(&new.identity_hash, &old.destination_hash),
+            verdict(Decision::Refuse, Rule::DefaultClosed),
+            "the old destination record must not allow the new key"
+        );
+        assert_eq!(
+            origin_verdict(&fx.store, &new),
+            verdict(Decision::Refuse, Rule::IdentityChanged)
+        );
+        assert!(!fx.store.is_trusted_identity(&new.identity_hash));
+        assert_eq!(
+            fx.store.identity_standing(&new.identity_hash),
+            IdentityStanding::Unknown
+        );
+        assert_eq!(
+            fx.store
+                .authorize(&old.identity_hash, &old.destination_hash),
+            verdict(Decision::Allow, Rule::DestinationTrusted),
+            "the grant stays with the identity that proved it"
+        );
+        assert_eq!(
+            origin_verdict(&fx.store, &old),
+            verdict(Decision::Allow, Rule::DestinationTrusted)
+        );
+    }
+
+    /// The new identity has standing of its own here, so the dispatcher reaches the verdict
+    /// stage; identity changed refuses it, and marking the record grants it nothing.
+    #[test]
+    fn identity_changed_is_never_an_allow() {
+        let fx = Fixture::new("trust-identity-changed-refuses");
+        let old = announced("alpha");
+        fx.announce(&old, t(2_000));
+        fx.trust_destination(&old, t(3_000));
+        let rotated = PrivateIdentity::new_from_rand(OsRng);
+        let new = announced_as(rotated.clone(), "alpha");
+        let new_key_elsewhere = announced_as(rotated, "beta");
+        fx.announce(&new_key_elsewhere, t(4_000));
+        fx.trust_destination(&new_key_elsewhere, t(4_500));
+        assert!(fx.store.is_trusted_identity(&new.identity_hash));
+
+        let (before, destination) = fx.store.authorize_origin(
+            &parse_hash(&new.identity_hash).unwrap(),
+            &decode_name_hash(&new.name_hash).unwrap(),
+        );
+        assert_eq!(before, verdict(Decision::Refuse, Rule::IdentityChanged));
+        assert_eq!(destination.to_hex_string(), new.destination_hash);
+
+        let marked = fx
+            .store
+            .note_key_change(&new.identity_hash, &new.name_hash, t(5_000));
+        assert_eq!(marked.len(), 1);
+
+        assert_eq!(
+            origin_verdict(&fx.store, &new),
+            verdict(Decision::Refuse, Rule::IdentityChanged),
+            "a marked record still refuses the identity that caused the mark"
+        );
+        assert_eq!(
+            fx.store
+                .authorize(&new.identity_hash, &old.destination_hash),
+            verdict(Decision::Refuse, Rule::DefaultClosed)
+        );
+        assert_eq!(
+            record(&fx.store, &old.destination_hash).identity.as_deref(),
+            Some(old.identity_hash.as_str()),
+            "the mark must not re-bind the record"
+        );
+        assert_eq!(
+            fx.store
+                .authorize(&old.identity_hash, &old.destination_hash),
+            verdict(Decision::Allow, Rule::DestinationTrusted)
+        );
+        assert!(
+            fx.store
+                .records()
+                .iter()
+                .all(|record| record.key_changed.is_none() || record.hash == old.destination_hash),
+            "only the conflicting record carries a mark"
+        );
+    }
+
+    #[test]
+    fn a_new_identity_on_a_known_instance_marks_the_record_once_and_notifies_once() {
+        let fx = Fixture::new("trust-key-change-once");
+        let surface = Arc::new(RecordingSurface::default());
+        fx.store
+            .attach_surface(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
+        let (old, new) = trusted_then_rotated(&fx);
+        let hooks = fx.observed();
+
+        let marked = fx
+            .store
+            .note_key_change(&new.identity_hash, &new.name_hash, t(5_000));
+
+        assert_eq!(
+            marked,
+            vec![MarkedKeyChange {
+                destination_hash: old.destination_hash.clone(),
+                bound_identity: old.identity_hash.clone(),
+                seen_identity: new.identity_hash.clone(),
+                label: None,
+            }]
+        );
+        assert_eq!(
+            record(&fx.store, &old.destination_hash).key_changed,
+            Some(KeyChange {
+                seen_identity: new.identity_hash.clone(),
+                at: t(5_000),
+            })
+        );
+        let texts = surface.texts();
+        assert_eq!(texts.len(), 1, "{texts:#?}");
+        let text = &texts[0];
+        assert!(text.contains(short(&old.destination_hash)), "{text}");
+        assert!(text.contains(short(&old.identity_hash)), "{text}");
+        assert!(text.contains(short(&new.identity_hash)), "{text}");
+        assert!(
+            text.contains(&format!(".mesh trust {}", new.destination_hash)),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(".mesh block {}", new.identity_hash)),
+            "{text}"
+        );
+        assert!(text.contains("announced under"), "{text}");
+        let after_first = fx.file_bytes().unwrap();
+        assert!(
+            String::from_utf8(after_first.clone())
+                .unwrap()
+                .contains("key_changed:")
+        );
+
+        let again = fx
+            .store
+            .note_key_change(&new.identity_hash, &new.name_hash, t(6_000));
+        assert!(again.is_empty(), "{again:?}");
+        assert_eq!(fx.file_bytes().unwrap(), after_first);
+
+        let third = announced("alpha");
+        let other = fx
+            .store
+            .note_key_change(&third.identity_hash, &third.name_hash, t(7_000));
+        assert!(other.is_empty(), "{other:?}");
+        assert_eq!(fx.file_bytes().unwrap(), after_first);
+        assert_eq!(
+            record(&fx.store, &old.destination_hash)
+                .key_changed
+                .map(|mark| mark.seen_identity),
+            Some(new.identity_hash.clone()),
+            "the mark keeps its first sighting"
+        );
+        assert_eq!(surface.texts().len(), 1);
+        assert!(hooks.drain().is_empty(), "a key change fires no trust hook");
+    }
+
+    #[test]
+    fn key_change_mark_survives_restart() {
+        let fx = Fixture::new("trust-key-change-restart");
+        let (old, new) = trusted_then_rotated(&fx);
+        fx.store
+            .note_key_change(&new.identity_hash, &new.name_hash, t(5_000));
+
+        let reopened = fx.reopen();
+
+        assert_eq!(
+            record(&reopened, &old.destination_hash).key_changed,
+            Some(KeyChange {
+                seen_identity: new.identity_hash.clone(),
+                at: t(5_000),
+            })
+        );
+        assert_eq!(
+            origin_verdict(&reopened, &new),
+            verdict(Decision::Refuse, Rule::IdentityChanged)
+        );
+        assert!(
+            reopened
+                .note_key_change(&new.identity_hash, &new.name_hash, t(6_000))
+                .is_empty(),
+            "a mark loaded from disk is not written again"
+        );
+    }
+
+    #[test]
+    fn open_still_refuses_unknown_fields_but_loads_a_record_without_key_changed() {
+        let tmp = TempDir::new("trust-key-changed-schema");
+        let path = mesh_config_dir(&tmp.path).join("trust.yaml");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let (identity, destination, seen) = (fake_hash(0x1a), fake_hash(0x2b), fake_hash(0x3c));
+        let ts = "2026-01-01T00:00:00Z";
+        let without_mark = format!(
+            "version: 1\nidentities:\n  {identity}:\n    added_at: {ts}\n    last_seen_at: {ts}\n    label: null\n    note: null\n    all_destinations: false\ndestinations:\n  {destination}:\n    identity: {identity}\n    added_at: {ts}\n    last_seen_at: {ts}\n    label: null\n    note: null\n"
+        );
+        fs::write(&path, &without_mark).unwrap();
+        let store = TrustStore::open(&tmp.path).unwrap();
+        assert_eq!(record(&store, &destination).key_changed, None);
+
+        let mark = |seen: &str| {
+            format!("{without_mark}    key_changed:\n      seen_identity: {seen}\n      at: {ts}\n")
+        };
+        fs::write(&path, mark(&seen)).unwrap();
+        let store = TrustStore::open(&tmp.path).unwrap();
+        assert_eq!(
+            record(&store, &destination).key_changed,
+            Some(KeyChange {
+                seen_identity: seen.clone(),
+                at: parse_rfc3339(ts).unwrap(),
+            })
+        );
+
+        fs::write(&path, mark(&seen.to_ascii_uppercase())).unwrap();
+        let err = TrustStore::open(&tmp.path).unwrap_err().to_string();
+        assert!(err.contains("key_changed.seen_identity field"), "{err}");
+        assert!(err.contains(&seen.to_ascii_uppercase()), "{err}");
+
+        fs::write(&path, format!("{}      rotated: true\n", mark(&seen))).unwrap();
+        let err = format!("{:#}", TrustStore::open(&tmp.path).unwrap_err());
+        assert!(err.contains("could not be parsed"), "{err}");
+        assert!(err.contains("rotated"), "{err}");
+    }
+
+    #[test]
+    fn explicit_re_trust_clears_the_key_change_mark() {
+        let fx = Fixture::new("trust-key-change-retrust");
+        let (old, new) = trusted_then_rotated(&fx);
+        fx.store
+            .note_key_change(&new.identity_hash, &new.name_hash, t(5_000));
+        assert!(
+            record(&fx.store, &old.destination_hash)
+                .key_changed
+                .is_some()
+        );
+
+        assert_eq!(fx.trust_destination(&old, t(7_000)), TrustChange::Updated);
+
+        assert_eq!(record(&fx.store, &old.destination_hash).key_changed, None);
+        assert_eq!(
+            record(&fx.reopen(), &old.destination_hash).key_changed,
+            None
+        );
+        assert!(
+            !String::from_utf8(fx.file_bytes().unwrap())
+                .unwrap()
+                .contains("key_changed")
+        );
+        assert_eq!(
+            fx.store
+                .note_key_change(&new.identity_hash, &new.name_hash, t(8_000))
+                .len(),
+            1,
+            "once cleared, the next conflicting sighting marks again"
+        );
+    }
+
+    #[test]
+    fn blocking_the_seen_identity_clears_its_marks() {
+        let fx = Fixture::new("trust-key-change-block-seen");
+        let (old, new) = trusted_then_rotated(&fx);
+        fx.store
+            .note_key_change(&new.identity_hash, &new.name_hash, t(5_000));
+        assert!(
+            record(&fx.store, &old.destination_hash)
+                .key_changed
+                .is_some()
+        );
+
+        let removed = fx
+            .store
+            .block_identity(&fx.mesh, &new.identity_hash, None, t(6_000))
+            .unwrap();
+
+        assert!(removed.is_empty(), "the new identity held no records");
+        assert_eq!(record(&fx.store, &old.destination_hash).key_changed, None);
+        assert_eq!(
+            record(&fx.reopen(), &old.destination_hash).key_changed,
+            None
+        );
+        assert_eq!(
+            fx.store
+                .authorize(&old.identity_hash, &old.destination_hash),
+            verdict(Decision::Allow, Rule::DestinationTrusted),
+            "the bound identity's grant is untouched"
+        );
+        let third = announced("alpha");
+        assert_eq!(
+            fx.store
+                .note_key_change(&third.identity_hash, &third.name_hash, t(7_000))
+                .len(),
+            1,
+            "a later sighting under yet another identity marks again"
+        );
+    }
+
+    #[test]
+    fn trusting_the_seen_identity_for_all_destinations_clears_its_marks() {
+        let fx = Fixture::new("trust-key-change-trust-seen");
+        let (old, new) = trusted_then_rotated(&fx);
+        fx.store
+            .note_key_change(&new.identity_hash, &new.name_hash, t(5_000));
+        assert!(
+            record(&fx.store, &old.destination_hash)
+                .key_changed
+                .is_some()
+        );
+
+        assert_eq!(
+            fx.trust_identity(&new.identity_hash, t(6_000)),
+            TrustChange::Added
+        );
+
+        assert_eq!(record(&fx.store, &old.destination_hash).key_changed, None);
+        assert_eq!(
+            record(&fx.reopen(), &old.destination_hash).key_changed,
+            None
+        );
+        assert!(
+            !String::from_utf8(fx.file_bytes().unwrap())
+                .unwrap()
+                .contains("key_changed")
+        );
+        assert_eq!(
+            fx.store
+                .authorize(&old.identity_hash, &old.destination_hash),
+            verdict(Decision::Allow, Rule::DestinationTrusted),
+            "the bound identity's grant is untouched"
+        );
+        assert!(
+            fx.store
+                .note_key_change(&new.identity_hash, &new.name_hash, t(7_000))
+                .is_empty(),
+            "an identity trusted for all destinations marks nothing"
+        );
+    }
+
+    #[test]
+    fn a_blocked_identity_marks_nothing() {
+        let fx = Fixture::new("trust-key-change-blocked-seen");
+        let (old, new) = trusted_then_rotated(&fx);
+        fx.store
+            .block_identity(&fx.mesh, &new.identity_hash, None, t(4_000))
+            .unwrap();
+        let before = fx.file_bytes().unwrap();
+
+        let marked = fx
+            .store
+            .note_key_change(&new.identity_hash, &new.name_hash, t(5_000));
+
+        assert!(marked.is_empty(), "{marked:?}");
+        assert_eq!(record(&fx.store, &old.destination_hash).key_changed, None);
+        assert_eq!(fx.file_bytes().unwrap(), before);
+    }
+
+    #[test]
+    fn a_denied_record_marks_nothing() {
+        let fx = Fixture::new("trust-key-change-denied-record");
+        let (old, new) = trusted_then_rotated(&fx);
+        fx.store
+            .deny_destination(&fx.mesh, &old.destination_hash, None, t(4_000))
+            .unwrap();
+        let before = fx.file_bytes().unwrap();
+
+        let marked = fx
+            .store
+            .note_key_change(&new.identity_hash, &new.name_hash, t(5_000));
+
+        assert!(marked.is_empty(), "{marked:?}");
+        assert_eq!(record(&fx.store, &old.destination_hash).key_changed, None);
+        assert_eq!(fx.file_bytes().unwrap(), before);
+    }
+
+    #[test]
+    fn an_all_destinations_identity_marks_nothing() {
+        let fx = Fixture::new("trust-key-change-all-destinations-seen");
+        let surface = Arc::new(RecordingSurface::default());
+        fx.store
+            .attach_surface(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
+        let (old, new) = trusted_then_rotated(&fx);
+        assert_eq!(
+            fx.trust_identity(&new.identity_hash, t(4_000)),
+            TrustChange::Added
+        );
+        let before = fx.file_bytes().unwrap();
+
+        let marked = fx
+            .store
+            .note_key_change(&new.identity_hash, &new.name_hash, t(5_000));
+
+        assert!(marked.is_empty(), "{marked:?}");
+        assert_eq!(record(&fx.store, &old.destination_hash).key_changed, None);
+        assert_eq!(fx.file_bytes().unwrap(), before);
+        assert!(surface.texts().is_empty(), "{:#?}", surface.texts());
+        assert_eq!(
+            origin_verdict(&fx.store, &new),
+            verdict(Decision::Allow, Rule::IdentityTrusted)
+        );
+    }
+
+    #[test]
+    fn an_identity_tier_grants_rotation_is_fail_closed_but_unmarked() {
+        let fx = Fixture::new("trust-key-change-identity-tier-grant");
+        let surface = Arc::new(RecordingSurface::default());
+        fx.store
+            .attach_surface(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
+        let old = announced("alpha");
+        fx.announce(&old, t(2_000));
+        assert_eq!(
+            fx.trust_identity(&old.identity_hash, t(3_000)),
+            TrustChange::Added
+        );
+        assert_eq!(
+            origin_verdict(&fx.store, &old),
+            verdict(Decision::Allow, Rule::IdentityTrusted)
+        );
+        let new = announced("alpha");
+        assert_eq!(new.name_hash, old.name_hash);
+        fx.announce(&new, t(4_000));
+        let before = fx.file_bytes().unwrap();
+
+        let marked = fx
+            .store
+            .note_key_change(&new.identity_hash, &new.name_hash, t(5_000));
+
+        assert!(marked.is_empty(), "{marked:?}");
+        assert_eq!(
+            fx.store.identity_standing(&new.identity_hash),
+            IdentityStanding::Unknown
+        );
+        assert_eq!(
+            origin_verdict(&fx.store, &new),
+            verdict(Decision::Refuse, Rule::DefaultClosed),
+            "with no destination record there is no binding to conflict with"
+        );
+        assert!(
+            fx.store
+                .records()
+                .iter()
+                .all(|record| record.key_changed.is_none()),
+            "{:#?}",
+            fx.store.records()
+        );
+        assert_eq!(fx.file_bytes().unwrap(), before);
+        assert!(surface.texts().is_empty(), "{:#?}", surface.texts());
+    }
+
+    struct DroppingSurface;
+
+    impl KnockSurface for DroppingSurface {
+        fn surface(&self, _note: IdleNotify) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn a_dropped_key_change_line_is_warned_about_and_the_mark_stands() {
+        install_log_collector();
+        let fx = Fixture::new("trust-key-change-dropped-line");
+        let surface = Arc::new(DroppingSurface);
+        fx.store
+            .attach_surface(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
+        let (old, new) = trusted_then_rotated(&fx);
+
+        let marked = fx
+            .store
+            .note_key_change(&new.identity_hash, &new.name_hash, t(5_000));
+
+        assert_eq!(marked.len(), 1);
+        assert!(
+            record(&fx.store, &old.destination_hash)
+                .key_changed
+                .is_some()
+        );
+        let line = format!(
+            "Mesh key-change notice for {} was dropped; the mark stands and .mesh peers shows it",
+            short(&old.destination_hash)
+        );
+        assert!(warn_snapshot().contains(&line), "{line}");
+        assert!(
+            fx.store
+                .note_key_change(&new.identity_hash, &new.name_hash, t(6_000))
+                .is_empty(),
+            "a dropped line is not offered again"
+        );
+    }
+
+    #[test]
+    fn trusting_the_new_destination_clears_the_old_records_mark_and_names_it() {
+        let fx = Fixture::new("trust-key-change-superseded");
+        let surface = Arc::new(RecordingSurface::default());
+        fx.store
+            .attach_surface(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
+        let (old, new) = trusted_then_rotated(&fx);
+        fx.store
+            .note_key_change(&new.identity_hash, &new.name_hash, t(5_000));
+        assert_eq!(surface.texts().len(), 1);
+        fx.announce(&new, t(6_000));
+
+        let outcome = fx
+            .store
+            .trust_destination(
+                &fx.mesh,
+                &new.destination_hash,
+                TrustOptions::default(),
+                t(7_000),
+            )
+            .unwrap();
+
+        assert_eq!(outcome.change, TrustChange::Added);
+        assert_eq!(outcome.identity_hash, new.identity_hash);
+        assert_eq!(outcome.superseded, vec![old.destination_hash.clone()]);
+        assert_eq!(record(&fx.store, &old.destination_hash).key_changed, None);
+        assert_eq!(
+            record(&fx.reopen(), &old.destination_hash).key_changed,
+            None
+        );
+        assert_eq!(
+            record(&fx.store, &new.destination_hash).identity.as_deref(),
+            Some(new.identity_hash.as_str())
+        );
+        assert_eq!(
+            fx.store
+                .authorize(&old.identity_hash, &old.destination_hash),
+            verdict(Decision::Allow, Rule::DestinationTrusted),
+            "the old record stays until untrusted"
+        );
+        assert_eq!(
+            origin_verdict(&fx.store, &new),
+            verdict(Decision::Allow, Rule::DestinationTrusted)
+        );
+        assert_eq!(
+            origin_verdict(&fx.store, &old),
+            verdict(Decision::Allow, Rule::DestinationTrusted),
+            "both keys are trusted for their own destinations; neither conflicts"
+        );
+
+        let after_trust = fx.file_bytes().unwrap();
+        fx.announce(&new, t(8_000));
+        let again = fx
+            .store
+            .note_key_change(&new.identity_hash, &new.name_hash, t(8_000));
+
+        assert!(again.is_empty(), "{again:?}");
+        assert_eq!(fx.file_bytes().unwrap(), after_trust);
+        assert_eq!(record(&fx.store, &old.destination_hash).key_changed, None);
+        assert_eq!(
+            surface.texts().len(),
+            1,
+            "the trusted identity's heartbeat marks the old record no more"
+        );
+        assert_eq!(
+            origin_verdict(&fx.store, &new),
+            verdict(Decision::Allow, Rule::DestinationTrusted)
         );
     }
 }

@@ -1,6 +1,6 @@
 use crate::mesh::announce::{HEARTBEAT_SECS, PEER_MISSED_HEARTBEATS_BEFORE_AGE_OUT};
 use crate::mesh::protocol::Compatibility;
-use crate::mesh::{redact_hashes, write_atomically};
+use crate::mesh::{redact_hashes, short, write_atomically};
 
 use anyhow::{Context, Result};
 use log::warn;
@@ -117,10 +117,22 @@ impl PeerTable {
         })
     }
 
+    /// A row whose identity differs from the sighting's follows the sighting: the transport
+    /// verified that the announced identity and name hash derive the destination, so the
+    /// row can only disagree when `peers.json` was corrupted or hand-edited. The change is
+    /// logged rather than silent.
     pub(crate) fn observe(&self, sighting: PeerSighting, now: SystemTime) -> PeerChange {
         let mut peers = self.inner.lock();
         let change = match peers.get_mut(&sighting.destination_hash) {
             Some(record) => {
+                if record.identity_hash != sighting.identity_hash {
+                    warn!(
+                        "Mesh peer {} re-bound from identity {} to {}: the row follows the verified announce",
+                        short(&record.destination_hash),
+                        short(&record.identity_hash),
+                        short(&sighting.identity_hash)
+                    );
+                }
                 record.identity_hash = sighting.identity_hash;
                 record.name_hash = sighting.name_hash;
                 record.display_name = sighting.display_name;
@@ -317,6 +329,38 @@ mod tests {
         assert_eq!(peers[0].identity_hash, "id-aa");
         assert_eq!(peers[0].name_hash, "name-aa");
         assert_eq!(peers[0].hops, 2);
+    }
+
+    #[test]
+    fn observe_logs_when_a_row_changes_identity() {
+        install_log_collector();
+        let (table, _tmp) = table("peers-observe-identity-change");
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let destination = "rebound-row-destination";
+        let old_identity = "first-key-of-rebound-row";
+        let new_identity = "second-key-of-rebound-row";
+        let rebound = |identity: &str| PeerSighting {
+            identity_hash: identity.to_string(),
+            ..sighting(destination, None)
+        };
+
+        table.observe(rebound(old_identity), t0);
+        let change = table.observe(rebound(new_identity), t0 + Duration::from_secs(1));
+
+        assert_eq!(change, PeerChange::Refreshed);
+        assert_eq!(table.get(destination).unwrap().identity_hash, new_identity);
+        let warns = warn_snapshot();
+        assert!(
+            warns.iter().any(|message| {
+                message.contains(&format!(
+                    "Mesh peer {} re-bound from identity {} to {}",
+                    short(destination),
+                    short(old_identity),
+                    short(new_identity)
+                ))
+            }),
+            "no warn line names the re-binding; captured: {warns:#?}"
+        );
     }
 
     #[test]

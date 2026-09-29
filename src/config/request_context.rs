@@ -4247,6 +4247,8 @@ impl RequestContext {
             values = self.mesh_completion_identities();
         } else if cmd == ".mesh" && args.len() == 3 && args[0] == "trust" && args[1] == "--prune" {
             values = super::map_completion_values(vec!["--older-than ", "--dry-run", "--confirm "]);
+        } else if cmd == ".mesh" && args.len() == 2 && args[0] == "rotate" {
+            values = super::map_completion_values(vec!["--dry-run", "--confirm "]);
         } else if cmd == ".mesh" && args.len() == 2 && args[0] == "untrust" {
             values = self.mesh_completion_trusted(false);
             values.push(("--identity ".to_string(), None));
@@ -20628,6 +20630,12 @@ mod tests {
             .map(|(value, _)| value)
             .collect();
         assert_eq!(prune, ["--older-than ", "--dry-run", "--confirm "]);
+        let rotate: Vec<String> = ctx
+            .repl_complete(".mesh", &["rotate", ""], "")
+            .into_iter()
+            .map(|(value, _)| value)
+            .collect();
+        assert_eq!(rotate, ["--dry-run", "--confirm "]);
     }
 
     #[cfg(unix)]

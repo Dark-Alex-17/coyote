@@ -745,9 +745,12 @@ enum Gate {
     Silent,
     /// `all_destinations`.
     Allow,
-    /// Known without `all_destinations` and bound to nothing: every instance knocks.
+    /// Known without `all_destinations` and bound to nothing: every instance knocks, or is
+    /// refused as identity changed when the instance is one the list binds to another identity.
     Knock,
-    /// Bound to one destination: that one is allowed, every other knocks.
+    /// Bound to one destination, its own at `FIXED_ORIGIN`: that one is allowed and every
+    /// other origin knocks. This tier never reaches identity changed, since the one origin
+    /// that would trigger it derives the destination it is bound to.
     BoundTo(AddressHash),
     /// Trusted for all destinations but with one denied.
     DeniedAt(AddressHash),
@@ -763,17 +766,25 @@ struct Tier {
 enum Verdict {
     Allow,
     Knock,
+    IdentityChanged,
     Refuse,
 }
 
 impl Gate {
     /// MESH-ENV-039: destination deny, identity block, destination allow, identity allow,
-    /// default closed. `Silent` never gets here.
-    fn verdict(self, destination: &AddressHash) -> Verdict {
+    /// identity changed, default closed. `FIXED_ORIGIN` is the one origin whose destination
+    /// the list binds to another identity (`bound`), so a default-closed instance from it is
+    /// refused as identity changed instead of knocking. `Silent` never gets here.
+    fn verdict(self, origin: &[u8; NAME_HASH_LEN], destination: &AddressHash) -> Verdict {
+        let closed = if *origin == FIXED_ORIGIN {
+            Verdict::IdentityChanged
+        } else {
+            Verdict::Knock
+        };
         match self {
             Self::Silent => unreachable!("silent tiers are judged before the trust verdict"),
             Self::Allow => Verdict::Allow,
-            Self::Knock => Verdict::Knock,
+            Self::Knock => closed,
             Self::BoundTo(bound) if bound == *destination => Verdict::Allow,
             Self::BoundTo(_) => Verdict::Knock,
             Self::DeniedAt(denied) if denied == *destination => Verdict::Refuse,
@@ -1000,7 +1011,7 @@ fn check_tier(
         }
         Expect::Ok { origin, body } => {
             let destination = destination_address(origin, &identity.address_hash);
-            match tier.gate.verdict(&destination) {
+            match tier.gate.verdict(origin, &destination) {
                 Verdict::Refuse => {
                     ensure(is_no_access(&reply), || {
                         format!(
@@ -1013,6 +1024,20 @@ fn check_tier(
                     })?;
                     ensure(handled == 0, || {
                         "MESH-ENV-033: a denied destination never reaches a handler".to_string()
+                    })
+                }
+                Verdict::IdentityChanged => {
+                    ensure(is_no_access(&reply), || {
+                        format!(
+                            "MESH-ENV-033/050: identity changed earns NoAccess, got {}",
+                            describe_reply(&reply)
+                        )
+                    })?;
+                    ensure(knocks.is_empty(), || {
+                        "MESH-ENV-050: identity changed files no knock".to_string()
+                    })?;
+                    ensure(handled == 0, || {
+                        "MESH-ENV-033: identity changed never reaches a handler".to_string()
                     })
                 }
                 Verdict::Knock => {
