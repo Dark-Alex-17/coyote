@@ -178,14 +178,18 @@ libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 # Raw Win32 bindings for locking down the on-disk identity key. Each feature below is
-# carried for one piece of that job. The call sites land with the identity-key work;
-# the list is audited ahead of them and named here so it can be checked without
-# guessing: `Win32_Security_Authorization` for
-# `ConvertStringSecurityDescriptorToSecurityDescriptorW`, `Win32_Foundation` for the
-# `LocalFree`/`HLOCAL` pair that releases the security descriptor it returns,
-# `Win32_Security` for the `ACL` type, `Win32_Storage_FileSystem` for `CreateFileW`, and
-# `Win32_System_Threading` for `OpenProcess` pid-liveness. No allocator feature is
-# needed, `LocalFree` not being one of the `Local*` calls in `Win32_System_Memory`.
+# carried for one piece of that job; the call sites are in `src/utils/windows_acl.rs`
+# and the list is named here so it can be checked without guessing:
+# `Win32_Security_Authorization` for
+# `ConvertStringSecurityDescriptorToSecurityDescriptorW` and `GetNamedSecurityInfoW`,
+# `Win32_Foundation` for the `LocalFree`/`HLOCAL` pair that releases what they return,
+# `Win32_Security` for the `ACL` type and the DACL walk, `Win32_Storage_FileSystem` for
+# `CreateFileW`, `Win32_System_Threading` for `OpenProcessToken` and `GetCurrentProcess`
+# (the current user's SID) and for `OpenProcess` in `src/testing.rs`, and
+# `Win32_System_SystemServices` for the `FILE_PERSISTENT_ACLS` volume flag and the
+# `ACCESS_ALLOWED_ACE_TYPE` ACE type, plain constants that live in no other module. No
+# allocator feature is needed, `LocalFree` not being one of the `Local*` calls in
+# `Win32_System_Memory`.
 #
 # The higher-level `windows` crate is not used: the surface here is a handful of FFI
 # calls that need `unsafe` either way, so its wrapper types and COM machinery would cost
@@ -197,6 +201,7 @@ windows-sys = { version = "0.61", features = [
   "Win32_Security",
   "Win32_Security_Authorization",
   "Win32_Storage_FileSystem",
+  "Win32_System_SystemServices",
   "Win32_System_Threading",
 ] }
 

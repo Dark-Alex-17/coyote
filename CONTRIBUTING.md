@@ -158,9 +158,11 @@ follow, but the first release is where that is actually tested.
 
 ### What was checked for the windows-sys feature list, and what was not
 
-The `windows-sys` entry in `Cargo.toml` names five Win32 features and one call or type each, and
-the call sites land later with the identity-key work. This is the record of what that list rests
-on, checked 2026-09-23 from Linux aarch64. It goes when the audit it describes stops mattering.
+The `windows-sys` entry in `Cargo.toml` names six Win32 features and the calls or types each is
+carried for; the call sites are in `src/utils/windows_acl.rs`, the one module that holds the
+crate's file-security FFI. This is the record of what that list rests on, checked the same way
+from Linux aarch64 on 2026-09-23 and again when the sixth feature was added. It goes when the
+audit it describes stops mattering.
 
 Checked, and reproducible:
 
@@ -169,7 +171,7 @@ cargo tree --target x86_64-pc-windows-msvc -e features -i windows-sys@0.61.2
 ```
 
 exits 0: the `cfg(windows)` graph resolves, and the 40 `windows-sys` features it enables include
-all five audited ones. The version in the spec is not optional; four `windows-sys` majors are in
+all six audited ones. The version in the spec is not optional; four `windows-sys` majors are in
 the graph (0.52.0, 0.59.0, 0.60.2, 0.61.2) and a bare `-i windows-sys` exits 101 with
 `specification 'windows-sys' is ambiguous`. Most of those 40 features come from other crates —
 `mio`, `socket2`, `schannel` and `dirs-sys` each enable their own — so the list read off that tree
@@ -180,12 +182,14 @@ A feature name that does not exist upstream cannot survive *any* build, on any p
 'coyote-ai' depends on 'windows-sys' with feature 'Win32_Bogus_DoesNotExist' but 'windows-sys'
 does not have that feature`: identically with `--target x86_64-pc-windows-msvc` and with no
 `--target` at all, because feature names are checked when the graph resolves and not when the
-`cfg` is compiled. Every `cargo test` run on every CI leg therefore already proves these five
-names exist in windows-sys 0.61. From the other side, windows-sys 0.61.2 declares all five in its
+`cfg` is compiled. Every `cargo test` run on every CI leg therefore already proves these six
+names exist in windows-sys 0.61. From the other side, windows-sys 0.61.2 declares all six in its
 own manifest, and each item the list is carried for is in the module the list claims: `LocalFree`
 and `HLOCAL` in `Win32/Foundation`, `ACL` in `Win32/Security`,
-`ConvertStringSecurityDescriptorToSecurityDescriptorW` in `Win32/Security/Authorization`,
-`CreateFileW` in `Win32/Storage/FileSystem`, `OpenProcess` in `Win32/System/Threading`. The
+`ConvertStringSecurityDescriptorToSecurityDescriptorW` and `GetNamedSecurityInfoW` in
+`Win32/Security/Authorization`, `CreateFileW` in `Win32/Storage/FileSystem`,
+`FILE_PERSISTENT_ACLS` and `ACCESS_ALLOWED_ACE_TYPE` in `Win32/System/SystemServices`,
+`OpenProcessToken`, `GetCurrentProcess` and `OpenProcess` in `Win32/System/Threading`. The
 `cfg(windows)` test in `tests/mesh_dependencies.rs` names those items, so the windows-latest leg
 checks the feature-to-call mapping itself instead of the manifest text that claims it.
 
@@ -194,9 +198,22 @@ Windows target. `cargo check --target x86_64-pc-windows-msvc` cannot run from a 
 all. It exits 101 inside dependency build scripts, long before reaching this crate, because the
 host C compiler cannot target Windows: `cc: error: unrecognized command-line option '-m64'`, from
 `ring`'s `cc-rs` invocation, with `rusqlite`, `bzip2-sys` and `duckdb` against the same wall.
-Whether these five features suffice for the identity-key call sites, and whether `cargo build` and
-`cargo test --all` pass on `macos-latest` and `windows-latest`, are answered by the first CI run
-that includes these dependencies and by nothing before it.
+Whether the windows tests pass, and whether `cargo build` and `cargo test --all` pass on
+`macos-latest` and `windows-latest`, are answered by the first CI run that includes these
+dependencies and by nothing before it.
+
+The gnu target does compile from Linux, which is how the `cfg(windows)` code was type-checked and
+linted before that run. With `mingw-w64` and `nasm` installed (`ring` assembles with `nasm`) and
+the big-object flag that `duckdb`'s bundled C++ needs to get past `file too big`:
+
+```shell
+CXXFLAGS_x86_64_pc_windows_gnu='-Wa,-mbig-obj' CFLAGS_x86_64_pc_windows_gnu='-Wa,-mbig-obj' \
+  cargo clippy --all-targets --target x86_64-pc-windows-gnu
+```
+
+exits 0 and compiles `src/utils/windows_acl.rs`, the identity-key call sites and the windows-only
+tests under clippy. It does not run them, and it is the gnu ABI rather than the msvc one the
+release builds use, so it is a type check and nothing more.
 
 ### Platform coverage of the pty tests
 

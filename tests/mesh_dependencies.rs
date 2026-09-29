@@ -49,11 +49,12 @@ const FIXED_TIMESTAMP: f64 = 1_700_000_000.0;
 /// addition here is unaudited surface and a removal breaks a call, so the list is
 /// pinned exactly rather than by containment. Nothing on a unix host compiles
 /// against these, which is why they are checked as manifest text.
-const WINDOWS_SYS_FEATURES: [&str; 5] = [
+const WINDOWS_SYS_FEATURES: [&str; 6] = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
+    "Win32_System_SystemServices",
     "Win32_System_Threading",
 ];
 
@@ -363,22 +364,31 @@ fn windows_sys_carries_exactly_the_audited_feature_set() {
 /// Naming each audited feature's call turns the list above from manifest text into a
 /// compile-time check of the claim the list is making: that each feature is carried
 /// for one named Win32 item, and that the item is where the manifest says it is.
-/// Nothing is invoked; taking an address is enough to require the import to resolve.
+/// Nothing is invoked; taking an address is enough to require the import to resolve
+/// (through a pointer first, which is the cast rustc accepts for a function item).
 /// Only the windows-latest CI leg compiles this.
 #[cfg(windows)]
 #[test]
 fn the_audited_win32_features_expose_the_calls_they_are_carried_for() {
     use windows_sys::Win32::Foundation::{HLOCAL, LocalFree};
     use windows_sys::Win32::Security::ACL;
-    use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW,
+    };
     use windows_sys::Win32::Storage::FileSystem::CreateFileW;
-    use windows_sys::Win32::System::Threading::OpenProcess;
+    use windows_sys::Win32::System::SystemServices::{
+        ACCESS_ALLOWED_ACE_TYPE, FILE_PERSISTENT_ACLS,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcess, OpenProcessToken};
 
-    let audited_calls: [usize; 4] = [
-        ConvertStringSecurityDescriptorToSecurityDescriptorW as usize,
-        LocalFree as usize,
-        CreateFileW as usize,
-        OpenProcess as usize,
+    let audited_calls: [usize; 7] = [
+        ConvertStringSecurityDescriptorToSecurityDescriptorW as *const () as usize,
+        GetNamedSecurityInfoW as *const () as usize,
+        LocalFree as *const () as usize,
+        CreateFileW as *const () as usize,
+        OpenProcessToken as *const () as usize,
+        GetCurrentProcess as *const () as usize,
+        OpenProcess as *const () as usize,
     ];
     assert!(
         audited_calls.iter().all(|address| *address != 0),
@@ -393,6 +403,16 @@ fn the_audited_win32_features_expose_the_calls_they_are_carried_for() {
         core::mem::size_of::<HLOCAL>(),
         core::mem::size_of::<*mut core::ffi::c_void>(),
         "Win32_Foundation is carried for the LocalFree/HLOCAL pair"
+    );
+    assert_eq!(
+        FILE_PERSISTENT_ACLS, 8,
+        "Win32_System_SystemServices is carried for the volume flag that tells an \
+         ACL-keeping volume from FAT"
+    );
+    assert_eq!(
+        ACCESS_ALLOWED_ACE_TYPE, 0,
+        "Win32_System_SystemServices is carried for the ACE type the DACL walk compares \
+         each header against"
     );
 }
 
