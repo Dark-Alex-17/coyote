@@ -4368,6 +4368,36 @@ mod tests {
         #[cfg(unix)]
         #[test]
         #[serial]
+        fn rotate_surfaces_a_refused_predecessors_file_and_changes_nothing() {
+            let guard = TestConfigDirGuard::new("repl-mesh-rotate-unversioned-history");
+            let (path, before, old) = minted_key(&guard);
+            let history = identity::predecessors_path(&path);
+            let unversioned = "{\"identity_hash\":\"ab\",\"rotated_at\":\"2026-01-01T00:00:00Z\",\"reason\":\"rotate\"}\n";
+            fs::write(&history, unversioned).unwrap();
+            let mut ctx = off_ctx();
+            let token = format!("rotate-{}", short(&old));
+
+            for line in [
+                ".mesh rotate".to_string(),
+                ".mesh rotate --dry-run".to_string(),
+                format!(".mesh rotate --confirm {token}"),
+            ] {
+                let err = err_of(&mut ctx, &line);
+                assert!(err.contains("no readable `version` field"), "{line}: {err}");
+                assert!(err.contains("move the file aside"), "{line}: {err}");
+                assert!(
+                    err.contains(&history.display().to_string()),
+                    "{line}: {err}"
+                );
+                assert_eq!(fs::read(&path).unwrap(), before, "{line}");
+                assert_eq!(fs::read_to_string(&history).unwrap(), unversioned, "{line}");
+                assert!(!path.with_added_extension("new").exists(), "{line}");
+            }
+        }
+
+        #[cfg(unix)]
+        #[test]
+        #[serial]
         fn rotate_is_refused_while_another_process_holds_the_identity_lock() {
             let guard = TestConfigDirGuard::new("repl-mesh-rotate-locked");
             let (path, before, old) = minted_key(&guard);

@@ -205,7 +205,9 @@ struct DestinationEntry {
     label: Option<String>,
     note: Option<String>,
     /// Set once this destination's name hash was seen under an identity other than
-    /// `identity`; absent from files written before the field existed.
+    /// `identity`. Added inside version 1 before MESH-CODE-005 made every new field bump
+    /// `TRUST_FILE_VERSION`, so a file written before it existed loads with it absent; the
+    /// default is grandfathered in the baseline and is not a precedent for the next field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     key_changed: Option<KeyChanged>,
 }

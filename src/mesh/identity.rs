@@ -16,6 +16,9 @@ const PRIVATE_KEY_LENGTH: usize = 64;
 
 /// Sibling of `identity.key`: one JSON line per rotation, oldest first.
 pub(crate) const PREDECESSORS_FILE: &str = "identity.predecessors.jsonl";
+/// No layout of this file was ever released without a `version` field: version 1 is the
+/// only one there has been, so a line without one is an unknown shape that is refused,
+/// never read as version 1.
 pub(crate) const PREDECESSOR_RECORD_VERSION: u64 = 1;
 /// The file is the user's history, not cache, but a cheap one: a refusal says so.
 const PREDECESSORS_REMEDY: Remedy =
@@ -221,8 +224,10 @@ fn remove_stale_staged_key(path: &Path) -> Result<()> {
 ///
 /// `expected_old` is the fingerprint the caller showed the human; a key that no longer
 /// matches it is left alone, since the consent was given for a different identity. The
-/// predecessors file is read before anything is written so a corrupt history fails the
-/// rotation with the key still in place.
+/// predecessors file is read under the lock and before the new key is minted, so a corrupt
+/// or refused history (a line of another version, or of none) fails the rotation with the
+/// key still in place and the reader's own refusal and remedy as the error; a rotation never
+/// appends a current line to a file the reader refuses.
 ///
 /// The new key is written to a sibling file and renamed over `path`, so the old private key
 /// is unlinked by the rename rather than overwritten or copied; the staged file is the only
@@ -799,6 +804,33 @@ mod tests {
         assert_eq!(
             fs::read_to_string(predecessors_path(&path)).unwrap(),
             "not json\n"
+        );
+        assert!(!dir.path.join("identity.key.new").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rotate_identity_refuses_an_unversioned_predecessors_line_and_appends_nothing() {
+        let dir = TempDir::new("identity-rotate-unversioned-predecessors");
+        let path = dir.path.join("identity.key");
+        let old = fingerprint(&load_or_mint_identity(&path).unwrap());
+        let before = fs::read(&path).unwrap();
+        let unversioned = "{\"identity_hash\":\"ab\",\"rotated_at\":\"2026-01-01T00:00:00Z\",\"reason\":\"rotate\"}\n";
+        fs::write(predecessors_path(&path), unversioned).unwrap();
+
+        let err = match rotate_identity(&path, &old, t(0)) {
+            Ok(_) => panic!("a refused history must not rotate"),
+            Err(err) => err.to_string(),
+        };
+
+        assert!(err.contains("line 1"), "{err}");
+        assert!(err.contains("no readable `version` field"), "{err}");
+        assert!(err.contains("move the file aside"), "{err}");
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(
+            fs::read_to_string(predecessors_path(&path)).unwrap(),
+            unversioned,
+            "no version-1 line is appended to a file the reader refuses"
         );
         assert!(!dir.path.join("identity.key.new").exists());
     }
