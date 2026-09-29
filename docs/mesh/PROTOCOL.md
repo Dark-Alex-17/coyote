@@ -241,6 +241,8 @@ A request is the msgpack array `[time, path_hash, data]`. Its encoding begins `9
 | `[2]` data | any | the Envelope (section 6.5) | **[MESH-ENV-003]** The receiver MUST reject a frame that is not an `array` of exactly three elements. |
 | trailing bytes | none | nothing | **[MESH-ENV-004]** The receiver MUST reject a frame followed by any further byte (`decode_whole`; `decode_refuses_malformed_frames`). |
 
+**[MESH-ENV-048]** The receiver MUST reject as undecodable (silence, stage 5 of section 6.6) a request frame whose msgpack nesting spends more than `MAX_R3_NESTING_DEPTH` = `128` units of the decoder's depth budget (`decode_whole`, src/mesh/r3/frame.rs; `frames_refuse_nesting_past_the_depth_budget_and_accept_the_deepest_legal_frame`, src/mesh/r3/tests.rs). Every msgpack value spends one unit, an `array` or `map` a second for its element list, a `bin` a second for its bytes and a `str` a third; the frame's outer array itself spends two, so 62 nested one-element arrays around a `nil` under `data` fit and a 63rd does not.
+
 ### 6.2 Response frame
 
 A response is the msgpack array `[request_id, value]`; its encoding begins `92 c4 10` (`response_frame_is_accepted_by_upstream_envelope_unpacker`).
@@ -250,6 +252,8 @@ A response is the msgpack array `[request_id, value]`; its encoding begins `92 c
 | `[0]` request_id | bin(16) | the request id of the request being answered (section 6.3) | **[MESH-ENV-005]** A responder MUST put the request id computed by section 6.3 for the request it answers; a response naming no outstanding request answers nothing. |
 | `[1]` value | any | a reply value, a refusal code, a version refusal map or a dispatch error map | **[MESH-ENV-006]** The requester MUST decode this element in the order given in section 6.7. |
 | any other element or trailing bytes | none | nothing | **[MESH-ENV-007]** The requester MUST drop a response that is longer than `MAX_R3_PAYLOAD_BYTES`, that is not an `array` of exactly two elements, whose `[0]` is not a `bin` of exactly 16 bytes, that is followed by any further byte, that names no outstanding request, or that arrives on a link other than the one its request went out on; the request then ends in `Timeout` (`ResponseFrame::decode`, src/mesh/r3/frame.rs; `R3Client::deliver`, src/mesh/r3/client.rs; `response_on_the_wrong_link_is_ignored`, src/mesh/r3/tests.rs). |
+
+**[MESH-ENV-049]** The requester MUST drop a response frame whose msgpack nesting spends more than `MAX_R3_NESTING_DEPTH` = `128` units of the depth budget accounted in MESH-ENV-048 (`ResponseFrame::decode`, `R3Error::Decode`); the request then ends in `Timeout` (`frames_refuse_nesting_past_the_depth_budget_and_accept_the_deepest_legal_frame`).
 
 ### 6.3 Size branches
 
@@ -618,7 +622,7 @@ A wire id is 1 to `PEER_ID_MAX_CHARS` = `64` bytes, each in `[0-9A-Za-z_.:-]` (`
 | `in_reply_to` | text, a wire id | the `id` of the message answered; omitted otherwise | **[MESH-MSG-004]** Present and not a wire id: the receiver MUST refuse with `InvalidData`. |
 | `title` | text | at most `PEER_TITLE_MAX_CHARS` = `120` characters; omitted when none | **[MESH-MSG-005]** Present and not text, or longer than 120 characters: the receiver MUST refuse with `InvalidData`. |
 | `content` | text | at most `PEER_CONTENT_MAX_CHARS` = `4000` characters | **[MESH-MSG-006]** Missing, not text, or longer than 4000 characters: the receiver MUST refuse with `InvalidData`. |
-| `fields` | map | a map of depth at most `PEER_FIELDS_MAX_DEPTH` = `8` and at most `PEER_FIELDS_MAX_BYTES` = `4096` bytes when re-serialised as JSON after cleaning (`sanitize_fields`, src/mesh/message.rs); omitted when none | **[MESH-MSG-007]** Present and not a `map`: the receiver MUST refuse with `InvalidData`. **[MESH-MSG-008]** Deeper than 8, or longer than 4096 bytes when re-serialised as JSON after cleaning (`sanitize_fields`, src/mesh/message.rs): the receiver MUST drop `fields` and keep the message. |
+| `fields` | map | a map of depth at most `PEER_FIELDS_MAX_DEPTH` = `8` and at most `PEER_FIELDS_MAX_BYTES` = `4096` bytes when re-serialised as JSON after cleaning (`sanitize_fields`, src/mesh/message.rs); omitted when none | **[MESH-MSG-007]** Present and not a `map`: the receiver MUST refuse with `InvalidData`. **[MESH-MSG-008]** Deeper than 8, or longer than 4096 bytes when re-serialised as JSON after cleaning (`sanitize_fields`, src/mesh/message.rs): the receiver MUST drop `fields` and keep the message, only while the whole frame stays within the decode budget of MESH-ENV-048; past it the frame is undecodable first. |
 | `ts` | f64 | Unix seconds of sending, as an `f64` | **[MESH-MSG-009]** Missing, not a number (`uint`, `int`, `f32` or `f64`), or not finite once read as f64: the receiver MUST refuse with `InvalidData` (`r3_body_round_trips_and_rejects_malformed` accepts a `uint` `ts`). |
 | any other key | any | nothing | **[MESH-MSG-010]** The receiver MUST ignore it (`r3_body_round_trips_and_rejects_malformed`). |
 
@@ -991,6 +995,7 @@ Every resource this document names is bounded by a constant of section 19, with 
 |---|---|---|
 | bytes the transport assembles for one request or response before any check of this implementation | the pinned transport's own advertisement cap of 32 MiB, which is not a constant of this document; no advertisement-time cap is armed here (MESH-LEN-001), so a peer can make the node assemble up to that much per in-flight resource | MESH-LEN-001 |
 | bytes of one request or response that reach a handler or the requester | `MAX_R3_PAYLOAD_BYTES` = `262144`, larger frames dropped after assembly | MESH-ENV-024 |
+| msgpack nesting of one request or response frame | `MAX_R3_NESTING_DEPTH` = `128` depth units, deeper frames undecodable | MESH-ENV-048, MESH-ENV-049 |
 | concurrent handlers | `MAX_CONCURRENT_INBOUND_REQUESTS` = `16` slots, the rest dropped in silence | MESH-ENV-025 |
 | time in one handler | `HANDLER_TIMEOUT` = `20` seconds | MESH-ENV-037 |
 | knocks surfaced per identity | a token bucket of `KNOCK_BUCKET_BURST` = `3`, one token per `KNOCK_BUCKET_REFILL_INTERVAL` = `600` seconds, over at most `KNOCK_GATE_MAX_IDENTITIES` = `256` identities | MESH-KNOCK-010, MESH-KNOCK-011 |
@@ -1084,6 +1089,7 @@ A leniency is a place where the reference deliberately does something other than
 | `NAME_HASH_LEN` | `10` | src/mesh/r3/frame.rs (re-export of rns_transport NAME_HASH_LENGTH) | envelope_round_trips_and_rejects_anything_that_names_no_origin |
 | `ADDRESS_HASH_SIZE` | `16` | rns_transport hash.rs (upstream) | request_frame_layout_is_fixed_width_apart_from_the_body |
 | `MAX_R3_PAYLOAD_BYTES` | `262144` | src/mesh/r3/frame.rs | oversized_request_resource_is_dropped_before_the_handler_runs |
+| `MAX_R3_NESTING_DEPTH` | `128` | src/mesh/r3/frame.rs | frames_refuse_nesting_past_the_depth_budget_and_accept_the_deepest_legal_frame |
 | `KNOCK_PATH` | `"/knock"` | src/mesh/r3/dispatch.rs | spec_pins (this table) |
 | `STATUS_PATH` | `"/status"` | src/mesh/r3/dispatch.rs | request_frame_matches_upstream_link_request_byte_for_byte |
 | `MESSAGE_PATH` | `"/message"` | src/mesh/r3/dispatch.rs | spec_pins (this table) |
@@ -1291,9 +1297,11 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 | MESH-ENV-002 | RequestFrameDecode (Boundary), RequestFrameDecode (Invalid) |
 | MESH-ENV-003 | RequestFrameDecode (Invalid) |
 | MESH-ENV-004 | RequestFrameDecode (Invalid) |
+| MESH-ENV-048 | RequestFrameDecode (Boundary), RequestFrameDecode (Invalid) |
 | MESH-ENV-005 | Correlation (Valid) |
 | MESH-ENV-006 | ResponseFrameDecode (Valid) |
 | MESH-ENV-007 | ResponseFrameDecode (Boundary), ResponseFrameDecode (Invalid), ResponseFrameDecode (Valid), WrongLink (Invalid) |
+| MESH-ENV-049 | ResponseFrameDecode (Boundary), ResponseFrameDecode (Invalid) |
 | MESH-ENV-008 | SizeBranch (Boundary), SizeBranch (Valid) |
 | MESH-ENV-009 | SizeBranch (Boundary) |
 | MESH-ENV-010 | SizeBranch (Boundary) |
@@ -1622,9 +1630,11 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 - [MESH-ENV-002](#61-request-frame) -- request path hash element type
 - [MESH-ENV-003](#61-request-frame) -- request frame arity
 - [MESH-ENV-004](#61-request-frame) -- no trailing bytes
+- [MESH-ENV-048](#61-request-frame) -- over-deep request frame undecodable, silence
 - [MESH-ENV-005](#62-response-frame) -- response request id
 - [MESH-ENV-006](#62-response-frame) -- response value decoding order
 - [MESH-ENV-007](#62-response-frame) -- malformed, unmatched or misrouted responses dropped
+- [MESH-ENV-049](#62-response-frame) -- over-deep response frame dropped
 - [MESH-ENV-008](#63-size-branches) -- packet branch
 - [MESH-ENV-009](#63-size-branches) -- resource branch
 - [MESH-ENV-010](#63-size-branches) -- size branch in both directions

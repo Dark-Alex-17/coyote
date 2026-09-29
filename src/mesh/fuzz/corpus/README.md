@@ -86,11 +86,12 @@ Windows CI leg does.
   one-element arrays (a 428-byte frame) to overflow a 2 MiB thread stack in a debug build
   and abort the process before the limit was reached. A release build returned
   `depth limit exceeded` cleanly. `decode_whole` in `src/mesh/r3/frame.rs` now reads with
-  `MAX_R3_NESTING_DEPTH` = 128 (about 60 nested containers, far above the deepest legal
-  frame: envelope, body and `fields` nested to the sanitiser's `PEER_FIELDS_MAX_DEPTH`
-  limit, about 25 of the 128), so both request and response frames
-  past it fail to decode and earn silence as MESH-ENV-028 requires. The `unpack_whole`
-  helper in `oracles.rs` reads with the same budget so the predicate agrees.
+  `MAX_R3_NESTING_DEPTH` = 128. The deepest frame the spec delivers intact (envelope, body
+  and `fields` nested to the sanitiser's `PEER_FIELDS_MAX_DEPTH` limit) spends about 25 of
+  the 128; 62 nested one-element arrays under `data` fit and a 63rd overruns it, so both
+  request and response frames past it fail to decode (MESH-ENV-048, MESH-ENV-049) and a
+  request earns silence as MESH-ENV-028 requires. The `unpack_whole` helper in
+  `oracles.rs` reads with the same budget so the predicate agrees.
 
 `docs/mesh/PROTOCOL.md` defines no reserved or must-be-zero field in any structure
 (envelope, card, body, knock, announce, LXMF custom data), so the "nonzero reserved

@@ -1021,7 +1021,7 @@ mod tests {
     use rns_transport::hash::ADDRESS_HASH_SIZE;
     use std::time::Duration;
 
-    const EXPECTED_LITERALS: &str = r#"1,1,10,16,262144,"/knock","/status","/message",30,10,10,2,20,16,0xf0,0xf1,0xf3,0xf4,0xf5,0xf6,0xfd,0xfe,"COYM",64,300,900,3,2700,1800,1024,"coyote.knock/1",200,15,10,256,3,600,256,16,1,0,1,2,64,280,64,64,120,280,"coyote.peer/1",1,120,4000,64,4096,8,15,10,604800,256,3600,120,256,1,60,100000,120,26,60,2,60,1024,64,240,131072,112,4096,15552000,3,256,0,32,0xfb,0xfc,8,64,256,64,8"#;
+    const EXPECTED_LITERALS: &str = r#"1,1,10,16,262144,128,"/knock","/status","/message",30,10,10,2,20,16,0xf0,0xf1,0xf3,0xf4,0xf5,0xf6,0xfd,0xfe,"COYM",64,300,900,3,2700,1800,1024,"coyote.knock/1",200,15,10,256,3,600,256,16,1,0,1,2,64,280,64,64,120,280,"coyote.peer/1",1,120,4000,64,4096,8,15,10,604800,256,3600,120,256,1,60,100000,120,26,60,2,60,1024,64,240,131072,112,4096,15552000,3,256,0,32,0xfb,0xfc,8,64,256,64,8"#;
 
     fn expected_constants() -> Vec<(&'static str, String)> {
         let secs = |d: Duration| d.as_secs().to_string();
@@ -1040,6 +1040,7 @@ mod tests {
             ("NAME_HASH_LEN", r3::NAME_HASH_LEN.to_string()),
             ("ADDRESS_HASH_SIZE", ADDRESS_HASH_SIZE.to_string()),
             ("MAX_R3_PAYLOAD_BYTES", r3::MAX_R3_PAYLOAD_BYTES.to_string()),
+            ("MAX_R3_NESTING_DEPTH", r3::MAX_R3_NESTING_DEPTH.to_string()),
             ("KNOCK_PATH", quoted(r3::KNOCK_PATH)),
             ("STATUS_PATH", quoted(r3::STATUS_PATH)),
             ("MESSAGE_PATH", quoted(r3::MESSAGE_PATH)),

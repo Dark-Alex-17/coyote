@@ -393,6 +393,10 @@ fn unpacked(bytes: &[u8]) -> Value {
     rmpv::decode::read_value(&mut Cursor::new(bytes)).unwrap()
 }
 
+fn nested_arrays(depth: usize, leaf: Value) -> Value {
+    (0..depth).fold(leaf, |inner, _| Value::Array(vec![inner]))
+}
+
 fn map(entries: Vec<(&str, Value)>) -> Value {
     Value::Map(
         entries
@@ -509,6 +513,10 @@ const NOT_F64: &str = "time is not a float64";
 const PATH_NOT_BIN: &str = "path hash is not a bin";
 const ID_NOT_BIN: &str = "request id is not a bin";
 const TRAILING: &str = "trailing bytes after the frame";
+const TOO_DEEP: &str = "depth limit exceeded";
+/// Nested one-element arrays under `data` that fit the decode budget of MESH-ENV-048 once
+/// the frame's own array has spent two units of `MAX_R3_NESTING_DEPTH`.
+const DEEPEST_DATA_ARRAYS: usize = 62;
 
 fn request_frame() -> RequestFrame {
     RequestFrame {
@@ -694,6 +702,30 @@ fn request_frame_vectors() -> Vec<Vector> {
             FrameAction::Rejected("1 trailing bytes"),
         ),
         request(
+            "MESH-ENV-048",
+            Kind::Boundary,
+            packed(&request_value(
+                Value::F64(0.0),
+                path_bin(16),
+                nested_arrays(DEEPEST_DATA_ARRAYS, Value::Nil),
+            )),
+            FrameAction::Accepted(RequestFrame {
+                time: 0.0,
+                path_hash: PathHash::from([0x5a; 16]),
+                data: nested_arrays(DEEPEST_DATA_ARRAYS, Value::Nil),
+            }),
+        ),
+        request(
+            "MESH-ENV-048",
+            Kind::Invalid,
+            packed(&request_value(
+                Value::F64(0.0),
+                path_bin(16),
+                nested_arrays(DEEPEST_DATA_ARRAYS + 1, Value::Nil),
+            )),
+            FrameAction::Rejected(TOO_DEEP),
+        ),
+        request(
             "MESH-ENV-028",
             Kind::Invalid,
             truncated,
@@ -836,6 +868,27 @@ fn response_frame_vectors() -> Vec<Vector> {
             Kind::Invalid,
             Vec::new(),
             FrameAction::Rejected(""),
+        ),
+        response(
+            "MESH-ENV-049",
+            Kind::Boundary,
+            packed(&response_value(
+                id.clone(),
+                nested_arrays(DEEPEST_DATA_ARRAYS, Value::Nil),
+            )),
+            FrameAction::Accepted(response_frame(nested_arrays(
+                DEEPEST_DATA_ARRAYS,
+                Value::Nil,
+            ))),
+        ),
+        response(
+            "MESH-ENV-049",
+            Kind::Invalid,
+            packed(&response_value(
+                id.clone(),
+                nested_arrays(DEEPEST_DATA_ARRAYS + 1, Value::Nil),
+            )),
+            FrameAction::Rejected(TOO_DEEP),
         ),
         response(
             "MESH-ENV-038",

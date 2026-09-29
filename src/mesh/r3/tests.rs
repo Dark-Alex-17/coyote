@@ -151,16 +151,24 @@ fn frames_refuse_nesting_past_the_depth_budget_and_accept_the_deepest_legal_fram
     let deepest = RequestFrame::new("/message", envelope).encode();
     assert!(RequestFrame::decode(&deepest).is_ok());
 
-    // 70 containers cost 140 of the 128 budget, far short of rmpv's default 1024.
-    let too_deep = RequestFrame::new("/message", nested_arrays(70, Value::Nil)).encode();
+    // The frame array spends 2 of the 128, leaving 126: 62 nested arrays and their Nil
+    // leaf cost 125, a 63rd array 127 (MESH-ENV-048, MESH-ENV-049).
+    let deepest_data = RequestFrame::new("/message", nested_arrays(62, Value::Nil)).encode();
+    assert!(RequestFrame::decode(&deepest_data).is_ok());
+    let too_deep = RequestFrame::new("/message", nested_arrays(63, Value::Nil)).encode();
     assert!(matches!(
         RequestFrame::decode(&too_deep),
         Err(R3Error::Decode(reason)) if reason.contains("depth limit exceeded")
     ));
 
+    let deepest_response = packed(Value::Array(vec![
+        sixteen(2),
+        nested_arrays(62, Value::Nil),
+    ]));
+    assert!(ResponseFrame::decode(&deepest_response).is_ok());
     let too_deep_response = packed(Value::Array(vec![
         sixteen(2),
-        nested_arrays(70, Value::Nil),
+        nested_arrays(63, Value::Nil),
     ]));
     assert!(matches!(
         ResponseFrame::decode(&too_deep_response),
