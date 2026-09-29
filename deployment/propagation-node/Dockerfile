@@ -11,14 +11,16 @@ ENV PYTHONUNBUFFERED=1
 
 # The pip_ca secret is only for builds behind a TLS-intercepting proxy; pip reads it as PIP_CERT.
 RUN --mount=type=secret,id=pip_ca,required=false \
-    sh -c 'if [ -f /run/secrets/pip_ca ]; then export PIP_CERT=/run/secrets/pip_ca; fi; \
-           pip install --no-cache-dir "rns==${RNS_VERSION}" "lxmf==${LXMF_VERSION}"'
+    if [ -f /run/secrets/pip_ca ]; then export PIP_CERT=/run/secrets/pip_ca; fi \
+    && pip install --no-cache-dir --root-user-action=ignore "rns==${RNS_VERSION}" "lxmf==${LXMF_VERSION}"
 
 # uid 1000 matches Coyote's own image, so a bind mount chowned 1000:1000 serves both.
 RUN useradd --uid 1000 --create-home --shell /usr/sbin/nologin lxmd \
     && mkdir -p /data /opt/coyote-pn && chown lxmd:lxmd /data
 
 COPY --chmod=0755 entrypoint.sh /usr/local/bin/coyote-pn-entrypoint
+# The mkdir above is load-bearing: left to COPY, /opt/coyote-pn would be created 0644 too and uid 1000
+# could not traverse it.
 COPY --chmod=0644 lxmd.config reticulum.config /opt/coyote-pn/
 
 USER lxmd

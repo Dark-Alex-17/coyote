@@ -367,6 +367,15 @@ fn root_readme_and_protocol_spec_point_at_the_operator_docs() {
 
 #[test]
 fn shipped_files_are_ascii_lf_and_carry_no_plan_references() {
+    let mut on_disk: Vec<String> = fs::read_dir(deployment_dir())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    on_disk.sort_unstable();
+    assert_eq!(
+        on_disk, SHIPPED_FILES,
+        "deployment/propagation-node/ holds something SHIPPED_FILES does not list (or vice versa); every file there ships in the image context"
+    );
     for name in SHIPPED_FILES {
         let path = deployment_dir().join(name);
         let bytes = fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
@@ -586,7 +595,7 @@ impl Node {
     }
 
     fn wait_started(&self) -> String {
-        self.wait_for("LXMF Propagation Node started on <")
+        self.wait_for("Started lxmd version")
     }
 
     fn restart(&self) {
@@ -945,6 +954,15 @@ fn upstream_lxmf_dir() -> Option<PathBuf> {
     default.join("LXMF").is_dir().then_some(default)
 }
 
+/// The RNS twin of [`upstream_lxmf_dir`]: `COYOTE_PN_UPSTREAM_RNS` or `.rns-audit/reticulum`.
+fn upstream_rns_dir() -> Option<PathBuf> {
+    if let Ok(dir) = env::var("COYOTE_PN_UPSTREAM_RNS") {
+        return Some(PathBuf::from(dir));
+    }
+    let default = repo_root().join(".rns-audit").join("reticulum");
+    default.join("RNS").is_dir().then_some(default)
+}
+
 /// Lines `from..=to` (1-based, inclusive) of `path`, joined with `\n`.
 fn cited_lines(path: &Path, from: usize, to: usize) -> String {
     let text = read(path);
@@ -982,7 +1000,7 @@ fn usage_probe_readme_upstream_citations_resolve_in_the_pinned_lxmf_clone() {
     // Every citation the shipped files make, with what the cited range must contain.
     // (citing file, `file:from-to` label as written, path, from, to, expected fragments)
     type Citation<'a> = (&'a str, &'a str, &'a Path, usize, usize, &'a [&'a str]);
-    let citations: [Citation<'_>; 6] = [
+    let citations: [Citation<'_>; 10] = [
         (
             "README",
             "lxmd.py:103-116",
@@ -1005,11 +1023,27 @@ fn usage_probe_readme_upstream_citations_resolve_in_the_pinned_lxmf_clone() {
         ),
         (
             "README",
-            "lxmd.py:204-220",
+            "lxmd.py:204-210",
             &lxmd_py,
             204,
+            210,
+            &["\"static_peers\"", "bytes.fromhex(static_peer)"],
+        ),
+        (
+            "README",
+            "lxmd.py:217-220",
+            &lxmd_py,
+            217,
             220,
-            &["\"static_peers\"", "\"from_static_only\""],
+            &["\"from_static_only\"", "as_bool(\"from_static_only\")"],
+        ),
+        (
+            "README",
+            "LXMRouter.py:309",
+            &router_py,
+            309,
+            309,
+            &["node_state    = self.propagation_node and not self.from_static_only"],
         ),
         (
             "README",
@@ -1018,6 +1052,29 @@ fn usage_probe_readme_upstream_citations_resolve_in_the_pinned_lxmf_clone() {
             1417,
             1429,
             &["def identity_allowed", "ERROR_NO_ACCESS"],
+        ),
+        (
+            "README",
+            "lxmd.py:639-643",
+            &lxmd_py,
+            639,
+            643,
+            &[
+                "RNS.Transport.has_path(control_destination.hash)",
+                "RNS.Transport.request_path(control_destination.hash)",
+            ],
+        ),
+        (
+            "README",
+            "lxmd.py:631-635",
+            &lxmd_py,
+            631,
+            635,
+            &[
+                "def check_timeout",
+                "Getting lxmd statistics timed out",
+                "exit(200)",
+            ],
         ),
         (
             "entrypoint.sh",
@@ -1068,6 +1125,28 @@ fn usage_probe_readme_upstream_citations_resolve_in_the_pinned_lxmf_clone() {
     assert!(
         router_text.contains("AUTOPEER_MAXDEPTH     = 4"),
         "LXMRouter's autopeer depth default is no longer 4; fix the README's 'within four hops'"
+    );
+
+    // entrypoint.sh: "RNS writes identities with a plain open(path, \"wb\") (RNS/Identity.py:665)".
+    let Some(rns) = upstream_rns_dir() else {
+        eprintln!(
+            "skipping: no pinned RNS clone at .rns-audit/reticulum (or COYOTE_PN_UPSTREAM_RNS); cannot check the entrypoint's RNS/Identity.py citation"
+        );
+        return;
+    };
+    let rns_version = read(rns.join("RNS").join("_version.py"));
+    assert!(
+        rns_version.contains(&format!("\"{RNS_VERSION}\"")),
+        "the pinned clone is not RNS {RNS_VERSION}: {rns_version:?}"
+    );
+    assert!(
+        entrypoint.contains("RNS/Identity.py:665"),
+        "entrypoint.sh no longer cites `RNS/Identity.py:665`; update this test"
+    );
+    let cited = cited_lines(&rns.join("RNS").join("Identity.py"), 665, 665);
+    assert!(
+        cited.contains("open(path, \"wb\")"),
+        "entrypoint.sh cites `RNS/Identity.py:665` for the plain `open(path, \"wb\")`, but RNS {RNS_VERSION} has there:\n{cited}"
     );
 }
 
@@ -1180,8 +1259,8 @@ fn usage_probe_unlisted_arguments_reach_the_daemon_not_a_tool() {
         );
     }
 
-    // README: "`static_peers = <hashes>` and `from_static_only = yes` are the knobs
-    // ... both are in `lxmd --exampleconfig`", reached through the `lxmd` passthrough.
+    // README: "`static_peers = <hashes>` is the knob (... it is in `lxmd --exampleconfig`)"
+    // and warns against `from_static_only = yes`; both reached through the `lxmd` passthrough.
     let example = docker_ok(&[
         "run",
         "--rm",
@@ -1302,4 +1381,333 @@ fn usage_probe_copying_only_the_lxmd_identity_moves_destinations_but_not_the_tra
         64,
         "sha256sum output: {partial_transport:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Usage probe, round 3 (spec-first from the README as of 0097462): the
+// bind-mount recipe, the `lxmd --status` operating note against a LIVE daemon,
+// seeding on the non-daemon paths, and the store-and-forward wording.
+// ---------------------------------------------------------------------------
+
+/// Collapse every whitespace run to one space so a re-wrapped sentence still matches.
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[test]
+fn usage_probe_docs_say_fetch_back_is_unwired_and_never_route_knocks_through_the_node() {
+    // Root README: "(posting is wired in this build; fetching held messages back is
+    // not yet)". Deployment README: only messages are posted to a propagation node;
+    // a knock never takes the store-and-forward path, and fetch-back is not triggered.
+    let root = one_line(&read(repo_root().join("README.md")));
+    assert!(
+        root.contains("posting is wired in this build; fetching held messages back is not yet"),
+        "root README must qualify the propagation-node promise (posting wired, fetch-back not):\n{root}"
+    );
+    let readme = one_line(&read(deployment_dir().join("README.md")));
+    assert!(
+        readme.contains("it posts the message to a propagation node"),
+        "deployment README must say messages (not knocks) are posted to the node"
+    );
+    for stale in [
+        "message or knock",
+        "knock to a propagation",
+        "posts the knock",
+    ] {
+        assert!(
+            !readme.contains(stale),
+            "deployment README must not claim knocks are posted to a propagation node ({stale:?}); MeshRuntime::knock has no production caller"
+        );
+    }
+    assert!(
+        readme.contains(
+            "Fetching held messages back is not yet triggered by any command or schedule"
+        ),
+        "deployment README must state that fetch-back is not wired in this build"
+    );
+}
+
+#[test]
+fn usage_probe_readme_status_note_matches_what_docker_exec_actually_does() {
+    // The round-3 README claimed that both `lxmd --status` forms write into the
+    // daemon's live `/data/reticulum/storage/` on exit. Live ground truth
+    // (usage_probe_lxmd_status_against_a_live_daemon): inside the
+    // daemon's network namespace the second instance never comes up. It dies while
+    // creating the "Coyote Peers" TCPServerInterface with `[Errno 98] Address already
+    // in use` (exit 255) and writes NOTHING under /data/reticulum/storage/. Only the
+    // separate-namespace `docker run` form reaches the path wait, exits 200 and
+    // rewrites destination_table/known_destinations/packet_hashlist.raw/tunnels.
+    let readme = one_line(&read(deployment_dir().join("README.md")));
+    assert!(
+        !readme
+            .contains("In both forms the second `RNS.Reticulum(configdir=/data/reticulum)` writes"),
+        "the docker exec form does not write into /data/reticulum/storage/: it exits 255 on `Address already in use` before Reticulum is up. Only the `docker run` form writes on exit."
+    );
+    assert!(
+        readme.contains("Address already in use") || readme.contains("cannot bind 4242"),
+        "the exec-form note should name what the operator will actually see: the second instance fails to bind the daemon's 4242 listener"
+    );
+}
+
+#[test]
+#[ignore = "needs docker and COYOTE_PN_IMAGE_TESTS=1"]
+fn usage_probe_lxmd_status_against_a_live_daemon() {
+    if skip_unless_live() {
+        return;
+    }
+    // README: "`lxmd --status` is not usable from this image, in either form. A second
+    // `docker run ... lxmd --status` ... exits 200 at the path wait with `Getting lxmd
+    // statistics timed out` ... `docker exec ...` dies with `[Errno 98] Address already
+    // in use`, exit 255 ... and writes nothing ... The log is the status surface."
+    // Whatever the probe does, the daemon must still be running afterwards.
+    let image = build_image();
+    let lbl = label();
+    let node = Node::fresh(&image, "live-status");
+    node.start(&[]);
+    node.wait_started();
+    let mount = format!("{}:/data", node.volume);
+
+    // --- `docker run` form: separate network namespace, no interface to the daemon.
+    node.on_volume("touch /data/probe-marker");
+    let out = docker(&[
+        "run",
+        "--rm",
+        "--label",
+        &lbl,
+        "-v",
+        &mount,
+        &image,
+        "lxmd",
+        "--status",
+        "--timeout",
+        "5",
+    ]);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(200),
+        "a second `docker run ... lxmd --status` against the live volume must exit 200 at the path wait:\n{combined}"
+    );
+    assert!(
+        combined.contains("Getting lxmd statistics timed out"),
+        "the run form should report the statistics timeout, not a config/identity error:\n{combined}"
+    );
+    let written =
+        node.on_volume("find /data/reticulum/storage -type f -newer /data/probe-marker | sort");
+    assert!(
+        written.contains("known_destinations") || written.contains("destination_table"),
+        "README: the run form's second Reticulum writes into the daemon's live storage on exit; nothing newer than the marker:\n{written}"
+    );
+
+    // --- `docker exec` form: same namespace, so the second instance collides with
+    // the daemon's 4242 listener and never comes up.
+    node.on_volume("touch /data/probe-marker");
+    let out = docker(&[
+        "exec",
+        &node.name,
+        "lxmd",
+        "--config",
+        "/data/lxmd",
+        "--rnsconfig",
+        "/data/reticulum",
+        "--status",
+        "--timeout",
+        "5",
+    ]);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success(),
+        "`docker exec ... lxmd --status` must not succeed (README: not usable in either form):\n{combined}"
+    );
+    assert!(
+        combined.contains("Address already in use"),
+        "inside the daemon's namespace the second instance must die on the 4242 bind, not reach a status query:\n{combined}"
+    );
+    assert!(
+        !combined.contains("Getting lxmd statistics timed out"),
+        "the exec form never reaches the path wait:\n{combined}"
+    );
+    thread::sleep(Duration::from_secs(2));
+    let written =
+        node.on_volume("find /data/reticulum/storage -type f -newer /data/probe-marker | sort");
+    assert!(
+        written.trim().is_empty(),
+        "the exec form dies before Reticulum is up, so it must not rewrite the daemon's live storage; newer than marker:\n{written}"
+    );
+
+    // --- Neither probe may take the daemon down.
+    let state = docker_ok(&["inspect", &node.name, "--format", "{{.State.Status}}"]);
+    assert_eq!(
+        state.trim(),
+        "running",
+        "a failed status probe must leave the daemon running"
+    );
+    let logs = node.logs();
+    assert_eq!(
+        logs.matches("Started lxmd version").count(),
+        1,
+        "the daemon must not have restarted:\n{logs}"
+    );
+}
+
+#[test]
+#[ignore = "needs docker and COYOTE_PN_IMAGE_TESTS=1"]
+fn usage_probe_version_and_exampleconfig_paths_seed_an_empty_volume_too() {
+    if skip_unless_live() {
+        return;
+    }
+    // README: "`docker run --rm coyote-pn lxmd --version`, `lxmd --exampleconfig` and a
+    // bare `lxmd` all behave exactly like the same command without the `lxmd`: every
+    // path seeds the volume first and then runs lxmd".
+    let image = build_image();
+    let lbl = label();
+    let check = "set -e; \
+        cmp -s /opt/coyote-pn/lxmd.config /data/lxmd/config && echo LXMD_SEEDED; \
+        cmp -s /opt/coyote-pn/reticulum.config /data/reticulum/config && echo RNS_SEEDED; \
+        test -f /data/lxmd/allowed && echo ALLOWED_PRESENT; \
+        test ! -e /data/lxmd/identity && echo NO_IDENTITY_YET";
+    for (suffix, command) in [
+        ("seed-version", vec!["--version"]),
+        ("seed-lxmd-version", vec!["lxmd", "--version"]),
+        ("seed-example", vec!["lxmd", "--exampleconfig"]),
+    ] {
+        let node = Node::fresh(&image, suffix);
+        let mount = format!("{}:/data", node.volume);
+        let mut args = vec!["run", "--rm", "--label", &lbl, "-v", &mount, &image];
+        args.extend(command.iter());
+        let out = docker_ok(&args);
+        if command.contains(&"--version") {
+            assert_eq!(out.trim(), format!("lxmd {LXMF_VERSION}"), "{command:?}");
+        } else {
+            assert!(out.contains("[propagation]"), "{command:?} output:\n{out}");
+        }
+        let listing = node.on_volume(check);
+        for expected in [
+            "LXMD_SEEDED",
+            "RNS_SEEDED",
+            "ALLOWED_PRESENT",
+            "NO_IDENTITY_YET",
+        ] {
+            assert!(
+                listing.contains(expected),
+                "after `docker run -v vol:/data IMG {}` the volume must be seeded like a daemon start ({expected} missing):\n{listing}",
+                command.join(" ")
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs docker and COYOTE_PN_IMAGE_TESTS=1"]
+fn usage_probe_bind_mount_recipe_runs_the_daemon_and_keeps_identities_private() {
+    if skip_unless_live() {
+        return;
+    }
+    // README: "The image runs as uid 1000. A bind mount instead of a named volume has
+    // to be owned by that uid, and mode 700 keeps the identity files it will hold
+    // from other users on the host: install -d -m 700 -o 1000 -g 1000 /srv/coyote-pn".
+    #[cfg(not(unix))]
+    {
+        eprintln!("skipping: the bind-mount recipe is a unix ownership recipe");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+
+        let dir = env::temp_dir().join(format!("{}-bind", run_prefix()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&dir)
+            .unwrap_or_else(|e| panic!("create {}: {e}", dir.display()));
+        let owner = fs::metadata(&dir).unwrap().uid();
+        if owner != 1000 {
+            // `install -o 1000` needs root or uid 1000 itself; without either the
+            // recipe cannot be reproduced faithfully here.
+            let chown = Command::new("chown").arg("1000:1000").arg(&dir).output();
+            if !matches!(chown, Ok(ref o) if o.status.success()) {
+                eprintln!(
+                    "skipping: cannot chown {} to 1000:1000 (running as uid {owner})",
+                    dir.display()
+                );
+                let _ = fs::remove_dir_all(&dir);
+                return;
+            }
+        }
+        struct BindNode {
+            name: String,
+            dir: PathBuf,
+        }
+        impl Drop for BindNode {
+            fn drop(&mut self) {
+                let _ = docker(&["rm", "-f", &self.name]);
+                let _ = fs::remove_dir_all(&self.dir);
+            }
+        }
+        let image = build_image();
+        let lbl = label();
+        let bind = BindNode {
+            name: format!("{}-bind", run_prefix()),
+            dir: dir.clone(),
+        };
+        let mount = format!("{}:/data", dir.display());
+        docker_ok(&[
+            "run", "-d", "--name", &bind.name, "--label", &lbl, "-v", &mount, &image,
+        ]);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let logs = loop {
+            let out = docker(&["logs", &bind.name]);
+            let logs = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            if logs.contains("Started lxmd version") {
+                break logs;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "daemon on a 700/1000:1000 bind mount never started; log so far:\n{logs}"
+            );
+            thread::sleep(Duration::from_millis(500));
+        };
+        assert!(
+            logs.contains(EMPTY_ALLOWED_WARNING),
+            "the bind-mounted node must run the shipped (auth-on) config:\n{logs}"
+        );
+        let mode = |rel: &str| {
+            let path = dir.join(rel);
+            fs::metadata(&path)
+                .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+                .permissions()
+                .mode()
+                & 0o777
+        };
+        assert_eq!(mode("lxmd/identity"), 0o600, "node identity on the host");
+        assert_eq!(
+            mode("reticulum/storage/transport_identity"),
+            0o600,
+            "transport identity on the host"
+        );
+        assert_eq!(mode("lxmd"), 0o700, "/data/lxmd on the host");
+        assert_eq!(mode("reticulum"), 0o700, "/data/reticulum on the host");
+        assert_eq!(
+            fs::metadata(dir.join("lxmd/identity")).unwrap().uid(),
+            1000,
+            "files the daemon writes must belong to uid 1000 (the recipe's owner)"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("lxmd/config")).unwrap(),
+            read(deployment_dir().join("lxmd.config")),
+            "the bind mount must be seeded with the shipped lxmd.config"
+        );
+    }
 }

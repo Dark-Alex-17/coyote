@@ -18,6 +18,8 @@ docker build -t coyote-pn deployment/propagation-node
 docker run -d --name coyote-pn -p <lan-or-vpn-ip>:4242:4242 -v coyote-pn-data:/data coyote-pn
 ```
 
+The build needs BuildKit, the default since Docker 23; older daemons need `DOCKER_BUILDKIT=1`.
+
 Publish the port on the LAN or VPN address the team's Coyote nodes dial, not on every address: the node relays for
 anyone who can reach 4242 (see "Private network").
 
@@ -109,8 +111,12 @@ with a cost up to 26). Network reachability, a firewall or a VPN, is the boundar
 Peering is off: `lxmd.config` sets `autopeer = no`, where lxmd's default would peer with any propagation node
 whose announce it hears within four hops and sync it a copy of every held message (`auth_required` does not gate
 peer sync). So `allowed` plus network reachability are the only ways messages leave the node. For a deliberate
-multi-node team, `static_peers = <hashes>` and `from_static_only = yes` are the knobs (`lxmd.py:204-220`; both
-are in `lxmd --exampleconfig`).
+multi-node team, `static_peers = <hashes>` is the knob (`lxmd.py:204-210`; it is in `lxmd --exampleconfig`): each
+node lists the others' propagation-node destination hashes and they sync held messages between themselves. Do not
+set `from_static_only = yes` (`lxmd.py:217-220`) on a node Coyote should post to. It clears the propagation-node
+flag in the node's announce (`LXMRouter.py:309`, `node_state = self.propagation_node and not
+self.from_static_only`), and Coyote only posts to nodes that announce that flag, so `mesh__send` would answer
+`no_propagation_node` even though the node is up and listed.
 
 `reticulum.config` also turns off Reticulum's announce ingress control (`ingress_control = No`), the
 per-interface burst limiter for announces and path requests, so a new instance's first announce is not held back.
@@ -140,13 +146,17 @@ Deployment recipes and the trust model are in the wiki:
 
 - Logs go to stdout; read them with `docker logs coyote-pn`. The daemon is started without `-s`, which would
   send them to a file instead.
-- `lxmd --status` is not usable from this image. A second `docker run` against the volume has its own network
-  namespace and no Reticulum interface that joins it to the daemon (`reticulum.config` only listens), so the
-  status query never finds a path to the node's control destination and exits 200 at the path wait
-  (`lxmd.py:639-643`, timeout at `lxmd.py:631-635`). A `docker exec` form is no better: with
-  `share_instance = No` it starts a second, isolated Reticulum instance. In both forms the second
-  `RNS.Reticulum(configdir=/data/reticulum)` writes into the daemon's live `/data/reticulum/storage/` on exit.
-  The log is the status surface.
+- `lxmd --status` is not usable from this image, in either form. A second `docker run ... lxmd --status` against
+  the volume has its own network namespace and no Reticulum interface that joins it to the daemon
+  (`reticulum.config` only listens), so the status query never finds a path to the node's control destination
+  and exits 200 at the path wait with `Getting lxmd statistics timed out` (`lxmd.py:639-643`, timeout at
+  `lxmd.py:631-635`); on the way out its second `RNS.Reticulum(configdir=/data/reticulum)` rewrites
+  `destination_table`, `known_destinations`, `packet_hashlist.raw` and `tunnels` under the daemon's live
+  `/data/reticulum/storage/`. `docker exec coyote-pn lxmd --config /data/lxmd --rnsconfig /data/reticulum --status`
+  shares the daemon's namespace instead, and with `share_instance = No` its second Reticulum instance tries to
+  open its own `Coyote Peers` listener on 4242, which the daemon holds: it dies with
+  `[Errno 98] Address already in use`, exit 255, before Reticulum is up, and writes nothing. The daemon keeps
+  running through both. The log is the status surface.
 - lxmd also registers a delivery destination for the daemon itself (the first hash in the smoke output).
   Anything sent to it is written under `/data/lxmd/storage/messages` with no count cap;
   `message_storage_limit` bounds the propagation store only. Size the volume for it, or set `on_inbound` to a
