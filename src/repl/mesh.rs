@@ -128,7 +128,7 @@ pub(super) const VERBS: &[(&str, &str, &str)] = &[
 ];
 
 pub(crate) const MESH_OFF: &str = "Mesh is off. Run `.mesh on` first.";
-const ROTATE_NEEDS_OFF: &str = "Mesh is on. Run `.mesh off` first; the identity is rotated only while the node is stopped, then `.mesh on` announces the new one.";
+const ROTATE_NEEDS_OFF: &str = "Mesh is on. Run `.mesh off` first; the identity is rotated only while no session's node on this config dir is running, then `.mesh on` announces the new one.";
 const BROADCAST_NOTICE: &str = "This sends a bulletin to every peer this node trusts that has a known path right now. Peers you have not trusted receive nothing.";
 const REPLY_REFUSAL_TAIL: &str = "Nothing is sent to a destination this node does not trust.";
 const STATUS_REFUSAL_TAIL: &str = "Status is only requested from trusted destinations.";
@@ -1045,7 +1045,10 @@ fn undeny(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
 }
 
 /// Like `untrust --identity`, a dry run until the printed token comes back. Bare
-/// `.mesh rotate` is the dry run itself: there is no target to prompt help for.
+/// `.mesh rotate` is the dry run itself: there is no target to prompt help for. The
+/// identity lock is taken here so a node in another process refuses the dry run as well,
+/// after the key is named so a config dir without one is left untouched; `rotate_identity`
+/// re-reads the key under its own lock, so the guard is released before the confirm.
 fn rotate(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     let args = parse_mutation_args(
         rest.unwrap_or(""),
@@ -1068,6 +1071,7 @@ fn rotate(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     }
     let path = MeshPaths::from_env().identity_path;
     let old = fingerprint(&identity::current_identity(&path)?);
+    let lock = identity::IdentityLock::exclusive(&path)?;
     let expected = format!("rotate-{}", short(&old));
     match args.confirm {
         None => {
@@ -1080,6 +1084,7 @@ fn rotate(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
                     identity::PREDECESSORS_FILE
                 ),
                 "  the instance id is unchanged, so the node announces a new destination hash under the new identity".to_string(),
+                "  rotation is refused while any session's node on this config dir is running: each running node holds mesh/identity.key.lock".to_string(),
                 "  every peer that trusted this identity or its instances now sees a stranger and must run .mesh trust again after verifying the new hash out of band; your own trust list is unchanged".to_string(),
                 format!(
                     "This was a dry run; nothing changed. To rotate, run: .mesh rotate --confirm {expected}"
@@ -1092,6 +1097,7 @@ fn rotate(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             short(&old)
         ),
         Some(_) => {
+            drop(lock);
             let rotation = identity::rotate_identity(&path, &old, SystemTime::now())?;
             out_text(&format!(
                 "Rotated the mesh identity: {} -> {}.\nPredecessors recorded: {}. Run .mesh on to announce the new identity; peers must re-trust it.",
@@ -4330,6 +4336,8 @@ mod tests {
             let guard = TestConfigDirGuard::new("repl-mesh-rotate-dry-run");
             let _capture = capture::install();
             let (path, before, old) = minted_key(&guard);
+            let stale = path.with_added_extension("new");
+            fs::write(&stale, [3u8; 64]).unwrap();
             let mut ctx = off_ctx();
             let token = format!("rotate-{}", short(&old));
 
@@ -4342,11 +4350,44 @@ mod tests {
                 assert!(out.contains("(0 recorded so far)"), "{line}: {out}");
                 assert!(out.contains("sees a stranger"), "{line}: {out}");
                 assert!(
+                    out.contains("refused while any session's node on this config dir is running"),
+                    "{line}: {out}"
+                );
+                assert!(out.contains("mesh/identity.key.lock"), "{line}: {out}");
+                assert!(
                     out.contains(&format!(".mesh rotate --confirm {token}")),
                     "{line}: {out}"
                 );
                 assert_eq!(fs::read(&path).unwrap(), before, "{line}");
                 assert!(!identity::predecessors_path(&path).exists(), "{line}");
+                assert!(stale.exists(), "{line}: a dry run sweeps nothing");
+            }
+        }
+
+        #[cfg(unix)]
+        #[test]
+        #[serial]
+        fn rotate_is_refused_while_another_process_holds_the_identity_lock() {
+            let guard = TestConfigDirGuard::new("repl-mesh-rotate-locked");
+            let (path, before, old) = minted_key(&guard);
+            let _node = identity::IdentityLock::share(&path).unwrap();
+            let mut ctx = off_ctx();
+            let token = format!("rotate-{}", short(&old));
+
+            for line in [
+                ".mesh rotate".to_string(),
+                ".mesh rotate --dry-run".to_string(),
+                format!(".mesh rotate --confirm {token}"),
+            ] {
+                let err = err_of(&mut ctx, &line);
+                assert!(err.contains(".mesh off"), "{line}: {err}");
+                assert!(
+                    err.contains(&format!("pid {}", std::process::id())),
+                    "{line}: {err}"
+                );
+                assert_eq!(fs::read(&path).unwrap(), before, "{line}");
+                assert!(!identity::predecessors_path(&path).exists(), "{line}");
+                assert!(!path.with_added_extension("new").exists(), "{line}");
             }
         }
 

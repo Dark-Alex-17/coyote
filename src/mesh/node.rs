@@ -9,6 +9,7 @@ use crate::mesh::envoy::{EnvoyJob, EnvoySink};
 use crate::mesh::events::{
     BriefUpdateSource, MeshEvent, MeshHookSink, MeshHooks, NodeFacts, Routed, TrustHookObserver,
 };
+use crate::mesh::identity::IdentityLock;
 use crate::mesh::idle::{IdleNotify, IdleSink, Origin};
 use crate::mesh::knock::{
     ChannelKnockSink, KNOCK_LINK_TIMEOUT, KNOCK_QUEUE_CAPACITY, KNOCK_REQUEST_TIMEOUT, KnockError,
@@ -237,6 +238,10 @@ pub(crate) struct MeshRuntime {
     transport: Mutex<Option<Arc<Transport>>>,
     interfaces: Mutex<Vec<JoinedInterface>>,
     destination: Mutex<DestinationState>,
+    /// Held shared for the node's lifetime so no process rotates the key it announces
+    /// under; `None` once `shutdown` has released it. Outside `DestinationState` because a
+    /// rekey replaces that whole value and the identity does not change with it.
+    identity_lock: parking_lot::Mutex<Option<IdentityLock>>,
     ids: RwLock<CurrentIds>,
     peers: Arc<PeerTable>,
     propagation_nodes: Arc<PropagationNodeTable>,
@@ -283,6 +288,7 @@ impl MeshRuntime {
 
         let instance_id = session.ensure_mesh_instance_id().to_string();
         let lock = InstanceLock::acquire(&paths.cache_dir, &instance_id)?;
+        let identity_lock = IdentityLock::share(&paths.identity_path)?;
         let core_identity = identity::load_or_mint_identity(&paths.identity_path)?;
         let fingerprint = identity::fingerprint(&core_identity);
         let transport_identity = to_transport_private_identity(&core_identity);
@@ -389,6 +395,7 @@ impl MeshRuntime {
                 lock: Some(lock),
                 last_announce,
             }),
+            identity_lock: parking_lot::Mutex::new(Some(identity_lock)),
             ids: RwLock::new(CurrentIds {
                 instance_id,
                 destination_hash: hash.to_hex_string(),
@@ -1002,8 +1009,8 @@ impl MeshRuntime {
     }
 
     /// Cancels and joins the node's tasks, stops the interfaces, drops the transport and
-    /// releases the instance lock, in that order so nothing outlives what it depends on. The
-    /// task joins share one grace window and the transport teardown another.
+    /// releases the instance and identity locks, in that order so nothing outlives what it
+    /// depends on. The task joins share one grace window and the transport teardown another.
     async fn shutdown(&self) -> Result<()> {
         self.cancel.cancel();
         let tasks = std::mem::take(&mut *self.tasks.lock());
@@ -1042,6 +1049,7 @@ impl MeshRuntime {
         }
         drop(transport);
         state.lock = None;
+        *self.identity_lock.lock() = None;
         if let Err(err) = self.peers.persist_if_dirty() {
             warn!(
                 "Failed to persist the mesh peer table on stop: {}",
@@ -5761,6 +5769,91 @@ mod tests {
             metrics.num_alive_tasks() == baseline
         })
         .await;
+        relay_handle.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_running_node_holds_the_identity_lock_and_stop_releases_it() {
+        let (addr, relay_handle, _) = loopback_relay().await;
+        let tmp = TempDir::new("node-identity-lock");
+        let paths = mesh_paths(&tmp);
+        let identity_path = paths.identity_path.clone();
+        let mut session = Session::default();
+        let runtime = MeshRuntime::start(
+            &private_config(addr.port()),
+            true,
+            &mut session,
+            paths,
+            NodeOptions::default(),
+        )
+        .await
+        .unwrap();
+        let before = std::fs::read(&identity_path).unwrap();
+        assert!(
+            IdentityLock::exclusive(&identity_path).is_err(),
+            "the running node must hold the identity lock"
+        );
+        let err = match identity::rotate_identity(
+            &identity_path,
+            &runtime.fingerprint,
+            SystemTime::now(),
+        ) {
+            Ok(_) => panic!("rotating under a running node must fail"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains(".mesh off"), "{err}");
+        assert_eq!(std::fs::read(&identity_path).unwrap(), before);
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime).unwrap();
+
+        assert!(slot.stop().await.unwrap());
+
+        let _rotation =
+            IdentityLock::exclusive(&identity_path).expect("stop must release the identity lock");
+        relay_handle.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_nodes_on_one_config_dir_both_start_and_rotation_is_refused_until_both_stop() {
+        let (addr, relay_handle, _) = loopback_relay().await;
+        let tmp = TempDir::new("node-shared-identity-lock");
+        let identity_path = mesh_paths(&tmp).identity_path;
+        let mut first_session = Session::default();
+        let mut second_session = Session::default();
+        let first = MeshRuntime::start(
+            &private_config(addr.port()),
+            true,
+            &mut first_session,
+            mesh_paths(&tmp),
+            NodeOptions::default(),
+        )
+        .await
+        .unwrap();
+        let second = MeshRuntime::start(
+            &private_config(addr.port()),
+            true,
+            &mut second_session,
+            mesh_paths(&tmp),
+            NodeOptions::default(),
+        )
+        .await
+        .expect("a second session on the same config dir must start alongside the first");
+        assert_eq!(first.fingerprint, second.fingerprint);
+        assert!(IdentityLock::exclusive(&identity_path).is_err());
+
+        first.shutdown().await.unwrap();
+
+        assert!(
+            IdentityLock::exclusive(&identity_path).is_err(),
+            "one node still running keeps rotation refused"
+        );
+
+        second.shutdown().await.unwrap();
+
+        let _rotation = IdentityLock::exclusive(&identity_path)
+            .expect("rotation is possible once every node has stopped");
         relay_handle.abort();
     }
 

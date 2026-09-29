@@ -1,10 +1,11 @@
 use crate::config::paths;
+use crate::mesh::lock::{read_holder_pid, write_holder_pid};
 use crate::mesh::{mesh_config_dir, redact_hashes, rfc3339_utc, short};
 
 use anyhow::{Context, Result, bail};
 use lxmf_core::identity::PrivateIdentity;
 use serde::{Deserialize, Serialize};
-use std::fs;
+use std::fs::{self, File, TryLockError};
 use std::io::{self, BufRead, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -27,6 +28,103 @@ pub(crate) fn predecessors_path(identity_path: &Path) -> PathBuf {
 /// The sibling `rotate_identity` writes the new key to before renaming it over the identity.
 fn staged_path(identity_path: &Path) -> PathBuf {
     identity_path.with_added_extension("new")
+}
+
+/// Guards `identity.key` across every Coyote process on this config dir through a kernel
+/// advisory lock on the sibling `identity.key.lock`, the primitive `InstanceLock` uses. A
+/// running node holds it shared for its lifetime, so sessions sharing a config dir run side
+/// by side; rotation holds it exclusive, so a new key is never renamed over one a node still
+/// announces under. The file is never removed, for the reason `InstanceLock` gives. Each
+/// holder writes its pid into the file to word a refusal; with several shared holders the
+/// pid a refusal shows is the last writer's, one of the holders.
+#[derive(Debug)]
+pub(crate) struct IdentityLock {
+    file: File,
+}
+
+impl IdentityLock {
+    /// The node's hold, refused only while a rotation holds the lock exclusively. The pid is
+    /// written best effort: a Windows shared lock denies writes to every handle, the
+    /// holder's included, and the pid only words a refusal.
+    pub(crate) fn share(identity_path: &Path) -> Result<Self> {
+        let (path, mut file) = open_lock_file(identity_path)?;
+        match file.try_lock_shared() {
+            Ok(()) => {
+                if let Err(err) = write_holder_pid(&mut file) {
+                    debug!(
+                        "Mesh identity lock '{}' holds no pid: {}",
+                        path.display(),
+                        redact_hashes(&err.to_string())
+                    );
+                }
+                Ok(Self { file })
+            }
+            Err(TryLockError::WouldBlock) => bail!(
+                "The mesh identity is being rotated by another Coyote process{}. Run `.mesh on` again once it finishes.",
+                holder_suffix(read_holder_pid(&mut file))
+            ),
+            Err(TryLockError::Error(err)) => Err(err).with_context(|| {
+                format!("Failed to take the mesh identity lock '{}'", path.display())
+            }),
+        }
+    }
+
+    /// Rotation's hold, refused while any process holds the lock shared or exclusively.
+    pub(crate) fn exclusive(identity_path: &Path) -> Result<Self> {
+        let (path, mut file) = open_lock_file(identity_path)?;
+        match file.try_lock() {
+            Ok(()) => Self::hold(&path, file),
+            Err(TryLockError::WouldBlock) => bail!(
+                "A mesh node on this config dir is running in a Coyote process{}; the identity is rotated only while no session's node on this config dir is running. Run `.mesh off` in every Coyote session that shares this config dir (the holder may be another process), then rotate again.",
+                holder_suffix(read_holder_pid(&mut file))
+            ),
+            Err(TryLockError::Error(err)) => Err(err).with_context(|| {
+                format!("Failed to take the mesh identity lock '{}'", path.display())
+            }),
+        }
+    }
+
+    fn hold(path: &Path, mut file: File) -> Result<Self> {
+        write_holder_pid(&mut file)
+            .with_context(|| format!("Failed to write mesh identity lock '{}'", path.display()))?;
+        Ok(Self { file })
+    }
+}
+
+impl Drop for IdentityLock {
+    fn drop(&mut self) {
+        if let Err(err) = self.file.unlock() {
+            warn!(
+                "Failed to release a mesh identity lock: {}",
+                redact_hashes(&err.to_string())
+            );
+        }
+    }
+}
+
+fn holder_suffix(pid: Option<u32>) -> String {
+    pid.map(|pid| format!(" (pid {pid})")).unwrap_or_default()
+}
+
+/// Opens the lock file without taking the lock. The parent is created owner-only because
+/// the lock may be taken before the first mint creates the key.
+fn open_lock_file(identity_path: &Path) -> Result<(PathBuf, File)> {
+    if let Some(parent) = identity_path.parent() {
+        create_private_dir(parent)?;
+    }
+    let path = identity_path.with_added_extension("lock");
+    refuse_symlink(&path)?;
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options
+        .open(&path)
+        .with_context(|| format!("Failed to open mesh identity lock '{}'", path.display()))?;
+    Ok((path, file))
 }
 
 /// One retired identity, as the predecessors file records it. Only the public hash is kept;
@@ -53,10 +151,8 @@ pub(crate) fn fingerprint(identity: &PrivateIdentity) -> String {
 }
 
 /// The identity at `path` as it stands; unlike `load_or_mint_identity` a missing key is an
-/// error, since the caller wants to name or replace the one that exists. A staged key left
-/// by an interrupted rotation is swept here too, so a dry run removes it as a start would.
+/// error, since the caller wants to name or replace the one that exists.
 pub(crate) fn current_identity(path: &Path) -> Result<PrivateIdentity> {
-    remove_stale_staged_key(path)?;
     refuse_symlink(path)?;
     if fs::symlink_metadata(path).is_err() {
         bail!(
@@ -107,12 +203,13 @@ fn remove_stale_staged_key(path: &Path) -> Result<()> {
 }
 
 /// Replaces the identity at `path` with a freshly minted one and records the old hash in
-/// the predecessors file. Only for a stopped node: the running node holds the old key in
-/// memory and its announces, links and trust checks all name it, so re-keying live would
-/// leave peers holding a destination that no longer answers. Once the node starts again it
-/// announces a new destination hash under the new identity; the instance id is unchanged.
-/// Peers that trusted the old identity or its destinations see a stranger and must trust
-/// the new one deliberately, while this node's own trust list is unaffected.
+/// the predecessors file. Refused while any session's node on this config dir is running,
+/// which each signals by holding `IdentityLock` shared: a running node has the old key in
+/// memory and its announces, links and trust checks all name it, so re-keying under it
+/// would leave peers holding a destination that no longer answers. Once a node starts again
+/// it announces a new destination hash under the new identity; the instance id is
+/// unchanged. Peers that trusted the old identity or its destinations see a stranger and
+/// must trust the new one deliberately, while this node's own trust list is unaffected.
 ///
 /// `expected_old` is the fingerprint the caller showed the human; a key that no longer
 /// matches it is left alone, since the consent was given for a different identity. The
@@ -129,6 +226,8 @@ pub(crate) fn rotate_identity(
     expected_old: &str,
     now: SystemTime,
 ) -> Result<Rotation> {
+    let _lock = IdentityLock::exclusive(path)?;
+    remove_stale_staged_key(path)?;
     let old = current_identity(path)?;
     let old_fingerprint = fingerprint(&old);
     if old_fingerprint != expected_old {
@@ -277,15 +376,7 @@ pub(crate) fn load_or_mint_identity(path: &Path) -> Result<PrivateIdentity> {
     let identity = PrivateIdentity::from_private_key_bytes(&bytes)
         .expect("64 random bytes are a valid identity");
     if let Some(parent) = path.parent() {
-        let mut dir = fs::DirBuilder::new();
-        dir.recursive(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            dir.mode(0o700);
-        }
-        dir.create(parent)
-            .with_context(|| format!("Failed to create directory '{}'", parent.display()))?;
+        create_private_dir(parent)?;
     }
     match write_owner_only_file(path, &identity.to_private_key_bytes()) {
         Ok(()) => {
@@ -296,6 +387,19 @@ pub(crate) fn load_or_mint_identity(path: &Path) -> Result<PrivateIdentity> {
         Err(err) if is_already_exists(&err) => load_identity(path),
         Err(err) => Err(err),
     }
+}
+
+fn create_private_dir(dir: &Path) -> Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder
+        .create(dir)
+        .with_context(|| format!("Failed to create directory '{}'", dir.display()))
 }
 
 fn load_identity(path: &Path) -> Result<PrivateIdentity> {
@@ -560,7 +664,7 @@ mod tests {
         assert_ne!(rotation.new_fingerprint, rotation.old_fingerprint);
         assert_eq!(rotation.predecessors, 1);
         let files = files_under(&dir.path);
-        assert_eq!(files.len(), 2, "{files:?}");
+        assert_eq!(files.len(), 3, "key, predecessors and lock: {files:?}");
         for file in &files {
             assert!(
                 !contains_bytes(&fs::read(file).unwrap(), &old_bytes),
@@ -573,6 +677,7 @@ mod tests {
         assert_eq!(fingerprint(&reloaded), rotation.new_fingerprint);
         assert_eq!(mode_of(&path), 0o600);
         assert_eq!(mode_of(&predecessors_path(&path)), 0o600);
+        assert_eq!(mode_of(&path.with_added_extension("lock")), 0o600);
     }
 
     #[cfg(unix)]
@@ -809,14 +914,103 @@ mod tests {
 
         assert!(err.contains("regular files"), "{err}");
         assert!(!err.contains("No mesh identity"), "{err}");
-        assert!(!stale.exists(), "the dry run sweeps the staged key too");
+        assert!(
+            stale.exists(),
+            "naming the identity must not sweep the staged key"
+        );
         assert!(
             fs::symlink_metadata(&link)
                 .unwrap()
                 .file_type()
                 .is_symlink()
         );
-        assert_eq!(files_under(&dir.path), vec![link], "nothing is minted");
+        let mut files = files_under(&dir.path);
+        files.sort();
+        assert_eq!(files, vec![link, stale], "nothing is minted");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dry_run_leaves_a_stale_staged_key_alone_and_rotation_sweeps_it() {
+        let dir = TempDir::new("identity-dry-run-stale-staged");
+        let path = dir.path.join("identity.key");
+        let old = fingerprint(&load_or_mint_identity(&path).unwrap());
+        let stale = dir.path.join("identity.key.new");
+        fs::write(&stale, [3u8; PRIVATE_KEY_LENGTH]).unwrap();
+
+        let named = fingerprint(&current_identity(&path).unwrap());
+
+        assert_eq!(named, old);
+        assert!(stale.exists(), "a dry run changes nothing");
+
+        let rotation = rotate_identity(&path, &old, t(0)).unwrap();
+
+        assert!(!stale.exists(), "rotation sweeps the staged key first");
+        assert_eq!(
+            fingerprint(&load_or_mint_identity(&path).unwrap()),
+            rotation.new_fingerprint
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rotate_identity_is_refused_while_a_node_holds_the_identity_lock() {
+        let dir = TempDir::new("identity-rotate-locked");
+        let path = dir.path.join("identity.key");
+        let old = fingerprint(&load_or_mint_identity(&path).unwrap());
+        let before = fs::read(&path).unwrap();
+        let _node = IdentityLock::share(&path).unwrap();
+
+        let err = match rotate_identity(&path, &old, t(0)) {
+            Ok(_) => panic!("rotating under a running node must fail"),
+            Err(err) => err.to_string(),
+        };
+
+        assert!(err.contains(".mesh off"), "{err}");
+        assert!(
+            err.contains(&format!("pid {}", std::process::id())),
+            "{err}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert!(!dir.path.join("identity.key.new").exists());
+        assert!(!predecessors_path(&path).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_lock_is_shared_between_nodes_and_exclusive_for_rotation() {
+        let dir = TempDir::new("identity-lock-modes");
+        let path = dir.path.join("mesh").join("identity.key");
+        let lock_path = dir.path.join("mesh").join("identity.key.lock");
+
+        let first = IdentityLock::share(&path).unwrap();
+        let second = IdentityLock::share(&path).unwrap();
+
+        assert_eq!(mode_of(path.parent().unwrap()), 0o700);
+        assert_eq!(mode_of(&lock_path), 0o600);
+        assert!(IdentityLock::exclusive(&path).is_err());
+        drop(first);
+        assert!(
+            IdentityLock::exclusive(&path).is_err(),
+            "one remaining node still refuses rotation"
+        );
+        drop(second);
+
+        let rotation = IdentityLock::exclusive(&path).unwrap();
+
+        let err = IdentityLock::share(&path).unwrap_err().to_string();
+        assert!(err.contains("rotated"), "{err}");
+        assert!(err.contains(".mesh on"), "{err}");
+        assert!(
+            err.contains(&format!("pid {}", std::process::id())),
+            "{err}"
+        );
+        drop(rotation);
+        assert!(
+            lock_path.exists(),
+            "releasing must not unlink the lock file"
+        );
+        let _again = IdentityLock::share(&path).unwrap();
     }
 
     #[cfg(unix)]
