@@ -1,0 +1,3 @@
+
+{"version":1,"id":"q1","peer_destination":"0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b","peer_identity":"0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a","question":"what time is it","sent_at":"2027-01-15T05:13:20Z","timeout_at":"2027-01-15T05:23:20Z","state":"open","later_field":"ignored"}
+

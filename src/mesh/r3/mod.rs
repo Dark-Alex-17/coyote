@@ -27,7 +27,9 @@ pub(crate) use dispatch::{
 pub(crate) use error::{R3Error, RefusalCode};
 pub(crate) use frame::{Envelope, MAX_R3_PAYLOAD_BYTES, NAME_HASH_LEN, OriginName};
 #[cfg(test)]
-pub(crate) use frame::{EnvelopeError, PathHash, RequestFrame, RequestId, ResponseFrame};
+pub(crate) use frame::{
+    EnvelopeError, MAX_R3_NESTING_DEPTH, PathHash, RequestFrame, RequestId, ResponseFrame,
+};
 pub(crate) use receipt::RequestReceipt;
 #[cfg(test)]
 pub(crate) use server::{

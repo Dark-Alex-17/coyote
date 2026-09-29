@@ -6,3 +6,4 @@ assets/functions/tools/* text eol=lf
 assets/functions/scripts/* text eol=lf
 assets/functions/utils/*.sh text eol=lf
 scripts/*.sh text eol=lf
+src/mesh/fuzz/corpus/**/*.bin binary

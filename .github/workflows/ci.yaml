@@ -73,6 +73,9 @@ jobs:
       if: steps.duckdb-extensions.outputs.cache-hit != 'true'
       run: cargo test --all duckdb
 
+    # `cargo test --all` also runs the mesh fuzz harness (src/mesh/fuzz): 2000 iterations per
+    # target under a 10 s wall cap, on all three legs. Setting COYOTE_MESH_FUZZ_ITERS=<n> runs
+    # exactly n iterations and lifts the wall cap (a local soak, not for CI).
     - name: Test
       run: cargo test --all
 

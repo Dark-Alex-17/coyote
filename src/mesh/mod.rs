@@ -7,6 +7,8 @@ pub(crate) mod card;
 mod conformance;
 pub(crate) mod envoy;
 pub(crate) mod events;
+#[cfg(test)]
+mod fuzz;
 mod identity;
 pub(crate) mod idle;
 pub(crate) mod knock;
