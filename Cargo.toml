@@ -183,7 +183,8 @@ libc = "0.2"
 # `Win32_Security_Authorization` for
 # `ConvertStringSecurityDescriptorToSecurityDescriptorW`, `GetSecurityInfo` and
 # `ConvertSidToStringSidW`, `Win32_Foundation` for the `LocalFree`/`HLOCAL` pair that
-# releases what they return, `Win32_Security` for the `ACL` type and the DACL walk,
+# releases what they return, `Win32_Security` for the `ACL` type and the DACL walk (and,
+# under `cfg(test)`, `SetFileSecurityW` for the DACL-widening fixture),
 # `Win32_Storage_FileSystem` for `CreateFileW` and `GetVolumeInformationByHandleW`,
 # `Win32_System_Threading` for `OpenProcessToken` and `GetCurrentProcess` (the current
 # user's SID) and for `OpenProcess` in `src/testing.rs`, and

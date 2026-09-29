@@ -365,7 +365,9 @@ fn windows_sys_carries_exactly_the_audited_feature_set() {
 /// compile-time check of the claim the list is making: that each feature is carried
 /// for one named Win32 item, and that the item is where the manifest says it is.
 /// Nothing is invoked; taking an address is enough to require the import to resolve
-/// (through a pointer first, which is the cast rustc accepts for a function item).
+/// (through a pointer first: casting a function item straight to an integer trips rustc's
+/// `function_casts_as_integer` lint, warn-by-default since 1.98, which this leg's
+/// `--deny warnings` turns into an error).
 /// Only the windows-latest CI leg compiles this.
 #[cfg(windows)]
 #[test]

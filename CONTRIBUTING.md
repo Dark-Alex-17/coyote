@@ -160,10 +160,10 @@ follow, but the first release is where that is actually tested.
 
 The `windows-sys` entry in `Cargo.toml` names six Win32 features and the calls or types each is
 carried for; the call sites are in `src/utils/windows_acl.rs`, the one module that holds the
-crate's file-security FFI, except `OpenProcess`, which `pid_alive` in `src/testing.rs` uses. This
-is the record of what that list rests on, checked the same way from Linux aarch64 on 2026-09-23
-and again on 2026-09-29 when the sixth feature was added. It goes when the audit it describes
-stops mattering.
+crate's file-security FFI; the exception is `OpenProcess`, which the test-only `pid_alive` in
+`src/testing.rs` uses for process liveness. This is the record of what that list rests on,
+checked the same way from Linux aarch64 on 2026-09-23 and again on 2026-09-29 when the sixth
+feature was added. It goes when the audit it describes stops mattering.
 
 Checked, and reproducible:
 
@@ -202,14 +202,14 @@ target, or links or runs for any Windows target. `cargo check --target x86_64-pc
 cannot run from a Linux host here at all. It exits 101 inside dependency build scripts, long
 before reaching this crate, because the host C compiler cannot target Windows:
 `cc: error: unrecognized command-line option '-m64'`, from `ring`'s `cc-rs` invocation, with
-`rusqlite`, `bzip2-sys` and `duckdb` against the same wall.
-Whether the windows tests pass, and whether `cargo build` and `cargo test --all` pass on
-`macos-latest` and `windows-latest`, are answered by the first CI run that includes these
-dependencies and by nothing before it.
+`rusqlite`, `bzip2-sys` and `duckdb` against the same wall. Whether the windows tests pass, and
+whether `cargo build` and `cargo test --all` pass on `macos-latest` and `windows-latest`, are
+answered by the first CI run that includes these dependencies and by nothing before it.
 
 The gnu target does compile from Linux, which is how the `cfg(windows)` code was type-checked and
-linted before that run. With `mingw-w64` and `nasm` installed (`ring` assembles with `nasm`) and
-the big-object flag that `duckdb`'s bundled C++ needs to get past `file too big`:
+linted before that run. With the target added (`rustup target add x86_64-pc-windows-gnu`),
+`mingw-w64` and `nasm` installed (`ring` assembles with `nasm`), and the big-object flag that
+`duckdb`'s bundled C++ needs to get past `file too big`:
 
 ```shell
 CXXFLAGS_x86_64_pc_windows_gnu='-Wa,-mbig-obj' CFLAGS_x86_64_pc_windows_gnu='-Wa,-mbig-obj' \

@@ -28,6 +28,8 @@ use windows_sys::Win32::Security::{
     GetTokenInformation, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED,
     SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR_CONTROL, TOKEN_QUERY, TOKEN_USER, TokenUser,
 };
+#[cfg(test)]
+use windows_sys::Win32::Security::{OBJECT_SECURITY_INFORMATION, SetFileSecurityW};
 use windows_sys::Win32::Storage::FileSystem::{
     CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT,
     GetVolumeInformationByHandleW, READ_CONTROL,
@@ -219,7 +221,9 @@ impl Descriptor {
 }
 
 /// Owner set to `sid`, and a DACL that is protected (`P`: no inheritance from the
-/// directory) and holds one allow ACE granting `sid` everything.
+/// directory) and holds one allow ACE granting `sid` everything. The explicit `O:` is
+/// load-bearing: an elevated token's default owner is typically `BUILTIN\Administrators`,
+/// which `owner_only_problem` would refuse as `OwnerIsNotCurrentUser` on the next load.
 fn owner_only_sddl(sid: &str) -> String {
     format!("O:{sid}D:P(A;;GA;;;{sid})")
 }
@@ -268,8 +272,9 @@ pub(crate) fn create_owner_only(path: &Path) -> io::Result<File> {
 }
 
 /// Opens `path` with `READ_CONTROL` alone, enough for `inspect` and nothing else. The
-/// owner holds that right whatever the DACL says, so a key whose DACL denies its owner
-/// the read `File::open` asks for can still have that DACL reported.
+/// owner is implicitly granted that right unless an `OWNER RIGHTS` ACE overrides it, so a
+/// key whose DACL denies its owner the read `File::open` asks for can still have that DACL
+/// reported; a key owned by someone else may not open even for this.
 pub(crate) fn open_for_security_read(path: &Path) -> io::Result<File> {
     OpenOptions::new().access_mode(READ_CONTROL).open(path)
 }
@@ -442,18 +447,28 @@ fn owner_only_problem(summary: &DaclSummary) -> Option<OwnerOnlyProblem> {
 /// same calls the check under test reads with.
 #[cfg(test)]
 pub(crate) fn widen_with_sddl(path: &Path, sddl: &str) -> io::Result<()> {
-    use windows_sys::Win32::Security::SetFileSecurityW;
+    set_security_with_sddl(path, sddl, DACL_SECURITY_INFORMATION)
+}
 
+/// Replaces the owner of `path` with the one `sddl` names, leaving the DACL alone. Only a
+/// SID the token may assign as owner is accepted: the current user, or a group it holds
+/// with `SE_GROUP_OWNER`, which for an elevated Administrators member includes
+/// `BUILTIN\Administrators`; anything else fails with `ERROR_INVALID_OWNER`.
+#[cfg(test)]
+pub(crate) fn set_owner_with_sddl(path: &Path, sddl: &str) -> io::Result<()> {
+    set_security_with_sddl(path, sddl, OWNER_SECURITY_INFORMATION)
+}
+
+#[cfg(test)]
+fn set_security_with_sddl(
+    path: &Path,
+    sddl: &str,
+    security_information: OBJECT_SECURITY_INFORMATION,
+) -> io::Result<()> {
     let descriptor = Descriptor::from_sddl(sddl)?;
     let wide = wide_path(path);
     // SAFETY: `wide` is NUL-terminated and the descriptor outlives the call.
-    let set = unsafe {
-        SetFileSecurityW(
-            wide.as_ptr(),
-            DACL_SECURITY_INFORMATION,
-            descriptor.as_ptr(),
-        )
-    };
+    let set = unsafe { SetFileSecurityW(wide.as_ptr(), security_information, descriptor.as_ptr()) };
     if set == 0 {
         return Err(io::Error::last_os_error());
     }
@@ -573,5 +588,22 @@ mod tests {
             owner_only_problem(&summary),
             Some(OwnerOnlyProblem::NoAceForCurrentUser)
         );
+    }
+
+    #[test]
+    fn volume_acls_reports_the_temp_volume_as_keeping_acls() {
+        let path = std::env::temp_dir().join(format!("coyote-volume-acls-{}", std::process::id()));
+        let file = create_owner_only(&path).unwrap();
+
+        let volume = volume_acls(&file).unwrap();
+
+        assert!(volume.persistent_acls, "{}", volume.fs_name);
+        assert!(
+            matches!(volume.fs_name.as_str(), "NTFS" | "ReFS"),
+            "{}",
+            volume.fs_name
+        );
+        drop(file);
+        std::fs::remove_file(&path).unwrap();
     }
 }

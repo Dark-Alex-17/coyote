@@ -315,7 +315,8 @@ fn extract_shebang_runtime(path: &Path) -> Option<String> {
 /// keeps the temp file's permissions, on Windows its security descriptor, which is why the
 /// mesh identity key does not come through here: `mesh::identity::write_owner_only_file`
 /// gives a secret its final permissions in the one call that creates the file, and refuses
-/// to overwrite.
+/// to overwrite. `mode` is applied on unix only; on Windows the file inherits its parent
+/// directory's DACL.
 pub(crate) fn write_file_atomic(
     path: &Path,
     content: &str,

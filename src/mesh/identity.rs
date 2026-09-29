@@ -490,8 +490,11 @@ fn load_identity(path: &Path) -> Result<PrivateIdentity> {
 /// reports every file as open to Everyone, so refusing there would contradict the
 /// warn-and-proceed the mint made on the same volume; the warning is repeated instead and
 /// the DACL check skipped. A key the current user cannot read at all (an empty protected
-/// DACL, or one that names other users only) is inspected through a `READ_CONTROL`-only
-/// handle, so its refusal names the DACL and the remedy rather than a bare access error.
+/// DACL, one that names other users only, or one whose single entry for the current user
+/// lacks read) is inspected through a `READ_CONTROL`-only handle, so its refusal names the
+/// DACL and the remedy rather than a bare access error. When even that handle is refused
+/// the key belongs to another user, since an owner always holds `READ_CONTROL`, and the
+/// refusal says so and leads with `takeown`.
 #[cfg(windows)]
 fn read_owner_only_key(path: &Path) -> Result<Vec<u8>> {
     use std::io::Read;
@@ -500,16 +503,24 @@ fn read_owner_only_key(path: &Path) -> Result<Vec<u8>> {
     let mut file = match File::open(path) {
         Ok(file) => file,
         Err(err) if err.kind() == ErrorKind::PermissionDenied => {
-            let handle = windows_acl::open_for_security_read(path).with_context(|| {
-                format!(
-                    "Failed to read the permissions of '{}' after it refused to open for reading. Delete the file to mint a new identity; any trust other peers hold for the old identity is lost.",
-                    path.display()
-                )
-            })?;
+            let handle = match windows_acl::open_for_security_read(path) {
+                Ok(handle) => handle,
+                Err(open_err) => {
+                    let advice = owner_only_advice(path, true)?;
+                    return Err(open_err).context(format!(
+                        "Mesh identity file '{}' refused even to report its permissions, a right its owner always holds, so another user owns it. {advice}",
+                        path.display()
+                    ));
+                }
+            };
             if let Err(problem) = owner_only_verdict(path, &handle)? {
                 bail!(owner_only_refusal(path, problem)?);
             }
-            return Err(err).with_context(read_context);
+            let advice = owner_only_advice(path, false)?;
+            return Err(err).context(format!(
+                "Mesh identity file '{}' refused to open for reading: its only entry does not grant read. {advice}",
+                path.display()
+            ));
         }
         Err(err) => return Err(err).with_context(read_context),
     };
@@ -553,52 +564,95 @@ fn owner_only_verdict(
 /// sees cannot depend on whether the key was readable.
 #[cfg(windows)]
 fn owner_only_refusal(path: &Path, problem: windows_acl::OwnerOnlyProblem) -> Result<String> {
+    let owner_is_wrong = problem == windows_acl::OwnerOnlyProblem::OwnerIsNotCurrentUser;
+    Ok(format!(
+        "Mesh identity file '{}' {problem}. {}",
+        path.display(),
+        owner_only_advice(path, owner_is_wrong)?
+    ))
+}
+
+/// What to do about a key that is not owner-only, whichever check found that out: the
+/// rendered remedy, the delete alternative, and the elevation note when ownership has to
+/// change first.
+#[cfg(windows)]
+fn owner_only_advice(path: &Path, owner_is_wrong: bool) -> Result<String> {
     let sid = windows_acl::current_user_sid_string()
         .context("Failed to look up the current user's SID")?;
-    let owner_is_wrong = problem == windows_acl::OwnerOnlyProblem::OwnerIsNotCurrentUser;
-    let remedy = render_remedy(&owner_only_remedy(path, &sid, owner_is_wrong));
+    let remedy = render_remedy(path, &owner_only_remedy(path, &sid, owner_is_wrong));
     let elevation = if owner_is_wrong {
-        " The commands must be run from an elevated (Administrator) prompt: taking ownership needs SeTakeOwnershipPrivilege."
+        " The `takeown` step must be run from an elevated (Administrator) prompt: taking ownership of a file another user owns needs SeTakeOwnershipPrivilege."
     } else {
         ""
     };
     Ok(format!(
-        "Mesh identity file '{}' {problem}. A private key other users can read must not be used. Run {remedy} and try again, or delete the file to mint a new identity; any trust other peers hold for the old identity is lost.{elevation}",
-        path.display()
+        "A private key whose permissions cannot be vouched for must not be used. Run {remedy} and try again, or delete the file to mint a new identity; any trust other peers hold for the old identity is lost.{elevation}"
     ))
 }
 
-/// The `icacls` invocations, as argument lists after the program name, that make `path`
-/// owner-only again whatever was found wrong with it. `/reset` drops every explicit ACE,
-/// which `/inheritance:r` (inherited ACEs only) and `/grant:r` (the named SID's ACEs only)
-/// would each leave in place for another principal; the last command then cuts
-/// inheritance and adds the single ACE. Ownership comes first, since an owner always holds
-/// the `WRITE_DAC` the other two need, and it alone needs elevation: `/setowner` on a file
-/// another user owns takes `SeTakeOwnershipPrivilege`, which only an elevated prompt holds.
 #[cfg(any(windows, test))]
-fn owner_only_remedy(path: &Path, sid: &str, owner_is_wrong: bool) -> Vec<Vec<String>> {
+#[derive(Debug, PartialEq, Eq)]
+struct RemedyCommand {
+    program: &'static str,
+    args: Vec<String>,
+}
+
+/// The commands that make `path` owner-only again whatever was found wrong with it.
+/// `icacls /reset` drops every explicit ACE, which `/inheritance:r` (inherited ACEs only)
+/// and `/grant:r` (the named SID's ACEs only) would each leave in place for another
+/// principal; the last command then cuts inheritance and adds the single ACE. Ownership
+/// comes first, since an owner always holds the `WRITE_DAC` the `icacls` steps need, and
+/// it alone needs elevation. It is `takeown` rather than `icacls /setowner` because the
+/// latter needs `WRITE_OWNER` on the file, which a DACL written by another user does not
+/// grant even from an elevated prompt; `takeown` enables `SeTakeOwnershipPrivilege` itself.
+#[cfg(any(windows, test))]
+fn owner_only_remedy(path: &Path, sid: &str, owner_is_wrong: bool) -> Vec<RemedyCommand> {
     let path = path.display().to_string();
     let mut commands = Vec::with_capacity(3);
     if owner_is_wrong {
-        commands.push(vec![path.clone(), "/setowner".into(), format!("*{sid}")]);
+        commands.push(RemedyCommand {
+            program: "takeown",
+            args: vec!["/F".into(), path.clone()],
+        });
     }
-    commands.push(vec![path.clone(), "/reset".into()]);
-    commands.push(vec![
-        path,
-        "/inheritance:r".into(),
-        "/grant:r".into(),
-        format!("*{sid}:F"),
-    ]);
+    commands.push(RemedyCommand {
+        program: "icacls",
+        args: vec![path.clone(), "/reset".into()],
+    });
+    commands.push(RemedyCommand {
+        program: "icacls",
+        args: vec![
+            path,
+            "/inheritance:r".into(),
+            "/grant:r".into(),
+            format!("*{sid}:F"),
+        ],
+    });
     commands
 }
 
 /// Renders `owner_only_remedy` as separate commands, since PowerShell 5.1 has no `&&`.
-/// The path is the first argument of each and the only one that can hold a space.
+/// The path is the only argument that can hold a space, so it is the one quoted.
 #[cfg(any(windows, test))]
-fn render_remedy(commands: &[Vec<String>]) -> String {
+fn render_remedy(path: &Path, commands: &[RemedyCommand]) -> String {
+    let path = path.display().to_string();
     commands
         .iter()
-        .map(|argv| format!("`icacls \"{}\" {}`", argv[0], argv[1..].join(" ")))
+        .map(|command| {
+            let args = command
+                .args
+                .iter()
+                .map(|arg| {
+                    if *arg == path {
+                        format!("\"{arg}\"")
+                    } else {
+                        arg.clone()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("`{} {args}`", command.program)
+        })
         .collect::<Vec<_>>()
         .join(", then ")
 }
@@ -786,13 +840,19 @@ mod tests {
         assert_eq!(
             commands,
             vec![
-                vec![path_arg.clone(), "/reset".to_string()],
-                vec![
-                    path_arg.clone(),
-                    "/inheritance:r".to_string(),
-                    "/grant:r".to_string(),
-                    format!("*{sid}:F"),
-                ],
+                RemedyCommand {
+                    program: "icacls",
+                    args: vec![path_arg.clone(), "/reset".to_string()],
+                },
+                RemedyCommand {
+                    program: "icacls",
+                    args: vec![
+                        path_arg.clone(),
+                        "/inheritance:r".to_string(),
+                        "/grant:r".to_string(),
+                        format!("*{sid}:F"),
+                    ],
+                },
             ]
         );
 
@@ -800,18 +860,45 @@ mod tests {
         assert_eq!(with_owner.len(), 3);
         assert_eq!(
             with_owner[0],
-            vec![path_arg.clone(), "/setowner".to_string(), format!("*{sid}")]
+            RemedyCommand {
+                program: "takeown",
+                args: vec!["/F".to_string(), path_arg.clone()],
+            }
         );
         assert_eq!(with_owner[1..], commands[..]);
 
-        let rendered = render_remedy(&with_owner);
+        let rendered = render_remedy(path, &with_owner);
         assert_eq!(
             rendered,
             format!(
-                "`icacls \"{path_arg}\" /setowner *{sid}`, then `icacls \"{path_arg}\" /reset`, then `icacls \"{path_arg}\" /inheritance:r /grant:r *{sid}:F`"
+                "`takeown /F \"{path_arg}\"`, then `icacls \"{path_arg}\" /reset`, then `icacls \"{path_arg}\" /inheritance:r /grant:r *{sid}:F`"
             )
         );
         assert!(!rendered.contains("&&"), "{rendered}");
+        for command in rendered.split(", then ") {
+            assert!(command.contains(&format!("\"{path_arg}\"")), "{command}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn owner_only_refusal_sends_only_a_foreign_owner_to_takeown() {
+        use windows_acl::OwnerOnlyProblem;
+
+        let path = Path::new("C:\\Users\\me\\My Files\\.coyote\\mesh\\identity.key");
+
+        let owner = owner_only_refusal(path, OwnerOnlyProblem::OwnerIsNotCurrentUser).unwrap();
+        assert!(owner.contains(&path.display().to_string()), "{owner}");
+        assert!(owner.contains("takeown"), "{owner}");
+        assert!(owner.contains("/F"), "{owner}");
+        assert!(owner.contains("SeTakeOwnershipPrivilege"), "{owner}");
+        assert!(owner.contains("elevated"), "{owner}");
+
+        let dacl = owner_only_refusal(path, OwnerOnlyProblem::DaclInherits).unwrap();
+        assert!(dacl.contains("icacls"), "{dacl}");
+        assert!(dacl.contains("/reset"), "{dacl}");
+        assert!(!dacl.contains("takeown"), "{dacl}");
+        assert!(!dacl.contains("elevated"), "{dacl}");
     }
 
     #[cfg(windows)]
@@ -828,6 +915,22 @@ mod tests {
         assert!(summary.aces[0].allows, "{summary:?}");
         assert!(summary.aces[0].current_user, "{summary:?}");
         assert_eq!(windows_acl::check_owner_only(&file).unwrap(), Ok(()));
+    }
+
+    #[cfg(windows)]
+    fn apply_remedy(path: &Path, sid: &str, owner_is_wrong: bool) {
+        for command in owner_only_remedy(path, sid, owner_is_wrong) {
+            let output = std::process::Command::new(command.program)
+                .args(&command.args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{command:?} failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 
     #[cfg(windows)]
@@ -892,8 +995,33 @@ mod tests {
         assert!(err.contains("*S-1-"), "{err}");
     }
 
-    // `OwnerIsNotCurrentUser` is absent: setting it up takes a second account, so the
-    // `/setowner` step is covered by the argv unit test alone.
+    #[cfg(windows)]
+    #[test]
+    fn load_or_mint_identity_names_the_remedy_when_the_only_ace_lacks_read() {
+        let dir = TempDir::new("identity-dacl-no-read");
+        let path = dir.path.join("identity.key");
+        load_or_mint_identity(&path).unwrap();
+        let sid = windows_acl::current_user_sid_string().unwrap();
+        windows_acl::widen_with_sddl(&path, &format!("D:P(A;;RC;;;{sid})")).unwrap();
+        assert_eq!(
+            windows_acl::check_owner_only(&windows_acl::open_for_security_read(&path).unwrap())
+                .unwrap(),
+            Ok(())
+        );
+
+        let err = load_error(&path);
+
+        assert!(err.contains(&path.display().to_string()), "{err}");
+        assert!(err.contains("does not grant read"), "{err}");
+        assert!(err.contains("icacls"), "{err}");
+        assert!(err.contains("/reset"), "{err}");
+        assert!(err.contains("delete the file"), "{err}");
+        assert!(!err.contains("takeown"), "{err}");
+
+        apply_remedy(&path, &sid, false);
+        assert_owner_only(&path);
+    }
+
     #[cfg(windows)]
     #[test]
     fn applying_the_printed_remedy_cures_every_reachable_dacl_problem() {
@@ -930,24 +1058,53 @@ mod tests {
             assert!(err.contains("icacls"), "{sddl}: {err}");
             assert!(err.contains("/reset"), "{sddl}: {err}");
             assert!(err.contains("/inheritance:r"), "{sddl}: {err}");
+            assert!(!err.contains("takeown"), "{sddl}: {err}");
+            assert!(!err.contains("elevated"), "{sddl}: {err}");
 
-            for argv in owner_only_remedy(&path, &sid, false) {
-                let output = std::process::Command::new("icacls")
-                    .args(&argv)
-                    .output()
-                    .unwrap();
-                assert!(
-                    output.status.success(),
-                    "{sddl}: icacls {argv:?} failed: {}{}",
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
+            apply_remedy(&path, &sid, false);
 
             assert_owner_only(&path);
             let loaded = load_or_mint_identity(&path).unwrap();
             assert_eq!(fingerprint(&minted), fingerprint(&loaded), "{sddl}");
         }
+    }
+
+    /// An elevated Administrators member's token carries `BUILTIN\Administrators` with
+    /// `SE_GROUP_OWNER`, so handing it the key needs no privilege; a non-admin account is
+    /// refused with `ERROR_INVALID_OWNER`, and the test says so and stops.
+    #[cfg(windows)]
+    #[test]
+    fn applying_the_printed_remedy_takes_a_key_back_from_another_owner() {
+        let dir = TempDir::new("identity-owner-remedy");
+        let path = dir.path.join("identity.key");
+        let minted = load_or_mint_identity(&path).unwrap();
+        if let Err(err) = windows_acl::set_owner_with_sddl(&path, "O:BA") {
+            if err.raw_os_error() == Some(1307) {
+                eprintln!(
+                    "skipping: this account cannot make BUILTIN\\Administrators the owner (ERROR_INVALID_OWNER)"
+                );
+                return;
+            }
+            panic!("set_owner_with_sddl failed: {err}");
+        }
+        assert_eq!(
+            windows_acl::check_owner_only(&windows_acl::open_for_security_read(&path).unwrap())
+                .unwrap(),
+            Err(windows_acl::OwnerOnlyProblem::OwnerIsNotCurrentUser)
+        );
+
+        let err = load_error(&path);
+        assert!(err.contains(&path.display().to_string()), "{err}");
+        assert!(err.contains("takeown"), "{err}");
+        assert!(err.contains("SeTakeOwnershipPrivilege"), "{err}");
+        assert!(err.contains("elevated"), "{err}");
+
+        let sid = windows_acl::current_user_sid_string().unwrap();
+        apply_remedy(&path, &sid, true);
+
+        assert_owner_only(&path);
+        let loaded = load_or_mint_identity(&path).unwrap();
+        assert_eq!(fingerprint(&minted), fingerprint(&loaded));
     }
 
     #[cfg(windows)]
