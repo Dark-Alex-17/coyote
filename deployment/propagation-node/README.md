@@ -1,7 +1,7 @@
 # Coyote-mesh propagation node
 
 An [LXMF propagation node](https://github.com/markqvist/LXMF#propagation-nodes) is store-and-forward for the
-mesh: when a Coyote instance cannot open a direct link to a peer, it posts the message or knock to a propagation
+mesh: when a Coyote instance cannot open a direct link to a peer, it posts the message to a propagation
 node, which holds it until the recipient fetches it. Coyote is never a propagation node itself; this directory
 builds one from the reference daemon, [`lxmd`](https://github.com/markqvist/LXMF#daemon-included), configured
 for a private team network.
