@@ -16,6 +16,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// because the upstream reject path deadlocks the transport (rev 3ed5932).
 pub(crate) const MAX_R3_PAYLOAD_BYTES: usize = 256 * 1024;
 
+/// The `rmpv` depth budget a frame may spend before it is refused as undecodable. Each
+/// container costs two, a `bin` leaf two and a `str` leaf three (`read_str_data` charges
+/// one before it reaches `read_bin_data`), so about 60 nested containers fit. `rmpv`'s own
+/// default (1024) lets ~400 nested arrays exhaust a 2 MiB thread stack in a debug build
+/// before the limit is reached.
+pub(crate) const MAX_R3_NESTING_DEPTH: usize = 128;
+
 /// Bytes of a destination name hash, the prefix of the full name hash Reticulum uses to
 /// derive a destination address.
 pub(crate) const NAME_HASH_LEN: usize = NAME_HASH_LENGTH;
@@ -302,8 +309,8 @@ fn encode_value(value: Value) -> Vec<u8> {
 
 fn decode_whole(bytes: &[u8]) -> Result<Value, R3Error> {
     let mut cursor = Cursor::new(bytes);
-    let value =
-        rmpv::decode::read_value(&mut cursor).map_err(|err| R3Error::Decode(err.to_string()))?;
+    let value = rmpv::decode::read_value_with_max_depth(&mut cursor, MAX_R3_NESTING_DEPTH)
+        .map_err(|err| R3Error::Decode(err.to_string()))?;
     let consumed = usize::try_from(cursor.position()).unwrap_or(usize::MAX);
     if consumed != bytes.len() {
         return Err(R3Error::Decode(format!(

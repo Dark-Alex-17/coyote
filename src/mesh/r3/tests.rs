@@ -1,8 +1,8 @@
 use super::dispatch::DispatchError;
 use super::error::{R3Error, RefusalCode};
 use super::frame::{
-    Envelope, EnvelopeError, NAME_HASH_LEN, OriginName, PathHash, RequestFrame, RequestId,
-    ResponseFrame,
+    Envelope, EnvelopeError, MAX_R3_NESTING_DEPTH, NAME_HASH_LEN, OriginName, PathHash,
+    RequestFrame, RequestId, ResponseFrame,
 };
 use crate::mesh::protocol::MESH_PROTOCOL_VERSION;
 
@@ -123,6 +123,48 @@ fn decode_refuses_malformed_frames() {
     assert!(matches!(
         RequestFrame::decode(&[0x93, 0xcb]),
         Err(R3Error::Decode(_))
+    ));
+}
+
+fn nested_arrays(depth: usize, leaf: Value) -> Value {
+    (0..depth).fold(leaf, |inner, _| Value::Array(vec![inner]))
+}
+
+#[test]
+fn frames_refuse_nesting_past_the_depth_budget_and_accept_the_deepest_legal_frame() {
+    assert_eq!(MAX_R3_NESTING_DEPTH, 128);
+
+    // Envelope, body and `fields` nested past the sanitiser's own limit: deeper than any
+    // frame the spec delivers intact, and still well inside the decode budget.
+    let fields = (0..8).fold(Value::from("leaf"), |inner, _| {
+        Value::Map(vec![(Value::from("k"), inner)])
+    });
+    let body = Value::Map(vec![
+        (Value::from("v"), Value::from(1)),
+        (Value::from("kind"), Value::from("message")),
+        (Value::from("id"), Value::from("m1")),
+        (Value::from("content"), Value::from("hello")),
+        (Value::from("ts"), Value::F64(1.0)),
+        (Value::from("fields"), fields),
+    ]);
+    let envelope = Envelope::new(OriginName([7; NAME_HASH_LEN]), body).into_value();
+    let deepest = RequestFrame::new("/message", envelope).encode();
+    assert!(RequestFrame::decode(&deepest).is_ok());
+
+    // 70 containers cost 140 of the 128 budget, far short of rmpv's default 1024.
+    let too_deep = RequestFrame::new("/message", nested_arrays(70, Value::Nil)).encode();
+    assert!(matches!(
+        RequestFrame::decode(&too_deep),
+        Err(R3Error::Decode(reason)) if reason.contains("depth limit exceeded")
+    ));
+
+    let too_deep_response = packed(Value::Array(vec![
+        sixteen(2),
+        nested_arrays(70, Value::Nil),
+    ]));
+    assert!(matches!(
+        ResponseFrame::decode(&too_deep_response),
+        Err(R3Error::Decode(reason)) if reason.contains("depth limit exceeded")
     ));
 }
 
