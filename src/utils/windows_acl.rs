@@ -18,8 +18,8 @@ use windows_sys::Win32::Foundation::{
     LocalFree, MAX_PATH,
 };
 use windows_sys::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-    GetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
+    SDDL_REVISION_1, SE_FILE_OBJECT,
 };
 use windows_sys::Win32::Security::{
     ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
@@ -303,21 +303,22 @@ pub(crate) fn volume_acls(file: &File) -> io::Result<VolumeAcls> {
     })
 }
 
-/// Reads back the owner and DACL of `path`. Only ACE types this module writes are looked
-/// into; any other type is reported as not allowing the current user without its layout
-/// being interpreted.
-pub(crate) fn inspect(path: &Path) -> io::Result<DaclSummary> {
+/// Reads back the owner and DACL of the file `file` is open on, so the verdict is about
+/// the same file whose bytes the handle reads and not whatever the name resolves to by
+/// then. Only ACE types this module writes are looked into; any other type is reported as
+/// not allowing the current user without its layout being interpreted.
+pub(crate) fn inspect(file: &File) -> io::Result<DaclSummary> {
     let user = CurrentUser::query()?;
-    let wide = wide_path(path);
     let mut owner: PSID = null_mut();
     let mut dacl: *mut ACL = null_mut();
     let mut psd: PSECURITY_DESCRIPTOR = null_mut();
-    // SAFETY: `wide` is NUL-terminated; the group and SACL out-parameters are optional
-    // and the requested information does not include them. On success `psd` is one
-    // allocation that `owner` and `dacl` point into, released by the guard below.
+    // SAFETY: the handle is open for as long as `file` is borrowed and was opened for
+    // reading, which carries `READ_CONTROL`; the group and SACL out-parameters are
+    // optional and the requested information does not include them. On success `psd` is
+    // one allocation that `owner` and `dacl` point into, released by the guard below.
     let code = unsafe {
-        GetNamedSecurityInfoW(
-            wide.as_ptr(),
+        GetSecurityInfo(
+            file.as_raw_handle(),
             SE_FILE_OBJECT,
             OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
             &mut owner,
@@ -402,10 +403,11 @@ pub(crate) fn inspect(path: &Path) -> io::Result<DaclSummary> {
     })
 }
 
-/// Whether `path` is readable by the current user alone. The outer error is a failed
-/// read of the security information; the inner one is the first shortfall found.
-pub(crate) fn check_owner_only(path: &Path) -> io::Result<Result<(), OwnerOnlyProblem>> {
-    let summary = inspect(path)?;
+/// Whether the file `file` is open on is readable by the current user alone. The outer
+/// error is a failed read of the security information; the inner one is the first
+/// shortfall found.
+pub(crate) fn check_owner_only(file: &File) -> io::Result<Result<(), OwnerOnlyProblem>> {
+    let summary = inspect(file)?;
     Ok(owner_only_problem(&summary).map_or(Ok(()), Err))
 }
 
@@ -453,4 +455,120 @@ pub(crate) fn widen_to_everyone(path: &Path) -> io::Result<()> {
         return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn owner_only() -> DaclSummary {
+        DaclSummary {
+            owner_is_current_user: true,
+            dacl_present: true,
+            protected: true,
+            aces: vec![AceSummary {
+                allows: true,
+                current_user: true,
+            }],
+        }
+    }
+
+    #[test]
+    fn owner_only_problem_accepts_the_summary_create_owner_only_writes() {
+        assert_eq!(owner_only_problem(&owner_only()), None);
+    }
+
+    #[test]
+    fn owner_only_problem_reports_the_owner_before_anything_else() {
+        let summary = DaclSummary {
+            owner_is_current_user: false,
+            dacl_present: false,
+            protected: false,
+            aces: vec![AceSummary {
+                allows: true,
+                current_user: false,
+            }],
+        };
+        assert_eq!(
+            owner_only_problem(&summary),
+            Some(OwnerOnlyProblem::OwnerIsNotCurrentUser)
+        );
+    }
+
+    #[test]
+    fn owner_only_problem_reports_a_missing_dacl() {
+        let summary = DaclSummary {
+            dacl_present: false,
+            aces: Vec::new(),
+            ..owner_only()
+        };
+        assert_eq!(
+            owner_only_problem(&summary),
+            Some(OwnerOnlyProblem::DaclMissing)
+        );
+    }
+
+    #[test]
+    fn owner_only_problem_reports_inheritance_before_the_aces_it_brought_in() {
+        let summary = DaclSummary {
+            protected: false,
+            aces: vec![AceSummary {
+                allows: true,
+                current_user: false,
+            }],
+            ..owner_only()
+        };
+        assert_eq!(
+            owner_only_problem(&summary),
+            Some(OwnerOnlyProblem::DaclInherits)
+        );
+    }
+
+    #[test]
+    fn owner_only_problem_reports_an_allow_for_another_principal() {
+        let summary = DaclSummary {
+            aces: vec![
+                AceSummary {
+                    allows: true,
+                    current_user: true,
+                },
+                AceSummary {
+                    allows: true,
+                    current_user: false,
+                },
+            ],
+            ..owner_only()
+        };
+        assert_eq!(
+            owner_only_problem(&summary),
+            Some(OwnerOnlyProblem::ForeignAce)
+        );
+    }
+
+    #[test]
+    fn owner_only_problem_treats_a_deny_ace_as_foreign() {
+        let summary = DaclSummary {
+            aces: vec![AceSummary {
+                allows: false,
+                current_user: false,
+            }],
+            ..owner_only()
+        };
+        assert_eq!(
+            owner_only_problem(&summary),
+            Some(OwnerOnlyProblem::ForeignAce)
+        );
+    }
+
+    #[test]
+    fn owner_only_problem_reports_an_empty_dacl() {
+        let summary = DaclSummary {
+            aces: Vec::new(),
+            ..owner_only()
+        };
+        assert_eq!(
+            owner_only_problem(&summary),
+            Some(OwnerOnlyProblem::NoAceForCurrentUser)
+        );
+    }
 }

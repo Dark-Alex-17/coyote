@@ -410,8 +410,8 @@ pub(crate) fn predecessors(identity_path: &Path) -> Result<Vec<Predecessor>> {
 }
 
 /// Loads the identity at `path`, minting and persisting a fresh one if none exists yet.
-/// A key that is the wrong length or, on unix, readable by other users is refused rather
-/// than used silently.
+/// A key that is the wrong length, readable by other users, or on Windows not owner-only
+/// is refused rather than used silently.
 pub(crate) fn load_or_mint_identity(path: &Path) -> Result<PrivateIdentity> {
     remove_stale_staged_key(path)?;
     if path.exists() {
@@ -516,20 +516,15 @@ fn read_owner_only_key(path: &Path) -> Result<Vec<u8>> {
         }
     };
     if dacl_is_meaningful
-        && let Err(problem) = windows_acl::check_owner_only(path)
+        && let Err(problem) = windows_acl::check_owner_only(&file)
             .with_context(|| format!("Failed to read the permissions of '{}'", path.display()))?
     {
         let sid = windows_acl::current_user_sid_string()
             .context("Failed to look up the current user's SID")?;
-        let mut remedy = format!(
-            "icacls \"{}\" /inheritance:r /grant:r \"*{sid}:F\"",
-            path.display()
-        );
-        if problem == windows_acl::OwnerOnlyProblem::OwnerIsNotCurrentUser {
-            remedy.push_str(&format!(" /setowner \"*{sid}\""));
-        }
+        let owner_is_wrong = problem == windows_acl::OwnerOnlyProblem::OwnerIsNotCurrentUser;
+        let remedy = render_remedy(&owner_only_remedy(path, &sid, owner_is_wrong));
         bail!(
-            "Mesh identity file '{}' {problem}. A private key other users can read must not be used. Run `{remedy}` and try again, or delete the file to mint a new identity; any trust other peers hold for the old identity is lost.",
+            "Mesh identity file '{}' {problem}. A private key other users can read must not be used. Run {remedy} and try again, or delete the file to mint a new identity; any trust other peers hold for the old identity is lost.",
             path.display()
         );
     }
@@ -537,6 +532,40 @@ fn read_owner_only_key(path: &Path) -> Result<Vec<u8>> {
     file.read_to_end(&mut bytes)
         .with_context(|| format!("Failed to read mesh identity file '{}'", path.display()))?;
     Ok(bytes)
+}
+
+/// The `icacls` invocations, as argument lists after the program name, that make `path`
+/// owner-only again whatever was found wrong with it. `/reset` drops every explicit ACE,
+/// which `/inheritance:r` (inherited ACEs only) and `/grant:r` (the named SID's ACEs only)
+/// would each leave in place for another principal; the last command then cuts
+/// inheritance and adds the single ACE. Ownership comes first because an owner always
+/// holds the `WRITE_DAC` the other two need.
+#[cfg(any(windows, test))]
+fn owner_only_remedy(path: &Path, sid: &str, owner_is_wrong: bool) -> Vec<Vec<String>> {
+    let path = path.display().to_string();
+    let mut commands = Vec::with_capacity(3);
+    if owner_is_wrong {
+        commands.push(vec![path.clone(), "/setowner".into(), format!("*{sid}")]);
+    }
+    commands.push(vec![path.clone(), "/reset".into()]);
+    commands.push(vec![
+        path,
+        "/inheritance:r".into(),
+        "/grant:r".into(),
+        format!("*{sid}:F"),
+    ]);
+    commands
+}
+
+/// Renders `owner_only_remedy` as separate commands, since PowerShell 5.1 has no `&&`.
+/// The path is the first argument of each and the only one that can hold a space.
+#[cfg(any(windows, test))]
+fn render_remedy(commands: &[Vec<String>]) -> String {
+    commands
+        .iter()
+        .map(|argv| format!("`icacls \"{}\" {}`", argv[0], argv[1..].join(" ")))
+        .collect::<Vec<_>>()
+        .join(", then ")
 }
 
 /// Worded once for mint and load: a volume that keeps no ACLs cannot hold the DACL that
@@ -547,7 +576,7 @@ fn acl_less_volume_warning(path: &Path, fs_name: &str, persistent_acls: bool) ->
         return None;
     }
     Some(format!(
-        "Mesh identity file '{}' is on a {fs_name} volume, which stores no file permissions: every user of this machine can read the key. Keep the config dir on an NTFS volume to keep the key private.",
+        "Mesh identity file '{}' is on a {fs_name} volume, which stores no file permissions: every user of this machine can read the key. Keep the config dir on an NTFS or ReFS volume to keep the key private.",
         path.display()
     ))
 }
@@ -712,9 +741,48 @@ mod tests {
         assert!(acl_less_volume_warning(path, "ReFS", true).is_none());
     }
 
+    #[test]
+    fn owner_only_remedy_resets_explicit_aces_before_cutting_inheritance() {
+        let path = Path::new("C:\\Users\\me\\My Files\\.coyote\\mesh\\identity.key");
+        let sid = "S-1-5-21-1-2-3-1001";
+        let path_arg = path.display().to_string();
+
+        let commands = owner_only_remedy(path, sid, false);
+        assert_eq!(
+            commands,
+            vec![
+                vec![path_arg.clone(), "/reset".to_string()],
+                vec![
+                    path_arg.clone(),
+                    "/inheritance:r".to_string(),
+                    "/grant:r".to_string(),
+                    format!("*{sid}:F"),
+                ],
+            ]
+        );
+
+        let with_owner = owner_only_remedy(path, sid, true);
+        assert_eq!(with_owner.len(), 3);
+        assert_eq!(
+            with_owner[0],
+            vec![path_arg.clone(), "/setowner".to_string(), format!("*{sid}")]
+        );
+        assert_eq!(with_owner[1..], commands[..]);
+
+        let rendered = render_remedy(&with_owner);
+        assert_eq!(
+            rendered,
+            format!(
+                "`icacls \"{path_arg}\" /setowner *{sid}`, then `icacls \"{path_arg}\" /reset`, then `icacls \"{path_arg}\" /inheritance:r /grant:r *{sid}:F`"
+            )
+        );
+        assert!(!rendered.contains("&&"), "{rendered}");
+    }
+
     #[cfg(windows)]
     fn assert_owner_only(path: &Path) {
-        let summary = windows_acl::inspect(path).unwrap();
+        let file = File::open(path).unwrap();
+        let summary = windows_acl::inspect(&file).unwrap();
         assert!(summary.owner_is_current_user, "{summary:?}");
         assert!(summary.dacl_present, "{summary:?}");
         assert!(
@@ -724,7 +792,7 @@ mod tests {
         assert_eq!(summary.aces.len(), 1, "{summary:?}");
         assert!(summary.aces[0].allows, "{summary:?}");
         assert!(summary.aces[0].current_user, "{summary:?}");
-        assert_eq!(windows_acl::check_owner_only(path).unwrap(), Ok(()));
+        assert_eq!(windows_acl::check_owner_only(&file).unwrap(), Ok(()));
     }
 
     #[cfg(windows)]
@@ -776,7 +844,9 @@ mod tests {
         load_or_mint_identity(&path).unwrap();
         windows_acl::widen_to_everyone(&path).unwrap();
         assert!(
-            windows_acl::check_owner_only(&path).unwrap().is_err(),
+            windows_acl::check_owner_only(&File::open(&path).unwrap())
+                .unwrap()
+                .is_err(),
             "the widened DACL must read back as not owner-only"
         );
 
@@ -784,9 +854,36 @@ mod tests {
 
         assert!(err.contains(&path.display().to_string()), "{err}");
         assert!(err.contains("icacls"), "{err}");
+        assert!(err.contains("/reset"), "{err}");
         assert!(err.contains("/inheritance:r"), "{err}");
         assert!(err.contains("*S-1-"), "{err}");
-        assert!(!err.contains("/reset"), "{err}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn applying_the_printed_remedy_makes_the_key_owner_only_again() {
+        let dir = TempDir::new("identity-dacl-remedy");
+        let path = dir.path.join("identity.key");
+        let minted = load_or_mint_identity(&path).unwrap();
+        windows_acl::widen_to_everyone(&path).unwrap();
+        let sid = windows_acl::current_user_sid_string().unwrap();
+
+        for argv in owner_only_remedy(&path, &sid, false) {
+            let output = std::process::Command::new("icacls")
+                .args(&argv)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "icacls {argv:?} failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        assert_owner_only(&path);
+        let loaded = load_or_mint_identity(&path).unwrap();
+        assert_eq!(fingerprint(&minted), fingerprint(&loaded));
     }
 
     #[cfg(windows)]

@@ -373,19 +373,22 @@ fn the_audited_win32_features_expose_the_calls_they_are_carried_for() {
     use windows_sys::Win32::Foundation::{HLOCAL, LocalFree};
     use windows_sys::Win32::Security::ACL;
     use windows_sys::Win32::Security::Authorization::{
-        ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW,
+        ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+        GetSecurityInfo,
     };
-    use windows_sys::Win32::Storage::FileSystem::CreateFileW;
+    use windows_sys::Win32::Storage::FileSystem::{CreateFileW, GetVolumeInformationByHandleW};
     use windows_sys::Win32::System::SystemServices::{
         ACCESS_ALLOWED_ACE_TYPE, FILE_PERSISTENT_ACLS,
     };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcess, OpenProcessToken};
 
-    let audited_calls: [usize; 7] = [
+    let audited_calls: [usize; 9] = [
         ConvertStringSecurityDescriptorToSecurityDescriptorW as *const () as usize,
-        GetNamedSecurityInfoW as *const () as usize,
+        GetSecurityInfo as *const () as usize,
+        ConvertSidToStringSidW as *const () as usize,
         LocalFree as *const () as usize,
         CreateFileW as *const () as usize,
+        GetVolumeInformationByHandleW as *const () as usize,
         OpenProcessToken as *const () as usize,
         GetCurrentProcess as *const () as usize,
         OpenProcess as *const () as usize,

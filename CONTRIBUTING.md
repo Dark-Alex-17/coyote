@@ -160,9 +160,10 @@ follow, but the first release is where that is actually tested.
 
 The `windows-sys` entry in `Cargo.toml` names six Win32 features and the calls or types each is
 carried for; the call sites are in `src/utils/windows_acl.rs`, the one module that holds the
-crate's file-security FFI. This is the record of what that list rests on, checked the same way
-from Linux aarch64 on 2026-09-23 and again when the sixth feature was added. It goes when the
-audit it describes stops mattering.
+crate's file-security FFI, except `OpenProcess`, which `pid_alive` in `src/testing.rs` uses. This
+is the record of what that list rests on, checked the same way from Linux aarch64 on 2026-09-23
+and again on 2026-09-29 when the sixth feature was added. It goes when the audit it describes
+stops mattering.
 
 Checked, and reproducible:
 
@@ -170,12 +171,14 @@ Checked, and reproducible:
 cargo tree --target x86_64-pc-windows-msvc -e features -i windows-sys@0.61.2
 ```
 
-exits 0: the `cfg(windows)` graph resolves, and the 40 `windows-sys` features it enables include
+exits 0: the `cfg(windows)` graph resolves, and the 42 `windows-sys` features it enables include
 all six audited ones. The version in the spec is not optional; four `windows-sys` majors are in
 the graph (0.52.0, 0.59.0, 0.60.2, 0.61.2) and a bare `-i windows-sys` exits 101 with
-`specification 'windows-sys' is ambiguous`. Most of those 40 features come from other crates —
+`specification 'windows-sys' is ambiguous`. Most of those 42 features come from other crates —
 `mio`, `socket2`, `schannel` and `dirs-sys` each enable their own — so the list read off that tree
-is a superset of ours and no substitute for the manifest.
+is a superset of ours and no substitute for the manifest. The count was 42 both before and after
+the sixth feature, `Win32_System_SystemServices`, went in: `os_info` and `rpassword` already
+enable it in the msvc graph, so it adds no compiled surface.
 
 A feature name that does not exist upstream cannot survive *any* build, on any platform. Adding
 `Win32_Bogus_DoesNotExist` to the list makes resolution fail closed at exit 101 with `package
@@ -186,18 +189,20 @@ does not have that feature`: identically with `--target x86_64-pc-windows-msvc` 
 names exist in windows-sys 0.61. From the other side, windows-sys 0.61.2 declares all six in its
 own manifest, and each item the list is carried for is in the module the list claims: `LocalFree`
 and `HLOCAL` in `Win32/Foundation`, `ACL` in `Win32/Security`,
-`ConvertStringSecurityDescriptorToSecurityDescriptorW` and `GetNamedSecurityInfoW` in
-`Win32/Security/Authorization`, `CreateFileW` in `Win32/Storage/FileSystem`,
-`FILE_PERSISTENT_ACLS` and `ACCESS_ALLOWED_ACE_TYPE` in `Win32/System/SystemServices`,
+`ConvertStringSecurityDescriptorToSecurityDescriptorW`, `GetSecurityInfo` and
+`ConvertSidToStringSidW` in `Win32/Security/Authorization`, `CreateFileW` and
+`GetVolumeInformationByHandleW` in `Win32/Storage/FileSystem`, `FILE_PERSISTENT_ACLS` and
+`ACCESS_ALLOWED_ACE_TYPE` in `Win32/System/SystemServices`,
 `OpenProcessToken`, `GetCurrentProcess` and `OpenProcess` in `Win32/System/Threading`. The
 `cfg(windows)` test in `tests/mesh_dependencies.rs` names those items, so the windows-latest leg
 checks the feature-to-call mapping itself instead of the manifest text that claims it.
 
-**Not** checked, and unverified until the first CI run: anything that compiles or links for a
-Windows target. `cargo check --target x86_64-pc-windows-msvc` cannot run from a Linux host here at
-all. It exits 101 inside dependency build scripts, long before reaching this crate, because the
-host C compiler cannot target Windows: `cc: error: unrecognized command-line option '-m64'`, from
-`ring`'s `cc-rs` invocation, with `rusqlite`, `bzip2-sys` and `duckdb` against the same wall.
+**Not** checked, and unverified until the first CI run: anything that compiles for the msvc
+target, or links or runs for any Windows target. `cargo check --target x86_64-pc-windows-msvc`
+cannot run from a Linux host here at all. It exits 101 inside dependency build scripts, long
+before reaching this crate, because the host C compiler cannot target Windows:
+`cc: error: unrecognized command-line option '-m64'`, from `ring`'s `cc-rs` invocation, with
+`rusqlite`, `bzip2-sys` and `duckdb` against the same wall.
 Whether the windows tests pass, and whether `cargo build` and `cargo test --all` pass on
 `macos-latest` and `windows-latest`, are answered by the first CI run that includes these
 dependencies and by nothing before it.

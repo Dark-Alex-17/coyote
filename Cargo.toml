@@ -181,11 +181,12 @@ libc = "0.2"
 # carried for one piece of that job; the call sites are in `src/utils/windows_acl.rs`
 # and the list is named here so it can be checked without guessing:
 # `Win32_Security_Authorization` for
-# `ConvertStringSecurityDescriptorToSecurityDescriptorW` and `GetNamedSecurityInfoW`,
-# `Win32_Foundation` for the `LocalFree`/`HLOCAL` pair that releases what they return,
-# `Win32_Security` for the `ACL` type and the DACL walk, `Win32_Storage_FileSystem` for
-# `CreateFileW`, `Win32_System_Threading` for `OpenProcessToken` and `GetCurrentProcess`
-# (the current user's SID) and for `OpenProcess` in `src/testing.rs`, and
+# `ConvertStringSecurityDescriptorToSecurityDescriptorW`, `GetSecurityInfo` and
+# `ConvertSidToStringSidW`, `Win32_Foundation` for the `LocalFree`/`HLOCAL` pair that
+# releases what they return, `Win32_Security` for the `ACL` type and the DACL walk,
+# `Win32_Storage_FileSystem` for `CreateFileW` and `GetVolumeInformationByHandleW`,
+# `Win32_System_Threading` for `OpenProcessToken` and `GetCurrentProcess` (the current
+# user's SID) and for `OpenProcess` in `src/testing.rs`, and
 # `Win32_System_SystemServices` for the `FILE_PERSISTENT_ACLS` volume flag and the
 # `ACCESS_ALLOWED_ACE_TYPE` ACE type, plain constants that live in no other module. No
 # allocator feature is needed, `LocalFree` not being one of the `Local*` calls in

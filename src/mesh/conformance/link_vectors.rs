@@ -38,6 +38,7 @@ enum Mark {
 }
 
 /// A refusal the knock responder sends back instead of filing the knock.
+// Its payload is read only by the unix executor below.
 #[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Clone, Copy, Debug)]
 enum KnockRefusal {
