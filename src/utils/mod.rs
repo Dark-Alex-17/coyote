@@ -12,6 +12,8 @@ mod render_prompt;
 mod request;
 mod spinner;
 mod variables;
+#[cfg(windows)]
+pub(crate) mod windows_acl;
 
 pub use self::abort_signal::*;
 pub use self::clipboard::set_text;

@@ -2,6 +2,8 @@ use crate::config::paths;
 use crate::mesh::lock::{read_holder_pid, write_holder_pid};
 use crate::mesh::schema::{Remedy, VersionProbe, unversioned_refusal, version_refusal};
 use crate::mesh::{mesh_config_dir, redact_hashes, rfc3339_utc, short};
+#[cfg(windows)]
+use crate::utils::windows_acl;
 
 use anyhow::{Context, Result, bail};
 use lxmf_core::identity::PrivateIdentity;
@@ -115,7 +117,9 @@ fn holder_suffix(pid: Option<u32>) -> String {
 }
 
 /// Opens the lock file without taking the lock. The parent is created owner-only because
-/// the lock may be taken before the first mint creates the key.
+/// the lock may be taken before the first mint creates the key. The file holds a pid and
+/// nothing secret, so on Windows it keeps the permissions it inherits from the directory
+/// rather than the key's protected DACL.
 fn open_lock_file(identity_path: &Path) -> Result<(PathBuf, File)> {
     if let Some(parent) = identity_path.parent() {
         create_private_dir(parent)?;
@@ -234,6 +238,11 @@ fn remove_stale_staged_key(path: &Path) -> Result<()> {
 /// other copy of the new key and is removed on any failure. The predecessors line is
 /// appended after the rename: an interruption between the two loses the bookkeeping line,
 /// never the key.
+///
+/// On Windows the staged key goes through the same owner-only primitive and the rename
+/// keeps the moved file's own security descriptor; its DACL is protected, so the new
+/// location's inheritable ACEs cannot widen it. The read-back at the end of the rotation
+/// runs the same owner-only check every load does.
 pub(crate) fn rotate_identity(
     path: &Path,
     expected_old: &str,
@@ -329,6 +338,8 @@ fn sync_dir(dir: &Path) {
     let _ = dir;
 }
 
+/// The file records only retired public hashes, nothing secret, so on Windows it keeps
+/// the permissions it inherits from the directory rather than the key's protected DACL.
 fn append_predecessor(path: &Path, predecessor: &Predecessor) -> Result<()> {
     let mut options = fs::OpenOptions::new();
     options.append(true).create(true);
@@ -424,6 +435,8 @@ pub(crate) fn load_or_mint_identity(path: &Path) -> Result<PrivateIdentity> {
     }
 }
 
+/// On Windows the directory inherits its parent's DACL and the key inside protects itself
+/// with a protected DACL of its own, so the unix 0700 has no counterpart there.
 fn create_private_dir(dir: &Path) -> Result<()> {
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true);
@@ -456,8 +469,11 @@ fn load_identity(path: &Path) -> Result<PrivateIdentity> {
         }
     }
 
+    #[cfg(not(windows))]
     let bytes = fs::read(path)
         .with_context(|| format!("Failed to read mesh identity file '{}'", path.display()))?;
+    #[cfg(windows)]
+    let bytes = read_owner_only_key(path)?;
     if bytes.len() != PRIVATE_KEY_LENGTH {
         bail!(
             "Mesh identity file '{}' is corrupt: expected {PRIVATE_KEY_LENGTH} bytes, found {}. Move the file aside to mint a new identity; any trust other peers hold for the old identity is lost.",
@@ -469,6 +485,73 @@ fn load_identity(path: &Path) -> Result<PrivateIdentity> {
         .with_context(|| format!("Failed to load mesh identity from '{}'", path.display()))
 }
 
+/// Windows counterpart of the unix mode check in `load_identity`, reading the key through
+/// the handle the volume was queried on. A volume without persistent ACLs (FAT32, exFAT)
+/// reports every file as open to Everyone, so refusing there would contradict the
+/// warn-and-proceed the mint made on the same volume; the warning is repeated instead and
+/// the DACL check skipped.
+#[cfg(windows)]
+fn read_owner_only_key(path: &Path) -> Result<Vec<u8>> {
+    use std::io::Read;
+
+    let mut file = File::open(path)
+        .with_context(|| format!("Failed to read mesh identity file '{}'", path.display()))?;
+    let dacl_is_meaningful = match windows_acl::volume_acls(&file) {
+        Ok(volume) => {
+            match acl_less_volume_warning(path, &volume.fs_name, volume.persistent_acls) {
+                Some(warning) => {
+                    warn!("{}", redact_hashes(&warning));
+                    false
+                }
+                None => true,
+            }
+        }
+        Err(err) => {
+            debug!(
+                "Could not query the volume holding '{}': {}",
+                path.display(),
+                redact_hashes(&err.to_string())
+            );
+            true
+        }
+    };
+    if dacl_is_meaningful
+        && let Err(problem) = windows_acl::check_owner_only(path)
+            .with_context(|| format!("Failed to read the permissions of '{}'", path.display()))?
+    {
+        let sid = windows_acl::current_user_sid_string()
+            .context("Failed to look up the current user's SID")?;
+        let mut remedy = format!(
+            "icacls \"{}\" /inheritance:r /grant:r \"*{sid}:F\"",
+            path.display()
+        );
+        if problem == windows_acl::OwnerOnlyProblem::OwnerIsNotCurrentUser {
+            remedy.push_str(&format!(" /setowner \"*{sid}\""));
+        }
+        bail!(
+            "Mesh identity file '{}' {problem}. A private key other users can read must not be used. Run `{remedy}` and try again, or delete the file to mint a new identity; any trust other peers hold for the old identity is lost.",
+            path.display()
+        );
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .with_context(|| format!("Failed to read mesh identity file '{}'", path.display()))?;
+    Ok(bytes)
+}
+
+/// Worded once for mint and load: a volume that keeps no ACLs cannot hold the DACL that
+/// makes the key owner-only, so the key is exactly as private as the volume is.
+#[cfg(any(windows, test))]
+fn acl_less_volume_warning(path: &Path, fs_name: &str, persistent_acls: bool) -> Option<String> {
+    if persistent_acls {
+        return None;
+    }
+    Some(format!(
+        "Mesh identity file '{}' is on a {fs_name} volume, which stores no file permissions: every user of this machine can read the key. Keep the config dir on an NTFS volume to keep the key private.",
+        path.display()
+    ))
+}
+
 fn is_already_exists(err: &anyhow::Error) -> bool {
     err.downcast_ref::<io::Error>()
         .is_some_and(|io| io.kind() == ErrorKind::AlreadyExists)
@@ -476,9 +559,17 @@ fn is_already_exists(err: &anyhow::Error) -> bool {
 
 /// Creates `path` with `bytes` so that only the owner can read it at any point in its life.
 /// The file must not already exist; a concurrent creator surfaces as `ErrorKind::AlreadyExists`.
+///
+/// This is a second primitive beside `write_file_atomic` rather than a mode on it: a temp
+/// file renamed into place carries the temp file's permissions, on Windows its security
+/// descriptor, so the key has to be created with its final permissions in the one call
+/// that creates it. On unix that is `create_new` with mode 0600; on Windows it is
+/// `CreateFileW` with a protected DACL holding a single allow ACE for the current user.
+/// The two are parity, not absolute protection: a local Administrator can take ownership
+/// of the file, the same limit 0600 has against root.
 pub(crate) fn write_owner_only_file(
-    #[cfg_attr(not(unix), expect(unused))] path: &Path,
-    #[cfg_attr(not(unix), expect(unused))] bytes: &[u8],
+    #[cfg_attr(not(any(unix, windows)), expect(unused))] path: &Path,
+    #[cfg_attr(not(any(unix, windows)), expect(unused))] bytes: &[u8],
 ) -> Result<()> {
     #[cfg(unix)]
     {
@@ -497,10 +588,38 @@ pub(crate) fn write_owner_only_file(
         }
         Ok(())
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        let mut file = windows_acl::create_owner_only(path)
+            .with_context(|| format!("Failed to create '{}'", path.display()))?;
+        match windows_acl::volume_acls(&file) {
+            Ok(volume) => {
+                if let Some(warning) =
+                    acl_less_volume_warning(path, &volume.fs_name, volume.persistent_acls)
+                {
+                    warn!("{}", redact_hashes(&warning));
+                }
+            }
+            Err(err) => debug!(
+                "Could not query the volume holding '{}': {}",
+                path.display(),
+                redact_hashes(&err.to_string())
+            ),
+        }
+        let written = file.write_all(bytes).and_then(|()| file.sync_all());
+        if let Err(err) = written {
+            // The handle was opened with no sharing, so the file cannot be removed while
+            // it is open.
+            drop(file);
+            let _ = fs::remove_file(path);
+            return Err(err).with_context(|| format!("Failed to write '{}'", path.display()));
+        }
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         bail!(
-            "Owner-only file creation is not yet implemented on Windows, so the mesh identity cannot be stored safely and mesh cannot be enabled on this platform yet. This is being tracked; no workaround is available."
+            "Owner-only file creation is not yet implemented on this platform, so the mesh identity cannot be stored safely and mesh cannot be enabled here yet. This is being tracked; no workaround is available."
         )
     }
 }
@@ -576,6 +695,114 @@ mod tests {
             "the persisted bytes must be the post-construction key so a reload matches"
         );
         assert_eq!(fingerprint(&identity).len(), 32);
+    }
+
+    #[test]
+    fn acl_less_volume_warning_names_the_path_and_filesystem_only_without_persistent_acls() {
+        let path = Path::new("C:\\Users\\me\\.coyote\\mesh\\identity.key");
+
+        let fat = acl_less_volume_warning(path, "FAT32", false).unwrap();
+        assert!(fat.contains("identity.key"), "{fat}");
+        assert!(fat.contains("FAT32"), "{fat}");
+        assert!(fat.is_ascii(), "{fat}");
+        let exfat = acl_less_volume_warning(path, "exFAT", false).unwrap();
+        assert!(exfat.contains("exFAT"), "{exfat}");
+
+        assert!(acl_less_volume_warning(path, "NTFS", true).is_none());
+        assert!(acl_less_volume_warning(path, "ReFS", true).is_none());
+    }
+
+    #[cfg(windows)]
+    fn assert_owner_only(path: &Path) {
+        let summary = windows_acl::inspect(path).unwrap();
+        assert!(summary.owner_is_current_user, "{summary:?}");
+        assert!(summary.dacl_present, "{summary:?}");
+        assert!(
+            summary.protected,
+            "SE_DACL_PROTECTED must be set: {summary:?}"
+        );
+        assert_eq!(summary.aces.len(), 1, "{summary:?}");
+        assert!(summary.aces[0].allows, "{summary:?}");
+        assert!(summary.aces[0].current_user, "{summary:?}");
+        assert_eq!(windows_acl::check_owner_only(path).unwrap(), Ok(()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn write_owner_only_file_creates_a_protected_single_ace_dacl_for_the_current_user() {
+        let dir = TempDir::new("owner-only-dacl");
+        let path = dir.path.join("secret");
+        let bytes: Vec<u8> = (0..=255).collect();
+
+        write_owner_only_file(&path, &bytes).unwrap();
+
+        assert_owner_only(&path);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn write_owner_only_file_refuses_an_existing_file_on_windows() {
+        let dir = TempDir::new("owner-only-exists-dacl");
+        let path = dir.path.join("secret");
+        fs::write(&path, b"first").unwrap();
+
+        let err = write_owner_only_file(&path, b"second").unwrap_err();
+
+        assert!(is_already_exists(&err), "{err:#}");
+        assert_eq!(fs::read(&path).unwrap(), b"first");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn load_or_mint_identity_mints_an_owner_only_key_and_reloads_it_on_windows() {
+        let dir = TempDir::new("identity-mint-dacl");
+        let path = dir.path.join("mesh").join("identity.key");
+
+        let minted = load_or_mint_identity(&path).unwrap();
+
+        assert_owner_only(&path);
+        assert_eq!(fs::read(&path).unwrap(), minted.to_private_key_bytes());
+        let loaded = load_or_mint_identity(&path).unwrap();
+        assert_eq!(fingerprint(&minted), fingerprint(&loaded));
+        assert_eq!(minted.to_private_key_bytes(), loaded.to_private_key_bytes());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn load_or_mint_identity_refuses_a_key_everyone_can_read_naming_icacls() {
+        let dir = TempDir::new("identity-dacl-everyone");
+        let path = dir.path.join("identity.key");
+        load_or_mint_identity(&path).unwrap();
+        windows_acl::widen_to_everyone(&path).unwrap();
+        assert!(
+            windows_acl::check_owner_only(&path).unwrap().is_err(),
+            "the widened DACL must read back as not owner-only"
+        );
+
+        let err = load_error(&path);
+
+        assert!(err.contains(&path.display().to_string()), "{err}");
+        assert!(err.contains("icacls"), "{err}");
+        assert!(err.contains("/inheritance:r"), "{err}");
+        assert!(err.contains("*S-1-"), "{err}");
+        assert!(!err.contains("/reset"), "{err}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rotate_identity_leaves_the_renamed_key_owner_only_on_windows() {
+        let dir = TempDir::new("identity-rotate-dacl");
+        let path = dir.path.join("mesh").join("identity.key");
+        let old = load_or_mint_identity(&path).unwrap();
+
+        let rotation = rotate_identity(&path, &fingerprint(&old), t(1_790_000_000)).unwrap();
+
+        assert_owner_only(&path);
+        assert!(!dir.path.join("mesh").join("identity.key.new").exists());
+        let reloaded = load_or_mint_identity(&path).unwrap();
+        assert_eq!(fingerprint(&reloaded), rotation.new_fingerprint);
+        assert_ne!(rotation.new_fingerprint, fingerprint(&old));
     }
 
     #[test]
