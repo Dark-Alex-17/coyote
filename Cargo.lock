@@ -1742,6 +1742,7 @@ version = "0.10.3"
 dependencies = [
  "ansi_colours",
  "anyhow",
+ "arbitrary",
  "arboard",
  "arc-swap",
  "argc",
