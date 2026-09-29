@@ -3,10 +3,10 @@
 //! forms of both, the canonical text forms, the destination derivations, the trust verdict
 //! and the code-point registry.
 //!
-//! Every row names the id it exercises and the receiver action section 16 of the spec
+//! Every row names the id it exercises and the receiver action the spec
 //! mandates for it. A row written faithfully from the spec that the code does not honour is
 //! kept as written and flagged with `known_divergence`; the executor prints such a row
-//! instead of asserting it, and fails when the flag goes stale.
+//! instead of asserting it, and fails when the flag goes stale. No row is flagged today.
 
 use super::{Kind, Listed};
 use crate::config::mesh_config::MeshInterface;
@@ -538,15 +538,6 @@ fn row(id: &'static str, kind: Kind, case: Case) -> Vector {
         kind,
         case,
         known_divergence: None,
-    }
-}
-
-fn flagged(id: &'static str, kind: Kind, case: Case, known_divergence: &'static str) -> Vector {
-    Vector {
-        id,
-        kind,
-        case,
-        known_divergence: Some(known_divergence),
     }
 }
 
@@ -7549,7 +7540,7 @@ fn prop_vectors() -> Vec<Vector> {
                 )
             }),
         ),
-        flagged(
+        row(
             "MESH-PROP-002",
             Kind::Valid,
             Case::Custom(|| {
@@ -7560,14 +7551,13 @@ fn prop_vectors() -> Vec<Vector> {
                     .map_err(|err| err.to_string())?;
                 let mut expected = vec![0x94, 0xcb];
                 expected.extend_from_slice(&1_700_000_000.0f64.to_be_bytes());
-                expected.extend_from_slice(&[0xc4, 0x02, b'h', b'i', 0xc4, 0x00, 0x80]);
+                expected.extend_from_slice(&[0xc4, 0x00, 0xc4, 0x02, b'h', b'i', 0x80]);
                 same(
-                    "(timestamp, content, title or empty, fields or empty map)",
+                    "[timestamp, title or empty, content, fields or empty map]",
                     payload,
                     expected,
                 )
             }),
-            "the spec lists the payload as (timestamp, content, title, fields); the code and LXMessage.pack emit [timestamp, title, content, fields]",
         ),
         row(
             "MESH-PROP-002",

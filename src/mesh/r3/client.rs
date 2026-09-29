@@ -5,7 +5,7 @@ use crate::mesh::r3::frame::{
 };
 #[cfg(test)]
 use crate::mesh::r3::receipt::RequestReceipt;
-use crate::mesh::r3::short;
+use crate::mesh::r3::{redact_hashes, short};
 
 use parking_lot::Mutex;
 use rmpv::Value;
@@ -509,9 +509,9 @@ impl R3Client {
             LinkEvent::Closed => {
                 let closed = self.pending.lock().remove_link(event.id);
                 if !closed.is_empty() {
+                    let link_id = event.id.to_hex_string();
                     debug!(
-                        "Mesh link {} closed with {} requests pending",
-                        event.id.to_hex_string(),
+                        "Mesh link {link_id} closed with {} requests pending",
                         closed.len()
                     );
                 }
@@ -586,7 +586,10 @@ impl R3Client {
         let frame = match ResponseFrame::decode(bytes) {
             Ok(frame) => frame,
             Err(err) => {
-                debug!("Dropped an undecodable mesh response ({branch:?}): {err}");
+                debug!(
+                    "Dropped an undecodable mesh response ({branch:?}): {}",
+                    redact_hashes(&err.to_string())
+                );
                 return;
             }
         };
@@ -656,7 +659,8 @@ pub(crate) async fn open_link(
         .await?
     {
         return Err(R3Error::LinkFailed(format!(
-            "no known path to destination {destination_hex}"
+            "no known path to destination {}",
+            short(&destination_hex)
         )));
     }
     let link = deadline.bound(path, transport.link(*destination)).await?;
@@ -675,8 +679,9 @@ pub(crate) async fn open_link(
         .bound(path, async { *link.lock().await.id() })
         .await?;
     debug!(
-        "Mesh link {} to destination {destination_hex} is active",
-        link_id.to_hex_string()
+        "Mesh link {} to destination {} is active",
+        link_id.to_hex_string(),
+        short(&destination_hex)
     );
     Ok(link)
 }

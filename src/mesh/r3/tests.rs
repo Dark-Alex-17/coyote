@@ -4218,6 +4218,7 @@ pub(crate) mod network {
     /// no posts is passed over, as it is for a peer message.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unreachable_knock_falls_back_to_the_propagation_node() {
+        install_log_collector();
         let (pair, mut node) = pair_with_propagation_node("r3-knock-fallback").await;
         let (ghost, ghost_desc) = ghost_destination();
         let (_, decoy_desc) = ghost_destination();
@@ -4267,6 +4268,20 @@ pub(crate) mod network {
         assert_eq!(
             destination_address(&origin.0, &pair.a_desc.identity.address_hash).to_hex_string(),
             pair.node_a.destination_hash().await
+        );
+        let ghost_hex = ghost_desc.address_hash.to_hex_string();
+        let dest8 = &ghost_hex[..8];
+        assert_debug_logged(&format!(
+            "Mesh knock to {dest8} could not be delivered over a link (The mesh link failed: no known path to destination {dest8})"
+        ));
+        let offenders: Vec<String> = debug_snapshot()
+            .into_iter()
+            .chain(warn_snapshot())
+            .filter(|line| line.contains(dest8))
+            .collect();
+        assert!(
+            !offenders.iter().any(|line| line.contains(&ghost_hex)),
+            "the fallback line must carry the destination truncated, never as a 32-hex run: {offenders:#?}"
         );
         node.nothing_else_received();
         pair.stop_node_a().await;

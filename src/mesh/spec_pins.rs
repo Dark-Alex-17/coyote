@@ -4,23 +4,28 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub(crate) const SPEC: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/docs/mesh/PROTOCOL.md"
 ));
+const UPSTREAM_ISSUES: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/docs/mesh/upstream-issues.md"
+));
 
 const EXPECTED_H1: &str = "# Coyote Mesh Protocol, version 1: wire format";
-const SECTION_COUNT: usize = 16;
-const CONSTANTS_HEADING: &str = "## 15. Constants";
-const INDEX_HEADING: &str = "## 16. Requirements index";
+const SECTION_COUNT: usize = 21;
+const CONSTANTS_HEADING: &str = "## 19. Constants";
+const INDEX_HEADING: &str = "## 21. Requirements index";
 const BCP14: &str = "The key words \"MUST\", \"MUST NOT\", \"REQUIRED\", \"SHALL\", \"SHALL NOT\", \
     \"SHOULD\", \"SHOULD NOT\", \"RECOMMENDED\", \"NOT RECOMMENDED\", \"MAY\", and \"OPTIONAL\" in \
     this document are to be interpreted as described in BCP 14 [RFC2119] [RFC8174] when, and \
     only when, they appear in all capitals, as shown here.";
-const AREAS: [&str; 12] = [
+const AREAS: [&str; 16] = [
     "DEST", "ANN", "ENV", "KNOCK", "STATUS", "MSG", "PROP", "VER", "TIME", "CANON", "EXT", "CODE",
+    "SEC", "INV", "LOG", "LEN",
 ];
 /// Every compound keyword (`MUST NOT`, `NOT RECOMMENDED`, ...) contains one of these.
 const KEYWORDS: [&str; 7] = [
@@ -45,6 +50,24 @@ const CONSTANTS_TABLE_HEADER: &str = "| Constant | Value | Defined in | Pinned b
 const PINNED_BY_THIS_TABLE: &str = "spec_pins (this table)";
 const CITED_IDENTIFIER_MIN_LEN: usize = 12;
 const CITED_IDENTIFIER_MIN_UNDERSCORES: usize = 2;
+const THREAT_MODEL_HEADING: &str = "### 15.1 Threat model";
+const ATTACK_CLASSES: [&str; 7] = [
+    "eavesdropping",
+    "replay",
+    "insertion",
+    "deletion",
+    "modification",
+    "man in the middle",
+    "denial of service",
+];
+const OUT_OF_SCOPE_HEADING: &str = "### 15.6 Out of scope";
+const LENIENCY_OPEN: &str = "**[MESH-LEN-";
+const LENIENCY_FIELDS: [&str; 3] = ["Why:", "Upstream:", "Removal:"];
+const DRAFT_MENTION: &str = "draft ";
+const PART_A: &str = "## Part A";
+const PART_B: &str = "## Part B";
+const DRAFT_HEADING: &str = "### ";
+const DRAFT_STATUS: &str = "Status: Drafted, not yet filed";
 
 #[derive(Debug)]
 struct Definition {
@@ -99,7 +122,7 @@ fn prepare(text: &str) -> String {
 }
 
 /// Splits `line` into (prose, code span) pairs; the last pair's span is empty.
-fn split_spans(line: &str) -> Vec<(&str, &str)> {
+pub(crate) fn split_spans(line: &str) -> Vec<(&str, &str)> {
     let mut parts = Vec::new();
     let mut rest = line;
     while let Some(open) = rest.find('`') {
@@ -495,18 +518,84 @@ fn cited_identifiers(text: &str) -> Vec<(usize, String)> {
         .collect()
 }
 
+/// The `( ... )` groups of `line` outside code spans, outermost only.
+fn parentheticals(line: &str) -> Vec<&str> {
+    let mut groups = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0;
+    let mut in_span = false;
+    for (at, byte) in line.bytes().enumerate() {
+        match byte {
+            b'`' => in_span = !in_span,
+            b'(' if !in_span => {
+                if depth == 0 {
+                    start = at + 1;
+                }
+                depth += 1;
+            }
+            b')' if !in_span && depth > 0 => {
+                depth -= 1;
+                if depth == 0 {
+                    groups.push(&line[start..at]);
+                }
+            }
+            _ => {}
+        }
+    }
+    groups
+}
+
+/// The name of the function `line` declares, when it declares one.
+fn declared_fn(line: &str) -> Option<&str> {
+    let mut rest = line.trim_start();
+    for qualifier in [
+        "pub(crate) ",
+        "pub(super) ",
+        "pub ",
+        "const ",
+        "async ",
+        "unsafe ",
+    ] {
+        rest = rest.strip_prefix(qualifier).unwrap_or(rest);
+    }
+    let rest = rest.strip_prefix("fn ")?;
+    let end = rest.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))?;
+    (end > 0 && (rest[end..].starts_with('(') || rest[end..].starts_with('<')))
+        .then_some(&rest[..end])
+}
+
+/// Every function declared under a `#[test]` or `#[tokio::test]` attribute, other
+/// attributes between the two allowed.
+pub(crate) fn test_functions(source: &str) -> BTreeSet<String> {
+    let lines: Vec<&str> = source.lines().collect();
+    lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let name = declared_fn(line)?;
+            lines[..index]
+                .iter()
+                .rev()
+                .map(|above| above.trim())
+                .filter(|above| !above.is_empty())
+                .take_while(|above| above.starts_with("#["))
+                .any(|attribute| attribute == "#[test]" || attribute.starts_with("#[tokio::test"))
+                .then(|| name.to_string())
+        })
+        .collect()
+}
+
 /// The spec cites tests and items by name but also struct fields, wire keys and upstream
 /// functions, so a citation resolves when the sources name it as a whole word anywhere.
 fn names_identifier(source: &str, name: &str) -> bool {
     contains_word(source, name)
 }
 
-/// The concatenated contents of every `.rs` file under `dir`, this file excepted: its
-/// fixtures name identifiers that exist nowhere else, and a citation must not resolve
-/// against the guard that checks it.
-fn rust_sources(dir: &Path) -> std::io::Result<String> {
+/// Every `.rs` file under `dir`, this file excepted: its fixtures name identifiers that exist
+/// nowhere else, and a citation must not resolve against the guard that checks it.
+fn rust_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     let guard = Path::new(file!()).file_name();
-    let mut out = String::new();
+    let mut files = Vec::new();
     let mut pending = vec![dir.to_path_buf()];
     while let Some(dir) = pending.pop() {
         for entry in std::fs::read_dir(dir)? {
@@ -514,12 +603,76 @@ fn rust_sources(dir: &Path) -> std::io::Result<String> {
             if path.is_dir() {
                 pending.push(path);
             } else if path.extension().is_some_and(|ext| ext == "rs") && path.file_name() != guard {
-                out.push_str(&std::fs::read_to_string(path)?);
-                out.push('\n');
+                files.push(path);
             }
         }
     }
+    Ok(files)
+}
+
+/// The concatenated contents of every `.rs` file under `dir`, as `rust_files` walks it.
+pub(crate) fn rust_sources(dir: &Path) -> std::io::Result<String> {
+    let mut out = String::new();
+    for path in rust_files(dir)? {
+        out.push_str(&std::fs::read_to_string(path)?);
+        out.push('\n');
+    }
     Ok(out)
+}
+
+/// Each `.rs` file under `root/src` as its `/`-joined path relative to `root` and its
+/// contents, as `rust_files` walks it.
+fn rust_source_files(root: &Path) -> std::io::Result<Vec<(String, String)>> {
+    rust_files(&root.join("src"))?
+        .into_iter()
+        .map(|path| {
+            let relative = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .components()
+                .map(|part| part.as_os_str().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("/");
+            Ok((relative, std::fs::read_to_string(&path)?))
+        })
+        .collect()
+}
+
+/// A test cited inside a parenthetical that also names a `src/....rs` path is defined in one
+/// of the files that parenthetical names; a citation without a path is left to
+/// `check_cited_identifiers`.
+fn check_cited_paths(
+    text: &str,
+    files: &[(String, String)],
+    tests: &BTreeSet<String>,
+) -> Vec<String> {
+    let mut problems = Vec::new();
+    for (index, line) in prepare(text).lines().enumerate() {
+        for group in parentheticals(line) {
+            let paths = source_paths(group);
+            if paths.is_empty() {
+                continue;
+            }
+            let named: Vec<&str> = files
+                .iter()
+                .filter(|(path, _)| paths.contains(path))
+                .map(|(_, source)| source.as_str())
+                .collect();
+            for (_, span) in split_spans(group) {
+                if !tests.contains(span) {
+                    continue;
+                }
+                let needle = format!("fn {span}(");
+                if !named.iter().any(|source| source.contains(&needle)) {
+                    problems.push(format!(
+                        "line {}: `{span}` is not defined in {paths:?}",
+                        index + 1
+                    ));
+                }
+            }
+        }
+    }
+    problems
 }
 
 fn check_cited_identifiers(text: &str, sources: &str) -> Vec<String> {
@@ -543,6 +696,142 @@ fn source_paths(text: &str) -> BTreeSet<String> {
         })
         .filter(|path| path.ends_with(".rs"))
         .collect()
+}
+
+/// The first table under `THREAT_MODEL_HEADING` has a row for each of `ATTACK_CLASSES` in
+/// its first column.
+fn check_threat_model(text: &str) -> Result<(), String> {
+    let section = section(text, THREAT_MODEL_HEADING)?;
+    let tables = tables(&section.content);
+    let table = tables
+        .first()
+        .ok_or_else(|| format!("{THREAT_MODEL_HEADING:?} holds no table"))?;
+    let attacks: Vec<String> = table.rows[1..]
+        .iter()
+        .map(|row| cells(row)[0].to_lowercase())
+        .collect();
+    let missing: Vec<&str> = ATTACK_CLASSES
+        .iter()
+        .copied()
+        .filter(|class| !attacks.iter().any(|attack| attack.contains(class)))
+        .collect();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "line {}: the threat model table has no row for {missing:?}",
+            section.first_line + table.line - 1
+        ))
+    }
+}
+
+/// A line under `OUT_OF_SCOPE_HEADING` places cryptographic agility with Reticulum.
+fn check_crypto_agility_out_of_scope(text: &str) -> Result<(), String> {
+    let section = section(text, OUT_OF_SCOPE_HEADING)?;
+    if section
+        .content
+        .lines()
+        .any(|line| line.contains("cryptographic agility") && line.contains("Reticulum"))
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "{OUT_OF_SCOPE_HEADING:?} has no line placing cryptographic agility with Reticulum"
+        ))
+    }
+}
+
+fn leading_digits(text: &str) -> Option<&str> {
+    let end = text
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(text.len());
+    (end > 0).then_some(&text[..end])
+}
+
+/// The number of every `draft <part><n>` mention in `line`.
+fn draft_mentions(line: &str, part: char) -> Vec<&str> {
+    let needle = format!("{DRAFT_MENTION}{part}");
+    line.match_indices(needle.as_str())
+        .filter_map(|(start, needle)| leading_digits(&line[start + needle.len()..]))
+        .collect()
+}
+
+/// The number of every `### A<n>` heading between `PART_A` and `PART_B` of `issues`.
+fn part_a_drafts(issues: &str) -> Vec<&str> {
+    let heading = format!("{DRAFT_HEADING}A");
+    issues
+        .lines()
+        .skip_while(|line| !line.starts_with(PART_A))
+        .take_while(|line| !line.starts_with(PART_B))
+        .filter_map(|line| leading_digits(line.strip_prefix(heading.as_str())?))
+        .collect()
+}
+
+/// The lines of `issues` under its `### A<number>` heading, up to the next `### ` heading.
+fn draft_block(issues: &str, number: &str) -> Option<String> {
+    let heading = format!("{DRAFT_HEADING}A{number}");
+    let lines: Vec<&str> = issues.lines().collect();
+    let at = lines.iter().position(|line| {
+        line.strip_prefix(heading.as_str())
+            .is_some_and(|rest| !rest.starts_with(|c: char| c.is_ascii_digit()))
+    })?;
+    Some(
+        lines[at + 1..]
+            .iter()
+            .take_while(|line| !line.starts_with(DRAFT_HEADING))
+            .copied()
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+/// Every leniency row states `LENIENCY_FIELDS`, its removal condition is not "none", and
+/// each draft it points at is a `### A<n>` block of `issues` still reading `DRAFT_STATUS`;
+/// in return every Part A draft is cited by some row and no row cites a Part B draft.
+fn check_leniency_rows(text: &str, issues: &str) -> Vec<String> {
+    let mut problems = Vec::new();
+    let mut cited = BTreeSet::new();
+    let text = prepare(text);
+    for (index, line) in text.lines().enumerate() {
+        if !line.contains(LENIENCY_OPEN) {
+            continue;
+        }
+        let number = index + 1;
+        for field in LENIENCY_FIELDS {
+            if !line.contains(field) {
+                problems.push(format!("line {number}: no {field:?}"));
+            }
+        }
+        if line
+            .split_once(LENIENCY_FIELDS[2])
+            .is_some_and(|(_, removal)| removal.trim_start().to_lowercase().starts_with("none"))
+        {
+            problems.push(format!("line {number}: the removal condition is \"none\""));
+        }
+        for draft in draft_mentions(line, 'B') {
+            problems.push(format!(
+                "line {number}: cites draft B{draft}, which no leniency rests on"
+            ));
+        }
+        for draft in draft_mentions(line, 'A') {
+            cited.insert(draft);
+            match draft_block(issues, draft) {
+                None => problems.push(format!(
+                    "line {number}: draft A{draft} has no heading in docs/mesh/upstream-issues.md"
+                )),
+                Some(block) if !block.contains(DRAFT_STATUS) => problems.push(format!(
+                    "line {number}: draft A{draft} does not read {DRAFT_STATUS:?}"
+                )),
+                Some(_) => {}
+            }
+        }
+    }
+    for draft in part_a_drafts(issues) {
+        if !cited.contains(draft) {
+            problems.push(format!("draft A{draft} is cited by no leniency row"));
+        }
+    }
+    problems
 }
 
 fn parse_constants_table(text: &str) -> Result<Vec<ConstantRow>, String> {
@@ -667,7 +956,7 @@ fn index_entries(text: &str) -> Result<Vec<IndexEntry>, Vec<String>> {
     }
 }
 
-/// Every requirement id the section 16 index lists, in index order.
+/// Every requirement id the section 21 index lists, in index order.
 pub(crate) fn requirement_ids(spec: &str) -> Result<Vec<String>, Vec<String>> {
     index_entries(spec).map(|entries| entries.into_iter().map(|entry| entry.id).collect())
 }
@@ -732,7 +1021,7 @@ mod tests {
     use rns_transport::hash::ADDRESS_HASH_SIZE;
     use std::time::Duration;
 
-    const EXPECTED_LITERALS: &str = r#"1,1,10,16,262144,"/knock","/status","/message",30,10,10,2,20,16,0xf0,0xf1,0xf3,0xf4,0xf5,0xf6,0xfd,0xfe,"COYM",64,300,900,3,2700,1800,1024,"coyote.knock/1",200,15,10,256,3,600,256,16,1,0,1,2,64,280,64,64,120,280,"coyote.peer/1",1,120,4000,64,4096,8,15,10,604800,256,3600,120,256,1,60,100000,120,26,60,2,60,1024,64,240,131072,112,4096,15552000,3,256,0,32,0xfb,0xfc"#;
+    const EXPECTED_LITERALS: &str = r#"1,1,10,16,262144,"/knock","/status","/message",30,10,10,2,20,16,0xf0,0xf1,0xf3,0xf4,0xf5,0xf6,0xfd,0xfe,"COYM",64,300,900,3,2700,1800,1024,"coyote.knock/1",200,15,10,256,3,600,256,16,1,0,1,2,64,280,64,64,120,280,"coyote.peer/1",1,120,4000,64,4096,8,15,10,604800,256,3600,120,256,1,60,100000,120,26,60,2,60,1024,64,240,131072,112,4096,15552000,3,256,0,32,0xfb,0xfc,8,64,256,64,8"#;
 
     fn expected_constants() -> Vec<(&'static str, String)> {
         let secs = |d: Duration| d.as_secs().to_string();
@@ -944,6 +1233,23 @@ mod tests {
             ),
             ("FIELD_CUSTOM_TYPE", byte(FIELD_CUSTOM_TYPE)),
             ("FIELD_CUSTOM_DATA", byte(FIELD_CUSTOM_DATA)),
+            ("LOGGED_HASH_CHARS", r3::LOGGED_HASH_CHARS.to_string()),
+            (
+                "PEER_INBOX_CAPACITY",
+                message::PEER_INBOX_CAPACITY.to_string(),
+            ),
+            (
+                "INBOUND_MAX_ENTRIES",
+                pending::INBOUND_MAX_ENTRIES.to_string(),
+            ),
+            (
+                "KNOCK_QUEUE_CAPACITY",
+                knock::KNOCK_QUEUE_CAPACITY.to_string(),
+            ),
+            (
+                "ENVOY_QUEUE_MAX",
+                crate::config::mesh_envoy::ENVOY_QUEUE_MAX.to_string(),
+            ),
         ]
     }
 
@@ -1009,14 +1315,24 @@ Fenced lines may say must and MUST without an id.
 
 ## 14. Fourteenth
 
-## 15. Constants
+## 15. Fifteenth
+
+## 16. Sixteenth
+
+## 17. Seventeenth
+
+## 18. Eighteenth
+
+## 19. Constants
 
 | Constant | Value | Defined in | Pinned by |
 |---|---|---|---|
 | `ALPHA` | `1` | a.rs | spec_pins (this table) |
 | `BETA` | `\"b\"` | b.rs | decode_whole_frame_test |
 
-## 16. Requirements index
+## 20. Twentieth
+
+## 21. Requirements index
 
 - [MESH-DEST-001](#4-destination-naming) -- hash the name
 - [MESH-DEST-002](#4-destination-naming) -- no reuse
@@ -1131,21 +1447,21 @@ Fenced lines may say must and MUST without an id.
                 .unwrap_err()
                 .contains("exactly one H1")
         );
-        let wrong_h1 = sections(&(1..=16).collect::<Vec<_>>()).replace("version 1", "version 2");
+        let wrong_h1 = sections(&(1..=21).collect::<Vec<_>>()).replace("version 1", "version 2");
         assert!(check_headings(&wrong_h1).is_err());
-        assert!(check_headings(&sections(&(1..=16).collect::<Vec<_>>())).is_ok());
+        assert!(check_headings(&sections(&(1..=21).collect::<Vec<_>>())).is_ok());
         assert!(
-            check_headings(&sections(&(1..=15).collect::<Vec<_>>()))
+            check_headings(&sections(&(1..=20).collect::<Vec<_>>()))
                 .unwrap_err()
-                .contains("found 15")
+                .contains("found 20")
         );
-        let gap: Vec<usize> = (1..=17).filter(|n| *n != 3).collect();
+        let gap: Vec<usize> = (1..=22).filter(|n| *n != 3).collect();
         assert!(
             check_headings(&sections(&gap))
                 .unwrap_err()
                 .contains("line 7")
         );
-        let unnumbered = format!("{}\n## Appendix\n", sections(&(1..=16).collect::<Vec<_>>()));
+        let unnumbered = format!("{}\n## Appendix\n", sections(&(1..=21).collect::<Vec<_>>()));
         assert!(check_headings(&unnumbered).is_err());
     }
 
@@ -1365,6 +1681,96 @@ Fenced lines may say must and MUST without an id.
     }
 
     #[test]
+    fn rust_source_file_lister_keys_each_file_by_its_crate_relative_path() {
+        let files = rust_source_files(Path::new(env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let mesh = files
+            .iter()
+            .find(|(path, _)| path == "src/mesh/mod.rs")
+            .expect("src/mesh/mod.rs is listed");
+        assert!(mesh.1.contains("fn destination_address"));
+        assert!(files.iter().all(|(path, _)| path.starts_with("src/")));
+        assert!(!files.iter().any(|(path, _)| path.ends_with("spec_pins.rs")));
+    }
+
+    #[test]
+    fn test_function_scanner_reads_through_attributes_and_skips_plain_fns() {
+        let source = "\
+#[test]
+fn plain_test() {}
+
+#[tokio::test(flavor = \"multi_thread\")]
+#[ignore = \"slow\"]
+async fn async_test() {}
+
+/// Doc comments sit above the attribute.
+#[test]
+
+fn after_a_blank() {}
+
+#[derive(Debug)]
+fn attributed_but_not_a_test() {}
+
+pub(crate) fn helper() {}
+// fn commented_out() {}
+";
+        let expected: BTreeSet<String> = ["plain_test", "async_test", "after_a_blank"]
+            .map(String::from)
+            .into();
+        assert_eq!(test_functions(source), expected);
+        assert_eq!(declared_fn("    pub async fn go<T>(x: T) {}"), Some("go"));
+        assert_eq!(declared_fn("    let fn_count = 1;"), None);
+        assert_eq!(declared_fn("fn (tuple)"), None);
+    }
+
+    #[test]
+    fn parenthetical_scanner_keeps_outer_groups_and_ignores_parens_in_spans() {
+        assert_eq!(
+            parentheticals("a (b (c) d) e (`(` f) g (h"),
+            vec!["b (c) d", "`(` f"]
+        );
+        assert_eq!(parentheticals("no groups"), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn cited_path_checker_wants_a_test_in_a_file_its_parenthetical_names() {
+        let files = vec![
+            (
+                "src/a.rs".to_string(),
+                "#[test]\nfn alpha_test_one() {}\n".to_string(),
+            ),
+            (
+                "src/b.rs".to_string(),
+                "#[test]\nfn beta_test_two() {}\nfn some_helper_fn() {}\n".to_string(),
+            ),
+        ];
+        let tests: BTreeSet<String> = ["alpha_test_one", "beta_test_two"].map(String::from).into();
+        let ok = "\
+A (`alpha_test_one`, src/a.rs; `beta_test_two`, src/b.rs).
+B (`alpha_test_one`) and (`some_helper_fn`, src/a.rs) and (`beta_test_two`, src/a.rs, src/b.rs).
+```text
+C (`alpha_test_one`, src/b.rs) is fenced.
+```
+";
+        assert_eq!(check_cited_paths(ok, &files, &tests), Vec::<String>::new());
+        let drifted = "\
+A (`alpha_test_one`, src/b.rs).
+B (see `(` in a span) (`beta_test_two`, src/a.rs).
+";
+        let problems = check_cited_paths(drifted, &files, &tests);
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert!(
+            problems[0].starts_with("line 1: `alpha_test_one` is not defined in"),
+            "{}",
+            problems[0]
+        );
+        assert!(
+            problems[1].starts_with("line 2: `beta_test_two` is not defined in"),
+            "{}",
+            problems[1]
+        );
+    }
+
+    #[test]
     fn cells_keep_a_pipe_inside_a_code_span_in_its_cell() {
         assert_eq!(
             cells("| `x || y` | concatenation | `a` |"),
@@ -1384,7 +1790,7 @@ Fenced lines may say must and MUST without an id.
     }
 
     const CONSTANTS_TWO_TABLES: &str = "\
-## 15. Constants
+## 19. Constants
 
 | Constant | Value | Defined in | Pinned by |
 |---|---|---|---|
@@ -1394,31 +1800,31 @@ Fenced lines may say must and MUST without an id.
 |---|---|---|---|
 | `BETA` | `2` | b.rs | y |
 
-## 16. Requirements index
+## 21. Requirements index
 ";
     const CONSTANTS_BAD_HEADER: &str = "\
-## 15. Constants
+## 19. Constants
 
 | Name | Value | Defined in | Pinned by |
 |---|---|---|---|
 | `ALPHA` | `1` | a.rs | x |
 ";
     const CONSTANTS_UNBACKTICKED: &str = "\
-## 15. Constants
+## 19. Constants
 
 | Constant | Value | Defined in | Pinned by |
 |---|---|---|---|
 | `ALPHA` | 1 | a.rs | x |
 ";
     const CONSTANTS_THREE_CELLS: &str = "\
-## 15. Constants
+## 19. Constants
 
 | Constant | Value | Defined in | Pinned by |
 |---|---|---|---|
 | `ALPHA` | `1` | a.rs |
 ";
     const CONSTANTS_PINNED_BY: &str = "\
-## 15. Constants
+## 19. Constants
 
 | Constant | Value | Defined in | Pinned by |
 |---|---|---|---|
@@ -1504,7 +1910,7 @@ Fenced lines may say must and MUST without an id.
     }
 
     const INDEX_BAD_LINES: &str = "\
-## 16. Requirements index
+## 21. Requirements index
 
 - [MESH-DEST-001](#4-destination-naming) -- fine
 - [MESH-DEST-002](#4-destination-naming) missing the dashes
@@ -1611,11 +2017,191 @@ Fenced lines may say must and MUST without an id.
 
     #[test]
     fn spec_cited_tests_exist() {
-        let sources = rust_sources(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src")).unwrap();
+        let files = rust_source_files(Path::new(env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let sources = files
+            .iter()
+            .map(|(_, source)| source.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         let cited = cited_identifiers(SPEC);
         assert!(!cited.is_empty(), "the spec cites no tests");
         assert_eq!(
             check_cited_identifiers(SPEC, &sources),
+            Vec::<String>::new()
+        );
+        let tests = test_functions(&sources);
+        assert!(!tests.is_empty(), "no test functions under src/");
+        assert_eq!(
+            check_cited_paths(SPEC, &files, &tests),
+            Vec::<String>::new()
+        );
+    }
+
+    const THREAT_ROWS: &str = "\
+| Attack | Scope | Where |
+|---|---|---|
+| Eavesdropping on a Link | Reticulum's | MESH-SEC-001 |
+| Replay | in scope | MESH-SEC-003 |
+| Insertion | in scope | MESH-SEC-001 |
+| Deletion | out of scope | MESH-SEC-004 |
+| Modification | in scope | MESH-SEC-006 |
+| Man in the middle | in scope | MESH-SEC-008 |
+| Denial of service | in scope | MESH-SEC-010 |
+";
+
+    fn security_section(heading: &str, content: &str) -> String {
+        format!("## 15. Security\n\n{heading}\n\n{content}\n## 16. Invariants\n")
+    }
+
+    #[test]
+    fn threat_model_checker_wants_a_row_per_attack_class() {
+        check_threat_model(&security_section(THREAT_MODEL_HEADING, THREAT_ROWS)).unwrap();
+        let without_replay: String = THREAT_ROWS
+            .lines()
+            .filter(|row| !row.starts_with("| Replay"))
+            .map(|row| format!("{row}\n"))
+            .collect();
+        let error = check_threat_model(&security_section(THREAT_MODEL_HEADING, &without_replay))
+            .unwrap_err();
+        assert!(
+            error.starts_with("line 5:") && error.contains("[\"replay\"]"),
+            "{error}"
+        );
+        assert!(
+            check_threat_model(&security_section(THREAT_MODEL_HEADING, ""))
+                .unwrap_err()
+                .contains("no table")
+        );
+        assert!(check_threat_model("## 15. Security\n").is_err());
+    }
+
+    #[test]
+    fn out_of_scope_checker_wants_crypto_agility_placed_with_reticulum() {
+        let bullet = |text: &str| security_section(OUT_OF_SCOPE_HEADING, &format!("- {text}\n"));
+        check_crypto_agility_out_of_scope(&bullet(
+            "Cryptography and cryptographic agility are Reticulum's.",
+        ))
+        .unwrap();
+        assert!(
+            check_crypto_agility_out_of_scope(&bullet("Cryptography is Reticulum's.")).is_err()
+        );
+        assert!(
+            check_crypto_agility_out_of_scope(&bullet("Cryptographic agility is inherited."))
+                .is_err()
+        );
+        assert!(check_crypto_agility_out_of_scope("## 15. Security\n").is_err());
+    }
+
+    const ISSUES: &str = "\
+## Part A
+
+### A1. First
+
+- Status: Drafted, not yet filed.
+
+### A10. Tenth
+
+- Status: Drafted, not yet filed.
+
+## Part B
+
+### B1. Inherited
+
+- Status: Drafted, not yet filed.
+";
+
+    #[test]
+    fn leniency_checker_wants_why_upstream_a_removal_and_a_resolvable_draft() {
+        let row = |id: &str, tail: &str| {
+            format!("**[MESH-LEN-{id}]** A node MUST bend. Why: because. {tail}")
+        };
+        let ok = row(
+            "001",
+            "Upstream: docs/mesh/upstream-issues.md, draft A1 and draft A10. \
+             Removal: when upstream bends back.",
+        );
+        assert_eq!(check_leniency_rows(&ok, ISSUES), Vec::<String>::new());
+        assert_eq!(
+            check_leniency_rows(
+                &format!(
+                    "{ok}\n{}",
+                    row("002", "Upstream: none. Removal: None planned.")
+                ),
+                ISSUES
+            ),
+            vec!["line 2: the removal condition is \"none\"".to_string()]
+        );
+        let filed = ISSUES.replace(
+            "### A10",
+            "### A2. Second\n\n- Status: Filed as #7.\n\n### A10",
+        );
+        let problems = check_leniency_rows(
+            &row(
+                "001",
+                "Removal: when draft A2 lands, draft A3 is filed and draft A10 too.",
+            ),
+            &filed,
+        );
+        assert_eq!(problems.len(), 4, "{problems:?}");
+        assert!(problems[0].contains("no \"Upstream:\""), "{}", problems[0]);
+        assert!(
+            problems[1].contains("draft A2 does not read"),
+            "{}",
+            problems[1]
+        );
+        assert!(
+            problems[2].contains("draft A3 has no heading"),
+            "{}",
+            problems[2]
+        );
+        assert_eq!(problems[3], "draft A1 is cited by no leniency row");
+        let uncited = ISSUES.replace(
+            "## Part B",
+            "### A4. Fourth\n\n- Status: Drafted, not yet filed.\n\n## Part B",
+        );
+        assert_eq!(
+            check_leniency_rows(&ok, &uncited),
+            vec!["draft A4 is cited by no leniency row".to_string()]
+        );
+        assert_eq!(
+            check_leniency_rows(
+                &format!(
+                    "{ok}\n{}",
+                    row("002", "Upstream: draft B1. Removal: later.")
+                ),
+                ISSUES
+            ),
+            vec!["line 2: cites draft B1, which no leniency rests on".to_string()]
+        );
+        assert_eq!(
+            check_leniency_rows(
+                &format!("{ok}\n**[MESH-SEC-001]** Not a leniency; see draft B1."),
+                ISSUES
+            ),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn spec_threat_model_names_every_attack_class() {
+        check_threat_model(SPEC).unwrap();
+    }
+
+    #[test]
+    fn spec_states_crypto_agility_is_inherited_and_out_of_scope() {
+        check_crypto_agility_out_of_scope(SPEC).unwrap();
+    }
+
+    #[test]
+    fn spec_leniency_rows_carry_why_upstream_and_removal() {
+        assert!(
+            prepare(SPEC)
+                .lines()
+                .any(|line| line.contains(LENIENCY_OPEN)),
+            "the spec has no leniency rows"
+        );
+        assert_eq!(
+            check_leniency_rows(SPEC, UPSTREAM_ISSUES),
             Vec::<String>::new()
         );
     }

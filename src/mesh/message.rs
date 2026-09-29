@@ -16,7 +16,7 @@ use crate::mesh::propagation_fetch::{InboundMessage, InboundSink};
 use crate::mesh::protocol::describe_version;
 use crate::mesh::r3::{
     AdmittedRequest, DEFAULT_LINK_TIMEOUT, Handler, MESSAGE_PATH, NAME_HASH_LEN, OriginName,
-    R3Error, RefusalCode, Reply, RequestOptions, short,
+    R3Error, RefusalCode, Reply, RequestOptions, redact_hashes, short,
 };
 use crate::mesh::trust::{Decision, TrustStore};
 use crate::mesh::{canonical_hash, decode_hex, destination_address, display_text, hex_lower};
@@ -962,7 +962,10 @@ impl MeshRuntime {
                 });
             }
             Err(err) => {
-                debug!("Mesh {kind} {id} to {dest8} was not sent over the link: {err}");
+                debug!(
+                    "Mesh {kind} {id} to {dest8} was not sent over the link: {}",
+                    redact_hashes(&err.to_string())
+                );
                 return Err(SendError::Direct(err));
             }
         };
@@ -974,7 +977,8 @@ impl MeshRuntime {
             .map_err(|_| SendError::NoPropagationNode)?;
         let node_hex = node.destination.address_hash.to_hex_string();
         debug!(
-            "Mesh {kind} {id} to {dest8} could not be delivered over a link ({unreachable}); storing it with propagation node {}",
+            "Mesh {kind} {id} to {dest8} could not be delivered over a link ({}); storing it with propagation node {}",
+            redact_hashes(&unreachable.to_string()),
             short(&node_hex)
         );
         self.post_to_node(

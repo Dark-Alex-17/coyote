@@ -31,7 +31,7 @@ pub(crate) mod trust;
 pub(crate) use node::{MESH_ALREADY_ON, MeshPaths, MeshRuntime, MeshSlot, NodeOptions};
 pub(crate) use peers::PeerRecord;
 pub(crate) use propagation_nodes::PropagationNodeRecord;
-pub(crate) use r3::{RequestOptions, short};
+pub(crate) use r3::{RequestOptions, redact_hashes, short};
 
 use crate::config::sanitize_display_text;
 use anyhow::{Context, Result};
@@ -925,5 +925,513 @@ mod tests {
                 "{name} must be among the scanned mesh sources"
             );
         }
+    }
+
+    /// Words a log line may not interpolate or pass as an argument. The list mirrors
+    /// MESH-LOG-001: "a peer's message content or title, its `fields`, a knock introduction,
+    /// an envoy question or answer, a status card or any text of one, nor the human's brief,
+    /// objective or session name".
+    const UNLOGGABLE_WORDS: [&str; 15] = [
+        "content",
+        "body",
+        "brief",
+        "objective",
+        "session_name",
+        "title",
+        "fields",
+        "intro",
+        "question",
+        "card",
+        "hint",
+        "text",
+        "answer",
+        "reply",
+        "reply_text",
+    ];
+    /// Identifiers that carry a full identity or destination hash; each must be inside
+    /// `short(` where it is logged.
+    const HASH_WORDS: [&str; 11] = [
+        "fingerprint",
+        "hash",
+        "destination_hash",
+        "destination_hex",
+        "identity_hex",
+        "identity_hash",
+        "address_hash",
+        "source_identity",
+        "source_destination",
+        "identity",
+        "destination",
+    ];
+    /// Calls that render a hash in full; the receiver or first argument decides.
+    const HASH_CALLS: [&str; 2] = [".to_hex_string()", "hex_lower("];
+    /// Receivers whose hex is a per-link, per-request or per-message identifier, which
+    /// section 17 lets a log line carry in full.
+    const FULL_HEX_RECEIVERS: [&str; 6] = [
+        "link_id",
+        "link",
+        "request_id",
+        "transient",
+        "transient_id",
+        "message_id",
+    ];
+    const LOG_MACROS: [&str; 5] = ["debug!(", "trace!(", "info!(", "warn!(", "error!("];
+
+    /// The files section 17 governs: the mesh module without its test-only files, and the
+    /// mesh-facing files under config, function and repl.
+    fn redaction_scan_sources() -> Vec<PathBuf> {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut sources: Vec<PathBuf> = rust_sources()
+            .into_iter()
+            .filter(|path| {
+                !path.components().any(|c| c.as_os_str() == "conformance")
+                    && path.file_name().is_some_and(|name| name != "tests.rs")
+            })
+            .collect();
+        for entry in fs::read_dir(src.join("config")).unwrap() {
+            let path = entry.unwrap().path();
+            let is_mesh_file = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("mesh_") && name.ends_with(".rs"));
+            if is_mesh_file {
+                sources.push(path);
+            }
+        }
+        sources.push(src.join("function").join("mesh.rs"));
+        sources.push(src.join("repl").join("mesh.rs"));
+        sources
+    }
+
+    /// `source` line for line, so line numbers hold, with every `#[cfg(test)]`-attributed
+    /// inline module blanked and `//` comments removed, a `//` inside a string literal kept.
+    fn production_code(source: &str) -> Vec<String> {
+        let mut lines: Vec<String> = source
+            .lines()
+            .map(|line| strip_line_comment(line).to_string())
+            .collect();
+        let mut at = 0;
+        while at + 1 < lines.len() {
+            let opener = &lines[at + 1];
+            let opens_test_module = lines[at] == "#[cfg(test)]"
+                && opener.trim_end().ends_with('{')
+                && (opener.starts_with("mod ") || opener.starts_with("pub(crate) mod "));
+            if !opens_test_module {
+                at += 1;
+                continue;
+            }
+            let rest = lines[at + 1..].join("\n");
+            let open = rest.find('{').unwrap();
+            let close = matching_bracket(&rest, open, (b'{', b'}'))
+                .unwrap_or_else(|| panic!("line {}: no closing brace for the test module", at + 2));
+            let end = at + 1 + rest[..=close].matches('\n').count();
+            for line in &mut lines[at..=end] {
+                line.clear();
+            }
+            at = end + 1;
+        }
+        lines
+    }
+
+    /// `line` up to its first `//` outside a string literal; a `'"'` char literal does not
+    /// open one.
+    fn strip_line_comment(line: &str) -> &str {
+        let bytes = line.as_bytes();
+        let mut in_string = false;
+        let mut at = 0;
+        while at < bytes.len() {
+            match bytes[at] {
+                b'\\' if in_string => at += 1,
+                b'\'' if !in_string && bytes.get(at + 2) == Some(&b'\'') => at += 2,
+                b'"' => in_string = !in_string,
+                b'/' if !in_string && bytes.get(at + 1) == Some(&b'/') => return &line[..at],
+                _ => {}
+            }
+            at += 1;
+        }
+        line
+    }
+
+    /// Every log macro invocation in `lines` as (1-based line, text from the macro name to
+    /// its closing paren), string literals kept. An invocation whose closing paren is not
+    /// found is a scanner fault, so it panics rather than scanning a guess.
+    fn log_invocations(lines: &[String]) -> Vec<(usize, String)> {
+        let joined = lines.join("\n");
+        let mut found = Vec::new();
+        let mut from = 0;
+        while let Some((start, macro_name)) = LOG_MACROS
+            .iter()
+            .filter_map(|name| joined[from..].find(name).map(|at| (from + at, *name)))
+            .min()
+        {
+            let boundary_before = start == 0
+                || !joined.as_bytes()[start - 1].is_ascii_alphanumeric()
+                    && joined.as_bytes()[start - 1] != b'_';
+            if !boundary_before {
+                from = start + macro_name.len();
+                continue;
+            }
+            let open = start + macro_name.len() - 1;
+            let line = joined[..start].matches('\n').count() + 1;
+            let close = matching_paren(&joined, open)
+                .unwrap_or_else(|| panic!("line {line}: no closing paren for `{macro_name}`"));
+            found.push((line, joined[start..=close].to_string()));
+            from = close + 1;
+        }
+        found
+    }
+
+    /// The index of the `)` closing the `(` at `open`.
+    fn matching_paren(text: &str, open: usize) -> Option<usize> {
+        matching_bracket(text, open, (b'(', b')'))
+    }
+
+    /// The index of the `pair.1` closing the `pair.0` at `open`, skipping brackets inside
+    /// string and char literals.
+    fn matching_bracket(text: &str, open: usize, pair: (u8, u8)) -> Option<usize> {
+        let bytes = text.as_bytes();
+        let mut depth = 0;
+        let mut in_string = false;
+        let mut at = open;
+        while at < bytes.len() {
+            match bytes[at] {
+                b'\\' if in_string => at += 1,
+                b'\'' if !in_string && bytes.get(at + 2) == Some(&b'\'') => at += 2,
+                b'"' => in_string = !in_string,
+                byte if !in_string && byte == pair.0 => depth += 1,
+                byte if !in_string && byte == pair.1 => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(at);
+                    }
+                }
+                _ => {}
+            }
+            at += 1;
+        }
+        None
+    }
+
+    /// (code, string literal) pairs of an invocation; the last pair's literal is empty.
+    fn split_literals(text: &str) -> Vec<(String, String)> {
+        let mut parts = Vec::new();
+        let mut code = String::new();
+        let mut literal = String::new();
+        let mut in_string = false;
+        let mut chars = text.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                '\\' if in_string => {
+                    literal.push(c);
+                    literal.extend(chars.next());
+                }
+                '"' if in_string => {
+                    parts.push((std::mem::take(&mut code), std::mem::take(&mut literal)));
+                    in_string = false;
+                }
+                '"' => in_string = true,
+                _ if in_string => literal.push(c),
+                _ => code.push(c),
+            }
+        }
+        parts.push((code, String::new()));
+        parts
+    }
+
+    fn is_ident_byte(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric() || byte == b'_'
+    }
+
+    fn word_positions(text: &str, word: &str) -> Vec<usize> {
+        let bytes = text.as_bytes();
+        text.match_indices(word)
+            .filter(|(at, _)| {
+                at.checked_sub(1)
+                    .is_none_or(|before| !is_ident_byte(bytes[before]))
+                    && bytes
+                        .get(at + word.len())
+                        .is_none_or(|after| !is_ident_byte(*after))
+            })
+            .map(|(at, _)| at)
+            .collect()
+    }
+
+    /// The argument expression starting at `at`: up to the next `,` or `)` at its own depth.
+    fn argument_from(code: &str, at: usize) -> &str {
+        let bytes = code.as_bytes();
+        let mut depth = 0;
+        let mut end = at;
+        while end < bytes.len() {
+            match bytes[end] {
+                b'(' => depth += 1,
+                b')' if depth > 0 => depth -= 1,
+                b')' => break,
+                b',' if depth == 0 => break,
+                _ => {}
+            }
+            end += 1;
+        }
+        code[at..end].trim()
+    }
+
+    /// A tag, an id, a length or a party hash taken from a peer value is a count or a key,
+    /// not its text; the hash rules hold the party hash to `short(`.
+    fn is_tag_id_or_length(argument: &str) -> bool {
+        [
+            ".kind",
+            ".id",
+            ".message_id",
+            ".source_identity",
+            ".source_destination",
+            ".len()",
+            "len)",
+        ]
+        .iter()
+        .any(|suffix| argument.ends_with(suffix))
+    }
+
+    /// `{name}` and `{name:?}` placeholders of a format string.
+    fn placeholders(literal: &str) -> Vec<&str> {
+        literal
+            .split('{')
+            .skip(1)
+            .filter_map(|rest| {
+                let end = rest.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))?;
+                (rest[end..].starts_with('}') || rest[end..].starts_with(':')).then(|| &rest[..end])
+            })
+            .filter(|name| !name.is_empty())
+            .collect()
+    }
+
+    /// Whether any unclosed `(` before `at` is a `short(` call.
+    fn inside_short(code: &str, at: usize) -> bool {
+        let bytes = code.as_bytes();
+        let mut depth = 0;
+        for index in (0..at).rev() {
+            match bytes[index] {
+                b')' => depth += 1,
+                b'(' if depth > 0 => depth -= 1,
+                b'(' if code[..index].ends_with("short") => return true,
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// The last identifier segment of the receiver before `.to_hex_string()` at `at`, or of
+    /// the first argument after `hex_lower(` at `at`.
+    fn hex_subject(code: &str, at: usize, call: &str) -> String {
+        let bytes = code.as_bytes();
+        if call.starts_with('.') {
+            let start = (0..at)
+                .rev()
+                .find(|index| !(is_ident_byte(bytes[*index]) || bytes[*index] == b'.'))
+                .map_or(0, |index| index + 1);
+            code[start..at].rsplit('.').next().unwrap_or("").to_string()
+        } else {
+            code[at + call.len()..]
+                .trim_start_matches(['&', ' '])
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '.')
+                .collect::<String>()
+                .rsplit('.')
+                .next()
+                .unwrap_or("")
+                .to_string()
+        }
+    }
+
+    /// The section 17 violations in one log invocation.
+    fn redaction_violations(invocation: &str) -> Vec<String> {
+        let mut violations = Vec::new();
+        for (code, literal) in split_literals(invocation) {
+            for name in placeholders(&literal) {
+                if UNLOGGABLE_WORDS.contains(&name) {
+                    violations.push(format!("interpolates `{{{name}}}`"));
+                }
+                if HASH_WORDS.contains(&name) {
+                    violations.push(format!("interpolates the full hash `{{{name}}}`"));
+                }
+            }
+            for word in UNLOGGABLE_WORDS {
+                for at in word_positions(&code, word) {
+                    if !is_tag_id_or_length(argument_from(&code, at)) {
+                        violations.push(format!("passes `{word}`"));
+                    }
+                }
+            }
+            for word in HASH_WORDS {
+                for at in word_positions(&code, word) {
+                    if !inside_short(&code, at) {
+                        violations.push(format!("passes `{word}` outside short()"));
+                    }
+                }
+            }
+            for call in HASH_CALLS {
+                for (at, _) in code.match_indices(call) {
+                    let subject = hex_subject(&code, at, call);
+                    if !FULL_HEX_RECEIVERS.contains(&subject.as_str()) && !inside_short(&code, at) {
+                        violations
+                            .push(format!("renders `{subject}` with `{call}` outside short()"));
+                    }
+                }
+            }
+        }
+        violations
+    }
+
+    #[test]
+    fn redaction_scanner_flags_each_rule_and_passes_the_permitted_forms() {
+        let flagged: [(&str, &[&str]); 14] = [
+            ("debug!(\"got {content}\")", &["interpolates `{content}`"]),
+            ("debug!(\"{content:?}\")", &["interpolates `{content}`"]),
+            ("debug!(\"got {}\", message.title)", &["passes `title`"]),
+            ("debug!(\"sent {}\", answer)", &["passes `answer`"]),
+            ("debug!(\"{reply_text}\")", &["interpolates `{reply_text}`"]),
+            (
+                "warn!(\"knock from {fingerprint}\")",
+                &["interpolates the full hash `{fingerprint}`"],
+            ),
+            (
+                "debug!(\"aged out {hash}\")",
+                &["interpolates the full hash `{hash}`"],
+            ),
+            (
+                "debug!(\"peer {}\", identity_hex)",
+                &["passes `identity_hex` outside short()"],
+            ),
+            (
+                "info!(\"peer {}\", destination.address_hash.to_hex_string())",
+                &[
+                    "passes `address_hash` outside short()",
+                    "passes `destination` outside short()",
+                    "renders `address_hash` with `.to_hex_string()` outside short()",
+                ],
+            ),
+            (
+                "debug!(\"peer {}\", identity.to_hex_string())",
+                &[
+                    "passes `identity` outside short()",
+                    "renders `identity` with `.to_hex_string()` outside short()",
+                ],
+            ),
+            (
+                "debug!(\"id {}\", hex_lower(advertised))",
+                &["renders `advertised` with `hex_lower(` outside short()"],
+            ),
+            (
+                "debug!(\n    \"multi {}\",\n    peer.destination_hash\n)",
+                &["passes `destination_hash` outside short()"],
+            ),
+            (
+                "debug!(\"{} // {}\", body.kind, message.content)",
+                &["passes `content`"],
+            ),
+            (
+                "debug!(\"from {}\", reply.source_identity)",
+                &["passes `source_identity` outside short()"],
+            ),
+        ];
+        for (text, violations) in flagged {
+            let invocations = log_invocations(&production_code(text));
+            assert_eq!(invocations.len(), 1, "{text}");
+            assert_eq!(
+                redaction_violations(&invocations[0].1),
+                violations,
+                "{text}"
+            );
+        }
+        let permitted = [
+            "debug!(\"peer {}\", short(&identity_hex))",
+            "debug!(\"peer {}\", short(&destination.address_hash.to_hex_string()))",
+            "debug!(\"resource {}\", short(&crate::mesh::hex_lower(hash.as_slice())))",
+            "debug!(\"link {}\", link_id.to_hex_string())",
+            "debug!(\"request {} on link {}\", request_id.to_hex_string(), event.link_id.to_hex_string())",
+            "debug!(\"transient {}\", hex_lower(transient))",
+            "debug!(\"({} bytes) body-free text: {}\", count, len)",
+            "debug!(\"{} {}\", body.kind, body.id)",
+            "debug!(\"reply {} from {}\", reply.message_id, short(&reply.source_identity))",
+            "debug!(\"{} bytes\", message.content.as_ref().map_or(0, Vec::len))",
+            "debug!(\"{} chars\", intro.len())",
+        ];
+        for text in permitted {
+            let lines = vec![text.to_string()];
+            for (_, invocation) in log_invocations(&lines) {
+                assert_eq!(
+                    redaction_violations(&invocation),
+                    Vec::<String>::new(),
+                    "{text}"
+                );
+            }
+        }
+        for opener in ["mod tests {", "pub(crate) mod x {"] {
+            let source = format!(
+                "fn a() {{\n    debug!(\"x\");\n}}\n#[cfg(test)]\n{opener}\n    debug!(\"{{content}}\");\n}}\n"
+            );
+            assert_eq!(
+                log_invocations(&production_code(&source)).len(),
+                1,
+                "{opener}"
+            );
+        }
+        let after_helpers = "#[cfg(test)]\nmod helpers {\n    fn a() {\n        let _ = '{';\n        debug!(\"{content} }}\");\n    }\n}\n\nfn b() {\n    debug!(\"{content}\");\n}\n";
+        let invocations = log_invocations(&production_code(after_helpers));
+        assert_eq!(
+            invocations
+                .iter()
+                .map(|(line, invocation)| (*line, redaction_violations(invocation)))
+                .collect::<Vec<_>>(),
+            [(10, vec!["interpolates `{content}`".to_string()])]
+        );
+        assert_eq!(
+            production_code("debug!(\"a // b\"); // debug!(\"{content}\")"),
+            ["debug!(\"a // b\"); "]
+        );
+        assert_eq!(
+            production_code("x.replace('\"', \"'\"); // debug!(\"{content}\")"),
+            ["x.replace('\"', \"'\"); "]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "no closing paren for `debug!(`")]
+    fn redaction_scanner_refuses_an_unclosed_log_macro() {
+        log_invocations(&["debug!(\"open".to_string()]);
+    }
+
+    #[test]
+    #[should_panic(expected = "line 2: no closing brace for the test module")]
+    fn redaction_scanner_refuses_an_unclosed_test_module() {
+        production_code("#[cfg(test)]\nmod helpers {\n    fn a() {}\n");
+    }
+
+    #[test]
+    fn mesh_log_lines_never_carry_peer_text_or_a_full_hash() {
+        let sources = redaction_scan_sources();
+        let mut hits = Vec::new();
+        let mut repl_invocations = 0;
+        for path in &sources {
+            let source = fs::read_to_string(path).unwrap();
+            let invocations = log_invocations(&production_code(&source));
+            if path.ends_with("repl/mesh.rs") {
+                repl_invocations = invocations.len();
+            }
+            for (line, invocation) in invocations {
+                for violation in redaction_violations(&invocation) {
+                    hits.push(format!("{}:{line}: {violation}", path.display()));
+                }
+            }
+        }
+        assert!(
+            repl_invocations > 0,
+            "the scan must reach the production log line in src/repl/mesh.rs"
+        );
+        assert!(
+            sources
+                .iter()
+                .any(|path| path.ends_with("config/mesh_envoy.rs")),
+            "the scan must reach the mesh-facing config files"
+        );
+        assert_eq!(hits, Vec::<String>::new(), "log lines violating section 17");
     }
 }

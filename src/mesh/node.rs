@@ -38,7 +38,7 @@ use crate::mesh::protocol::{Compatibility, MESH_PROTOCOL_MIN_SUPPORTED, MESH_PRO
 use crate::mesh::r3::RequestHandler;
 use crate::mesh::r3::{
     Dispatcher, Envelope, KNOCK_PATH, MESSAGE_PATH, OriginName, R3Client, R3Error, R3Server,
-    RefusalCode, RequestOptions, RequestOutcome, RequestReceipt, STATUS_PATH, short,
+    RefusalCode, RequestOptions, RequestOutcome, RequestReceipt, STATUS_PATH, redact_hashes, short,
 };
 use crate::mesh::snapshot::MeshSnapshot;
 use crate::mesh::trust::TrustStore;
@@ -351,8 +351,9 @@ impl MeshRuntime {
             }
         }
         debug!(
-            "Started mesh node {fingerprint} (instance {instance_id}) as destination {}",
-            hash.to_hex_string()
+            "Started mesh node {} (instance {instance_id}) as destination {}",
+            short(&fingerprint),
+            short(&hash.to_hex_string())
         );
 
         // Nothing fallible may follow: a failure once the tasks exist would leak them.
@@ -774,7 +775,10 @@ impl MeshRuntime {
             Err(R3Error::NotRunning | R3Error::Shutdown) => return Err(KnockError::NotRunning),
             Err(err @ R3Error::UnsupportedVersion { .. }) => return Err(KnockError::Direct(err)),
             Err(err) => {
-                debug!("Mesh knock to {dest8} was not filed over the link: {err}");
+                debug!(
+                    "Mesh knock to {dest8} was not filed over the link: {}",
+                    redact_hashes(&err.to_string())
+                );
                 return Err(KnockError::Direct(err));
             }
         };
@@ -786,7 +790,8 @@ impl MeshRuntime {
             .map_err(|_| KnockError::NoPropagationNode)?;
         let node_hex = node.destination.address_hash.to_hex_string();
         debug!(
-            "Mesh knock to {dest8} could not be delivered over a link ({unreachable}); storing it with propagation node {}",
+            "Mesh knock to {dest8} could not be delivered over a link ({}); storing it with propagation node {}",
+            redact_hashes(&unreachable.to_string()),
             short(&node_hex)
         );
         self.post_to_node(
@@ -952,16 +957,16 @@ impl MeshRuntime {
         {
             warn!(
                 "The mesh transport did not release destination {} within {}s; it stays registered until the node stops",
-                state.hash.to_hex_string(),
+                short(&state.hash.to_hex_string()),
                 REKEY_GRACE.as_secs()
             );
         }
         debug!(
             "Re-keyed mesh node {} from instance {} to fork instance {} (destination {})",
-            self.fingerprint,
+            short(&self.fingerprint),
             state.instance_id,
             rekey.fork_instance_id,
-            hash.to_hex_string()
+            short(&hash.to_hex_string())
         );
         *state = DestinationState {
             dest,
@@ -980,12 +985,14 @@ impl MeshRuntime {
             match timeout_at(deadline, self.send_announce(&mut state, &transport)).await {
                 Ok(Ok(())) => {}
                 Ok(Err(err)) => warn!(
-                    "Failed to announce mesh node {} for fork instance {} after re-keying; the heartbeat will announce it: {err:#}",
-                    self.fingerprint, state.instance_id
+                    "Failed to announce mesh node {} for fork instance {} after re-keying; the heartbeat will announce it: {}",
+                    short(&self.fingerprint),
+                    state.instance_id,
+                    redact_hashes(&format!("{err:#}"))
                 ),
                 Err(_) => warn!(
                     "Mesh node {} did not announce fork instance {} within {}s of re-keying; the heartbeat will announce it",
-                    self.fingerprint,
+                    short(&self.fingerprint),
                     state.instance_id,
                     REKEY_GRACE.as_secs()
                 ),
@@ -1029,7 +1036,7 @@ impl MeshRuntime {
         {
             warn!(
                 "Mesh destination {} could not be deregistered within {}s; dropping the transport",
-                state.hash.to_hex_string(),
+                short(&state.hash.to_hex_string()),
                 SHUTDOWN_GRACE.as_secs()
             );
         }
@@ -1040,9 +1047,9 @@ impl MeshRuntime {
         }
         debug!(
             "Stopped mesh node {} (instance {}, destination {})",
-            self.fingerprint,
+            short(&self.fingerprint),
             state.instance_id,
-            state.hash.to_hex_string()
+            short(&state.hash.to_hex_string())
         );
         Ok(())
     }
@@ -1111,7 +1118,7 @@ async fn announce_destination(
     transport.send_packet(packet).await;
     debug!(
         "Sent mesh announce for destination {}",
-        hash.to_hex_string()
+        short(&hash.to_hex_string())
     );
     Ok(Instant::now())
 }
@@ -1310,11 +1317,15 @@ fn record_announce(
     now: SystemTime,
 ) -> Option<FiledAnnounce> {
     let Some(decoded) = AnnounceAppData::decode(app_data) else {
-        debug!("Ignored announce from {destination_hash} ({hops} hops): not a Coyote node");
+        debug!(
+            "Ignored announce from {} ({hops} hops): not a Coyote node",
+            short(&destination_hash)
+        );
         return None;
     };
     debug!(
-        "Received mesh announce from {destination_hash} ({hops} hops, protocol version {})",
+        "Received mesh announce from {} ({hops} hops, protocol version {})",
+        short(&destination_hash),
         decoded.version
     );
     let compatibility = Compatibility::of(decoded.version);
@@ -1336,8 +1347,8 @@ fn record_announce(
         now,
     );
     match change {
-        PeerChange::Added => debug!("Added mesh peer {destination_hash}"),
-        PeerChange::Refreshed => debug!("Refreshed mesh peer {destination_hash}"),
+        PeerChange::Added => debug!("Added mesh peer {}", short(&destination_hash)),
+        PeerChange::Refreshed => debug!("Refreshed mesh peer {}", short(&destination_hash)),
     }
     Some(FiledAnnounce {
         change,
@@ -1592,7 +1603,7 @@ async fn receive_announces(
 
 fn log_aged_out_peers(aged_out: &[String]) {
     for hash in aged_out {
-        debug!("Aged out mesh peer {hash}");
+        debug!("Aged out mesh peer {}", short(hash));
     }
 }
 
@@ -1635,7 +1646,10 @@ async fn announce_periodically(runtime: Arc<MeshRuntime>, cancel: CancellationTo
             () = cancel.cancelled() => break,
             _ = ticks.tick() => {
                 if let Err(err) = runtime.announce_now().await {
-                    warn!("Failed to send the mesh heartbeat announce: {err:#}");
+                    warn!(
+                        "Failed to send the mesh heartbeat announce: {}",
+                        redact_hashes(&format!("{err:#}"))
+                    );
                 }
             }
         }
@@ -2193,7 +2207,10 @@ impl MeshSlot {
         ) {
             Ok(out) => out,
             Err(err) => {
-                warn!("Mesh refusal of {id} to instance {dest8} could not be built: {err}");
+                warn!(
+                    "Mesh refusal of {id} to instance {dest8} could not be built: {}",
+                    redact_hashes(&err.to_string())
+                );
                 return;
             }
         };
@@ -2203,7 +2220,10 @@ impl MeshSlot {
                 let id = id.to_string();
                 handle.spawn(async move {
                     if let Err(err) = runtime.send_peer(&destination, &out).await {
-                        warn!("Mesh refusal of {id} to instance {dest8} could not be sent: {err}");
+                        warn!(
+                            "Mesh refusal of {id} to instance {dest8} could not be sent: {}",
+                            redact_hashes(&err.to_string())
+                        );
                     }
                 });
             }
@@ -4754,16 +4774,23 @@ mod tests {
         assert_eq!(ignored, None);
         assert_eq!(aged_out, vec![coyote_hash.to_string()]);
         let debugs = debug_snapshot();
+        let (coyote8, other8) = (short(coyote_hash), short(other_hash));
         assert_logged(
             &debugs,
-            &format!("Received mesh announce from {coyote_hash} (2 hops, protocol version 1)"),
+            &format!("Received mesh announce from {coyote8} (2 hops, protocol version 1)"),
         );
-        assert_logged(&debugs, &format!("Added mesh peer {coyote_hash}"));
+        assert_logged(&debugs, &format!("Added mesh peer {coyote8}"));
         assert_logged(
             &debugs,
-            &format!("Ignored announce from {other_hash} (1 hops): not a Coyote node"),
+            &format!("Ignored announce from {other8} (1 hops): not a Coyote node"),
         );
-        assert_logged(&debugs, &format!("Aged out mesh peer {coyote_hash}"));
+        assert_logged(&debugs, &format!("Aged out mesh peer {coyote8}"));
+        assert!(
+            debugs
+                .iter()
+                .all(|message| !message.contains(coyote_hash) && !message.contains(other_hash)),
+            "a log line carries a full hash: {debugs:#?}"
+        );
     }
 
     #[test]
@@ -5102,23 +5129,30 @@ mod tests {
         }
 
         let debugs = debug_snapshot();
+        let (fingerprint8, hash8) = (short(&fingerprint), short(&hash));
         assert_logged(
             &debugs,
             &format!(
-                "Started mesh node {fingerprint} (instance {instance_id}) as destination {hash}"
+                "Started mesh node {fingerprint8} (instance {instance_id}) as destination {hash8}"
             ),
         );
         assert_logged(&debugs, &format!("Joined mesh interface {interface}"));
         assert_logged(
             &debugs,
-            &format!("Sent mesh announce for destination {hash}"),
+            &format!("Sent mesh announce for destination {hash8}"),
         );
         assert_logged(&debugs, &format!("Left mesh interface {interface}"));
         assert_logged(
             &debugs,
             &format!(
-                "Stopped mesh node {fingerprint} (instance {instance_id}, destination {hash})"
+                "Stopped mesh node {fingerprint8} (instance {instance_id}, destination {hash8})"
             ),
+        );
+        assert!(
+            debugs
+                .iter()
+                .all(|message| !message.contains(&fingerprint) && !message.contains(&hash)),
+            "a log line carries a full hash: {debugs:#?}"
         );
     }
 
@@ -6148,10 +6182,10 @@ mod tests {
     }
 
     /// The debug lines logged after `mark` that report a link to `destination_hex` coming
-    /// up: `open_link` names the full hash, so the filter is this test's own.
+    /// up: `open_link` names the truncated hash, so the filter is this test's own.
     #[cfg(unix)]
     fn links_opened_since(mark: usize, destination_hex: &str) -> Vec<String> {
-        let needle = format!("to destination {destination_hex} is active");
+        let needle = format!("to destination {} is active", short(destination_hex));
         debug_snapshot()
             .into_iter()
             .skip(mark)

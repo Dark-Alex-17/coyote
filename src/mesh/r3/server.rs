@@ -4,7 +4,7 @@ use crate::mesh::r3::error::{R3Error, RefusalCode};
 use crate::mesh::r3::frame::{
     MAX_R3_PAYLOAD_BYTES, PathHash, RequestFrame, RequestId, ResponseFrame,
 };
-use crate::mesh::r3::short;
+use crate::mesh::r3::{redact_hashes, short};
 
 use async_trait::async_trait;
 use parking_lot::{Mutex, RwLock};
@@ -339,9 +339,10 @@ impl R3Server {
                     Ok(frame) => frame,
                     Err(err) => {
                         debug!(
-                            "Dropped an undecodable mesh request {} on link {}: {err}",
+                            "Dropped an undecodable mesh request {} on link {}: {}",
                             request_id.to_hex_string(),
-                            link_id.to_hex_string()
+                            link_id.to_hex_string(),
+                            redact_hashes(&err.to_string())
                         );
                         return;
                     }
@@ -378,9 +379,10 @@ impl R3Server {
                 {
                     Ok(Ok(())) => {}
                     Ok(Err(err)) => warn!(
-                        "Failed to send mesh response {} on link {}: {err}",
+                        "Failed to send mesh response {} on link {}: {}",
                         request_id.to_hex_string(),
-                        link_id.to_hex_string()
+                        link_id.to_hex_string(),
+                        redact_hashes(&err.to_string())
                     ),
                     Err(_) => warn!(
                         "Mesh response {} on link {} was not sent within {}s; gave up on it",
@@ -431,9 +433,9 @@ fn resource_request_id(complete: &ResourceComplete) -> RequestId {
     if let Some(advertised) = &complete.request_id
         && advertised.as_slice() != request_id.as_bytes()
     {
+        let advertised_request_id = hex_lower(advertised);
         debug!(
-            "Mesh request resource advertised id {} but its bytes hash to {}",
-            hex_lower(advertised),
+            "Mesh request resource advertised id {advertised_request_id} but its bytes hash to {}",
             request_id.to_hex_string()
         );
     }

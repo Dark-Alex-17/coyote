@@ -31,7 +31,7 @@ use crate::mesh::pending::{
     INBOUND_ENVOY_QUESTION_MAX_CHARS, INBOUND_RECORD_VERSION, InboundRecord,
     PENDING_QUESTION_MAX_CHARS,
 };
-use crate::mesh::{display_text, rfc3339_utc, short};
+use crate::mesh::{display_text, redact_hashes, rfc3339_utc, short};
 use crate::supervisor::escalation::{EscalationQueue, EscalationRequest};
 use crate::utils::{AbortSignal, create_abort_signal};
 
@@ -745,7 +745,7 @@ impl EnvoyRunner {
                 Some(format!("unavailable: {reason}")),
             ),
             EnvoyOutcome::Failed(err) => {
-                warn!("Mesh envoy run for {id} failed: {err}");
+                warn!("Mesh envoy run for {id} failed: {}", redact_hashes(err));
                 (
                     "this node cannot answer right now".to_string(),
                     Some(err.clone()),
@@ -778,7 +778,10 @@ impl EnvoyRunner {
             (_, Err(err)) => Some(err.to_string()),
         };
         if let Some(why) = unsent {
-            warn!("Mesh envoy reply to {id} could not be sent: {why}");
+            warn!(
+                "Mesh envoy reply to {id} could not be sent: {}",
+                redact_hashes(&why)
+            );
             let retry = if settles_question {
                 format!("; the question stays open for `.mesh answer {id}`")
             } else {

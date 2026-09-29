@@ -1,5 +1,5 @@
 use crate::config::paths;
-use crate::mesh::mesh_config_dir;
+use crate::mesh::{mesh_config_dir, short};
 
 use anyhow::{Context, Result, bail};
 use lxmf_core::identity::PrivateIdentity;
@@ -15,7 +15,8 @@ pub(crate) fn identity_path() -> PathBuf {
     mesh_config_dir(&paths::config_dir()).join("identity.key")
 }
 
-/// The identity's address hash as hex. This is what peers see, so it is safe to log.
+/// The identity's address hash as hex. This is what peers see; log lines still truncate it
+/// with `short`, like every other hash.
 pub(crate) fn fingerprint(identity: &PrivateIdentity) -> String {
     identity.address_hash().to_hex_string()
 }
@@ -44,7 +45,7 @@ pub(crate) fn load_or_mint_identity(path: &Path) -> Result<PrivateIdentity> {
     }
     match write_owner_only_file(path, &identity.to_private_key_bytes()) {
         Ok(()) => {
-            debug!("Minted mesh identity {}", fingerprint(&identity));
+            debug!("Minted mesh identity {}", short(&fingerprint(&identity)));
             Ok(identity)
         }
         // Another process minted first; its key is the one every later start will load.

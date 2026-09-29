@@ -3,7 +3,7 @@ use crate::mesh::node::MeshSlot;
 use crate::mesh::peers::{PeerRecord, PeerTable};
 use crate::mesh::{
     canonical_hash, decode_hex, destination_address, mesh_config_dir, parse_rfc3339, rfc3339_utc,
-    write_atomically,
+    short, write_atomically,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -262,33 +262,41 @@ enum TrustMutation {
     },
 }
 
+/// The log rendering: every hash truncated with `short`, as MESH-LOG-002 requires of a log
+/// line; the only reader is `TrustStore::commit`'s debug line.
 impl fmt::Display for TrustMutation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::TrustDestination { destination, .. } => {
-                write!(f, "trust destination {destination}")
+                write!(f, "trust destination {}", short(destination))
             }
-            Self::TrustIdentity { identity, .. } => write!(f, "trust identity {identity}"),
+            Self::TrustIdentity { identity, .. } => {
+                write!(f, "trust identity {}", short(identity))
+            }
             Self::UntrustDestination { destination, .. } => {
-                write!(f, "untrust destination {destination}")
+                write!(f, "untrust destination {}", short(destination))
             }
             Self::UntrustIdentity {
                 identity, removed, ..
             } => write!(
                 f,
-                "untrust identity {identity} (+{} destinations)",
+                "untrust identity {} (+{} destinations)",
+                short(identity),
                 removed.len()
             ),
             Self::BlockIdentity {
                 identity, removed, ..
             } => write!(
                 f,
-                "block identity {identity} (+{} destinations)",
+                "block identity {} (+{} destinations)",
+                short(identity),
                 removed.len()
             ),
-            Self::UnblockIdentity { identity } => write!(f, "unblock identity {identity}"),
-            Self::Deny { destination } => write!(f, "deny {destination}"),
-            Self::Undeny { destination } => write!(f, "undeny {destination}"),
+            Self::UnblockIdentity { identity } => {
+                write!(f, "unblock identity {}", short(identity))
+            }
+            Self::Deny { destination } => write!(f, "deny {}", short(destination)),
+            Self::Undeny { destination } => write!(f, "undeny {}", short(destination)),
             Self::Prune { stale } => write!(f, "prune {} destinations", stale.len()),
         }
     }
@@ -1766,6 +1774,61 @@ mod tests {
 
         assert!(err.contains("does not match"), "{err}");
         assert_eq!(fx.file_bytes(), None);
+    }
+
+    #[test]
+    fn trust_mutation_renders_every_hash_truncated() {
+        let identity = fake_hash(0xab);
+        let destination = fake_hash(0xcd);
+        let mutations = [
+            TrustMutation::TrustDestination {
+                destination: destination.clone(),
+                identity: identity.clone(),
+                change: TrustChange::Added,
+            },
+            TrustMutation::TrustIdentity {
+                identity: identity.clone(),
+                granted: true,
+            },
+            TrustMutation::UntrustDestination {
+                destination: destination.clone(),
+                identity: identity.clone(),
+            },
+            TrustMutation::UntrustIdentity {
+                identity: identity.clone(),
+                was_granting: true,
+                removed: vec![destination.clone()],
+            },
+            TrustMutation::BlockIdentity {
+                identity: identity.clone(),
+                was_granting: false,
+                removed: vec![destination.clone()],
+            },
+            TrustMutation::UnblockIdentity {
+                identity: identity.clone(),
+            },
+            TrustMutation::Deny {
+                destination: destination.clone(),
+            },
+            TrustMutation::Undeny {
+                destination: destination.clone(),
+            },
+            TrustMutation::Prune {
+                stale: vec![(destination.clone(), identity.clone())],
+            },
+        ];
+        for mutation in &mutations {
+            let rendered = mutation.to_string();
+            assert!(!rendered.contains(&identity), "{rendered}");
+            assert!(!rendered.contains(&destination), "{rendered}");
+            let names_a_short_hash =
+                rendered.contains(short(&identity)) || rendered.contains(short(&destination));
+            assert_eq!(
+                names_a_short_hash,
+                !matches!(mutation, TrustMutation::Prune { .. }),
+                "{rendered}"
+            );
+        }
     }
 
     #[test]

@@ -81,8 +81,11 @@ enum Case {
     HandlerTimeout,
     /// A requester that hears nothing ends in `Timeout` after its request timeout.
     RequestTimeout,
-    /// A link that never comes up ends the request in `LinkFailed`.
+    /// A link that never comes up ends the request in `Timeout` at the link timeout.
     LinkTimeout,
+    /// A destination the transport has no path to ends the request in `LinkFailed` at once,
+    /// naming the destination truncated.
+    NoKnownPath,
     /// A wire version refusal with this window marks the peer `Incompatible { found: marked }`.
     VersionMark {
         min: u16,
@@ -113,6 +116,7 @@ impl Case {
             Self::HandlerTimeout => "HandlerTimeout",
             Self::RequestTimeout => "RequestTimeout",
             Self::LinkTimeout => "LinkTimeout",
+            Self::NoKnownPath => "NoKnownPath",
             Self::VersionMark { .. } => "VersionMark",
             Self::IncompatibleOutbound { .. } => "IncompatibleOutbound",
             Self::OtherKnockRefusal { .. } => "OtherKnockRefusal",
@@ -244,10 +248,13 @@ const VECTORS: &[Vector] = &[
         id: "MESH-TIME-009",
         kind: Kind::Invalid,
         case: Case::LinkTimeout,
-        known_divergence: Some(
-            "open_link maps a link that never activates to R3Error::Timeout (deadline.expired, \
-             src/mesh/r3/client.rs), not the LinkFailed the spec names",
-        ),
+        known_divergence: None,
+    },
+    Vector {
+        id: "MESH-TIME-011",
+        kind: Kind::Invalid,
+        case: Case::NoKnownPath,
+        known_divergence: None,
     },
     Vector {
         id: "MESH-VER-013",
@@ -424,7 +431,7 @@ mod loopback {
     use crate::mesh::r3::{
         Deadline, MAX_CONCURRENT_INBOUND_REQUESTS, MAX_R3_PAYLOAD_BYTES, R3Error, R3Server,
         RefusalCode, Reply, RequestFrame, RequestId, RequestOptions, ResponseFrame, STATUS_PATH,
-        SizeBranch, open_link,
+        SizeBranch, open_link, short,
     };
     use crate::mesh::test_support::{
         INTEROP_TIMEOUT, LEGACY_LINK_MTU, StartedRuntime, started_runtime_on, wait_until,
@@ -434,7 +441,7 @@ mod loopback {
 
     use rand_core::OsRng;
     use rmpv::Value;
-    use rns_transport::destination::{DestinationDesc, DestinationName};
+    use rns_transport::destination::{DestinationDesc, DestinationName, SingleInputDestination};
     use rns_transport::identity::PrivateIdentity as TransportIdentity;
     use rns_transport::iface::InterfaceSharedConfig;
     use rns_transport::iface::tcp_client::TcpClient;
@@ -467,9 +474,11 @@ mod loopback {
             Case::WrongLink | Case::UndecodableFrame | Case::InboundCap | Case::HandlerSlots => {
                 Group::Drops
             }
-            Case::OutboundCap | Case::HandlerTimeout | Case::RequestTimeout | Case::LinkTimeout => {
-                Group::Timeouts
-            }
+            Case::OutboundCap
+            | Case::HandlerTimeout
+            | Case::RequestTimeout
+            | Case::LinkTimeout
+            | Case::NoKnownPath => Group::Timeouts,
             Case::VersionMark { .. } | Case::IncompatibleOutbound { .. } => Group::Versions,
             Case::OtherKnockRefusal { .. } | Case::UnacknowledgedReply { .. } => Group::Outcomes,
         }
@@ -552,6 +561,7 @@ mod loopback {
             Case::HandlerTimeout => handler_timeout().await,
             Case::RequestTimeout => request_timeout().await,
             Case::LinkTimeout => link_timeout().await,
+            Case::NoKnownPath => no_known_path().await,
             Case::VersionMark { min, max, marked } => version_mark(min, max, marked).await,
             Case::IncompatibleOutbound { via } => incompatible_outbound(via).await,
             Case::OtherKnockRefusal { reply } => other_knock_refusal(reply).await,
@@ -1000,9 +1010,47 @@ mod loopback {
             .await
             .unwrap_err();
 
-        assert!(matches!(err, R3Error::LinkFailed(_)), "{err:?}");
+        assert!(matches!(err, R3Error::Timeout { .. }), "{err:?}");
         assert_eq!(recorder.seen_count(), 0);
         requester.stop().await;
+    }
+
+    /// A destination nobody serves and the requester has never heard announced, so the
+    /// transport holds no path to it and the request fails before a link is attempted.
+    async fn no_known_path() {
+        let recorder = Arc::new(Recorder::default());
+        let (responder, requester, _desc) = pair(recorder.clone()).await;
+        let ghost = SingleInputDestination::new(
+            TransportIdentity::new_from_rand(OsRng),
+            DestinationName::new("coyote", "mesh.ghost"),
+        )
+        .desc;
+        let ghost_hex = ghost.address_hash.to_hex_string();
+
+        let err = requester
+            .client
+            .request(
+                &requester.transport,
+                &requester.identity,
+                &ghost,
+                ECHO_PATH,
+                requester.envelope(Value::Nil),
+                RequestOptions {
+                    link_timeout: SHORT_LINK_TIMEOUT,
+                    request_timeout: SHORT_REQUEST_TIMEOUT,
+                },
+            )
+            .await
+            .unwrap_err();
+
+        let R3Error::LinkFailed(reason) = err else {
+            panic!("expected LinkFailed for a destination without a path, got {err:?}");
+        };
+        assert!(reason.contains(short(&ghost_hex)), "{reason}");
+        assert!(!reason.contains(&ghost_hex), "{reason}");
+        assert_eq!(recorder.seen_count(), 0);
+        requester.stop().await;
+        responder.stop().await;
     }
 
     /// A runtime whose only peer is a recorder-backed responder that announced `version`.
@@ -1088,7 +1136,7 @@ mod loopback {
 
         /// The debug lines since `mark` that report a link to the responder coming up.
         fn links_opened_since(&self, mark: usize) -> Vec<String> {
-            let needle = format!("to destination {} is active", self.destination_hex);
+            let needle = format!("to destination {} is active", short(&self.destination_hex));
             debug_snapshot()
                 .into_iter()
                 .skip(mark)

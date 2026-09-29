@@ -1,6 +1,6 @@
 # Coyote Mesh Protocol, version 1: wire format
 
-Status: normative. This document specifies the bytes that Coyote instances exchange over Reticulum. The reference implementation is `src/mesh/` in this repository; every value below is the code's value, named by its constant and by the test that pins it. Companion documents: the Security Considerations document (forthcoming under docs/mesh/) and the conformance vector suite (forthcoming as cfg(test) modules under src/mesh/).
+Status: normative. This document specifies the bytes that Coyote instances exchange over Reticulum. The reference implementation is `src/mesh/` in this repository; every value below is the code's value, named by its constant and by the test that pins it. Security considerations are section 15, invariants section 16, log redaction section 17 and the leniency register section 18; the conformance vector suite is the `cfg(test)` module `src/mesh/conformance/`, and section 20 maps every requirement id to what exercises it.
 
 ## 1. Introduction and scope
 
@@ -15,15 +15,17 @@ This document specifies:
 (e) the request paths `/knock`, `/status` and `/message` (sections 8 to 10);
 (f) store-and-forward through LXMF propagation nodes, outbound and inbound (section 11);
 (g) extensibility and code-point rules (sections 12 and 13);
-(h) the canonical forms applied before any peer datum is compared or displayed (section 3).
+(h) the canonical forms applied before any peer datum is compared or displayed (section 3);
+(i) security considerations, invariants, log redaction and the leniency register (sections 15 to 18);
+(j) the conformance coverage of every requirement (section 20).
 
 This document does not specify:
 
-- Security. Security considerations, invariants and the threat model are specified in the companion Security Considerations document (forthcoming under docs/mesh/), not here. Cryptographic agility is inherited from Reticulum and out of scope.
+- Cryptography. Identity keys, Link encryption, signatures and cryptographic agility are Reticulum's and LXMF's; section 15 states what this document relies on them for and specifies no cipher, key size or negotiation of its own.
 - The human-facing `.mesh` REPL surface and its output text, except where a stored or shown value fixes a wire form.
 - On-disk formats, except where a stored form fixes a canonical form (section 3) or a wire value (the knock record, section 8.4).
 
-Section 15 is the single authoritative listing of constants; every constant named in prose is written as `NAME` with its value and is listed there.
+Section 19 is the single authoritative listing of constants; every constant named in prose is written as `NAME` with its value and is listed there.
 
 ## 2. Conventions and requirements language
 
@@ -42,7 +44,7 @@ Notation:
 - Per-field tables for maps have the columns `Field`, `Type`, `Sender puts`, `Receiver action on any other value`. The last column states what the receiver does for a missing key, a wrong type, an out-of-range value, and (final row) an unknown key. Positional layouts (byte offsets, array elements, announce slots) use `Bytes`, `Element` or `Slot` in place of `Field` and carry the same three remaining columns; their final row covers the bytes, elements or slots this document does not name.
 - Byte listings are hex with `<n>` standing for `n` bytes of variable content, for example `92 c4 10 <16>`.
 
-Requirement ids have the form `MESH-<AREA>-<NNN>`. The areas are `DEST` (section 4), `ANN` and `TIME` (sections 5 and 6.8), `ENV` (section 6), `VER` (section 7), `KNOCK` (section 8), `STATUS` (section 9), `MSG` (section 10), `PROP` (section 11), `CANON` (section 3), `EXT` (section 12) and `CODE` (section 13). An id is defined once, in bold brackets at the start of the sentence it governs, and referenced elsewhere in plain form. Ids are stable under the rules of section 14. The conformance vector suite (forthcoming as cfg(test) modules under src/mesh/) is keyed by requirement id: each vector names the ids it exercises, and the byte vectors there are the only place where emitted map key order is compared.
+Requirement ids have the form `MESH-<AREA>-<NNN>`. The areas are `DEST` (section 4), `ANN` and `TIME` (sections 5 and 6.8), `ENV` (section 6), `VER` (section 7), `KNOCK` (section 8), `STATUS` (section 9), `MSG` (section 10), `PROP` (section 11), `CANON` (section 3), `EXT` (section 12), `CODE` (section 13), `SEC` (section 15), `INV` (section 16), `LOG` (section 17) and `LEN` (section 18). An id is defined once, in bold brackets at the start of the sentence it governs, and referenced elsewhere in plain form. Ids are stable under the rules of section 14. The conformance vector suite (`src/mesh/conformance/`, section 20) is keyed by requirement id: each vector names the ids it exercises, and the byte vectors there are the only place where emitted map key order is compared.
 
 ## 3. Canonical forms
 
@@ -135,7 +137,7 @@ Derivations, from the identity's public keys outward:
 
 **[MESH-DEST-004]** The name hash MUST be the first 10 bytes of the SHA-256 of the ASCII string `coyote.mesh.<instance_id>` (upstream `DestinationName::new`, which hashes `app || "." || aspects`).
 
-**[MESH-DEST-005]** The destination hash MUST be `trunc_16(H(name_hash || identity_hash))` (`destination_address`, src/mesh/mod.rs; pinned by `destination_address_matches_upstream_derivation`).
+**[MESH-DEST-005]** The destination hash MUST be `trunc_16(H(name_hash || identity_hash))` (`destination_address`, src/mesh/mod.rs; pinned by `destination_address_matches_upstream_derivation`, src/mesh/r3/tests.rs).
 
 **[MESH-DEST-006]** A receiver MUST attribute a destination hash to an identity only when the derivation of MESH-DEST-005, from the name hash carried with it and the identity hash proven for it, reproduces that destination hash (`verify_binding`, src/mesh/trust.rs; `trust_destination_records_the_identity_the_formula_proves`).
 
@@ -158,7 +160,7 @@ Layout: `magic(4) || version(2) || display_name(0..=64)`; total length 6 to 70 b
 | Bytes | Type | Sender puts | Receiver action on any other value |
 |---|---|---|---|
 | magic, bytes 0..4 | 4 bytes | `ANNOUNCE_MAGIC` = `"COYM"` | **[MESH-ANN-001]** The receiver MUST treat application data shorter than 6 bytes, or whose first 4 bytes are not `"COYM"`, as not a Coyote announce and MUST NOT record it. |
-| version, bytes 4..6 | u16 big-endian | its own `MESH_PROTOCOL_VERSION` = `1` | **[MESH-ANN-002]** The receiver MUST record the announce for every value and MUST mark the peer `Incompatible` with the found version when it lies outside the receiver's window (section 7; `Compatibility::of`, src/mesh/protocol.rs; `observe_marks_an_unsupported_announce_version_incompatible`). |
+| version, bytes 4..6 | u16 big-endian | its own `MESH_PROTOCOL_VERSION` = `1` | **[MESH-ANN-002]** The receiver MUST record the announce for every value and MUST mark the peer `Incompatible` with the found version when it lies outside the receiver's window (section 7; `Compatibility::of`, src/mesh/protocol.rs; `observe_marks_an_unsupported_announce_version_incompatible`, src/mesh/peers.rs). |
 | display_name, bytes 6..end | UTF-8, 0 to `MAX_DISPLAY_NAME_BYTES` = `64` bytes | the configured display name, or nothing (section 5.2) | **[MESH-ANN-003]** The receiver MUST ignore the whole announce when the name is longer than 64 bytes, is not valid UTF-8, or contains any character of the section 3.3 table. **[MESH-ANN-004]** The receiver MUST read an empty name as no display name. |
 | any other byte | none | nothing | **[MESH-ANN-005]** There is no other field: the receiver MUST read every byte from offset 6 to the end as the display name (`app_data_carries_only_version_and_display_name`). |
 
@@ -247,7 +249,7 @@ A response is the msgpack array `[request_id, value]`; its encoding begins `92 c
 |---|---|---|---|
 | `[0]` request_id | bin(16) | the request id of the request being answered (section 6.3) | **[MESH-ENV-005]** A responder MUST put the request id computed by section 6.3 for the request it answers; a response naming no outstanding request answers nothing. |
 | `[1]` value | any | a reply value, a refusal code, a version refusal map or a dispatch error map | **[MESH-ENV-006]** The requester MUST decode this element in the order given in section 6.7. |
-| any other element or trailing bytes | none | nothing | **[MESH-ENV-007]** The requester MUST drop a response that is longer than `MAX_R3_PAYLOAD_BYTES`, that is not an `array` of exactly two elements, whose `[0]` is not a `bin` of exactly 16 bytes, that is followed by any further byte, that names no outstanding request, or that arrives on a link other than the one its request went out on; the request then ends in `Timeout` (`ResponseFrame::decode`, src/mesh/r3/frame.rs; `R3Client::deliver`, src/mesh/r3/client.rs; `response_on_the_wrong_link_is_ignored`). |
+| any other element or trailing bytes | none | nothing | **[MESH-ENV-007]** The requester MUST drop a response that is longer than `MAX_R3_PAYLOAD_BYTES`, that is not an `array` of exactly two elements, whose `[0]` is not a `bin` of exactly 16 bytes, that is followed by any further byte, that names no outstanding request, or that arrives on a link other than the one its request went out on; the request then ends in `Timeout` (`ResponseFrame::decode`, src/mesh/r3/frame.rs; `R3Client::deliver`, src/mesh/r3/client.rs; `response_on_the_wrong_link_is_ignored`, src/mesh/r3/tests.rs). |
 
 ### 6.3 Size branches
 
@@ -267,7 +269,7 @@ A response is the msgpack array `[request_id, value]`; its encoding begins `92 c
 
 ### 6.5 The Envelope
 
-The `data` of every request is the map below (`Envelope::into_value`, `Envelope::from_value`, src/mesh/r3/frame.rs; `envelope_round_trips_and_rejects_anything_that_names_no_origin`).
+The `data` of every request is the map below (`Envelope::into_value`, `Envelope::from_value`, src/mesh/r3/frame.rs; `envelope_round_trips_and_rejects_anything_that_names_no_origin`, src/mesh/r3/tests.rs).
 
 | Field | Type | Sender puts | Receiver action on any other value |
 |---|---|---|---|
@@ -313,7 +315,7 @@ Stages run in this order; the first that fires decides the response (src/mesh/r3
 
 **[MESH-ENV-039]** The trust verdict MUST be evaluated in this precedence: destination deny, identity block, destination allow (the identity recorded for that destination equal to the proven identity, compared per MESH-CANON-004), identity allow for all destinations, default closed (`authorize`, src/mesh/trust.rs).
 
-Dispatch error maps (`DispatchError`, src/mesh/r3/dispatch.rs; `dispatch_errors_round_trip_as_maps_and_never_read_as_refusal_codes`):
+Dispatch error maps (`DispatchError`, src/mesh/r3/dispatch.rs; `dispatch_errors_round_trip_as_maps_and_never_read_as_refusal_codes`, src/mesh/r3/tests.rs):
 
 | Field | Type | Sender puts | Receiver action on any other value |
 |---|---|---|---|
@@ -324,7 +326,7 @@ Dispatch error maps (`DispatchError`, src/mesh/r3/dispatch.rs; `dispatch_errors_
 
 ### 6.7 Refusal codes and client decoding
 
-A refusal is a bare msgpack `uint` as the response value (`RefusalCode`, src/mesh/r3/error.rs; `refusal_codes_round_trip_the_wire_and_reject_other_values`).
+A refusal is a bare msgpack `uint` as the response value (`RefusalCode`, src/mesh/r3/error.rs; `refusal_codes_round_trip_the_wire_and_reject_other_values`, src/mesh/r3/tests.rs).
 
 | Code | Value | Wire bytes | Built by Coyote | Read by Coyote |
 |---|---|---|---|---|
@@ -360,9 +362,11 @@ A refusal is a bare msgpack `uint` as the response value (`RefusalCode`, src/mes
 
 **[MESH-TIME-008]** A requester that hears no response within its request timeout MUST treat the request as `Timeout`; this is one of the outcomes that permit store-and-forward fallback (sections 8.5 and 10.4).
 
-**[MESH-TIME-009]** A requester whose link is not open and identified within `DEFAULT_LINK_TIMEOUT` MUST treat the request as `LinkFailed`.
+**[MESH-TIME-009]** A requester whose link is not open and identified within its link timeout (`DEFAULT_LINK_TIMEOUT` unless the path sets its own) MUST treat the request as `Timeout`, the same outcome as MESH-TIME-008 (`open_link`, `Deadline::expired`, src/mesh/r3/client.rs).
 
 **[MESH-TIME-010]** A responder MUST abandon a handler that has not replied within `HANDLER_TIMEOUT` (stage 10 of section 6.6).
+
+**[MESH-TIME-011]** A requester MUST treat the request as `LinkFailed` only when the transport could not establish the link or put a packet on it: no known path to the destination, a link establishment error other than a timeout, or a request or identify packet the transport did not send (`open_link`, `identify`, src/mesh/r3/client.rs).
 
 ## 7. Version negotiation
 
@@ -695,7 +699,7 @@ What a peer hears after an `ask` or `message` without `in_reply_to` (src/config/
 
 ### 10.7 Peer limits
 
-Limits are counted per sending identity over fixed windows of `PEER_WINDOW` = `3600` seconds anchored at the identity's first sighting, for at most `PEER_LIMITS_MAX_IDENTITIES` = `256` identities, the least recently seen idle identity evicted at the cap (src/mesh/limits.rs; `the_cap_evicts_the_least_recently_seen_idle_identity`). Defaults (src/config/mesh_config.rs; `config_maps_the_four_mesh_knobs_and_defaults_match`): `DEFAULT_PEER_MAX_MESSAGES_PER_HOUR` = `60`, `DEFAULT_PEER_MAX_CONCURRENT` = `1`, `DEFAULT_PEER_MAX_TOKENS_PER_HOUR` = `100000`, cost ceiling off (`0.0`). Reservation order is concurrency, token ceiling, then cost ceiling (only when above zero).
+Limits are counted per sending identity over fixed windows of `PEER_WINDOW` = `3600` seconds anchored at the identity's first sighting, for at most `PEER_LIMITS_MAX_IDENTITIES` = `256` identities, the least recently seen idle identity evicted at the cap (src/mesh/limits.rs; `the_cap_evicts_the_least_recently_seen_idle_identity`). Defaults (src/config/mesh_config.rs; `config_maps_the_four_mesh_knobs_and_defaults_match`, src/mesh/limits.rs): `DEFAULT_PEER_MAX_MESSAGES_PER_HOUR` = `60`, `DEFAULT_PEER_MAX_CONCURRENT` = `1`, `DEFAULT_PEER_MAX_TOKENS_PER_HOUR` = `100000`, cost ceiling off (`0.0`). Reservation order is concurrency, token ceiling, then cost ceiling (only when above zero).
 
 Refusal reasons (`RefusalReason`):
 
@@ -772,7 +776,7 @@ When a direct request times out or the link fails (MESH-KNOCK-017, MESH-MSG-024)
 
 **[MESH-PROP-001]** The LXMF message MUST be addressed to the recipient's delivery hash with the sender's delivery hash as source (MESH-DEST-009).
 
-**[MESH-PROP-002]** The payload MUST be `(timestamp, content, title or empty, fields map or empty map)`, with no stamp.
+**[MESH-PROP-002]** The payload MUST be the msgpack array `[timestamp, title, content, fields]` with no stamp: the `f64` timestamp, the title as `bin` (empty when absent), the content as `bin`, and the `fields` map (empty when absent), in the order `LXMessage.pack` emits them (`a_missing_title_and_fields_go_as_empty_bytes_and_an_empty_map`, src/mesh/propagation.rs).
 
 **[MESH-PROP-003]** A sender MUST refuse to encode `fields` that is not a `map`.
 
@@ -928,7 +932,150 @@ Registry of code points allocated by this document:
 
 An id, once published, is never renumbered and never reused. A retired requirement keeps its id; its body text is replaced by `[RETIRED]` and its index entry is kept with the same marker. A new requirement takes the next unused number in its area, wherever it lands in the document. A reference to an id is written plain (`MESH-MSG-007`); the bold-bracket form appears only at the definition.
 
-## 15. Constants
+## 15. Security considerations
+
+This section states what the protocol defends against, what it leaves to Reticulum and what it leaves open, with the reason for each. The requirements here restate, from the attacker's side, behaviour the earlier sections fix; the earlier sections govern the bytes.
+
+### 15.1 Threat model
+
+The attacker is on the path between two nodes or operates a propagation node. The attacker reads and writes any interface, replays, reorders, drops and modifies packets, runs any number of Reticulum identities, announces any destination and posts to any propagation node. The attacker holds neither node's identity key and does not break Reticulum's cryptography.
+
+| Attack | Scope | Where |
+|---|---|---|
+| Eavesdropping on a Link | Reticulum's: every R3 exchange runs inside a Link, whose encryption this document inherits | MESH-SEC-001 |
+| Eavesdropping on an announce | In scope: announce application data is plaintext by design and carries nothing private | MESH-SEC-002 |
+| Eavesdropping at rest | In scope for the mesh log lines of section 17, which carry neither peer text nor a full identity or destination hash; out of scope for the model client's own lines in the same log file (section 17, closing paragraph) and for the on-disk stores (the trust store, the knock cache of section 8.4, the pending and inbound stores), which hold full hashes, and all but the trust store peer text, in plaintext under the config and cache directories and rely on filesystem permissions | section 17, section 15.6 |
+| Replay | In scope: identity is bound to the Link, and store-and-forward bodies are deduplicated by id inside a stated window | MESH-SEC-003, MESH-SEC-007 |
+| Insertion | In scope: an unproven or unknown identity hears silence, and a fetched body needs a verifying signature and a trusted signer | MESH-SEC-001, MESH-SEC-005 |
+| Deletion | Out of scope: neither Reticulum nor LXMF guarantees delivery, so a dropped request is a timeout and a dropped spooled message is invisible to both ends | MESH-SEC-004 |
+| Modification | Reticulum's on a Link; in scope for a spooled message, whose signature covers destination, source and payload | MESH-SEC-006 |
+| Man in the middle | In scope at the trust boundary: standing is granted by the proven identity hash alone, which the human verified out of band | MESH-SEC-008 |
+| Prompt injection through peer text | In scope: peer text is cleaned before display and fenced before the envoy reads it | MESH-SEC-009 |
+| Denial of service | In scope for every resource this document names, each bounded by a stated constant; out of scope for the interfaces, path tables and announce floods beneath, which are Reticulum's | MESH-SEC-010 to MESH-SEC-013 |
+
+### 15.2 Channel security
+
+**[MESH-SEC-001]** An implementation MUST carry every R3 request and response inside a Reticulum Link on which the requester's identity is proven, answering a frame on a link without a proven identity, or from an identity whose standing is `Unknown` or `Blocked`, with silence before any byte of it is decoded (MESH-ENV-026, MESH-ENV-027; `empty_trust_list_admits_nobody_and_never_decodes`, `an_identity_untrusted_before_handle_is_answered_silently`).
+
+**[MESH-SEC-002]** A sender MUST NOT put anything but the magic, the protocol version and the display name of section 5.1 into announce application data, which travels in plaintext and is stored by every transport node that relays it (`encode_layout_is_magic_version_name`, `app_data_carries_only_version_and_display_name`).
+
+**[MESH-SEC-003]** A responder MUST bind every request to the identity proven on the link that carries it, taking the identity from the transport's proof and never from the body, and MUST forget that identity when the link closes (`a_claimed_instance_is_bound_to_the_proven_identity`, `identity_is_tracked_only_after_proof_and_forgotten_on_close`).
+
+**[MESH-SEC-004]** A requester over a Link MUST treat a request that draws no response as `Timeout` (MESH-TIME-008) and MUST NOT conclude from silence that the peer received it (`receipt_fails_with_the_timeout_when_nothing_answers`); delivery is guaranteed neither by Reticulum nor by LXMF nor by this document, and a dropped request or spooled message is not detectable by the sender beyond that timeout.
+
+### 15.3 Store-and-forward: object security
+
+A message posted to a propagation node (section 11) leaves the Link that carried it there. In the node's spool it is protected by object security alone: LXMF encrypts the message to the recipient's delivery destination and the sender signs `destination || source || payload || message_id`, where `payload` is the msgpack payload with the stamp left out (`to_msgpack_without_stamp`) and `message_id` the SHA-256 of the first three (`WireMessage::sign`, lxmf-core, rev `3ed5932`); the stamp lies outside the signature and is bound to the message only through `message_id`. The node, and anyone who reads its store, sees the destination hash in the clear, the length, the arrival time and the stamp. The node cannot read or alter the payload without breaking the encryption or the signature, but it can drop, delay or duplicate the message and can replay it to the recipient later.
+
+**[MESH-SEC-005]** A receiver MUST verify a fetched body's signature and the signer's standing before routing it (stages 7 to 9 of section 11.4) and MUST NOT rely on the Link to the propagation node for the authenticity or confidentiality of anything in the body (`an_untrusted_sender_is_discarded_and_a_trusted_one_delivered`, `a_blocked_signer_is_discarded_and_the_stamp_line_is_logged_for_a_trusted_one`).
+
+**[MESH-SEC-006]** A receiver MUST discard a fetched body whose signature does not verify (MESH-PROP-035) without acting on any field of it (`an_unknown_source_is_left_on_the_node_while_a_forgery_is_acknowledged`).
+
+**[MESH-SEC-007]** A receiver MUST discard a fetched body whose transient id or whose message id it has already recorded (MESH-PROP-029, MESH-PROP-032), keeping each dedup set to `DEDUP_CAPACITY` = `4096` ids with the oldest evicted first, forgetting ids older than `DEDUP_HORIZON` = `15552000` seconds on insert and on load, and persisting both sets across restarts (MESH-PROP-040; `dedup_evicts_the_oldest_past_capacity_and_logs_it`, `dedup_forgets_past_the_horizon_on_insert_and_on_load`).
+
+The replay window is the horizon or `DEDUP_CAPACITY` later entries, whichever comes first: a body replayed more than 180 days after its first delivery is delivered again. Inside the window a node that replays the same transient is refused at stage 2 of section 11.4, before decryption, and one that re-encrypts the same message is refused at stage 5, after it. Only a delivered body enters the delivered set, so a propagation node cannot shorten the message-id window by serving junk.
+
+### 15.4 Trust boundary
+
+A Reticulum Link is established to a destination whose public key the transport learned from that destination's announce, so the requester knows it reached the announced identity; the requester in turn proves its own identity on the link (MESH-SEC-003), and that proven hash, not anything announced or claimed, is what the trust store is consulted for. The trust store holds identity hashes the human entered or accepted from a knock (section 8); an attacker who announces another destination under a copied display name is `Unknown` and hears silence.
+
+**[MESH-SEC-008]** A receiver MUST grant standing by the proven identity hash alone, in its canonical form (MESH-CANON-002, MESH-CANON-004, MESH-ENV-039), and MUST NOT grant it from a display name, an instance id, a destination hash or any other datum a peer claims; the one direct equality against a peer-derived identity, the destination binding (`authorize`, src/mesh/trust.rs), runs in constant time over the canonical 32-hex form, while the trust-store lookups are keyed on values the peer already knows and are not a timing boundary (`same_hash_is_constant_time_shaped`, `trust_destination_refuses_a_forged_name_hash`, `a_claimed_instance_is_bound_to_the_proven_identity`).
+
+**[MESH-SEC-009]** A receiver MUST pass every peer-supplied text through `display_text` at its field's cap before displaying or comparing it (MESH-CANON-005) and MUST fence peer text as data when composing the envoy's input, so a peer's message is never read as an instruction (`compose_envoy_input_fences_the_peer_text_and_carries_the_data_rule`, src/config/mesh_envoy.rs).
+
+### 15.5 Denial of service
+
+Every resource this document names is bounded by a constant of section 19, with one exception the table states: the bytes the pinned transport assembles for a resource before this implementation sees them (MESH-LEN-001). The table names each bound and, where one exists, the wire requirement that fixes it.
+
+| Resource | Bound | Requirement |
+|---|---|---|
+| bytes the transport assembles for one request or response before any check of this implementation | the pinned transport's own advertisement cap of 32 MiB, which is not a constant of this document; no advertisement-time cap is armed here (MESH-LEN-001), so a peer can make the node assemble up to that much per in-flight resource | MESH-LEN-001 |
+| bytes of one request or response that reach a handler or the requester | `MAX_R3_PAYLOAD_BYTES` = `262144`, larger frames dropped after assembly | MESH-ENV-024 |
+| concurrent handlers | `MAX_CONCURRENT_INBOUND_REQUESTS` = `16` slots, the rest dropped in silence | MESH-ENV-025 |
+| time in one handler | `HANDLER_TIMEOUT` = `20` seconds | MESH-ENV-037 |
+| knocks surfaced per identity | a token bucket of `KNOCK_BUCKET_BURST` = `3`, one token per `KNOCK_BUCKET_REFILL_INTERVAL` = `600` seconds, over at most `KNOCK_GATE_MAX_IDENTITIES` = `256` identities | MESH-KNOCK-010, MESH-KNOCK-011 |
+| knock records | `KNOCK_CACHE_MAX_ENTRIES` = `256`, `KNOCK_CACHE_MAX_PER_IDENTITY` = `16` | MESH-KNOCK-013, MESH-KNOCK-014 |
+| knocks queued for the gate | `KNOCK_QUEUE_CAPACITY` = `64`, newer knocks dropped and counted while the queue is full | MESH-SEC-012 |
+| envoy runs, model tokens and spend per sending identity | the section 10.7 budget | MESH-MSG-041 to MESH-MSG-043, MESH-SEC-011 |
+| peer table | `PEER_TABLE_MAX_ENTRIES` = `1024` | MESH-TIME-007 |
+| propagation node table | `PROPAGATION_NODE_TABLE_MAX_ENTRIES` = `32` | MESH-ANN-030 |
+| stamp mining | `MAX_ACCEPTED_STAMP_COST` = `26` | MESH-PROP-011 |
+| fetched ids, wants and bodies | `MAX_LISTED_IDS` = `1024`, `MAX_WANTS_PER_FETCH` = `64`, `MAX_FETCHED_MESSAGE_BYTES` = `131072` | MESH-PROP-021, MESH-PROP-022, MESH-PROP-028 |
+| deferral and dedup tables | `MAX_DEFERRED_IDS` = `256`, `DEDUP_CAPACITY` = `4096` | MESH-PROP-039, MESH-PROP-040 |
+| peer messages held in memory and on disk | `PEER_INBOX_CAPACITY` = `64` per inbox, oldest evicted first; `INBOUND_MAX_ENTRIES` = `256` in the inbound store, oldest truncated first | MESH-SEC-010 |
+| envoy jobs queued for the worker | `ENVOY_QUEUE_MAX` = `8`, the ninth refused as busy | MESH-SEC-011 |
+
+**[MESH-SEC-010]** An implementation MUST enforce every bound in the table above and MUST NOT hold any per-peer state, queue or buffer that a peer can grow without limit (`oversized_request_resource_is_dropped_before_the_handler_runs`, `requests_beyond_the_handler_slots_are_dropped_silently`, `a_handler_past_its_timeout_answers_nothing_and_frees_its_slot`).
+
+**[MESH-SEC-011]** A receiver MUST run an envoy for a peer message only within the per-identity budget of section 10.7: `mesh.peer_max_messages_per_hour` messages, `mesh.peer_max_concurrent` runs, `mesh.peer_max_tokens_per_hour` model tokens and, when above zero, `mesh.peer_max_cost_usd_per_hour` of spend, each counted in fixed windows of `PEER_WINDOW` = `3600` seconds anchored at the identity's first sighting, refusing anything beyond with `Throttled` over a link or with one typed refusal per identity per reason per hour by store-and-forward (`admit_message_refuses_the_sixty_first_in_an_hour_and_resets_after_rollover`, `try_reserve_refuses_while_a_run_is_in_flight_and_admits_once_the_guard_drops`, `try_reserve_refuses_past_the_token_ceiling_until_rollover`, `cost_ceiling_is_off_at_zero_and_ignores_unpriced_debits`; src/mesh/limits.rs).
+
+**[MESH-SEC-012]** A receiver MUST NOT surface more knocks to its human than the gate of section 8.3 admits, and MUST NOT let a knock from an identity the trust store knows but has not allowed for the destination cost more than the gate's bookkeeping: no envoy run, no model call and no stored body beyond the knock record, while a knock from an `Unknown` identity costs nothing at all, since it is refused before the gate exists (MESH-ENV-027, MESH-PROP-036; `one_identity_is_rate_limited_per_identity_and_surfaced_once`, `the_gate_forgets_the_least_recently_seen_identity_past_its_cap`).
+
+**[MESH-SEC-013]** A sender MUST NOT mine a stamp for an announced cost above `MAX_ACCEPTED_STAMP_COST` = `26` (MESH-PROP-011), since each extra bit of cost doubles the expected work and an announce is authenticated by nothing beyond its signer (`costs_above_the_ceiling_are_refused_before_any_mining`).
+
+### 15.6 Out of scope
+
+- Cryptography and cryptographic agility: identity keys, Link encryption, announce and message signatures and their algorithms are Reticulum's and LXMF's; this document inherits them and specifies no cipher, key size or negotiation of its own.
+- Traffic analysis: an observer of an interface learns that two destinations exchange traffic, how much and when.
+- Floods below R3: announce floods, path table exhaustion and interface saturation are Reticulum's to bound; this document bounds only what a node keeps from what Reticulum delivers.
+- Resource assembly memory: until the transport's advertisement-time reject path is fixed upstream (docs/mesh/upstream-issues.md, draft A1), the memory a peer can make the node assemble per in-flight resource is bounded by the transport's 32 MiB cap alone, and `MAX_CONCURRENT_INBOUND_REQUESTS` = `16` applies only after assembly.
+- On-disk stores: the trust store (`trust.yaml` under the config directory's `mesh/`) holds full identity and destination hashes with the human's labels and notes; the knock cache (`knocks.jsonl`), the pending store (`pending-<instance_id>.jsonl`) and the inbound store (`inbound-<instance_id>.jsonl`), all under the cache directory's `mesh/`, hold full hashes and peer text (display names, intros, questions and replies) in plaintext. A reader with filesystem access reads them; their protection is the filesystem's and their on-disk formats are a section 1 non-goal.
+- A propagation node's operator: the node can drop and delay spooled messages, and can replay one beyond the dedup window of section 15.3 (a replay inside it is refused), and can read the destination hash, size and timing of each.
+- The human's own trust decisions: this document does not specify how a human verifies an identity hash before trusting it.
+
+## 16. Invariants
+
+The invariants are structural properties of the reference implementation that the requirements above assume. Each is stated once here with the test that holds it.
+
+**[MESH-INV-001]** A serving path MUST NOT take the session's request-context lock: `/status` is answered from a lock-free snapshot published at turn boundaries and `/message` and `/knock` from their own stores, so a request is served while the human's turn runs and a request arriving mid-turn cannot deadlock the node (`mesh_module_never_names_the_request_ctx`, src/mesh/mod.rs).
+
+**[MESH-INV-002]** Every request and response path MUST be able to carry a payload larger than the link MDU: a frame that fits the MDU travels as a single link packet and a larger one as a resource, on both sides of every path (sections 6.3 and 11.1; `representation_is_a_packet_up_to_the_mdu_and_a_resource_above`, `oversize_status_card_round_trips_as_a_resource`).
+
+**[MESH-INV-003]** Inbound peer traffic MUST NOT spend model tokens beyond the section 10.7 budget: every envoy run is reserved against the sending identity's concurrency, token and cost ceilings before it starts and debited when it ends (`try_reserve_refuses_while_a_run_is_in_flight_and_admits_once_the_guard_drops`, `try_reserve_refuses_past_the_token_ceiling_until_rollover`, `admit_message_refuses_the_sixty_first_in_an_hour_and_resets_after_rollover`).
+
+**[MESH-INV-004]** On the R3 path a responder MUST refuse a frame from an unproven, `Unknown` or `Blocked` identity before decoding any byte of it (MESH-ENV-026, MESH-ENV-027; `blocked_identity_is_dropped_before_decode_without_a_knock`, `empty_trust_list_admits_nobody_and_never_decodes`).
+
+The pre-parse guarantee is R3-only. On the LXMF fetch path (section 11.3) the LXMF layer decrypts and parses the body before the identity tier can act: the signer is known only at stage 6 of section 11.4, so a parsed but unauthorised payload exists in memory before it is discarded. That asymmetry is the reason `/status` runs over R3 rather than LXMF, and it does not disappear because this node is the fetcher.
+
+**[MESH-INV-005]** On the LXMF fetch path a receiver MUST bound its exposure instead: the body's length is checked against `MIN_FETCHED_MESSAGE_BYTES` = `112` and `MAX_FETCHED_MESSAGE_BYTES` = `131072` before any byte of it is decoded (MESH-PROP-028), a body of any content within those bounds is decoded without panicking and discarded when it does not decode, duplicates are dropped before decryption and again before dispatch (MESH-PROP-029, MESH-PROP-032), and a body from an `Unknown` or `Blocked` signer is discarded before it reaches a handler, an envoy or a model (MESH-PROP-036, MESH-PROP-037; `bounds_leave_room_under_the_transport_and_response_caps`, `garbage_bodies_are_discarded_in_bound_order_and_never_reach_the_sink`, `a_blocked_signer_is_discarded_and_the_stamp_line_is_logged_for_a_trusted_one`, `an_untrusted_sender_is_discarded_and_a_trusted_one_delivered`).
+
+**[MESH-INV-006]** A mesh notification (a knock, an inbound message, an envoy outcome) MUST reach the human through a delivery path that does not depend on a supervisor job or agent handle existing for it, ahead of supervisor events in the same batch (`drain_live_notifications_passes_mesh_events_without_a_supervisor`, src/function/mod.rs; `top_level_mesh_note_survives_drain_live_notifications`, src/repl/idle.rs).
+
+**[MESH-INV-007]** Only the top-level session touches the mesh: a child agent and the envoy MUST be built on a fresh, empty mesh slot and MUST NOT be offered a `mesh__*` tool, so the envoy that answers a peer cannot itself send to the mesh (`child_agents_get_a_fresh_mesh_slot_never_the_parents`, `a_spawned_child_declares_no_mesh_tools_while_the_parent_does`, `the_envoy_child_has_only_user_tools_and_the_read_only_trio`).
+
+## 17. Log redaction
+
+The feature's premise is that a node is private by default. A debug log that writes a peer's message, the human's brief or objective, or a session name into `~/.cache/coyote/coyote.log` in plaintext is itself the leak, so the mesh treats its log lines as a wire: what leaves the process through them is fixed here. A "mesh log line" is one emitted from the mesh sources this section names at its end; the model client's own lines are a separate channel, described after the requirements.
+
+**[MESH-LOG-001]** A mesh log line at any level MUST NOT carry a peer's message content or title, its `fields`, a knock introduction, an envoy question or answer, a status card or any text of one, nor the human's brief, objective or session name; a count, a length or the `kind` tag of a body is the most a line says about it (`mesh_log_lines_never_carry_peer_text_or_a_full_hash`, src/mesh/mod.rs).
+
+**[MESH-LOG-002]** A mesh log line MUST truncate every identity and destination hash, the node's own fingerprint included, to its first `LOGGED_HASH_CHARS` = `8` hex digits (`short` and `redact_hashes`, src/mesh/r3/mod.rs; `mesh_log_lines_never_carry_peer_text_or_a_full_hash`, src/mesh/mod.rs; `serving_path_logs_never_carry_a_full_identity_or_instance_hash`, `an_unreachable_knock_falls_back_to_the_propagation_node`, src/mesh/r3/tests.rs).
+
+**[MESH-LOG-003]** A mesh log line MAY carry a link id, a request id, a transient id or a message id in full: each names one link, request or message rather than a party (`redaction_scanner_flags_each_rule_and_passes_the_permitted_forms`).
+
+**[MESH-LOG-004]** A mesh log line MAY carry the `kind` tag and the wire `id` of a message body, a length, a count and a refusal code; the wire `id` is a bounded ASCII token (section 10.1), not free text (`redaction_scanner_flags_each_rule_and_passes_the_permitted_forms`).
+
+The reference enforces MESH-LOG-001 and MESH-LOG-002 with a source scan over every `debug!`, `trace!`, `info!`, `warn!` and `error!` invocation under `src/mesh/` (test-only modules excepted), the mesh files under `src/config/`, `src/function/mesh.rs` and `src/repl/mesh.rs`: a placeholder or argument named for a peer datum, or a hash rendered outside `short`, inside one of those invocations fails the test run. The scan is lexical: it reads the invocation only, trusts the names of placeholders and arguments, and does not look through an error value's Display or through a local bound before the call. Every mesh sink that logs an error value's text therefore passes it through `redact_hashes` first; two of those sinks, the serving path and the knock fallback, are held by behavioural log tests (`serving_path_logs_never_carry_a_full_identity_or_instance_hash`, `an_unreachable_knock_falls_back_to_the_propagation_node`, src/mesh/r3/tests.rs), and the rest, like the pre-bound link and request ids, rest on the helper's own test (`redact_hashes_cuts_only_runs_of_exactly_32_hex_digits`, src/mesh/r3/mod.rs) and on review.
+
+Outside this section's reach, and outside the guarantee it gives, is the model client. The envoy answers a peer by running a model turn whose input is the brief and the fenced peer text and whose output is the envoy's answer; the shared client logs every request body in full at debug level (`Request {url} {body}`, src/client/common.rs; the Bedrock client's own request line, src/client/bedrock.rs) and every response, streamed or not, at debug level (the per-provider `stream-data` and `non-stream-data` lines under `src/client/`), and the digest generator (src/config/mesh_digest.rs) runs the session transcript through the same client. Those lines reach `~/.cache/coyote/coyote.log` whenever the log level is `debug`: the default in a debug build, and in a release build only when `COYOTE_LOG_LEVEL` asks for it. The source scan does not cover `src/client/`, no mesh test asserts on those lines, and this document does not claim that they are redacted; gating or redacting them for envoy and digest runs is tracked as a follow-up to this document.
+
+## 18. Leniency register
+
+A leniency is a place where the reference deliberately does something other than the strict reading of an upstream contract, to interoperate with the pinned Reticulum, LXMF and rns-transport revisions as they are. Each entry states what is accepted, why, where the upstream side is recorded and what would remove it. Upstream issue drafts are kept in docs/mesh/upstream-issues.md; Part A holds the drafts this register cites, each cited by at least one entry, their status is "Drafted, not yet filed", and filing them is tracked as a follow-up. The drafts inherited from the earlier Reticulum audit (Part B of that file) correspond to no entry here.
+
+**[MESH-LEN-001]** Inbound size cap after assembly: an implementation MUST NOT set an advertisement-time request size cap or a response size limit on the pinned rns-transport, and MUST bound inbound frames after assembly on its own side instead (MESH-ENV-024; `oversized_request_resource_is_dropped_before_the_handler_runs`, `oversized_response_resource_is_dropped_after_assembly`). Why: rns-transport rev `3ed5932` awaits the reject handler while holding the link lock, so any advertisement-time reject deadlocks the transport. Upstream: docs/mesh/upstream-issues.md, draft A1. Removal: when the pinned transport releases the lock before it sends the reject, re-arm the caps and keep the post-assembly bound as the second line.
+
+**[MESH-LEN-002]** Acceptance by silence: a sender MUST read silence for `PROPAGATION_REJECT_WINDOW` = `2` seconds after a completed transfer as the propagation node having accepted the message (MESH-PROP-016; `a_completed_transfer_is_accepted_one_window_later_not_at_the_deadline`). Why: the reference node answers an accepted packet with a packet proof only, which rns-transport turns into no event on an active link, so acceptance is inferred from the absence of the rejection signal of MESH-PROP-017. Upstream: docs/mesh/upstream-issues.md, draft A2. Removal: when the transport surfaces the proof as a link event, read acceptance from it and stop inferring it from silence.
+
+**[MESH-LEN-003]** Stamp cost floor and ceiling: a receiver MUST file a propagation node announce with any non-negative stamp cost, those below the reference's own floor of 13 included (MESH-ANN-024, MESH-ANN-025), and a sender MUST refuse to mine above `MAX_ACCEPTED_STAMP_COST` = `26` (MESH-PROP-011; `from_announce_refuses_negative_costs_and_files_any_other`, `costs_above_the_ceiling_are_refused_before_any_mining`). Why: the reference clamps an operator's configured cost only from below and its client mines whatever a node announces with no ceiling; 26 is the reference's peering-cost ceiling, borrowed as the posting ceiling, and a node too dear to post to is still worth fetching from. Upstream: none, this is the reference's documented behaviour rather than a defect. Removal: when the reference client adopts a client-side ceiling, adopt its value.
+
+**[MESH-LEN-004]** Packet or resource by the link MDU: a sender MUST choose the single-packet form when the encoded envelope is at most the link MDU and the resource form above it (MESH-PROP-015; `representation_is_a_packet_up_to_the_mdu_and_a_resource_above`), the test RNS `Link.request` makes. Why: the reference client applies the stricter `LINK_PACKET_MAX_CONTENT = MDU - LXMF_OVERHEAD`, but the node accepts both forms, so the physical bound is the one that matters. Upstream: none. Removal: when a reference node is found to refuse a packet in the band between the two thresholds, adopt the stricter one.
+
+**[MESH-LEN-005]** Ingress control in the test suites: the conformance and interop suites MUST switch Reticulum's announce ingress control off on their own nodes' interfaces (the `disable_ingress_control` helper, src/mesh/mod.rs, held to flipping only that setting by `usage_probe_disable_ingress_control_flips_only_ingress_control_on_every_interface`, src/mesh/conformance/netns.rs), and a production node MUST leave it at Reticulum's default. Why: ingress control on an interface younger than two hours holds every announce for an unknown destination for 360 seconds once announces arrive faster than 3.5 a second, and the relay echoes a node's start announce back at it, so a fresh peer's announce in that burst is held past every wait in the suites. Upstream: none, the hold is Reticulum's intended behaviour. Removal: when the suites' waits outlast the hold, or the transport exempts a node's own echoed announce.
+
+**[MESH-LEN-006]** Hash text before the transport: an implementation MUST pass every identity or destination hash given as text through `canonical_hash` (MESH-CANON-002) before handing it to the transport's hex parser (`malformed_hashes_are_refused_without_panicking`, src/mesh/trust.rs). Why: the pinned parser checks byte length only and slices by byte, so a 32-byte string that is not 32 ASCII hex digits is sliced mid-character rather than refused. Upstream: docs/mesh/upstream-issues.md, draft A3. Removal: when the pinned parser validates its input, the guard becomes defence in depth and this row is retired.
+
+## 19. Constants
 
 | Constant | Value | Defined in | Pinned by |
 |---|---|---|---|
@@ -1016,8 +1163,397 @@ An id, once published, is never renumbered and never reused. A retired requireme
 | `PROPAGATION_NODE_TABLE_MAX_ENTRIES` | `32` | src/mesh/propagation_nodes.rs | cap_evicts_the_least_recently_heard_and_logs_it |
 | `FIELD_CUSTOM_TYPE` | `0xfb` | lxmf_core constants.rs (upstream) | lxmf_knock_wire_shape_is_exactly_the_typed_two_field_layout |
 | `FIELD_CUSTOM_DATA` | `0xfc` | lxmf_core constants.rs (upstream) | lxmf_knock_wire_shape_is_exactly_the_typed_two_field_layout |
+| `LOGGED_HASH_CHARS` | `8` | src/mesh/r3/mod.rs | redact_hashes_cuts_only_runs_of_exactly_32_hex_digits |
+| `PEER_INBOX_CAPACITY` | `64` | src/mesh/message.rs | peer_inbox_evicts_the_oldest_peer_at_capacity_and_counts_it |
+| `INBOUND_MAX_ENTRIES` | `256` | src/mesh/pending.rs | inbound_store_survives_reopen_and_prunes_by_ttl_and_cap |
+| `KNOCK_QUEUE_CAPACITY` | `64` | src/mesh/knock.rs | the_channel_sink_never_waits_on_a_reader_and_counts_what_it_drops |
+| `ENVOY_QUEUE_MAX` | `8` | src/config/mesh_envoy.rs | a_ninth_job_is_refused_while_the_worker_is_parked |
 
-## 16. Requirements index
+## 20. Conformance coverage
+
+Every requirement id and what exercises it: the vector families of `src/mesh/conformance/` with the kinds (`Valid`, `Boundary`, `Invalid`) they feed it, the `Interop` family being the ids the exchange with the Python reference exercises, and for sections 15 to 18 the tests that enforce the id, since those ids govern scope and structure rather than bytes. The vector rows come from `all_listed()` and the section 15 to 18 rows from `ENFORCED_BY`, both in src/mesh/conformance/mod.rs. An id with neither is marked `no vector yet`. The first table names, for each family, the `#[test]` or `#[tokio::test]` function that runs its vectors, from `EXECUTED_BY` (src/mesh/conformance/mod.rs); the second is the per-id table. Both are generated by `coverage_table` (src/mesh/conformance/mod.rs) from the same tables the coverage report reads and are held to that output by `the_coverage_table_in_the_spec_is_the_generated_one`; `ids_marked_no_vector_yet_are_exactly_the_uncovered_ids` holds the markers to the report's uncovered set.
+
+| Family | Executed by |
+|---|---|
+| Ack | `acknowledgement_vectors_are_read_only_for_their_id` |
+| Announce | `announce_vectors_decode_as_section_5_1_mandates` |
+| AnnounceEncode | `announce_encode_vectors_refuse_what_a_sender_must_not_emit` |
+| AnnouncePolicy | `announce_policy_vectors_withhold_the_display_name_as_section_5_2_mandates` |
+| Card | `card_vectors_decode_as_section_9_mandates` |
+| CardEncode | `card_encode_vectors_pin_the_emission_order` |
+| Correlation | `size_branches_and_correlation_hold_on_a_live_link` |
+| Custom | `custom_vectors_hold` |
+| Derivation | `derivation_vectors_reproduce_section_4` |
+| Dispatch | `dispatch_vectors_answer_as_section_6_6_mandates` |
+| DispatchErrorDecode | `dispatch_error_vectors_read_as_section_6_7_mandates` |
+| EnvelopeDecode | `envelope_vectors_decode_as_section_6_5_mandates` |
+| EnvelopeEncode | `envelope_vectors_encode_in_the_key_order_of_section_6_5` |
+| HandlerSlots | `the_responder_drops_what_section_6_6_says_it_drops` |
+| HandlerTimeout | `the_timeouts_and_the_outbound_cap_end_requests_as_specified` |
+| HashText | `hash_text_vectors_accept_only_32_hex_digits` |
+| Identified | `size_branches_and_correlation_hold_on_a_live_link` |
+| InboundCap | `the_responder_drops_what_section_6_6_says_it_drops` |
+| IncompatibleOutbound | `version_refusals_mark_peers_and_marked_peers_are_refused_outbound` |
+| Interop | `the_reference_announce_is_filed_and_it_derives_our_destination_from_our_announce`, `reference_requests_hear_the_specified_replies`, `our_requests_are_decoded_by_the_reference`, `a_propagation_node_demanding_a_raised_stamp_cost_still_takes_our_message` |
+| KnockBody | `knock_body_vectors_read_the_intro_as_section_8_1_mandates` |
+| KnockIntro | `knock_intro_vectors_clean_and_refuse_as_section_8_1_mandates` |
+| LinkTimeout | `the_timeouts_and_the_outbound_cap_end_requests_as_specified` |
+| LxmfKnock | `lxmf_knock_vectors_decode_as_section_8_6_mandates` |
+| LxmfPeer | `lxmf_peer_vectors_decode_as_section_10_8_mandates` |
+| MessageBody | `message_body_vectors_decode_as_section_10_1_mandates` |
+| MessageBodyEncode | `message_body_encode_vectors_pin_the_emission_order` |
+| NoKnownPath | `the_timeouts_and_the_outbound_cap_end_requests_as_specified` |
+| OtherKnockRefusal | `the_sender_outcomes_end_as_sections_8_5_and_10_4_mandate` |
+| Outbound | `outbound_vectors_mint_clean_and_refuse_as_section_10_1_mandates` |
+| OutboundCap | `the_timeouts_and_the_outbound_cap_end_requests_as_specified` |
+| PnAnnounce | `propagation_node_announce_vectors_file_or_refuse_as_section_5_4_mandates` |
+| RefusalCodeDecode | `refusal_code_vectors_decode_as_section_6_7_mandates` |
+| Registry | `registry_vectors_pin_the_code_points_of_section_13` |
+| RequestFrameDecode | `request_frame_vectors_decode_as_section_6_1_mandates` |
+| RequestTimeout | `the_timeouts_and_the_outbound_cap_end_requests_as_specified` |
+| ResponseFrameDecode | `response_frame_vectors_decode_as_section_6_2_mandates` |
+| SizeBranch | `size_branches_and_correlation_hold_on_a_live_link` |
+| Text | `text_vectors_clean_as_section_3_2_mandates` |
+| Trust | `trust_vectors_authorize_as_the_precedence_mandates` |
+| UnacknowledgedReply | `the_sender_outcomes_end_as_sections_8_5_and_10_4_mandate` |
+| UndecodableFrame | `the_responder_drops_what_section_6_6_says_it_drops` |
+| VersionMark | `version_refusals_mark_peers_and_marked_peers_are_refused_outbound` |
+| VersionRefusalDecode | `version_refusal_vectors_hold_the_shape_of_section_7` |
+| VersionRefusalEncode | `version_refusal_vectors_hold_the_shape_of_section_7` |
+| WrongLink | `the_responder_drops_what_section_6_6_says_it_drops` |
+
+| Requirement | Vectors and tests |
+|---|---|
+| MESH-CANON-001 | Custom (Valid) |
+| MESH-CANON-002 | HashText (Boundary), HashText (Invalid), HashText (Valid) |
+| MESH-CANON-003 | Custom (Invalid), Custom (Valid) |
+| MESH-CANON-004 | Trust (Invalid), Trust (Valid) |
+| MESH-CANON-005 | Card (Valid), Text (Boundary), Text (Invalid), Text (Valid) |
+| MESH-CANON-006 | Custom (Valid) |
+| MESH-CANON-007 | Custom (Valid) |
+| MESH-CANON-008 | CardEncode (Valid), Custom (Valid), Interop (Valid), MessageBodyEncode (Valid) |
+| MESH-CANON-009 | Ack (Valid), Card (Valid), MessageBody (Valid) |
+| MESH-CANON-010 | LxmfKnock (Valid), LxmfPeer (Valid), MessageBody (Valid) |
+| MESH-CANON-011 | Custom (Valid) |
+| MESH-CANON-012 | Ack (Valid), Card (Valid), KnockBody (Valid), LxmfKnock (Valid), LxmfPeer (Valid), MessageBody (Valid) |
+| MESH-CANON-013 | CardEncode (Valid), MessageBodyEncode (Valid) |
+| MESH-DEST-001 | Derivation (Invalid), Derivation (Valid) |
+| MESH-DEST-002 | Derivation (Invalid), Derivation (Valid) |
+| MESH-DEST-003 | Derivation (Invalid), Derivation (Valid), Interop (Valid) |
+| MESH-DEST-004 | Derivation (Valid), Interop (Valid) |
+| MESH-DEST-005 | Derivation (Invalid), Derivation (Valid), Interop (Valid) |
+| MESH-DEST-006 | Custom (Valid) |
+| MESH-DEST-007 | Custom (Invalid) |
+| MESH-DEST-008 | Custom (Invalid), Trust (Invalid), Trust (Valid) |
+| MESH-DEST-009 | Custom (Valid), Derivation (Valid) |
+| MESH-DEST-010 | Derivation (Valid), PnAnnounce (Invalid), PnAnnounce (Valid) |
+| MESH-ANN-001 | Announce (Boundary), Announce (Invalid), Interop (Valid) |
+| MESH-ANN-002 | Announce (Boundary), Announce (Valid), Custom (Valid), Interop (Valid) |
+| MESH-ANN-003 | Announce (Boundary), Announce (Invalid), Announce (Valid) |
+| MESH-ANN-004 | Announce (Valid), Interop (Valid) |
+| MESH-ANN-005 | Announce (Valid) |
+| MESH-ANN-006 | AnnounceEncode (Boundary), AnnounceEncode (Invalid), AnnounceEncode (Valid) |
+| MESH-ANN-007 | Announce (Valid), AnnounceEncode (Valid), Text (Valid) |
+| MESH-ANN-008 | AnnouncePolicy (Valid) |
+| MESH-ANN-009 | AnnouncePolicy (Invalid), AnnouncePolicy (Valid) |
+| MESH-ANN-010 | Custom (Valid), Interop (Valid) |
+| MESH-ANN-011 | Custom (Valid) |
+| MESH-TIME-001 | no vector yet |
+| MESH-TIME-002 | Custom (Valid) |
+| MESH-TIME-003 | Custom (Valid) |
+| MESH-TIME-004 | Custom (Boundary), Custom (Valid) |
+| MESH-TIME-005 | Custom (Boundary) |
+| MESH-TIME-006 | no vector yet |
+| MESH-TIME-007 | Custom (Boundary) |
+| MESH-ANN-012 | Custom (Invalid), PnAnnounce (Invalid), PnAnnounce (Valid) |
+| MESH-ANN-013 | PnAnnounce (Invalid) |
+| MESH-ANN-033 | PnAnnounce (Valid) |
+| MESH-ANN-014 | PnAnnounce (Boundary), PnAnnounce (Invalid) |
+| MESH-ANN-015 | PnAnnounce (Valid) |
+| MESH-ANN-016 | PnAnnounce (Boundary), PnAnnounce (Invalid), PnAnnounce (Valid) |
+| MESH-ANN-017 | PnAnnounce (Valid) |
+| MESH-ANN-018 | PnAnnounce (Invalid) |
+| MESH-ANN-019 | PnAnnounce (Boundary), PnAnnounce (Valid) |
+| MESH-ANN-020 | PnAnnounce (Invalid) |
+| MESH-ANN-021 | PnAnnounce (Invalid) |
+| MESH-ANN-022 | PnAnnounce (Invalid), PnAnnounce (Valid) |
+| MESH-ANN-023 | PnAnnounce (Boundary), PnAnnounce (Invalid), PnAnnounce (Valid) |
+| MESH-ANN-024 | Interop (Boundary), PnAnnounce (Boundary), PnAnnounce (Valid) |
+| MESH-ANN-025 | PnAnnounce (Invalid) |
+| MESH-ANN-026 | PnAnnounce (Boundary), PnAnnounce (Invalid) |
+| MESH-ANN-027 | Interop (Boundary), PnAnnounce (Boundary), PnAnnounce (Valid) |
+| MESH-ANN-028 | PnAnnounce (Invalid), PnAnnounce (Valid) |
+| MESH-ANN-029 | PnAnnounce (Valid) |
+| MESH-ANN-030 | Custom (Boundary) |
+| MESH-ANN-031 | Custom (Valid) |
+| MESH-ANN-032 | Custom (Valid) |
+| MESH-ENV-001 | RequestFrameDecode (Invalid), RequestFrameDecode (Valid) |
+| MESH-ENV-002 | RequestFrameDecode (Boundary), RequestFrameDecode (Invalid) |
+| MESH-ENV-003 | RequestFrameDecode (Invalid) |
+| MESH-ENV-004 | RequestFrameDecode (Invalid) |
+| MESH-ENV-005 | Correlation (Valid) |
+| MESH-ENV-006 | ResponseFrameDecode (Valid) |
+| MESH-ENV-007 | ResponseFrameDecode (Boundary), ResponseFrameDecode (Invalid), ResponseFrameDecode (Valid), WrongLink (Invalid) |
+| MESH-ENV-008 | SizeBranch (Boundary), SizeBranch (Valid) |
+| MESH-ENV-009 | SizeBranch (Boundary) |
+| MESH-ENV-010 | SizeBranch (Boundary) |
+| MESH-ENV-011 | Custom (Boundary), OutboundCap (Invalid) |
+| MESH-ENV-012 | Identified (Valid), Interop (Valid) |
+| MESH-ENV-013 | Custom (Invalid), Custom (Valid), Dispatch (Invalid) |
+| MESH-ENV-014 | Dispatch (Invalid), EnvelopeDecode (Boundary), EnvelopeDecode (Invalid), EnvelopeDecode (Valid), Interop (Invalid) |
+| MESH-ENV-015 | Dispatch (Invalid), EnvelopeDecode (Boundary), EnvelopeDecode (Invalid), Interop (Invalid) |
+| MESH-ENV-016 | Dispatch (Invalid), EnvelopeDecode (Invalid), EnvelopeDecode (Valid) |
+| MESH-ENV-017 | Dispatch (Valid), EnvelopeDecode (Valid) |
+| MESH-ENV-018 | EnvelopeEncode (Valid), Interop (Valid) |
+| MESH-ENV-019 | Dispatch (Valid), EnvelopeDecode (Invalid), EnvelopeDecode (Valid) |
+| MESH-ENV-020 | Dispatch (Invalid), EnvelopeDecode (Invalid) |
+| MESH-ENV-021 | Dispatch (Invalid), EnvelopeDecode (Invalid) |
+| MESH-ENV-022 | Dispatch (Invalid), Dispatch (Valid), Interop (Valid) |
+| MESH-ENV-023 | Dispatch (Invalid) |
+| MESH-ENV-024 | InboundCap (Invalid) |
+| MESH-ENV-025 | Custom (Boundary), HandlerSlots (Invalid) |
+| MESH-ENV-026 | Dispatch (Invalid) |
+| MESH-ENV-027 | Custom (Invalid), Dispatch (Invalid) |
+| MESH-ENV-028 | RequestFrameDecode (Invalid), UndecodableFrame (Invalid) |
+| MESH-ENV-029 | Dispatch (Invalid), Interop (Invalid) |
+| MESH-ENV-030 | Dispatch (Invalid), EnvelopeDecode (Invalid), Interop (Invalid) |
+| MESH-ENV-031 | Dispatch (Invalid) |
+| MESH-ENV-032 | Dispatch (Invalid), Interop (Invalid) |
+| MESH-ENV-033 | Dispatch (Invalid) |
+| MESH-ENV-034 | Dispatch (Valid), Interop (Invalid) |
+| MESH-ENV-035 | Dispatch (Valid) |
+| MESH-ENV-036 | Dispatch (Invalid), Dispatch (Valid) |
+| MESH-ENV-037 | Custom (Boundary), HandlerTimeout (Invalid) |
+| MESH-ENV-038 | Custom (Valid), Interop (Invalid), ResponseFrameDecode (Valid) |
+| MESH-ENV-039 | Custom (Invalid), Custom (Valid) |
+| MESH-ENV-040 | DispatchErrorDecode (Invalid), DispatchErrorDecode (Valid) |
+| MESH-ENV-041 | DispatchErrorDecode (Boundary), DispatchErrorDecode (Invalid), DispatchErrorDecode (Valid) |
+| MESH-ENV-042 | DispatchErrorDecode (Invalid), DispatchErrorDecode (Valid) |
+| MESH-ENV-043 | DispatchErrorDecode (Valid) |
+| MESH-ENV-044 | Custom (Valid), ResponseFrameDecode (Valid) |
+| MESH-ENV-045 | RefusalCodeDecode (Valid) |
+| MESH-ENV-046 | DispatchErrorDecode (Invalid), DispatchErrorDecode (Valid), RefusalCodeDecode (Invalid), RefusalCodeDecode (Valid), VersionRefusalDecode (Invalid), VersionRefusalDecode (Valid) |
+| MESH-ENV-047 | RefusalCodeDecode (Invalid) |
+| MESH-TIME-008 | RequestTimeout (Invalid) |
+| MESH-TIME-009 | LinkTimeout (Invalid) |
+| MESH-TIME-010 | HandlerTimeout (Invalid) |
+| MESH-TIME-011 | NoKnownPath (Invalid) |
+| MESH-VER-001 | Dispatch (Boundary), EnvelopeDecode (Boundary), EnvelopeDecode (Invalid) |
+| MESH-VER-002 | Custom (Boundary), EnvelopeDecode (Boundary), EnvelopeDecode (Invalid), VersionRefusalDecode (Valid), VersionRefusalEncode (Valid) |
+| MESH-VER-003 | Custom (Valid), EnvelopeEncode (Valid), Interop (Valid) |
+| MESH-VER-004 | EnvelopeDecode (Invalid) |
+| MESH-VER-005 | Dispatch (Invalid), EnvelopeDecode (Invalid), Interop (Invalid) |
+| MESH-VER-006 | Interop (Invalid), VersionRefusalDecode (Invalid), VersionRefusalDecode (Valid) |
+| MESH-VER-007 | Interop (Invalid), VersionRefusalDecode (Boundary), VersionRefusalDecode (Invalid), VersionRefusalDecode (Valid) |
+| MESH-VER-008 | Interop (Invalid), VersionRefusalDecode (Boundary), VersionRefusalDecode (Invalid) |
+| MESH-VER-009 | Interop (Invalid), VersionRefusalDecode (Boundary), VersionRefusalDecode (Invalid) |
+| MESH-VER-010 | Interop (Invalid), VersionRefusalDecode (Valid) |
+| MESH-VER-011 | Interop (Invalid), VersionRefusalEncode (Valid) |
+| MESH-VER-012 | Dispatch (Invalid) |
+| MESH-VER-013 | VersionMark (Invalid), VersionMark (Valid) |
+| MESH-VER-014 | IncompatibleOutbound (Invalid) |
+| MESH-KNOCK-001 | KnockBody (Boundary), KnockBody (Invalid), KnockBody (Valid) |
+| MESH-KNOCK-002 | KnockBody (Valid) |
+| MESH-KNOCK-003 | KnockIntro (Boundary), KnockIntro (Invalid) |
+| MESH-KNOCK-004 | Custom (Valid), KnockIntro (Valid) |
+| MESH-KNOCK-005 | no vector yet |
+| MESH-KNOCK-006 | no vector yet |
+| MESH-KNOCK-007 | no vector yet |
+| MESH-KNOCK-008 | no vector yet |
+| MESH-KNOCK-009 | no vector yet |
+| MESH-KNOCK-010 | no vector yet |
+| MESH-KNOCK-011 | no vector yet |
+| MESH-KNOCK-012 | no vector yet |
+| MESH-KNOCK-013 | no vector yet |
+| MESH-KNOCK-014 | no vector yet |
+| MESH-KNOCK-015 | no vector yet |
+| MESH-KNOCK-016 | no vector yet |
+| MESH-KNOCK-017 | no vector yet |
+| MESH-KNOCK-018 | OtherKnockRefusal (Invalid) |
+| MESH-KNOCK-019 | no vector yet |
+| MESH-KNOCK-020 | LxmfKnock (Invalid), LxmfKnock (Valid) |
+| MESH-KNOCK-021 | LxmfKnock (Invalid) |
+| MESH-KNOCK-022 | LxmfKnock (Valid) |
+| MESH-KNOCK-023 | LxmfKnock (Boundary), LxmfKnock (Invalid) |
+| MESH-KNOCK-024 | LxmfKnock (Valid) |
+| MESH-KNOCK-025 | Custom (Valid) |
+| MESH-KNOCK-026 | Custom (Valid) |
+| MESH-KNOCK-027 | LxmfKnock (Boundary), LxmfKnock (Valid) |
+| MESH-KNOCK-028 | no vector yet |
+| MESH-KNOCK-029 | no vector yet |
+| MESH-STATUS-001 | Interop (Valid) |
+| MESH-STATUS-002 | Interop (Valid) |
+| MESH-STATUS-003 | Interop (Invalid) |
+| MESH-STATUS-004 | Card (Boundary), Card (Invalid), Interop (Valid) |
+| MESH-STATUS-005 | Card (Boundary), Card (Invalid), Card (Valid) |
+| MESH-STATUS-006 | Card (Boundary), Card (Invalid), Card (Valid) |
+| MESH-STATUS-007 | Card (Invalid), Card (Valid) |
+| MESH-STATUS-008 | Card (Invalid), Card (Valid) |
+| MESH-STATUS-009 | Card (Invalid), Card (Valid) |
+| MESH-STATUS-010 | Card (Invalid), Card (Valid) |
+| MESH-STATUS-011 | Card (Boundary), Card (Invalid), Card (Valid) |
+| MESH-STATUS-012 | Card (Boundary), Card (Invalid), Interop (Valid) |
+| MESH-STATUS-013 | Card (Valid) |
+| MESH-STATUS-014 | CardEncode (Valid) |
+| MESH-STATUS-015 | CardEncode (Valid) |
+| MESH-STATUS-016 | Card (Invalid), Card (Valid) |
+| MESH-STATUS-017 | Card (Boundary), Card (Invalid), Card (Valid) |
+| MESH-STATUS-018 | Card (Boundary), Card (Invalid), Card (Valid) |
+| MESH-STATUS-019 | Card (Valid) |
+| MESH-STATUS-020 | Card (Boundary), Card (Invalid), Card (Valid) |
+| MESH-STATUS-021 | Card (Boundary), Card (Invalid), Card (Valid) |
+| MESH-STATUS-022 | Card (Valid) |
+| MESH-STATUS-023 | Card (Boundary), Card (Invalid), Card (Valid) |
+| MESH-STATUS-024 | Card (Valid) |
+| MESH-STATUS-025 | Card (Boundary), Card (Invalid), Card (Valid) |
+| MESH-STATUS-026 | Card (Boundary), Card (Invalid) |
+| MESH-STATUS-027 | Card (Boundary), Card (Invalid), Card (Valid) |
+| MESH-STATUS-028 | Card (Valid) |
+| MESH-STATUS-029 | Card (Boundary), Card (Valid) |
+| MESH-STATUS-030 | Card (Boundary), Card (Valid) |
+| MESH-MSG-001 | Interop (Valid), MessageBody (Boundary), MessageBody (Invalid) |
+| MESH-MSG-002 | Interop (Invalid), MessageBody (Invalid), MessageBody (Valid) |
+| MESH-MSG-003 | MessageBody (Boundary), MessageBody (Invalid), MessageBody (Valid) |
+| MESH-MSG-004 | MessageBody (Boundary), MessageBody (Invalid), MessageBody (Valid) |
+| MESH-MSG-005 | MessageBody (Boundary), MessageBody (Invalid), MessageBody (Valid) |
+| MESH-MSG-006 | MessageBody (Boundary), MessageBody (Invalid), MessageBody (Valid) |
+| MESH-MSG-007 | MessageBody (Invalid), MessageBody (Valid) |
+| MESH-MSG-008 | Custom (Boundary), Custom (Invalid), MessageBody (Invalid) |
+| MESH-MSG-009 | MessageBody (Boundary), MessageBody (Invalid), MessageBody (Valid) |
+| MESH-MSG-010 | MessageBody (Valid) |
+| MESH-MSG-011 | Custom (Valid), Interop (Valid), MessageBodyEncode (Valid) |
+| MESH-MSG-012 | MessageBody (Invalid) |
+| MESH-MSG-013 | MessageBody (Invalid), MessageBody (Valid) |
+| MESH-MSG-014 | Custom (Valid), Interop (Valid), Outbound (Boundary), Outbound (Invalid), Outbound (Valid) |
+| MESH-MSG-015 | Ack (Invalid), Ack (Valid), Interop (Valid) |
+| MESH-MSG-016 | Ack (Invalid), Ack (Valid), Interop (Valid) |
+| MESH-MSG-017 | Ack (Valid) |
+| MESH-MSG-018 | Interop (Invalid) |
+| MESH-MSG-019 | no vector yet |
+| MESH-MSG-020 | no vector yet |
+| MESH-MSG-021 | no vector yet |
+| MESH-MSG-022 | Interop (Valid) |
+| MESH-MSG-023 | UnacknowledgedReply (Invalid) |
+| MESH-MSG-024 | Interop (Valid) |
+| MESH-MSG-025 | no vector yet |
+| MESH-MSG-026 | no vector yet |
+| MESH-MSG-027 | no vector yet |
+| MESH-MSG-028 | no vector yet |
+| MESH-MSG-029 | no vector yet |
+| MESH-MSG-030 | no vector yet |
+| MESH-MSG-031 | no vector yet |
+| MESH-MSG-032 | no vector yet |
+| MESH-MSG-033 | no vector yet |
+| MESH-MSG-034 | no vector yet |
+| MESH-MSG-035 | no vector yet |
+| MESH-MSG-036 | no vector yet |
+| MESH-MSG-037 | MessageBody (Valid) |
+| MESH-MSG-038 | Custom (Valid), MessageBody (Valid) |
+| MESH-MSG-039 | MessageBody (Valid) |
+| MESH-MSG-040 | no vector yet |
+| MESH-MSG-041 | no vector yet |
+| MESH-MSG-042 | no vector yet |
+| MESH-MSG-043 | no vector yet |
+| MESH-MSG-044 | no vector yet |
+| MESH-MSG-045 | no vector yet |
+| MESH-MSG-046 | LxmfPeer (Invalid), LxmfPeer (Valid) |
+| MESH-MSG-047 | LxmfPeer (Invalid) |
+| MESH-MSG-048 | LxmfPeer (Valid) |
+| MESH-MSG-049 | LxmfPeer (Invalid), LxmfPeer (Valid) |
+| MESH-MSG-050 | LxmfPeer (Boundary), LxmfPeer (Invalid), LxmfPeer (Valid) |
+| MESH-MSG-051 | LxmfPeer (Boundary), LxmfPeer (Invalid), LxmfPeer (Valid) |
+| MESH-MSG-052 | LxmfPeer (Boundary), LxmfPeer (Invalid) |
+| MESH-MSG-053 | LxmfPeer (Valid) |
+| MESH-MSG-054 | Custom (Invalid), LxmfPeer (Boundary), LxmfPeer (Invalid) |
+| MESH-MSG-055 | LxmfPeer (Valid) |
+| MESH-MSG-056 | Custom (Valid) |
+| MESH-MSG-057 | Custom (Boundary), LxmfPeer (Valid) |
+| MESH-MSG-058 | no vector yet |
+| MESH-MSG-059 | no vector yet |
+| MESH-PROP-001 | Custom (Valid) |
+| MESH-PROP-002 | Custom (Valid) |
+| MESH-PROP-003 | Custom (Invalid), Custom (Valid) |
+| MESH-PROP-004 | Custom (Valid) |
+| MESH-PROP-005 | Custom (Valid) |
+| MESH-PROP-006 | Custom (Valid) |
+| MESH-PROP-007 | Custom (Valid) |
+| MESH-PROP-008 | Custom (Valid) |
+| MESH-PROP-009 | Custom (Valid) |
+| MESH-PROP-010 | Interop (Boundary) |
+| MESH-PROP-011 | Custom (Invalid) |
+| MESH-PROP-012 | Interop (Boundary) |
+| MESH-PROP-013 | Custom (Invalid) |
+| MESH-PROP-014 | no vector yet |
+| MESH-PROP-015 | Interop (Valid) |
+| MESH-PROP-016 | no vector yet |
+| MESH-PROP-017 | no vector yet |
+| MESH-PROP-018 | no vector yet |
+| MESH-PROP-019 | no vector yet |
+| MESH-PROP-020 | no vector yet |
+| MESH-PROP-021 | no vector yet |
+| MESH-PROP-022 | no vector yet |
+| MESH-PROP-023 | no vector yet |
+| MESH-PROP-024 | no vector yet |
+| MESH-PROP-025 | no vector yet |
+| MESH-PROP-026 | no vector yet |
+| MESH-PROP-027 | no vector yet |
+| MESH-PROP-028 | Custom (Boundary), Custom (Invalid) |
+| MESH-PROP-029 | no vector yet |
+| MESH-PROP-030 | no vector yet |
+| MESH-PROP-031 | no vector yet |
+| MESH-PROP-032 | no vector yet |
+| MESH-PROP-033 | no vector yet |
+| MESH-PROP-034 | no vector yet |
+| MESH-PROP-035 | no vector yet |
+| MESH-PROP-036 | no vector yet |
+| MESH-PROP-037 | no vector yet |
+| MESH-PROP-038 | LxmfKnock (Valid), LxmfPeer (Valid) |
+| MESH-PROP-039 | no vector yet |
+| MESH-PROP-040 | no vector yet |
+| MESH-PROP-041 | no vector yet |
+| MESH-PROP-042 | no vector yet |
+| MESH-EXT-001 | Card (Valid), KnockBody (Valid), LxmfKnock (Valid), LxmfPeer (Valid), MessageBody (Valid) |
+| MESH-EXT-002 | LxmfPeer (Invalid), MessageBody (Invalid) |
+| MESH-EXT-003 | Card (Valid) |
+| MESH-EXT-004 | Custom (Valid) |
+| MESH-EXT-005 | Custom (Valid) |
+| MESH-EXT-006 | Custom (Valid) |
+| MESH-EXT-007 | Card (Valid), MessageBody (Valid) |
+| MESH-EXT-008 | Registry (Valid) |
+| MESH-CODE-001 | Registry (Valid) |
+| MESH-CODE-002 | Registry (Valid) |
+| MESH-SEC-001 | `empty_trust_list_admits_nobody_and_never_decodes`, `an_identity_untrusted_before_handle_is_answered_silently` |
+| MESH-SEC-002 | `encode_layout_is_magic_version_name`, `app_data_carries_only_version_and_display_name` |
+| MESH-SEC-003 | `a_claimed_instance_is_bound_to_the_proven_identity`, `identity_is_tracked_only_after_proof_and_forgotten_on_close` |
+| MESH-SEC-004 | `receipt_fails_with_the_timeout_when_nothing_answers` |
+| MESH-SEC-005 | `an_untrusted_sender_is_discarded_and_a_trusted_one_delivered`, `a_blocked_signer_is_discarded_and_the_stamp_line_is_logged_for_a_trusted_one` |
+| MESH-SEC-006 | `an_unknown_source_is_left_on_the_node_while_a_forgery_is_acknowledged` |
+| MESH-SEC-007 | `dedup_evicts_the_oldest_past_capacity_and_logs_it`, `dedup_forgets_past_the_horizon_on_insert_and_on_load` |
+| MESH-SEC-008 | `same_hash_is_constant_time_shaped`, `trust_destination_refuses_a_forged_name_hash`, `a_claimed_instance_is_bound_to_the_proven_identity` |
+| MESH-SEC-009 | `compose_envoy_input_fences_the_peer_text_and_carries_the_data_rule` |
+| MESH-SEC-010 | `oversized_request_resource_is_dropped_before_the_handler_runs`, `requests_beyond_the_handler_slots_are_dropped_silently`, `a_handler_past_its_timeout_answers_nothing_and_frees_its_slot` |
+| MESH-SEC-011 | `admit_message_refuses_the_sixty_first_in_an_hour_and_resets_after_rollover`, `try_reserve_refuses_while_a_run_is_in_flight_and_admits_once_the_guard_drops`, `try_reserve_refuses_past_the_token_ceiling_until_rollover`, `cost_ceiling_is_off_at_zero_and_ignores_unpriced_debits` |
+| MESH-SEC-012 | `one_identity_is_rate_limited_per_identity_and_surfaced_once`, `the_gate_forgets_the_least_recently_seen_identity_past_its_cap` |
+| MESH-SEC-013 | `costs_above_the_ceiling_are_refused_before_any_mining` |
+| MESH-INV-001 | `mesh_module_never_names_the_request_ctx` |
+| MESH-INV-002 | `representation_is_a_packet_up_to_the_mdu_and_a_resource_above`, `oversize_status_card_round_trips_as_a_resource` |
+| MESH-INV-003 | `admit_message_refuses_the_sixty_first_in_an_hour_and_resets_after_rollover`, `try_reserve_refuses_while_a_run_is_in_flight_and_admits_once_the_guard_drops`, `try_reserve_refuses_past_the_token_ceiling_until_rollover` |
+| MESH-INV-004 | `blocked_identity_is_dropped_before_decode_without_a_knock`, `empty_trust_list_admits_nobody_and_never_decodes` |
+| MESH-INV-005 | `bounds_leave_room_under_the_transport_and_response_caps`, `garbage_bodies_are_discarded_in_bound_order_and_never_reach_the_sink`, `a_blocked_signer_is_discarded_and_the_stamp_line_is_logged_for_a_trusted_one`, `an_untrusted_sender_is_discarded_and_a_trusted_one_delivered` |
+| MESH-INV-006 | `drain_live_notifications_passes_mesh_events_without_a_supervisor`, `top_level_mesh_note_survives_drain_live_notifications` |
+| MESH-INV-007 | `child_agents_get_a_fresh_mesh_slot_never_the_parents`, `a_spawned_child_declares_no_mesh_tools_while_the_parent_does`, `the_envoy_child_has_only_user_tools_and_the_read_only_trio` |
+| MESH-LOG-001 | `mesh_log_lines_never_carry_peer_text_or_a_full_hash` |
+| MESH-LOG-002 | `mesh_log_lines_never_carry_peer_text_or_a_full_hash`, `serving_path_logs_never_carry_a_full_identity_or_instance_hash`, `an_unreachable_knock_falls_back_to_the_propagation_node` |
+| MESH-LOG-003 | `redaction_scanner_flags_each_rule_and_passes_the_permitted_forms` |
+| MESH-LOG-004 | `redaction_scanner_flags_each_rule_and_passes_the_permitted_forms` |
+| MESH-LEN-001 | `oversized_request_resource_is_dropped_before_the_handler_runs`, `oversized_response_resource_is_dropped_after_assembly` |
+| MESH-LEN-002 | `a_completed_transfer_is_accepted_one_window_later_not_at_the_deadline` |
+| MESH-LEN-003 | `from_announce_refuses_negative_costs_and_files_any_other`, `costs_above_the_ceiling_are_refused_before_any_mining` |
+| MESH-LEN-004 | `representation_is_a_packet_up_to_the_mdu_and_a_resource_above` |
+| MESH-LEN-005 | `usage_probe_disable_ingress_control_flips_only_ingress_control_on_every_interface` |
+| MESH-LEN-006 | `malformed_hashes_are_refused_without_panicking` |
+
+## 21. Requirements index
 
 - [MESH-CANON-001](#31-hashes-as-text) -- hashes written as lowercase hex
 - [MESH-CANON-002](#31-hashes-as-text) -- hash text accepted only as 32 hex digits, lowercased
@@ -1132,6 +1668,7 @@ An id, once published, is never renumbered and never reused. A retired requireme
 - [MESH-TIME-008](#68-timeouts) -- request timeout outcome
 - [MESH-TIME-009](#68-timeouts) -- link timeout outcome
 - [MESH-TIME-010](#68-timeouts) -- handler abandoned at its timeout
+- [MESH-TIME-011](#68-timeouts) -- `LinkFailed` only when the transport could not establish the link or send on it
 - [MESH-VER-001](#7-version-negotiation) -- version is a 16-bit unsigned integer
 - [MESH-VER-002](#7-version-negotiation) -- supported window
 - [MESH-VER-003](#7-version-negotiation) -- sender puts its own version
@@ -1316,3 +1853,33 @@ An id, once published, is never renumbered and never reused. A retired requireme
 - [MESH-EXT-008](#12-extensibility) -- schema versions bump for incompatible changes
 - [MESH-CODE-001](#13-code-point-immutability) -- code point semantics never change
 - [MESH-CODE-002](#13-code-point-immutability) -- new semantics take a new code point
+- [MESH-SEC-001](#152-channel-security) -- every exchange inside a Link with a proven, trusted identity, else silence
+- [MESH-SEC-002](#152-channel-security) -- announce data carries only magic, version and display name
+- [MESH-SEC-003](#152-channel-security) -- identity bound to the link's proof, forgotten on close
+- [MESH-SEC-004](#152-channel-security) -- silence is a timeout, never a receipt
+- [MESH-SEC-005](#153-store-and-forward-object-security) -- spooled bodies verified by signature and standing, not by the link
+- [MESH-SEC-006](#153-store-and-forward-object-security) -- a body with a bad signature is discarded without acting on any field
+- [MESH-SEC-007](#153-store-and-forward-object-security) -- replay defence: dedup by transient and message id, capacity, horizon, persisted
+- [MESH-SEC-008](#154-trust-boundary) -- standing by the proven identity hash alone, constant time
+- [MESH-SEC-009](#154-trust-boundary) -- peer text cleaned before display and fenced before the envoy
+- [MESH-SEC-010](#155-denial-of-service) -- every bound enforced, no unbounded per-peer state
+- [MESH-SEC-011](#155-denial-of-service) -- envoy runs only inside the per-identity budget
+- [MESH-SEC-012](#155-denial-of-service) -- knocks cost the gate's bookkeeping and nothing more
+- [MESH-SEC-013](#155-denial-of-service) -- no mining above the stamp cost ceiling
+- [MESH-INV-001](#16-invariants) -- no serving path takes the request-context lock
+- [MESH-INV-002](#16-invariants) -- every path carries payloads larger than the MDU
+- [MESH-INV-003](#16-invariants) -- inbound traffic spends no tokens beyond the budget
+- [MESH-INV-004](#16-invariants) -- R3 refuses unproven and untrusted identities before decoding
+- [MESH-INV-005](#16-invariants) -- the LXMF fetch path bounds its exposure: size, dedup, discard before dispatch
+- [MESH-INV-006](#16-invariants) -- mesh notifications reach the human without a supervisor handle
+- [MESH-INV-007](#16-invariants) -- children and the envoy get an empty mesh slot and no mesh tools
+- [MESH-LOG-001](#17-log-redaction) -- no peer text, brief, objective or session name in a mesh log line
+- [MESH-LOG-002](#17-log-redaction) -- identity and destination hashes truncated to 8 hex digits
+- [MESH-LOG-003](#17-log-redaction) -- link, request, transient and message ids in full
+- [MESH-LOG-004](#17-log-redaction) -- kind, wire id, lengths, counts and codes
+- [MESH-LEN-001](#18-leniency-register) -- size caps after assembly, not at advertisement time
+- [MESH-LEN-002](#18-leniency-register) -- propagation acceptance inferred from silence
+- [MESH-LEN-003](#18-leniency-register) -- stamp costs below 13 filed, above 26 not mined
+- [MESH-LEN-004](#18-leniency-register) -- packet or resource by the physical MDU
+- [MESH-LEN-005](#18-leniency-register) -- ingress control off in the suites only
+- [MESH-LEN-006](#18-leniency-register) -- hash text canonicalised before the transport's parser

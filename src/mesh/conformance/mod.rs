@@ -30,8 +30,12 @@
 //! feature. Product code under `src/mesh/` is never cfg-gated; those three are the only
 //! exemption. Windows mesh behaviour is covered by the unit tests, the platform-independent
 //! vectors and manual verification, not by the Python interop matrix.
+//!
+//! `coverage_table` renders the same data as the section 20 table of the spec, which
+//! `tests::the_coverage_table_in_the_spec_is_the_generated_one` holds to it.
 
 mod env_vectors;
+mod interop_ids;
 mod link_vectors;
 mod vectors;
 
@@ -58,12 +62,469 @@ pub(super) struct Listed {
     pub family: &'static str,
 }
 
+/// The tests that enforce the ids of sections 15 to 18. Those ids govern scope, structure
+/// and the reference's own conduct rather than bytes a vector could feed to a codec, so the
+/// section 20 table names these instead of vector families.
+const ENFORCED_BY: &[(&str, &[&str])] = &[
+    (
+        "MESH-SEC-001",
+        &[
+            "empty_trust_list_admits_nobody_and_never_decodes",
+            "an_identity_untrusted_before_handle_is_answered_silently",
+        ],
+    ),
+    (
+        "MESH-SEC-002",
+        &[
+            "encode_layout_is_magic_version_name",
+            "app_data_carries_only_version_and_display_name",
+        ],
+    ),
+    (
+        "MESH-SEC-003",
+        &[
+            "a_claimed_instance_is_bound_to_the_proven_identity",
+            "identity_is_tracked_only_after_proof_and_forgotten_on_close",
+        ],
+    ),
+    (
+        "MESH-SEC-004",
+        &["receipt_fails_with_the_timeout_when_nothing_answers"],
+    ),
+    (
+        "MESH-SEC-005",
+        &[
+            "an_untrusted_sender_is_discarded_and_a_trusted_one_delivered",
+            "a_blocked_signer_is_discarded_and_the_stamp_line_is_logged_for_a_trusted_one",
+        ],
+    ),
+    (
+        "MESH-SEC-006",
+        &["an_unknown_source_is_left_on_the_node_while_a_forgery_is_acknowledged"],
+    ),
+    (
+        "MESH-SEC-007",
+        &[
+            "dedup_evicts_the_oldest_past_capacity_and_logs_it",
+            "dedup_forgets_past_the_horizon_on_insert_and_on_load",
+        ],
+    ),
+    (
+        "MESH-SEC-008",
+        &[
+            "same_hash_is_constant_time_shaped",
+            "trust_destination_refuses_a_forged_name_hash",
+            "a_claimed_instance_is_bound_to_the_proven_identity",
+        ],
+    ),
+    (
+        "MESH-SEC-009",
+        &["compose_envoy_input_fences_the_peer_text_and_carries_the_data_rule"],
+    ),
+    (
+        "MESH-SEC-010",
+        &[
+            "oversized_request_resource_is_dropped_before_the_handler_runs",
+            "requests_beyond_the_handler_slots_are_dropped_silently",
+            "a_handler_past_its_timeout_answers_nothing_and_frees_its_slot",
+        ],
+    ),
+    (
+        "MESH-SEC-011",
+        &[
+            "admit_message_refuses_the_sixty_first_in_an_hour_and_resets_after_rollover",
+            "try_reserve_refuses_while_a_run_is_in_flight_and_admits_once_the_guard_drops",
+            "try_reserve_refuses_past_the_token_ceiling_until_rollover",
+            "cost_ceiling_is_off_at_zero_and_ignores_unpriced_debits",
+        ],
+    ),
+    (
+        "MESH-SEC-012",
+        &[
+            "one_identity_is_rate_limited_per_identity_and_surfaced_once",
+            "the_gate_forgets_the_least_recently_seen_identity_past_its_cap",
+        ],
+    ),
+    (
+        "MESH-SEC-013",
+        &["costs_above_the_ceiling_are_refused_before_any_mining"],
+    ),
+    ("MESH-INV-001", &["mesh_module_never_names_the_request_ctx"]),
+    (
+        "MESH-INV-002",
+        &[
+            "representation_is_a_packet_up_to_the_mdu_and_a_resource_above",
+            "oversize_status_card_round_trips_as_a_resource",
+        ],
+    ),
+    (
+        "MESH-INV-003",
+        &[
+            "admit_message_refuses_the_sixty_first_in_an_hour_and_resets_after_rollover",
+            "try_reserve_refuses_while_a_run_is_in_flight_and_admits_once_the_guard_drops",
+            "try_reserve_refuses_past_the_token_ceiling_until_rollover",
+        ],
+    ),
+    (
+        "MESH-INV-004",
+        &[
+            "blocked_identity_is_dropped_before_decode_without_a_knock",
+            "empty_trust_list_admits_nobody_and_never_decodes",
+        ],
+    ),
+    (
+        "MESH-INV-005",
+        &[
+            "bounds_leave_room_under_the_transport_and_response_caps",
+            "garbage_bodies_are_discarded_in_bound_order_and_never_reach_the_sink",
+            "a_blocked_signer_is_discarded_and_the_stamp_line_is_logged_for_a_trusted_one",
+            "an_untrusted_sender_is_discarded_and_a_trusted_one_delivered",
+        ],
+    ),
+    (
+        "MESH-INV-006",
+        &[
+            "drain_live_notifications_passes_mesh_events_without_a_supervisor",
+            "top_level_mesh_note_survives_drain_live_notifications",
+        ],
+    ),
+    (
+        "MESH-INV-007",
+        &[
+            "child_agents_get_a_fresh_mesh_slot_never_the_parents",
+            "a_spawned_child_declares_no_mesh_tools_while_the_parent_does",
+            "the_envoy_child_has_only_user_tools_and_the_read_only_trio",
+        ],
+    ),
+    (
+        "MESH-LOG-001",
+        &["mesh_log_lines_never_carry_peer_text_or_a_full_hash"],
+    ),
+    (
+        "MESH-LOG-002",
+        &[
+            "mesh_log_lines_never_carry_peer_text_or_a_full_hash",
+            "serving_path_logs_never_carry_a_full_identity_or_instance_hash",
+            "an_unreachable_knock_falls_back_to_the_propagation_node",
+        ],
+    ),
+    (
+        "MESH-LOG-003",
+        &["redaction_scanner_flags_each_rule_and_passes_the_permitted_forms"],
+    ),
+    (
+        "MESH-LOG-004",
+        &["redaction_scanner_flags_each_rule_and_passes_the_permitted_forms"],
+    ),
+    (
+        "MESH-LEN-001",
+        &[
+            "oversized_request_resource_is_dropped_before_the_handler_runs",
+            "oversized_response_resource_is_dropped_after_assembly",
+        ],
+    ),
+    (
+        "MESH-LEN-002",
+        &["a_completed_transfer_is_accepted_one_window_later_not_at_the_deadline"],
+    ),
+    (
+        "MESH-LEN-003",
+        &[
+            "from_announce_refuses_negative_costs_and_files_any_other",
+            "costs_above_the_ceiling_are_refused_before_any_mining",
+        ],
+    ),
+    (
+        "MESH-LEN-004",
+        &["representation_is_a_packet_up_to_the_mdu_and_a_resource_above"],
+    ),
+    (
+        "MESH-LEN-005",
+        &["usage_probe_disable_ingress_control_flips_only_ingress_control_on_every_interface"],
+    ),
+    (
+        "MESH-LEN-006",
+        &["malformed_hashes_are_refused_without_panicking"],
+    ),
+];
+
+/// The `#[test]`/`#[tokio::test]` functions that execute each vector family of `all_listed`:
+/// the `run_family` callers of `vectors` and `env_vectors`, the group tests of
+/// `link_vectors::loopback`, and the reference exchanges of `interop`. The section 20 family
+/// table is rendered from this.
+const EXECUTED_BY: &[(&str, &[&str])] = &[
+    (
+        "Ack",
+        &["acknowledgement_vectors_are_read_only_for_their_id"],
+    ),
+    (
+        "Announce",
+        &["announce_vectors_decode_as_section_5_1_mandates"],
+    ),
+    (
+        "AnnounceEncode",
+        &["announce_encode_vectors_refuse_what_a_sender_must_not_emit"],
+    ),
+    (
+        "AnnouncePolicy",
+        &["announce_policy_vectors_withhold_the_display_name_as_section_5_2_mandates"],
+    ),
+    ("Card", &["card_vectors_decode_as_section_9_mandates"]),
+    (
+        "CardEncode",
+        &["card_encode_vectors_pin_the_emission_order"],
+    ),
+    (
+        "Correlation",
+        &["size_branches_and_correlation_hold_on_a_live_link"],
+    ),
+    ("Custom", &["custom_vectors_hold"]),
+    ("Derivation", &["derivation_vectors_reproduce_section_4"]),
+    (
+        "Dispatch",
+        &["dispatch_vectors_answer_as_section_6_6_mandates"],
+    ),
+    (
+        "DispatchErrorDecode",
+        &["dispatch_error_vectors_read_as_section_6_7_mandates"],
+    ),
+    (
+        "EnvelopeDecode",
+        &["envelope_vectors_decode_as_section_6_5_mandates"],
+    ),
+    (
+        "EnvelopeEncode",
+        &["envelope_vectors_encode_in_the_key_order_of_section_6_5"],
+    ),
+    (
+        "HandlerSlots",
+        &["the_responder_drops_what_section_6_6_says_it_drops"],
+    ),
+    (
+        "HandlerTimeout",
+        &["the_timeouts_and_the_outbound_cap_end_requests_as_specified"],
+    ),
+    ("HashText", &["hash_text_vectors_accept_only_32_hex_digits"]),
+    (
+        "Identified",
+        &["size_branches_and_correlation_hold_on_a_live_link"],
+    ),
+    (
+        "InboundCap",
+        &["the_responder_drops_what_section_6_6_says_it_drops"],
+    ),
+    (
+        "IncompatibleOutbound",
+        &["version_refusals_mark_peers_and_marked_peers_are_refused_outbound"],
+    ),
+    (
+        "Interop",
+        &[
+            "the_reference_announce_is_filed_and_it_derives_our_destination_from_our_announce",
+            "reference_requests_hear_the_specified_replies",
+            "our_requests_are_decoded_by_the_reference",
+            "a_propagation_node_demanding_a_raised_stamp_cost_still_takes_our_message",
+        ],
+    ),
+    (
+        "KnockBody",
+        &["knock_body_vectors_read_the_intro_as_section_8_1_mandates"],
+    ),
+    (
+        "KnockIntro",
+        &["knock_intro_vectors_clean_and_refuse_as_section_8_1_mandates"],
+    ),
+    (
+        "LinkTimeout",
+        &["the_timeouts_and_the_outbound_cap_end_requests_as_specified"],
+    ),
+    (
+        "LxmfKnock",
+        &["lxmf_knock_vectors_decode_as_section_8_6_mandates"],
+    ),
+    (
+        "LxmfPeer",
+        &["lxmf_peer_vectors_decode_as_section_10_8_mandates"],
+    ),
+    (
+        "MessageBody",
+        &["message_body_vectors_decode_as_section_10_1_mandates"],
+    ),
+    (
+        "MessageBodyEncode",
+        &["message_body_encode_vectors_pin_the_emission_order"],
+    ),
+    (
+        "NoKnownPath",
+        &["the_timeouts_and_the_outbound_cap_end_requests_as_specified"],
+    ),
+    (
+        "OtherKnockRefusal",
+        &["the_sender_outcomes_end_as_sections_8_5_and_10_4_mandate"],
+    ),
+    (
+        "Outbound",
+        &["outbound_vectors_mint_clean_and_refuse_as_section_10_1_mandates"],
+    ),
+    (
+        "OutboundCap",
+        &["the_timeouts_and_the_outbound_cap_end_requests_as_specified"],
+    ),
+    (
+        "PnAnnounce",
+        &["propagation_node_announce_vectors_file_or_refuse_as_section_5_4_mandates"],
+    ),
+    (
+        "RefusalCodeDecode",
+        &["refusal_code_vectors_decode_as_section_6_7_mandates"],
+    ),
+    (
+        "Registry",
+        &["registry_vectors_pin_the_code_points_of_section_13"],
+    ),
+    (
+        "RequestFrameDecode",
+        &["request_frame_vectors_decode_as_section_6_1_mandates"],
+    ),
+    (
+        "RequestTimeout",
+        &["the_timeouts_and_the_outbound_cap_end_requests_as_specified"],
+    ),
+    (
+        "ResponseFrameDecode",
+        &["response_frame_vectors_decode_as_section_6_2_mandates"],
+    ),
+    (
+        "SizeBranch",
+        &["size_branches_and_correlation_hold_on_a_live_link"],
+    ),
+    ("Text", &["text_vectors_clean_as_section_3_2_mandates"]),
+    (
+        "Trust",
+        &["trust_vectors_authorize_as_the_precedence_mandates"],
+    ),
+    (
+        "UnacknowledgedReply",
+        &["the_sender_outcomes_end_as_sections_8_5_and_10_4_mandate"],
+    ),
+    (
+        "UndecodableFrame",
+        &["the_responder_drops_what_section_6_6_says_it_drops"],
+    ),
+    (
+        "VersionMark",
+        &["version_refusals_mark_peers_and_marked_peers_are_refused_outbound"],
+    ),
+    (
+        "VersionRefusalDecode",
+        &["version_refusal_vectors_hold_the_shape_of_section_7"],
+    ),
+    (
+        "VersionRefusalEncode",
+        &["version_refusal_vectors_hold_the_shape_of_section_7"],
+    ),
+    (
+        "WrongLink",
+        &["the_responder_drops_what_section_6_6_says_it_drops"],
+    ),
+];
+
+const COVERAGE_HEADING: &str = "## 20. Conformance coverage";
+const FAMILY_TABLE_HEADER: &str = "| Family | Executed by |\n|---|---|";
+const COVERAGE_TABLE_HEADER: &str = "| Requirement | Vectors and tests |\n|---|---|";
+const NO_VECTOR: &str = "no vector yet";
+
+fn all_listed() -> Vec<Listed> {
+    let mut listed = vectors::listed();
+    listed.extend(env_vectors::listed());
+    listed.extend(link_vectors::listed());
+    listed.extend(interop_ids::listed());
+    listed
+}
+
+fn enforced_by(id: &str) -> &'static [&'static str] {
+    ENFORCED_BY
+        .iter()
+        .find(|(enforced, _)| *enforced == id)
+        .map_or(&[], |(_, tests)| tests)
+}
+
+fn executed_by(family: &str) -> &'static [&'static str] {
+    EXECUTED_BY
+        .iter()
+        .find(|(executed, _)| *executed == family)
+        .map_or(&[], |(_, tests)| tests)
+}
+
+fn spec_ids() -> Vec<String> {
+    crate::mesh::spec_pins::requirement_ids(crate::mesh::spec_pins::SPEC)
+        .expect("the spec index parses")
+}
+
+/// The spec ids with neither a vector in `all_listed` nor a test in `ENFORCED_BY`.
+fn uncovered_ids() -> std::collections::BTreeSet<String> {
+    let covered: std::collections::BTreeSet<&str> =
+        all_listed().iter().map(|listed| listed.id).collect();
+    spec_ids()
+        .into_iter()
+        .filter(|id| !covered.contains(id.as_str()) && enforced_by(id).is_empty())
+        .collect()
+}
+
+/// The section 20 tables: one row per vector family in name order naming the tests of
+/// `EXECUTED_BY` that run it, then one row per requirement id in index order naming each
+/// vector family with the kinds it feeds and the tests of `ENFORCED_BY`, or `no vector yet`.
+fn coverage_table() -> String {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let mut families: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
+    let mut names: BTreeSet<&str> = BTreeSet::new();
+    for row in all_listed() {
+        families
+            .entry(row.id)
+            .or_default()
+            .insert(format!("{} ({:?})", row.family, row.kind));
+        names.insert(row.family);
+    }
+    let mut table = FAMILY_TABLE_HEADER.to_string();
+    for family in names {
+        let tests: Vec<String> = executed_by(family)
+            .iter()
+            .map(|test| format!("`{test}`"))
+            .collect();
+        table.push_str(&format!("\n| {family} | {} |", tests.join(", ")));
+    }
+    table.push_str("\n\n");
+    table.push_str(COVERAGE_TABLE_HEADER);
+    for id in spec_ids() {
+        let mut cells: Vec<String> = families
+            .remove(id.as_str())
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        cells.extend(enforced_by(&id).iter().map(|test| format!("`{test}`")));
+        let coverage = if cells.is_empty() {
+            NO_VECTOR.to_string()
+        } else {
+            cells.join(", ")
+        };
+        table.push_str(&format!("\n| {id} | {coverage} |"));
+    }
+    table
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Kind, Listed, env_vectors, link_vectors, vectors};
-    use crate::mesh::spec_pins::{CATCH_ALL_ROW_PREFIXES, SPEC, is_catch_all_row, requirement_ids};
+    use super::{
+        COVERAGE_HEADING, ENFORCED_BY, EXECUTED_BY, Kind, NO_VECTOR, all_listed, coverage_table,
+        spec_ids, uncovered_ids,
+    };
+    use crate::mesh::spec_pins::{
+        CATCH_ALL_ROW_PREFIXES, SPEC, is_catch_all_row, rust_sources, split_spans, test_functions,
+    };
 
     use std::collections::{BTreeMap, BTreeSet};
+    use std::path::Path;
 
     /// The ids that must have at least one vector: every id of the areas whose receiver
     /// actions are fully decidable from bytes, plus every catch-all row of the other areas.
@@ -200,19 +661,6 @@ mod tests {
         "MESH-PROP-009",
     ];
 
-    fn all_listed() -> Vec<Listed> {
-        let mut listed = vectors::listed();
-        listed.extend(env_vectors::listed());
-        listed.extend(link_vectors::listed());
-        #[cfg(unix)]
-        listed.extend(super::interop::listed());
-        listed
-    }
-
-    fn spec_ids() -> Vec<String> {
-        requirement_ids(SPEC).expect("the spec index parses")
-    }
-
     fn area(id: &str) -> &str {
         id.split('-').nth(1).unwrap()
     }
@@ -244,15 +692,14 @@ mod tests {
 
     #[test]
     fn coverage_report() {
-        // Interop ids are folded into `all_listed()` only on unix (the `interop` module is
-        // `#[cfg(unix)]`), so the counts below are lower on other platforms.
         let listed = all_listed();
         let covered: BTreeSet<&str> = listed.iter().map(|listed| listed.id).collect();
         let spec = spec_ids();
-        let uncovered: Vec<&str> = spec
+        let uncovered = uncovered_ids();
+        let enforced_only: Vec<&str> = spec
             .iter()
             .map(String::as_str)
-            .filter(|id| !covered.contains(id))
+            .filter(|id| !covered.contains(id) && !uncovered.contains(*id))
             .collect();
 
         let mut per_area: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
@@ -280,6 +727,10 @@ mod tests {
         println!("by area (ids covered / ids in spec):");
         for (area, (total, covered)) in &per_area {
             println!("  {area}: {covered} / {total}");
+        }
+        println!("ids enforced by test, no vector ({}):", enforced_only.len());
+        for id in &enforced_only {
+            println!("  {id}");
         }
         println!("ids without a vector ({}):", uncovered.len());
         for id in &uncovered {
@@ -429,6 +880,254 @@ mod tests {
             Vec::<String>::new(),
             "ids the minimum-coverage ruling requires that have no vector"
         );
+    }
+
+    /// The `| id | coverage |` rows of the spec's section 20, in document order.
+    fn spec_coverage_rows() -> Vec<(String, String)> {
+        SPEC.lines()
+            .skip_while(|line| *line != COVERAGE_HEADING)
+            .skip(1)
+            .take_while(|line| !line.starts_with("## "))
+            .filter(|line| line.starts_with("| MESH-"))
+            .map(|line| {
+                let mut cells = line.trim_matches('|').split(" | ").map(str::trim);
+                (
+                    cells.next().unwrap().to_string(),
+                    cells.next().unwrap().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_coverage_table_in_the_spec_is_the_generated_one() {
+        assert!(
+            SPEC.contains(COVERAGE_HEADING),
+            "the coverage heading moved; update COVERAGE_HEADING to the section's new number"
+        );
+        let in_spec: Vec<&str> = SPEC
+            .lines()
+            .skip_while(|line| *line != COVERAGE_HEADING)
+            .skip(1)
+            .take_while(|line| !line.starts_with("## "))
+            .filter(|line| line.starts_with('|'))
+            .collect();
+        let generated = coverage_table();
+        let generated_rows: Vec<&str> = generated
+            .lines()
+            .filter(|line| line.starts_with('|'))
+            .collect();
+        assert_eq!(
+            in_spec, generated_rows,
+            "section 20 of docs/mesh/PROTOCOL.md is stale; replace its tables with:\n{generated}"
+        );
+    }
+
+    #[test]
+    fn enforced_by_covers_exactly_the_ids_that_have_no_vector_by_design() {
+        let by_design: BTreeSet<String> = spec_ids()
+            .into_iter()
+            .filter(|id| ["SEC", "INV", "LOG", "LEN"].contains(&area(id)))
+            .collect();
+        let keys: Vec<String> = ENFORCED_BY.iter().map(|(id, _)| id.to_string()).collect();
+        let unique: BTreeSet<String> = keys.iter().cloned().collect();
+        assert_eq!(
+            keys.len(),
+            unique.len(),
+            "an id is listed twice in ENFORCED_BY"
+        );
+        assert_eq!(
+            unique, by_design,
+            "ENFORCED_BY and the SEC/INV/LOG/LEN ids of the spec differ"
+        );
+        assert!(
+            all_listed().iter().all(|row| !by_design.contains(row.id)),
+            "a SEC/INV/LOG/LEN id has a vector; the section 20 intro no longer holds"
+        );
+        for (id, tests) in ENFORCED_BY {
+            assert!(!tests.is_empty(), "{id} names no test");
+        }
+    }
+
+    #[test]
+    fn enforced_by_names_tests_that_exist() {
+        let sources = rust_sources(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src")).unwrap();
+        let missing: Vec<String> = ENFORCED_BY
+            .iter()
+            .flat_map(|(id, tests)| tests.iter().map(move |test| (id, test)))
+            .filter(|(_, test)| !sources.contains(&format!("fn {test}(")))
+            .map(|(id, test)| format!("{id}: {test}"))
+            .collect();
+        assert_eq!(
+            missing,
+            Vec::<String>::new(),
+            "ENFORCED_BY names functions that do not exist under src/"
+        );
+    }
+
+    /// For each id of `enforced`, the test functions (those of `tests`) its defining line of
+    /// `spec` cites in code spans, against the names `enforced` lists for it.
+    fn citation_mismatches(
+        spec: &str,
+        tests: &BTreeSet<String>,
+        enforced: &[(&str, &[&str])],
+    ) -> Vec<String> {
+        enforced
+            .iter()
+            .filter_map(|(id, names)| {
+                let opener = format!("**[{id}]**");
+                let Some(line) = spec.lines().find(|line| line.contains(&opener)) else {
+                    return Some(format!("{id}: not defined in the spec"));
+                };
+                let cited: BTreeSet<&str> = split_spans(line)
+                    .into_iter()
+                    .map(|(_, span)| span)
+                    .filter(|span| tests.contains(*span))
+                    .collect();
+                let listed: BTreeSet<&str> = names.iter().copied().collect();
+                (cited != listed).then(|| {
+                    format!("{id}: ENFORCED_BY lists {listed:?}, the spec cites {cited:?}")
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn citation_mismatch_checker_reports_extra_missing_and_undefined() {
+        let spec = "\
+**[MESH-SEC-001]** A MUST (`alpha_test_one`, `helper_fn_x`, src/a.rs).
+**[MESH-SEC-002]** B MUST (`beta_test_two`).
+";
+        let tests: BTreeSet<String> = ["alpha_test_one", "beta_test_two", "gamma_test_three"]
+            .map(String::from)
+            .into();
+        assert_eq!(
+            citation_mismatches(
+                spec,
+                &tests,
+                &[
+                    ("MESH-SEC-001", &["alpha_test_one"][..]),
+                    ("MESH-SEC-002", &["beta_test_two"][..]),
+                ]
+            ),
+            Vec::<String>::new()
+        );
+        let mismatched = citation_mismatches(
+            spec,
+            &tests,
+            &[
+                ("MESH-SEC-001", &["alpha_test_one", "gamma_test_three"][..]),
+                ("MESH-SEC-002", &["alpha_test_one"][..]),
+                ("MESH-SEC-003", &["beta_test_two"][..]),
+            ],
+        );
+        assert_eq!(mismatched.len(), 3, "{mismatched:?}");
+        assert!(
+            mismatched[0].contains("gamma_test_three"),
+            "{}",
+            mismatched[0]
+        );
+        assert!(
+            mismatched[1].contains("the spec cites {\"beta_test_two\"}"),
+            "{}",
+            mismatched[1]
+        );
+        assert_eq!(mismatched[2], "MESH-SEC-003: not defined in the spec");
+    }
+
+    #[test]
+    fn enforced_by_matches_the_inline_citations() {
+        let sources = rust_sources(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src")).unwrap();
+        let tests = test_functions(&sources);
+        assert!(!tests.is_empty(), "no test functions under src/");
+        assert_eq!(
+            citation_mismatches(SPEC, &tests, ENFORCED_BY),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn executed_by_covers_exactly_the_families_that_are_listed() {
+        let listed: BTreeSet<&str> = all_listed().iter().map(|row| row.family).collect();
+        let keys: Vec<&str> = EXECUTED_BY.iter().map(|(family, _)| *family).collect();
+        let unique: BTreeSet<&str> = keys.iter().copied().collect();
+        assert_eq!(
+            keys.len(),
+            unique.len(),
+            "a family is listed twice in EXECUTED_BY"
+        );
+        assert_eq!(
+            unique, listed,
+            "EXECUTED_BY and the families of all_listed differ"
+        );
+        for (family, tests) in EXECUTED_BY {
+            assert!(!tests.is_empty(), "{family} names no test");
+        }
+    }
+
+    /// Each test of `EXECUTED_BY` is defined in a conformance module that names the family it
+    /// is claimed to run, as the `"Family"` literal of a vector table or the `` `Family` `` of
+    /// a doc comment, so a test cannot be credited with a family from another module. This
+    /// file names every family in `EXECUTED_BY` itself, so it is left out of the match.
+    #[test]
+    fn executed_by_names_tests_in_the_module_of_their_family() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mesh/conformance");
+        let sources: Vec<(String, String)> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+            .filter(|path| path.file_name().is_some_and(|name| name != "mod.rs"))
+            .map(|path| {
+                let source = std::fs::read_to_string(&path).unwrap();
+                (
+                    path.file_name().unwrap().to_string_lossy().into_owned(),
+                    source,
+                )
+            })
+            .collect();
+        let names_family = |source: &str, family: &str| {
+            source.contains(&format!("\"{family}\"")) || source.contains(&format!("`{family}`"))
+        };
+        let missing: Vec<String> = EXECUTED_BY
+            .iter()
+            .flat_map(|(family, tests)| tests.iter().map(move |test| (*family, *test)))
+            .filter(|(family, test)| {
+                !sources.iter().any(|(_, source)| {
+                    source.contains(&format!("fn {test}(")) && names_family(source, family)
+                })
+            })
+            .map(|(family, test)| {
+                let defined_in: Vec<&str> = sources
+                    .iter()
+                    .filter(|(_, source)| source.contains(&format!("fn {test}(")))
+                    .map(|(file, _)| file.as_str())
+                    .collect();
+                format!("{family}: {test} (defined in {defined_in:?})")
+            })
+            .collect();
+        assert_eq!(
+            missing,
+            Vec::<String>::new(),
+            "EXECUTED_BY names tests that are not defined in a src/mesh/conformance/ module naming their family"
+        );
+    }
+
+    #[test]
+    fn ids_marked_no_vector_yet_are_exactly_the_uncovered_ids() {
+        let rows = spec_coverage_rows();
+        let spec = spec_ids();
+        assert_eq!(
+            rows.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            spec.iter().map(String::as_str).collect::<Vec<_>>(),
+            "section 20 lists a different set of ids than the index"
+        );
+        let marked: BTreeSet<String> = rows
+            .iter()
+            .filter(|(_, coverage)| coverage == NO_VECTOR)
+            .map(|(id, _)| id.clone())
+            .collect();
+        assert_eq!(marked, uncovered_ids());
+        assert!(!marked.is_empty(), "every id has a vector; drop the marker");
     }
 
     // Acceptance (f), pinned on the workflow file rather than on a run of it: a Linux-only

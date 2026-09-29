@@ -15,8 +15,8 @@ use super::request_context::{
 use super::{Input, RequestContext, RoleLike, SUMMARY_CONTEXT_PROMPT, Session};
 use crate::client::{Message, MessageRole, Model, ModelType};
 use crate::config::mesh_config::MeshBrief;
-use crate::mesh::MeshSlot;
 use crate::mesh::brief::{DIGEST_MAX_CHARS, Digest, sanitize_block};
+use crate::mesh::{MeshSlot, redact_hashes};
 
 use anyhow::{Result, anyhow};
 use log::{debug, warn};
@@ -367,7 +367,10 @@ impl MeshDigestDriver {
                         );
                     }
                 }
-                Err(err) => warn!("Mesh digest generation failed: {err:#}"),
+                Err(err) => warn!(
+                    "Mesh digest generation failed: {}",
+                    redact_hashes(&format!("{err:#}"))
+                ),
             }
         }));
     }

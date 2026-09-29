@@ -262,7 +262,7 @@ impl KnockSink for ChannelKnockSink {
         let dest8 = short(&knock.destination_hash).to_string();
         let link = knock.link_id.to_hex_string();
         let path = describe_path(knock.path_hash);
-        let intro = if knock.data.is_some() {
+        let intro_note = if knock.data.is_some() {
             " with an introduction"
         } else {
             ""
@@ -270,7 +270,7 @@ impl KnockSink for ChannelKnockSink {
         match self.tx.try_send(knock) {
             Ok(()) => {
                 debug!(
-                    "Mesh knock from {id8} for destination {dest8} on link {link} via {path}{intro}"
+                    "Mesh knock from {id8} for destination {dest8} on link {link} via {path}{intro_note}"
                 );
             }
             Err(TrySendError::Full(_)) => {
