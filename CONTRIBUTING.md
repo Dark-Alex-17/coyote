@@ -213,12 +213,12 @@ the big-object flag that `duckdb`'s bundled C++ needs to get past `file too big`
 
 ```shell
 CXXFLAGS_x86_64_pc_windows_gnu='-Wa,-mbig-obj' CFLAGS_x86_64_pc_windows_gnu='-Wa,-mbig-obj' \
-  cargo clippy --all-targets --target x86_64-pc-windows-gnu
+  cargo clippy --all-targets --target x86_64-pc-windows-gnu -- -D warnings
 ```
 
-exits 0 and compiles `src/utils/windows_acl.rs`, the identity-key call sites and the windows-only
-tests under clippy. It does not run them, and it is the gnu ABI rather than the msvc one the
-release builds use, so it is a type check and nothing more.
+exits 0 with warnings denied and compiles `src/utils/windows_acl.rs`, the identity-key call sites
+and the windows-only tests under clippy. It does not run them, and it is the gnu ABI rather than
+the msvc one the release builds use, so it is a type check and nothing more.
 
 ### Platform coverage of the pty tests
 

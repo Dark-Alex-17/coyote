@@ -274,7 +274,8 @@ pub(crate) mod test_support {
     /// A TCP listener that accepts every connection and holds it open until the peer hangs
     /// up, which is all a `TcpClient` needs to report itself connected. The counter is the
     /// number of accepted streams the peer has closed. Unix-only with everything below it:
-    /// starting a runtime mints an owner-only identity file, which only unix implements.
+    /// the loopback fixtures and the pty harness have only been run on unix so far, and
+    /// lifting that gate is future work.
     #[cfg(unix)]
     pub(crate) async fn loopback_relay() -> (SocketAddr, JoinHandle<()>, Arc<AtomicUsize>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -448,8 +448,9 @@ fn envelope_without_a_supported_version_is_refused_before_its_origin_is_read() {
     }
 }
 
-// Two real nodes over loopback TCP. Unix-only like the node tests: the `MeshRuntime` test
-// mints an owner-only identity file, which only unix implements.
+// Two real nodes over loopback TCP. Unix-only like the node tests: the loopback fixtures
+// under `test_support` have only been run on unix so far, and lifting that gate is future
+// work.
 #[cfg(unix)]
 pub(crate) mod network {
     use super::super::client::{

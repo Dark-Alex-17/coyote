@@ -5,17 +5,18 @@
 
 use std::ffi::c_void;
 use std::fmt;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io;
 use std::iter::once;
 use std::os::windows::ffi::OsStrExt;
-use std::os::windows::io::{AsRawHandle, FromRawHandle};
+use std::os::windows::fs::OpenOptionsExt;
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
 use std::ptr::null_mut;
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_INSUFFICIENT_BUFFER, GENERIC_WRITE, HANDLE, HLOCAL, INVALID_HANDLE_VALUE,
-    LocalFree, MAX_PATH,
+    ERROR_INSUFFICIENT_BUFFER, GENERIC_WRITE, HANDLE, HLOCAL, INVALID_HANDLE_VALUE, LocalFree,
+    MAX_PATH,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
@@ -29,7 +30,7 @@ use windows_sys::Win32::Security::{
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT,
-    GetVolumeInformationByHandleW,
+    GetVolumeInformationByHandleW, READ_CONTROL,
 };
 use windows_sys::Win32::System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, FILE_PERSISTENT_ACLS};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
@@ -73,7 +74,9 @@ impl fmt::Display for OwnerOnlyProblem {
             Self::OwnerIsNotCurrentUser => "is owned by another user",
             Self::DaclMissing => "has no DACL, so every user can read it",
             Self::DaclInherits => "inherits permissions from its directory",
-            Self::ForeignAce => "grants access to a user or group other than the current user",
+            Self::ForeignAce => {
+                "carries an access-control entry that is not a plain allow for the current user"
+            }
             Self::NoAceForCurrentUser => "grants access to nobody",
         })
     }
@@ -89,19 +92,6 @@ impl Drop for LocalAllocation {
         // release, and this guard is the only place it is freed.
         unsafe {
             LocalFree(self.0);
-        }
-    }
-}
-
-/// A kernel handle this module opened, closed however the function holding it returns.
-struct OwnedHandle(HANDLE);
-
-impl Drop for OwnedHandle {
-    fn drop(&mut self) {
-        // SAFETY: the handle was returned open by the call that produced this guard and is
-        // closed nowhere else.
-        unsafe {
-            CloseHandle(self.0);
         }
     }
 }
@@ -123,12 +113,16 @@ impl CurrentUser {
         if opened == 0 {
             return Err(io::Error::last_os_error());
         }
-        let token = OwnedHandle(raw);
+        // SAFETY: `OpenProcessToken` just returned this handle open, and nothing else
+        // closes it.
+        let token = unsafe { OwnedHandle::from_raw_handle(raw) };
 
         let mut needed = 0u32;
         // SAFETY: a null buffer of length zero is the documented way to size the result;
         // the call writes only `needed`.
-        let sized = unsafe { GetTokenInformation(token.0, TokenUser, null_mut(), 0, &mut needed) };
+        let sized = unsafe {
+            GetTokenInformation(token.as_raw_handle(), TokenUser, null_mut(), 0, &mut needed)
+        };
         if sized != 0 {
             return Err(io::Error::other(
                 "GetTokenInformation reported success for a zero-length TOKEN_USER buffer",
@@ -146,7 +140,7 @@ impl CurrentUser {
         // capacity, and outlives the call.
         let filled = unsafe {
             GetTokenInformation(
-                token.0,
+                token.as_raw_handle(),
                 TokenUser,
                 token_user.as_mut_ptr().cast::<c_void>(),
                 capacity,
@@ -273,6 +267,13 @@ pub(crate) fn create_owner_only(path: &Path) -> io::Result<File> {
     Ok(unsafe { File::from_raw_handle(handle) })
 }
 
+/// Opens `path` with `READ_CONTROL` alone, enough for `inspect` and nothing else. The
+/// owner holds that right whatever the DACL says, so a key whose DACL denies its owner
+/// the read `File::open` asks for can still have that DACL reported.
+pub(crate) fn open_for_security_read(path: &Path) -> io::Result<File> {
+    OpenOptions::new().access_mode(READ_CONTROL).open(path)
+}
+
 pub(crate) fn volume_acls(file: &File) -> io::Result<VolumeAcls> {
     let mut flags = 0u32;
     let mut name = [0u16; MAX_PATH as usize + 1];
@@ -305,17 +306,19 @@ pub(crate) fn volume_acls(file: &File) -> io::Result<VolumeAcls> {
 
 /// Reads back the owner and DACL of the file `file` is open on, so the verdict is about
 /// the same file whose bytes the handle reads and not whatever the name resolves to by
-/// then. Only ACE types this module writes are looked into; any other type is reported as
-/// not allowing the current user without its layout being interpreted.
+/// then. The handle must carry `READ_CONTROL`, which every `File::open`,
+/// `create_owner_only` and `open_for_security_read` handle does. Only ACE types this
+/// module writes are looked into; any other type is reported as not allowing the current
+/// user without its layout being interpreted.
 pub(crate) fn inspect(file: &File) -> io::Result<DaclSummary> {
     let user = CurrentUser::query()?;
     let mut owner: PSID = null_mut();
     let mut dacl: *mut ACL = null_mut();
     let mut psd: PSECURITY_DESCRIPTOR = null_mut();
-    // SAFETY: the handle is open for as long as `file` is borrowed and was opened for
-    // reading, which carries `READ_CONTROL`; the group and SACL out-parameters are
-    // optional and the requested information does not include them. On success `psd` is
-    // one allocation that `owner` and `dacl` point into, released by the guard below.
+    // SAFETY: the handle is open for as long as `file` is borrowed; the group and SACL
+    // out-parameters are optional and the requested information does not include them.
+    // On success `psd` is one allocation that `owner` and `dacl` point into, released by
+    // the guard below.
     let code = unsafe {
         GetSecurityInfo(
             file.as_raw_handle(),
@@ -405,7 +408,7 @@ pub(crate) fn inspect(file: &File) -> io::Result<DaclSummary> {
 
 /// Whether the file `file` is open on is readable by the current user alone. The outer
 /// error is a failed read of the security information; the inner one is the first
-/// shortfall found.
+/// shortfall found. The handle needs `READ_CONTROL`, as for `inspect`.
 pub(crate) fn check_owner_only(file: &File) -> io::Result<Result<(), OwnerOnlyProblem>> {
     let summary = inspect(file)?;
     Ok(owner_only_problem(&summary).map_or(Ok(()), Err))
@@ -434,14 +437,14 @@ fn owner_only_problem(summary: &DaclSummary) -> Option<OwnerOnlyProblem> {
     None
 }
 
-/// Replaces the DACL of `path` with one allow ACE for Everyone. Written through
-/// `SetFileSecurityW` so a test that widens a key does not go through the same calls the
-/// check under test reads with.
+/// Replaces the DACL of `path` with the one `sddl` describes, leaving the owner alone.
+/// Written through `SetFileSecurityW` so a test that widens a key does not go through the
+/// same calls the check under test reads with.
 #[cfg(test)]
-pub(crate) fn widen_to_everyone(path: &Path) -> io::Result<()> {
+pub(crate) fn widen_with_sddl(path: &Path, sddl: &str) -> io::Result<()> {
     use windows_sys::Win32::Security::SetFileSecurityW;
 
-    let descriptor = Descriptor::from_sddl("D:(A;;GA;;;WD)")?;
+    let descriptor = Descriptor::from_sddl(sddl)?;
     let wide = wide_path(path);
     // SAFETY: `wide` is NUL-terminated and the descriptor outlives the call.
     let set = unsafe {

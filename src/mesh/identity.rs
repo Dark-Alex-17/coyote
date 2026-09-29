@@ -116,10 +116,10 @@ fn holder_suffix(pid: Option<u32>) -> String {
     pid.map(|pid| format!(" (pid {pid})")).unwrap_or_default()
 }
 
-/// Opens the lock file without taking the lock. The parent is created owner-only because
-/// the lock may be taken before the first mint creates the key. The file holds a pid and
-/// nothing secret, so on Windows it keeps the permissions it inherits from the directory
-/// rather than the key's protected DACL.
+/// Opens the lock file without taking the lock. The parent is created first (owner-only on
+/// unix) because the lock may be taken before the first mint creates the key. The file
+/// holds a pid and nothing secret, so on Windows it keeps the permissions it inherits from
+/// the directory rather than the key's protected DACL.
 fn open_lock_file(identity_path: &Path) -> Result<(PathBuf, File)> {
     if let Some(parent) = identity_path.parent() {
         create_private_dir(parent)?;
@@ -489,13 +489,30 @@ fn load_identity(path: &Path) -> Result<PrivateIdentity> {
 /// the handle the volume was queried on. A volume without persistent ACLs (FAT32, exFAT)
 /// reports every file as open to Everyone, so refusing there would contradict the
 /// warn-and-proceed the mint made on the same volume; the warning is repeated instead and
-/// the DACL check skipped.
+/// the DACL check skipped. A key the current user cannot read at all (an empty protected
+/// DACL, or one that names other users only) is inspected through a `READ_CONTROL`-only
+/// handle, so its refusal names the DACL and the remedy rather than a bare access error.
 #[cfg(windows)]
 fn read_owner_only_key(path: &Path) -> Result<Vec<u8>> {
     use std::io::Read;
 
-    let mut file = File::open(path)
-        .with_context(|| format!("Failed to read mesh identity file '{}'", path.display()))?;
+    let read_context = || format!("Failed to read mesh identity file '{}'", path.display());
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == ErrorKind::PermissionDenied => {
+            let handle = windows_acl::open_for_security_read(path).with_context(|| {
+                format!(
+                    "Failed to read the permissions of '{}' after it refused to open for reading. Delete the file to mint a new identity; any trust other peers hold for the old identity is lost.",
+                    path.display()
+                )
+            })?;
+            if let Err(problem) = owner_only_verdict(path, &handle)? {
+                bail!(owner_only_refusal(path, problem)?);
+            }
+            return Err(err).with_context(read_context);
+        }
+        Err(err) => return Err(err).with_context(read_context),
+    };
     let dacl_is_meaningful = match windows_acl::volume_acls(&file) {
         Ok(volume) => {
             match acl_less_volume_warning(path, &volume.fs_name, volume.persistent_acls) {
@@ -515,31 +532,49 @@ fn read_owner_only_key(path: &Path) -> Result<Vec<u8>> {
             true
         }
     };
-    if dacl_is_meaningful
-        && let Err(problem) = windows_acl::check_owner_only(&file)
-            .with_context(|| format!("Failed to read the permissions of '{}'", path.display()))?
-    {
-        let sid = windows_acl::current_user_sid_string()
-            .context("Failed to look up the current user's SID")?;
-        let owner_is_wrong = problem == windows_acl::OwnerOnlyProblem::OwnerIsNotCurrentUser;
-        let remedy = render_remedy(&owner_only_remedy(path, &sid, owner_is_wrong));
-        bail!(
-            "Mesh identity file '{}' {problem}. A private key other users can read must not be used. Run {remedy} and try again, or delete the file to mint a new identity; any trust other peers hold for the old identity is lost.",
-            path.display()
-        );
+    if dacl_is_meaningful && let Err(problem) = owner_only_verdict(path, &file)? {
+        bail!(owner_only_refusal(path, problem)?);
     }
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
-        .with_context(|| format!("Failed to read mesh identity file '{}'", path.display()))?;
+    file.read_to_end(&mut bytes).with_context(read_context)?;
     Ok(bytes)
+}
+
+#[cfg(windows)]
+fn owner_only_verdict(
+    path: &Path,
+    file: &File,
+) -> Result<Result<(), windows_acl::OwnerOnlyProblem>> {
+    windows_acl::check_owner_only(file)
+        .with_context(|| format!("Failed to read the permissions of '{}'", path.display()))
+}
+
+/// The one refusal both open paths of `read_owner_only_key` print, so the message a user
+/// sees cannot depend on whether the key was readable.
+#[cfg(windows)]
+fn owner_only_refusal(path: &Path, problem: windows_acl::OwnerOnlyProblem) -> Result<String> {
+    let sid = windows_acl::current_user_sid_string()
+        .context("Failed to look up the current user's SID")?;
+    let owner_is_wrong = problem == windows_acl::OwnerOnlyProblem::OwnerIsNotCurrentUser;
+    let remedy = render_remedy(&owner_only_remedy(path, &sid, owner_is_wrong));
+    let elevation = if owner_is_wrong {
+        " The commands must be run from an elevated (Administrator) prompt: taking ownership needs SeTakeOwnershipPrivilege."
+    } else {
+        ""
+    };
+    Ok(format!(
+        "Mesh identity file '{}' {problem}. A private key other users can read must not be used. Run {remedy} and try again, or delete the file to mint a new identity; any trust other peers hold for the old identity is lost.{elevation}",
+        path.display()
+    ))
 }
 
 /// The `icacls` invocations, as argument lists after the program name, that make `path`
 /// owner-only again whatever was found wrong with it. `/reset` drops every explicit ACE,
 /// which `/inheritance:r` (inherited ACEs only) and `/grant:r` (the named SID's ACEs only)
 /// would each leave in place for another principal; the last command then cuts
-/// inheritance and adds the single ACE. Ownership comes first because an owner always
-/// holds the `WRITE_DAC` the other two need.
+/// inheritance and adds the single ACE. Ownership comes first, since an owner always holds
+/// the `WRITE_DAC` the other two need, and it alone needs elevation: `/setowner` on a file
+/// another user owns takes `SeTakeOwnershipPrivilege`, which only an elevated prompt holds.
 #[cfg(any(windows, test))]
 fn owner_only_remedy(path: &Path, sid: &str, owner_is_wrong: bool) -> Vec<Vec<String>> {
     let path = path.display().to_string();
@@ -838,16 +873,14 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn load_or_mint_identity_refuses_a_key_everyone_can_read_naming_icacls() {
+    fn load_or_mint_identity_refuses_an_unprotected_everyone_dacl_naming_icacls() {
         let dir = TempDir::new("identity-dacl-everyone");
         let path = dir.path.join("identity.key");
         load_or_mint_identity(&path).unwrap();
-        windows_acl::widen_to_everyone(&path).unwrap();
-        assert!(
-            windows_acl::check_owner_only(&File::open(&path).unwrap())
-                .unwrap()
-                .is_err(),
-            "the widened DACL must read back as not owner-only"
+        windows_acl::widen_with_sddl(&path, "D:(A;;GA;;;WD)").unwrap();
+        assert_eq!(
+            windows_acl::check_owner_only(&File::open(&path).unwrap()).unwrap(),
+            Err(windows_acl::OwnerOnlyProblem::DaclInherits)
         );
 
         let err = load_error(&path);
@@ -859,31 +892,84 @@ mod tests {
         assert!(err.contains("*S-1-"), "{err}");
     }
 
+    // `OwnerIsNotCurrentUser` is absent: setting it up takes a second account, so the
+    // `/setowner` step is covered by the argv unit test alone.
     #[cfg(windows)]
     #[test]
-    fn applying_the_printed_remedy_makes_the_key_owner_only_again() {
-        let dir = TempDir::new("identity-dacl-remedy");
-        let path = dir.path.join("identity.key");
-        let minted = load_or_mint_identity(&path).unwrap();
-        windows_acl::widen_to_everyone(&path).unwrap();
-        let sid = windows_acl::current_user_sid_string().unwrap();
+    fn applying_the_printed_remedy_cures_every_reachable_dacl_problem() {
+        use windows_acl::OwnerOnlyProblem;
 
-        for argv in owner_only_remedy(&path, &sid, false) {
-            let output = std::process::Command::new("icacls")
-                .args(&argv)
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "icacls {argv:?} failed: {}{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
+        let sid = windows_acl::current_user_sid_string().unwrap();
+        let cases = [
+            (
+                format!("D:P(A;;GA;;;WD)(A;;GA;;;{sid})"),
+                OwnerOnlyProblem::ForeignAce,
+            ),
+            ("D:(A;;GA;;;WD)".to_string(), OwnerOnlyProblem::DaclInherits),
+            (
+                "D:NO_ACCESS_CONTROL".to_string(),
+                OwnerOnlyProblem::DaclMissing,
+            ),
+            ("D:P".to_string(), OwnerOnlyProblem::NoAceForCurrentUser),
+        ];
+
+        for (sddl, expected) in cases {
+            let dir = TempDir::new("identity-dacl-remedy");
+            let path = dir.path.join("identity.key");
+            let minted = load_or_mint_identity(&path).unwrap();
+            windows_acl::widen_with_sddl(&path, &sddl).unwrap();
+            let handle = windows_acl::open_for_security_read(&path).unwrap();
+            assert_eq!(
+                windows_acl::check_owner_only(&handle).unwrap(),
+                Err(expected),
+                "{sddl}"
             );
+
+            let err = load_error(&path);
+            assert!(err.contains(&path.display().to_string()), "{sddl}: {err}");
+            assert!(err.contains("icacls"), "{sddl}: {err}");
+            assert!(err.contains("/reset"), "{sddl}: {err}");
+            assert!(err.contains("/inheritance:r"), "{sddl}: {err}");
+
+            for argv in owner_only_remedy(&path, &sid, false) {
+                let output = std::process::Command::new("icacls")
+                    .args(&argv)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{sddl}: icacls {argv:?} failed: {}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+
+            assert_owner_only(&path);
+            let loaded = load_or_mint_identity(&path).unwrap();
+            assert_eq!(fingerprint(&minted), fingerprint(&loaded), "{sddl}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn write_owner_only_file_refuses_a_symlink_instead_of_creating_its_target() {
+        let dir = TempDir::new("owner-only-symlink");
+        let target = dir.path.join("target");
+        let path = dir.path.join("secret");
+        if let Err(err) = std::os::windows::fs::symlink_file(&target, &path) {
+            if err.raw_os_error() == Some(1314) {
+                eprintln!(
+                    "skipping: this account cannot create symlinks (ERROR_PRIVILEGE_NOT_HELD)"
+                );
+                return;
+            }
+            panic!("symlink_file failed: {err}");
         }
 
-        assert_owner_only(&path);
-        let loaded = load_or_mint_identity(&path).unwrap();
-        assert_eq!(fingerprint(&minted), fingerprint(&loaded));
+        let err = write_owner_only_file(&path, b"x").unwrap_err();
+
+        assert!(is_already_exists(&err), "{err:#}");
+        assert!(!target.exists(), "the symlink target must not be created");
     }
 
     #[cfg(windows)]
@@ -935,12 +1021,7 @@ mod tests {
     fn load_or_mint_identity_rejects_wrong_length_naming_path() {
         let dir = TempDir::new("identity-corrupt");
         let path = dir.path.join("identity.key");
-        fs::write(&path, [7u8; 10]).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-        }
+        write_owner_only_file(&path, &[7u8; 10]).unwrap();
 
         let err = load_error(&path);
 

@@ -2770,8 +2770,8 @@ impl PeerSurface for MeshSlot {
     }
 }
 
-// Tests that start a runtime are unix-only because identity minting writes an owner-only
-// file, which is implemented for unix alone so far.
+// Tests that start a runtime are unix-only: they run on the loopback fixtures under
+// `test_support`, which have only been run on unix so far. Lifting that gate is future work.
 #[cfg(test)]
 mod tests {
     use super::*;
