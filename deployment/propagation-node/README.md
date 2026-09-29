@@ -116,7 +116,9 @@ node lists the others' propagation-node destination hashes and they sync held me
 set `from_static_only = yes` (`lxmd.py:217-220`) on a node Coyote should post to. It clears the propagation-node
 flag in the node's announce (`LXMRouter.py:309`, `node_state = self.propagation_node and not
 self.from_static_only`), and Coyote only posts to nodes that announce that flag, so `mesh__send` would answer
-`no_propagation_node` even though the node is up and listed.
+`no_propagation_node` even though the node is up and listed. With it off, the same flag is also the only gate on
+inbound peer sync (`LXMRouter.py:2089`, `:2157`): a rogue propagation node that reaches port 4242 can sync messages
+into this node's store, so the network boundary covers that direction too; egress stays closed by `autopeer = no`.
 
 `reticulum.config` also turns off Reticulum's announce ingress control (`ingress_control = No`), the
 per-interface burst limiter for announces and path requests, so a new instance's first announce is not held back.

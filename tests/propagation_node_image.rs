@@ -1711,3 +1711,290 @@ fn usage_probe_bind_mount_recipe_runs_the_daemon_and_keeps_identities_private() 
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Usage probe, round 4 (6bd1512): the corrected multi-node advice, the BuildKit
+// note, the .gitattributes widening, the load-bearing /opt/coyote-pn mkdir and the
+// exact exit codes / rewritten-file list the status note now promises.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn usage_probe_readme_multi_node_advice_names_the_knob_coyote_actually_honours() {
+    // README: "`static_peers = <hashes>` is the knob ... Do not set `from_static_only
+    // = yes` ... on a node Coyote should post to. It clears the propagation-node flag
+    // in the node's announce (`LXMRouter.py:309`, ...), and Coyote only posts to nodes
+    // that announce that flag, so `mesh__send` would answer `no_propagation_node`".
+    let readme = one_line(&read(deployment_dir().join("README.md")));
+    assert!(
+        readme.contains("`static_peers = <hashes>` is the knob"),
+        "README must name static_peers as the multi-node knob"
+    );
+    assert!(
+        readme.contains("Do not set `from_static_only = yes`"),
+        "README must warn against from_static_only on a node Coyote posts to"
+    );
+    assert!(
+        !readme.contains("`from_static_only = yes` are the knobs"),
+        "the round-3 recommendation of from_static_only must be gone"
+    );
+    assert!(
+        readme.contains("`mesh__send` would answer `no_propagation_node`"),
+        "README must name the exact answer the operator will see from Coyote"
+    );
+
+    // The shipped node config must not itself trip the warning it gives.
+    let lxmd_config = read(deployment_dir().join("lxmd.config"));
+    for (key, value) in section_keys(&lxmd_config, "propagation") {
+        if key == "from_static_only" {
+            assert!(
+                !matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "yes" | "true" | "1" | "on"
+                ),
+                "the shipped lxmd.config sets from_static_only = {value}, which hides the node from Coyote"
+            );
+        }
+    }
+
+    // Cross-check the README's claims about Coyote against the tool's own strings:
+    // the answer literal exists on the mesh__send path, and the announce parser
+    // reads the flag the README says it reads, citing the same upstream line.
+    let mesh_tool = read(repo_root().join("src").join("function").join("mesh.rs"));
+    assert!(
+        mesh_tool.contains("\"no_propagation_node\""),
+        "README promises `no_propagation_node`, but src/function/mesh.rs has no such answer literal"
+    );
+    assert!(
+        mesh_tool.contains("mesh__send"),
+        "README attributes the answer to `mesh__send`, which src/function/mesh.rs must define"
+    );
+    let parser = read(repo_root().join("src").join("mesh").join("propagation.rs"));
+    assert!(
+        parser.contains("LXMRouter.py:309") && parser.contains("NotAPropagationNode"),
+        "README says Coyote only posts to nodes announcing the propagation-node flag (LXMRouter.py:309); src/mesh/propagation.rs must read that slot and refuse the rest"
+    );
+}
+
+#[test]
+fn usage_probe_build_note_and_line_ending_pins_match_the_dockerfile() {
+    // README: "The build needs BuildKit, the default since Docker 23; older daemons
+    // need `DOCKER_BUILDKIT=1`." The Dockerfile's `RUN --mount=type=secret` is
+    // BuildKit-only syntax, so the note is load-bearing; if the mount ever goes, the
+    // note may too, and vice versa.
+    let dockerfile = read(deployment_dir().join("Dockerfile"));
+    let readme = read(deployment_dir().join("README.md"));
+    let buildkit_only = dockerfile.contains("--mount=type=");
+    assert!(
+        buildkit_only,
+        "the Dockerfile no longer uses BuildKit-only syntax; drop the README's BuildKit note or update this test"
+    );
+    assert!(
+        readme.contains("BuildKit") && readme.contains("`DOCKER_BUILDKIT=1`"),
+        "a BuildKit-only Dockerfile must be documented as such, with the legacy-daemon escape hatch"
+    );
+    assert!(
+        dockerfile.contains("--root-user-action=ignore"),
+        "pip runs as root in the build stage on purpose; the warning must be silenced, not the user changed"
+    );
+
+    // .gitattributes pins LF for everything under deployment/propagation-node/,
+    // including any future nested path (`**`, not `*`). Checked through git itself
+    // so the glob semantics are git's, not ours.
+    let attributes = read(repo_root().join(".gitattributes"));
+    assert!(
+        attributes.contains("deployment/propagation-node/** text eol=lf"),
+        ".gitattributes must pin LF for the whole propagation-node tree"
+    );
+    let check = Command::new("git")
+        .current_dir(repo_root())
+        .args([
+            "check-attr",
+            "eol",
+            "--",
+            "deployment/propagation-node/entrypoint.sh",
+            "deployment/propagation-node/nested/dir/future.sh",
+        ])
+        .output();
+    match check {
+        Ok(out) if out.status.success() => {
+            let text = String::from_utf8_lossy(&out.stdout);
+            let lf_lines = text.lines().filter(|l| l.ends_with(": eol: lf")).count();
+            assert_eq!(
+                lf_lines, 2,
+                "git check-attr must report eol=lf for both a shipped and a nested path:\n{text}"
+            );
+        }
+        _ => eprintln!(
+            "skipping the git check-attr half: git is unavailable or this is not a checkout"
+        ),
+    }
+}
+
+#[test]
+#[ignore = "needs docker and COYOTE_PN_IMAGE_TESTS=1"]
+fn usage_probe_seed_templates_are_readable_by_uid_1000() {
+    if skip_unless_live() {
+        return;
+    }
+    // Dockerfile: "The mkdir above is load-bearing: left to COPY, /opt/coyote-pn would
+    // be created 0644 too and uid 1000 could not traverse it." The entrypoint seeds
+    // the volume from /opt/coyote-pn as uid 1000, so the directory must be
+    // traversable and the templates readable by that uid, and byte-identical to the
+    // files in the tree.
+    let image = build_image();
+    let lbl = label();
+    let out = docker_ok(&[
+        "run",
+        "--rm",
+        "--label",
+        &lbl,
+        &image,
+        "sh",
+        "-c",
+        "set -e; echo UID=$(id -u); echo DIR=$(stat -c %a /opt/coyote-pn); \
+         echo ENTRY=$(stat -c %a /usr/local/bin/coyote-pn-entrypoint); \
+         echo ---LXMD---; cat /opt/coyote-pn/lxmd.config; \
+         echo ---RNS---; cat /opt/coyote-pn/reticulum.config",
+    ]);
+    assert!(
+        out.contains("UID=1000\n"),
+        "the image must run as uid 1000:\n{out}"
+    );
+    let dir_mode = out
+        .lines()
+        .find_map(|l| l.strip_prefix("DIR="))
+        .expect("DIR= line");
+    let others = u32::from_str_radix(dir_mode, 8).unwrap() & 0o007;
+    assert_eq!(
+        others & 0o005,
+        0o005,
+        "/opt/coyote-pn must be readable and traversable by uid 1000 (mode {dir_mode})"
+    );
+    let entry_mode = out
+        .lines()
+        .find_map(|l| l.strip_prefix("ENTRY="))
+        .expect("ENTRY= line");
+    assert_eq!(entry_mode, "755", "entrypoint must be COPY --chmod=0755");
+    let (lxmd, rns) = out
+        .split_once("---LXMD---\n")
+        .and_then(|(_, rest)| rest.split_once("---RNS---\n"))
+        .expect("both template dumps present");
+    assert_eq!(
+        lxmd,
+        read(deployment_dir().join("lxmd.config")),
+        "the lxmd.config template in the image must be the file in the tree"
+    );
+    assert_eq!(
+        rns,
+        read(deployment_dir().join("reticulum.config")),
+        "the reticulum.config template in the image must be the file in the tree"
+    );
+}
+
+#[test]
+#[ignore = "needs docker and COYOTE_PN_IMAGE_TESTS=1"]
+fn usage_probe_status_note_exit_codes_and_rewritten_files_are_exact() {
+    if skip_unless_live() {
+        return;
+    }
+    // README, verbatim promises this test pins exactly (the sibling live-status test
+    // pins the messages and the daemon surviving): the `docker run` form "exits 200"
+    // and "rewrites `destination_table`, `known_destinations`, `packet_hashlist.raw`
+    // and `tunnels`"; the `docker exec` form dies with "exit 255 ... and writes
+    // nothing"; "The daemon keeps running through both" -- so 4242 must still accept
+    // a connection inside the daemon's namespace afterwards.
+    let image = build_image();
+    let lbl = label();
+    let node = Node::fresh(&image, "status-exact");
+    node.start(&[]);
+    node.wait_started();
+    let mount = format!("{}:/data", node.volume);
+
+    node.on_volume("touch /data/probe-marker");
+    let run_form = docker(&[
+        "run",
+        "--rm",
+        "--label",
+        &lbl,
+        "-v",
+        &mount,
+        &image,
+        "lxmd",
+        "--status",
+        "--timeout",
+        "5",
+    ]);
+    assert_eq!(
+        run_form.status.code(),
+        Some(200),
+        "README: the `docker run` form exits 200:\n{}",
+        String::from_utf8_lossy(&run_form.stderr)
+    );
+    let rewritten =
+        node.on_volume("find /data/reticulum/storage -type f -newer /data/probe-marker | sort");
+    for file in [
+        "destination_table",
+        "known_destinations",
+        "packet_hashlist.raw",
+        "tunnels",
+    ] {
+        assert!(
+            rewritten.lines().any(|l| l.ends_with(&format!("/{file}"))),
+            "README lists `{file}` among the files the run form rewrites; newer than the marker:\n{rewritten}"
+        );
+    }
+
+    node.on_volume("touch /data/probe-marker");
+    let exec_form = docker(&[
+        "exec",
+        &node.name,
+        "lxmd",
+        "--config",
+        "/data/lxmd",
+        "--rnsconfig",
+        "/data/reticulum",
+        "--status",
+        "--timeout",
+        "5",
+    ]);
+    assert_eq!(
+        exec_form.status.code(),
+        Some(255),
+        "README: the `docker exec` form exits 255:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&exec_form.stdout),
+        String::from_utf8_lossy(&exec_form.stderr)
+    );
+    thread::sleep(Duration::from_secs(2));
+    let rewritten =
+        node.on_volume("find /data/reticulum/storage -type f -newer /data/probe-marker | sort");
+    assert!(
+        rewritten.trim().is_empty(),
+        "README: the exec form writes nothing; newer than the marker:\n{rewritten}"
+    );
+
+    // "The daemon keeps running through both": still the same process, still listening.
+    let state = docker_ok(&["inspect", &node.name, "--format", "{{.State.Status}}"]);
+    assert_eq!(state.trim(), "running");
+    let accept = docker(&[
+        "exec",
+        &node.name,
+        "python3",
+        "-c",
+        "import socket; socket.create_connection(('127.0.0.1', 4242), 5).close(); print('ACCEPTED')",
+    ]);
+    assert!(
+        accept.status.success() && String::from_utf8_lossy(&accept.stdout).contains("ACCEPTED"),
+        "the daemon's 4242 listener must still accept after both probes:\n{}",
+        String::from_utf8_lossy(&accept.stderr)
+    );
+    let logs = node.logs();
+    assert_eq!(
+        logs.matches("Started lxmd version").count(),
+        1,
+        "the daemon must not have restarted:\n{logs}"
+    );
+    assert!(
+        !logs.contains("Address already in use"),
+        "the exec form's bind failure belongs to the probe, not the daemon's log:\n{logs}"
+    );
+}
