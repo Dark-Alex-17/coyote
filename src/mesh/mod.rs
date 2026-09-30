@@ -34,7 +34,9 @@ pub(crate) mod trust;
 
 pub(crate) use node::{MESH_ALREADY_ON, MeshPaths, MeshRuntime, MeshSlot, NodeOptions};
 pub(crate) use peers::PeerRecord;
-pub(crate) use propagation_fetch::{FetchError, FetchReport, LoggingInboundSink};
+pub(crate) use propagation_fetch::{
+    FetchError, FetchReport, LoggingInboundSink, MAX_WANTS_PER_FETCH,
+};
 pub(crate) use propagation_nodes::PropagationNodeRecord;
 pub(crate) use r3::{RequestOptions, redact_hashes, short};
 

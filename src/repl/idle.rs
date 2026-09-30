@@ -377,9 +377,12 @@ struct DriverLoop {
     retry_at: Option<tokio::time::Instant>,
     /// Built from the interval and `announce` in the config the REPL started with:
     /// `update_app_config` replaces `ctx.app`, but the driver keeps the `AppState` it was
-    /// started on, so a `.set` of either mid-session takes effect at the next start.
+    /// started on, so the schedule reflects config.yaml as loaded at start.
     sync: SyncSchedule,
     sync_task: Option<SyncTask>,
+    /// Whether the wait for a propagation node has been logged since the last fetch
+    /// started, so a mesh without one says so once per streak rather than every retry.
+    no_node_logged: bool,
 }
 
 type SyncTask = JoinHandle<Result<FetchReport, FetchError>>;
@@ -510,6 +513,7 @@ impl DriverLoop {
             retry_at: None,
             sync,
             sync_task: None,
+            no_node_logged: false,
         }
     }
 
@@ -786,12 +790,16 @@ impl DriverLoop {
             return;
         };
         let Ok(node) = runtime.propagation_nodes().select() else {
-            debug!("Propagation sync waits for a propagation node to announce itself");
+            if !self.no_node_logged {
+                debug!("Propagation sync waits for a propagation node to announce itself");
+                self.no_node_logged = true;
+            }
             self.sync.no_node(now);
             return;
         };
         let node = node.destination.address_hash.to_hex_string();
         debug!("Propagation sync from {} starting", short(&node));
+        self.no_node_logged = false;
         self.sync.started(node);
         self.sync_task = Some(tokio::spawn(async move {
             runtime.fetch_propagated(&LoggingInboundSink).await
@@ -3398,7 +3406,7 @@ mod tests {
         use super::*;
         use crate::config::{AppConfig, MeshConfig};
         use crate::mesh::MeshSlot;
-        use crate::mesh::idle::PROPAGATION_SYNC_RETRY_WITHOUT_NODE;
+        use crate::mesh::idle::PROPAGATION_SYNC_SHORT_RETRY;
         use crate::mesh::test_support::{FakeNode, StartedRuntime, started_runtime_on};
         use rmpv::Value;
         use rns_transport::iface::tcp_server::TcpServer;
@@ -3654,7 +3662,7 @@ mod tests {
             .await;
             // The retry waits the shorter of the 1 s interval and the 15 s no-node retry,
             // so a ceiling under 15 s proves the interval won.
-            assert!(PROPAGATION_SYNC_RETRY_WITHOUT_NODE > TEST_TIMEOUT);
+            assert!(PROPAGATION_SYNC_SHORT_RETRY > TEST_TIMEOUT);
             wait_for_rounds(&fake, 1, TEST_TIMEOUT).await;
             tear_down(driver, &slot(&ctx), started, fake).await;
         }

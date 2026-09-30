@@ -631,22 +631,20 @@ Type ".help" for additional help.
         drain_stale_tty_input();
 
         if self.ctx.read().app.config.mesh.enabled {
+            // The digest is observed and refreshed at turn boundaries only, so the brief
+            // is assembled at the first one, exactly as after a `.mesh on` typed in a turn.
             let result = {
                 let mut ctx = self.ctx.write();
                 publish_mesh_snapshot(&ctx, TurnState::working_now());
                 let result = mesh::autostart(&mut ctx).await;
                 self.envoy.refresh(&ctx.app);
                 self.mesh_hooks.refresh(&ctx.app);
-                self.digest.observe_session(&ctx);
                 publish_mesh_snapshot(&ctx, TurnState::idle_now());
                 result
             };
-            match result {
-                Ok(()) => self.digest.maybe_refresh(&self.ctx),
-                Err(err) => {
-                    render_error(err);
-                    println!()
-                }
+            if let Err(err) = result {
+                render_error(err);
+                println!()
             }
         }
 
@@ -3365,8 +3363,8 @@ mod tests {
             assert_eq!(source.rfind(needle), Some(first), "{needle} not unique");
             first
         };
-        // The autostart block refreshes the same hooks and observes the digest too, so
-        // both are located relative to the per-turn command rather than as unique needles.
+        // The autostart block refreshes the same hooks, so the refresh is located
+        // relative to the per-turn command rather than as a unique needle.
         let position_after = |start: usize, needle: &str| {
             start
                 + source[start..]
@@ -3375,7 +3373,7 @@ mod tests {
         };
         let command_at = position(&command);
         let refresh_at = position_after(command_at, &refresh);
-        let observe_at = position_after(refresh_at, &observe);
+        let observe_at = position(&observe);
         assert!(
             command_at < refresh_at,
             "envoy refresh must follow the command"
@@ -3410,7 +3408,7 @@ mod tests {
         let autostart = strip(&["mesh::auto", "start(&mut ctx).await"].concat());
         let surfaced = strip(
             &[
-                "Ok(()) => self.digest.maybe_refresh(&self.ctx), Err(err) => { render_",
+                "if let Err(err) = result { render_",
                 "error(err); println!() }",
             ]
             .concat(),

@@ -809,7 +809,7 @@ async fn the_reference_announce_is_filed_and_it_derives_our_destination_from_our
 }
 
 /// Ceiling on the automatic fetch after a rejoin: the join-time sync finds no node yet and
-/// asks again after `PROPAGATION_SYNC_RETRY_WITHOUT_NODE`, by when the node is filed.
+/// asks again after `PROPAGATION_SYNC_SHORT_RETRY`, by when the node is filed.
 const AUTOMATIC_SYNC_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Default)]

@@ -1021,7 +1021,7 @@ mod tests {
     use rns_transport::hash::ADDRESS_HASH_SIZE;
     use std::time::Duration;
 
-    const EXPECTED_LITERALS: &str = r#"1,1,10,16,262144,128,"/knock","/status","/message",30,10,10,2,20,16,0xf0,0xf1,0xf3,0xf4,0xf5,0xf6,0xfd,0xfe,"COYM",64,300,900,3,2700,1800,1024,"coyote.knock/1",200,15,10,256,3,600,256,16,1,0,1,2,64,280,64,64,120,280,"coyote.peer/1",1,120,4000,64,4096,8,15,10,604800,256,3600,120,256,1,60,100000,120,26,60,2,60,1024,64,240,131072,112,4096,15552000,3,256,0,32,0xfb,0xfc,8,64,256,64,8,1,1,1,1,1,1,1"#;
+    const EXPECTED_LITERALS: &str = r#"1,1,10,16,262144,128,"/knock","/status","/message",30,10,10,2,20,16,0xf0,0xf1,0xf3,0xf4,0xf5,0xf6,0xfd,0xfe,"COYM",64,300,900,3,2700,1800,1024,"coyote.knock/1",200,15,10,256,3,600,256,16,1,0,1,2,64,280,64,64,120,280,"coyote.peer/1",1,120,4000,64,4096,8,15,10,604800,256,3600,120,256,1,60,100000,120,26,60,2,60,1024,64,240,131072,112,4096,15552000,3,900,256,0,32,0xfb,0xfc,8,64,256,64,8,1,1,1,1,1,1,1"#;
 
     fn expected_constants() -> Vec<(&'static str, String)> {
         let secs = |d: Duration| d.as_secs().to_string();
@@ -1219,6 +1219,10 @@ mod tests {
             (
                 "MAX_UNKNOWN_SOURCE_DEFERRALS",
                 propagation_fetch::MAX_UNKNOWN_SOURCE_DEFERRALS.to_string(),
+            ),
+            (
+                "UNKNOWN_SOURCE_DEFERRAL_HORIZON",
+                secs(propagation_fetch::UNKNOWN_SOURCE_DEFERRAL_HORIZON),
             ),
             (
                 "MAX_DEFERRED_IDS",

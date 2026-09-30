@@ -94,10 +94,16 @@ pub(crate) const DEDUP_CAPACITY: usize = 4096;
 /// (`LXMRouter.py:38, 962`). Entries older than this are dropped on load and on insert.
 pub(crate) const DEDUP_HORIZON: Duration = Duration::from_secs(180 * 24 * 60 * 60);
 
-/// How many times a body whose claimed source has no known key is left on the node before
-/// it is given up on. The transport's announce cache is empty after every restart and a
-/// Coyote peer never announces `lxmf.delivery`, so the key may well arrive later.
+/// How many sightings of a body whose claimed source has no known key are left on the
+/// node before it may be given up on. The transport's announce cache is empty after every
+/// restart and a Coyote peer never announces `lxmf.delivery`, so the key may well arrive
+/// later.
 pub(crate) const MAX_UNKNOWN_SOURCE_DEFERRALS: u8 = 3;
+
+/// How long a deferred body is kept at least: one peer heartbeat, so the sender gets one
+/// announce in before the body is given up on.
+pub(crate) const UNKNOWN_SOURCE_DEFERRAL_HORIZON: Duration =
+    Duration::from_secs(crate::mesh::announce::HEARTBEAT_SECS);
 
 /// How many deferred transient ids are tracked. Past this, the one first deferred longest
 /// ago goes first; a node serving unresolvable bodies without end cannot grow the table.
@@ -649,8 +655,9 @@ pub(crate) struct Deferred {
 pub(crate) enum Deferral {
     /// Left on the node; `attempts` sightings have been deferred so far.
     Retry { attempts: u8 },
-    /// Deferred `MAX_UNKNOWN_SOURCE_DEFERRALS` times already; the body is now discarded.
-    BudgetSpent,
+    /// Deferred `attempts` times over `held`, at least `MAX_UNKNOWN_SOURCE_DEFERRALS` and
+    /// `UNKNOWN_SOURCE_DEFERRAL_HORIZON`; the body is now discarded.
+    BudgetSpent { attempts: u8, held: Duration },
 }
 
 /// Transient ids already processed, so a body the node serves again (or another node
@@ -725,18 +732,25 @@ impl FetchStore {
         self.delivered.insert_at(message_id, now, now)
     }
 
-    /// Counts one more sighting of `id` without a key for its source. The first
-    /// `MAX_UNKNOWN_SOURCE_DEFERRALS` sightings are deferred; the next spends the budget,
-    /// and the caller records the id as processed instead.
+    /// Counts one more sighting of `id` without a key for its source. Sightings are
+    /// deferred until `MAX_UNKNOWN_SOURCE_DEFERRALS` have been and
+    /// `UNKNOWN_SOURCE_DEFERRAL_HORIZON` has passed since the first; the next spends the
+    /// budget, and the caller records the id as processed instead.
     pub(crate) fn defer(&mut self, id: TransientId, now: SystemTime) -> Deferral {
         if let Some(entry) = self.deferred.get_mut(&id) {
-            if entry.attempts < MAX_UNKNOWN_SOURCE_DEFERRALS {
-                entry.attempts += 1;
-                return Deferral::Retry {
+            let held = now.duration_since(entry.first_seen_at).unwrap_or_default();
+            if entry.attempts >= MAX_UNKNOWN_SOURCE_DEFERRALS
+                && held >= UNKNOWN_SOURCE_DEFERRAL_HORIZON
+            {
+                return Deferral::BudgetSpent {
                     attempts: entry.attempts,
+                    held,
                 };
             }
-            return Deferral::BudgetSpent;
+            entry.attempts = entry.attempts.saturating_add(1);
+            return Deferral::Retry {
+                attempts: entry.attempts,
+            };
         }
         self.deferred.insert(
             id,
@@ -977,8 +991,8 @@ pub(crate) enum Discard {
     /// No announced public key matches the `lxmf.delivery` hash it names as its source.
     /// Deferred rather than recorded: the node keeps the body for a later fetch.
     UnknownSource,
-    /// `UnknownSource` once more after `MAX_UNKNOWN_SOURCE_DEFERRALS` deferrals; recorded
-    /// and acknowledged like any other discard.
+    /// `UnknownSource` once more after `MAX_UNKNOWN_SOURCE_DEFERRALS` deferrals and
+    /// `UNKNOWN_SOURCE_DEFERRAL_HORIZON`; recorded and acknowledged like any other discard.
     UnknownSourceBudgetSpent,
     /// The signature does not verify against the key the claimed source announced.
     BadSignature,
@@ -1020,7 +1034,8 @@ impl fmt::Display for Discard {
             Self::UnknownSource => write!(f, "no public key known for the claimed source"),
             Self::UnknownSourceBudgetSpent => write!(
                 f,
-                "no public key known for the claimed source after {MAX_UNKNOWN_SOURCE_DEFERRALS} deferrals; giving up on it"
+                "no public key known for the claimed source after {MAX_UNKNOWN_SOURCE_DEFERRALS} or more deferrals over at least {} s; giving up on it",
+                UNKNOWN_SOURCE_DEFERRAL_HORIZON.as_secs()
             ),
             Self::BadSignature => {
                 write!(f, "signature does not verify against the claimed source")
@@ -1155,19 +1170,21 @@ impl BodyPipeline<'_> {
             Err(Discard::UnknownSource) => match store.defer(transient_id, now) {
                 Deferral::Retry { attempts } => {
                     debug!(
-                        "Propagation fetch from {}: deferred transient {}: {}, sighting {attempts} of {MAX_UNKNOWN_SOURCE_DEFERRALS}",
+                        "Propagation fetch from {}: deferred transient {}: {}, sighting {attempts} (kept for at least {MAX_UNKNOWN_SOURCE_DEFERRALS} sightings and {} s)",
                         self.node,
                         short(&hex_lower(&transient_id)),
-                        Discard::UnknownSource
+                        Discard::UnknownSource,
+                        UNKNOWN_SOURCE_DEFERRAL_HORIZON.as_secs()
                     );
                     Ok(BodyOutcome::Deferred { attempts })
                 }
-                Deferral::BudgetSpent => {
+                Deferral::BudgetSpent { attempts, held } => {
                     store.insert(transient_id, now);
                     warn!(
-                        "Propagation fetch from {}: giving up on transient {} after {MAX_UNKNOWN_SOURCE_DEFERRALS} deferrals; no key for its claimed source",
+                        "Propagation fetch from {}: giving up on transient {} after {attempts} deferrals over {} s; no key for its claimed source",
                         self.node,
-                        short(&hex_lower(&transient_id))
+                        short(&hex_lower(&transient_id)),
+                        held.as_secs()
                     );
                     Ok(BodyOutcome::Discarded(Discard::UnknownSourceBudgetSpent))
                 }
@@ -1877,6 +1894,10 @@ mod tests {
         }
 
         async fn process(&mut self, body: &[u8]) -> BodyOutcome {
+            self.process_at(body, SystemTime::now()).await
+        }
+
+        async fn process_at(&mut self, body: &[u8], now: SystemTime) -> BodyOutcome {
             let Self {
                 recipient,
                 keys,
@@ -1885,7 +1906,7 @@ mod tests {
                 store,
                 ..
             } = self;
-            run_body(recipient, keys, trust, sink, store, body).await
+            run_body(recipient, keys, trust, sink, store, body, now).await
         }
 
         /// `process` into `sink` in place of the bench's own.
@@ -1897,7 +1918,7 @@ mod tests {
                 store,
                 ..
             } = self;
-            run_body(recipient, keys, trust, sink, store, body).await
+            run_body(recipient, keys, trust, sink, store, body, SystemTime::now()).await
         }
     }
 
@@ -1908,6 +1929,7 @@ mod tests {
         sink: &dyn InboundSink,
         store: &mut FetchStore,
         body: &[u8],
+        now: SystemTime,
     ) -> BodyOutcome {
         let pipeline = BodyPipeline {
             recipient,
@@ -1917,10 +1939,7 @@ mod tests {
             sink,
             node: "fake",
         };
-        pipeline
-            .process(body, store, SystemTime::now())
-            .await
-            .unwrap()
+        pipeline.process(body, store, now).await.unwrap()
     }
 
     fn discarded(outcome: BodyOutcome) -> Discard {
@@ -2059,7 +2078,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unknown_source_is_deferred_three_times_then_given_up_on() {
+    async fn an_unknown_source_is_deferred_for_three_sightings_and_a_heartbeat_then_given_up_on() {
         install_log_collector();
         let sender = CorePrivateIdentity::new_from_rand(OsRng);
         let sender_id = transport_identity_of(&sender);
@@ -2070,9 +2089,11 @@ mod tests {
         let me = bench.me();
         let body = honest_body(&sender, &me, b"early");
         let id = transient_id_of(&body);
+        let first = SystemTime::now();
+        let horizon_secs = UNKNOWN_SOURCE_DEFERRAL_HORIZON.as_secs();
 
         assert_eq!(
-            bench.process(&body).await,
+            bench.process_at(&body, first).await,
             BodyOutcome::Deferred { attempts: 1 }
         );
         assert!(
@@ -2081,34 +2102,50 @@ mod tests {
         );
         assert_eq!(bench.store.deferral_of(&id).map(|d| d.attempts), Some(1));
         let deferred_line = format!(
-            "Propagation fetch from fake: deferred transient {}: no public key known for the claimed source, sighting 1 of {MAX_UNKNOWN_SOURCE_DEFERRALS}",
+            "Propagation fetch from fake: deferred transient {}: no public key known for the claimed source, sighting 1 (kept for at least {MAX_UNKNOWN_SOURCE_DEFERRALS} sightings and {horizon_secs} s)",
             short(&hex_lower(&id))
         );
         assert!(
             debug_snapshot().iter().any(|line| line == &deferred_line),
             "{deferred_line:?}"
         );
-        for attempts in 2..=MAX_UNKNOWN_SOURCE_DEFERRALS {
+        // Sightings come 15 s apart, as the automatic sync's short retry serves them, so
+        // the fourth is well inside the heartbeat and is still deferred.
+        for attempts in 2..=MAX_UNKNOWN_SOURCE_DEFERRALS + 1 {
+            let at = first + Duration::from_secs(15 * u64::from(attempts - 1));
             assert_eq!(
-                bench.process(&body).await,
+                bench.process_at(&body, at).await,
                 BodyOutcome::Deferred { attempts }
             );
             assert!(!bench.store.contains(&id));
         }
         assert_eq!(
             bench.store.deferral_of(&id).map(|d| d.attempts),
-            Some(MAX_UNKNOWN_SOURCE_DEFERRALS)
+            Some(MAX_UNKNOWN_SOURCE_DEFERRALS + 1)
         );
 
-        let spent = discarded(bench.process(&body).await);
+        let spent = discarded(
+            bench
+                .process_at(&body, first + UNKNOWN_SOURCE_DEFERRAL_HORIZON)
+                .await,
+        );
         assert_eq!(spent, Discard::UnknownSourceBudgetSpent);
-        assert!(spent.to_string().contains("after 3 deferrals"), "{spent}");
-        assert!(bench.store.contains(&id), "the fourth sighting is recorded");
+        assert!(
+            spent
+                .to_string()
+                .contains("after 3 or more deferrals over at least 900 s"),
+            "{spent}"
+        );
+        assert!(
+            bench.store.contains(&id),
+            "the sighting that spends the budget is recorded"
+        );
         assert_eq!(bench.store.deferral_of(&id), None);
         assert_eq!(bench.sink.count(), 0);
         let gave_up_line = format!(
-            "Propagation fetch from fake: giving up on transient {} after {MAX_UNKNOWN_SOURCE_DEFERRALS} deferrals; no key for its claimed source",
-            short(&hex_lower(&id))
+            "Propagation fetch from fake: giving up on transient {} after {} deferrals over {horizon_secs} s; no key for its claimed source",
+            short(&hex_lower(&id)),
+            MAX_UNKNOWN_SOURCE_DEFERRALS + 1
         );
         assert_eq!(
             warn_snapshot()
@@ -2139,6 +2176,34 @@ mod tests {
             None,
             "recording the id ends its deferral"
         );
+    }
+
+    #[tokio::test]
+    async fn a_deferred_body_older_than_a_heartbeat_but_seen_fewer_than_three_times_is_kept() {
+        let sender = CorePrivateIdentity::new_from_rand(OsRng);
+        let sender_id = transport_identity_of(&sender);
+        let mut bench = Bench::new(
+            "fetch-deferred-old",
+            TrustList::default().identity(&identity_hex(&sender_id), true),
+        );
+        let me = bench.me();
+        let body = honest_body(&sender, &me, b"patient");
+        let id = transient_id_of(&body);
+        let first = SystemTime::now();
+
+        assert_eq!(
+            bench.process_at(&body, first).await,
+            BodyOutcome::Deferred { attempts: 1 }
+        );
+        let past_the_horizon = first + UNKNOWN_SOURCE_DEFERRAL_HORIZON + Duration::from_secs(1);
+        assert_eq!(
+            bench.process_at(&body, past_the_horizon).await,
+            BodyOutcome::Deferred { attempts: 2 },
+            "time alone does not spend the budget"
+        );
+        assert!(!bench.store.contains(&id));
+        assert_eq!(bench.store.deferral_of(&id).map(|d| d.attempts), Some(2));
+        assert_eq!(bench.sink.count(), 0);
     }
 
     #[test]
@@ -3166,9 +3231,10 @@ mod tests {
             assert!(!store.contains(&orphan_id));
             assert_eq!(store.deferral_of(&orphan_id).map(|d| d.attempts), Some(1));
             let deferred_line = format!(
-                "Propagation fetch from {}: deferred transient {}: no public key known for the claimed source, sighting 1 of {MAX_UNKNOWN_SOURCE_DEFERRALS}",
+                "Propagation fetch from {}: deferred transient {}: no public key known for the claimed source, sighting 1 (kept for at least {MAX_UNKNOWN_SOURCE_DEFERRALS} sightings and {} s)",
                 short(&fake.hex()),
-                short(&hex_lower(&orphan_id))
+                short(&hex_lower(&orphan_id)),
+                UNKNOWN_SOURCE_DEFERRAL_HORIZON.as_secs()
             );
             assert!(
                 debug_snapshot().iter().any(|line| line == &deferred_line),

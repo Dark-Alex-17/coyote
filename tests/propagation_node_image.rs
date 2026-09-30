@@ -1419,6 +1419,10 @@ fn usage_probe_docs_say_messages_are_posted_and_held_messages_are_fetched_back_a
         root.contains("held messages are fetched automatically every"),
         "root README must say held messages are fetched automatically:\n{root}"
     );
+    assert!(
+        !root.contains("fetching held messages back is not yet"),
+        "root README must not still say fetch-back is not yet wired up"
+    );
     let readme = one_line(&read(deployment_dir().join("README.md")));
     assert!(
         readme.contains("it posts the message to a propagation node"),
@@ -1435,6 +1439,21 @@ fn usage_probe_docs_say_messages_are_posted_and_held_messages_are_fetched_back_a
     assert!(
         readme.contains("A node with `announce: false` never fetches on its own"),
         "deployment README must say a node that does not announce never fetches on its own"
+    );
+    assert!(
+        readme
+            .contains("A `.mesh knock` to an unreachable peer is parked on the node the same way"),
+        "deployment README must say a knock to an unreachable peer is held by the node too"
+    );
+    assert!(
+        readme.contains(
+            "a held message whose sender has not announced since the restart is kept on the node until it has been seen on three fetches and at least 15 minutes (one peer heartbeat) have passed; then it is dropped"
+        ),
+        "deployment README must state the deferral budget: three fetches and one heartbeat"
+    );
+    assert!(
+        !readme.contains("Fetching held messages back is not yet triggered"),
+        "deployment README must not still say fetch-back is not yet triggered"
     );
 }
 

@@ -830,7 +830,7 @@ Propagation envelope, msgpack array `[timestamp, [transient]]`:
 
 A fetch is three requests on the propagation node's `/get` path over an identified link, each bounded by `FETCH_REQUEST_TIMEOUT` = `60` seconds (src/mesh/propagation_fetch.rs; `request_bodies_match_the_reference_bytes`, `three_rounds_identify_first_and_put_the_reference_bytes_on_the_wire`).
 
-The reference drives this path (`fetch_propagated`, src/mesh/node.rs) from the REPL's idle-time driver, once a propagation node is heard after the node joins and then every `mesh.propagation_sync_interval_secs` seconds (default `300`), and from `.mesh fetch`; with `0`, or while `mesh.announce` is false, only `.mesh fetch` runs a fetch.
+The reference drives this path (`fetch_propagated`, src/mesh/node.rs) from the REPL's idle-time driver, once a propagation node is heard after the node joins and then every `mesh.propagation_sync_interval_secs` seconds, and from `.mesh fetch`; with `0`, or while `mesh.announce` is false, only `.mesh fetch` runs a fetch.
 
 **[MESH-PROP-020]** A fetching node MUST identify on the link before the first request.
 
@@ -857,7 +857,7 @@ Each body of round 2 runs the stages below in order; the first that fails decide
 | 3 | the first 16 bytes equal the receiver's delivery hash | **[MESH-PROP-030]** The receiver MUST discard it as `Undecryptable` (`destination is not ours`). | yes |
 | 4 | the remainder decrypts | **[MESH-PROP-031]** The receiver MUST discard it as `Undecryptable`. | yes |
 | 5 | message id `H(destination || source || payload_without_stamp)` is not in the delivered dedup set | **[MESH-PROP-032]** The receiver MUST discard it as `Duplicate`. | no |
-| 6 | the source's public key resolves (transport announce cache, then the peer table by delivery hash) | **[MESH-PROP-033]** The receiver MUST defer it as `UnknownSource`: not acknowledged, not recorded. **[MESH-PROP-034]** On the sighting after `MAX_UNKNOWN_SOURCE_DEFERRALS` = `3` deferrals the receiver MUST record, acknowledge and drop it (`UnknownSourceBudgetSpent`; `an_unknown_source_is_deferred_three_times_then_given_up_on`). | no, then yes |
+| 6 | the source's public key resolves (transport announce cache, then the peer table by delivery hash) | **[MESH-PROP-033]** The receiver MUST defer it as `UnknownSource`: not acknowledged, not recorded. **[MESH-PROP-034]** The receiver MUST keep deferring it until both `MAX_UNKNOWN_SOURCE_DEFERRALS` = `3` deferrals have passed and `UNKNOWN_SOURCE_DEFERRAL_HORIZON` = `900` seconds (one `HEARTBEAT_SECS`) have elapsed since the first sighting, and on the next sighting MUST record, acknowledge and drop it (`UnknownSourceBudgetSpent`; `an_unknown_source_is_deferred_for_three_sightings_and_a_heartbeat_then_given_up_on`). | no, then yes |
 | 7 | the signature verifies | **[MESH-PROP-035]** The receiver MUST discard it as `BadSignature`. | yes |
 | 8 | the signer's standing is `Trusted` | **[MESH-PROP-036]** `Unknown` MUST be discarded as `UntrustedSource`. **[MESH-PROP-037]** `Blocked` MUST be discarded as `BlockedSource` (`a_blocked_signer_is_discarded_and_the_stamp_line_is_logged_for_a_trusted_one`). | yes |
 | 9 | routing | **[MESH-PROP-038]** The receiver MUST route in this order: knock (`"coyote.knock/1"`, section 8.6), then peer message (`"coyote.peer/1"`, section 10.8), then the ordinary inbox. | yes |
@@ -1193,7 +1193,8 @@ A leniency is a place where the reference deliberately does something other than
 | `MIN_FETCHED_MESSAGE_BYTES` | `112` | src/mesh/propagation_fetch.rs | bounds_leave_room_under_the_transport_and_response_caps |
 | `DEDUP_CAPACITY` | `4096` | src/mesh/propagation_fetch.rs | dedup_evicts_the_oldest_past_capacity_and_logs_it |
 | `DEDUP_HORIZON` | `15552000` | src/mesh/propagation_fetch.rs | bounds_leave_room_under_the_transport_and_response_caps |
-| `MAX_UNKNOWN_SOURCE_DEFERRALS` | `3` | src/mesh/propagation_fetch.rs | an_unknown_source_is_deferred_three_times_then_given_up_on |
+| `MAX_UNKNOWN_SOURCE_DEFERRALS` | `3` | src/mesh/propagation_fetch.rs | an_unknown_source_is_deferred_for_three_sightings_and_a_heartbeat_then_given_up_on |
+| `UNKNOWN_SOURCE_DEFERRAL_HORIZON` | `900` | src/mesh/propagation_fetch.rs | an_unknown_source_is_deferred_for_three_sightings_and_a_heartbeat_then_given_up_on |
 | `MAX_DEFERRED_IDS` | `256` | src/mesh/propagation_fetch.rs | deferrals_evict_the_longest_deferred_past_capacity_and_log_it |
 | `REQUIRED_DELIVERY_STAMP_COST` | `0` | src/mesh/propagation_fetch.rs | a_blocked_signer_is_discarded_and_the_stamp_line_is_logged_for_a_trusted_one |
 | `PROPAGATION_NODE_TABLE_MAX_ENTRIES` | `32` | src/mesh/propagation_nodes.rs | cap_evicts_the_least_recently_heard_and_logs_it |

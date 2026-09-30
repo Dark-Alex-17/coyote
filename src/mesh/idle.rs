@@ -4,7 +4,7 @@
 //! session context; nothing here does.
 
 use crate::mesh::notify::{Notification, Source};
-use crate::mesh::propagation_fetch::{FetchError, FetchReport};
+use crate::mesh::propagation_fetch::{FetchError, FetchReport, MAX_WANTS_PER_FETCH};
 use crate::mesh::r3::{R3Error, redact_hashes, short};
 use crate::supervisor::notification::SystemNotification;
 
@@ -28,9 +28,11 @@ pub(crate) const IDLE_COALESCE_MAX_PEERS: usize = 8;
 /// alike. Past this many the closing line says the cap followed by `+` rather than
 /// growing a set keyed by whatever a flood chooses to send.
 pub(crate) const IDLE_COALESCE_MAX_OTHER_PEERS: usize = 64;
-/// How soon an automatic propagation fetch is tried again when no propagation node has
-/// announced itself yet, when that is sooner than the configured interval.
-pub(crate) const PROPAGATION_SYNC_RETRY_WITHOUT_NODE: Duration = Duration::from_secs(15);
+/// How soon an automatic propagation fetch is tried again, when that is sooner than the
+/// configured interval: when no propagation node has announced itself yet, after a fetch
+/// that deferred a body (the first retry; later ones back off), and when a join-time
+/// request never reached the driver.
+pub(crate) const PROPAGATION_SYNC_SHORT_RETRY: Duration = Duration::from_secs(15);
 
 /// Who produced an event, which decides whether flood control applies. `Local` events
 /// are minted by this crate (child completions, node lifecycle) and are bounded by what
@@ -56,8 +58,8 @@ pub(crate) struct IdleNotify {
 /// Where producers push. `push` returns the note when it could not be queued; the driver
 /// counts overflow itself, so the caller decides what, if anything, to do with it.
 /// `request_sync` asks for a propagation fetch at the driver's next chance and is never
-/// lost: a request that cannot be queued is left as a flag the driver reads whenever it
-/// next wakes.
+/// lost while a driver runs: a request the queue refuses is left as a flag the driver
+/// reads on its next wake; with no driver it waits for the next install.
 pub(crate) trait IdleSink: Send + Sync {
     fn push(&self, note: IdleNotify) -> Result<(), IdleNotify>;
     fn request_sync(&self);
@@ -215,12 +217,16 @@ impl Coalescer {
 /// interval re-arms from the moment the fetch ends rather than from when it was asked
 /// for. An interval that does not fit the clock (`Instant::checked_add` fails) is never
 /// armed and never healed, so an absurd interval disables the timer rather than
-/// panicking the driver; only the short no-node retry, which always fits, still runs.
+/// panicking the driver; only the short retry, which always fits, still runs. A body
+/// waiting for its sender's announce is retried soon and then less and less often, so an
+/// unresolvable sender cannot hold this node at a 15 s fetch cadence.
 pub(crate) struct SyncSchedule {
     interval: Option<Duration>,
     due_at: Option<Instant>,
     in_flight: Option<String>,
     pending: bool,
+    stopped: bool,
+    deferred_backoff: Option<Duration>,
     last_failure: Option<String>,
 }
 
@@ -235,6 +241,8 @@ impl SyncSchedule {
             due_at: None,
             in_flight: None,
             pending: false,
+            stopped: false,
+            deferred_backoff: None,
             last_failure: None,
         }
     }
@@ -249,6 +257,7 @@ impl SyncSchedule {
     /// running is owed a re-run when that fetch ends.
     pub(crate) fn accepts_request(&mut self) -> bool {
         self.due_at = None;
+        self.stopped = false;
         if self.interval.is_none() {
             return false;
         }
@@ -260,23 +269,26 @@ impl SyncSchedule {
     }
 
     /// The slot is empty: nothing to fetch from and nothing to wait for, since the next
-    /// install asks again.
+    /// install asks again. A fetch still running ends without re-arming anything; a
+    /// replay owed is forgotten.
     pub(crate) fn mesh_off(&mut self) {
         self.due_at = None;
         self.pending = false;
+        self.stopped = true;
     }
 
     /// No propagation node has announced itself yet: ask again after the shorter of the
-    /// interval and `PROPAGATION_SYNC_RETRY_WITHOUT_NODE`.
+    /// interval and `PROPAGATION_SYNC_SHORT_RETRY`.
     pub(crate) fn no_node(&mut self, now: Instant) {
         self.retry_soon(now);
     }
 
     /// Automatic, with no timer armed and no fetch running, while a node is installed:
     /// the state a join-time request that never reached the driver leaves behind. Arms
-    /// the no-node retry so the schedule recovers on its own, unless the interval is one
+    /// the short retry so the schedule recovers on its own, unless the interval is one
     /// that never arms.
     pub(crate) fn heal(&mut self, now: Instant) {
+        self.stopped = false;
         let Some(interval) = self.interval else {
             return;
         };
@@ -297,9 +309,11 @@ impl SyncSchedule {
     /// failure already shown, so a node that stays dead is reported once. Refusals from
     /// a fetch already running elsewhere, cancellation and a stopped node say nothing;
     /// a fetch that found no node yet retries as `no_node` does. A request refused while
-    /// this fetch ran is due at once instead. A fetch that deferred a body also retries
-    /// as `no_node` does: the body is waiting for its sender's announce, which arrives
-    /// on its own schedule, not the interval's.
+    /// this fetch ran is due at once instead. A fetch that deferred a body retries after
+    /// the short retry, doubled each time until a fetch defers nothing: the body is
+    /// waiting for its sender's announce, which arrives on its own schedule, not the
+    /// interval's. A fetch that wanted a full page retries soon as well, so a backlog
+    /// drains without waiting an interval per page. Nothing is armed after `mesh_off`.
     pub(crate) fn finished(
         &mut self,
         outcome: &Result<FetchReport, FetchError>,
@@ -309,9 +323,14 @@ impl SyncSchedule {
         let line = match outcome {
             Ok(report) => {
                 if report.deferred > 0 {
-                    self.retry_soon(now);
+                    self.retry_deferred(now);
                 } else {
-                    self.re_arm(now);
+                    self.deferred_backoff = None;
+                    if report.wanted == MAX_WANTS_PER_FETCH {
+                        self.retry_soon(now);
+                    } else {
+                        self.re_arm(now);
+                    }
                 }
                 self.last_failure = None;
                 (report.received > 0).then(|| synced_line(report))
@@ -351,13 +370,29 @@ impl SyncSchedule {
     }
 
     fn re_arm(&mut self, now: Instant) {
-        self.due_at = self.interval.and_then(|interval| now.checked_add(interval));
+        self.arm(now, Duration::MAX);
     }
 
     fn retry_soon(&mut self, now: Instant) {
-        self.due_at = self.interval.and_then(|interval| {
-            now.checked_add(interval.min(PROPAGATION_SYNC_RETRY_WITHOUT_NODE))
-        });
+        self.arm(now, PROPAGATION_SYNC_SHORT_RETRY);
+    }
+
+    fn retry_deferred(&mut self, now: Instant) {
+        let wait = self
+            .deferred_backoff
+            .map_or(PROPAGATION_SYNC_SHORT_RETRY, |wait| wait.saturating_mul(2));
+        self.deferred_backoff = Some(wait);
+        self.arm(now, wait);
+    }
+
+    /// Arms the shorter of `wait` and the interval, unless the mesh went off.
+    fn arm(&mut self, now: Instant, wait: Duration) {
+        if self.stopped {
+            return;
+        }
+        self.due_at = self
+            .interval
+            .and_then(|interval| now.checked_add(interval.min(wait)));
     }
 }
 
@@ -674,7 +709,7 @@ mod tests {
         schedule.no_node(now);
         assert_eq!(
             schedule.due_at(),
-            Some(now + PROPAGATION_SYNC_RETRY_WITHOUT_NODE),
+            Some(now + PROPAGATION_SYNC_SHORT_RETRY),
             "the no-node retry still fits the clock"
         );
         schedule.mesh_off();
@@ -701,7 +736,7 @@ mod tests {
         );
         assert_eq!(
             schedule.due_at(),
-            Some(now + PROPAGATION_SYNC_RETRY_WITHOUT_NODE),
+            Some(now + PROPAGATION_SYNC_SHORT_RETRY),
             "the sender's announce is waited for as a node's is"
         );
         let mut short_interval = SyncSchedule::new(5, true);
@@ -715,19 +750,77 @@ mod tests {
     }
 
     #[test]
+    fn retries_after_a_deferred_body_back_off_to_the_interval() {
+        let now = Instant::now();
+        let deferred = || FetchReport {
+            deferred: 1,
+            ..report(1, 0, 0)
+        };
+        let mut schedule = SyncSchedule::new(300, true);
+        for secs in [15, 30, 60, 120, 240] {
+            schedule.started(NODE.to_string());
+            schedule.finished(&Ok(deferred()), now);
+            assert_eq!(
+                schedule.due_at(),
+                Some(now + Duration::from_secs(secs)),
+                "each deferred fetch doubles the wait"
+            );
+        }
+        for _ in 0..3 {
+            schedule.started(NODE.to_string());
+            schedule.finished(&Ok(deferred()), now);
+            assert_eq!(
+                schedule.due_at(),
+                Some(now + Duration::from_secs(300)),
+                "the backoff is capped at the interval"
+            );
+        }
+        schedule.started(NODE.to_string());
+        schedule.finished(&Ok(report(1, 1, 0)), now);
+        assert_eq!(schedule.due_at(), Some(now + Duration::from_secs(300)));
+        schedule.started(NODE.to_string());
+        schedule.finished(&Ok(deferred()), now);
+        assert_eq!(
+            schedule.due_at(),
+            Some(now + PROPAGATION_SYNC_SHORT_RETRY),
+            "a fetch that deferred nothing resets the backoff"
+        );
+    }
+
+    #[test]
+    fn a_full_page_is_followed_by_another_fetch_soon() {
+        let now = Instant::now();
+        let mut schedule = SyncSchedule::new(300, true);
+        schedule.started(NODE.to_string());
+        schedule.finished(&Ok(report(MAX_WANTS_PER_FETCH, 0, 0)), now);
+        assert_eq!(schedule.due_at(), Some(now + PROPAGATION_SYNC_SHORT_RETRY));
+        schedule.started(NODE.to_string());
+        schedule.finished(&Ok(report(MAX_WANTS_PER_FETCH, 0, 0)), now);
+        assert_eq!(
+            schedule.due_at(),
+            Some(now + PROPAGATION_SYNC_SHORT_RETRY),
+            "a backlog is drained page by page without backing off"
+        );
+        schedule.started(NODE.to_string());
+        schedule.finished(&Ok(report(MAX_WANTS_PER_FETCH - 1, 0, 0)), now);
+        assert_eq!(
+            schedule.due_at(),
+            Some(now + Duration::from_secs(300)),
+            "a page with room left is the last of the backlog"
+        );
+    }
+
+    #[test]
     fn sync_schedule_heals_an_automatic_schedule_left_unarmed() {
         let now = Instant::now();
         let mut schedule = SyncSchedule::new(300, true);
         schedule.heal(now);
-        assert_eq!(
-            schedule.due_at(),
-            Some(now + PROPAGATION_SYNC_RETRY_WITHOUT_NODE)
-        );
+        assert_eq!(schedule.due_at(), Some(now + PROPAGATION_SYNC_SHORT_RETRY));
         let later = now + Duration::from_secs(5);
         schedule.heal(later);
         assert_eq!(
             schedule.due_at(),
-            Some(now + PROPAGATION_SYNC_RETRY_WITHOUT_NODE),
+            Some(now + PROPAGATION_SYNC_SHORT_RETRY),
             "an armed timer is left alone"
         );
         assert!(schedule.accepts_request());
@@ -741,10 +834,7 @@ mod tests {
         let now = Instant::now();
         let mut schedule = SyncSchedule::new(300, true);
         schedule.no_node(now);
-        assert_eq!(
-            schedule.due_at(),
-            Some(now + PROPAGATION_SYNC_RETRY_WITHOUT_NODE)
-        );
+        assert_eq!(schedule.due_at(), Some(now + PROPAGATION_SYNC_SHORT_RETRY));
         let mut short_interval = SyncSchedule::new(5, true);
         short_interval.no_node(now);
         assert_eq!(
@@ -760,7 +850,7 @@ mod tests {
         );
         assert_eq!(
             raced.due_at(),
-            Some(now + PROPAGATION_SYNC_RETRY_WITHOUT_NODE),
+            Some(now + PROPAGATION_SYNC_SHORT_RETRY),
             "a node that vanished between the check and the fetch is waited for the same way"
         );
     }
@@ -781,9 +871,31 @@ mod tests {
         replay_owed.finished(&Err(FetchError::Cancelled), now);
         assert_eq!(
             replay_owed.due_at(),
-            Some(now + Duration::from_secs(300)),
-            "a replay owed before the mesh went off is forgotten with it: the interval re-arms, not a replay at once"
+            None,
+            "a replay owed before the mesh went off is forgotten with it"
         );
+        for outcome in [
+            Err(FetchError::NoPropagationNode),
+            Ok(FetchReport {
+                deferred: 1,
+                ..report(1, 0, 0)
+            }),
+        ] {
+            replay_owed.started(NODE.to_string());
+            replay_owed.finished(&outcome, now);
+            assert_eq!(
+                replay_owed.due_at(),
+                None,
+                "a fetch ending after the mesh went off arms no retry either: {outcome:?}"
+            );
+        }
+        assert!(
+            replay_owed.accepts_request(),
+            "the next request is what starts the schedule again"
+        );
+        replay_owed.started(NODE.to_string());
+        replay_owed.finished(&Ok(report(0, 0, 0)), now);
+        assert_eq!(replay_owed.due_at(), Some(now + Duration::from_secs(300)));
     }
 
     #[test]

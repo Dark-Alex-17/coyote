@@ -337,6 +337,8 @@ pub fn render_mesh_info(mesh: &MeshConfig) -> String {
         "propagation_sync_interval_secs",
         if sync == 0 {
             "0 (manual)".to_string()
+        } else if !mesh.announce {
+            format!("{sync} (off: announce is false)")
         } else {
             sync.to_string()
         },
@@ -826,6 +828,29 @@ mod tests {
             ..Default::default()
         };
         let info = render_mesh_info(&manual);
+        assert!(
+            info.contains("  propagation_sync_interval_secs  0 (manual)\n"),
+            "{info}"
+        );
+    }
+
+    #[test]
+    fn render_mesh_info_marks_the_sync_interval_off_while_announce_is_false() {
+        let quiet = MeshConfig {
+            announce: false,
+            ..Default::default()
+        };
+        let info = render_mesh_info(&quiet);
+        assert!(
+            info.contains("  propagation_sync_interval_secs  300 (off: announce is false)\n"),
+            "{info}"
+        );
+        let manual_and_quiet = MeshConfig {
+            announce: false,
+            propagation_sync_interval_secs: 0,
+            ..Default::default()
+        };
+        let info = render_mesh_info(&manual_and_quiet);
         assert!(
             info.contains("  propagation_sync_interval_secs  0 (manual)\n"),
             "{info}"

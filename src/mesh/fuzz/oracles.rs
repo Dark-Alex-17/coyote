@@ -21,7 +21,7 @@ use crate::mesh::pending::{
 use crate::mesh::propagation::lxmf_delivery_hash;
 use crate::mesh::propagation_fetch::{
     BodyOutcome, BodyPipeline, Discard, FetchStore, InboundMessage, InboundSink,
-    MAX_FETCHED_MESSAGE_BYTES, MAX_UNKNOWN_SOURCE_DEFERRALS, MIN_FETCHED_MESSAGE_BYTES, SourceKeys,
+    MAX_FETCHED_MESSAGE_BYTES, MIN_FETCHED_MESSAGE_BYTES, SourceKeys,
 };
 use crate::mesh::protocol::{MESH_PROTOCOL_MIN_SUPPORTED, MESH_PROTOCOL_VERSION, VersionRefusal};
 use crate::mesh::r3::{
@@ -1290,7 +1290,8 @@ struct Model {
 }
 
 impl Model {
-    /// The "Recorded" column of 11.4 plus MESH-PROP-034's budget.
+    /// The "Recorded" column of 11.4 plus MESH-PROP-034's deferral count. The fixture's
+    /// clock never advances, so the deferral horizon never passes and no budget is spent.
     fn apply(&mut self, transient: [u8; 32], outcome: &BodyOutcome, message_id: Option<[u8; 32]>) {
         match outcome {
             BodyOutcome::Delivered => {
@@ -1588,20 +1589,18 @@ impl ReceiptFixture {
             );
         }
         if !source_known {
-            let sightings = model.deferrals.get(transient).copied().unwrap_or(0) + 1;
-            return if sightings <= MAX_UNKNOWN_SOURCE_DEFERRALS {
-                (
-                    BodyOutcome::Deferred {
-                        attempts: sightings,
-                    },
-                    Stage::SourceKey,
-                )
-            } else {
-                (
-                    BodyOutcome::Discarded(Discard::UnknownSourceBudgetSpent),
-                    Stage::SourceKey,
-                )
-            };
+            let sightings = model
+                .deferrals
+                .get(transient)
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(1);
+            return (
+                BodyOutcome::Deferred {
+                    attempts: sightings,
+                },
+                Stage::SourceKey,
+            );
         }
         if !sealed.signature_valid {
             return (

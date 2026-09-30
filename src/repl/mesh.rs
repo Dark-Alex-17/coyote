@@ -17,9 +17,9 @@ use crate::mesh::trust::{
     Verdict, decode_name_hash, parse_hash,
 };
 use crate::mesh::{
-    FetchError, FetchReport, LoggingInboundSink, MESH_ALREADY_ON, MeshPaths, MeshRuntime,
-    NodeOptions, PeerRecord, PropagationNodeRecord, age_text, canonical_hash, destination_address,
-    display_text, parse_rfc3339, redact_hashes, short,
+    FetchError, FetchReport, LoggingInboundSink, MAX_WANTS_PER_FETCH, MESH_ALREADY_ON, MeshPaths,
+    MeshRuntime, NodeOptions, PeerRecord, PropagationNodeRecord, age_text, canonical_hash,
+    destination_address, display_text, parse_rfc3339, redact_hashes, short,
 };
 use crate::supervisor::mailbox::EnvelopePayload;
 use crate::utils::{AbortSignal, drain_stale_tty_input, wait_user_interrupt};
@@ -654,13 +654,7 @@ async fn reply(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
 /// own rule.
 fn peer_for_contact(runtime: &MeshRuntime, destination: &str, only: &str) -> Result<PeerRecord> {
     let Some(peer) = runtime.peers().get(destination) else {
-        let verdict = runtime.trust().authorize("", destination);
-        if verdict.rule == Rule::DestinationDenied
-            && let Some(refusal) = trust_refusal(destination, verdict, only)
-        {
-            bail!(refusal);
-        }
-        return Err(not_heard(destination));
+        return Err(unheard_refusal(runtime, destination, only));
     };
     let verdict = runtime.trust().authorize(&peer.identity_hash, destination);
     if let Some(refusal) = trust_refusal(destination, verdict, only) {
@@ -669,7 +663,15 @@ fn peer_for_contact(runtime: &MeshRuntime, destination: &str, only: &str) -> Res
     Ok(peer)
 }
 
-fn not_heard(destination: &str) -> anyhow::Error {
+/// Why a destination not in the peer table is refused: the trust list's denial of the
+/// destination itself when there is one, otherwise that it has not been heard.
+fn unheard_refusal(runtime: &MeshRuntime, destination: &str, tail: &str) -> anyhow::Error {
+    let verdict = runtime.trust().authorize("", destination);
+    if verdict.rule == Rule::DestinationDenied
+        && let Some(refusal) = trust_refusal(destination, verdict, tail)
+    {
+        return anyhow!(refusal);
+    }
     anyhow!(
         "Destination {destination} has not been heard from: it is not in the peer table. Only peers this node has heard announce can be contacted; check `.mesh peers`."
     )
@@ -733,13 +735,7 @@ async fn knock(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
     let destination = destination_hash(target)?;
     let runtime = live(ctx)?;
     let Some(peer) = runtime.peers().get(&destination) else {
-        let verdict = runtime.trust().authorize("", &destination);
-        if verdict.rule == Rule::DestinationDenied
-            && let Some(refusal) = trust_refusal(&destination, verdict, KNOCK_REFUSAL_TAIL)
-        {
-            bail!(refusal);
-        }
-        return Err(not_heard(&destination));
+        return Err(unheard_refusal(&runtime, &destination, KNOCK_REFUSAL_TAIL));
     };
     let verdict = runtime.trust().authorize(&peer.identity_hash, &destination);
     if matches!(
@@ -801,10 +797,16 @@ async fn knock(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
 
 fn render_fetch(report: &FetchReport) -> String {
     let node = short(&report.node);
+    if report.listed > 0 && report.wanted == 0 {
+        return format!(
+            "Nothing new held for this node at {node}: {} listed, all already processed.",
+            report.listed
+        );
+    }
     if report.received == 0 {
         return format!("Nothing held for this node at {node}.");
     }
-    format!(
+    let mut line = format!(
         "Fetched from {node}: {} listed, {} wanted, {} received, {} delivered, {} duplicates, {} discarded, {} deferred.",
         report.listed,
         report.wanted,
@@ -813,7 +815,11 @@ fn render_fetch(report: &FetchReport) -> String {
         report.duplicates,
         report.discarded,
         report.deferred
-    )
+    );
+    if report.wanted == MAX_WANTS_PER_FETCH {
+        line.push_str(" More may be held; run .mesh fetch again.");
+    }
+    line
 }
 
 fn trust(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
@@ -4198,11 +4204,30 @@ mod tests {
             );
             let empty = FetchReport {
                 received: 0,
-                ..report
+                ..report.clone()
             };
             assert_eq!(
                 render_fetch(&empty),
                 "Nothing held for this node at deadbeef."
+            );
+            let all_known = FetchReport {
+                wanted: 0,
+                received: 0,
+                ..report.clone()
+            };
+            assert_eq!(
+                render_fetch(&all_known),
+                "Nothing new held for this node at deadbeef: 7 listed, all already processed."
+            );
+            let full_page = FetchReport {
+                listed: 100,
+                wanted: MAX_WANTS_PER_FETCH,
+                received: MAX_WANTS_PER_FETCH,
+                ..report
+            };
+            assert_eq!(
+                render_fetch(&full_page),
+                "Fetched from deadbeef: 100 listed, 64 wanted, 64 received, 2 delivered, 1 duplicates, 1 discarded, 1 deferred. More may be held; run .mesh fetch again."
             );
         }
 

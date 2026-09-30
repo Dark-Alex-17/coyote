@@ -12,8 +12,9 @@ Status in this build: Coyote discovers propagation nodes from their announces (`
 seconds (default 300; `0` turns the automatic path off, including the join-time fetch) and once a propagation node is
 heard after the node joins; `.mesh fetch` runs a fetch now. A `.mesh knock` to an unreachable peer is parked on the
 node the same way. The node table is not kept across restarts, so after a restart the first fetch waits for the node's
-next announce; a held message whose sender has not announced since the restart is left on the node for three fetches
-and then dropped. A node with `announce: false` never fetches on its own; `.mesh fetch` does.
+next announce; a held message whose sender has not announced since the restart is kept on the node until it has been
+seen on three fetches and at least 15 minutes (one peer heartbeat) have passed; then it is dropped. A node with
+`announce: false` never fetches on its own; `.mesh fetch` does.
 
 ## Build and run
 
