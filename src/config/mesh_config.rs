@@ -66,9 +66,9 @@ pub struct MeshConfig {
     /// message is still filed in the inbox for the human.
     pub peer_max_cost_usd_per_hour: f64,
     /// Seconds between automatic fetches of the messages a propagation node holds for
-    /// this node, the first running when the node joins; 0 = fetch only on `.mesh fetch`;
-    /// off while `announce` is false, since a fetch identifies this node to the
-    /// propagation node.
+    /// this node, the first running once a propagation node is heard after the node
+    /// joins; 0 = fetch only on `.mesh fetch`; off while `announce` is false, since a
+    /// fetch identifies this node to the propagation node.
     /// Sideband's `lxmf_sync_interval` defaults to 43200 s with periodic sync off and
     /// NomadNet's to 21600 s; neither fits an interactive REPL, so 300 s is used.
     pub propagation_sync_interval_secs: u64,

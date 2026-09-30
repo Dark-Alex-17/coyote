@@ -733,6 +733,12 @@ async fn knock(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
     let destination = destination_hash(target)?;
     let runtime = live(ctx)?;
     let Some(peer) = runtime.peers().get(&destination) else {
+        let verdict = runtime.trust().authorize("", &destination);
+        if verdict.rule == Rule::DestinationDenied
+            && let Some(refusal) = trust_refusal(&destination, verdict, KNOCK_REFUSAL_TAIL)
+        {
+            bail!(refusal);
+        }
         return Err(not_heard(&destination));
     };
     let verdict = runtime.trust().authorize(&peer.identity_hash, &destination);
@@ -4583,7 +4589,11 @@ mod tests {
             assert!(!ctx.app.config.mesh.enabled);
         }
 
+        // `autostart` prints its leading notice through `out_text`, which lands in the
+        // process-global `capture` when another `#[serial]` test has one installed, so this
+        // test must not overlap them (it broke `bare_info_while_off_puts_every_value_in_the_same_column`).
         #[test]
+        #[serial]
         fn autostart_without_a_session_prints_the_mesh_on_refusal_and_stays_off() {
             let enabled = MeshConfig {
                 enabled: true,
@@ -7549,6 +7559,133 @@ mod tests {
                 });
             }
 
+            /// Usage probe (TASK-100 ruling 2): `announce: false` turns the AUTOMATIC sync
+            /// off; `.mesh fetch` is still a working manual trigger under that config.
+            #[test]
+            #[serial]
+            fn usage_probe_fetch_by_hand_works_while_announce_is_false() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-fetch-quiet");
+                let _capture = capture::install();
+                run_async(async {
+                    let (fake, started) = runtime_with_fake_node("repl-mesh-fetch-quiet").await;
+                    let mut ctx = ctx_with(
+                        MeshConfig {
+                            announce: false,
+                            ..MeshConfig::default()
+                        },
+                        true,
+                    );
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    fake.script.reply_with([Value::Array(vec![])]);
+
+                    run(&mut ctx, ".mesh fetch").await.unwrap();
+
+                    let lines = stdout_lines();
+                    index_of(
+                        &lines,
+                        &format!("Nothing held for this node at {}.", short(&fake.hex())),
+                    );
+                    assert_eq!(fake.script.seen().len(), 1, "one fetch went to the node");
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                    fake.stop().await;
+                });
+            }
+
+            /// An interval of 0 turns the automatic sync off; `.mesh fetch` still fetches.
+            #[test]
+            #[serial]
+            fn fetch_by_hand_works_while_the_interval_is_zero() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-fetch-zero");
+                let _capture = capture::install();
+                run_async(async {
+                    let (fake, started) = runtime_with_fake_node("repl-mesh-fetch-zero").await;
+                    let mut ctx = ctx_with(
+                        MeshConfig {
+                            propagation_sync_interval_secs: 0,
+                            ..MeshConfig::default()
+                        },
+                        true,
+                    );
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    fake.script.reply_with([Value::Array(vec![])]);
+
+                    run(&mut ctx, ".mesh fetch").await.unwrap();
+
+                    let lines = stdout_lines();
+                    index_of(
+                        &lines,
+                        &format!("Nothing held for this node at {}.", short(&fake.hex())),
+                    );
+                    assert_eq!(fake.script.seen().len(), 1, "one fetch went to the node");
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                    fake.stop().await;
+                });
+            }
+
+            /// Usage probe (TASK-100 (c)): a fetch lock held by another process (here: a
+            /// second `flock` on the same lock file, which is what `FetchLock` refuses on)
+            /// is the other contention variant: one line, `Ok`, nothing asked of the node,
+            /// and the next `.mesh fetch` after the lock is released runs normally.
+            #[test]
+            #[serial]
+            fn usage_probe_fetch_held_by_another_process_prints_one_line_and_succeeds() {
+                use crate::mesh::mesh_cache_dir;
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-fetch-held");
+                let _capture = capture::install();
+                run_async(async {
+                    let (fake, started) = runtime_with_fake_node("repl-mesh-fetch-held").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let lock_dir = mesh_cache_dir(started.runtime.cache_dir());
+                    fs::create_dir_all(&lock_dir).unwrap();
+                    let lock_path = lock_dir.join("propagation.json.lock");
+                    let holder = fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .create(true)
+                        .truncate(false)
+                        .open(&lock_path)
+                        .unwrap();
+                    holder.try_lock().unwrap();
+
+                    run(&mut ctx, ".mesh fetch").await.unwrap();
+
+                    let lines = stdout_lines();
+                    let held = index_of(&lines, "another Coyote process");
+                    assert!(
+                        lines[held].contains(&lock_path.display().to_string()),
+                        "{lines:?}"
+                    );
+                    assert!(
+                        fake.script.seen().is_empty(),
+                        "nothing was asked of the node"
+                    );
+                    assert!(
+                        !lines.iter().any(|line| line.contains("Nothing held")),
+                        "{lines:?}"
+                    );
+
+                    drop(holder);
+                    fake.script.reply_with([Value::Array(vec![])]);
+                    run(&mut ctx, ".mesh fetch").await.unwrap();
+                    let lines = stdout_lines();
+                    index_of(
+                        &lines,
+                        &format!("Nothing held for this node at {}.", short(&fake.hex())),
+                    );
+                    assert_eq!(fake.script.seen().len(), 1);
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                    fake.stop().await;
+                });
+            }
+
             /// Usage probe (TASK-100 (d)): like every consenting verb, a knock without a
             /// terminal and without `--yes` is refused naming the flag, after the notice
             /// but before anything is sent; the intro bound is enforced BEFORE consent is
@@ -7655,7 +7792,7 @@ mod tests {
 
             /// Untrusted is not denied: a knock is for a peer that has not trusted us, but
             /// this node's own deny and block lists still stand in its way, before any
-            /// notice or question.
+            /// notice or question, whether or not the denied destination has been heard.
             #[test]
             #[serial]
             fn knock_to_a_denied_destination_or_blocked_identity_is_refused() {
@@ -7669,20 +7806,32 @@ mod tests {
                     let now = SystemTime::now();
                     let (denied, _) = heard_peer(&started.runtime, "Dot", now);
                     let (blocked, blocked_identity) = heard_peer(&started.runtime, "Bex", now);
+                    let unheard_denied = hex_lower(&[0x52; 16]);
                     let trust = started.runtime.trust();
                     let slot: &dyn LiveMesh = ctx.app.mesh.as_ref();
                     trust.deny_destination(slot, &denied, None, now).unwrap();
                     trust
+                        .deny_destination(slot, &unheard_denied, None, now)
+                        .unwrap();
+                    trust
                         .block_identity(slot, &blocked_identity, None, now)
                         .unwrap();
 
-                    for (destination, standing) in [(&denied, "denied"), (&blocked, "blocked")] {
+                    for (destination, standing) in [
+                        (&denied, "denied"),
+                        (&unheard_denied, "denied"),
+                        (&blocked, "blocked"),
+                    ] {
                         let before = stdout_lines().len();
                         let err =
                             refusal(&mut ctx, &format!(".mesh knock {destination} --yes")).await;
                         assert!(
                             err.contains(&format!(" is {standing} in this node's trust list")),
                             "{standing}: {err}"
+                        );
+                        assert!(
+                            !err.contains("has not been heard"),
+                            "{standing}: the deny is named, not the missing peer row: {err}"
                         );
                         assert!(err.contains(KNOCK_REFUSAL_TAIL), "{standing}: {err}");
                         assert!(
@@ -7692,6 +7841,69 @@ mod tests {
                         );
                     }
                     assert_eq!(prompt_script::prompts_asked(), 0);
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// Usage probe (TASK-100 knock ruling): only denied/blocked stand in a knock's
+            /// way. An instance heard under a NEW key (marked `key changed` in the peer
+            /// table; `authorize` judges it default-closed, which refuses `.mesh reply`) is
+            /// still knockable: the notice shows `trust: untrusted` and the question is
+            /// asked; nothing is sent when it is declined.
+            #[test]
+            #[serial]
+            fn usage_probe_knock_passes_the_gate_for_an_instance_whose_key_changed() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-knock-key-changed");
+                let _script = prompt_script::install(&[false]);
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-knock-key-changed").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let runtime = started.runtime.clone();
+                    let slot: &dyn LiveMesh = ctx.app.mesh.as_ref();
+                    let old_dest = heard_trusted_peer(&runtime, slot);
+                    let (new_dest, new_identity) =
+                        heard_peer(&runtime, "Tia again", SystemTime::now());
+                    let name_hash = runtime.peers().get(&old_dest).unwrap().name_hash;
+                    runtime
+                        .trust()
+                        .note_key_change(&new_identity, &name_hash, SystemTime::now());
+                    let verdict = runtime.trust().authorize(&new_identity, &new_dest);
+                    assert_eq!(
+                        verdict.decision,
+                        Decision::Refuse,
+                        "fixture: the new key is not trusted"
+                    );
+                    let peers = out_of(&mut ctx, ".mesh peers").await.unwrap();
+                    assert!(
+                        peers.contains("key changed:") && peers.contains(short(&new_identity)),
+                        "fixture: the peer table marks the key change: {peers}"
+                    );
+
+                    let err = refusal(&mut ctx, &format!(".mesh reply {new_dest} hi")).await;
+                    assert!(err.contains(REPLY_REFUSAL_TAIL), "reply stays gated: {err}");
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+
+                    run(&mut ctx, &format!(".mesh knock {new_dest}"))
+                        .await
+                        .unwrap();
+
+                    let out = stdout_lines();
+                    let notice = index_of(&out, "This knocks on Tia again (");
+                    assert!(out[notice].contains("trust: untrusted"), "{out:?}");
+                    assert!(
+                        !out.iter().any(|line| line.contains(KNOCK_REFUSAL_TAIL)),
+                        "{out:?}"
+                    );
+                    index_of(&out, "Nothing was sent.");
+                    assert_eq!(prompt_script::prompts_asked(), 1, "the knock asked");
+                    assert!(
+                        !out.iter().any(|line| line.starts_with("Knocking on")),
+                        "{out:?}"
+                    );
 
                     assert!(ctx.app.mesh.stop().await.unwrap());
                     started.relay_handle.abort();

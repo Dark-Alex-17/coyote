@@ -1428,6 +1428,14 @@ fn usage_probe_docs_say_messages_are_posted_and_held_messages_are_fetched_back_a
         readme.contains("Held messages are fetched back automatically every"),
         "deployment README must state that fetch-back runs on a schedule in this build"
     );
+    assert!(
+        readme.contains("`0` turns the automatic path off"),
+        "deployment README must say what an interval of 0 does"
+    );
+    assert!(
+        readme.contains("A node with `announce: false` never fetches on its own"),
+        "deployment README must say a node that does not announce never fetches on its own"
+    );
 }
 
 #[test]

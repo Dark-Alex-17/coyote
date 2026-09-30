@@ -11,7 +11,6 @@ use super::interop_ids::{
     REQUEST_IDS,
 };
 use crate::config::Session;
-use crate::mesh::hex_lower;
 use crate::mesh::message::{OutboundPeer, PeerKind, PeerVia};
 use crate::mesh::node::{MeshRuntime, MeshSlot, NodeOptions};
 use crate::mesh::notify::{NotificationSink, RenderedNotification};
@@ -20,6 +19,7 @@ use crate::mesh::test_support::{
     private_config, wait_until,
 };
 use crate::mesh::trust::TrustOptions;
+use crate::mesh::{hex_lower, short};
 use crate::repl::idle::testing::driver_on_a_fresh_state;
 use crate::supervisor::mailbox::EnvelopePayload;
 
@@ -450,23 +450,8 @@ impl Node {
         name_hash_of(&self.instance_id)
     }
 
-    /// Waits for the reference's announce to be filed, then trusts its destination.
     async fn trust_reference(&self, reference: &Reference) {
-        let peers = self.runtime.peers();
-        let destination = reference.ready.destination_hash.clone();
-        wait_until("the node to file the reference", || {
-            peers.get(&destination).is_some()
-        })
-        .await;
-        self.runtime
-            .trust()
-            .trust_destination(
-                self.slot.as_ref(),
-                &destination,
-                TrustOptions::default(),
-                SystemTime::now(),
-            )
-            .unwrap();
+        trust_peer(self, &reference.ready.destination_hash).await;
     }
 
     async fn stop(self) {
@@ -949,6 +934,10 @@ async fn a_message_spooled_while_the_receiver_is_off_is_delivered_after_it_rejoi
 
     let receiver = parked.rejoin().await;
     assert!(app.mesh.get().is_some());
+    assert!(
+        receiver.runtime.propagation_nodes().snapshot().is_empty(),
+        "the node table is in-memory; a PN filed this early means the reference's delayed self-announce landed inside the off-window"
+    );
     // The rejoined transport knows no identities yet; the sender's start announce brings
     // back the key the held message was signed with.
     let sender = sender.leave().await.rejoin().await;
@@ -981,12 +970,12 @@ async fn a_message_spooled_while_the_receiver_is_off_is_delivered_after_it_rejoi
         received.source_destination,
         sender.runtime.current_destination_hash()
     );
+    let synced_line = format!(
+        "[mesh:propagation] synced 1 message from {}: 1 delivered",
+        short(&pn_hash)
+    );
     wait_until("the sync line to be printed", || {
-        printed
-            .0
-            .lock()
-            .iter()
-            .any(|line| line.contains("[mesh:propagation] synced 1 message"))
+        printed.0.lock().contains(&synced_line)
     })
     .await;
     wait_for_pn_count(&mut reference, 0).await;

@@ -113,8 +113,9 @@ pub(crate) enum IdleEvent {
 }
 
 /// Producer side of the driver's queue. Never waits: a full or closed queue hands the
-/// event back; only a full one counts as overflow. A sync request is also left as a flag
-/// the loop reads whenever it wakes, so one that misses the queue is not lost.
+/// event back; only a full one counts as overflow. A sync request that finds the queue
+/// full is left as a flag instead, which the loop reads whenever it wakes, so it is not
+/// lost; one that gets into the queue is delivered once, by the queue alone.
 #[derive(Clone)]
 pub(crate) struct IdleHandle {
     tx: mpsc::Sender<IdleEvent>,
@@ -169,10 +170,10 @@ impl IdleSink for IdleHandle {
     }
 
     fn request_sync(&self) {
-        self.sync_requested.store(true, Ordering::Release);
         match self.tx.try_send(IdleEvent::SyncNow) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => {
+                self.sync_requested.store(true, Ordering::Release);
                 debug!(
                     "Idle driver queue full; the propagation sync runs when the driver next wakes"
                 );
@@ -330,12 +331,14 @@ impl IdleDriver {
 }
 
 /// The synchronous part of `stop`, so an early return from the REPL that never reaches
-/// `stop` still detaches the slot and signals the children. Every step is idempotent, so
-/// running again after `stop_with_timeout` changes nothing.
+/// `stop` still detaches the slot, signals the children and takes the loop down with the
+/// fetch it owns (`DriverLoop::drop` aborts that). Every step is idempotent, so running
+/// again after `stop_with_timeout` changes nothing.
 impl Drop for IdleDriver {
     fn drop(&mut self) {
         self.app.mesh.clear_idle();
         self.cancel.cancel();
+        self.tasks.abort_all();
         self.in_flight.cancel_children();
     }
 }
@@ -347,8 +350,8 @@ struct DriverLoop {
     /// Shared with the producers' handle; read and reset at each coalesce tick so the
     /// prompt hears about a full queue while the driver runs.
     overflow: Arc<AtomicUsize>,
-    /// Shared with the producers' handle; set by every sync request and read at each
-    /// wake, so a `SyncNow` the full queue refused still starts a fetch.
+    /// Shared with the producers' handle; set by a sync request the full queue refused
+    /// and read at each wake, so that request still starts a fetch.
     sync_requested: Arc<AtomicBool>,
     cancel: CancellationToken,
     in_flight: Arc<InFlight>,
@@ -3600,6 +3603,32 @@ mod tests {
             app.mesh.stop().await.unwrap();
             started.relay_handle.abort();
             fake.stop().await;
+        }
+
+        /// The install's `SyncNow` queues behind notes the loop is still working through,
+        /// so it is acted on from the queue once the loop gets to it; nothing else asks
+        /// for the same fetch, and no second one follows the first.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_sync_request_is_started_once_even_when_the_loop_is_busy() {
+            let ctx = sync_ctx(3600);
+            let app = Arc::clone(&ctx.try_read().unwrap().app);
+            let driver = start_driver(&ctx);
+            let (fake, started) = runtime_with_node("idle-sync-once").await;
+            fake.script.reply_with([Value::Array(vec![])]);
+            for index in 0..8 {
+                assert!(app.mesh.push_idle(note(&format!("note {index}"), None)));
+            }
+
+            app.mesh.install(started.runtime.clone()).unwrap();
+
+            wait_for_rounds(&fake, 1, FETCH_TIMEOUT).await;
+            sleep(Duration::from_millis(1500)).await;
+            assert_eq!(
+                fake.script.seen().len(),
+                1,
+                "one request, one fetch: the queue delivers it and the flag is not also set"
+            );
+            tear_down(driver, &slot(&ctx), started, fake).await;
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

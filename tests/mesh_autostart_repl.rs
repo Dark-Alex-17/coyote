@@ -314,7 +314,9 @@ fn repl_with_mesh_enabled_joins_before_the_first_prompt_without_asking() {
     });
     assert!(notice_at < summary_at, "{startup:?}");
     assert!(
-        !startup.contains("Turn mesh on?") && !startup.contains("[y/n]"),
+        !startup.contains("Join the mesh on")
+            && !startup.contains("Join anyway?")
+            && !startup.contains("(y/N)"),
         "autostart must not ask: {startup:?}"
     );
     assert!(

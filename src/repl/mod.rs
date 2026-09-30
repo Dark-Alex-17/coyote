@@ -643,7 +643,10 @@ Type ".help" for additional help.
             };
             match result {
                 Ok(()) => self.digest.maybe_refresh(&self.ctx),
-                Err(err) => render_error(err),
+                Err(err) => {
+                    render_error(err);
+                    println!()
+                }
             }
         }
 
@@ -3405,7 +3408,13 @@ mod tests {
         let run_start = strip(&["pub async fn run(", "&mut self)"].concat());
         let gate = strip(&["if self.ctx.read().app.config.mesh.", "enabled {"].concat());
         let autostart = strip(&["mesh::auto", "start(&mut ctx).await"].concat());
-        let surfaced = strip(&["Err(err) => render_", "error(err),"].concat());
+        let surfaced = strip(
+            &[
+                "Ok(()) => self.digest.maybe_refresh(&self.ctx), Err(err) => { render_",
+                "error(err); println!() }",
+            ]
+            .concat(),
+        );
         let banner = strip(&["print_pause_", "banner(&self.ctx.read());"].concat());
         let read_line = strip(&["self.editor.", "read_line(&self.prompt)"].concat());
 

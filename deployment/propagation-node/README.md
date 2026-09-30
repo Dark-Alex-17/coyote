@@ -9,10 +9,11 @@ for a private team network.
 Status in this build: Coyote discovers propagation nodes from their announces (`.mesh info` lists them under
 `propagation_nodes`) and posts to the nearest one when a direct link fails (`mesh__send` reports
 `via: store_and_forward`). Held messages are fetched back automatically every `mesh.propagation_sync_interval_secs`
-seconds (default 300) and once when the node joins; `.mesh fetch` runs a fetch now. The node table is not kept across
-restarts, so after a restart the first fetch waits for the node's next announce; a held message whose sender has not
-announced since the restart is left on the node for three fetches and then dropped. A node with `announce: false`
-never fetches on its own; `.mesh fetch` does.
+seconds (default 300; `0` turns the automatic path off, including the join-time fetch) and once a propagation node is
+heard after the node joins; `.mesh fetch` runs a fetch now. A `.mesh knock` to an unreachable peer is parked on the
+node the same way. The node table is not kept across restarts, so after a restart the first fetch waits for the node's
+next announce; a held message whose sender has not announced since the restart is left on the node for three fetches
+and then dropped. A node with `announce: false` never fetches on its own; `.mesh fetch` does.
 
 ## Build and run
 
