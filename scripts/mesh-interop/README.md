@@ -48,7 +48,7 @@ COYOTE_MESH_INTEROP=1 cargo test --all mesh::conformance -- --include-ignored
 else. The interop tests are `#[ignore]`d, so a plain `cargo test` never spawns Python; without
 `COYOTE_MESH_INTEROP=1` they print `skipping: ...` and pass. With it set, every missing
 prerequisite is a failure that names `setup.sh`. The script also byte-compiles both clones:
-the tests run four references in parallel with 15 s waits, and a reference compiling
+the tests run five references in parallel with 15 s waits, and a reference compiling
 Reticulum's interfaces and LXMF's router on first import starts late enough to miss them
 (`timed out waiting for the node to file the reference` on a cold clone is this).
 

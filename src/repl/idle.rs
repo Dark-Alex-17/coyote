@@ -787,6 +787,7 @@ impl DriverLoop {
         let now = tokio::time::Instant::now().into_std();
         let Some(runtime) = self.app.mesh.get() else {
             self.sync.mesh_off();
+            self.no_node_logged = false;
             return;
         };
         let Ok(node) = runtime.propagation_nodes().select() else {
@@ -806,6 +807,8 @@ impl DriverLoop {
         }));
     }
 
+    /// A fetch that ended after `.mesh off` emptied the slot arms nothing: the schedule is
+    /// stopped before the outcome reaches it.
     fn on_sync_finished(&mut self, joined: Result<Result<FetchReport, FetchError>, JoinError>) {
         let now = tokio::time::Instant::now().into_std();
         let outcome = match joined {
@@ -831,6 +834,10 @@ impl DriverLoop {
                 "Propagation sync failed: {}",
                 redact_hashes(&err.to_string())
             ),
+        }
+        if self.app.mesh.get().is_none() {
+            self.sync.mesh_off();
+            self.no_node_logged = false;
         }
         if let Some(text) = self.sync.finished(&outcome, now) {
             self.app
@@ -3684,6 +3691,34 @@ mod tests {
                 fake.script.seen().len(),
                 rounds,
                 "no fetch runs once the node is off"
+            );
+            driver.stop().await;
+            started.relay_handle.abort();
+            fake.stop().await;
+        }
+
+        /// `.mesh off` while a fetch is parked on a silent node: the fetch ends after the
+        /// slot is already empty, and its outcome must not re-arm the 1 s interval.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn stopping_the_mesh_during_a_fetch_arms_nothing_afterwards() {
+            let ctx = sync_ctx(1);
+            let driver = start_driver(&ctx);
+            let (fake, started) = runtime_with_node("idle-sync-stop-in-flight").await;
+
+            slot(&ctx).install(started.runtime.clone()).unwrap();
+            wait_for_rounds(&fake, 1, FETCH_TIMEOUT).await;
+
+            assert!(
+                timeout(FETCH_TIMEOUT, slot(&ctx).stop())
+                    .await
+                    .expect("stopping the slot does not wait on the parked fetch")
+                    .unwrap()
+            );
+            sleep(Duration::from_millis(2500)).await;
+            assert_eq!(
+                fake.script.seen().len(),
+                1,
+                "the fetch cut short by .mesh off arms no follow-up"
             );
             driver.stop().await;
             started.relay_handle.abort();

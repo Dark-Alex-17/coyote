@@ -5,6 +5,7 @@ use crate::config::{MeshConfig, RequestContext};
 use crate::function::mesh::trust_label;
 use crate::mesh::card::{CardSource, DISPLAY_NAME_MAX_CHARS, StatusHandler, render_for_human};
 use crate::mesh::identity::{self, Predecessor, fingerprint};
+use crate::mesh::idle::plural;
 use crate::mesh::knock::{KnockIntro, KnockOutcome, KnockVia};
 use crate::mesh::knocks::KnockRecord;
 use crate::mesh::message::{
@@ -802,6 +803,17 @@ fn render_fetch(report: &FetchReport) -> String {
             "Nothing new held for this node at {node}: {} listed, all already processed.",
             report.listed
         );
+    }
+    if report.wanted > 0 && report.received == 0 {
+        let mut line = format!(
+            "{node} lists {} for this node and {} were asked for, but none were served; run .mesh fetch again or check the node's logs.",
+            plural(report.listed, "message", "messages"),
+            report.wanted
+        );
+        if report.wanted == MAX_WANTS_PER_FETCH {
+            line.push_str(" More may be held.");
+        }
+        return line;
     }
     if report.received == 0 {
         return format!("Nothing held for this node at {node}.");
@@ -4203,12 +4215,34 @@ mod tests {
                 "the full node hash is not needed here"
             );
             let empty = FetchReport {
+                listed: 0,
+                wanted: 0,
                 received: 0,
                 ..report.clone()
             };
             assert_eq!(
                 render_fetch(&empty),
                 "Nothing held for this node at deadbeef."
+            );
+            let none_served = FetchReport {
+                listed: 7,
+                wanted: 3,
+                received: 0,
+                ..report.clone()
+            };
+            assert_eq!(
+                render_fetch(&none_served),
+                "deadbeef lists 7 messages for this node and 3 were asked for, but none were served; run .mesh fetch again or check the node's logs."
+            );
+            let full_page_none_served = FetchReport {
+                listed: 100,
+                wanted: MAX_WANTS_PER_FETCH,
+                received: 0,
+                ..report.clone()
+            };
+            assert!(
+                render_fetch(&full_page_none_served)
+                    .ends_with("check the node's logs. More may be held.")
             );
             let all_known = FetchReport {
                 wanted: 0,

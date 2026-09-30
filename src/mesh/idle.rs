@@ -31,7 +31,8 @@ pub(crate) const IDLE_COALESCE_MAX_OTHER_PEERS: usize = 64;
 /// How soon an automatic propagation fetch is tried again, when that is sooner than the
 /// configured interval: when no propagation node has announced itself yet, after a fetch
 /// that deferred a body (the first retry; later ones back off), and when a join-time
-/// request never reached the driver.
+/// request never reached the driver, and after a fetch that wanted a full page (the first
+/// retry backs off the same way while the pages serve nothing).
 pub(crate) const PROPAGATION_SYNC_SHORT_RETRY: Duration = Duration::from_secs(15);
 
 /// Who produced an event, which decides whether flood control applies. `Local` events
@@ -226,7 +227,7 @@ pub(crate) struct SyncSchedule {
     in_flight: Option<String>,
     pending: bool,
     stopped: bool,
-    deferred_backoff: Option<Duration>,
+    backoff: Option<Duration>,
     last_failure: Option<String>,
 }
 
@@ -242,7 +243,7 @@ impl SyncSchedule {
             in_flight: None,
             pending: false,
             stopped: false,
-            deferred_backoff: None,
+            backoff: None,
             last_failure: None,
         }
     }
@@ -270,11 +271,12 @@ impl SyncSchedule {
 
     /// The slot is empty: nothing to fetch from and nothing to wait for, since the next
     /// install asks again. A fetch still running ends without re-arming anything; a
-    /// replay owed is forgotten.
+    /// replay owed is forgotten, and so is the backoff.
     pub(crate) fn mesh_off(&mut self) {
         self.due_at = None;
         self.pending = false;
         self.stopped = true;
+        self.backoff = None;
     }
 
     /// No propagation node has announced itself yet: ask again after the shorter of the
@@ -312,8 +314,11 @@ impl SyncSchedule {
     /// this fetch ran is due at once instead. A fetch that deferred a body retries after
     /// the short retry, doubled each time until a fetch defers nothing: the body is
     /// waiting for its sender's announce, which arrives on its own schedule, not the
-    /// interval's. A fetch that wanted a full page retries soon as well, so a backlog
-    /// drains without waiting an interval per page. Nothing is armed after `mesh_off`.
+    /// interval's. Failing that, a fetch that wanted a full page retries soon as well, so
+    /// a backlog drains without waiting an interval per page; when the page served
+    /// nothing it backs off the same way, so a node that lists a full page every round
+    /// and serves none of it cannot hold the short cadence either. Any other fetch that
+    /// defers nothing resets the backoff. Nothing is armed after `mesh_off`.
     pub(crate) fn finished(
         &mut self,
         outcome: &Result<FetchReport, FetchError>,
@@ -322,15 +327,15 @@ impl SyncSchedule {
         let node = self.in_flight.take().unwrap_or_default();
         let line = match outcome {
             Ok(report) => {
-                if report.deferred > 0 {
-                    self.retry_deferred(now);
+                let full_page = report.wanted == MAX_WANTS_PER_FETCH;
+                if report.deferred > 0 || (full_page && report.received == 0) {
+                    self.retry_backed_off(now);
+                } else if full_page {
+                    self.backoff = None;
+                    self.retry_soon(now);
                 } else {
-                    self.deferred_backoff = None;
-                    if report.wanted == MAX_WANTS_PER_FETCH {
-                        self.retry_soon(now);
-                    } else {
-                        self.re_arm(now);
-                    }
+                    self.backoff = None;
+                    self.re_arm(now);
                 }
                 self.last_failure = None;
                 (report.received > 0).then(|| synced_line(report))
@@ -377,11 +382,11 @@ impl SyncSchedule {
         self.arm(now, PROPAGATION_SYNC_SHORT_RETRY);
     }
 
-    fn retry_deferred(&mut self, now: Instant) {
+    fn retry_backed_off(&mut self, now: Instant) {
         let wait = self
-            .deferred_backoff
+            .backoff
             .map_or(PROPAGATION_SYNC_SHORT_RETRY, |wait| wait.saturating_mul(2));
-        self.deferred_backoff = Some(wait);
+        self.backoff = Some(wait);
         self.arm(now, wait);
     }
 
@@ -421,7 +426,7 @@ fn synced_line(report: &FetchReport) -> String {
     line
 }
 
-fn plural(count: usize, one: &str, many: &str) -> String {
+pub(crate) fn plural(count: usize, one: &str, many: &str) -> String {
     format!("{count} {}", if count == 1 { one } else { many })
 }
 
@@ -807,6 +812,50 @@ mod tests {
             schedule.due_at(),
             Some(now + Duration::from_secs(300)),
             "a page with room left is the last of the backlog"
+        );
+    }
+
+    #[test]
+    fn a_full_page_that_serves_nothing_backs_off() {
+        let now = Instant::now();
+        let unserved = || FetchReport {
+            listed: 100,
+            wanted: MAX_WANTS_PER_FETCH,
+            ..report(0, 0, 0)
+        };
+        let mut schedule = SyncSchedule::new(300, true);
+        for secs in [15, 30, 60, 120, 240, 300, 300] {
+            schedule.started(NODE.to_string());
+            schedule.finished(&Ok(unserved()), now);
+            assert_eq!(
+                schedule.due_at(),
+                Some(now + Duration::from_secs(secs)),
+                "a full page that serves nothing doubles the wait up to the interval"
+            );
+        }
+        schedule.started(NODE.to_string());
+        schedule.finished(&Ok(report(MAX_WANTS_PER_FETCH, 1, 0)), now);
+        assert_eq!(
+            schedule.due_at(),
+            Some(now + PROPAGATION_SYNC_SHORT_RETRY),
+            "a full page that serves something is a draining backlog again"
+        );
+        schedule.started(NODE.to_string());
+        schedule.finished(&Ok(unserved()), now);
+        assert_eq!(
+            schedule.due_at(),
+            Some(now + PROPAGATION_SYNC_SHORT_RETRY),
+            "progress reset the backoff"
+        );
+        schedule.started(NODE.to_string());
+        schedule.finished(&Ok(report(1, 1, 0)), now);
+        assert_eq!(schedule.due_at(), Some(now + Duration::from_secs(300)));
+        schedule.started(NODE.to_string());
+        schedule.finished(&Ok(unserved()), now);
+        assert_eq!(
+            schedule.due_at(),
+            Some(now + PROPAGATION_SYNC_SHORT_RETRY),
+            "a short page reset the backoff too"
         );
     }
 

@@ -21,7 +21,8 @@ use crate::mesh::pending::{
 use crate::mesh::propagation::lxmf_delivery_hash;
 use crate::mesh::propagation_fetch::{
     BodyOutcome, BodyPipeline, Discard, FetchStore, InboundMessage, InboundSink,
-    MAX_FETCHED_MESSAGE_BYTES, MIN_FETCHED_MESSAGE_BYTES, SourceKeys,
+    MAX_FETCHED_MESSAGE_BYTES, MAX_UNKNOWN_SOURCE_DEFERRALS, MIN_FETCHED_MESSAGE_BYTES, SourceKeys,
+    UNKNOWN_SOURCE_DEFERRAL_HORIZON,
 };
 use crate::mesh::protocol::{MESH_PROTOCOL_MIN_SUPPORTED, MESH_PROTOCOL_VERSION, VersionRefusal};
 use crate::mesh::r3::{
@@ -1190,6 +1191,16 @@ enum Event {
     /// An earlier event's signed message sealed again under a fresh ephemeral key: a new
     /// transient id carrying the same message id.
     Reencrypt(u8),
+    /// Moves the bench clock forward by up to twice the deferral horizon, so a deferred
+    /// body's budget can be spent within one sequence.
+    Advance(u32),
+}
+
+impl Event {
+    fn advance(secs: u32) -> Duration {
+        let horizon = UNKNOWN_SOURCE_DEFERRAL_HORIZON.as_secs();
+        Duration::from_secs(u64::from(secs) % (2 * horizon + 1))
+    }
 }
 
 pub(super) struct Sequence(Vec<Event>);
@@ -1280,19 +1291,31 @@ struct Built {
     sealed: Option<Sealed>,
 }
 
+/// MESH-PROP-034's per-body deferral record, as `FetchStore::defer` keeps it.
+#[derive(Clone, Copy)]
+struct Sighting {
+    attempts: u8,
+    first_seen: SystemTime,
+}
+
 /// What the spec's dedup and deferral state must be after each body.
 #[derive(Default)]
 struct Model {
     recorded: BTreeSet<[u8; 32]>,
     delivered: BTreeSet<[u8; 32]>,
-    deferrals: BTreeMap<[u8; 32], u8>,
+    deferrals: BTreeMap<[u8; 32], Sighting>,
     delivered_log: Vec<[u8; 32]>,
 }
 
 impl Model {
-    /// The "Recorded" column of 11.4 plus MESH-PROP-034's deferral count. The fixture's
-    /// clock never advances, so the deferral horizon never passes and no budget is spent.
-    fn apply(&mut self, transient: [u8; 32], outcome: &BodyOutcome, message_id: Option<[u8; 32]>) {
+    /// The "Recorded" column of 11.4 plus MESH-PROP-034's deferral count and first sighting.
+    fn apply(
+        &mut self,
+        transient: [u8; 32],
+        outcome: &BodyOutcome,
+        message_id: Option<[u8; 32]>,
+        now: SystemTime,
+    ) {
         match outcome {
             BodyOutcome::Delivered => {
                 self.record(transient);
@@ -1301,7 +1324,13 @@ impl Model {
                 self.delivered_log.push(id);
             }
             BodyOutcome::Deferred { attempts } => {
-                self.deferrals.insert(transient, *attempts);
+                self.deferrals
+                    .entry(transient)
+                    .or_insert(Sighting {
+                        attempts: 0,
+                        first_seen: now,
+                    })
+                    .attempts = *attempts;
             }
             BodyOutcome::Discarded(
                 Discard::Oversize { .. }
@@ -1338,6 +1367,7 @@ struct Bench {
     sink: CountingSink,
     store: FetchStore,
     model: Model,
+    now: SystemTime,
     delivered_outcomes: usize,
 }
 
@@ -1408,6 +1438,7 @@ impl ReceiptFixture {
             sink: CountingSink::default(),
             store,
             model: Model::default(),
+            now: self.now,
             delivered_outcomes: 0,
         }
     }
@@ -1475,8 +1506,8 @@ impl ReceiptFixture {
         }
     }
 
-    /// The body for `event`, with the key table set as the event says; `None` for a
-    /// reference to an event that does not exist or cannot be re-sealed.
+    /// The body for `event`, with the key table set as the event says; `None` for a clock
+    /// advance or a reference to an event that does not exist or cannot be re-sealed.
     fn build(&self, event: &Event, built: &[Built], keys: &MutableKeys) -> Option<Built> {
         Some(match event {
             Event::Garbage(bytes) => self.opaque(bytes.clone()),
@@ -1535,16 +1566,18 @@ impl ReceiptFixture {
                     sealed: Some(sealed),
                 }
             }
+            Event::Advance(_) => return None,
         })
     }
 
-    /// The first failing stage of 11.4 for `built` given the model's state.
+    /// The first failing stage of 11.4 for `built` given the model's state at `now`.
     fn predict(
         &self,
         model: &Model,
         built: &Built,
         transient: &[u8; 32],
         source_known: bool,
+        now: SystemTime,
     ) -> (BodyOutcome, Stage) {
         let len = built.bytes.len();
         if len > MAX_FETCHED_MESSAGE_BYTES {
@@ -1589,15 +1622,23 @@ impl ReceiptFixture {
             );
         }
         if !source_known {
-            let sightings = model
-                .deferrals
-                .get(transient)
-                .copied()
-                .unwrap_or(0)
-                .saturating_add(1);
+            let earlier = model.deferrals.get(transient).copied();
+            if let Some(Sighting {
+                attempts,
+                first_seen,
+            }) = earlier
+                && attempts >= MAX_UNKNOWN_SOURCE_DEFERRALS
+                && now.duration_since(first_seen).unwrap_or_default()
+                    >= UNKNOWN_SOURCE_DEFERRAL_HORIZON
+            {
+                return (
+                    BodyOutcome::Discarded(Discard::UnknownSourceBudgetSpent),
+                    Stage::SourceKey,
+                );
+            }
             return (
                 BodyOutcome::Deferred {
-                    attempts: sightings,
+                    attempts: earlier.map_or(0, |s| s.attempts).saturating_add(1),
                 },
                 Stage::SourceKey,
             );
@@ -1622,14 +1663,15 @@ impl ReceiptFixture {
     }
 
     /// Runs one body through the real pipeline and holds the outcome, the collaborator
-    /// counters and the store to the model.
-    fn run_event(&self, bench: &mut Bench, built: &Built) -> Result<(), String> {
+    /// counters and the store to the model; returns what the pipeline said.
+    fn run_event(&self, bench: &mut Bench, built: &Built) -> Result<BodyOutcome, String> {
         let transient: [u8; 32] = Sha256::digest(&built.bytes).into();
         let source_known = built
             .sealed
             .as_ref()
             .is_some_and(|sealed| bench.keys.is_known(&sealed.source));
-        let (mut expected, mut stage) = self.predict(&bench.model, built, &transient, source_known);
+        let (mut expected, mut stage) =
+            self.predict(&bench.model, built, &transient, source_known, bench.now);
         let calls_before = bench.keys.calls.load(Ordering::SeqCst);
         let deliveries_before = bench.sink.delivered.lock().unwrap().len();
         let pipeline = BodyPipeline {
@@ -1642,7 +1684,7 @@ impl ReceiptFixture {
         };
         let observed = self
             .rt
-            .block_on(pipeline.process(&built.bytes, &mut bench.store, self.now))
+            .block_on(pipeline.process(&built.bytes, &mut bench.store, bench.now))
             .map_err(|err| format!("process returned a transport error for a local body: {err}"))?;
         if built.tampered && observed == BodyOutcome::Discarded(Discard::BadSignature) {
             expected = observed.clone();
@@ -1685,7 +1727,9 @@ impl ReceiptFixture {
             bench.delivered_outcomes += 1;
         }
         let message_id = built.sealed.as_ref().map(|sealed| sealed.message_id);
-        bench.model.apply(transient, &observed, message_id);
+        bench
+            .model
+            .apply(transient, &observed, message_id, bench.now);
         ensure(
             bench.store.contains(&transient) == bench.model.recorded.contains(&transient),
             || {
@@ -1707,7 +1751,7 @@ impl ReceiptFixture {
                 },
             )?;
         }
-        Ok(())
+        Ok(observed)
     }
 }
 
@@ -1736,7 +1780,33 @@ pub(super) fn check_receipt_file(fx: &ReceiptFixture, bytes: &[u8]) -> Result<()
 fn check_receipt_body(fx: &ReceiptFixture, bytes: &[u8]) -> Result<(), String> {
     let mut bench = fx.bench();
     let built = fx.opaque(bytes.to_vec());
-    fx.run_event(&mut bench, &built)
+    fx.run_event(&mut bench, &built).map(drop)
+}
+
+/// Every body of `sequence` through `bench` in order; the outcomes of the bodies that were
+/// built, since a clock advance and a dangling reference build none.
+fn run_sequence(
+    fx: &ReceiptFixture,
+    bench: &mut Bench,
+    sequence: &Sequence,
+) -> Result<Vec<BodyOutcome>, String> {
+    let mut built: Vec<Built> = Vec::new();
+    let mut outcomes = Vec::new();
+    for event in &sequence.0 {
+        if let Event::Advance(secs) = event {
+            bench.now += Event::advance(*secs);
+            continue;
+        }
+        let Some(body) = fx.build(event, &built, &bench.keys) else {
+            continue;
+        };
+        let outcome = fx
+            .run_event(bench, &body)
+            .map_err(|what| format!("event {event:?}: {what}"))?;
+        outcomes.push(outcome);
+        built.push(body);
+    }
+    Ok(outcomes)
 }
 
 pub(super) fn check_receipt_sequence(
@@ -1744,15 +1814,7 @@ pub(super) fn check_receipt_sequence(
     sequence: Sequence,
 ) -> Result<(), String> {
     let mut bench = fx.bench();
-    let mut built: Vec<Built> = Vec::new();
-    for event in &sequence.0 {
-        let Some(body) = fx.build(event, &built, &bench.keys) else {
-            continue;
-        };
-        fx.run_event(&mut bench, &body)
-            .map_err(|what| format!("event {event:?}: {what}"))?;
-        built.push(body);
-    }
+    run_sequence(fx, &mut bench, &sequence)?;
     let delivered = bench.sink.delivered.lock().unwrap();
     ensure(
         delivered.len() == bench.delivered_outcomes && *delivered == bench.model.delivered_log,
@@ -1764,6 +1826,44 @@ pub(super) fn check_receipt_sequence(
             )
         },
     )
+}
+
+/// MESH-PROP-034 end to end: a body whose source has no key is deferred on three sightings
+/// and on a fourth still short of the heartbeat, discarded on the first sighting a
+/// heartbeat after the first, and a duplicate from then on. The oracle's prediction and the
+/// pipeline's verdict must agree at every step, so this also proves the model's budget leg
+/// is reachable.
+pub(super) fn check_receipt_deferral_budget(fx: &ReceiptFixture) -> Result<(), String> {
+    let horizon = u32::try_from(UNKNOWN_SOURCE_DEFERRAL_HORIZON.as_secs()).unwrap();
+    let sequence = Sequence(vec![
+        Event::Honest {
+            signer: Signer::C,
+            content: b"no key for me yet".to_vec(),
+            known: false,
+        },
+        Event::Replay(0),
+        Event::Replay(0),
+        Event::Advance(horizon - 1),
+        Event::Replay(0),
+        Event::Advance(1),
+        Event::Replay(0),
+        Event::Replay(0),
+    ]);
+    let mut bench = fx.bench();
+    let outcomes = run_sequence(fx, &mut bench, &sequence)?;
+    let expected = [
+        BodyOutcome::Deferred { attempts: 1 },
+        BodyOutcome::Deferred { attempts: 2 },
+        BodyOutcome::Deferred { attempts: 3 },
+        BodyOutcome::Deferred { attempts: 4 },
+        BodyOutcome::Discarded(Discard::UnknownSourceBudgetSpent),
+        BodyOutcome::Discarded(Discard::Duplicate),
+    ];
+    ensure(outcomes == expected, || {
+        format!(
+            "three sightings and a heartbeat spend the budget: expected {expected:?}, got {outcomes:?}"
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------------------

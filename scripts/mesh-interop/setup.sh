@@ -95,7 +95,7 @@ print(f"[mesh-interop] RNS {RNS.__version__} / LXMF {LXMF.__version__}")
 PY
 
 # The import above compiles only what loads eagerly; Reticulum pulls its interfaces and
-# LXMF its router and stamper in lazily at start. Left cold, four references compiling the
+# LXMF its router and stamper in lazily at start. Left cold, five references compiling the
 # same modules in parallel start late enough for the suite's 15 s waits to expire on the
 # first run, so compile everything now.
 "$PYTHON" -m compileall -q "$DIR/reticulum/RNS" "$DIR/lxmf/LXMF" >&2

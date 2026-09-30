@@ -373,6 +373,12 @@ fn fuzz_receipt_pipeline_follows_the_stage_order_and_the_dedup_model() {
 }
 
 #[test]
+fn fuzz_receipt_oracle_spends_the_deferral_budget_a_heartbeat_after_three_sightings() {
+    let fixture = oracles::ReceiptFixture::new(&mut SplitMix::new(seed()));
+    oracles::check_receipt_deferral_budget(&fixture).unwrap_or_else(|what| panic!("{what}"));
+}
+
+#[test]
 fn fuzz_codecs_refuse_only_what_the_spec_names_and_re_encode_stably() {
     let seed = seed();
     let fixture = oracles::CodecFixture::new();
