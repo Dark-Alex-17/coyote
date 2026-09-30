@@ -1014,8 +1014,9 @@ impl ChildRun {
 }
 
 /// Fixtures for tests outside this module that need a driver on a slot without naming
-/// the session context themselves, such as the mesh conformance suite.
-#[cfg(test)]
+/// the session context themselves, such as the mesh conformance suite. That suite's
+/// `interop` module is `#[cfg(unix)]`, so the fixture follows it.
+#[cfg(all(test, unix))]
 pub(crate) mod testing {
     use super::IdleDriver;
     use crate::config::{AppState, RequestContext, WorkingMode};
