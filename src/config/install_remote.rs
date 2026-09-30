@@ -5,7 +5,8 @@ use super::bundles::{
 use crate::config::builtin_manifest::is_builtin_manifest_name;
 use crate::config::conflict::{ConflictAction, NonInteractive, StickyMode, resolve_conflict};
 use crate::config::{
-    AssetCategory, BUNDLE_MANIFEST_FILE, InstallFilter, paths, set_executable_bit_if_script,
+    AssetCategory, BUNDLE_MANIFEST_FILE, InstallFilter, paths, reserved_agent,
+    set_executable_bit_if_script,
 };
 use crate::mcp::{McpServer, McpServersConfig};
 use crate::utils;
@@ -1703,6 +1704,7 @@ fn plan_dir_into(
     category: TopCategory,
     out: &mut Vec<PlannedFile>,
 ) -> Result<()> {
+    let mut warned_reserved_agents: HashSet<&'static str> = HashSet::new();
     for src in walk_files(src_dir)? {
         let rel = src
             .strip_prefix(src_dir)
@@ -1726,6 +1728,21 @@ fn plan_dir_into(
                 rel.display(),
                 category.label()
             );
+            continue;
+        }
+
+        if category == TopCategory::Agents
+            && let Some(agent) = rel.components().next().and_then(|c| c.as_os_str().to_str())
+            && let Some(canonical) = reserved_agent(agent)
+        {
+            if warned_reserved_agents.insert(canonical) {
+                log::warn!(
+                    "Ignoring bundle file {} ({}): the agent name '{agent}' is reserved for \
+                     the built-in agent '{canonical}'",
+                    rel.display(),
+                    category.label()
+                );
+            }
             continue;
         }
 
@@ -2842,6 +2859,46 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn plan_dir_into_skips_bundle_shipped_reserved_agents() {
+        crate::testing::install_log_collector();
+        let root = fresh_temp_dir("plan-reserved-agent-skip-");
+        let src_dir = root.join("agents");
+        touch(&src_dir.join("envoy/config.yaml"));
+        touch(&src_dir.join("Envoy/graph.yaml"));
+        touch(&src_dir.join("envoy./config.yaml"));
+        touch(&src_dir.join("other/config.yaml"));
+        let dst_dir = root.join("dst");
+        let reserved_warnings = || {
+            crate::testing::warn_snapshot()
+                .into_iter()
+                .filter(|m| {
+                    m.starts_with("Ignoring bundle file")
+                        && m.contains("'envoy'")
+                        && m.contains("reserved")
+                })
+                .count()
+        };
+        let before = reserved_warnings();
+
+        let mut files = Vec::new();
+        plan_dir_into(&src_dir, &dst_dir, TopCategory::Agents, &mut files).unwrap();
+
+        let rels: Vec<&Path> = files.iter().map(|p| p.rel.as_path()).collect();
+        assert_eq!(
+            rels,
+            vec![Path::new("other/config.yaml")],
+            "a bundle must never install an agent under a reserved name"
+        );
+        assert_eq!(
+            reserved_warnings(),
+            before + 1,
+            "one warning per reserved agent, not per file"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn hook_script_lines_cover_every_hooks_dir_and_nothing_else() {
         let file = |rel: &str, cat: TopCategory| PlannedFile {
             src: PathBuf::from("src").join(rel),
@@ -3544,6 +3601,41 @@ mod tests {
         assert_eq!(record.mcp_servers[0].name, "srv");
         assert_eq!(record.mcp_servers[0].action, McpAction::Added);
         assert_eq!(record.mcp_servers[0].renamed_to, None);
+        let _ = fs::remove_dir_all(&src_root);
+    }
+
+    #[test]
+    #[serial]
+    fn install_remote_skips_reserved_agent_dirs() {
+        let _guard = TestVaultConfigGuard::new("reserved-agent");
+        let src_root = fresh_temp_dir("reserved-agent-src-");
+        let repo = src_root.join("agent-bundle");
+        write_src(&repo, BUNDLE_MANIFEST_FILE, "name: agent-bundle\n");
+        write_src(
+            &repo,
+            "agents/envoy/config.yaml",
+            "name: envoy\ninstructions: shadow\n",
+        );
+        write_src(
+            &repo,
+            "agents/other/config.yaml",
+            "name: other\ninstructions: hi\n",
+        );
+        init_bundle_repo(&repo);
+
+        install_remote(repo.to_str().unwrap(), None, false).unwrap();
+
+        assert!(
+            paths::agents_data_dir()
+                .join("other")
+                .join("config.yaml")
+                .exists()
+        );
+        assert!(!paths::agents_data_dir().join("envoy").exists());
+        let store = BundleStore::load().unwrap();
+        let record = store.get("agent-bundle").unwrap();
+        let recorded: Vec<&str> = record.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(recorded, vec!["agents/other/config.yaml"]);
         let _ = fs::remove_dir_all(&src_root);
     }
 

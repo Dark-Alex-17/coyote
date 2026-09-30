@@ -1,0 +1,8024 @@
+use crate::config::mesh_config::{
+    MESH_INFO_LABEL_WIDTH, MeshBrief, MeshInterface, render_mesh_info,
+};
+use crate::config::{MeshConfig, RequestContext};
+use crate::function::mesh::trust_label;
+use crate::mesh::card::{CardSource, DISPLAY_NAME_MAX_CHARS, StatusHandler, render_for_human};
+use crate::mesh::identity::{self, Predecessor, fingerprint};
+use crate::mesh::idle::plural;
+use crate::mesh::knock::{KnockIntro, KnockOutcome, KnockVia};
+use crate::mesh::knocks::KnockRecord;
+use crate::mesh::message::{
+    BroadcastOutcome, OutboundPeer, PEER_CONTENT_MAX_CHARS, PeerKind, PeerMessage, PeerVia,
+    RecipientOutcome,
+};
+use crate::mesh::pending::{Correlation, InboundRecord, PendingState};
+use crate::mesh::trust::{
+    Decision, KeyChange, LiveMesh, Rule, Tier, TrustChange, TrustOptions, TrustRecord, TrustStore,
+    Verdict, decode_name_hash, parse_hash,
+};
+use crate::mesh::{
+    FetchError, FetchReport, LoggingInboundSink, MAX_WANTS_PER_FETCH, MESH_ALREADY_ON, MeshPaths,
+    MeshRuntime, NodeOptions, PeerRecord, PropagationNodeRecord, age_text, canonical_hash,
+    destination_address, display_text, parse_rfc3339, redact_hashes, short,
+};
+use crate::supervisor::mailbox::EnvelopePayload;
+use crate::utils::{AbortSignal, drain_stale_tty_input, wait_user_interrupt};
+
+use anyhow::{Result, anyhow, bail};
+use chrono::{DateTime, Utc};
+use inquire::Confirm;
+use log::debug;
+use std::env;
+use std::fs;
+use std::io::IsTerminal;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+
+/// (verb, one-line description, example), in `.mesh` help order.
+pub(super) const VERBS: &[(&str, &str, &str)] = &[
+    (
+        "on",
+        "Join the mesh for this session only; config.yaml is not changed",
+        ".mesh on [--yes] [--fresh]",
+    ),
+    (
+        "off",
+        "Leave the mesh and drop the mesh__* tools",
+        ".mesh off [--yes]",
+    ),
+    ("peers", "List the nodes heard on the mesh", ".mesh peers"),
+    (
+        "knocks",
+        "List the untrusted nodes that knocked",
+        ".mesh knocks",
+    ),
+    (
+        "info",
+        "Show the mesh settings and this node, or one peer",
+        ".mesh info [<destination>]",
+    ),
+    (
+        "status",
+        "Show this node's status card, set its objective, or fetch a peer's card",
+        ".mesh status [\"objective\"|clear|<destination>]",
+    ),
+    (
+        "brief",
+        "Show the brief peers receive, or set its text or mode",
+        ".mesh brief [set \"text\"|clear|auto|manual|off]",
+    ),
+    (
+        "inbox",
+        "Drain the peer messages waiting for this node",
+        ".mesh inbox",
+    ),
+    (
+        "pending",
+        "List the questions this node asked and the ones peers escalated to you",
+        ".mesh pending",
+    ),
+    (
+        "answer",
+        "Answer an escalated question, or follow up on one this node asked",
+        ".mesh answer <id> \"text\"",
+    ),
+    (
+        "reply",
+        "Send your own text to one peer, bypassing the model",
+        ".mesh reply <destination> [--yes] \"text\"",
+    ),
+    (
+        "broadcast",
+        "Send a bulletin to every trusted peer with a known path",
+        ".mesh broadcast [--yes] \"text\"",
+    ),
+    (
+        "trust",
+        "Trust one instance, or every instance of an identity, or prune stale trusted instances",
+        ".mesh trust <destination> [--yes] [--label \"text\"] | --identity <identity> [--yes] [--label \"text\"] | --prune [--older-than 30d] [--dry-run|--confirm prune-<N>]",
+    ),
+    (
+        "untrust",
+        "Forget a trusted instance, or an identity together with every instance bound to it",
+        ".mesh untrust <destination> [--yes] | --identity <identity> [--dry-run|--confirm untrust-<identity-short>]",
+    ),
+    (
+        "block",
+        "Silence a whole identity: its knocks are dropped and its trust removed",
+        ".mesh block <identity> [--yes] [--note \"text\"]",
+    ),
+    (
+        "unblock",
+        "Lift a block so the identity may knock again",
+        ".mesh unblock <identity> [--yes]",
+    ),
+    (
+        "deny",
+        "Refuse one instance: deny stops one destination being contacted, where block silences a whole identity",
+        ".mesh deny <destination> [--yes] [--note \"text\"]",
+    ),
+    (
+        "undeny",
+        "Lift a deny on one instance (the identity-level counterpart is unblock)",
+        ".mesh undeny <destination> [--yes]",
+    ),
+    (
+        "rotate",
+        "Mint a new mesh identity while the node is off; peers must re-trust the new one",
+        ".mesh rotate [--dry-run|--confirm rotate-<identity-short>]",
+    ),
+    (
+        "fetch",
+        "Fetch the messages a propagation node holds for this node now",
+        ".mesh fetch",
+    ),
+    (
+        "knock",
+        "Ask an untrusted peer to trust this instance, with an optional intro",
+        ".mesh knock <destination> [--yes] [--intro \"text\"]",
+    ),
+];
+
+pub(crate) const MESH_OFF: &str = "Mesh is off. Run `.mesh on` first.";
+const ROTATE_NEEDS_OFF: &str = "Mesh is on. Run `.mesh off` first; the identity is rotated only while no session's node on this config dir is running, then `.mesh on` announces the new one.";
+const BROADCAST_NOTICE: &str = "This sends a bulletin to every peer this node trusts that has a known path right now. Peers you have not trusted receive nothing.";
+const REPLY_REFUSAL_TAIL: &str = "Nothing is sent to a destination this node does not trust.";
+const STATUS_REFUSAL_TAIL: &str = "Status is only requested from trusted destinations.";
+const KNOCK_REFUSAL_TAIL: &str = "A knock is not sent to a destination this node has denied or an identity it has blocked; `.mesh undeny` / `.mesh unblock` lift that.";
+const INBOX_CONTENT_MAX_CHARS: usize = 200;
+const NOTHING_CHANGED: &str = "Nothing was changed.";
+/// How long a trusted instance goes unheard before `.mesh trust --prune` lists it, when
+/// `--older-than` is not given.
+const PRUNE_DEFAULT_OLDER_THAN: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+pub(crate) async fn run(
+    ctx: &mut RequestContext,
+    abort_signal: AbortSignal,
+    args: Option<&str>,
+) -> Result<()> {
+    let Some((verb, rest)) = split_verb(args) else {
+        out_text(&render_help());
+        return Ok(());
+    };
+    match verb {
+        "on" => turn_on(ctx, rest).await,
+        "off" => turn_off(ctx, rest).await,
+        "peers" => peers(ctx),
+        "knocks" => knocks(ctx),
+        "info" => info(ctx, rest),
+        "status" => status(ctx, &abort_signal, rest).await,
+        "brief" => brief(ctx, rest),
+        "inbox" => inbox(ctx),
+        "pending" => pending(ctx),
+        "answer" => answer(ctx, rest).await,
+        "reply" => reply(ctx, rest).await,
+        "broadcast" => broadcast(ctx, rest).await,
+        "trust" => trust(ctx, rest),
+        "untrust" => untrust(ctx, rest),
+        "block" => block(ctx, rest),
+        "unblock" => unblock(ctx, rest),
+        "deny" => deny(ctx, rest),
+        "undeny" => undeny(ctx, rest),
+        "rotate" => rotate(ctx, rest),
+        "fetch" => fetch(ctx, &abort_signal, rest).await,
+        "knock" => knock(ctx, &abort_signal, rest).await,
+        other => bail!("Unknown .mesh command '{other}'. Type `.mesh` for the list."),
+    }
+}
+
+async fn turn_on(ctx: &mut RequestContext, rest: Option<&str>) -> Result<()> {
+    let args = parse_args(rest, &["--yes", "--fresh"], "on")?;
+    join(
+        ctx,
+        JoinOptions {
+            yes: args.has("--yes"),
+            fresh: args.has("--fresh"),
+        },
+    )
+    .await
+}
+
+/// Joins the mesh for this session because config.yaml asked for it; the only
+/// difference from `.mesh on --yes` is the line saying where the decision came from.
+pub(crate) async fn autostart(ctx: &mut RequestContext) -> Result<()> {
+    out_text(
+        "mesh.enabled is true in config.yaml: joining the mesh for this session (`.mesh off` leaves it).",
+    );
+    join(
+        ctx,
+        JoinOptions {
+            yes: true,
+            fresh: false,
+        },
+    )
+    .await
+}
+
+struct JoinOptions {
+    yes: bool,
+    fresh: bool,
+}
+
+async fn join(ctx: &mut RequestContext, options: JoinOptions) -> Result<()> {
+    let JoinOptions { yes, fresh } = options;
+    if ctx.app.mesh.get().is_some() {
+        bail!(MESH_ALREADY_ON);
+    }
+    let config = ctx.app.config.mesh.clone();
+    let function_calling_support = ctx.app.config.function_calling_support;
+    let mut enabled_view = config.clone();
+    enabled_view.enabled = true;
+    enabled_view.validate(function_calling_support)?;
+    let Some(session_name) = ctx
+        .session
+        .as_ref()
+        .map(|session| session.name().to_string())
+    else {
+        bail!(
+            "Mesh needs a session: this node's destination is derived from an id kept in the session file. Run `.session <name>` first."
+        );
+    };
+    let cwd = env::current_dir()?;
+    out_text(&render_on_preview(&config, &session_name, fresh));
+    if let Some(warning) = cwd_warning(&cwd, dirs::home_dir().as_deref()) {
+        err_text(&warning);
+    }
+    if !confirm_or_flag(&on_question(&config), "--yes", yes)? {
+        out_text("Mesh stays off.");
+        return Ok(());
+    }
+    let Some(session) = ctx.session.as_mut() else {
+        bail!("The session went away before the mesh could start. Run `.mesh on` again.");
+    };
+    // The start runs against a copy so a refused start leaves the live session's id, and
+    // the on-disk state keyed by it, exactly as it was. Only `mesh_instance_id` is copied
+    // back, which relies on `MeshRuntime::start` touching nothing else on the trial.
+    let mut trial = session.clone();
+    if fresh {
+        trial.remint_mesh_instance_id();
+    }
+    let runtime = MeshRuntime::start(
+        &config,
+        function_calling_support,
+        &mut trial,
+        MeshPaths::from_env(),
+        NodeOptions {
+            hooks: ctx.app.mesh.hooks(),
+            ..NodeOptions::default()
+        },
+    )
+    .await?;
+    if let Some(id) = trial.mesh_instance_id() {
+        session.set_mesh_instance_id(id.to_string());
+    }
+    ctx.app.mesh.install(Arc::clone(&runtime))?;
+    ctx.set_mesh_enabled_for_session(true);
+    let app = Arc::clone(&ctx.app.config);
+    ctx.refresh_mesh_tools(&app);
+    out_text(&render_on_summary(&runtime, fresh));
+    Ok(())
+}
+
+async fn turn_off(ctx: &mut RequestContext, rest: Option<&str>) -> Result<()> {
+    let args = parse_args(rest, &["--yes"], "off")?;
+    if ctx.app.mesh.get().is_none() {
+        ctx.set_mesh_enabled_for_session(false);
+        let app = Arc::clone(&ctx.app.config);
+        ctx.refresh_mesh_tools(&app);
+        out_text("Mesh is already off for this session.");
+        return Ok(());
+    }
+    let question =
+        "Turn mesh off? Peers lose this node and the mesh__* tools leave the tool catalog.";
+    if !confirm_or_flag(question, "--yes", args.has("--yes"))? {
+        out_text("Mesh stays on.");
+        return Ok(());
+    }
+    let stopped = ctx.app.mesh.stop().await;
+    ctx.app.mesh.clear_digest_for_new_epoch();
+    ctx.set_mesh_enabled_for_session(false);
+    let app = Arc::clone(&ctx.app.config);
+    ctx.refresh_mesh_tools(&app);
+    stopped?;
+    out_text("Mesh is off for this session. Run `.mesh on` to join again.");
+    Ok(())
+}
+
+fn peers(ctx: &RequestContext) -> Result<()> {
+    let runtime = live(ctx)?;
+    let now = SystemTime::now();
+    let mut records = runtime.peers().snapshot();
+    records.sort_by_key(|peer| std::cmp::Reverse(peer.last_seen));
+    let trust = runtime.trust();
+    let heard: Vec<String> = records
+        .iter()
+        .map(|peer| peer.destination_hash.clone())
+        .collect();
+    let trust_records = trust.records();
+    let mut rows: Vec<PeerRow> = records
+        .iter()
+        .map(|peer| {
+            let label = trust_label(trust.authorize(&peer.identity_hash, &peer.destination_hash));
+            let mark = key_change_mark(peer, &trust_records);
+            PeerRow::Heard(peer.clone(), label, mark)
+        })
+        .collect();
+    let successors: Vec<(String, &PeerRecord)> = records
+        .iter()
+        .filter_map(|peer| {
+            let name_hash = decode_name_hash(&peer.name_hash)?;
+            Some(
+                trust
+                    .binding_conflicts(&peer.identity_hash, &name_hash)
+                    .into_iter()
+                    .map(move |conflict| (conflict.destination_hash, peer)),
+            )
+        })
+        .flatten()
+        .collect();
+    rows.extend(unheard_rows(trust_records, &heard, &successors, |record| {
+        unheard_label(&trust, record)
+    }));
+    out_text(&render_peers(&rows, now));
+    Ok(())
+}
+
+/// The trust column for a record no heard peer announces from: the store's verdict for the
+/// identity it is bound to, so a stale record of a since-blocked identity reads `blocked`.
+fn unheard_label(trust: &TrustStore, record: &TrustRecord) -> &'static str {
+    trust_label(trust.authorize(record.identity.as_deref().unwrap_or_default(), &record.hash))
+}
+
+/// The key-change mark on `peer`'s trust record, paired with the destination the same
+/// instance derives under the identity that caused the mark.
+fn key_change_mark(peer: &PeerRecord, trust_records: &[TrustRecord]) -> Option<KeyChangeMark> {
+    let change = trust_records
+        .iter()
+        .find(|record| record.hash == peer.destination_hash)?
+        .key_changed
+        .clone()?;
+    let new_destination = decode_name_hash(&peer.name_hash)
+        .zip(parse_hash(&change.seen_identity))
+        .map(|(name_hash, seen)| destination_address(&name_hash, &seen).to_hex_string());
+    Some(KeyChangeMark {
+        change,
+        new_destination,
+    })
+}
+
+fn knocks(ctx: &RequestContext) -> Result<()> {
+    let runtime = live(ctx)?;
+    let now = SystemTime::now();
+    let records = runtime.knock_gate().cache().list(now)?;
+    out_text(&render_knocks(&records, now));
+    Ok(())
+}
+
+fn info(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
+    let Some(rest) = rest else {
+        let mut text = render_mesh_info(&ctx.app.config.mesh);
+        text.push_str(&format!(
+            "  {:<MESH_INFO_LABEL_WIDTH$}{}\n",
+            "reach",
+            reach_line(&ctx.app.config.mesh)
+        ));
+        match ctx.app.mesh.get() {
+            Some(runtime) => {
+                let predecessors = identity::predecessors(&MeshPaths::from_env().identity_path);
+                text.push_str(&render_node_facts(
+                    &runtime,
+                    predecessors.as_deref(),
+                    SystemTime::now(),
+                ));
+            }
+            None => text.push_str(&format!("  {:<MESH_INFO_LABEL_WIDTH$}off\n", "node")),
+        }
+        out_text(text.trim_end());
+        return Ok(());
+    };
+    let runtime = live(ctx)?;
+    let Some(destination) = canonical_hash(rest.trim()) else {
+        bail!(
+            "'{}' is not a destination hash: expected 32 hex characters, as `.mesh peers` lists them.",
+            rest.trim()
+        );
+    };
+    let now = SystemTime::now();
+    let peer = runtime.peers().get(&destination);
+    let knock = match runtime.knock_gate().cache().list(now) {
+        Ok(knocks) => match knocks
+            .into_iter()
+            .find(|knock| knock.destination_hash == destination)
+        {
+            Some(knock) => KnockLookup::Knocked(knock),
+            None => KnockLookup::NotKnocked,
+        },
+        Err(err) if peer.is_some() => {
+            debug!(
+                "knock cache unreadable while describing a known peer: {}",
+                redact_hashes(&format!("{err:#}"))
+            );
+            KnockLookup::Unreadable
+        }
+        Err(err) => return Err(err),
+    };
+    if peer.is_none() && !matches!(knock, KnockLookup::Knocked(_)) {
+        bail!(
+            "Destination {destination} has not been heard from: it is not in the peer table and has not knocked. Run `.mesh peers` or `.mesh knocks` to see who has."
+        );
+    }
+    let trust = peer
+        .as_ref()
+        .map(|peer| trust_label(runtime.trust().authorize(&peer.identity_hash, &destination)));
+    out_text(&render_peer_detail(
+        &destination,
+        peer.as_ref(),
+        &knock,
+        trust,
+        now,
+    ));
+    if matches!(knock, KnockLookup::Unreadable) {
+        err_text(
+            "The knock cache could not be read, so whether this peer knocked is unknown; `.mesh knocks` reports the error.",
+        );
+    }
+    Ok(())
+}
+
+async fn status(
+    ctx: &RequestContext,
+    abort_signal: &AbortSignal,
+    rest: Option<&str>,
+) -> Result<()> {
+    match classify_status(rest) {
+        StatusArg::Own => {
+            live(ctx)?;
+            let source: Arc<dyn CardSource> = ctx.app.mesh.clone();
+            let card = StatusHandler::new(Arc::downgrade(&source)).card(SystemTime::now());
+            out_text(&render_for_human(&card, SystemTime::now()));
+        }
+        StatusArg::Set(objective) => {
+            ctx.app
+                .mesh
+                .set_objective_override(Some(objective.to_string()));
+            out_text(&format!(
+                "Objective set to \"{objective}\" for this session; peers see it in this node's status card and brief. `.mesh status clear` removes it."
+            ));
+        }
+        StatusArg::Clear => {
+            ctx.app.mesh.set_objective_override(None);
+            out_text("Objective override cleared; the card shows the session's own objective.");
+        }
+        StatusArg::Fetch(destination) => {
+            let runtime = live(ctx)?;
+            peer_for_contact(&runtime, &destination, STATUS_REFUSAL_TAIL)?;
+            let Some(desc) = runtime.resolve_destination(&destination).await else {
+                bail!(
+                    "Destination {destination} cannot be reached yet: its announce has not been heard since this node started. Wait for it to announce, or check `.mesh peers`."
+                );
+            };
+            out_text(&format!(
+                "Asking {} for its status card; Ctrl-C cancels...",
+                short(&destination)
+            ));
+            let card = tokio::select! {
+                outcome = runtime.request_status(&desc) => outcome?,
+                _ = wait_user_interrupt(Some(abort_signal)) => {
+                    out_text("Status request interrupted.");
+                    return Ok(());
+                }
+            };
+            out_text(&render_for_human(&card, SystemTime::now()));
+        }
+        StatusArg::Help => out_text(&render_verb_help("status")),
+    }
+    Ok(())
+}
+
+fn brief(ctx: &mut RequestContext, rest: Option<&str>) -> Result<()> {
+    match classify_brief(rest) {
+        BriefArg::Show => {
+            let mode = ctx.app.config.mesh.brief;
+            let text = match ctx.app.mesh.brief() {
+                Some(brief) => format!("brief mode: {mode}\n{}", brief.render_for_human()),
+                None => format!(
+                    "brief mode: {mode}\nNo brief is being served yet: it is assembled at the first turn boundary after the mesh is on."
+                ),
+            };
+            out_text(&text);
+        }
+        BriefArg::Set(text) => {
+            ctx.app.mesh.set_user_brief(Some(text.to_string()));
+            out_text("Brief text set for this session; peers receive it with the next request.");
+        }
+        BriefArg::Clear => {
+            ctx.app.mesh.set_user_brief(None);
+            out_text("Brief text cleared.");
+        }
+        BriefArg::Mode(mode) => {
+            ctx.set_mesh_brief_for_session(mode);
+            out_text(&format!(
+                "Brief mode is {mode} for this session; config.yaml is not changed. It takes effect at the next turn boundary."
+            ));
+        }
+        BriefArg::Help => out_text(&render_verb_help("brief")),
+    }
+    Ok(())
+}
+
+fn inbox(ctx: &RequestContext) -> Result<()> {
+    let (envelopes, dropped) = ctx.app.mesh.peer_inbox().drain();
+    let rows: Vec<InboxRow> = envelopes
+        .into_iter()
+        .filter_map(|envelope| match envelope.payload {
+            EnvelopePayload::Peer(message) => Some(InboxRow {
+                name: ctx.app.mesh.peer_name(&message),
+                received: envelope.timestamp,
+                message: *message,
+            }),
+            _ => None,
+        })
+        .collect();
+    let awaiting_collect: Vec<String> = ctx
+        .app
+        .mesh
+        .correlations()
+        .list()
+        .into_iter()
+        .filter(|correlation| correlation.reply.is_some())
+        .map(|correlation| correlation.record.id)
+        .collect();
+    out_text(&render_inbox(&rows, &awaiting_collect));
+    if dropped > 0 {
+        err_text(&dropped_warning(dropped));
+    }
+    Ok(())
+}
+
+fn pending(ctx: &RequestContext) -> Result<()> {
+    live(ctx)?;
+    let asked = ctx.app.mesh.correlations().list();
+    let escalated = match ctx.app.mesh.inbound_store() {
+        Some(store) => store.list(SystemTime::now())?,
+        None => Vec::new(),
+    };
+    out_text(&render_pending(&asked, &escalated));
+    Ok(())
+}
+
+async fn answer(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
+    let Some((id, text)) = split_id_and_text(rest) else {
+        out_text(&render_verb_help("answer"));
+        return Ok(());
+    };
+    let runtime = live(ctx)?;
+    let inbound = match ctx.app.mesh.inbound_store() {
+        Some(store) => store.get(id)?,
+        None => None,
+    };
+    let outbound = ctx.app.mesh.correlations().get(id);
+    let route = answer_route(inbound.is_some(), outbound.is_some());
+    match (route, inbound, outbound) {
+        (AnswerRoute::Inbound, Some(record), _) => {
+            out_text(&sending_notice(&record.peer_destination));
+            ctx.app.mesh.answer_inbound(id, text).await?;
+            out_text(&format!("Answered {}.", short(id)));
+        }
+        (AnswerRoute::Outbound, _, Some(correlation)) => {
+            let destination = &correlation.record.peer_destination;
+            out_text(&sending_notice(destination));
+            let out = OutboundPeer::new(PeerKind::Reply, text, None, Some(id), None)?;
+            let outcome = runtime.send_peer(destination, &out).await?;
+            out_text(&format!(
+                "Sent {} to {} as a reply to {} (via {}).",
+                short(&outcome.id),
+                short(destination),
+                short(id),
+                via_text(outcome.via)
+            ));
+        }
+        _ => bail!(
+            "No open question has id {id}. `.mesh pending` lists the ones this node knows about."
+        ),
+    }
+    Ok(())
+}
+
+async fn reply(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
+    let Some(rest) = rest else {
+        out_text(&render_verb_help("reply"));
+        return Ok(());
+    };
+    let (yes_first, rest) = take_flag(rest, "--yes");
+    let Some((target, rest)) = rest.split_once(char::is_whitespace) else {
+        out_text(&render_verb_help("reply"));
+        return Ok(());
+    };
+    let Some(destination) = canonical_hash(target) else {
+        bail!(
+            "'{target}' is not a destination hash: expected 32 hex characters, as `.mesh peers` lists them."
+        );
+    };
+    let Some(outgoing) = parse_outgoing(rest) else {
+        out_text(&render_verb_help("reply"));
+        return Ok(());
+    };
+    let runtime = live(ctx)?;
+    let peer = peer_for_contact(&runtime, &destination, REPLY_REFUSAL_TAIL)?;
+    let verdict = runtime.trust().authorize(&peer.identity_hash, &destination);
+    out_text(&format!(
+        "This sends your text to {} ({}, trust: {}) over the mesh.",
+        name_label(peer.display_name.as_deref()),
+        short(&destination),
+        trust_label(verdict)
+    ));
+    if !confirm_or_flag("Send it?", "--yes", yes_first || outgoing.yes)? {
+        out_text("Nothing was sent.");
+        return Ok(());
+    }
+    let out = OutboundPeer::new(PeerKind::Message, outgoing.text, None, None, None)?;
+    let outcome = runtime.send_peer(&destination, &out).await?;
+    out_text(&format!(
+        "Sent {} to {} (via {}).",
+        short(&outcome.id),
+        short(&destination),
+        via_text(outcome.via)
+    ));
+    Ok(())
+}
+
+/// The pre-flight every verb that contacts one peer runs: a destination the trust list
+/// denies is refused whether or not it has been heard; an unheard one is a not-heard
+/// error; a heard one is refused on any verdict short of Allow, `only` being the verb's
+/// own rule.
+fn peer_for_contact(runtime: &MeshRuntime, destination: &str, only: &str) -> Result<PeerRecord> {
+    let Some(peer) = runtime.peers().get(destination) else {
+        return Err(unheard_refusal(runtime, destination, only));
+    };
+    let verdict = runtime.trust().authorize(&peer.identity_hash, destination);
+    if let Some(refusal) = trust_refusal(destination, verdict, only) {
+        bail!(refusal);
+    }
+    Ok(peer)
+}
+
+/// Why a destination not in the peer table is refused: the trust list's denial of the
+/// destination itself when there is one, otherwise that it has not been heard.
+fn unheard_refusal(runtime: &MeshRuntime, destination: &str, tail: &str) -> anyhow::Error {
+    let verdict = runtime.trust().authorize("", destination);
+    if verdict.rule == Rule::DestinationDenied
+        && let Some(refusal) = trust_refusal(destination, verdict, tail)
+    {
+        return anyhow!(refusal);
+    }
+    anyhow!(
+        "Destination {destination} has not been heard from: it is not in the peer table. Only peers this node has heard announce can be contacted; check `.mesh peers`."
+    )
+}
+
+async fn broadcast(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
+    let Some(outgoing) = rest.and_then(parse_outgoing) else {
+        out_text(&render_verb_help("broadcast"));
+        return Ok(());
+    };
+    let runtime = live(ctx)?;
+    out_text(BROADCAST_NOTICE);
+    if !confirm_or_flag("Send the bulletin?", "--yes", outgoing.yes)? {
+        out_text("Nothing was sent.");
+        return Ok(());
+    }
+    let out = OutboundPeer::new(PeerKind::Bulletin, outgoing.text, None, None, None)?;
+    let outcome = runtime.broadcast(&out).await?;
+    out_text(&render_broadcast(&outcome));
+    Ok(())
+}
+
+/// The automatic sync runs on the idle-time driver's interval; this runs one now. A
+/// fetch already running, here or in another process of this identity, is reported and
+/// left to finish rather than treated as a failure.
+async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&str>) -> Result<()> {
+    parse_args(rest, &[], "fetch")?;
+    let runtime = live(ctx)?;
+    out_text("Asking the nearest propagation node for held messages; Ctrl-C cancels...");
+    let outcome = tokio::select! {
+        outcome = runtime.fetch_propagated(&LoggingInboundSink) => outcome,
+        _ = wait_user_interrupt(Some(abort_signal)) => {
+            out_text("Fetch interrupted.");
+            return Ok(());
+        }
+    };
+    match outcome {
+        Ok(report) => out_text(&render_fetch(&report)),
+        Err(FetchError::AlreadyRunning) => {
+            out_text("A sync is already running; wait for it to finish.")
+        }
+        Err(err @ FetchError::HeldByOtherProcess { .. }) => out_text(&err.to_string()),
+        Err(err) => bail!(err.to_string()),
+    }
+    Ok(())
+}
+
+/// Unlike the other one-peer verbs, a knock is not gated on this node trusting the
+/// destination: it is what a peer that has not trusted us is asked with. It is still
+/// refused for a destination this node has denied or an identity it has blocked.
+async fn knock(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&str>) -> Result<()> {
+    let Some(rest) = rest else {
+        out_text(&render_verb_help("knock"));
+        return Ok(());
+    };
+    let args = parse_mutation_args(rest, "knock", &["--yes", "--intro"])?;
+    let Some(target) = args.positional.first() else {
+        out_text(&render_verb_help("knock"));
+        return Ok(());
+    };
+    let destination = destination_hash(target)?;
+    let runtime = live(ctx)?;
+    let Some(peer) = runtime.peers().get(&destination) else {
+        return Err(unheard_refusal(&runtime, &destination, KNOCK_REFUSAL_TAIL));
+    };
+    let verdict = runtime.trust().authorize(&peer.identity_hash, &destination);
+    if matches!(
+        verdict.rule,
+        Rule::DestinationDenied | Rule::IdentityBlocked
+    ) && let Some(refusal) = trust_refusal(&destination, verdict, KNOCK_REFUSAL_TAIL)
+    {
+        bail!(refusal);
+    }
+    let intro = KnockIntro::new(args.intro.as_deref().unwrap_or(""))?;
+    let intro_label = if intro.as_str().is_empty() {
+        "without an intro".to_string()
+    } else {
+        format!("with intro \"{}\"", intro.as_str())
+    };
+    out_text(&format!(
+        "This knocks on {} ({}, trust: {}) so it can trust this instance, {intro_label}; if the peer is unreachable the knock is stored with a propagation node.",
+        name_label(peer.display_name.as_deref()),
+        short(&destination),
+        trust_label(verdict)
+    ));
+    if !confirm_or_flag("Knock?", "--yes", args.yes)? {
+        out_text("Nothing was sent.");
+        return Ok(());
+    }
+    let Some(desc) = runtime.resolve_destination(&destination).await else {
+        bail!(
+            "Destination {destination} cannot be reached yet: its announce has not been heard since this node started. Wait for it to announce, or check `.mesh peers`."
+        );
+    };
+    out_text(&format!(
+        "Knocking on {}; Ctrl-C cancels...",
+        short(&destination)
+    ));
+    let outcome = tokio::select! {
+        outcome = runtime.knock(&desc, &intro) => outcome,
+        _ = wait_user_interrupt(Some(abort_signal)) => {
+            out_text("Knock interrupted.");
+            return Ok(());
+        }
+    };
+    match outcome {
+        Ok(KnockOutcome {
+            via: KnockVia::Direct,
+        }) => out_text(&format!(
+            "Knocked on {} directly; the peer decides whether to trust this instance.",
+            short(&destination)
+        )),
+        Ok(KnockOutcome {
+            via: KnockVia::StoreAndForward,
+        }) => out_text(&format!(
+            "Knocked on {} via store-and-forward; a propagation node holds the knock until the peer fetches it.",
+            short(&destination)
+        )),
+        Err(err) => bail!(err.to_string()),
+    }
+    Ok(())
+}
+
+fn render_fetch(report: &FetchReport) -> String {
+    let node = short(&report.node);
+    if report.listed > 0 && report.wanted == 0 {
+        return format!(
+            "Nothing new held for this node at {node}: {} listed, all already processed.",
+            report.listed
+        );
+    }
+    if report.wanted > 0 && report.received == 0 {
+        let mut line = format!(
+            "{node} lists {} for this node and {} were asked for, but none were served; run .mesh fetch again or check the node's logs.",
+            plural(report.listed, "message", "messages"),
+            report.wanted
+        );
+        if report.wanted == MAX_WANTS_PER_FETCH {
+            line.push_str(" More may be held.");
+        }
+        return line;
+    }
+    if report.received == 0 {
+        return format!("Nothing held for this node at {node}.");
+    }
+    let mut line = format!(
+        "Fetched from {node}: {} listed, {} wanted, {} received, {} delivered, {} duplicates, {} discarded, {} deferred.",
+        report.listed,
+        report.wanted,
+        report.received,
+        report.delivered,
+        report.duplicates,
+        report.discarded,
+        report.deferred
+    );
+    if report.wanted == MAX_WANTS_PER_FETCH {
+        line.push_str(" More may be held; run .mesh fetch again.");
+    }
+    line
+}
+
+fn trust(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
+    let Some(rest) = rest else {
+        out_text(&render_verb_help("trust"));
+        return Ok(());
+    };
+    let args = parse_mutation_args(
+        rest,
+        "trust",
+        &[
+            "--yes",
+            "--label",
+            "--identity",
+            "--prune",
+            "--older-than",
+            "--dry-run",
+            "--confirm",
+        ],
+    )?;
+    let Some(arg) = classify_trust(args)? else {
+        out_text(&render_verb_help("trust"));
+        return Ok(());
+    };
+    let store = trust_store(ctx)?;
+    let mesh: &dyn LiveMesh = ctx.app.mesh.as_ref();
+    let now = SystemTime::now();
+    match arg {
+        TrustArg::Destination { target, label, yes } => {
+            let destination = destination_hash(&target)?;
+            out_text(&format!(
+                "This trusts instance {}: a peer you trust can message this node and ask it questions.",
+                short(&destination)
+            ));
+            if !confirm_or_flag(&format!("Trust {}?", short(&destination)), "--yes", yes)? {
+                out_text(NOTHING_CHANGED);
+                return Ok(());
+            }
+            let outcome = store.trust_destination(
+                mesh,
+                &destination,
+                TrustOptions { label, note: None },
+                now,
+            )?;
+            let mut lines = vec![format!(
+                "Trusted {} (identity {}) - {}.",
+                short(&outcome.destination_hash),
+                short(&outcome.identity_hash),
+                change_text(outcome.change)
+            )];
+            lines.extend(outcome.superseded.iter().map(|old| {
+                format!(
+                    "  This instance was trusted before as {old} under another identity; that record's key-change mark is cleared. The old record stays trusted for the old key until you run .mesh untrust {old}."
+                )
+            }));
+            out_text(&lines.join("\n"));
+        }
+        TrustArg::Identity { target, label, yes } => {
+            let identity = identity_hash(&target)?;
+            out_text(&format!(
+                "This trusts identity {} and every instance it announces, now or later: each of them can message this node and ask it questions. A rotation of this identity is not detected; trust its instances with .mesh trust <destination> instead if you want a key-change notice.",
+                short(&identity)
+            ));
+            let question = format!("Trust every instance of {}?", short(&identity));
+            if !confirm_or_flag(&question, "--yes", yes)? {
+                out_text(NOTHING_CHANGED);
+                return Ok(());
+            }
+            let change =
+                store.trust_identity(mesh, &identity, TrustOptions { label, note: None }, now)?;
+            out_text(&format!(
+                "Trusted identity {}, all destinations - {}.",
+                short(&identity),
+                change_text(change)
+            ));
+        }
+        TrustArg::Prune {
+            older_than,
+            confirm,
+        } => {
+            prune(ctx, &store, mesh, older_than, confirm, now)?;
+        }
+    }
+    Ok(())
+}
+
+/// Without `--confirm` this is a dry run: it lists what would go and prints the token that
+/// removes exactly that many. The token, not `--yes`, is the consent, and it is checked
+/// against a fresh count so a list that moved since the dry run is never pruned blind.
+fn prune(
+    ctx: &RequestContext,
+    store: &TrustStore,
+    mesh: &dyn LiveMesh,
+    older_than: Option<Duration>,
+    confirm: Option<String>,
+    now: SystemTime,
+) -> Result<()> {
+    let threshold = older_than.unwrap_or(PRUNE_DEFAULT_OLDER_THAN);
+    let threshold_text = older_than_text(threshold);
+    let expected = confirm.as_deref().map(prune_token_count).transpose()?;
+    let stale = store.prune_destinations(mesh, threshold, now, true)?;
+    if let Some(expected) = expected
+        && expected != stale.len()
+    {
+        bail!(
+            "The stale list has changed since the dry run (now {}, token names {expected}); run .mesh trust --prune again for a fresh token.",
+            stale.len()
+        );
+    }
+    if stale.is_empty() {
+        out_text(&format!(
+            "No trusted instance is older than {threshold_text}; nothing to prune."
+        ));
+        return Ok(());
+    }
+    if expected.is_none() {
+        let records = store.records();
+        let mut lines = vec![format!(
+            "Trusted instances not heard from in the last {threshold_text}:"
+        )];
+        let mut key_changed = 0;
+        for hash in &stale {
+            let who = records
+                .iter()
+                .find(|record| record.hash == *hash)
+                .map(|record| {
+                    let mut who = format!(
+                        "{}  last seen {}",
+                        record_label(record),
+                        age_text(now, record.last_seen_at)
+                    );
+                    if let Some(change) = &record.key_changed {
+                        key_changed += 1;
+                        who.push_str(&format!(
+                            " key changed: announced under identity {} {}",
+                            short(&change.seen_identity),
+                            age_text(now, change.at)
+                        ));
+                    }
+                    who
+                })
+                .unwrap_or_default();
+            lines.push(format!("  {hash}  {who}"));
+        }
+        let older_than_flag = older_than
+            .map(|_| format!(" --older-than {threshold_text}"))
+            .unwrap_or_default();
+        let marked = match key_changed {
+            0 => String::new(),
+            n => format!(", {n} of them marked key-changed"),
+        };
+        lines.push(format!(
+            "This was a dry run; nothing changed. To remove these {} instance(s){marked}, run: .mesh trust --prune{older_than_flag} --confirm prune-{}",
+            stale.len(),
+            stale.len()
+        ));
+        out_text(&lines.join("\n"));
+        return Ok(());
+    }
+    let removed = store.prune_destinations(mesh, threshold, now, false)?;
+    let mut lines = vec![format!("Removed {} trusted instance(s):", removed.len())];
+    lines.extend(removed.iter().map(|hash| format!("  {hash}")));
+    out_text(&lines.join("\n"));
+    match live(ctx)?.knock_gate().cache().prune(now) {
+        Ok(0) => {}
+        Ok(dropped) => out_text(&format!(
+            "Dropped {dropped} expired knock(s) from the cache."
+        )),
+        Err(err) => err_text(&format!("The knock cache could not be pruned: {err:#}")),
+    }
+    Ok(())
+}
+
+fn untrust(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
+    let Some(rest) = rest else {
+        out_text(&render_verb_help("untrust"));
+        return Ok(());
+    };
+    let args = parse_mutation_args(
+        rest,
+        "untrust",
+        &["--yes", "--identity", "--dry-run", "--confirm"],
+    )?;
+    let Some(arg) = classify_untrust(args)? else {
+        out_text(&render_verb_help("untrust"));
+        return Ok(());
+    };
+    let store = trust_store(ctx)?;
+    let mesh: &dyn LiveMesh = ctx.app.mesh.as_ref();
+    match arg {
+        UntrustArg::Destination { target, yes } => {
+            let destination = destination_hash(&target)?;
+            out_text(&format!(
+                "This forgets trusted instance {}; the record for its identity stays.",
+                short(&destination)
+            ));
+            if !confirm_or_flag(&format!("Untrust {}?", short(&destination)), "--yes", yes)? {
+                out_text(NOTHING_CHANGED);
+                return Ok(());
+            }
+            store.untrust_destination(mesh, &destination)?;
+            out_text(&format!("Untrusted {}.", short(&destination)));
+        }
+        UntrustArg::Identity { target, confirm } => {
+            let identity = identity_hash(&target)?;
+            untrust_identity(&store, mesh, &identity, confirm, SystemTime::now())?;
+        }
+    }
+    Ok(())
+}
+
+/// Like `prune`, a dry run until the printed token comes back; the listing is the store's
+/// own records, since `untrust_identity` has no dry-run form.
+fn untrust_identity(
+    store: &TrustStore,
+    mesh: &dyn LiveMesh,
+    identity: &str,
+    confirm: Option<String>,
+    now: SystemTime,
+) -> Result<()> {
+    let records = store.records();
+    let identity_record = records
+        .iter()
+        .find(|record| record.tier == Tier::Identity && record.hash == identity);
+    let bound: Vec<&TrustRecord> = records
+        .iter()
+        .filter(|record| {
+            record.tier == Tier::Destination && record.identity.as_deref() == Some(identity)
+        })
+        .collect();
+    if identity_record.is_none() && bound.is_empty() {
+        bail!("Identity {identity} is not in the trust list, so there is nothing to untrust.");
+    }
+    let expected = format!("untrust-{}", short(identity));
+    match confirm {
+        None => {
+            let mut lines = vec![format!("Untrusting identity {identity} forgets:")];
+            if let Some(record) = identity_record {
+                let scope = if record.all_destinations {
+                    "all destinations"
+                } else {
+                    "listed instances only"
+                };
+                lines.push(format!(
+                    "  identity {}  {}  {scope}",
+                    short(identity),
+                    record_label(record)
+                ));
+            }
+            for record in &bound {
+                lines.push(format!(
+                    "  instance {}  {}  last seen {}",
+                    record.hash,
+                    record_label(record),
+                    age_text(now, record.last_seen_at)
+                ));
+            }
+            lines.push(format!(
+                "This was a dry run; nothing changed. To forget this identity and its {} instance(s), run: .mesh untrust --identity {identity} --confirm {expected}",
+                bound.len()
+            ));
+            out_text(&lines.join("\n"));
+        }
+        Some(token) if token != expected => bail!(
+            "'{token}' is not the token for identity {}; run .mesh untrust --identity {identity} --confirm {expected}",
+            short(identity)
+        ),
+        Some(_) => {
+            let removed = store.untrust_identity(mesh, identity)?;
+            let mut lines = vec![format!(
+                "Untrusted identity {} and {} instance(s).",
+                short(identity),
+                removed.len()
+            )];
+            lines.extend(removed.iter().map(|hash| format!("  {hash}")));
+            out_text(&lines.join("\n"));
+        }
+    }
+    Ok(())
+}
+
+fn block(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
+    let Some(rest) = rest else {
+        out_text(&render_verb_help("block"));
+        return Ok(());
+    };
+    let args = parse_mutation_args(rest, "block", &["--yes", "--note"])?;
+    let Some(target) = args.positional.first() else {
+        out_text(&render_verb_help("block"));
+        return Ok(());
+    };
+    let store = trust_store(ctx)?;
+    let identity = identity_hash(target)?;
+    out_text(&format!(
+        "This blocks identity {}: its knocks are dropped without a word, and every trust record for it, identity and instances alike, is removed.",
+        short(&identity)
+    ));
+    if !confirm_or_flag(&format!("Block {}?", short(&identity)), "--yes", args.yes)? {
+        out_text(NOTHING_CHANGED);
+        return Ok(());
+    }
+    let removed = store.block_identity(
+        ctx.app.mesh.as_ref(),
+        &identity,
+        args.note,
+        SystemTime::now(),
+    )?;
+    let mut lines = vec![format!("Blocked {}.", short(&identity))];
+    if !removed.is_empty() {
+        lines.push(format!(
+            "Removed {} trust record(s) for its instance(s):",
+            removed.len()
+        ));
+        lines.extend(removed.iter().map(|hash| format!("  {hash}")));
+    }
+    out_text(&lines.join("\n"));
+    Ok(())
+}
+
+fn unblock(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
+    let Some(rest) = rest else {
+        out_text(&render_verb_help("unblock"));
+        return Ok(());
+    };
+    let args = parse_mutation_args(rest, "unblock", &["--yes"])?;
+    let Some(target) = args.positional.first() else {
+        out_text(&render_verb_help("unblock"));
+        return Ok(());
+    };
+    let store = trust_store(ctx)?;
+    let identity = identity_hash(target)?;
+    out_text(&format!(
+        "This lifts the block on identity {}, so it may knock again; trust is not restored.",
+        short(&identity)
+    ));
+    if !confirm_or_flag(&format!("Unblock {}?", short(&identity)), "--yes", args.yes)? {
+        out_text(NOTHING_CHANGED);
+        return Ok(());
+    }
+    store.unblock_identity(ctx.app.mesh.as_ref(), &identity)?;
+    out_text(&format!(
+        "Unblocked {}. It is not trusted; `.mesh trust` grants that.",
+        short(&identity)
+    ));
+    Ok(())
+}
+
+fn deny(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
+    let Some(rest) = rest else {
+        out_text(&render_verb_help("deny"));
+        return Ok(());
+    };
+    let args = parse_mutation_args(rest, "deny", &["--yes", "--note"])?;
+    let Some(target) = args.positional.first() else {
+        out_text(&render_verb_help("deny"));
+        return Ok(());
+    };
+    let store = trust_store(ctx)?;
+    let destination = destination_hash(target)?;
+    out_text(&format!(
+        "This denies instance {}: it is not contacted and its messages are refused, even if its identity is trusted. To silence a whole identity's knocks, use `.mesh block <identity>` instead.",
+        short(&destination)
+    ));
+    if !confirm_or_flag(&format!("Deny {}?", short(&destination)), "--yes", args.yes)? {
+        out_text(NOTHING_CHANGED);
+        return Ok(());
+    }
+    store.deny_destination(
+        ctx.app.mesh.as_ref(),
+        &destination,
+        args.note,
+        SystemTime::now(),
+    )?;
+    out_text(&format!("Denied {}.", short(&destination)));
+    Ok(())
+}
+
+fn undeny(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
+    let Some(rest) = rest else {
+        out_text(&render_verb_help("undeny"));
+        return Ok(());
+    };
+    let args = parse_mutation_args(rest, "undeny", &["--yes"])?;
+    let Some(target) = args.positional.first() else {
+        out_text(&render_verb_help("undeny"));
+        return Ok(());
+    };
+    let store = trust_store(ctx)?;
+    let destination = destination_hash(target)?;
+    out_text(&format!(
+        "This lifts the deny on instance {}; its standing is then whatever the rest of the trust list says.",
+        short(&destination)
+    ));
+    if !confirm_or_flag(
+        &format!("Undeny {}?", short(&destination)),
+        "--yes",
+        args.yes,
+    )? {
+        out_text(NOTHING_CHANGED);
+        return Ok(());
+    }
+    store.undeny_destination(ctx.app.mesh.as_ref(), &destination)?;
+    out_text(&format!("Undenied {}.", short(&destination)));
+    Ok(())
+}
+
+/// Like `untrust --identity`, a dry run until the printed token comes back. Bare
+/// `.mesh rotate` is the dry run itself: there is no target to prompt help for. The
+/// identity lock is taken here so a node in another process refuses the dry run as well,
+/// after the key is named so a config dir without one is left untouched; `rotate_identity`
+/// re-reads the key under its own lock, so the guard is released before the confirm.
+fn rotate(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
+    let args = parse_mutation_args(
+        rest.unwrap_or(""),
+        "rotate",
+        &["--dry-run", "--confirm", "--yes"],
+    )?;
+    if args.yes {
+        bail!(
+            "`.mesh rotate` takes `--confirm rotate-<identity-short>` from a dry run, not `--yes`."
+        );
+    }
+    if let Some(token) = args.positional.first() {
+        return Err(unexpected(token, "rotate"));
+    }
+    if args.dry_run && args.confirm.is_some() {
+        return Err(unexpected("--dry-run", "rotate"));
+    }
+    if ctx.app.mesh.get().is_some() {
+        bail!(ROTATE_NEEDS_OFF);
+    }
+    let path = MeshPaths::from_env().identity_path;
+    let old = fingerprint(&identity::current_identity(&path)?);
+    let lock = identity::IdentityLock::exclusive(&path)?;
+    let expected = format!("rotate-{}", short(&old));
+    match args.confirm {
+        None => {
+            let recorded = identity::predecessors(&path)?.len();
+            let lines = [
+                format!("Rotating the mesh identity replaces {old}:"),
+                "  a new identity is minted and written over mesh/identity.key; the old private key is not kept".to_string(),
+                format!(
+                    "  the old identity hash is appended to mesh/{} ({recorded} recorded so far)",
+                    identity::PREDECESSORS_FILE
+                ),
+                "  the instance id is unchanged, so the node announces a new destination hash under the new identity".to_string(),
+                "  rotation is refused while any session's node on this config dir is running: each running node holds mesh/identity.key.lock".to_string(),
+                "  every peer that trusted this identity or its instances now sees a stranger and must run .mesh trust again after verifying the new hash out of band; your own trust list is unchanged".to_string(),
+                format!(
+                    "This was a dry run; nothing changed. To rotate, run: .mesh rotate --confirm {expected}"
+                ),
+            ];
+            out_text(&lines.join("\n"));
+        }
+        Some(token) if token != expected => bail!(
+            "'{token}' is not the token for identity {}; run .mesh rotate --confirm {expected}",
+            short(&old)
+        ),
+        Some(_) => {
+            drop(lock);
+            let rotation = identity::rotate_identity(&path, &old, SystemTime::now())?;
+            out_text(&format!(
+                "Rotated the mesh identity: {} -> {}.\nPredecessors recorded: {}. Run .mesh on to announce the new identity; peers must re-trust it.",
+                rotation.old_fingerprint, rotation.new_fingerprint, rotation.predecessors
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The store behind every trust mutation, refused with the store's own teaching text while
+/// the mesh is off; the store checks again through `LiveMesh` on the call itself.
+fn trust_store(ctx: &RequestContext) -> Result<Arc<TrustStore>> {
+    ctx.app
+        .mesh
+        .get()
+        .map(|runtime| runtime.trust())
+        .ok_or_else(|| anyhow!(crate::mesh::trust::MESH_OFF))
+}
+
+fn destination_hash(token: &str) -> Result<String> {
+    canonical_hash(token).ok_or_else(|| {
+        anyhow!(
+            "'{token}' is not a destination hash: expected 32 hex characters, as `.mesh peers` lists them."
+        )
+    })
+}
+
+fn identity_hash(token: &str) -> Result<String> {
+    canonical_hash(token).ok_or_else(|| {
+        anyhow!(
+            "'{token}' is not an identity hash: expected 32 hex characters, as `.mesh knocks` and `.mesh peers` list them."
+        )
+    })
+}
+
+fn change_text(change: TrustChange) -> &'static str {
+    match change {
+        TrustChange::Added => "added",
+        TrustChange::Updated => "updated",
+    }
+}
+
+/// A trust record as one word: its label, else the short identity it is bound to.
+fn record_label(record: &TrustRecord) -> String {
+    record
+        .label
+        .as_deref()
+        .and_then(|label| display_text(label, DISPLAY_NAME_MAX_CHARS))
+        .or_else(|| record.identity.as_deref().map(|id| short(id).to_string()))
+        .unwrap_or_else(|| "-".to_string())
+}
+
+#[derive(Debug)]
+enum TrustArg {
+    Destination {
+        target: String,
+        label: Option<String>,
+        yes: bool,
+    },
+    Identity {
+        target: String,
+        label: Option<String>,
+        yes: bool,
+    },
+    Prune {
+        older_than: Option<Duration>,
+        confirm: Option<String>,
+    },
+}
+
+/// `None` when no target was named: the caller prints the usage.
+fn classify_trust(args: MutationArgs) -> Result<Option<TrustArg>> {
+    if args.prune {
+        if args.yes {
+            bail!("`.mesh trust --prune` takes `--confirm prune-<N>` from a dry run, not `--yes`.");
+        }
+        if let Some(target) = args.positional.first() {
+            return Err(unexpected(target, "trust"));
+        }
+        if args.identity.is_some() {
+            return Err(unexpected("--identity", "trust"));
+        }
+        if args.label.is_some() {
+            return Err(unexpected("--label", "trust"));
+        }
+        if args.dry_run && args.confirm.is_some() {
+            return Err(unexpected("--dry-run", "trust"));
+        }
+        return Ok(Some(TrustArg::Prune {
+            older_than: args.older_than,
+            confirm: args.confirm,
+        }));
+    }
+    for (given, flag) in [
+        (args.older_than.is_some(), "--older-than"),
+        (args.dry_run, "--dry-run"),
+        (args.confirm.is_some(), "--confirm"),
+    ] {
+        if given {
+            return Err(unexpected(flag, "trust"));
+        }
+    }
+    if let Some(identity) = args.identity {
+        if let Some(target) = args.positional.first() {
+            return Err(unexpected(target, "trust"));
+        }
+        return Ok(Some(TrustArg::Identity {
+            target: identity,
+            label: args.label,
+            yes: args.yes,
+        }));
+    }
+    Ok(args
+        .positional
+        .into_iter()
+        .next()
+        .map(|target| TrustArg::Destination {
+            target,
+            label: args.label,
+            yes: args.yes,
+        }))
+}
+
+#[derive(Debug)]
+enum UntrustArg {
+    Destination {
+        target: String,
+        yes: bool,
+    },
+    Identity {
+        target: String,
+        confirm: Option<String>,
+    },
+}
+
+fn classify_untrust(args: MutationArgs) -> Result<Option<UntrustArg>> {
+    if let Some(identity) = args.identity {
+        if args.yes {
+            bail!(
+                "`.mesh untrust --identity` takes `--confirm untrust-<identity-short>` from a dry run, not `--yes`."
+            );
+        }
+        if let Some(target) = args.positional.first() {
+            return Err(unexpected(target, "untrust"));
+        }
+        if args.dry_run && args.confirm.is_some() {
+            return Err(unexpected("--dry-run", "untrust"));
+        }
+        return Ok(Some(UntrustArg::Identity {
+            target: identity,
+            confirm: args.confirm,
+        }));
+    }
+    if args.dry_run {
+        return Err(unexpected("--dry-run", "untrust"));
+    }
+    if args.confirm.is_some() {
+        return Err(unexpected("--confirm", "untrust"));
+    }
+    Ok(args
+        .positional
+        .into_iter()
+        .next()
+        .map(|target| UntrustArg::Destination {
+            target,
+            yes: args.yes,
+        }))
+}
+
+fn unexpected(token: &str, verb: &str) -> anyhow::Error {
+    anyhow!("Unexpected '{token}'. {}", render_verb_help(verb))
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct MutationArgs {
+    positional: Vec<String>,
+    yes: bool,
+    dry_run: bool,
+    prune: bool,
+    identity: Option<String>,
+    label: Option<String>,
+    note: Option<String>,
+    intro: Option<String>,
+    older_than: Option<Duration>,
+    confirm: Option<String>,
+}
+
+/// The trust verbs take one hash and valued flags, so every token is parsed and a flag may
+/// sit anywhere; `reply` differs, honouring `--yes` as the leading word only, because the
+/// rest of its line is free text.
+fn parse_mutation_args(rest: &str, verb: &str, allowed: &[&str]) -> Result<MutationArgs> {
+    let mut args = MutationArgs::default();
+    let mut tokens = split_tokens(rest).into_iter();
+    while let Some(token) = tokens.next() {
+        if !token.starts_with("--") {
+            if !args.positional.is_empty() {
+                return Err(unexpected(&token, verb));
+            }
+            args.positional.push(token);
+            continue;
+        }
+        if !allowed.contains(&token.as_str()) {
+            return Err(unexpected(&token, verb));
+        }
+        let mut value = || match tokens.next() {
+            Some(value) if !value.starts_with("--") => Ok(value),
+            _ => Err(anyhow!(
+                "'{token}' needs a value. {}",
+                render_verb_help(verb)
+            )),
+        };
+        match token.as_str() {
+            "--yes" => args.yes = true,
+            "--dry-run" => args.dry_run = true,
+            "--prune" => args.prune = true,
+            "--identity" => args.identity = Some(value()?),
+            "--label" => args.label = Some(value()?),
+            "--note" => args.note = Some(value()?),
+            "--intro" => args.intro = Some(value()?),
+            "--older-than" => args.older_than = Some(parse_older_than(&value()?)?),
+            "--confirm" => args.confirm = Some(value()?),
+            _ => return Err(unexpected(&token, verb)),
+        }
+    }
+    Ok(args)
+}
+
+/// Whitespace-separated tokens, a double-quoted run being one token with its quotes
+/// stripped; an unclosed quote runs to the end of the line.
+fn split_tokens(rest: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut open = false;
+    for c in rest.chars() {
+        if c == '"' {
+            in_quotes = !in_quotes;
+            open = true;
+        } else if c.is_whitespace() && !in_quotes {
+            if open {
+                tokens.push(std::mem::take(&mut current));
+                open = false;
+            }
+        } else {
+            current.push(c);
+            open = true;
+        }
+    }
+    if open {
+        tokens.push(current);
+    }
+    tokens
+}
+
+/// `<N>d`, `<N>h` or `<N>m` (minutes), N a whole number above zero.
+fn parse_older_than(text: &str) -> Result<Duration> {
+    let teaching = || {
+        anyhow!(
+            "'{text}' is not a duration: use a whole number of days, hours or minutes, such as 30d, 12h or 90m."
+        )
+    };
+    let unit = text.chars().last().ok_or_else(teaching)?;
+    let secs_per_unit = match unit {
+        'd' => 86_400,
+        'h' => 3_600,
+        'm' => 60,
+        _ => return Err(teaching()),
+    };
+    let count: u64 = text[..text.len() - unit.len_utf8()]
+        .parse()
+        .ok()
+        .filter(|count| *count > 0)
+        .ok_or_else(teaching)?;
+    count
+        .checked_mul(secs_per_unit)
+        .map(Duration::from_secs)
+        .ok_or_else(teaching)
+}
+
+/// `parse_older_than` in reverse, in the coarsest unit that divides it.
+fn older_than_text(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    if secs.is_multiple_of(86_400) {
+        format!("{}d", secs / 86_400)
+    } else if secs.is_multiple_of(3_600) {
+        format!("{}h", secs / 3_600)
+    } else {
+        format!("{}m", secs / 60)
+    }
+}
+
+fn prune_token_count(token: &str) -> Result<usize> {
+    token
+        .strip_prefix("prune-")
+        .and_then(|count| count.parse().ok())
+        .ok_or_else(|| {
+            anyhow!(
+                "'{token}' is not a prune token: run .mesh trust --prune for a dry run and pass the prune-<N> it prints."
+            )
+        })
+}
+
+fn live(ctx: &RequestContext) -> Result<Arc<MeshRuntime>> {
+    match ctx.app.mesh.get() {
+        Some(runtime) => Ok(runtime),
+        None => bail!(MESH_OFF),
+    }
+}
+
+fn split_verb(args: Option<&str>) -> Option<(&str, Option<&str>)> {
+    let args = args?.trim();
+    if args.is_empty() {
+        return None;
+    }
+    let mut parts = args.splitn(2, char::is_whitespace);
+    let verb = parts.next()?;
+    let rest = parts.next().map(str::trim).filter(|rest| !rest.is_empty());
+    Some((verb, rest))
+}
+
+#[derive(Debug)]
+struct Flags<'a> {
+    flags: Vec<&'a str>,
+}
+
+impl Flags<'_> {
+    fn has(&self, flag: &str) -> bool {
+        self.flags.contains(&flag)
+    }
+}
+
+/// Every token must be one of `allowed`; anything else is answered with the verb's usage.
+fn parse_args<'a>(rest: Option<&'a str>, allowed: &[&str], verb: &str) -> Result<Flags<'a>> {
+    let mut flags = Vec::new();
+    for token in rest.unwrap_or("").split_whitespace() {
+        if !allowed.contains(&token) {
+            bail!("Unexpected '{token}'. {}", render_verb_help(verb));
+        }
+        flags.push(token);
+    }
+    Ok(Flags { flags })
+}
+
+enum StatusArg<'a> {
+    Own,
+    Set(&'a str),
+    Clear,
+    Fetch(String),
+    Help,
+}
+
+fn classify_status(rest: Option<&str>) -> StatusArg<'_> {
+    let Some(rest) = rest else {
+        return StatusArg::Own;
+    };
+    if rest == "clear" {
+        return StatusArg::Clear;
+    }
+    if let Some(objective) = quoted(rest) {
+        return match objective.trim() {
+            "" => StatusArg::Clear,
+            text => StatusArg::Set(text),
+        };
+    }
+    match canonical_hash(rest) {
+        Some(destination) => StatusArg::Fetch(destination),
+        None => StatusArg::Help,
+    }
+}
+
+enum BriefArg<'a> {
+    Show,
+    Set(&'a str),
+    Clear,
+    Mode(MeshBrief),
+    Help,
+}
+
+fn classify_brief(rest: Option<&str>) -> BriefArg<'_> {
+    let Some(rest) = rest else {
+        return BriefArg::Show;
+    };
+    match rest {
+        "auto" => return BriefArg::Mode(MeshBrief::Auto),
+        "manual" => return BriefArg::Mode(MeshBrief::Manual),
+        "off" => return BriefArg::Mode(MeshBrief::Off),
+        "clear" => return BriefArg::Clear,
+        _ => {}
+    }
+    let Some(text) = rest.strip_prefix("set") else {
+        return BriefArg::Help;
+    };
+    if !text.is_empty() && !text.starts_with(char::is_whitespace) {
+        return BriefArg::Help;
+    }
+    let text = text.trim();
+    let text = quoted(text).unwrap_or(text).trim();
+    if text.is_empty() {
+        BriefArg::Help
+    } else {
+        BriefArg::Set(text)
+    }
+}
+
+/// The text between a leading and a trailing double quote, when both are present.
+fn quoted(text: &str) -> Option<&str> {
+    let inner = text.strip_prefix('"')?.strip_suffix('"')?;
+    Some(inner)
+}
+
+/// The words to send, unquoted and trimmed; `None` when nothing is left.
+fn message_text(text: &str) -> Option<&str> {
+    let text = text.trim();
+    let text = quoted(text).unwrap_or(text).trim();
+    (!text.is_empty()).then_some(text)
+}
+
+/// `flag` counts only as the first word of `text`; anywhere else, a trailing one
+/// included, it is text to send.
+fn take_flag<'a>(text: &'a str, flag: &str) -> (bool, &'a str) {
+    let text = text.trim();
+    if let Some(rest) = text.strip_prefix(flag)
+        && (rest.is_empty() || rest.starts_with(char::is_whitespace))
+    {
+        return (true, rest.trim());
+    }
+    (false, text)
+}
+
+struct Outgoing<'a> {
+    yes: bool,
+    text: &'a str,
+}
+
+fn parse_outgoing(rest: &str) -> Option<Outgoing<'_>> {
+    let (yes, rest) = take_flag(rest, "--yes");
+    let text = message_text(rest)?;
+    Some(Outgoing { yes, text })
+}
+
+/// `.mesh answer`'s id and the answer after it; `None` when either is missing.
+fn split_id_and_text(rest: Option<&str>) -> Option<(&str, &str)> {
+    let (id, text) = rest?.split_once(char::is_whitespace)?;
+    Some((id, message_text(text)?))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AnswerRoute {
+    /// A peer's escalated question: the answer goes back to the peer as its reply.
+    Inbound,
+    /// A question this node asked: the text goes to the peer as a follow-up.
+    Outbound,
+    Unknown,
+}
+
+/// An id held by both stores answers the peer: their question is the one waiting on a human.
+fn answer_route(inbound: bool, outbound: bool) -> AnswerRoute {
+    match (inbound, outbound) {
+        (true, _) => AnswerRoute::Inbound,
+        (false, true) => AnswerRoute::Outbound,
+        (false, false) => AnswerRoute::Unknown,
+    }
+}
+
+fn via_text(via: PeerVia) -> &'static str {
+    match via {
+        PeerVia::Direct => "direct",
+        PeerVia::StoreAndForward => "store-and-forward",
+    }
+}
+
+fn sending_notice(destination: &str) -> String {
+    format!(
+        "Sending your answer to {} over the mesh...",
+        short(destination)
+    )
+}
+
+fn dropped_warning(dropped: usize) -> String {
+    format!("WARNING: {dropped} peer message(s) were dropped because the inbox was full.")
+}
+
+/// Asks the human when nothing already said yes: `flag_given` skips the prompt, no
+/// terminal on stdin is an error naming the flag rather than a hang, and any prompt
+/// failure (Ctrl-C, EOF, a broken terminal) counts as no.
+pub(crate) fn confirm_or_flag(question: &str, flag: &str, flag_given: bool) -> Result<bool> {
+    #[cfg(test)]
+    if let Some(forced_tty) = prompt_script::forced_tty() {
+        return confirm_or_flag_with(question, flag, flag_given, forced_tty, |question| {
+            Some(prompt_script::next_answer(question))
+        });
+    }
+    confirm_or_flag_with(
+        question,
+        flag,
+        flag_given,
+        std::io::stdin().is_terminal(),
+        |question| {
+            drain_stale_tty_input();
+            Confirm::new(question).with_default(false).prompt().ok()
+        },
+    )
+}
+
+pub(crate) fn confirm_or_flag_with(
+    question: &str,
+    flag: &str,
+    flag_given: bool,
+    stdin_is_tty: bool,
+    prompt: impl FnOnce(&str) -> Option<bool>,
+) -> Result<bool> {
+    if flag_given {
+        return Ok(true);
+    }
+    if !stdin_is_tty {
+        bail!(
+            "{question} Standard input is not a terminal, so there is no prompt to answer; pass {flag} to confirm."
+        );
+    }
+    Ok(prompt(question).unwrap_or(false))
+}
+
+pub(crate) fn colour_allowed(stream_is_tty: bool, no_color: bool) -> bool {
+    stream_is_tty && !no_color
+}
+
+/// The `NO_COLOR` opt-out is the shared `utils` parse, so `.mesh` output honours the
+/// variable exactly as the rest of the binary does (one parse path).
+fn err_text_coloured() -> bool {
+    colour_allowed(
+        std::io::stderr().is_terminal(),
+        crate::utils::no_color_env_set(),
+    )
+}
+
+pub(crate) fn out_text(text: &str) {
+    #[cfg(test)]
+    capture::push(capture::Stream::Out, text);
+    println!("{text}");
+}
+
+pub(crate) fn err_text(text: &str) {
+    #[cfg(test)]
+    capture::push(capture::Stream::Err, text);
+    if err_text_coloured() {
+        eprintln!("{}", nu_ansi_term::Color::Yellow.paint(text));
+    } else {
+        eprintln!("{text}");
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod prompt_script {
+    //! Scripted stand-in for the `.mesh` confirmations. `inquire::Confirm` cannot run
+    //! under the test harness, so while a guard is installed `confirm_or_flag` takes its
+    //! terminal state from the guard and answers each prompt from a queue, counting every
+    //! prompt asked. The script is process-global: tests using it must be `#[serial]`.
+
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const INACTIVE: usize = 0;
+    const TTY: usize = 1;
+    const NON_TTY: usize = 2;
+
+    static STATE: AtomicUsize = AtomicUsize::new(INACTIVE);
+    static ASKED: AtomicUsize = AtomicUsize::new(0);
+    static ANSWERS: Mutex<Vec<bool>> = Mutex::new(Vec::new());
+
+    /// Forces a terminal on stdin and answers the prompts from `answers`, front to back;
+    /// a prompt beyond the scripted answers panics.
+    #[must_use]
+    pub fn install(answers: &[bool]) -> ScriptGuard {
+        install_with_state(TTY, answers)
+    }
+
+    /// Forces stdin to be no terminal, so the flag-naming refusal is pinned wherever the
+    /// tests run.
+    #[must_use]
+    pub fn install_non_interactive() -> ScriptGuard {
+        install_with_state(NON_TTY, &[])
+    }
+
+    fn install_with_state(state: usize, answers: &[bool]) -> ScriptGuard {
+        *ANSWERS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = answers.to_vec();
+        ASKED.store(0, Ordering::SeqCst);
+        STATE.store(state, Ordering::SeqCst);
+        ScriptGuard
+    }
+
+    pub struct ScriptGuard;
+
+    impl Drop for ScriptGuard {
+        fn drop(&mut self) {
+            STATE.store(INACTIVE, Ordering::SeqCst);
+            ANSWERS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clear();
+        }
+    }
+
+    /// Number of prompts asked since the script was installed.
+    pub fn prompts_asked() -> usize {
+        ASKED.load(Ordering::SeqCst)
+    }
+
+    pub(super) fn forced_tty() -> Option<bool> {
+        match STATE.load(Ordering::SeqCst) {
+            TTY => Some(true),
+            NON_TTY => Some(false),
+            _ => None,
+        }
+    }
+
+    pub(super) fn next_answer(question: &str) -> bool {
+        ASKED.fetch_add(1, Ordering::SeqCst);
+        let mut answers = ANSWERS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            !answers.is_empty(),
+            "mesh prompt asked with no scripted answer left: {question}"
+        );
+        answers.remove(0)
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod capture {
+    //! Records what `out_text` and `err_text` print while a guard is installed, in order,
+    //! so a test can assert what the human saw and in which sequence. Process-global like
+    //! `prompt_script`: tests using it must be `#[serial]`.
+
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Stream {
+        Out,
+        Err,
+    }
+
+    static ACTIVE: AtomicBool = AtomicBool::new(false);
+    static LINES: Mutex<Vec<(Stream, String)>> = Mutex::new(Vec::new());
+
+    #[must_use]
+    pub fn install() -> CaptureGuard {
+        LINES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        ACTIVE.store(true, Ordering::SeqCst);
+        CaptureGuard
+    }
+
+    pub struct CaptureGuard;
+
+    impl Drop for CaptureGuard {
+        fn drop(&mut self) {
+            ACTIVE.store(false, Ordering::SeqCst);
+            LINES
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clear();
+        }
+    }
+
+    /// Everything printed since the guard was installed, oldest first.
+    pub fn lines() -> Vec<(Stream, String)> {
+        LINES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub(super) fn push(stream: Stream, text: &str) {
+        if !ACTIVE.load(Ordering::SeqCst) {
+            return;
+        }
+        LINES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push((stream, text.to_string()));
+    }
+}
+
+fn render_help() -> String {
+    let mut lines = vec![
+        "Mesh commands (nothing here writes config.yaml; trust and rotate persist under the mesh/ directory):".to_string(),
+    ];
+    for (verb, description, example) in VERBS {
+        lines.push(format!("  .mesh {verb:<10} {description}"));
+        lines.push(format!("  {:<16} e.g. {example}", ""));
+    }
+    lines.join("\n")
+}
+
+fn render_verb_help(verb: &str) -> String {
+    match VERBS.iter().find(|(name, _, _)| *name == verb) {
+        Some((_, description, example)) => format!("Usage: {example}\n  {description}"),
+        None => render_help(),
+    }
+}
+
+fn is_public(config: &MeshConfig) -> bool {
+    config
+        .interfaces
+        .iter()
+        .any(|interface| matches!(interface, MeshInterface::Public { .. }))
+}
+
+/// How far this node is visible, from the configured interfaces alone.
+fn reach_line(config: &MeshConfig) -> String {
+    let public = is_public(config);
+    let private = config
+        .interfaces
+        .iter()
+        .any(|interface| matches!(interface, MeshInterface::Private { .. }));
+    match (public, private) {
+        (true, true) => {
+            "world-visible via a community node (public interface), plus the configured relay and the peers it reaches".to_string()
+        }
+        (true, false) => "world-visible via a community node (public interface)".to_string(),
+        (false, true) => "the configured relay and the peers it reaches".to_string(),
+        (false, false) => "this link-local segment only".to_string(),
+    }
+}
+
+/// Why a verb declines to reach a peer that is in the table but not trusted, `only`
+/// being the verb's own rule; `None` for a trusted one.
+fn trust_refusal(destination: &str, verdict: Verdict, only: &str) -> Option<String> {
+    if verdict.decision == Decision::Allow {
+        return None;
+    }
+    Some(format!(
+        "{} is {} in this node's trust list; `.mesh peers` shows the standing. {only}",
+        short(destination),
+        trust_label(verdict)
+    ))
+}
+
+fn audience(interface: &MeshInterface) -> &'static str {
+    match interface {
+        MeshInterface::Lan => "every node on this LAN",
+        MeshInterface::Private { .. } => "the nodes joined to that relay",
+        MeshInterface::Public { .. } => "anyone on the internet who reaches that relay",
+    }
+}
+
+/// What `.mesh on` prints before anything leaves the machine.
+fn render_on_preview(config: &MeshConfig, session_name: &str, fresh: bool) -> String {
+    let mut lines = vec![
+        format!(
+            "Joining the mesh for session '{session_name}' (this session only; config.yaml is not changed)."
+        ),
+        "What leaves this machine:".to_string(),
+    ];
+    lines.push(if config.announce {
+        "  announce: this node's destination hash and protocol version, repeated while the mesh is on".to_string()
+    } else {
+        "  announce: nothing until you contact a peer (announce: false)".to_string()
+    });
+    lines.push(match (config.announce, config.propagation_sync_interval_secs) {
+        (false, _) => "  propagation sync: off (announce: false); .mesh fetch runs one".to_string(),
+        (true, 0) => {
+            "  propagation sync: off (propagation_sync_interval_secs: 0); .mesh fetch runs one"
+                .to_string()
+        }
+        (true, interval) => format!(
+            "  propagation sync: this node identifies itself to the nearest propagation node heard, at join and every {interval} s; .mesh fetch runs one now"
+        ),
+    });
+    lines.push(match &config.display_name {
+        Some(name) if config.display_name_on_public => {
+            format!("  display name: '{name}', on every interface including public ones")
+        }
+        Some(name) => format!(
+            "  display name: '{name}' on lan and private interfaces; withheld on public ones"
+        ),
+        None => "  display name: none".to_string(),
+    });
+    lines.push(
+        "  status card and brief: this session's objective, state, repo and todo, served to trusted peers on request".to_string(),
+    );
+    if fresh {
+        lines.push(
+            "  fresh id: this session gets a new mesh id and destination; peers that trusted the old destination must trust the new one".to_string(),
+        );
+    }
+    lines.push("To whom:".to_string());
+    for interface in &config.interfaces {
+        lines.push(format!("  {interface}: {}", audience(interface)));
+    }
+    lines.push("Turn it off again with `.mesh off`.".to_string());
+    lines.join("\n")
+}
+
+fn on_question(config: &MeshConfig) -> String {
+    if is_public(config) {
+        let relays: Vec<String> = config
+            .interfaces
+            .iter()
+            .filter(|interface| matches!(interface, MeshInterface::Public { .. }))
+            .map(ToString::to_string)
+            .collect();
+        format!(
+            "This node will be WORLD-VISIBLE through {}: anyone reaching that relay can see its announce and knock on it. Join anyway?",
+            relays.join(", ")
+        )
+    } else {
+        format!(
+            "Join the mesh on {} interface(s), visible to the nodes there?",
+            config.interfaces.len()
+        )
+    }
+}
+
+/// The envoy's read-only tools are confined to the working directory, so joining from
+/// `$HOME` or a filesystem root leaves the name deny-list as the only barrier to dotfiles.
+/// Home is compared by canonical path when both resolve, so a symlinked home still warns.
+fn cwd_warning(cwd: &Path, home: Option<&Path>) -> Option<String> {
+    let is_home = home.is_some_and(|home| {
+        home == cwd
+            || matches!(
+                (fs::canonicalize(cwd), fs::canonicalize(home)),
+                (Ok(cwd), Ok(home)) if cwd == home
+            )
+    });
+    if is_home || cwd.parent().is_none() {
+        Some(format!(
+            "Warning: this session's working directory is {}. A peer's question is answered by the envoy with read-only tools confined to it, so every file under it that the name deny-list does not cover is one question away from a peer. Start Coyote from a project directory before joining the mesh.",
+            cwd.display()
+        ))
+    } else {
+        None
+    }
+}
+
+fn render_on_summary(runtime: &MeshRuntime, fresh: bool) -> String {
+    let suffix = if fresh { " (fresh id)" } else { "" };
+    format!(
+        "Mesh is on for this session{suffix}.\n  identity: {}\n  destination: {}\n  instance: {}\n  interfaces: {}\nTurn it off with `.mesh off`.",
+        runtime.fingerprint(),
+        runtime.current_destination_hash(),
+        runtime.current_instance_id(),
+        runtime.interfaces().join(", ")
+    )
+}
+
+fn name_label(name: Option<&str>) -> String {
+    name.and_then(|name| display_text(name, DISPLAY_NAME_MAX_CHARS))
+        .unwrap_or_else(|| "(no name)".to_string())
+}
+
+/// One `.mesh peers` line: a node heard on the mesh with its trust label and the key-change
+/// mark on its trust record; a denied destination nothing has announced from yet, listed
+/// so the deny (and any mark it carries) is visible; or a marked record whose destination
+/// has aged out of the peer table, listed so the mark outlives the row it was first shown on.
+enum PeerRow {
+    Heard(PeerRecord, &'static str, Option<KeyChangeMark>),
+    DenyOnly(TrustRecord, Option<KeyChangeMark>),
+    MarkedOnly(TrustRecord, &'static str, KeyChangeMark),
+}
+
+/// A trust record's key-change mark with, when the peer table has heard it, the destination
+/// the same instance announces under the new identity, so the marker can name what to trust.
+struct KeyChangeMark {
+    change: KeyChange,
+    new_destination: Option<String>,
+}
+
+/// The rows for trust records no heard peer announces from, at most one per record: a
+/// denied destination, with its mark when it carries one, else a marked record labelled by
+/// `label_of`. `successors` pairs a superseded trusted destination with the peer now
+/// announcing the same instance under another identity.
+fn unheard_rows(
+    records: Vec<TrustRecord>,
+    heard: &[String],
+    successors: &[(String, &PeerRecord)],
+    label_of: impl Fn(&TrustRecord) -> &'static str,
+) -> Vec<PeerRow> {
+    records
+        .into_iter()
+        .filter(|record| !heard.contains(&record.hash))
+        .filter_map(|record| {
+            let mark = record.key_changed.clone().map(|change| {
+                let new_destination = successors
+                    .iter()
+                    .find(|(superseded, peer)| {
+                        *superseded == record.hash && peer.identity_hash == change.seen_identity
+                    })
+                    .map(|(_, peer)| peer.destination_hash.clone());
+                KeyChangeMark {
+                    change,
+                    new_destination,
+                }
+            });
+            if record.denied && record.tier == Tier::Destination {
+                return Some(PeerRow::DenyOnly(record, mark));
+            }
+            let mark = mark?;
+            let label = label_of(&record);
+            Some(PeerRow::MarkedOnly(record, label, mark))
+        })
+        .collect()
+}
+
+fn render_peers(rows: &[PeerRow], now: SystemTime) -> String {
+    if rows.is_empty() {
+        return "No peers heard yet. Nodes appear here as their announces arrive.".to_string();
+    }
+    let mut lines = vec![format!(
+        "{:<20} {:<10} {:<10} {:<10} {:>4}  {}",
+        "name", "dest", "identity", "trust", "hops", "last seen"
+    )];
+    for row in rows {
+        match row {
+            PeerRow::Heard(peer, trust, key_changed) => {
+                let stale = if peer.is_stale(now) { " (stale)" } else { "" };
+                lines.push(format!(
+                    "{:<20} {:<10} {:<10} {:<10} {:>4}  {}{stale}",
+                    name_label(peer.display_name.as_deref()),
+                    short(&peer.destination_hash),
+                    short(&peer.identity_hash),
+                    trust,
+                    peer.hops,
+                    age_text(now, peer.last_seen),
+                ));
+                if let Some(line) = peer.compatibility_line() {
+                    lines.push(format!("{:<20} {line}", ""));
+                }
+                if let Some(mark) = key_changed {
+                    lines.push(key_change_line(
+                        mark,
+                        &peer.identity_hash,
+                        &peer.destination_hash,
+                        now,
+                    ));
+                }
+            }
+            PeerRow::DenyOnly(record, key_changed) => {
+                let bound = record.identity.as_deref().unwrap_or("-");
+                lines.push(format!(
+                    "{:<20} {:<10} {:<10} {:<10} {:>4}  {}",
+                    "-",
+                    short(&record.hash),
+                    short(bound),
+                    "denied",
+                    "-",
+                    "never"
+                ));
+                if let Some(mark) = key_changed {
+                    lines.push(key_change_line(mark, bound, &record.hash, now));
+                }
+            }
+            PeerRow::MarkedOnly(record, trust, mark) => {
+                let bound = record.identity.as_deref().unwrap_or("-");
+                let label = record
+                    .label
+                    .as_deref()
+                    .and_then(|label| display_text(label, DISPLAY_NAME_MAX_CHARS))
+                    .unwrap_or_else(|| "(not heard)".to_string());
+                lines.push(format!(
+                    "{:<20} {:<10} {:<10} {:<10} {:>4}  {}",
+                    label,
+                    short(&record.hash),
+                    short(bound),
+                    trust,
+                    "-",
+                    age_text(now, record.last_seen_at),
+                ));
+                lines.push(key_change_line(mark, bound, &record.hash, now));
+            }
+        }
+    }
+    lines.push(format!(
+        "{} peer(s). Names are peer-supplied text. Full hashes: `.mesh info <dest>`.",
+        rows.len()
+    ));
+    lines.join("\n")
+}
+
+/// The indented marker under a row whose trust record was marked `key_changed`, ending with
+/// the same exits as the notification: trust the instance under its new key if the peer
+/// rotated, otherwise block the identity that announced it; and forget the old key.
+fn key_change_line(
+    mark: &KeyChangeMark,
+    bound_identity: &str,
+    old_destination: &str,
+    now: SystemTime,
+) -> String {
+    let trust = match &mark.new_destination {
+        Some(destination) => format!(".mesh trust {destination}"),
+        None => ".mesh trust its new destination once heard".to_string(),
+    };
+    format!(
+        "{:<20} key changed: announced under identity {} {}; the grant stays with {}. If the peer rotated, verify out of band, then {trust}; otherwise .mesh block {}; .mesh untrust {old_destination} forgets the old key",
+        "",
+        short(&mark.change.seen_identity),
+        age_text(now, mark.change.at),
+        short(bound_identity),
+        mark.change.seen_identity,
+    )
+}
+
+fn render_knocks(records: &[KnockRecord], now: SystemTime) -> String {
+    if records.is_empty() {
+        return "No knocks. An untrusted node that wants in appears here.".to_string();
+    }
+    let mut lines = vec![format!(
+        "{:<20} {:<10} {:<10} {:<9} {}",
+        "name", "identity", "dest", "age", "intro"
+    )];
+    for knock in records {
+        let age = parse_rfc3339(&knock.received_at)
+            .map(|then| age_text(now, then))
+            .unwrap_or_else(|| "unknown".to_string());
+        lines.push(format!(
+            "{:<20} {:<10} {:<10} {:<9} {}",
+            name_label(knock.display_name.as_deref()),
+            short(&knock.identity_hash),
+            short(&knock.destination_hash),
+            age,
+            peer_line(knock.intro.as_deref(), INBOX_CONTENT_MAX_CHARS)
+                .unwrap_or_else(|| "(no intro)".to_string()),
+        ));
+    }
+    lines.push(format!(
+        "{} knock(s). Names and intros are peer-supplied text.",
+        records.len()
+    ));
+    lines.join("\n")
+}
+
+fn render_node_facts(
+    runtime: &MeshRuntime,
+    predecessors: Result<&[Predecessor], &anyhow::Error>,
+    now: SystemTime,
+) -> String {
+    let mut output = String::new();
+    let mut row = |name: &str, value: String| {
+        output.push_str(&format!("  {name:<MESH_INFO_LABEL_WIDTH$}{value}\n"))
+    };
+    row("node", "on".to_string());
+    row("identity", runtime.fingerprint().to_string());
+    row(
+        "identity predecessors",
+        predecessors_text(predecessors, now),
+    );
+    row("destination", runtime.current_destination_hash());
+    row("instance", runtime.current_instance_id());
+    row("joined", runtime.interfaces().join(", "));
+    let key_changes = runtime
+        .trust()
+        .records()
+        .iter()
+        .filter(|record| record.key_changed.is_some())
+        .count();
+    row(
+        "key changes",
+        match key_changes {
+            0 => "none".to_string(),
+            n => {
+                format!("{n} trusted instance(s) announced under another identity; see .mesh peers")
+            }
+        },
+    );
+    output.push_str(&render_propagation_nodes(
+        runtime.propagation_nodes().snapshot(),
+        now,
+    ));
+    output
+}
+
+fn predecessors_text(
+    predecessors: Result<&[Predecessor], &anyhow::Error>,
+    now: SystemTime,
+) -> String {
+    match predecessors {
+        Err(err) => format!("unreadable: {err:#}"),
+        Ok([]) => "none".to_string(),
+        Ok(all) => {
+            let latest = &all[all.len() - 1];
+            let when = parse_rfc3339(&latest.rotated_at)
+                .map(|then| age_text(now, then))
+                .or_else(|| display_text(&latest.rotated_at, DISPLAY_NAME_MAX_CHARS))
+                .unwrap_or_else(|| "-".to_string());
+            format!(
+                "{} (latest {} rotated {when})",
+                all.len(),
+                short(&latest.identity_hash)
+            )
+        }
+    }
+}
+
+/// Nearest first, the most recently heard breaking ties, so the row the node would
+/// pick for store-and-forward is the top one.
+fn render_propagation_nodes(mut nodes: Vec<PropagationNodeRecord>, now: SystemTime) -> String {
+    nodes.sort_by_key(|node| (node.hops, std::cmp::Reverse(node.last_seen)));
+    let mut output = String::new();
+    if nodes.is_empty() {
+        output.push_str(&format!(
+            "  {:<MESH_INFO_LABEL_WIDTH$}none heard yet\n",
+            "propagation_nodes"
+        ));
+    }
+    for (i, record) in nodes.iter().enumerate() {
+        let name = format!("propagation_nodes[{i}]");
+        output.push_str(&format!(
+            "  {name:<MESH_INFO_LABEL_WIDTH$}{} ({} hop(s), {})\n",
+            record.node.destination.address_hash.to_hex_string(),
+            record.hops,
+            age_text(now, record.last_seen),
+        ));
+    }
+    output
+        .push_str("  selection: nearest by hops (an operator-pinned node is not supported yet)\n");
+    output
+}
+
+/// What `.mesh info` found in the knock cache for a destination.
+enum KnockLookup {
+    Knocked(KnockRecord),
+    NotKnocked,
+    Unreadable,
+}
+
+/// Peer-supplied text as one printable line: line breaks and tabs flattened to spaces,
+/// then cleaned and capped like every other peer string. Blank text is `None`.
+fn peer_line(text: Option<&str>, max_chars: usize) -> Option<String> {
+    let flat: String = text?
+        .chars()
+        .map(|c| if c.is_whitespace() { ' ' } else { c })
+        .collect();
+    display_text(&flat, max_chars)
+}
+
+fn render_peer_detail(
+    destination: &str,
+    peer: Option<&PeerRecord>,
+    knock: &KnockLookup,
+    trust: Option<&str>,
+    now: SystemTime,
+) -> String {
+    let mut lines = vec![format!("destination: {destination}")];
+    if let Some(peer) = peer {
+        lines.push(format!("identity: {}", peer.identity_hash));
+        lines.push(format!(
+            "name: {}",
+            name_label(peer.display_name.as_deref())
+        ));
+        lines.push(format!("trust: {}", trust.unwrap_or("unknown")));
+        lines.push(format!("protocol: {}", peer.protocol_version));
+        if let Some(line) = peer.compatibility_line() {
+            lines.push(line);
+        }
+        lines.push(format!("hops: {}", peer.hops));
+        lines.push(format!(
+            "last seen: {}{}",
+            age_text(now, peer.last_seen),
+            if peer.is_stale(now) { " (stale)" } else { "" }
+        ));
+    }
+    match knock {
+        KnockLookup::Knocked(knock) => {
+            if peer.is_none() {
+                lines.push(format!("identity: {}", knock.identity_hash));
+                lines.push(format!(
+                    "name: {}",
+                    name_label(knock.display_name.as_deref())
+                ));
+                lines.push("trust: untrusted (known only from its knock)".to_string());
+            }
+            let age = parse_rfc3339(&knock.received_at)
+                .map(|then| age_text(now, then))
+                .unwrap_or_else(|| "unknown".to_string());
+            lines.push(format!(
+                "knocked: {age}, intro: {}",
+                peer_line(knock.intro.as_deref(), INBOX_CONTENT_MAX_CHARS)
+                    .unwrap_or_else(|| "(none)".to_string())
+            ));
+        }
+        KnockLookup::NotKnocked => lines.push("knocked: no".to_string()),
+        KnockLookup::Unreadable => {
+            lines.push("knocked: unknown (knock cache unreadable)".to_string())
+        }
+    }
+    lines.push("Names and intros are peer-supplied text.".to_string());
+    lines.join("\n")
+}
+
+/// One `.mesh inbox` line: a peer message with its sender's name and when it landed here.
+struct InboxRow {
+    name: String,
+    received: DateTime<Utc>,
+    message: PeerMessage,
+}
+
+/// The inbox drain is destructive, so each message's content is rendered in full: it
+/// was capped at `PEER_CONTENT_MAX_CHARS` on decode and is flattened to one line here.
+fn render_inbox(rows: &[InboxRow], awaiting_collect: &[String]) -> String {
+    let mut lines = Vec::new();
+    if rows.is_empty() {
+        lines.push("Inbox is empty.".to_string());
+    }
+    for row in rows {
+        let message = &row.message;
+        let title = peer_line(message.title.as_deref(), INBOX_CONTENT_MAX_CHARS)
+            .map(|title| format!("{title}: "))
+            .unwrap_or_default();
+        let content = peer_line(Some(&message.content), PEER_CONTENT_MAX_CHARS).unwrap_or_default();
+        let reply = message
+            .in_reply_to
+            .as_deref()
+            .map(|id| format!(" (reply to {})", short(id)))
+            .unwrap_or_default();
+        lines.push(format!(
+            "[{}] from {} ({}) via {} at {}: {title}{content}{reply}",
+            message.kind,
+            row.name,
+            short(&message.source_destination),
+            via_text(message.via),
+            row.received.format("%H:%M UTC"),
+        ));
+    }
+    if !awaiting_collect.is_empty() {
+        let ids: Vec<&str> = awaiting_collect.iter().map(|id| short(id)).collect();
+        lines.push(format!("answered awaiting collect: {}", ids.join(", ")));
+    }
+    lines.join("\n")
+}
+
+fn render_pending(asked: &[Correlation], escalated: &[InboundRecord]) -> String {
+    let mut lines = vec!["Questions this node asked (awaiting a reply):".to_string()];
+    if asked.is_empty() {
+        lines.push("  none".to_string());
+    }
+    for correlation in asked {
+        let record = &correlation.record;
+        let state = match record.state {
+            PendingState::Open => "open",
+            PendingState::Answered => "answered, awaiting collect",
+        };
+        lines.push(format!(
+            "  {}  {}  {state}  sent {}  timeout {}  {}",
+            record.id,
+            short(&record.peer_destination),
+            record.sent_at,
+            record.timeout_at,
+            peer_line(Some(&record.question), INBOX_CONTENT_MAX_CHARS).unwrap_or_default()
+        ));
+    }
+    lines.push("Questions peers asked (escalated to you):".to_string());
+    if escalated.is_empty() {
+        lines.push("  none".to_string());
+    }
+    for record in escalated {
+        lines.push(format!(
+            "  {}  {}  received {}  {}",
+            record.id,
+            short(&record.peer_destination),
+            record.received_at,
+            peer_line(Some(&record.question), INBOX_CONTENT_MAX_CHARS).unwrap_or_default()
+        ));
+        if let Some(question) = peer_line(Some(&record.envoy_question), INBOX_CONTENT_MAX_CHARS) {
+            lines.push(format!("    envoy asks: {question}"));
+        }
+    }
+    lines.push("answer one with `.mesh answer <id> <text>`".to_string());
+    lines.join("\n")
+}
+
+fn render_broadcast(outcome: &BroadcastOutcome) -> String {
+    if outcome.recipients.is_empty() {
+        return "No trusted peer has a known path right now; nothing was sent. `.mesh peers` lists what this node has heard from.".to_string();
+    }
+    let (mut delivered, mut stored, mut unreachable, mut refused) = (0, 0, 0, 0);
+    let mut lines = Vec::with_capacity(outcome.recipients.len() + 1);
+    for recipient in &outcome.recipients {
+        let status = match &recipient.outcome {
+            RecipientOutcome::Delivered => {
+                delivered += 1;
+                "delivered".to_string()
+            }
+            RecipientOutcome::StoreAndForward => {
+                stored += 1;
+                "store-and-forward".to_string()
+            }
+            RecipientOutcome::Unreachable { reason } => {
+                unreachable += 1;
+                format!("unreachable: {reason}")
+            }
+            RecipientOutcome::Refused { reason } => {
+                refused += 1;
+                format!("refused: {reason}")
+            }
+        };
+        lines.push(format!(
+            "  {} ({}): {status}",
+            name_label(recipient.display_name.as_deref()),
+            short(&recipient.destination)
+        ));
+    }
+    lines.push(format!(
+        "Bulletin {}: {delivered} delivered, {stored} store-and-forward, {unreachable} unreachable, {refused} refused.",
+        short(&outcome.id)
+    ));
+    lines.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mesh::message::{RawPeerMessage, RecipientReport};
+    use crate::mesh::pending::{INBOUND_RECORD_VERSION, PENDING_RECORD_VERSION, PendingRecord};
+    use crate::mesh::test_support::{Compatibility, PropagationNode, private_config};
+    use rand_core::OsRng;
+    use rns_transport::destination::{DestinationName, SingleOutputDestination};
+    use rns_transport::identity::PrivateIdentity as TransportIdentity;
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    fn peer(name: Option<&str>, seen_secs_ago: u64, now: SystemTime) -> PeerRecord {
+        PeerRecord {
+            destination_hash: "ab".repeat(16),
+            identity_hash: "cd".repeat(16),
+            name_hash: String::new(),
+            display_name: name.map(str::to_string),
+            protocol_version: 1,
+            compatibility: Compatibility::Compatible,
+            hops: 2,
+            first_seen: now - Duration::from_secs(3600),
+            last_seen: now - Duration::from_secs(seen_secs_ago),
+        }
+    }
+
+    fn knock(name: Option<&str>, intro: Option<&str>, received_at: &str) -> KnockRecord {
+        KnockRecord {
+            version: 1,
+            received_at: received_at.to_string(),
+            identity_hash: "ef".repeat(16),
+            destination_hash: "12".repeat(16),
+            name_hash: String::new(),
+            display_name: name.map(str::to_string),
+            intro: intro.map(str::to_string),
+            hops: 1,
+        }
+    }
+
+    fn public_config() -> MeshConfig {
+        MeshConfig {
+            interfaces: vec![
+                MeshInterface::Lan,
+                MeshInterface::Public {
+                    host: "relay.example.com".into(),
+                    port: 4242,
+                },
+            ],
+            ..MeshConfig::default()
+        }
+    }
+
+    #[test]
+    fn flag_given_confirms_without_prompting() {
+        for tty in [true, false] {
+            let ok = confirm_or_flag_with("Go?", "--yes", true, tty, |_| {
+                panic!("the prompt must not run")
+            })
+            .unwrap();
+            assert!(ok);
+        }
+    }
+
+    #[test]
+    fn no_terminal_and_no_flag_is_an_error_naming_the_flag() {
+        let err = confirm_or_flag_with("Go?", "--yes", false, false, |_| Some(true))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--yes"), "{err}");
+        assert!(err.contains("not a terminal"), "{err}");
+        assert!(err.starts_with("Go?"), "{err}");
+    }
+
+    #[test]
+    fn a_terminal_answer_is_taken_as_given() {
+        assert!(confirm_or_flag_with("Go?", "--yes", false, true, |_| Some(true)).unwrap());
+        assert!(!confirm_or_flag_with("Go?", "--yes", false, true, |_| Some(false)).unwrap());
+    }
+
+    #[test]
+    fn an_interrupted_prompt_counts_as_no() {
+        assert!(!confirm_or_flag_with("Go?", "--yes", false, true, |_| None).unwrap());
+    }
+
+    #[test]
+    fn colour_needs_a_terminal_and_no_opt_out() {
+        assert!(colour_allowed(true, false));
+        assert!(!colour_allowed(true, true));
+        assert!(!colour_allowed(false, false));
+        assert!(!colour_allowed(false, true));
+    }
+
+    #[test]
+    fn no_color_opt_out_is_the_shared_utils_parse() {
+        // Mesh has no NO_COLOR parser of its own: the stderr decision is the shared
+        // `utils::no_color_env_set` combined with the tty check, nothing else.
+        assert_eq!(
+            err_text_coloured(),
+            std::io::stderr().is_terminal() && !crate::utils::no_color_env_set()
+        );
+        // The shared parse is `parse_bool`: NO_COLOR=0 keeps colour, unlike "any non-empty".
+        assert_eq!(crate::utils::parse_bool("0"), Some(false));
+        assert_eq!(crate::utils::parse_bool("1"), Some(true));
+        assert_eq!(crate::utils::parse_bool(""), None);
+    }
+
+    #[test]
+    fn help_lists_every_verb_with_an_example() {
+        let help = render_help();
+        for (verb, description, example) in VERBS {
+            assert!(help.contains(&format!(".mesh {verb}")), "{help}");
+            assert!(help.contains(description), "{help}");
+            assert!(help.contains(example), "{help}");
+        }
+        assert!(help.contains("config.yaml"), "{help}");
+    }
+
+    #[test]
+    fn verb_help_shows_the_example_and_falls_back_to_the_full_list() {
+        let status = render_verb_help("status");
+        assert!(status.starts_with("Usage: .mesh status"), "{status}");
+        assert_eq!(render_verb_help("nope"), render_help());
+    }
+
+    #[test]
+    fn deny_and_undeny_help_contrast_with_block() {
+        for verb in ["trust", "untrust", "block", "unblock", "deny", "undeny"] {
+            assert!(VERBS.iter().any(|(name, _, _)| *name == verb), "{verb}");
+        }
+        assert!(render_verb_help("deny").contains("block"));
+        assert!(render_verb_help("undeny").contains("block"));
+        assert!(!render_verb_help("block").contains("deny"));
+    }
+
+    #[test]
+    fn split_tokens_keeps_a_quoted_run_as_one_token() {
+        assert_eq!(
+            split_tokens("--label \"two words\" abc"),
+            vec!["--label", "two words", "abc"]
+        );
+        assert_eq!(
+            split_tokens("abc \"runs to the end"),
+            vec!["abc", "runs to the end"]
+        );
+        assert_eq!(split_tokens("--label \"\" abc"), vec!["--label", "", "abc"]);
+        assert!(split_tokens("   ").is_empty());
+    }
+
+    const TRUST_FLAGS: &[&str] = &[
+        "--yes",
+        "--label",
+        "--identity",
+        "--prune",
+        "--older-than",
+        "--dry-run",
+        "--confirm",
+    ];
+
+    #[test]
+    fn parse_mutation_args_reads_flags_anywhere_and_refuses_the_rest() {
+        let hash = "ab".repeat(16);
+        let args = parse_mutation_args(&format!("{hash} --yes"), "trust", TRUST_FLAGS).unwrap();
+        assert!(args.yes);
+        assert_eq!(args.positional, vec![hash.clone()]);
+
+        let err = parse_mutation_args(&format!("{hash} --bogus"), "trust", TRUST_FLAGS)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Unexpected '--bogus'"), "{err}");
+        assert!(err.contains(&render_verb_help("trust")), "{err}");
+
+        let err = parse_mutation_args(&format!("{hash} --label"), "trust", TRUST_FLAGS)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("'--label' needs a value"), "{err}");
+        let err = parse_mutation_args("--label --yes", "trust", TRUST_FLAGS)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("'--label' needs a value"), "{err}");
+
+        let err = parse_mutation_args(&format!("{hash} {hash}"), "trust", TRUST_FLAGS)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(&format!("Unexpected '{hash}'")), "{err}");
+    }
+
+    #[test]
+    fn older_than_accepts_days_hours_minutes_only() {
+        for (text, secs) in [("30d", 30 * 86_400), ("12h", 12 * 3_600), ("90m", 90 * 60)] {
+            let duration = parse_older_than(text).unwrap();
+            assert_eq!(duration, Duration::from_secs(secs), "{text}");
+            assert_eq!(older_than_text(duration), text);
+        }
+        for text in ["abc", "0d", "5w", ""] {
+            let err = parse_older_than(text).unwrap_err().to_string();
+            assert!(err.contains("30d, 12h or 90m"), "{text:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn prune_token_names_the_count_or_is_refused() {
+        assert_eq!(prune_token_count("prune-3").unwrap(), 3);
+        for token in ["prune-x", "3", "untrust-3"] {
+            let err = prune_token_count(token).unwrap_err().to_string();
+            assert!(err.contains("prune-<N>"), "{token}: {err}");
+        }
+    }
+
+    #[test]
+    fn trust_argument_shapes_are_classified() {
+        let hash = "ab".repeat(16);
+        let trust_arg =
+            |rest: &str| parse_mutation_args(rest, "trust", TRUST_FLAGS).and_then(classify_trust);
+        let untrust_arg = |rest: &str| {
+            parse_mutation_args(
+                rest,
+                "untrust",
+                &["--yes", "--identity", "--dry-run", "--confirm"],
+            )
+            .and_then(classify_untrust)
+        };
+
+        let err = trust_arg("--prune --yes").unwrap_err().to_string();
+        assert!(err.contains("--confirm prune-<N>"), "{err}");
+        let err = trust_arg(&format!("--prune {hash}"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(&format!("Unexpected '{hash}'")), "{err}");
+        let err = trust_arg(&format!("{hash} --dry-run"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Unexpected '--dry-run'"), "{err}");
+        match trust_arg(&format!("--identity {hash} --label x --yes")).unwrap() {
+            Some(TrustArg::Identity { target, label, yes }) => {
+                assert_eq!(target, hash);
+                assert_eq!(label.as_deref(), Some("x"));
+                assert!(yes);
+            }
+            _ => panic!("--identity is the identity shape"),
+        }
+        assert!(matches!(
+            trust_arg("--prune --older-than 12h --confirm prune-2").unwrap(),
+            Some(TrustArg::Prune {
+                older_than: Some(older_than),
+                confirm: Some(confirm),
+            }) if older_than == Duration::from_secs(12 * 3_600) && confirm == "prune-2"
+        ));
+        assert!(trust_arg("--yes").unwrap().is_none());
+
+        let err = untrust_arg(&format!("--identity {hash} --yes"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--confirm untrust-"), "{err}");
+        let err = untrust_arg(&format!("{hash} --confirm x"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Unexpected '--confirm'"), "{err}");
+        assert!(matches!(
+            untrust_arg(&format!("{hash} --yes")).unwrap(),
+            Some(UntrustArg::Destination { target, yes: true }) if target == hash
+        ));
+    }
+
+    #[test]
+    fn split_verb_separates_the_verb_from_the_rest() {
+        assert_eq!(split_verb(None), None);
+        assert_eq!(split_verb(Some("   ")), None);
+        assert_eq!(split_verb(Some("on")), Some(("on", None)));
+        assert_eq!(
+            split_verb(Some("status  \"ship it\" ")),
+            Some(("status", Some("\"ship it\"")))
+        );
+    }
+
+    #[test]
+    fn parse_args_accepts_known_flags_and_refuses_the_rest() {
+        let args = parse_args(Some("--yes --fresh"), &["--yes", "--fresh"], "on").unwrap();
+        assert!(args.has("--yes"));
+        assert!(args.has("--fresh"));
+        let none = parse_args(None, &["--yes"], "off").unwrap();
+        assert!(!none.has("--yes"));
+        let err = parse_args(Some("--force"), &["--yes"], "off")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--force"), "{err}");
+        assert!(err.contains("Usage: .mesh off"), "{err}");
+    }
+
+    #[test]
+    fn status_argument_is_classified_by_shape() {
+        assert!(matches!(classify_status(None), StatusArg::Own));
+        assert!(matches!(classify_status(Some("clear")), StatusArg::Clear));
+        assert!(matches!(classify_status(Some("\"\"")), StatusArg::Clear));
+        assert!(matches!(
+            classify_status(Some("\"ship it\"")),
+            StatusArg::Set("ship it")
+        ));
+        let hex = "AB".repeat(16);
+        match classify_status(Some(&hex)) {
+            StatusArg::Fetch(destination) => assert_eq!(destination, "ab".repeat(16)),
+            _ => panic!("a 32-hex argument fetches"),
+        }
+        assert!(matches!(classify_status(Some("ship it")), StatusArg::Help));
+        assert!(matches!(classify_status(Some("abc")), StatusArg::Help));
+    }
+
+    #[test]
+    fn brief_argument_is_classified_by_shape() {
+        assert!(matches!(classify_brief(None), BriefArg::Show));
+        assert!(matches!(
+            classify_brief(Some("auto")),
+            BriefArg::Mode(MeshBrief::Auto)
+        ));
+        assert!(matches!(
+            classify_brief(Some("manual")),
+            BriefArg::Mode(MeshBrief::Manual)
+        ));
+        assert!(matches!(
+            classify_brief(Some("off")),
+            BriefArg::Mode(MeshBrief::Off)
+        ));
+        assert!(matches!(classify_brief(Some("clear")), BriefArg::Clear));
+        assert!(matches!(
+            classify_brief(Some("set \"we ship on Friday\"")),
+            BriefArg::Set("we ship on Friday")
+        ));
+        assert!(matches!(
+            classify_brief(Some("set plain words")),
+            BriefArg::Set("plain words")
+        ));
+        assert!(matches!(classify_brief(Some("set")), BriefArg::Help));
+        assert!(matches!(classify_brief(Some("set \"\"")), BriefArg::Help));
+        assert!(matches!(classify_brief(Some("settle")), BriefArg::Help));
+        assert!(matches!(classify_brief(Some("loud")), BriefArg::Help));
+    }
+
+    #[test]
+    fn public_and_private_confirmations_are_worded_apart() {
+        let public = on_question(&public_config());
+        let private = on_question(&MeshConfig::default());
+        assert!(public.contains("WORLD-VISIBLE"), "{public}");
+        assert!(public.contains("relay.example.com:4242"), "{public}");
+        assert!(!private.contains("WORLD-VISIBLE"), "{private}");
+        assert_ne!(public, private);
+    }
+
+    #[test]
+    fn on_preview_names_what_leaves_to_whom_and_the_off_command() {
+        let config = MeshConfig {
+            display_name: Some("Ann".into()),
+            ..public_config()
+        };
+        let text = render_on_preview(&config, "work", false);
+        assert!(text.contains("session 'work'"), "{text}");
+        assert!(text.contains("config.yaml is not changed"), "{text}");
+        assert!(text.contains("announce:"), "{text}");
+        assert!(
+            text.contains(
+                "\n  propagation sync: this node identifies itself to the nearest propagation node heard, at join and every 300 s; .mesh fetch runs one now\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "display name: 'Ann' on lan and private interfaces; withheld on public ones"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("lan: every node on this LAN"), "{text}");
+        assert!(text.contains("world-visible"), "{text}");
+        assert!(text.contains("anyone on the internet"), "{text}");
+        assert!(
+            text.ends_with("Turn it off again with `.mesh off`."),
+            "{text}"
+        );
+        assert!(!text.contains("fresh id:"), "{text}");
+
+        let quiet = MeshConfig {
+            announce: false,
+            ..MeshConfig::default()
+        };
+        let text = render_on_preview(&quiet, "work", true);
+        assert!(text.contains("announce: nothing until"), "{text}");
+        assert!(
+            text.contains("\n  propagation sync: off (announce: false); .mesh fetch runs one\n"),
+            "{text}"
+        );
+        assert!(text.contains("display name: none"), "{text}");
+        assert!(
+            text.contains("fresh id: this session gets a new mesh id and destination"),
+            "{text}"
+        );
+
+        let manual = MeshConfig {
+            propagation_sync_interval_secs: 0,
+            ..MeshConfig::default()
+        };
+        let text = render_on_preview(&manual, "work", false);
+        assert!(
+            text.contains(
+                "\n  propagation sync: off (propagation_sync_interval_secs: 0); .mesh fetch runs one\n"
+            ),
+            "{text}"
+        );
+        let quiet_and_manual = MeshConfig {
+            announce: false,
+            ..manual
+        };
+        let text = render_on_preview(&quiet_and_manual, "work", false);
+        assert!(
+            text.contains("propagation sync: off (announce: false)"),
+            "announce: false is the reason given when both are off: {text}"
+        );
+    }
+
+    #[test]
+    fn reach_line_follows_the_configured_interfaces() {
+        let lan_only = reach_line(&MeshConfig::default());
+        assert_eq!(lan_only, "this link-local segment only");
+
+        let private = reach_line(&private_config(4242));
+        assert_eq!(private, "the configured relay and the peers it reaches");
+
+        let public = reach_line(&public_config());
+        assert!(
+            public.starts_with("world-visible via a community node"),
+            "{public}"
+        );
+        assert!(!public.contains("configured relay"), "{public}");
+
+        let mut both = public_config();
+        both.interfaces.push(MeshInterface::Private {
+            host: "relay.internal".into(),
+            port: 4242,
+        });
+        let both = reach_line(&both);
+        assert!(
+            both.contains("world-visible via a community node"),
+            "{both}"
+        );
+        assert!(
+            both.contains("the configured relay and the peers it reaches"),
+            "{both}"
+        );
+    }
+
+    #[test]
+    fn cwd_warning_fires_for_home_and_roots_only() {
+        let home = PathBuf::from("/Users/ann");
+        assert!(cwd_warning(&home, Some(&home)).is_some());
+        assert!(cwd_warning(Path::new("/"), Some(&home)).is_some());
+        assert!(cwd_warning(&home.join("code").join("app"), Some(&home)).is_none());
+        assert!(cwd_warning(Path::new("/srv/app"), None).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cwd_warning_sees_through_a_symlinked_home() {
+        let tmp = crate::mesh::test_support::TempDir::new("cwd-symlink-home");
+        let home = tmp.path.join("home");
+        let link = tmp.path.join("home-link");
+        std::fs::create_dir_all(&home).unwrap();
+        std::os::unix::fs::symlink(&home, &link).unwrap();
+        assert!(cwd_warning(&link, Some(&home)).is_some());
+        assert!(cwd_warning(&home, Some(&link)).is_some());
+        let project = home.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        assert!(cwd_warning(&project, Some(&link)).is_none());
+    }
+
+    #[test]
+    fn peer_listing_marks_stale_incompatible_and_denied_peers() {
+        let now = SystemTime::now();
+        assert!(render_peers(&[], now).starts_with("No peers heard yet"));
+        let mut old = peer(Some("Old"), 3600, now);
+        old.compatibility = Compatibility::Incompatible { found: 9 };
+        let rows = vec![
+            PeerRow::Heard(peer(Some("Ann"), 5, now), "trusted", None),
+            PeerRow::Heard(old, "denied", None),
+            PeerRow::Heard(peer(None, 30, now), "untrusted", None),
+        ];
+        let text = render_peers(&rows, now);
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[0].starts_with("name"), "{text}");
+        assert!(
+            lines[1].contains("Ann") && lines[1].contains("trusted"),
+            "{text}"
+        );
+        assert!(
+            lines[1].contains("5s ago") && !lines[1].contains("stale"),
+            "{text}"
+        );
+        assert!(
+            lines[2].contains("denied") && lines[2].contains("(stale)"),
+            "{text}"
+        );
+        assert!(lines[2].contains("1h ago"), "{text}");
+        assert!(
+            lines[3].contains("incompatible: speaks protocol 9"),
+            "{text}"
+        );
+        assert!(lines[4].contains("(no name)"), "{text}");
+        assert!(
+            text.ends_with(
+                "3 peer(s). Names are peer-supplied text. Full hashes: `.mesh info <dest>`."
+            ),
+            "{text}"
+        );
+    }
+
+    fn deny_record(hash: &str, identity: Option<&str>) -> TrustRecord {
+        let now = SystemTime::now();
+        TrustRecord {
+            tier: Tier::Destination,
+            hash: hash.to_string(),
+            identity: identity.map(str::to_string),
+            label: None,
+            note: None,
+            added_at: now,
+            last_seen_at: now,
+            all_destinations: false,
+            denied: true,
+            session: false,
+            key_changed: None,
+        }
+    }
+
+    #[test]
+    fn deny_only_destinations_are_appended_as_denied_rows() {
+        let now = SystemTime::now();
+        let heard = peer(Some("Ann"), 5, now);
+        let unseen = "77".repeat(16);
+        let bound = "88".repeat(16);
+        let records = vec![
+            deny_record(&unseen, None),
+            deny_record(&heard.destination_hash, None),
+            deny_record(&bound, Some(&"99".repeat(16))),
+        ];
+        let heard_hashes = vec![heard.destination_hash.clone()];
+        let mut rows = vec![PeerRow::Heard(heard.clone(), "trusted", None)];
+        rows.extend(unheard_rows(records, &heard_hashes, &[], |_| "trusted"));
+        assert_eq!(
+            rows.len(),
+            3,
+            "the heard destination's deny is not a second row"
+        );
+        let text = render_peers(&rows, now);
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[2].starts_with('-'), "{text}");
+        assert!(lines[2].contains(&"77".repeat(4)), "{text}");
+        assert!(lines[2].contains("denied"), "{text}");
+        assert!(lines[2].contains("never"), "{text}");
+        assert!(!lines[2].contains("trusted"), "{text}");
+        assert!(lines[3].contains(&"88".repeat(4)), "{text}");
+        assert!(
+            lines[3].contains(&"99".repeat(4)),
+            "a deny bound to an identity shows it: {text}"
+        );
+        assert!(
+            text.ends_with(
+                "3 peer(s). Names are peer-supplied text. Full hashes: `.mesh info <dest>`."
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn peers_marks_a_record_whose_instance_was_announced_under_another_identity() {
+        let now = SystemTime::now();
+        let seen_identity = "77".repeat(16);
+        let new_destination = "88".repeat(16);
+        let rows = vec![
+            PeerRow::Heard(
+                peer(Some("Ann"), 5, now),
+                "trusted",
+                Some(KeyChangeMark {
+                    change: KeyChange {
+                        seen_identity: seen_identity.clone(),
+                        at: now - Duration::from_secs(120),
+                    },
+                    new_destination: Some(new_destination.clone()),
+                }),
+            ),
+            PeerRow::Heard(
+                peer(Some("Bob"), 5, now),
+                "trusted",
+                Some(KeyChangeMark {
+                    change: KeyChange {
+                        seen_identity: seen_identity.clone(),
+                        at: now,
+                    },
+                    new_destination: None,
+                }),
+            ),
+            PeerRow::Heard(peer(Some("Cy"), 5, now), "trusted", None),
+        ];
+        let text = render_peers(&rows, now);
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[1].contains("Ann"), "{text}");
+        assert!(lines[2].starts_with(&" ".repeat(20)), "{text}");
+        assert!(
+            lines[2].contains(&format!(
+                "key changed: announced under identity {} 2m ago",
+                short(&seen_identity)
+            )),
+            "{text}"
+        );
+        assert!(
+            lines[2].contains(&format!("the grant stays with {}", "cd".repeat(4))),
+            "{text}"
+        );
+        assert!(
+            lines[2].contains(&format!("then .mesh trust {new_destination}; ")),
+            "{text}"
+        );
+        assert!(
+            lines[2].contains(&format!("; otherwise .mesh block {seen_identity}; ")),
+            "the block exit names the full seen identity: {text}"
+        );
+        assert!(
+            lines[2].ends_with(&format!(
+                ".mesh untrust {} forgets the old key",
+                "ab".repeat(16)
+            )),
+            "{text}"
+        );
+        assert!(lines[3].contains("Bob"), "{text}");
+        assert!(
+            lines[4].contains(&format!(
+                "then .mesh trust its new destination once heard; otherwise .mesh block {seen_identity}; .mesh untrust "
+            )),
+            "a mark without a heard new destination still says what to do: {text}"
+        );
+        assert!(lines[5].contains("Cy"), "{text}");
+        assert!(
+            lines[6].starts_with("3 peer(s)."),
+            "an unmarked row has no marker line: {text}"
+        );
+    }
+
+    #[test]
+    fn peers_lists_a_marked_record_after_its_row_aged_out() {
+        let now = SystemTime::now();
+        let old_destination = "77".repeat(16);
+        let bound_identity = "88".repeat(16);
+        let seen_identity = "99".repeat(16);
+        let mut successor = peer(Some("Tia again"), 5, now);
+        successor.identity_hash = seen_identity.clone();
+        let mut record = deny_record(&old_destination, Some(&bound_identity));
+        record.denied = false;
+        record.label = Some("Tia".to_string());
+        record.last_seen_at = now - Duration::from_secs(7200);
+        record.key_changed = Some(KeyChange {
+            seen_identity: seen_identity.clone(),
+            at: now - Duration::from_secs(3600),
+        });
+        let mut unlabeled = record.clone();
+        unlabeled.hash = "66".repeat(16);
+        unlabeled.label = None;
+        let mut unmarked = deny_record(&"55".repeat(16), None);
+        unmarked.denied = false;
+        let heard = vec![successor.destination_hash.clone()];
+        let successors = vec![(old_destination.clone(), &successor)];
+
+        let mut rows = vec![PeerRow::Heard(successor.clone(), "untrusted", None)];
+        rows.extend(unheard_rows(
+            vec![record.clone(), unlabeled, unmarked],
+            &heard,
+            &successors,
+            |_| "trusted",
+        ));
+        assert_eq!(rows.len(), 3, "a record without a mark is not a row");
+
+        let text = render_peers(&rows, now);
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[2].starts_with("Tia "), "{text}");
+        assert!(lines[2].contains(&"77".repeat(4)), "{text}");
+        assert!(lines[2].contains(&"88".repeat(4)), "{text}");
+        assert!(lines[2].contains("trusted"), "{text}");
+        assert!(
+            lines[2].contains("   -  2h ago"),
+            "no hops for a row nobody heard: {text}"
+        );
+        assert!(lines[3].starts_with(&" ".repeat(20)), "{text}");
+        assert!(
+            lines[3].contains(&format!(
+                "key changed: announced under identity {} 1h ago; the grant stays with {}",
+                short(&seen_identity),
+                short(&bound_identity)
+            )),
+            "{text}"
+        );
+        assert!(
+            lines[3].contains(&format!(
+                "then .mesh trust {}; otherwise .mesh block {seen_identity}; .mesh untrust {old_destination} forgets the old key",
+                successor.destination_hash
+            )),
+            "the exits name the heard successor, the full seen identity and the full old hash: {text}"
+        );
+        assert!(lines[4].starts_with("(not heard) "), "{text}");
+        assert!(
+            lines[5].contains(&format!(
+                "then .mesh trust its new destination once heard; otherwise .mesh block {seen_identity}; .mesh untrust "
+            )),
+            "a mark whose successor is not heard still says what to do: {text}"
+        );
+        assert!(lines[6].starts_with("3 peer(s)."), "{text}");
+
+        let heard_again = vec![old_destination.clone()];
+        assert!(
+            unheard_rows(vec![record], &heard_again, &successors, |_| "trusted").is_empty(),
+            "a heard destination carries its mark on its own row"
+        );
+    }
+
+    #[test]
+    fn an_aged_out_marked_record_of_a_blocked_identity_is_labelled_blocked() {
+        let tmp = crate::mesh::test_support::TempDir::new("repl-peers-marked-blocked");
+        let now = SystemTime::now();
+        let old_destination = "77".repeat(16);
+        let bound_identity = "88".repeat(16);
+        crate::mesh::test_support::TrustList::default()
+            .destination(&old_destination, &bound_identity)
+            .block(&bound_identity)
+            .write(&tmp.path);
+        let trust = TrustStore::open(&tmp.path).unwrap();
+        let mut records = trust.records();
+        let record = records
+            .iter_mut()
+            .find(|record| record.hash == old_destination)
+            .unwrap();
+        record.key_changed = Some(KeyChange {
+            seen_identity: "99".repeat(16),
+            at: now - Duration::from_secs(3600),
+        });
+
+        let rows = unheard_rows(records, &[], &[], |record| unheard_label(&trust, record));
+        assert_eq!(rows.len(), 1);
+
+        let text = render_peers(&rows, now);
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[1].contains(&"77".repeat(4)), "{text}");
+        assert!(lines[1].contains(" blocked "), "{text}");
+        assert!(
+            !lines[1].contains("trusted"),
+            "the row is labelled by the store's verdict, not by the record's existence: {text}"
+        );
+        assert!(lines[2].contains("key changed"), "{text}");
+    }
+
+    #[test]
+    fn a_marked_records_label_is_sanitised_like_any_peer_name() {
+        let now = SystemTime::now();
+        let label = "Tia\u{1b}[31m\nX";
+        let mut record = deny_record(&"77".repeat(16), Some(&"88".repeat(16)));
+        record.denied = false;
+        record.label = Some(label.to_string());
+        record.key_changed = Some(KeyChange {
+            seen_identity: "99".repeat(16),
+            at: now - Duration::from_secs(60),
+        });
+
+        let rows = unheard_rows(vec![record], &[], &[], |_| "trusted");
+        let text = render_peers(&rows, now);
+
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 4, "{text:?}");
+        let shown = display_text(label, DISPLAY_NAME_MAX_CHARS).unwrap();
+        assert!(lines[1].starts_with(&format!("{shown:<20} ")), "{text:?}");
+        assert!(!text.contains('\u{1b}'), "{text:?}");
+        assert!(!text.contains("[31m"), "{text:?}");
+    }
+
+    #[test]
+    fn predecessors_text_sanitises_an_unparsable_rotated_at() {
+        let now = SystemTime::now();
+        let raw = "yesterday\u{1b}[31m\nish";
+        let all = [Predecessor {
+            version: identity::PREDECESSOR_RECORD_VERSION,
+            identity_hash: "ab".repeat(16),
+            rotated_at: raw.to_string(),
+            reason: "rotate".to_string(),
+        }];
+
+        let text = predecessors_text(Ok(&all), now);
+
+        let shown = display_text(raw, DISPLAY_NAME_MAX_CHARS).unwrap();
+        assert_eq!(
+            text,
+            format!(
+                "1 (latest {} rotated {shown})",
+                short(&all[0].identity_hash)
+            )
+        );
+        assert!(!text.contains('\u{1b}'), "{text:?}");
+        assert!(!text.contains('\n'), "{text:?}");
+    }
+
+    #[test]
+    fn peers_lists_a_denied_and_marked_unheard_record_once_as_denied() {
+        let now = SystemTime::now();
+        let old_destination = "77".repeat(16);
+        let seen_identity = "99".repeat(16);
+        let mut record = deny_record(&old_destination, Some(&"88".repeat(16)));
+        record.key_changed = Some(KeyChange {
+            seen_identity: seen_identity.clone(),
+            at: now - Duration::from_secs(120),
+        });
+
+        let rows = unheard_rows(vec![record], &[], &[], |_| "trusted");
+        assert_eq!(
+            rows.len(),
+            1,
+            "a denied record with a mark is one row, not two"
+        );
+
+        let text = render_peers(&rows, now);
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[1].starts_with('-'), "{text}");
+        assert!(lines[1].contains("denied"), "{text}");
+        assert!(!lines[1].contains("trusted"), "{text}");
+        assert!(lines[2].starts_with(&" ".repeat(20)), "{text}");
+        assert!(
+            lines[2].contains(&format!(
+                "key changed: announced under identity {} 2m ago; the grant stays with {}",
+                short(&seen_identity),
+                "88".repeat(4)
+            )),
+            "the deny row still shows the mark: {text}"
+        );
+        assert!(
+            lines[2].ends_with(&format!(
+                "otherwise .mesh block {seen_identity}; .mesh untrust {old_destination} forgets the old key"
+            )),
+            "{text}"
+        );
+        assert!(lines[3].starts_with("1 peer(s)."), "{text}");
+    }
+
+    #[test]
+    fn knock_listing_shows_label_identity_age_and_intro() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_120);
+        assert!(render_knocks(&[], now).starts_with("No knocks"));
+        let records = vec![
+            knock(Some("Bea"), Some("hello there"), "2026-09-21T14:13:20Z"),
+            knock(None, None, "not a time"),
+        ];
+        let text = render_knocks(&records, now);
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[1].contains("Bea"), "{text}");
+        assert!(lines[1].contains(&"ef".repeat(4)), "{text}");
+        assert!(lines[1].contains("2m ago"), "{text}");
+        assert!(lines[1].ends_with("hello there"), "{text}");
+        assert!(lines[2].contains("(no name)"), "{text}");
+        assert!(lines[2].contains("unknown"), "{text}");
+        assert!(lines[2].ends_with("(no intro)"), "{text}");
+        assert!(
+            text.ends_with("2 knock(s). Names and intros are peer-supplied text."),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn peer_detail_covers_a_peer_a_knocker_and_both() {
+        let now = SystemTime::now();
+        let destination = "ab".repeat(16);
+        let known = peer(Some("Ann"), 5, now);
+        let text = render_peer_detail(
+            &destination,
+            Some(&known),
+            &KnockLookup::NotKnocked,
+            Some("trusted"),
+            now,
+        );
+        assert!(
+            text.starts_with(&format!("destination: {destination}\n")),
+            "{text}"
+        );
+        assert!(text.contains("trust: trusted"), "{text}");
+        assert!(text.contains("knocked: no"), "{text}");
+
+        let text = render_peer_detail(
+            &destination,
+            Some(&known),
+            &KnockLookup::Unreadable,
+            Some("trusted"),
+            now,
+        );
+        assert!(
+            text.contains("knocked: unknown (knock cache unreadable)"),
+            "{text}"
+        );
+
+        let knocker = knock(
+            Some("Bea"),
+            Some("hi\nthere\u{1b}[31m"),
+            "2026-09-21T14:13:20Z",
+        );
+        let text = render_peer_detail(
+            &destination,
+            None,
+            &KnockLookup::Knocked(knocker),
+            None,
+            now,
+        );
+        assert!(
+            text.contains("trust: untrusted (known only from its knock)"),
+            "{text}"
+        );
+        assert!(text.contains("name: Bea"), "{text}");
+        assert!(text.contains("intro: hi there"), "{text}");
+        assert!(!text.contains('\u{1b}'), "{text}");
+
+        let knocker = knock(Some("Bea"), Some("hi"), "2026-09-21T14:13:20Z");
+        let text = render_peer_detail(
+            &destination,
+            Some(&known),
+            &KnockLookup::Knocked(knocker),
+            Some("untrusted"),
+            now,
+        );
+        assert_eq!(text.matches("identity:").count(), 1, "{text}");
+        assert!(text.contains("name: Ann"), "{text}");
+        assert!(
+            text.contains("knocked:") && text.contains("intro: hi"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn propagation_nodes_render_nearest_first_or_say_none() {
+        let now = SystemTime::now();
+        let none = render_propagation_nodes(Vec::new(), now);
+        assert!(none.contains("none heard yet"), "{none}");
+        assert!(
+            none.contains("selection: nearest by hops"),
+            "the selection rule is stated even before a node is heard: {none}"
+        );
+
+        let record = |hops: u8, aspect: &str| PropagationNodeRecord {
+            node: PropagationNode {
+                destination: SingleOutputDestination::new(
+                    *TransportIdentity::new_from_rand(OsRng).as_identity(),
+                    DestinationName::new("lxmf", aspect),
+                )
+                .desc,
+                stamp_cost: 8,
+                per_transfer_limit_kb: 256,
+                propagation_enabled: true,
+            },
+            hops,
+            last_seen: now - Duration::from_secs(60),
+        };
+        let far = record(3, "far");
+        let near = record(1, "near");
+        let far_hex = far.node.destination.address_hash.to_hex_string();
+        let near_hex = near.node.destination.address_hash.to_hex_string();
+        let text = render_propagation_nodes(vec![far, near], now);
+        let first = text.lines().next().unwrap();
+        assert!(
+            first.starts_with("  propagation_nodes[0]") && first.contains(&near_hex),
+            "the renderer itself puts the 1-hop node first: {text}"
+        );
+        assert!(first.contains("(1 hop(s), 1m ago)"), "{text}");
+        assert!(text.lines().nth(1).unwrap().contains(&far_hex), "{text}");
+        assert!(
+            text.contains(
+                "selection: nearest by hops (an operator-pinned node is not supported yet)"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn ages_scale_with_distance() {
+        let now = SystemTime::now();
+        assert_eq!(age_text(now, now - Duration::from_secs(59)), "59s ago");
+        assert_eq!(age_text(now, now - Duration::from_secs(60)), "1m ago");
+        assert_eq!(age_text(now, now - Duration::from_secs(7200)), "2h ago");
+        assert_eq!(age_text(now, now - Duration::from_secs(200_000)), "2d ago");
+        assert_eq!(age_text(now, now + Duration::from_secs(5)), "0s ago");
+    }
+
+    fn message(kind: PeerKind, content: &str, in_reply_to: Option<&str>) -> PeerMessage {
+        PeerMessage::new(RawPeerMessage {
+            source_identity: "cd".repeat(16),
+            source_destination: "ab".repeat(16),
+            destination: "01".repeat(16),
+            title: None,
+            content: content.to_string(),
+            fields: None,
+            timestamp: 0.0,
+            message_id: "m1".repeat(16),
+            in_reply_to: in_reply_to.map(str::to_string),
+            kind,
+            via: PeerVia::Direct,
+        })
+    }
+
+    fn inbox_row(message: PeerMessage) -> InboxRow {
+        InboxRow {
+            name: "Ann".to_string(),
+            received: DateTime::from_timestamp(1_790_000_120, 0).unwrap(),
+            message,
+        }
+    }
+
+    #[test]
+    fn inbox_lines_name_kind_sender_route_time_and_reply_target() {
+        assert_eq!(render_inbox(&[], &[]), "Inbox is empty.");
+        let mut bulletin = message(PeerKind::Bulletin, "first line\nsecond line", None);
+        bulletin.title = Some("Heads up".into());
+        bulletin.via = PeerVia::StoreAndForward;
+        let rows = vec![
+            inbox_row(bulletin),
+            inbox_row(message(
+                PeerKind::Reply,
+                &"x".repeat(PEER_CONTENT_MAX_CHARS + 300),
+                Some(&"77".repeat(16)),
+            )),
+        ];
+        let text = render_inbox(&rows, &["q1".to_string()]);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "{text}");
+        assert!(
+            lines[0].starts_with(&format!(
+                "[bulletin] from Ann ({}) via store-and-forward at 14:15 UTC: Heads up: first line second line",
+                "ab".repeat(4)
+            )),
+            "{text}"
+        );
+        assert!(!lines[0].contains("reply to"), "{text}");
+        assert!(lines[1].starts_with("[reply] from Ann"), "{text}");
+        assert!(lines[1].contains("via direct at"), "{text}");
+        assert!(
+            lines[1].ends_with(&format!(" (reply to {})", "77".repeat(4))),
+            "{text}"
+        );
+        let content_len = lines[1]
+            .split(": ")
+            .nth(1)
+            .unwrap()
+            .trim_end_matches(|c| c != 'x')
+            .len();
+        assert_eq!(content_len, PEER_CONTENT_MAX_CHARS, "{text}");
+        assert_eq!(lines[2], "answered awaiting collect: q1");
+    }
+
+    fn correlation(id: &str, state: PendingState) -> Correlation {
+        Correlation {
+            record: PendingRecord {
+                version: PENDING_RECORD_VERSION,
+                id: id.to_string(),
+                peer_destination: "ab".repeat(16),
+                peer_identity: "cd".repeat(16),
+                question: "what now?".to_string(),
+                sent_at: "2026-09-21T14:13:20Z".to_string(),
+                timeout_at: "2026-09-21T14:23:20Z".to_string(),
+                state,
+                reply: None,
+            },
+            reply: None,
+        }
+    }
+
+    fn inbound(id: &str, envoy_question: &str) -> InboundRecord {
+        InboundRecord {
+            version: INBOUND_RECORD_VERSION,
+            id: id.to_string(),
+            peer_destination: "12".repeat(16),
+            peer_identity: "ef".repeat(16),
+            question: "may I read the plan?".to_string(),
+            envoy_question: envoy_question.to_string(),
+            received_at: "2026-09-21T14:13:20Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn pending_lists_both_directions_or_says_none() {
+        let empty = render_pending(&[], &[]);
+        let lines: Vec<&str> = empty.lines().collect();
+        assert_eq!(
+            lines,
+            [
+                "Questions this node asked (awaiting a reply):",
+                "  none",
+                "Questions peers asked (escalated to you):",
+                "  none",
+                "answer one with `.mesh answer <id> <text>`",
+            ]
+        );
+
+        let asked = vec![
+            correlation("q1", PendingState::Open),
+            correlation("q2", PendingState::Answered),
+        ];
+        let escalated = vec![inbound("p1", "Share the plan?"), inbound("p2", "")];
+        let text = render_pending(&asked, &escalated);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 8, "{text}");
+        assert!(
+            lines[1].starts_with(&format!(
+                "  q1  {}  open  sent 2026-09-21T14:13:20Z",
+                "ab".repeat(4)
+            )),
+            "{text}"
+        );
+        assert!(lines[1].contains("timeout 2026-09-21T14:23:20Z"), "{text}");
+        assert!(lines[1].ends_with("what now?"), "{text}");
+        assert!(lines[2].contains("answered, awaiting collect"), "{text}");
+        assert!(
+            lines[4].starts_with(&format!(
+                "  p1  {}  received 2026-09-21T14:13:20Z",
+                "12".repeat(4)
+            )),
+            "{text}"
+        );
+        assert_eq!(lines[5], "    envoy asks: Share the plan?");
+        assert!(lines[6].starts_with("  p2  "), "{text}");
+        assert!(!lines[7].contains("envoy asks"), "{text}");
+    }
+
+    #[test]
+    fn answer_splits_the_id_from_quoted_or_bare_text() {
+        assert_eq!(
+            split_id_and_text(Some("q1 \"yes, go ahead\"")),
+            Some(("q1", "yes, go ahead"))
+        );
+        assert_eq!(
+            split_id_and_text(Some("q1   plain words here")),
+            Some(("q1", "plain words here"))
+        );
+        assert_eq!(split_id_and_text(Some("q1")), None);
+        assert_eq!(split_id_and_text(Some("q1 \"\"")), None);
+        assert_eq!(split_id_and_text(Some("q1   ")), None);
+        assert_eq!(split_id_and_text(None), None);
+    }
+
+    #[test]
+    fn answer_routes_to_the_peer_first_then_to_our_own_question() {
+        assert_eq!(answer_route(true, false), AnswerRoute::Inbound);
+        assert_eq!(answer_route(true, true), AnswerRoute::Inbound);
+        assert_eq!(answer_route(false, true), AnswerRoute::Outbound);
+        assert_eq!(answer_route(false, false), AnswerRoute::Unknown);
+    }
+
+    #[test]
+    fn yes_flag_is_taken_only_as_the_leading_word() {
+        assert_eq!(take_flag("--yes hello", "--yes"), (true, "hello"));
+        assert_eq!(take_flag("hello --yes", "--yes"), (false, "hello --yes"));
+        assert_eq!(take_flag("--yes", "--yes"), (true, ""));
+        assert_eq!(
+            take_flag("say --yes now", "--yes"),
+            (false, "say --yes now")
+        );
+        assert_eq!(take_flag("--yesterday", "--yes"), (false, "--yesterday"));
+
+        let out = parse_outgoing("--yes \"ship it\"").unwrap();
+        assert!(out.yes);
+        assert_eq!(out.text, "ship it");
+        let out = parse_outgoing("ship it").unwrap();
+        assert!(!out.yes);
+        assert_eq!(out.text, "ship it");
+        let out = parse_outgoing("please say --yes").unwrap();
+        assert!(!out.yes, "a trailing --yes is text, not consent");
+        assert_eq!(out.text, "please say --yes");
+        assert!(parse_outgoing("--yes").is_none());
+        assert!(parse_outgoing("\"\"").is_none());
+    }
+
+    fn recipient(name: Option<&str>, outcome: RecipientOutcome) -> RecipientReport {
+        RecipientReport {
+            destination: "ab".repeat(16),
+            display_name: name.map(str::to_string),
+            outcome,
+        }
+    }
+
+    #[test]
+    fn broadcast_report_lists_each_recipient_and_totals_them() {
+        let nobody = BroadcastOutcome {
+            id: "b1".repeat(16),
+            recipients: vec![],
+        };
+        assert!(render_broadcast(&nobody).starts_with("No trusted peer has a known path"));
+
+        let outcome = BroadcastOutcome {
+            id: "b1".repeat(16),
+            recipients: vec![
+                recipient(Some("Ann"), RecipientOutcome::Delivered),
+                recipient(None, RecipientOutcome::StoreAndForward),
+                recipient(
+                    Some("Cy"),
+                    RecipientOutcome::Unreachable {
+                        reason: "no path".into(),
+                    },
+                ),
+                recipient(
+                    Some("Di"),
+                    RecipientOutcome::Refused {
+                        reason: "no access".into(),
+                    },
+                ),
+                recipient(Some("Ed"), RecipientOutcome::Delivered),
+            ],
+        };
+        let text = render_broadcast(&outcome);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 6, "{text}");
+        assert_eq!(lines[0], format!("  Ann ({}): delivered", "ab".repeat(4)));
+        assert!(lines[1].starts_with("  (no name) "), "{text}");
+        assert!(lines[1].ends_with("store-and-forward"), "{text}");
+        assert!(lines[2].ends_with("unreachable: no path"), "{text}");
+        assert!(lines[3].ends_with("refused: no access"), "{text}");
+        assert_eq!(
+            lines[5],
+            format!(
+                "Bulletin {}: 2 delivered, 1 store-and-forward, 1 unreachable, 1 refused.",
+                "b1".repeat(4)
+            )
+        );
+    }
+
+    #[test]
+    fn results_go_to_stdout_and_warnings_to_stderr() {
+        let source = include_str!("mesh.rs");
+        let println = format!("{}!(", "println");
+        let eprintln = format!("e{println}");
+        let eprintln_count = source.matches(&eprintln).count();
+        let println_count = source.matches(&println).count() - eprintln_count;
+        assert_eq!(println_count, 1, "stdout is written by out_text alone");
+        assert_eq!(eprintln_count, 2, "stderr is written by err_text alone");
+    }
+
+    #[test]
+    fn markers_are_plain_words_in_the_rendered_text() {
+        let now = SystemTime::now();
+        let mut old = peer(Some("Old"), 3600, now);
+        old.compatibility = Compatibility::Incompatible { found: 9 };
+        let rows = vec![
+            PeerRow::Heard(old, "denied", None),
+            PeerRow::Heard(peer(Some("Bad"), 5, now), "blocked", None),
+        ];
+        let text = render_peers(&rows, now);
+        for marker in ["denied", "blocked", "(stale)", "incompatible"] {
+            assert!(text.contains(marker), "{marker}: {text}");
+        }
+        assert!(dropped_warning(3).starts_with("WARNING: 3 peer message(s)"));
+    }
+
+    #[test]
+    fn send_notices_name_the_destination_and_the_audience() {
+        let destination = "ab".repeat(16);
+        let notice = sending_notice(&destination);
+        assert!(notice.contains("Sending"), "{notice}");
+        assert!(notice.contains("abababab"), "{notice}");
+        assert!(!notice.contains(&destination), "{notice}");
+        assert!(BROADCAST_NOTICE.contains("every peer this node trusts"));
+        assert!(BROADCAST_NOTICE.contains("not trusted receive nothing"));
+    }
+
+    /// Spec-first usage probe: peer-supplied text in `.mesh pending` and `.mesh knocks` is
+    /// display-sanitised (`display_text`): escape sequences, control characters and line
+    /// breaks never reach the terminal, and one record never renders as two rows.
+    #[test]
+    fn pending_and_knock_rows_strip_peer_control_characters() {
+        let hostile = "\u{1b}[2J\u{1b}[31mSTOLEN\u{7}\nfake row\r\u{200b}?";
+        let forbidden = ['\u{1b}', '\u{7}', '\r', '\u{200b}'];
+
+        let mut escalated = inbound("p1", hostile);
+        escalated.question = hostile.to_string();
+        let text = render_pending(&[correlation("q1", PendingState::Open)], &[escalated]);
+        for c in forbidden {
+            assert!(
+                !text.contains(c),
+                "{c:?} leaked into `.mesh pending`: {text:?}"
+            );
+        }
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines.len(),
+            6,
+            "one escalated record is one row plus its envoy line: {text}"
+        );
+        assert!(lines[3].starts_with("  p1  "), "{text}");
+        assert!(
+            lines[3].contains("STOLEN") && lines[3].contains("fake row"),
+            "the readable part of the text survives on the same row: {text}"
+        );
+        assert!(
+            lines[4].starts_with("    envoy asks: ") && lines[4].contains("fake row"),
+            "{text}"
+        );
+        assert!(
+            !lines[3].contains("[2J") && !lines[3].contains("[31m"),
+            "escape bodies are stripped, not just their ESC: {text}"
+        );
+
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_120);
+        let records = vec![knock(
+            Some("\u{1b}[0mEve\u{200b}"),
+            Some(hostile),
+            "2026-09-21T14:13:20Z",
+        )];
+        let text = render_knocks(&records, now);
+        for c in forbidden {
+            assert!(
+                !text.contains(c),
+                "{c:?} leaked into `.mesh knocks`: {text:?}"
+            );
+        }
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "one knock is one row: {text}");
+        assert!(lines[1].contains("Eve"), "{text}");
+        assert!(!lines[1].contains("[0m"), "{text}");
+        assert!(
+            lines[1].contains("STOLEN") && lines[1].contains("fake row"),
+            "{text}"
+        );
+        assert!(
+            text.ends_with("1 knock(s). Names and intros are peer-supplied text."),
+            "{text}"
+        );
+
+        // Peer text that is nothing but control characters renders as absent, never as an
+        // empty column that could be mistaken for a blank name or intro.
+        let blank = "\u{1b}[2J\u{7}\r\n";
+        let records = vec![knock(Some(blank), Some(blank), "2026-09-21T14:13:20Z")];
+        let text = render_knocks(&records, now);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "{text}");
+        assert!(lines[1].contains("(no name)"), "{text}");
+        assert!(lines[1].ends_with("(no intro)"), "{text}");
+        let mut escalated = inbound("p2", blank);
+        escalated.question = blank.to_string();
+        let text = render_pending(&[], &[escalated]);
+        assert!(
+            !text.contains("envoy asks"),
+            "a blank envoy question prints no envoy line: {text}"
+        );
+        assert_eq!(
+            text.lines().count(),
+            5,
+            "two headers, `none`, one row, the footer: {text}"
+        );
+    }
+
+    mod repl {
+        use super::super::*;
+        use crate::config::{AppConfig, AppState, Session, WorkingMode};
+        use crate::repl::run_repl_command;
+        use crate::testing::TestConfigDirGuard;
+        use crate::utils::create_abort_signal;
+        use serial_test::serial;
+        use std::future::Future;
+
+        /// `run_repl_command`'s poll frame is far larger than a test thread's stack, so the
+        /// body runs on an 8 MiB thread; two workers keep a node's tasks moving meanwhile.
+        fn run_async<F>(f: F) -> F::Output
+        where
+            F: Future + Send,
+            F::Output: Send,
+        {
+            std::thread::scope(|scope| {
+                std::thread::Builder::new()
+                    .stack_size(8 * 1024 * 1024)
+                    .spawn_scoped(scope, || {
+                        tokio::runtime::Builder::new_multi_thread()
+                            .worker_threads(2)
+                            .enable_all()
+                            .build()
+                            .unwrap()
+                            .block_on(f)
+                    })
+                    .unwrap()
+                    .join()
+                    .unwrap()
+            })
+        }
+
+        fn ctx_with(mesh: MeshConfig, function_calling_support: bool) -> RequestContext {
+            let mut app = AppState::test_default();
+            app.config = Arc::new(AppConfig {
+                mesh,
+                function_calling_support,
+                ..AppConfig::default()
+            });
+            RequestContext::new(Arc::new(app), WorkingMode::Repl)
+        }
+
+        fn off_ctx() -> RequestContext {
+            RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Repl)
+        }
+
+        async fn run(ctx: &mut RequestContext, line: &str) -> Result<bool> {
+            Box::pin(run_repl_command(ctx, create_abort_signal(), line)).await
+        }
+
+        fn err_of(ctx: &mut RequestContext, line: &str) -> String {
+            run_async(run(ctx, line)).unwrap_err().to_string()
+        }
+
+        #[cfg(unix)]
+        fn mesh_tool_names(ctx: &RequestContext) -> Vec<String> {
+            ctx.tool_scope
+                .functions
+                .declarations()
+                .iter()
+                .map(|f| f.name.clone())
+                .filter(|name| name.starts_with("mesh__"))
+                .collect()
+        }
+
+        #[test]
+        fn every_mesh_verb_is_refused_inside_a_macro() {
+            let mut ctx = off_ctx();
+            ctx.macro_flag = true;
+            for (verb, _, _) in VERBS {
+                let err = err_of(&mut ctx, &format!(".mesh {verb}"));
+                assert_eq!(
+                    err, "Cannot perform this operation because you are in a macro",
+                    "{verb}"
+                );
+            }
+        }
+
+        #[test]
+        #[serial]
+        fn bare_info_while_off_puts_every_value_in_the_same_column() {
+            let _capture = capture::install();
+            let mut ctx = off_ctx();
+            run_async(run(&mut ctx, ".mesh info")).unwrap();
+            let out = stdout_lines().join("\n");
+            let rows: Vec<&str> = out.lines().filter(|line| !line.trim().is_empty()).collect();
+            assert!(rows.iter().any(|line| line.starts_with("  reach")), "{out}");
+            assert!(rows.iter().any(|line| line.starts_with("  node")), "{out}");
+            for line in rows {
+                let indent = line.len() - line.trim_start().len();
+                let label_end = indent + line[indent..].find(' ').unwrap();
+                let padding = line[label_end..].len() - line[label_end..].trim_start().len();
+                assert_eq!(
+                    label_end + padding,
+                    2 + MESH_INFO_LABEL_WIDTH,
+                    "{line:?} is not aligned with the rest:\n{out}"
+                );
+            }
+        }
+
+        #[test]
+        #[serial]
+        fn bare_mesh_and_verb_help_never_error() {
+            let _capture = capture::install();
+            let _script = prompt_script::install(&[]);
+            let mut ctx = off_ctx();
+            for line in [
+                ".mesh",
+                ".mesh brief set",
+                ".mesh brief nonsense",
+                ".mesh info",
+                ".mesh answer",
+                ".mesh reply",
+                ".mesh broadcast",
+                ".mesh reply 3f9c2a7b1d4e6f80a1b2c3d4e5f60718",
+                ".mesh trust",
+                ".mesh untrust",
+                ".mesh block",
+                ".mesh unblock",
+                ".mesh deny",
+                ".mesh undeny",
+                ".mesh knock",
+            ] {
+                run_async(run(&mut ctx, line)).unwrap_or_else(|err| panic!("{line}: {err}"));
+            }
+            let out = stdout_lines().join("\n");
+            for example in [
+                ".mesh answer <id>",
+                ".mesh reply <destination>",
+                ".mesh broadcast",
+                ".mesh trust <destination>",
+                ".mesh untrust <destination>",
+                ".mesh block <identity>",
+                ".mesh unblock <identity>",
+                ".mesh deny <destination>",
+                ".mesh undeny <destination>",
+                ".mesh knock <destination>",
+            ] {
+                assert!(out.contains(example), "{example} missing from {out}");
+            }
+            assert_eq!(prompt_script::prompts_asked(), 0);
+            let err = err_of(&mut ctx, ".mesh bogus");
+            assert!(err.contains(".mesh"), "{err}");
+
+            run_async(run(&mut ctx, ".mesh status \"focus\"")).unwrap();
+            assert_eq!(
+                ctx.app
+                    .mesh
+                    .objective_override()
+                    .as_deref()
+                    .map(String::as_str),
+                Some("focus")
+            );
+            run_async(run(&mut ctx, ".mesh status clear")).unwrap();
+            assert!(ctx.app.mesh.objective_override().is_none());
+        }
+
+        /// The mesh-off refusal comes from the store's own text and lands before any
+        /// prompt, so an unattended `.mesh trust` never hangs on a question it cannot act on.
+        #[test]
+        #[serial]
+        fn trust_mutations_are_refused_while_the_mesh_is_off_before_any_prompt() {
+            let _script = prompt_script::install(&[true; 9]);
+            let mut ctx = off_ctx();
+            let h = "ab".repeat(16);
+            for line in [
+                format!(".mesh trust {h}"),
+                format!(".mesh trust --identity {h}"),
+                ".mesh trust --prune".to_string(),
+                format!(".mesh untrust {h}"),
+                format!(".mesh untrust --identity {h}"),
+                format!(".mesh block {h}"),
+                format!(".mesh unblock {h}"),
+                format!(".mesh deny {h}"),
+                format!(".mesh undeny {h}"),
+            ] {
+                assert_eq!(
+                    err_of(&mut ctx, &line),
+                    crate::mesh::trust::MESH_OFF,
+                    "{line}"
+                );
+            }
+            assert_eq!(prompt_script::prompts_asked(), 0);
+        }
+
+        /// Usage probe (TASK-100 (c)/(d)): the two new node-required verbs refuse while the
+        /// mesh is off with the SAME teaching text as every other node verb, before any
+        /// prompt and before any progress line, so an unattended `.mesh fetch` or
+        /// `.mesh knock` never hangs or claims to be asking a node that is not there.
+        #[test]
+        #[serial]
+        fn fetch_and_knock_are_refused_while_the_mesh_is_off_before_any_prompt() {
+            let _capture = capture::install();
+            let _script = prompt_script::install(&[true; 4]);
+            let mut ctx = off_ctx();
+            let h = "ab".repeat(16);
+            for line in [
+                ".mesh fetch".to_string(),
+                format!(".mesh knock {h}"),
+                format!(".mesh knock {h} --yes --intro \"hi\""),
+            ] {
+                assert_eq!(err_of(&mut ctx, &line), MESH_OFF, "{line}");
+            }
+            let out = stdout_lines();
+            assert!(
+                !out.iter().any(|line| {
+                    line.starts_with("Asking the nearest propagation node")
+                        || line.starts_with("This knocks on")
+                        || line.starts_with("Knocking on")
+                }),
+                "no progress or consent line while off: {out:?}"
+            );
+            assert_eq!(prompt_script::prompts_asked(), 0);
+        }
+
+        /// Usage probe (TASK-100 (c)): `.mesh fetch` takes no arguments, so a stray word
+        /// or flag is a teaching error carrying the verb's usage line, like the other
+        /// flagless verbs, and is refused before the node is consulted.
+        #[test]
+        #[serial]
+        fn fetch_with_arguments_is_a_usage_error_naming_the_verb() {
+            let _capture = capture::install();
+            let mut ctx = off_ctx();
+            for line in [".mesh fetch now", ".mesh fetch --yes"] {
+                let err = err_of(&mut ctx, line);
+                assert!(err.starts_with("Unexpected '"), "{line}: {err}");
+                assert!(err.contains(".mesh fetch"), "{line}: {err}");
+                assert_ne!(err, MESH_OFF, "{line}: the usage check comes first");
+            }
+            assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
+        }
+
+        /// Usage probe (TASK-100 (c)): "reports counts" means every counter of the report
+        /// is on the line, with the node named by its short hash, so a human can tell
+        /// listed-but-unwanted from received-but-deferred without reading logs.
+        #[test]
+        fn fetch_report_line_carries_every_counter_and_the_short_node() {
+            let node = "deadbeefdeadbeefdeadbeefdeadbeef".to_string();
+            let report = FetchReport {
+                node: node.clone(),
+                listed: 7,
+                wanted: 6,
+                received: 5,
+                delivered: 2,
+                duplicates: 1,
+                discarded: 1,
+                deferred: 1,
+                acknowledged: 5,
+                response_branch: None,
+            };
+            let line = render_fetch(&report);
+            assert_eq!(
+                line,
+                "Fetched from deadbeef: 7 listed, 6 wanted, 5 received, 2 delivered, 1 duplicates, 1 discarded, 1 deferred."
+            );
+            assert!(
+                !line.contains(&node),
+                "the full node hash is not needed here"
+            );
+            let empty = FetchReport {
+                listed: 0,
+                wanted: 0,
+                received: 0,
+                ..report.clone()
+            };
+            assert_eq!(
+                render_fetch(&empty),
+                "Nothing held for this node at deadbeef."
+            );
+            let none_served = FetchReport {
+                listed: 7,
+                wanted: 3,
+                received: 0,
+                ..report.clone()
+            };
+            assert_eq!(
+                render_fetch(&none_served),
+                "deadbeef lists 7 messages for this node and 3 were asked for, but none were served; run .mesh fetch again or check the node's logs."
+            );
+            let full_page_none_served = FetchReport {
+                listed: 100,
+                wanted: MAX_WANTS_PER_FETCH,
+                received: 0,
+                ..report.clone()
+            };
+            assert!(
+                render_fetch(&full_page_none_served)
+                    .ends_with("check the node's logs. More may be held.")
+            );
+            let all_known = FetchReport {
+                wanted: 0,
+                received: 0,
+                ..report.clone()
+            };
+            assert_eq!(
+                render_fetch(&all_known),
+                "Nothing new held for this node at deadbeef: 7 listed, all already processed."
+            );
+            let full_page = FetchReport {
+                listed: 100,
+                wanted: MAX_WANTS_PER_FETCH,
+                received: MAX_WANTS_PER_FETCH,
+                ..report
+            };
+            assert_eq!(
+                render_fetch(&full_page),
+                "Fetched from deadbeef: 100 listed, 64 wanted, 64 received, 2 delivered, 1 duplicates, 1 discarded, 1 deferred. More may be held; run .mesh fetch again."
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn bare_mesh_brief_renders_the_served_brief() {
+            use crate::mesh::test_support::snapshot_fixture;
+
+            let _capture = capture::install();
+            let mut ctx = off_ctx();
+            ctx.app.mesh.publish(snapshot_fixture());
+            ctx.app.mesh.set_user_brief(Some("note".to_string()));
+            let served = ctx
+                .app
+                .mesh
+                .brief()
+                .expect("a snapshot and a user brief serve one");
+
+            run_async(run(&mut ctx, ".mesh brief")).unwrap();
+
+            let out = stdout_lines().join("\n");
+            assert!(out.contains("brief mode:"), "{out}");
+            assert!(out.contains(served.render_for_human()), "{out}");
+        }
+
+        #[test]
+        #[serial]
+        fn mesh_off_teaching_error_names_the_enabling_command() {
+            let _capture = capture::install();
+            let mut ctx = off_ctx();
+            let hash = "ab".repeat(16);
+            // `.mesh rotate` is gated the other way round and has its own tests.
+            for line in [
+                ".mesh peers".to_string(),
+                ".mesh knocks".to_string(),
+                ".mesh status".to_string(),
+                format!(".mesh status {hash}"),
+                format!(".mesh info {hash}"),
+                ".mesh pending".to_string(),
+                ".mesh answer q1 text".to_string(),
+                format!(".mesh reply {hash} text"),
+                ".mesh broadcast text".to_string(),
+                ".mesh fetch".to_string(),
+                format!(".mesh knock {hash}"),
+            ] {
+                let err = err_of(&mut ctx, &line);
+                assert!(err.contains(".mesh on"), "{line}: {err}");
+            }
+            // The inbox outlives the node: messages filed before `.mesh off` stay readable.
+            run_async(run(&mut ctx, ".mesh inbox")).unwrap();
+            assert!(
+                stdout_lines().iter().any(|line| line == "Inbox is empty."),
+                "{:?}",
+                stdout_lines()
+            );
+            run_async(run(&mut ctx, ".mesh off")).unwrap();
+            run_async(run(&mut ctx, ".mesh off --yes")).unwrap();
+        }
+
+        /// `.mesh off` is the session's decision even when nothing is running: a config
+        /// loaded with `enabled: true` is overridden for the session, and nothing is
+        /// written to disk.
+        #[test]
+        #[serial]
+        fn mesh_off_overrides_an_enabled_config_even_when_no_node_runs() {
+            let guard = TestConfigDirGuard::new("repl-mesh-off-enabled-config");
+            let _capture = capture::install();
+            let mesh = MeshConfig {
+                enabled: true,
+                ..MeshConfig::default()
+            };
+            let mut ctx = ctx_with(mesh, true);
+            assert!(ctx.app.config.mesh.enabled);
+            assert!(ctx.app.mesh.get().is_none());
+
+            run_async(run(&mut ctx, ".mesh off")).unwrap();
+
+            assert!(!ctx.app.config.mesh.enabled);
+            assert!(!guard.path.join("config.yaml").exists());
+            assert!(
+                stdout_lines()
+                    .iter()
+                    .any(|line| line == "Mesh is already off for this session."),
+                "{:?}",
+                stdout_lines()
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn set_mesh_enabled_for_session_overrides_the_loaded_config_without_touching_disk() {
+            let guard = TestConfigDirGuard::new("repl-mesh-session-override");
+            let mut ctx = off_ctx();
+            assert!(!ctx.app.config.mesh.enabled);
+            let slot = Arc::clone(&ctx.app.mesh);
+
+            ctx.set_mesh_enabled_for_session(true);
+
+            assert!(ctx.app.config.mesh.enabled);
+            assert!(Arc::ptr_eq(&slot, &ctx.app.mesh));
+            assert!(!guard.path.join("config.yaml").exists());
+        }
+
+        #[test]
+        #[serial]
+        fn mesh_on_without_a_tty_and_without_yes_refuses_before_any_effect() {
+            let _script = prompt_script::install_non_interactive();
+            let mesh = MeshConfig {
+                interfaces: vec![MeshInterface::Lan],
+                ..MeshConfig::default()
+            };
+            let mut ctx = ctx_with(mesh, true);
+            ctx.session = Some(Session::default());
+            let err = err_of(&mut ctx, ".mesh on");
+            assert!(err.contains("--yes"), "{err}");
+            assert!(ctx.app.mesh.get().is_none());
+            assert!(!ctx.app.config.mesh.enabled);
+        }
+
+        #[test]
+        #[serial]
+        fn mesh_on_declined_at_the_prompt_starts_nothing() {
+            let _script = prompt_script::install(&[false]);
+            let _capture = capture::install();
+            let mesh = MeshConfig {
+                interfaces: vec![MeshInterface::Lan],
+                ..MeshConfig::default()
+            };
+            let mut ctx = ctx_with(mesh, true);
+            ctx.session = Some(Session::default());
+
+            run_async(run(&mut ctx, ".mesh on")).unwrap();
+
+            assert!(ctx.app.mesh.get().is_none());
+            assert!(!ctx.app.config.mesh.enabled);
+            assert_eq!(prompt_script::prompts_asked(), 1);
+            let out = stdout_lines();
+            let preview = index_of(&out, "What leaves this machine");
+            let declined = index_of(&out, "Mesh stays off");
+            assert!(preview < declined, "{out:?}");
+        }
+
+        /// The start runs on a copy of the session, so a refused start leaves the id it
+        /// was minted for untouched and the session clean.
+        #[test]
+        fn mesh_on_with_fresh_keeps_the_old_id_when_the_start_is_refused() {
+            let id = "0123456789abcdef".repeat(2);
+            let session: Session = serde_yaml::from_str(&format!(
+                "model: provider:test\nmessages: []\nmesh_instance_id: {id}"
+            ))
+            .unwrap();
+            assert!(!session.dirty());
+            let mut ctx = ctx_with(MeshConfig::default(), false);
+            ctx.session = Some(session);
+
+            let err = err_of(&mut ctx, ".mesh on --fresh --yes");
+
+            assert!(err.contains("function_calling_support"), "{err}");
+            let session = ctx.session.as_ref().unwrap();
+            assert_eq!(session.mesh_instance_id(), Some(id.as_str()));
+            assert!(!session.dirty());
+            assert!(ctx.app.mesh.get().is_none());
+        }
+
+        /// Spec-first usage probe: the louder `type: public` confirmation must reach the
+        /// human on the command path, not just exist as a rendering. Without a terminal the
+        /// refusal carries the question that would have been asked, so the public wording
+        /// (`WORLD-VISIBLE`) is visible there and absent for a LAN-only node; declined at
+        /// the prompt from `$HOME`, the stdout preview names the world-visible reach before
+        /// the decline, the `$HOME` warning lands on stderr (never stdout), and nothing
+        /// starts. From a project directory the same command warns about nothing.
+        #[cfg(unix)]
+        #[test]
+        #[serial]
+        fn public_on_confirmation_reaches_the_human_and_a_home_cwd_warns_on_stderr() {
+            use crate::testing::EnvVarGuard;
+
+            let public = || {
+                let mut ctx = ctx_with(super::public_config(), true);
+                ctx.session = Some(Session::default());
+                ctx
+            };
+            let lan = || {
+                let mesh = MeshConfig {
+                    interfaces: vec![MeshInterface::Lan],
+                    ..MeshConfig::default()
+                };
+                let mut ctx = ctx_with(mesh, true);
+                ctx.session = Some(Session::default());
+                ctx
+            };
+
+            {
+                let _script = prompt_script::install_non_interactive();
+                let mut ctx = public();
+                let err = err_of(&mut ctx, ".mesh on");
+                assert!(
+                    err.contains("WORLD-VISIBLE"),
+                    "public wording missing: {err}"
+                );
+                assert!(err.contains("--yes"), "{err}");
+                assert!(ctx.app.mesh.get().is_none());
+                assert!(!ctx.app.config.mesh.enabled);
+
+                let mut ctx = lan();
+                let err = err_of(&mut ctx, ".mesh on");
+                assert!(!err.contains("WORLD-VISIBLE"), "lan must not shout: {err}");
+                assert!(err.contains("--yes"), "{err}");
+                assert!(ctx.app.mesh.get().is_none());
+            }
+
+            let cwd = env::current_dir().unwrap();
+            let parent = cwd
+                .parent()
+                .expect("cargo test does not run from a filesystem root")
+                .to_path_buf();
+            let warning_marker = "this session's working directory is";
+            {
+                let _home = EnvVarGuard::set("HOME", &cwd);
+                let _script = prompt_script::install(&[false]);
+                let _capture = capture::install();
+                let mut ctx = public();
+
+                run_async(run(&mut ctx, ".mesh on")).unwrap();
+
+                assert_eq!(prompt_script::prompts_asked(), 1);
+                assert!(ctx.app.mesh.get().is_none(), "declined must start nothing");
+                assert!(!ctx.app.config.mesh.enabled);
+                let out = stdout_lines();
+                let preview = index_of(&out, "world-visible");
+                let declined = index_of(&out, "Mesh stays off");
+                assert!(preview < declined, "{out:?}");
+                assert!(
+                    !out.iter().any(|line| line.contains(warning_marker)),
+                    "the cwd warning must not go to stdout: {out:?}"
+                );
+                let warned = stderr_lines();
+                assert!(
+                    warned.iter().any(|line| {
+                        line.contains(warning_marker) && line.contains(&cwd.display().to_string())
+                    }),
+                    "a `$HOME` cwd warns on stderr naming the directory: {warned:?}"
+                );
+            }
+            {
+                let _home = EnvVarGuard::set("HOME", &parent);
+                let _script = prompt_script::install(&[false]);
+                let _capture = capture::install();
+                let mut ctx = lan();
+
+                run_async(run(&mut ctx, ".mesh on")).unwrap();
+
+                assert_eq!(prompt_script::prompts_asked(), 1);
+                assert!(
+                    stderr_lines().is_empty(),
+                    "a project directory warns about nothing: {:?}",
+                    stderr_lines()
+                );
+                index_of(&stdout_lines(), "Mesh stays off");
+            }
+        }
+
+        /// Spec-first usage probe: `.mesh inbox` works with the mesh off, renders the FULL
+        /// sanitised content of every filed message (control sequences stripped, nothing
+        /// truncated below the peer content cap), drains what it rendered, and reports
+        /// messages dropped past the inbox cap as a stderr warning, never in the results.
+        #[test]
+        #[serial]
+        fn inbox_with_the_mesh_off_renders_full_sanitised_content_then_drains() {
+            use crate::mesh::message::{PEER_INBOX_CAPACITY, RawPeerMessage};
+
+            let raw = |content: String, id: &str| {
+                PeerMessage::new(RawPeerMessage {
+                    source_identity: "cd".repeat(16),
+                    source_destination: "ab".repeat(16),
+                    destination: "01".repeat(16),
+                    title: None,
+                    content,
+                    fields: None,
+                    timestamp: 0.0,
+                    message_id: id.repeat(16),
+                    in_reply_to: None,
+                    kind: PeerKind::Message,
+                    via: PeerVia::Direct,
+                })
+            };
+            let _capture = capture::install();
+            let mut ctx = off_ctx();
+            assert!(ctx.app.mesh.get().is_none());
+            let head = "a".repeat(900);
+            let tail = "b".repeat(900);
+            ctx.app
+                .mesh
+                .peer_inbox()
+                .deliver(raw(format!("{head}\x1b[31m\u{7}\r\n{tail}"), "m1"));
+
+            run_async(run(&mut ctx, ".mesh inbox")).unwrap();
+
+            let out = stdout_lines().join("\n");
+            assert!(out.contains("[message] from"), "{out}");
+            assert!(out.contains(&head), "the head is rendered in full: {out}");
+            assert!(out.contains(&tail), "the tail is rendered in full: {out}");
+            for control in ['\x1b', '\u{7}', '\r'] {
+                assert!(
+                    !out.contains(control),
+                    "{control:?} leaked into `.mesh inbox`: {out:?}"
+                );
+            }
+            assert!(!out.contains("[31m"), "{out}");
+            assert!(stderr_lines().is_empty(), "{:?}", stderr_lines());
+
+            let before = stdout_lines().len();
+            run_async(run(&mut ctx, ".mesh inbox")).unwrap();
+            assert_eq!(
+                stdout_lines()[before..],
+                ["Inbox is empty.".to_string()],
+                "a drained inbox renders nothing twice"
+            );
+
+            for i in 0..=PEER_INBOX_CAPACITY {
+                ctx.app
+                    .mesh
+                    .peer_inbox()
+                    .deliver(raw(format!("note {i}"), "m2"));
+            }
+            let before = stdout_lines().len();
+            run_async(run(&mut ctx, ".mesh inbox")).unwrap();
+            let rows: Vec<String> = stdout_lines()[before..]
+                .iter()
+                .flat_map(|text| text.lines().map(str::to_string).collect::<Vec<_>>())
+                .collect();
+            assert_eq!(rows.len(), PEER_INBOX_CAPACITY, "{rows:?}");
+            assert!(
+                !rows.iter().any(|line| line.contains("dropped")),
+                "the drop warning must not be in the results: {rows:?}"
+            );
+            let warned = stderr_lines();
+            assert_eq!(warned.len(), 1, "{warned:?}");
+            assert!(
+                warned[0].contains("1 peer message(s) were dropped"),
+                "{warned:?}"
+            );
+        }
+
+        fn stdout_lines() -> Vec<String> {
+            capture::lines()
+                .into_iter()
+                .filter(|(stream, _)| *stream == capture::Stream::Out)
+                .map(|(_, text)| text)
+                .collect()
+        }
+
+        fn stderr_lines() -> Vec<String> {
+            capture::lines()
+                .into_iter()
+                .filter(|(stream, _)| *stream == capture::Stream::Err)
+                .map(|(_, text)| text)
+                .collect()
+        }
+
+        fn index_of(lines: &[String], needle: &str) -> usize {
+            lines
+                .iter()
+                .position(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("{needle:?} not printed: {lines:?}"))
+        }
+
+        #[test]
+        fn mesh_on_refuses_without_function_calling() {
+            let mut ctx = ctx_with(MeshConfig::default(), false);
+            ctx.session = Some(Session::default());
+            let err = err_of(&mut ctx, ".mesh on --yes");
+            assert!(err.contains("function_calling_support"), "{err}");
+            assert!(ctx.app.mesh.get().is_none());
+            assert!(!ctx.app.config.mesh.enabled);
+        }
+
+        #[test]
+        fn mesh_on_refuses_without_a_session() {
+            let mut ctx = ctx_with(MeshConfig::default(), true);
+            let err = err_of(&mut ctx, ".mesh on --yes");
+            assert!(err.contains(".session"), "{err}");
+            assert!(ctx.app.mesh.get().is_none());
+            assert!(!ctx.app.config.mesh.enabled);
+        }
+
+        // `autostart` prints its leading notice through `out_text`, which lands in the
+        // process-global `capture` when another `#[serial]` test has one installed, so this
+        // test must not overlap them (it broke `bare_info_while_off_puts_every_value_in_the_same_column`).
+        #[test]
+        #[serial]
+        fn autostart_without_a_session_prints_the_mesh_on_refusal_and_stays_off() {
+            let enabled = MeshConfig {
+                enabled: true,
+                ..MeshConfig::default()
+            };
+            let mut ctx = ctx_with(enabled.clone(), true);
+            let err = run_async(autostart(&mut ctx)).unwrap_err().to_string();
+            assert_eq!(
+                err,
+                "Mesh needs a session: this node's destination is derived from an id kept in the session file. Run `.session <name>` first."
+            );
+            assert!(ctx.app.mesh.get().is_none());
+
+            let mut by_command = ctx_with(enabled, true);
+            assert_eq!(err_of(&mut by_command, ".mesh on --yes"), err);
+            assert!(by_command.app.mesh.get().is_none());
+        }
+
+        /// Criterion (b): an unmatched `.mesh` verb is refused by the mesh family itself
+        /// and never falls through to the macro path's generic "Unknown command".
+        #[test]
+        fn an_unknown_mesh_verb_is_refused_by_mesh_itself_not_the_macro_path() {
+            let mut ctx = off_ctx();
+            let err = err_of(&mut ctx, ".mesh bogus");
+            assert!(err.starts_with("Unknown .mesh command 'bogus'"), "{err}");
+            assert!(err.contains("`.mesh`"), "{err}");
+            assert!(!err.contains("Unknown command. Type"), "{err}");
+            assert!(!err.to_lowercase().contains("macro"), "{err}");
+        }
+
+        /// `.mesh brief auto|manual|off` flips the per-session mode and `set`/`clear`
+        /// drive `set_user_brief`, all in memory: config.yaml is never written.
+        #[test]
+        #[serial]
+        fn brief_mode_and_text_are_session_scoped_and_never_written_to_disk() {
+            let guard = TestConfigDirGuard::new("repl-mesh-brief");
+            let mut ctx = off_ctx();
+            assert_eq!(ctx.app.config.mesh.brief, MeshBrief::Auto);
+            let slot = Arc::clone(&ctx.app.mesh);
+
+            run_async(run(&mut ctx, ".mesh brief manual")).unwrap();
+            assert_eq!(ctx.app.config.mesh.brief, MeshBrief::Manual);
+            run_async(run(&mut ctx, ".mesh brief off")).unwrap();
+            assert_eq!(ctx.app.config.mesh.brief, MeshBrief::Off);
+            run_async(run(&mut ctx, ".mesh brief auto")).unwrap();
+            assert_eq!(ctx.app.config.mesh.brief, MeshBrief::Auto);
+
+            run_async(run(&mut ctx, ".mesh brief set \"we ship on Friday\"")).unwrap();
+            assert_eq!(
+                ctx.app.mesh.user_brief().as_deref().map(String::as_str),
+                Some("we ship on Friday")
+            );
+            run_async(run(&mut ctx, ".mesh brief")).unwrap();
+            run_async(run(&mut ctx, ".mesh brief clear")).unwrap();
+            assert!(ctx.app.mesh.user_brief().is_none());
+
+            assert!(
+                Arc::ptr_eq(&slot, &ctx.app.mesh),
+                "the slot survives the config swap"
+            );
+            assert!(!guard.path.join("config.yaml").exists());
+        }
+
+        #[cfg(unix)]
+        fn minted_key(guard: &TestConfigDirGuard) -> (std::path::PathBuf, Vec<u8>, String) {
+            let path = identity::identity_path();
+            assert!(path.starts_with(&guard.path));
+            let minted = identity::load_or_mint_identity(&path).unwrap();
+            let bytes = fs::read(&path).unwrap();
+            (path, bytes, fingerprint(&minted))
+        }
+
+        #[cfg(unix)]
+        fn files_under(dir: &Path) -> Vec<std::path::PathBuf> {
+            let mut out = Vec::new();
+            for entry in fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    out.extend(files_under(&path));
+                } else {
+                    out.push(path);
+                }
+            }
+            out
+        }
+
+        #[cfg(unix)]
+        fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+            haystack
+                .windows(needle.len())
+                .any(|window| window == needle)
+        }
+
+        #[cfg(unix)]
+        #[test]
+        #[serial]
+        fn rotate_dry_run_prints_the_token_and_changes_nothing() {
+            let guard = TestConfigDirGuard::new("repl-mesh-rotate-dry-run");
+            let _capture = capture::install();
+            let (path, before, old) = minted_key(&guard);
+            let stale = path.with_added_extension("new");
+            fs::write(&stale, [3u8; 64]).unwrap();
+            let mut ctx = off_ctx();
+            let token = format!("rotate-{}", short(&old));
+
+            for line in [".mesh rotate", ".mesh rotate --dry-run"] {
+                let printed = stdout_lines().len();
+                run_async(run(&mut ctx, line)).unwrap();
+                let out = stdout_lines()[printed..].join("\n");
+                assert!(out.contains(&old), "{line}: {out}");
+                assert!(out.contains("This was a dry run"), "{line}: {out}");
+                assert!(out.contains("(0 recorded so far)"), "{line}: {out}");
+                assert!(out.contains("sees a stranger"), "{line}: {out}");
+                assert!(
+                    out.contains("refused while any session's node on this config dir is running"),
+                    "{line}: {out}"
+                );
+                assert!(out.contains("mesh/identity.key.lock"), "{line}: {out}");
+                assert!(
+                    out.contains(&format!(".mesh rotate --confirm {token}")),
+                    "{line}: {out}"
+                );
+                assert_eq!(fs::read(&path).unwrap(), before, "{line}");
+                assert!(!identity::predecessors_path(&path).exists(), "{line}");
+                assert!(stale.exists(), "{line}: a dry run sweeps nothing");
+            }
+        }
+
+        #[cfg(unix)]
+        #[test]
+        #[serial]
+        fn rotate_surfaces_a_refused_predecessors_file_and_changes_nothing() {
+            let guard = TestConfigDirGuard::new("repl-mesh-rotate-unversioned-history");
+            let (path, before, old) = minted_key(&guard);
+            let history = identity::predecessors_path(&path);
+            let unversioned = "{\"identity_hash\":\"ab\",\"rotated_at\":\"2026-01-01T00:00:00Z\",\"reason\":\"rotate\"}\n";
+            fs::write(&history, unversioned).unwrap();
+            let mut ctx = off_ctx();
+            let token = format!("rotate-{}", short(&old));
+
+            for line in [
+                ".mesh rotate".to_string(),
+                ".mesh rotate --dry-run".to_string(),
+                format!(".mesh rotate --confirm {token}"),
+            ] {
+                let err = err_of(&mut ctx, &line);
+                assert!(err.contains("no readable `version` field"), "{line}: {err}");
+                assert!(err.contains("move the file aside"), "{line}: {err}");
+                assert!(
+                    err.contains(&history.display().to_string()),
+                    "{line}: {err}"
+                );
+                assert_eq!(fs::read(&path).unwrap(), before, "{line}");
+                assert_eq!(fs::read_to_string(&history).unwrap(), unversioned, "{line}");
+                assert!(!path.with_added_extension("new").exists(), "{line}");
+            }
+        }
+
+        #[cfg(unix)]
+        #[test]
+        #[serial]
+        fn rotate_is_refused_while_another_process_holds_the_identity_lock() {
+            let guard = TestConfigDirGuard::new("repl-mesh-rotate-locked");
+            let (path, before, old) = minted_key(&guard);
+            let _node = identity::IdentityLock::share(&path).unwrap();
+            let mut ctx = off_ctx();
+            let token = format!("rotate-{}", short(&old));
+
+            for line in [
+                ".mesh rotate".to_string(),
+                ".mesh rotate --dry-run".to_string(),
+                format!(".mesh rotate --confirm {token}"),
+            ] {
+                let err = err_of(&mut ctx, &line);
+                assert!(err.contains(".mesh off"), "{line}: {err}");
+                assert!(
+                    err.contains(&format!("pid {}", std::process::id())),
+                    "{line}: {err}"
+                );
+                assert_eq!(fs::read(&path).unwrap(), before, "{line}");
+                assert!(!identity::predecessors_path(&path).exists(), "{line}");
+                assert!(!path.with_added_extension("new").exists(), "{line}");
+            }
+        }
+
+        #[cfg(unix)]
+        #[test]
+        #[serial]
+        fn rotate_with_a_wrong_token_refuses_and_changes_nothing() {
+            let guard = TestConfigDirGuard::new("repl-mesh-rotate-wrong-token");
+            let (path, before, old) = minted_key(&guard);
+            let mut ctx = off_ctx();
+
+            let err = err_of(&mut ctx, ".mesh rotate --confirm rotate-nope");
+
+            assert!(err.contains("'rotate-nope' is not the token"), "{err}");
+            assert!(
+                err.contains(&format!("--confirm rotate-{}", short(&old))),
+                "{err}"
+            );
+            assert_eq!(fs::read(&path).unwrap(), before);
+            assert!(!identity::predecessors_path(&path).exists());
+        }
+
+        /// The instance id lives in the session, not the key; rotating one leaves the
+        /// other alone.
+        #[cfg(unix)]
+        #[test]
+        #[serial]
+        fn rotate_replaces_the_key_records_the_predecessor_and_leaves_no_trace_or_instance_change()
+        {
+            let guard = TestConfigDirGuard::new("repl-mesh-rotate-confirm");
+            let _capture = capture::install();
+            let (path, before, old) = minted_key(&guard);
+            assert_eq!(
+                before.len(),
+                64,
+                "the minted key is the 64-byte private key"
+            );
+            let mut ctx = off_ctx();
+            let mut session = Session::default();
+            let id = session.ensure_mesh_instance_id().to_string();
+            ctx.session = Some(session);
+
+            run_async(run(
+                &mut ctx,
+                &format!(".mesh rotate --confirm rotate-{}", short(&old)),
+            ))
+            .unwrap();
+
+            let files = files_under(&guard.path.join("mesh"));
+            assert!(!files.is_empty(), "{files:?}");
+            for file in &files {
+                assert!(
+                    !contains_bytes(&fs::read(file).unwrap(), &before),
+                    "old key material survives in {}",
+                    file.display()
+                );
+            }
+            let now = fingerprint(&identity::load_or_mint_identity(&path).unwrap());
+            assert_ne!(now, old);
+            let predecessors = identity::predecessors(&path).unwrap();
+            assert_eq!(predecessors.len(), 1, "{predecessors:?}");
+            assert_eq!(predecessors[0].identity_hash, old);
+            assert_eq!(
+                ctx.session.as_ref().unwrap().mesh_instance_id(),
+                Some(id.as_str())
+            );
+            let out = stdout_lines().join("\n");
+            assert!(
+                out.contains(&format!("Rotated the mesh identity: {old} -> {now}.")),
+                "{out}"
+            );
+            assert!(out.contains("Predecessors recorded: 1."), "{out}");
+            assert!(out.contains(".mesh on"), "{out}");
+            assert!(out.contains("peers must re-trust it"), "{out}");
+        }
+
+        #[cfg(unix)]
+        #[test]
+        #[serial]
+        fn rotate_refuses_yes_and_positional_and_dry_run_with_confirm() {
+            let guard = TestConfigDirGuard::new("repl-mesh-rotate-flags");
+            let (path, before, old) = minted_key(&guard);
+            let mut ctx = off_ctx();
+            let token = format!("rotate-{}", short(&old));
+
+            let err = err_of(&mut ctx, ".mesh rotate --yes");
+            assert_eq!(
+                err,
+                "`.mesh rotate` takes `--confirm rotate-<identity-short>` from a dry run, not `--yes`."
+            );
+            assert_eq!(fs::read(&path).unwrap(), before);
+
+            for (line, offending) in [
+                (format!(".mesh rotate {token}"), token.as_str()),
+                (
+                    format!(".mesh rotate --dry-run --confirm {token}"),
+                    "--dry-run",
+                ),
+            ] {
+                let err = err_of(&mut ctx, &line);
+                assert!(
+                    err.starts_with(&format!("Unexpected '{offending}'.")),
+                    "{line}: {err}"
+                );
+                assert!(err.contains(".mesh rotate ["), "{line}: {err}");
+                assert_eq!(fs::read(&path).unwrap(), before, "{line}");
+            }
+        }
+
+        #[test]
+        #[serial]
+        fn rotate_with_no_identity_names_mesh_on() {
+            let guard = TestConfigDirGuard::new("repl-mesh-rotate-no-identity");
+            let mut ctx = off_ctx();
+
+            let err = err_of(&mut ctx, ".mesh rotate");
+
+            assert!(err.contains("No mesh identity"), "{err}");
+            assert!(err.contains(".mesh on"), "{err}");
+            assert!(!guard.path.join("mesh").exists());
+        }
+
+        #[cfg(unix)]
+        mod with_a_node {
+            use super::*;
+            use crate::mesh::brief::Digest;
+            use crate::mesh::envoy::{EnvoyJob, EnvoySink};
+            use crate::mesh::hex_lower;
+            use crate::mesh::idle::{IdleNotify, IdleSink, Origin};
+            use crate::mesh::limits::{PeerRefusal, RefusalReason};
+            use crate::mesh::notify::{
+                Notification, NotificationSink, RenderedNotification, Source,
+            };
+            use crate::mesh::test_support::{
+                FakeNode, PeerSighting, PeerStub, StartedRuntime, loopback_relay, private_config,
+                started_runtime, started_runtime_on, wait_until,
+            };
+            use crate::mesh::trust::{LiveMesh, TrustOptions};
+            use crate::testing::EnvVarGuard;
+            use crate::utils::get_env_name;
+            use parking_lot::Mutex;
+            use rmpv::Value;
+            use rns_transport::iface::tcp_server::TcpServer;
+            use std::sync::atomic::{AtomicUsize, Ordering};
+
+            /// (destination, identity, name hash) of a freshly minted peer. Trusting verifies
+            /// identity + name hash -> destination, so the destination is derived for real.
+            fn announced_peer() -> (String, String, String) {
+                use rand_core::OsRng;
+                use rns_transport::destination::{DestinationName, SingleInputDestination};
+                use rns_transport::identity::PrivateIdentity;
+
+                let name = DestinationName::new("coyote", "mesh.probe");
+                let announced =
+                    SingleInputDestination::new(PrivateIdentity::new_from_rand(OsRng), name);
+                (
+                    announced.desc.address_hash.to_hex_string(),
+                    announced.desc.identity.address_hash.to_hex_string(),
+                    hex_lower(name.as_name_hash_slice()),
+                )
+            }
+
+            /// Puts a heard peer in `runtime`'s peer table, last seen `at`, and returns its
+            /// (destination, identity); nothing is trusted.
+            fn heard_peer(runtime: &MeshRuntime, name: &str, at: SystemTime) -> (String, String) {
+                let (destination, identity, name_hash) = announced_peer();
+                runtime.peers().observe(
+                    PeerSighting {
+                        destination_hash: destination.clone(),
+                        identity_hash: identity.clone(),
+                        name_hash,
+                        display_name: Some(name.to_string()),
+                        protocol_version: 1,
+                        hops: 1,
+                    },
+                    at,
+                );
+                (destination, identity)
+            }
+
+            /// Puts a heard, trusted peer named "Tia" in `runtime`'s peer table and returns
+            /// its destination hash.
+            fn heard_trusted_peer(runtime: &MeshRuntime, slot: &dyn LiveMesh) -> String {
+                let now = SystemTime::now();
+                let (hash, _) = heard_peer(runtime, "Tia", now);
+                runtime
+                    .trust()
+                    .trust_destination(slot, &hash, TrustOptions::default(), now)
+                    .unwrap();
+                hash
+            }
+
+            #[derive(Default)]
+            struct Recording(Mutex<Vec<String>>);
+
+            impl IdleSink for Recording {
+                fn push(&self, note: IdleNotify) -> std::result::Result<(), IdleNotify> {
+                    self.0.lock().push(note.text);
+                    Ok(())
+                }
+
+                fn request_sync(&self) {}
+            }
+
+            impl NotificationSink for Recording {
+                fn notify(&self, rendered: RenderedNotification) {
+                    self.0.lock().extend(rendered.lines().iter().cloned());
+                }
+            }
+
+            /// An envoy that takes nothing and only counts how often it is interrupted.
+            #[derive(Default)]
+            struct BusyEnvoy {
+                interrupts: AtomicUsize,
+            }
+
+            impl EnvoySink for BusyEnvoy {
+                fn accept(&self, _job: EnvoyJob) -> std::result::Result<(), PeerRefusal> {
+                    Err(PeerRefusal::capacity(RefusalReason::EnvoyBusy))
+                }
+
+                fn answer(&self, _id: &str, _text: &str) -> bool {
+                    false
+                }
+
+                fn interrupt(&self) {
+                    self.interrupts.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+
+            #[test]
+            #[serial]
+            fn mesh_off_leaves_the_idle_and_notifier_hooks_in_place() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-off");
+                run_async(async {
+                    let started = started_runtime("repl-mesh-off").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let idle = Arc::new(Recording::default());
+                    let notifier = Arc::new(Recording::default());
+                    let envoy = Arc::new(BusyEnvoy::default());
+                    ctx.app.mesh.set_idle(idle.clone());
+                    ctx.app.mesh.set_notifier(notifier.clone());
+                    ctx.app.mesh.set_envoy(envoy.clone());
+
+                    run(&mut ctx, ".mesh off --yes").await.unwrap();
+
+                    assert!(ctx.app.mesh.get().is_none());
+                    assert_eq!(
+                        envoy.interrupts.load(Ordering::SeqCst),
+                        1,
+                        "stopping the node cuts the envoy's run short exactly once"
+                    );
+                    assert!(
+                        ctx.app.mesh.envoy_attached(),
+                        "the envoy hook outlives the node"
+                    );
+                    assert!(ctx.app.mesh.push_idle(IdleNotify {
+                        source: Source::Mesh,
+                        text: "still routed".to_string(),
+                        origin: Origin::Local,
+                        model_note: None,
+                    }));
+                    assert_eq!(idle.0.lock().as_slice(), ["still routed"]);
+                    ctx.app
+                        .mesh
+                        .notify(Notification::new(Source::Mesh, "still printed"));
+                    let printed = notifier.0.lock();
+                    assert_eq!(printed.len(), 1, "{printed:?}");
+                    assert!(printed[0].contains("still printed"), "{printed:?}");
+                    started.relay_handle.abort();
+                });
+            }
+
+            #[test]
+            #[serial]
+            fn mesh_on_and_off_flip_the_session_config_and_the_tool_catalog() {
+                let guard = TestConfigDirGuard::new("repl-mesh-on");
+                let _cache = EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
+                run_async(async {
+                    let (addr, relay_handle, _) = loopback_relay().await;
+                    let mut ctx = ctx_with(private_config(addr.port()), true);
+                    ctx.session = Some(Session::default());
+                    ctx.refresh_tool_scope(create_abort_signal()).await.unwrap();
+                    assert!(mesh_tool_names(&ctx).is_empty());
+                    let idle = Arc::new(Recording::default());
+                    let notifier = Arc::new(Recording::default());
+                    let envoy = Arc::new(BusyEnvoy::default());
+                    ctx.app.mesh.set_idle(idle.clone());
+                    ctx.app.mesh.set_notifier(notifier.clone());
+                    ctx.app.mesh.set_envoy(envoy.clone());
+
+                    run(&mut ctx, ".mesh on --yes").await.unwrap();
+
+                    assert!(ctx.app.mesh.get().is_some());
+                    assert!(ctx.app.config.mesh.enabled);
+                    assert!(ctx.app.mesh.push_idle(IdleNotify {
+                        source: Source::Mesh,
+                        text: "routed after on".to_string(),
+                        origin: Origin::Local,
+                        model_note: None,
+                    }));
+                    assert!(
+                        idle.0.lock().contains(&"routed after on".to_string()),
+                        "the idle hook attached before `.mesh on` still receives events"
+                    );
+                    ctx.app
+                        .mesh
+                        .notify(Notification::new(Source::Mesh, "printed after on"));
+                    assert!(
+                        notifier
+                            .0
+                            .lock()
+                            .iter()
+                            .any(|line| line.contains("printed after on")),
+                        "the notifier attached before `.mesh on` still prints"
+                    );
+                    assert!(
+                        ctx.app.mesh.envoy_attached(),
+                        "the envoy attached before `.mesh on` is still attached"
+                    );
+                    assert_eq!(
+                        mesh_tool_names(&ctx),
+                        [
+                            "mesh__peers",
+                            "mesh__send",
+                            "mesh__ask",
+                            "mesh__collect",
+                            "mesh__check_inbox",
+                            "mesh__broadcast",
+                        ]
+                    );
+                    let slot = Arc::clone(&ctx.app.mesh);
+
+                    let err = run(&mut ctx, ".mesh on --yes")
+                        .await
+                        .unwrap_err()
+                        .to_string();
+                    assert!(err.contains(".mesh off"), "{err}");
+
+                    slot.publish_digest(Some(Digest {
+                        text: "- Working on the widget".into(),
+                        generated_at: SystemTime::now(),
+                        covered_messages: 3,
+                    }));
+                    assert!(slot.digest().is_some());
+
+                    run(&mut ctx, ".mesh off --yes").await.unwrap();
+
+                    assert!(slot.get().is_none());
+                    assert!(
+                        slot.digest().is_none(),
+                        "a served digest must not outlive the node"
+                    );
+                    assert!(!ctx.app.config.mesh.enabled);
+                    assert!(mesh_tool_names(&ctx).is_empty());
+                    assert!(Arc::ptr_eq(&slot, &ctx.app.mesh));
+
+                    let old_id = ctx
+                        .session
+                        .as_ref()
+                        .unwrap()
+                        .mesh_instance_id()
+                        .expect("the first start minted an id")
+                        .to_string();
+                    run(&mut ctx, ".mesh on --fresh --yes").await.unwrap();
+                    let new_id = ctx
+                        .session
+                        .as_ref()
+                        .unwrap()
+                        .mesh_instance_id()
+                        .unwrap()
+                        .to_string();
+                    assert_ne!(new_id, old_id);
+                    assert_eq!(slot.get().unwrap().current_instance_id(), new_id);
+
+                    run(&mut ctx, ".mesh off --yes").await.unwrap();
+                    assert!(slot.get().is_none());
+                    relay_handle.abort();
+                });
+            }
+
+            #[test]
+            #[serial]
+            fn autostart_joins_the_mesh_without_a_prompt() {
+                let guard = TestConfigDirGuard::new("repl-mesh-autostart");
+                let _cache = EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
+                let _script = prompt_script::install_non_interactive();
+                let _capture = capture::install();
+                run_async(async {
+                    let (addr, relay_handle, _) = loopback_relay().await;
+                    let mut ctx = ctx_with(
+                        MeshConfig {
+                            enabled: true,
+                            ..private_config(addr.port())
+                        },
+                        true,
+                    );
+                    ctx.session = Some(Session::default());
+
+                    autostart(&mut ctx).await.unwrap();
+
+                    assert!(ctx.app.mesh.get().is_some());
+                    assert!(ctx.app.config.mesh.enabled);
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+                    let out = stdout_lines();
+                    let notice = index_of(&out, "mesh.enabled is true in config.yaml");
+                    let preview = index_of(&out, "What leaves this machine");
+                    let summary = index_of(&out, "Mesh is on for this session");
+                    assert!(notice < preview && preview < summary, "{out:?}");
+
+                    run(&mut ctx, ".mesh off --yes").await.unwrap();
+                    assert!(ctx.app.mesh.get().is_none());
+                    relay_handle.abort();
+                });
+            }
+
+            #[test]
+            #[serial]
+            fn autostart_when_the_mesh_is_already_on_is_the_mesh_on_refusal() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-autostart-already-on");
+                run_async(async {
+                    let started = started_runtime("repl-mesh-autostart-already-on").await;
+                    let mut ctx = ctx_with(
+                        MeshConfig {
+                            enabled: true,
+                            ..MeshConfig::default()
+                        },
+                        true,
+                    );
+                    ctx.session = Some(Session::default());
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+
+                    let err = autostart(&mut ctx).await.unwrap_err().to_string();
+                    assert_eq!(err, MESH_ALREADY_ON);
+                    assert!(ctx.app.mesh.get().is_some());
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// Criterion (i) end to end: the real `.mesh on` path leaves config.yaml
+            /// unwritten; `.mesh status "<text>"|clear` drive the objective override; the
+            /// read-only listings never error on a fresh node.
+            #[test]
+            #[serial]
+            fn mesh_on_writes_nothing_to_disk_and_status_objective_is_session_scoped() {
+                let guard = TestConfigDirGuard::new("repl-mesh-objective");
+                let _cache = EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
+                let _capture = capture::install();
+                run_async(async {
+                    let (addr, relay_handle, _) = loopback_relay().await;
+                    let mut ctx = ctx_with(private_config(addr.port()), true);
+                    ctx.session = Some(Session::default());
+
+                    run(&mut ctx, ".mesh on --yes").await.unwrap();
+                    assert!(ctx.app.mesh.get().is_some());
+                    assert!(
+                        !guard.path.join("config.yaml").exists(),
+                        "`.mesh on` must not persist"
+                    );
+
+                    let before = stdout_lines().len();
+                    run(&mut ctx, ".mesh status").await.unwrap();
+                    let out: Vec<String> = stdout_lines()[before..]
+                        .iter()
+                        .flat_map(|text| text.lines().map(str::to_string))
+                        .collect();
+                    for field in ["name: ", "objective: ", "state: ", "served: "] {
+                        assert!(
+                            out.iter().any(|line| line.starts_with(field)),
+                            "bare `.mesh status` shows the node's own card ({field}): {out:?}"
+                        );
+                    }
+                    run(&mut ctx, ".mesh status \"ship it\"").await.unwrap();
+                    assert_eq!(
+                        ctx.app
+                            .mesh
+                            .objective_override()
+                            .as_deref()
+                            .map(String::as_str),
+                        Some("ship it")
+                    );
+                    let before = stdout_lines().len();
+                    run(&mut ctx, ".mesh status").await.unwrap();
+                    let out: Vec<String> = stdout_lines()[before..]
+                        .iter()
+                        .flat_map(|text| text.lines().map(str::to_string))
+                        .collect();
+                    assert!(
+                        out.iter().any(|line| line == "objective: ship it"),
+                        "the override shows in the node's own card: {out:?}"
+                    );
+                    run(&mut ctx, ".mesh status clear").await.unwrap();
+                    assert!(ctx.app.mesh.objective_override().is_none());
+
+                    for line in [
+                        ".mesh peers",
+                        ".mesh knocks",
+                        ".mesh info",
+                        ".mesh pending",
+                        ".mesh inbox",
+                        ".mesh brief",
+                    ] {
+                        run(&mut ctx, line)
+                            .await
+                            .unwrap_or_else(|err| panic!("{line}: {err}"));
+                    }
+
+                    run(&mut ctx, ".mesh off --yes").await.unwrap();
+                    assert!(!guard.path.join("config.yaml").exists());
+                    relay_handle.abort();
+                });
+            }
+
+            /// Criterion (e) with the mesh on: a verb missing its arguments prints help and
+            /// takes no action. Under `cargo test` stdin is not a terminal, so any attempt to
+            /// send would have failed naming `--yes`; `Ok` is the proof that nothing was tried.
+            /// Unknown targets fail with the remedy named.
+            #[test]
+            #[serial]
+            fn missing_arguments_print_help_and_unknown_targets_name_the_remedy_while_on() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-help-on");
+                let _script = prompt_script::install_non_interactive();
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-help-on").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let hash = "ab".repeat(16);
+
+                    for line in [
+                        ".mesh reply".to_string(),
+                        format!(".mesh reply {hash}"),
+                        format!(".mesh reply {hash} \"\""),
+                        ".mesh answer".to_string(),
+                        ".mesh answer q1".to_string(),
+                        ".mesh broadcast".to_string(),
+                        ".mesh broadcast --yes".to_string(),
+                        ".mesh status nonsense".to_string(),
+                        ".mesh brief set".to_string(),
+                    ] {
+                        run(&mut ctx, &line)
+                            .await
+                            .unwrap_or_else(|err| panic!("{line}: {err}"));
+                    }
+                    assert!(ctx.app.mesh.correlations().list().is_empty());
+                    let out = stdout_lines().join("\n");
+                    for usage in [
+                        "Usage: .mesh reply <destination>",
+                        "Usage: .mesh answer <id>",
+                        "Usage: .mesh broadcast",
+                    ] {
+                        assert!(out.contains(usage), "{usage} missing from {out}");
+                    }
+
+                    let err = run(&mut ctx, &format!(".mesh info {hash}"))
+                        .await
+                        .unwrap_err()
+                        .to_string();
+                    assert!(
+                        err.contains(&hash) && err.contains("not been heard"),
+                        "{err}"
+                    );
+                    assert!(
+                        err.contains(".mesh peers") && err.contains(".mesh knocks"),
+                        "{err}"
+                    );
+
+                    let err = run(&mut ctx, ".mesh info nothex")
+                        .await
+                        .unwrap_err()
+                        .to_string();
+                    assert!(err.contains("32 hex"), "{err}");
+
+                    let err = run(&mut ctx, ".mesh reply nothex --yes hi")
+                        .await
+                        .unwrap_err()
+                        .to_string();
+                    assert!(err.contains("32 hex"), "{err}");
+
+                    let err = run(&mut ctx, ".mesh answer nope \"yes\"")
+                        .await
+                        .unwrap_err()
+                        .to_string();
+                    assert!(err.contains("No open question has id nope"), "{err}");
+                    assert!(err.contains(".mesh pending"), "{err}");
+
+                    let err = run(&mut ctx, &format!(".mesh status {hash}"))
+                        .await
+                        .unwrap_err()
+                        .to_string();
+                    assert!(err.contains(&hash) && err.contains(".mesh peers"), "{err}");
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            #[test]
+            #[serial]
+            fn bare_info_with_a_node_lists_instance_destination_interfaces_and_reach() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-info-node");
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-info-node").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let runtime = started.runtime.clone();
+
+                    run(&mut ctx, ".mesh info").await.unwrap();
+
+                    let out = stdout_lines().join("\n");
+                    let row = |name: &str| {
+                        let head = format!("  {name:<MESH_INFO_LABEL_WIDTH$}");
+                        out.lines()
+                            .find_map(|line| line.strip_prefix(&head))
+                            .unwrap_or_else(|| panic!("no {name} row in {out}"))
+                            .to_string()
+                    };
+                    assert_eq!(row("node"), "on", "{out}");
+                    assert_eq!(row("instance"), runtime.current_instance_id(), "{out}");
+                    assert_eq!(
+                        row("destination"),
+                        runtime.current_destination_hash(),
+                        "{out}"
+                    );
+                    let joined = row("joined");
+                    for interface in runtime.interfaces() {
+                        assert!(joined.contains(&interface), "{interface} missing: {out}");
+                    }
+                    assert_eq!(row("reach"), reach_line(&ctx.app.config.mesh), "{out}");
+                    assert!(out.contains("selection: nearest by hops"), "{out}");
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// The row named `name` of the last `.mesh info` printed.
+            fn info_row(out: &str, name: &str) -> String {
+                let head = format!("  {name:<MESH_INFO_LABEL_WIDTH$}");
+                out.lines()
+                    .rev()
+                    .find_map(|line| line.strip_prefix(&head))
+                    .unwrap_or_else(|| panic!("no {name} row in {out}"))
+                    .to_string()
+            }
+
+            #[test]
+            #[serial]
+            fn rotate_is_refused_while_the_mesh_is_on_and_names_mesh_off() {
+                let guard = TestConfigDirGuard::new("repl-mesh-rotate-while-on");
+                run_async(async {
+                    let started = started_runtime("repl-mesh-rotate-while-on").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let path = identity::identity_path();
+                    let minted = identity::load_or_mint_identity(&path).unwrap();
+                    let before = fs::read(&path).unwrap();
+                    let token = format!("rotate-{}", short(&fingerprint(&minted)));
+
+                    for line in [
+                        ".mesh rotate".to_string(),
+                        format!(".mesh rotate --confirm {token}"),
+                    ] {
+                        let err = refusal(&mut ctx, &line).await;
+                        assert_eq!(err, ROTATE_NEEDS_OFF, "{line}");
+                        assert!(err.contains(".mesh off"), "{line}: {err}");
+                    }
+                    assert_eq!(fs::read(&path).unwrap(), before);
+                    assert!(!identity::predecessors_path(&path).exists());
+                    assert!(path.starts_with(&guard.path));
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            #[test]
+            #[serial]
+            fn node_facts_show_predecessors_and_key_changes() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-info-predecessors");
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-info-predecessors").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let runtime = started.runtime.clone();
+
+                    let out = out_of(&mut ctx, ".mesh info").await.unwrap();
+                    assert_eq!(info_row(&out, "identity predecessors"), "none", "{out}");
+                    assert_eq!(info_row(&out, "key changes"), "none", "{out}");
+
+                    let path = identity::identity_path();
+                    let retired = fingerprint(&identity::load_or_mint_identity(&path).unwrap());
+                    identity::rotate_identity(&path, &retired, SystemTime::now()).unwrap();
+                    let old_dest = heard_trusted_peer(&runtime, ctx.app.mesh.as_ref());
+                    let (_, new_identity) = heard_peer(&runtime, "Tia again", SystemTime::now());
+                    let name_hash = runtime.peers().get(&old_dest).unwrap().name_hash;
+                    assert_eq!(
+                        runtime
+                            .trust()
+                            .note_key_change(&new_identity, &name_hash, SystemTime::now())
+                            .len(),
+                        1
+                    );
+
+                    let out = out_of(&mut ctx, ".mesh info").await.unwrap();
+                    assert_eq!(
+                        info_row(&out, "identity predecessors"),
+                        format!("1 (latest {} rotated 0s ago)", short(&retired)),
+                        "{out}"
+                    );
+                    assert_eq!(
+                        info_row(&out, "key changes"),
+                        "1 trusted instance(s) announced under another identity; see .mesh peers",
+                        "{out}"
+                    );
+
+                    fs::write(identity::predecessors_path(&path), "not json\n").unwrap();
+                    let out = out_of(&mut ctx, ".mesh info").await.unwrap();
+                    let row = info_row(&out, "identity predecessors");
+                    assert!(row.starts_with("unreadable: "), "{out}");
+                    assert!(row.contains(identity::PREDECESSORS_FILE), "{out}");
+                    assert!(
+                        row.contains(&crate::mesh::schema::unversioned_cause(
+                            identity::PREDECESSOR_RECORD_VERSION
+                        )),
+                        "{out}"
+                    );
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// The peer table's marker and the trust verb's naming of the superseded
+            /// record are two views of one mark: trusting the instance under its new key
+            /// clears it.
+            #[test]
+            #[serial]
+            fn trusting_the_new_key_of_a_known_instance_names_the_superseded_record() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-trust-superseded");
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-trust-superseded").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let runtime = started.runtime.clone();
+                    let slot: &dyn LiveMesh = ctx.app.mesh.as_ref();
+                    let old_dest = heard_trusted_peer(&runtime, slot);
+                    let old_identity = identity_of(&runtime.trust(), &old_dest);
+                    let (new_dest, new_identity) =
+                        heard_peer(&runtime, "Tia again", SystemTime::now());
+                    let name_hash = runtime.peers().get(&old_dest).unwrap().name_hash;
+                    assert_eq!(
+                        runtime.peers().get(&new_dest).unwrap().name_hash,
+                        name_hash,
+                        "both announces name the same instance"
+                    );
+                    runtime
+                        .trust()
+                        .note_key_change(&new_identity, &name_hash, SystemTime::now());
+
+                    let out = out_of(&mut ctx, ".mesh peers").await.unwrap();
+                    let marker = out
+                        .lines()
+                        .find(|line| line.contains("key changed:"))
+                        .unwrap_or_else(|| panic!("no key-change marker in {out}"));
+                    assert!(marker.starts_with(' '), "{out}");
+                    assert!(marker.contains(short(&new_identity)), "{out}");
+                    assert!(marker.contains(short(&old_identity)), "{out}");
+                    assert!(
+                        marker.contains(&format!("then .mesh trust {new_dest}; ")),
+                        "the marker names the destination heard under the new key: {out}"
+                    );
+                    assert!(
+                        marker.ends_with(&format!(".mesh untrust {old_dest} forgets the old key")),
+                        "{out}"
+                    );
+
+                    let out = out_of(&mut ctx, &format!(".mesh trust {new_dest} --yes"))
+                        .await
+                        .unwrap();
+                    assert!(out.contains("added"), "{out}");
+                    assert!(
+                        out.contains(&format!(
+                            "trusted before as {old_dest} under another identity"
+                        )),
+                        "{out}"
+                    );
+                    assert!(out.contains(&format!(".mesh untrust {old_dest}")), "{out}");
+
+                    let out = out_of(&mut ctx, ".mesh peers").await.unwrap();
+                    assert!(!out.contains("key changed:"), "{out}");
+                    let out = out_of(&mut ctx, ".mesh info").await.unwrap();
+                    assert_eq!(info_row(&out, "key changes"), "none", "{out}");
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            #[test]
+            #[serial]
+            fn mesh_on_accepted_at_the_prompt_reaches_start() {
+                let guard = TestConfigDirGuard::new("repl-mesh-on-accepted");
+                let _cache = EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
+                let _script = prompt_script::install(&[true]);
+                let _capture = capture::install();
+                run_async(async {
+                    let (addr, relay_handle, _) = loopback_relay().await;
+                    let mut ctx = ctx_with(private_config(addr.port()), true);
+                    ctx.session = Some(Session::default());
+
+                    run(&mut ctx, ".mesh on").await.unwrap();
+
+                    assert!(ctx.app.mesh.get().is_some());
+                    assert!(ctx.app.config.mesh.enabled);
+                    assert_eq!(prompt_script::prompts_asked(), 1);
+                    let out = stdout_lines();
+                    let preview = index_of(&out, "What leaves this machine");
+                    let summary = index_of(&out, "Mesh is on for this session");
+                    assert!(preview < summary, "{out:?}");
+
+                    run(&mut ctx, ".mesh off --yes").await.unwrap();
+                    assert!(ctx.app.mesh.get().is_none());
+                    relay_handle.abort();
+                });
+            }
+
+            #[test]
+            #[serial]
+            fn mesh_off_declined_keeps_the_node() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-off-declined");
+                let _script = prompt_script::install(&[false]);
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-off-declined").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    ctx.set_mesh_enabled_for_session(true);
+
+                    run(&mut ctx, ".mesh off").await.unwrap();
+
+                    assert!(ctx.app.mesh.get().is_some());
+                    assert!(ctx.app.config.mesh.enabled);
+                    assert_eq!(prompt_script::prompts_asked(), 1);
+                    index_of(&stdout_lines(), "Mesh stays on");
+
+                    run(&mut ctx, ".mesh off --yes").await.unwrap();
+                    assert!(ctx.app.mesh.get().is_none());
+                    started.relay_handle.abort();
+                });
+            }
+
+            #[test]
+            #[serial]
+            fn reply_and_broadcast_announce_then_send_nothing_when_declined() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-declined-sends");
+                let _script = prompt_script::install(&[false, false]);
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-declined-sends").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let hash = heard_trusted_peer(&started.runtime, ctx.app.mesh.as_ref());
+
+                    run(&mut ctx, &format!(".mesh reply {hash} hello"))
+                        .await
+                        .unwrap();
+                    let out = stdout_lines();
+                    let notice = index_of(&out, "This sends your text to");
+                    assert!(out[notice].contains("trust: trusted"), "{out:?}");
+                    let nothing = index_of(&out, "Nothing was sent.");
+                    assert!(notice < nothing, "{out:?}");
+                    let before = out.len();
+
+                    run(&mut ctx, ".mesh broadcast hello").await.unwrap();
+                    let out = stdout_lines()[before..].to_vec();
+                    let notice = index_of(&out, BROADCAST_NOTICE);
+                    let nothing = index_of(&out, "Nothing was sent.");
+                    assert!(notice < nothing, "{out:?}");
+
+                    assert_eq!(prompt_script::prompts_asked(), 2);
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            #[test]
+            #[serial]
+            fn non_tty_reply_and_broadcast_and_off_name_the_flag() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-non-tty");
+                let _script = prompt_script::install_non_interactive();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-non-tty").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let hash = heard_trusted_peer(&started.runtime, ctx.app.mesh.as_ref());
+
+                    for line in [
+                        ".mesh off".to_string(),
+                        format!(".mesh reply {hash} hi"),
+                        ".mesh broadcast hi".to_string(),
+                    ] {
+                        let err = run(&mut ctx, &line).await.unwrap_err().to_string();
+                        assert!(err.contains("--yes"), "{line}: {err}");
+                        assert!(ctx.app.mesh.get().is_some(), "{line}");
+                    }
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// Spec-first usage probe, criterion (f) at the command level: `--yes` is consent
+            /// only as the LEADING token. Inside the message text it is just words, so
+            /// without a terminal the send is refused naming the flag, no prompt is asked,
+            /// and nothing leaves the node; a leading `--yes` on the same node proceeds to
+            /// the send path (which then fails at the link, since the trusted peer has not
+            /// announced, still naming the destination rather than the flag).
+            #[test]
+            #[serial]
+            fn a_yes_inside_the_message_text_is_words_not_consent() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-yes-in-text");
+                let _script = prompt_script::install_non_interactive();
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-yes-in-text").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let hash = heard_trusted_peer(&started.runtime, ctx.app.mesh.as_ref());
+
+                    for line in [
+                        format!(".mesh reply {hash} please say --yes"),
+                        format!(".mesh reply {hash} \"--yes in quotes\""),
+                        ".mesh broadcast ship it --yes".to_string(),
+                        ".mesh broadcast \"--yes\" now".to_string(),
+                    ] {
+                        let err = run(&mut ctx, &line).await.unwrap_err().to_string();
+                        assert!(err.contains("--yes"), "{line}: {err}");
+                        assert!(
+                            !err.contains(&hash),
+                            "{line}: refused for want of consent, not at trust: {err}"
+                        );
+                    }
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+                    let out = stdout_lines();
+                    assert!(
+                        !out.iter().any(|line| line.contains("delivered")
+                            || line.contains("store-and-forward")
+                            || line.starts_with("Bulletin ")),
+                        "nothing was sent: {out:?}"
+                    );
+
+                    let err = run(
+                        &mut ctx,
+                        &format!(".mesh reply {hash} --yes please say --yes"),
+                    )
+                    .await
+                    .unwrap_err()
+                    .to_string();
+                    assert!(
+                        err.contains(&hash),
+                        "a leading --yes consents and the send reaches trust: {err}"
+                    );
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// `.mesh answer <id>` routes an inbound id to `answer_inbound` and an outbound
+            /// correlation id to a Reply toward that correlation's peer; `reply` takes a
+            /// destination and never an id. Both peers are unheard, so each send fails fast
+            /// at the trust check naming the routed destination, before any network.
+            #[test]
+            #[serial]
+            fn answer_routes_by_store_and_reply_is_never_an_alias() {
+                use crate::mesh::pending::{INBOUND_RECORD_VERSION, PENDING_RECORD_VERSION};
+                use crate::mesh::rfc3339_utc;
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-answer");
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-answer").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let now = SystemTime::now();
+                    let asked_peer = "ab".repeat(16);
+                    let asker_peer = "12".repeat(16);
+
+                    ctx.app
+                        .mesh
+                        .correlations()
+                        .open(crate::mesh::pending::PendingRecord {
+                            version: PENDING_RECORD_VERSION,
+                            id: "q1".to_string(),
+                            peer_destination: asked_peer.clone(),
+                            peer_identity: "cd".repeat(16),
+                            question: "what now?".to_string(),
+                            sent_at: rfc3339_utc(now),
+                            timeout_at: rfc3339_utc(now + std::time::Duration::from_secs(600)),
+                            state: PendingState::Open,
+                            reply: None,
+                        })
+                        .unwrap();
+                    let store = ctx
+                        .app
+                        .mesh
+                        .inbound_store()
+                        .expect("install attaches a store");
+                    store
+                        .upsert(
+                            InboundRecord {
+                                version: INBOUND_RECORD_VERSION,
+                                id: "p1".to_string(),
+                                peer_destination: asker_peer.clone(),
+                                peer_identity: "ef".repeat(16),
+                                question: "may I read the plan?".to_string(),
+                                envoy_question: String::new(),
+                                received_at: rfc3339_utc(now),
+                            },
+                            now,
+                        )
+                        .unwrap();
+
+                    let err = run(&mut ctx, ".mesh answer q1 \"yes\"")
+                        .await
+                        .unwrap_err()
+                        .to_string();
+                    assert!(!err.contains("No open question"), "{err}");
+                    assert!(
+                        err.contains(&asked_peer),
+                        "outbound id routes to its peer: {err}"
+                    );
+                    assert!(ctx.app.mesh.correlations().get("q1").is_some());
+
+                    let err = run(&mut ctx, ".mesh answer p1 \"no\"")
+                        .await
+                        .unwrap_err()
+                        .to_string();
+                    assert!(!err.contains("No open question"), "{err}");
+                    assert!(
+                        err.contains(&asker_peer),
+                        "inbound id routes to its asker: {err}"
+                    );
+                    assert!(
+                        store.get("p1").unwrap().is_some(),
+                        "a failed send keeps the question"
+                    );
+                    let out = stdout_lines();
+                    assert_eq!(
+                        out.iter()
+                            .filter(|line| line.contains("Sending your answer to"))
+                            .count(),
+                        2,
+                        "each routed answer announces its destination before sending: {out:?}"
+                    );
+                    assert!(
+                        out.iter().any(|line| line.contains(short(&asker_peer))),
+                        "{out:?}"
+                    );
+                    assert!(!out.iter().any(|line| line.contains("Answered")), "{out:?}");
+
+                    let err = run(&mut ctx, ".mesh reply q1 --yes hi")
+                        .await
+                        .unwrap_err()
+                        .to_string();
+                    assert!(err.contains("32 hex"), "reply never accepts an id: {err}");
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// Criterion (i), refused by the start itself rather than by `validate`: a
+            /// private relay nobody listens on makes `MeshRuntime::start` fail after the
+            /// trial id was minted. The session keeps its old id and stays clean, no node is
+            /// installed, the catalog and the session config are untouched, and the preview
+            /// (with the fresh-id consequence) was already on stdout before the start ran
+            /// (B-40) while no "on" summary ever appeared.
+            #[test]
+            #[serial]
+            fn fresh_id_is_not_committed_when_the_real_start_is_refused() {
+                let guard = TestConfigDirGuard::new("repl-mesh-fresh-refused");
+                let _cache = EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
+                let _capture = capture::install();
+                let id = "fedcba9876543210".repeat(2);
+                let session: Session = serde_yaml::from_str(&format!(
+                    "model: provider:test\nmessages: []\nmesh_instance_id: {id}"
+                ))
+                .unwrap();
+                assert!(!session.dirty());
+                run_async(async {
+                    let closed_port = {
+                        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                        listener.local_addr().unwrap().port()
+                    };
+                    let mut ctx = ctx_with(private_config(closed_port), true);
+                    ctx.session = Some(session);
+                    ctx.refresh_tool_scope(create_abort_signal()).await.unwrap();
+
+                    let err = run(&mut ctx, ".mesh on --fresh --yes")
+                        .await
+                        .unwrap_err()
+                        .to_string();
+
+                    assert!(
+                        !err.contains("function_calling_support"),
+                        "the refusal must come from the start, not from validate: {err}"
+                    );
+                    let session = ctx.session.as_ref().unwrap();
+                    assert_eq!(session.mesh_instance_id(), Some(id.as_str()));
+                    assert!(!session.dirty(), "a refused start leaves the session clean");
+                    assert!(ctx.app.mesh.get().is_none());
+                    assert!(!ctx.app.config.mesh.enabled);
+                    assert!(mesh_tool_names(&ctx).is_empty());
+                    let out = stdout_lines();
+                    index_of(&out, "What leaves this machine");
+                    index_of(&out, "fresh id");
+                    assert!(
+                        !out.iter()
+                            .any(|line| line.contains("Mesh is on for this session")),
+                        "{out:?}"
+                    );
+                });
+            }
+
+            /// `.mesh status <dest>` on a trusted peer whose announce this node's transport
+            /// has not carried (the table row exists, the identity does not resolve) says so
+            /// instead of opening a link.
+            #[test]
+            #[serial]
+            fn status_of_a_trusted_but_unresolvable_peer_says_it_cannot_be_reached_yet() {
+                use crate::mesh::hex_lower;
+                use crate::mesh::test_support::PeerSighting;
+                use crate::mesh::trust::{LiveMesh, TrustOptions};
+                use rand_core::OsRng;
+                use rns_transport::destination::{DestinationName, SingleInputDestination};
+                use rns_transport::identity::PrivateIdentity;
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-status-unresolvable");
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-status-unresolvable").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let now = SystemTime::now();
+                    let name = DestinationName::new("coyote", "mesh.probe");
+                    let announced =
+                        SingleInputDestination::new(PrivateIdentity::new_from_rand(OsRng), name);
+                    let trusted = announced.desc.address_hash.to_hex_string();
+                    started.runtime.peers().observe(
+                        PeerSighting {
+                            destination_hash: trusted.clone(),
+                            identity_hash: announced.desc.identity.address_hash.to_hex_string(),
+                            name_hash: hex_lower(name.as_name_hash_slice()),
+                            display_name: Some("Tia".to_string()),
+                            protocol_version: 1,
+                            hops: 1,
+                        },
+                        now,
+                    );
+                    let slot: &dyn LiveMesh = ctx.app.mesh.as_ref();
+                    started
+                        .runtime
+                        .trust()
+                        .trust_destination(slot, &trusted, TrustOptions::default(), now)
+                        .unwrap();
+
+                    let err = run(&mut ctx, &format!(".mesh status {trusted}"))
+                        .await
+                        .unwrap_err()
+                        .to_string();
+                    assert!(err.contains("cannot be reached yet"), "{err}");
+                    let out = stdout_lines();
+                    assert!(
+                        !out.iter().any(|line| line.contains("Asking")),
+                        "no link is opened toward an unresolvable peer: {out:?}"
+                    );
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// `.mesh status <dest>` on a peer that is in the table but not trusted is
+            /// refused by trust standing before any link is opened, naming the same
+            /// standing `.mesh peers` lists (`untrusted` / `denied` / `blocked`); a denied
+            /// destination the node has never heard is likewise never linked, and its
+            /// deny-only row reads `denied`, never `trusted`.
+            #[test]
+            #[serial]
+            fn status_of_an_untrusted_denied_or_blocked_peer_is_refused_before_any_link() {
+                use crate::mesh::hex_lower;
+                use crate::mesh::test_support::PeerSighting;
+                use crate::mesh::trust::LiveMesh;
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-status-refusal");
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-status-refusal").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let now = SystemTime::now();
+                    let sighting = |dest: u8, identity: u8, name: &str| PeerSighting {
+                        destination_hash: hex_lower(&[dest; 16]),
+                        identity_hash: hex_lower(&[identity; 16]),
+                        name_hash: String::new(),
+                        display_name: Some(name.to_string()),
+                        protocol_version: 1,
+                        hops: 1,
+                    };
+                    let untrusted = hex_lower(&[0xa1; 16]);
+                    let denied = hex_lower(&[0xb2; 16]);
+                    let blocked = hex_lower(&[0xc3; 16]);
+                    let blocked_identity = hex_lower(&[0xc4; 16]);
+                    let deny_only = hex_lower(&[0xd5; 16]);
+                    let peers = started.runtime.peers();
+                    peers.observe(sighting(0xa1, 0xa2, "Ann"), now);
+                    peers.observe(sighting(0xb2, 0xb3, "Bea"), now);
+                    peers.observe(sighting(0xc3, 0xc4, "Cid"), now);
+                    let trust = started.runtime.trust();
+                    let slot: &dyn LiveMesh = ctx.app.mesh.as_ref();
+                    trust.deny_destination(slot, &denied, None, now).unwrap();
+                    trust
+                        .block_identity(slot, &blocked_identity, None, now)
+                        .unwrap();
+                    trust.deny_destination(slot, &deny_only, None, now).unwrap();
+
+                    for (destination, standing) in [
+                        (&untrusted, "untrusted"),
+                        (&denied, "denied"),
+                        (&blocked, "blocked"),
+                    ] {
+                        let err = run(&mut ctx, &format!(".mesh status {destination}"))
+                            .await
+                            .unwrap_err()
+                            .to_string();
+                        assert!(
+                            err.contains(&format!(" is {standing} ")),
+                            "{destination} should be refused as {standing}: {err}"
+                        );
+                    }
+                    assert!(
+                        run(&mut ctx, &format!(".mesh status {deny_only}"))
+                            .await
+                            .is_err(),
+                        "an unheard denied destination is never fetched"
+                    );
+                    let out = stdout_lines();
+                    assert!(
+                        !out.iter().any(|line| line.contains("Asking")),
+                        "no status link may be opened toward a refused destination: {out:?}"
+                    );
+
+                    run(&mut ctx, ".mesh peers").await.unwrap();
+                    let out = stdout_lines();
+                    let row = |destination: &str| {
+                        out.iter()
+                            .flat_map(|text| text.lines())
+                            .find(|line| line.contains(short(destination)))
+                            .unwrap_or_else(|| panic!("{destination} missing from {out:?}"))
+                            .to_string()
+                    };
+                    assert!(row(&untrusted).contains("untrusted"), "{}", row(&untrusted));
+                    assert!(row(&denied).contains(" denied "), "{}", row(&denied));
+                    assert!(!row(&denied).contains(" trusted "), "{}", row(&denied));
+                    assert!(row(&blocked).contains(" blocked "), "{}", row(&blocked));
+                    assert!(row(&deny_only).contains(" denied "), "{}", row(&deny_only));
+                    assert!(
+                        !row(&deny_only).contains(" trusted "),
+                        "{}",
+                        row(&deny_only)
+                    );
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// `.mesh info <dest>` consults the peer table first: a knock cache that no
+            /// longer parses does not hide a known peer, while for a destination the node
+            /// has not heard the command still errors rather than rendering anything.
+            /// `.mesh knocks` reports the unreadable cache as an error, never as an empty
+            /// list.
+            #[test]
+            #[serial]
+            fn info_on_a_known_peer_survives_an_unreadable_knock_cache() {
+                use crate::mesh::hex_lower;
+                use crate::mesh::test_support::PeerSighting;
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-info-knocks");
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-info-knocks").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let now = SystemTime::now();
+                    let known = hex_lower(&[0x5a; 16]);
+                    started.runtime.peers().observe(
+                        PeerSighting {
+                            destination_hash: known.clone(),
+                            identity_hash: hex_lower(&[0x5b; 16]),
+                            name_hash: String::new(),
+                            display_name: Some("Kay".to_string()),
+                            protocol_version: 1,
+                            hops: 2,
+                        },
+                        now,
+                    );
+                    let cache_path = started.runtime.knock_gate().cache().path().to_path_buf();
+                    std::fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
+                    std::fs::write(&cache_path, "{this is not a knock record\n").unwrap();
+
+                    run(&mut ctx, &format!(".mesh info {known}")).await.unwrap();
+                    let out = stdout_lines();
+                    assert!(out.iter().any(|line| line.contains("Kay")), "{out:?}");
+                    assert!(out.iter().any(|line| line.contains(&known)), "{out:?}");
+                    let warned: Vec<String> = capture::lines()
+                        .into_iter()
+                        .filter(|(stream, _)| *stream == capture::Stream::Err)
+                        .map(|(_, text)| text)
+                        .collect();
+                    assert!(
+                        warned.iter().any(|line| line.contains("knock cache")),
+                        "the unreadable cache is reported on stderr: {warned:?}"
+                    );
+
+                    let unknown = hex_lower(&[0x6b; 16]);
+                    assert!(
+                        run(&mut ctx, &format!(".mesh info {unknown}"))
+                            .await
+                            .is_err(),
+                        "nothing known must be an error"
+                    );
+                    assert!(
+                        !stdout_lines().iter().any(|line| line.contains(&unknown)),
+                        "an unknown destination renders no detail"
+                    );
+                    let err = run(&mut ctx, ".mesh knocks").await.unwrap_err().to_string();
+                    assert!(err.contains("knock"), "{err}");
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// A destination that only knocked is still something `.mesh info` can describe.
+            #[test]
+            #[serial]
+            fn info_on_a_knock_only_destination_renders_the_knock() {
+                use crate::mesh::hex_lower;
+                use crate::mesh::knocks::KNOCK_RECORD_VERSION;
+                use crate::mesh::rfc3339_utc;
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-info-knock-only");
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-info-knock-only").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let now = SystemTime::now();
+                    let knocker = hex_lower(&[0x7c; 16]);
+                    started
+                        .runtime
+                        .knock_gate()
+                        .cache()
+                        .append(
+                            KnockRecord {
+                                version: KNOCK_RECORD_VERSION,
+                                received_at: rfc3339_utc(now),
+                                identity_hash: hex_lower(&[0x7d; 16]),
+                                destination_hash: knocker.clone(),
+                                name_hash: String::new(),
+                                display_name: Some("Kip".to_string()),
+                                intro: Some("hello there".to_string()),
+                                hops: 1,
+                            },
+                            now,
+                        )
+                        .unwrap();
+
+                    run(&mut ctx, &format!(".mesh info {knocker}"))
+                        .await
+                        .unwrap();
+
+                    let out = stdout_lines();
+                    assert!(out.iter().any(|line| line.contains(&knocker)), "{out:?}");
+                    assert!(out.iter().any(|line| line.contains("Kip")), "{out:?}");
+                    assert!(out.iter().any(|line| line.contains("knocked:")), "{out:?}");
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// Spec-first usage probe, criterion (f) + B-28 at the command level: `.mesh reply`
+            /// announces a trusted destination WITH its trust standing before asking, and an
+            /// untrusted, denied or blocked destination is refused naming that standing before
+            /// any prompt is asked (a leading `--yes` does not bypass that refusal: it is not a
+            /// consent question). A destination the trust list denies but the node has not
+            /// heard is still a denied destination and must be refused before the prompt too.
+            #[test]
+            #[serial]
+            fn reply_shows_the_standing_and_refuses_denied_or_blocked_before_asking() {
+                use crate::mesh::hex_lower;
+                use crate::mesh::test_support::PeerSighting;
+                use crate::mesh::trust::{LiveMesh, TrustOptions};
+                use rand_core::OsRng;
+                use rns_transport::destination::{DestinationName, SingleInputDestination};
+                use rns_transport::identity::PrivateIdentity;
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-reply-standing");
+                let _script = prompt_script::install(&[false, false, false, false, false]);
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-reply-standing").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let now = SystemTime::now();
+                    let sighting = |dest: u8, identity: u8, name: &str| PeerSighting {
+                        destination_hash: hex_lower(&[dest; 16]),
+                        identity_hash: hex_lower(&[identity; 16]),
+                        name_hash: String::new(),
+                        display_name: Some(name.to_string()),
+                        protocol_version: 1,
+                        hops: 1,
+                    };
+                    // Trusting a destination verifies identity + name hash -> destination,
+                    // so the trusted peer is derived for real.
+                    let name = DestinationName::new("coyote", "mesh.probe");
+                    let announced =
+                        SingleInputDestination::new(PrivateIdentity::new_from_rand(OsRng), name);
+                    let trusted = announced.desc.address_hash.to_hex_string();
+                    let untrusted = hex_lower(&[0x22; 16]);
+                    let denied = hex_lower(&[0x33; 16]);
+                    let blocked = hex_lower(&[0x44; 16]);
+                    let blocked_identity = hex_lower(&[0x45; 16]);
+                    let deny_only = hex_lower(&[0x66; 16]);
+                    let peers = started.runtime.peers();
+                    peers.observe(
+                        PeerSighting {
+                            destination_hash: trusted.clone(),
+                            identity_hash: announced.desc.identity.address_hash.to_hex_string(),
+                            name_hash: hex_lower(name.as_name_hash_slice()),
+                            display_name: Some("Tia".to_string()),
+                            protocol_version: 1,
+                            hops: 1,
+                        },
+                        now,
+                    );
+                    peers.observe(sighting(0x22, 0x23, "Uma"), now);
+                    peers.observe(sighting(0x33, 0x34, "Dee"), now);
+                    peers.observe(sighting(0x44, 0x45, "Bob"), now);
+                    let trust = started.runtime.trust();
+                    let slot: &dyn LiveMesh = ctx.app.mesh.as_ref();
+                    trust
+                        .trust_destination(slot, &trusted, TrustOptions::default(), now)
+                        .unwrap();
+                    trust.deny_destination(slot, &denied, None, now).unwrap();
+                    trust
+                        .block_identity(slot, &blocked_identity, None, now)
+                        .unwrap();
+                    trust.deny_destination(slot, &deny_only, None, now).unwrap();
+
+                    // Trusted peer: the announcement names the peer and its standing, then the
+                    // (declined) prompt is asked and nothing is sent.
+                    let asked_before = prompt_script::prompts_asked();
+                    let before = stdout_lines().len();
+                    run(&mut ctx, &format!(".mesh reply {trusted} hello"))
+                        .await
+                        .unwrap();
+                    let out = stdout_lines()[before..].to_vec();
+                    let notice = &out[index_of(&out, "This sends your text to")];
+                    assert!(notice.contains("Tia"), "{notice}");
+                    assert!(
+                        notice.contains("trust: trusted"),
+                        "the announcement carries the standing: {notice}"
+                    );
+                    assert!(
+                        out.iter().any(|line| line == "Nothing was sent."),
+                        "{out:?}"
+                    );
+                    assert_eq!(prompt_script::prompts_asked(), asked_before + 1);
+
+                    // Untrusted, denied and blocked heard peers: refused before any prompt,
+                    // and `--yes` changes nothing about that.
+                    for (destination, standing) in [
+                        (&untrusted, "untrusted"),
+                        (&denied, "denied"),
+                        (&blocked, "blocked"),
+                    ] {
+                        for line in [
+                            format!(".mesh reply {destination} hello"),
+                            format!(".mesh reply --yes {destination} hello"),
+                        ] {
+                            let asked_before = prompt_script::prompts_asked();
+                            let before = stdout_lines().len();
+                            let err = run(&mut ctx, &line).await.unwrap_err().to_string();
+                            assert!(
+                                err.contains(&format!(" is {standing} ")),
+                                "{line}: refused naming the standing: {err}"
+                            );
+                            assert_eq!(
+                                prompt_script::prompts_asked(),
+                                asked_before,
+                                "{line}: refused before the prompt"
+                            );
+                            let out = stdout_lines()[before..].to_vec();
+                            assert!(
+                                !out.iter()
+                                    .any(|text| text.contains("This sends your text to")
+                                        || text.starts_with("Sent ")),
+                                "{line}: no announcement, no send: {out:?}"
+                            );
+                        }
+                    }
+
+                    // A denied destination the node has not heard: still denied, so still
+                    // refused before the prompt, and never announced as a plain unheard node.
+                    let asked_before = prompt_script::prompts_asked();
+                    let before = stdout_lines().len();
+                    let result = run(&mut ctx, &format!(".mesh reply {deny_only} hello")).await;
+                    let out = stdout_lines()[before..].to_vec();
+                    assert!(
+                        result.is_err(),
+                        "a denied destination is refused even when unheard: {out:?}"
+                    );
+                    assert_eq!(
+                        prompt_script::prompts_asked(),
+                        asked_before,
+                        "a denied destination is refused before the prompt: {out:?}"
+                    );
+                    assert!(
+                        !out.iter().any(|text| text.contains("unheard node")),
+                        "the trust list knows this destination; it is not a plain unheard node: {out:?}"
+                    );
+                    // With consent given up front nothing may leave either, and the
+                    // announcement must still not misreport the standing.
+                    let before = stdout_lines().len();
+                    let err = run(&mut ctx, &format!(".mesh reply --yes {deny_only} hello"))
+                        .await
+                        .unwrap_err()
+                        .to_string();
+                    let out = stdout_lines()[before..].to_vec();
+                    assert!(!out.iter().any(|text| text.starts_with("Sent ")), "{out:?}");
+                    assert!(err.contains(&deny_only) || err.contains("denied"), "{err}");
+                    assert!(
+                        !out.iter().any(|text| text.contains("unheard node")),
+                        "denied, not merely unheard: {out:?}"
+                    );
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// Usage probe (spec (f)): the reply gate runs BEFORE any notice or prompt and
+            /// refuses every non-Allow verdict. A destination the node has not heard (and
+            /// the trust list does not deny) is a not-heard error, never an announcement or
+            /// a consent question; a heard peer whose verdict is not Allow ("untrusted",
+            /// the default-closed standing) is refused naming that standing, and a leading
+            /// `--yes` does not turn it into a send. Nothing may reach `send_peer`, which
+            /// would refuse the same peer as NotTrusted after the human had already consented.
+            #[test]
+            #[serial]
+            fn reply_refuses_unheard_and_untrusted_destinations_before_asking() {
+                use crate::mesh::test_support::PeerSighting;
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-reply-gate-first");
+                // Every answer is "yes": if any prompt is asked at all, consent is given,
+                // so a wrongly gated destination would visibly reach the send path.
+                let _script = prompt_script::install(&[true, true, true, true]);
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-reply-gate-first").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let now = SystemTime::now();
+                    let unheard = hex_lower(&[0x77; 16]);
+                    let untrusted = hex_lower(&[0x88; 16]);
+                    started.runtime.peers().observe(
+                        PeerSighting {
+                            destination_hash: untrusted.clone(),
+                            identity_hash: hex_lower(&[0x89; 16]),
+                            name_hash: String::new(),
+                            display_name: Some("Uma".to_string()),
+                            protocol_version: 1,
+                            hops: 1,
+                        },
+                        now,
+                    );
+
+                    // Not heard, not denied: a not-heard error, no notice, no prompt.
+                    for line in [
+                        format!(".mesh reply {unheard} hello"),
+                        format!(".mesh reply --yes {unheard} hello"),
+                    ] {
+                        let asked_before = prompt_script::prompts_asked();
+                        let before = stdout_lines().len();
+                        let err = run(&mut ctx, &line).await.unwrap_err().to_string();
+                        let out = stdout_lines()[before..].to_vec();
+                        assert!(
+                            err.contains("has not been heard"),
+                            "{line}: an unheard destination is a not-heard error: {err}"
+                        );
+                        assert_eq!(
+                            prompt_script::prompts_asked(),
+                            asked_before,
+                            "{line}: no consent question for an unheard destination"
+                        );
+                        assert!(
+                            !out.iter()
+                                .any(|text| text.contains("This sends your text to")
+                                    || text.starts_with("Sent ")),
+                            "{line}: no announcement, no send: {out:?}"
+                        );
+                    }
+
+                    // Heard but untrusted (default-closed): the verdict is not Allow, so the
+                    // gate refuses naming the standing before any notice or prompt.
+                    for line in [
+                        format!(".mesh reply {untrusted} hello"),
+                        format!(".mesh reply --yes {untrusted} hello"),
+                    ] {
+                        let asked_before = prompt_script::prompts_asked();
+                        let before = stdout_lines().len();
+                        let result = run(&mut ctx, &line).await;
+                        let out = stdout_lines()[before..].to_vec();
+                        let err = match result {
+                            Ok(_) => panic!(
+                                "{line}: an untrusted peer must be refused, not sent to: {out:?}"
+                            ),
+                            Err(err) => err.to_string(),
+                        };
+                        assert!(
+                            err.contains("untrusted"),
+                            "{line}: refused naming the standing: {err}"
+                        );
+                        assert_eq!(
+                            prompt_script::prompts_asked(),
+                            asked_before,
+                            "{line}: the trust gate runs before the prompt (out: {out:?}, err: {err})"
+                        );
+                        assert!(
+                            !out.iter()
+                                .any(|text| text.contains("This sends your text to")),
+                            "{line}: the gate runs before any notice: {out:?}"
+                        );
+                    }
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            #[test]
+            #[serial]
+            fn knock_help_intro_limit_and_bad_hash_are_teaching_errors() {
+                use crate::mesh::knocks::KNOCK_INTRO_MAX_CHARS;
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-knock-teaching");
+                let _script = prompt_script::install(&[]);
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-knock-teaching").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let (heard, _) = heard_peer(&started.runtime, "Tia", SystemTime::now());
+
+                    run(&mut ctx, ".mesh knock").await.unwrap();
+                    let out = stdout_lines();
+                    assert!(
+                        out.iter()
+                            .any(|line| line.contains(".mesh knock <destination>")),
+                        "{out:?}"
+                    );
+
+                    let err = run(&mut ctx, ".mesh knock nothex")
+                        .await
+                        .unwrap_err()
+                        .to_string();
+                    assert!(err.contains("is not a destination hash"), "{err}");
+
+                    let long = "x".repeat(KNOCK_INTRO_MAX_CHARS + 1);
+                    let err = run(&mut ctx, &format!(".mesh knock {heard} --intro \"{long}\""))
+                        .await
+                        .unwrap_err()
+                        .to_string();
+                    assert!(
+                        err.contains(&format!(
+                            "above the {KNOCK_INTRO_MAX_CHARS}-character limit"
+                        )),
+                        "{err}"
+                    );
+
+                    // Heard, but its announce never reached the transport: refused after the
+                    // consent, before any link is opened.
+                    let before = stdout_lines().len();
+                    let err = run(&mut ctx, &format!(".mesh knock {heard} --yes"))
+                        .await
+                        .unwrap_err()
+                        .to_string();
+                    assert!(err.contains("cannot be reached yet"), "{err}");
+                    let out = stdout_lines()[before..].to_vec();
+                    assert!(
+                        !out.iter().any(|line| line.starts_with("Knocking on")),
+                        "{out:?}"
+                    );
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            #[test]
+            #[serial]
+            fn knock_announces_then_sends_nothing_when_declined() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-knock-declined");
+                let _script = prompt_script::install(&[false]);
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-knock-declined").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let (heard, _) = heard_peer(&started.runtime, "Tia", SystemTime::now());
+
+                    run(&mut ctx, &format!(".mesh knock {heard} --intro \"hello\""))
+                        .await
+                        .unwrap();
+                    let out = stdout_lines();
+                    let notice = index_of(&out, "This knocks on Tia (");
+                    assert!(out[notice].contains("with intro \"hello\""), "{out:?}");
+                    let nothing = index_of(&out, "Nothing was sent.");
+                    assert!(notice < nothing, "{out:?}");
+                    assert!(
+                        !out.iter().any(|line| line.starts_with("Knocking on")),
+                        "{out:?}"
+                    );
+                    assert_eq!(prompt_script::prompts_asked(), 1);
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            #[test]
+            #[serial]
+            fn knock_to_a_destination_never_heard_is_refused() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-knock-unheard");
+                let _script = prompt_script::install(&[]);
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-knock-unheard").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let unheard = hex_lower(&[0x77; 16]);
+
+                    for line in [
+                        format!(".mesh knock {unheard}"),
+                        format!(".mesh knock {unheard} --yes --intro \"hi\""),
+                    ] {
+                        let before = stdout_lines().len();
+                        let err = run(&mut ctx, &line).await.unwrap_err().to_string();
+                        assert!(err.contains("has not been heard"), "{line}: {err}");
+                        let out = stdout_lines()[before..].to_vec();
+                        assert!(
+                            !out.iter().any(|text| text.starts_with("This knocks on")),
+                            "{line}: no notice for an unheard destination: {out:?}"
+                        );
+                    }
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// Usage probe (spec (f)): `.mesh reply <dest>` applies the SAME trust gate as
+            /// `.mesh status <dest>`, so for one destination both verbs classify the refusal
+            /// the same way: plain unheard -> not-heard; unheard but denied at the
+            /// destination tier -> denied; heard untrusted/denied/blocked -> that standing.
+            #[test]
+            #[serial]
+            fn reply_and_status_classify_the_same_destination_the_same_way() {
+                use crate::mesh::test_support::PeerSighting;
+                use crate::mesh::trust::LiveMesh;
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-reply-status-parity");
+                let _script = prompt_script::install(&[false, false, false, false, false]);
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-reply-status-parity").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let now = SystemTime::now();
+                    let sighting = |dest: u8, identity: u8, name: &str| PeerSighting {
+                        destination_hash: hex_lower(&[dest; 16]),
+                        identity_hash: hex_lower(&[identity; 16]),
+                        name_hash: String::new(),
+                        display_name: Some(name.to_string()),
+                        protocol_version: 1,
+                        hops: 1,
+                    };
+                    let unheard = hex_lower(&[0x51; 16]);
+                    let unheard_denied = hex_lower(&[0x52; 16]);
+                    let untrusted = hex_lower(&[0x61; 16]);
+                    let denied = hex_lower(&[0x62; 16]);
+                    let blocked = hex_lower(&[0x63; 16]);
+                    let blocked_identity = hex_lower(&[0x64; 16]);
+                    let peers = started.runtime.peers();
+                    peers.observe(sighting(0x61, 0x71, "Una"), now);
+                    peers.observe(sighting(0x62, 0x72, "Dot"), now);
+                    peers.observe(sighting(0x63, 0x64, "Bex"), now);
+                    let trust = started.runtime.trust();
+                    let slot: &dyn LiveMesh = ctx.app.mesh.as_ref();
+                    trust.deny_destination(slot, &denied, None, now).unwrap();
+                    trust
+                        .deny_destination(slot, &unheard_denied, None, now)
+                        .unwrap();
+                    trust
+                        .block_identity(slot, &blocked_identity, None, now)
+                        .unwrap();
+
+                    let classify = |err: &str| -> &'static str {
+                        if err.contains(" is denied ") {
+                            "denied"
+                        } else if err.contains(" is blocked ") {
+                            "blocked"
+                        } else if err.contains(" is untrusted ") {
+                            "untrusted"
+                        } else if err.contains("has not been heard") {
+                            "not-heard"
+                        } else {
+                            "other"
+                        }
+                    };
+
+                    for (destination, expected) in [
+                        (&unheard, "not-heard"),
+                        (&unheard_denied, "denied"),
+                        (&untrusted, "untrusted"),
+                        (&denied, "denied"),
+                        (&blocked, "blocked"),
+                    ] {
+                        let asked_before = prompt_script::prompts_asked();
+                        let status_err = run(&mut ctx, &format!(".mesh status {destination}"))
+                            .await
+                            .unwrap_err()
+                            .to_string();
+                        let reply_err = run(&mut ctx, &format!(".mesh reply {destination} hello"))
+                            .await
+                            .unwrap_err()
+                            .to_string();
+                        assert_eq!(
+                            classify(&reply_err),
+                            expected,
+                            "reply gate for {destination}: {reply_err}"
+                        );
+                        assert_eq!(
+                            classify(&status_err),
+                            expected,
+                            "status gate for {destination}: {status_err}"
+                        );
+                        assert_eq!(
+                            classify(&status_err),
+                            classify(&reply_err),
+                            "reply and status share one gate for {destination}:\n  status: {status_err}\n  reply:  {reply_err}"
+                        );
+                        assert_eq!(
+                            prompt_script::prompts_asked(),
+                            asked_before,
+                            "{destination}: refused before any prompt"
+                        );
+                    }
+                    let out = stdout_lines();
+                    assert!(
+                        !out.iter().any(|line| line.contains("Asking")
+                            || line.contains("This sends your text to")
+                            || line.starts_with("Sent ")),
+                        "no notice or link toward a refused destination: {out:?}"
+                    );
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            fn trust_file(store: &TrustStore) -> Option<Vec<u8>> {
+                fs::read(store.path()).ok()
+            }
+
+            fn identity_of(store: &TrustStore, destination: &str) -> String {
+                store
+                    .records()
+                    .into_iter()
+                    .find(|record| record.hash == destination)
+                    .and_then(|record| record.identity)
+                    .unwrap_or_else(|| panic!("{destination} has no trust record"))
+            }
+
+            fn trusted_hashes(store: &TrustStore) -> Vec<String> {
+                store
+                    .records()
+                    .into_iter()
+                    .map(|record| record.hash)
+                    .collect()
+            }
+
+            /// What `line` alone printed to stdout, apart from the commands before it.
+            async fn out_of(ctx: &mut RequestContext, line: &str) -> Result<String> {
+                let before = stdout_lines().len();
+                run(ctx, line).await?;
+                Ok(stdout_lines()[before..].join("\n"))
+            }
+
+            async fn refusal(ctx: &mut RequestContext, line: &str) -> String {
+                run(ctx, line).await.expect_err(line).to_string()
+            }
+
+            /// The answer is the consent: `no` writes nothing, `yes` adds the record with
+            /// its label, and `--yes` stands in for the question rather than asking it.
+            #[test]
+            #[serial]
+            fn trust_confirms_then_writes_the_record_on_yes_and_nothing_on_no() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-trust-confirm");
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-trust-confirm").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let trust = started.runtime.trust();
+                    let (dest, id) = heard_peer(&started.runtime, "Tia", SystemTime::now());
+                    assert!(trust_file(&trust).is_none());
+
+                    let declined = prompt_script::install(&[false]);
+                    let out = out_of(&mut ctx, &format!(".mesh trust {dest}"))
+                        .await
+                        .unwrap();
+                    assert!(out.contains(NOTHING_CHANGED), "{out}");
+                    assert_eq!(prompt_script::prompts_asked(), 1);
+                    assert!(trust_file(&trust).is_none());
+                    assert_eq!(trust.authorize(&id, &dest).decision, Decision::Refuse);
+                    drop(declined);
+
+                    let _script = prompt_script::install(&[true]);
+                    let out = out_of(&mut ctx, &format!(".mesh trust {dest} --label \"Tia box\""))
+                        .await
+                        .unwrap();
+                    assert!(out.contains("added"), "{out}");
+                    assert_eq!(prompt_script::prompts_asked(), 1);
+                    assert_eq!(trust.authorize(&id, &dest).decision, Decision::Allow);
+                    assert!(
+                        trust.records().iter().any(|record| record.hash == dest
+                            && record.label.as_deref() == Some("Tia box")),
+                        "{:?}",
+                        trust.records()
+                    );
+
+                    let out = out_of(&mut ctx, &format!(".mesh trust {dest} --yes"))
+                        .await
+                        .unwrap();
+                    assert!(out.contains("updated"), "{out}");
+                    assert_eq!(prompt_script::prompts_asked(), 1);
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// Without a terminal each mutation refuses naming `--yes` instead of hanging on
+            /// a prompt nobody can answer; with `--yes` each goes through, and a block takes
+            /// the identity's instance record with it.
+            #[test]
+            #[serial]
+            fn trust_mutations_without_a_terminal_fail_naming_the_flag() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-trust-non-tty");
+                let _capture = capture::install();
+                let _script = prompt_script::install_non_interactive();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-trust-non-tty").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let trust = started.runtime.trust();
+                    let slot: &dyn LiveMesh = ctx.app.mesh.as_ref();
+                    let dest = heard_trusted_peer(&started.runtime, slot);
+                    let id = identity_of(&trust, &dest);
+                    let before = trust_file(&trust);
+                    assert!(before.is_some());
+
+                    for line in [
+                        format!(".mesh trust {dest}"),
+                        format!(".mesh untrust {dest}"),
+                        format!(".mesh block {id}"),
+                        format!(".mesh unblock {id}"),
+                        format!(".mesh deny {dest}"),
+                        format!(".mesh undeny {dest}"),
+                    ] {
+                        let err = refusal(&mut ctx, &line).await;
+                        assert!(err.contains("pass --yes to confirm"), "{line}: {err}");
+                    }
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+                    assert_eq!(trust_file(&trust), before);
+
+                    let out = out_of(&mut ctx, &format!(".mesh deny {dest} --yes"))
+                        .await
+                        .unwrap();
+                    assert!(out.contains("Denied"), "{out}");
+                    assert!(trust.denied().iter().any(|record| record.hash == dest));
+                    let out = out_of(&mut ctx, &format!(".mesh undeny {dest} --yes"))
+                        .await
+                        .unwrap();
+                    assert!(out.contains("Undenied"), "{out}");
+                    assert!(trust.denied().is_empty());
+                    let out = out_of(&mut ctx, &format!(".mesh block {id} --yes"))
+                        .await
+                        .unwrap();
+                    assert!(out.contains("Blocked"), "{out}");
+                    assert!(trust.blocked().iter().any(|record| record.hash == id));
+                    assert!(
+                        !trusted_hashes(&trust).contains(&dest),
+                        "a block removes the identity's instance record"
+                    );
+                    let out = out_of(&mut ctx, &format!(".mesh unblock {id} --yes"))
+                        .await
+                        .unwrap();
+                    assert!(out.contains("Unblocked"), "{out}");
+                    assert!(trust.blocked().is_empty());
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            #[test]
+            #[serial]
+            fn trust_identity_confirms_with_every_instance_wording() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-trust-identity");
+                let _capture = capture::install();
+                let _script = prompt_script::install(&[true]);
+                run_async(async {
+                    let started = started_runtime("repl-mesh-trust-identity").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let trust = started.runtime.trust();
+                    let (_, id) = heard_peer(&started.runtime, "Tia", SystemTime::now());
+
+                    let out = out_of(&mut ctx, &format!(".mesh trust --identity {id}"))
+                        .await
+                        .unwrap();
+                    assert!(out.contains("every instance"), "{out}");
+                    assert!(out.contains("added"), "{out}");
+                    assert!(
+                        out.contains("A rotation of this identity is not detected"),
+                        "{out}"
+                    );
+                    assert!(out.contains(".mesh trust <destination>"), "{out}");
+                    assert_eq!(prompt_script::prompts_asked(), 1);
+                    assert!(
+                        trust
+                            .records()
+                            .iter()
+                            .any(|record| record.tier == Tier::Identity
+                                && record.hash == id
+                                && record.all_destinations),
+                        "{:?}",
+                        trust.records()
+                    );
+                    let other = hex_lower(&[0x5a; 16]);
+                    assert_eq!(trust.authorize(&id, &other).decision, Decision::Allow);
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// The prune token, not a prompt, is the consent: bare and `--dry-run` only list
+            /// and print the token (on a terminal or not), a token for a different count is
+            /// refused, and the matching token removes exactly the listed instances.
+            #[test]
+            #[serial]
+            fn trust_prune_is_a_dry_run_until_the_token_comes_back() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-trust-prune");
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-trust-prune").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let trust = started.runtime.trust();
+                    let slot: &dyn LiveMesh = ctx.app.mesh.as_ref();
+                    // The peer table's sighting rescues a record from pruning, so the stale
+                    // peer must have been heard as long ago as it was trusted.
+                    let long_ago = SystemTime::now() - Duration::from_secs(40 * 86_400);
+                    let (old, _) = heard_peer(&started.runtime, "Old", long_ago);
+                    trust
+                        .trust_destination(slot, &old, TrustOptions::default(), long_ago)
+                        .unwrap();
+                    let fresh = heard_trusted_peer(&started.runtime, slot);
+                    let before = trust_file(&trust);
+                    assert!(before.is_some());
+
+                    let tty = prompt_script::install(&[]);
+                    for line in [".mesh trust --prune", ".mesh trust --prune --dry-run"] {
+                        let out = out_of(&mut ctx, line).await.unwrap();
+                        assert!(out.contains(&old), "{line}: {out}");
+                        assert!(!out.contains(&fresh), "{line}: {out}");
+                        assert!(out.contains("This was a dry run"), "{line}: {out}");
+                        assert!(
+                            out.contains(
+                                "To remove these 1 instance(s), run: .mesh trust --prune --confirm prune-1"
+                            ),
+                            "no key-change count when nothing is marked: {line}: {out}"
+                        );
+                        assert_eq!(trust_file(&trust), before, "{line}");
+                    }
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+                    drop(tty);
+
+                    let _script = prompt_script::install_non_interactive();
+                    for line in [".mesh trust --prune", ".mesh trust --prune --dry-run"] {
+                        let out = out_of(&mut ctx, line).await.unwrap();
+                        assert!(out.contains(&old), "{line}: {out}");
+                        assert!(out.contains("This was a dry run"), "{line}: {out}");
+                        assert!(out.contains("--confirm prune-1"), "{line}: {out}");
+                        assert_eq!(trust_file(&trust), before, "{line}");
+                    }
+
+                    let err = refusal(&mut ctx, ".mesh trust --prune --confirm prune-2").await;
+                    assert!(err.contains("has changed since the dry run"), "{err}");
+                    let err = refusal(&mut ctx, ".mesh trust --prune --yes").await;
+                    assert!(err.contains("--confirm prune-<N>"), "{err}");
+                    let err = refusal(&mut ctx, ".mesh trust --prune --confirm bogus").await;
+                    assert!(err.contains("prune-<N>"), "{err}");
+                    assert_eq!(trust_file(&trust), before);
+
+                    let out = out_of(&mut ctx, ".mesh trust --prune --confirm prune-1")
+                        .await
+                        .unwrap();
+                    assert!(out.contains("Removed 1"), "{out}");
+                    assert!(out.contains(&old), "{out}");
+                    let hashes = trusted_hashes(&trust);
+                    assert!(!hashes.contains(&old), "{hashes:?}");
+                    assert!(hashes.contains(&fresh), "{hashes:?}");
+
+                    let out = out_of(&mut ctx, ".mesh trust --prune --older-than 1m")
+                        .await
+                        .unwrap();
+                    assert!(out.contains("nothing to prune"), "{out}");
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            #[test]
+            #[serial]
+            fn prune_dry_run_shows_key_change_marks() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-trust-prune-marked");
+                let _capture = capture::install();
+                let _script = prompt_script::install(&[]);
+                run_async(async {
+                    let started = started_runtime("repl-mesh-trust-prune-marked").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let trust = started.runtime.trust();
+                    let slot: &dyn LiveMesh = ctx.app.mesh.as_ref();
+                    let long_ago = SystemTime::now() - Duration::from_secs(40 * 86_400);
+                    let (marked, _) = heard_peer(&started.runtime, "Old", long_ago);
+                    trust
+                        .trust_destination(slot, &marked, TrustOptions::default(), long_ago)
+                        .unwrap();
+                    let (_, seen) = heard_peer(&started.runtime, "Old again", SystemTime::now());
+                    let name_hash = started.runtime.peers().get(&marked).unwrap().name_hash;
+                    assert_eq!(
+                        trust
+                            .note_key_change(&seen, &name_hash, SystemTime::now())
+                            .len(),
+                        1
+                    );
+                    let before = trust_file(&trust);
+
+                    let out = out_of(&mut ctx, ".mesh trust --prune").await.unwrap();
+
+                    let marked_row = out
+                        .lines()
+                        .find(|line| line.contains(&marked))
+                        .unwrap_or_else(|| panic!("{out}"));
+                    assert!(
+                        marked_row.contains(&format!(
+                            "key changed: announced under identity {} 0s ago",
+                            short(&seen)
+                        )),
+                        "{out}"
+                    );
+                    assert!(
+                        out.contains(
+                            "To remove these 1 instance(s), 1 of them marked key-changed, run: .mesh trust --prune --confirm prune-1"
+                        ),
+                        "{out}"
+                    );
+                    assert_eq!(trust_file(&trust), before);
+
+                    let out = out_of(&mut ctx, ".mesh trust --prune --confirm prune-1")
+                        .await
+                        .unwrap();
+                    assert!(out.contains("Removed 1"), "{out}");
+                    assert!(
+                        trust
+                            .records()
+                            .iter()
+                            .all(|record| record.key_changed.is_none()),
+                        "a confirmed prune removes the marked record with the rest"
+                    );
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            #[test]
+            #[serial]
+            fn untrust_identity_is_a_dry_run_until_its_token_comes_back() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-untrust-identity");
+                let _capture = capture::install();
+                let _script = prompt_script::install(&[]);
+                run_async(async {
+                    let started = started_runtime("repl-mesh-untrust-identity").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let trust = started.runtime.trust();
+                    let slot: &dyn LiveMesh = ctx.app.mesh.as_ref();
+                    let dest = heard_trusted_peer(&started.runtime, slot);
+                    let id = identity_of(&trust, &dest);
+                    run(&mut ctx, &format!(".mesh trust --identity {id} --yes"))
+                        .await
+                        .unwrap();
+                    let before = trust_file(&trust);
+                    let token = format!("untrust-{}", short(&id));
+
+                    for line in [
+                        format!(".mesh untrust --identity {id}"),
+                        format!(".mesh untrust --identity {id} --dry-run"),
+                    ] {
+                        let out = out_of(&mut ctx, &line).await.unwrap();
+                        assert!(out.contains(&id), "{line}: {out}");
+                        assert!(out.contains(&format!("instance {dest}")), "{line}: {out}");
+                        assert!(out.contains("This was a dry run"), "{line}: {out}");
+                        assert!(out.contains(&format!("--confirm {token}")), "{line}: {out}");
+                        assert_eq!(trust_file(&trust), before, "{line}");
+                    }
+                    let err = refusal(
+                        &mut ctx,
+                        &format!(".mesh untrust --identity {id} --confirm untrust-nope"),
+                    )
+                    .await;
+                    assert!(err.contains(&token), "{err}");
+                    let err =
+                        refusal(&mut ctx, &format!(".mesh untrust --identity {id} --yes")).await;
+                    assert!(err.contains("--confirm untrust-"), "{err}");
+                    assert_eq!(trust_file(&trust), before);
+
+                    let out = out_of(
+                        &mut ctx,
+                        &format!(".mesh untrust --identity {id} --confirm {token}"),
+                    )
+                    .await
+                    .unwrap();
+                    assert!(out.contains("Untrusted identity"), "{out}");
+                    let hashes = trusted_hashes(&trust);
+                    assert!(!hashes.contains(&id), "{hashes:?}");
+                    assert!(!hashes.contains(&dest), "{hashes:?}");
+
+                    let unknown = hex_lower(&[0x5b; 16]);
+                    let err =
+                        refusal(&mut ctx, &format!(".mesh untrust --identity {unknown}")).await;
+                    assert!(err.contains("nothing to untrust"), "{err}");
+                    let err = refusal(&mut ctx, &format!(".mesh untrust {dest} --yes")).await;
+                    assert!(err.contains("nothing to untrust"), "{err}");
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// A knock carries the same proof as an announce, so a destination heard only
+            /// through the knock cache can be trusted; one in neither place is sent to the
+            /// lists that show what can be.
+            #[test]
+            #[serial]
+            fn trust_accepts_a_destination_that_only_knocked() {
+                use crate::mesh::knocks::KNOCK_RECORD_VERSION;
+                use crate::mesh::rfc3339_utc;
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-trust-knock-only");
+                let _capture = capture::install();
+                let _script = prompt_script::install(&[]);
+                run_async(async {
+                    let started = started_runtime("repl-mesh-trust-knock-only").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let trust = started.runtime.trust();
+                    let now = SystemTime::now();
+                    let (dest, id, name_hash) = announced_peer();
+                    started
+                        .runtime
+                        .knock_gate()
+                        .cache()
+                        .append(
+                            KnockRecord {
+                                version: KNOCK_RECORD_VERSION,
+                                received_at: rfc3339_utc(now),
+                                identity_hash: id.clone(),
+                                destination_hash: dest.clone(),
+                                name_hash,
+                                display_name: Some("Kip".to_string()),
+                                intro: None,
+                                hops: 1,
+                            },
+                            now,
+                        )
+                        .unwrap();
+
+                    let out = out_of(&mut ctx, &format!(".mesh trust {dest} --yes"))
+                        .await
+                        .unwrap();
+                    assert!(out.contains("added"), "{out}");
+                    assert_eq!(trust.authorize(&id, &dest).decision, Decision::Allow);
+
+                    let (other, _, _) = announced_peer();
+                    let err = refusal(&mut ctx, &format!(".mesh trust {other} --yes")).await;
+                    assert!(err.contains(".mesh knocks"), "{err}");
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// With the mesh on, a malformed hash is refused by shape, naming which kind of
+            /// hash the verb wanted, before any prompt.
+            #[test]
+            #[serial]
+            fn mutation_errors_name_the_hash_shape() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-hash-shape");
+                let _capture = capture::install();
+                let _script = prompt_script::install(&[]);
+                run_async(async {
+                    let started = started_runtime("repl-mesh-hash-shape").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+
+                    for flag in ["", " --yes"] {
+                        let err = refusal(&mut ctx, &format!(".mesh block nothex{flag}")).await;
+                        assert!(err.contains("is not an identity hash"), "{err}");
+                        let err = refusal(&mut ctx, &format!(".mesh deny nothex{flag}")).await;
+                        assert!(err.contains("is not a destination hash"), "{err}");
+                    }
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// With a node running, each bare trust verb is still help: no error, no
+            /// prompt, no change to the trust file, and the deny help draws the
+            /// instance-versus-identity contrast with block.
+            #[test]
+            #[serial]
+            fn bare_trust_verbs_while_on_print_help_and_touch_nothing() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-bare-trust-on");
+                let _capture = capture::install();
+                let _script = prompt_script::install(&[]);
+                run_async(async {
+                    let started = started_runtime("repl-mesh-bare-trust-on").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let trust = started.runtime.trust();
+                    let slot: &dyn LiveMesh = ctx.app.mesh.as_ref();
+                    let dest = heard_trusted_peer(&started.runtime, slot);
+                    let id = identity_of(&trust, &dest);
+                    let before = trust_file(&trust);
+                    assert!(before.is_some());
+
+                    for (verb, noun) in [
+                        ("trust", "<destination>"),
+                        ("untrust", "<destination>"),
+                        ("block", "<identity>"),
+                        ("unblock", "<identity>"),
+                        ("deny", "<destination>"),
+                        ("undeny", "<destination>"),
+                    ] {
+                        let out = out_of(&mut ctx, &format!(".mesh {verb}")).await.unwrap();
+                        assert!(
+                            out.contains(&format!(".mesh {verb} {noun}")),
+                            "{verb}: {out}"
+                        );
+                        assert!(
+                            !out.contains("added"),
+                            "{verb}: help is never an action: {out}"
+                        );
+                    }
+                    let deny_help = out_of(&mut ctx, ".mesh deny").await.unwrap();
+                    assert!(
+                        deny_help.contains("one")
+                            && deny_help.contains("block")
+                            && deny_help.contains("whole identity"),
+                        "deny help contrasts one instance with a whole identity: {deny_help}"
+                    );
+                    let block_help = out_of(&mut ctx, ".mesh block").await.unwrap();
+                    assert!(!block_help.contains("deny"), "{block_help}");
+
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+                    assert_eq!(trust_file(&trust), before);
+                    assert_eq!(trust.authorize(&id, &dest).decision, Decision::Allow);
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// `untrust <destination>` is its own question: declined it leaves the record
+            /// and the Allow verdict in place; accepted it removes exactly that record and
+            /// the verdict falls back to the closed default.
+            #[test]
+            #[serial]
+            fn untrust_destination_confirms_then_removes_only_that_record() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-untrust-dest");
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-untrust-dest").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let trust = started.runtime.trust();
+                    let slot: &dyn LiveMesh = ctx.app.mesh.as_ref();
+                    let dest = heard_trusted_peer(&started.runtime, slot);
+                    let id = identity_of(&trust, &dest);
+                    let other = heard_trusted_peer(&started.runtime, slot);
+                    let other_id = identity_of(&trust, &other);
+                    let before = trust_file(&trust);
+
+                    let declined = prompt_script::install(&[false]);
+                    let out = out_of(&mut ctx, &format!(".mesh untrust {dest}"))
+                        .await
+                        .unwrap();
+                    assert!(out.contains(NOTHING_CHANGED), "{out}");
+                    assert_eq!(prompt_script::prompts_asked(), 1);
+                    assert_eq!(trust_file(&trust), before);
+                    assert_eq!(trust.authorize(&id, &dest).decision, Decision::Allow);
+                    drop(declined);
+
+                    let _script = prompt_script::install(&[true]);
+                    let out = out_of(&mut ctx, &format!(".mesh untrust {dest}"))
+                        .await
+                        .unwrap();
+                    assert!(out.contains("Untrusted"), "{out}");
+                    assert!(
+                        out.contains(short(&dest)),
+                        "the removed record is named: {out}"
+                    );
+                    assert_eq!(prompt_script::prompts_asked(), 1);
+                    let verdict = trust.authorize(&id, &dest);
+                    assert_eq!(verdict.decision, Decision::Refuse);
+                    assert_eq!(verdict.rule, Rule::DefaultClosed);
+                    assert_eq!(
+                        trust.authorize(&other_id, &other).decision,
+                        Decision::Allow,
+                        "the other instance keeps its record"
+                    );
+                    let instances: Vec<String> = trust
+                        .records()
+                        .into_iter()
+                        .filter(|record| record.tier == Tier::Destination)
+                        .map(|record| record.hash)
+                        .collect();
+                    assert_eq!(
+                        instances,
+                        vec![other.clone()],
+                        "exactly the named instance record is gone"
+                    );
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// Deny and block are distinct standings with distinct words: a denied
+            /// destination is refused by the destination rule while its identity's other
+            /// instances stay reachable; a blocked identity is refused everywhere. Each
+            /// declines to nothing, and neither borrows the other's vocabulary.
+            #[test]
+            #[serial]
+            fn deny_and_block_set_distinct_verdicts_and_decline_to_nothing() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-deny-vs-block");
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-deny-vs-block").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let trust = started.runtime.trust();
+                    let now = SystemTime::now();
+                    let (dest, id) = heard_peer(&started.runtime, "Tia", now);
+                    let sibling = hex_lower(&[0x5c; 16]);
+                    assert!(trust_file(&trust).is_none());
+
+                    let declined = prompt_script::install(&[false, false]);
+                    for line in [format!(".mesh deny {dest}"), format!(".mesh block {id}")] {
+                        let out = out_of(&mut ctx, &line).await.unwrap();
+                        assert!(out.contains(NOTHING_CHANGED), "{line}: {out}");
+                    }
+                    assert_eq!(prompt_script::prompts_asked(), 2);
+                    assert!(trust_file(&trust).is_none());
+                    assert_eq!(trust.authorize(&id, &dest).rule, Rule::DefaultClosed);
+                    drop(declined);
+
+                    let _script = prompt_script::install(&[true, true]);
+                    let out = out_of(&mut ctx, &format!(".mesh deny {dest} --note \"spam\""))
+                        .await
+                        .unwrap();
+                    assert!(out.contains("Denied"), "{out}");
+                    assert!(
+                        !out.contains("Blocked"),
+                        "deny reports a deny, not a block: {out}"
+                    );
+                    assert_eq!(trust.authorize(&id, &dest).rule, Rule::DestinationDenied);
+                    assert_eq!(
+                        trust.authorize(&id, &sibling).rule,
+                        Rule::DefaultClosed,
+                        "deny stops one instance, not the identity"
+                    );
+
+                    let out = out_of(&mut ctx, &format!(".mesh block {id}"))
+                        .await
+                        .unwrap();
+                    assert!(out.contains("Blocked"), "{out}");
+                    assert!(
+                        !out.contains("deny") && !out.contains("Denied") && !out.contains("denied"),
+                        "block never says deny: {out}"
+                    );
+                    assert_eq!(trust.authorize(&id, &sibling).rule, Rule::IdentityBlocked);
+                    assert_eq!(prompt_script::prompts_asked(), 2);
+
+                    let out = out_of(&mut ctx, &format!(".mesh unblock {id} --yes"))
+                        .await
+                        .unwrap();
+                    assert!(out.contains("Unblocked"), "{out}");
+                    assert_eq!(
+                        trust.authorize(&id, &dest).rule,
+                        Rule::DestinationDenied,
+                        "unblocking the identity does not lift the destination's deny"
+                    );
+                    assert_eq!(trust.authorize(&id, &sibling).rule, Rule::DefaultClosed);
+                    let out = out_of(&mut ctx, &format!(".mesh undeny {dest} --yes"))
+                        .await
+                        .unwrap();
+                    assert!(out.contains("Undenied"), "{out}");
+                    assert_eq!(trust.authorize(&id, &dest).rule, Rule::DefaultClosed);
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// A knock is only proof when its hashes derive the destination: one cached
+            /// before its name hash was kept and one whose identity does not derive the
+            /// destination are both refused with a teaching text, and nothing is written.
+            #[test]
+            #[serial]
+            fn trust_refuses_a_knock_without_proof_through_the_repl() {
+                use crate::mesh::knocks::KNOCK_RECORD_VERSION;
+                use crate::mesh::rfc3339_utc;
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-trust-knock-proof");
+                let _capture = capture::install();
+                let _script = prompt_script::install(&[true; 4]);
+                run_async(async {
+                    let started = started_runtime("repl-mesh-trust-knock-proof").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let trust = started.runtime.trust();
+                    let now = SystemTime::now();
+                    let gate = started.runtime.knock_gate();
+
+                    let (legacy_dest, legacy_id, _) = announced_peer();
+                    let (forged_dest, _, forged_name_hash) = announced_peer();
+                    let (_, wrong_id, _) = announced_peer();
+                    for (dest, id, name_hash, name) in [
+                        (&legacy_dest, &legacy_id, String::new(), "Old"),
+                        (&forged_dest, &wrong_id, forged_name_hash, "Forger"),
+                    ] {
+                        gate.cache()
+                            .append(
+                                KnockRecord {
+                                    version: KNOCK_RECORD_VERSION,
+                                    received_at: rfc3339_utc(now),
+                                    identity_hash: id.clone(),
+                                    destination_hash: dest.clone(),
+                                    name_hash,
+                                    display_name: Some(name.to_string()),
+                                    intro: None,
+                                    hops: 1,
+                                },
+                                now,
+                            )
+                            .unwrap();
+                    }
+
+                    for flag in ["", " --yes"] {
+                        let err =
+                            refusal(&mut ctx, &format!(".mesh trust {legacy_dest}{flag}")).await;
+                        assert!(
+                            err.contains("knocked before its name hash was kept"),
+                            "a knock without its name hash teaches what to wait for: {err}"
+                        );
+                        assert!(!err.contains("added"), "{err}");
+                        let err =
+                            refusal(&mut ctx, &format!(".mesh trust {forged_dest}{flag}")).await;
+                        assert!(
+                            err.contains(&forged_dest) && !err.contains("added"),
+                            "a forged knock is refused naming the destination: {err}"
+                        );
+                    }
+                    assert!(trust_file(&trust).is_none(), "nothing was written");
+                    assert_eq!(
+                        trust.authorize(&legacy_id, &legacy_dest).decision,
+                        Decision::Refuse
+                    );
+                    assert_eq!(
+                        trust.authorize(&wrong_id, &forged_dest).decision,
+                        Decision::Refuse
+                    );
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// `trust --identity` is a mutation like the rest: without a terminal it refuses
+            /// naming the flag, and declined at the prompt it writes nothing.
+            #[test]
+            #[serial]
+            fn trust_identity_without_a_terminal_or_declined_writes_nothing() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-trust-identity-refused");
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-trust-identity-refused").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let trust = started.runtime.trust();
+                    let (dest, id) = heard_peer(&started.runtime, "Tia", SystemTime::now());
+
+                    let non_tty = prompt_script::install_non_interactive();
+                    let err = refusal(&mut ctx, &format!(".mesh trust --identity {id}")).await;
+                    assert!(err.contains("--yes"), "{err}");
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+                    drop(non_tty);
+
+                    let _script = prompt_script::install(&[false]);
+                    let out = out_of(&mut ctx, &format!(".mesh trust --identity {id}"))
+                        .await
+                        .unwrap();
+                    assert!(out.contains(NOTHING_CHANGED), "{out}");
+                    assert_eq!(prompt_script::prompts_asked(), 1);
+                    assert!(trust_file(&trust).is_none());
+                    assert_eq!(trust.authorize(&id, &dest).decision, Decision::Refuse);
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// A runtime joined to a fake propagation node that has announced itself.
+            async fn runtime_with_fake_node(tag: &str) -> (FakeNode, StartedRuntime) {
+                // A `MeshRuntime` joins with `TcpClient`'s default MTU, so the fake matches it.
+                let fake = FakeNode::listen_with_mtu(TcpServer::DEFAULT_CLIENT_MTU).await;
+                let started = started_runtime_on(tag, fake.listener.port).await;
+                fake.announce().await;
+                let runtime = started.runtime.clone();
+                wait_until("the runtime to file the propagation node", || {
+                    runtime.propagation_nodes().select().is_ok()
+                })
+                .await;
+                (fake, started)
+            }
+
+            #[test]
+            #[serial]
+            fn fetch_reports_the_counts_from_the_node() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-fetch");
+                let _capture = capture::install();
+                run_async(async {
+                    let (fake, started) = runtime_with_fake_node("repl-mesh-fetch").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    fake.script.reply_with([Value::Array(vec![])]);
+
+                    run(&mut ctx, ".mesh fetch").await.unwrap();
+
+                    let lines = stdout_lines();
+                    let asking = index_of(
+                        &lines,
+                        "Asking the nearest propagation node for held messages; Ctrl-C cancels...",
+                    );
+                    let nothing = index_of(
+                        &lines,
+                        &format!("Nothing held for this node at {}.", short(&fake.hex())),
+                    );
+                    assert!(asking < nothing, "{lines:?}");
+                    assert_eq!(fake.script.seen().len(), 1);
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                    fake.stop().await;
+                });
+            }
+
+            #[test]
+            #[serial]
+            fn fetch_while_a_sync_is_running_prints_one_line_and_succeeds() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-fetch-busy");
+                let _capture = capture::install();
+                run_async(async {
+                    let (fake, started) = runtime_with_fake_node("repl-mesh-fetch-busy").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    // Nothing scripted: the fake stays silent and the fetch waits in round 1.
+                    let blocked = tokio::spawn({
+                        let runtime = started.runtime.clone();
+                        async move { runtime.fetch_propagated(&LoggingInboundSink).await }
+                    });
+                    wait_until("the blocked fetch to reach round 1", || {
+                        fake.script.seen().len() == 1
+                    })
+                    .await;
+
+                    run(&mut ctx, ".mesh fetch").await.unwrap();
+
+                    let lines = stdout_lines();
+                    index_of(&lines, "A sync is already running; wait for it to finish.");
+                    assert!(
+                        !lines.iter().any(|line| line.contains("Nothing held")),
+                        "{lines:?}"
+                    );
+
+                    blocked.abort();
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                    fake.stop().await;
+                });
+            }
+
+            #[test]
+            #[serial]
+            fn fetch_with_no_node_heard_is_a_teaching_error() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-fetch-no-node");
+                run_async(async {
+                    let started = started_runtime("repl-mesh-fetch-no-node").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+
+                    let err = refusal(&mut ctx, ".mesh fetch").await;
+                    assert!(
+                        err.starts_with("No LXMF propagation node has announced itself"),
+                        "{err}"
+                    );
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// Usage probe (TASK-100 ruling 2): `announce: false` turns the AUTOMATIC sync
+            /// off; `.mesh fetch` is still a working manual trigger under that config.
+            #[test]
+            #[serial]
+            fn usage_probe_fetch_by_hand_works_while_announce_is_false() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-fetch-quiet");
+                let _capture = capture::install();
+                run_async(async {
+                    let (fake, started) = runtime_with_fake_node("repl-mesh-fetch-quiet").await;
+                    let mut ctx = ctx_with(
+                        MeshConfig {
+                            announce: false,
+                            ..MeshConfig::default()
+                        },
+                        true,
+                    );
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    fake.script.reply_with([Value::Array(vec![])]);
+
+                    run(&mut ctx, ".mesh fetch").await.unwrap();
+
+                    let lines = stdout_lines();
+                    index_of(
+                        &lines,
+                        &format!("Nothing held for this node at {}.", short(&fake.hex())),
+                    );
+                    assert_eq!(fake.script.seen().len(), 1, "one fetch went to the node");
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                    fake.stop().await;
+                });
+            }
+
+            /// An interval of 0 turns the automatic sync off; `.mesh fetch` still fetches.
+            #[test]
+            #[serial]
+            fn fetch_by_hand_works_while_the_interval_is_zero() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-fetch-zero");
+                let _capture = capture::install();
+                run_async(async {
+                    let (fake, started) = runtime_with_fake_node("repl-mesh-fetch-zero").await;
+                    let mut ctx = ctx_with(
+                        MeshConfig {
+                            propagation_sync_interval_secs: 0,
+                            ..MeshConfig::default()
+                        },
+                        true,
+                    );
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    fake.script.reply_with([Value::Array(vec![])]);
+
+                    run(&mut ctx, ".mesh fetch").await.unwrap();
+
+                    let lines = stdout_lines();
+                    index_of(
+                        &lines,
+                        &format!("Nothing held for this node at {}.", short(&fake.hex())),
+                    );
+                    assert_eq!(fake.script.seen().len(), 1, "one fetch went to the node");
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                    fake.stop().await;
+                });
+            }
+
+            /// Usage probe (TASK-100 (c)): a fetch lock held by another process (here: a
+            /// second `flock` on the same lock file, which is what `FetchLock` refuses on)
+            /// is the other contention variant: one line, `Ok`, nothing asked of the node,
+            /// and the next `.mesh fetch` after the lock is released runs normally.
+            #[test]
+            #[serial]
+            fn usage_probe_fetch_held_by_another_process_prints_one_line_and_succeeds() {
+                use crate::mesh::mesh_cache_dir;
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-fetch-held");
+                let _capture = capture::install();
+                run_async(async {
+                    let (fake, started) = runtime_with_fake_node("repl-mesh-fetch-held").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let lock_dir = mesh_cache_dir(started.runtime.cache_dir());
+                    fs::create_dir_all(&lock_dir).unwrap();
+                    let lock_path = lock_dir.join("propagation.json.lock");
+                    let holder = fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .create(true)
+                        .truncate(false)
+                        .open(&lock_path)
+                        .unwrap();
+                    holder.try_lock().unwrap();
+
+                    run(&mut ctx, ".mesh fetch").await.unwrap();
+
+                    let lines = stdout_lines();
+                    let held = index_of(&lines, "another Coyote process");
+                    assert!(
+                        lines[held].contains(&lock_path.display().to_string()),
+                        "{lines:?}"
+                    );
+                    assert!(
+                        fake.script.seen().is_empty(),
+                        "nothing was asked of the node"
+                    );
+                    assert!(
+                        !lines.iter().any(|line| line.contains("Nothing held")),
+                        "{lines:?}"
+                    );
+
+                    drop(holder);
+                    fake.script.reply_with([Value::Array(vec![])]);
+                    run(&mut ctx, ".mesh fetch").await.unwrap();
+                    let lines = stdout_lines();
+                    index_of(
+                        &lines,
+                        &format!("Nothing held for this node at {}.", short(&fake.hex())),
+                    );
+                    assert_eq!(fake.script.seen().len(), 1);
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                    fake.stop().await;
+                });
+            }
+
+            /// Usage probe (TASK-100 (d)): like every consenting verb, a knock without a
+            /// terminal and without `--yes` is refused naming the flag, after the notice
+            /// but before anything is sent; the intro bound is enforced BEFORE consent is
+            /// even considered (an over-long intro is refused with no notice and no prompt).
+            #[test]
+            #[serial]
+            fn knock_without_a_terminal_names_the_flag_and_sends_nothing() {
+                use crate::mesh::knocks::KNOCK_INTRO_MAX_CHARS;
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-knock-non-tty");
+                let _script = prompt_script::install_non_interactive();
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-knock-non-tty").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let (heard, _) = heard_peer(&started.runtime, "Tia", SystemTime::now());
+
+                    let err = refusal(&mut ctx, &format!(".mesh knock {heard}")).await;
+                    assert!(err.contains("--yes"), "{err}");
+                    let out = stdout_lines();
+                    assert!(
+                        out.iter()
+                            .any(|line| line.starts_with("This knocks on Tia (")),
+                        "the notice precedes the consent question: {out:?}"
+                    );
+                    assert!(
+                        !out.iter().any(|line| line.starts_with("Knocking on")),
+                        "{out:?}"
+                    );
+
+                    let before = stdout_lines().len();
+                    let long = "y".repeat(KNOCK_INTRO_MAX_CHARS + 1);
+                    let err =
+                        refusal(&mut ctx, &format!(".mesh knock {heard} --intro \"{long}\"")).await;
+                    assert!(
+                        err.contains(&format!(
+                            "above the {KNOCK_INTRO_MAX_CHARS}-character limit"
+                        )),
+                        "{err}"
+                    );
+                    assert!(
+                        !err.contains("--yes"),
+                        "the bound, not consent, is the refusal: {err}"
+                    );
+                    assert!(
+                        stdout_lines()[before..].is_empty(),
+                        "no notice for a refused intro: {:?}",
+                        &stdout_lines()[before..]
+                    );
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// Usage probe (TASK-100 (d)): a knock is NOT gated on this node's trust of the
+            /// peer. The same heard-but-untrusted destination that `.mesh reply` refuses
+            /// with the trust tail reaches the knock's consent notice, and an intro of
+            /// exactly the bound is accepted.
+            #[test]
+            #[serial]
+            fn knock_reaches_consent_for_a_peer_this_node_does_not_trust() {
+                use crate::mesh::knocks::KNOCK_INTRO_MAX_CHARS;
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-knock-untrusted");
+                let _script = prompt_script::install(&[false, false]);
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-knock-untrusted").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let (heard, _) = heard_peer(&started.runtime, "Tia", SystemTime::now());
+
+                    let err = refusal(&mut ctx, &format!(".mesh reply {heard} hi")).await;
+                    assert!(
+                        err.contains(REPLY_REFUSAL_TAIL),
+                        "reply is trust-gated: {err}"
+                    );
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+
+                    let at_bound = "z".repeat(KNOCK_INTRO_MAX_CHARS);
+                    run(
+                        &mut ctx,
+                        &format!(".mesh knock {heard} --intro \"{at_bound}\""),
+                    )
+                    .await
+                    .unwrap();
+                    let out = stdout_lines();
+                    let notice = index_of(&out, "This knocks on Tia (");
+                    assert!(out[notice].contains(&at_bound), "{out:?}");
+                    index_of(&out, "Nothing was sent.");
+                    assert_eq!(
+                        prompt_script::prompts_asked(),
+                        1,
+                        "knock asked, reply did not"
+                    );
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// Untrusted is not denied: a knock is for a peer that has not trusted us, but
+            /// this node's own deny and block lists still stand in its way, before any
+            /// notice or question, whether or not the denied destination has been heard.
+            #[test]
+            #[serial]
+            fn knock_to_a_denied_destination_or_blocked_identity_is_refused() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-knock-denied");
+                let _script = prompt_script::install(&[]);
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-knock-denied").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let now = SystemTime::now();
+                    let (denied, _) = heard_peer(&started.runtime, "Dot", now);
+                    let (blocked, blocked_identity) = heard_peer(&started.runtime, "Bex", now);
+                    let unheard_denied = hex_lower(&[0x52; 16]);
+                    let trust = started.runtime.trust();
+                    let slot: &dyn LiveMesh = ctx.app.mesh.as_ref();
+                    trust.deny_destination(slot, &denied, None, now).unwrap();
+                    trust
+                        .deny_destination(slot, &unheard_denied, None, now)
+                        .unwrap();
+                    trust
+                        .block_identity(slot, &blocked_identity, None, now)
+                        .unwrap();
+
+                    for (destination, standing) in [
+                        (&denied, "denied"),
+                        (&unheard_denied, "denied"),
+                        (&blocked, "blocked"),
+                    ] {
+                        let before = stdout_lines().len();
+                        let err =
+                            refusal(&mut ctx, &format!(".mesh knock {destination} --yes")).await;
+                        assert!(
+                            err.contains(&format!(" is {standing} in this node's trust list")),
+                            "{standing}: {err}"
+                        );
+                        assert!(
+                            !err.contains("has not been heard"),
+                            "{standing}: the deny is named, not the missing peer row: {err}"
+                        );
+                        assert!(err.contains(KNOCK_REFUSAL_TAIL), "{standing}: {err}");
+                        assert!(
+                            stdout_lines()[before..].is_empty(),
+                            "{standing}: refused before the notice: {:?}",
+                            &stdout_lines()[before..]
+                        );
+                    }
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// Usage probe (TASK-100 knock ruling): only denied/blocked stand in a knock's
+            /// way. An instance heard under a NEW key (marked `key changed` in the peer
+            /// table; `authorize` judges it default-closed, which refuses `.mesh reply`) is
+            /// still knockable: the notice shows `trust: untrusted` and the question is
+            /// asked; nothing is sent when it is declined.
+            #[test]
+            #[serial]
+            fn usage_probe_knock_passes_the_gate_for_an_instance_whose_key_changed() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-knock-key-changed");
+                let _script = prompt_script::install(&[false]);
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-knock-key-changed").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let runtime = started.runtime.clone();
+                    let slot: &dyn LiveMesh = ctx.app.mesh.as_ref();
+                    let old_dest = heard_trusted_peer(&runtime, slot);
+                    let (new_dest, new_identity) =
+                        heard_peer(&runtime, "Tia again", SystemTime::now());
+                    let name_hash = runtime.peers().get(&old_dest).unwrap().name_hash;
+                    runtime
+                        .trust()
+                        .note_key_change(&new_identity, &name_hash, SystemTime::now());
+                    let verdict = runtime.trust().authorize(&new_identity, &new_dest);
+                    assert_eq!(
+                        verdict.decision,
+                        Decision::Refuse,
+                        "fixture: the new key is not trusted"
+                    );
+                    let peers = out_of(&mut ctx, ".mesh peers").await.unwrap();
+                    assert!(
+                        peers.contains("key changed:") && peers.contains(short(&new_identity)),
+                        "fixture: the peer table marks the key change: {peers}"
+                    );
+
+                    let err = refusal(&mut ctx, &format!(".mesh reply {new_dest} hi")).await;
+                    assert!(err.contains(REPLY_REFUSAL_TAIL), "reply stays gated: {err}");
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+
+                    run(&mut ctx, &format!(".mesh knock {new_dest}"))
+                        .await
+                        .unwrap();
+
+                    let out = stdout_lines();
+                    let notice = index_of(&out, "This knocks on Tia again (");
+                    assert!(out[notice].contains("trust: untrusted"), "{out:?}");
+                    assert!(
+                        !out.iter().any(|line| line.contains(KNOCK_REFUSAL_TAIL)),
+                        "{out:?}"
+                    );
+                    index_of(&out, "Nothing was sent.");
+                    assert_eq!(prompt_script::prompts_asked(), 1, "the knock asked");
+                    assert!(
+                        !out.iter().any(|line| line.starts_with("Knocking on")),
+                        "{out:?}"
+                    );
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// The peer is a stub behind the real dispatcher that knows this node's identity
+            /// but trusts none of its instances, so the knock over the link is admitted and
+            /// refused `NoAccess`: a knock that landed, reported as direct delivery.
+            #[test]
+            #[serial]
+            fn knock_over_a_link_reports_direct_delivery() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-knock-direct");
+                let _script = prompt_script::install(&[]);
+                let _capture = capture::install();
+                run_async(async {
+                    let stub = PeerStub::listen(
+                        "repl-mesh-knock-direct-stub",
+                        TcpServer::DEFAULT_CLIENT_MTU,
+                    )
+                    .await;
+                    let started = started_runtime_on("repl-mesh-knock-direct", stub.port()).await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    stub.know_identity(started.runtime.fingerprint());
+                    stub.announce(Some("Tia")).await;
+                    let peer = stub.destination_hex();
+                    let peers = started.runtime.peers();
+                    wait_until("the node to file the stub", || peers.get(&peer).is_some()).await;
+
+                    run(
+                        &mut ctx,
+                        &format!(".mesh knock {peer} --yes --intro \"hi\""),
+                    )
+                    .await
+                    .unwrap();
+
+                    let out = stdout_lines();
+                    let notice = index_of(&out, "This knocks on Tia (");
+                    assert!(out[notice].contains("trust: untrusted"), "{out:?}");
+                    let knocking = index_of(&out, &format!("Knocking on {}", short(&peer)));
+                    let landed = index_of(
+                        &out,
+                        &format!(
+                            "Knocked on {} directly; the peer decides whether to trust this instance.",
+                            short(&peer)
+                        ),
+                    );
+                    assert!(notice < knocking && knocking < landed, "{out:?}");
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                    stub.stop().await;
+                });
+            }
+        }
+    }
+}

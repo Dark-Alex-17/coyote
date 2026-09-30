@@ -56,7 +56,7 @@ Coming from [AIChat](https://github.com/sigoden/aichat)? Follow the [migration g
 * [Agents](https://github.com/Dark-Alex-17/coyote/wiki/Agents): Leverage AI agents to perform complex tasks and workflows, including sub-agent spawning, teammate messaging, and user interaction tools.
     * [Graph Agents](https://github.com/Dark-Alex-17/coyote/wiki/Graph-Agents): Define an agent as a declarative, YAML-driven workflow. A directed graph of typed nodes (LLM calls, scripts, approvals, user input, RAG retrieval, sub-agent spawns).
 * [Background Jobs](https://github.com/Dark-Alex-17/coyote/wiki/Background-Jobs): Run long tool calls (builds, test suites, slow MCP calls) in the background with the `job__*` tools while the model keeps working, and completion arrives as a push notification.
-* [Hooks](https://github.com/Dark-Alex-17/coyote/wiki/Hooks): Run your own fire-and-forget commands when lifecycle events fire. Turns, tools, LLM requests, agents, sub-agent escalations, and more (26 events). Perfect for desktop notifications, activity logging, and downstream automation; hooks never block Coyote or change its behavior.
+* [Hooks](https://github.com/Dark-Alex-17/coyote/wiki/Hooks): Run your own fire-and-forget commands when lifecycle events fire. Turns, tools, LLM requests, agents, sub-agent escalations, mesh peers, and more (43 events). Perfect for desktop notifications, activity logging, and downstream automation; hooks never block Coyote or change its behavior.
 * [Todo System](https://github.com/Dark-Alex-17/coyote/wiki/TODO-System): Built-in task tracking for improved LLM reliability with smaller models.
 * [Environment Variables](https://github.com/Dark-Alex-17/coyote/wiki/Environment-Variables): Override and customize your Coyote configuration at runtime with environment variables.
 * [Client Configurations](https://github.com/Dark-Alex-17/coyote/wiki/Clients): Configuration instructions for various LLM providers.
@@ -341,6 +341,41 @@ The appearance of Coyote can be modified using the following settings:
 |----------------------|---------------|------------------------------------------------------------------------------------------------------------------|
 | `user_agent`         | `null`        | The name of the `User-Agent` that should be passed in the `User-Agent` header on all requests to model providers |
 | `save_shell_history` | `true`        | Enables or disables REPL command history                                                                         |
+
+### Mesh
+The `mesh` block controls the [Coyote Mesh](https://github.com/Dark-Alex-17/coyote/wiki/Mesh), which lets Coyote
+instances discover and message each other. It is off by default, and setting `mesh.enabled: true` requires
+`function_calling_support: true`; config loading is refused otherwise. Interface entries under `mesh.interfaces` are
+always checked when config is parsed; the remaining `mesh` keys (rate limits, retention, the function-calling
+requirement) are only checked when `mesh.enabled` is `true`.
+The wire format Coyote instances speak to each other is specified normatively in
+[docs/mesh/PROTOCOL.md](https://github.com/Dark-Alex-17/coyote/blob/main/docs/mesh/PROTOCOL.md).
+Interoperability is exercised against the reference Reticulum/LXMF implementation by the
+[mesh interop harness](https://github.com/Dark-Alex-17/coyote/blob/main/scripts/mesh-interop/README.md),
+run in the informational `Mesh Interop` CI job.
+The [propagation node image](https://github.com/Dark-Alex-17/coyote/blob/main/deployment/propagation-node/README.md)
+guide covers a ready-to-run LXMF propagation node for store-and-forward between your instances
+(held messages are fetched automatically every `mesh.propagation_sync_interval_secs` seconds and on demand with
+`.mesh fetch`).
+
+| Setting                           | Default Value   | Description                                                                                                                                                                  |
+|-----------------------------------|-----------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `mesh.enabled`                    | `false`         | Join the mesh when the REPL starts (one-shot runs never join); nothing leaves the machine while this is `false`                                                              |
+| `mesh.announce`                   | `true`          | Announce this node so peers can see it; `false` is outbound-only (see peers without being seen); also turns the automatic propagation sync off (`.mesh fetch` still works) |
+| `mesh.display_name`               | `null`          | Opt-in plaintext label carried in the announce                                                                                                                               |
+| `mesh.display_name_on_public`     | `false`         | Also carry `display_name` when any interface is `type: public`, where presence is world-visible                                                                              |
+| `mesh.interfaces`                 | `[{type: lan}]` | Interfaces the node joins: `lan` (link-local only; takes no `host`/`port`, at most once), or `private`/`public` with `host` and `port` for a relay. No auto-detection, no fallback |
+| `mesh.brief`                      | `auto`          | `auto` (status card + session digest + user brief), `manual` (card + user brief; no digest, so no model spend), or `off` (status card only)                                  |
+| `mesh.digest_prompt`              | `null`          | Prompt used to build the shareable session digest; `null` or blank uses the built-in default                                                                                 |
+| `mesh.brief_model`                | `null`          | Model used to build the digest; `null` uses the session's current model                                                                                                      |
+| `mesh.envoy_model`                | `null`          | Model the envoy answers peers with; `null` uses the configured `model_id` (the envoy never follows a `.model` switch)                                                          |
+| `mesh.envoy_escalation_timeout`   | `0`             | Seconds the envoy holds a peer's question open for the human before handing it off; `0` hands off at once (the question stays open for `.mesh answer`); a hold longer than the 120 s run ceiling is cut to it |
+| `mesh.knock_retention_hours`      | `24`            | How long unanswered knocks from known identities are kept; must be `1` or more                                                                                               |
+| `mesh.peer_max_concurrent`        | `1`             | Envoy runs one sending identity may have queued or running at once; must be `1` or more. Further messages are refused with a typed reason until one finishes; the message is still filed in the inbox for the human |
+| `mesh.peer_max_messages_per_hour` | `60`            | Messages accepted from one sending identity per hour, in fixed hourly windows kept in memory (a restart opens a fresh window); must be `1` or more. Further messages are refused with a typed reason: on a live link in the reply itself, on store-and-forward with one reply per identity per reason per hour, and on store-and-forward the message is still filed in the inbox for the human, without an envoy run; plus one folded REPL line per identity, per reason, per hour, with the folded count reported the next time that peer is heard from after the hour rolls over; on a live link the refused message is not filed; the peer is told to retry |
+| `mesh.peer_max_tokens_per_hour`   | `100000`        | Model tokens one sending identity may cost per hour, counted after each envoy run, so the runs in flight may overshoot the ceiling by at most `peer_max_concurrent` runs before the next is refused; must be `1` or more. The message is still filed in the inbox for the human |
+| `mesh.peer_max_cost_usd_per_hour` | `0`             | USD one sending identity may cost per hour, counted like the token ceiling and enforced only when the envoy model's prices are known; `0` = no cost ceiling, otherwise a positive amount. The message is still filed in the inbox for the human |
+| `mesh.propagation_sync_interval_secs` | `300`       | Seconds between automatic fetches of the messages a propagation node holds for this node; the first fetch runs once a propagation node is heard after the node joins; `0` = fetch only on `.mesh fetch`; at most `31536000`; off while `announce` is false |
 
 ---
 

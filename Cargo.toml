@@ -24,7 +24,7 @@ dunce = "1.0.5"
 futures-util = "0.3.29"
 inquire = "0.9.4"
 is-terminal = "0.4.9"
-reedline = "0.47.0"
+reedline = { version = "0.47.0", features = ["external_printer"] }
 serde = { version = "1.0.152", features = ["derive"] }
 serde_json = { version = "1.0.93", features = ["preserve_order"] }
 serde_yaml = "0.9.17"
@@ -60,6 +60,7 @@ log4rs = { version = "1.4.0", features = [
 ] }
 shell-words = "1.1.0"
 sha2 = "0.10.8"
+subtle = "2.6.1"
 unicode-width = "0.2.0"
 async-recursion = "1.1.1"
 http = "1.1.0"
@@ -116,6 +117,40 @@ self_update = { version = "0.44", default-features = false, features = [
   "compression-zip-deflate",
 ] }
 qrcode = "0.14"
+tokio-util = "0.7"
+arc-swap = "1.9.2"
+# Pinned to the rand_core generation `reticulum-rs-transport` is built on: its announce
+# builder takes a `CryptoRngCore` from this version and re-exports none, so `rand` 0.10's
+# `OsRng` cannot be passed. Moves together with the transport dependency below.
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+# Reticulum transport and LXMF wire format. The two move together: they share
+# `reticulum-rs-core`, and resolving them at incompatible versions duplicates it.
+#
+# Both entries are unconditional on purpose: the mesh runtime in `src/mesh` is not
+# feature-gated, so every CI leg compiles and tests it.
+#
+# Default features are kept deliberately too. `reticulum-rs-transport`'s default
+# `storage` feature gates the SQLite-backed message and announce store that the
+# store-and-forward work needs. The cost is that it pulls rusqlite with a bundled
+# SQLite, whose C amalgamation is compiled on every platform. `bzip2-sys` comes in
+# regardless of that feature and compiles a second, much smaller C library on Windows
+# and anywhere pkg-config finds no system libbz2. Neither is a new prerequisite:
+# `duckdb` above already requires a C toolchain everywhere.
+#
+# `lxmf-wire` (lib name `lxmf_core`) pulls `reticulum-rs-core` transitively, so that
+# crate needs no entry of its own; `reticulum-rs-transport`'s lib name is
+# `rns_transport`. The `reticulum-rs` umbrella is deliberately not used, for two
+# independent reasons: it gates transport behind a feature and re-exports surface we do
+# not use, and it covers only the `rns-*` crates and not `lxmf-wire`, so it cannot
+# replace both entries anyway. Depending on the two directly keeps one mechanism
+# instead of two.
+reticulum-rs-transport = "0.12.0"
+lxmf-wire = "0.12.0"
+# Its `Value` appears in `rns_transport`'s `Link::request_payload` and
+# `unpack_response_envelope` signatures, so it must stay semver-unified with the
+# transport's own `rmpv`. Moves together with the transport dependency above.
+rmpv = "1.3"
 
 [dependencies.reqwest]
 version = "0.13.3"
@@ -141,16 +176,57 @@ arboard = { version = "3.3.0", default-features = false }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[target.'cfg(windows)'.dependencies]
+# Raw Win32 bindings for locking down the on-disk identity key. Each feature below is
+# carried for one piece of that job; the call sites are in `src/utils/windows_acl.rs`
+# and the list is named here so it can be checked without guessing:
+# `Win32_Security_Authorization` for
+# `ConvertStringSecurityDescriptorToSecurityDescriptorW`, `GetSecurityInfo`,
+# `GetNamedSecurityInfoW` and `ConvertSidToStringSidW` (and, under `cfg(test)`,
+# `SetNamedSecurityInfoW` for the DACL-widening fixture), `Win32_Foundation` for the
+# `LocalFree`/`HLOCAL` pair that releases what they return, `Win32_Security` for the `ACL`
+# type and the DACL walk (and, under `cfg(test)`, `GetSecurityDescriptorDacl` for that
+# fixture and `SetFileSecurityW` for the owner-changing one),
+# `Win32_Storage_FileSystem` for `CreateFileW` and `GetVolumeInformationByHandleW`,
+# `Win32_System_Threading` for `OpenProcessToken` and `GetCurrentProcess` (the current
+# user's SID) and for `OpenProcess` in `src/testing.rs`, and
+# `Win32_System_SystemServices` for the `FILE_PERSISTENT_ACLS` volume flag and the
+# `ACCESS_ALLOWED_ACE_TYPE` ACE type, plain constants that live in no other module. No
+# allocator feature is needed, `LocalFree` not being one of the `Local*` calls in
+# `Win32_System_Memory`.
+#
+# The higher-level `windows` crate is not used: the surface here is a handful of FFI
+# calls that need `unsafe` either way, so its wrapper types and COM machinery would cost
+# compile time for little gain. `windows-acl` (last release 2021-01-11, winapi 0.3, Rust
+# 2015 edition) and `windows-permissions` (last release 2021-06-29, winapi 0.3.9) are
+# both dormant and would each drag a second Win32 binding stack in alongside this one.
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_Storage_FileSystem",
+  "Win32_System_SystemServices",
+  "Win32_System_Threading",
+] }
+
 [dev-dependencies]
+arbitrary = { version = "1.4", features = ["derive"] }
 ctor = "1.0.13"
 pretty_assertions = "1.4.0"
 rmcp = { version = "3.1.2", features = ["server"] }
 serial_test = "3"
 tokio = { version = "1.34.0", features = ["test-util"] }
 
+[target.'cfg(unix)'.dev-dependencies]
+expectrl = "0.9.0"
+
 [[bin]]
 name = "coyote"
 path = "src/main.rs"
+
+[[example]]
+name = "pty-reedline-target"
+path = "examples/pty-reedline-target.rs"
 
 [profile.release]
 lto = true

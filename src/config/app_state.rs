@@ -1,9 +1,10 @@
 use super::mcp_factory::{McpFactory, McpServerKey};
 use super::rag_cache::RagCache;
 use crate::config::AppConfig;
-use crate::config::jobs_enabled;
+use crate::config::{jobs_enabled, mesh_tools_available};
 use crate::function::Functions;
 use crate::mcp::{McpRegistry, McpServersConfig};
+use crate::mesh::MeshSlot;
 use crate::utils::AbortSignal;
 use crate::vault::{GlobalVault, Vault};
 
@@ -21,6 +22,7 @@ pub struct AppState {
     pub mcp_log_path: Option<PathBuf>,
     pub mcp_registry: Option<Arc<McpRegistry>>,
     pub functions: Functions,
+    pub mesh: Arc<MeshSlot>,
 }
 
 impl AppState {
@@ -35,6 +37,7 @@ impl AppState {
             mcp_log_path: None,
             mcp_registry: None,
             functions: Functions::default(),
+            mesh: Arc::new(MeshSlot::default()),
         }
     }
 
@@ -87,6 +90,12 @@ impl AppState {
         if jobs_enabled(None, &config) {
             functions.append_job_functions();
         }
+        let mesh = Arc::new(MeshSlot::default());
+        // `mesh` was just created empty, so the predicate is false here and nothing is
+        // appended. The guarded call is kept so every append site reads the same way.
+        if mesh_tools_available(&config, &mesh) {
+            functions.append_mesh_functions();
+        }
 
         let mcp_registry = if mcp_registry.is_empty() {
             None
@@ -103,6 +112,7 @@ impl AppState {
             mcp_log_path,
             mcp_registry,
             functions,
+            mesh,
         })
     }
 }

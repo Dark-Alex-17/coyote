@@ -13,10 +13,39 @@ defaults:
     shell: bash
 
 jobs:
+  merge-gates:
+    name: Merge Gates
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust Toolchain Components
+      uses: dtolnay/rust-toolchain@stable
+
+    # The resolved graph, not the root manifest: a git source reached through a
+    # dependency's own manifest or a `[patch]` never appears in Cargo.toml. `--locked`
+    # keeps the gate from rewriting the lockfile it audits. A branch may carry a git
+    # `rev` pin while it is in development, so a red run here on a development branch
+    # is this gate working, not CI breaking; see CONTRIBUTING.md#dependency-policy.
+    - name: Nothing is pulled from git
+      run: |
+        meta=$(cargo metadata --format-version 1 --locked)
+        if printf '%s' "$meta" | grep -q '"source":"git+'; then
+          printf '%s' "$meta" | grep -o '"source":"git+[^"]*"' | sort -u
+          echo "::error::The resolved dependency graph contains the git sources listed above. Git pins are development-only and must be replaced by a crates.io version pin before merge. See CONTRIBUTING.md#dependency-policy."
+          exit 1
+        fi
+        echo "No git sources in the resolved dependency graph."
+
   all:
     name: All
 
     strategy:
+      # Each OS leg is independent evidence; a failure on one must not cancel the
+      # others, or a flake on the fastest runner hides the slower legs' verdicts.
+      fail-fast: false
       matrix:
         os:
         - ubuntu-latest
@@ -47,6 +76,9 @@ jobs:
       if: steps.duckdb-extensions.outputs.cache-hit != 'true'
       run: cargo test --all duckdb
 
+    # `cargo test --all` also runs the mesh fuzz harness (src/mesh/fuzz): 2000 iterations per
+    # target under a 10 s wall cap, on all three legs. Setting COYOTE_MESH_FUZZ_ITERS=<n> runs
+    # exactly n iterations and lifts the wall cap (a local soak, not for CI).
     - name: Test
       run: cargo test --all
 
@@ -55,3 +87,76 @@ jobs:
 
     - name: Format
       run: cargo fmt --all --check
+
+  # Informational: not part of the required `All` matrix or branch protection until it
+  # proves stable, so a red run here never blocks a merge. Deliberately NOT
+  # `continue-on-error`: a red interop suite (or a missing reference) must show as a red
+  # job, not vanish into a green run; the wall-clock is in the step summary. Linux-only
+  # because the Python reference harness is unix-only and the reachability suite needs
+  # Linux network namespaces; the mesh itself is covered on every OS by the unit tests and
+  # the platform-independent vectors in `All`. Creating the namespaces needs root
+  # (CAP_NET_ADMIN and CAP_SYS_ADMIN), which the ubuntu runners provide through
+  # passwordless sudo; the tests themselves stay unprivileged and enter the namespaces
+  # with `sudo -n ip netns exec`.
+  mesh-interop:
+    name: Mesh Interop
+
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 60
+
+    env:
+      RUSTFLAGS: --deny warnings
+      COYOTE_MESH_INTEROP_DIR: ${{ github.workspace }}/.mesh-interop
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Start The Clock
+      run: echo "start=$(date +%s)" >> "$GITHUB_ENV"
+
+    - name: Install Rust Toolchain Components
+      uses: dtolnay/rust-toolchain@stable
+
+    - uses: Swatinem/rust-cache@v2
+      with:
+        cache-on-failure: true
+
+    - uses: actions/setup-python@v5
+      id: python
+      with:
+        python-version: '3.12'
+
+    - name: Cache The Pinned Reference
+      uses: actions/cache@v4
+      with:
+        path: ${{ env.COYOTE_MESH_INTEROP_DIR }}
+        key: mesh-interop-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/mesh-interop/setup.sh') }}-py${{ steps.python.outputs.python-version }}
+
+    - name: Prepare The Reference
+      run: scripts/mesh-interop/setup.sh
+
+    - name: Create The Network Namespaces
+      run: sudo scripts/mesh-netns/setup.sh
+
+    - name: Conformance Including Interop
+      run: COYOTE_MESH_INTEROP=1 cargo test --all mesh::conformance -- --include-ignored
+
+    # The propagation-node image tests resolve the README's upstream `file:line`
+    # citations against the same pinned clones; this is the one leg where they exist.
+    # The Docker-backed tests stay ignored (no COYOTE_PN_IMAGE_TESTS here).
+    - name: Propagation Node Citations
+      run: cargo test --all --test propagation_node_image
+
+    - name: Remove The Network Namespaces
+      if: always()
+      run: sudo scripts/mesh-netns/teardown.sh
+
+    - name: Record Wall-Clock
+      if: always()
+      run: |
+        end=$(date +%s)
+        {
+          echo "### Mesh interop wall-clock: $((end - ${start:-$end})) s"
+          echo "Outcome: ${{ job.status }}"
+        } >> "$GITHUB_STEP_SUMMARY"

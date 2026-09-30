@@ -1,10 +1,15 @@
 mod completer;
 mod highlighter;
+pub(crate) mod idle;
+pub(crate) mod mesh;
+mod printer;
 mod prompt;
 mod replay;
 
 use self::completer::ReplCompleter;
 use self::highlighter::ReplHighlighter;
+use self::idle::IdleDriver;
+use self::printer::PromptPrinter;
 use self::prompt::ReplPrompt;
 
 use crate::client::{
@@ -12,13 +17,17 @@ use crate::client::{
     oauth,
 };
 use crate::config::{
-    AgentVariables, AppConfig, AssertState, Input, LastMessage, MacroState, RequestContext,
-    SessionScope, StateFlags, flatten_prompt_messages, macro_execute, resolve_prompt_args,
+    AgentVariables, AppConfig, AssertState, EnvoyRunner, Input, LastMessage, MacroState,
+    MeshDigestDriver, MeshHookBridge, RequestContext, SessionScope, StateFlags,
+    flatten_prompt_messages, macro_execute, publish_mesh_snapshot, resolve_prompt_args,
     sanitize_display_text,
 };
 use crate::config::{AssetCategory, paths};
 use crate::function::agents::{GuardrailAction, check_pending_tasks_guardrail};
 use crate::hooks::{self, HookEvent};
+use crate::mesh::events::MeshHookSink;
+use crate::mesh::notify::NotificationSink;
+use crate::mesh::snapshot::TurnState;
 use crate::render::render_error;
 use crate::supervisor::Supervisor;
 use crate::utils::{
@@ -115,7 +124,7 @@ pub const DEFAULT_CONTINUATION_PROMPT: &str = indoc! {"
     5. Otherwise, continue with the next pending item now. Call tools immediately."
 };
 
-static REPL_COMMANDS: LazyLock<[ReplCommand; 63]> = LazyLock::new(|| {
+static REPL_COMMANDS: LazyLock<[ReplCommand; 84]> = LazyLock::new(|| {
     [
         ReplCommand::new(".help", "Show this help guide", AssertState::pass()),
         ReplCommand::new(".info", "Show system info", AssertState::pass()),
@@ -147,6 +156,111 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 63]> = LazyLock::new(|| {
         ReplCommand::new(
             ".mcp disable",
             "Disable a single MCP server in the current context",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh on",
+            "Join the mesh for this session only; config.yaml is not changed",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh off",
+            "Leave the mesh and drop the mesh__* tools",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh peers",
+            "List the nodes heard on the mesh",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh knocks",
+            "List the untrusted nodes that knocked",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh info",
+            "Show the mesh settings and this node, or one peer",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh status",
+            "Show this node's status card, set its objective, or fetch a peer's card",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh brief",
+            "Show the brief peers receive, or set its text or mode",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh inbox",
+            "Drain the peer messages waiting for this node",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh pending",
+            "List the questions this node asked and the ones peers escalated to you",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh answer",
+            "Answer an escalated question, or follow up on one this node asked",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh reply",
+            "Send your own text to one peer, bypassing the model",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh broadcast",
+            "Send a bulletin to every trusted peer with a known path",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh trust",
+            "Trust one instance, or every instance of an identity, or prune stale trusted instances",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh untrust",
+            "Forget a trusted instance, or an identity together with every instance bound to it",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh block",
+            "Silence a whole identity: its knocks are dropped and its trust removed",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh unblock",
+            "Lift a block so the identity may knock again",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh deny",
+            "Refuse one instance: deny stops one destination being contacted, where block silences a whole identity",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh undeny",
+            "Lift a deny on one instance (the identity-level counterpart is unblock)",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh rotate",
+            "Mint a new mesh identity while the node is off; peers must re-trust the new one",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh fetch",
+            "Fetch the messages a propagation node holds for this node now",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh knock",
+            "Ask an untrusted peer to trust this instance, with an optional intro",
             AssertState::pass(),
         ),
         ReplCommand::new(
@@ -414,21 +528,43 @@ pub struct Repl {
     editor: Reedline,
     prompt: ReplPrompt,
     abort_signal: AbortSignal,
+    idle: Option<IdleDriver>,
+    digest: MeshDigestDriver,
+    envoy: Arc<EnvoyRunner>,
+    mesh_hooks: Arc<MeshHookBridge>,
 }
 
 impl Repl {
     pub fn init(ctx: RequestContext) -> Result<Self> {
         let app = Arc::clone(&ctx.app.config);
+        publish_mesh_snapshot(&ctx, TurnState::idle_now());
+        let printer = Arc::new(PromptPrinter::new());
+        ctx.app
+            .mesh
+            .set_notifier(Arc::clone(&printer) as Arc<dyn NotificationSink>);
+        let mesh_hooks = MeshHookBridge::new(Arc::clone(&ctx.app));
+        ctx.app
+            .mesh
+            .set_hook_sink(Arc::clone(&mesh_hooks) as Arc<dyn MeshHookSink>);
+        let app_state = Arc::clone(&ctx.app);
         let ctx = Arc::new(RwLock::new(ctx));
-        let editor = Self::create_editor(Arc::clone(&ctx), app.as_ref())?;
+        let editor = Self::create_editor(Arc::clone(&ctx), app.as_ref(), &printer)?;
         let prompt = ReplPrompt::new(Arc::clone(&ctx));
         let abort_signal = create_abort_signal();
+        // Last, so a failed editor set-up leaves no loop task behind.
+        let idle = IdleDriver::start(Arc::clone(&ctx), Arc::clone(&app_state));
+        let envoy = EnvoyRunner::start(app_state);
+        envoy.attach();
 
         Ok(Self {
             ctx,
             editor,
             prompt,
             abort_signal,
+            idle: Some(idle),
+            digest: MeshDigestDriver::new(),
+            envoy,
+            mesh_hooks,
         })
     }
 
@@ -459,7 +595,10 @@ Type ".help" for additional help.
             };
             if !compressed.is_empty() || !active.is_empty() {
                 let app = Arc::clone(&self.ctx.read().app.config);
-                replay::render(app.as_ref(), &compressed, &active)?;
+                // Replaying history is best-effort: a render failure must not skip shutdown.
+                if let Err(err) = replay::render(app.as_ref(), &compressed, &active) {
+                    render_error(err);
+                }
                 let last_msgs: &[Message] = if !active.is_empty() {
                     &active
                 } else {
@@ -492,6 +631,24 @@ Type ".help" for additional help.
         // OSC 11 / DA1 responses) so they don't get injected into the prompt.
         drain_stale_tty_input();
 
+        if self.ctx.read().app.config.mesh.enabled {
+            // The digest is observed and refreshed at turn boundaries only, so the brief
+            // is assembled at the first one, exactly as after a `.mesh on` typed in a turn.
+            let result = {
+                let mut ctx = self.ctx.write();
+                publish_mesh_snapshot(&ctx, TurnState::working_now());
+                let result = mesh::autostart(&mut ctx).await;
+                self.envoy.refresh(&ctx.app);
+                self.mesh_hooks.refresh(&ctx.app);
+                publish_mesh_snapshot(&ctx, TurnState::idle_now());
+                result
+            };
+            if let Err(err) = result {
+                render_error(err);
+                println!()
+            }
+        }
+
         print_pause_banner(&self.ctx.read());
 
         loop {
@@ -504,8 +661,20 @@ Type ".help" for additional help.
                     self.abort_signal.reset();
                     let result = {
                         let mut ctx = self.ctx.write();
-                        run_repl_command(&mut ctx, self.abort_signal.clone(), &line).await
+                        publish_mesh_snapshot(&ctx, TurnState::working_now());
+                        let result =
+                            run_repl_command(&mut ctx, self.abort_signal.clone(), &line).await;
+                        self.envoy.refresh(&ctx.app);
+                        self.mesh_hooks.refresh(&ctx.app);
+                        self.digest.observe_session(&ctx);
+                        publish_mesh_snapshot(&ctx, TurnState::idle_now());
+                        result
                     };
+                    // An exiting turn, or one Ctrl-D cut short, spawns nothing: shutdown
+                    // below would only abort it.
+                    if !matches!(result, Ok(true)) && !self.abort_signal.aborted_ctrld() {
+                        self.digest.maybe_refresh(&self.ctx);
+                    }
                     match result {
                         Ok(exit) => {
                             if exit {
@@ -536,6 +705,23 @@ Type ".help" for additional help.
             }
         }
 
+        // Notifier first: lines from children and the envoy winding down under `stop`
+        // then reach stderr instead of a printer the loop above no longer drains.
+        self.ctx.read().app.mesh.clear_notifier();
+        self.digest.shutdown().await;
+        if let Some(idle) = self.idle.take() {
+            idle.stop().await;
+        }
+        self.envoy.stop().await;
+        // Cloned so the context guard is not held across the await.
+        let mesh = Arc::clone(&self.ctx.read().app.mesh);
+        if let Err(err) = mesh.stop().await {
+            render_error(err);
+        }
+        // After the node's own `mesh.stopped`, so nothing left in the slot can run hooks
+        // against a session on its way out.
+        mesh.clear_hook_sink();
+
         if let Some(supervisor) = self.ctx.read().supervisor.clone() {
             supervisor.read().cancel_recursive();
         }
@@ -548,7 +734,11 @@ Type ".help" for additional help.
         exit_result
     }
 
-    fn create_editor(ctx: Arc<RwLock<RequestContext>>, app: &AppConfig) -> Result<Reedline> {
+    fn create_editor(
+        ctx: Arc<RwLock<RequestContext>>,
+        app: &AppConfig,
+        printer: &PromptPrinter,
+    ) -> Result<Reedline> {
         let completer = ReplCompleter::new(Arc::clone(&ctx));
         let highlighter = ReplHighlighter::new();
         let menu = Self::create_menu();
@@ -564,6 +754,7 @@ Type ".help" for additional help.
             .with_menu(menu)
             .with_edit_mode(edit_mode)
             .with_cursor_config(cursor_config)
+            .with_external_printer(printer.attach())
             .with_quick_completions(true)
             .with_partial_completions(true)
             .use_bracketed_paste(true)
@@ -670,14 +861,10 @@ impl Validator for ReplValidator {
 pub async fn run_repl_command(
     ctx: &mut RequestContext,
     abort_signal: AbortSignal,
-    mut line: &str,
+    line: &str,
 ) -> Result<bool> {
     ctx.pending_tasks_guardrail_count = 0;
-    if let Ok(Some(captures)) = MULTILINE_RE.captures(line)
-        && let Some(text_match) = captures.get(1)
-    {
-        line = text_match.as_str();
-    }
+    let line = unwrap_multiline(line);
     match parse_command(line) {
         Some((cmd, args)) => match cmd {
             ".help" => {
@@ -1083,7 +1270,22 @@ pub async fn run_repl_command(
                 }
             },
             ".fork" => {
-                ctx.fork_session(args)?;
+                // The session switch comes last and cannot fail, so a refused rekey never
+                // leaves the context in the fork while the node still serves the original.
+                let pending = ctx.prepare_fork(args)?;
+                match ctx.app.mesh.rekey(pending.rekey.clone()).await {
+                    Ok(()) => {
+                        let forked = ctx.commit_fork(pending);
+                        println!("Forked '{}' into '{}'", forked.from, forked.to);
+                    }
+                    Err(err) => {
+                        let (from, to) = (pending.from.clone(), pending.to.clone());
+                        ctx.abandon_fork(pending);
+                        return Err(err.context(format!(
+                            "Could not fork '{from}' into '{to}': the mesh node could not be re-keyed onto the fork, so you are still in '{from}' and the node still serves it; the fork file was removed"
+                        )));
+                    }
+                }
             }
             ".save" => match split_first_arg(args) {
                 Some(("role", name)) => {
@@ -1470,6 +1672,12 @@ pub async fn run_repl_command(
                     println!("Usage: .vault <add|get|update|delete|list> [name]")
                 }
             },
+            ".mesh" => {
+                if ctx.macro_flag {
+                    bail!("Cannot perform this operation because you are in a macro")
+                }
+                mesh::run(ctx, abort_signal.clone(), args).await?;
+            }
             _ => {
                 let name = cmd.strip_prefix('.').unwrap_or(cmd);
                 let policy = ctx.macro_policy();
@@ -2047,6 +2255,22 @@ fn parse_command(line: &str) -> Option<(&str, Option<&str>)> {
     }
 }
 
+pub(crate) fn unwrap_multiline(line: &str) -> &str {
+    if let Ok(Some(captures)) = MULTILINE_RE.captures(line)
+        && let Some(text_match) = captures.get(1)
+    {
+        return text_match.as_str();
+    }
+    line
+}
+
+/// The command token the REPL would dispatch on for `line`, after
+/// unwrapping a `:::` multiline fence; `None` when the line is not a
+/// command.
+pub(crate) fn command_head(line: &str) -> Option<&str> {
+    parse_command(unwrap_multiline(line)).map(|(cmd, _)| cmd)
+}
+
 fn try_extract_shell_command(line: &str) -> Option<&str> {
     let rest = line.strip_prefix('!')?;
     Some(rest.trim_start())
@@ -2183,6 +2407,11 @@ mod tests {
     use crate::config::{AppState, Role, RoleLike, Session, TEMP_ROLE_NAME, WorkingMode};
     use crate::function::ToolResult;
     use crate::hooks::{HookDef, HooksMap, test_sink};
+    use crate::mesh::test_support::TempDir;
+    #[cfg(unix)]
+    use crate::mesh::test_support::started_runtime;
+    use crate::testing::EnvVarGuard;
+    use crate::utils::get_env_name;
     use anyhow::anyhow;
     use serde_json::json;
     use serial_test::serial;
@@ -3153,8 +3382,142 @@ mod tests {
     }
 
     #[test]
-    fn repl_commands_has_63_entries() {
-        assert_eq!(REPL_COMMANDS.len(), 63);
+    fn repl_commands_has_84_entries() {
+        assert_eq!(REPL_COMMANDS.len(), 84);
+    }
+
+    #[test]
+    fn mesh_verbs_and_repl_commands_never_drift() {
+        let commands: Vec<(&str, &str)> = REPL_COMMANDS
+            .iter()
+            .filter_map(|cmd| {
+                cmd.name
+                    .strip_prefix(".mesh ")
+                    .map(|verb| (verb, cmd.description))
+            })
+            .collect();
+        let verbs: Vec<(&str, &str)> = mesh::VERBS
+            .iter()
+            .map(|(verb, description, _)| (*verb, *description))
+            .collect();
+        assert_eq!(commands.len(), 21);
+        assert_eq!(commands, verbs);
+    }
+
+    #[test]
+    fn the_envoy_sees_the_context_replaced_by_the_command_before_the_digest_observes_it() {
+        // Needles are assembled at runtime so this test's own text does not match.
+        let strip = |s: &str| s.split_whitespace().collect::<String>();
+        let source = strip(include_str!("mod.rs"));
+        let command = strip(
+            &[
+                "run_repl_",
+                "command(&mut ctx, self.abort_signal.clone(), &line)",
+            ]
+            .concat(),
+        );
+        let refresh = strip(&["self.envoy.", "refresh(&ctx.app)"].concat());
+        let observe = strip(&["self.digest.", "observe_session(&ctx)"].concat());
+        let envoy_stop = strip(&["self.envoy.", "stop().await;"].concat());
+        let mesh_stop = strip(&["if let Err(err) = mesh.", "stop().await"].concat());
+        let run_start = strip(&["pub async fn run(", "&mut self)"].concat());
+        let replay_checked = strip(&["if let Err(err) = replay::", "render("].concat());
+        let replay_propagated =
+            strip(&["replay::", "render(app.as_ref(), &compressed, &active)?"].concat());
+
+        let position = |needle: &str| {
+            let first = source
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle} missing"));
+            assert_eq!(source.rfind(needle), Some(first), "{needle} not unique");
+            first
+        };
+        // The autostart block refreshes the same hooks, so the refresh is located
+        // relative to the per-turn command rather than as a unique needle.
+        let position_after = |start: usize, needle: &str| {
+            start
+                + source[start..]
+                    .find(needle)
+                    .unwrap_or_else(|| panic!("{needle} missing after {start}"))
+        };
+        let command_at = position(&command);
+        let refresh_at = position_after(command_at, &refresh);
+        let observe_at = position(&observe);
+        assert!(
+            command_at < refresh_at,
+            "envoy refresh must follow the command"
+        );
+        assert!(
+            refresh_at < observe_at,
+            "digest must observe after the envoy refresh"
+        );
+        let mesh_stop_at = position(&mesh_stop);
+        assert!(
+            position(&envoy_stop) < mesh_stop_at,
+            "the node must stop after the envoy on shutdown"
+        );
+        let run_at = position(&run_start);
+        let replay_at = position(&replay_checked);
+        assert!(
+            run_at < replay_at && replay_at < mesh_stop_at,
+            "the history replay in Repl::run must precede the node's stop"
+        );
+        assert!(
+            !source[run_at..mesh_stop_at].contains(&replay_propagated),
+            "a replay failure in Repl::run must not skip the shutdown"
+        );
+    }
+
+    #[test]
+    fn the_mesh_autostarts_inside_repl_run_before_the_first_prompt() {
+        let strip = |s: &str| s.split_whitespace().collect::<String>();
+        let source = strip(include_str!("mod.rs"));
+        let run_start = strip(&["pub async fn run(", "&mut self)"].concat());
+        let gate = strip(&["if self.ctx.read().app.config.mesh.", "enabled {"].concat());
+        let autostart = strip(&["mesh::auto", "start(&mut ctx).await"].concat());
+        let surfaced = strip(
+            &[
+                "if let Err(err) = result { render_",
+                "error(err); println!() }",
+            ]
+            .concat(),
+        );
+        let banner = strip(&["print_pause_", "banner(&self.ctx.read());"].concat());
+        let read_line = strip(&["self.editor.", "read_line(&self.prompt)"].concat());
+
+        let position = |needle: &str| {
+            let first = source
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle} missing"));
+            assert_eq!(source.rfind(needle), Some(first), "{needle} not unique");
+            first
+        };
+        let run_at = position(&run_start);
+        let gate_at = position(&gate);
+        let autostart_at = position(&autostart);
+        let surfaced_at = position(&surfaced);
+        let banner_at = position(&banner);
+        assert!(
+            run_at < gate_at && gate_at < autostart_at,
+            "Repl::run joins only when config.yaml enables the mesh"
+        );
+        assert!(
+            autostart_at < surfaced_at && surfaced_at < banner_at,
+            "an autostart failure is rendered and the REPL goes on to its banner"
+        );
+        assert!(
+            banner_at < position(&read_line),
+            "the join must settle before the first prompt is read"
+        );
+    }
+
+    #[test]
+    fn one_shot_entry_points_never_autostart_the_mesh() {
+        let main = include_str!("../main.rs");
+        assert!(
+            !main.contains("autostart"),
+            "main.rs must reach the mesh autostart only through Repl::run"
+        );
     }
 
     #[test]
@@ -3637,6 +4000,24 @@ mod tests {
     }
 
     #[test]
+    fn command_head_unwraps_multiline_fence() {
+        assert_eq!(command_head("::: .mesh trust abc :::"), Some(".mesh"));
+        assert_eq!(command_head(":::\n.mesh status\n:::"), Some(".mesh"));
+    }
+
+    #[test]
+    fn command_head_returns_command_token_without_args() {
+        assert_eq!(command_head(".model x"), Some(".model"));
+        assert_eq!(command_head("  .mesh"), Some(".mesh"));
+    }
+
+    #[test]
+    fn command_head_prose_returns_none() {
+        assert_eq!(command_head("hello world"), None);
+        assert_eq!(command_head("::: echo .mesh :::"), None);
+    }
+
+    #[test]
     fn try_extract_shell_command_strips_bang() {
         assert_eq!(try_extract_shell_command("!ls"), Some("ls"));
         assert_eq!(try_extract_shell_command("!ls -la"), Some("ls -la"));
@@ -3847,6 +4228,96 @@ mod tests {
         assert!(
             child_signal.aborted_ctrlc(),
             "the child must still be cancelled"
+        );
+    }
+
+    /// A REPL ctx holding a named session, with sessions saved under a temp dir for the
+    /// guard's lifetime. Callers must be `#[serial]`: the sessions dir is process env.
+    fn fork_ctx(tag: &str) -> (RequestContext, TempDir, EnvVarGuard) {
+        let sessions_dir = TempDir::new(tag);
+        let env = EnvVarGuard::set(get_env_name("sessions_dir"), &sessions_dir.path);
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Repl);
+        let mut session = Session::default();
+        session.set_name("original".to_string());
+        ctx.session = Some(session);
+        (ctx, sessions_dir, env)
+    }
+
+    #[test]
+    #[serial]
+    fn fork_command_with_mesh_off_writes_fork_and_switches_to_it() {
+        let (mut ctx, sessions_dir, _env) = fork_ctx("repl-fork-mesh-off");
+        run_async(async {
+            let result = Box::pin(run_repl_command(
+                &mut ctx,
+                create_abort_signal(),
+                ".fork branch",
+            ))
+            .await;
+
+            result.expect("forking with the mesh off must succeed");
+        });
+
+        assert!(sessions_dir.path.join("original.yaml").exists());
+        assert!(sessions_dir.path.join("branch.yaml").exists());
+        let live = ctx.session.as_ref().unwrap();
+        assert_eq!(live.name(), "branch");
+        assert!(live.mesh_instance_id().is_some());
+    }
+
+    /// The rekey is refused hermetically by giving the ctx's session a lineage id other
+    /// than the one the node serves: `MeshRuntime::rekey` bails on that mismatch before it
+    /// takes any lock or touches the transport, so no second process or pre-held lock is
+    /// needed. The fork's own id is minted inside `prepare_fork`, so holding its lock ahead
+    /// of time is not an option.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn fork_command_with_refused_rekey_leaves_context_and_node_on_original() {
+        let (mut ctx, sessions_dir, _env) = fork_ctx("repl-fork-refused");
+        let original_id = ctx
+            .session
+            .as_mut()
+            .unwrap()
+            .ensure_mesh_instance_id()
+            .to_string();
+        run_async(async {
+            let started = started_runtime("repl-fork-refused-node").await;
+            let served_id = started.runtime.instance_id().await;
+            assert_ne!(served_id, original_id);
+            ctx.app.mesh.install(started.runtime.clone()).unwrap();
+
+            let err = Box::pin(run_repl_command(
+                &mut ctx,
+                create_abort_signal(),
+                ".fork branch",
+            ))
+            .await
+            .expect_err("a refused rekey must fail the fork");
+
+            let err = format!("{err:#}");
+            assert!(
+                err.contains("Could not fork 'original' into 'branch'"),
+                "{err}"
+            );
+            assert!(err.contains("you are still in 'original'"), "{err}");
+            assert!(
+                err.contains(&format!("serving instance {served_id}")),
+                "{err}"
+            );
+            assert_eq!(started.runtime.instance_id().await, served_id);
+
+            assert!(ctx.app.mesh.stop().await.unwrap());
+            started.relay_handle.abort();
+        });
+
+        let live = ctx.session.as_ref().unwrap();
+        assert_eq!(live.name(), "original");
+        assert_eq!(live.mesh_instance_id(), Some(original_id.as_str()));
+        assert!(sessions_dir.path.join("original.yaml").exists());
+        assert!(
+            !sessions_dir.path.join("branch.yaml").exists(),
+            "the fork file must be removed when the rekey is refused"
         );
     }
 }

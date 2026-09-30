@@ -21,4 +21,128 @@ receive Coyote as a combined work, your rights and obligations for the work as
 a whole are governed by the AGPL-3.0-only license; the MIT notice is retained
 to satisfy the attribution requirements of the MIT-licensed portions.
 
+--------------------------------------------------------------------------------
+LXMF-rs (Reticulum transport and LXMF wire format)
+--------------------------------------------------------------------------------
+
+Coyote depends on the `reticulum-rs-transport` and `lxmf-wire` crates from
+LXMF-rs (https://github.com/FreeTAKTeam/LXMF-rs). LXMF-rs is dual-licensed:
+its package metadata declares `license = "EPL-2.0 OR GPL-2.0-or-later"`, and
+its LICENSE file carries the Eclipse Public License 2.0 text followed by a
+completed Secondary Licenses Notice offering the source under the "GNU
+General Public License, version 2 or any later version".
+
+Coyote relies on the GPL-2.0-or-later arm of that disjunction, which is the
+only arm compatible with Coyote's AGPL-3.0-only license (GPL-2.0-or-later
+permits GPL-3.0, which AGPL-3.0 section 13 allows to be combined with AGPL
+work). The EPL-2.0 arm is not compatible with the GNU General Public License
+family and is not relied upon here.
+
+Two obligations of Coyote's own remain outstanding from these dependencies.
+The rest are discharged where they are recorded below, or folded into these
+two. Neither of the two is an assertion of wrongdoing upstream.
+
+  - License texts the distributed binary relies on are not shipped with it.
+    Relying on a GPL arm means shipping a copy of that license, and LXMF-rs
+    ships the EPL-2.0 text and the Secondary Licenses Notice but no copy of
+    the GNU General Public License; neither does this repository. The same
+    is true of the BSD 3-Clause text the dalek crates and `subtle` below are
+    under. This one blocks a release.
+  - Coyote's package metadata still declares `license = "AGPL-3.0-only"`,
+    which no longer describes the combined work once these dependencies
+    ship. Settling the aggregate expression is the license owner's call and
+    is tracked separately, not as a release gate.
+
+Transitive dependencies. `reticulum-rs-transport` enables its default
+`storage` feature, which pulls in `rusqlite` with upstream's `bundled`
+setting and therefore compiles the SQLite C amalgamation into Coyote.
+`rusqlite` and `libsqlite3-sys` are distributed under the MIT License,
+Copyright (c) 2014 The rusqlite developers; the MIT permission notice is
+reproduced in the LICENSE-MIT file. That file carries only the Coyote and
+AIChat copyright lines; for every third party named here under the MIT
+License, the permission text is the shared one in LICENSE-MIT and the
+copyright notice is the one given inline below. SQLite itself is in the
+public domain.
+
+`reticulum-rs-transport` also pulls in `bzip2`, Copyright (c) 2014 Alex
+Crichton, and `bzip2-sys`, Copyright (c) 2014-2025 Alex Crichton and
+Contributors, both distributed under `MIT/Apache-2.0` and used here under
+the MIT License. `bzip2-sys` ships libbzip2, "copyright (C) 1996-2019 Julian R
+Seward", and compiles it on Windows and anywhere pkg-config finds no system
+libbz2; where one exists it links that instead. libbzip2's BSD-style license
+requires source redistributions to retain its copyright notice and
+conditions; that notice travels with the bundled source in the `bzip2-sys`
+crate.
+
+`x25519-dalek` arrives with these dependencies and is distributed under the
+BSD 3-Clause License:
+
+    Copyright (c) 2017-2021 isis agora lovecruft. All rights reserved.
+    Copyright (c) 2019-2021 DebugSteven. All rights reserved.
+
+That license requires binary redistributions to reproduce those notices
+together with its list of conditions and its disclaimer. The notices are
+recorded here; the license text itself is not shipped, which is the
+release-blocking obligation recorded above. The sibling `curve25519-dalek`
+and `ed25519-dalek` crates are under the same license with their own
+copyright lines; they predate these dependencies and their notices are not
+recorded here either, which the same obligation covers. `subtle`, already in
+the tree via `digest` and now a direct dependency for the mesh trust store, is
+under the same BSD 3-Clause License, "Copyright (c) 2016-2017 Isis Agora
+Lovecruft, Henry de Valence. All rights reserved. Copyright (c) 2016-2024 Isis
+Agora Lovecruft. All rights reserved."
+
+`reticulum-rs-transport` depends on `tokio-serial` unconditionally, which
+brings in `mio-serial` and `serialport`. `tokio-serial` is under the MIT
+License, Copyright (c) 2017 Zac Berkowitz and other tokio-serial
+contributors; `mio-serial` is under the MIT License, Copyright (c) 2017 Zac
+Berkowitz (zac.berkowitz@gmail.com). `serialport` is distributed under the
+Mozilla Public License 2.0 and needs no copyright line here. It is used
+unmodified, and MPL-2.0 section 3.3 permits distributing the larger work
+under Coyote's own terms; the obligation MPL-2.0 section 3.2 attaches is that
+recipients of a binary be told how to obtain the source of the covered files,
+which are published unmodified at
+https://github.com/serialport/serialport-rs. The same obligation already
+applies to `colored`, a direct dependency under the same license, published
+at https://github.com/mackwic/colored. The MPL-2.0 text itself is at
+https://mozilla.org/MPL/2.0/.
+
+This section records the obligations these dependencies add, not the full
+dependency graph. Coyote's wider tree carries notice obligations that predate
+these dependencies, most of them enumerated nowhere; closing that gap is a
+separate piece of work.
+
+--------------------------------------------------------------------------------
+Other dependencies
+--------------------------------------------------------------------------------
+
+`arc-swap`, already in the tree via `log4rs` and the AWS SDK crates and now a
+direct dependency for the mesh snapshot slot, is distributed under `MIT OR
+Apache-2.0`, Copyright (c) 2017 arc-swap developers; Coyote uses it under the
+MIT License, whose shared permission text is in the LICENSE-MIT file.
+
+`crossbeam`, `crossbeam-channel` and `crossbeam-queue` enter the shipped
+binary through reedline's `external_printer` feature, which the REPL uses to
+print mesh notifications above the prompt; `crossbeam-deque`,
+`crossbeam-epoch` and `crossbeam-utils` were already in the tree. All are
+distributed under `MIT OR Apache-2.0`, Copyright (c) 2019 The Crossbeam Project
+Developers; Coyote uses them under the MIT License, whose shared permission
+text is in the LICENSE-MIT file. The pty test harness crates (`expectrl`,
+`ptyprocess`, `conpty` and its `windows` bindings) are dev-dependencies only
+and never ship.
+
+`arbitrary` and `derive_arbitrary`, distributed under `MIT OR Apache-2.0`,
+Copyright (c) 2019 Manish Goregaokar, are dev-dependencies of the mesh fuzz
+harness under `src/mesh/fuzz` and never ship; the harness uses them under the
+MIT License, whose shared permission text is in the LICENSE-MIT file.
+
+--------------------------------------------------------------------------------
+Windows platform bindings
+--------------------------------------------------------------------------------
+
+On Windows targets, Coyote links against `windows-sys`
+(https://github.com/microsoft/windows-rs), Copyright (c) Microsoft
+Corporation, distributed under `MIT OR Apache-2.0`. Coyote uses it under the
+MIT License, whose shared permission text is in the LICENSE-MIT file.
+
 See CREDITS.md for additional background and attribution.

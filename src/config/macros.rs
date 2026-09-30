@@ -1,6 +1,8 @@
 use crate::config::paths;
-use crate::config::{RequestContext, RoleLike, ensure_parent_exists};
-use crate::repl::{run_repl_command, split_args_text};
+use crate::config::{
+    RequestContext, RoleLike, ensure_parent_exists, refresh_mesh_snapshot, sanitize_display_text,
+};
+use crate::repl::{command_head, run_repl_command, split_args_text};
 use crate::utils::{AbortSignal, multiline_text};
 use anyhow::{Context, Result, anyhow, bail};
 use indexmap::IndexMap;
@@ -44,6 +46,7 @@ pub async fn macro_execute(
             let command = Macro::interpolate_command(step, &variables);
             println!(">> {}", multiline_text(&command));
             run_repl_command(&mut live, abort_signal.clone(), &command).await?;
+            refresh_mesh_snapshot(&live);
         }
 
         return Ok(());
@@ -88,6 +91,9 @@ pub async fn macro_execute(
             let command = Macro::interpolate_command(step, &variables);
             println!(">> {}", multiline_text(&command));
             run_repl_command(&mut macro_ctx, abort_signal.clone(), &command).await?;
+            // Deliberately the outer ctx: the mesh describes the outer session, not the
+            // isolated macro context.
+            refresh_mesh_snapshot(ctx);
         }
         Ok(())
     }
@@ -159,7 +165,34 @@ impl Macro {
         let err = || format!("Failed to load macro '{name}' at '{}'", path.display());
         let content = read_to_string(&path).with_context(err)?;
         let value: Macro = serde_yaml::from_str(&content).with_context(err)?;
+        if let Some(reason) = value.forbidden_mesh_step() {
+            bail!("{}: {reason}", err());
+        }
         Ok(value)
+    }
+
+    /// The refusal reason for the first step that is a literal `.mesh`
+    /// command, or `None` when no step is. A step counts when the REPL's
+    /// own tokenizer would dispatch it to `.mesh`, so a `:::` multiline
+    /// fence is unwrapped first: `.mesh`, `  .mesh trust x`,
+    /// `\t.mesh\tstatus` and `::: .mesh status :::` are refused;
+    /// `.meshy foo`, `echo .mesh`,
+    /// `mesh trust`, `. mesh` and `.MESH trust x` (dispatch is
+    /// case-sensitive, so that is not a `.mesh` command at runtime either)
+    /// are not. A step that only becomes `.mesh` through variable
+    /// interpolation (`{{cmd}} trust x`) is out of scope by design: the
+    /// runtime macro guard refuses it when it executes.
+    pub(crate) fn forbidden_mesh_step(&self) -> Option<String> {
+        let (index, step) = self
+            .steps
+            .iter()
+            .enumerate()
+            .find(|(_, step)| command_head(step) == Some(".mesh"))?;
+        Some(format!(
+            "step {} '{}': literal `.mesh` steps are refused at load; the runtime guard covers the rest",
+            index + 1,
+            sanitize_display_text(step)
+        ))
     }
 
     pub fn install_macros(force: bool) -> Result<()> {
@@ -1137,5 +1170,282 @@ variables:
             "a pre-existing flag must be restored, not cleared"
         );
         assert!(!ctx.macro_non_isolated);
+    }
+
+    fn macro_with_steps(steps: &[&str]) -> Macro {
+        Macro {
+            description: None,
+            isolated: true,
+            variables: vec![],
+            steps: steps.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    const NON_MESH_STEPS: [&str; 12] = [
+        ".model gpt-4o",
+        ".session foo",
+        ".set temperature 0.5",
+        ".list macros",
+        ".role coder",
+        ".agent probe",
+        ".file x",
+        ".help",
+        ".info",
+        ".meshy foo",
+        "echo .mesh",
+        "hello world",
+    ];
+
+    #[test]
+    fn forbidden_mesh_step_matches_only_a_leading_mesh_token() {
+        let refused = [
+            ".mesh",
+            "  .mesh trust {{peer}}",
+            "\t.mesh\ttrust x",
+            "\n.mesh status",
+            "::: .mesh trust abc :::",
+            ":::\n.mesh status\n:::",
+        ];
+        for step in refused {
+            let reason = macro_with_steps(&[step]).forbidden_mesh_step();
+            assert!(reason.is_some(), "{step:?} must be refused");
+            let reason = reason.unwrap();
+            assert!(reason.contains("step 1"), "{reason}");
+            // The reason renders the step with control chars replaced by spaces.
+            assert!(reason.contains(&sanitize_display_text(step)), "{reason}");
+            assert!(
+                reason.contains("literal `.mesh` steps are refused at load"),
+                "{reason}"
+            );
+        }
+
+        let accepted = [
+            ".MESH trust x",
+            "mesh trust",
+            ". mesh",
+            "{{cmd}} trust x",
+            "::: echo .mesh :::",
+        ];
+        for step in accepted.iter().chain(NON_MESH_STEPS.iter()) {
+            assert_eq!(
+                macro_with_steps(&[step]).forbidden_mesh_step(),
+                None,
+                "{step:?} must not be refused"
+            );
+        }
+        assert_eq!(
+            macro_with_steps(&NON_MESH_STEPS).forbidden_mesh_step(),
+            None
+        );
+    }
+
+    #[test]
+    fn forbidden_mesh_step_reports_first_offender_by_one_based_index() {
+        let m = macro_with_steps(&[".model x", ".mesh trust a", ".mesh trust b"]);
+
+        let reason = m.forbidden_mesh_step().unwrap();
+
+        assert!(reason.contains("step 2 '.mesh trust a'"), "{reason}");
+        assert!(!reason.contains("trust b"), "{reason}");
+    }
+
+    #[test]
+    fn forbidden_mesh_step_reason_strips_ansi_escapes_from_step() {
+        let m = macro_with_steps(&[".mesh \u{1b}[31mtrust\u{1b}[0m x"]);
+
+        let reason = m.forbidden_mesh_step().unwrap();
+
+        assert!(!reason.contains('\u{1b}'), "{reason:?}");
+        assert!(reason.contains("step 1 '.mesh trust x'"), "{reason}");
+    }
+
+    #[test]
+    #[serial]
+    fn load_refuses_macro_with_mesh_step_after_other_steps() {
+        let _guard = TestConfigDirGuard::new("macros-tests");
+        write_macro_file(
+            "mesh-macro",
+            "steps:\n  - \".model gpt-4o\"\n  - \".mesh trust abc\"\n  - \".set temperature 0.1\"\n",
+        );
+        let path = paths::macros_dir().join("mesh-macro.yaml");
+
+        let err = Macro::load("mesh-macro", false).unwrap_err().to_string();
+
+        assert!(err.contains("Failed to load macro 'mesh-macro'"), "{err}");
+        assert!(err.contains(&path.display().to_string()), "{err}");
+        assert!(err.contains("step 2 '.mesh trust abc'"), "{err}");
+        assert!(
+            err.contains("literal `.mesh` steps are refused at load"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn load_accepts_macro_of_non_mesh_steps() {
+        let _guard = TestConfigDirGuard::new("macros-tests");
+        let steps: Vec<String> = NON_MESH_STEPS
+            .iter()
+            .map(|s| format!("  - {s:?}"))
+            .collect();
+        write_macro_file("plain-macro", &format!("steps:\n{}\n", steps.join("\n")));
+
+        let loaded = Macro::load("plain-macro", false).unwrap();
+
+        assert_eq!(loaded.steps.len(), NON_MESH_STEPS.len());
+    }
+
+    #[test]
+    #[serial]
+    fn non_isolated_mesh_step_refused_before_any_step_runs() {
+        let _guard = TestConfigDirGuard::new("macros-tests");
+        write_macro_file(
+            "mesh-live-macro",
+            "isolated: false\nsteps:\n  - \".set temperature 0.9\"\n  - \".mesh trust abc\"\n",
+        );
+        let mut ctx = test_ctx();
+        ctx.session = Some(Session::default());
+
+        let result = run_async(macro_execute(
+            &mut ctx,
+            "mesh-live-macro",
+            None,
+            create_abort_signal(),
+        ));
+
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains(".mesh trust abc"), "{err}");
+        assert_eq!(
+            ctx.session.as_ref().unwrap().temperature(),
+            None,
+            "refusal at load must precede the first step"
+        );
+        assert!(!ctx.macro_flag);
+        assert!(!ctx.macro_non_isolated);
+    }
+
+    #[test]
+    #[serial]
+    fn isolated_mesh_step_refused_before_any_step_runs() {
+        let _guard = TestConfigDirGuard::new("macros-tests");
+        write_macro_file(
+            "mesh-iso-macro",
+            "steps:\n  - \".set temperature 0.9\"\n  - \".mesh trust abc\"\n",
+        );
+        let mut ctx = test_ctx();
+        ctx.session = Some(Session::default());
+
+        let result = run_async(macro_execute(
+            &mut ctx,
+            "mesh-iso-macro",
+            None,
+            create_abort_signal(),
+        ));
+
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains(".mesh trust abc"), "{err}");
+        assert!(!ctx.macro_flag);
+        assert!(!ctx.macro_non_isolated);
+    }
+
+    // ---- usage probe: spec-first tests for the .mesh-in-macros exclusion ----
+
+    /// Spec (c) fixes the reason wording verbatim; pin the whole sentence so
+    /// the `.list macros` row and the load error cannot drift apart from it.
+    #[test]
+    fn usage_probe_reason_is_the_exact_spec_sentence() {
+        let m = macro_with_steps(&[".model x", "  .mesh trust {{peer}}"]);
+
+        assert_eq!(
+            m.forbidden_mesh_step().as_deref(),
+            Some(
+                "step 2 '  .mesh trust {{peer}}': literal `.mesh` steps are refused at load; the runtime guard covers the rest"
+            )
+        );
+    }
+
+    /// Spec (a)/(d): both REPL arms that reach a macro — `.macro <name> [args]`
+    /// and the top-level `.<name> [args]` fallback — surface the load-time
+    /// refusal (via `resolve_state` -> `Invalid`) and run no step, even when
+    /// the macro is non-isolated and would otherwise mutate the live session.
+    #[test]
+    #[serial]
+    fn usage_probe_repl_arms_refuse_mesh_macro_before_first_step() {
+        let _guard = TestConfigDirGuard::new("macros-tests");
+        write_macro_file(
+            "meshy",
+            "isolated: false\n\
+             variables:\n  - name: peer\n\
+             steps:\n  - \".set temperature 0.9\"\n  - \"  .mesh trust {{peer}}\"\n",
+        );
+        let expected = "Macro 'meshy' is invalid: step 2 '  .mesh trust {{peer}}': literal `.mesh` steps are refused at load; the runtime guard covers the rest";
+
+        for line in [".macro meshy peer=abc", ".meshy peer=abc"] {
+            let mut ctx = test_ctx();
+            ctx.session = Some(Session::default());
+
+            let err = run_async(run_repl_command(&mut ctx, create_abort_signal(), line))
+                .unwrap_err()
+                .to_string();
+
+            assert_eq!(err, expected, "{line}");
+            assert_eq!(
+                ctx.session.as_ref().unwrap().temperature(),
+                None,
+                "{line}: refusal must precede the first step"
+            );
+            assert!(!ctx.macro_flag, "{line}");
+            assert!(!ctx.macro_non_isolated, "{line}");
+        }
+    }
+
+    /// Spec (d): enforcement lives in `Macro::load`, so it fires before
+    /// variable resolution — a mesh macro invoked WITHOUT its required
+    /// variable reports the refusal, not the usage error.
+    #[test]
+    #[serial]
+    fn usage_probe_load_refusal_precedes_variable_resolution() {
+        let _guard = TestConfigDirGuard::new("macros-tests");
+        write_macro_file(
+            "mesh-vars",
+            "variables:\n  - name: peer\nsteps:\n  - \".mesh trust {{peer}}\"\n",
+        );
+        let mut ctx = test_ctx();
+
+        let err = run_async(macro_execute(
+            &mut ctx,
+            "mesh-vars",
+            None,
+            create_abort_signal(),
+        ))
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("step 1 '.mesh trust {{peer}}'"), "{err}");
+        assert!(err.contains("refused at load"), "{err}");
+        assert!(!err.contains("Usage:"), "{err}");
+    }
+
+    /// Spec (e): the exclusion is exactly one command family. A macro made of
+    /// every OTHER built-in REPL command still loads from disk, so the check
+    /// cannot silently broaden to `.model`, `.session`, `.rag`, ...
+    #[test]
+    #[serial]
+    fn usage_probe_every_other_builtin_command_still_loads() {
+        let _guard = TestConfigDirGuard::new("macros-tests");
+        // `builtin_command_names` yields the dot-less, deduped family names.
+        let others: Vec<String> = crate::repl::builtin_command_names()
+            .into_iter()
+            .filter(|name| *name != "mesh")
+            .map(|name| format!(".{name}"))
+            .collect();
+        assert!(others.len() > 20, "{others:?}");
+        let body: Vec<String> = others.iter().map(|c| format!("  - \"{c} arg\"")).collect();
+        write_macro_file("all-others", &format!("steps:\n{}\n", body.join("\n")));
+
+        let loaded = Macro::load("all-others", false).unwrap();
+
+        assert_eq!(loaded.steps.len(), others.len());
+        assert_eq!(loaded.forbidden_mesh_step(), None);
     }
 }

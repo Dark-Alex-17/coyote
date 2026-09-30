@@ -7,7 +7,7 @@ pub use inquire::prompt_theme;
 pub use self::markdown::{MarkdownRender, RenderOptions};
 use self::stream::{markdown_stream, raw_stream};
 
-use crate::utils::{AbortSignal, IS_STDOUT_TERMINAL, error_text, pretty_error};
+use crate::utils::{AbortSignal, IS_STDOUT_TERMINAL, pretty_error, stderr_error_text};
 use crate::{client::SseEvent, config::AppConfig};
 
 use anyhow::Result;
@@ -49,5 +49,5 @@ async fn drain_silently(
 }
 
 pub fn render_error(err: anyhow::Error) {
-    eprintln!("{}", error_text(&pretty_error(&err)));
+    eprintln!("{}", stderr_error_text(&pretty_error(&err)));
 }

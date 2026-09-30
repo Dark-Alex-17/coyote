@@ -4,11 +4,13 @@
 
 import os
 import re
+import inspect
 import json
 import sys
 import importlib.util
 from pathlib import Path
 
+# cwd-venv-begin
 def _ensure_cwd_venv():
     cwd = Path.cwd()
     venv_dir = cwd / ".venv"
@@ -25,6 +27,7 @@ def _ensure_cwd_venv():
     os.execv(str(py), [str(py)] + sys.argv)
 
 _ensure_cwd_venv()
+# cwd-venv-end
 
 
 def resolve_dir(env_name, default_path):
@@ -124,10 +127,24 @@ def run(agent_path, agent_func, agent_data):
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
 
-    if not hasattr(mod, agent_func):
+    fn = getattr(mod, agent_func, None)
+    if not callable(fn):
         raise Exception(f"Not module function '{agent_func}' at '{agent_path}'")
 
-    value = getattr(mod, agent_func)(**agent_data)
+    try:
+        signature = inspect.signature(fn)
+    except ValueError:
+        # Some callables carry no signature; the call itself reports bad arguments.
+        signature = None
+    if signature is not None:
+        try:
+            signature.bind(**agent_data)
+        except TypeError as exc:
+            return_to_llm({"tool_call_error": f"invalid arguments for {agent_func}: {exc}"})
+            dump_result('{agent_name}' + f':{agent_func}')
+            return
+
+    value = fn(**agent_data)
     return_to_llm(value)
     dump_result('{agent_name}' + f':{agent_func}')
 

@@ -1,3 +1,5 @@
+use crate::mesh::message::PeerMessage;
+
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -13,10 +15,20 @@ pub struct Envelope {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EnvelopePayload {
-    Text { content: String },
-    TaskCompleted { task_id: String, summary: String },
-    ShutdownRequest { reason: String },
+    Text {
+        content: String,
+    },
+    TaskCompleted {
+        task_id: String,
+        summary: String,
+    },
+    ShutdownRequest {
+        reason: String,
+    },
     ShutdownApproved,
+    /// A message a trusted mesh peer addressed to this node. Boxed so the local variants
+    /// stay small.
+    Peer(Box<PeerMessage>),
 }
 
 #[derive(Debug, Default)]
@@ -35,6 +47,31 @@ impl Inbox {
         self.messages.lock().push(envelope);
     }
 
+    /// `deliver` for a peer channel that must not hold more than `cap` `Peer` envelopes:
+    /// at the cap, the oldest makes room and is returned so the caller can count the
+    /// loss. Local envelopes neither count toward the cap nor get evicted. `cap` is at
+    /// least one: a bound of zero would evict on every delivery and hold nothing.
+    pub fn deliver_bounded(&self, envelope: Envelope, cap: usize) -> Option<Envelope> {
+        debug_assert!(cap > 0, "a bounded inbox holds at least one envelope");
+        let mut messages = self.messages.lock();
+        let is_peer = |e: &Envelope| matches!(e.payload, EnvelopePayload::Peer(_));
+        let evicted = if messages.iter().filter(|e| is_peer(e)).count() >= cap {
+            messages
+                .iter()
+                .position(is_peer)
+                .map(|index| messages.remove(index))
+        } else {
+            None
+        };
+        messages.push(envelope);
+        evicted
+    }
+
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.messages.lock().len()
+    }
+
     pub fn drain(&self) -> Vec<Envelope> {
         let mut msgs = {
             let mut guard = self.messages.lock();
@@ -45,7 +82,8 @@ impl Inbox {
             EnvelopePayload::ShutdownRequest { .. } => 0,
             EnvelopePayload::ShutdownApproved => 0,
             EnvelopePayload::TaskCompleted { .. } => 1,
-            EnvelopePayload::Text { .. } => 2,
+            EnvelopePayload::Peer(_) => 2,
+            EnvelopePayload::Text { .. } => 3,
         });
 
         msgs
@@ -173,6 +211,28 @@ mod tests {
         }
     }
 
+    fn peer_envelope(from: &str, to: &str, id: &str) -> Envelope {
+        use crate::mesh::message::{PeerKind, PeerVia};
+        Envelope {
+            from: from.to_string(),
+            to: to.to_string(),
+            payload: EnvelopePayload::Peer(Box::new(PeerMessage {
+                source_identity: "cd".repeat(16),
+                source_destination: from.to_string(),
+                destination: to.to_string(),
+                title: None,
+                content: "hi".into(),
+                fields: None,
+                timestamp: 1_700_000_000.0,
+                message_id: id.to_string(),
+                in_reply_to: None,
+                kind: PeerKind::Message,
+                via: PeerVia::Direct,
+            })),
+            timestamp: Utc::now(),
+        }
+    }
+
     #[test]
     fn inbox_new_is_empty() {
         let inbox = Inbox::new();
@@ -219,6 +279,49 @@ mod tests {
             msgs[1].payload,
             EnvelopePayload::TaskCompleted { .. }
         ));
+        assert!(matches!(msgs[2].payload, EnvelopePayload::Text { .. }));
+    }
+
+    #[test]
+    fn inbox_drain_sorts_peer_after_task_completed_and_before_text() {
+        let inbox = Inbox::new();
+        inbox.deliver(text_envelope("a", "b", "msg"));
+        inbox.deliver(peer_envelope("p", "b", "m-1"));
+        inbox.deliver(task_completed_envelope("a", "b"));
+
+        let msgs = inbox.drain();
+        assert_eq!(msgs.len(), 3);
+        assert!(matches!(
+            msgs[0].payload,
+            EnvelopePayload::TaskCompleted { .. }
+        ));
+        assert!(matches!(&msgs[1].payload, EnvelopePayload::Peer(m) if m.message_id == "m-1"));
+        assert!(matches!(msgs[2].payload, EnvelopePayload::Text { .. }));
+    }
+
+    #[test]
+    fn deliver_bounded_evicts_the_oldest_peer_and_leaves_local_envelopes_alone() {
+        let inbox = Inbox::new();
+        inbox.deliver(text_envelope("a", "b", "keep"));
+        assert!(
+            inbox
+                .deliver_bounded(peer_envelope("p", "b", "m-1"), 2)
+                .is_none()
+        );
+        assert!(
+            inbox
+                .deliver_bounded(peer_envelope("p", "b", "m-2"), 2)
+                .is_none()
+        );
+        let evicted = inbox
+            .deliver_bounded(peer_envelope("p", "b", "m-3"), 2)
+            .expect("the cap is on peer envelopes, and the text one does not count");
+        assert!(matches!(&evicted.payload, EnvelopePayload::Peer(m) if m.message_id == "m-1"));
+        assert_eq!(inbox.len(), 3);
+
+        let msgs = inbox.drain();
+        assert!(matches!(&msgs[0].payload, EnvelopePayload::Peer(m) if m.message_id == "m-2"));
+        assert!(matches!(&msgs[1].payload, EnvelopePayload::Peer(m) if m.message_id == "m-3"));
         assert!(matches!(msgs[2].payload, EnvelopePayload::Text { .. }));
     }
 

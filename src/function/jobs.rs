@@ -1,12 +1,15 @@
 use super::agents::AGENT_FUNCTION_PREFIX;
 use super::memory::MEMORY_FUNCTION_PREFIX;
+use super::mesh::MESH_FUNCTION_PREFIX;
 use super::rag_query::RAG_FUNCTION_PREFIX;
 use super::skill::SKILL_FUNCTION_PREFIX;
 use super::todo::TODO_FUNCTION_PREFIX;
 use super::user_interaction::USER_FUNCTION_PREFIX;
-use super::{FunctionDeclaration, JsonSchema, PATH_SEP, mcp_error_display, render_tool_result};
+use super::{
+    FunctionDeclaration, JsonSchema, PATH_SEP, mcp_error_display, render_tool_result, timeout_hint,
+};
 use crate::config::{
-    McpRuntime, RequestContext, effective_max_concurrent_jobs, jobs_enabled, paths,
+    Agent, McpRuntime, RequestContext, effective_max_concurrent_jobs, jobs_enabled, paths,
 };
 use crate::graph;
 use crate::hooks::{self, HookEvent, ResolvedHook};
@@ -192,6 +195,7 @@ pub struct JobEnvSnapshot {
     display_name: String,
     cmd_args: Vec<String>,
     envs: HashMap<String, String>,
+    env_clear: bool,
     output_file: PathBuf,
     timeout_secs: u64,
 }
@@ -351,6 +355,13 @@ pub async fn handle_job_tool(
         .strip_prefix(JOB_FUNCTION_PREFIX)
         .unwrap_or(cmd_name);
 
+    if ctx.agent.as_ref().is_some_and(Agent::is_builtin) {
+        return Ok(json!({
+            "status": "error",
+            "message": "Job tools are never available to a built-in agent.",
+        }));
+    }
+
     match action {
         "start" => handle_start(ctx, args).await,
         "check" => handle_check(ctx, args),
@@ -394,7 +405,9 @@ fn whitelist_rejection(tool: &str) -> Option<Value> {
         MCP_READ_META_FUNCTION_NAME_PREFIX,
         MCP_PROMPT_META_FUNCTION_NAME_PREFIX,
     ];
-    let reason = if tool.starts_with(AGENT_FUNCTION_PREFIX) || tool.starts_with(JOB_FUNCTION_PREFIX)
+    let reason = if tool.starts_with(AGENT_FUNCTION_PREFIX)
+        || tool.starts_with(JOB_FUNCTION_PREFIX)
+        || tool.starts_with(MESH_FUNCTION_PREFIX)
     {
         Some(format!(
             "'{tool}' is already asynchronous — call it directly. Agents may start jobs, but jobs never start agents or other jobs."
@@ -471,17 +484,7 @@ async fn handle_start(ctx: &mut RequestContext, args: &Value) -> Result<Value> {
         }));
     }
 
-    let supervisor = match ctx.supervisor.as_ref() {
-        Some(sup) => Arc::clone(sup),
-        None => {
-            let max_jobs = effective_max_concurrent_jobs(ctx.agent.as_ref(), &ctx.app.config);
-            let sup = Arc::new(RwLock::new(
-                Supervisor::new(0, 0).with_max_concurrent_jobs(max_jobs),
-            ));
-            ctx.supervisor = Some(Arc::clone(&sup));
-            sup
-        }
-    };
+    let supervisor = ctx.ensure_supervisor();
 
     {
         let sup = supervisor.read();
@@ -994,7 +997,7 @@ fn build_env_snapshot(
     let (cmd_name, mut cmd_args, mut envs) = match agent {
         Some(agent) => match agent.functions().find(tool) {
             Some(declaration) if declaration.agent => (
-                format!("{}-{tool}", agent.name()),
+                agent.name().to_string(),
                 vec![tool.to_string()],
                 agent.variable_envs(),
             ),
@@ -1030,6 +1033,13 @@ fn build_env_snapshot(
     envs.insert("FORCE_COLOR".into(), "1".into());
     envs.entry("COYOTE_CURRENT_MODEL".to_string())
         .or_insert_with(|| ctx.current_model().id());
+    // handle_job_tool already refuses built-ins; this pin guards against a
+    // future relaxation of that gate.
+    for (key, value) in super::builtin_agent_env(agent.map(|agent| agent.name())) {
+        envs.insert(key, value);
+    }
+    let env_clear = super::is_builtin_agent(agent.map(|agent| agent.name()));
+    let launch = super::builtin_agent_launch(agent.map(|agent| agent.name()), &cmd_name)?;
 
     cmd_args.push(arguments.to_string());
 
@@ -1050,13 +1060,36 @@ fn build_env_snapshot(
         args
     };
 
-    let timeout_secs = super::tool_timeout_secs(ctx.app.config.tool_timeout);
+    let (cmd_name, cmd_args) = match launch {
+        Some((interpreter, prefix)) => (
+            interpreter.display().to_string(),
+            prefix.into_iter().chain(cmd_args).collect::<Vec<_>>(),
+        ),
+        None => (cmd_name, cmd_args),
+    };
+
+    if env_clear {
+        let mut hermetic = super::builtin_agent_child_env(&super::inherited_process_env());
+        hermetic.extend(envs);
+        envs = hermetic;
+    }
+
+    // Same pin as the env clear above: a built-in's child is never unlimited.
+    let timeout_secs = if env_clear {
+        super::builtin_tool_timeout_secs(
+            ctx.app.config.tool_timeout,
+            super::BUILTIN_TOOL_TIMEOUT_SECS,
+        )
+    } else {
+        super::tool_timeout_secs(ctx.app.config.tool_timeout)
+    };
 
     Ok(JobEnvSnapshot {
         cmd_name,
         display_name: tool.to_string(),
         cmd_args,
         envs,
+        env_clear,
         output_file,
         timeout_secs,
     })
@@ -1135,6 +1168,9 @@ async fn run_process_job(
     let _temp_guard = TempFileGuard(temp_files);
 
     let mut command = tokio::process::Command::new(&snapshot.cmd_name);
+    if snapshot.env_clear {
+        command.env_clear();
+    }
     command
         .args(&snapshot.cmd_args)
         .envs(&snapshot.envs)
@@ -1189,8 +1225,10 @@ async fn run_process_job(
                 drain_output_file(&snapshot.output_file, &file_offset, &output_buf);
                 let output_bytes_captured = output_buf.lock().total_written();
                 let message = format!(
-                    "Tool call '{}' timed out after {}s and was killed (set tool_timeout in config or COYOTE_TOOL_TIMEOUT to adjust; 0 = unlimited)",
-                    snapshot.display_name, snapshot.timeout_secs
+                    "Tool call '{}' timed out after {}s and was killed ({})",
+                    snapshot.display_name,
+                    snapshot.timeout_secs,
+                    timeout_hint(snapshot.env_clear)
                 );
 
                 return Ok(JobResult {
@@ -1449,6 +1487,7 @@ mod tests {
             display_name: cmd.to_string(),
             cmd_args: args.iter().map(|s| s.to_string()).collect(),
             envs,
+            env_clear: false,
             output_file,
             timeout_secs,
         }
@@ -1580,7 +1619,7 @@ mod tests {
 
     #[test]
     fn whitelist_rejects_async_and_interactive_tools() {
-        for tool in ["agent__spawn", "job__check"] {
+        for tool in ["agent__spawn", "job__check", "mesh__collect"] {
             let message = whitelist_rejection(tool).unwrap()["message"]
                 .as_str()
                 .unwrap()
@@ -1753,6 +1792,7 @@ mod tests {
         assert!(is_backgroundable_tool("mcp_invoke_github"));
         assert!(!is_backgroundable_tool("job__start"));
         assert!(!is_backgroundable_tool("agent__spawn"));
+        assert!(!is_backgroundable_tool("mesh__collect"));
         assert!(!is_backgroundable_tool("user__confirm"));
         assert!(!is_backgroundable_tool("todo__add"));
         assert!(!is_backgroundable_tool("fs_read"));
@@ -2578,30 +2618,33 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn run_process_job_times_out_and_clears_pgid() {
-        run_async(async {
-            let state = Arc::new(Mutex::new(JobState {
-                status: JobStatus::Running,
-                pgid: None,
-            }));
-            let output_buf = Arc::new(Mutex::new(RingBuf::default()));
-            let snapshot = test_snapshot("sleep", &["30"], 1);
+        for (env_clear, hint) in [
+            (false, "0 = unlimited"),
+            (true, "built-in agent tools are capped at"),
+        ] {
+            run_async(async {
+                let state = Arc::new(Mutex::new(JobState {
+                    status: JobStatus::Running,
+                    pgid: None,
+                }));
+                let output_buf = Arc::new(Mutex::new(RingBuf::default()));
+                let mut snapshot = test_snapshot("sleep", &["30"], 1);
+                snapshot.env_clear = env_clear;
 
-            let result = run_process_job(snapshot, Arc::clone(&state), output_buf)
-                .await
-                .unwrap();
+                let result = run_process_job(snapshot, Arc::clone(&state), output_buf)
+                    .await
+                    .unwrap();
 
-            assert_eq!(result.exit_code, None);
-            assert!(
-                result.output["tool_call_error"]
-                    .as_str()
-                    .unwrap()
-                    .contains("timed out after 1s")
-            );
-            assert!(
-                state.lock().pgid.is_none(),
-                "pid-reuse guard must clear pgid"
-            );
-        });
+                assert_eq!(result.exit_code, None);
+                let message = result.output["tool_call_error"].as_str().unwrap();
+                assert!(message.contains("timed out after 1s"), "{message}");
+                assert!(message.contains(hint), "env_clear={env_clear}: {message}");
+                assert!(
+                    state.lock().pgid.is_none(),
+                    "pid-reuse guard must clear pgid"
+                );
+            });
+        }
     }
 
     #[cfg(unix)]
@@ -2633,6 +2676,40 @@ mod tests {
             );
             assert_eq!(result.output_bytes_captured, 11);
         });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn run_process_job_clears_the_env_for_hermetic_snapshots() {
+        let _leak = crate::testing::EnvVarGuard::set("LEAK_MARKER", "leaked");
+        for (env_clear, expected) in [(true, Value::Null), (false, json!({"output": "leaked"}))] {
+            run_async(async {
+                let state = Arc::new(Mutex::new(JobState {
+                    status: JobStatus::Running,
+                    pgid: None,
+                }));
+                let output_buf = Arc::new(Mutex::new(RingBuf::default()));
+                let mut snapshot = test_snapshot(
+                    "bash",
+                    &["-c", "printf %s \"$LEAK_MARKER\" > \"$LLM_OUTPUT\""],
+                    0,
+                );
+                snapshot.env_clear = env_clear;
+                snapshot.envs = crate::function::builtin_agent_child_env(
+                    &crate::function::inherited_process_env(),
+                );
+                snapshot.envs.insert(
+                    "LLM_OUTPUT".to_string(),
+                    snapshot.output_file.display().to_string(),
+                );
+
+                let result = run_process_job(snapshot, state, output_buf).await.unwrap();
+
+                assert_eq!(result.exit_code, Some(0), "env_clear={env_clear}");
+                assert_eq!(result.output, expected, "env_clear={env_clear}");
+            });
+        }
     }
 
     #[cfg(unix)]
@@ -2848,11 +2925,11 @@ mod tests {
         .unwrap();
 
         assert_eq!(result["status"], "error");
+        let message = result["message"].as_str().unwrap();
+        assert!(message.contains("Agent spawning not enabled"), "{message}");
         assert!(
-            result["message"]
-                .as_str()
-                .unwrap()
-                .contains("At capacity: 0/0")
+            !message.contains("Wait for one to finish"),
+            "a zero budget must not read as a full one: {message}"
         );
     }
 
@@ -3388,5 +3465,150 @@ mod tests {
 
         assert_eq!(result["status"], "error");
         assert!(job_captures(marker).is_empty());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn build_env_snapshot_hands_the_envoy_its_data_dir() {
+        use crate::config::envoy::EnvoySource;
+        use crate::config::reserved_agents::BuiltinSourceGuard;
+        use crate::testing::{EnvVarGuard, TestConfigDirGuard};
+
+        let _guard = TestConfigDirGuard::new("jobs-envoy-env");
+        let _data_dir = EnvVarGuard::unset("ENVOY_DATA_DIR");
+        let _config_file = EnvVarGuard::unset("ENVOY_CONFIG_FILE");
+        let _root_dir = EnvVarGuard::set("ENVOY_ROOT_DIR", "/evil");
+        let source = Arc::new(EnvoySource::with_stub_probes());
+        let _source = BuiltinSourceGuard::new(source.clone());
+        let mut ctx = plain_ctx();
+        let app = ctx.app.config.clone();
+        run_async(ctx.use_agent(&app, "envoy", None, create_abort_signal())).unwrap();
+        let dir = crate::config::builtin_agent_dir("envoy").unwrap();
+
+        let snapshot = build_env_snapshot(&ctx, "user__input", &json!({})).unwrap();
+        assert_eq!(
+            snapshot.envs.get("ENVOY_DATA_DIR"),
+            Some(&dir.display().to_string())
+        );
+        assert_eq!(
+            snapshot.envs.get("ENVOY_FUNCTIONS_DIR"),
+            Some(&dir.join("functions").display().to_string())
+        );
+        let cwd = dunce::canonicalize(env::current_dir().unwrap()).unwrap();
+        assert_eq!(
+            snapshot.envs.get("ENVOY_ROOT_DIR"),
+            Some(&cwd.display().to_string()),
+            "the inherited ENVOY_ROOT_DIR must be overridden"
+        );
+        assert!(
+            snapshot.envs.contains_key("ENVOY_DENY_DIRS"),
+            "{:?}",
+            snapshot.envs
+        );
+        assert!(
+            snapshot.envs["PATH"].starts_with(&format!("{}{PATH_SEP}", dir.join("bin").display())),
+            "{}",
+            snapshot.envs["PATH"]
+        );
+        assert!(
+            !snapshot
+                .envs
+                .values()
+                .any(|v| v.contains(&paths::agents_data_dir().display().to_string())),
+            "{:?}",
+            snapshot.envs
+        );
+
+        let snapshot = build_env_snapshot(&plain_ctx(), "execute_command", &json!({})).unwrap();
+        assert!(!snapshot.envs.contains_key("ENVOY_DATA_DIR"));
+        assert!(!snapshot.envs.contains_key("ENVOY_FUNCTIONS_DIR"));
+        assert!(!snapshot.envs.contains_key("ENVOY_ROOT_DIR"));
+        assert!(!snapshot.envs.contains_key("ENVOY_DENY_DIRS"));
+        source.remove_dir();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn build_env_snapshot_clears_the_env_only_for_builtin_agents() {
+        use crate::config::envoy::EnvoySource;
+        use crate::config::reserved_agents::BuiltinSourceGuard;
+        use crate::testing::{EnvVarGuard, TestConfigDirGuard};
+
+        let _guard = TestConfigDirGuard::new("jobs-envoy-hermetic");
+        let _timeout = EnvVarGuard::unset(crate::utils::get_env_name("tool_timeout"));
+        let _leak = EnvVarGuard::set("LEAK_MARKER", "leaked");
+        let _data_dir = EnvVarGuard::set("ENVOY_DATA_DIR", "/evil");
+        let _root_dir = EnvVarGuard::set("ENVOY_ROOT_DIR", "/evil");
+        let source = Arc::new(EnvoySource::with_stub_probes());
+        let _source = BuiltinSourceGuard::new(source.clone());
+        let mut ctx = plain_ctx();
+        let app = ctx.app.config.clone();
+        run_async(ctx.use_agent(&app, "envoy", None, create_abort_signal())).unwrap();
+        let dir = crate::config::builtin_agent_dir("envoy").unwrap();
+
+        let snapshot = build_env_snapshot(&ctx, "user__input", &json!({})).unwrap();
+        assert!(snapshot.env_clear);
+        assert_eq!(
+            snapshot.timeout_secs,
+            super::super::BUILTIN_TOOL_TIMEOUT_SECS
+        );
+        assert!(
+            !snapshot.envs.contains_key("LEAK_MARKER"),
+            "{:?}",
+            snapshot.envs
+        );
+        assert_eq!(
+            snapshot.envs.get("ENVOY_DATA_DIR"),
+            Some(&dir.display().to_string())
+        );
+        assert_eq!(
+            snapshot.envs.get("ENVOY_ROOT_DIR"),
+            Some(
+                &dunce::canonicalize(env::current_dir().unwrap())
+                    .unwrap()
+                    .display()
+                    .to_string()
+            )
+        );
+        assert!(snapshot.envs.contains_key("ENVOY_DENY_DIRS"));
+        assert_eq!(snapshot.envs.get("HOME"), env::var("HOME").ok().as_ref());
+
+        let snapshot = build_env_snapshot(&plain_ctx(), "execute_command", &json!({})).unwrap();
+        assert!(!snapshot.env_clear);
+        assert!(!snapshot.envs.contains_key("LEAK_MARKER"));
+        source.remove_dir();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn build_env_snapshot_launches_a_builtin_tool_through_its_interpreter() {
+        use crate::config::envoy::EnvoySource;
+        use crate::config::reserved_agents::BuiltinSourceGuard;
+        use crate::testing::{EnvVarGuard, TestConfigDirGuard};
+
+        let _guard = TestConfigDirGuard::new("jobs-envoy-launch");
+        let _timeout = EnvVarGuard::unset(crate::utils::get_env_name("tool_timeout"));
+        let source = Arc::new(EnvoySource::with_stub_probes());
+        let _source = BuiltinSourceGuard::new(source.clone());
+        let mut ctx = plain_ctx();
+        let app = ctx.app.config.clone();
+        run_async(ctx.use_agent(&app, "envoy", None, create_abort_signal())).unwrap();
+        let dir = crate::config::builtin_agent_dir("envoy").unwrap();
+
+        let snapshot = build_env_snapshot(&ctx, "fs_read", &json!({"path": "x"})).unwrap();
+        assert_eq!(snapshot.display_name, "fs_read");
+        assert_eq!(snapshot.cmd_name, "/usr/bin/python3");
+        assert_eq!(
+            &snapshot.cmd_args[..4],
+            [
+                "-I".to_string(),
+                "-B".to_string(),
+                dir.join("bin").join("run-envoy.py").display().to_string(),
+                "fs_read".to_string(),
+            ],
+            "{:?}",
+            snapshot.cmd_args
+        );
+        source.remove_dir();
     }
 }

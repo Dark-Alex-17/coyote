@@ -4,6 +4,9 @@ mod app_state;
 pub(crate) mod builtin_manifest;
 mod bundles;
 pub(crate) mod conflict;
+pub(crate) mod envoy;
+#[cfg(test)]
+mod envoy_tools_tests;
 mod input;
 mod install_remote;
 pub(crate) mod instructions;
@@ -12,10 +15,16 @@ mod macros;
 mod mcp_factory;
 mod mcp_tool_policy;
 pub(crate) mod memory;
+pub(crate) mod mesh_config;
+pub(crate) mod mesh_digest;
+pub(crate) mod mesh_envoy;
+pub(crate) mod mesh_hooks;
+pub(crate) mod mesh_snapshot;
 pub(crate) mod paths;
 pub(crate) mod prompts;
 mod rag_cache;
 mod request_context;
+pub(crate) mod reserved_agents;
 mod role;
 mod session;
 mod skill;
@@ -29,8 +38,9 @@ mod update;
 pub(crate) use self::agent::AgentConfig;
 pub(crate) use self::agent::default_max_agent_depth;
 pub use self::agent::{
-    Agent, AgentVariable, AgentVariables, complete_agent_variables, list_agents,
-    list_agents_with_descriptions, load_agent_variables,
+    Agent, AgentListing, AgentVariable, AgentVariables, complete_agent_variables,
+    list_agents_for_humans, list_agents_with_descriptions, load_agent_variables,
+    validate_agent_name,
 };
 #[allow(unused_imports)]
 pub use self::app_config::AppConfig;
@@ -39,6 +49,7 @@ pub use self::app_state::AppState;
 pub(crate) use self::bundles::installed_bundle_names;
 pub use self::bundles::list_installed_bundles;
 use self::conflict::{InstallMode, StickyMode};
+pub use self::envoy::{cleanup_envoy_dir, register_envoy_source};
 pub use self::input::Input;
 pub use self::install_remote::{
     DEFAULT_GIT_HOST, install_or_update, install_or_update_from_repl_args, uninstall_bundle,
@@ -50,15 +61,28 @@ pub use self::macro_policy::{
 pub(crate) use self::mcp_tool_policy::expand_mcp_server_alias;
 #[cfg(test)]
 pub(crate) use self::mcp_tool_policy::{LayerSource, ToolFilter};
+pub use self::mesh_config::MeshConfig;
+pub(crate) use self::mesh_digest::MeshDigestDriver;
+pub(crate) use self::mesh_envoy::EnvoyRunner;
+pub(crate) use self::mesh_hooks::MeshHookBridge;
+pub use self::mesh_snapshot::{publish_mesh_snapshot, refresh_mesh_snapshot};
 #[allow(unused_imports)]
 pub use self::request_context::{
-    RenderMode, RequestContext, effective_max_concurrent_jobs, jobs_enabled,
-    should_inject_skill_instructions,
+    ForkedSession, PendingFork, RenderMode, RequestContext, effective_max_concurrent_jobs,
+    jobs_enabled, mesh_tools_available, should_inject_skill_instructions,
+};
+pub use self::reserved_agents::{
+    BuiltinAgentSource, BuiltinAgentUnavailable, RESERVED_AGENT_NAMES, UnavailableReason,
+    builtin_agent_description, builtin_agent_dir, builtin_agent_tool_runtime,
+    builtin_agent_unavailable_reason, builtin_default_description, register_builtin_source,
+    reserved_agent, reserved_agent_refusal,
 };
 pub use self::role::{
     CODE_ROLE, CREATE_TITLE_ROLE, EXPLAIN_SHELL_ROLE, Role, RoleLike, SHELL_ROLE,
 };
-pub use self::session::{Session, SessionScope, labeled_session_names, session_scope_dirs};
+pub use self::session::{
+    ForkRekey, Session, SessionScope, labeled_session_names, session_scope_dirs,
+};
 #[allow(unused_imports)]
 pub use self::skill::Skill;
 #[allow(unused_imports)]
@@ -271,6 +295,9 @@ pub struct Config {
     #[serde(default)]
     pub hooks: HooksMap,
 
+    #[serde(default)]
+    pub mesh: MeshConfig,
+
     pub auto_continue: bool,
     pub max_auto_continues: usize,
     pub inject_todo_instructions: bool,
@@ -362,6 +389,8 @@ impl Default for Config {
 
             hooks: Default::default(),
 
+            mesh: Default::default(),
+
             auto_continue: false,
             max_auto_continues: 10,
             inject_todo_instructions: true,
@@ -417,6 +446,14 @@ impl Default for Config {
 
             clients: vec![],
         }
+    }
+}
+
+/// The top-level session's transcript file, honouring its env override.
+pub fn default_messages_file() -> PathBuf {
+    match env::var(get_env_name("messages_file")) {
+        Ok(value) => PathBuf::from(value),
+        Err(_) => paths::cache_dir().join(MESSAGES_FILE_NAME),
     }
 }
 
@@ -1466,7 +1503,11 @@ clients:
     #[test]
     fn config_template_does_not_carry_the_per_agent_escalation_timeout_key() {
         // `escalation_timeout` is a per-agent setting; the global template must never grow it.
-        assert!(!CONFIG_TEMPLATE.contains("escalation_timeout"));
+        assert!(
+            !CONFIG_TEMPLATE
+                .lines()
+                .any(|line| line.trim_start().starts_with("escalation_timeout"))
+        );
     }
 
     #[test]
@@ -1474,6 +1515,62 @@ clients:
         // `global_hooks` is a per-agent whitelist; the global template must never grow it.
         assert!(CONFIG_TEMPLATE.contains("\nhooks:"));
         assert!(!CONFIG_TEMPLATE.contains("global_hooks"));
+    }
+
+    const CONFIG_EXAMPLE: &str =
+        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/config.example.yaml"));
+
+    fn mesh_keys_of(yaml: &str) -> HashSet<String> {
+        let root: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        root["mesh"]
+            .as_mapping()
+            .expect("mesh: must be a nested mapping")
+            .keys()
+            .map(|k| k.as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn config_template_and_example_document_every_mesh_key() {
+        let clients = json!([{ "type": "openai", "api_key": "sk-test" }]);
+        let rendered = render_config_template("openai:gpt-4o", None, &clients).unwrap();
+
+        let serialized = serde_yaml::to_value(MeshConfig::default()).unwrap();
+        let struct_keys: HashSet<String> = serialized
+            .as_mapping()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str().unwrap().to_string())
+            .collect();
+        assert!(!struct_keys.is_empty());
+
+        let template_keys = mesh_keys_of(&rendered);
+        let example_keys = mesh_keys_of(CONFIG_EXAMPLE);
+        for (file, keys) in [
+            ("config-template.yaml", &template_keys),
+            ("config.example.yaml", &example_keys),
+        ] {
+            let missing: Vec<_> = struct_keys.difference(keys).collect();
+            assert!(missing.is_empty(), "{file} lacks mesh keys {missing:?}");
+            let stale: Vec<_> = keys.difference(&struct_keys).collect();
+            assert!(
+                stale.is_empty(),
+                "{file} carries unknown mesh keys {stale:?}"
+            );
+        }
+
+        let cfg = Config::load_from_str(&rendered).unwrap();
+        assert_eq!(cfg.mesh, MeshConfig::default());
+    }
+
+    #[test]
+    fn config_example_loads_with_the_config_loader() {
+        let example = Config::load_from_str(CONFIG_EXAMPLE).unwrap();
+        assert!(!example.mesh.enabled);
+        assert_eq!(
+            example.mesh.interfaces,
+            vec![mesh_config::MeshInterface::Lan]
+        );
     }
 
     #[test]

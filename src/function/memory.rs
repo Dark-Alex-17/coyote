@@ -8,12 +8,12 @@ use indexmap::IndexMap;
 use serde_json::{Value, json};
 
 use super::{FunctionDeclaration, JsonSchema};
-use crate::config::RequestContext;
 use crate::config::memory::{
     MemoryFile, MemoryFrontmatter, MemoryStore, WorkspaceMemory, bootstrap_workspace_memory,
     find_git_root,
 };
 use crate::config::paths;
+use crate::config::{Agent, RequestContext};
 
 pub const MEMORY_FUNCTION_PREFIX: &str = "memory__";
 
@@ -279,6 +279,12 @@ pub fn memory_function_declarations() -> Vec<FunctionDeclaration> {
 }
 
 pub fn handle_memory_tool(ctx: &mut RequestContext, cmd_name: &str, args: &Value) -> Result<Value> {
+    if ctx.agent.as_ref().is_some_and(Agent::is_builtin) {
+        return Ok(json!({
+            "status": "error",
+            "message": "Memory tools are never available to a built-in agent.",
+        }));
+    }
     if !ctx.should_register_memory_tools() {
         bail!("Memory tools are disabled (memory off or function calling unavailable).");
     }
@@ -1336,5 +1342,40 @@ mod tests {
         assert_eq!(saved.frontmatter.expires, None);
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn handle_memory_tool_refuses_a_builtin_agent_before_dispatch() {
+        use crate::config::{Agent, AgentConfig, AppConfig, AppState, WorkingMode};
+        use std::sync::Arc;
+
+        let app = AppState {
+            config: Arc::new(AppConfig {
+                memory: Some(true),
+                ..Default::default()
+            }),
+            ..AppState::test_default()
+        };
+        let mut ctx = RequestContext::new(Arc::new(app), WorkingMode::Cmd);
+        ctx.agent = Some(Agent::test_new(AgentConfig {
+            name: "envoy".into(),
+            memory: Some(true),
+            ..Default::default()
+        }));
+        assert!(ctx.agent.as_ref().unwrap().is_builtin());
+
+        for action in ["list", "read", "write", "lint", "nosuch"] {
+            let result = handle_memory_tool(
+                &mut ctx,
+                &format!("{MEMORY_FUNCTION_PREFIX}{action}"),
+                &json!({"name": "x", "content": "y", "description": "z", "scope": "global"}),
+            )
+            .unwrap();
+            assert_eq!(result["status"], "error", "{action}: {result}");
+            assert_eq!(
+                result["message"], "Memory tools are never available to a built-in agent.",
+                "{action}: {result}"
+            );
+        }
     }
 }

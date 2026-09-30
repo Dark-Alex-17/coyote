@@ -11,6 +11,7 @@ use crate::config::{
 use crate::function::ToolResult;
 use crate::function::agents::{GuardrailAction, check_pending_tasks_guardrail};
 use crate::function::jobs::reap_jobs;
+use crate::function::mesh::MESH_FUNCTION_PREFIX;
 use crate::function::skill::skill_function_declarations;
 use crate::function::todo::TODO_FUNCTION_PREFIX;
 use crate::utils::AbortSignal;
@@ -494,6 +495,12 @@ fn validate_tools_subset(
                      multi-step work, use an agent node whose agent sets auto_continue: true."
                 );
             }
+            if name.starts_with(MESH_FUNCTION_PREFIX) {
+                bail!(
+                    "llm node cannot enable '{name}': mesh tools are only available to the \
+                     top-level session, never inside a graph llm node. Remove it from `tools`."
+                );
+            }
             if !known.contains(name.as_str()) {
                 let mut avail: Vec<&str> = known.iter().copied().collect();
                 avail.sort();
@@ -818,6 +825,20 @@ mod tests {
         assert!(
             err.to_string().contains("todo tools drive chat turn loops"),
             "expected the todo teaching error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_tools_subset_rejects_mesh_tools() {
+        let mut ctx = plain_ctx();
+        ctx.agent = Some(Agent::test_new(AgentConfig::default()));
+
+        let err = validate_tools_subset(&["mesh__collect".to_string()], &[], &ctx).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("mesh tools are only available to the top-level session"),
+            "expected the mesh teaching error, got: {err}"
         );
     }
 

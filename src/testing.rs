@@ -16,9 +16,10 @@ static DEBUG_MESSAGES: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 /// output so the buffer is not flooded by the rest of the crate. Matching is
 /// module-boundary-aware: only these exact modules or their `::` submodules
 /// qualify, so a sibling like `hooks_registry` would not.
-const DEBUG_TARGET_PREFIXES: [&str; 2] = [
+const DEBUG_TARGET_PREFIXES: [&str; 3] = [
     concat!(env!("CARGO_CRATE_NAME"), "::hooks"),
     concat!(env!("CARGO_CRATE_NAME"), "::config::agent"),
+    concat!(env!("CARGO_CRATE_NAME"), "::mesh"),
 ];
 
 fn captures_warn(metadata: &Metadata) -> bool {
@@ -196,5 +197,44 @@ impl Drop for TestConfigDirGuard {
         if let Some(root) = self.workspace_path.parent() {
             let _ = std::fs::remove_dir_all(root);
         }
+    }
+}
+
+/// Whether a process with `pid` still exists. A pid that exists but cannot
+/// be signalled or queried counts as alive.
+///
+/// The unix arm asks the kernel directly through `libc::kill(pid, 0)` (the
+/// same FFI probe `function::jobs` uses) rather than exposing and reusing the
+/// private `config::envoy::pid_alive`: that one falls back to shelling out to `ps`
+/// where `/proc` is absent, and a test asserting that a timeout kill reached
+/// its interpreter must not depend on an external tool being installed. This
+/// module is `#[cfg(test)]` support, so the duplication never ships.
+#[cfg(unix)]
+pub(crate) fn pid_alive(pid: u32) -> bool {
+    // SAFETY: signal 0 performs only the existence and permission checks.
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Windows arm of [`pid_alive`]: `OpenProcess` + `GetExitCodeProcess`.
+#[cfg(windows)]
+pub(crate) fn pid_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, ERROR_ACCESS_DENIED, GetLastError, STILL_ACTIVE,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    // SAFETY: plain Win32 calls; the handle is closed before returning.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return GetLastError() == ERROR_ACCESS_DENIED;
+        }
+        let mut code = 0u32;
+        let queried = GetExitCodeProcess(handle, &mut code) != 0;
+        CloseHandle(handle);
+        queried && code == STILL_ACTIVE as u32
     }
 }
