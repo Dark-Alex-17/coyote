@@ -858,8 +858,12 @@ mod tests {
         let cache = KnockCache::new(&tmp.path, u64::MAX);
         cache.append(knock("ancient", t(0)), t(0)).unwrap();
 
-        assert_eq!(cache.prune(t(u64::MAX / 4)).unwrap(), 0);
-        assert_eq!(tags(&cache.list(t(u64::MAX / 4)).unwrap()), vec!["ancient"]);
+        // The last second RFC 3339 can spell (9999-12-31T23:59:59Z). Anything much later
+        // is not a `SystemTime` on Windows, whose clock is i64 100-ns ticks and ends in
+        // the year 30828, so `UNIX_EPOCH + Duration` would panic before the cache is asked.
+        let far_future = t(253_402_300_799);
+        assert_eq!(cache.prune(far_future).unwrap(), 0);
+        assert_eq!(tags(&cache.list(far_future).unwrap()), vec!["ancient"]);
     }
 
     #[test]
