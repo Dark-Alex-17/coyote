@@ -1877,6 +1877,8 @@ mod tests {
         use rns_transport::iface::tcp_client::TcpClient;
         use rns_transport::resource::LINK_PACKET_MDU;
         use rns_transport::transport::{AnnounceEvent, TransportConfig};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
         use tokio::task::JoinHandle;
 
         const POLL: Duration = Duration::from_millis(100);
@@ -1948,11 +1950,76 @@ mod tests {
             }
         }
 
+        /// A byte relay between the poster and the fake node whose node-bound direction can
+        /// be held. While it is held nothing the poster sends reaches the node, however
+        /// fast the runner is, so a test can freeze a transfer in flight by construction
+        /// instead of racing it against a clock.
+        struct Relay {
+            port: u16,
+            node_bound: Arc<tokio::sync::Mutex<()>>,
+            accept: JoinHandle<()>,
+        }
+
+        impl Relay {
+            async fn start(node_port: u16) -> Self {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let port = listener.local_addr().unwrap().port();
+                let node_bound = Arc::new(tokio::sync::Mutex::new(()));
+                let gate = node_bound.clone();
+                let accept = tokio::spawn(async move {
+                    loop {
+                        let (poster, _) = listener.accept().await.unwrap();
+                        let node = TcpStream::connect(("127.0.0.1", node_port)).await.unwrap();
+                        tokio::spawn(Self::forward(poster, node, gate.clone()));
+                    }
+                });
+                Self {
+                    port,
+                    node_bound,
+                    accept,
+                }
+            }
+
+            /// Copies bytes both ways until either side closes; each node-bound chunk
+            /// waits for the gate first.
+            async fn forward(
+                poster: TcpStream,
+                node: TcpStream,
+                gate: Arc<tokio::sync::Mutex<()>>,
+            ) {
+                let (mut from_poster, mut to_poster) = poster.into_split();
+                let (mut from_node, mut to_node) = node.into_split();
+                let node_bound = async {
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        let n = from_poster.read(&mut buf).await?;
+                        if n == 0 {
+                            break Ok::<(), std::io::Error>(());
+                        }
+                        let _open = gate.lock().await;
+                        to_node.write_all(&buf[..n]).await?;
+                    }
+                };
+                let poster_bound = tokio::io::copy(&mut from_node, &mut to_poster);
+                let _ = tokio::select! {
+                    outcome = node_bound => outcome,
+                    outcome = poster_bound => outcome.map(|_| ()),
+                };
+            }
+
+            /// Holds the node-bound direction until the guard is dropped.
+            async fn hold(&self) -> tokio::sync::OwnedMutexGuard<()> {
+                self.node_bound.clone().lock_owned().await
+            }
+        }
+
         /// Everything one end-to-end post needs: the two transports, the node as the client
         /// learned it from the announce, and fresh sender and recipient identities.
         struct Post {
             node: FakeNode,
             client: Client,
+            /// Present when the client reaches the node through a [`Relay`].
+            relay: Option<Relay>,
             learned: PropagationNode,
             sender: PrivateIdentity,
             recipient: PrivateIdentity,
@@ -1961,14 +2028,31 @@ mod tests {
 
         impl Post {
             async fn start(cost: i64, per_transfer_kb: i64) -> Self {
+                Self::start_with(cost, per_transfer_kb, false).await
+            }
+
+            /// A post whose client connects through a [`Relay`] rather than to the node
+            /// directly.
+            async fn start_relayed(cost: i64, per_transfer_kb: i64) -> Self {
+                Self::start_with(cost, per_transfer_kb, true).await
+            }
+
+            async fn start_with(cost: i64, per_transfer_kb: i64, relayed: bool) -> Self {
                 let node = FakeNode::listen(LEGACY_LINK_MTU).await;
-                let mut client = Client::connect(node.port).await;
+                let relay = if relayed {
+                    Some(Relay::start(node.port).await)
+                } else {
+                    None
+                };
+                let mut client =
+                    Client::connect(relay.as_ref().map_or(node.port, |relay| relay.port)).await;
                 node.announce(&pn_app_data(cost, per_transfer_kb)).await;
                 let (desc, app_data) = client.learn(&node.desc.address_hash).await;
                 let learned = PropagationNode::from_announce(&desc, &app_data).unwrap();
                 Self {
                     node,
                     client,
+                    relay,
                     learned,
                     sender: PrivateIdentity::new_from_rand(OsRng),
                     recipient: PrivateIdentity::new_from_rand(OsRng),
@@ -2046,6 +2130,9 @@ mod tests {
 
             async fn stop(self) {
                 self.client.stop().await;
+                if let Some(relay) = &self.relay {
+                    relay.accept.abort();
+                }
                 self.node.stop().await;
             }
         }
@@ -2218,17 +2305,42 @@ mod tests {
             post.stop().await;
         }
 
-        /// At this MTU a 200 KB envelope takes the transport about 0.1 s to accept and
-        /// about 1.5 s to deliver, so a 400 ms deadline expires with the resource in
-        /// flight.
+        /// The deadline overtakes the transfer by construction: the relay holds every
+        /// node-bound byte, so the advertisement never reaches the node and the transfer
+        /// cannot progress however fast the runner is (a timing version of this test
+        /// raced a 400 ms deadline against a 200 KB delivery and lost on a fast macOS
+        /// runner, where the node completed before the cancel landed). The only work
+        /// still under the deadline is the transport accepting the envelope, about 0.1 s
+        /// for 100 KB on a slow debug build against a 1 s deadline; the deadline stays
+        /// under the transport's 2 s advertisement retry so no retry can fail the
+        /// transfer first.
+        ///
+        /// The cancel is the poster's own `cancel_resource`, which the transport reports
+        /// as `OutboundCancelled` (`ResourceManager::cancel_outgoing`); `OutboundRejected`
+        /// is the far end's RCL and cannot occur here, since the node has seen nothing.
+        /// Once the hold lifts the node reads the advertisement and, right behind it on
+        /// the same stream, the initiator's cancel, so it reports the transfer as
+        /// `remote_cancelled` rather than completing it: not one part was sent before the
+        /// poster dropped the resource.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn a_transfer_the_deadline_overtakes_is_cancelled_at_the_transport() {
-            const TRANSFER_TIMEOUT: Duration = Duration::from_millis(400);
-            let mut post = Post::start(1, 2000).await;
+            const TRANSFER_TIMEOUT: Duration = Duration::from_secs(1);
+            let mut post = Post::start_relayed(1, 2000).await;
+
+            // Bring the link up before the hold: the transport reuses an active out-link,
+            // so the held post spends its deadline on the transfer alone.
+            post.propagate(&message(b"warm")).await.unwrap();
+            assert!(matches!(
+                post.node.next_received().await,
+                Received::Packet { .. }
+            ));
+
             post.options.transfer_timeout = TRANSFER_TIMEOUT;
             let mut resource_events = post.client.transport.resource_events();
+            let mut node_events = post.node.transport.resource_events();
+            let held = post.relay.as_ref().unwrap().hold().await;
 
-            let outcome = post.propagate(&message(&[b'z'; 200_000])).await;
+            let outcome = post.propagate(&message(&[b'z'; 100_000])).await;
             assert_eq!(
                 outcome,
                 Err(PropagationError::Link(R3Error::Timeout {
@@ -2236,13 +2348,21 @@ mod tests {
                     after: TRANSFER_TIMEOUT,
                 }))
             );
-            timeout(Duration::from_secs(2), async {
+            let cancelled = timeout(Duration::from_secs(2), async {
                 loop {
                     match resource_events.recv().await {
                         Ok(ResourceEvent {
+                            hash,
                             kind: ResourceEventKind::OutboundCancelled,
                             ..
-                        }) => break,
+                        }) => break hash,
+                        Ok(ResourceEvent {
+                            kind:
+                                kind @ (ResourceEventKind::OutboundComplete
+                                | ResourceEventKind::OutboundFailed
+                                | ResourceEventKind::OutboundRejected),
+                            ..
+                        }) => panic!("the client transport ended the transfer with {kind:?}"),
                         Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
                         Err(broadcast::error::RecvError::Closed) => {
                             panic!("the client transport went away")
@@ -2252,12 +2372,35 @@ mod tests {
             })
             .await
             .expect("the client transport must report the cancelled resource");
+            post.node.nothing_else_received();
 
-            sleep(Duration::from_secs(1)).await;
-            assert!(
-                post.node.received.try_recv().is_err(),
-                "the node completed a transfer the client had cancelled"
-            );
+            drop(held);
+            let failed = timeout(INTEROP_TIMEOUT, async {
+                loop {
+                    match node_events.recv().await {
+                        Ok(ResourceEvent {
+                            hash,
+                            kind: ResourceEventKind::InboundFailed(failure),
+                            ..
+                        }) => {
+                            assert_eq!(failure.reason, "remote_cancelled");
+                            break hash;
+                        }
+                        Ok(ResourceEvent {
+                            kind: ResourceEventKind::Complete(_),
+                            ..
+                        }) => panic!("the node completed a transfer the client had cancelled"),
+                        Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(broadcast::error::RecvError::Closed) => {
+                            panic!("the node transport went away")
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("the node must see the initiator's cancel");
+            assert_eq!(failed, cancelled);
+            post.node.nothing_else_received();
             post.stop().await;
         }
     }
