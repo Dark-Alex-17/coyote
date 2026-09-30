@@ -23,7 +23,6 @@ use crate::mesh::trust::TrustOptions;
 use crate::repl::idle::testing::driver_on_a_fresh_state;
 use crate::supervisor::mailbox::EnvelopePayload;
 
-use parking_lot::RwLock;
 use rns_transport::destination::DestinationName;
 use serde_json::{Value, json};
 use std::collections::VecDeque;

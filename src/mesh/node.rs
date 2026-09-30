@@ -737,8 +737,6 @@ impl MeshRuntime {
     /// Asks `destination` to trust this node's current instance, with `intro` as the
     /// words. The link is tried first; a peer that cannot be reached gets the knock held
     /// by a propagation node until it next fetches.
-    // Reached by the REPL mesh commands once they land.
-    #[allow(dead_code)]
     pub(crate) async fn knock(
         &self,
         destination: &DestinationDesc,

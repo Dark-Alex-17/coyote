@@ -5637,7 +5637,10 @@ pub(crate) mod network {
             .unwrap_err();
 
         assert_eq!(err, SendError::Refused(RefusalCode::NoAccess));
-        assert!(err.to_string().contains(".mesh knock"), "{err}");
+        assert!(
+            err.to_string().contains(".mesh knock <destination>"),
+            "{err}"
+        );
         sleep(Duration::from_millis(500)).await;
         node.nothing_else_received();
         wait_until("node B to surface the refused request as a knock", || {

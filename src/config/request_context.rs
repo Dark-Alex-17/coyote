@@ -4237,12 +4237,16 @@ impl RequestContext {
             }
         } else if cmd == ".mesh"
             && args.len() == 2
-            && matches!(args[0], "info" | "status" | "reply")
+            && matches!(args[0], "info" | "status" | "reply" | "knock")
         {
             values = self.mesh_completion_peers(args[0] == "info");
             match args[0] {
                 "status" => values.push(("clear".to_string(), None)),
                 "reply" => values.push(("--yes".to_string(), None)),
+                "knock" => {
+                    values.push(("--yes".to_string(), None));
+                    values.push(("--intro ".to_string(), None));
+                }
                 _ => {}
             }
         } else if cmd == ".mesh" && args.len() == 3 && args[0] == "reply" && args[1] == "--yes" {
@@ -20735,6 +20739,16 @@ mod tests {
             ctx.repl_complete(".mesh", &["reply", "words", ""], "")
                 .is_empty()
         );
+        let knock: Vec<String> = ctx
+            .repl_complete(".mesh", &["knock", ""], "")
+            .into_iter()
+            .map(|(value, _)| value)
+            .collect();
+        assert_eq!(
+            knock,
+            ["--yes", "--intro "],
+            "no peers heard, so the flags alone"
+        );
         let trust: Vec<String> = ctx
             .repl_complete(".mesh", &["trust", ""], "")
             .into_iter()
@@ -21193,7 +21207,7 @@ mod tests {
             },
             now,
         );
-        for verb in ["info", "status", "reply"] {
+        for verb in ["info", "status", "reply", "knock"] {
             let offered = ctx.repl_complete(".mesh", &[verb, ""], "");
             let peer = offered
                 .iter()

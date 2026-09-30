@@ -712,7 +712,7 @@ impl fmt::Display for SendError {
             ),
             Self::Refused(RefusalCode::NoAccess) => write!(
                 f,
-                "The peer does not trust this instance and refused the message; `.mesh knock` asks it to"
+                "The peer does not trust this instance and refused the message; `.mesh knock <destination>` asks it to"
             ),
             Self::Refused(code) => write!(f, "The peer refused the message: {code}"),
             Self::Direct(err) => write!(f, "The message could not be sent: {err}"),
@@ -2269,7 +2269,7 @@ mod tests {
         assert!(
             SendError::Refused(RefusalCode::NoAccess)
                 .to_string()
-                .contains(".mesh knock")
+                .contains(".mesh knock <destination>")
         );
         assert!(
             SendError::Refused(RefusalCode::Throttled)

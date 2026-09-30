@@ -3,6 +3,7 @@ use crate::config::{MeshConfig, RequestContext};
 use crate::function::mesh::trust_label;
 use crate::mesh::card::{CardSource, DISPLAY_NAME_MAX_CHARS, StatusHandler, render_for_human};
 use crate::mesh::identity::{self, Predecessor, fingerprint};
+use crate::mesh::knock::{KnockIntro, KnockOutcome, KnockVia};
 use crate::mesh::knocks::KnockRecord;
 use crate::mesh::message::{
     BroadcastOutcome, OutboundPeer, PEER_CONTENT_MAX_CHARS, PeerKind, PeerMessage, PeerVia,
@@ -130,6 +131,11 @@ pub(super) const VERBS: &[(&str, &str, &str)] = &[
         "Fetch the messages a propagation node holds for this node now",
         ".mesh fetch",
     ),
+    (
+        "knock",
+        "Ask an untrusted peer to trust this instance, with an optional intro",
+        ".mesh knock <destination> [--yes] [--intro \"text\"]",
+    ),
 ];
 
 pub(crate) const MESH_OFF: &str = "Mesh is off. Run `.mesh on` first.";
@@ -173,6 +179,7 @@ pub(crate) async fn run(
         "undeny" => undeny(ctx, rest),
         "rotate" => rotate(ctx, rest),
         "fetch" => fetch(ctx, rest).await,
+        "knock" => knock(ctx, &abort_signal, rest).await,
         other => bail!("Unknown .mesh command '{other}'. Type `.mesh` for the list."),
     }
 }
@@ -650,15 +657,19 @@ fn peer_for_contact(runtime: &MeshRuntime, destination: &str, only: &str) -> Res
         {
             bail!(refusal);
         }
-        bail!(
-            "Destination {destination} has not been heard from: it is not in the peer table. Only peers this node has heard announce can be contacted; check `.mesh peers`."
-        );
+        return Err(not_heard(destination));
     };
     let verdict = runtime.trust().authorize(&peer.identity_hash, destination);
     if let Some(refusal) = trust_refusal(destination, verdict, only) {
         bail!(refusal);
     }
     Ok(peer)
+}
+
+fn not_heard(destination: &str) -> anyhow::Error {
+    anyhow!(
+        "Destination {destination} has not been heard from: it is not in the peer table. Only peers this node has heard announce can be contacted; check `.mesh peers`."
+    )
 }
 
 async fn broadcast(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
@@ -691,6 +702,73 @@ async fn fetch(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             out_text("A sync is already running; wait for it to finish.")
         }
         Err(err @ FetchError::HeldByOtherProcess { .. }) => out_text(&err.to_string()),
+        Err(err) => bail!(err.to_string()),
+    }
+    Ok(())
+}
+
+/// Unlike the other one-peer verbs, a knock is not gated on this node's trust of the
+/// destination: it is what a peer that has not trusted us is asked with, so only the
+/// peer having been heard matters.
+async fn knock(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&str>) -> Result<()> {
+    let Some(rest) = rest else {
+        out_text(&render_verb_help("knock"));
+        return Ok(());
+    };
+    let args = parse_mutation_args(rest, "knock", &["--yes", "--intro"])?;
+    let Some(target) = args.positional.first() else {
+        out_text(&render_verb_help("knock"));
+        return Ok(());
+    };
+    let destination = destination_hash(target)?;
+    let runtime = live(ctx)?;
+    let Some(peer) = runtime.peers().get(&destination) else {
+        return Err(not_heard(&destination));
+    };
+    let intro = KnockIntro::new(args.intro.as_deref().unwrap_or(""))?;
+    let intro_label = if intro.as_str().is_empty() {
+        "without an intro".to_string()
+    } else {
+        format!("with intro \"{}\"", intro.as_str())
+    };
+    out_text(&format!(
+        "This knocks on {} ({}) so it can trust this instance, {intro_label}; if the peer is unreachable the knock is stored with a propagation node.",
+        name_label(peer.display_name.as_deref()),
+        short(&destination)
+    ));
+    if !confirm_or_flag("Knock?", "--yes", args.yes)? {
+        out_text("Nothing was sent.");
+        return Ok(());
+    }
+    let Some(desc) = runtime.resolve_destination(&destination).await else {
+        bail!(
+            "Destination {destination} cannot be reached yet: its announce has not been heard since this node started. Wait for it to announce, or check `.mesh peers`."
+        );
+    };
+    out_text(&format!(
+        "Knocking on {}; Ctrl-C cancels...",
+        short(&destination)
+    ));
+    let outcome = tokio::select! {
+        outcome = runtime.knock(&desc, &intro) => outcome,
+        _ = wait_user_interrupt(Some(abort_signal)) => {
+            out_text("Knock interrupted.");
+            return Ok(());
+        }
+    };
+    match outcome {
+        Ok(KnockOutcome {
+            via: KnockVia::Direct,
+        }) => out_text(&format!(
+            "Knocked on {} directly; the peer decides whether to trust this instance.",
+            short(&destination)
+        )),
+        Ok(KnockOutcome {
+            via: KnockVia::StoreAndForward,
+        }) => out_text(&format!(
+            "Knocked on {} via store-and-forward; a propagation node holds the knock until the peer fetches it.",
+            short(&destination)
+        )),
         Err(err) => bail!(err.to_string()),
     }
     Ok(())
@@ -1354,6 +1432,7 @@ struct MutationArgs {
     identity: Option<String>,
     label: Option<String>,
     note: Option<String>,
+    intro: Option<String>,
     older_than: Option<Duration>,
     confirm: Option<String>,
 }
@@ -1389,6 +1468,7 @@ fn parse_mutation_args(rest: &str, verb: &str, allowed: &[&str]) -> Result<Mutat
             "--identity" => args.identity = Some(value()?),
             "--label" => args.label = Some(value()?),
             "--note" => args.note = Some(value()?),
+            "--intro" => args.intro = Some(value()?),
             "--older-than" => args.older_than = Some(parse_older_than(&value()?)?),
             "--confirm" => args.confirm = Some(value()?),
             _ => return Err(unexpected(&token, verb)),
@@ -3885,6 +3965,7 @@ mod tests {
                 ".mesh unblock",
                 ".mesh deny",
                 ".mesh undeny",
+                ".mesh knock",
             ] {
                 run_async(run(&mut ctx, line)).unwrap_or_else(|err| panic!("{line}: {err}"));
             }
@@ -3899,6 +3980,7 @@ mod tests {
                 ".mesh unblock <identity>",
                 ".mesh deny <destination>",
                 ".mesh undeny <destination>",
+                ".mesh knock <destination>",
             ] {
                 assert!(out.contains(example), "{example} missing from {out}");
             }
@@ -3987,6 +4069,7 @@ mod tests {
                 format!(".mesh reply {hash} text"),
                 ".mesh broadcast text".to_string(),
                 ".mesh fetch".to_string(),
+                format!(".mesh knock {hash}"),
             ] {
                 let err = err_of(&mut ctx, &line);
                 assert!(err.contains(".mesh on"), "{line}: {err}");
@@ -6169,6 +6252,129 @@ mod tests {
                             "{line}: the gate runs before any notice: {out:?}"
                         );
                     }
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            #[test]
+            #[serial]
+            fn knock_help_intro_limit_and_bad_hash_are_teaching_errors() {
+                use crate::mesh::knocks::KNOCK_INTRO_MAX_CHARS;
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-knock-teaching");
+                let _script = prompt_script::install(&[]);
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-knock-teaching").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let (heard, _) = heard_peer(&started.runtime, "Tia", SystemTime::now());
+
+                    run(&mut ctx, ".mesh knock").await.unwrap();
+                    let out = stdout_lines();
+                    assert!(
+                        out.iter()
+                            .any(|line| line.contains(".mesh knock <destination>")),
+                        "{out:?}"
+                    );
+
+                    let err = run(&mut ctx, ".mesh knock nothex")
+                        .await
+                        .unwrap_err()
+                        .to_string();
+                    assert!(err.contains("is not a destination hash"), "{err}");
+
+                    let long = "x".repeat(KNOCK_INTRO_MAX_CHARS + 1);
+                    let err = run(&mut ctx, &format!(".mesh knock {heard} --intro \"{long}\""))
+                        .await
+                        .unwrap_err()
+                        .to_string();
+                    assert!(
+                        err.contains(&format!(
+                            "above the {KNOCK_INTRO_MAX_CHARS}-character limit"
+                        )),
+                        "{err}"
+                    );
+
+                    // Heard, but its announce never reached the transport: refused after the
+                    // consent, before any link is opened.
+                    let before = stdout_lines().len();
+                    let err = run(&mut ctx, &format!(".mesh knock {heard} --yes"))
+                        .await
+                        .unwrap_err()
+                        .to_string();
+                    assert!(err.contains("cannot be reached yet"), "{err}");
+                    let out = stdout_lines()[before..].to_vec();
+                    assert!(
+                        !out.iter().any(|line| line.starts_with("Knocking on")),
+                        "{out:?}"
+                    );
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            #[test]
+            #[serial]
+            fn knock_announces_then_sends_nothing_when_declined() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-knock-declined");
+                let _script = prompt_script::install(&[false]);
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-knock-declined").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let (heard, _) = heard_peer(&started.runtime, "Tia", SystemTime::now());
+
+                    run(&mut ctx, &format!(".mesh knock {heard} --intro \"hello\""))
+                        .await
+                        .unwrap();
+                    let out = stdout_lines();
+                    let notice = index_of(&out, "This knocks on Tia (");
+                    assert!(out[notice].contains("with intro \"hello\""), "{out:?}");
+                    let nothing = index_of(&out, "Nothing was sent.");
+                    assert!(notice < nothing, "{out:?}");
+                    assert!(
+                        !out.iter().any(|line| line.starts_with("Knocking on")),
+                        "{out:?}"
+                    );
+                    assert_eq!(prompt_script::prompts_asked(), 1);
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            #[test]
+            #[serial]
+            fn knock_to_a_destination_never_heard_is_refused() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-knock-unheard");
+                let _script = prompt_script::install(&[]);
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-knock-unheard").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let unheard = hex_lower(&[0x77; 16]);
+
+                    for line in [
+                        format!(".mesh knock {unheard}"),
+                        format!(".mesh knock {unheard} --yes --intro \"hi\""),
+                    ] {
+                        let before = stdout_lines().len();
+                        let err = run(&mut ctx, &line).await.unwrap_err().to_string();
+                        assert!(err.contains("has not been heard"), "{line}: {err}");
+                        let out = stdout_lines()[before..].to_vec();
+                        assert!(
+                            !out.iter().any(|text| text.starts_with("This knocks on")),
+                            "{line}: no notice for an unheard destination: {out:?}"
+                        );
+                    }
+                    assert_eq!(prompt_script::prompts_asked(), 0);
 
                     assert!(ctx.app.mesh.stop().await.unwrap());
                     started.relay_handle.abort();

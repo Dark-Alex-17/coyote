@@ -66,8 +66,6 @@ pub(crate) const KNOCK_BUCKET_REFILL_INTERVAL: Duration = Duration::from_secs(10
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct KnockIntro(String);
 
-// Reached by the REPL mesh commands once they land.
-#[allow(dead_code)]
 impl KnockIntro {
     /// Cleans `text` as the receiver will and refuses it when what is left is still over
     /// the cap: the sender is told rather than having its words cut silently.
