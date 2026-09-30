@@ -9,7 +9,7 @@ use crate::mesh::idle::plural;
 use crate::mesh::knock::{KnockIntro, KnockOutcome, KnockVia};
 use crate::mesh::knocks::KnockRecord;
 use crate::mesh::message::{
-    BroadcastOutcome, OutboundPeer, PEER_CONTENT_MAX_CHARS, PeerKind, PeerMessage, PeerVia,
+    BroadcastOutcome, OutboundPeer, PEER_CONTENT_MAX_CHARS, Part, PeerKind, PeerMessage, PeerVia,
     RecipientOutcome,
 };
 use crate::mesh::pending::{Correlation, InboundRecord, PendingState};
@@ -2521,6 +2521,23 @@ fn render_inbox(rows: &[InboxRow], awaiting_collect: &[String]) -> String {
             via_text(message.via),
             row.received.format("%H:%M UTC"),
         ));
+        for part in &message.parts {
+            if let Part::File {
+                name,
+                size,
+                staged,
+                reference,
+                ..
+            } = part
+            {
+                let location = match (staged, reference) {
+                    (Some(path), _) => format!("staged at {}", path.display()),
+                    (None, Some(path)) => format!("fetchable as {path}"),
+                    (None, None) => "not kept".to_string(),
+                };
+                lines.push(format!("  file: {name} ({size} B) {location}"));
+            }
+        }
     }
     if !awaiting_collect.is_empty() {
         let ids: Vec<&str> = awaiting_collect.iter().map(|id| short(id)).collect();
@@ -2538,6 +2555,7 @@ fn render_pending(asked: &[Correlation], escalated: &[InboundRecord]) -> String 
         let record = &correlation.record;
         let state = match record.state {
             PendingState::Open => "open",
+            PendingState::Escalated => "escalated: the peer's human has been asked",
             PendingState::Answered => "answered, awaiting collect",
         };
         lines.push(format!(
@@ -2612,7 +2630,9 @@ mod tests {
     use super::*;
     use crate::mesh::knocks::KNOCK_RECORD_VERSION;
     use crate::mesh::message::{RawPeerMessage, RecipientReport};
-    use crate::mesh::pending::{INBOUND_RECORD_VERSION, PENDING_RECORD_VERSION, PendingRecord};
+    use crate::mesh::pending::{
+        INBOUND_RECORD_VERSION, InboundKind, PENDING_RECORD_VERSION, PendingRecord,
+    };
     use crate::mesh::test_support::{Compatibility, PropagationNode, private_config};
     use rand_core::OsRng;
     use rns_transport::destination::{DestinationName, SingleOutputDestination};
@@ -3604,6 +3624,10 @@ mod tests {
             in_reply_to: in_reply_to.map(str::to_string),
             kind,
             via: PeerVia::Direct,
+            thread: None,
+            disposition: None,
+            retry_after: None,
+            parts: Vec::new(),
         })
     }
 
@@ -3663,6 +3687,7 @@ mod tests {
                 id: id.to_string(),
                 peer_destination: "ab".repeat(16),
                 peer_identity: "cd".repeat(16),
+                thread: id.to_string(),
                 question: "what now?".to_string(),
                 sent_at: "2026-09-21T14:13:20Z".to_string(),
                 timeout_at: "2026-09-21T14:23:20Z".to_string(),
@@ -3679,9 +3704,13 @@ mod tests {
             id: id.to_string(),
             peer_destination: "12".repeat(16),
             peer_identity: "ef".repeat(16),
+            thread: id.to_string(),
             question: "may I read the plan?".to_string(),
             envoy_question: envoy_question.to_string(),
             received_at: "2026-09-21T14:13:20Z".to_string(),
+            kind: InboundKind::Question,
+            paths: Vec::new(),
+            reason: String::new(),
         }
     }
 
@@ -4547,6 +4576,10 @@ mod tests {
                     in_reply_to: None,
                     kind: PeerKind::Message,
                     via: PeerVia::Direct,
+                    thread: None,
+                    disposition: None,
+                    retry_after: None,
+                    parts: Vec::new(),
                 })
             };
             let _capture = capture::install();
@@ -5821,7 +5854,9 @@ mod tests {
             #[test]
             #[serial]
             fn answer_routes_by_store_and_reply_is_never_an_alias() {
-                use crate::mesh::pending::{INBOUND_RECORD_VERSION, PENDING_RECORD_VERSION};
+                use crate::mesh::pending::{
+                    INBOUND_RECORD_VERSION, InboundKind, PENDING_RECORD_VERSION,
+                };
                 use crate::mesh::rfc3339_utc;
 
                 let _guard = TestConfigDirGuard::new("repl-mesh-answer");
@@ -5842,6 +5877,7 @@ mod tests {
                             id: "q1".to_string(),
                             peer_destination: asked_peer.clone(),
                             peer_identity: "cd".repeat(16),
+                            thread: "q1".to_string(),
                             question: "what now?".to_string(),
                             sent_at: rfc3339_utc(now),
                             timeout_at: rfc3339_utc(now + std::time::Duration::from_secs(600)),
@@ -5861,9 +5897,13 @@ mod tests {
                                 id: "p1".to_string(),
                                 peer_destination: asker_peer.clone(),
                                 peer_identity: "ef".repeat(16),
+                                thread: "p1".to_string(),
                                 question: "may I read the plan?".to_string(),
                                 envoy_question: String::new(),
                                 received_at: rfc3339_utc(now),
+                                kind: InboundKind::Question,
+                                paths: Vec::new(),
+                                reason: String::new(),
                             },
                             now,
                         )

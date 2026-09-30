@@ -63,10 +63,6 @@ impl InboxStaging {
         Self::new(inbox_root(cache_dir, instance_id))
     }
 
-    pub(crate) fn root(&self) -> &Path {
-        &self.root
-    }
-
     /// Writes `bytes` under `<root>/<peer-dest8>/<rel>` and returns the absolute staged
     /// path. `peer_destination` is the peer's destination hash; its first eight characters,
     /// lower-cased, name the peer's directory. A file already at the target with the same
@@ -183,7 +179,7 @@ mod tests {
             cache_dir.join("mesh").join("inbox").join("inst")
         );
         assert_eq!(
-            InboxStaging::for_instance(cache_dir, "inst").root(),
+            InboxStaging::for_instance(cache_dir, "inst").root,
             inbox_root(cache_dir, "inst")
         );
     }
@@ -198,12 +194,12 @@ mod tests {
             .stage(PEER, &rel, &digest(b"hello"), b"hello")
             .unwrap();
 
-        let canonical_root = dunce::canonicalize(inbox.root()).unwrap();
+        let canonical_root = dunce::canonicalize(&inbox.root).unwrap();
         assert!(staged.is_absolute());
         assert!(staged.starts_with(&canonical_root), "{}", staged.display());
         assert_eq!(staged, canonical_root.join(DEST8).join("docs").join("a.md"));
         assert_eq!(fs::read(&staged).unwrap(), b"hello");
-        assert_eq!(files_under(inbox.root()), [staged]);
+        assert_eq!(files_under(&inbox.root), [staged]);
     }
 
     #[test]
@@ -218,7 +214,7 @@ mod tests {
 
         assert_eq!(first, second);
         assert_eq!(fs::read(&second).unwrap(), b"hello");
-        assert_eq!(files_under(inbox.root()), [first]);
+        assert_eq!(files_under(&inbox.root), [first]);
     }
 
     #[test]
@@ -258,7 +254,7 @@ mod tests {
         let inbox = staging(&tmp);
         let outside = tmp.path.join("outside");
         fs::create_dir_all(&outside).unwrap();
-        let peer_dir = inbox.root().join(DEST8);
+        let peer_dir = inbox.root.join(DEST8);
         fs::create_dir_all(&peer_dir).unwrap();
         std::os::unix::fs::symlink(&outside, peer_dir.join("link")).unwrap();
 
@@ -272,14 +268,14 @@ mod tests {
             );
         }
         assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
-        assert_eq!(files_under(inbox.root()), Vec::<PathBuf>::new());
+        assert_eq!(files_under(&inbox.root), Vec::<PathBuf>::new());
     }
 
     #[test]
     fn the_grammar_refuses_traversal_before_the_inbox_is_touched() {
         let tmp = TempDir::new("inbox-grammar");
         let inbox = staging(&tmp);
-        fs::create_dir_all(inbox.root().join(DEST8)).unwrap();
+        fs::create_dir_all(inbox.root.join(DEST8)).unwrap();
 
         for (text, rule) in [
             ("../../.bashrc", "segment"),
@@ -289,10 +285,10 @@ mod tests {
             ("docs/he\u{301}llo.md", "nfc"),
         ] {
             assert_eq!(WirePath::parse(text).unwrap_err().rule, rule, "{text:?}");
-            assert_eq!(files_under(inbox.root()), Vec::<PathBuf>::new());
+            assert_eq!(files_under(&inbox.root), Vec::<PathBuf>::new());
         }
         assert_eq!(
-            fs::read_dir(inbox.root())
+            fs::read_dir(&inbox.root)
                 .unwrap()
                 .map(|entry| entry.unwrap().file_name())
                 .collect::<Vec<_>>(),

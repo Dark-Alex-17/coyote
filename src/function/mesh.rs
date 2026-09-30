@@ -15,6 +15,7 @@ use crate::mesh::trust::{Decision, Rule, Verdict};
 use crate::mesh::{
     MeshRuntime, MeshSlot, RequestOptions, canonical_hash, display_text, rfc3339_utc,
 };
+use crate::supervisor::mailbox::EnvelopePayload;
 use crate::utils::wait_user_interrupt;
 
 use anyhow::{Result, anyhow, bail};
@@ -50,6 +51,11 @@ pub fn mesh_function_declarations() -> Vec<FunctionDeclaration> {
         description: Some(format!(
             "Optional subject line (at most {PEER_TITLE_MAX_CHARS} characters)"
         )),
+        ..Default::default()
+    };
+    let thread_schema = JsonSchema {
+        type_value: Some("string".to_string()),
+        description: Some("Thread id to continue; absent on a root message means its own id, absent on a reply means the receiver inherits the answered message's thread".into()),
         ..Default::default()
     };
     let timeout_schema = |what: &str| JsonSchema {
@@ -117,6 +123,7 @@ pub fn mesh_function_declarations() -> Vec<FunctionDeclaration> {
                             ..Default::default()
                         },
                     ),
+                    ("thread".to_string(), thread_schema.clone()),
                 ])),
                 required: Some(vec!["to".to_string(), "message".to_string()]),
                 ..Default::default()
@@ -145,6 +152,7 @@ pub fn mesh_function_declarations() -> Vec<FunctionDeclaration> {
                     ),
                     ("message".to_string(), message_schema("The question")),
                     ("title".to_string(), title_schema.clone()),
+                    ("thread".to_string(), thread_schema),
                     (
                         "timeout_secs".to_string(),
                         timeout_schema("How long a `wait: true` ask blocks for the reply"),
@@ -313,7 +321,8 @@ fn collect_timeout(args: &Value) -> Result<Duration> {
 
 /// The message the tool arguments describe, of `kind` unless a plain message names a
 /// question in `in_reply_to`, which makes it the reply to that question. An ask or a
-/// bulletin never answers anything, so for those the argument is ignored.
+/// bulletin never answers anything, so for those the argument is ignored. A `thread`
+/// names the conversation to continue.
 pub(crate) fn outbound_from_args(
     kind: PeerKind,
     message: &str,
@@ -330,7 +339,13 @@ pub(crate) fn outbound_from_args(
     } else {
         kind
     };
-    OutboundPeer::new(kind, message, title, in_reply_to, None)
+    let thread = args
+        .get("thread")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string);
+    OutboundPeer::new(kind, message, title, in_reply_to, None)?.with_thread(thread)
 }
 
 pub(crate) fn trust_label(verdict: Verdict) -> &'static str {
@@ -350,6 +365,7 @@ fn send_error_kind(err: &SendError) -> &'static str {
         SendError::ContentTooLong { .. } => "content_too_long",
         SendError::TitleTooLong { .. } => "title_too_long",
         SendError::InvalidFields(_) => "invalid_fields",
+        SendError::InvalidParts(_) => "invalid_parts",
         SendError::Refused(_) => "refused",
         SendError::Direct(_) => "direct",
         SendError::IncompatibleVersion { .. } => "incompatible_version",
@@ -472,6 +488,7 @@ async fn handle_send(runtime: &MeshRuntime, args: &Value) -> Result<Value> {
         Ok(out) => out,
         Err(err) => return Ok(send_error(&err)),
     };
+    let thread = out.thread.clone().unwrap_or_else(|| out.id.clone());
     match runtime.send_peer(to, &out).await {
         Ok(outcome) => Ok(json!({
             "status": "sent",
@@ -480,6 +497,7 @@ async fn handle_send(runtime: &MeshRuntime, args: &Value) -> Result<Value> {
             "to": canonical_hash(to).unwrap_or_else(|| to.to_string()),
             "kind": out.kind,
             "in_reply_to": out.in_reply_to,
+            "thread": thread,
         })),
         Err(err) => Ok(send_error(&err)),
     }
@@ -519,11 +537,13 @@ async fn handle_ask(ctx: &RequestContext, runtime: &MeshRuntime, args: &Value) -
 
     let slot = &ctx.app.mesh;
     let now = SystemTime::now();
+    let thread = out.thread.clone().unwrap_or_else(|| out.id.clone());
     slot.correlations().open(PendingRecord {
         version: PENDING_RECORD_VERSION,
         id: out.id.clone(),
         peer_destination: destination.clone(),
         peer_identity: peer.identity_hash,
+        thread: thread.clone(),
         question: display_text(message, PENDING_QUESTION_MAX_CHARS).unwrap_or_default(),
         sent_at: rfc3339_utc(now),
         timeout_at: rfc3339_utc(now + timeout),
@@ -546,6 +566,7 @@ async fn handle_ask(ctx: &RequestContext, runtime: &MeshRuntime, args: &Value) -
         "id": outcome.id,
         "via": outcome.via,
         "to": destination,
+        "thread": thread,
         "next_action": collect_next_action(&outcome.id),
         "message": format!(
             "The reply arrives as a system_notifications entry; collect it with mesh__collect --id {}.",
@@ -561,7 +582,9 @@ async fn handle_collect(ctx: &RequestContext, args: &Value) -> Result<Value> {
 
 /// Nothing here cancels: a timeout or a Ctrl-C leaves the question open for the reply
 /// to answer later. The wait is sliced so a child blocked on a `user__*` escalation is
-/// not starved while this call blocks; the pending escalations come back instead.
+/// not starved while this call blocks; the pending escalations come back instead. A
+/// question the peer's human has been asked keeps waiting like any other until the
+/// deadline, then says so.
 async fn collect_reply(ctx: &RequestContext, id: &str, timeout: Duration) -> Value {
     let correlations = ctx.app.mesh.correlations();
     let deadline = tokio::time::Instant::now() + timeout;
@@ -578,7 +601,7 @@ async fn collect_reply(ctx: &RequestContext, id: &str, timeout: Duration) -> Val
                 });
             }
         };
-        if outcome != WaitOutcome::Pending {
+        if !matches!(outcome, WaitOutcome::Pending | WaitOutcome::Escalated) {
             break outcome;
         }
         if let Some(queue) = ctx.root_escalation_queue()
@@ -593,18 +616,26 @@ async fn collect_reply(ctx: &RequestContext, id: &str, timeout: Duration) -> Val
             });
         }
         if tokio::time::Instant::now() >= deadline {
-            break WaitOutcome::Pending;
+            break outcome;
         }
     };
     match outcome {
         WaitOutcome::Replied(_) => match correlations.take_answer(id) {
-            Some(reply) => json!({
-                "status": "replied",
-                "id": id,
-                "from": reply.source_destination,
-                "reply": reply,
-                "note": PEER_TEXT_IS_DATA,
-            }),
+            Some(reply) => {
+                let mut replied = json!({
+                    "status": "replied",
+                    "id": id,
+                    "from": reply.source_destination,
+                    "disposition": reply.disposition().wire_name(),
+                    "thread": reply.thread(),
+                    "reply": reply,
+                    "note": PEER_TEXT_IS_DATA,
+                });
+                if let Some(retry_after) = reply.retry_after {
+                    replied["retry_after"] = json!(retry_after);
+                }
+                replied
+            }
             None => json!({
                 "status": "error",
                 "message": format!(
@@ -621,6 +652,12 @@ async fn collect_reply(ctx: &RequestContext, id: &str, timeout: Duration) -> Val
                 timeout.as_secs()
             ),
         }),
+        WaitOutcome::Escalated => json!({
+            "status": "escalated",
+            "id": id,
+            "next_action": collect_next_action(id),
+            "message": "The peer's human has been asked; the question stays open. Collect again later.",
+        }),
         WaitOutcome::Unknown => json!({
             "status": "error",
             "message": format!(
@@ -630,30 +667,48 @@ async fn collect_reply(ctx: &RequestContext, id: &str, timeout: Duration) -> Val
     }
 }
 
+/// The inbox as the model reads it: every envelope, the drained messages grouped by
+/// thread in first-seen order, and the questions of ours whose answer waits to be
+/// collected or whose peer has asked its human.
 fn handle_check_inbox(slot: &MeshSlot) -> Value {
     let (envelopes, dropped) = slot.peer_inbox().drain();
-    let messages: Vec<Value> = envelopes
+    let mut threads: IndexMap<String, Vec<String>> = IndexMap::new();
+    let mut messages = Vec::with_capacity(envelopes.len());
+    for envelope in envelopes {
+        if let EnvelopePayload::Peer(message) = &envelope.payload {
+            threads
+                .entry(message.thread().to_string())
+                .or_default()
+                .push(message.message_id.clone());
+        }
+        messages.push(json!({
+            "from": envelope.from,
+            "to": envelope.to,
+            "payload": envelope.payload,
+            "timestamp": envelope.timestamp.to_rfc3339(),
+        }));
+    }
+    let threads: Vec<Value> = threads
         .into_iter()
-        .map(|e| {
-            json!({
-                "from": e.from,
-                "to": e.to,
-                "payload": e.payload,
-                "timestamp": e.timestamp.to_rfc3339(),
-            })
-        })
+        .map(|(thread, ids)| json!({ "thread": thread, "ids": ids }))
         .collect();
-    let answered_awaiting_collect: Vec<String> = slot
-        .correlations()
-        .list()
-        .into_iter()
+    let correlations = slot.correlations().list();
+    let answered_awaiting_collect: Vec<&str> = correlations
+        .iter()
         .filter(|correlation| correlation.reply.is_some())
-        .map(|correlation| correlation.record.id)
+        .map(|correlation| correlation.record.id.as_str())
+        .collect();
+    let escalated: Vec<&str> = correlations
+        .iter()
+        .filter(|correlation| correlation.record.state == PendingState::Escalated)
+        .map(|correlation| correlation.record.id.as_str())
         .collect();
     let mut result = json!({
         "messages": messages,
         "count": messages.len(),
+        "threads": threads,
         "answered_awaiting_collect": answered_awaiting_collect,
+        "escalated": escalated,
     });
     if !messages.is_empty() {
         result["note"] = json!(PEER_TEXT_IS_DATA);
@@ -710,11 +765,14 @@ mod tests {
     use crate::config::{AppConfig, AppState, WorkingMode, mesh_tools_available};
     use crate::function::{ToolCall, ToolResult, drain_live_notifications, merge_system_channel};
     use crate::mesh::hex_lower;
-    use crate::mesh::message::{PEER_INBOX_CAPACITY, PeerMessage, PeerVia, RawPeerMessage};
+    use crate::mesh::message::{
+        Disposition, PEER_INBOX_CAPACITY, Part, PeerMessage, PeerVia, RawPeerMessage, to_r3_body,
+    };
     use crate::mesh::notify::{NotificationSink, RenderedNotification};
     use crate::supervisor::escalation::EscalationRequest;
 
     use parking_lot::RwLock;
+    use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::mpsc;
     use std::thread;
@@ -753,8 +811,8 @@ mod tests {
         ctx
     }
 
-    fn peer_message(kind: PeerKind, id: &str, in_reply_to: Option<&str>) -> PeerMessage {
-        PeerMessage::new(RawPeerMessage {
+    fn raw_message(kind: PeerKind, id: &str, in_reply_to: Option<&str>) -> RawPeerMessage {
+        RawPeerMessage {
             source_identity: hex_lower(&[0xcd; 16]),
             source_destination: hex_lower(&[0xab; 16]),
             destination: hex_lower(&[0x01; 16]),
@@ -766,7 +824,15 @@ mod tests {
             in_reply_to: in_reply_to.map(str::to_string),
             kind,
             via: PeerVia::Direct,
-        })
+            thread: None,
+            disposition: None,
+            retry_after: None,
+            parts: Vec::new(),
+        }
+    }
+
+    fn peer_message(kind: PeerKind, id: &str, in_reply_to: Option<&str>) -> PeerMessage {
+        PeerMessage::new(raw_message(kind, id, in_reply_to))
     }
 
     fn open_question(slot: &MeshSlot, id: &str) {
@@ -777,6 +843,7 @@ mod tests {
                 id: id.to_string(),
                 peer_destination: hex_lower(&[0xab; 16]),
                 peer_identity: hex_lower(&[0xcd; 16]),
+                thread: id.to_string(),
                 question: "what now?".into(),
                 sent_at: rfc3339_utc(now),
                 timeout_at: rfc3339_utc(now + DEFAULT_COLLECT_TIMEOUT),
@@ -927,6 +994,32 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(too_long, SendError::ContentTooLong { .. }));
+    }
+
+    #[test]
+    fn send_with_thread_puts_it_on_the_wire_body() {
+        let out = outbound_from_args(PeerKind::Message, "still here", &json!({"thread": " t-1 "}))
+            .unwrap();
+        assert_eq!(out.thread.as_deref(), Some("t-1"));
+        let rmpv::Value::Map(entries) = to_r3_body(&out, 1.0) else {
+            panic!("a map body");
+        };
+        let thread = entries
+            .iter()
+            .find(|(key, _)| key.as_str() == Some("thread"))
+            .map(|(_, value)| value.as_str());
+        assert_eq!(thread, Some(Some("t-1")));
+
+        let untied = outbound_from_args(PeerKind::Message, "hi", &json!({"thread": ""})).unwrap();
+        assert_eq!(untied.thread, None);
+    }
+
+    #[test]
+    fn a_thread_that_is_not_an_id_is_an_invalid_fields_error() {
+        let err = outbound_from_args(PeerKind::Message, "hi", &json!({"thread": "has a space"}))
+            .unwrap_err();
+        assert_eq!(err, SendError::InvalidFields("thread is not a message id"));
+        assert_eq!(send_error(&err)["kind"], "invalid_fields");
     }
 
     #[test]
@@ -1165,6 +1258,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn collect_reports_escalated_for_an_escalated_question() {
+        let ctx = plain_ctx();
+        let slot = Arc::clone(&ctx.app.mesh);
+        open_question(&slot, "q1");
+        slot.deliver_peer(PeerMessage::new(RawPeerMessage {
+            disposition: Some(Disposition::Escalated),
+            ..raw_message(PeerKind::Reply, "r1", Some("q1"))
+        }));
+
+        let escalated = handle_collect(&ctx, &json!({"id": "q1", "timeout_secs": 1}))
+            .await
+            .unwrap();
+        assert_eq!(escalated["status"], "escalated", "{escalated}");
+        assert_eq!(escalated["id"], "q1");
+        assert_eq!(escalated["next_action"], "mesh__collect --id q1");
+        assert!(
+            escalated["message"]
+                .as_str()
+                .unwrap()
+                .contains("human has been asked"),
+            "{escalated}"
+        );
+        assert!(slot.correlations().is_open("q1"), "the question waits on");
+        assert_eq!(
+            slot.correlations().get("q1").unwrap().record.state,
+            PendingState::Escalated
+        );
+        assert_eq!(handle_check_inbox(&slot)["escalated"], json!(["q1"]));
+    }
+
+    #[tokio::test]
+    async fn collect_surfaces_the_disposition_and_retry_after_of_a_refused_reply() {
+        let ctx = plain_ctx();
+        let slot = Arc::clone(&ctx.app.mesh);
+        open_question(&slot, "q1");
+        slot.deliver_peer(PeerMessage::new(RawPeerMessage {
+            disposition: Some(Disposition::Refused),
+            retry_after: Some(90),
+            ..raw_message(PeerKind::Reply, "r1", Some("q1"))
+        }));
+
+        let replied = handle_collect(&ctx, &json!({"id": "q1", "timeout_secs": 1}))
+            .await
+            .unwrap();
+        assert_eq!(replied["status"], "replied", "{replied}");
+        assert_eq!(replied["disposition"], "refused");
+        assert_eq!(replied["retry_after"], 90);
+        assert_eq!(
+            replied["thread"], "q1",
+            "a reply inherits the answered question's thread"
+        );
+        assert_eq!(replied["reply"]["disposition"], "refused");
+        assert_eq!(replied["reply"]["retry_after"], 90);
+        assert!(slot.correlations().get("q1").is_none(), "collected");
+    }
+
+    #[tokio::test]
     async fn collect_returns_early_with_the_pending_escalations_and_keeps_the_question_open() {
         let mut ctx = plain_ctx();
         open_question(&ctx.app.mesh, "q1");
@@ -1257,6 +1407,82 @@ mod tests {
             json!(["q1"]),
             "an answer waits until it is collected"
         );
+    }
+
+    #[test]
+    fn check_inbox_groups_messages_by_thread_and_lists_escalated_questions() {
+        let slot = MeshSlot::default();
+        slot.deliver_peer(peer_message(PeerKind::Message, "m1", None));
+        slot.deliver_peer(PeerMessage::new(RawPeerMessage {
+            thread: Some("m1".into()),
+            ..raw_message(PeerKind::Message, "m2", None)
+        }));
+        slot.deliver_peer(peer_message(PeerKind::Message, "m3", None));
+        open_question(&slot, "q1");
+        open_question(&slot, "q2");
+        assert!(slot.correlations().answer(
+            "q1",
+            PeerMessage::new(RawPeerMessage {
+                disposition: Some(Disposition::Escalated),
+                ..raw_message(PeerKind::Reply, "r1", Some("q1"))
+            })
+        ));
+
+        let inbox = handle_check_inbox(&slot);
+        assert_eq!(inbox["count"], 3);
+        assert_eq!(
+            inbox["threads"],
+            json!([
+                { "thread": "m1", "ids": ["m1", "m2"] },
+                { "thread": "m3", "ids": ["m3"] },
+            ]),
+            "{inbox}"
+        );
+        assert_eq!(inbox["messages"][1]["payload"]["thread"], "m1");
+        assert_eq!(inbox["escalated"], json!(["q1"]));
+        assert_eq!(inbox["answered_awaiting_collect"], json!([]));
+
+        let again = handle_check_inbox(&slot);
+        assert_eq!(again["threads"], json!([]));
+        assert_eq!(
+            again["escalated"],
+            json!(["q1"]),
+            "still asked of the human"
+        );
+    }
+
+    #[test]
+    fn a_delivered_file_part_reaches_check_inbox_as_a_staged_path_and_never_as_bytes() {
+        let slot = MeshSlot::default();
+        let staged = std::env::temp_dir()
+            .join("coyote-mesh-inbox")
+            .join("abcdef01")
+            .join("docs")
+            .join("notes.md");
+        assert!(staged.is_absolute());
+        let mut message = peer_message(PeerKind::Message, "m1", None);
+        message.parts.push(Part::File {
+            name: "docs/notes.md".into(),
+            size: 8,
+            sha256: "ab".repeat(32),
+            staged: Some(staged.clone()),
+            reference: None,
+        });
+        message.dropped_parts = 1;
+        slot.peer_inbox().deliver(message);
+
+        let inbox = handle_check_inbox(&slot);
+        let payload = &inbox["messages"][0]["payload"];
+        assert_eq!(payload["message_id"], "m1");
+        assert_eq!(payload["parts"][0]["type"], "file");
+        assert_eq!(payload["parts"][0]["name"], "docs/notes.md");
+        assert_eq!(
+            payload["parts"][0]["staged"].as_str().map(PathBuf::from),
+            Some(staged)
+        );
+        assert_eq!(payload["dropped_parts"], 1);
+        let text = inbox.to_string();
+        assert!(!text.contains("\"bytes\""), "{text}");
     }
 
     #[test]

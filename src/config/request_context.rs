@@ -12275,6 +12275,7 @@ mod tests {
                 id: "q1".into(),
                 peer_destination: b_dest.clone(),
                 peer_identity: b_identity.clone(),
+                thread: "q1".into(),
                 question: "what now?".into(),
                 sent_at: rfc3339_utc(now),
                 timeout_at: rfc3339_utc(now + DEFAULT_COLLECT_TIMEOUT),
@@ -12294,6 +12295,10 @@ mod tests {
             in_reply_to: Some("q1".into()),
             kind: PeerKind::Reply,
             via: PeerVia::Direct,
+            thread: None,
+            disposition: None,
+            retry_after: None,
+            parts: Vec::new(),
         }));
         let replied = handle_mesh_tool(
             &mut ctx,
@@ -12437,6 +12442,10 @@ mod tests {
             in_reply_to: Some(id.clone()),
             kind: PeerKind::Reply,
             via: PeerVia::Direct,
+            thread: None,
+            disposition: None,
+            retry_after: None,
+            parts: Vec::new(),
         }));
         let collected = handle_mesh_tool(
             &mut ctx,
@@ -22363,8 +22372,8 @@ mod tests {
     async fn repl_complete_mesh_offers_heard_peers_and_open_questions_from_the_cache() {
         use crate::mesh::hex_lower;
         use crate::mesh::pending::{
-            INBOUND_RECORD_VERSION, InboundRecord, PENDING_RECORD_VERSION, PendingRecord,
-            PendingState,
+            INBOUND_RECORD_VERSION, InboundKind, InboundRecord, PENDING_RECORD_VERSION,
+            PendingRecord, PendingState,
         };
         use crate::mesh::rfc3339_utc;
         use crate::mesh::test_support::PeerSighting;
@@ -22427,6 +22436,7 @@ mod tests {
                 id: "q1".to_string(),
                 peer_destination: heard.clone(),
                 peer_identity: hex_lower(&[0xab; 16]),
+                thread: "q1".to_string(),
                 question: "what now?".to_string(),
                 sent_at: rfc3339_utc(now),
                 timeout_at: rfc3339_utc(now + std::time::Duration::from_secs(600)),
@@ -22444,9 +22454,13 @@ mod tests {
                     id: "p1".to_string(),
                     peer_destination: hex_lower(&[0x12; 16]),
                     peer_identity: hex_lower(&[0xef; 16]),
+                    thread: "p1".to_string(),
                     question: "may I read the plan?".to_string(),
                     envoy_question: String::new(),
                     received_at: rfc3339_utc(now),
+                    kind: InboundKind::Question,
+                    paths: Vec::new(),
+                    reason: String::new(),
                 },
                 now,
             )
@@ -22471,9 +22485,13 @@ mod tests {
                     id: "p2".to_string(),
                     peer_destination: hex_lower(&[0x13; 16]),
                     peer_identity: hex_lower(&[0xee; 16]),
+                    thread: "p2".to_string(),
                     question: "line one\nline two\x1b[31m\x07 tail".to_string(),
                     envoy_question: String::new(),
                     received_at: rfc3339_utc(now),
+                    kind: InboundKind::Question,
+                    paths: Vec::new(),
+                    reason: String::new(),
                 },
                 now,
             )

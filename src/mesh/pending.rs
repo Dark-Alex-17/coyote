@@ -5,7 +5,7 @@
 //! this node that the envoy escalated to the person at the keyboard, kept apart so a
 //! peer's reply can never be matched against one.
 
-use crate::mesh::message::{PEER_ID_MAX_CHARS, PeerMessage};
+use crate::mesh::message::{Disposition, PEER_ID_MAX_CHARS, PeerMessage};
 use crate::mesh::r3::{redact_hashes, short};
 use crate::mesh::schema::{Remedy, VersionProbe, unversioned_refusal, version_refusal};
 use crate::mesh::{canonical_hash, mesh_cache_dir, parse_rfc3339, write_atomically};
@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use tokio::sync::Notify;
 
-pub(crate) const PENDING_RECORD_VERSION: u64 = 1;
+pub(crate) const PENDING_RECORD_VERSION: u64 = 2;
 /// Past this many live records the oldest go, answered ones before open ones: an answer
 /// nobody collected is worth less than a question still waiting on one.
 pub(crate) const PENDING_MAX_ENTRIES: usize = 256;
@@ -30,7 +30,7 @@ pub(crate) const PENDING_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
 pub(crate) const PENDING_QUESTION_MAX_CHARS: usize = 280;
 /// How long a collect waits for a reply before reporting the question still open.
 pub(crate) const DEFAULT_COLLECT_TIMEOUT: Duration = Duration::from_secs(30);
-pub(crate) const INBOUND_RECORD_VERSION: u64 = 1;
+pub(crate) const INBOUND_RECORD_VERSION: u64 = 2;
 /// Past this many escalated questions the oldest go; expiry reuses `PENDING_TTL`.
 pub(crate) const INBOUND_MAX_ENTRIES: usize = 256;
 /// What the envoy asked the human is kept whole, so a late `.mesh answer` still shows
@@ -41,7 +41,16 @@ pub(crate) const INBOUND_ENVOY_QUESTION_MAX_CHARS: usize = 1_000;
 #[serde(rename_all = "snake_case")]
 pub(crate) enum PendingState {
     Open,
+    /// The peer's human has been asked; still waiting, like `Open`, for the answer.
+    Escalated,
     Answered,
+}
+
+impl PendingState {
+    /// Whether a reply from the asked identity would still answer the question.
+    fn awaits_reply(self) -> bool {
+        matches!(self, Self::Open | Self::Escalated)
+    }
 }
 
 /// One line of `pending-<instance_id>.jsonl`. The shape is a stable on-disk record other
@@ -58,6 +67,8 @@ pub(crate) struct PendingRecord {
     pub peer_destination: String,
     /// Lower-hex, the identity behind that instance when the question was sent.
     pub peer_identity: String,
+    /// The conversation the question continues; its own id when it opened one.
+    pub thread: String,
     /// The question's first words, at most `PENDING_QUESTION_MAX_CHARS`.
     pub question: String,
     /// RFC 3339 UTC seconds.
@@ -201,10 +212,10 @@ impl PendingStore {
     }
 
     /// The questions this store still has something to do with, newest first, after
-    /// pruning: the open ones and the answered ones whose reply is on the line, waiting
-    /// to be collected. An answered record without a reply was written before replies
-    /// were persisted; nothing can be shown for it, so it is dropped from the file in the
-    /// same pass. The file is left as it was when anything fails.
+    /// pruning: the ones still awaiting a reply and the answered ones whose reply is on
+    /// the line, waiting to be collected. An answered record without a reply has nothing
+    /// to show, so it is dropped from the file in the same pass. The file is left as it
+    /// was when anything fails.
     pub(crate) fn load_pending(&self, now: SystemTime) -> Result<Vec<PendingRecord>> {
         if !self.path.exists() {
             return Ok(Vec::new());
@@ -214,7 +225,7 @@ impl PendingStore {
         let mut records = self.read_all()?;
         let before = records.len();
         evict(&mut records, now);
-        records.retain(|record| record.state == PendingState::Open || record.reply.is_some());
+        records.retain(|record| record.state != PendingState::Answered || record.reply.is_some());
         if records.len() != before {
             self.write_all(&records)?;
         }
@@ -244,7 +255,7 @@ fn is_expired(record: &PendingRecord, now: SystemTime) -> bool {
 }
 
 /// Expired first, then past `PENDING_MAX_ENTRIES` the oldest answered records, then the
-/// oldest open ones; `records` is newest first. Returns how many went.
+/// oldest still awaiting a reply; `records` is newest first. Returns how many went.
 fn evict(records: &mut Vec<PendingRecord>, now: SystemTime) -> usize {
     let before = records.len();
     records.retain(|record| !is_expired(record, now));
@@ -261,6 +272,14 @@ fn evict(records: &mut Vec<PendingRecord>, now: SystemTime) -> usize {
     before - records.len()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum InboundKind {
+    #[default]
+    Question,
+    Access,
+}
+
 /// One line of `inbound-<instance_id>.jsonl`: a question a peer asked that the envoy
 /// could not answer on its own, waiting on the person at the keyboard. The same on-disk
 /// discipline as `PendingRecord`: unknown fields are rejected and any layout change bumps
@@ -275,6 +294,8 @@ pub(crate) struct InboundRecord {
     pub peer_destination: String,
     /// Lower-hex, the identity behind that instance when it asked.
     pub peer_identity: String,
+    /// The conversation the peer's question belongs to.
+    pub thread: String,
     /// The question's first words, at most `PENDING_QUESTION_MAX_CHARS`.
     pub question: String,
     /// What the envoy asked the human about the peer's question, empty when it asked
@@ -282,6 +303,14 @@ pub(crate) struct InboundRecord {
     pub envoy_question: String,
     /// RFC 3339 UTC seconds.
     pub received_at: String,
+    /// Filled by the access-request path; a question until then.
+    #[serde(default)]
+    pub kind: InboundKind,
+    /// The paths an access request names; empty for a question.
+    #[serde(default)]
+    pub paths: Vec<String>,
+    #[serde(default)]
+    pub reason: String,
 }
 
 const INBOUND_NAMES: StoreNames = StoreNames {
@@ -561,6 +590,8 @@ pub(crate) enum WaitOutcome {
     Replied(Box<PeerMessage>),
     /// The question is known and still unanswered when the wait ran out.
     Pending,
+    /// Still unanswered when the wait ran out, and the peer's human has been asked.
+    Escalated,
     /// No question with that id is open or awaiting collection.
     Unknown,
 }
@@ -661,29 +692,30 @@ impl Correlations {
             .lock()
             .entries
             .get(id)
-            .is_some_and(|entry| entry.record.state == PendingState::Open)
+            .is_some_and(|entry| entry.record.state.awaits_reply())
     }
 
     /// Whether a reply naming `id` from `identity` is the answer this node is still
     /// waiting for: the same test `answer` applies, so admission and correlation agree.
     pub(crate) fn accepts_reply_from(&self, id: &str, identity: &str) -> bool {
         self.state.lock().entries.get(id).is_some_and(|entry| {
-            entry.record.state == PendingState::Open
+            entry.record.state.awaits_reply()
                 && entry.record.peer_identity.eq_ignore_ascii_case(identity)
         })
     }
 
-    /// `true` when `in_reply_to` named an open question asked of `reply`'s identity, which
-    /// `reply` now answers, on disk too so it survives to the next process uncollected. A
-    /// reply from any other identity, or a second reply to the same question, does not
-    /// match: it is an ordinary message.
+    /// `true` when `in_reply_to` named a question still awaiting a reply, asked of
+    /// `reply`'s identity. An `Escalated` reply moves the question to `Escalated` and
+    /// keeps waiting; any other closes it with `reply` as its answer, on disk too so it
+    /// survives to the next process uncollected. A reply from any other identity, or one
+    /// to a question already answered, does not match: it is an ordinary message.
     pub(crate) fn answer(&self, in_reply_to: &str, reply: PeerMessage) -> bool {
         let mut state = self.state.lock();
         let CorrelationState { store, entries } = &mut *state;
         let Some(entry) = entries.get_mut(in_reply_to) else {
             return false;
         };
-        if entry.record.state != PendingState::Open {
+        if !entry.record.state.awaits_reply() {
             debug!(
                 "Mesh reply {} from {} names question {in_reply_to}, which is already answered; treating it as a message",
                 reply.message_id,
@@ -704,9 +736,13 @@ impl Correlations {
             );
             return false;
         }
-        entry.record.state = PendingState::Answered;
-        entry.record.reply = Some(reply.clone());
-        entry.reply = Some(reply);
+        if reply.disposition() == Disposition::Escalated {
+            entry.record.state = PendingState::Escalated;
+        } else {
+            entry.record.state = PendingState::Answered;
+            entry.record.reply = Some(reply.clone());
+            entry.reply = Some(reply);
+        }
         if let Some(store) = store
             && let Err(err) = store.upsert(entry.record.clone(), SystemTime::now())
         {
@@ -721,7 +757,8 @@ impl Correlations {
     }
 
     /// Waits up to `timeout` for the reply to `id`. Nothing is removed: the reply is
-    /// collected with `take_answer`, so a wait that is cancelled or times out loses nothing.
+    /// collected with `take_answer`, so a wait that is cancelled or times out loses
+    /// nothing. A timeout says whether the peer's human has been asked meanwhile.
     pub(crate) async fn wait(&self, id: &str, timeout: Duration) -> WaitOutcome {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
@@ -744,7 +781,12 @@ impl Correlations {
                 }
             }
             if tokio::time::timeout_at(deadline, changed).await.is_err() {
-                return WaitOutcome::Pending;
+                return match self.get(id) {
+                    Some(correlation) if correlation.record.state == PendingState::Escalated => {
+                        WaitOutcome::Escalated
+                    }
+                    _ => WaitOutcome::Pending,
+                };
             }
         }
     }
@@ -769,15 +811,15 @@ impl Correlations {
         Some(reply)
     }
 
-    /// Forgets an open question whose send failed, so nothing waits on a reply that was
-    /// never asked for. `true` when an open record with `id` was there to remove; an
-    /// answered one stays for `take_answer`.
+    /// Forgets a question still awaiting a reply, as after a send that failed, so nothing
+    /// waits on a reply that was never asked for. `true` when such a record with `id` was
+    /// there to remove; an answered one stays for `take_answer`.
     pub(crate) fn abandon(&self, id: &str) -> bool {
         let mut state = self.state.lock();
         let CorrelationState { store, entries } = &mut *state;
         if !entries
             .get(id)
-            .is_some_and(|entry| entry.record.state == PendingState::Open)
+            .is_some_and(|entry| entry.record.state.awaits_reply())
         {
             return false;
         }
@@ -797,6 +839,15 @@ impl Correlations {
 
     pub(crate) fn get(&self, id: &str) -> Option<Correlation> {
         self.state.lock().entries.get(id).cloned()
+    }
+
+    /// The thread of question `id`, for the reply that answers it to inherit.
+    pub(crate) fn thread_of(&self, id: &str) -> Option<String> {
+        self.state
+            .lock()
+            .entries
+            .get(id)
+            .map(|entry| entry.record.thread.clone())
     }
 
     /// Every question in flight, newest first by `sent_at`.
@@ -824,6 +875,7 @@ mod tests {
             id: id.to_string(),
             peer_destination: hex_lower(&[0xab; 16]),
             peer_identity: hex_lower(&[0xcd; 16]),
+            thread: id.to_string(),
             question: format!("question {id}"),
             sent_at: rfc3339_utc(sent_at),
             timeout_at: rfc3339_utc(sent_at + DEFAULT_COLLECT_TIMEOUT),
@@ -845,6 +897,19 @@ mod tests {
             in_reply_to: Some(id.to_string()),
             kind: PeerKind::Reply,
             via: PeerVia::Direct,
+            thread: None,
+            disposition: None,
+            retry_after: None,
+            parts: Vec::new(),
+            dropped_parts: 0,
+        }
+    }
+
+    fn reply_with(id: &str, disposition: Disposition, retry_after: Option<u32>) -> PeerMessage {
+        PeerMessage {
+            disposition: Some(disposition),
+            retry_after,
+            ..reply_to(id)
         }
     }
 
@@ -1001,8 +1066,14 @@ mod tests {
         assert!(err.contains(&store.path().display().to_string()), "{err}");
         assert!(err.contains("pending store"), "{err}");
         assert!(err.contains("line 2"), "{err}");
-        assert!(err.contains("version 2"), "{err}");
-        assert!(err.contains("version 1"), "{err}");
+        assert!(
+            err.contains(&format!("version {}", PENDING_RECORD_VERSION + 1)),
+            "{err}"
+        );
+        assert!(
+            err.contains(&format!("version {PENDING_RECORD_VERSION}")),
+            "{err}"
+        );
         assert!(err.contains("upgrade Coyote"), "{err}");
         assert!(err.contains("move the file aside"), "{err}");
         assert!(store.load_pending(t(2_000)).is_err());
@@ -1055,15 +1126,15 @@ mod tests {
     }
 
     #[test]
-    fn usage_probe_a_version_1_pending_line_written_before_scope_still_loads() {
-        // T33 (SCOPE wire rename) bumps trust/peers/knocks 1 -> 2 and MUST NOT bump the
-        // pending store: a `pending-<id>.jsonl` a user wrote on the build before the
-        // rename is spelled with a literal `"version":1` here, not the constant, so a
-        // wrongful bump goes red instead of following the constant silently.
-        let tmp = TempDir::new("pending-v1-before-scope");
+    fn a_version_1_pending_line_from_before_the_parts_bump_is_refused() {
+        // TASK-108 bumped the pending store 1 -> 2 (thread, escalated state). A
+        // `pending-<id>.jsonl` from the build before it is spelled with a literal
+        // `"version":1` here, not the constant: there is no migration, so the line is
+        // refused whole rather than loaded with a guessed thread.
+        let tmp = TempDir::new("pending-v1-before-bump");
         let store = PendingStore::new(&tmp.path, "inst");
         let line = concat!(
-            r#"{"version":1,"id":"q-before-rename","#,
+            r#"{"version":1,"id":"q-before-bump","#,
             r#""peer_destination":"abababababababababababababababab","#,
             r#""peer_identity":"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd","#,
             r#""question":"still pending?","#,
@@ -1074,33 +1145,36 @@ mod tests {
         fs::create_dir_all(store.path().parent().unwrap()).unwrap();
         fs::write(store.path(), line).unwrap();
 
-        let listed = store
-            .list(t(1_100))
-            .expect("a version-1 pending line still loads");
+        let err = format!("{:#}", store.list(t(1_100)).unwrap_err());
 
-        assert_eq!(ids(&listed), vec!["q-before-rename"]);
-        assert_eq!(listed[0].version, PENDING_RECORD_VERSION);
-        assert_eq!(listed[0].state, PendingState::Open);
-        assert_eq!(
-            ids(&store.load_pending(t(1_100)).unwrap()),
-            vec!["q-before-rename"]
-        );
+        assert!(err.contains("pending store"), "{err}");
+        assert!(err.contains("line 1"), "{err}");
+        assert!(err.contains("is version 1"), "{err}");
         assert!(
-            fs::read_to_string(store.path())
-                .unwrap()
-                .contains("q-before-rename"),
-            "a loadable file is left where it is"
+            err.contains(&format!("writes version {PENDING_RECORD_VERSION}")),
+            "{err}"
+        );
+        assert!(err.contains("no migration exists"), "{err}");
+        assert!(err.contains("move the file aside"), "{err}");
+        assert!(store.load_pending(t(1_100)).is_err());
+        let path = store.path().to_path_buf();
+        let correlations = Correlations::new();
+        assert!(correlations.attach_store(store, t(1_100)).is_err());
+        assert!(correlations.list().is_empty(), "no record is surfaced");
+        assert!(
+            fs::read_to_string(path).unwrap().contains("q-before-bump"),
+            "a refused file is left where it is"
         );
     }
 
     #[test]
-    fn usage_probe_a_version_1_inbound_line_written_before_scope_still_loads() {
-        // Same MUST NOT as the pending store: `INBOUND_RECORD_VERSION` stays 1 across the
-        // SCOPE rename (TASK-108 owns any pending/inbound bump).
-        let tmp = TempDir::new("inbound-v1-before-scope");
+    fn a_version_1_inbound_line_from_before_the_parts_bump_is_refused() {
+        // Same as the pending store: TASK-108 bumped the inbound record 1 -> 2 (thread,
+        // kind, paths, reason) and a pre-bump line is refused, not migrated.
+        let tmp = TempDir::new("inbound-v1-before-bump");
         let store = InboundStore::new(&tmp.path, "inst");
         let line = concat!(
-            r#"{"version":1,"id":"peer-q-before-rename","#,
+            r#"{"version":1,"id":"peer-q-before-bump","#,
             r#""peer_destination":"abababababababababababababababab","#,
             r#""peer_identity":"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd","#,
             r#""question":"what does the envoy think?","#,
@@ -1111,19 +1185,26 @@ mod tests {
         fs::create_dir_all(store.path().parent().unwrap()).unwrap();
         fs::write(store.path(), line).unwrap();
 
-        let listed = store
-            .list(t(1_100))
-            .expect("a version-1 inbound line still loads");
+        let err = format!("{:#}", store.list(t(1_100)).unwrap_err());
 
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].id, "peer-q-before-rename");
-        assert_eq!(listed[0].version, INBOUND_RECORD_VERSION);
-        assert_eq!(
-            store
-                .get("peer-q-before-rename")
+        assert!(err.contains("inbound store"), "{err}");
+        assert!(err.contains("line 1"), "{err}");
+        assert!(err.contains("is version 1"), "{err}");
+        assert!(
+            err.contains(&format!("writes version {INBOUND_RECORD_VERSION}")),
+            "{err}"
+        );
+        assert!(err.contains("no migration exists"), "{err}");
+        assert!(err.contains("move the file aside"), "{err}");
+        assert!(
+            store.get("peer-q-before-bump").is_err(),
+            "no record of a refused store is readable"
+        );
+        assert!(
+            fs::read_to_string(store.path())
                 .unwrap()
-                .map(|r| r.question),
-            Some("what does the envoy think?".to_string())
+                .contains("peer-q-before-bump"),
+            "a refused file is left where it is"
         );
     }
 
@@ -1166,9 +1247,13 @@ mod tests {
             id: id.to_string(),
             peer_destination: hex_lower(&[0xab; 16]),
             peer_identity: hex_lower(&[0xcd; 16]),
+            thread: id.to_string(),
             question: format!("question {id}"),
             envoy_question: format!("proposal {id}"),
             received_at: rfc3339_utc(received_at),
+            kind: InboundKind::Question,
+            paths: Vec::new(),
+            reason: String::new(),
         }
     }
 
@@ -1365,8 +1450,14 @@ mod tests {
         assert!(err.contains(&store.path().display().to_string()), "{err}");
         assert!(err.contains("inbound store"), "{err}");
         assert!(err.contains("line 1"), "{err}");
-        assert!(err.contains("version 2"), "{err}");
-        assert!(err.contains("version 1"), "{err}");
+        assert!(
+            err.contains(&format!("version {}", INBOUND_RECORD_VERSION + 1)),
+            "{err}"
+        );
+        assert!(
+            err.contains(&format!("version {INBOUND_RECORD_VERSION}")),
+            "{err}"
+        );
         assert!(err.contains("upgrade Coyote"), "{err}");
         assert!(err.contains("move the file aside"), "{err}");
         assert!(
@@ -1429,6 +1520,37 @@ mod tests {
         assert!(err.contains("line 1"), "{err}");
         assert!(err.contains("inbound question"), "{err}");
         assert!(err.contains("added_later"), "{err}");
+    }
+
+    #[test]
+    fn an_inbound_line_without_the_access_placeholders_loads_as_a_question() {
+        let tmp = TempDir::new("inbound-access-defaults");
+        let store = InboundStore::new(&tmp.path, "inst");
+        let mut question = serde_json::to_value(inbound("q", t(1_000))).unwrap();
+        let fields = question.as_object_mut().unwrap();
+        for placeholder in ["kind", "paths", "reason"] {
+            assert!(fields.remove(placeholder).is_some());
+        }
+        assert_eq!(
+            question["version"],
+            serde_json::json!(INBOUND_RECORD_VERSION)
+        );
+        let mut access = serde_json::to_value(inbound("a", t(1_001))).unwrap();
+        access["kind"] = serde_json::json!("access");
+        access["paths"] = serde_json::json!(["src/x.rs"]);
+        access["reason"] = serde_json::json!("need it");
+        fs::create_dir_all(store.path().parent().unwrap()).unwrap();
+        fs::write(store.path(), format!("{access}\n{question}\n")).unwrap();
+
+        let listed = store.list(t(1_001)).unwrap();
+
+        assert_eq!(inbound_ids(&listed), vec!["a", "q"]);
+        assert_eq!(listed[1].kind, InboundKind::Question);
+        assert!(listed[1].paths.is_empty());
+        assert!(listed[1].reason.is_empty());
+        assert_eq!(listed[0].kind, InboundKind::Access);
+        assert_eq!(listed[0].paths, vec!["src/x.rs".to_string()]);
+        assert_eq!(listed[0].reason, "need it");
     }
 
     #[test]
@@ -1762,6 +1884,166 @@ mod tests {
         assert_eq!(
             ids(&PendingStore::new(&tmp.path, "inst").list(now).unwrap()),
             vec!["answered"]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_escalated_reply_keeps_the_question_pending_across_a_reopen() {
+        let tmp = TempDir::new("pending-escalated");
+        let now = SystemTime::now();
+        let identity = hex_lower(&[0xcd; 16]);
+        let first = Correlations::new();
+        first
+            .attach_store(PendingStore::new(&tmp.path, "inst"), now)
+            .unwrap();
+        first.open(record("q1", now, PendingState::Open)).unwrap();
+
+        assert!(first.answer("q1", reply_with("q1", Disposition::Escalated, None)));
+
+        let listed = first.list();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].record.state, PendingState::Escalated);
+        assert!(listed[0].record.reply.is_none());
+        assert!(listed[0].reply.is_none());
+        assert_eq!(
+            first.wait("q1", Duration::from_millis(10)).await,
+            WaitOutcome::Escalated
+        );
+        assert!(first.is_open("q1"));
+        assert!(first.accepts_reply_from("q1", &identity));
+        assert_eq!(first.take_answer("q1"), None, "nothing to collect yet");
+        drop(first);
+
+        let second = Correlations::new();
+        assert_eq!(
+            second
+                .attach_store(PendingStore::new(&tmp.path, "inst"), now)
+                .unwrap(),
+            1
+        );
+        let listed = second.list();
+        assert_eq!(listed[0].record.state, PendingState::Escalated);
+        assert_eq!(
+            second.wait("q1", Duration::from_millis(10)).await,
+            WaitOutcome::Escalated
+        );
+        assert!(second.accepts_reply_from("q1", &identity));
+
+        let answer = reply_with("q1", Disposition::Answered, None);
+        assert!(second.answer("q1", answer.clone()));
+        assert_eq!(
+            second.wait("q1", Duration::from_millis(10)).await,
+            WaitOutcome::Replied(Box::new(answer.clone()))
+        );
+        assert!(!second.accepts_reply_from("q1", &identity));
+        assert_eq!(second.take_answer("q1"), Some(answer));
+    }
+
+    fn a_closing_disposition_ends_the_question(disposition: Disposition, retry_after: u32) {
+        let correlations = Correlations::new();
+        correlations
+            .open(record("q1", t(1_000), PendingState::Open))
+            .unwrap();
+
+        assert!(correlations.answer("q1", reply_with("q1", disposition, Some(retry_after))));
+
+        assert_eq!(
+            correlations.get("q1").unwrap().record.state,
+            PendingState::Answered
+        );
+        assert!(!correlations.is_open("q1"));
+        assert!(
+            !correlations.answer("q1", reply_with("q1", Disposition::Answered, None)),
+            "the question is closed to a second reply"
+        );
+        let reply = correlations.take_answer("q1").unwrap();
+        assert_eq!(reply.disposition(), disposition);
+        assert_eq!(reply.retry_after, Some(retry_after));
+        assert!(correlations.get("q1").is_none());
+    }
+
+    #[test]
+    fn a_refused_reply_closes_the_question_with_its_disposition_and_retry_after() {
+        a_closing_disposition_ends_the_question(Disposition::Refused, 90);
+    }
+
+    #[test]
+    fn a_budget_exhausted_reply_closes_the_question_like_a_refusal() {
+        a_closing_disposition_ends_the_question(Disposition::BudgetExhausted, 3600);
+    }
+
+    #[test]
+    fn thread_is_persisted_on_pending_and_inbound_records() {
+        let tmp = TempDir::new("pending-thread");
+        let now = SystemTime::now();
+        let correlations = Correlations::new();
+        correlations
+            .attach_store(PendingStore::new(&tmp.path, "inst"), now)
+            .unwrap();
+        correlations
+            .open(PendingRecord {
+                thread: "t-root".into(),
+                ..record("q1", now, PendingState::Open)
+            })
+            .unwrap();
+        assert_eq!(correlations.thread_of("q1"), Some("t-root".to_string()));
+        assert_eq!(correlations.thread_of("nope"), None);
+        InboundStore::new(&tmp.path, "inst")
+            .upsert(
+                InboundRecord {
+                    thread: "t-in".into(),
+                    ..inbound("peer-q", now)
+                },
+                now,
+            )
+            .unwrap();
+
+        let reopened = Correlations::new();
+        reopened
+            .attach_store(PendingStore::new(&tmp.path, "inst"), now)
+            .unwrap();
+        assert_eq!(reopened.get("q1").unwrap().record.thread, "t-root");
+        assert_eq!(reopened.thread_of("q1"), Some("t-root".to_string()));
+        assert_eq!(
+            InboundStore::new(&tmp.path, "inst")
+                .get("peer-q")
+                .unwrap()
+                .unwrap()
+                .thread,
+            "t-in"
+        );
+    }
+
+    #[test]
+    fn evict_drops_an_answered_record_before_an_escalated_one() {
+        let tmp = TempDir::new("pending-evict-escalated");
+        let store = PendingStore::new(&tmp.path, "inst");
+        let base = 1_000_000;
+        let mut records: Vec<PendingRecord> = (1..=PENDING_MAX_ENTRIES)
+            .rev()
+            .map(|n| record(&format!("q{n}"), t(base + n as u64), PendingState::Open))
+            .collect();
+        records[PENDING_MAX_ENTRIES / 2] = PendingRecord {
+            reply: Some(reply_to("answered")),
+            ..record(
+                "answered",
+                t(base + (PENDING_MAX_ENTRIES / 2) as u64),
+                PendingState::Answered,
+            )
+        };
+        records.push(record("escalated", t(base), PendingState::Escalated));
+        assert_eq!(records.len(), PENDING_MAX_ENTRIES + 1);
+        store.write_all(&records).unwrap();
+
+        assert_eq!(store.prune(t(base + 10_000)).unwrap(), 1);
+
+        let listed = store.list(t(base + 10_000)).unwrap();
+        assert_eq!(listed.len(), PENDING_MAX_ENTRIES);
+        assert!(!ids(&listed).contains(&"answered"), "the answered one goes");
+        assert_eq!(
+            listed.last().map(|record| record.id.as_str()),
+            Some("escalated"),
+            "the oldest, still awaiting a reply, stays"
         );
     }
 }

@@ -29,17 +29,19 @@ use crate::mesh::knock::{
 use crate::mesh::knocks::{KNOCK_INTRO_MAX_CHARS, KNOCK_RECORD_VERSION, KnockRecord};
 use crate::mesh::limits::{PEER_RETRY_AFTER_CAPACITY, PeerRefusal, RefusalReason};
 use crate::mesh::message::{
-    OutboundPeer, PEER_CONTENT_MAX_CHARS, PEER_FIELDS_MAX_BYTES, PEER_FIELDS_MAX_DEPTH,
-    PEER_ID_MAX_CHARS, PEER_MESSAGE_TYPE, PEER_TITLE_MAX_CHARS, PEER_WIRE_VERSION, PeerBody,
-    PeerKind, PeerLxmf, PeerMessage, PeerVia, RawPeerMessage, SendError, decode_peer_lxmf,
-    from_r3_body, is_received_reply, is_wire_id, peer_lxmf_message, received_reply, to_r3_body,
+    Disposition, LxmfPeer, OutboundPeer, PEER_CONTENT_MAX_CHARS, PEER_FIELDS_MAX_BYTES,
+    PEER_FIELDS_MAX_DEPTH, PEER_ID_MAX_CHARS, PEER_MESSAGE_TYPE, PEER_TITLE_MAX_CHARS,
+    PEER_WIRE_VERSION, PeerBody, PeerKind, PeerLxmf, PeerMessage, PeerVia, RawPeerMessage,
+    SendError, decode_peer_lxmf, from_r3_body, is_received_reply, is_wire_id, peer_lxmf_message,
+    received_reply, to_r3_body,
 };
 use crate::mesh::peers::{
     PEER_STALE_AFTER, PEER_TABLE_MAX_ENTRIES, PEER_TABLE_VERSION, PEER_TTL, PeerRecord,
     PeerSighting, PeerTable, PeerTableFile,
 };
 use crate::mesh::pending::{
-    INBOUND_RECORD_VERSION, InboundRecord, PENDING_RECORD_VERSION, PendingRecord, PendingState,
+    INBOUND_RECORD_VERSION, InboundKind, InboundRecord, PENDING_RECORD_VERSION, PendingRecord,
+    PendingState,
 };
 use crate::mesh::propagation::{
     MAX_ACCEPTED_STAMP_COST, OutboundMessage, PropagationError, PropagationNode,
@@ -240,7 +242,7 @@ enum CardAction {
 
 #[derive(Debug, PartialEq)]
 enum BodyAction {
-    Accepted(PeerBody),
+    Accepted(Box<PeerBody>),
     InvalidData(&'static str),
 }
 
@@ -408,7 +410,7 @@ fn run(case: &Case) -> Result<(), String> {
         }
         Case::MessageBody { value, expect } => {
             let observed = match from_r3_body(value) {
-                Ok(body) => BodyAction::Accepted(body),
+                Ok(body) => BodyAction::Accepted(Box::new(body)),
                 Err(reason) => BodyAction::InvalidData(reason),
             };
             same("from_r3_body", &observed, expect)
@@ -740,11 +742,15 @@ fn body() -> PeerBody {
         content: "hi".to_string(),
         fields: None,
         timestamp: 1.5,
+        thread: None,
+        disposition: None,
+        retry_after: None,
+        parts: Vec::new(),
     }
 }
 
 fn accepted_body(body: PeerBody) -> BodyAction {
-    BodyAction::Accepted(body)
+    BodyAction::Accepted(Box::new(body))
 }
 
 /// `depth` maps nested in one another, the innermost empty.
@@ -843,7 +849,7 @@ fn peer_text(
     content: &str,
     fields: Option<serde_json::Value>,
 ) -> PeerLxmf {
-    PeerLxmf::Peer {
+    PeerLxmf::Peer(Box::new(LxmfPeer {
         name_hash: ORIGIN,
         kind,
         id: id.to_string(),
@@ -851,7 +857,11 @@ fn peer_text(
         title: title.map(str::to_string),
         content: content.to_string(),
         fields,
-    }
+        thread: None,
+        disposition: (kind == PeerKind::Reply).then_some(Disposition::Answered),
+        retry_after: None,
+        parts: Vec::new(),
+    }))
 }
 
 fn verdict(decision: Decision, rule: Rule) -> Verdict {
@@ -871,6 +881,10 @@ fn raw(fields: Option<serde_json::Value>, title: Option<&str>, content: &str) ->
         in_reply_to: None,
         kind: PeerKind::Message,
         via: PeerVia::StoreAndForward,
+        thread: None,
+        disposition: None,
+        retry_after: None,
+        parts: Vec::new(),
     }
 }
 
@@ -3780,8 +3794,8 @@ fn code_vectors() -> Vec<Vector> {
             Case::Registry(|| {
                 same("TRUST_FILE_VERSION", TRUST_FILE_VERSION, 2)?;
                 same("KNOCK_RECORD_VERSION", KNOCK_RECORD_VERSION, 2)?;
-                same("PENDING_RECORD_VERSION", PENDING_RECORD_VERSION, 1)?;
-                same("INBOUND_RECORD_VERSION", INBOUND_RECORD_VERSION, 1)?;
+                same("PENDING_RECORD_VERSION", PENDING_RECORD_VERSION, 2)?;
+                same("INBOUND_RECORD_VERSION", INBOUND_RECORD_VERSION, 2)?;
                 same("PREDECESSOR_RECORD_VERSION", PREDECESSOR_RECORD_VERSION, 1)?;
                 same("PEER_TABLE_VERSION", PEER_TABLE_VERSION, 2)?;
                 same("PROPAGATION_STORE_VERSION", PROPAGATION_STORE_VERSION, 1)
@@ -3846,6 +3860,7 @@ fn code_vectors() -> Vec<Vector> {
                         id: "q1".to_string(),
                         peer_destination: "0b".repeat(16),
                         peer_identity: "0a".repeat(16),
+                        thread: "q1".to_string(),
                         question: "what time is it".to_string(),
                         sent_at: "2027-01-15T05:13:20Z".to_string(),
                         timeout_at: "2027-01-15T05:23:20Z".to_string(),
@@ -3860,9 +3875,13 @@ fn code_vectors() -> Vec<Vector> {
                         id: "q1".to_string(),
                         peer_destination: "0b".repeat(16),
                         peer_identity: "0a".repeat(16),
+                        thread: "q1".to_string(),
                         question: "what time is it".to_string(),
                         envoy_question: String::new(),
                         received_at: "2027-01-15T05:13:20Z".to_string(),
+                        kind: InboundKind::Question,
+                        paths: Vec::new(),
+                        reason: String::new(),
                     },
                 )?;
                 refuses_an_unknown_key(
@@ -5937,6 +5956,7 @@ fn message_vectors() -> Vec<Vector> {
             set(body_value(), "kind", Value::from("reply")),
             accepted_body(PeerBody {
                 kind: PeerKind::Reply,
+                disposition: Some(Disposition::Answered),
                 ..body()
             }),
         ),
@@ -6938,6 +6958,7 @@ fn message_vectors() -> Vec<Vector> {
                 expect: accepted_body(PeerBody {
                     kind: PeerKind::Reply,
                     in_reply_to: Some("m-0".to_string()),
+                    disposition: Some(Disposition::Answered),
                     fields: Some(
                         serde_json::json!({ "refusal": "out_of_coffee", "retry_after_secs": 60 }),
                     ),
@@ -6961,6 +6982,7 @@ fn message_vectors() -> Vec<Vector> {
                 expect: accepted_body(PeerBody {
                     kind: PeerKind::Reply,
                     in_reply_to: Some("m-0".to_string()),
+                    disposition: Some(Disposition::Answered),
                     fields: Some(serde_json::json!({ "retry_after_secs": 60 })),
                     ..body()
                 }),
@@ -6985,6 +7007,7 @@ fn message_vectors() -> Vec<Vector> {
                 expect: accepted_body(PeerBody {
                     kind: PeerKind::Reply,
                     in_reply_to: Some("m-0".to_string()),
+                    disposition: Some(Disposition::Answered),
                     fields: Some(
                         serde_json::json!({ "refusal": "rate_limited", "retry_after_secs": "soon" }),
                     ),
@@ -7055,6 +7078,7 @@ fn message_vectors() -> Vec<Vector> {
                 expect: accepted_body(PeerBody {
                     kind: PeerKind::Reply,
                     in_reply_to: Some("m-0".to_string()),
+                    disposition: Some(Disposition::Answered),
                     fields: Some(
                         serde_json::json!({ "refusal": "envoy_busy", "retry_after_secs": 120, "operator_note": "back soon" }),
                     ),

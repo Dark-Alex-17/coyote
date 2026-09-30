@@ -11,6 +11,7 @@ use crate::mesh::events::{
 };
 use crate::mesh::identity::IdentityLock;
 use crate::mesh::idle::{IdleNotify, IdleSink, Origin};
+use crate::mesh::inbox::InboxStaging;
 use crate::mesh::knock::{
     ChannelKnockSink, KNOCK_LINK_TIMEOUT, KNOCK_QUEUE_CAPACITY, KNOCK_REQUEST_TIMEOUT, KnockError,
     KnockGate, KnockIntro, KnockOutcome, KnockRouting, KnockSurface, KnockVia, drain_knocks,
@@ -20,9 +21,9 @@ use crate::mesh::knocks::KnockCache;
 use crate::mesh::limits::{FoldNotice, PeerLimitConfig, PeerLimits, PeerRefusal, RefusalReason};
 use crate::mesh::lock::InstanceLock;
 use crate::mesh::message::{
-    CHECK_INBOX_NEXT_ACTION, ModelNotes, OutboundPeer, PEER_LINE_MAX_CHARS, PeerAdmission,
-    PeerInbox, PeerKind, PeerMessage, PeerMessageHandler, PeerRouting, PeerSurface, PeerVia,
-    RawPeerMessage, collect_next_action, unix_now,
+    CHECK_INBOX_NEXT_ACTION, Disposition, ModelNotes, OutboundPeer, PEER_LINE_MAX_CHARS,
+    PartLimits, PeerAdmission, PeerInbox, PeerKind, PeerMessage, PeerMessageHandler, PeerRouting,
+    PeerSurface, PeerVia, RawPeerMessage, collect_next_action, unix_now,
 };
 use crate::mesh::notify::{Notification, NotificationSink, Source};
 use crate::mesh::peers::{PEER_TABLE_MAX_ENTRIES, PeerChange, PeerSighting, PeerTable};
@@ -229,6 +230,7 @@ pub(crate) struct MeshRuntime {
     display_name: Option<String>,
     about: Option<String>,
     peer_limits: PeerLimitConfig,
+    inline_max_bytes: u64,
     cache_dir: PathBuf,
     interface_labels: Vec<String>,
     interface_kinds: Vec<&'static str>,
@@ -386,6 +388,7 @@ impl MeshRuntime {
             display_name: config.display_name.clone(),
             about: config.about.clone(),
             peer_limits: PeerLimitConfig::from(config),
+            inline_max_bytes: config.fetch.inline_max_bytes,
             cache_dir: paths.cache_dir,
             interface_labels: plans.iter().map(InterfacePlan::label).collect(),
             interface_kinds: plans.iter().map(InterfacePlan::kind).collect(),
@@ -498,6 +501,13 @@ impl MeshRuntime {
     /// The per-peer ceilings the node was started with, for the slot that installs it.
     pub(crate) fn peer_limits(&self) -> PeerLimitConfig {
         self.peer_limits
+    }
+
+    /// The ceilings an inbound message's parts are admitted under.
+    pub(crate) fn part_limits(&self) -> PartLimits {
+        PartLimits {
+            inline_max_bytes: self.inline_max_bytes,
+        }
     }
 
     /// Test oracle: `destination_hash` read under the destination lock, checked against the cache.
@@ -2269,6 +2279,10 @@ impl MeshSlot {
             in_reply_to: Some(original.message_id.clone()),
             kind: PeerKind::Reply,
             via: PeerVia::Direct,
+            thread: Some(original.thread().to_string()),
+            disposition: None,
+            retry_after: None,
+            parts: Vec::new(),
         });
         let who = self.peer_name(original);
         let asked = match original.kind {
@@ -2374,7 +2388,9 @@ impl MeshSlot {
                 short(&record.peer_destination)
             );
         };
-        let reply = OutboundPeer::new(PeerKind::Reply, text, None, Some(id), None)?;
+        let reply = OutboundPeer::new(PeerKind::Reply, text, None, Some(id), None)?
+            .with_thread(Some(record.thread.clone()))?
+            .with_disposition(Disposition::Answered, None);
         runtime.send_peer(&record.peer_destination, &reply).await?;
         store.remove(id)?;
         self.record_human_answer(&record, text);
@@ -2405,6 +2421,10 @@ impl MeshSlot {
             in_reply_to: Some(record.id.clone()),
             kind: PeerKind::Reply,
             via: PeerVia::Direct,
+            thread: Some(record.thread.clone()),
+            disposition: None,
+            retry_after: None,
+            parts: Vec::new(),
         });
         let dest8 = short(&record.peer_destination).to_string();
         let text = format!(
@@ -2427,9 +2447,16 @@ impl MeshSlot {
         });
     }
 
-    /// Matches a reply to the question of ours it answers. A reply that answers nothing
-    /// is downgraded to a message, since to this node it is one; `true` when it matched.
+    /// Matches a reply to the question of ours it answers; a reply that named no thread
+    /// inherits the question's. A reply that answers nothing is downgraded to a message,
+    /// since to this node it is one; `true` when it matched.
     fn answer_correlation(&self, message: &mut PeerMessage) -> bool {
+        if message.kind == PeerKind::Reply
+            && message.thread.is_none()
+            && let Some(id) = message.in_reply_to.as_deref()
+        {
+            message.thread = self.correlations.thread_of(id);
+        }
         let answered = message.kind == PeerKind::Reply
             && message
                 .in_reply_to
@@ -2727,6 +2754,19 @@ impl PeerSurface for MeshSlot {
     fn local_destination(&self) -> Option<String> {
         self.get().map(|runtime| runtime.current_destination_hash())
     }
+
+    fn part_limits(&self) -> PartLimits {
+        self.get()
+            .map(|runtime| runtime.part_limits())
+            .unwrap_or_default()
+    }
+
+    /// The running instance's inbox; with the mesh off there is nowhere to stage a file.
+    fn inbox_staging(&self) -> Option<InboxStaging> {
+        self.get().map(|runtime| {
+            InboxStaging::for_instance(runtime.cache_dir(), &runtime.current_instance_id())
+        })
+    }
 }
 
 // Tests that start a runtime are unix-only: they run on the loopback fixtures under
@@ -2746,8 +2786,8 @@ mod tests {
     #[cfg(unix)]
     use crate::mesh::peers::{PEER_TABLE_VERSION, PeerTableFile};
     use crate::mesh::pending::{
-        DEFAULT_COLLECT_TIMEOUT, INBOUND_RECORD_VERSION, InboundRecord, PENDING_RECORD_VERSION,
-        PendingState,
+        DEFAULT_COLLECT_TIMEOUT, INBOUND_RECORD_VERSION, InboundKind, InboundRecord,
+        PENDING_RECORD_VERSION, PendingState,
     };
     use crate::mesh::propagation_fetch::InboundMessage;
     use crate::mesh::r3::{
@@ -3193,6 +3233,11 @@ mod tests {
             in_reply_to: in_reply_to.map(str::to_string),
             kind,
             via: PeerVia::Direct,
+            thread: None,
+            disposition: None,
+            retry_after: None,
+            parts: Vec::new(),
+            dropped_parts: 0,
         }
     }
 
@@ -3203,6 +3248,7 @@ mod tests {
             id: id.to_string(),
             peer_destination: hex_lower(&PEER_INSTANCE),
             peer_identity: hex_lower(&PEER_IDENTITY),
+            thread: id.to_string(),
             question: "what now".to_string(),
             sent_at: rfc3339_utc(now),
             timeout_at: rfc3339_utc(now + DEFAULT_COLLECT_TIMEOUT),
@@ -4347,9 +4393,13 @@ mod tests {
             id: id.to_string(),
             peer_destination: hex_lower(&PEER_INSTANCE),
             peer_identity: hex_lower(&PEER_IDENTITY),
+            thread: id.to_string(),
             question: format!("words of {id}"),
             envoy_question: String::new(),
             received_at: rfc3339_utc(SystemTime::now()),
+            kind: InboundKind::Question,
+            paths: Vec::new(),
+            reason: String::new(),
         }
     }
 
@@ -5207,6 +5257,10 @@ mod tests {
             title: None,
             content: "secret body".to_string(),
             fields: None,
+            parts: Vec::new(),
+            thread: None,
+            disposition: None,
+            retry_after: None,
         };
 
         let err = runtime.send_peer(&destination, &message).await.unwrap_err();
@@ -5337,6 +5391,10 @@ mod tests {
             title: Some("plan".to_string()),
             content: "the secret words for the peer".to_string(),
             fields: None,
+            parts: Vec::new(),
+            thread: None,
+            disposition: None,
+            retry_after: None,
         };
 
         let sent = runtime.send_peer(&to, &message).await.unwrap();
@@ -5368,6 +5426,10 @@ mod tests {
             title: None,
             content: "the bulletin words for everyone".to_string(),
             fields: None,
+            parts: Vec::new(),
+            thread: None,
+            disposition: None,
+            retry_after: None,
         };
 
         let outcome = runtime.broadcast(&bulletin).await.unwrap();
@@ -6232,6 +6294,10 @@ mod tests {
             in_reply_to: None,
             kind: PeerKind::Message,
             via: PeerVia::Direct,
+            thread: None,
+            disposition: None,
+            retry_after: None,
+            parts: Vec::new(),
         });
 
         slot.deliver_peer(message);

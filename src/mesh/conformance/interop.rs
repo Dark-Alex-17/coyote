@@ -963,6 +963,10 @@ async fn a_message_spooled_while_the_receiver_is_off_is_delivered_after_it_rejoi
         title: None,
         content: "words for later".to_string(),
         fields: None,
+        parts: Vec::new(),
+        thread: None,
+        disposition: None,
+        retry_after: None,
     };
     let sent = tokio::time::timeout(
         STORE_AND_FORWARD_TIMEOUT,
@@ -1180,6 +1184,10 @@ async fn our_requests_are_decoded_by_the_reference() {
         title: Some("plan".to_string()),
         content: "words for the reference".to_string(),
         fields: None,
+        parts: Vec::new(),
+        thread: None,
+        disposition: None,
+        retry_after: None,
     };
     let sent = node
         .runtime
@@ -1278,6 +1286,10 @@ async fn a_propagation_node_demanding_a_raised_stamp_cost_still_takes_our_messag
         title: Some("held".to_string()),
         content: "words for later".to_string(),
         fields: None,
+        parts: Vec::new(),
+        thread: None,
+        disposition: None,
+        retry_after: None,
     };
     let sent = tokio::time::timeout(
         STORE_AND_FORWARD_TIMEOUT,

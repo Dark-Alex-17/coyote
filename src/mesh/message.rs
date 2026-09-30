@@ -6,8 +6,10 @@
 //! a `PeerMessage` over and answer at once. Nothing on either inbound path waits on the
 //! model.
 
+use crate::config::mesh_config::{DEFAULT_INLINE_MAX_BYTES, MAX_INLINE_FILE_TOTAL};
 use crate::mesh::card::DISPLAY_NAME_MAX_CHARS;
 use crate::mesh::events::MeshEvent;
+use crate::mesh::inbox::InboxStaging;
 use crate::mesh::limits::PeerRefusal;
 use crate::mesh::node::MeshRuntime;
 use crate::mesh::peers::PeerRecord;
@@ -19,6 +21,7 @@ use crate::mesh::r3::{
     R3Error, RefusalCode, Reply, RequestOptions, redact_hashes, short,
 };
 use crate::mesh::trust::{Decision, TrustStore};
+use crate::mesh::wire_path::WirePath;
 use crate::mesh::{canonical_hash, decode_hex, destination_address, display_text, hex_lower};
 use crate::supervisor::mailbox::{Envelope, EnvelopePayload, Inbox};
 use crate::supervisor::notification::{
@@ -33,8 +36,10 @@ use rmpv::Value;
 use rns_transport::destination::{DestinationDesc, DestinationName};
 use rns_transport::hash::AddressHash;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -54,6 +59,12 @@ pub(crate) const PEER_ID_MAX_CHARS: usize = 64;
 /// message kept, since the words are what the user asked for.
 pub(crate) const PEER_FIELDS_MAX_BYTES: usize = 4_096;
 pub(crate) const PEER_FIELDS_MAX_DEPTH: usize = 8;
+pub(crate) const MAX_PARTS: usize = 8;
+/// Ceiling on the msgpack-encoded `parts` array. With content, title, fields and every id
+/// at their caps beside it, this is what keeps a message under the 128 KiB LXMF bound on
+/// the store-and-forward route, with room for the LXMF header (user ruling 2026-09-30).
+pub(crate) const MAX_PARTS_BYTES: usize = 104 * 1024;
+const SHA256_MISMATCH: &str = "file part sha256 does not match its bytes";
 /// Peer envelopes the inbox holds before the oldest is dropped; the loss is counted.
 pub(crate) const PEER_INBOX_CAPACITY: usize = 64;
 /// Ceiling on the direct attempt. The handler answers before anything slow happens, so a
@@ -122,6 +133,98 @@ pub(crate) enum PeerVia {
     StoreAndForward,
 }
 
+/// What a reply says about the question it names. Only a `kind: reply` carries one; an
+/// unknown wire value reads as `Answered`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Disposition {
+    #[default]
+    Answered,
+    /// The peer's human has been asked; the correlation stays open for a later answer.
+    Escalated,
+    Refused,
+    BudgetExhausted,
+}
+
+impl Disposition {
+    pub(crate) fn wire_name(self) -> &'static str {
+        match self {
+            Self::Answered => "answered",
+            Self::Escalated => "escalated",
+            Self::Refused => "refused",
+            Self::BudgetExhausted => "budget_exhausted",
+        }
+    }
+
+    fn from_wire_name(name: &str) -> Option<Self> {
+        [
+            Self::Answered,
+            Self::Escalated,
+            Self::Refused,
+            Self::BudgetExhausted,
+        ]
+        .into_iter()
+        .find(|disposition| disposition.wire_name() == name)
+    }
+}
+
+/// The configured ceilings a part is admitted under, the same on both routes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PartLimits {
+    pub inline_max_bytes: u64,
+}
+
+impl Default for PartLimits {
+    fn default() -> Self {
+        Self {
+            inline_max_bytes: DEFAULT_INLINE_MAX_BYTES,
+        }
+    }
+}
+
+/// One `parts` element as it travels: hand-encoded, so an inline file's bytes exist only
+/// here and in the staging inbox they are written to.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum RawPart {
+    Text {
+        text: String,
+    },
+    Data {
+        data: serde_json::Value,
+    },
+    File {
+        name: String,
+        size: u64,
+        sha256: [u8; 32],
+        /// Inline bytes; a reference file carries `reference` instead, never both.
+        bytes: Option<Vec<u8>>,
+        reference: Option<String>,
+    },
+}
+
+/// A part as the pending store, an inbox envelope and a tool result see it. Never the
+/// bytes: an inline file is a path in the staging inbox by the time anyone reads this.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub(crate) enum Part {
+    Text {
+        text: String,
+    },
+    Data {
+        data: serde_json::Value,
+    },
+    File {
+        name: String,
+        size: u64,
+        /// Lower-hex.
+        sha256: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        staged: Option<PathBuf>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reference: Option<String>,
+    },
+}
+
 /// One message as it lands, LXMF-shaped: who sent it, where it arrived, the words and the
 /// routing. Every peer-supplied string has been capped and sanitised by `new`, so a
 /// consumer may show or store any field as it is. Serde serves two readers: the pending
@@ -148,6 +251,18 @@ pub(crate) struct PeerMessage {
     pub in_reply_to: Option<String>,
     pub kind: PeerKind,
     pub via: PeerVia,
+    /// The conversation this message belongs to; `thread()` falls back to its own id.
+    #[serde(default)]
+    pub thread: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disposition: Option<Disposition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after: Option<u32>,
+    #[serde(default)]
+    pub parts: Vec<Part>,
+    /// Parts the sender attached that did not survive admission or staging.
+    #[serde(default)]
+    pub dropped_parts: u32,
 }
 
 /// `PeerMessage` before sanitising: what a codec read off the wire.
@@ -163,13 +278,37 @@ pub(crate) struct RawPeerMessage {
     pub in_reply_to: Option<String>,
     pub kind: PeerKind,
     pub via: PeerVia,
+    pub thread: Option<String>,
+    pub disposition: Option<Disposition>,
+    pub retry_after: Option<u32>,
+    pub parts: Vec<RawPart>,
 }
 
 impl PeerMessage {
     /// The one place peer text is cleaned: title, content and ids are capped and stripped
     /// of escapes and invisible characters, and `fields` loses every string leaf's
     /// escapes too or is dropped whole when it nests or weighs more than the caps allow.
+    /// Parts are admitted under the default limits with nowhere to stage an inline file.
     pub(crate) fn new(raw: RawPeerMessage) -> Self {
+        Self::new_with(raw, &PartLimits::default(), None)
+    }
+
+    /// `new` with the node's part limits and its staging inbox: an inline file is written
+    /// there and kept as its path, dropped and counted when there is no inbox or the write
+    /// fails. Runs on a blocking thread on the request path, since it touches the disk.
+    pub(crate) fn new_with(
+        raw: RawPeerMessage,
+        limits: &PartLimits,
+        staging: Option<&InboxStaging>,
+    ) -> Self {
+        let (admitted, mut dropped_parts) = admit_parts(raw.parts, limits);
+        let mut parts = Vec::with_capacity(admitted.len());
+        for part in admitted {
+            match keep_part(part, &raw.source_destination, staging) {
+                Some(part) => parts.push(part),
+                None => dropped_parts += 1,
+            }
+        }
         Self {
             source_identity: raw.source_identity,
             source_destination: raw.source_destination,
@@ -192,7 +331,25 @@ impl PeerMessage {
                 .and_then(|id| display_text(id, PEER_ID_MAX_CHARS)),
             kind: raw.kind,
             via: raw.via,
+            thread: raw
+                .thread
+                .as_deref()
+                .and_then(|id| display_text(id, PEER_ID_MAX_CHARS)),
+            disposition: raw.disposition,
+            retry_after: raw.retry_after,
+            parts,
+            dropped_parts,
         }
+    }
+
+    /// The conversation this message belongs to: the `thread` it carried, else its own id.
+    pub(crate) fn thread(&self) -> &str {
+        self.thread.as_deref().unwrap_or(&self.message_id)
+    }
+
+    /// `Answered` unless the reply said otherwise; a non-reply never carries one.
+    pub(crate) fn disposition(&self) -> Disposition {
+        self.disposition.unwrap_or_default()
     }
 
     /// `"<name or dest8> says|asks|replies|announces: <words>"`, one terminal line. The
@@ -320,6 +477,264 @@ fn rmpv_from_json(value: &serde_json::Value) -> Value {
     }
 }
 
+/// The msgpack size of `value`. The only error source is the writer, and a `Vec` never
+/// fails to grow; should it, the value reads as past every cap.
+fn packed_len(value: &Value) -> usize {
+    let mut packed = Vec::new();
+    match rmpv::encode::write_value(&mut packed, value) {
+        Ok(()) => packed.len(),
+        Err(_) => usize::MAX,
+    }
+}
+
+/// `parts` as both routes carry it: a list of string-keyed maps, each with a `type`. A
+/// file carries `sha256` as 32 binary bytes and either `bytes` (inline) or `ref: {path}`.
+fn encode_parts(parts: &[RawPart]) -> Value {
+    Value::Array(
+        parts
+            .iter()
+            .map(|part| {
+                Value::Map(match part {
+                    RawPart::Text { text } => vec![
+                        (Value::from("type"), Value::from("text")),
+                        (Value::from("text"), Value::from(text.as_str())),
+                    ],
+                    RawPart::Data { data } => vec![
+                        (Value::from("type"), Value::from("data")),
+                        (Value::from("data"), rmpv_from_json(data)),
+                    ],
+                    RawPart::File {
+                        name,
+                        size,
+                        sha256,
+                        bytes,
+                        reference,
+                    } => {
+                        let mut entries = vec![
+                            (Value::from("type"), Value::from("file")),
+                            (Value::from("name"), Value::from(name.as_str())),
+                            (Value::from("size"), Value::from(*size)),
+                            (Value::from("sha256"), Value::Binary(sha256.to_vec())),
+                        ];
+                        if let Some(bytes) = bytes {
+                            entries.push((Value::from("bytes"), Value::Binary(bytes.clone())));
+                        }
+                        if let Some(path) = reference {
+                            entries.push((
+                                Value::from("ref"),
+                                Value::Map(vec![(Value::from("path"), Value::from(path.as_str()))]),
+                            ));
+                        }
+                        entries
+                    }
+                })
+            })
+            .collect(),
+    )
+}
+
+/// Reads `parts`. Only a value that is not a list is an error; an element that is not a
+/// map, names no known `type` or lacks that type's fields is skipped, so a part this
+/// build does not know never costs the message its words.
+fn decode_parts(value: &Value) -> Result<Vec<RawPart>, &'static str> {
+    let items = value.as_array().ok_or("parts is not a list")?;
+    Ok(items.iter().filter_map(decode_part).collect())
+}
+
+fn decode_part(value: &Value) -> Option<RawPart> {
+    let entries = value.as_map()?;
+    let kind = entry(entries, "type").and_then(text_of)?;
+    match kind.as_str() {
+        "text" => Some(RawPart::Text {
+            text: entry(entries, "text").and_then(text_of)?,
+        }),
+        "data" => Some(RawPart::Data {
+            data: json_from_rmpv(entry(entries, "data")?, 1)?,
+        }),
+        "file" => {
+            let name = entry(entries, "name").and_then(text_of)?;
+            let size = entry(entries, "size").and_then(Value::as_u64)?;
+            let Value::Binary(digest) = entry(entries, "sha256")? else {
+                return None;
+            };
+            let sha256 = <[u8; 32]>::try_from(digest.as_slice()).ok()?;
+            let bytes = match entry(entries, "bytes") {
+                None => None,
+                Some(Value::Binary(bytes)) => Some(bytes.clone()),
+                Some(_) => return None,
+            };
+            let reference = match entry(entries, "ref") {
+                None => None,
+                Some(Value::Map(reference)) => Some(entry(reference, "path").and_then(text_of)?),
+                Some(_) => return None,
+            };
+            if bytes.is_some() == reference.is_some() {
+                return None;
+            }
+            Some(RawPart::File {
+                name,
+                size,
+                sha256,
+                bytes,
+                reference,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The rule `part` breaks, if any, given the inline bytes already admitted before it.
+/// The sender refuses on the first rule; the receiver drops the part and keeps the
+/// message. The text names the rule and nothing of the part, so it can be logged.
+fn part_violation(part: &RawPart, limits: &PartLimits, inline_so_far: u64) -> Option<&'static str> {
+    match part {
+        RawPart::Text { text } => {
+            (text.chars().count() > PEER_CONTENT_MAX_CHARS).then_some("text part is too long")
+        }
+        RawPart::Data { data } => sanitize_fields(data.clone())
+            .is_err()
+            .then_some("data part is too large or nests too deeply"),
+        RawPart::File {
+            name,
+            size,
+            sha256,
+            bytes,
+            reference,
+        } => {
+            if WirePath::parse(name).is_err() {
+                return Some("file part name is not a wire path");
+            }
+            if reference
+                .as_deref()
+                .is_some_and(|path| WirePath::parse(path).is_err())
+            {
+                return Some("file part ref is not a wire path");
+            }
+            let Some(bytes) = bytes else {
+                return None;
+            };
+            if u64::try_from(bytes.len()) != Ok(*size) {
+                return Some("file part size does not match its bytes");
+            }
+            if *size > limits.inline_max_bytes {
+                return Some("file part is over the inline cap");
+            }
+            if inline_so_far.saturating_add(*size) > MAX_INLINE_FILE_TOTAL {
+                return Some("file parts are over the per-message inline total");
+            }
+            if Sha256::digest(bytes).as_slice() != sha256 {
+                return Some(SHA256_MISMATCH);
+            }
+            None
+        }
+    }
+}
+
+fn inline_size(part: &RawPart) -> u64 {
+    match part {
+        RawPart::File {
+            size,
+            bytes: Some(_),
+            ..
+        } => *size,
+        _ => 0,
+    }
+}
+
+/// The receiver's admission: the parts that pass, in order, and how many did not. A part
+/// past `MAX_PARTS` or breaking a rule goes; then parts go from the tail until the encoded
+/// list fits `MAX_PARTS_BYTES`. A hash mismatch earns one warning per message.
+fn admit_parts(parts: Vec<RawPart>, limits: &PartLimits) -> (Vec<RawPart>, u32) {
+    let mut admitted = Vec::new();
+    let mut dropped = 0u32;
+    let mut inline_so_far = 0u64;
+    let mut hash_mismatch = false;
+    for (index, part) in parts.into_iter().enumerate() {
+        if index >= MAX_PARTS {
+            dropped += 1;
+            continue;
+        }
+        match part_violation(&part, limits, inline_so_far) {
+            Some(rule) => {
+                hash_mismatch |= rule == SHA256_MISMATCH;
+                dropped += 1;
+            }
+            None => {
+                inline_so_far += inline_size(&part);
+                admitted.push(part);
+            }
+        }
+    }
+    if hash_mismatch {
+        warn!(
+            "Mesh message part dropped: {}",
+            redact_hashes(SHA256_MISMATCH)
+        );
+    }
+    while !admitted.is_empty() && packed_len(&encode_parts(&admitted)) > MAX_PARTS_BYTES {
+        admitted.pop();
+        dropped += 1;
+    }
+    (admitted, dropped)
+}
+
+/// An admitted part as the message keeps it, or `None` for one nothing can be kept of:
+/// text that cleans to nothing, or inline bytes with no inbox to land in.
+fn keep_part(
+    part: RawPart,
+    source_destination: &str,
+    staging: Option<&InboxStaging>,
+) -> Option<Part> {
+    match part {
+        RawPart::Text { text } => {
+            display_text(&text, PEER_CONTENT_MAX_CHARS).map(|text| Part::Text { text })
+        }
+        RawPart::Data { data } => sanitize_fields(data).ok().map(|data| Part::Data { data }),
+        RawPart::File {
+            name,
+            size,
+            sha256,
+            bytes: None,
+            reference,
+        } => Some(Part::File {
+            name,
+            size,
+            sha256: hex_lower(&sha256),
+            staged: None,
+            reference,
+        }),
+        RawPart::File {
+            name,
+            size,
+            sha256,
+            bytes: Some(bytes),
+            reference: _,
+        } => {
+            let Some(staging) = staging else {
+                debug!("Mesh file part dropped: no staging inbox is attached");
+                return None;
+            };
+            let rel = WirePath::parse(&name).ok()?;
+            match staging.stage(source_destination, &rel, &sha256, &bytes) {
+                Ok(staged) => Some(Part::File {
+                    name,
+                    size,
+                    sha256: hex_lower(&sha256),
+                    staged: Some(staged),
+                    reference: None,
+                }),
+                Err(err) => {
+                    debug!(
+                        "Mesh file part dropped: {}",
+                        redact_hashes(&err.to_string())
+                    );
+                    None
+                }
+            }
+        }
+    }
+}
+
 /// A message this node sends. `new` cleans the text as the receiver will and refuses
 /// what is still over a cap, so the sender is told rather than having its words cut.
 #[derive(Debug, Clone, PartialEq)]
@@ -330,6 +745,12 @@ pub(crate) struct OutboundPeer {
     pub title: Option<String>,
     pub content: String,
     pub fields: Option<serde_json::Value>,
+    pub parts: Vec<RawPart>,
+    pub thread: Option<String>,
+    /// Sent only on a reply.
+    pub disposition: Option<Disposition>,
+    /// Sent only beside a disposition.
+    pub retry_after: Option<u32>,
 }
 
 impl OutboundPeer {
@@ -339,6 +760,28 @@ impl OutboundPeer {
         title: Option<&str>,
         in_reply_to: Option<&str>,
         fields: Option<serde_json::Value>,
+    ) -> Result<Self, SendError> {
+        Self::with_parts(
+            kind,
+            content,
+            title,
+            in_reply_to,
+            fields,
+            Vec::new(),
+            &PartLimits::default(),
+        )
+    }
+
+    /// `new` with `parts`, refused whole on the first rule any part breaks: the receiver
+    /// would drop that part, and the sender is better told than silently trimmed.
+    pub(crate) fn with_parts(
+        kind: PeerKind,
+        content: &str,
+        title: Option<&str>,
+        in_reply_to: Option<&str>,
+        fields: Option<serde_json::Value>,
+        parts: Vec<RawPart>,
+        limits: &PartLimits,
     ) -> Result<Self, SendError> {
         let content = display_text(content, usize::MAX).unwrap_or_default();
         let chars = content.chars().count();
@@ -366,6 +809,19 @@ impl OutboundPeer {
             .map(sanitize_fields)
             .transpose()
             .map_err(SendError::InvalidFields)?;
+        if parts.len() > MAX_PARTS {
+            return Err(SendError::InvalidParts("too many parts"));
+        }
+        let mut inline_so_far = 0u64;
+        for part in &parts {
+            if let Some(rule) = part_violation(part, limits, inline_so_far) {
+                return Err(SendError::InvalidParts(rule));
+            }
+            inline_so_far += inline_size(part);
+        }
+        if packed_len(&encode_parts(&parts)) > MAX_PARTS_BYTES {
+            return Err(SendError::InvalidParts("parts are too large once encoded"));
+        }
         Ok(Self {
             kind,
             id: uuid::Uuid::new_v4().simple().to_string(),
@@ -373,12 +829,39 @@ impl OutboundPeer {
             title,
             content,
             fields,
+            parts,
+            thread: None,
+            disposition: None,
+            retry_after: None,
         })
+    }
+
+    /// Names the conversation; `None` leaves the receiver to infer it (a root message is
+    /// its own thread, a reply inherits the answered message's).
+    pub(crate) fn with_thread(mut self, thread: Option<String>) -> Result<Self, SendError> {
+        let thread = thread.and_then(|id| display_text(&id, usize::MAX));
+        if thread.as_deref().is_some_and(|id| !is_wire_id(id)) {
+            return Err(SendError::InvalidFields("thread is not a message id"));
+        }
+        self.thread = thread;
+        Ok(self)
+    }
+
+    /// What this reply says about its question; the wire carries it on a reply only.
+    pub(crate) fn with_disposition(
+        mut self,
+        disposition: Disposition,
+        retry_after: Option<u32>,
+    ) -> Self {
+        self.disposition = Some(disposition);
+        self.retry_after = retry_after;
+        self
     }
 }
 
 /// The R3 `/message` body: a string-keyed map with `v`, `kind`, `id`, `content`, `ts`
-/// and, when set, `in_reply_to`, `title` and `fields`.
+/// and, when set, `in_reply_to`, `thread`, `title`, `fields`, a reply's `disposition` and
+/// `retry_after`, and `parts`.
 pub(crate) fn to_r3_body(message: &OutboundPeer, timestamp: f64) -> Value {
     let mut entries = vec![
         (Value::from("v"), Value::from(PEER_WIRE_VERSION)),
@@ -391,6 +874,9 @@ pub(crate) fn to_r3_body(message: &OutboundPeer, timestamp: f64) -> Value {
             Value::from(in_reply_to.as_str()),
         ));
     }
+    if let Some(thread) = &message.thread {
+        entries.push((Value::from("thread"), Value::from(thread.as_str())));
+    }
     if let Some(title) = &message.title {
         entries.push((Value::from("title"), Value::from(title.as_str())));
     }
@@ -401,8 +887,30 @@ pub(crate) fn to_r3_body(message: &OutboundPeer, timestamp: f64) -> Value {
     if let Some(fields) = &message.fields {
         entries.push((Value::from("fields"), rmpv_from_json(fields)));
     }
+    entries.extend(reply_entries(message));
+    if !message.parts.is_empty() {
+        entries.push((Value::from("parts"), encode_parts(&message.parts)));
+    }
     entries.push((Value::from("ts"), Value::F64(timestamp)));
     Value::Map(entries)
+}
+
+/// `disposition` and `retry_after`, on a reply that set one; the same on both routes.
+fn reply_entries(message: &OutboundPeer) -> Vec<(Value, Value)> {
+    let mut entries = Vec::new();
+    if message.kind != PeerKind::Reply {
+        return entries;
+    }
+    if let Some(disposition) = message.disposition {
+        entries.push((
+            Value::from("disposition"),
+            Value::from(disposition.wire_name()),
+        ));
+        if let Some(retry_after) = message.retry_after {
+            entries.push((Value::from("retry_after"), Value::from(retry_after)));
+        }
+    }
+    entries
 }
 
 /// What a well-formed `/message` body carries, still the peer's own text.
@@ -415,6 +923,10 @@ pub(crate) struct PeerBody {
     pub content: String,
     pub fields: Option<serde_json::Value>,
     pub timestamp: f64,
+    pub thread: Option<String>,
+    pub disposition: Option<Disposition>,
+    pub retry_after: Option<u32>,
+    pub parts: Vec<RawPart>,
 }
 
 /// A string or its bytes, since msgpack encoders differ on which they emit; bytes that
@@ -449,6 +961,49 @@ pub(crate) fn is_wire_id(text: &str) -> bool {
 
 fn kind_of(value: &Value) -> Option<PeerKind> {
     text_of(value).and_then(|name| PeerKind::from_wire_name(&name))
+}
+
+/// The optional keys beside the words, read the same way on both routes.
+struct BodyExtras {
+    thread: Option<String>,
+    disposition: Option<Disposition>,
+    retry_after: Option<u32>,
+    parts: Vec<RawPart>,
+}
+
+/// `thread` must be an id when present. A reply always has a disposition, `Answered`
+/// when it names none or one this build does not know; nothing else carries one, nor a
+/// `retry_after`. `parts` is optional and only refused when it is not a list.
+fn body_extras(entries: &[(Value, Value)], kind: PeerKind) -> Result<BodyExtras, &'static str> {
+    let thread = match entry(entries, "thread") {
+        None => None,
+        Some(value) => Some(
+            text_of(value)
+                .filter(|id| is_wire_id(id))
+                .ok_or("thread is not a message id")?,
+        ),
+    };
+    let is_reply = kind == PeerKind::Reply;
+    let disposition = is_reply.then(|| {
+        entry(entries, "disposition")
+            .and_then(text_of)
+            .and_then(|name| Disposition::from_wire_name(&name))
+            .unwrap_or_default()
+    });
+    let retry_after = is_reply
+        .then(|| entry(entries, "retry_after").and_then(Value::as_u64))
+        .flatten()
+        .and_then(|secs| u32::try_from(secs).ok());
+    let parts = match entry(entries, "parts") {
+        None => Vec::new(),
+        Some(value) => decode_parts(value)?,
+    };
+    Ok(BodyExtras {
+        thread,
+        disposition,
+        retry_after,
+        parts,
+    })
 }
 
 /// Reads a `/message` body. Anything the sender's own `OutboundPeer::new` would have
@@ -495,6 +1050,12 @@ pub(crate) fn from_r3_body(body: &Value) -> Result<PeerBody, &'static str> {
         .and_then(Value::as_f64)
         .filter(|ts| ts.is_finite())
         .ok_or("ts is missing or not a finite number")?;
+    let BodyExtras {
+        thread,
+        disposition,
+        retry_after,
+        parts,
+    } = body_extras(entries, kind)?;
     Ok(PeerBody {
         kind,
         id,
@@ -503,6 +1064,10 @@ pub(crate) fn from_r3_body(body: &Value) -> Result<PeerBody, &'static str> {
         content,
         fields,
         timestamp,
+        thread,
+        disposition,
+        retry_after,
+        parts,
     })
 }
 
@@ -522,9 +1087,16 @@ pub(crate) fn peer_lxmf_message(message: &OutboundPeer, origin: &OriginName) -> 
             Value::from(in_reply_to.as_str()),
         ));
     }
+    if let Some(thread) = &message.thread {
+        data.push((Value::from("thread"), Value::from(thread.as_str())));
+    }
     data.push((Value::from("name_hash"), Value::Binary(origin.0.to_vec())));
     if let Some(fields) = &message.fields {
         data.push((Value::from("fields"), rmpv_from_json(fields)));
+    }
+    data.extend(reply_entries(message));
+    if !message.parts.is_empty() {
+        data.push((Value::from("parts"), encode_parts(&message.parts)));
     }
     OutboundMessage {
         title: message
@@ -547,15 +1119,23 @@ pub(crate) enum PeerLxmf {
     NotAPeer,
     /// Typed as a peer message but not laid out as one; never a plain message either.
     Malformed(&'static str),
-    Peer {
-        name_hash: [u8; NAME_HASH_LEN],
-        kind: PeerKind,
-        id: String,
-        in_reply_to: Option<String>,
-        title: Option<String>,
-        content: String,
-        fields: Option<serde_json::Value>,
-    },
+    Peer(Box<LxmfPeer>),
+}
+
+/// What a peer message carries on the store-and-forward route, still the peer's own text.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct LxmfPeer {
+    pub name_hash: [u8; NAME_HASH_LEN],
+    pub kind: PeerKind,
+    pub id: String,
+    pub in_reply_to: Option<String>,
+    pub title: Option<String>,
+    pub content: String,
+    pub fields: Option<serde_json::Value>,
+    pub thread: Option<String>,
+    pub disposition: Option<Disposition>,
+    pub retry_after: Option<u32>,
+    pub parts: Vec<RawPart>,
 }
 
 /// Reads a fetched message as a peer message. Text is returned as sent: the recipient
@@ -608,12 +1188,21 @@ pub(crate) fn decode_peer_lxmf(message: &InboundMessage) -> PeerLxmf {
         Some(Some(id)) if is_wire_id(&id) => Some(id),
         Some(_) => return PeerLxmf::Malformed("in_reply_to is not a message id"),
     };
+    let BodyExtras {
+        thread,
+        disposition,
+        retry_after,
+        parts,
+    } = match body_extras(data, kind) {
+        Ok(extras) => extras,
+        Err(why) => return PeerLxmf::Malformed(why),
+    };
     let bytes_text = |bytes: &Option<Vec<u8>>| {
         bytes
             .as_deref()
             .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
     };
-    PeerLxmf::Peer {
+    PeerLxmf::Peer(Box::new(LxmfPeer {
         name_hash,
         kind,
         id,
@@ -621,7 +1210,11 @@ pub(crate) fn decode_peer_lxmf(message: &InboundMessage) -> PeerLxmf {
         title: bytes_text(&message.title),
         content: bytes_text(&message.content).unwrap_or_default(),
         fields: entry(data, "fields").and_then(|fields| json_from_rmpv(fields, 1)),
-    }
+        thread,
+        disposition,
+        retry_after,
+        parts,
+    }))
 }
 
 /// The handler's answer once the message is in the inbox.
@@ -664,6 +1257,8 @@ pub(crate) enum SendError {
         max: usize,
     },
     InvalidFields(&'static str),
+    /// A part breaks a rule the receiver would drop it for; the text names the rule.
+    InvalidParts(&'static str),
     /// The peer answered with a refusal code; nothing is stored for a peer that said no.
     Refused(RefusalCode),
     /// The direct attempt failed for a reason that is not the peer being unreachable, so
@@ -710,6 +1305,10 @@ impl fmt::Display for SendError {
                 f,
                 "The message fields were refused: {reason} (at most {PEER_FIELDS_MAX_DEPTH} levels deep and {PEER_FIELDS_MAX_BYTES} bytes serialised)"
             ),
+            Self::InvalidParts(reason) => write!(
+                f,
+                "The message parts were refused: {reason} (at most {MAX_PARTS} parts, {MAX_PARTS_BYTES} bytes encoded, {MAX_INLINE_FILE_TOTAL} inline file bytes)"
+            ),
             Self::Refused(RefusalCode::NoAccess) => write!(
                 f,
                 "The peer does not trust this instance and refused the message; `.mesh knock <destination>` asks it to"
@@ -754,6 +1353,7 @@ impl SendError {
             Self::ContentTooLong { .. } => "content_too_long",
             Self::TitleTooLong { .. } => "title_too_long",
             Self::InvalidFields(_) => "invalid_fields",
+            Self::InvalidParts(_) => "invalid_parts",
             Self::Refused(_) => "refused",
             Self::Direct(_) => "direct",
             Self::IncompatibleVersion { .. } => "incompatible_version",
@@ -1168,6 +1768,13 @@ pub(crate) trait PeerSurface: Send + Sync {
     fn file_peer(&self, message: PeerMessage);
     /// Lower-hex of the destination this node receives on right now; `None` while off.
     fn local_destination(&self) -> Option<String>;
+    fn part_limits(&self) -> PartLimits {
+        PartLimits::default()
+    }
+    /// Where an inline file part is written; `None` drops every inline file, counted.
+    fn inbox_staging(&self) -> Option<InboxStaging> {
+        None
+    }
 }
 
 /// Serves `/message` to whoever the dispatcher has already let through: decodes and
@@ -1232,7 +1839,8 @@ impl Handler for PeerMessageHandler {
         // The sender checks the acknowledgement against the id it sent, so the raw wire
         // id is echoed; the alphabet check in `from_r3_body` has already bounded it.
         let id = body.id.clone();
-        let message = PeerMessage::new(RawPeerMessage {
+        let kind = body.kind;
+        let raw = RawPeerMessage {
             source_identity: identity_hex.clone(),
             source_destination: destination_hex.clone(),
             destination: surface.local_destination().unwrap_or_default(),
@@ -1244,12 +1852,23 @@ impl Handler for PeerMessageHandler {
             in_reply_to: body.in_reply_to,
             kind: body.kind,
             via: PeerVia::Direct,
-        });
-        debug!(
-            "Mesh {} {id} from {id8} (instance {dest8}) received on link {link}",
-            message.kind
-        );
-        let delivered = tokio::task::spawn_blocking(move || surface.deliver_peer(message)).await;
+            thread: body.thread,
+            disposition: body.disposition,
+            retry_after: body.retry_after,
+            parts: body.parts,
+        };
+        debug!("Mesh {kind} {id} from {id8} (instance {dest8}) received on link {link}");
+        // Staging an inline file writes to disk, so the sanitising runs off the request
+        // loop with the delivery.
+        let delivered = tokio::task::spawn_blocking(move || {
+            let message = PeerMessage::new_with(
+                raw,
+                &surface.part_limits(),
+                surface.inbox_staging().as_ref(),
+            );
+            surface.deliver_peer(message)
+        })
+        .await;
         match delivered {
             Ok(()) => Reply::Value(received_reply(&id)),
             Err(err) => {
@@ -1281,35 +1900,51 @@ pub(crate) struct PeerRouting<'a> {
 impl InboundSink for PeerRouting<'_> {
     fn deliver(&self, message: InboundMessage) {
         let id8 = short(&message.source_identity_hash);
-        let (name_hash, kind, id, in_reply_to, title, content, fields) =
-            match decode_peer_lxmf(&message) {
-                PeerLxmf::NotAPeer => return self.inner.deliver(message),
-                PeerLxmf::Malformed(why) => {
-                    debug!(
-                        "Propagated peer message from {id8} dropped: {}",
-                        redact_hashes(why)
-                    );
-                    return;
-                }
-                PeerLxmf::Peer {
-                    name_hash,
-                    kind,
-                    id,
-                    in_reply_to,
-                    title,
-                    content,
-                    fields,
-                } => (name_hash, kind, id, in_reply_to, title, content, fields),
-            };
+        // The sending instance and the local destination are filled in below, once the
+        // signer's identity has been read and the surface found.
+        let (name_hash, mut raw) = match decode_peer_lxmf(&message) {
+            PeerLxmf::NotAPeer => return self.inner.deliver(message),
+            PeerLxmf::Malformed(why) => {
+                debug!(
+                    "Propagated peer message from {id8} dropped: {}",
+                    redact_hashes(why)
+                );
+                return;
+            }
+            PeerLxmf::Peer(peer) => {
+                let peer = *peer;
+                (
+                    peer.name_hash,
+                    RawPeerMessage {
+                        source_identity: message.source_identity_hash.clone(),
+                        source_destination: String::new(),
+                        destination: String::new(),
+                        title: peer.title,
+                        content: peer.content,
+                        fields: peer.fields,
+                        timestamp: message.timestamp,
+                        message_id: peer.id,
+                        in_reply_to: peer.in_reply_to,
+                        kind: peer.kind,
+                        via: PeerVia::StoreAndForward,
+                        thread: peer.thread,
+                        disposition: peer.disposition,
+                        retry_after: peer.retry_after,
+                        parts: peer.parts,
+                    },
+                )
+            }
+        };
+        let kind = raw.kind;
         let Ok(identity) = AddressHash::new_from_hex_string(&message.source_identity_hash) else {
             debug!("Propagated peer message from {id8} dropped: the signer's hash is malformed");
             return;
         };
-        let source_destination = destination_address(&name_hash, &identity).to_hex_string();
-        let dest8 = short(&source_destination).to_string();
+        raw.source_destination = destination_address(&name_hash, &identity).to_hex_string();
+        let dest8 = short(&raw.source_destination).to_string();
         if self
             .trust
-            .authorize(&message.source_identity_hash, &source_destination)
+            .authorize(&message.source_identity_hash, &raw.source_destination)
             .decision
             != Decision::Allow
         {
@@ -1324,26 +1959,19 @@ impl InboundSink for PeerRouting<'_> {
         };
         let admission = PeerAdmission {
             source_identity: &message.source_identity_hash,
-            source_destination: &source_destination,
-            message_id: &id,
+            source_destination: &raw.source_destination,
+            message_id: &raw.message_id,
             kind,
-            in_reply_to: in_reply_to.as_deref(),
+            in_reply_to: raw.in_reply_to.as_deref(),
             via: PeerVia::StoreAndForward,
         };
         let admitted = surface.admit_peer_message(&admission);
-        let peer = PeerMessage::new(RawPeerMessage {
-            source_identity: message.source_identity_hash.clone(),
-            source_destination,
-            destination: surface.local_destination().unwrap_or_default(),
-            title,
-            content,
-            fields,
-            timestamp: message.timestamp,
-            message_id: id,
-            in_reply_to,
-            kind,
-            via: PeerVia::StoreAndForward,
-        });
+        raw.destination = surface.local_destination().unwrap_or_default();
+        let peer = PeerMessage::new_with(
+            raw,
+            &surface.part_limits(),
+            surface.inbox_staging().as_ref(),
+        );
         if let Err(refusal) = admitted {
             debug!(
                 "Propagated {kind} {} from {id8} (instance {dest8}) over its limit: {}; filed in the inbox without an envoy run, the surface answers the first refusal of the hour",
@@ -1450,7 +2078,7 @@ mod tests {
     use crate::mesh::knock::{KNOCK_TYPE, KnockIntro, knock_message};
     use crate::mesh::limits::RefusalReason;
     use crate::mesh::r3::{PathHash, RequestId, SizeBranch};
-    use crate::mesh::test_support::TrustList;
+    use crate::mesh::test_support::{TempDir, TrustList};
     use crate::supervisor::notification::MESH_EVENTS_DROPPED_EVENT;
 
     use rand_core::OsRng;
@@ -1479,6 +2107,10 @@ mod tests {
             in_reply_to: None,
             kind: PeerKind::Message,
             via: PeerVia::Direct,
+            thread: None,
+            disposition: None,
+            retry_after: None,
+            parts: Vec::new(),
         }
     }
 
@@ -1745,6 +2377,10 @@ mod tests {
                 content: "the answer".into(),
                 fields: message.fields.clone(),
                 timestamp: 1_700_000_000.5,
+                thread: None,
+                disposition: Some(Disposition::Answered),
+                retry_after: None,
+                parts: Vec::new(),
             }
         );
         let bare =
@@ -1995,7 +2631,7 @@ mod tests {
         ));
         assert_eq!(
             decoded,
-            PeerLxmf::Peer {
+            PeerLxmf::Peer(Box::new(LxmfPeer {
                 name_hash: origin.0,
                 kind: PeerKind::Ask,
                 id: message.id.clone(),
@@ -2003,7 +2639,11 @@ mod tests {
                 title: Some("ping".into()),
                 content: "are you there".into(),
                 fields: Some(serde_json::json!({ "k": ["v"] })),
-            }
+                thread: None,
+                disposition: None,
+                retry_after: None,
+                parts: Vec::new(),
+            }))
         );
 
         let knock = knock_message(&KnockIntro::new("hi").unwrap(), &origin);
@@ -2134,7 +2774,7 @@ mod tests {
                 Some(vec![0xff, b'h', b'i']),
                 &hash_of("s")
             )),
-            PeerLxmf::Peer {
+            PeerLxmf::Peer(Box::new(LxmfPeer {
                 name_hash: [3; NAME_HASH_LEN],
                 kind: PeerKind::Bulletin,
                 id: "b-1".into(),
@@ -2142,7 +2782,11 @@ mod tests {
                 title: None,
                 content: "\u{FFFD}hi".into(),
                 fields: None,
-            },
+                thread: None,
+                disposition: None,
+                retry_after: None,
+                parts: Vec::new(),
+            })),
             "invalid UTF-8 is read lossily, never refused"
         );
     }
@@ -2773,5 +3417,576 @@ mod tests {
         assert_eq!(fresh.offered(), 2);
         assert_eq!(fresh.delivered.lock().len(), 1);
         assert_eq!(fresh.filed.lock().len(), 1);
+    }
+
+    fn pack(value: &Value) -> Vec<u8> {
+        let mut packed = Vec::new();
+        rmpv::encode::write_value(&mut packed, value).unwrap();
+        packed
+    }
+
+    fn text_part(text: &str) -> RawPart {
+        RawPart::Text {
+            text: text.to_string(),
+        }
+    }
+
+    fn inline_file(name: &str, bytes: Vec<u8>) -> RawPart {
+        RawPart::File {
+            name: name.to_string(),
+            size: bytes.len() as u64,
+            sha256: Sha256::digest(&bytes).into(),
+            bytes: Some(bytes),
+            reference: None,
+        }
+    }
+
+    fn with_parts(parts: Vec<RawPart>) -> RawPeerMessage {
+        RawPeerMessage {
+            parts,
+            ..raw("hello")
+        }
+    }
+
+    fn staging(tmp: &TempDir) -> InboxStaging {
+        InboxStaging::new(tmp.path.join("inbox"))
+    }
+
+    fn body_entries(kind: PeerKind, edit: impl FnOnce(&mut Vec<(Value, Value)>)) -> Value {
+        let Value::Map(mut entries) = to_r3_body(&outbound(kind, "hi"), 1.0) else {
+            unreachable!()
+        };
+        edit(&mut entries);
+        Value::Map(entries)
+    }
+
+    fn set_entry(entries: &mut Vec<(Value, Value)>, key: &str, value: Value) {
+        entries.retain(|(k, _)| k.as_str() != Some(key));
+        entries.push((Value::from(key), value));
+    }
+
+    #[test]
+    fn an_unknown_part_type_is_skipped_and_the_message_still_lands_with_its_content() {
+        let body = body_entries(PeerKind::Message, |entries| {
+            set_entry(
+                entries,
+                "parts",
+                Value::Array(vec![
+                    Value::Map(vec![
+                        (Value::from("type"), Value::from("sticker")),
+                        (Value::from("id"), Value::from(7)),
+                    ]),
+                    Value::from("not a map"),
+                    Value::Map(vec![
+                        (Value::from("type"), Value::from("text")),
+                        (Value::from("text"), Value::from("kept")),
+                    ]),
+                ]),
+            );
+        });
+        let decoded = from_r3_body(&round_trip(&body)).unwrap();
+        assert_eq!(decoded.parts, vec![text_part("kept")]);
+        let message = PeerMessage::new(RawPeerMessage {
+            parts: decoded.parts,
+            ..raw(&decoded.content)
+        });
+        assert_eq!(message.content, "hi");
+        assert_eq!(
+            message.parts,
+            vec![Part::Text {
+                text: "kept".into()
+            }]
+        );
+        assert_eq!(message.dropped_parts, 0);
+    }
+
+    #[test]
+    fn a_ninth_part_is_dropped_and_counted() {
+        let parts = (0..MAX_PARTS + 1)
+            .map(|n| text_part(&format!("part {n}")))
+            .collect();
+        let message = PeerMessage::new(with_parts(parts));
+        assert_eq!(message.parts.len(), MAX_PARTS);
+        assert_eq!(message.dropped_parts, 1);
+        assert_eq!(
+            message.parts.last(),
+            Some(&Part::Text {
+                text: "part 7".into()
+            })
+        );
+    }
+
+    #[test]
+    fn a_text_part_over_the_content_cap_is_dropped() {
+        let message = PeerMessage::new(with_parts(vec![
+            text_part(&"x".repeat(PEER_CONTENT_MAX_CHARS + 1)),
+            text_part("fits"),
+        ]));
+        assert_eq!(
+            message.parts,
+            vec![Part::Text {
+                text: "fits".into()
+            }]
+        );
+        assert_eq!(message.dropped_parts, 1);
+    }
+
+    #[test]
+    fn a_data_part_over_the_fields_cap_is_dropped() {
+        let message = PeerMessage::new(with_parts(vec![
+            RawPart::Data {
+                data: serde_json::json!({ "blob": "b".repeat(PEER_FIELDS_MAX_BYTES) }),
+            },
+            RawPart::Data {
+                data: serde_json::json!({ "n": 1 }),
+            },
+        ]));
+        assert_eq!(
+            message.parts,
+            vec![Part::Data {
+                data: serde_json::json!({ "n": 1 })
+            }]
+        );
+        assert_eq!(message.dropped_parts, 1);
+    }
+
+    #[test]
+    fn an_inline_file_over_inline_max_bytes_is_dropped() {
+        let tmp = TempDir::new("message-inline-cap");
+        let limits = PartLimits {
+            inline_max_bytes: 16,
+        };
+        let message = PeerMessage::new_with(
+            with_parts(vec![
+                inline_file("big.bin", vec![1; 17]),
+                inline_file("small.bin", vec![2; 16]),
+            ]),
+            &limits,
+            Some(&staging(&tmp)),
+        );
+        assert_eq!(message.dropped_parts, 1);
+        assert!(
+            matches!(message.parts.as_slice(), [Part::File { name, .. }] if name == "small.bin"),
+            "{:?}",
+            message.parts
+        );
+    }
+
+    #[test]
+    fn inline_files_past_the_per_message_total_are_dropped_from_the_second() {
+        let tmp = TempDir::new("message-inline-total");
+        let half = usize::try_from(MAX_INLINE_FILE_TOTAL / 2 + 1).unwrap();
+        let limits = PartLimits {
+            inline_max_bytes: MAX_INLINE_FILE_TOTAL,
+        };
+        let message = PeerMessage::new_with(
+            with_parts(vec![
+                inline_file("first.bin", vec![1; half]),
+                inline_file("second.bin", vec![2; half]),
+            ]),
+            &limits,
+            Some(&staging(&tmp)),
+        );
+        assert_eq!(message.dropped_parts, 1);
+        assert!(
+            matches!(message.parts.as_slice(), [Part::File { name, .. }] if name == "first.bin"),
+            "{:?}",
+            message.parts
+        );
+    }
+
+    #[test]
+    fn a_file_part_whose_sha256_does_not_match_is_dropped_and_the_message_kept() {
+        let tmp = TempDir::new("message-sha-mismatch");
+        let RawPart::File {
+            name, size, bytes, ..
+        } = inline_file("a.bin", b"hello".to_vec())
+        else {
+            unreachable!()
+        };
+        let message = PeerMessage::new_with(
+            with_parts(vec![RawPart::File {
+                name,
+                size,
+                sha256: [0; 32],
+                bytes,
+                reference: None,
+            }]),
+            &PartLimits::default(),
+            Some(&staging(&tmp)),
+        );
+        assert_eq!(message.content, "hello");
+        assert!(message.parts.is_empty());
+        assert_eq!(message.dropped_parts, 1);
+    }
+
+    #[test]
+    fn a_file_part_named_with_dot_dot_is_dropped() {
+        let tmp = TempDir::new("message-dot-dot");
+        let message = PeerMessage::new_with(
+            with_parts(vec![inline_file("../../.bashrc", b"evil".to_vec())]),
+            &PartLimits::default(),
+            Some(&staging(&tmp)),
+        );
+        assert!(message.parts.is_empty());
+        assert_eq!(message.dropped_parts, 1);
+        assert!(!tmp.path.join("inbox").exists());
+    }
+
+    #[test]
+    fn an_inline_file_is_staged_under_the_peer_directory_and_the_part_carries_the_path() {
+        let tmp = TempDir::new("message-staged");
+        let bytes = b"# notes\n".to_vec();
+        let raw = with_parts(vec![inline_file("docs/notes.md", bytes.clone())]);
+        let dest8 = raw.source_destination[..8].to_lowercase();
+        let message = PeerMessage::new_with(raw, &PartLimits::default(), Some(&staging(&tmp)));
+        assert_eq!(message.dropped_parts, 0);
+        let [
+            Part::File {
+                name,
+                size,
+                sha256,
+                staged: Some(staged),
+                reference: None,
+            },
+        ] = message.parts.as_slice()
+        else {
+            panic!("{:?}", message.parts);
+        };
+        assert_eq!(name, "docs/notes.md");
+        assert_eq!(*size, bytes.len() as u64);
+        assert_eq!(*sha256, hex_lower(&Sha256::digest(&bytes)));
+        assert!(staged.is_absolute());
+        let root = dunce::canonicalize(tmp.path.join("inbox")).unwrap();
+        assert_eq!(*staged, root.join(dest8).join("docs").join("notes.md"));
+        assert_eq!(std::fs::read(staged).unwrap(), bytes);
+    }
+
+    #[test]
+    fn an_inline_file_with_no_staging_inbox_is_dropped_and_counted() {
+        let message = PeerMessage::new_with(
+            with_parts(vec![inline_file("a.bin", b"hello".to_vec())]),
+            &PartLimits::default(),
+            None,
+        );
+        assert!(message.parts.is_empty());
+        assert_eq!(message.dropped_parts, 1);
+    }
+
+    #[test]
+    fn a_reference_file_part_is_kept_with_its_ref_path() {
+        let message = PeerMessage::new(with_parts(vec![RawPart::File {
+            name: "report.pdf".into(),
+            size: 1 << 30,
+            sha256: [9; 32],
+            bytes: None,
+            reference: Some("shared/report.pdf".into()),
+        }]));
+        assert_eq!(message.dropped_parts, 0);
+        assert_eq!(
+            message.parts,
+            vec![Part::File {
+                name: "report.pdf".into(),
+                size: 1 << 30,
+                sha256: hex_lower(&[9; 32]),
+                staged: None,
+                reference: Some("shared/report.pdf".into()),
+            }]
+        );
+    }
+
+    #[test]
+    fn parts_that_is_a_map_is_refused() {
+        let body = body_entries(PeerKind::Message, |entries| {
+            set_entry(entries, "parts", Value::Map(vec![]));
+        });
+        assert_eq!(from_r3_body(&body), Err("parts is not a list"));
+    }
+
+    #[test]
+    fn a_thread_that_is_not_a_wire_id_is_refused() {
+        let body = body_entries(PeerKind::Message, |entries| {
+            set_entry(entries, "thread", Value::from("has a space"));
+        });
+        assert_eq!(from_r3_body(&body), Err("thread is not a message id"));
+    }
+
+    #[test]
+    fn an_unknown_disposition_on_a_reply_reads_as_answered() {
+        let body = body_entries(PeerKind::Reply, |entries| {
+            set_entry(entries, "in_reply_to", Value::from("q-1"));
+            set_entry(entries, "disposition", Value::from("shrugged"));
+        });
+        let decoded = from_r3_body(&body).unwrap();
+        assert_eq!(decoded.disposition, Some(Disposition::Answered));
+    }
+
+    #[test]
+    fn a_disposition_on_a_non_reply_is_ignored() {
+        let body = body_entries(PeerKind::Ask, |entries| {
+            set_entry(entries, "disposition", Value::from("refused"));
+            set_entry(entries, "retry_after", Value::from(30));
+        });
+        let decoded = from_r3_body(&body).unwrap();
+        assert_eq!(decoded.disposition, None);
+        assert_eq!(decoded.retry_after, None);
+    }
+
+    #[test]
+    fn a_retry_after_past_u32_reads_as_none() {
+        let body = body_entries(PeerKind::Reply, |entries| {
+            set_entry(entries, "in_reply_to", Value::from("q-1"));
+            set_entry(entries, "disposition", Value::from("refused"));
+            set_entry(entries, "retry_after", Value::from(u64::from(u32::MAX) + 1));
+        });
+        let decoded = from_r3_body(&body).unwrap();
+        assert_eq!(decoded.disposition, Some(Disposition::Refused));
+        assert_eq!(decoded.retry_after, None);
+    }
+
+    #[test]
+    fn a_staged_part_serialises_its_path_and_never_bytes() {
+        let tmp = TempDir::new("message-staged-json");
+        let message = PeerMessage::new_with(
+            with_parts(vec![inline_file("a.bin", b"secret bytes".to_vec())]),
+            &PartLimits::default(),
+            Some(&staging(&tmp)),
+        );
+        assert_eq!(message.parts.len(), 1);
+        let json = serde_json::to_string(&message).unwrap();
+        assert!(json.contains("\"staged\""), "{json}");
+        assert!(!json.contains("\"bytes\""), "{json}");
+        assert!(!json.contains("secret bytes"), "{json}");
+    }
+
+    #[test]
+    fn a_wire_reader_that_predates_parts_sees_a_plain_v1_body() {
+        let out = OutboundPeer::with_parts(
+            PeerKind::Reply,
+            "the answer",
+            None,
+            Some("q-1"),
+            None,
+            vec![text_part("aside")],
+            &PartLimits::default(),
+        )
+        .unwrap()
+        .with_thread(Some("t-1".into()))
+        .unwrap()
+        .with_disposition(Disposition::Refused, Some(60));
+        let Value::Map(mut entries) = to_r3_body(&out, 1.0) else {
+            unreachable!()
+        };
+        for key in ["parts", "thread", "disposition", "retry_after"] {
+            assert!(
+                entries.iter().any(|(k, _)| k.as_str() == Some(key)),
+                "{key} is on the wire"
+            );
+            entries.retain(|(k, _)| k.as_str() != Some(key));
+        }
+        let decoded = from_r3_body(&round_trip(&Value::Map(entries))).unwrap();
+        assert_eq!(decoded.id, out.id);
+        assert_eq!(decoded.content, "the answer");
+        assert_eq!(decoded.in_reply_to.as_deref(), Some("q-1"));
+        assert_eq!(decoded.thread, None);
+        assert_eq!(decoded.disposition, Some(Disposition::Answered));
+        assert_eq!(decoded.retry_after, None);
+        assert!(decoded.parts.is_empty());
+    }
+
+    /// Plan criterion (f): with content, title, both ids, fields and parts all at their
+    /// caps at once, the message still fits under both receivers' bounds and every field
+    /// survives encode→decode byte-for-byte on both routes.
+    #[test]
+    fn a_message_at_every_cap_fits_under_both_receiver_bounds_on_both_routes() {
+        const TEXT_PARTS: usize = 6;
+        let ts = 1_700_000_000.5;
+        let content = "\u{10000}".repeat(PEER_CONTENT_MAX_CHARS);
+        let title = "\u{10000}".repeat(PEER_TITLE_MAX_CHARS);
+        let in_reply_to = "a".repeat(PEER_ID_MAX_CHARS);
+        let thread = "b".repeat(PEER_ID_MAX_CHARS);
+        let fields_overhead = serde_json::to_vec(&serde_json::json!({ "k": "" }))
+            .unwrap()
+            .len();
+        let fields =
+            serde_json::json!({ "k": "x".repeat(PEER_FIELDS_MAX_BYTES - fields_overhead) });
+        assert_eq!(
+            serde_json::to_vec(&fields).unwrap().len(),
+            PEER_FIELDS_MAX_BYTES
+        );
+        let name = "n".repeat(1_024);
+        let large = usize::try_from(DEFAULT_INLINE_MAX_BYTES).unwrap();
+        let small = usize::try_from(MAX_INLINE_FILE_TOTAL).unwrap() - large;
+        let files = vec![
+            inline_file(&name, vec![0xAB; large]),
+            inline_file(&name, vec![0xCD; small]),
+        ];
+        let assemble = |texts: &[String]| {
+            let mut parts = files.clone();
+            parts.extend(texts.iter().map(|text| text_part(text)));
+            parts
+        };
+
+        // Pad the text parts until the encoded list lands exactly on the cap; a str
+        // length prefix grows with its text, so the measure→pad loop runs to a fixpoint.
+        let mut texts = vec![String::new(); TEXT_PARTS];
+        for _ in 0..16 {
+            let len = packed_len(&encode_parts(&assemble(&texts)));
+            if len == MAX_PARTS_BYTES {
+                break;
+            }
+            if len < MAX_PARTS_BYTES {
+                let short = MAX_PARTS_BYTES - len;
+                for (index, text) in texts.iter_mut().enumerate() {
+                    let share = short / TEXT_PARTS + usize::from(index < short % TEXT_PARTS);
+                    text.push_str(&"t".repeat(share));
+                }
+            } else {
+                let over = len - MAX_PARTS_BYTES;
+                let keep = texts[0].len() - over;
+                texts[0].truncate(keep);
+            }
+        }
+        let parts = assemble(&texts);
+        assert_eq!(packed_len(&encode_parts(&parts)), MAX_PARTS_BYTES);
+        assert!(
+            texts
+                .iter()
+                .all(|text| text.chars().count() <= PEER_CONTENT_MAX_CHARS)
+        );
+        assert_eq!(parts.len(), MAX_PARTS);
+
+        let build = |parts: Vec<RawPart>| {
+            OutboundPeer::with_parts(
+                PeerKind::Reply,
+                &content,
+                Some(&title),
+                Some(&in_reply_to),
+                Some(fields.clone()),
+                parts,
+                &PartLimits::default(),
+            )
+            .and_then(|out| out.with_thread(Some(thread.clone())))
+            .map(|out| out.with_disposition(Disposition::Refused, Some(u32::MAX)))
+        };
+        let out = build(parts.clone()).unwrap();
+        assert_eq!(out.content, content);
+        assert_eq!(out.title.as_deref(), Some(title.as_str()));
+        assert_eq!(out.fields, Some(fields.clone()));
+        assert_eq!(out.parts, parts);
+
+        let mut over = texts.clone();
+        over[0].push('t');
+        assert!(matches!(
+            build(assemble(&over)),
+            Err(SendError::InvalidParts(_))
+        ));
+
+        let body = to_r3_body(&out, ts);
+        let r3_total = packed_len(&Value::Array(vec![
+            Value::F64(ts),
+            Value::Binary(vec![0; 16]),
+            Value::Map(vec![
+                (Value::from("name_hash"), Value::Binary(vec![0; 10])),
+                (Value::from("body"), body.clone()),
+            ]),
+        ]));
+        assert!(
+            r3_total < crate::mesh::r3::MAX_R3_PAYLOAD_BYTES,
+            "R3 request at every cap packs to {r3_total} bytes, bound {}",
+            crate::mesh::r3::MAX_R3_PAYLOAD_BYTES
+        );
+
+        let origin = OriginName([7u8; NAME_HASH_LEN]);
+        let stored = peer_lxmf_message(&out, &origin);
+        let lxmf_total = packed_len(&Value::Array(vec![
+            Value::F64(ts),
+            Value::Binary(stored.title.clone().unwrap()),
+            Value::Binary(stored.content.clone()),
+            stored.fields.clone().unwrap(),
+        ])) + 16
+            + 16
+            + 64;
+        assert!(
+            lxmf_total < crate::mesh::propagation_fetch::MAX_FETCHED_MESSAGE_BYTES,
+            "LXMF message at every cap is {lxmf_total} bytes with its header, bound {}",
+            crate::mesh::propagation_fetch::MAX_FETCHED_MESSAGE_BYTES
+        );
+
+        let decoded = from_r3_body(&round_trip(&body)).unwrap();
+        assert_eq!(
+            decoded,
+            PeerBody {
+                kind: PeerKind::Reply,
+                id: out.id.clone(),
+                in_reply_to: Some(in_reply_to.clone()),
+                title: Some(title.clone()),
+                content: content.clone(),
+                fields: Some(fields.clone()),
+                timestamp: ts,
+                thread: Some(thread.clone()),
+                disposition: Some(Disposition::Refused),
+                retry_after: Some(u32::MAX),
+                parts: parts.clone(),
+            }
+        );
+        let rebuilt = OutboundPeer {
+            kind: decoded.kind,
+            id: decoded.id,
+            in_reply_to: decoded.in_reply_to,
+            title: decoded.title,
+            content: decoded.content,
+            fields: decoded.fields,
+            parts: decoded.parts,
+            thread: decoded.thread,
+            disposition: decoded.disposition,
+            retry_after: decoded.retry_after,
+        };
+        assert_eq!(pack(&to_r3_body(&rebuilt, ts)), pack(&body));
+
+        let PeerLxmf::Peer(peer) = decode_peer_lxmf(&inbound(
+            Some(round_trip(stored.fields.as_ref().unwrap())),
+            stored.title.clone(),
+            Some(stored.content.clone()),
+            &hash_of("signer"),
+        )) else {
+            panic!("a peer message");
+        };
+        assert_eq!(
+            *peer,
+            LxmfPeer {
+                name_hash: origin.0,
+                kind: PeerKind::Reply,
+                id: out.id.clone(),
+                in_reply_to: Some(in_reply_to.clone()),
+                title: Some(title.clone()),
+                content: content.clone(),
+                fields: Some(fields.clone()),
+                thread: Some(thread.clone()),
+                disposition: Some(Disposition::Refused),
+                retry_after: Some(u32::MAX),
+                parts: parts.clone(),
+            }
+        );
+        let peer = *peer;
+        let rebuilt = OutboundPeer {
+            kind: peer.kind,
+            id: peer.id,
+            in_reply_to: peer.in_reply_to,
+            title: peer.title,
+            content: peer.content,
+            fields: peer.fields,
+            parts: peer.parts,
+            thread: peer.thread,
+            disposition: peer.disposition,
+            retry_after: peer.retry_after,
+        };
+        let restored = peer_lxmf_message(&rebuilt, &origin);
+        assert_eq!(restored.title, stored.title);
+        assert_eq!(restored.content, stored.content);
+        assert_eq!(
+            pack(restored.fields.as_ref().unwrap()),
+            pack(stored.fields.as_ref().unwrap())
+        );
     }
 }

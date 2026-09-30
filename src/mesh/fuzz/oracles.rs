@@ -2337,6 +2337,10 @@ fn check_body(value: &Value) -> Result<(), String> {
                 title: body.title.clone(),
                 content: body.content.clone(),
                 fields: body.fields.clone(),
+                parts: body.parts.clone(),
+                thread: body.thread.clone(),
+                disposition: body.disposition,
+                retry_after: body.retry_after,
             };
             let again = from_r3_body(&to_r3_body(&peer, body.timestamp));
             ensure(again.as_ref() == Ok(&body), || {
@@ -2634,12 +2638,10 @@ fn check_peer_fields(fields: &Value) -> Result<(), String> {
         (Some(_), PeerLxmf::Malformed(reason)) => ensure(PEER_REASONS.contains(reason), || {
             format!("MESH-MSG-049..052: `{reason}` is not a refusal section 10.8 names")
         }),
-        (Some(Some(expected)), PeerLxmf::Peer { name_hash, .. }) => {
-            ensure(*name_hash == expected, || {
-                "MESH-MSG-052: the peer's name_hash is the 10-byte bin under the custom data"
-                    .to_string()
-            })
-        }
+        (Some(Some(expected)), PeerLxmf::Peer(peer)) => ensure(peer.name_hash == expected, || {
+            "MESH-MSG-052: the peer's name_hash is the 10-byte bin under the custom data"
+                .to_string()
+        }),
         (expected, observed) => Err(format!(
             "MESH-PROP-038/MESH-MSG-052: typed={expected:?} by the predicate, decoded as {observed:?}"
         )),
@@ -2961,12 +2963,18 @@ impl RecordGen {
             in_reply_to: Some(id.clone()),
             kind: PeerKind::Reply,
             via: PeerVia::Direct,
+            thread: None,
+            disposition: None,
+            retry_after: None,
+            parts: Vec::new(),
+            dropped_parts: 0,
         });
         PendingRecord {
             version: PENDING_RECORD_VERSION,
-            id,
+            id: id.clone(),
             peer_destination: "0b".repeat(ADDRESS_HASH_SIZE),
             peer_identity: "0a".repeat(ADDRESS_HASH_SIZE),
+            thread: id,
             question: self.question.chars().take(40).collect(),
             sent_at: rfc3339_utc(sent_at),
             timeout_at: rfc3339_utc(sent_at + Duration::from_secs(u64::from(self.timeout_secs))),
@@ -3044,8 +3052,8 @@ impl JsonlGen {
     }
 }
 
-/// The file rule of `read_jsonl`: every non-blank line is a version-1 pending record with
-/// an RFC 3339 `sent_at`, or the whole file is refused naming the first line that is not.
+/// The file rule of `read_jsonl`: every non-blank line is a current-version pending record
+/// with an RFC 3339 `sent_at`, or the whole file is refused naming the first line that is not.
 fn expect_pending(text: &str) -> Result<Vec<PendingRecord>, usize> {
     text.lines()
         .enumerate()
@@ -3077,19 +3085,19 @@ fn check_pending(fx: &CodecFixture, payload: &[u8]) -> Result<(), String> {
             loaded.len() <= records.len()
                 && loaded.iter().all(|record| {
                     record.version == PENDING_RECORD_VERSION
-                        && (record.state == PendingState::Open || record.reply.is_some())
+                        && (record.state != PendingState::Answered || record.reply.is_some())
                         && records.contains(record)
                 }),
             || {
                 format!(
-                    "load_pending returns a subset of the file's version-1 records, each open or carrying its reply; file {}, loaded {}",
+                    "load_pending returns a subset of the file's current-version records, each awaiting a reply or carrying its reply; file {}, loaded {}",
                     records.len(),
                     loaded.len()
                 )
             },
         ),
         (Err(line), Ok(loaded)) => Err(format!(
-            "the loader accepted a file whose line {line} is not a version-1 pending record with an RFC 3339 sent_at; loaded {}",
+            "the loader accepted a file whose line {line} is not a current-version pending record with an RFC 3339 sent_at; loaded {}",
             loaded.len()
         )),
         (Ok(records), Err(err)) => Err(format!(

@@ -509,18 +509,22 @@ fn fuzz_receipt_boundary_corpus_lengths_are_pinned() {
     );
 }
 
-/// The codec corpus files that spell a wire identifier are derived from the live
-/// constants, so a rename of the magic or a type tag regenerates them instead of
-/// leaving the corpus replaying the old bytes. `WRITE_CORPUS_ENV=1` writes the derived
-/// bytes in place of checking them. Either way each file must still reach the decoder
-/// outcome its name describes, so a regenerated file cannot silently stop exercising it.
+/// The codec corpus files that spell a wire identifier or a store version are derived
+/// from the live constants, so a rename of the magic or a type tag, or a store bump,
+/// regenerates them instead of leaving the corpus replaying the old bytes.
+/// `WRITE_CORPUS_ENV=1` writes the derived bytes in place of checking them. Either way
+/// each file must still reach the decoder outcome its name describes, so a regenerated
+/// file cannot silently stop exercising it.
 #[test]
 fn fuzz_codec_corpus_files_carrying_wire_identifiers_are_built_from_the_live_constants() {
     use super::announce::{ANNOUNCE_MAGIC, AnnounceAppData};
     use super::knock::{KNOCK_TYPE, KnockMessage, decode_knock_message};
     use super::message::{PEER_MESSAGE_TYPE, PeerLxmf, decode_peer_lxmf};
+    use super::pending::{PENDING_RECORD_VERSION, PendingRecord, PendingState};
     use lxmf_core::constants::{FIELD_CUSTOM_DATA, FIELD_CUSTOM_TYPE};
-    use oracles::{TAG_ANNOUNCE, TAG_KNOCK_FIELDS, TAG_PEER_FIELDS, inbound_with, unpack_whole};
+    use oracles::{
+        TAG_ANNOUNCE, TAG_KNOCK_FIELDS, TAG_PEER_FIELDS, TAG_PENDING, inbound_with, unpack_whole,
+    };
     use rmpv::Value;
 
     fn announce(version: [u8; 2], name: &[u8]) -> Vec<u8> {
@@ -535,12 +539,33 @@ fn fuzz_codec_corpus_files_carrying_wire_identifiers_are_built_from_the_live_con
         rmpv::encode::write_value(&mut bytes, &fields).unwrap();
         bytes
     }
+    fn pending_line_with_unknown_field() -> Vec<u8> {
+        let record = PendingRecord {
+            version: PENDING_RECORD_VERSION,
+            id: "q1".to_string(),
+            peer_destination: "0b".repeat(16),
+            peer_identity: "0a".repeat(16),
+            thread: "q1".to_string(),
+            question: "what time is it".to_string(),
+            sent_at: "2027-01-15T05:13:20Z".to_string(),
+            timeout_at: "2027-01-15T05:23:20Z".to_string(),
+            state: PendingState::Open,
+            reply: None,
+        };
+        let mut object = serde_json::to_value(&record).unwrap();
+        object["later_field"] = serde_json::Value::from("refused");
+        let mut bytes = vec![TAG_PENDING];
+        bytes.extend(serde_json::to_string(&object).unwrap().into_bytes());
+        bytes.push(b'\n');
+        bytes
+    }
 
     enum Outcome {
         AnnounceVersion(u16),
         NotAnAnnounce,
         PeerNameHashLength,
         KnockNameHashLength,
+        PendingUnknownField,
     }
     const NAME_HASH_LENGTH_REASON: &str = "name_hash is not 10 bytes";
 
@@ -576,6 +601,11 @@ fn fuzz_codec_corpus_files_carrying_wire_identifiers_are_built_from_the_live_con
                 vec![(Value::from("name_hash"), Value::Binary(vec![0x07; 9]))],
             ),
             Outcome::KnockNameHashLength,
+        ),
+        (
+            "MESH-CODE-005-pending-unknown-field.bin",
+            pending_line_with_unknown_field(),
+            Outcome::PendingUnknownField,
         ),
     ];
     let write = std::env::var_os(WRITE_CORPUS_ENV).is_some_and(|v| v == "1");
@@ -616,6 +646,17 @@ fn fuzz_codec_corpus_files_carrying_wire_identifiers_are_built_from_the_live_con
                 assert!(
                     matches!(observed, KnockMessage::Malformed(NAME_HASH_LENGTH_REASON)),
                     "codecs/{name}: decoded as {observed:?}"
+                );
+            }
+            Outcome::PendingUnknownField => {
+                let line = std::str::from_utf8(payload).unwrap().trim_end();
+                let refusal = serde_json::from_str::<PendingRecord>(line)
+                    .err()
+                    .map(|error| error.to_string())
+                    .unwrap_or_else(|| panic!("codecs/{name} must be refused by PendingRecord"));
+                assert!(
+                    refusal.contains("later_field"),
+                    "codecs/{name}: refusal must name the unknown key, got {refusal}"
                 );
             }
         }
@@ -688,7 +729,7 @@ fn usage_probe_announce_decoder_and_oracle_agree_at_the_magic_relative_header_bo
 fn fuzz_corpus_files_belong_to_the_classes_their_names_claim() {
     use super::card::StatusCard;
     use super::message::PEER_FIELDS_MAX_DEPTH;
-    use super::pending::PendingRecord;
+    use super::pending::{PENDING_RECORD_VERSION, PendingRecord};
     use super::propagation_fetch::MAX_FETCHED_MESSAGE_BYTES;
     use super::r3::{MAX_R3_PAYLOAD_BYTES, R3Error, RefusalCode, RequestFrame};
     use oracles::{
@@ -932,8 +973,8 @@ fn fuzz_corpus_files_belong_to_the_classes_their_names_claim() {
     );
     assert_eq!(
         object.get("version").and_then(serde_json::Value::as_u64),
-        Some(1),
-        "codecs/MESH-CODE-005-pending-unknown-field.bin claims MESH-CODE-005: a version-1 record"
+        Some(PENDING_RECORD_VERSION),
+        "codecs/MESH-CODE-005-pending-unknown-field.bin claims MESH-CODE-005: a current-version record"
     );
     assert!(
         object.contains_key("later_field"),

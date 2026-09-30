@@ -63,10 +63,6 @@ impl WirePath {
         }
     }
 
-    pub(crate) fn as_str(&self) -> &str {
-        &self.0
-    }
-
     pub(crate) fn segments(&self) -> impl Iterator<Item = &str> {
         self.0.split('/')
     }
@@ -154,7 +150,7 @@ mod tests {
     fn a_composed_non_ascii_path_parses_and_round_trips() {
         let text = "docs/h\u{e9}llo/na\u{ef}ve.md";
         let path = WirePath::parse(text).unwrap();
-        assert_eq!(path.as_str(), text);
+        assert_eq!(path.0, text);
         assert_eq!(
             path.segments().collect::<Vec<_>>(),
             ["docs", "h\u{e9}llo", "na\u{ef}ve.md"]

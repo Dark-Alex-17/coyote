@@ -488,8 +488,8 @@ pub(crate) mod network {
     };
     use crate::mesh::knocks::KnockCache;
     use crate::mesh::message::{
-        OutboundPeer, PeerKind, PeerLxmf, PeerSendOptions, PeerVia, RecipientOutcome, SendError,
-        SendOutcome, decode_peer_lxmf, is_received_reply, received_reply, to_r3_body,
+        LxmfPeer, OutboundPeer, PeerKind, PeerLxmf, PeerSendOptions, PeerVia, RecipientOutcome,
+        SendError, SendOutcome, decode_peer_lxmf, is_received_reply, received_reply, to_r3_body,
     };
     use crate::mesh::node::{
         KnockOptions, MeshRuntime, MeshSlot, NodeOptions, REKEY_GRACE, SHUTDOWN_GRACE,
@@ -5326,6 +5326,7 @@ pub(crate) mod network {
             id: ask.id.clone(),
             peer_destination: responder.desc.address_hash.to_hex_string(),
             peer_identity: responder.desc.identity.address_hash.to_hex_string(),
+            thread: ask.id.clone(),
             question: ask.content.clone(),
             sent_at: rfc3339_utc(now),
             timeout_at: rfc3339_utc(now + Duration::from_secs(30)),
@@ -5583,7 +5584,7 @@ pub(crate) mod network {
         );
         assert_eq!(
             stored,
-            PeerLxmf::Peer {
+            PeerLxmf::Peer(Box::new(LxmfPeer {
                 name_hash: OriginName::of(&pair.a_desc.name).0,
                 kind: PeerKind::Message,
                 id: message.id.clone(),
@@ -5591,7 +5592,11 @@ pub(crate) mod network {
                 title: Some("ping".to_string()),
                 content: "are you there".to_string(),
                 fields: Some(serde_json::json!({ "n": 1 })),
-            }
+                thread: None,
+                disposition: None,
+                retry_after: None,
+                parts: Vec::new(),
+            }))
         );
         node.nothing_else_received();
         pair.stop_node_a().await;

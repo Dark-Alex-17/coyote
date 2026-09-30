@@ -45,7 +45,8 @@ fn subject(store: &str, path: &Path, line: Option<usize>) -> String {
 
 /// The refusal for a store whose version is not `expected`. A newer version means a newer
 /// Coyote wrote it; an older one has no migration. The baseline is the version this build
-/// writes (2 for the trust file, knock records and peer table, 1 elsewhere).
+/// writes (2 for the trust file, knock records, peer table and the pending and inbound
+/// records, 1 elsewhere).
 pub(crate) fn version_refusal(
     store: &str,
     path: &Path,
@@ -113,7 +114,7 @@ mod tests {
         ),
         ("knocks.rs", &["KnockRecord"]),
         ("pending.rs", &["PendingRecord", "InboundRecord"]),
-        ("message.rs", &["PeerMessage"]),
+        ("message.rs", &["PeerMessage", "Part"]),
         ("identity.rs", &["Predecessor"]),
         ("peers.rs", &["PeerTableFile", "PeerRecord"]),
         ("protocol.rs", &["Compatibility"]),
@@ -136,8 +137,10 @@ mod tests {
         ("schema.rs", "VersionProbe"),
         // Fieldless enums, serialized as bare strings.
         ("pending.rs", "PendingState"),
+        ("pending.rs", "InboundKind"),
         ("message.rs", "PeerKind"),
         ("message.rs", "PeerVia"),
+        ("message.rs", "Disposition"),
     ];
 
     /// The name a `struct`/`enum` line declares, with any generics, tuple body or brace
@@ -385,12 +388,12 @@ mod tests {
             (
                 "PENDING_RECORD_VERSION",
                 crate::mesh::pending::PENDING_RECORD_VERSION,
-                1,
+                2,
             ),
             (
                 "INBOUND_RECORD_VERSION",
                 crate::mesh::pending::INBOUND_RECORD_VERSION,
-                1,
+                2,
             ),
             (
                 "PREDECESSOR_RECORD_VERSION",

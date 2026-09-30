@@ -24,11 +24,11 @@ use crate::mesh::idle::{IdleNotify, Origin};
 use crate::mesh::limits::{PeerRefusal, RefusalReason};
 use crate::mesh::message::{
     OutboundPeer, PEER_CONTENT_MAX_CHARS, PEER_LINE_MAX_CHARS, PEER_TITLE_MAX_CHARS, PeerKind,
-    PeerMessage, PeerVia,
+    PeerMessage, PeerVia, SendError,
 };
 use crate::mesh::notify::Source;
 use crate::mesh::pending::{
-    INBOUND_ENVOY_QUESTION_MAX_CHARS, INBOUND_RECORD_VERSION, InboundRecord,
+    INBOUND_ENVOY_QUESTION_MAX_CHARS, INBOUND_RECORD_VERSION, InboundKind, InboundRecord,
     PENDING_QUESTION_MAX_CHARS,
 };
 use crate::mesh::{display_text, redact_hashes, rfc3339_utc, short};
@@ -666,11 +666,15 @@ impl EnvoyRunner {
             id: message.message_id.clone(),
             peer_destination: message.source_destination.clone(),
             peer_identity: message.source_identity.clone(),
+            thread: message.thread().to_string(),
             question: display_text(&message.content, PENDING_QUESTION_MAX_CHARS)
                 .unwrap_or_default(),
             envoy_question: display_text(question, INBOUND_ENVOY_QUESTION_MAX_CHARS)
                 .unwrap_or_default(),
             received_at: rfc3339_utc(now),
+            kind: InboundKind::Question,
+            paths: Vec::new(),
+            reason: String::new(),
         };
         if let Err(err) = store.upsert(record, now) {
             warn!(
@@ -703,12 +707,10 @@ impl EnvoyRunner {
 
     /// Replies to the peer, records the exchange for the session and fires the result
     /// hook. A reply that cannot be sent still gets recorded, with one line telling the
-    /// human why the peer did not hear it. Only a final outcome goes out as a `Reply`;
-    /// the escalation hand-off is a `Message` naming the question, so the asker's
-    /// correlation stays open for the human's answer. A held run that took the human's
-    /// answer and then failed to deliver still gets that answer to the peer. An
-    /// escalated question leaves the store only once the peer has heard its answer;
-    /// an unsent one stays open so `.mesh answer` can send it again.
+    /// human why the peer did not hear it. `envoy_reply` shapes what goes out. A held
+    /// run that took the human's answer and then failed to deliver still gets that
+    /// answer to the peer. An escalated question leaves the store only once the peer has
+    /// heard its answer; an unsent one stays open so `.mesh answer` can send it again.
     async fn deliver(
         &self,
         message: PeerMessage,
@@ -761,18 +763,9 @@ impl EnvoyRunner {
                 Some(format!("refused: {}", refusal.reason.as_str())),
             ),
         };
-        let (kind, reply_text) = match (&outcome, &human_answer) {
-            (_, Some(text)) => (PeerKind::Reply, text.clone()),
-            (EnvoyOutcome::Escalated { .. }, None) => (PeerKind::Message, reply_text),
-            _ => (PeerKind::Reply, reply_text),
-        };
-        let fields = match (&outcome, &human_answer) {
-            (EnvoyOutcome::Refused(refusal), None) => Some(refusal.fields()),
-            _ => None,
-        };
         let unsent = match (
             app.mesh.get(),
-            OutboundPeer::new(kind, &reply_text, None, Some(&id), fields),
+            envoy_reply(&outcome, human_answer.as_deref(), reply_text, &message),
         ) {
             (Some(runtime), Ok(out)) => runtime
                 .send_peer(&message.source_destination, &out)
@@ -928,6 +921,30 @@ fn strip_tool_tag(question: &str) -> &str {
     .trim()
 }
 
+/// What the peer hears for `outcome`, in the thread of the message it answers: the
+/// human's words when they took the question, else `reply_text`. Only a final outcome
+/// goes out as a `Reply`; the escalation hand-off is a `Message` naming the question, so
+/// the asker's correlation stays open for the human's answer. Words and, on a refusal,
+/// the refusal's fields: the envoy never attaches a part.
+fn envoy_reply(
+    outcome: &EnvoyOutcome,
+    human_answer: Option<&str>,
+    reply_text: String,
+    message: &PeerMessage,
+) -> Result<OutboundPeer, SendError> {
+    let (kind, reply_text) = match (outcome, human_answer) {
+        (_, Some(text)) => (PeerKind::Reply, text.to_string()),
+        (EnvoyOutcome::Escalated { .. }, None) => (PeerKind::Message, reply_text),
+        _ => (PeerKind::Reply, reply_text),
+    };
+    let fields = match (outcome, human_answer) {
+        (EnvoyOutcome::Refused(refusal), None) => Some(refusal.fields()),
+        _ => None,
+    };
+    OutboundPeer::new(kind, &reply_text, None, Some(&message.message_id), fields)?
+        .with_thread(Some(message.thread().to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1032,21 +1049,29 @@ mod tests {
         Arc::new(move |ctx, input, abort| Box::pin(f(ctx, input, abort)))
     }
 
+    fn raw_job(kind: PeerKind, id: &str, content: &str) -> RawPeerMessage {
+        RawPeerMessage {
+            source_identity: hex_lower(&PEER_IDENTITY),
+            source_destination: hex_lower(&[0xab; 16]),
+            destination: hex_lower(&[0x01; 16]),
+            title: None,
+            content: content.into(),
+            fields: None,
+            timestamp: 1_700_000_000.0,
+            message_id: id.into(),
+            in_reply_to: None,
+            kind,
+            via: PeerVia::Direct,
+            thread: None,
+            disposition: None,
+            retry_after: None,
+            parts: Vec::new(),
+        }
+    }
+
     fn job(kind: PeerKind, id: &str, content: &str) -> EnvoyJob {
         EnvoyJob {
-            message: PeerMessage::new(RawPeerMessage {
-                source_identity: hex_lower(&PEER_IDENTITY),
-                source_destination: hex_lower(&[0xab; 16]),
-                destination: hex_lower(&[0x01; 16]),
-                title: None,
-                content: content.into(),
-                fields: None,
-                timestamp: 1_700_000_000.0,
-                message_id: id.into(),
-                in_reply_to: None,
-                kind,
-                via: PeerVia::Direct,
-            }),
+            message: PeerMessage::new(raw_job(kind, id, content)),
             reservation: None,
         }
     }
@@ -1181,6 +1206,114 @@ mod tests {
             "Should we merge?"
         );
         assert_eq!(strip_tool_tag("no tag"), "no tag");
+    }
+
+    /// I7: file bytes never traverse a model. Whatever the run came to, and whether or
+    /// not the human took the question, what goes back is words in the asker's thread
+    /// with no part, no disposition and no retry hint.
+    #[test]
+    fn the_envoy_never_attaches_a_part_whatever_the_outcome() {
+        let outcomes = [
+            ("answered", EnvoyOutcome::Answered("x".into())),
+            ("escalated", EnvoyOutcome::Escalated { cut_short: false }),
+            (
+                "escalated cut short",
+                EnvoyOutcome::Escalated { cut_short: true },
+            ),
+            ("timed out", EnvoyOutcome::TimedOut),
+            ("interrupted", EnvoyOutcome::Interrupted),
+            (
+                "unavailable: no source",
+                EnvoyOutcome::Unavailable(UnavailableReason::NoSource),
+            ),
+            (
+                "unavailable: materialize",
+                EnvoyOutcome::Unavailable(UnavailableReason::Materialize("disk full".into())),
+            ),
+            (
+                "unavailable: runtime missing",
+                EnvoyOutcome::Unavailable(UnavailableReason::RuntimeMissing {
+                    candidates: vec!["uv".into()],
+                }),
+            ),
+            (
+                "unavailable: runtime unusable",
+                EnvoyOutcome::Unavailable(UnavailableReason::RuntimeUnusable {
+                    tried: vec![("uv".into(), "exit 1".into())],
+                }),
+            ),
+            (
+                "unavailable: no executable dir",
+                EnvoyOutcome::Unavailable(UnavailableReason::NoExecutableDir {
+                    primary: "/a".into(),
+                    fallback: "/b".into(),
+                }),
+            ),
+            ("failed", EnvoyOutcome::Failed("boom".into())),
+            (
+                "refused: capacity",
+                EnvoyOutcome::Refused(PeerRefusal::capacity(RefusalReason::EnvoyBusy)),
+            ),
+            (
+                "refused: window",
+                EnvoyOutcome::Refused(PeerRefusal {
+                    reason: RefusalReason::RateLimited,
+                    retry_after: Duration::from_secs(30),
+                }),
+            ),
+        ];
+        let root = job(PeerKind::Ask, "q-1", "what now?").message;
+        let threaded = PeerMessage::new(RawPeerMessage {
+            thread: Some("t-9".into()),
+            ..raw_job(PeerKind::Ask, "q-2", "and then?")
+        });
+        assert_eq!(root.thread(), "q-1");
+        assert_eq!(threaded.thread(), "t-9");
+
+        for message in [&root, &threaded] {
+            for (label, outcome) in &outcomes {
+                for human_answer in [None, Some("human says")] {
+                    let out = envoy_reply(outcome, human_answer, "text".into(), message)
+                        .unwrap_or_else(|err| panic!("{label} / {human_answer:?}: {err}"));
+                    let case = format!("{label} / {human_answer:?} -> {out:?}");
+                    assert!(out.parts.is_empty(), "{case}");
+                    assert!(out.disposition.is_none(), "{case}");
+                    assert!(out.retry_after.is_none(), "{case}");
+                    assert_eq!(out.thread.as_deref(), Some(message.thread()), "{case}");
+                    assert_eq!(
+                        out.in_reply_to.as_deref(),
+                        Some(message.message_id.as_str()),
+                        "{case}"
+                    );
+                    let expected_kind = match (outcome, human_answer) {
+                        (EnvoyOutcome::Escalated { .. }, None) => PeerKind::Message,
+                        _ => PeerKind::Reply,
+                    };
+                    assert_eq!(out.kind, expected_kind, "{case}");
+                }
+            }
+        }
+    }
+
+    /// The runtime and the runner have no code path that builds a file part; the needles
+    /// are assembled at run time so this scan never matches itself.
+    #[test]
+    fn envoy_sources_never_build_a_file_part() {
+        let sources = [
+            concat!(env!("CARGO_MANIFEST_DIR"), "/src/mesh/envoy.rs"),
+            concat!(env!("CARGO_MANIFEST_DIR"), "/src/config/mesh_envoy.rs"),
+        ];
+        let needles = [
+            concat!("with_", "parts("),
+            concat!("RawPart::", "File"),
+            concat!("Part::", "File {"),
+        ];
+        for path in sources {
+            let source = std::fs::read_to_string(path).unwrap();
+            for needle in needles {
+                assert!(!source.contains(needle), "{path} contains {needle:?}");
+            }
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2471,9 +2604,13 @@ mod tests {
             id: id.to_string(),
             peer_destination: hex_lower(&[0xee; 16]),
             peer_identity: hex_lower(&[0xef; 16]),
+            thread: id.to_string(),
             question: "an earlier question".to_string(),
             envoy_question: String::new(),
             received_at: rfc3339_utc(SystemTime::now()),
+            kind: InboundKind::Question,
+            paths: Vec::new(),
+            reason: String::new(),
         }
     }
 
