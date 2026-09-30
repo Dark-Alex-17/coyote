@@ -483,7 +483,7 @@ trust: .mesh trust {destination} | who: .mesh info {destination} | silence: .mes
 
 The knocker requests `/knock` with `KNOCK_REQUEST_TIMEOUT` = `15` seconds (src/mesh/node.rs).
 
-The reference implements this path in `MeshRuntime` (`knock`, src/mesh/node.rs) but does not yet drive it from a REPL verb or a scheduler.
+The reference drives this path (`knock`, src/mesh/node.rs) from `.mesh knock`.
 
 | Result of the direct request | Outcome |
 |---|---|
@@ -830,7 +830,7 @@ Propagation envelope, msgpack array `[timestamp, [transient]]`:
 
 A fetch is three requests on the propagation node's `/get` path over an identified link, each bounded by `FETCH_REQUEST_TIMEOUT` = `60` seconds (src/mesh/propagation_fetch.rs; `request_bodies_match_the_reference_bytes`, `three_rounds_identify_first_and_put_the_reference_bytes_on_the_wire`).
 
-The reference implements this path in `MeshRuntime` (`fetch_propagated`, src/mesh/node.rs) but does not yet drive it from a REPL verb or a scheduler.
+The reference drives this path (`fetch_propagated`, src/mesh/node.rs) from the REPL's idle-time driver on `mesh.propagation_sync_interval_secs` (default `300` seconds; `0` = only on `.mesh fetch`), once when the node joins, and from `.mesh fetch`.
 
 **[MESH-PROP-020]** A fetching node MUST identify on the link before the first request.
 

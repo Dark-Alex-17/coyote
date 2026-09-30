@@ -347,12 +347,13 @@ Interoperability is exercised against the reference Reticulum/LXMF implementatio
 [mesh interop harness](https://github.com/Dark-Alex-17/coyote/blob/main/scripts/mesh-interop/README.md),
 run in the informational `Mesh Interop` CI job.
 The [propagation node image](https://github.com/Dark-Alex-17/coyote/blob/main/deployment/propagation-node/README.md)
-guide covers a ready-to-run LXMF propagation node for store-and-forward between your instances (posting is
-wired in this build; fetching held messages back is not yet).
+guide covers a ready-to-run LXMF propagation node for store-and-forward between your instances
+(held messages are fetched automatically every `mesh.propagation_sync_interval_secs` seconds and on demand with
+`.mesh fetch`).
 
 | Setting                           | Default Value   | Description                                                                                                                                                                  |
 |-----------------------------------|-----------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `mesh.enabled`                    | `false`         | Join the mesh at startup; nothing leaves the machine while this is `false`                                                                                                   |
+| `mesh.enabled`                    | `false`         | Join the mesh when the REPL starts (one-shot runs never join); nothing leaves the machine while this is `false`                                                              |
 | `mesh.announce`                   | `true`          | Announce this node so peers can see it; `false` is outbound-only (see peers without being seen)                                                                              |
 | `mesh.display_name`               | `null`          | Opt-in plaintext label carried in the announce                                                                                                                               |
 | `mesh.display_name_on_public`     | `false`         | Also carry `display_name` when any interface is `type: public`, where presence is world-visible                                                                              |
@@ -367,6 +368,7 @@ wired in this build; fetching held messages back is not yet).
 | `mesh.peer_max_messages_per_hour` | `60`            | Messages accepted from one sending identity per hour, in fixed hourly windows kept in memory (a restart opens a fresh window); must be `1` or more. Further messages are refused with a typed reason: on a live link in the reply itself, on store-and-forward with one reply per identity per reason per hour, and on store-and-forward the message is still filed in the inbox for the human, without an envoy run; plus one folded REPL line per identity, per reason, per hour, with the folded count reported the next time that peer is heard from after the hour rolls over; on a live link the refused message is not filed; the peer is told to retry |
 | `mesh.peer_max_tokens_per_hour`   | `100000`        | Model tokens one sending identity may cost per hour, counted after each envoy run, so the runs in flight may overshoot the ceiling by at most `peer_max_concurrent` runs before the next is refused; must be `1` or more. The message is still filed in the inbox for the human |
 | `mesh.peer_max_cost_usd_per_hour` | `0`             | USD one sending identity may cost per hour, counted like the token ceiling and enforced only when the envoy model's prices are known; `0` = no cost ceiling, otherwise a positive amount. The message is still filed in the inbox for the human |
+| `mesh.propagation_sync_interval_secs` | `300`       | Seconds between automatic fetches of the messages a propagation node holds for this node; the first fetch runs when the node joins; `0` = fetch only on `.mesh fetch` |
 
 ---
 

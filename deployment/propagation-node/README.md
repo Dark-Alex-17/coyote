@@ -8,8 +8,10 @@ for a private team network.
 
 Status in this build: Coyote discovers propagation nodes from their announces (`.mesh info` lists them under
 `propagation_nodes`) and posts to the nearest one when a direct link fails (`mesh__send` reports
-`via: store_and_forward`). Fetching held messages back is not yet triggered by any command or schedule, so a
-message parked on the node is not picked up yet.
+`via: store_and_forward`). Held messages are fetched back automatically every `mesh.propagation_sync_interval_secs`
+seconds (default 300) and once when the node joins; `.mesh fetch` runs a fetch now. The node table is not kept across
+restarts, so after a restart the first fetch waits for the node's next announce; a held message whose sender has not
+announced since the restart is left on the node for three fetches and then dropped.
 
 ## Build and run
 

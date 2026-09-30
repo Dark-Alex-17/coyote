@@ -1413,35 +1413,20 @@ fn one_line(text: &str) -> String {
 }
 
 #[test]
-fn usage_probe_docs_say_fetch_back_is_unwired_and_never_route_knocks_through_the_node() {
-    // Root README: "(posting is wired in this build; fetching held messages back is
-    // not yet)". Deployment README: only messages are posted to a propagation node;
-    // a knock never takes the store-and-forward path, and fetch-back is not triggered.
+fn usage_probe_docs_say_messages_are_posted_and_held_messages_are_fetched_back_automatically() {
     let root = one_line(&read(repo_root().join("README.md")));
     assert!(
-        root.contains("posting is wired in this build; fetching held messages back is not yet"),
-        "root README must qualify the propagation-node promise (posting wired, fetch-back not):\n{root}"
+        root.contains("held messages are fetched automatically every"),
+        "root README must say held messages are fetched automatically:\n{root}"
     );
     let readme = one_line(&read(deployment_dir().join("README.md")));
     assert!(
         readme.contains("it posts the message to a propagation node"),
-        "deployment README must say messages (not knocks) are posted to the node"
+        "deployment README must say a message that cannot be delivered directly is posted to the node"
     );
-    for stale in [
-        "message or knock",
-        "knock to a propagation",
-        "posts the knock",
-    ] {
-        assert!(
-            !readme.contains(stale),
-            "deployment README must not claim knocks are posted to a propagation node ({stale:?}); MeshRuntime::knock has no production caller"
-        );
-    }
     assert!(
-        readme.contains(
-            "Fetching held messages back is not yet triggered by any command or schedule"
-        ),
-        "deployment README must state that fetch-back is not wired in this build"
+        readme.contains("Held messages are fetched back automatically every"),
+        "deployment README must state that fetch-back runs on a schedule in this build"
     );
 }
 
