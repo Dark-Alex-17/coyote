@@ -1514,7 +1514,7 @@ mod tests {
     use crate::mesh::peers::PeerSighting;
     use crate::mesh::propagation::build_signed_message;
     use crate::mesh::r3::{OriginName, RequestFrame};
-    use crate::mesh::test_support::{TempDir, TrustList, rust_sources};
+    use crate::mesh::test_support::{TempDir, TrustList, read_source, rust_sources};
     use crate::testing::{debug_snapshot, install_log_collector, warn_snapshot};
 
     use lxmf_core::message::Payload;
@@ -2785,7 +2785,7 @@ mod tests {
                 continue;
             }
             checked += 1;
-            let source = fs::read_to_string(&path).unwrap();
+            let source = read_source(&path);
             let production = source
                 .split(&["#[cfg(test)]\n", "mod tests"].concat())
                 .next()

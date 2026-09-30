@@ -917,6 +917,13 @@ pub(crate) mod test_support {
         sources
     }
 
+    /// A source file with its line endings normalised to `\n`, so the marker searches
+    /// the scanning tests do (`"#[cfg(test)]\nmod tests"` and the like) hold on a CRLF
+    /// checkout as well.
+    pub(crate) fn read_source(path: &Path) -> String {
+        fs::read_to_string(path).unwrap().replace("\r\n", "\n")
+    }
+
     #[cfg(unix)]
     pub(crate) struct StartedRuntime {
         pub(crate) runtime: Arc<MeshRuntime>,

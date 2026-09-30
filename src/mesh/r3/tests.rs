@@ -278,7 +278,7 @@ fn no_access_is_named_at_exactly_one_site_outside_the_error_module() {
         if name == "error.rs" || path.ends_with("r3/tests.rs") {
             continue;
         }
-        let source = std::fs::read_to_string(&path).unwrap();
+        let source = crate::mesh::test_support::read_source(&path);
         let end = markers
             .iter()
             .filter_map(|marker| source.find(marker))

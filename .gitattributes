@@ -1,3 +1,12 @@
+# Tests grep the crate's own sources, manifests and docs for markers such as
+# "#[cfg(test)]\nmod tests"; a CRLF checkout (core.autocrlf=true on the Windows
+# runners) must not change what they read.
+*.rs text eol=lf
+*.md text eol=lf
+*.toml text eol=lf
+*.yaml text eol=lf
+Cargo.lock text eol=lf
+NOTICE text eol=lf
 assets/config-template.yaml text eol=lf
 assets/hooks/*.sh text eol=lf
 assets/agents/** text eol=lf
