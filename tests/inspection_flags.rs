@@ -46,6 +46,13 @@ fn probe_inspection_flag(flag: &str, require_stdout: bool) -> String {
         // dirs::home_dir() panics inside gman when home can't be determined.
         .env("HOME", &home_dir)
         .env("USERPROFILE", &home_dir)
+        // Pin the cache (log file, oauth tokens) under the fake HOME too. On
+        // Windows the LocalAppData Known Folder expands `%USERPROFILE%` from
+        // the process environment and is verified to exist, so with a fresh
+        // USERPROFILE `dirs::cache_dir()` is None and `paths::cache_dir()`
+        // would fall back to the process temp dir; unix resolves `~/.cache`
+        // without that check. An explicit override keeps every OS in step.
+        .env("COYOTE_CACHE_DIR", home_dir.join("cache"))
         // A leaked sandbox/provider env would reroute the vault and config
         // paths under test.
         .env_remove("IS_SANDBOX")
@@ -132,6 +139,7 @@ fn agent_info_on_empty_config_dir_bootstraps_builtins() {
         .env("COYOTE_CONFIG_DIR", &tmp_dir)
         .env("HOME", &home_dir)
         .env("USERPROFILE", &home_dir)
+        .env("COYOTE_CACHE_DIR", home_dir.join("cache"))
         .env_remove("IS_SANDBOX")
         .env_remove("COYOTE_PROVIDER")
         .env_remove("COYOTE_PLATFORM")
@@ -212,6 +220,7 @@ fn agent_envoy_build_tools_runs_the_embedded_builtin_and_cleans_up() {
         .env("COYOTE_CONFIG_DIR", &tmp_dir)
         .env("HOME", &home_dir)
         .env("USERPROFILE", &home_dir)
+        .env("COYOTE_CACHE_DIR", home_dir.join("cache"))
         .env_remove("IS_SANDBOX")
         .env_remove("COYOTE_PROVIDER")
         .env_remove("COYOTE_PLATFORM")
@@ -333,6 +342,12 @@ impl EnvoyProbe {
         cmd.env("COYOTE_CONFIG_DIR", &self.tmp_dir)
             .env("HOME", &self.home_dir)
             .env("USERPROFILE", &self.home_dir)
+            // The cache (coyote.log lives there) must stay OUT of temp_root:
+            // the probes below assert on temp_root's contents and one makes it
+            // deliberately unusable. Without this pin Windows would resolve the
+            // cache to `<temp_root>/coyote` (see probe_inspection_flag) and fail
+            // logging init before the envoy check even runs.
+            .env("COYOTE_CACHE_DIR", self.home_dir.join("cache"))
             // std::env::temp_dir reads TMPDIR on unix and TMP/TEMP on Windows.
             .env("TMPDIR", &self.temp_root)
             .env("TMP", &self.temp_root)
@@ -1655,6 +1670,7 @@ fn sandbox_list_secrets_prints_informational_message_and_writes_nothing() {
         .env("IS_SANDBOX", "1")
         .env("HOME", &home_dir)
         .env("USERPROFILE", &home_dir)
+        .env("COYOTE_CACHE_DIR", home_dir.join("cache"))
         .current_dir(&home_dir)
         .stdin(Stdio::null())
         .output()
@@ -1720,6 +1736,7 @@ fn sandbox_mutating_vault_flag_stays_strict() {
         .env("IS_SANDBOX", "1")
         .env("HOME", &home_dir)
         .env("USERPROFILE", &home_dir)
+        .env("COYOTE_CACHE_DIR", home_dir.join("cache"))
         .current_dir(&home_dir)
         .stdin(Stdio::null())
         .output()
@@ -1778,6 +1795,7 @@ fn probe_strict_mcp_flag(label: &str, args: &[&str]) {
         .env("COYOTE_CONFIG_DIR", &tmp_dir)
         .env("HOME", &home_dir)
         .env("USERPROFILE", &home_dir)
+        .env("COYOTE_CACHE_DIR", home_dir.join("cache"))
         .env_remove("IS_SANDBOX")
         .env_remove("COYOTE_PROVIDER")
         .env_remove("COYOTE_PLATFORM")
@@ -1847,6 +1865,7 @@ fn mcp_list_lists_configured_server_without_vault() {
         .env("COYOTE_CONFIG_DIR", &tmp_dir)
         .env("HOME", &home_dir)
         .env("USERPROFILE", &home_dir)
+        .env("COYOTE_CACHE_DIR", home_dir.join("cache"))
         .env_remove("IS_SANDBOX")
         .env_remove("COYOTE_PROVIDER")
         .env_remove("COYOTE_PLATFORM")
@@ -1896,6 +1915,7 @@ fn sync_models_stays_on_bootstrap_path() {
         .env("COYOTE_CONFIG_DIR", &tmp_dir)
         .env("HOME", &home_dir)
         .env("USERPROFILE", &home_dir)
+        .env("COYOTE_CACHE_DIR", home_dir.join("cache"))
         .env_remove("IS_SANDBOX")
         .env_remove("COYOTE_PROVIDER")
         .env_remove("COYOTE_PLATFORM")
@@ -1933,6 +1953,7 @@ fn run_list_sessions(
         .env("COYOTE_SESSIONS_DIR", global_sessions)
         .env("HOME", home_dir)
         .env("USERPROFILE", home_dir)
+        .env("COYOTE_CACHE_DIR", home_dir.join("cache"))
         .env_remove("IS_SANDBOX")
         .env_remove("COYOTE_PROVIDER")
         .env_remove("COYOTE_PLATFORM")
