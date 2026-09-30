@@ -16,9 +16,10 @@ use crate::mesh::announce::{
     PEER_MISSED_HEARTBEATS_BEFORE_AGE_OUT, REANNOUNCE_FLOOR_SECS, announce_app_data,
 };
 use crate::mesh::card::{
-    BRANCH_MAX_CHARS, CardPlan, CardRepo, CardState, CardTodo, DISPLAY_NAME_MAX_CHARS,
-    OBJECTIVE_MAX_CHARS, PLAN_TITLE_MAX_CHARS, REPO_NAME_MAX_CHARS, STATE_IDLE, STATE_UNKNOWN,
-    STATE_WORKING, STATUS_CARD_VERSION, StatusCard, StatusError, TODO_GOAL_MAX_CHARS,
+    ABOUT_MAX_CHARS, BRANCH_MAX_CHARS, CardPlan, CardRepo, CardState, CardTodo,
+    DISPLAY_NAME_MAX_CHARS, OBJECTIVE_MAX_CHARS, PLAN_TITLE_MAX_CHARS, REPO_NAME_MAX_CHARS,
+    STATE_IDLE, STATE_UNKNOWN, STATE_WORKING, STATUS_CARD_VERSION, StatusCard, StatusError,
+    TODO_GOAL_MAX_CHARS,
 };
 use crate::mesh::identity::{PREDECESSOR_RECORD_VERSION, Predecessor};
 use crate::mesh::knock::{
@@ -228,7 +229,7 @@ enum PnAction {
 
 #[derive(Debug, PartialEq)]
 enum CardAction {
-    Accepted(StatusCard),
+    Accepted(Box<StatusCard>),
     /// `Malformed` whose reason contains the text.
     Malformed(&'static str),
     UnsupportedVersion {
@@ -381,7 +382,7 @@ fn run(case: &Case) -> Result<(), String> {
         }
         Case::Card { value, expect } => {
             let observed = match StatusCard::from_value(value) {
-                Ok(card) => CardAction::Accepted(card),
+                Ok(card) => CardAction::Accepted(Box::new(card)),
                 Err(StatusError::Malformed(reason)) => match expect {
                     CardAction::Malformed(text) if reason.contains(text) => {
                         CardAction::Malformed(text)
@@ -675,6 +676,8 @@ fn minimal_card() -> StatusCard {
         repo: None,
         plan: None,
         todo: None,
+        about: None,
+        caps: Vec::new(),
         snapshot_age_secs: None,
         served_at_secs: SERVED_AT,
     }
@@ -700,6 +703,8 @@ fn maximal_card() -> StatusCard {
             done: 3,
             total: 7,
         }),
+        about: Some(text(ABOUT_MAX_CHARS)),
+        caps: vec!["fetch".to_string()],
         snapshot_age_secs: Some(5),
         served_at_secs: SERVED_AT,
     }
@@ -713,7 +718,7 @@ fn repo(name: &str, branch: Option<&str>) -> CardRepo {
 }
 
 fn accepted(card: StatusCard) -> CardAction {
-    CardAction::Accepted(card)
+    CardAction::Accepted(Box::new(card))
 }
 
 fn body_value() -> Value {
@@ -2869,6 +2874,8 @@ fn canon_vectors() -> Vec<Vector> {
                             ("total", Value::from(7u32)),
                         ]),
                     ),
+                    ("about", Value::from(text(ABOUT_MAX_CHARS))),
+                    ("caps", Value::Array(vec![Value::from("fetch")])),
                     ("snapshot_age_secs", Value::from(5u64)),
                     ("served_at_secs", Value::from(SERVED_AT)),
                 ]),
@@ -3610,6 +3617,8 @@ fn code_vectors() -> Vec<Vector> {
                         "repo",
                         "plan",
                         "todo",
+                        "about",
+                        "caps",
                         "snapshot_age_secs",
                         "served_at_secs",
                     ],
@@ -5011,6 +5020,8 @@ fn status_vectors() -> Vec<Vector> {
                             ("total", Value::from(7u32)),
                         ]),
                     ),
+                    ("about", Value::from(text(ABOUT_MAX_CHARS))),
+                    ("caps", Value::Array(vec![Value::from("fetch")])),
                     ("snapshot_age_secs", Value::from(5u64)),
                     ("served_at_secs", Value::from(SERVED_AT)),
                 ]),

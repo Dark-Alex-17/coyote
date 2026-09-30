@@ -4811,6 +4811,8 @@ pub(crate) mod network {
                 self.objective_override.as_deref(),
                 None,
                 self.display_name.as_deref(),
+                None,
+                &[],
                 now,
             )
         }
@@ -4831,6 +4833,14 @@ pub(crate) mod network {
 
         fn display_name(&self) -> Option<String> {
             self.display_name.clone()
+        }
+
+        fn about(&self) -> Option<String> {
+            None
+        }
+
+        fn caps(&self) -> Vec<String> {
+            Vec::new()
         }
     }
 
@@ -5088,7 +5098,7 @@ pub(crate) mod network {
         let card = StatusCard::from_value(&outcome.value).unwrap();
         assert_eq!(
             timeless(card),
-            timeless(build_card(None, None, None, None, now))
+            timeless(build_card(None, None, None, None, None, &[], now))
         );
         requester.stop().await;
         responder.stop().await;

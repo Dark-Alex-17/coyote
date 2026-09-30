@@ -254,6 +254,7 @@ mesh:
   announce: true                 # Announce this node so peers can see it (default: true); false = outbound-only, see peers without being seen; also turns the automatic propagation sync off (`.mesh fetch` still works)
   display_name: null             # Opt-in plaintext label carried in the announce (default: null = nothing but the protocol version is announced)
   display_name_on_public: false  # Also carry display_name when any interface is type public (default: false; public presence is world-visible)
+  about: null                    # One human-written line (up to 200 characters) on what this node's envoy can help with; carried on the status card to trusted peers only, never in the announce (default: null = nothing)
   interfaces:                    # Interfaces the node joins. Exactly what is listed here and nothing else; there is no auto-detection and no fallback between types (default: a single lan entry)
     - type: lan                  # lan = link-local only (Reticulum AutoInterface). Does not cross sbx, WireGuard, Tailscale or OpenVPN; only one process per host can bind it
     # - type: private            # private = TCP client to a relay your team runs; requires host + port
@@ -273,6 +274,8 @@ mesh:
   peer_max_tokens_per_hour: 100000 # Model tokens one sending identity may cost per hour, counted after each envoy run, so the runs in flight may overshoot the ceiling by at most peer_max_concurrent runs before the next is refused; the message is still filed in the inbox for the human (default: 100000; must be 1 or more)
   peer_max_cost_usd_per_hour: 0  # USD one sending identity may cost per hour, counted like the token ceiling and enforced only when the envoy model's prices are known; the message is still filed in the inbox for the human (default: 0 = no cost ceiling; must be 0 or a positive amount)
   propagation_sync_interval_secs: 300 # Seconds between automatic fetches of the messages a propagation node holds for this node; the first fetch runs once a propagation node is heard after the node joins (default: 300; 0 = fetch only on .mesh fetch; at most 31536000); off while `announce` is false
+  fetch:                         # File sharing between trusted peers (more keys arrive with the share set)
+    inline_max_bytes: 65536      # Largest file a peer may attach inline to a message; larger files are dropped by the receiver (default: 65536; must be 1 to 98304, the per-message total)
 
 # ---- Appearance ----
 highlight: true                  # Controls syntax highlighting

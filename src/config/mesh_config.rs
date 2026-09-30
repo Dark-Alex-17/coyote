@@ -1,3 +1,4 @@
+use crate::mesh::card::ABOUT_MAX_CHARS;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -10,6 +11,9 @@ pub const DEFAULT_PEER_MAX_COST_USD_PER_HOUR: f64 = 0.0;
 pub const DEFAULT_PROPAGATION_SYNC_INTERVAL_SECS: u64 = 300;
 /// One year: the longest automatic sync interval `validate` accepts.
 pub const MAX_PROPAGATION_SYNC_INTERVAL_SECS: u64 = 31_536_000;
+pub const DEFAULT_INLINE_MAX_BYTES: u64 = 64 * 1024;
+/// Σ inline file bytes one message may carry; `inline_max_bytes` cannot exceed it.
+pub const MAX_INLINE_FILE_TOTAL: u64 = 96 * 1024;
 /// Width of the label column in `.mesh info`, shared by every row so the values line up
 /// whichever module renders them.
 pub const MESH_INFO_LABEL_WIDTH: usize = 32;
@@ -34,6 +38,9 @@ pub struct MeshConfig {
     pub announce: bool,
     pub display_name: Option<String>,
     pub display_name_on_public: bool,
+    /// One human-written line on what this node's envoy can help with; carried on the
+    /// status card to trusted peers, never in the announce.
+    pub about: Option<String>,
     pub interfaces: Vec<MeshInterface>,
     pub brief: MeshBrief,
     pub digest_prompt: Option<String>,
@@ -72,6 +79,23 @@ pub struct MeshConfig {
     /// Sideband's `lxmf_sync_interval` defaults to 43200 s with periodic sync off and
     /// NomadNet's to 21600 s; neither fits an interactive REPL, so 300 s is used.
     pub propagation_sync_interval_secs: u64,
+    pub fetch: MeshFetch,
+}
+
+/// File-sharing knobs. TASK-108 creates the block with one key; TASK-109 adds the rest.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MeshFetch {
+    /// Largest file a peer may attach inline to a message; the receiver drops larger ones.
+    pub inline_max_bytes: u64,
+}
+
+impl Default for MeshFetch {
+    fn default() -> Self {
+        Self {
+            inline_max_bytes: DEFAULT_INLINE_MAX_BYTES,
+        }
+    }
 }
 
 impl Default for MeshConfig {
@@ -81,6 +105,7 @@ impl Default for MeshConfig {
             announce: true,
             display_name: None,
             display_name_on_public: false,
+            about: None,
             interfaces: vec![MeshInterface::Lan],
             brief: MeshBrief::default(),
             digest_prompt: None,
@@ -93,6 +118,7 @@ impl Default for MeshConfig {
             peer_max_tokens_per_hour: DEFAULT_PEER_MAX_TOKENS_PER_HOUR,
             peer_max_cost_usd_per_hour: DEFAULT_PEER_MAX_COST_USD_PER_HOUR,
             propagation_sync_interval_secs: DEFAULT_PROPAGATION_SYNC_INTERVAL_SECS,
+            fetch: MeshFetch::default(),
         }
     }
 }
@@ -136,6 +162,14 @@ impl MeshConfig {
                 "mesh.interfaces lists lan more than once; only one lan interface can be bound per process"
             );
         }
+        if let Some(about) = &self.about {
+            let n = about.chars().count();
+            if n > ABOUT_MAX_CHARS {
+                bail!(
+                    "mesh.about is {n} characters, which is over the cap; use {ABOUT_MAX_CHARS} or fewer"
+                );
+            }
+        }
         for (name, value) in [
             ("knock_retention_hours", self.knock_retention_hours),
             ("peer_max_concurrent", u64::from(self.peer_max_concurrent)),
@@ -159,6 +193,12 @@ impl MeshConfig {
         if sync > MAX_PROPAGATION_SYNC_INTERVAL_SECS {
             bail!(
                 "mesh.propagation_sync_interval_secs is {sync}, which is out of range; use 0 (manual) or up to {MAX_PROPAGATION_SYNC_INTERVAL_SECS} (one year)"
+            );
+        }
+        let inline = self.fetch.inline_max_bytes;
+        if !(1..=MAX_INLINE_FILE_TOTAL).contains(&inline) {
+            bail!(
+                "mesh.fetch.inline_max_bytes is {inline}, which is out of range; use 1 to {MAX_INLINE_FILE_TOTAL}"
             );
         }
         Ok(())
@@ -299,6 +339,7 @@ pub fn render_mesh_info(mesh: &MeshConfig) -> String {
         "display_name_on_public",
         mesh.display_name_on_public.to_string(),
     );
+    row("about", super::format_option_value(&mesh.about));
     for (i, interface) in mesh.interfaces.iter().enumerate() {
         row(&format!("interfaces[{i}]"), interface.to_string());
     }
@@ -343,6 +384,10 @@ pub fn render_mesh_info(mesh: &MeshConfig) -> String {
             sync.to_string()
         },
     );
+    row(
+        "fetch.inline_max_bytes",
+        mesh.fetch.inline_max_bytes.to_string(),
+    );
     output
 }
 
@@ -364,6 +409,7 @@ mod tests {
         assert!(mesh.announce);
         assert_eq!(mesh.display_name, None);
         assert!(!mesh.display_name_on_public);
+        assert_eq!(mesh.about, None);
         assert_eq!(mesh.interfaces, vec![MeshInterface::Lan]);
         assert_eq!(mesh.brief, MeshBrief::Auto);
         assert_eq!(mesh.digest_prompt, None);
@@ -376,6 +422,9 @@ mod tests {
         assert_eq!(mesh.peer_max_tokens_per_hour, 100_000);
         assert_eq!(mesh.peer_max_cost_usd_per_hour, 0.0);
         assert_eq!(mesh.propagation_sync_interval_secs, 300);
+        assert_eq!(mesh.fetch.inline_max_bytes, 65_536);
+        assert_eq!(DEFAULT_INLINE_MAX_BYTES, 65_536);
+        assert_eq!(MAX_INLINE_FILE_TOTAL, 98_304);
     }
 
     #[test]
@@ -391,6 +440,15 @@ mod tests {
     fn mesh_block_ignores_unknown_key_within_mesh() {
         let cfg: Config = serde_yaml::from_str("mesh: {bogus: 1}\n").unwrap();
         assert_eq!(cfg.mesh, MeshConfig::default());
+    }
+
+    #[test]
+    fn mesh_fetch_block_ignores_unknown_key_within_fetch() {
+        let cfg: Config = serde_yaml::from_str("mesh:\n  fetch: {bogus: 1}\n").unwrap();
+        assert_eq!(cfg.mesh, MeshConfig::default());
+        let cfg: Config =
+            serde_yaml::from_str("mesh:\n  fetch:\n    inline_max_bytes: 1024\n").unwrap();
+        assert_eq!(cfg.mesh.fetch.inline_max_bytes, 1024);
     }
 
     #[test]
@@ -799,6 +857,66 @@ mod tests {
     }
 
     #[test]
+    fn validate_caps_about_at_the_card_limit_counting_characters() {
+        let enabled = MeshConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        for accepted in [
+            String::new(),
+            "\u{e9}".repeat(ABOUT_MAX_CHARS),
+            "a".repeat(ABOUT_MAX_CHARS),
+        ] {
+            let mesh = MeshConfig {
+                about: Some(accepted),
+                ..enabled.clone()
+            };
+            mesh.validate(true).unwrap();
+        }
+        let mesh = MeshConfig {
+            about: Some("\u{e9}".repeat(ABOUT_MAX_CHARS + 1)),
+            ..enabled
+        };
+        let err = mesh.validate(true).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "mesh.about is 201 characters, which is over the cap; use 200 or fewer"
+        );
+    }
+
+    #[test]
+    fn validate_keeps_inline_max_bytes_between_one_and_the_per_message_total() {
+        let enabled = MeshConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        for accepted in [1, DEFAULT_INLINE_MAX_BYTES, MAX_INLINE_FILE_TOTAL] {
+            let mesh = MeshConfig {
+                fetch: MeshFetch {
+                    inline_max_bytes: accepted,
+                },
+                ..enabled.clone()
+            };
+            mesh.validate(true).unwrap();
+        }
+        for refused in [0, MAX_INLINE_FILE_TOTAL + 1, u64::MAX] {
+            let mesh = MeshConfig {
+                fetch: MeshFetch {
+                    inline_max_bytes: refused,
+                },
+                ..enabled.clone()
+            };
+            let err = mesh.validate(true).unwrap_err().to_string();
+            assert_eq!(
+                err,
+                format!(
+                    "mesh.fetch.inline_max_bytes is {refused}, which is out of range; use 1 to 98304"
+                )
+            );
+        }
+    }
+
+    #[test]
     fn render_mesh_info_marks_a_zero_cost_ceiling_as_off() {
         let info = render_mesh_info(&MeshConfig::default());
         assert!(
@@ -893,11 +1011,19 @@ mod tests {
             "{info}"
         );
         assert!(
+            info.contains("  about                           null\n"),
+            "{info}"
+        );
+        assert!(
             info.contains("  brief                           manual\n"),
             "{info}"
         );
         assert!(
             info.contains("  peer_max_tokens_per_hour        100000\n"),
+            "{info}"
+        );
+        assert!(
+            info.ends_with("  fetch.inline_max_bytes          65536\n"),
             "{info}"
         );
     }

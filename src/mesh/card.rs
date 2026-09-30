@@ -32,19 +32,24 @@ pub(crate) const REPO_NAME_MAX_CHARS: usize = 64;
 pub(crate) const BRANCH_MAX_CHARS: usize = 64;
 pub(crate) const PLAN_TITLE_MAX_CHARS: usize = 120;
 pub(crate) const TODO_GOAL_MAX_CHARS: usize = 280;
+pub(crate) const ABOUT_MAX_CHARS: usize = 200;
+pub(crate) const CAPS_MAX_ENTRIES: usize = 16;
+pub(crate) const CAP_MAX_CHARS: usize = 32;
 
 /// What a trusted peer learns about this session when it asks `/status`.
 ///
 /// Wire form: a msgpack map with string keys. `v` (integer) and `served_at_secs` (integer)
 /// are required, as is `state` (a map whose `code` is required and `since_secs` optional).
 /// `display_name`, `objective`, `repo` (`name` required, `branch` optional), `plan`
-/// (`title`), `todo` (`goal` optional, `done`, `total`) and `snapshot_age_secs` are
-/// optional and left out when absent; a reader treats a missing key and nil alike.
+/// (`title`), `todo` (`goal` optional, `done`, `total`), `about`, `caps` and
+/// `snapshot_age_secs` are optional and left out when absent; a reader treats a missing
+/// key and nil alike, and an empty `caps` list is never emitted.
 ///
 /// Two rules keep a card readable across versions. Keys a reader does not know are
 /// ignored, so a same-version peer may add fields without breaking older readers. State
 /// code points are immutable: never renumbered, only appended, and an unknown code is kept
-/// as it came rather than refused. A `v` above `STATUS_CARD_VERSION` is refused with an
+/// as it came rather than refused. `caps` entries this Coyote does not define are kept as
+/// they came for the same reason. A `v` above `STATUS_CARD_VERSION` is refused with an
 /// error that names the upgrade.
 ///
 /// The card never carries a path, the working directory, the session name, the model, the
@@ -63,6 +68,8 @@ pub(crate) struct StatusCard {
     pub repo: Option<CardRepo>,
     pub plan: Option<CardPlan>,
     pub todo: Option<CardTodo>,
+    pub about: Option<String>,
+    pub caps: Vec<String>,
     pub snapshot_age_secs: Option<u64>,
     pub served_at_secs: u64,
 }
@@ -114,6 +121,11 @@ impl StatusCard {
             map.push((Value::from("done"), Value::from(todo.done)));
             map.push((Value::from("total"), Value::from(todo.total)));
             entries.push((Value::from("todo"), Value::Map(map)));
+        }
+        push_text(&mut entries, "about", self.about.as_deref());
+        if !self.caps.is_empty() {
+            let caps = self.caps.iter().map(|cap| Value::from(cap.as_str()));
+            entries.push((Value::from("caps"), Value::Array(caps.collect())));
         }
         push_u64(&mut entries, "snapshot_age_secs", self.snapshot_age_secs);
         entries.push((
@@ -181,6 +193,8 @@ impl StatusCard {
             repo,
             plan,
             todo,
+            about: card.text("about", ABOUT_MAX_CHARS)?,
+            caps: card.text_list("caps", CAPS_MAX_ENTRIES, CAP_MAX_CHARS)?,
             snapshot_age_secs: card.u64("snapshot_age_secs")?,
             served_at_secs: card
                 .u64("served_at_secs")?
@@ -230,6 +244,31 @@ impl<'a> Fields<'a> {
                 .as_str()
                 .map(|text| display_text(text, max_chars))
                 .ok_or_else(|| malformed(&format!("`{key}` is not a string"))),
+        }
+    }
+
+    /// The strings in the list at `key`, each as `display_text` leaves it. Entries that
+    /// are not strings or come out blank are skipped rather than refused, and entries past
+    /// `max_entries` are dropped; only a value that is not a list is malformed.
+    fn text_list(
+        &self,
+        key: &str,
+        max_entries: usize,
+        max_chars: usize,
+    ) -> Result<Vec<String>, StatusError> {
+        match self.get(key) {
+            None => Ok(Vec::new()),
+            Some(value) => value
+                .as_array()
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .take(max_entries)
+                        .filter_map(Value::as_str)
+                        .filter_map(|text| display_text(text, max_chars))
+                        .collect()
+                })
+                .ok_or_else(|| malformed(&format!("`{key}` is not a list"))),
         }
     }
 
@@ -285,6 +324,12 @@ pub(crate) fn render_for_human(card: &StatusCard, now: SystemTime) -> String {
             card.objective.as_deref().unwrap_or("(none)")
         ),
     ];
+    if let Some(about) = &card.about {
+        lines.push(format!("about: {about}"));
+    }
+    if !card.caps.is_empty() {
+        lines.push(format!("caps: {}", card.caps.join(", ")));
+    }
     let state = match card.state.code {
         STATE_IDLE => "idle".to_string(),
         STATE_WORKING => "working".to_string(),
@@ -326,6 +371,8 @@ pub(crate) fn build_card(
     objective_override: Option<&str>,
     digest_objective: Option<&str>,
     display_name: Option<&str>,
+    about: Option<&str>,
+    caps: &[String],
     now: SystemTime,
 ) -> StatusCard {
     let objective = [
@@ -385,6 +432,8 @@ pub(crate) fn build_card(
         repo,
         plan,
         todo,
+        about: about.and_then(|about| display_text(about, ABOUT_MAX_CHARS)),
+        caps: caps.to_vec(),
         snapshot_age_secs: snapshot.map(|snapshot| snapshot.age(now).as_secs()),
         served_at_secs: unix_secs(now),
     }
@@ -397,6 +446,8 @@ pub(crate) trait CardSource: Send + Sync {
     fn objective_override(&self) -> Option<Arc<String>>;
     fn digest(&self) -> Option<Arc<Digest>>;
     fn display_name(&self) -> Option<String>;
+    fn about(&self) -> Option<String>;
+    fn caps(&self) -> Vec<String>;
 }
 
 impl CardSource for MeshSlot {
@@ -415,6 +466,16 @@ impl CardSource for MeshSlot {
     fn display_name(&self) -> Option<String> {
         self.get()
             .and_then(|runtime| runtime.display_name().map(str::to_string))
+    }
+
+    fn about(&self) -> Option<String> {
+        self.get()
+            .and_then(|runtime| runtime.about().map(str::to_string))
+    }
+
+    // TASK-111 advertises "fetch" once the /fetch handler exists.
+    fn caps(&self) -> Vec<String> {
+        Vec::new()
     }
 }
 
@@ -438,7 +499,7 @@ impl StatusHandler {
             debug!(
                 "Mesh /status served the minimal card: the session slot behind the provider is gone"
             );
-            return build_card(None, None, None, None, now);
+            return build_card(None, None, None, None, None, &[], now);
         };
         let snapshot = source.snapshot();
         let objective_override = source.objective_override();
@@ -447,11 +508,14 @@ impl StatusHandler {
             .as_deref()
             .and_then(|snapshot| digest_objective_for(snapshot, digest.as_deref()));
         let display_name = source.display_name();
+        let about = source.about();
         build_card(
             snapshot.as_deref(),
             objective_override.as_deref().map(String::as_str),
             digest_objective.as_deref(),
             display_name.as_deref(),
+            about.as_deref(),
+            &source.caps(),
             now,
         )
     }
@@ -567,9 +631,11 @@ mod tests {
             card.repo.as_ref().and_then(|repo| repo.branch.as_deref()),
             card.plan.as_ref().map(|plan| plan.title.as_str()),
             card.todo.as_ref().and_then(|todo| todo.goal.as_deref()),
+            card.about.as_deref(),
         ]
         .into_iter()
         .flatten()
+        .chain(card.caps.iter().map(String::as_str))
         .collect()
     }
 
@@ -620,7 +686,7 @@ mod tests {
     fn a_session_without_repo_plan_or_todo_still_yields_a_card_that_round_trips() {
         let mut snapshot = snapshot_fixture();
         snapshot.captured_at = now();
-        let card = build_card(Some(&snapshot), None, None, Some("Alex"), now());
+        let card = build_card(Some(&snapshot), None, None, Some("Alex"), None, &[], now());
         assert_eq!(card.display_name.as_deref(), Some("Alex"));
         assert_eq!(card.objective.as_deref(), Some("ship it"));
         assert_eq!(card.state.code, STATE_IDLE);
@@ -628,11 +694,13 @@ mod tests {
         assert_eq!(card.repo, None);
         assert_eq!(card.plan, None);
         assert_eq!(card.todo, None);
+        assert_eq!(card.about, None);
+        assert!(card.caps.is_empty());
         assert_eq!(card.snapshot_age_secs, Some(0));
         assert_eq!(card.served_at_secs, unix_secs(now()));
         assert_eq!(StatusCard::from_value(&card.to_value()), Ok(card));
 
-        let minimal = build_card(None, None, None, None, now());
+        let minimal = build_card(None, None, None, None, None, &[], now());
         assert_eq!(
             minimal,
             StatusCard {
@@ -645,6 +713,8 @@ mod tests {
                 repo: None,
                 plan: None,
                 todo: None,
+                about: None,
+                caps: Vec::new(),
                 snapshot_age_secs: None,
                 served_at_secs: unix_secs(now()),
             }
@@ -664,7 +734,7 @@ mod tests {
         drop(source);
         assert_eq!(
             handler.card(now()),
-            build_card(None, None, None, None, now())
+            build_card(None, None, None, None, None, &[], now())
         );
     }
 
@@ -689,6 +759,27 @@ mod tests {
         fn display_name(&self) -> Option<String> {
             None
         }
+
+        fn about(&self) -> Option<String> {
+            None
+        }
+
+        fn caps(&self) -> Vec<String> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn a_slot_without_a_runtime_has_no_about_and_advertises_no_caps() {
+        let slot = Arc::new(MeshSlot::default());
+        slot.publish(snapshot_fixture());
+        assert_eq!(CardSource::about(slot.as_ref()), None);
+        assert!(CardSource::caps(slot.as_ref()).is_empty());
+        let handler = StatusHandler::new(Arc::downgrade(&slot) as Weak<dyn CardSource>);
+        let card = handler.card(now());
+        assert_eq!(card.objective.as_deref(), Some("ship it"));
+        assert_eq!(card.about, None);
+        assert!(card.caps.is_empty());
     }
 
     #[test]
@@ -748,18 +839,36 @@ mod tests {
             Some("from the override"),
             Some("from the digest"),
             None,
+            None,
+            &[],
             now(),
         );
         assert_eq!(card.objective.as_deref(), Some("from the override"));
 
-        let card = build_card(Some(&snapshot), None, Some("from the digest"), None, now());
+        let card = build_card(
+            Some(&snapshot),
+            None,
+            Some("from the digest"),
+            None,
+            None,
+            &[],
+            now(),
+        );
         assert_eq!(card.objective.as_deref(), Some("from the todo goal"));
 
         snapshot.objective = None;
-        let card = build_card(Some(&snapshot), None, Some("from the digest"), None, now());
+        let card = build_card(
+            Some(&snapshot),
+            None,
+            Some("from the digest"),
+            None,
+            None,
+            &[],
+            now(),
+        );
         assert_eq!(card.objective.as_deref(), Some("from the digest"));
 
-        let card = build_card(Some(&snapshot), Some("  "), None, None, now());
+        let card = build_card(Some(&snapshot), Some("  "), None, None, None, &[], now());
         assert_eq!(card.objective, None);
     }
 
@@ -783,7 +892,7 @@ mod tests {
 
     #[test]
     fn version_is_one_and_newer_or_missing_versions_are_refused_by_name() {
-        let card = build_card(None, None, None, None, now());
+        let card = build_card(None, None, None, None, None, &[], now());
         let Value::Map(entries) = card.to_value() else {
             unreachable!("a card encodes as a map");
         };
@@ -842,6 +951,121 @@ mod tests {
         assert_eq!(card.state.since_secs, None);
         assert_eq!(card.objective, None);
         assert_eq!(card.served_at_secs, 5);
+        assert_eq!(card.about, None, "a card from before `about` reads as none");
+        assert!(
+            card.caps.is_empty(),
+            "a card from before `caps` reads as none"
+        );
+    }
+
+    fn card_with(key: &str, value: Value) -> Value {
+        Value::Map(vec![
+            (Value::from("v"), Value::from(1u64)),
+            (
+                Value::from("state"),
+                Value::Map(vec![(Value::from("code"), Value::from(STATE_IDLE))]),
+            ),
+            (Value::from(key), value),
+            (Value::from("served_at_secs"), Value::from(5u64)),
+        ])
+    }
+
+    #[test]
+    fn about_is_sanitised_and_cut_on_a_character_boundary() {
+        let about = format!("\u{1b}[31m{}\u{202E}", "\u{e9}".repeat(ABOUT_MAX_CHARS + 5));
+        let card = StatusCard::from_value(&card_with("about", Value::from(about))).unwrap();
+        let about = card.about.as_deref().unwrap();
+        assert_eq!(about.chars().count(), ABOUT_MAX_CHARS);
+        assert_eq!(about.len(), ABOUT_MAX_CHARS * 2);
+        assert!(about.chars().all(|c| c == '\u{e9}'), "{about:?}");
+
+        assert_eq!(
+            StatusCard::from_value(&card_with("about", Value::from(7u64))).unwrap_err(),
+            StatusError::Malformed("`about` is not a string".into())
+        );
+        let blank = StatusCard::from_value(&card_with("about", Value::from(" \u{200B} "))).unwrap();
+        assert_eq!(blank.about, None);
+    }
+
+    #[test]
+    fn caps_skips_entries_that_are_not_text_and_drops_those_past_the_cap() {
+        let mut entries: Vec<Value> = (0..20).map(|i| Value::from(format!("cap-{i}"))).collect();
+        entries[3] = Value::from(3u64);
+        entries[5] = Value::from("\u{1b}[2J");
+        entries[7] = Value::from(format!("fetch{}", "x".repeat(CAP_MAX_CHARS)));
+        let card = StatusCard::from_value(&card_with("caps", Value::Array(entries))).unwrap();
+        assert_eq!(card.caps.len(), CAPS_MAX_ENTRIES - 2);
+        assert!(
+            card.caps
+                .iter()
+                .all(|cap| cap.chars().count() <= CAP_MAX_CHARS)
+        );
+        assert_eq!(card.caps[0], "cap-0");
+        assert_eq!(card.caps[3], "cap-4");
+        assert_eq!(card.caps[4], "cap-6");
+        assert_eq!(
+            card.caps[5],
+            format!("fetch{}", "x".repeat(CAP_MAX_CHARS - 5)),
+            "an over-long entry is cut, not dropped"
+        );
+        assert_eq!(card.caps[6], "cap-8");
+        assert_eq!(card.caps.last().map(String::as_str), Some("cap-15"));
+        assert!(!card.caps.iter().any(|cap| cap.contains("cap-16")));
+
+        let empty = StatusCard::from_value(&card_with("caps", Value::Array(vec![]))).unwrap();
+        assert!(empty.caps.is_empty());
+        let nil = StatusCard::from_value(&card_with("caps", Value::Nil)).unwrap();
+        assert!(nil.caps.is_empty());
+    }
+
+    #[test]
+    fn caps_that_are_not_a_list_are_malformed() {
+        for wrong in [
+            Value::Map(vec![(Value::from("fetch"), Value::Boolean(true))]),
+            Value::from("fetch"),
+            Value::from(1u64),
+        ] {
+            assert_eq!(
+                StatusCard::from_value(&card_with("caps", wrong)).unwrap_err(),
+                StatusError::Malformed("`caps` is not a list".into())
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_caps_are_kept_and_the_maximal_card_round_trips_about_and_caps() {
+        let card = StatusCard::from_value(&card_with(
+            "caps",
+            Value::Array(vec![Value::from("fetch"), Value::from("teleport")]),
+        ))
+        .unwrap();
+        assert_eq!(card.caps, vec!["fetch".to_string(), "teleport".to_string()]);
+
+        let card = maximal_card();
+        let decoded = StatusCard::from_value(&card.to_value()).unwrap();
+        assert_eq!(decoded.about, card.about);
+        assert_eq!(decoded.caps, card.caps);
+        assert_eq!(decoded, card);
+    }
+
+    #[test]
+    fn build_card_sanitises_about_and_copies_caps_as_given() {
+        let caps = vec!["fetch".to_string()];
+        let card = build_card(
+            None,
+            None,
+            None,
+            None,
+            Some("  Ask me about the \u{1b}[31mmesh\u{1b}[0m  "),
+            &caps,
+            now(),
+        );
+        assert_eq!(card.about.as_deref(), Some("Ask me about the mesh"));
+        assert_eq!(card.caps, caps);
+
+        let blank = build_card(None, None, None, None, Some(" \t "), &[], now());
+        assert_eq!(blank.about, None);
+        assert!(blank.caps.is_empty());
     }
 
     #[test]
@@ -879,7 +1103,17 @@ mod tests {
     fn card_text_goes_through_display_text_and_never_leaks_paths_or_session_data() {
         let snapshot = adversarial_snapshot();
         let display_name = format!("Zed\u{1b}[2J Quill{}", "\u{1f600}".repeat(70));
-        let card = build_card(Some(&snapshot), None, None, Some(&display_name), now());
+        let about = format!("help\u{1b}[31m with\u{200B} the mesh {}", "a".repeat(300));
+        let caps = vec!["fetch".to_string()];
+        let card = build_card(
+            Some(&snapshot),
+            None,
+            None,
+            Some(&display_name),
+            Some(&about),
+            &caps,
+            now(),
+        );
 
         let objective = card.objective.as_deref().unwrap();
         assert_eq!(objective.chars().count(), OBJECTIVE_MAX_CHARS);
@@ -889,6 +1123,11 @@ mod tests {
         assert_eq!(name.chars().count(), DISPLAY_NAME_MAX_CHARS);
         assert!(name.starts_with("Zed Quill"), "{name:?}");
         assert!(name.ends_with('\u{1f600}'), "{name:?}");
+
+        let about = card.about.as_deref().unwrap();
+        assert_eq!(about.chars().count(), ABOUT_MAX_CHARS);
+        assert!(about.starts_with("help with the mesh aaa"), "{about:?}");
+        assert_eq!(card.caps, caps);
 
         let repo = card.repo.as_ref().unwrap();
         assert_eq!(repo.name, "proj");
@@ -960,7 +1199,7 @@ mod tests {
             root: PathBuf::from("/home/u/proj"),
             branch: None,
         });
-        let card = build_card(Some(&snapshot), None, None, None, now());
+        let card = build_card(Some(&snapshot), None, None, None, None, &[], now());
         assert_eq!(
             card.repo,
             Some(CardRepo {
@@ -973,7 +1212,7 @@ mod tests {
             root: PathBuf::from("/"),
             branch: Some("main".into()),
         });
-        let card = build_card(Some(&snapshot), None, None, None, now());
+        let card = build_card(Some(&snapshot), None, None, None, None, &[], now());
         assert_eq!(card.repo, None);
     }
 
@@ -982,12 +1221,12 @@ mod tests {
         let mut snapshot = snapshot_fixture();
         snapshot.todo = TodoList::default();
         assert_eq!(
-            build_card(Some(&snapshot), None, None, None, now()).todo,
+            build_card(Some(&snapshot), None, None, None, None, &[], now()).todo,
             None
         );
 
         snapshot.todo.goal = "  finish  ".into();
-        let card = build_card(Some(&snapshot), None, None, None, now());
+        let card = build_card(Some(&snapshot), None, None, None, None, &[], now());
         assert_eq!(
             card.todo,
             Some(CardTodo {
@@ -1033,6 +1272,10 @@ mod tests {
                 done: u32::MAX,
                 total: u32::MAX,
             }),
+            about: Some("a".repeat(ABOUT_MAX_CHARS)),
+            caps: (0..CAPS_MAX_ENTRIES)
+                .map(|_| "c".repeat(CAP_MAX_CHARS))
+                .collect(),
             snapshot_age_secs: Some(u64::MAX),
             served_at_secs: u64::MAX,
         }
@@ -1052,6 +1295,8 @@ mod tests {
             "repo",
             "plan",
             "todo",
+            "about",
+            "caps",
             "snapshot_age_secs",
             "served_at_secs",
         ];
@@ -1069,17 +1314,19 @@ mod tests {
     #[test]
     fn maximal_card_exceeds_the_link_mdu_and_the_minimal_card_is_small() {
         assert!(encoded(&maximal_card()).len() > LINK_PACKET_MDU);
-        assert!(encoded(&build_card(None, None, None, None, now())).len() < 100);
+        assert!(encoded(&build_card(None, None, None, None, None, &[], now())).len() < 100);
     }
 
     #[test]
     fn human_rendering_keeps_unknown_state_codes() {
-        let mut card = build_card(None, None, None, None, now());
+        let mut card = build_card(None, None, None, None, None, &[], now());
         card.state.code = 7;
         let text = render_for_human(&card, now());
         assert!(text.contains("state: unknown (7)"), "{text}");
         assert!(text.contains("name: (none)"), "{text}");
         assert!(text.contains("objective: (none)"), "{text}");
+        assert!(!text.contains("about:"), "{text}");
+        assert!(!text.contains("caps:"), "{text}");
         assert!(!text.contains("since:"), "{text}");
         assert!(!text.contains("repo:"), "{text}");
         assert!(text.contains("served: 0s ago"), "{text}");
@@ -1100,7 +1347,15 @@ mod tests {
         );
         let early = render_for_human(&maximal_card(), UNIX_EPOCH);
         assert!(early.contains("since: 0s ago"), "{early}");
-        let mut aged = build_card(Some(&snapshot_fixture()), None, None, None, now());
+        let mut aged = build_card(
+            Some(&snapshot_fixture()),
+            None,
+            None,
+            None,
+            None,
+            &[],
+            now(),
+        );
         aged.state.since_secs = Some(unix_secs(now()) - 3 * 3600);
         let text = render_for_human(&aged, now() + Duration::from_secs(90));
         assert!(text.contains("since: 3h ago"), "{text}");
@@ -1134,8 +1389,25 @@ mod tests {
             text.contains(&format!("\nsnapshot: {}s old when served\n", u64::MAX)),
             "{text}"
         );
+        assert!(
+            text.contains(&format!(
+                "\nobjective: {}\nabout: {}\ncaps: {}\nstate: working\n",
+                "o".repeat(OBJECTIVE_MAX_CHARS),
+                "a".repeat(ABOUT_MAX_CHARS),
+                vec!["c".repeat(CAP_MAX_CHARS); CAPS_MAX_ENTRIES].join(", ")
+            )),
+            "{text}"
+        );
 
-        let card = build_card(Some(&snapshot_fixture()), None, None, Some("Ann"), now());
+        let card = build_card(
+            Some(&snapshot_fixture()),
+            None,
+            None,
+            Some("Ann"),
+            None,
+            &[],
+            now(),
+        );
         let text = render_for_human(&card, now() + Duration::from_secs(5));
         assert!(
             text.starts_with("name: Ann\nobjective: ship it\nstate: idle\n"),
@@ -1143,14 +1415,14 @@ mod tests {
         );
         assert!(text.contains("served: 5s ago"), "{text}");
 
-        let text = render_for_human(&build_card(None, None, None, None, now()), now());
+        let text = render_for_human(&build_card(None, None, None, None, None, &[], now()), now());
         assert!(text.contains("\nstate: unknown\n"), "{text}");
         let odd = StatusCard {
             state: CardState {
                 code: 7,
                 since_secs: None,
             },
-            ..build_card(None, None, None, None, now())
+            ..build_card(None, None, None, None, None, &[], now())
         };
         assert!(
             render_for_human(&odd, now()).contains("\nstate: unknown (7)\n"),

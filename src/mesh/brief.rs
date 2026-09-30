@@ -290,6 +290,8 @@ mod tests {
                 done: 1,
                 total: 2,
             }),
+            about: None,
+            caps: Vec::new(),
             snapshot_age_secs: Some(0),
             served_at_secs: 1,
         }
@@ -460,6 +462,8 @@ mod tests {
             repo: None,
             plan: None,
             todo: None,
+            about: None,
+            caps: Vec::new(),
             snapshot_age_secs: None,
             served_at_secs: 1,
         };

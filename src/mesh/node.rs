@@ -227,6 +227,7 @@ pub(crate) struct MeshRuntime {
     app_data: Vec<u8>,
     announce: bool,
     display_name: Option<String>,
+    about: Option<String>,
     peer_limits: PeerLimitConfig,
     cache_dir: PathBuf,
     interface_labels: Vec<String>,
@@ -383,6 +384,7 @@ impl MeshRuntime {
             app_data,
             announce: config.announce,
             display_name: config.display_name.clone(),
+            about: config.about.clone(),
             peer_limits: PeerLimitConfig::from(config),
             cache_dir: paths.cache_dir,
             interface_labels: plans.iter().map(InterfacePlan::label).collect(),
@@ -486,6 +488,11 @@ impl MeshRuntime {
     /// reaches trusted destinations and nobody else.
     pub(crate) fn display_name(&self) -> Option<&str> {
         self.display_name.as_deref()
+    }
+
+    /// The configured `mesh.about` line, carried on the status card and nowhere else.
+    pub(crate) fn about(&self) -> Option<&str> {
+        self.about.as_deref()
     }
 
     /// The per-peer ceilings the node was started with, for the slot that installs it.
@@ -1926,11 +1933,14 @@ impl MeshSlot {
             let digest = self.digest();
             let digest_objective = digest_objective_for(&snapshot, digest.as_deref());
             let display_name = CardSource::display_name(self);
+            let about = CardSource::about(self);
             let card = build_card(
                 Some(&snapshot),
                 objective_override.as_deref().map(String::as_str),
                 digest_objective.as_deref(),
                 display_name.as_deref(),
+                about.as_deref(),
+                &CardSource::caps(self),
                 now,
             );
             let user_brief = self.user_brief();
