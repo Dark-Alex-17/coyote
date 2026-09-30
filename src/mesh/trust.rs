@@ -17,7 +17,7 @@
 //! `I1 != I2`.
 //!
 //! Instance ids are public, so anyone who has heard the peer can announce
-//! `coyote.mesh.<instance_id>` under their own identity: the signal is forgeable by any
+//! `scope.session.<instance_id>` under their own identity: the signal is forgeable by any
 //! stranger. Hence the mark never alters the existing grant (`I1` still proves its own key
 //! and stays trusted for `D`); the new identity is a stranger and stays fail-closed; the
 //! human is told once per record while the mark stands; the first conflicting identity is
@@ -71,7 +71,7 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 
-pub(crate) const TRUST_FILE_VERSION: u64 = 1;
+pub(crate) const TRUST_FILE_VERSION: u64 = 2;
 /// The trust list is the human's own decisions, so a refusal says what starting fresh costs.
 const TRUST_FILE_REMEDY: Remedy =
     Remedy::UserFile("is the trust list, and a fresh one trusts nobody");
@@ -205,9 +205,9 @@ struct DestinationEntry {
     label: Option<String>,
     note: Option<String>,
     /// Set once this destination's name hash was seen under an identity other than
-    /// `identity`. Added inside version 1 before MESH-CODE-005 made every new field bump
-    /// `TRUST_FILE_VERSION`, so a file written before it existed loads with it absent; the
-    /// default is grandfathered in the baseline and is not a precedent for the next field.
+    /// `identity`. Added before MESH-CODE-005 made every new field bump `TRUST_FILE_VERSION`,
+    /// so a current-version file written without it loads with it absent; the default is a
+    /// tolerance inside one version and is not a precedent for the next field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     key_changed: Option<KeyChanged>,
 }
@@ -1946,10 +1946,11 @@ mod tests {
     use crate::mesh::hex_lower;
     use crate::mesh::knock::RecordingSurface;
     use crate::mesh::peers::{PEER_TTL, PeerSighting};
+    use crate::mesh::session_destination_name;
     use crate::testing::{install_log_collector, warn_snapshot};
 
     use rand_core::OsRng;
-    use rns_transport::destination::{DestinationName, SingleInputDestination};
+    use rns_transport::destination::SingleInputDestination;
     use rns_transport::identity::PrivateIdentity;
 
     struct MeshOff;
@@ -1990,7 +1991,7 @@ mod tests {
     }
 
     fn announced_as(identity: PrivateIdentity, aspect: &str) -> Announced {
-        let name = DestinationName::new("coyote", &format!("mesh.{aspect}"));
+        let name = session_destination_name(aspect);
         let destination = SingleInputDestination::new(identity, name);
         Announced {
             destination_hash: destination.desc.address_hash.to_hex_string(),
@@ -2949,7 +2950,7 @@ mod tests {
         let text = String::from_utf8(fx.file_bytes().unwrap()).unwrap();
 
         let expected = format!(
-            "version: 1\n\
+            "version: {TRUST_FILE_VERSION}\n\
              identities:\n  {id}:\n    added_at: {ts}\n    last_seen_at: {ts}\n    label: null\n    note: null\n    all_destinations: false\n\
              destinations:\n  {dest}:\n    identity: {id}\n    added_at: {ts}\n    last_seen_at: {ts}\n    label: Bob\n    note: null\n\
              denied_destinations:\n  {denied}:\n    added_at: {ts}\n    note: noisy\n\
@@ -2969,12 +2970,17 @@ mod tests {
         let tmp = TempDir::new("trust-newer");
         let path = mesh_config_dir(&tmp.path).join("trust.yaml");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, "version: 2\nidentities: {}\nfuture_section: {}\n").unwrap();
+        let newer = TRUST_FILE_VERSION + 1;
+        fs::write(
+            &path,
+            format!("version: {newer}\nidentities: {{}}\nfuture_section: {{}}\n"),
+        )
+        .unwrap();
 
         let err = TrustStore::open(&tmp.path).unwrap_err().to_string();
 
         assert!(err.contains(&path.display().to_string()), "{err}");
-        assert!(err.contains("version 2"), "{err}");
+        assert!(err.contains(&format!("version {newer}")), "{err}");
         assert!(err.contains("upgrade Coyote"), "{err}");
         assert!(err.contains("move the file aside"), "{err}");
     }
@@ -2990,10 +2996,52 @@ mod tests {
 
         assert!(err.contains(&path.display().to_string()), "{err}");
         assert!(err.contains("version 0"), "{err}");
-        assert!(err.contains("version 1"), "{err}");
+        assert!(
+            err.contains(&format!("version {TRUST_FILE_VERSION}")),
+            "{err}"
+        );
         assert!(err.contains("no migration"), "{err}");
         assert!(err.contains("move the file aside"), "{err}");
         assert!(!err.contains("upgrade Coyote"), "{err}");
+    }
+
+    /// Usage probe for T33 (e): a `trust.yaml` the pre-SCOPE build wrote (a well-formed
+    /// version-1 file whose destination hashes derive from the old application name) is
+    /// refused with a clear message, never opened as an empty trust list.
+    #[test]
+    fn usage_probe_open_refuses_a_well_formed_version_1_trust_file_written_before_scope() {
+        assert_eq!(TRUST_FILE_VERSION, 2, "T33 bumps the trust file 1 -> 2");
+        let tmp = TempDir::new("trust-pre-scope-v1");
+        let path = mesh_config_dir(&tmp.path).join("trust.yaml");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let (identity, destination) = (fake_hash(0x1a), fake_hash(0x2b));
+        let ts = "2026-01-01T00:00:00Z";
+        let old = format!(
+            "version: 1\n\
+             identities:\n  {identity}:\n    added_at: {ts}\n    last_seen_at: {ts}\n    label: null\n    note: null\n    all_destinations: false\n\
+             destinations:\n  {destination}:\n    identity: {identity}\n    added_at: {ts}\n    last_seen_at: {ts}\n    label: Bob\n    note: null\n"
+        );
+        fs::write(&path, &old).unwrap();
+
+        let err = match TrustStore::open(&tmp.path) {
+            Ok(store) => panic!(
+                "a version-1 trust file must be refused, not opened with {} records",
+                store.records().len()
+            ),
+            Err(err) => err.to_string(),
+        };
+
+        assert!(err.contains(&path.display().to_string()), "{err}");
+        assert!(err.contains("version 1"), "{err}");
+        assert!(err.contains("version 2"), "{err}");
+        assert!(err.contains("no migration"), "{err}");
+        assert!(err.contains("move the file aside"), "{err}");
+        assert!(!err.contains("upgrade Coyote"), "{err}");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            old,
+            "a refused trust file is left as it was"
+        );
     }
 
     #[test]
@@ -3018,14 +3066,19 @@ mod tests {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         let identity = fake_hash(0x1a);
         let good = format!(
-            "version: 1\nidentities:\n  {identity}:\n    added_at: 2026-01-01T00:00:00Z\n    last_seen_at: 2026-01-01T00:00:00Z\n    label: null\n    note: null\n    all_destinations: true\n"
+            "version: {TRUST_FILE_VERSION}\nidentities:\n  {identity}:\n    added_at: 2026-01-01T00:00:00Z\n    last_seen_at: 2026-01-01T00:00:00Z\n    label: null\n    note: null\n    all_destinations: true\n"
         );
         fs::write(&path, &good).unwrap();
         assert_eq!(TrustStore::open(&tmp.path).unwrap().records().len(), 1);
 
         fs::write(&path, format!("{good}    tier: identity\n")).unwrap();
         let err = format!("{:#}", TrustStore::open(&tmp.path).unwrap_err());
-        assert!(err.contains("could not be parsed as version 1"), "{err}");
+        assert!(
+            err.contains(&format!(
+                "could not be parsed as version {TRUST_FILE_VERSION}"
+            )),
+            "{err}"
+        );
         assert!(err.contains("trusts nobody"), "{err}");
         assert!(err.contains("tier"), "{err}");
 
@@ -3049,7 +3102,7 @@ mod tests {
         fs::write(
             &path,
             format!(
-                "version: 1\ndenied_destinations:\n  {upper}:\n    added_at: 2026-01-01T00:00:00Z\n    note: null\n"
+                "version: {TRUST_FILE_VERSION}\ndenied_destinations:\n  {upper}:\n    added_at: 2026-01-01T00:00:00Z\n    note: null\n"
             ),
         )
         .unwrap();
@@ -3066,7 +3119,7 @@ mod tests {
         fs::write(
             &path,
             format!(
-                "version: 1\ndestinations:\n  {}:\n    identity: {}\n    added_at: 2026-01-01T00:00:00Z\n    last_seen_at: 2026-01-01T00:00:00Z\n    label: null\n    note: null\n",
+                "version: {TRUST_FILE_VERSION}\ndestinations:\n  {}:\n    identity: {}\n    added_at: 2026-01-01T00:00:00Z\n    last_seen_at: 2026-01-01T00:00:00Z\n    label: null\n    note: null\n",
                 fake_hash(0x2b),
                 identity.to_ascii_uppercase()
             ),
@@ -3087,7 +3140,7 @@ mod tests {
         fs::write(
             &path,
             format!(
-                "version: 1\ndestinations:\n  {destination}:\n    identity: {missing}\n    added_at: 2026-01-01T00:00:00Z\n    last_seen_at: 2026-01-01T00:00:00Z\n    label: null\n    note: null\n"
+                "version: {TRUST_FILE_VERSION}\ndestinations:\n  {destination}:\n    identity: {missing}\n    added_at: 2026-01-01T00:00:00Z\n    last_seen_at: 2026-01-01T00:00:00Z\n    label: null\n    note: null\n"
             ),
         )
         .unwrap();
@@ -3342,7 +3395,7 @@ mod tests {
         fs::write(
             fx.store.path(),
             format!(
-                "version: 1\n\
+                "version: {TRUST_FILE_VERSION}\n\
                  identities:\n  {identity}:\n    added_at: {ts}\n    last_seen_at: {ts}\n    label: null\n    note: null\n    all_destinations: true\n\
                  destinations:\n  {destination}:\n    identity: {identity}\n    added_at: {ts}\n    last_seen_at: {ts}\n    label: null\n    note: null\n\
                  denied_destinations:\n  {destination}:\n    added_at: {ts}\n    note: null\n\
@@ -4567,7 +4620,7 @@ mod tests {
         let (identity, destination, seen) = (fake_hash(0x1a), fake_hash(0x2b), fake_hash(0x3c));
         let ts = "2026-01-01T00:00:00Z";
         let without_mark = format!(
-            "version: 1\nidentities:\n  {identity}:\n    added_at: {ts}\n    last_seen_at: {ts}\n    label: null\n    note: null\n    all_destinations: false\ndestinations:\n  {destination}:\n    identity: {identity}\n    added_at: {ts}\n    last_seen_at: {ts}\n    label: null\n    note: null\n"
+            "version: {TRUST_FILE_VERSION}\nidentities:\n  {identity}:\n    added_at: {ts}\n    last_seen_at: {ts}\n    label: null\n    note: null\n    all_destinations: false\ndestinations:\n  {destination}:\n    identity: {identity}\n    added_at: {ts}\n    last_seen_at: {ts}\n    label: null\n    note: null\n"
         );
         fs::write(&path, &without_mark).unwrap();
         let store = TrustStore::open(&tmp.path).unwrap();

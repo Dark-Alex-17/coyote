@@ -43,7 +43,7 @@ within the frame decoder's nesting budget is a violation, not a skip.
 | `0x01` | `StatusCard::from_value` (section 9.2) | msgpack card map |
 | `0x02` | `from_r3_body`, the `/message` body (section 10.1) | msgpack body map |
 | `0x03` | `intro_from_r3_body`, the `/knock` body (section 8) | msgpack map |
-| `0x04` | `AnnounceAppData::decode` (section 5.1) | raw bytes: `COYM`, u16 BE version, name |
+| `0x04` | `AnnounceAppData::decode` (section 5.1) | raw bytes: `SCOPE`, u16 BE version, name |
 | `0x05` | `decode_peer_lxmf`, LXMF peer custom fields (section 10.8) | msgpack fields map keyed `0xFB`, `0xFC` |
 | `0x06` | `decode_knock_message`, LXMF knock custom fields (section 8.6) | msgpack fields map keyed `0xFB`, `0xFC` |
 | `0x07` | `RefusalCode::from_wire` (section 6.7) | msgpack value |
@@ -73,6 +73,10 @@ with its tag byte. For `receipt/` it already starts with kind `0x01` and holds t
 `Unstructured` buffer, because the sealed bodies of a sequence depend on the bench they
 were built against and only the buffer reproduces them; a hand-made single body goes in
 under kind `0x00`.
+
+The four `codecs/` files that spell the announce magic or an LXMF type tag are pinned to
+the live constants by `fuzz_codec_corpus_files_carrying_wire_identifiers_are_built_from_the_live_constants`;
+after a rename, `COYOTE_MESH_FUZZ_WRITE_CORPUS=1 cargo test --all fuzz_codec_corpus_files_carrying` rewrites them.
 
 `.gitattributes` marks `src/mesh/fuzz/corpus/**/*.bin` as `binary`. Without it Git's text
 heuristic can take a small msgpack file for text and rewrite a `0x0a` byte (`c4 0a`, the

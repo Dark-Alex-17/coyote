@@ -1059,6 +1059,7 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::decode_envelope;
     use super::*;
+    use crate::mesh::session_destination_name;
     use crate::mesh::test_support::rust_sources;
     use crate::testing::{debug_snapshot, install_log_collector};
 
@@ -1343,11 +1344,9 @@ mod tests {
     #[test]
     fn from_announce_refuses_a_destination_that_is_not_a_propagation_node() {
         let identity = TransportIdentity::new_from_rand(OsRng);
-        let other = SingleOutputDestination::new(
-            *identity.as_identity(),
-            DestinationName::new("coyote", "mesh.x"),
-        )
-        .desc;
+        let other =
+            SingleOutputDestination::new(*identity.as_identity(), session_destination_name("x"))
+                .desc;
         assert_eq!(
             parse_error(&other, &pn_app_data(20, DEFAULT_LIMIT_KB)),
             PropagationNodeError::NotAPropagationNode

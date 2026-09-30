@@ -144,6 +144,7 @@ impl PropagationNodeTable {
 mod tests {
     use super::*;
     use crate::mesh::propagation::pn_announce_app_data;
+    use crate::mesh::session_destination_name;
     use crate::testing::{debug_snapshot, install_log_collector};
 
     use rand_core::OsRng;
@@ -316,7 +317,7 @@ mod tests {
         let pn = desc("propagation");
         let coyote = SingleOutputDestination::new(
             *TransportIdentity::new_from_rand(OsRng).as_identity(),
-            DestinationName::new("coyote", "mesh.abc"),
+            session_destination_name("abc"),
         )
         .desc;
 

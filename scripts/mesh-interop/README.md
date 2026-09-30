@@ -16,15 +16,15 @@ next to it in `vectors.rs`.
 
 ### Verification record
 
-Last verified 2026-09-29, on Linux, with the Rust side at the crates.io `0.12.0` release of
+Last verified 2026-09-30, on Linux, with the Rust side at the crates.io `0.12.0` release of
 `lxmf-wire`, `reticulum-rs-transport` and `reticulum-rs-core`, and the Python side at RNS
 `1.5.2` / LXMF `0.9.6` (the two commits pinned above):
 
 | Invocation | Result |
 |---|---|
-| `COYOTE_MESH_INTEROP=1 cargo test --all mesh::conformance -- --include-ignored` (interop + netns) | 72 passed, 0 ignored |
-| `cargo test --all mesh::fuzz` | 14 passed |
-| `cargo test --all` | 4700 passed, 0 failed |
+| `COYOTE_MESH_INTEROP=1 cargo test --all mesh::conformance -- --include-ignored` (interop + netns) | 73 passed, 0 ignored |
+| `cargo test --all mesh::fuzz` | 17 passed |
+| `cargo test --all` | 4751 passed, 0 failed in the unit binary; 86 passed across the integration binaries |
 
 The macOS and Windows legs are proven by the PR's CI matrix rather than by this record.
 Re-run the three commands and refresh this table whenever either side's pin moves.
@@ -66,16 +66,16 @@ One Python process, driven over stdin/stdout with one JSON object per line. Comm
 `{"id": N, "ok": false, "error": "..."}`; what the reference observes on its own arrives as
 `{"event": "...", ...}`. Bytes are lowercase hex. On start it writes a Reticulum config
 (transport enabled, one `TCPServerInterface` on a free loopback port, no shared instance),
-creates a Coyote-shaped destination `coyote.mesh.<instance_id>` serving `/status` and
+creates a Coyote-shaped destination `scope.session.<instance_id>` serving `/status` and
 `/message` to anyone, and prints `READY {json}` with `relay_port`, `identity_hash`,
 `destination_hash`, `name_hash` and `instance_id`.
 
 | Command | Arguments | Reply / effect |
 |---|---|---|
-| `announce` | `display_name: str \| null` | Announces the peer destination with `COYM`, version `1` and the name. |
-| `watch` | `instance_id` | Registers an announce handler for `coyote.mesh.<instance_id>`; each hit is an `announce` event with `destination_hash`, `identity_hash`, `app_data`, `derived_destination_hash` (the reference's own derivation from the announced identity) and `decoded` (`magic_ok`, `version`, `display_name`). |
+| `announce` | `display_name: str \| null` | Announces the peer destination with `SCOPE`, version `1` and the name. |
+| `watch` | `instance_id` | Registers an announce handler for `scope.session.<instance_id>`; each hit is an `announce` event with `destination_hash`, `identity_hash`, `app_data`, `derived_destination_hash` (the reference's own derivation from the announced identity) and `decoded` (`magic_ok`, `version`, `display_name`). |
 | `wait_path` | `destination_hash`, `timeout_secs` | Requests a path once and waits until the transport has one and the identity is known; replies with `hops`. |
-| `request` | `destination_hash`, `instance_id`, `path`, `envelope` or `raw_envelope`, `timeout_secs` | Opens a link to `coyote.mesh.<instance_id>`, identifies as the peer identity, sends the request and replies with `status` (`ready`/`failed`), `response` (an integer for a refusal code, a map otherwise) and `response_type`. In `envelope`, a string `name_hash` is hex; keys are emitted in the given order. |
+| `request` | `destination_hash`, `instance_id`, `path`, `envelope` or `raw_envelope`, `timeout_secs` | Opens a link to `scope.session.<instance_id>`, identifies as the peer identity, sends the request and replies with `status` (`ready`/`failed`), `response` (an integer for a refusal code, a map otherwise) and `response_type`. In `envelope`, a string `name_hash` is hex; keys are emitted in the given order. |
 | `silence` | `path` | Deregisters that request handler on the peer destination, so a request to it goes unanswered. Fails when nothing is registered at `path`. |
 | `pn_start` | `cost` | Starts an `LXMRouter` propagation node at that stamp cost and announces it at once; replies with `destination_hash`, `stamp_cost`, `stamp_cost_flexibility`. |
 | `pn_announce` | | Announces the running propagation node again, so a peer that restarted after `pn_start` files it; replies with `destination_hash`. |

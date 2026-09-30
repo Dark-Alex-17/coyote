@@ -17,6 +17,8 @@ const UPSTREAM_ISSUES: &str = include_str!(concat!(
 
 const EXPECTED_H1: &str = "# Coyote Mesh Protocol, version 1: wire format";
 const SECTION_COUNT: usize = 21;
+const CODE_POINT_HEADING: &str = "## 13. Code-point immutability";
+const ON_DISK_SCHEMA_KIND: &str = "on-disk schema version";
 const CONSTANTS_HEADING: &str = "## 19. Constants";
 const INDEX_HEADING: &str = "## 21. Requirements index";
 const BCP14: &str = "The key words \"MUST\", \"MUST NOT\", \"REQUIRED\", \"SHALL\", \"SHALL NOT\", \
@@ -1021,7 +1023,7 @@ mod tests {
     use rns_transport::hash::ADDRESS_HASH_SIZE;
     use std::time::Duration;
 
-    const EXPECTED_LITERALS: &str = r#"1,1,10,16,262144,128,"/knock","/status","/message",30,10,10,2,20,16,0xf0,0xf1,0xf3,0xf4,0xf5,0xf6,0xfd,0xfe,"COYM",64,300,900,3,2700,1800,1024,"coyote.knock/1",200,15,10,256,3,600,256,16,1,0,1,2,64,280,64,64,120,280,"coyote.peer/1",1,120,4000,64,4096,8,15,10,604800,256,3600,120,256,1,60,100000,120,26,60,2,60,1024,64,240,131072,112,4096,15552000,3,900,256,0,32,0xfb,0xfc,8,64,256,64,8,1,1,1,1,1,1,1"#;
+    const EXPECTED_LITERALS: &str = r#"1,1,10,16,262144,128,"/knock","/status","/message",30,10,10,2,20,16,0xf0,0xf1,0xf3,0xf4,0xf5,0xf6,0xfd,0xfe,"SCOPE",64,300,900,3,2700,1800,1024,"scope.knock/1",200,15,10,256,3,600,256,16,1,0,1,2,64,280,64,64,120,280,"scope.peer/1",1,120,4000,64,4096,8,15,10,604800,256,3600,120,256,1,60,100000,120,26,60,2,60,1024,64,240,131072,112,4096,15552000,3,900,256,0,32,0xfb,0xfc,8,64,256,64,8,2,2,1,1,1,2,1"#;
 
     fn expected_constants() -> Vec<(&'static str, String)> {
         let secs = |d: Duration| d.as_secs().to_string();
@@ -2064,6 +2066,182 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
         );
     }
 
+    /// Usage probe for T33 (b)/B2: the protocol spec's definition and table rows spell
+    /// the SCOPE wire identifiers everywhere. Nothing is released, so there is no
+    /// "formerly" form to allow: the pre-SCOPE announce magic (as text or as its hex
+    /// bytes), the old `<app>.mesh` destination name in any spelling of application and
+    /// aspect, and the old `<app>.<kind>/1` LXMF type tags may not appear on any line.
+    #[test]
+    fn usage_probe_spec_spells_no_pre_scope_wire_identifier() {
+        // Assembled at runtime so the mesh source guard does not match this test's text.
+        let old_app = ["coy", "ote"].concat();
+        let needles = [
+            ["COY", "M"].concat(),
+            "43 4f 59 4d".to_string(),
+            format!("{old_app}.mesh"),
+            format!("{old_app}.peer/"),
+            format!("{old_app}.knock/"),
+            format!("application `{old_app}`"),
+            "aspect `mesh.".to_string(),
+            format!("DestinationName::new(\"{old_app}\""),
+            format!("`{old_app}`, `.`, `mesh."),
+        ];
+        let hits: Vec<String> = SPEC
+            .lines()
+            .enumerate()
+            .flat_map(|(index, line)| {
+                needles
+                    .iter()
+                    .filter(|needle| line.contains(needle.as_str()))
+                    .map(move |needle| {
+                        format!("docs/mesh/PROTOCOL.md:{}: spells {needle:?}", index + 1)
+                    })
+            })
+            .collect();
+        assert!(hits.is_empty(), "{}", hits.join("\n"));
+
+        // Positive control: the SCOPE forms are what the same rows spell now.
+        for present in [
+            "`\"SCOPE\"`",
+            "53 43 4f 50 45",
+            "scope.session.<instance_id>",
+            "DestinationName::new(\"scope\", \"session.<instance_id>\")",
+            "\"scope.knock/1\"",
+            "\"scope.peer/1\"",
+        ] {
+            assert!(
+                SPEC.contains(present),
+                "the spec no longer spells {present:?}"
+            );
+        }
+    }
+
+    /// Usage probe for T33 (a)/B2: section 5.1's layout line, every offset the field
+    /// table spells, and both worked hex examples are derived from the live five-byte
+    /// magic, not left at the old four-byte arithmetic. The examples must round-trip
+    /// through the live codec to exactly the version and name the prose gives them.
+    #[test]
+    fn usage_probe_spec_announce_layout_widths_and_examples_follow_the_live_magic() {
+        let magic_len = announce::ANNOUNCE_MAGIC.len();
+        let header_len = magic_len + 2;
+        let max_total = header_len + announce::MAX_DISPLAY_NAME_BYTES;
+        let magic_text = std::str::from_utf8(&announce::ANNOUNCE_MAGIC).unwrap();
+
+        let section = section(SPEC, "### 5.1 Application data").unwrap();
+        // `section` runs to the next `## ` heading; stop at 5.2.
+        let content = section.content.as_str();
+        let end = content.find("\n### ").unwrap_or(content.len());
+        let text = &content[..end];
+
+        let layout = text
+            .lines()
+            .find(|line| line.starts_with("Layout: "))
+            .expect("section 5.1 opens with a Layout line");
+        assert_eq!(
+            layout,
+            format!(
+                "Layout: `magic({magic_len}) || version(2) || display_name(0..={})`; total length {header_len} to {max_total} bytes. There is no length prefix.",
+                announce::MAX_DISPLAY_NAME_BYTES
+            )
+        );
+
+        let tables = tables(text);
+        let [table] = tables.as_slice() else {
+            panic!("section 5.1 holds one table");
+        };
+        let rows: Vec<Vec<&str>> = table.rows.iter().map(|row| cells(row)).collect();
+        let field = |name: &str| -> Vec<&str> {
+            rows.iter()
+                .find(|cells| cells[0].starts_with(name))
+                .unwrap_or_else(|| panic!("section 5.1 has no {name} row"))
+                .clone()
+        };
+        let magic_row = field("magic");
+        assert_eq!(magic_row[0], format!("magic, bytes 0..{magic_len}"));
+        assert_eq!(magic_row[1], format!("{magic_len} bytes"));
+        assert_eq!(magic_row[2], format!("`ANNOUNCE_MAGIC` = `{magic_text:?}`"));
+        assert!(
+            magic_row[3].contains(&format!("shorter than {header_len} bytes"))
+                && magic_row[3]
+                    .contains(&format!("first {magic_len} bytes are not `{magic_text:?}`")),
+            "MESH-ANN-001 row: {}",
+            magic_row[3]
+        );
+        assert_eq!(
+            field("version")[0],
+            format!("version, bytes {magic_len}..{header_len}")
+        );
+        assert_eq!(
+            field("display_name")[0],
+            format!("display_name, bytes {header_len}..end")
+        );
+        assert!(
+            field("any other byte")[3].contains(&format!("from offset {header_len} to the end")),
+            "MESH-ANN-005 row: {}",
+            field("any other byte")[3]
+        );
+
+        // The worked examples decode with the live codec to what the prose says, and the
+        // named one re-encodes to the very bytes printed.
+        let examples = text
+            .lines()
+            .find(|line| line.starts_with("Examples ("))
+            .expect("section 5.1 gives worked examples");
+        let hex_spans: Vec<Vec<u8>> = examples
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .filter(|span| {
+                span.split(' ')
+                    .all(|byte| byte.len() == 2 && u8::from_str_radix(byte, 16).is_ok())
+            })
+            .map(|span| {
+                span.split(' ')
+                    .map(|byte| u8::from_str_radix(byte, 16).unwrap())
+                    .collect()
+            })
+            .collect();
+        let [named, bare] = hex_spans.as_slice() else {
+            panic!("section 5.1 gives two hex examples, found {hex_spans:?}");
+        };
+        assert!(
+            examples.contains("is version 1, display name `Alex`"),
+            "{examples}"
+        );
+        assert!(
+            examples.contains("is version `0x0102`, no display name"),
+            "{examples}"
+        );
+        assert_eq!(named.len(), header_len + "Alex".len());
+        assert_eq!(
+            announce::AnnounceAppData::decode(named),
+            Some(announce::AnnounceAppData {
+                version: 1,
+                display_name: Some("Alex".to_string()),
+            }),
+            "{named:02x?}"
+        );
+        assert_eq!(
+            announce::AnnounceAppData {
+                version: 1,
+                display_name: Some("Alex".to_string()),
+            }
+            .encode()
+            .unwrap(),
+            *named,
+            "the printed example is not what the live encoder emits"
+        );
+        assert_eq!(bare.len(), header_len);
+        assert_eq!(
+            announce::AnnounceAppData::decode(bare),
+            Some(announce::AnnounceAppData {
+                version: 0x0102,
+                display_name: None,
+            }),
+            "{bare:02x?}"
+        );
+    }
+
     const THREAT_ROWS: &str = "\
 | Attack | Scope | Where |
 |---|---|---|
@@ -2237,6 +2415,68 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
     fn spec_constants_table_matches_the_code() {
         let actual = parse_constants_table(SPEC).unwrap();
         check_constants(&actual, &expected_constants()).unwrap();
+    }
+
+    #[test]
+    fn registry_on_disk_schema_version_rows_match_the_live_constants() {
+        let live = [
+            ("TRUST_FILE_VERSION", trust::TRUST_FILE_VERSION),
+            ("KNOCK_RECORD_VERSION", knocks::KNOCK_RECORD_VERSION),
+            ("PENDING_RECORD_VERSION", pending::PENDING_RECORD_VERSION),
+            ("INBOUND_RECORD_VERSION", pending::INBOUND_RECORD_VERSION),
+            (
+                "PREDECESSOR_RECORD_VERSION",
+                identity::PREDECESSOR_RECORD_VERSION,
+            ),
+            ("PEER_TABLE_VERSION", peers::PEER_TABLE_VERSION),
+            (
+                "PROPAGATION_STORE_VERSION",
+                propagation_fetch::PROPAGATION_STORE_VERSION,
+            ),
+        ];
+        let section = section(SPEC, CODE_POINT_HEADING).unwrap();
+        let tables = tables(&section.content);
+        let [table] = tables.as_slice() else {
+            panic!(
+                "{CODE_POINT_HEADING:?} holds {} tables, expected exactly one",
+                tables.len()
+            );
+        };
+        let rows: Vec<(u64, Vec<&str>)> = table
+            .rows
+            .iter()
+            .map(|row| cells(row))
+            .filter(|cells| cells.get(1) == Some(&ON_DISK_SCHEMA_KIND))
+            .map(|cells| {
+                let [value, _, names, _] = cells.as_slice() else {
+                    panic!("registry row {cells:?} does not have four cells");
+                };
+                let value = backticked(value)
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or_else(|| panic!("registry row {cells:?} has no backticked version"));
+                let names = names
+                    .split(", ")
+                    .map(|name| {
+                        backticked(name)
+                            .unwrap_or_else(|| panic!("registry row {cells:?} names {name:?}"))
+                    })
+                    .collect();
+                (value, names)
+            })
+            .collect();
+        let listed: Vec<&str> = rows
+            .iter()
+            .flat_map(|(_, names)| names.iter().copied())
+            .collect();
+        let expected: Vec<&str> = live.iter().map(|(name, _)| *name).collect();
+        assert_eq!(listed, expected);
+        for (value, names) in &rows {
+            let [name] = names.as_slice() else {
+                panic!("registry row {names:?} must list one constant");
+            };
+            let (_, want) = live.iter().find(|(live, _)| live == name).unwrap();
+            assert_eq!(value, want, "`{name}`");
+        }
     }
 
     #[test]

@@ -1873,9 +1873,9 @@ pub(super) fn check_receipt_deferral_budget(fx: &ReceiptFixture) -> Result<(), S
 pub(super) const TAG_CARD: u8 = 0x01;
 pub(super) const TAG_BODY: u8 = 0x02;
 const TAG_INTRO: u8 = 0x03;
-const TAG_ANNOUNCE: u8 = 0x04;
-const TAG_PEER_FIELDS: u8 = 0x05;
-const TAG_KNOCK_FIELDS: u8 = 0x06;
+pub(super) const TAG_ANNOUNCE: u8 = 0x04;
+pub(super) const TAG_PEER_FIELDS: u8 = 0x05;
+pub(super) const TAG_KNOCK_FIELDS: u8 = 0x06;
 pub(super) const TAG_REFUSAL_CODE: u8 = 0x07;
 const TAG_VERSION_REFUSAL: u8 = 0x08;
 const TAG_DISPATCH_ERROR: u8 = 0x09;
@@ -2419,7 +2419,11 @@ impl AnnounceGen {
         let mut out = Vec::new();
         match self.magic.0 {
             Some(()) => out.extend_from_slice(&ANNOUNCE_MAGIC),
-            None => out.extend_from_slice(b"COYX"),
+            None => {
+                let mut wrong = ANNOUNCE_MAGIC;
+                wrong[ANNOUNCE_MAGIC.len() - 1] ^= 0x01;
+                out.extend_from_slice(&wrong);
+            }
         }
         out.extend_from_slice(&self.version.to_be_bytes());
         match self.name {
@@ -2443,13 +2447,14 @@ impl AnnounceGen {
 
 /// MESH-ANN-001 (length and magic), MESH-ANN-002 (big-endian version), MESH-ANN-003
 /// (name at most 64 bytes, UTF-8, no control or invisible character), MESH-ANN-004 (empty
-/// name is no name), MESH-ANN-005 (every byte from 6 on is the name).
+/// name is no name), MESH-ANN-005 (every byte from 7 on is the name).
 fn expect_announce(bytes: &[u8]) -> Option<(u16, Option<&str>)> {
-    if bytes.len() < ANNOUNCE_MAGIC.len() + 2 || bytes[..ANNOUNCE_MAGIC.len()] != ANNOUNCE_MAGIC {
+    let (magic, rest) = bytes.split_at_checked(ANNOUNCE_MAGIC.len())?;
+    if magic != ANNOUNCE_MAGIC {
         return None;
     }
-    let version = u16::from_be_bytes([bytes[4], bytes[5]]);
-    let name = &bytes[6..];
+    let (version, name) = rest.split_at_checked(2)?;
+    let version = u16::from_be_bytes([version[0], version[1]]);
     if name.len() > MAX_DISPLAY_NAME_BYTES {
         return None;
     }
@@ -2608,7 +2613,7 @@ fn expect_typed(fields: &Value, tag: &str) -> Option<Option<[u8; NAME_HASH_LEN]>
     Some(name_hash)
 }
 
-fn inbound_with(fields: Value) -> InboundMessage {
+pub(super) fn inbound_with(fields: Value) -> InboundMessage {
     InboundMessage {
         transient_id: [1u8; 32],
         message_id: [2u8; 32],

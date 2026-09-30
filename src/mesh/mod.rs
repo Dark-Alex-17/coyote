@@ -32,6 +32,8 @@ pub(crate) mod snapshot;
 mod spec_pins;
 pub(crate) mod trust;
 
+#[cfg(test)]
+pub(crate) use node::session_destination_name;
 pub(crate) use node::{MESH_ALREADY_ON, MeshPaths, MeshRuntime, MeshSlot, NodeOptions};
 pub(crate) use peers::PeerRecord;
 pub(crate) use propagation_fetch::{
@@ -190,6 +192,8 @@ pub(crate) mod test_support {
         AdmittedRequest, Handler, MESSAGE_PATH, NAME_HASH_LEN, OriginName, PathHash, RefusalCode,
         Reply, RequestId, SizeBranch,
     };
+    #[cfg(unix)]
+    use super::session_destination_name;
     use super::snapshot::{BriefState, MeshSnapshot, SessionInfo, TurnState};
     use super::trust::TrustStore;
     use super::{mesh_config_dir, rfc3339_utc};
@@ -685,7 +689,7 @@ pub(crate) mod test_support {
                 handler,
                 client_mtu,
                 identity.clone(),
-                DestinationName::new("coyote", &format!("mesh.{tag}")),
+                session_destination_name(tag),
             )
             .await;
             Self {
@@ -769,7 +773,7 @@ pub(crate) mod test_support {
     #[cfg(unix)]
     pub(crate) fn derived_sighting(aspect: &str, display_name: Option<&str>) -> PeerSighting {
         let identity = TransportIdentity::new_from_rand(OsRng);
-        let name = DestinationName::new("coyote", &format!("mesh.{aspect}"));
+        let name = session_destination_name(aspect);
         let desc = SingleInputDestination::new(identity, name).desc;
         PeerSighting {
             destination_hash: desc.address_hash.to_hex_string(),
@@ -1077,6 +1081,79 @@ mod tests {
                     .any(|path| path.file_name().is_some_and(|file| file == name)),
                 "{name} must be among the scanned mesh sources"
             );
+        }
+    }
+
+    /// The wire identifiers before the SCOPE rename (announce magic, destination
+    /// application and aspect, LXMF type tags) must not survive anywhere under `src/mesh`
+    /// nor in the mesh-facing files outside it that the redaction scan covers, the one
+    /// permitted form being the foreign-magic decode vector that asserts they are refused.
+    /// A status-card repo named after this program is not a wire identifier.
+    #[test]
+    fn no_source_under_mesh_spells_the_pre_scope_wire_identifiers() {
+        let mut sources = rust_sources();
+        let mesh = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("mesh");
+        sources.extend(
+            redaction_scan_sources()
+                .into_iter()
+                .filter(|path| !path.starts_with(&mesh)),
+        );
+        /// Whether a line spelling the needle is one of the permitted forms.
+        type Allowed = fn(&str) -> bool;
+        fn never(_: &str) -> bool {
+            false
+        }
+        fn refused_foreign_magic(line: &str) -> bool {
+            line.contains("::decode(") && line.contains("), None)")
+        }
+        fn card_repo_name(line: &str) -> bool {
+            line.contains("\"repo\"") || line.contains("repo(") || line.contains("(\"name\"")
+        }
+        // Needles assembled at runtime so this test's own text does not match them.
+        let needles: [(String, Allowed); 5] = [
+            (["COY", "M"].concat(), refused_foreign_magic),
+            (["\"coy", "ote\""].concat(), card_repo_name),
+            (["coy", "ote.mesh"].concat(), never),
+            (["coy", "ote.peer/"].concat(), never),
+            (["coy", "ote.knock/"].concat(), never),
+        ];
+        let mut hits = Vec::new();
+        for path in &sources {
+            for (index, line) in fs::read_to_string(path).unwrap().lines().enumerate() {
+                for (needle, allowed) in &needles {
+                    if line.contains(needle.as_str()) && !allowed(line) {
+                        hits.push(format!(
+                            "{}:{}: spells {needle:?}",
+                            path.display(),
+                            index + 1
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(hits.is_empty(), "{}", hits.join("\n"));
+        for expected in ["announce.rs", "conformance/interop.rs", "repl/mesh.rs"] {
+            assert!(
+                sources.iter().any(|path| path.ends_with(expected)),
+                "{expected} must be among the scanned sources"
+            );
+        }
+    }
+
+    #[test]
+    fn announce_doc_comments_name_the_scope_node() {
+        let announce = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("mesh")
+            .join("announce.rs");
+        let text = fs::read_to_string(&announce).unwrap();
+        for expected in ["SCOPE node", "SCOPE announce"] {
+            assert!(text.contains(expected), "announce.rs must say {expected:?}");
+        }
+        for stale in ["Coyote node", "Coyote announce"] {
+            assert!(!text.contains(stale), "announce.rs still says {stale:?}");
         }
     }
 

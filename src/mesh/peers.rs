@@ -24,7 +24,7 @@ pub(crate) const PEER_TTL: Duration =
 /// before `PEER_TTL` removes it.
 pub(crate) const PEER_STALE_AFTER: Duration = Duration::from_secs(2 * HEARTBEAT_SECS);
 
-pub(crate) const PEER_TABLE_VERSION: u64 = 1;
+pub(crate) const PEER_TABLE_VERSION: u64 = 2;
 
 /// `peers.json` whole: the version first, then the peers. Rejects unknown fields, as does
 /// each `PeerRecord`, so any change to the layout bumps `PEER_TABLE_VERSION`.
@@ -37,7 +37,7 @@ pub(crate) struct PeerTableFile {
 
 /// One remembered peer. A field with a default is one the table did not always keep; a
 /// record without it still loads, but a field this build does not know refuses the record.
-/// The defaults are a tolerance for hand-edited tables inside version 1, not a migration:
+/// The defaults are a tolerance for hand-edited tables inside one version, not a migration:
 /// a layout change still bumps `PEER_TABLE_VERSION`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -45,14 +45,14 @@ pub(crate) struct PeerRecord {
     pub destination_hash: String,
     pub identity_hash: String,
     /// Lower-hex of the announce's 10-byte name hash; it is what lets the trust store prove
-    /// the destination belongs to the identity. Empty when the table predates the field.
+    /// the destination belongs to the identity. Empty when a current-version table omits it.
     #[serde(default)]
     pub name_hash: String,
     pub display_name: Option<String>,
     pub protocol_version: u16,
     /// Whether this Coyote speaks `protocol_version`, kept so the outbound gate reads a
-    /// verdict. A table written before the field was kept loads it as compatible and
-    /// `load` reconciles it against `protocol_version`.
+    /// verdict. A current-version table that omits it loads it as compatible and `load`
+    /// reconciles it against `protocol_version`.
     #[serde(default)]
     pub compatibility: Compatibility,
     pub hops: u8,
@@ -127,10 +127,10 @@ impl PeerTable {
             .into_iter()
             .filter(|record| !is_expired(record, now))
             .map(|mut record| {
-                // A record written before the field existed loads as compatible and is
-                // judged from its announced version here. An `Incompatible` written by a
-                // previous run is kept as written until the peer's next announce
-                // re-judges it.
+                // A record inside the current version that lacks the field loads as
+                // compatible and is judged from its announced version here (older versions
+                // are refused by the version gate). An `Incompatible` written by a previous
+                // run is kept as written until the peer's next announce re-judges it.
                 if record.compatibility == Compatibility::Compatible {
                     record.compatibility = Compatibility::of(record.protocol_version);
                 }
@@ -755,19 +755,20 @@ mod tests {
     #[test]
     fn load_sets_aside_a_current_table_with_an_unknown_field() {
         let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let cause = format!("is not a version-{PEER_TABLE_VERSION} peer table");
         let mut file = file_of(vec![record("aa", 1, t0)]);
         file["peers"][0]["later"] = serde_json::json!(true);
         assert_corrupt_file_is_set_aside(
             "peers-corrupt-unknown-field",
             &serde_json::to_vec(&file).unwrap(),
-            "is not a version-1 peer table",
+            &cause,
         );
         let mut file = file_of(vec![record("aa", 1, t0)]);
         file["later"] = serde_json::json!(true);
         assert_corrupt_file_is_set_aside(
             "peers-corrupt-unknown-envelope-field",
             &serde_json::to_vec(&file).unwrap(),
-            "is not a version-1 peer table",
+            &cause,
         );
         let mut file = file_of(vec![record("aa", 1, t0)]);
         file["peers"][0]["compatibility"] =
@@ -775,7 +776,7 @@ mod tests {
         assert_corrupt_file_is_set_aside(
             "peers-corrupt-unknown-compatibility-field",
             &serde_json::to_vec(&file).unwrap(),
-            "is not a version-1 peer table",
+            &cause,
         );
     }
 
@@ -810,7 +811,10 @@ mod tests {
 
         assert!(err.contains(&path.display().to_string()), "{err}");
         assert!(err.contains(&format!("version {found}")), "{err}");
-        assert!(err.contains("version 1"), "{err}");
+        assert!(
+            err.contains(&format!("version {PEER_TABLE_VERSION}")),
+            "{err}"
+        );
         assert!(err.contains(cause), "{err}");
         assert!(err.contains("move the file aside"), "{err}");
         assert_eq!(
@@ -829,5 +833,14 @@ mod tests {
     #[test]
     fn load_refuses_a_pre_baseline_table_version_as_having_no_migration() {
         assert_version_is_refused("peers-older", 0, "no migration");
+    }
+
+    /// Usage probe for T33 (e): the `peers.json` a pre-SCOPE build wrote is a well-formed
+    /// version-1 table whose destination hashes derive from the old application name. It
+    /// must be refused with a clear message, not loaded as an empty table.
+    #[test]
+    fn usage_probe_load_refuses_a_well_formed_version_1_table_written_before_scope() {
+        assert_eq!(PEER_TABLE_VERSION, 2, "T33 bumps the peer table 1 -> 2");
+        assert_version_is_refused("peers-pre-scope-v1", 1, "no migration");
     }
 }

@@ -1514,6 +1514,7 @@ mod tests {
     use crate::mesh::peers::PeerSighting;
     use crate::mesh::propagation::build_signed_message;
     use crate::mesh::r3::{OriginName, RequestFrame};
+    use crate::mesh::session_destination_name;
     use crate::mesh::test_support::{TempDir, TrustList, read_source, rust_sources};
     use crate::testing::{debug_snapshot, install_log_collector, warn_snapshot};
 
@@ -1521,7 +1522,6 @@ mod tests {
     use lxmf_core::stamp::generate_stamp;
     use parking_lot::Mutex;
     use rand_core::OsRng;
-    use rns_transport::destination::DestinationName;
     use rns_transport::identity_bridge::to_transport_identity;
     use rns_transport::transport::TransportConfig;
     use std::sync::{Arc, Weak};
@@ -2375,7 +2375,7 @@ mod tests {
             gate: &gate,
             inner: &inner,
         };
-        let origin = OriginName::of(&DestinationName::new("coyote", "mesh.knocker"));
+        let origin = OriginName::of(&session_destination_name("knocker"));
 
         let knock = knock_body(&knocker, &me, "let me in", &origin);
         assert_eq!(
@@ -2693,6 +2693,46 @@ mod tests {
             "fetch-store-unknown-field",
             br#"{"version": 1, "seen": [], "delivered": [], "deferred": [], "cursor": null, "later": true}"#,
             "is not a version-1 propagation fetch state",
+        );
+    }
+
+    #[test]
+    fn usage_probe_a_version_1_propagation_store_written_before_scope_still_loads() {
+        // T33 (SCOPE wire rename) bumps trust/peers/knocks 1 -> 2 and MUST NOT bump
+        // `PROPAGATION_STORE_VERSION`: a fetch state a user's node wrote on the build
+        // before the rename, spelled with a literal `"version": 1`, still loads in place,
+        // is not set aside, and keeps its dedup memory.
+        install_log_collector();
+        let tmp = TempDir::new("fetch-store-v1-before-scope");
+        let path = tmp.path.join("propagation.json");
+        let aside = tmp.path.join("propagation.json.corrupt");
+        let seen_hex = "1".repeat(64);
+        let delivered_hex = "2".repeat(64);
+        let bytes = format!(
+            concat!(
+                r#"{{"version": 1, "seen": [{{"transient_id": "{seen}", "seen_at": "1970-01-01T00:00:01Z"}}],"#,
+                r#" "delivered": [{{"message_id": "{delivered}", "delivered_at": "1970-01-01T00:00:01Z"}}],"#,
+                r#" "deferred": [], "cursor": null}}"#
+            ),
+            seen = seen_hex,
+            delivered = delivered_hex,
+        );
+        fs::write(&path, bytes.as_bytes()).unwrap();
+
+        let store = FetchStore::load(path.clone(), t(10))
+            .expect("a version-1 propagation store still loads");
+
+        assert_eq!(store.len(), 1, "the seen id survives the load");
+        assert!(store.contains(&[0x11; 32]));
+        assert!(store.was_delivered(&[0x22; 32]));
+        assert_eq!(store.cursor(), None);
+        assert!(path.exists(), "a loadable file is left where it is");
+        assert!(!aside.exists(), "a loadable file is not set aside");
+        assert!(
+            !warn_snapshot()
+                .iter()
+                .any(|line| line.contains(&path.display().to_string())),
+            "no warning names a file that loaded cleanly"
         );
     }
 
@@ -3288,7 +3328,7 @@ mod tests {
             )
             .await;
             // A Coyote peer announces its own destination, never `lxmf.delivery`.
-            let name = DestinationName::new("coyote", "mesh.test");
+            let name = session_destination_name("test");
             let coyote_hash = fetcher.learn_announce(&fake, sender, name).await;
             let me = fetcher.identity();
             let body = honest_body(&sender_core, &me, b"from a coyote");

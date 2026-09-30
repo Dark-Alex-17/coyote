@@ -11,7 +11,7 @@ use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-pub(crate) const KNOCK_RECORD_VERSION: u64 = 1;
+pub(crate) const KNOCK_RECORD_VERSION: u64 = 2;
 
 /// The knock path caps the knocker's text here; `append` refuses anything longer as a
 /// backstop rather than truncating it.
@@ -52,8 +52,9 @@ pub(crate) struct KnockRecord {
     pub identity_hash: String,
     /// Lower-hex, the knocking instance.
     pub destination_hash: String,
-    /// Lower-hex origin name hash, the other half of what derives `destination_hash`;
-    /// empty on rows written before it was kept.
+    /// Lower-hex origin name hash, the other half of what derives `destination_hash`. The
+    /// default is a tolerance for a hand-edited row inside one version, not a migration: a
+    /// row from an older version is refused by the version gate.
     #[serde(default)]
     pub name_hash: String,
     pub display_name: Option<String>,
@@ -881,8 +882,14 @@ mod tests {
 
         assert!(err.contains(&cache.path().display().to_string()), "{err}");
         assert!(err.contains("line 1"), "{err}");
-        assert!(err.contains("version 2"), "{err}");
-        assert!(err.contains("version 1"), "{err}");
+        assert!(
+            err.contains(&format!("version {}", KNOCK_RECORD_VERSION + 1)),
+            "{err}"
+        );
+        assert!(
+            err.contains(&format!("version {KNOCK_RECORD_VERSION}")),
+            "{err}"
+        );
         assert!(err.contains("upgrade Coyote"), "{err}");
         assert!(err.contains("move the file aside"), "{err}");
         assert!(cache.append(knock("more", t(3_000)), t(3_000)).is_err());
@@ -907,6 +914,37 @@ mod tests {
         assert!(err.contains("no migration"), "{err}");
         assert!(err.contains("move the file aside"), "{err}");
         assert!(!err.contains("upgrade Coyote"), "{err}");
+    }
+
+    /// Usage probe for T33 (e): a `knocks.jsonl` line the pre-SCOPE build wrote (a
+    /// well-formed version-1 record whose hashes derive from the old application name)
+    /// refuses the cache with a clear message, on listing and on the next append, rather
+    /// than reading as an empty cache or being silently skipped.
+    #[test]
+    fn usage_probe_a_well_formed_version_1_record_written_before_scope_refuses_the_cache() {
+        assert_eq!(KNOCK_RECORD_VERSION, 2, "T33 bumps the knock record 1 -> 2");
+        let tmp = TempDir::new("knocks-pre-scope-v1");
+        let cache = KnockCache::new(&tmp.path, 24);
+        let mut old = serde_json::to_value(knock("pre-scope", t(1_000))).unwrap();
+        old["version"] = serde_json::json!(1);
+        fs::create_dir_all(cache.path().parent().unwrap()).unwrap();
+        fs::write(cache.path(), format!("{old}\n")).unwrap();
+
+        let err = match cache.list(t(2_000)) {
+            Ok(listed) => panic!(
+                "a version-1 knock line must refuse the cache, not list {} records",
+                listed.len()
+            ),
+            Err(err) => err.to_string(),
+        };
+
+        assert!(err.contains(&cache.path().display().to_string()), "{err}");
+        assert!(err.contains("line 1"), "{err}");
+        assert!(err.contains("version 1"), "{err}");
+        assert!(err.contains("version 2"), "{err}");
+        assert!(err.contains("no migration"), "{err}");
+        assert!(err.contains("move the file aside"), "{err}");
+        assert!(cache.append(knock("more", t(3_000)), t(3_000)).is_err());
     }
 
     #[test]

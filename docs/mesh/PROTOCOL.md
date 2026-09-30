@@ -125,8 +125,8 @@ Derivations, from the identity's public keys outward:
 
 - identity hash = `trunc_16(H(x25519_public(32) || ed25519_public(32)))`, 16 bytes.
 - instance id = a UUIDv4 in simple form, 32 lowercase hex digits.
-- destination name = application `coyote`, aspect `mesh.<instance_id>`.
-- name hash = `trunc_10(H(name_bytes))` where `name_bytes` is the ASCII string `coyote.mesh.<instance_id>`: the bytes `coyote`, `.`, `mesh.`, then the 32 hex digits of the instance id. 10 bytes.
+- destination name = application `scope`, aspect `session.<instance_id>`.
+- name hash = `trunc_10(H(name_bytes))` where `name_bytes` is the ASCII string `scope.session.<instance_id>`: the bytes `scope`, `.`, `session.`, then the 32 hex digits of the instance id. 10 bytes.
 - destination hash = `trunc_16(H(name_hash(10) || identity_hash(16)))`, 16 bytes.
 - LXMF delivery hash = `trunc_16(H(trunc_10(H("lxmf.delivery")) || identity_hash(16)))`, 16 bytes.
 - propagation node name hash = `trunc_10(H("lxmf.propagation"))`, 10 bytes.
@@ -137,9 +137,9 @@ An instance whose identity key is replaced keeps its instance id, and with it it
 
 **[MESH-DEST-002]** A node's instance id MUST be 32 lowercase hex digits, minted once per session lineage and reused by every session of that lineage (`mesh_instance_id`, `is_valid_mesh_instance_id`, src/config/session.rs).
 
-**[MESH-DEST-003]** A Coyote instance's destination name MUST be application `coyote`, aspect `mesh.<instance_id>` (`DestinationName::new("coyote", "mesh.<instance_id>")`, src/mesh/node.rs).
+**[MESH-DEST-003]** A Coyote instance's destination name MUST be application `scope`, aspect `session.<instance_id>` (`DestinationName::new("scope", "session.<instance_id>")`, src/mesh/node.rs).
 
-**[MESH-DEST-004]** The name hash MUST be the first 10 bytes of the SHA-256 of the ASCII string `coyote.mesh.<instance_id>` (upstream `DestinationName::new`, which hashes `app || "." || aspects`).
+**[MESH-DEST-004]** The name hash MUST be the first 10 bytes of the SHA-256 of the ASCII string `scope.session.<instance_id>` (upstream `DestinationName::new`, which hashes `app || "." || aspects`).
 
 **[MESH-DEST-005]** The destination hash MUST be `trunc_16(H(name_hash || identity_hash))` (`destination_address`, src/mesh/mod.rs; pinned by `destination_address_matches_upstream_derivation`, src/mesh/r3/tests.rs).
 
@@ -159,16 +159,16 @@ A Coyote instance announces its destination (section 4) over Reticulum. The anno
 
 ### 5.1 Application data
 
-Layout: `magic(4) || version(2) || display_name(0..=64)`; total length 6 to 70 bytes. There is no length prefix.
+Layout: `magic(5) || version(2) || display_name(0..=64)`; total length 7 to 71 bytes. There is no length prefix.
 
 | Bytes | Type | Sender puts | Receiver action on any other value |
 |---|---|---|---|
-| magic, bytes 0..4 | 4 bytes | `ANNOUNCE_MAGIC` = `"COYM"` | **[MESH-ANN-001]** The receiver MUST treat application data shorter than 6 bytes, or whose first 4 bytes are not `"COYM"`, as not a Coyote announce and MUST NOT record it. |
-| version, bytes 4..6 | u16 big-endian | its own `MESH_PROTOCOL_VERSION` = `1` | **[MESH-ANN-002]** The receiver MUST record the announce for every value and MUST mark the peer `Incompatible` with the found version when it lies outside the receiver's window (section 7; `Compatibility::of`, src/mesh/protocol.rs; `observe_marks_an_unsupported_announce_version_incompatible`, src/mesh/peers.rs). |
-| display_name, bytes 6..end | UTF-8, 0 to `MAX_DISPLAY_NAME_BYTES` = `64` bytes | the configured display name, or nothing (section 5.2) | **[MESH-ANN-003]** The receiver MUST ignore the whole announce when the name is longer than 64 bytes, is not valid UTF-8, or contains any character of the section 3.3 table. **[MESH-ANN-004]** The receiver MUST read an empty name as no display name. |
-| any other byte | none | nothing | **[MESH-ANN-005]** There is no other field: the receiver MUST read every byte from offset 6 to the end as the display name (`app_data_carries_only_version_and_display_name`). |
+| magic, bytes 0..5 | 5 bytes | `ANNOUNCE_MAGIC` = `"SCOPE"` | **[MESH-ANN-001]** The receiver MUST treat application data shorter than 7 bytes, or whose first 5 bytes are not `"SCOPE"`, as not a Coyote announce and MUST NOT record it. |
+| version, bytes 5..7 | u16 big-endian | its own `MESH_PROTOCOL_VERSION` = `1` | **[MESH-ANN-002]** The receiver MUST record the announce for every value and MUST mark the peer `Incompatible` with the found version when it lies outside the receiver's window (section 7; `Compatibility::of`, src/mesh/protocol.rs; `observe_marks_an_unsupported_announce_version_incompatible`, src/mesh/peers.rs). |
+| display_name, bytes 7..end | UTF-8, 0 to `MAX_DISPLAY_NAME_BYTES` = `64` bytes | the configured display name, or nothing (section 5.2) | **[MESH-ANN-003]** The receiver MUST ignore the whole announce when the name is longer than 64 bytes, is not valid UTF-8, or contains any character of the section 3.3 table. **[MESH-ANN-004]** The receiver MUST read an empty name as no display name. |
+| any other byte | none | nothing | **[MESH-ANN-005]** There is no other field: the receiver MUST read every byte from offset 7 to the end as the display name (`app_data_carries_only_version_and_display_name`). |
 
-Examples (`encode_layout_is_magic_version_name`, `decode_reads_version_big_endian`): `43 4f 59 4d 00 01 41 6c 65 78` is version 1, display name `Alex`; `43 4f 59 4d 01 02` is version `0x0102`, no display name.
+Examples (`encode_layout_is_magic_version_name`, `decode_reads_version_big_endian`): `53 43 4f 50 45 00 01 41 6c 65 78` is version 1, display name `Alex`; `53 43 4f 50 45 01 02` is version `0x0102`, no display name.
 
 **[MESH-ANN-006]** A sender MUST NOT emit a display name longer than 64 bytes or containing a character of the section 3.3 table (`AnnounceAppData::encode` refuses both).
 
@@ -410,7 +410,7 @@ The version refusal value (`VersionRefusal::to_value`, `VersionRefusal::from_val
 
 The announce is authoritative: every announce re-judges the mark from its version (MESH-ANN-011), and an announce outside the window records the peer and marks it (MESH-ANN-002).
 
-Schema versions are distinct from the protocol version and travel inside bodies: `STATUS_CARD_VERSION` = `1` (card `v`, section 9.2), `PEER_WIRE_VERSION` = `1` (message body `v`, section 10.1), and the LXMF type tags `"coyote.knock/1"` and `"coyote.peer/1"` (sections 8.6 and 10.8).
+Schema versions are distinct from the protocol version and travel inside bodies: `STATUS_CARD_VERSION` = `1` (card `v`, section 9.2), `PEER_WIRE_VERSION` = `1` (message body `v`, section 10.1), and the LXMF type tags `"scope.knock/1"` and `"scope.peer/1"` (sections 8.6 and 10.8).
 
 Two nodes interoperate exactly when their windows intersect. Failure is visible as the refusal map above over R3, and as a local `Incompatible` mark with outbound refused after an announce.
 
@@ -500,7 +500,7 @@ LXMF fields map:
 
 | Field | Type | Sender puts | Receiver action on any other value |
 |---|---|---|---|
-| `0xfb` (`FIELD_CUSTOM_TYPE`) | text | `KNOCK_TYPE` = `"coyote.knock/1"` | **[MESH-KNOCK-020]** When absent or not this tag, the receiver MUST NOT treat the message as a knock; it proceeds as an ordinary message (section 11.4, stage 9). |
+| `0xfb` (`FIELD_CUSTOM_TYPE`) | text | `KNOCK_TYPE` = `"scope.knock/1"` | **[MESH-KNOCK-020]** When absent or not this tag, the receiver MUST NOT treat the message as a knock; it proceeds as an ordinary message (section 11.4, stage 9). |
 | `0xfc` (`FIELD_CUSTOM_DATA`) | map | the custom data map below | **[MESH-KNOCK-021]** When missing or not a `map`, the receiver MUST drop the message as malformed. |
 | any other key | any | nothing | **[MESH-KNOCK-022]** The receiver MUST ignore it. |
 
@@ -612,7 +612,7 @@ The requester's typed errors are `NotServed` (a dispatch error map, `no_provider
 
 ## 10. /message
 
-A peer message is a request on `MESSAGE_PATH` = `"/message"` (src/mesh/message.rs). The same body travels by store-and-forward as `"coyote.peer/1"` (section 10.8).
+A peer message is a request on `MESSAGE_PATH` = `"/message"` (src/mesh/message.rs). The same body travels by store-and-forward as `"scope.peer/1"` (section 10.8).
 
 ### 10.1 Body
 
@@ -675,7 +675,7 @@ The sender requests `/message` with `PEER_REQUEST_TIMEOUT` = `15` seconds.
 |---|---|
 | the acknowledgement of section 10.3 | **[MESH-MSG-022]** The sender MUST treat the message as delivered directly (`Direct`). |
 | any other reply value | **[MESH-MSG-023]** The sender MUST report `NotAcknowledged` and MUST NOT fall back. |
-| `Timeout`, `LinkFailed` or `LinkClosed` | **[MESH-MSG-024]** The sender MUST fall back to store-and-forward as `"coyote.peer/1"` (section 10.8). |
+| `Timeout`, `LinkFailed` or `LinkClosed` | **[MESH-MSG-024]** The sender MUST fall back to store-and-forward as `"scope.peer/1"` (section 10.8). |
 | any refusal code | **[MESH-MSG-025]** The sender MUST report `Refused` with the code and MUST NOT fall back. |
 | a version refusal | **[MESH-MSG-026]** The sender MUST report `IncompatibleVersion` and MUST NOT fall back. |
 
@@ -753,7 +753,7 @@ LXMF fields map:
 
 | Field | Type | Sender puts | Receiver action on any other value |
 |---|---|---|---|
-| `0xfb` (`FIELD_CUSTOM_TYPE`) | text | `PEER_MESSAGE_TYPE` = `"coyote.peer/1"` | **[MESH-MSG-046]** When absent or not this tag, the receiver MUST NOT treat the message as a peer message. |
+| `0xfb` (`FIELD_CUSTOM_TYPE`) | text | `PEER_MESSAGE_TYPE` = `"scope.peer/1"` | **[MESH-MSG-046]** When absent or not this tag, the receiver MUST NOT treat the message as a peer message. |
 | `0xfc` (`FIELD_CUSTOM_DATA`) | map | the custom data map below | **[MESH-MSG-047]** When missing or not a `map`, the receiver MUST drop the message as malformed. |
 | any other key | any | nothing | **[MESH-MSG-048]** The receiver MUST ignore it. |
 
@@ -860,7 +860,7 @@ Each body of round 2 runs the stages below in order; the first that fails decide
 | 6 | the source's public key resolves (transport announce cache, then the peer table by delivery hash) | **[MESH-PROP-033]** The receiver MUST defer it as `UnknownSource`: not acknowledged, not recorded. **[MESH-PROP-034]** The receiver MUST keep deferring it until both `MAX_UNKNOWN_SOURCE_DEFERRALS` = `3` deferrals have passed and `UNKNOWN_SOURCE_DEFERRAL_HORIZON` = `900` seconds (one `HEARTBEAT_SECS`) have elapsed since the first sighting, and on the next sighting MUST record, acknowledge and drop it (`UnknownSourceBudgetSpent`; `an_unknown_source_is_deferred_for_three_sightings_and_a_heartbeat_then_given_up_on`). | no, then yes |
 | 7 | the signature verifies | **[MESH-PROP-035]** The receiver MUST discard it as `BadSignature`. | yes |
 | 8 | the signer's standing is `Trusted` | **[MESH-PROP-036]** `Unknown` MUST be discarded as `UntrustedSource`. **[MESH-PROP-037]** `Blocked` MUST be discarded as `BlockedSource` (`a_blocked_signer_is_discarded_and_the_stamp_line_is_logged_for_a_trusted_one`). | yes |
-| 9 | routing | **[MESH-PROP-038]** The receiver MUST route in this order: knock (`"coyote.knock/1"`, section 8.6), then peer message (`"coyote.peer/1"`, section 10.8), then the ordinary inbox. | yes |
+| 9 | routing | **[MESH-PROP-038]** The receiver MUST route in this order: knock (`"scope.knock/1"`, section 8.6), then peer message (`"scope.peer/1"`, section 10.8), then the ordinary inbox. | yes |
 
 **[MESH-PROP-039]** The deferral table MUST hold at most `MAX_DEFERRED_IDS` = `256` ids, the longest deferred evicted past the cap (`deferrals_evict_the_longest_deferred_past_capacity_and_log_it`).
 
@@ -930,14 +930,20 @@ Registry of code points allocated by this document:
 | `received`, `id` | map key, acknowledgement | | 10.3 |
 | `refusal`, `"retry_after_secs"` | map key, typed refusal | | 10.7 |
 | `rate_limited`, `envoy_busy`, `envoy_stopping`, `peer_concurrency`, `token_ceiling`, `cost_ceiling`, `loop_guard` | `refusal` reason | | 10.7 |
-| `"coyote.knock/1"` | LXMF type tag | `KNOCK_TYPE` | 8.6 |
-| `"coyote.peer/1"` | LXMF type tag | `PEER_MESSAGE_TYPE` | 10.8 |
+| `"scope.knock/1"` | LXMF type tag | `KNOCK_TYPE` | 8.6 |
+| `"scope.peer/1"` | LXMF type tag | `PEER_MESSAGE_TYPE` | 10.8 |
 | `0xfb`, `0xfc` | LXMF field key | `FIELD_CUSTOM_TYPE`, `FIELD_CUSTOM_DATA` | 8.6, 10.8 |
-| `"COYM"` | announce magic | `ANNOUNCE_MAGIC` | 5.1 |
+| `"SCOPE"` | announce magic | `ANNOUNCE_MAGIC` | 5.1 |
 | `1` | protocol version | `MESH_PROTOCOL_VERSION` | 7 |
 | `1` | card schema version | `STATUS_CARD_VERSION` | 9.2 |
 | `1` | message schema version | `PEER_WIRE_VERSION` | 10.1 |
-| `1` | on-disk schema version | `TRUST_FILE_VERSION`, `KNOCK_RECORD_VERSION`, `PENDING_RECORD_VERSION`, `INBOUND_RECORD_VERSION`, `PREDECESSOR_RECORD_VERSION`, `PEER_TABLE_VERSION`, `PROPAGATION_STORE_VERSION` | 14.1 |
+| `2` | on-disk schema version | `TRUST_FILE_VERSION` | 14.1 |
+| `2` | on-disk schema version | `KNOCK_RECORD_VERSION` | 14.1 |
+| `1` | on-disk schema version | `PENDING_RECORD_VERSION` | 14.1 |
+| `1` | on-disk schema version | `INBOUND_RECORD_VERSION` | 14.1 |
+| `1` | on-disk schema version | `PREDECESSOR_RECORD_VERSION` | 14.1 |
+| `2` | on-disk schema version | `PEER_TABLE_VERSION` | 14.1 |
+| `1` | on-disk schema version | `PROPAGATION_STORE_VERSION` | 14.1 |
 
 ## 14. Requirement-id stability
 
@@ -957,11 +963,11 @@ The layouts of the stores below are not wire format and stay a section 1 non-goa
 | `peers.json` | cache `mesh/` | file | `PEER_TABLE_VERSION` | cache: move it aside |
 | `propagation.json` | cache `mesh/` | file | `PROPAGATION_STORE_VERSION` | cache: move it aside |
 
-**[MESH-CODE-003]** Every store in the table MUST carry its schema version, per file or per line as the table says, in a `version` field read before any other, and a writer MUST write the version this build reads: `TRUST_FILE_VERSION`, `KNOCK_RECORD_VERSION`, `PENDING_RECORD_VERSION`, `INBOUND_RECORD_VERSION`, `PREDECESSOR_RECORD_VERSION`, `PEER_TABLE_VERSION` and `PROPAGATION_STORE_VERSION`, all `1` (section 19; `every_on_disk_store_version_is_the_baseline`).
+**[MESH-CODE-003]** Every store in the table MUST carry its schema version, per file or per line as the table says, in a `version` field read before any other, and a writer MUST write the version this build reads: `TRUST_FILE_VERSION`, `KNOCK_RECORD_VERSION` and `PEER_TABLE_VERSION` at `2`; `PENDING_RECORD_VERSION`, `INBOUND_RECORD_VERSION`, `PREDECESSOR_RECORD_VERSION` and `PROPAGATION_STORE_VERSION` at `1` (section 19; `every_on_disk_store_version_is_pinned`).
 
 **[MESH-CODE-004]** A reader MUST read the version before any other field and MUST refuse the whole store, never one record and never a shorter list, when the version is not the one this build writes, and the refusal MUST name the file path, the version found, the version this build writes and the remedy: a newer version asks the person to upgrade Coyote, an older one states that no migration exists for versions before the baseline and asks them to move the file aside, and a version that cannot be read at all is an unknown shape, refused with the same remedy and naming the version this build writes. A disposable cache whose whole file is one document (`peers.json`, `propagation.json`) can set an unknown shape aside itself and start empty, but a readable version it does not write is refused under MESH-CODE-004 all the same. The per-store fixtures (`open_refuses_a_newer_file_version_naming_the_path`, `open_refuses_a_pre_baseline_file_version_as_having_no_migration`, `open_refuses_a_file_without_a_version`; src/mesh/trust.rs), (`newer_record_version_refuses_naming_the_file`, `pre_baseline_record_version_refuses_as_having_no_migration`, `a_line_without_a_version_refuses_the_whole_cache`; src/mesh/knocks.rs), (`a_newer_pending_line_refuses_the_whole_store_and_surfaces_no_record`, `a_pre_baseline_pending_line_refuses_as_having_no_migration`, `a_pending_line_without_a_version_refuses_the_whole_store`, `a_newer_inbound_line_refuses_the_whole_store_and_surfaces_no_record`, `a_pre_baseline_inbound_line_refuses_as_having_no_migration`, `an_inbound_line_without_a_version_refuses_the_whole_store`; src/mesh/pending.rs), (`predecessors_refuses_a_newer_line_and_shows_none_of_the_history`, `predecessors_refuses_a_pre_baseline_line_as_having_no_migration`, `predecessors_refuses_a_line_without_a_version`; src/mesh/identity.rs), (`load_refuses_a_newer_table_version_naming_the_path`, `load_refuses_a_pre_baseline_table_version_as_having_no_migration`, `load_sets_aside_an_unversioned_table_and_starts_empty`; src/mesh/peers.rs) and (`store_from_a_newer_coyote_is_refused_by_name`, `store_from_before_the_baseline_is_refused_as_having_no_migration`, `garbage_and_malformed_stores_are_set_aside`; src/mesh/propagation_fetch.rs) pin each store's wording.
 
-**[MESH-CODE-005]** Version `1` is the baseline, and every on-disk struct and enum rejects a field it does not know, so a current-version record carrying such a field is refused, never read, and any change to a layout, a field added included, MUST bump the store's constant and MUST ship either a migration or an explicit refusal of the older version, and a version number MUST NOT be reused (MESH-CODE-001). The scan (`every_on_disk_struct_rejects_unknown_fields`, `every_deserializable_mesh_type_is_classified`; src/mesh/schema.rs) covers every type, and the per-store fixtures (`a_record_with_a_field_this_coyote_does_not_know_is_refused`, `a_reply_with_a_field_this_coyote_does_not_know_refuses_the_store`, `an_inbound_record_with_an_unknown_field_is_refused`; src/mesh/pending.rs), (`predecessors_refuses_an_unknown_field`; src/mesh/identity.rs) and (`load_sets_aside_a_current_table_with_an_unknown_field`; src/mesh/peers.rs) pin the refusal. One field, `key_changed` on the `trust.yaml` destination entry, was added inside version `1` before this rule existed and is grandfathered in the baseline: a file written without it loads through the field's `#[serde(default)]`, a tolerance that is not a precedent for the next field (`open_still_refuses_unknown_fields_but_loads_a_record_without_key_changed`; src/mesh/trust.rs).
+**[MESH-CODE-005]** The baseline is version `2` for `TRUST_FILE_VERSION`, `KNOCK_RECORD_VERSION` and `PEER_TABLE_VERSION` and version `1` for `PENDING_RECORD_VERSION`, `INBOUND_RECORD_VERSION`, `PREDECESSOR_RECORD_VERSION` and `PROPAGATION_STORE_VERSION`, and every on-disk struct and enum rejects a field it does not know, so a current-version record carrying such a field is refused, never read, and any change to a layout, a field added included, MUST bump the store's constant and MUST ship either a migration or an explicit refusal of the older version, and a version number MUST NOT be reused (MESH-CODE-001). The scan (`every_on_disk_struct_rejects_unknown_fields`, `every_deserializable_mesh_type_is_classified`; src/mesh/schema.rs) covers every type, and the per-store fixtures (`a_record_with_a_field_this_coyote_does_not_know_is_refused`, `a_reply_with_a_field_this_coyote_does_not_know_refuses_the_store`, `an_inbound_record_with_an_unknown_field_is_refused`; src/mesh/pending.rs), (`predecessors_refuses_an_unknown_field`; src/mesh/identity.rs) and (`load_sets_aside_a_current_table_with_an_unknown_field`; src/mesh/peers.rs) pin the refusal. One field, `key_changed` on the `trust.yaml` destination entry, was added before this rule existed and keeps a `#[serde(default)]`: a version-`2` trust file written without it loads with the field absent, a tolerance inside one version that is not a precedent for the next field (`open_still_refuses_unknown_fields_but_loads_a_record_without_key_changed`; src/mesh/trust.rs).
 
 ## 15. Security considerations
 
@@ -1137,7 +1143,7 @@ A leniency is a place where the reference deliberately does something other than
 | `RefusalCode::Throttled` | `0xf6` | src/mesh/r3/error.rs | refusal_codes_round_trip_the_wire_and_reject_other_values |
 | `RefusalCode::NotFound` | `0xfd` | src/mesh/r3/error.rs | refusal_codes_round_trip_the_wire_and_reject_other_values |
 | `RefusalCode::Timeout` | `0xfe` | src/mesh/r3/error.rs | refusal_codes_round_trip_the_wire_and_reject_other_values |
-| `ANNOUNCE_MAGIC` | `"COYM"` | src/mesh/announce.rs | announce_constants_are_pinned |
+| `ANNOUNCE_MAGIC` | `"SCOPE"` | src/mesh/announce.rs | announce_constants_are_pinned |
 | `MAX_DISPLAY_NAME_BYTES` | `64` | src/mesh/announce.rs | announce_constants_are_pinned |
 | `REANNOUNCE_FLOOR_SECS` | `300` | src/mesh/announce.rs | announce_constants_are_pinned |
 | `HEARTBEAT_SECS` | `900` | src/mesh/announce.rs | announce_constants_are_pinned |
@@ -1145,7 +1151,7 @@ A leniency is a place where the reference deliberately does something other than
 | `PEER_TTL` | `2700` | src/mesh/peers.rs | ttl_is_three_heartbeats |
 | `PEER_STALE_AFTER` | `1800` | src/mesh/peers.rs | stale_is_two_heartbeats_and_never_for_a_future_sighting |
 | `PEER_TABLE_MAX_ENTRIES` | `1024` | src/mesh/peers.rs | ttl_is_three_heartbeats |
-| `KNOCK_TYPE` | `"coyote.knock/1"` | src/mesh/knock.rs | lxmf_knock_wire_shape_is_exactly_the_typed_two_field_layout |
+| `KNOCK_TYPE` | `"scope.knock/1"` | src/mesh/knock.rs | lxmf_knock_wire_shape_is_exactly_the_typed_two_field_layout |
 | `KNOCK_INTRO_MAX_CHARS` | `200` | src/mesh/knocks.rs | intro_is_refused_over_the_cap_and_cleaned_under_it |
 | `KNOCK_REQUEST_TIMEOUT` | `15` | src/mesh/knock.rs | spec_pins (this table) |
 | `KNOCK_LINK_TIMEOUT` | `10` | src/mesh/knock.rs | spec_pins (this table) |
@@ -1164,7 +1170,7 @@ A leniency is a place where the reference deliberately does something other than
 | `BRANCH_MAX_CHARS` | `64` | src/mesh/card.rs | human_rendering_shows_the_repo_plan_and_todo_when_present |
 | `PLAN_TITLE_MAX_CHARS` | `120` | src/mesh/card.rs | human_rendering_shows_the_repo_plan_and_todo_when_present |
 | `TODO_GOAL_MAX_CHARS` | `280` | src/mesh/card.rs | human_rendering_shows_the_repo_plan_and_todo_when_present |
-| `PEER_MESSAGE_TYPE` | `"coyote.peer/1"` | src/mesh/message.rs | peer_lxmf_round_trips_and_a_knock_is_not_a_peer |
+| `PEER_MESSAGE_TYPE` | `"scope.peer/1"` | src/mesh/message.rs | peer_lxmf_round_trips_and_a_knock_is_not_a_peer |
 | `PEER_WIRE_VERSION` | `1` | src/mesh/message.rs | r3_body_round_trips_and_rejects_malformed |
 | `PEER_TITLE_MAX_CHARS` | `120` | src/mesh/message.rs | outbound_refuses_over_long_text_and_bad_fields_and_mints_an_id |
 | `PEER_CONTENT_MAX_CHARS` | `4000` | src/mesh/message.rs | outbound_refuses_over_long_text_and_bad_fields_and_mints_an_id |
@@ -1205,12 +1211,12 @@ A leniency is a place where the reference deliberately does something other than
 | `INBOUND_MAX_ENTRIES` | `256` | src/mesh/pending.rs | inbound_store_survives_reopen_and_prunes_by_ttl_and_cap |
 | `KNOCK_QUEUE_CAPACITY` | `64` | src/mesh/knock.rs | the_channel_sink_never_waits_on_a_reader_and_counts_what_it_drops |
 | `ENVOY_QUEUE_MAX` | `8` | src/config/mesh_envoy.rs | a_ninth_job_is_refused_while_the_worker_is_parked |
-| `TRUST_FILE_VERSION` | `1` | src/mesh/trust.rs | open_refuses_a_newer_file_version_naming_the_path |
-| `KNOCK_RECORD_VERSION` | `1` | src/mesh/knocks.rs | newer_record_version_refuses_naming_the_file |
+| `TRUST_FILE_VERSION` | `2` | src/mesh/trust.rs | open_refuses_a_newer_file_version_naming_the_path |
+| `KNOCK_RECORD_VERSION` | `2` | src/mesh/knocks.rs | newer_record_version_refuses_naming_the_file |
 | `PENDING_RECORD_VERSION` | `1` | src/mesh/pending.rs | a_newer_pending_line_refuses_the_whole_store_and_surfaces_no_record |
 | `INBOUND_RECORD_VERSION` | `1` | src/mesh/pending.rs | a_newer_inbound_line_refuses_the_whole_store_and_surfaces_no_record |
 | `PREDECESSOR_RECORD_VERSION` | `1` | src/mesh/identity.rs | predecessors_refuses_a_newer_line_and_shows_none_of_the_history |
-| `PEER_TABLE_VERSION` | `1` | src/mesh/peers.rs | load_refuses_a_newer_table_version_naming_the_path |
+| `PEER_TABLE_VERSION` | `2` | src/mesh/peers.rs | load_refuses_a_newer_table_version_naming_the_path |
 | `PROPAGATION_STORE_VERSION` | `1` | src/mesh/propagation_fetch.rs | store_from_a_newer_coyote_is_refused_by_name |
 
 ## 20. Conformance coverage
@@ -1633,7 +1639,7 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 - [MESH-ANN-002](#51-application-data) -- every version recorded, out-of-window marked
 - [MESH-ANN-003](#51-application-data) -- invalid display name ignores the announce
 - [MESH-ANN-004](#51-application-data) -- empty name is no name
-- [MESH-ANN-005](#51-application-data) -- everything after offset 6 is the name
+- [MESH-ANN-005](#51-application-data) -- everything after offset 7 is the name
 - [MESH-ANN-006](#51-application-data) -- sender-side display name limits
 - [MESH-ANN-007](#51-application-data) -- variation selectors pass the wire
 - [MESH-ANN-008](#52-display-name-policy-and-receiver-record) -- display name only when configured

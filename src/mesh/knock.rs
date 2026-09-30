@@ -40,7 +40,7 @@ use tokio_util::sync::CancellationToken;
 /// a knock from a message before it reads anything else. Versioned in the name: a later
 /// layout gets a new type, and a node that does not know it treats the payload as a
 /// message.
-pub(crate) const KNOCK_TYPE: &str = "coyote.knock/1";
+pub(crate) const KNOCK_TYPE: &str = "scope.knock/1";
 /// Ceiling on the direct attempt. The dispatcher answers a knock at once, so a peer that
 /// is up replies well inside this; a longer wait only delays the fallback.
 pub(crate) const KNOCK_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
@@ -938,7 +938,7 @@ mod tests {
         }
         assert_eq!(
             decode_knock_message(&inbound(
-                Some(typed(Value::from("coyote.knock/1"))),
+                Some(typed(Value::from(KNOCK_TYPE))),
                 None,
                 &hash_of("s")
             )),
@@ -1868,7 +1868,7 @@ mod tests {
         assert_eq!(
             message.fields,
             Some(Value::Map(vec![
-                (Value::from(0xFBu8), Value::from("coyote.knock/1")),
+                (Value::from(0xFBu8), Value::from(KNOCK_TYPE)),
                 (
                     Value::from(0xFCu8),
                     Value::Map(vec![(

@@ -14,6 +14,8 @@
 //! deliberate soak, so exactly that many iterations run and the cap is lifted.
 //! `COYOTE_MESH_FUZZ_SEED` (decimal or `0x` hex) replaces `DEFAULT_SEED`; the same seed
 //! yields the same inputs, so a run is reproducible on every platform.
+//! `COYOTE_MESH_FUZZ_WRITE_CORPUS=1` rewrites the codec corpus files that carry a wire
+//! identifier from the live constants instead of checking them.
 //!
 //! Reproducing a failure. A violation prints the target, the seed, the iteration (or corpus
 //! file), the oracle's text and the input as hex, and writes the input to
@@ -47,6 +49,7 @@ pub(super) const DEFAULT_ITERS: u64 = 2000;
 pub(super) const TARGET_WALL_CAP: Duration = Duration::from_secs(10);
 const ITERS_ENV: &str = "COYOTE_MESH_FUZZ_ITERS";
 const SEED_ENV: &str = "COYOTE_MESH_FUZZ_SEED";
+const WRITE_CORPUS_ENV: &str = "COYOTE_MESH_FUZZ_WRITE_CORPUS";
 const DEFAULT_SEED: u64 = 0xC07E_5EED_2026_0001;
 /// The splitmix64 increment, also the per-iteration seed spreader.
 const GOLDEN: u64 = 0x9E37_79B9_7F4A_7C15;
@@ -402,6 +405,7 @@ fn fuzz_budget_constants_are_pinned() {
     assert_eq!(TARGET_WALL_CAP, Duration::from_secs(10));
     assert_eq!(ITERS_ENV, "COYOTE_MESH_FUZZ_ITERS");
     assert_eq!(SEED_ENV, "COYOTE_MESH_FUZZ_SEED");
+    assert_eq!(WRITE_CORPUS_ENV, "COYOTE_MESH_FUZZ_WRITE_CORPUS");
     let ci = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/.github/workflows/ci.yaml"
@@ -503,6 +507,181 @@ fn fuzz_receipt_boundary_corpus_lengths_are_pinned() {
         body_len("MESH-PROP-028-oversize-131073.bin"),
         MAX_FETCHED_MESSAGE_BYTES + 1
     );
+}
+
+/// The codec corpus files that spell a wire identifier are derived from the live
+/// constants, so a rename of the magic or a type tag regenerates them instead of
+/// leaving the corpus replaying the old bytes. `WRITE_CORPUS_ENV=1` writes the derived
+/// bytes in place of checking them. Either way each file must still reach the decoder
+/// outcome its name describes, so a regenerated file cannot silently stop exercising it.
+#[test]
+fn fuzz_codec_corpus_files_carrying_wire_identifiers_are_built_from_the_live_constants() {
+    use super::announce::{ANNOUNCE_MAGIC, AnnounceAppData};
+    use super::knock::{KNOCK_TYPE, KnockMessage, decode_knock_message};
+    use super::message::{PEER_MESSAGE_TYPE, PeerLxmf, decode_peer_lxmf};
+    use lxmf_core::constants::{FIELD_CUSTOM_DATA, FIELD_CUSTOM_TYPE};
+    use oracles::{TAG_ANNOUNCE, TAG_KNOCK_FIELDS, TAG_PEER_FIELDS, inbound_with, unpack_whole};
+    use rmpv::Value;
+
+    fn announce(version: [u8; 2], name: &[u8]) -> Vec<u8> {
+        [&[TAG_ANNOUNCE][..], &ANNOUNCE_MAGIC, &version, name].concat()
+    }
+    fn lxmf_fields(tag: u8, custom_type: &str, data: Vec<(Value, Value)>) -> Vec<u8> {
+        let fields = Value::Map(vec![
+            (Value::from(FIELD_CUSTOM_TYPE), Value::from(custom_type)),
+            (Value::from(FIELD_CUSTOM_DATA), Value::Map(data)),
+        ]);
+        let mut bytes = vec![tag];
+        rmpv::encode::write_value(&mut bytes, &fields).unwrap();
+        bytes
+    }
+
+    enum Outcome {
+        AnnounceVersion(u16),
+        NotAnAnnounce,
+        PeerNameHashLength,
+        KnockNameHashLength,
+    }
+    const NAME_HASH_LENGTH_REASON: &str = "name_hash is not 10 bytes";
+
+    let expected = [
+        (
+            "MESH-ANN-002-announce-version-ffff.bin",
+            announce([0xff, 0xff], b"Alex"),
+            Outcome::AnnounceVersion(0xffff),
+        ),
+        (
+            "MESH-ANN-003-announce-name-65-bytes.bin",
+            announce([0x00, 0x01], &[b'a'; 65]),
+            Outcome::NotAnAnnounce,
+        ),
+        (
+            "MESH-MSG-052-peer-name-hash-nine-bytes.bin",
+            lxmf_fields(
+                TAG_PEER_FIELDS,
+                PEER_MESSAGE_TYPE,
+                vec![
+                    (Value::from("name_hash"), Value::Binary(vec![0x09; 9])),
+                    (Value::from("kind"), Value::from("message")),
+                    (Value::from("id"), Value::from("m1")),
+                ],
+            ),
+            Outcome::PeerNameHashLength,
+        ),
+        (
+            "MESH-KNOCK-023-name-hash-nine-bytes.bin",
+            lxmf_fields(
+                TAG_KNOCK_FIELDS,
+                KNOCK_TYPE,
+                vec![(Value::from("name_hash"), Value::Binary(vec![0x07; 9]))],
+            ),
+            Outcome::KnockNameHashLength,
+        ),
+    ];
+    let write = std::env::var_os(WRITE_CORPUS_ENV).is_some_and(|v| v == "1");
+    for (name, bytes, outcome) in expected {
+        let path = corpus_dir("codecs").join(name);
+        if write {
+            fs::write(&path, &bytes).unwrap();
+        }
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            bytes,
+            "codecs/{name} must be the bytes built from the live wire constants; regenerate with {WRITE_CORPUS_ENV}=1"
+        );
+        let payload = &bytes[1..];
+        match outcome {
+            Outcome::AnnounceVersion(version) => {
+                let decoded = AnnounceAppData::decode(payload)
+                    .unwrap_or_else(|| panic!("codecs/{name} must decode as an announce"));
+                assert_eq!(decoded.version, version, "codecs/{name}");
+            }
+            Outcome::NotAnAnnounce => {
+                assert!(
+                    AnnounceAppData::decode(payload).is_none(),
+                    "codecs/{name} must be refused by the announce decoder"
+                );
+            }
+            Outcome::PeerNameHashLength => {
+                let fields = unpack_whole(payload).unwrap();
+                let observed = decode_peer_lxmf(&inbound_with(fields));
+                assert!(
+                    matches!(observed, PeerLxmf::Malformed(NAME_HASH_LENGTH_REASON)),
+                    "codecs/{name}: decoded as {observed:?}"
+                );
+            }
+            Outcome::KnockNameHashLength => {
+                let fields = unpack_whole(payload).unwrap();
+                let observed = decode_knock_message(&inbound_with(fields));
+                assert!(
+                    matches!(observed, KnockMessage::Malformed(NAME_HASH_LENGTH_REASON)),
+                    "codecs/{name}: decoded as {observed:?}"
+                );
+            }
+        }
+    }
+}
+
+/// Usage probe for T33 (a)/B2: the decoder and the fuzz oracle both read the version at a
+/// magic-length-relative offset. Every prefix of a valid announce, the exact one-short
+/// header (magic + 1 byte) and the exact header (magic + 2 bytes) must agree between the
+/// two, and the header-only announce must decode as its big-endian version with no name;
+/// an announce in the old four-byte-magic layout is another application for both.
+#[test]
+fn usage_probe_announce_decoder_and_oracle_agree_at_the_magic_relative_header_boundary() {
+    use super::announce::{ANNOUNCE_MAGIC, AnnounceAppData};
+    use oracles::TAG_ANNOUNCE;
+
+    let fixture = oracles::CodecFixture::new();
+    let agree = |bytes: &[u8]| {
+        let tagged = [&[TAG_ANNOUNCE][..], bytes].concat();
+        oracles::check_codec_bytes(&fixture, &tagged)
+            .unwrap_or_else(|what| panic!("decoder and oracle disagree on {bytes:?}: {what}"));
+    };
+
+    let full = [&ANNOUNCE_MAGIC[..], &[0x01, 0x02], b"Alex"].concat();
+    for len in 0..=full.len() {
+        agree(&full[..len]);
+    }
+
+    let one_short = &full[..ANNOUNCE_MAGIC.len() + 1];
+    assert_eq!(
+        AnnounceAppData::decode(one_short),
+        None,
+        "magic plus one byte is shorter than the header"
+    );
+    let header_only = &full[..ANNOUNCE_MAGIC.len() + 2];
+    let decoded = AnnounceAppData::decode(header_only).expect("magic plus two bytes is a header");
+    assert_eq!(
+        decoded.version, 0x0102,
+        "the version is the two bytes right after the magic, not bytes 4..6"
+    );
+    assert_eq!(decoded.display_name, None);
+    let decoded = AnnounceAppData::decode(&full).unwrap();
+    assert_eq!(decoded.version, 0x0102);
+    assert_eq!(
+        decoded.display_name.as_deref(),
+        Some("Alex"),
+        "the name starts right after the version, not at offset 6"
+    );
+
+    // A same-width magic one bit off is a foreign announce: neither the decoder nor the
+    // oracle reads it, and they agree on that at every prefix.
+    let mut foreign = ANNOUNCE_MAGIC;
+    foreign[ANNOUNCE_MAGIC.len() - 1] ^= 0x01;
+    let foreign_layout = [&foreign[..], &[0x00, 0x01], b"Alex"].concat();
+    assert_eq!(AnnounceAppData::decode(&foreign_layout), None);
+    agree(&foreign_layout);
+    for len in 0..=foreign_layout.len() {
+        agree(&foreign_layout[..len]);
+    }
+    // A SCOPE-prefixed announce padded to the old total header width still needs the full
+    // seven header bytes.
+    let mut padded = ANNOUNCE_MAGIC.to_vec();
+    padded.push(0x00);
+    assert_eq!(padded.len(), 6);
+    assert_eq!(AnnounceAppData::decode(&padded), None);
+    agree(&padded);
 }
 
 #[test]
@@ -824,6 +1003,8 @@ fn fuzz_source_never_gates_on_platform_or_ignores() {
 
 #[test]
 fn fuzz_codec_tag_table_in_the_readme_matches_the_code() {
+    use super::announce::ANNOUNCE_MAGIC;
+
     let readme = include_str!("corpus/README.md");
     let table = &readme[readme.find("### Codec tag bytes").unwrap()..];
     let table = &table[..table.find("\n## ").unwrap_or(table.len())];
@@ -832,6 +1013,22 @@ fn fuzz_codec_tag_table_in_the_readme_matches_the_code() {
         assert!(table.contains(&row), "the README codec table lacks {row}");
     }
     assert_eq!(table.matches("\n| `0x").count(), oracles::CODEC_TAGS.len());
+    let announce_prefix = format!("| `{:#04x}` |", oracles::TAG_ANNOUNCE);
+    let announce_row = table
+        .lines()
+        .find(|line| line.starts_with(&announce_prefix))
+        .unwrap();
+    let magic = format!("`{}`", std::str::from_utf8(&ANNOUNCE_MAGIC).unwrap());
+    assert!(
+        announce_row.contains(&magic),
+        "the README announce row does not spell {magic}: {announce_row}"
+    );
+    for pin in [
+        WRITE_CORPUS_ENV,
+        "fuzz_codec_corpus_files_carrying_wire_identifiers_are_built_from_the_live_constants",
+    ] {
+        assert!(readme.contains(pin), "the README does not name {pin}");
+    }
 }
 
 #[test]

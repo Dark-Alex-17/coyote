@@ -1,6 +1,6 @@
 //! Messages between trusted peers. Outbound, a message is one R3 request on `/message`
 //! that the peer acknowledges by id; a peer that cannot be reached gets the message held
-//! by an LXMF propagation node instead, typed `coyote.peer/1`, until it next fetches.
+//! by an LXMF propagation node instead, typed `scope.peer/1`, until it next fetches.
 //! Inbound, both routes end in the same `PeerSurface`: the handler behind `/message` and
 //! the fetch path's `PeerRouting` decode, bound and sanitise what the peer sent, then hand
 //! a `PeerMessage` over and answer at once. Nothing on either inbound path waits on the
@@ -40,7 +40,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// The LXMF custom type a stored peer message carries, so a fetch can tell it from a
 /// knock or a plain LXMF message before reading anything else. Versioned in the name.
-pub(crate) const PEER_MESSAGE_TYPE: &str = "coyote.peer/1";
+pub(crate) const PEER_MESSAGE_TYPE: &str = "scope.peer/1";
 /// The `v` every R3 `/message` body carries; a body with any other value is refused. It is
 /// the body's own schema version, evolving under the one mesh protocol version the
 /// envelope carries.

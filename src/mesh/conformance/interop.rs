@@ -11,8 +11,9 @@ use super::interop_ids::{
     REQUEST_IDS,
 };
 use crate::config::Session;
-use crate::mesh::message::{OutboundPeer, PeerKind, PeerVia};
-use crate::mesh::node::{MeshRuntime, MeshSlot, NodeOptions};
+use crate::mesh::announce::ANNOUNCE_MAGIC;
+use crate::mesh::message::{OutboundPeer, PEER_MESSAGE_TYPE, PeerKind, PeerVia};
+use crate::mesh::node::{MeshRuntime, MeshSlot, NodeOptions, session_destination_name};
 use crate::mesh::notify::{NotificationSink, RenderedNotification};
 use crate::mesh::test_support::{
     Compatibility, OriginName, TempDir, TrustList, disable_ingress_control, mesh_paths,
@@ -23,7 +24,6 @@ use crate::mesh::{hex_lower, short};
 use crate::repl::idle::testing::driver_on_a_fresh_state;
 use crate::supervisor::mailbox::EnvelopePayload;
 
-use rns_transport::destination::DestinationName;
 use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::ffi::OsStr;
@@ -51,6 +51,10 @@ const SCRIPT: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/scripts/mesh-interop/reference_peer.py"
 );
+const SCRIPT_SOURCE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/scripts/mesh-interop/reference_peer.py"
+));
 const SETUP_SH_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/mesh-interop/setup.sh");
 
 /// A link open or a path wait on the reference's side.
@@ -492,9 +496,9 @@ fn session_with_instance_id() -> (Session, String) {
     (session, instance_id)
 }
 
-/// This crate's name hash for `coyote.mesh.<instance_id>`, section 4's `trunc_10(H(name))`.
+/// This crate's name hash for `scope.session.<instance_id>`, section 4's `trunc_10(H(name))`.
 fn name_hash_of(instance_id: &str) -> String {
-    let name = DestinationName::new("coyote", &format!("mesh.{instance_id}"));
+    let name = session_destination_name(instance_id);
     hex_lower(&OriginName::of(&name).0)
 }
 
@@ -544,6 +548,44 @@ fn the_pins_agree_with_setup_sh_and_the_harness_readme() {
         Vec::<&str>::new(),
         "setup.sh installs the reference from a package index instead of the pinned clones"
     );
+
+    let magic = str::from_utf8(&ANNOUNCE_MAGIC).unwrap();
+    for present in [
+        format!("`{magic}`"),
+        "scope.session.<instance_id>".to_string(),
+    ] {
+        assert!(
+            HARNESS_README.contains(&present),
+            "scripts/mesh-interop/README.md does not spell {present:?}"
+        );
+    }
+    // Assembled at runtime so the mesh source guard does not match this test's text.
+    let old_app = ["coy", "ote"].concat();
+    for absent in [
+        ["COY", "M"].concat(),
+        format!("{old_app}.mesh"),
+        format!("{old_app}.peer/"),
+        format!("{old_app}.knock/"),
+    ] {
+        assert!(
+            !HARNESS_README.contains(&absent),
+            "scripts/mesh-interop/README.md still spells {absent:?}"
+        );
+        assert!(
+            !SCRIPT_SOURCE.contains(&absent),
+            "scripts/mesh-interop/reference_peer.py still spells {absent:?}"
+        );
+    }
+    for line in [
+        format!("MESH_APP = {:?}", "scope"),
+        format!("ANNOUNCE_MAGIC = b{magic:?}"),
+        format!("return ({:?}, instance_id)", "session"),
+    ] {
+        assert!(
+            SCRIPT_SOURCE.lines().any(|l| l.trim() == line),
+            "scripts/mesh-interop/reference_peer.py does not spell {line:?}"
+        );
+    }
 }
 
 #[test]
@@ -1264,7 +1306,7 @@ async fn a_propagation_node_demanding_a_raised_stamp_cost_still_takes_our_messag
     );
     assert_eq!(
         held["fields"][FIELD_CUSTOM_TYPE],
-        json!("coyote.peer/1"),
+        json!(PEER_MESSAGE_TYPE),
         "{held}"
     );
     let custom = &held["fields"][FIELD_CUSTOM_DATA];

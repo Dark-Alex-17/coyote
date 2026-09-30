@@ -44,8 +44,8 @@ fn subject(store: &str, path: &Path, line: Option<usize>) -> String {
 }
 
 /// The refusal for a store whose version is not `expected`. A newer version means a newer
-/// Coyote wrote it; an older one has no migration, since the first version is the
-/// baseline and every later layout ships its own or refuses.
+/// Coyote wrote it; an older one has no migration. The baseline is the version this build
+/// writes (2 for the trust file, knock records and peer table, 1 elsewhere).
 pub(crate) fn version_refusal(
     store: &str,
     path: &Path,
@@ -370,35 +370,48 @@ mod tests {
     }
 
     #[test]
-    fn every_on_disk_store_version_is_the_baseline() {
+    fn every_on_disk_store_version_is_pinned() {
         let versions = [
-            ("TRUST_FILE_VERSION", crate::mesh::trust::TRUST_FILE_VERSION),
+            (
+                "TRUST_FILE_VERSION",
+                crate::mesh::trust::TRUST_FILE_VERSION,
+                2,
+            ),
             (
                 "KNOCK_RECORD_VERSION",
                 crate::mesh::knocks::KNOCK_RECORD_VERSION,
+                2,
             ),
             (
                 "PENDING_RECORD_VERSION",
                 crate::mesh::pending::PENDING_RECORD_VERSION,
+                1,
             ),
             (
                 "INBOUND_RECORD_VERSION",
                 crate::mesh::pending::INBOUND_RECORD_VERSION,
+                1,
             ),
             (
                 "PREDECESSOR_RECORD_VERSION",
                 crate::mesh::identity::PREDECESSOR_RECORD_VERSION,
+                1,
             ),
-            ("PEER_TABLE_VERSION", crate::mesh::peers::PEER_TABLE_VERSION),
+            (
+                "PEER_TABLE_VERSION",
+                crate::mesh::peers::PEER_TABLE_VERSION,
+                2,
+            ),
             (
                 "PROPAGATION_STORE_VERSION",
                 crate::mesh::propagation_fetch::PROPAGATION_STORE_VERSION,
+                1,
             ),
         ];
-        for (name, version) in versions {
+        for (name, version, pinned) in versions {
             assert_eq!(
-                version, 1,
-                "{name} left the baseline: a bump ships a migration or a refusal, and its section 19 row moves with it"
+                version, pinned,
+                "{name} moved: a bump ships a migration or a refusal, and its section 19 row moves with it"
             );
         }
     }

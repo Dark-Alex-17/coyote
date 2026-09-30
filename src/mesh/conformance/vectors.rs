@@ -62,7 +62,9 @@ use crate::mesh::test_support::{TempDir, TrustList};
 use crate::mesh::trust::{
     Decision, LiveMesh, Rule, TRUST_FILE_VERSION, TrustOptions, TrustStore, Verdict,
 };
-use crate::mesh::{canonical_hash, destination_address, display_text, hex_lower};
+use crate::mesh::{
+    canonical_hash, destination_address, display_text, hex_lower, session_destination_name,
+};
 
 use lxmf_core::constants::{FIELD_CUSTOM_DATA, FIELD_CUSTOM_TYPE};
 use lxmf_core::identity::PrivateIdentity as LxmfIdentity;
@@ -608,7 +610,8 @@ fn t(secs: u64) -> SystemTime {
 }
 
 fn app(name: &str) -> Vec<u8> {
-    let mut bytes = b"COYM\x00\x01".to_vec();
+    let mut bytes = ANNOUNCE_MAGIC.to_vec();
+    bytes.extend_from_slice(&[0x00, 0x01]);
     bytes.extend_from_slice(name.as_bytes());
     bytes
 }
@@ -875,7 +878,7 @@ struct Announced {
 
 fn announced(instance_id: &str) -> Announced {
     let identity = PrivateIdentity::new_from_rand(OsRng);
-    let name = DestinationName::new("coyote", &format!("mesh.{instance_id}"));
+    let name = session_destination_name(instance_id);
     let desc = SingleOutputDestination::new(*identity.as_identity(), name).desc;
     Announced {
         destination_hash: desc.address_hash.to_hex_string(),
@@ -1037,7 +1040,7 @@ fn dest_vectors() -> Vec<Vector> {
             Case::Derivation(|| {
                 let instance = "0123456789abcdef0123456789abcdef";
                 let peer = announced(instance);
-                let name = DestinationName::new("coyote", &format!("mesh.{instance}"));
+                let name = DestinationName::new("scope", &format!("session.{instance}"));
                 same(
                     "name hash",
                     peer.name_hash,
@@ -1050,17 +1053,20 @@ fn dest_vectors() -> Vec<Vector> {
             Kind::Invalid,
             Case::Derivation(|| {
                 let instance = "0123456789abcdef0123456789abcdef";
-                let coyote = DestinationName::new("coyote", &format!("mesh.{instance}"));
+                let ours = session_destination_name(instance);
                 for (app, aspect) in [
-                    ("coyote", instance.to_string()),
-                    ("coyote", format!("mesh.{}", instance.to_ascii_uppercase())),
-                    ("lxmf", format!("mesh.{instance}")),
-                    ("coyote", format!("mesh.{instance}.extra")),
+                    ("scope", instance.to_string()),
+                    (
+                        "scope",
+                        format!("session.{}", instance.to_ascii_uppercase()),
+                    ),
+                    ("lxmf", format!("session.{instance}")),
+                    ("scope", format!("session.{instance}.extra")),
                 ] {
                     let other = DestinationName::new(app, &aspect);
                     ensure(
-                        other.as_name_hash_slice() != coyote.as_name_hash_slice(),
-                        format!("{app}.{aspect} shares the name hash of coyote.mesh.<id>"),
+                        other.as_name_hash_slice() != ours.as_name_hash_slice(),
+                        format!("{app}.{aspect} shares the name hash of scope.session.<id>"),
                     )?;
                 }
                 Ok(())
@@ -1071,8 +1077,8 @@ fn dest_vectors() -> Vec<Vector> {
             Kind::Valid,
             Case::Derivation(|| {
                 let instance = "0123456789abcdef0123456789abcdef";
-                let name = DestinationName::new("coyote", &format!("mesh.{instance}"));
-                let digest = Sha256::digest(format!("coyote.mesh.{instance}").as_bytes());
+                let name = session_destination_name(instance);
+                let digest = Sha256::digest(format!("scope.session.{instance}").as_bytes());
                 same(
                     "name hash",
                     name.as_name_hash_slice(),
@@ -1086,7 +1092,7 @@ fn dest_vectors() -> Vec<Vector> {
             Kind::Valid,
             Case::Derivation(|| {
                 let identity = PrivateIdentity::new_from_rand(OsRng);
-                let name = DestinationName::new("coyote", "mesh.0123456789abcdef0123456789abcdef");
+                let name = session_destination_name("0123456789abcdef0123456789abcdef");
                 let upstream = SingleOutputDestination::new(*identity.as_identity(), name).desc;
                 let name_hash: [u8; NAME_HASH_LEN] = name.as_name_hash_slice().try_into().unwrap();
                 let ours = destination_address(&name_hash, &identity.as_identity().address_hash);
@@ -1390,7 +1396,7 @@ fn announce_vectors() -> Vec<Vector> {
         announce(
             "MESH-ANN-001",
             Kind::Invalid,
-            b"COYM\x00".to_vec(),
+            b"SCOPE\x00".to_vec(),
             AnnounceAction::Ignored,
         ),
         announce(
@@ -1402,19 +1408,19 @@ fn announce_vectors() -> Vec<Vector> {
         announce(
             "MESH-ANN-001",
             Kind::Invalid,
-            b"coym\x00\x01Alex".to_vec(),
+            b"scope\x00\x01Alex".to_vec(),
             AnnounceAction::Ignored,
         ),
         announce(
             "MESH-ANN-001",
             Kind::Invalid,
-            b"COY".to_vec(),
+            b"SCOP".to_vec(),
             AnnounceAction::Ignored,
         ),
         announce(
             "MESH-ANN-001",
             Kind::Boundary,
-            b"COYM\x00\x01".to_vec(),
+            b"SCOPE\x00\x01".to_vec(),
             recorded(1, None),
         ),
         announce(
@@ -1426,19 +1432,19 @@ fn announce_vectors() -> Vec<Vector> {
         announce(
             "MESH-ANN-002",
             Kind::Valid,
-            b"COYM\x01\x02".to_vec(),
+            b"SCOPE\x01\x02".to_vec(),
             recorded(0x0102, None),
         ),
         announce(
             "MESH-ANN-002",
             Kind::Boundary,
-            b"COYM\x00\x00".to_vec(),
+            b"SCOPE\x00\x00".to_vec(),
             recorded(0, None),
         ),
         announce(
             "MESH-ANN-002",
             Kind::Boundary,
-            b"COYM\xff\xffAlex".to_vec(),
+            b"SCOPE\xff\xffAlex".to_vec(),
             recorded(0xffff, Some("Alex")),
         ),
         row(
@@ -1490,13 +1496,13 @@ fn announce_vectors() -> Vec<Vector> {
         announce(
             "MESH-ANN-003",
             Kind::Invalid,
-            b"COYM\x00\x01\xff\xfe".to_vec(),
+            b"SCOPE\x00\x01\xff\xfe".to_vec(),
             AnnounceAction::Ignored,
         ),
         announce(
             "MESH-ANN-003",
             Kind::Invalid,
-            b"COYM\x00\x01Al\xc3".to_vec(),
+            b"SCOPE\x00\x01Al\xc3".to_vec(),
             AnnounceAction::Ignored,
         ),
         announce(
@@ -1586,14 +1592,14 @@ fn announce_vectors() -> Vec<Vector> {
         announce(
             "MESH-ANN-004",
             Kind::Valid,
-            b"COYM\x00\x01".to_vec(),
+            b"SCOPE\x00\x01".to_vec(),
             recorded(1, None),
         ),
         announce(
             "MESH-ANN-005",
             Kind::Valid,
-            app("COYM"),
-            recorded(1, Some("COYM")),
+            app("SCOPE"),
+            recorded(1, Some("SCOPE")),
         ),
         announce(
             "MESH-ANN-005",
@@ -1660,14 +1666,14 @@ fn announce_vectors() -> Vec<Vector> {
             Kind::Valid,
             Some("Alex"),
             EncodeAction::Bytes(vec![
-                0x43, 0x4f, 0x59, 0x4d, 0x00, 0x01, 0x41, 0x6c, 0x65, 0x78,
+                0x53, 0x43, 0x4f, 0x50, 0x45, 0x00, 0x01, 0x41, 0x6c, 0x65, 0x78,
             ]),
         ),
         encode(
             "MESH-ANN-006",
             Kind::Valid,
             None,
-            EncodeAction::Bytes(vec![0x43, 0x4f, 0x59, 0x4d, 0x00, 0x01]),
+            EncodeAction::Bytes(vec![0x53, 0x43, 0x4f, 0x50, 0x45, 0x00, 0x01]),
         ),
         encode(
             "MESH-ANN-006",
@@ -1681,7 +1687,7 @@ fn announce_vectors() -> Vec<Vector> {
             Case::AnnounceEncode {
                 version: 0x0102,
                 display_name: None,
-                expect: EncodeAction::Bytes(vec![0x43, 0x4f, 0x59, 0x4d, 0x01, 0x02]),
+                expect: EncodeAction::Bytes(vec![0x53, 0x43, 0x4f, 0x50, 0x45, 0x01, 0x02]),
             },
         ),
         announce(
@@ -1817,9 +1823,7 @@ fn announce_vectors() -> Vec<Vector> {
                 let peer = announced("alpha");
                 table.observe(
                     PeerSighting {
-                        display_name: AnnounceAppData::decode(b"COYM\x00\x01")
-                            .unwrap()
-                            .display_name,
+                        display_name: AnnounceAppData::decode(&app("")).unwrap().display_name,
                         ..sighting(&peer)
                     },
                     t(1_000),
@@ -1925,7 +1929,7 @@ fn pn_vectors() -> Vec<Vector> {
             Case::Custom(|| {
                 let coyote = SingleOutputDestination::new(
                     *PrivateIdentity::new_from_rand(OsRng).as_identity(),
-                    DestinationName::new("coyote", "mesh.0123456789abcdef0123456789abcdef"),
+                    session_destination_name("0123456789abcdef0123456789abcdef"),
                 )
                 .desc;
                 same(
@@ -3463,8 +3467,8 @@ fn ext_vectors() -> Vec<Vector> {
             Case::Registry(|| {
                 same("STATUS_CARD_VERSION", STATUS_CARD_VERSION, 1)?;
                 same("PEER_WIRE_VERSION", PEER_WIRE_VERSION, 1)?;
-                same("KNOCK_TYPE", KNOCK_TYPE, "coyote.knock/1")?;
-                same("PEER_MESSAGE_TYPE", PEER_MESSAGE_TYPE, "coyote.peer/1")?;
+                same("KNOCK_TYPE", KNOCK_TYPE, "scope.knock/1")?;
+                same("PEER_MESSAGE_TYPE", PEER_MESSAGE_TYPE, "scope.peer/1")?;
                 same("MESH_PROTOCOL_VERSION", MESH_PROTOCOL_VERSION, 1)
             }),
         ),
@@ -3713,11 +3717,11 @@ fn code_vectors() -> Vec<Vector> {
                         "loop_guard",
                     ],
                 )?;
-                same("KNOCK_TYPE", KNOCK_TYPE, "coyote.knock/1")?;
-                same("PEER_MESSAGE_TYPE", PEER_MESSAGE_TYPE, "coyote.peer/1")?;
+                same("KNOCK_TYPE", KNOCK_TYPE, "scope.knock/1")?;
+                same("PEER_MESSAGE_TYPE", PEER_MESSAGE_TYPE, "scope.peer/1")?;
                 same("FIELD_CUSTOM_TYPE", FIELD_CUSTOM_TYPE, 0xfb)?;
                 same("FIELD_CUSTOM_DATA", FIELD_CUSTOM_DATA, 0xfc)?;
-                same("ANNOUNCE_MAGIC", ANNOUNCE_MAGIC, *b"COYM")?;
+                same("ANNOUNCE_MAGIC", ANNOUNCE_MAGIC, *b"SCOPE")?;
                 same("MESH_PROTOCOL_VERSION", MESH_PROTOCOL_VERSION, 1)?;
                 same("STATUS_CARD_VERSION", STATUS_CARD_VERSION, 1)?;
                 same("PEER_WIRE_VERSION", PEER_WIRE_VERSION, 1)
@@ -3765,12 +3769,12 @@ fn code_vectors() -> Vec<Vector> {
             "MESH-CODE-003",
             Kind::Valid,
             Case::Registry(|| {
-                same("TRUST_FILE_VERSION", TRUST_FILE_VERSION, 1)?;
-                same("KNOCK_RECORD_VERSION", KNOCK_RECORD_VERSION, 1)?;
+                same("TRUST_FILE_VERSION", TRUST_FILE_VERSION, 2)?;
+                same("KNOCK_RECORD_VERSION", KNOCK_RECORD_VERSION, 2)?;
                 same("PENDING_RECORD_VERSION", PENDING_RECORD_VERSION, 1)?;
                 same("INBOUND_RECORD_VERSION", INBOUND_RECORD_VERSION, 1)?;
                 same("PREDECESSOR_RECORD_VERSION", PREDECESSOR_RECORD_VERSION, 1)?;
-                same("PEER_TABLE_VERSION", PEER_TABLE_VERSION, 1)?;
+                same("PEER_TABLE_VERSION", PEER_TABLE_VERSION, 2)?;
                 same("PROPAGATION_STORE_VERSION", PROPAGATION_STORE_VERSION, 1)
             }),
         ),
@@ -4241,7 +4245,7 @@ fn knock_vectors() -> Vec<Vector> {
             "MESH-KNOCK-020",
             Kind::Invalid,
             knock_inbound(
-                lxmf_fields(Some(Value::from("coyote.knock/2")), Some(knock_data())),
+                lxmf_fields(Some(Value::from("scope.knock/2")), Some(knock_data())),
                 b"hi",
             ),
             KnockMessage::NotAKnock,
@@ -7066,7 +7070,7 @@ fn message_vectors() -> Vec<Vector> {
             "MESH-MSG-046",
             Kind::Invalid,
             peer_inbound(lxmf_fields(
-                Some(Value::from("coyote.peer/2")),
+                Some(Value::from("scope.peer/2")),
                 Some(peer_data()),
             )),
             PeerLxmf::NotAPeer,

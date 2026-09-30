@@ -4,8 +4,8 @@ use crate::mesh::protocol::MESH_PROTOCOL_VERSION;
 
 use anyhow::{Result, bail};
 
-/// Leading bytes that mark an announce as a Coyote node; anything else is another application.
-pub(crate) const ANNOUNCE_MAGIC: [u8; 4] = *b"COYM";
+/// Leading bytes that mark an announce as a SCOPE node; anything else is another application.
+pub(crate) const ANNOUNCE_MAGIC: [u8; 5] = *b"SCOPE";
 pub(crate) const MAX_DISPLAY_NAME_BYTES: usize = 64;
 
 /// This node's own floor between repeated announces of one destination: heartbeats are
@@ -19,7 +19,7 @@ pub(crate) const PEER_MISSED_HEARTBEATS_BEFORE_AGE_OUT: u32 = 3;
 
 const HEADER_LEN: usize = ANNOUNCE_MAGIC.len() + 2;
 
-/// Everything a Coyote announce says about its sender: `magic(4) | version u16 BE | display name UTF-8`.
+/// Everything a SCOPE announce says about its sender: `magic(5) | version u16 BE | display name UTF-8`.
 /// The layout is protocol; it never carries session, path, or objective data.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AnnounceAppData {
@@ -49,7 +49,7 @@ impl AnnounceAppData {
         Ok(bytes)
     }
 
-    /// `None` for anything that is not a well-formed Coyote announce; malformed input is
+    /// `None` for anything that is not a well-formed SCOPE announce; malformed input is
     /// rejected rather than repaired. A name carrying control characters or the invisible
     /// format characters used for visual spoofing is refused too, since a peer's name ends
     /// up on this node's terminal.
@@ -57,7 +57,8 @@ impl AnnounceAppData {
         if bytes.len() < HEADER_LEN || bytes[..ANNOUNCE_MAGIC.len()] != ANNOUNCE_MAGIC {
             return None;
         }
-        let version = u16::from_be_bytes([bytes[4], bytes[5]]);
+        let version =
+            u16::from_be_bytes([bytes[ANNOUNCE_MAGIC.len()], bytes[ANNOUNCE_MAGIC.len() + 1]]);
         let name = &bytes[HEADER_LEN..];
         if name.len() > MAX_DISPLAY_NAME_BYTES {
             return None;
@@ -146,6 +147,12 @@ mod tests {
         AnnounceAppData::decode(&bytes).unwrap().display_name
     }
 
+    fn announce(after_magic: &[u8]) -> Vec<u8> {
+        let mut bytes = ANNOUNCE_MAGIC.to_vec();
+        bytes.extend_from_slice(after_magic);
+        bytes
+    }
+
     fn private() -> MeshInterface {
         MeshInterface::Private {
             host: "relay.internal".to_string(),
@@ -163,7 +170,8 @@ mod tests {
     #[test]
     fn announce_constants_are_pinned() {
         assert_eq!(MESH_PROTOCOL_VERSION, 1);
-        assert_eq!(ANNOUNCE_MAGIC, *b"COYM");
+        assert_eq!(ANNOUNCE_MAGIC, *b"SCOPE");
+        assert_eq!(ANNOUNCE_MAGIC.len(), 5);
         assert_eq!(MAX_DISPLAY_NAME_BYTES, 64);
         assert_eq!(REANNOUNCE_FLOOR_SECS, 300);
         assert_eq!(HEARTBEAT_SECS, 900);
@@ -183,7 +191,7 @@ mod tests {
         .encode()
         .unwrap();
 
-        assert_eq!(bytes, b"COYM\x00\x01Alex");
+        assert_eq!(bytes, b"SCOPE\x00\x01Alex");
     }
 
     #[test]
@@ -243,18 +251,22 @@ mod tests {
 
     #[test]
     fn decode_rejects_short_wrong_magic_oversized_and_invalid_utf8() {
-        assert_eq!(AnnounceAppData::decode(b"COYM\x00"), None);
+        assert_eq!(AnnounceAppData::decode(&announce(b"\x00")), None);
         assert_eq!(AnnounceAppData::decode(b""), None);
         assert_eq!(AnnounceAppData::decode(b"LXMF\x00\x01Alex"), None);
-        assert_eq!(AnnounceAppData::decode(b"COYM\x00\x01\xff\xfe"), None);
-        let mut oversized = b"COYM\x00\x01".to_vec();
+        assert_eq!(AnnounceAppData::decode(b"COYM\x00\x01Alex"), None);
+        assert_eq!(
+            AnnounceAppData::decode(&announce(b"\x00\x01\xff\xfe")),
+            None
+        );
+        let mut oversized = announce(b"\x00\x01");
         oversized.extend(std::iter::repeat_n(b'a', 65));
         assert_eq!(AnnounceAppData::decode(&oversized), None);
     }
 
     #[test]
     fn decode_reads_version_big_endian() {
-        let decoded = AnnounceAppData::decode(b"COYM\x01\x02").unwrap();
+        let decoded = AnnounceAppData::decode(&announce(b"\x01\x02")).unwrap();
         assert_eq!(decoded.version, 0x0102);
         assert_eq!(decoded.display_name, None);
     }
@@ -262,7 +274,7 @@ mod tests {
     #[test]
     fn decode_rejects_control_characters_in_display_name() {
         for name in ["\u{1b}[2Jname", "na\rme", "name\n", "\u{7f}name", "na\tme"] {
-            let mut bytes = b"COYM\x00\x01".to_vec();
+            let mut bytes = announce(b"\x00\x01");
             bytes.extend_from_slice(name.as_bytes());
             assert_eq!(AnnounceAppData::decode(&bytes), None, "{name:?}");
         }
@@ -276,12 +288,12 @@ mod tests {
             "join\u{2060}er",
             "\u{FEFF}bom",
         ] {
-            let mut bytes = b"COYM\x00\x01".to_vec();
+            let mut bytes = announce(b"\x00\x01");
             bytes.extend_from_slice(name.as_bytes());
             assert_eq!(AnnounceAppData::decode(&bytes), None, "{name:?}");
         }
 
-        let mut bytes = b"COYM\x00\x01".to_vec();
+        let mut bytes = announce(b"\x00\x01");
         bytes.extend_from_slice("Zoë".as_bytes());
         let decoded = AnnounceAppData::decode(&bytes).unwrap();
         assert_eq!(decoded.display_name.as_deref(), Some("Zoë"));
@@ -320,7 +332,7 @@ mod tests {
     #[test]
     fn decode_rejects_every_format_character_class() {
         let decode_name = |name: &str| {
-            let mut bytes = b"COYM\x00\x01".to_vec();
+            let mut bytes = announce(b"\x00\x01");
             bytes.extend_from_slice(name.as_bytes());
             AnnounceAppData::decode(&bytes)
         };
@@ -349,7 +361,7 @@ mod tests {
     #[test]
     fn variation_selectors_decode_verbatim_and_are_dropped_only_from_display_text() {
         let heart = "Alex \u{2764}\u{FE0F}";
-        let mut bytes = b"COYM\x00\x01".to_vec();
+        let mut bytes = announce(b"\x00\x01");
         bytes.extend_from_slice(heart.as_bytes());
         let decoded = AnnounceAppData::decode(&bytes).unwrap();
         assert_eq!(decoded.display_name.as_deref(), Some(heart));

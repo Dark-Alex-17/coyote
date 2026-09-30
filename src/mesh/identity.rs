@@ -1510,6 +1510,35 @@ mod tests {
     }
 
     #[test]
+    fn usage_probe_a_version_1_predecessors_line_written_before_scope_still_loads() {
+        // T33 (SCOPE wire rename) bumps trust/peers/knocks 1 -> 2 and MUST NOT bump
+        // `PREDECESSOR_RECORD_VERSION`: a history file written on the build before the
+        // rename, spelled with a literal `"version":1` (not the constant, which a wrongful
+        // bump would follow silently), still loads with its line intact.
+        let dir = TempDir::new("identity-predecessors-v1-before-scope");
+        let path = dir.path.join("identity.key");
+        let file = predecessors_path(&path);
+        fs::write(
+            &file,
+            "{\"version\":1,\"identity_hash\":\"0123456789abcdef0123456789abcdef\",\"rotated_at\":\"2026-01-01T00:00:00Z\",\"reason\":\"rotate\"}\n",
+        )
+        .unwrap();
+
+        let history = predecessors(&path).expect("a version-1 predecessors line still loads");
+
+        assert_eq!(
+            history,
+            vec![Predecessor {
+                version: PREDECESSOR_RECORD_VERSION,
+                identity_hash: "0123456789abcdef0123456789abcdef".to_string(),
+                rotated_at: "2026-01-01T00:00:00Z".to_string(),
+                reason: "rotate".to_string(),
+            }]
+        );
+        assert_eq!(history[0].version, 1);
+    }
+
+    #[test]
     fn predecessors_refuses_a_line_without_a_version() {
         let dir = TempDir::new("identity-predecessors-unversioned");
         let path = dir.path.join("identity.key");

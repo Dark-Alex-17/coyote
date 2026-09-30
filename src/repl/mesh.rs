@@ -2610,6 +2610,7 @@ fn render_broadcast(outcome: &BroadcastOutcome) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mesh::knocks::KNOCK_RECORD_VERSION;
     use crate::mesh::message::{RawPeerMessage, RecipientReport};
     use crate::mesh::pending::{INBOUND_RECORD_VERSION, PENDING_RECORD_VERSION, PendingRecord};
     use crate::mesh::test_support::{Compatibility, PropagationNode, private_config};
@@ -2635,7 +2636,7 @@ mod tests {
 
     fn knock(name: Option<&str>, intro: Option<&str>, received_at: &str) -> KnockRecord {
         KnockRecord {
-            version: 1,
+            version: KNOCK_RECORD_VERSION,
             received_at: received_at.to_string(),
             identity_hash: "ef".repeat(16),
             destination_hash: "12".repeat(16),
@@ -4983,11 +4984,12 @@ mod tests {
             /// (destination, identity, name hash) of a freshly minted peer. Trusting verifies
             /// identity + name hash -> destination, so the destination is derived for real.
             fn announced_peer() -> (String, String, String) {
+                use crate::mesh::session_destination_name;
                 use rand_core::OsRng;
-                use rns_transport::destination::{DestinationName, SingleInputDestination};
+                use rns_transport::destination::SingleInputDestination;
                 use rns_transport::identity::PrivateIdentity;
 
-                let name = DestinationName::new("coyote", "mesh.probe");
+                let name = session_destination_name("probe");
                 let announced =
                     SingleInputDestination::new(PrivateIdentity::new_from_rand(OsRng), name);
                 (
@@ -5976,10 +5978,11 @@ mod tests {
             #[serial]
             fn status_of_a_trusted_but_unresolvable_peer_says_it_cannot_be_reached_yet() {
                 use crate::mesh::hex_lower;
+                use crate::mesh::session_destination_name;
                 use crate::mesh::test_support::PeerSighting;
                 use crate::mesh::trust::{LiveMesh, TrustOptions};
                 use rand_core::OsRng;
-                use rns_transport::destination::{DestinationName, SingleInputDestination};
+                use rns_transport::destination::SingleInputDestination;
                 use rns_transport::identity::PrivateIdentity;
 
                 let _guard = TestConfigDirGuard::new("repl-mesh-status-unresolvable");
@@ -5989,7 +5992,7 @@ mod tests {
                     let mut ctx = ctx_with(MeshConfig::default(), true);
                     ctx.app.mesh.install(started.runtime.clone()).unwrap();
                     let now = SystemTime::now();
-                    let name = DestinationName::new("coyote", "mesh.probe");
+                    let name = session_destination_name("probe");
                     let announced =
                         SingleInputDestination::new(PrivateIdentity::new_from_rand(OsRng), name);
                     let trusted = announced.desc.address_hash.to_hex_string();
@@ -6248,10 +6251,11 @@ mod tests {
             #[serial]
             fn reply_shows_the_standing_and_refuses_denied_or_blocked_before_asking() {
                 use crate::mesh::hex_lower;
+                use crate::mesh::session_destination_name;
                 use crate::mesh::test_support::PeerSighting;
                 use crate::mesh::trust::{LiveMesh, TrustOptions};
                 use rand_core::OsRng;
-                use rns_transport::destination::{DestinationName, SingleInputDestination};
+                use rns_transport::destination::SingleInputDestination;
                 use rns_transport::identity::PrivateIdentity;
 
                 let _guard = TestConfigDirGuard::new("repl-mesh-reply-standing");
@@ -6272,7 +6276,7 @@ mod tests {
                     };
                     // Trusting a destination verifies identity + name hash -> destination,
                     // so the trusted peer is derived for real.
-                    let name = DestinationName::new("coyote", "mesh.probe");
+                    let name = session_destination_name("probe");
                     let announced =
                         SingleInputDestination::new(PrivateIdentity::new_from_rand(OsRng), name);
                     let trusted = announced.desc.address_hash.to_hex_string();
@@ -8017,6 +8021,185 @@ mod tests {
                     assert!(ctx.app.mesh.stop().await.unwrap());
                     started.relay_handle.abort();
                     stub.stop().await;
+                });
+            }
+
+            /// A well-formed trust file of the layout this program wrote before the SCOPE
+            /// rename (`version: 1`; the trust file is at `2` now), as an operator upgrading
+            /// in place would have on disk. The literal `1` is deliberate: a fixture built
+            /// from the constant would follow a wrongful bump and could never go red.
+            fn pre_scope_trust_file() -> String {
+                let (identity, destination) = ("1a".repeat(16), "2b".repeat(16));
+                let ts = "2026-01-01T00:00:00Z";
+                format!(
+                    "version: 1\n\
+                     identities:\n  {identity}:\n    added_at: {ts}\n    last_seen_at: {ts}\n    label: null\n    note: null\n    all_destinations: false\n\
+                     destinations:\n  {destination}:\n    identity: {identity}\n    added_at: {ts}\n    last_seen_at: {ts}\n    label: Bob\n    note: null\n"
+                )
+            }
+
+            /// A session carrying an instance id, the shape `.mesh on` needs to start.
+            fn session_with_id() -> Session {
+                let id = "0123456789abcdef".repeat(2);
+                serde_yaml::from_str(&format!(
+                    "model: provider:test\nmessages: []\nmesh_instance_id: {id}"
+                ))
+                .unwrap()
+            }
+
+            /// Usage probe (T33 (e), at the consumer surface): a trust file written before
+            /// the rename is not "silently empty" — `.mesh on` itself refuses, the message
+            /// names the file, both versions and the remedy, the mesh stays off with no
+            /// tools exposed, and the file is left exactly as it was. The relay port is
+            /// closed so a wrongly-accepted file cannot start a node: the refusal must be
+            /// the trust file's, not the join's.
+            #[test]
+            #[serial]
+            fn usage_probe_mesh_on_refuses_a_pre_scope_trust_file_and_stays_off() {
+                let guard = TestConfigDirGuard::new("repl-mesh-on-pre-scope-trust");
+                let _cache = EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
+                let _capture = capture::install();
+                let trust_path = crate::mesh::mesh_config_dir(&guard.path).join("trust.yaml");
+                fs::create_dir_all(trust_path.parent().unwrap()).unwrap();
+                let old = pre_scope_trust_file();
+                fs::write(&trust_path, &old).unwrap();
+                run_async(async {
+                    let closed_port = {
+                        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                        listener.local_addr().unwrap().port()
+                    };
+                    let mut ctx = ctx_with(private_config(closed_port), true);
+                    ctx.session = Some(session_with_id());
+                    ctx.refresh_tool_scope(create_abort_signal()).await.unwrap();
+
+                    let err = format!("{:#}", run(&mut ctx, ".mesh on --yes").await.unwrap_err());
+
+                    assert!(err.contains(&trust_path.display().to_string()), "{err}");
+                    assert!(err.contains("version 1"), "{err}");
+                    assert!(err.contains("version 2"), "{err}");
+                    assert!(err.contains("move the file aside"), "{err}");
+                    assert!(
+                        !err.contains("connect") && !err.contains("relay"),
+                        "the refusal must be the trust file's, not the closed relay's: {err}"
+                    );
+                    assert!(ctx.app.mesh.get().is_none(), "no node may be installed");
+                    assert!(!ctx.app.config.mesh.enabled);
+                    assert!(mesh_tool_names(&ctx).is_empty());
+                    assert_eq!(
+                        fs::read_to_string(&trust_path).unwrap(),
+                        old,
+                        "a refused trust file is left as it was"
+                    );
+                    let out = stdout_lines();
+                    assert!(
+                        !out.iter()
+                            .any(|line| line.contains("Mesh is on for this session")),
+                        "{out:?}"
+                    );
+                });
+            }
+
+            /// Usage probe (T33 (e), at the consumer surface): the peer table lives in the
+            /// cache and is loaded by the start too; one written before the rename
+            /// (`"version":1`, the table is at `2` now) refuses `.mesh on` by name, with the
+            /// mesh staying off and the table untouched.
+            #[test]
+            #[serial]
+            fn usage_probe_mesh_on_refuses_a_pre_scope_peer_table_and_stays_off() {
+                let guard = TestConfigDirGuard::new("repl-mesh-on-pre-scope-peers");
+                let cache_dir = guard.path.join("cache");
+                let _cache = EnvVarGuard::set(get_env_name("cache_dir"), &cache_dir);
+                let _capture = capture::install();
+                let peers_path = crate::mesh::mesh_cache_dir(&cache_dir).join("peers.json");
+                fs::create_dir_all(peers_path.parent().unwrap()).unwrap();
+                let old = br#"{"version":1,"peers":[]}"#.to_vec();
+                fs::write(&peers_path, &old).unwrap();
+                run_async(async {
+                    let closed_port = {
+                        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                        listener.local_addr().unwrap().port()
+                    };
+                    let mut ctx = ctx_with(private_config(closed_port), true);
+                    ctx.session = Some(session_with_id());
+                    ctx.refresh_tool_scope(create_abort_signal()).await.unwrap();
+
+                    let err = format!("{:#}", run(&mut ctx, ".mesh on --yes").await.unwrap_err());
+
+                    assert!(err.contains(&peers_path.display().to_string()), "{err}");
+                    assert!(err.contains("version 1"), "{err}");
+                    assert!(err.contains("version 2"), "{err}");
+                    assert!(err.contains("move the file aside"), "{err}");
+                    assert!(ctx.app.mesh.get().is_none(), "no node may be installed");
+                    assert!(!ctx.app.config.mesh.enabled);
+                    assert!(mesh_tool_names(&ctx).is_empty());
+                    assert_eq!(
+                        fs::read(&peers_path).unwrap(),
+                        old,
+                        "a refused peer table is left as it was"
+                    );
+                    assert!(!peers_path.with_extension("json.corrupt").exists());
+                });
+            }
+
+            /// Usage probe (T33 (e), at the consumer surface): the knock cache is read
+            /// lazily, so a pre-rename line (`"version":1`; records are at `2` now) surfaces
+            /// at `.mesh knocks` — by file and line, naming both versions and the remedy —
+            /// instead of listing nothing. The node itself keeps running (the cache is not
+            /// a start-time store), and the file is left as it was.
+            #[test]
+            #[serial]
+            fn usage_probe_mesh_knocks_surfaces_a_pre_scope_knock_line_by_file_and_line() {
+                use crate::mesh::rfc3339_utc;
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-knocks-pre-scope");
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-knocks-pre-scope").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let path = started.runtime.knock_gate().cache().path().to_path_buf();
+                    let (dest, id, name_hash) = announced_peer();
+                    let mut old = serde_json::to_value(KnockRecord {
+                        version: 1,
+                        received_at: rfc3339_utc(SystemTime::now()),
+                        identity_hash: id,
+                        destination_hash: dest,
+                        name_hash,
+                        display_name: Some("Old".to_string()),
+                        intro: None,
+                        hops: 1,
+                    })
+                    .unwrap();
+                    // Whatever `KnockRecord` serialises today, the line on disk says 1.
+                    old["version"] = serde_json::json!(1);
+                    let old = format!("{old}\n");
+                    fs::create_dir_all(path.parent().unwrap()).unwrap();
+                    fs::write(&path, &old).unwrap();
+
+                    let err = format!(
+                        "{:#}",
+                        run(&mut ctx, ".mesh knocks")
+                            .await
+                            .expect_err(".mesh knocks")
+                    );
+
+                    assert!(err.contains(&path.display().to_string()), "{err}");
+                    assert!(err.contains("line 1"), "{err}");
+                    assert!(err.contains("version 1"), "{err}");
+                    assert!(err.contains("version 2"), "{err}");
+                    assert!(err.contains("move the file aside"), "{err}");
+                    assert_eq!(
+                        fs::read_to_string(&path).unwrap(),
+                        old,
+                        "a refused knock cache is left as it was"
+                    );
+                    assert!(
+                        ctx.app.mesh.get().is_some(),
+                        "a refused knock cache does not take the node down"
+                    );
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
                 });
             }
         }

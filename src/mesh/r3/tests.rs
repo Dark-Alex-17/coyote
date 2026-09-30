@@ -501,12 +501,15 @@ pub(crate) mod network {
     use crate::mesh::propagation::{PropagationNode, PropagationOptions, pn_announce_app_data};
     use crate::mesh::propagation_fetch::InboundMessage;
     use crate::mesh::protocol::{MESH_PROTOCOL_MIN_SUPPORTED, MESH_PROTOCOL_VERSION};
+    use crate::mesh::session_destination_name;
     use crate::mesh::snapshot::{MeshSnapshot, PlanRef, RepoInfo, TurnState};
     use crate::mesh::test_support::{
         Connector, INTEROP_TIMEOUT, LEGACY_LINK_MTU, Listener, TempDir, TrustList, contains_bytes,
         loopback_relay, mesh_paths, private_config, snapshot_fixture, started_runtime, wait_until,
     };
-    use crate::mesh::trust::{IdentityStanding, Rule, TrustChange, TrustOptions};
+    use crate::mesh::trust::{
+        IdentityStanding, Rule, TRUST_FILE_VERSION, TrustChange, TrustOptions,
+    };
     use crate::mesh::{destination_address, mesh_config_dir, rfc3339_utc};
     use crate::supervisor::mailbox::EnvelopePayload;
     use crate::testing::{debug_snapshot, install_log_collector, warn_snapshot};
@@ -557,7 +560,7 @@ pub(crate) mod network {
 
     fn fresh_destination_name() -> DestinationName {
         let instance_id = Session::default().ensure_mesh_instance_id().to_string();
-        DestinationName::new("coyote", &format!("mesh.{instance_id}"))
+        session_destination_name(&instance_id)
     }
 
     /// What the handler observed about one request, kept in plain data for assertions.
@@ -3527,7 +3530,11 @@ pub(crate) mod network {
         let identity_path = paths.identity_path.clone();
         let trust_path = mesh_config_dir(&paths.config_dir).join("trust.yaml");
         fs::create_dir_all(trust_path.parent().unwrap()).unwrap();
-        fs::write(&trust_path, "version: 1\nidentities: [not, a, map]\n").unwrap();
+        fs::write(
+            &trust_path,
+            format!("version: {TRUST_FILE_VERSION}\nidentities: [not, a, map]\n"),
+        )
+        .unwrap();
 
         let Err(err) = MeshRuntime::start(
             &private_config(addr.port()),
@@ -3545,6 +3552,12 @@ pub(crate) mod network {
         assert!(
             text.contains(&trust_path.display().to_string()),
             "the error must name the trust file: {text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "could not be parsed as version {TRUST_FILE_VERSION}"
+            )),
+            "the refusal must be the shape failure, not the version gate: {text}"
         );
         assert!(
             !identity_path.exists(),
@@ -4253,11 +4266,8 @@ pub(crate) mod network {
     /// A destination nobody serves and node A has never heard announced.
     fn ghost_destination() -> (TransportIdentity, DestinationDesc) {
         let identity = TransportIdentity::new_from_rand(OsRng);
-        let desc = SingleInputDestination::new(
-            identity.clone(),
-            DestinationName::new("coyote", "mesh.ghost"),
-        )
-        .desc;
+        let desc =
+            SingleInputDestination::new(identity.clone(), session_destination_name("ghost")).desc;
         (identity, desc)
     }
 

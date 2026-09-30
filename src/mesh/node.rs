@@ -296,7 +296,11 @@ impl MeshRuntime {
             SystemTime::now(),
         )?);
 
-        let transport = Transport::new(TransportConfig::new("coyote", &transport_identity, false));
+        let transport = Transport::new(TransportConfig::new(
+            SCOPE_APP_NAME,
+            &transport_identity,
+            false,
+        ));
         // Every stream is subscribed before an interface is joined so nothing is missed.
         let announces = transport.recv_announces().await;
         let out_link_events = transport.out_link_events();
@@ -865,7 +869,7 @@ impl MeshRuntime {
     /// registering the fork's destination) happens before the swap, and the fork's
     /// destination is registered before the original is released so a transport that stalls
     /// on the registration leaves the node serving exactly what it served before. The two
-    /// hashes differ (`mesh.{instance_id}`), so both may be registered at once; a release of
+    /// hashes differ (`session.{instance_id}`), so both may be registered at once; a release of
     /// the original that does not finish within `REKEY_GRACE` is logged and the swap goes
     /// ahead, leaving the original registered until the node stops. Each transport wait is
     /// bounded because a wedged handler lock would otherwise hold `destination` for good.
@@ -1005,6 +1009,15 @@ impl MeshRuntime {
     }
 }
 
+const SCOPE_APP_NAME: &str = "scope";
+
+/// The Reticulum destination name `scope.session.<instance_id>` (section 4) a node with
+/// `instance_id` registers, announces and is reached at. `SCOPE_APP_NAME` also labels the
+/// transport's logs (`TransportConfig::new`), which puts nothing on the wire.
+pub(crate) fn session_destination_name(instance_id: &str) -> DestinationName {
+    DestinationName::new(SCOPE_APP_NAME, &format!("session.{instance_id}"))
+}
+
 /// Registers the destination for `instance_id` and attaches `app_data` to its announces;
 /// each transport wait gives up at `deadline`. A destination registered but left without
 /// its announce data is deregistered again, best effort, and the error says whether that
@@ -1018,7 +1031,7 @@ async fn register_destination(
     app_data: &[u8],
     deadline: tokio::time::Instant,
 ) -> Result<(Arc<Mutex<SingleInputDestination>>, AddressHash, OriginName)> {
-    let name = DestinationName::new("coyote", &format!("mesh.{instance_id}"));
+    let name = session_destination_name(instance_id);
     let destination = SingleInputDestination::new(identity.clone(), name);
     let hash = destination.desc.address_hash;
     let origin = OriginName::of(&destination.desc.name);
@@ -5936,7 +5949,7 @@ mod tests {
         let runtime = &started.runtime;
         let peer = SingleInputDestination::new(
             TransportIdentity::new_from_rand(OsRng),
-            DestinationName::new("coyote", "mesh.peer"),
+            session_destination_name("peer"),
         )
         .desc;
         runtime.shutdown().await.unwrap();
@@ -6282,7 +6295,7 @@ mod tests {
             })
         );
 
-        let b_name = DestinationName::new("coyote", &format!("mesh.{}", fresh_instance_id()));
+        let b_name = session_destination_name(&fresh_instance_id());
         let b_dest = node_b
             .add_destination(TransportIdentity::new_from_rand(OsRng), b_name)
             .await;
@@ -6745,7 +6758,7 @@ mod tests {
                 destination_hash: to.clone(),
                 identity_hash: stub.identity_hex(),
                 name_hash: hex_lower(
-                    DestinationName::new("coyote", "mesh.node-seen-stub").as_name_hash_slice(),
+                    session_destination_name("node-seen-stub").as_name_hash_slice(),
                 ),
                 display_name: Some("Stub".to_string()),
                 protocol_version: MESH_PROTOCOL_VERSION,

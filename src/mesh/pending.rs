@@ -1055,6 +1055,79 @@ mod tests {
     }
 
     #[test]
+    fn usage_probe_a_version_1_pending_line_written_before_scope_still_loads() {
+        // T33 (SCOPE wire rename) bumps trust/peers/knocks 1 -> 2 and MUST NOT bump the
+        // pending store: a `pending-<id>.jsonl` a user wrote on the build before the
+        // rename is spelled with a literal `"version":1` here, not the constant, so a
+        // wrongful bump goes red instead of following the constant silently.
+        let tmp = TempDir::new("pending-v1-before-scope");
+        let store = PendingStore::new(&tmp.path, "inst");
+        let line = concat!(
+            r#"{"version":1,"id":"q-before-rename","#,
+            r#""peer_destination":"abababababababababababababababab","#,
+            r#""peer_identity":"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd","#,
+            r#""question":"still pending?","#,
+            r#""sent_at":"1970-01-01T00:16:40Z","timeout_at":"1970-01-01T00:17:10Z","#,
+            r#""state":"open"}"#,
+            "\n"
+        );
+        fs::create_dir_all(store.path().parent().unwrap()).unwrap();
+        fs::write(store.path(), line).unwrap();
+
+        let listed = store
+            .list(t(1_100))
+            .expect("a version-1 pending line still loads");
+
+        assert_eq!(ids(&listed), vec!["q-before-rename"]);
+        assert_eq!(listed[0].version, PENDING_RECORD_VERSION);
+        assert_eq!(listed[0].state, PendingState::Open);
+        assert_eq!(
+            ids(&store.load_pending(t(1_100)).unwrap()),
+            vec!["q-before-rename"]
+        );
+        assert!(
+            fs::read_to_string(store.path())
+                .unwrap()
+                .contains("q-before-rename"),
+            "a loadable file is left where it is"
+        );
+    }
+
+    #[test]
+    fn usage_probe_a_version_1_inbound_line_written_before_scope_still_loads() {
+        // Same MUST NOT as the pending store: `INBOUND_RECORD_VERSION` stays 1 across the
+        // SCOPE rename (TASK-108 owns any pending/inbound bump).
+        let tmp = TempDir::new("inbound-v1-before-scope");
+        let store = InboundStore::new(&tmp.path, "inst");
+        let line = concat!(
+            r#"{"version":1,"id":"peer-q-before-rename","#,
+            r#""peer_destination":"abababababababababababababababab","#,
+            r#""peer_identity":"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd","#,
+            r#""question":"what does the envoy think?","#,
+            r#""envoy_question":"","#,
+            r#""received_at":"1970-01-01T00:16:40Z"}"#,
+            "\n"
+        );
+        fs::create_dir_all(store.path().parent().unwrap()).unwrap();
+        fs::write(store.path(), line).unwrap();
+
+        let listed = store
+            .list(t(1_100))
+            .expect("a version-1 inbound line still loads");
+
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, "peer-q-before-rename");
+        assert_eq!(listed[0].version, INBOUND_RECORD_VERSION);
+        assert_eq!(
+            store
+                .get("peer-q-before-rename")
+                .unwrap()
+                .map(|r| r.question),
+            Some("what does the envoy think?".to_string())
+        );
+    }
+
+    #[test]
     fn a_record_with_a_field_this_coyote_does_not_know_is_refused() {
         let tmp = TempDir::new("pending-unknown-field");
         let store = PendingStore::new(&tmp.path, "inst");

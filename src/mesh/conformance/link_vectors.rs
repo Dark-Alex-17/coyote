@@ -435,6 +435,7 @@ mod loopback {
         RefusalCode, Reply, RequestFrame, RequestId, RequestOptions, ResponseFrame, STATUS_PATH,
         SizeBranch, open_link, short,
     };
+    use crate::mesh::session_destination_name;
     use crate::mesh::test_support::{
         INTEROP_TIMEOUT, LEGACY_LINK_MTU, StartedRuntime, started_runtime_on, wait_until,
     };
@@ -443,7 +444,7 @@ mod loopback {
 
     use rand_core::OsRng;
     use rmpv::Value;
-    use rns_transport::destination::{DestinationDesc, DestinationName, SingleInputDestination};
+    use rns_transport::destination::{DestinationDesc, SingleInputDestination};
     use rns_transport::identity::PrivateIdentity as TransportIdentity;
     use rns_transport::iface::InterfaceSharedConfig;
     use rns_transport::iface::tcp_client::TcpClient;
@@ -772,7 +773,7 @@ mod loopback {
             .transport
             .add_destination(
                 TransportIdentity::new_from_rand(OsRng),
-                DestinationName::new("coyote", "mesh.decoy"),
+                session_destination_name("decoy"),
             )
             .await;
         let decoy_hash = decoy.lock().await.desc.address_hash;
@@ -1024,7 +1025,7 @@ mod loopback {
         let (responder, requester, _desc) = pair(recorder.clone()).await;
         let ghost = SingleInputDestination::new(
             TransportIdentity::new_from_rand(OsRng),
-            DestinationName::new("coyote", "mesh.ghost"),
+            session_destination_name("ghost"),
         )
         .desc;
         let ghost_hex = ghost.address_hash.to_hex_string();
