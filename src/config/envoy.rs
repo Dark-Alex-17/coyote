@@ -636,6 +636,17 @@ mod tests {
         ))
     }
 
+    /// The launcher `Functions::build_binaries` writes for a global tool: the script
+    /// itself on unix, a `.cmd` in front of `run-<tool>.<ext>` on Windows.
+    fn tool_launcher(bin_dir: &Path, tool: &str) -> PathBuf {
+        let launcher = if cfg!(windows) {
+            format!("{tool}.cmd")
+        } else {
+            tool.to_string()
+        };
+        bin_dir.join(launcher)
+    }
+
     fn embedded_config_bytes() -> Vec<u8> {
         EnvoyAssets::get(CONFIG_FILE_NAME)
             .unwrap()
@@ -1569,11 +1580,8 @@ mod tests {
             plain_names.iter().any(|name| name == "execute_command"),
             "{plain_names:?}"
         );
-        assert!(
-            paths::agent_bin_dir("plain")
-                .join("execute_command")
-                .exists()
-        );
+        let plain_launcher = tool_launcher(&paths::agent_bin_dir("plain"), "execute_command");
+        assert!(plain_launcher.is_file(), "{}", plain_launcher.display());
         assert!(plain.can_spawn_agents());
         assert!(plain.auto_continue_enabled());
         assert_eq!(plain.memory(), Some(true));
@@ -1603,7 +1611,7 @@ mod tests {
             envoy_names.iter().any(|name| name.starts_with("user__")),
             "{envoy_names:?}"
         );
-        assert!(!envoy_dir.join("bin").join("execute_command").exists());
+        assert!(!tool_launcher(&envoy_dir.join("bin"), "execute_command").exists());
         assert!(!envoy.can_spawn_agents());
         assert!(!envoy.auto_continue_enabled());
         assert_eq!(envoy.memory(), Some(false));
