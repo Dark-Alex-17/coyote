@@ -53,10 +53,11 @@ fn marker_log(dir: &Path, marker: &str) -> PathBuf {
 
 /// Builds the hook command that appends `marker` to its own marker file, in
 /// the dialect of the shell the hook engine dispatches through: `sh -c`
-/// elsewhere, `cmd /C` on Windows. The cmd form parenthesizes the echo
-/// because `echo X >> f` under cmd writes "X " with a trailing space, which
-/// would break exact marker matching. Both forms double-quote the path, so
-/// the command also survives YAML single-quoting and spaces in temp paths.
+/// elsewhere, `cmd /C` (with the command line passed verbatim) on Windows.
+/// The cmd form parenthesizes the echo because `echo X >> f` under cmd
+/// writes "X " with a trailing space, which would break exact marker
+/// matching. Both forms double-quote the path, so the command also survives
+/// YAML single-quoting and spaces in temp paths.
 fn marker_command(marker: &str, dir: &Path) -> String {
     let log = marker_log(dir, marker);
     let log = log.display();
@@ -65,6 +66,42 @@ fn marker_command(marker: &str, dir: &Path) -> String {
     } else {
         format!(r#"echo {marker} >> "{log}""#)
     }
+}
+
+/// The shell `run_coyote` pins for `!` passthrough steps via `COYOTE_SHELL`.
+/// Unpinned, the REPL picks the runner from the environment (`$SHELL`, or a
+/// `PSModulePath` heuristic on Windows that lands on pwsh, Windows
+/// PowerShell, or cmd depending on how the parent process was started), so
+/// the dialect a step must be written in would vary by machine.
+const STEP_SHELL: &str = if cfg!(windows) {
+    "powershell.exe"
+} else {
+    "/bin/sh"
+};
+
+/// Builds a macro `!` step that appends `marker` to its own marker file, in
+/// the dialect of `STEP_SHELL`. This is NOT `marker_command`'s dialect: the
+/// `!` runner hands the step to the shell through `Command::args()`, whose
+/// CommandLineToArgvW quoting cmd does not parse (the `\"` escapes reach cmd
+/// verbatim and corrupt a quoted redirect target), so the Windows step runs
+/// under PowerShell instead. `Add-Content -Encoding Ascii` writes the same
+/// bytes under Windows PowerShell 5.1 and pwsh 7 — a plain `>>` would emit
+/// UTF-16LE with a BOM under 5.1, which `marker_count` cannot read.
+fn step_marker_command(marker: &str, dir: &Path) -> String {
+    let log = marker_log(dir, marker);
+    let log = log.display();
+    if cfg!(windows) {
+        format!(r#"Add-Content -LiteralPath "{log}" -Value {marker} -Encoding Ascii"#)
+    } else {
+        format!(r#"echo {marker} >> "{log}""#)
+    }
+}
+
+/// Wraps a shell passthrough as a single-quoted YAML macro step: a bare
+/// leading `!` would parse as a tag, and the command carries double quotes
+/// (and backslashes on Windows).
+fn step_yaml(command: &str) -> String {
+    format!("  - '!{command}'\n")
 }
 
 /// Lays out a config dir with a dry_run model, global agent.* hooks that
@@ -149,6 +186,7 @@ fn run_coyote(dir: &Path, args: &[&str]) -> Output {
         .args(args)
         .current_dir(dir)
         .env("COYOTE_CONFIG_DIR", dir)
+        .env("COYOTE_SHELL", STEP_SHELL)
         .env_remove("IS_SANDBOX")
         .stdin(Stdio::null())
         .output()
@@ -339,12 +377,10 @@ fn literal_mesh_step_is_refused_at_load_and_closes_the_bracket() {
 fn bare_macro_route_refuses_literal_mesh_step_before_the_first_step_runs() {
     let dir = fresh_config_dir("mesh-step-first-unrun");
     let _cleanup = TempDirGuard(dir.clone());
-    let step_ran = marker_command("STEP_RAN", &dir);
-    // Single-quoted YAML scalar: a bare leading `!` would parse as a tag, and
-    // the path carries double quotes (and backslashes on Windows).
+    let step_ran = step_yaml(&step_marker_command("STEP_RAN", &dir));
     write_fixture(
         &dir,
-        &format!("steps:\n  - '!{step_ran}'\n  - \".mesh trust abc\"\n"),
+        &format!("steps:\n{step_ran}  - \".mesh trust abc\"\n"),
     );
 
     let output = run_coyote(&dir, &["--macro", "probe"]);
@@ -388,10 +424,10 @@ fn bare_macro_route_refuses_literal_mesh_step_before_the_first_step_runs() {
 fn bare_macro_route_runs_the_first_step_when_no_mesh_step_is_present() {
     let dir = fresh_config_dir("mesh-step-control");
     let _cleanup = TempDirGuard(dir.clone());
-    let step_ran = marker_command("STEP_RAN", &dir);
+    let step_ran = step_yaml(&step_marker_command("STEP_RAN", &dir));
     write_fixture(
         &dir,
-        &format!("steps:\n  - '!{step_ran}'\n  - \".set temperature 0.5\"\n"),
+        &format!("steps:\n{step_ran}  - \".set temperature 0.5\"\n"),
     );
 
     let output = run_coyote(&dir, &["--macro", "probe"]);
