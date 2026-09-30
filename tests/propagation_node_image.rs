@@ -12,7 +12,11 @@
 //!   node and requires auth, the README documents the private-network contract
 //!   without citing upstream's build-only Dockerfile, the root README and the
 //!   protocol spec cross-link, and every shipped file is plain ASCII with LF
-//!   endings and no plan-tracker references.
+//!   endings and no plan-tracker references. The `file:line` citations the README
+//!   and entrypoint make into upstream are resolved against the interop harness
+//!   checkout that `scripts/mesh-interop/setup.sh` makes under
+//!   `${COYOTE_MESH_INTEROP_DIR:-$HOME/.cache/coyote/mesh-interop}` (the
+//!   `mesh-interop` CI job runs them there); without it they print `skipping:`.
 //! * The live tests build the image and run it. They need a Docker daemon and
 //!   are `#[ignore]`d; run them with
 //!
@@ -943,24 +947,38 @@ fn crlf_terminated_allowed_lines_are_accepted_by_lxmd() {
 // shutdown path and the identity-portability fine print.
 // ---------------------------------------------------------------------------
 
-/// Pinned upstream clones the README's `file:line` citations are checked against.
-/// Set `COYOTE_PN_UPSTREAM_LXMF=/path/to/LXMF` to point elsewhere; when neither the
-/// variable nor `.rns-audit/lxmf` exists the citation test prints `skipping:`.
-fn upstream_lxmf_dir() -> Option<PathBuf> {
-    if let Ok(dir) = env::var("COYOTE_PN_UPSTREAM_LXMF") {
+/// The interop harness checkout of `clone` (`lxmf` or `reticulum`, as
+/// `scripts/mesh-interop/setup.sh` names them). `override_var` wins when set;
+/// `COYOTE_MESH_INTEROP_DIR` is authoritative when set, as it is in CI, so a
+/// missing clone there fails the version guard instead of skipping; the
+/// `$HOME/.cache/coyote/mesh-interop` default is used only when it holds the
+/// `package` tree, since a checkout that never ran `setup.sh` has nothing to check.
+fn upstream_clone(override_var: &str, clone: &str, package: &str) -> Option<PathBuf> {
+    if let Some(dir) = env::var_os(override_var) {
         return Some(PathBuf::from(dir));
     }
-    let default = repo_root().join(".rns-audit").join("lxmf");
-    default.join("LXMF").is_dir().then_some(default)
+    if let Some(dir) = env::var_os("COYOTE_MESH_INTEROP_DIR") {
+        return Some(PathBuf::from(dir).join(clone));
+    }
+    let default = dirs::home_dir()?
+        .join(".cache")
+        .join("coyote")
+        .join("mesh-interop")
+        .join(clone);
+    default.join(package).is_dir().then_some(default)
 }
 
-/// The RNS twin of [`upstream_lxmf_dir`]: `COYOTE_PN_UPSTREAM_RNS` or `.rns-audit/reticulum`.
+/// Pinned LXMF clone the README's `file:line` citations are checked against:
+/// `COYOTE_PN_UPSTREAM_LXMF=/path/to/LXMF`, else the interop harness `lxmf` checkout
+/// (see [`upstream_clone`]). `None` means the citation test prints `skipping:`.
+fn upstream_lxmf_dir() -> Option<PathBuf> {
+    upstream_clone("COYOTE_PN_UPSTREAM_LXMF", "lxmf", "LXMF")
+}
+
+/// The RNS twin of [`upstream_lxmf_dir`]: `COYOTE_PN_UPSTREAM_RNS`, else the interop
+/// harness `reticulum` checkout.
 fn upstream_rns_dir() -> Option<PathBuf> {
-    if let Ok(dir) = env::var("COYOTE_PN_UPSTREAM_RNS") {
-        return Some(PathBuf::from(dir));
-    }
-    let default = repo_root().join(".rns-audit").join("reticulum");
-    default.join("RNS").is_dir().then_some(default)
+    upstream_clone("COYOTE_PN_UPSTREAM_RNS", "reticulum", "RNS")
 }
 
 /// Lines `from..=to` (1-based, inclusive) of `path`, joined with `\n`.
@@ -983,7 +1001,7 @@ fn cited_lines(path: &Path, from: usize, to: usize) -> String {
 fn usage_probe_readme_upstream_citations_resolve_in_the_pinned_lxmf_clone() {
     let Some(lxmf) = upstream_lxmf_dir() else {
         eprintln!(
-            "skipping: no pinned LXMF clone at .rns-audit/lxmf (or COYOTE_PN_UPSTREAM_LXMF); cannot check the README's file:line citations"
+            "skipping: no pinned LXMF clone; run scripts/mesh-interop/setup.sh (checks it out under ${{COYOTE_MESH_INTEROP_DIR:-$HOME/.cache/coyote/mesh-interop}}/lxmf) or set COYOTE_PN_UPSTREAM_LXMF; cannot check the README's file:line citations"
         );
         return;
     };
@@ -1130,7 +1148,7 @@ fn usage_probe_readme_upstream_citations_resolve_in_the_pinned_lxmf_clone() {
     // entrypoint.sh: "RNS writes identities with a plain open(path, \"wb\") (RNS/Identity.py:665)".
     let Some(rns) = upstream_rns_dir() else {
         eprintln!(
-            "skipping: no pinned RNS clone at .rns-audit/reticulum (or COYOTE_PN_UPSTREAM_RNS); cannot check the entrypoint's RNS/Identity.py citation"
+            "skipping: no pinned RNS clone; run scripts/mesh-interop/setup.sh (checks it out under ${{COYOTE_MESH_INTEROP_DIR:-$HOME/.cache/coyote/mesh-interop}}/reticulum) or set COYOTE_PN_UPSTREAM_RNS; cannot check the entrypoint's RNS/Identity.py citation"
         );
         return;
     };
