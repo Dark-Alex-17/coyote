@@ -43,6 +43,9 @@ jobs:
     name: All
 
     strategy:
+      # Each OS leg is independent evidence; a failure on one must not cancel the
+      # others, or a flake on the fastest runner hides the slower legs' verdicts.
+      fail-fast: false
       matrix:
         os:
         - ubuntu-latest
