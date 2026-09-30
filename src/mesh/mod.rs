@@ -717,6 +717,17 @@ pub(crate) mod test_support {
             ));
         }
 
+        /// Knows `identity_hex` without trusting any of its instances: a knock from one
+        /// of them is admitted and refused `NoAccess`, which is the knock landing.
+        pub(crate) fn know_identity(&self, identity_hex: &str) {
+            let list = TrustList::default().identity(identity_hex, false);
+            self.listener.server.set_handler(Self::gate(
+                &list,
+                &self.trust_dir,
+                self.recorder.clone(),
+            ));
+        }
+
         /// Announces as a Coyote node, which is what gets this stub into a runtime's peer
         /// table with a path.
         pub(crate) async fn announce(&self, display_name: Option<&str>) {

@@ -8,6 +8,11 @@ pub const DEFAULT_PEER_MAX_MESSAGES_PER_HOUR: u32 = 60;
 pub const DEFAULT_PEER_MAX_TOKENS_PER_HOUR: u64 = 100_000;
 pub const DEFAULT_PEER_MAX_COST_USD_PER_HOUR: f64 = 0.0;
 pub const DEFAULT_PROPAGATION_SYNC_INTERVAL_SECS: u64 = 300;
+/// One year: the longest automatic sync interval `validate` accepts.
+pub const MAX_PROPAGATION_SYNC_INTERVAL_SECS: u64 = 31_536_000;
+/// Width of the label column in `.mesh info`, shared by every row so the values line up
+/// whichever module renders them.
+pub const MESH_INFO_LABEL_WIDTH: usize = 32;
 
 pub(crate) const MESH_DIGEST_PROMPT: &str = r#"The session above may be shared with a trusted collaborator's Coyote instance. Write a digest of it that lets that collaborator understand what is happening here without reading the transcript.
 
@@ -61,7 +66,9 @@ pub struct MeshConfig {
     /// message is still filed in the inbox for the human.
     pub peer_max_cost_usd_per_hour: f64,
     /// Seconds between automatic fetches of the messages a propagation node holds for
-    /// this node, the first running when the node joins; 0 = fetch only on `.mesh fetch`.
+    /// this node, the first running when the node joins; 0 = fetch only on `.mesh fetch`;
+    /// off while `announce` is false, since a fetch identifies this node to the
+    /// propagation node.
     /// Sideband's `lxmf_sync_interval` defaults to 43200 s with periodic sync off and
     /// NomadNet's to 21600 s; neither fits an interactive REPL, so 300 s is used.
     pub propagation_sync_interval_secs: u64,
@@ -146,6 +153,12 @@ impl MeshConfig {
         if !cost.is_finite() || cost < 0.0 {
             bail!(
                 "mesh.peer_max_cost_usd_per_hour is {cost}, which is out of range; use 0 (no ceiling) or a positive amount"
+            );
+        }
+        let sync = self.propagation_sync_interval_secs;
+        if sync > MAX_PROPAGATION_SYNC_INTERVAL_SECS {
+            bail!(
+                "mesh.propagation_sync_interval_secs is {sync}, which is out of range; use 0 (manual) or up to {MAX_PROPAGATION_SYNC_INTERVAL_SECS} (one year)"
             );
         }
         Ok(())
@@ -273,7 +286,9 @@ pub fn render_mesh_info(mesh: &MeshConfig) -> String {
         "custom"
     };
     let mut output = String::new();
-    let mut row = |name: &str, value: String| output.push_str(&format!("  {name:<32}{value}\n"));
+    let mut row = |name: &str, value: String| {
+        output.push_str(&format!("  {name:<MESH_INFO_LABEL_WIDTH$}{value}\n"))
+    };
     row("enabled", mesh.enabled.to_string());
     row("announce", mesh.announce.to_string());
     row(
@@ -691,6 +706,42 @@ mod tests {
         }
     }
 
+    /// Usage probe (TASK-100 (b)/(f)): the documented `0 = fetch only on .mesh fetch` is a
+    /// VALID setting for an enabled mesh, unlike the rate and retention keys where 0 is out
+    /// of range; an absent key reads as the documented 300; a negative or fractional value
+    /// is refused at parse time naming the key rather than silently clamped.
+    #[test]
+    fn propagation_sync_interval_zero_is_manual_and_valid_while_negatives_fail_to_parse() {
+        let enabled = "mesh:\n  enabled: true\n  interfaces:\n    - {type: private, host: relay, port: 4242}\n";
+        let manual: Config =
+            serde_yaml::from_str(&format!("{enabled}  propagation_sync_interval_secs: 0\n"))
+                .unwrap();
+        assert_eq!(manual.mesh.propagation_sync_interval_secs, 0);
+        manual
+            .mesh
+            .validate(true)
+            .expect("0 is the documented manual-only setting, not out of range");
+
+        let implicit: Config = serde_yaml::from_str(enabled).unwrap();
+        assert_eq!(
+            implicit.mesh.propagation_sync_interval_secs,
+            DEFAULT_PROPAGATION_SYNC_INTERVAL_SECS
+        );
+        assert_eq!(DEFAULT_PROPAGATION_SYNC_INTERVAL_SECS, 300);
+
+        for bad in ["-1", "1.5", "five"] {
+            let err = serde_yaml::from_str::<Config>(&format!(
+                "{enabled}  propagation_sync_interval_secs: {bad}\n"
+            ))
+            .expect_err(bad)
+            .to_string();
+            assert!(
+                err.contains("propagation_sync_interval_secs"),
+                "{bad}: the refusal names the key: {err}"
+            );
+        }
+    }
+
     #[test]
     fn validate_accepts_only_zero_or_a_positive_finite_cost_ceiling() {
         let enabled = MeshConfig {
@@ -714,6 +765,34 @@ mod tests {
                 "mesh.peer_max_cost_usd_per_hour is {rendered}, which is out of range; use 0 (no ceiling) or a positive amount"
             );
             assert!(err.contains(&expected), "{rendered}: {err}");
+        }
+    }
+
+    #[test]
+    fn validate_caps_the_sync_interval_at_one_year() {
+        let enabled = MeshConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        for accepted in [0, 1, MAX_PROPAGATION_SYNC_INTERVAL_SECS] {
+            let mesh = MeshConfig {
+                propagation_sync_interval_secs: accepted,
+                ..enabled.clone()
+            };
+            mesh.validate(true).unwrap();
+        }
+        for refused in [MAX_PROPAGATION_SYNC_INTERVAL_SECS + 1, u64::MAX] {
+            let mesh = MeshConfig {
+                propagation_sync_interval_secs: refused,
+                ..enabled.clone()
+            };
+            let err = mesh.validate(true).unwrap_err().to_string();
+            assert_eq!(
+                err,
+                format!(
+                    "mesh.propagation_sync_interval_secs is {refused}, which is out of range; use 0 (manual) or up to 31536000 (one year)"
+                )
+            );
         }
     }
 

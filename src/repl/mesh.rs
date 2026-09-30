@@ -1,4 +1,6 @@
-use crate::config::mesh_config::{MeshBrief, MeshInterface, render_mesh_info};
+use crate::config::mesh_config::{
+    MESH_INFO_LABEL_WIDTH, MeshBrief, MeshInterface, render_mesh_info,
+};
 use crate::config::{MeshConfig, RequestContext};
 use crate::function::mesh::trust_label;
 use crate::mesh::card::{CardSource, DISPLAY_NAME_MAX_CHARS, StatusHandler, render_for_human};
@@ -143,6 +145,7 @@ const ROTATE_NEEDS_OFF: &str = "Mesh is on. Run `.mesh off` first; the identity 
 const BROADCAST_NOTICE: &str = "This sends a bulletin to every peer this node trusts that has a known path right now. Peers you have not trusted receive nothing.";
 const REPLY_REFUSAL_TAIL: &str = "Nothing is sent to a destination this node does not trust.";
 const STATUS_REFUSAL_TAIL: &str = "Status is only requested from trusted destinations.";
+const KNOCK_REFUSAL_TAIL: &str = "A knock is not sent to a destination this node has denied or an identity it has blocked; `.mesh undeny` / `.mesh unblock` lift that.";
 const INBOX_CONTENT_MAX_CHARS: usize = 200;
 const NOTHING_CHANGED: &str = "Nothing was changed.";
 /// How long a trusted instance goes unheard before `.mesh trust --prune` lists it, when
@@ -178,7 +181,7 @@ pub(crate) async fn run(
         "deny" => deny(ctx, rest),
         "undeny" => undeny(ctx, rest),
         "rotate" => rotate(ctx, rest),
-        "fetch" => fetch(ctx, rest).await,
+        "fetch" => fetch(ctx, &abort_signal, rest).await,
         "knock" => knock(ctx, &abort_signal, rest).await,
         other => bail!("Unknown .mesh command '{other}'. Type `.mesh` for the list."),
     }
@@ -376,7 +379,7 @@ fn info(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     let Some(rest) = rest else {
         let mut text = render_mesh_info(&ctx.app.config.mesh);
         text.push_str(&format!(
-            "  {:<28}{}\n",
+            "  {:<MESH_INFO_LABEL_WIDTH$}{}\n",
             "reach",
             reach_line(&ctx.app.config.mesh)
         ));
@@ -389,7 +392,7 @@ fn info(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
                     SystemTime::now(),
                 ));
             }
-            None => text.push_str("  node                        off\n"),
+            None => text.push_str(&format!("  {:<MESH_INFO_LABEL_WIDTH$}off\n", "node")),
         }
         out_text(text.trim_end());
         return Ok(());
@@ -692,11 +695,18 @@ async fn broadcast(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
 /// The automatic sync runs on the idle-time driver's interval; this runs one now. A
 /// fetch already running, here or in another process of this identity, is reported and
 /// left to finish rather than treated as a failure.
-async fn fetch(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
+async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&str>) -> Result<()> {
     parse_args(rest, &[], "fetch")?;
     let runtime = live(ctx)?;
-    out_text("Asking the nearest propagation node for held messages...");
-    match runtime.fetch_propagated(&LoggingInboundSink).await {
+    out_text("Asking the nearest propagation node for held messages; Ctrl-C cancels...");
+    let outcome = tokio::select! {
+        outcome = runtime.fetch_propagated(&LoggingInboundSink) => outcome,
+        _ = wait_user_interrupt(Some(abort_signal)) => {
+            out_text("Fetch interrupted.");
+            return Ok(());
+        }
+    };
+    match outcome {
         Ok(report) => out_text(&render_fetch(&report)),
         Err(FetchError::AlreadyRunning) => {
             out_text("A sync is already running; wait for it to finish.")
@@ -707,9 +717,9 @@ async fn fetch(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// Unlike the other one-peer verbs, a knock is not gated on this node's trust of the
-/// destination: it is what a peer that has not trusted us is asked with, so only the
-/// peer having been heard matters.
+/// Unlike the other one-peer verbs, a knock is not gated on this node trusting the
+/// destination: it is what a peer that has not trusted us is asked with. It is still
+/// refused for a destination this node has denied or an identity it has blocked.
 async fn knock(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&str>) -> Result<()> {
     let Some(rest) = rest else {
         out_text(&render_verb_help("knock"));
@@ -725,6 +735,14 @@ async fn knock(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
     let Some(peer) = runtime.peers().get(&destination) else {
         return Err(not_heard(&destination));
     };
+    let verdict = runtime.trust().authorize(&peer.identity_hash, &destination);
+    if matches!(
+        verdict.rule,
+        Rule::DestinationDenied | Rule::IdentityBlocked
+    ) && let Some(refusal) = trust_refusal(&destination, verdict, KNOCK_REFUSAL_TAIL)
+    {
+        bail!(refusal);
+    }
     let intro = KnockIntro::new(args.intro.as_deref().unwrap_or(""))?;
     let intro_label = if intro.as_str().is_empty() {
         "without an intro".to_string()
@@ -732,9 +750,10 @@ async fn knock(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
         format!("with intro \"{}\"", intro.as_str())
     };
     out_text(&format!(
-        "This knocks on {} ({}) so it can trust this instance, {intro_label}; if the peer is unreachable the knock is stored with a propagation node.",
+        "This knocks on {} ({}, trust: {}) so it can trust this instance, {intro_label}; if the peer is unreachable the knock is stored with a propagation node.",
         name_label(peer.display_name.as_deref()),
-        short(&destination)
+        short(&destination),
+        trust_label(verdict)
     ));
     if !confirm_or_flag("Knock?", "--yes", args.yes)? {
         out_text("Nothing was sent.");
@@ -2015,6 +2034,16 @@ fn render_on_preview(config: &MeshConfig, session_name: &str, fresh: bool) -> St
     } else {
         "  announce: nothing until you contact a peer (announce: false)".to_string()
     });
+    lines.push(match (config.announce, config.propagation_sync_interval_secs) {
+        (false, _) => "  propagation sync: off (announce: false); .mesh fetch runs one".to_string(),
+        (true, 0) => {
+            "  propagation sync: off (propagation_sync_interval_secs: 0); .mesh fetch runs one"
+                .to_string()
+        }
+        (true, interval) => format!(
+            "  propagation sync: this node identifies itself to the nearest propagation node heard, at join and every {interval} s; .mesh fetch runs one now"
+        ),
+    });
     lines.push(match &config.display_name {
         Some(name) if config.display_name_on_public => {
             format!("  display name: '{name}', on every interface including public ones")
@@ -2283,7 +2312,9 @@ fn render_node_facts(
     now: SystemTime,
 ) -> String {
     let mut output = String::new();
-    let mut row = |name: &str, value: String| output.push_str(&format!("  {name:<28}{value}\n"));
+    let mut row = |name: &str, value: String| {
+        output.push_str(&format!("  {name:<MESH_INFO_LABEL_WIDTH$}{value}\n"))
+    };
     row("node", "on".to_string());
     row("identity", runtime.fingerprint().to_string());
     row(
@@ -2343,12 +2374,15 @@ fn render_propagation_nodes(mut nodes: Vec<PropagationNodeRecord>, now: SystemTi
     nodes.sort_by_key(|node| (node.hops, std::cmp::Reverse(node.last_seen)));
     let mut output = String::new();
     if nodes.is_empty() {
-        output.push_str("  propagation_nodes           none heard yet\n");
+        output.push_str(&format!(
+            "  {:<MESH_INFO_LABEL_WIDTH$}none heard yet\n",
+            "propagation_nodes"
+        ));
     }
     for (i, record) in nodes.iter().enumerate() {
         let name = format!("propagation_nodes[{i}]");
         output.push_str(&format!(
-            "  {name:<28}{} ({} hop(s), {})\n",
+            "  {name:<MESH_INFO_LABEL_WIDTH$}{} ({} hop(s), {})\n",
             record.node.destination.address_hash.to_hex_string(),
             record.hops,
             age_text(now, record.last_seen),
@@ -2907,6 +2941,12 @@ mod tests {
         assert!(text.contains("announce:"), "{text}");
         assert!(
             text.contains(
+                "\n  propagation sync: this node identifies itself to the nearest propagation node heard, at join and every 300 s; .mesh fetch runs one now\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
                 "display name: 'Ann' on lan and private interfaces; withheld on public ones"
             ),
             "{text}"
@@ -2926,10 +2966,35 @@ mod tests {
         };
         let text = render_on_preview(&quiet, "work", true);
         assert!(text.contains("announce: nothing until"), "{text}");
+        assert!(
+            text.contains("\n  propagation sync: off (announce: false); .mesh fetch runs one\n"),
+            "{text}"
+        );
         assert!(text.contains("display name: none"), "{text}");
         assert!(
             text.contains("fresh id: this session gets a new mesh id and destination"),
             "{text}"
+        );
+
+        let manual = MeshConfig {
+            propagation_sync_interval_secs: 0,
+            ..MeshConfig::default()
+        };
+        let text = render_on_preview(&manual, "work", false);
+        assert!(
+            text.contains(
+                "\n  propagation sync: off (propagation_sync_interval_secs: 0); .mesh fetch runs one\n"
+            ),
+            "{text}"
+        );
+        let quiet_and_manual = MeshConfig {
+            announce: false,
+            ..manual
+        };
+        let text = render_on_preview(&quiet_and_manual, "work", false);
+        assert!(
+            text.contains("propagation sync: off (announce: false)"),
+            "announce: false is the reason given when both are off: {text}"
         );
     }
 
@@ -3946,6 +4011,28 @@ mod tests {
 
         #[test]
         #[serial]
+        fn bare_info_while_off_puts_every_value_in_the_same_column() {
+            let _capture = capture::install();
+            let mut ctx = off_ctx();
+            run_async(run(&mut ctx, ".mesh info")).unwrap();
+            let out = stdout_lines().join("\n");
+            let rows: Vec<&str> = out.lines().filter(|line| !line.trim().is_empty()).collect();
+            assert!(rows.iter().any(|line| line.starts_with("  reach")), "{out}");
+            assert!(rows.iter().any(|line| line.starts_with("  node")), "{out}");
+            for line in rows {
+                let indent = line.len() - line.trim_start().len();
+                let label_end = indent + line[indent..].find(' ').unwrap();
+                let padding = line[label_end..].len() - line[label_end..].trim_start().len();
+                assert_eq!(
+                    label_end + padding,
+                    2 + MESH_INFO_LABEL_WIDTH,
+                    "{line:?} is not aligned with the rest:\n{out}"
+                );
+            }
+        }
+
+        #[test]
+        #[serial]
         fn bare_mesh_and_verb_help_never_error() {
             let _capture = capture::install();
             let _script = prompt_script::install(&[]);
@@ -4027,6 +4114,90 @@ mod tests {
                 );
             }
             assert_eq!(prompt_script::prompts_asked(), 0);
+        }
+
+        /// Usage probe (TASK-100 (c)/(d)): the two new node-required verbs refuse while the
+        /// mesh is off with the SAME teaching text as every other node verb, before any
+        /// prompt and before any progress line, so an unattended `.mesh fetch` or
+        /// `.mesh knock` never hangs or claims to be asking a node that is not there.
+        #[test]
+        #[serial]
+        fn fetch_and_knock_are_refused_while_the_mesh_is_off_before_any_prompt() {
+            let _capture = capture::install();
+            let _script = prompt_script::install(&[true; 4]);
+            let mut ctx = off_ctx();
+            let h = "ab".repeat(16);
+            for line in [
+                ".mesh fetch".to_string(),
+                format!(".mesh knock {h}"),
+                format!(".mesh knock {h} --yes --intro \"hi\""),
+            ] {
+                assert_eq!(err_of(&mut ctx, &line), MESH_OFF, "{line}");
+            }
+            let out = stdout_lines();
+            assert!(
+                !out.iter().any(|line| {
+                    line.starts_with("Asking the nearest propagation node")
+                        || line.starts_with("This knocks on")
+                        || line.starts_with("Knocking on")
+                }),
+                "no progress or consent line while off: {out:?}"
+            );
+            assert_eq!(prompt_script::prompts_asked(), 0);
+        }
+
+        /// Usage probe (TASK-100 (c)): `.mesh fetch` takes no arguments, so a stray word
+        /// or flag is a teaching error carrying the verb's usage line, like the other
+        /// flagless verbs, and is refused before the node is consulted.
+        #[test]
+        #[serial]
+        fn fetch_with_arguments_is_a_usage_error_naming_the_verb() {
+            let _capture = capture::install();
+            let mut ctx = off_ctx();
+            for line in [".mesh fetch now", ".mesh fetch --yes"] {
+                let err = err_of(&mut ctx, line);
+                assert!(err.starts_with("Unexpected '"), "{line}: {err}");
+                assert!(err.contains(".mesh fetch"), "{line}: {err}");
+                assert_ne!(err, MESH_OFF, "{line}: the usage check comes first");
+            }
+            assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
+        }
+
+        /// Usage probe (TASK-100 (c)): "reports counts" means every counter of the report
+        /// is on the line, with the node named by its short hash, so a human can tell
+        /// listed-but-unwanted from received-but-deferred without reading logs.
+        #[test]
+        fn fetch_report_line_carries_every_counter_and_the_short_node() {
+            let node = "deadbeefdeadbeefdeadbeefdeadbeef".to_string();
+            let report = FetchReport {
+                node: node.clone(),
+                listed: 7,
+                wanted: 6,
+                received: 5,
+                delivered: 2,
+                duplicates: 1,
+                discarded: 1,
+                deferred: 1,
+                acknowledged: 5,
+                response_branch: None,
+            };
+            let line = render_fetch(&report);
+            assert_eq!(
+                line,
+                "Fetched from deadbeef: 7 listed, 6 wanted, 5 received, 2 delivered, 1 duplicates, 1 discarded, 1 deferred."
+            );
+            assert!(
+                !line.contains(&node),
+                "the full node hash is not needed here"
+            );
+            let empty = FetchReport {
+                received: 0,
+                ..report
+            };
+            assert_eq!(
+                render_fetch(&empty),
+                "Nothing held for this node at deadbeef."
+            );
         }
 
         #[test]
@@ -4729,7 +4900,7 @@ mod tests {
                 Notification, NotificationSink, RenderedNotification, Source,
             };
             use crate::mesh::test_support::{
-                FakeNode, PeerSighting, StartedRuntime, loopback_relay, private_config,
+                FakeNode, PeerSighting, PeerStub, StartedRuntime, loopback_relay, private_config,
                 started_runtime, started_runtime_on, wait_until,
             };
             use crate::mesh::trust::{LiveMesh, TrustOptions};
@@ -5210,7 +5381,7 @@ mod tests {
 
                     let out = stdout_lines().join("\n");
                     let row = |name: &str| {
-                        let head = format!("  {name:<28}");
+                        let head = format!("  {name:<MESH_INFO_LABEL_WIDTH$}");
                         out.lines()
                             .find_map(|line| line.strip_prefix(&head))
                             .unwrap_or_else(|| panic!("no {name} row in {out}"))
@@ -5237,7 +5408,7 @@ mod tests {
 
             /// The row named `name` of the last `.mesh info` printed.
             fn info_row(out: &str, name: &str) -> String {
-                let head = format!("  {name:<28}");
+                let head = format!("  {name:<MESH_INFO_LABEL_WIDTH$}");
                 out.lines()
                     .rev()
                     .find_map(|line| line.strip_prefix(&head))
@@ -7308,7 +7479,7 @@ mod tests {
                     let lines = stdout_lines();
                     let asking = index_of(
                         &lines,
-                        "Asking the nearest propagation node for held messages...",
+                        "Asking the nearest propagation node for held messages; Ctrl-C cancels...",
                     );
                     let nothing = index_of(
                         &lines,
@@ -7375,6 +7546,206 @@ mod tests {
 
                     assert!(ctx.app.mesh.stop().await.unwrap());
                     started.relay_handle.abort();
+                });
+            }
+
+            /// Usage probe (TASK-100 (d)): like every consenting verb, a knock without a
+            /// terminal and without `--yes` is refused naming the flag, after the notice
+            /// but before anything is sent; the intro bound is enforced BEFORE consent is
+            /// even considered (an over-long intro is refused with no notice and no prompt).
+            #[test]
+            #[serial]
+            fn knock_without_a_terminal_names_the_flag_and_sends_nothing() {
+                use crate::mesh::knocks::KNOCK_INTRO_MAX_CHARS;
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-knock-non-tty");
+                let _script = prompt_script::install_non_interactive();
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-knock-non-tty").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let (heard, _) = heard_peer(&started.runtime, "Tia", SystemTime::now());
+
+                    let err = refusal(&mut ctx, &format!(".mesh knock {heard}")).await;
+                    assert!(err.contains("--yes"), "{err}");
+                    let out = stdout_lines();
+                    assert!(
+                        out.iter()
+                            .any(|line| line.starts_with("This knocks on Tia (")),
+                        "the notice precedes the consent question: {out:?}"
+                    );
+                    assert!(
+                        !out.iter().any(|line| line.starts_with("Knocking on")),
+                        "{out:?}"
+                    );
+
+                    let before = stdout_lines().len();
+                    let long = "y".repeat(KNOCK_INTRO_MAX_CHARS + 1);
+                    let err =
+                        refusal(&mut ctx, &format!(".mesh knock {heard} --intro \"{long}\"")).await;
+                    assert!(
+                        err.contains(&format!(
+                            "above the {KNOCK_INTRO_MAX_CHARS}-character limit"
+                        )),
+                        "{err}"
+                    );
+                    assert!(
+                        !err.contains("--yes"),
+                        "the bound, not consent, is the refusal: {err}"
+                    );
+                    assert!(
+                        stdout_lines()[before..].is_empty(),
+                        "no notice for a refused intro: {:?}",
+                        &stdout_lines()[before..]
+                    );
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// Usage probe (TASK-100 (d)): a knock is NOT gated on this node's trust of the
+            /// peer. The same heard-but-untrusted destination that `.mesh reply` refuses
+            /// with the trust tail reaches the knock's consent notice, and an intro of
+            /// exactly the bound is accepted.
+            #[test]
+            #[serial]
+            fn knock_reaches_consent_for_a_peer_this_node_does_not_trust() {
+                use crate::mesh::knocks::KNOCK_INTRO_MAX_CHARS;
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-knock-untrusted");
+                let _script = prompt_script::install(&[false, false]);
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-knock-untrusted").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let (heard, _) = heard_peer(&started.runtime, "Tia", SystemTime::now());
+
+                    let err = refusal(&mut ctx, &format!(".mesh reply {heard} hi")).await;
+                    assert!(
+                        err.contains(REPLY_REFUSAL_TAIL),
+                        "reply is trust-gated: {err}"
+                    );
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+
+                    let at_bound = "z".repeat(KNOCK_INTRO_MAX_CHARS);
+                    run(
+                        &mut ctx,
+                        &format!(".mesh knock {heard} --intro \"{at_bound}\""),
+                    )
+                    .await
+                    .unwrap();
+                    let out = stdout_lines();
+                    let notice = index_of(&out, "This knocks on Tia (");
+                    assert!(out[notice].contains(&at_bound), "{out:?}");
+                    index_of(&out, "Nothing was sent.");
+                    assert_eq!(
+                        prompt_script::prompts_asked(),
+                        1,
+                        "knock asked, reply did not"
+                    );
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// Untrusted is not denied: a knock is for a peer that has not trusted us, but
+            /// this node's own deny and block lists still stand in its way, before any
+            /// notice or question.
+            #[test]
+            #[serial]
+            fn knock_to_a_denied_destination_or_blocked_identity_is_refused() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-knock-denied");
+                let _script = prompt_script::install(&[]);
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-knock-denied").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let now = SystemTime::now();
+                    let (denied, _) = heard_peer(&started.runtime, "Dot", now);
+                    let (blocked, blocked_identity) = heard_peer(&started.runtime, "Bex", now);
+                    let trust = started.runtime.trust();
+                    let slot: &dyn LiveMesh = ctx.app.mesh.as_ref();
+                    trust.deny_destination(slot, &denied, None, now).unwrap();
+                    trust
+                        .block_identity(slot, &blocked_identity, None, now)
+                        .unwrap();
+
+                    for (destination, standing) in [(&denied, "denied"), (&blocked, "blocked")] {
+                        let before = stdout_lines().len();
+                        let err =
+                            refusal(&mut ctx, &format!(".mesh knock {destination} --yes")).await;
+                        assert!(
+                            err.contains(&format!(" is {standing} in this node's trust list")),
+                            "{standing}: {err}"
+                        );
+                        assert!(err.contains(KNOCK_REFUSAL_TAIL), "{standing}: {err}");
+                        assert!(
+                            stdout_lines()[before..].is_empty(),
+                            "{standing}: refused before the notice: {:?}",
+                            &stdout_lines()[before..]
+                        );
+                    }
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// The peer is a stub behind the real dispatcher that knows this node's identity
+            /// but trusts none of its instances, so the knock over the link is admitted and
+            /// refused `NoAccess`: a knock that landed, reported as direct delivery.
+            #[test]
+            #[serial]
+            fn knock_over_a_link_reports_direct_delivery() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-knock-direct");
+                let _script = prompt_script::install(&[]);
+                let _capture = capture::install();
+                run_async(async {
+                    let stub = PeerStub::listen(
+                        "repl-mesh-knock-direct-stub",
+                        TcpServer::DEFAULT_CLIENT_MTU,
+                    )
+                    .await;
+                    let started = started_runtime_on("repl-mesh-knock-direct", stub.port()).await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    stub.know_identity(started.runtime.fingerprint());
+                    stub.announce(Some("Tia")).await;
+                    let peer = stub.destination_hex();
+                    let peers = started.runtime.peers();
+                    wait_until("the node to file the stub", || peers.get(&peer).is_some()).await;
+
+                    run(
+                        &mut ctx,
+                        &format!(".mesh knock {peer} --yes --intro \"hi\""),
+                    )
+                    .await
+                    .unwrap();
+
+                    let out = stdout_lines();
+                    let notice = index_of(&out, "This knocks on Tia (");
+                    assert!(out[notice].contains("trust: untrusted"), "{out:?}");
+                    let knocking = index_of(&out, &format!("Knocking on {}", short(&peer)));
+                    let landed = index_of(
+                        &out,
+                        &format!(
+                            "Knocked on {} directly; the peer decides whether to trust this instance.",
+                            short(&peer)
+                        ),
+                    );
+                    assert!(notice < knocking && knocking < landed, "{out:?}");
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                    stub.stop().await;
                 });
             }
         }

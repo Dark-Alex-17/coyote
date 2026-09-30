@@ -11,7 +11,8 @@ Status in this build: Coyote discovers propagation nodes from their announces (`
 `via: store_and_forward`). Held messages are fetched back automatically every `mesh.propagation_sync_interval_secs`
 seconds (default 300) and once when the node joins; `.mesh fetch` runs a fetch now. The node table is not kept across
 restarts, so after a restart the first fetch waits for the node's next announce; a held message whose sender has not
-announced since the restart is left on the node for three fetches and then dropped.
+announced since the restart is left on the node for three fetches and then dropped. A node with `announce: false`
+never fetches on its own; `.mesh fetch` does.
 
 ## Build and run
 

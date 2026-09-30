@@ -43,7 +43,7 @@ use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::sync::mpsc;
@@ -113,14 +113,24 @@ pub(crate) enum IdleEvent {
 }
 
 /// Producer side of the driver's queue. Never waits: a full or closed queue hands the
-/// event back; only a full one counts as overflow.
+/// event back; only a full one counts as overflow. A sync request is also left as a flag
+/// the loop reads whenever it wakes, so one that misses the queue is not lost.
 #[derive(Clone)]
 pub(crate) struct IdleHandle {
     tx: mpsc::Sender<IdleEvent>,
     overflow: Arc<AtomicUsize>,
+    sync_requested: Arc<AtomicBool>,
 }
 
 impl IdleHandle {
+    fn new(tx: mpsc::Sender<IdleEvent>) -> Self {
+        Self {
+            tx,
+            overflow: Arc::new(AtomicUsize::new(0)),
+            sync_requested: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
     fn send(&self, event: IdleEvent) -> Result<(), IdleEvent> {
         self.tx.try_send(event).map_err(|err| {
             if matches!(err, TrySendError::Full(_)) {
@@ -159,8 +169,17 @@ impl IdleSink for IdleHandle {
     }
 
     fn request_sync(&self) {
-        if self.send(IdleEvent::SyncNow).is_err() {
-            debug!("Idle driver queue full; the propagation sync waits for its interval");
+        self.sync_requested.store(true, Ordering::Release);
+        match self.tx.try_send(IdleEvent::SyncNow) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                debug!(
+                    "Idle driver queue full; the propagation sync runs when the driver next wakes"
+                );
+            }
+            Err(TrySendError::Closed(_)) => {
+                debug!("Idle driver stopped; the propagation sync waits for the next install");
+            }
         }
     }
 }
@@ -236,10 +255,7 @@ impl IdleDriver {
     /// from inside the runtime.
     pub(crate) fn start(ctx: Arc<RwLock<RequestContext>>, app: Arc<AppState>) -> Self {
         let (tx, rx) = mpsc::channel(IDLE_QUEUE_CAPACITY);
-        let handle = IdleHandle {
-            tx,
-            overflow: Arc::new(AtomicUsize::new(0)),
-        };
+        let handle = IdleHandle::new(tx);
         app.mesh
             .set_idle(Arc::new(handle.clone()) as Arc<dyn IdleSink>);
         let cancel = CancellationToken::new();
@@ -251,6 +267,7 @@ impl IdleDriver {
                 Arc::clone(&app),
                 rx,
                 Arc::clone(&handle.overflow),
+                Arc::clone(&handle.sync_requested),
                 cancel.clone(),
                 Arc::clone(&in_flight),
             )
@@ -330,6 +347,9 @@ struct DriverLoop {
     /// Shared with the producers' handle; read and reset at each coalesce tick so the
     /// prompt hears about a full queue while the driver runs.
     overflow: Arc<AtomicUsize>,
+    /// Shared with the producers' handle; set by every sync request and read at each
+    /// wake, so a `SyncNow` the full queue refused still starts a fetch.
+    sync_requested: Arc<AtomicBool>,
     cancel: CancellationToken,
     in_flight: Arc<InFlight>,
     rate_limiter: RateLimiter,
@@ -352,9 +372,9 @@ struct DriverLoop {
     refusals: Refusals,
     coalesce_at: Option<tokio::time::Instant>,
     retry_at: Option<tokio::time::Instant>,
-    /// Built from the interval in the config the REPL started with: `update_app_config`
-    /// replaces `ctx.app`, but the driver keeps the `AppState` it was started on, so a
-    /// `.set` of the interval mid-session takes effect at the next start.
+    /// Built from the interval and `announce` in the config the REPL started with:
+    /// `update_app_config` replaces `ctx.app`, but the driver keeps the `AppState` it was
+    /// started on, so a `.set` of either mid-session takes effect at the next start.
     sync: SyncSchedule,
     sync_task: Option<SyncTask>,
 }
@@ -363,10 +383,14 @@ type SyncTask = JoinHandle<Result<FetchReport, FetchError>>;
 
 /// The slot must not outlive the loop that drains it: a loop that panics or is aborted
 /// would otherwise leave every later event queued for nobody. Idempotent with `stop`
-/// and `IdleDriver::drop`, which clear the slot first.
+/// and `IdleDriver::drop`, which clear the slot first. A fetch still in flight is
+/// aborted with the loop that would have reported it.
 impl Drop for DriverLoop {
     fn drop(&mut self) {
         self.app.mesh.clear_idle();
+        if let Some(task) = &self.sync_task {
+            task.abort();
+        }
     }
 }
 
@@ -455,15 +479,20 @@ impl DriverLoop {
         app: Arc<AppState>,
         rx: mpsc::Receiver<IdleEvent>,
         overflow: Arc<AtomicUsize>,
+        sync_requested: Arc<AtomicBool>,
         cancel: CancellationToken,
         in_flight: Arc<InFlight>,
     ) -> Self {
-        let sync = SyncSchedule::new(app.config.mesh.propagation_sync_interval_secs);
+        let sync = SyncSchedule::new(
+            app.config.mesh.propagation_sync_interval_secs,
+            app.config.mesh.announce,
+        );
         Self {
             ctx,
             app,
             rx,
             overflow,
+            sync_requested,
             cancel,
             in_flight,
             rate_limiter: RateLimiter::new(),
@@ -485,6 +514,9 @@ impl DriverLoop {
     /// still in flight, if any, for `stop` to wait on.
     async fn run(mut self) -> Option<SyncTask> {
         loop {
+            if self.sync_requested.swap(false, Ordering::AcqRel) {
+                self.on_sync_request();
+            }
             let coalesce_at = self.coalesce_at.unwrap_or_else(tokio::time::Instant::now);
             let retry_at = self.retry_at.unwrap_or_else(tokio::time::Instant::now);
             let sync_at = self
@@ -603,7 +635,9 @@ impl DriverLoop {
     }
 
     /// Timers run only while there is something for them to do, and a running one is
-    /// left alone so a steady trickle of events cannot keep pushing it back.
+    /// left alone so a steady trickle of events cannot keep pushing it back. The sync
+    /// timer is the exception: an automatic schedule with nothing armed while a node is
+    /// installed has lost its request, and is given the no-node retry.
     fn arm_timers(&mut self) {
         let now = tokio::time::Instant::now();
         let summaries_pending = !self.coalescer.is_empty()
@@ -616,6 +650,9 @@ impl DriverLoop {
             !self.pending_spawns.is_empty() || !self.pending_model_notes.is_empty();
         if ctx_work_pending && self.retry_at.is_none() {
             self.retry_at = Some(now + IDLE_LOCK_RETRY_TICK);
+        }
+        if self.app.mesh.get().is_some() {
+            self.sync.heal(now.into_std());
         }
     }
 
@@ -736,6 +773,7 @@ impl DriverLoop {
     /// ask. An empty slot ends the schedule until the next install asks again; a mesh
     /// with no propagation node heard yet is asked again shortly.
     fn on_sync_request(&mut self) {
+        self.sync_requested.store(false, Ordering::Release);
         if !self.sync.accepts_request() {
             return;
         }
@@ -2117,10 +2155,7 @@ mod tests {
         let app = Arc::clone(&ctx.try_read().unwrap().app);
         let sink = install_sink(&ctx);
         let (tx, rx) = mpsc::channel(IDLE_QUEUE_CAPACITY);
-        let handle = IdleHandle {
-            tx,
-            overflow: Arc::new(AtomicUsize::new(0)),
-        };
+        let handle = IdleHandle::new(tx);
         app.mesh
             .set_idle(Arc::new(handle.clone()) as Arc<dyn IdleSink>);
         let driver_loop = DriverLoop::new(
@@ -2128,6 +2163,7 @@ mod tests {
             Arc::clone(&app),
             rx,
             Arc::clone(&handle.overflow),
+            Arc::clone(&handle.sync_requested),
             CancellationToken::new(),
             Arc::new(InFlight::default()),
         );
@@ -2212,10 +2248,7 @@ mod tests {
     #[test]
     fn queue_overflow_is_counted_and_returns_the_note() {
         let (tx, _rx) = mpsc::channel(1);
-        let handle = IdleHandle {
-            tx,
-            overflow: Arc::new(AtomicUsize::new(0)),
-        };
+        let handle = IdleHandle::new(tx);
         assert!(handle.push(note("fits", None)).is_ok());
         let returned = handle
             .push(note("overflows", None))
@@ -3372,12 +3405,16 @@ mod tests {
         const FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 
         fn sync_ctx(interval_secs: u64) -> Arc<RwLock<RequestContext>> {
+            ctx_for(MeshConfig {
+                propagation_sync_interval_secs: interval_secs,
+                ..MeshConfig::default()
+            })
+        }
+
+        fn ctx_for(mesh: MeshConfig) -> Arc<RwLock<RequestContext>> {
             let mut app = AppState::test_default();
             app.config = Arc::new(AppConfig {
-                mesh: MeshConfig {
-                    propagation_sync_interval_secs: interval_secs,
-                    ..MeshConfig::default()
-                },
+                mesh,
                 ..AppConfig::default()
             });
             Arc::new(RwLock::new(RequestContext::new(
@@ -3482,6 +3519,89 @@ mod tests {
             tear_down(driver, &slot(&ctx), started, fake).await;
         }
 
+        /// A fetch identifies the node to the propagation node, so a node whose operator
+        /// chose not to announce is never identified on its own; `.mesh fetch` still is.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_node_that_does_not_announce_never_fetches_automatically() {
+            let ctx = ctx_for(MeshConfig {
+                announce: false,
+                propagation_sync_interval_secs: 1,
+                ..MeshConfig::default()
+            });
+            let driver = start_driver(&ctx);
+            let (fake, started) = runtime_with_node("idle-sync-quiet").await;
+
+            slot(&ctx).install(started.runtime.clone()).unwrap();
+
+            sleep(Duration::from_millis(1500)).await;
+            assert!(
+                fake.script.seen().is_empty(),
+                "nothing is fetched on its own while announce is false"
+            );
+            fake.script.reply_with([Value::Array(vec![])]);
+            let report = timeout(
+                FETCH_TIMEOUT,
+                started.runtime.fetch_propagated(&LoggingInboundSink),
+            )
+            .await
+            .expect("a manual fetch finishes within FETCH_TIMEOUT")
+            .unwrap();
+            assert_eq!(report.node, fake.hex());
+            assert_eq!(fake.script.seen().len(), 1);
+            tear_down(driver, &slot(&ctx), started, fake).await;
+        }
+
+        /// The loop is built on a one-slot queue already holding a note, so the install's
+        /// `SyncNow` is refused by the queue; the flag it leaves behind starts the fetch
+        /// when the loop wakes, and the refusal is not counted as a dropped peer event.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_sync_request_that_misses_the_queue_still_starts_a_fetch() {
+            let ctx = sync_ctx(3600);
+            let app = Arc::clone(&ctx.try_read().unwrap().app);
+            let (fake, started) = runtime_with_node("idle-sync-lost-request").await;
+            fake.script.reply_with([Value::Array(vec![])]);
+            let (tx, rx) = mpsc::channel(1);
+            let handle = IdleHandle::new(tx);
+            app.mesh
+                .set_idle(Arc::new(handle.clone()) as Arc<dyn IdleSink>);
+            assert!(app.mesh.push_idle(note("fills the queue", None)));
+
+            app.mesh.install(started.runtime.clone()).unwrap();
+
+            assert!(handle.sync_requested.load(Ordering::Acquire));
+            assert_eq!(
+                handle.overflow(),
+                0,
+                "a lost sync request is not a peer event"
+            );
+            let cancel = CancellationToken::new();
+            let driver_loop = tokio::spawn(
+                DriverLoop::new(
+                    Arc::clone(&ctx),
+                    Arc::clone(&app),
+                    rx,
+                    Arc::clone(&handle.overflow),
+                    Arc::clone(&handle.sync_requested),
+                    cancel.clone(),
+                    Arc::new(InFlight::default()),
+                )
+                .run(),
+            );
+
+            wait_for_rounds(&fake, 1, FETCH_TIMEOUT).await;
+            assert!(
+                !handle.sync_requested.load(Ordering::Acquire),
+                "the loop consumes the flag it acted on"
+            );
+            cancel.cancel();
+            if let Some(task) = driver_loop.await.unwrap() {
+                let _ = task.await;
+            }
+            app.mesh.stop().await.unwrap();
+            started.relay_handle.abort();
+            fake.stop().await;
+        }
+
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn a_sync_that_arrives_before_any_node_is_heard_is_retried_when_one_announces() {
             let ctx = sync_ctx(1);
@@ -3531,6 +3651,49 @@ mod tests {
             driver.stop().await;
             started.relay_handle.abort();
             fake.stop().await;
+        }
+
+        /// Usage probe (TASK-100 (b)): the `.mesh off` / `.mesh on` cycle. Leaving the mesh
+        /// disarms the schedule with nothing owed; the NEXT install asks again on its own,
+        /// so a rejoined node gets its join-time fetch without `.mesh fetch`, and a fetch
+        /// that receives nothing stays silent across both joins.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn rejoining_after_mesh_off_starts_the_join_time_sync_again() {
+            let ctx = sync_ctx(3600);
+            let sink = install_sink(&ctx);
+            let driver = start_driver(&ctx);
+            let (fake, started) = runtime_with_node("idle-sync-rejoin-1").await;
+            fake.script
+                .reply_with([Value::Array(vec![]), Value::Array(vec![])]);
+
+            slot(&ctx).install(started.runtime.clone()).unwrap();
+            wait_for_rounds(&fake, 1, FETCH_TIMEOUT).await;
+
+            assert!(slot(&ctx).stop().await.unwrap());
+            started.relay_handle.abort();
+            sleep(Duration::from_millis(500)).await;
+            assert_eq!(
+                fake.script.seen().len(),
+                1,
+                "an hour-long interval fires nothing while the node is off"
+            );
+
+            let rejoined = started_runtime_on("idle-sync-rejoin-2", fake.listener.port).await;
+            fake.announce().await;
+            let runtime = rejoined.runtime.clone();
+            wait_until("the rejoined runtime to file the propagation node", || {
+                runtime.propagation_nodes().select().is_ok()
+            })
+            .await;
+            slot(&ctx).install(rejoined.runtime.clone()).unwrap();
+
+            wait_for_rounds(&fake, 2, FETCH_TIMEOUT).await;
+            assert!(
+                propagation_lines(&sink).is_empty(),
+                "two empty fetches say nothing: {:?}",
+                sink.lines()
+            );
+            tear_down(driver, &slot(&ctx), rejoined, fake).await;
         }
     }
 }

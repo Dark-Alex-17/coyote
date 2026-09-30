@@ -637,11 +637,13 @@ Type ".help" for additional help.
                 let result = mesh::autostart(&mut ctx).await;
                 self.envoy.refresh(&ctx.app);
                 self.mesh_hooks.refresh(&ctx.app);
+                self.digest.observe_session(&ctx);
                 publish_mesh_snapshot(&ctx, TurnState::idle_now());
                 result
             };
-            if let Err(err) = result {
-                render_error(err);
+            match result {
+                Ok(()) => self.digest.maybe_refresh(&self.ctx),
+                Err(err) => render_error(err),
             }
         }
 
@@ -3360,8 +3362,8 @@ mod tests {
             assert_eq!(source.rfind(needle), Some(first), "{needle} not unique");
             first
         };
-        // The autostart block refreshes the same hooks, so the refresh is located
-        // relative to the per-turn command rather than as a unique needle.
+        // The autostart block refreshes the same hooks and observes the digest too, so
+        // both are located relative to the per-turn command rather than as unique needles.
         let position_after = |start: usize, needle: &str| {
             start
                 + source[start..]
@@ -3370,7 +3372,7 @@ mod tests {
         };
         let command_at = position(&command);
         let refresh_at = position_after(command_at, &refresh);
-        let observe_at = position(&observe);
+        let observe_at = position_after(refresh_at, &observe);
         assert!(
             command_at < refresh_at,
             "envoy refresh must follow the command"
@@ -3403,7 +3405,7 @@ mod tests {
         let run_start = strip(&["pub async fn run(", "&mut self)"].concat());
         let gate = strip(&["if self.ctx.read().app.config.mesh.", "enabled {"].concat());
         let autostart = strip(&["mesh::auto", "start(&mut ctx).await"].concat());
-        let surfaced = strip(&["if let Err(err) = result {", "render_error(err);"].concat());
+        let surfaced = strip(&["Err(err) => render_", "error(err),"].concat());
         let banner = strip(&["print_pause_", "banner(&self.ctx.read());"].concat());
         let read_line = strip(&["self.editor.", "read_line(&self.prompt)"].concat());
 
