@@ -39,7 +39,7 @@ use crate::mesh::protocol::{Compatibility, MESH_PROTOCOL_MIN_SUPPORTED, MESH_PRO
 use crate::mesh::r3::RequestHandler;
 use crate::mesh::r3::{
     Dispatcher, Envelope, KNOCK_PATH, MESSAGE_PATH, OriginName, R3Client, R3Error, R3Server,
-    RefusalCode, RequestOptions, RequestOutcome, RequestReceipt, STATUS_PATH, redact_hashes, short,
+    RefusalCode, RequestOptions, RequestOutcome, STATUS_PATH, redact_hashes, short,
 };
 use crate::mesh::snapshot::MeshSnapshot;
 use crate::mesh::trust::TrustStore;
@@ -250,7 +250,6 @@ pub(crate) struct MeshRuntime {
     r3_server: Arc<R3Server>,
     dispatcher: Arc<Dispatcher>,
     knock_gate: Arc<KnockGate>,
-    knock_sink: Arc<ChannelKnockSink>,
     /// Where fetched peer messages go; attached by the slot the node is installed into.
     peer_surface: parking_lot::Mutex<Option<Weak<dyn PeerSurface>>>,
     /// Held for the length of one propagation fetch; a second caller is refused, never
@@ -366,7 +365,7 @@ impl MeshRuntime {
         let transport = Arc::new(transport);
         let r3_server = Arc::new(R3Server::new());
         let (knock_sink, knock_rx) = ChannelKnockSink::new(KNOCK_QUEUE_CAPACITY);
-        let dispatcher = Arc::new(Dispatcher::new(trust.clone(), knock_sink.clone()));
+        let dispatcher = Arc::new(Dispatcher::new(trust.clone(), knock_sink));
         r3_server.set_handler(dispatcher.clone());
         let knock_gate = Arc::new(KnockGate::new(
             trust.clone(),
@@ -407,7 +406,6 @@ impl MeshRuntime {
             r3_server,
             dispatcher,
             knock_gate,
-            knock_sink,
             peer_surface: parking_lot::Mutex::new(None),
             fetching: Mutex::new(()),
             posting: Mutex::new(()),
@@ -455,8 +453,8 @@ impl MeshRuntime {
         Ok(runtime)
     }
 
-    // Reached by the REPL mesh commands once they land.
-    #[allow(dead_code)]
+    /// Test oracle: `instance_id` read under the destination lock, checked against the cache.
+    #[cfg(all(test, unix))]
     pub(crate) async fn instance_id(&self) -> String {
         self.destination.lock().await.instance_id.clone()
     }
@@ -491,8 +489,8 @@ impl MeshRuntime {
         self.peer_limits
     }
 
-    // Reached by the REPL mesh commands once they land.
-    #[allow(dead_code)]
+    /// Test oracle: `destination_hash` read under the destination lock, checked against the cache.
+    #[cfg(all(test, unix))]
     pub(crate) async fn destination_hash(&self) -> String {
         self.destination.lock().await.hash.to_hex_string()
     }
@@ -540,13 +538,6 @@ impl MeshRuntime {
     /// owns the runtime.
     pub(crate) fn attach_peer_surface(&self, surface: Weak<dyn PeerSurface>) {
         *self.peer_surface.lock() = Some(surface);
-    }
-
-    /// Knocks the dispatcher had to drop because the gate's queue was full.
-    // Reached by the REPL mesh commands once they land.
-    #[allow(dead_code)]
-    pub(crate) fn knock_overflow(&self) -> u64 {
-        self.knock_sink.overflow()
     }
 
     #[cfg(all(test, unix))]
@@ -632,8 +623,6 @@ impl MeshRuntime {
 
     /// Sends one request to `destination` over a link, proving this node's identity first
     /// and naming its current instance as the origin.
-    // Reached by the REPL mesh commands once they land.
-    #[allow(dead_code)]
     pub(crate) async fn request(
         &self,
         destination: &DestinationDesc,
@@ -646,10 +635,10 @@ impl MeshRuntime {
             .await
     }
 
-    /// `request` with the envelope already built. Every request to a peer passes here or
-    /// through `request_with_receipt`: a peer the table knows speaks another protocol is
-    /// refused before any link is opened, and a peer that refuses this node's version over
-    /// the wire is marked so the next request is refused here.
+    /// `request` with the envelope already built. Every request to a peer passes here: a peer
+    /// the table knows speaks another protocol is refused before any link is opened, and a
+    /// peer that refuses this node's version over the wire is marked so the next request is
+    /// refused here.
     async fn request_envelope(
         &self,
         destination: &DestinationDesc,
@@ -680,52 +669,6 @@ impl MeshRuntime {
         };
         note_version_refusal(&self.peers, &dest_hex, path, sent, &outcome);
         outcome
-    }
-
-    /// `request` as a receipt: returns as soon as the request is on its own task and reports
-    /// its progress from there. Stopping the node settles every receipt still in flight,
-    /// link opening included, as `Failed(Shutdown)`.
-    // Reached by the REPL mesh commands and the message tools once they land.
-    #[allow(dead_code)]
-    pub(crate) async fn request_with_receipt(
-        &self,
-        destination: &DestinationDesc,
-        path: &str,
-        data: rmpv::Value,
-        options: RequestOptions,
-    ) -> Result<RequestReceipt, R3Error> {
-        let dest_hex = destination.address_hash.to_hex_string();
-        refuse_incompatible_peer(&self.peers, &dest_hex, path)?;
-        let transport = self
-            .transport
-            .lock()
-            .await
-            .clone()
-            .ok_or(R3Error::NotRunning)?;
-        let envelope = self.envelope(data).await;
-        let sent = envelope.version;
-        let client = self.r3_client.clone();
-        let identity = self.transport_identity.clone();
-        let peers = self.peers.clone();
-        let (destination, path) = (*destination, path.to_string());
-        Ok(RequestReceipt::track(
-            self.cancellation_token(),
-            move |delivered| async move {
-                let outcome = client
-                    .request_with(
-                        &transport,
-                        &identity,
-                        &destination,
-                        &path,
-                        envelope,
-                        options,
-                        Some(delivered),
-                    )
-                    .await;
-                note_version_refusal(&peers, &dest_hex, &path, sent, &outcome);
-                outcome
-            },
-        ))
     }
 
     /// `body` in the envelope naming the instance this node speaks for right now, read per
@@ -1882,18 +1825,6 @@ impl MeshSlot {
         self.snapshot.load_full()
     }
 
-    /// Errors only when nothing was ever published. Whether a published snapshot is too old
-    /// to serve is the caller's decision, via `MeshSnapshot::age`.
-    // Reached by the envoy request handlers once they land.
-    #[allow(dead_code)]
-    pub(crate) fn snapshot_or_stale_error(&self) -> Result<Arc<MeshSnapshot>> {
-        self.snapshot().ok_or_else(|| {
-            anyhow!(
-                "No session snapshot has been published yet, so there is nothing to serve: this process has not reached its first turn boundary. Every entry point (each REPL line, headless run, or ACP prompt) publishes one when its turn ends, so let the current turn finish or send one line, then try again."
-            )
-        })
-    }
-
     pub(crate) fn set_objective_override(&self, objective: Option<String>) {
         self.objective_override.store(non_blank(objective));
         self.reassemble_brief();
@@ -2843,15 +2774,6 @@ mod tests {
             slot.snapshot().unwrap().captured_at,
             first_at + Duration::from_secs(1)
         );
-    }
-
-    #[test]
-    fn slot_stale_error_names_the_remedy_until_a_snapshot_lands() {
-        let slot = MeshSlot::default();
-        let err = slot.snapshot_or_stale_error().unwrap_err().to_string();
-        assert!(err.contains("turn boundary"), "{err}");
-        slot.publish(snapshot_fixture());
-        assert!(slot.snapshot_or_stale_error().is_ok());
     }
 
     #[test]

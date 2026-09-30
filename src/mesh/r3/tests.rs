@@ -3520,38 +3520,6 @@ pub(crate) mod network {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn stopping_the_node_fails_an_in_flight_receipt_with_shutdown() {
-        let pair = NodePair::start("r3-runtime-receipt-shutdown").await;
-        pair.introduce_b_to_a().await;
-        pair.recorder_b.queue(Script::Hang);
-        let receipt = pair
-            .node_a
-            .request_with_receipt(
-                &pair.responder.desc,
-                "/slow",
-                Value::Nil,
-                RequestOptions::default(),
-            )
-            .await
-            .unwrap();
-        wait_until("node B to receive the hanging request", || {
-            pair.recorder_b.seen_count() == 1
-        })
-        .await;
-        let slot = Arc::new(MeshSlot::default());
-        slot.install(pair.node_a.clone()).unwrap();
-
-        assert!(slot.stop().await.unwrap());
-
-        let states = timeout(SHUTDOWN_GRACE, receipt_states(receipt))
-            .await
-            .expect("the receipt must settle within the shutdown grace");
-        assert_eq!(states, vec![ReceiptState::Failed(R3Error::Shutdown)]);
-        pair.cancel_b.cancel();
-        pair.responder.stop().await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mesh_runtime_refuses_to_start_on_a_corrupt_trust_list() {
         let (addr, relay, _) = loopback_relay().await;
         let tmp = TempDir::new("r3-runtime-corrupt-trust");

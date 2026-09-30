@@ -30,7 +30,6 @@ pub(crate) use frame::{Envelope, MAX_R3_PAYLOAD_BYTES, NAME_HASH_LEN, OriginName
 pub(crate) use frame::{
     EnvelopeError, MAX_R3_NESTING_DEPTH, PathHash, RequestFrame, RequestId, ResponseFrame,
 };
-pub(crate) use receipt::RequestReceipt;
 #[cfg(test)]
 pub(crate) use server::{
     Admission, DEFAULT_RESPONSE_SEND_TIMEOUT, HANDLER_TIMEOUT, InboundRequest,

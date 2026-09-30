@@ -250,7 +250,8 @@ impl ChannelKnockSink {
         )
     }
 
-    /// Knocks dropped because the queue was full.
+    /// Knocks dropped because the queue was full; the drop path also logs the running count.
+    #[cfg(test)]
     pub(crate) fn overflow(&self) -> u64 {
         self.overflow.load(Ordering::Relaxed)
     }
