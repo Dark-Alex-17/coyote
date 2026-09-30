@@ -78,6 +78,7 @@ creates a Coyote-shaped destination `coyote.mesh.<instance_id>` serving `/status
 | `request` | `destination_hash`, `instance_id`, `path`, `envelope` or `raw_envelope`, `timeout_secs` | Opens a link to `coyote.mesh.<instance_id>`, identifies as the peer identity, sends the request and replies with `status` (`ready`/`failed`), `response` (an integer for a refusal code, a map otherwise) and `response_type`. In `envelope`, a string `name_hash` is hex; keys are emitted in the given order. |
 | `silence` | `path` | Deregisters that request handler on the peer destination, so a request to it goes unanswered. Fails when nothing is registered at `path`. |
 | `pn_start` | `cost` | Starts an `LXMRouter` propagation node at that stamp cost and announces it at once; replies with `destination_hash`, `stamp_cost`, `stamp_cost_flexibility`. |
+| `pn_announce` | | Announces the running propagation node again, so a peer that restarted after `pn_start` files it; replies with `destination_hash`. |
 | `pn_count` | | `count` of messages the node holds. |
 | `pn_messages` | | Every held message as `transient_id`, `destination_hash`, `stamp_value`; those addressed to the peer's `lxmf.delivery` are also decrypted and unpacked (`title`, `content`, `fields`, `source_hash`, `timestamp`). |
 | `quit` | | Shuts Reticulum down and exits. |

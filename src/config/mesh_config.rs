@@ -7,6 +7,7 @@ pub const DEFAULT_PEER_MAX_CONCURRENT: u32 = 1;
 pub const DEFAULT_PEER_MAX_MESSAGES_PER_HOUR: u32 = 60;
 pub const DEFAULT_PEER_MAX_TOKENS_PER_HOUR: u64 = 100_000;
 pub const DEFAULT_PEER_MAX_COST_USD_PER_HOUR: f64 = 0.0;
+pub const DEFAULT_PROPAGATION_SYNC_INTERVAL_SECS: u64 = 300;
 
 pub(crate) const MESH_DIGEST_PROMPT: &str = r#"The session above may be shared with a trusted collaborator's Coyote instance. Write a digest of it that lets that collaborator understand what is happening here without reading the transcript.
 
@@ -59,6 +60,11 @@ pub struct MeshConfig {
     /// no cost ceiling. Enforced only when the envoy model's prices are known; the
     /// message is still filed in the inbox for the human.
     pub peer_max_cost_usd_per_hour: f64,
+    /// Seconds between automatic fetches of the messages a propagation node holds for
+    /// this node, the first running when the node joins; 0 = fetch only on `.mesh fetch`.
+    /// Sideband's `lxmf_sync_interval` defaults to 43200 s with periodic sync off and
+    /// NomadNet's to 21600 s; neither fits an interactive REPL, so 300 s is used.
+    pub propagation_sync_interval_secs: u64,
 }
 
 impl Default for MeshConfig {
@@ -79,6 +85,7 @@ impl Default for MeshConfig {
             peer_max_messages_per_hour: DEFAULT_PEER_MAX_MESSAGES_PER_HOUR,
             peer_max_tokens_per_hour: DEFAULT_PEER_MAX_TOKENS_PER_HOUR,
             peer_max_cost_usd_per_hour: DEFAULT_PEER_MAX_COST_USD_PER_HOUR,
+            propagation_sync_interval_secs: DEFAULT_PROPAGATION_SYNC_INTERVAL_SECS,
         }
     }
 }
@@ -266,7 +273,7 @@ pub fn render_mesh_info(mesh: &MeshConfig) -> String {
         "custom"
     };
     let mut output = String::new();
-    let mut row = |name: &str, value: String| output.push_str(&format!("  {name:<28}{value}\n"));
+    let mut row = |name: &str, value: String| output.push_str(&format!("  {name:<32}{value}\n"));
     row("enabled", mesh.enabled.to_string());
     row("announce", mesh.announce.to_string());
     row(
@@ -310,6 +317,15 @@ pub fn render_mesh_info(mesh: &MeshConfig) -> String {
             cost.to_string()
         },
     );
+    let sync = mesh.propagation_sync_interval_secs;
+    row(
+        "propagation_sync_interval_secs",
+        if sync == 0 {
+            "0 (manual)".to_string()
+        } else {
+            sync.to_string()
+        },
+    );
     output
 }
 
@@ -342,6 +358,7 @@ mod tests {
         assert_eq!(mesh.peer_max_messages_per_hour, 60);
         assert_eq!(mesh.peer_max_tokens_per_hour, 100_000);
         assert_eq!(mesh.peer_max_cost_usd_per_hour, 0.0);
+        assert_eq!(mesh.propagation_sync_interval_secs, 300);
     }
 
     #[test]
@@ -704,7 +721,7 @@ mod tests {
     fn render_mesh_info_marks_a_zero_cost_ceiling_as_off() {
         let info = render_mesh_info(&MeshConfig::default());
         assert!(
-            info.contains("  peer_max_cost_usd_per_hour  0 (off)\n"),
+            info.contains("  peer_max_cost_usd_per_hour      0 (off)\n"),
             "{info}"
         );
         let priced = MeshConfig {
@@ -713,7 +730,25 @@ mod tests {
         };
         let info = render_mesh_info(&priced);
         assert!(
-            info.contains("  peer_max_cost_usd_per_hour  1.5\n"),
+            info.contains("  peer_max_cost_usd_per_hour      1.5\n"),
+            "{info}"
+        );
+    }
+
+    #[test]
+    fn render_mesh_info_marks_a_zero_sync_interval_as_manual() {
+        let info = render_mesh_info(&MeshConfig::default());
+        assert!(
+            info.contains("  propagation_sync_interval_secs  300\n"),
+            "{info}"
+        );
+        let manual = MeshConfig {
+            propagation_sync_interval_secs: 0,
+            ..Default::default()
+        };
+        let info = render_mesh_info(&manual);
+        assert!(
+            info.contains("  propagation_sync_interval_secs  0 (manual)\n"),
             "{info}"
         );
     }
@@ -736,29 +771,29 @@ mod tests {
         };
         let info = render_mesh_info(&mesh);
         assert!(
-            info.contains("  interfaces[0]               private relay.example.com:4242\n"),
+            info.contains("  interfaces[0]                   private relay.example.com:4242\n"),
             "{info}"
         );
         assert!(
             info.contains(
-                "  interfaces[1]               public node.example.com:4242 (world-visible)\n"
+                "  interfaces[1]                   public node.example.com:4242 (world-visible)\n"
             ),
             "{info}"
         );
         assert!(
-            info.contains("  enabled                     false\n"),
+            info.contains("  enabled                         false\n"),
             "{info}"
         );
         assert!(
-            info.contains("  display_name                null\n"),
+            info.contains("  display_name                    null\n"),
             "{info}"
         );
         assert!(
-            info.contains("  brief                       manual\n"),
+            info.contains("  brief                           manual\n"),
             "{info}"
         );
         assert!(
-            info.contains("  peer_max_tokens_per_hour    100000\n"),
+            info.contains("  peer_max_tokens_per_hour        100000\n"),
             "{info}"
         );
     }
@@ -772,20 +807,20 @@ mod tests {
         };
         let info = render_mesh_info(&mesh);
         assert!(
-            info.contains("  digest_prompt               custom\n"),
+            info.contains("  digest_prompt                   custom\n"),
             "{info}"
         );
         assert!(!info.contains(secret), "{info}");
         assert!(
             render_mesh_info(&MeshConfig::default())
-                .contains("  digest_prompt               default\n")
+                .contains("  digest_prompt                   default\n")
         );
         let blank = MeshConfig {
             digest_prompt: Some("  \n".into()),
             ..Default::default()
         };
         assert!(
-            render_mesh_info(&blank).contains("  digest_prompt               default\n"),
+            render_mesh_info(&blank).contains("  digest_prompt                   default\n"),
             "{}",
             render_mesh_info(&blank)
         );

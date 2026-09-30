@@ -13,14 +13,22 @@
 //! An agent switch cancels in-flight driver children along with the rest of the old
 //! supervisor's tree, as Ctrl-C does; their completion notes still land in the queue the
 //! switch installed.
+//!
+//! The driver also runs the automatic propagation fetch: once when the node joins the
+//! slot and then every `mesh.propagation_sync_interval_secs`, on its own task since a
+//! fetch may wait minutes on the node. `stop` gives an in-flight fetch the same grace as
+//! a child and then aborts it. An abort that lands inside the fetch's body loop skips the
+//! persist of its dedup store, so the node keeps holding those bodies and the next fetch
+//! hands some of them to the sink again: the sink is at-least-once, and nothing is lost.
 
 use crate::config::{AppState, RequestContext};
 use crate::function::agents::child_app_state;
 use crate::mesh::idle::{
     Coalescer, IDLE_COALESCE_MAX_PEERS, IDLE_COALESCE_TICK, IDLE_QUEUE_CAPACITY, IdleNotify,
-    IdleSink, Origin, OtherNames, RateLimiter,
+    IdleSink, Origin, OtherNames, RateLimiter, SyncSchedule,
 };
 use crate::mesh::notify::{Notification, Source};
+use crate::mesh::{FetchError, FetchReport, LoggingInboundSink, redact_hashes, short};
 use crate::supervisor::mailbox::Inbox;
 use crate::supervisor::notification::{
     MESH_NOTIFICATION_QUEUE_CAPACITY, SystemNotification, mesh_events_dropped, mesh_notification,
@@ -40,7 +48,7 @@ use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::task::{AbortHandle, JoinSet};
+use tokio::task::{AbortHandle, JoinError, JoinHandle, JoinSet};
 use tokio::time::sleep_until;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -100,6 +108,8 @@ pub(crate) enum IdleEvent {
     // Constructed by the mesh request handlers once they land.
     #[allow(dead_code)]
     Spawn(IdleSpawn),
+    /// The node joined the slot: fetch what a propagation node holds for it.
+    SyncNow,
 }
 
 /// Producer side of the driver's queue. Never waits: a full or closed queue hands the
@@ -126,7 +136,9 @@ impl IdleHandle {
         match self.send(IdleEvent::Spawn(spawn)) {
             Ok(()) => Ok(()),
             Err(IdleEvent::Spawn(spawn)) => Err(spawn),
-            Err(IdleEvent::Notify(_)) => unreachable!("try_send hands back the event it was given"),
+            Err(IdleEvent::Notify(_) | IdleEvent::SyncNow) => {
+                unreachable!("try_send hands back the event it was given")
+            }
         }
     }
 
@@ -140,7 +152,15 @@ impl IdleSink for IdleHandle {
         match self.send(IdleEvent::Notify(note)) {
             Ok(()) => Ok(()),
             Err(IdleEvent::Notify(note)) => Err(note),
-            Err(IdleEvent::Spawn(_)) => unreachable!("try_send hands back the event it was given"),
+            Err(IdleEvent::Spawn(_) | IdleEvent::SyncNow) => {
+                unreachable!("try_send hands back the event it was given")
+            }
+        }
+    }
+
+    fn request_sync(&self) {
+        if self.send(IdleEvent::SyncNow).is_err() {
+            debug!("Idle driver queue full; the propagation sync waits for its interval");
         }
     }
 }
@@ -206,7 +226,7 @@ impl InFlight {
 pub(crate) struct IdleDriver {
     handle: IdleHandle,
     cancel: CancellationToken,
-    tasks: JoinSet<()>,
+    tasks: JoinSet<Option<SyncTask>>,
     in_flight: Arc<InFlight>,
     app: Arc<AppState>,
 }
@@ -255,25 +275,35 @@ impl IdleDriver {
         self.stop_with_timeout(IDLE_STOP_TIMEOUT).await
     }
 
-    /// Detaches from the slot, stops the loop, cancels every child and waits for them.
-    /// A child that ignores its abort signal for `timeout` is aborted outright. Returns
+    /// Detaches from the slot, stops the loop, cancels every child and waits for them and
+    /// for a propagation fetch in flight. A child that ignores its abort signal for
+    /// `timeout` is aborted outright, as is a fetch still waiting on its node. Returns
     /// only once nothing the driver started is still running.
     pub(crate) async fn stop_with_timeout(mut self, timeout: Duration) {
         self.app.mesh.clear_idle();
         self.cancel.cancel();
+        let mut sync = None;
         while let Some(joined) = self.tasks.join_next().await {
-            if let Err(join_error) = joined {
-                warn!("Idle driver loop did not exit cleanly: {join_error}");
+            match joined {
+                Ok(in_flight_sync) => sync = in_flight_sync,
+                Err(join_error) => warn!("Idle driver loop did not exit cleanly: {join_error}"),
             }
         }
         // Only after the loop has exited: it is the one place children are registered.
         self.in_flight.cancel_children();
-        if tokio::time::timeout(timeout, self.in_flight.wait_empty())
-            .await
-            .is_err()
-        {
+        let wound_down = async {
+            self.in_flight.wait_empty().await;
+            if let Some(sync) = &mut sync {
+                let _ = sync.await;
+            }
+        };
+        if tokio::time::timeout(timeout, wound_down).await.is_err() {
             self.in_flight.abort_children();
             self.in_flight.wait_empty().await;
+            if let Some(sync) = sync {
+                sync.abort();
+                let _ = sync.await;
+            }
         }
         let overflow = self.handle.overflow();
         if overflow > 0 {
@@ -322,7 +352,14 @@ struct DriverLoop {
     refusals: Refusals,
     coalesce_at: Option<tokio::time::Instant>,
     retry_at: Option<tokio::time::Instant>,
+    /// Built from the interval in the config the REPL started with: `update_app_config`
+    /// replaces `ctx.app`, but the driver keeps the `AppState` it was started on, so a
+    /// `.set` of the interval mid-session takes effect at the next start.
+    sync: SyncSchedule,
+    sync_task: Option<SyncTask>,
 }
+
+type SyncTask = JoinHandle<Result<FetchReport, FetchError>>;
 
 /// The slot must not outlive the loop that drains it: a loop that panics or is aborted
 /// would otherwise leave every later event queued for nobody. Idempotent with `stop`
@@ -421,6 +458,7 @@ impl DriverLoop {
         cancel: CancellationToken,
         in_flight: Arc<InFlight>,
     ) -> Self {
+        let sync = SyncSchedule::new(app.config.mesh.propagation_sync_interval_secs);
         Self {
             ctx,
             app,
@@ -438,18 +476,27 @@ impl DriverLoop {
             refusals: Refusals::default(),
             coalesce_at: None,
             retry_at: None,
+            sync,
+            sync_task: None,
         }
     }
 
-    async fn run(mut self) {
+    /// Runs until cancelled or the producers are gone; hands back the propagation fetch
+    /// still in flight, if any, for `stop` to wait on.
+    async fn run(mut self) -> Option<SyncTask> {
         loop {
             let coalesce_at = self.coalesce_at.unwrap_or_else(tokio::time::Instant::now);
             let retry_at = self.retry_at.unwrap_or_else(tokio::time::Instant::now);
+            let sync_at = self
+                .sync
+                .due_at()
+                .map_or_else(tokio::time::Instant::now, tokio::time::Instant::from_std);
             tokio::select! {
                 _ = self.cancel.cancelled() => break,
                 event = self.rx.recv() => match event {
                     Some(IdleEvent::Notify(note)) => self.on_notify(note),
                     Some(IdleEvent::Spawn(spawn)) => self.on_spawn(spawn),
+                    Some(IdleEvent::SyncNow) => self.on_sync_request(),
                     None => break,
                 },
                 _ = sleep_until(coalesce_at), if self.coalesce_at.is_some() => {
@@ -459,10 +506,18 @@ impl DriverLoop {
                 _ = sleep_until(retry_at), if self.retry_at.is_some() => {
                     self.retry_at = None;
                 }
+                _ = sleep_until(sync_at), if self.sync.due_at().is_some() => {
+                    self.on_sync_request();
+                }
+                joined = sync_outcome(&mut self.sync_task) => {
+                    self.sync_task = None;
+                    self.on_sync_finished(joined);
+                }
             }
             self.flush_ctx_work();
             self.arm_timers();
         }
+        self.sync_task.take()
     }
 
     /// Local notes always go through, as do peer notes from a source bounded upstream.
@@ -676,6 +731,75 @@ impl DriverLoop {
         debug!("Idle driver refused to start '{agent_name}': {reason}");
         self.refusals.record(agent_name, reason);
     }
+
+    /// Starts a propagation fetch when the schedule allows one and there is a node to
+    /// ask. An empty slot ends the schedule until the next install asks again; a mesh
+    /// with no propagation node heard yet is asked again shortly.
+    fn on_sync_request(&mut self) {
+        if !self.sync.accepts_request() {
+            return;
+        }
+        let now = tokio::time::Instant::now().into_std();
+        let Some(runtime) = self.app.mesh.get() else {
+            self.sync.mesh_off();
+            return;
+        };
+        let Ok(node) = runtime.propagation_nodes().select() else {
+            debug!("Propagation sync waits for a propagation node to announce itself");
+            self.sync.no_node(now);
+            return;
+        };
+        let node = node.destination.address_hash.to_hex_string();
+        debug!("Propagation sync from {} starting", short(&node));
+        self.sync.started(node);
+        self.sync_task = Some(tokio::spawn(async move {
+            runtime.fetch_propagated(&LoggingInboundSink).await
+        }));
+    }
+
+    fn on_sync_finished(&mut self, joined: Result<Result<FetchReport, FetchError>, JoinError>) {
+        let now = tokio::time::Instant::now().into_std();
+        let outcome = match joined {
+            Ok(outcome) => outcome,
+            Err(join_error) => {
+                warn!("Propagation sync task did not finish: {join_error}");
+                Err(FetchError::Cancelled)
+            }
+        };
+        match &outcome {
+            Ok(report) => debug!(
+                "Propagation sync from {} done: {} listed, {} wanted, {} received, {} delivered, {} duplicates, {} discarded, {} deferred",
+                short(&report.node),
+                report.listed,
+                report.wanted,
+                report.received,
+                report.delivered,
+                report.duplicates,
+                report.discarded,
+                report.deferred
+            ),
+            Err(err) => debug!(
+                "Propagation sync failed: {}",
+                redact_hashes(&err.to_string())
+            ),
+        }
+        if let Some(text) = self.sync.finished(&outcome, now) {
+            self.app
+                .mesh
+                .notify(Notification::new(Source::Propagation, text));
+        }
+    }
+}
+
+/// Resolves when the fetch in flight ends; pending forever while there is none, so the
+/// loop's `select!` needs no precondition that would leave an unpolled handle behind.
+async fn sync_outcome(
+    task: &mut Option<SyncTask>,
+) -> Result<Result<FetchReport, FetchError>, JoinError> {
+    match task {
+        Some(handle) => handle.await,
+        None => std::future::pending().await,
+    }
 }
 
 fn is_completion(note: &SystemNotification) -> bool {
@@ -830,6 +954,26 @@ impl ChildRun {
             ))),
         });
         Ok(agent_result)
+    }
+}
+
+/// Fixtures for tests outside this module that need a driver on a slot without naming
+/// the session context themselves, such as the mesh conformance suite.
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::IdleDriver;
+    use crate::config::{AppState, RequestContext, WorkingMode};
+
+    use parking_lot::RwLock;
+    use std::sync::Arc;
+
+    /// A driver on a fresh top-level REPL context; the returned state's `mesh` slot is
+    /// the one it watches.
+    pub(crate) fn driver_on_a_fresh_state() -> (Arc<AppState>, IdleDriver) {
+        let app = Arc::new(AppState::test_default());
+        let ctx = RequestContext::new(Arc::clone(&app), WorkingMode::Repl);
+        let driver = IdleDriver::start(Arc::new(RwLock::new(ctx)), Arc::clone(&app));
+        (app, driver)
     }
 }
 
@@ -3209,5 +3353,184 @@ mod tests {
             sink.lines()
         );
         driver.stop().await;
+    }
+
+    /// The automatic propagation fetch against a fake node, driven from the slot the way
+    /// `.mesh on` and `.mesh off` drive it. Unix-only with the loopback fixtures.
+    #[cfg(unix)]
+    mod sync {
+        use super::*;
+        use crate::config::{AppConfig, MeshConfig};
+        use crate::mesh::MeshSlot;
+        use crate::mesh::idle::PROPAGATION_SYNC_RETRY_WITHOUT_NODE;
+        use crate::mesh::test_support::{FakeNode, StartedRuntime, started_runtime_on};
+        use rmpv::Value;
+        use rns_transport::iface::tcp_server::TcpServer;
+        use tokio::time::timeout;
+
+        /// Ceiling on one fetch over loopback: a link, an identify and a round.
+        const FETCH_TIMEOUT: Duration = Duration::from_secs(15);
+
+        fn sync_ctx(interval_secs: u64) -> Arc<RwLock<RequestContext>> {
+            let mut app = AppState::test_default();
+            app.config = Arc::new(AppConfig {
+                mesh: MeshConfig {
+                    propagation_sync_interval_secs: interval_secs,
+                    ..MeshConfig::default()
+                },
+                ..AppConfig::default()
+            });
+            Arc::new(RwLock::new(RequestContext::new(
+                Arc::new(app),
+                WorkingMode::Cmd,
+            )))
+        }
+
+        fn slot(ctx: &Arc<RwLock<RequestContext>>) -> Arc<MeshSlot> {
+            Arc::clone(&ctx.try_read().unwrap().app.mesh)
+        }
+
+        /// A runtime joined to a fake node that has announced itself, with the node filed.
+        async fn runtime_with_node(tag: &str) -> (FakeNode, StartedRuntime) {
+            // A `MeshRuntime` joins with `TcpClient`'s default MTU, so the fake matches it.
+            let fake = FakeNode::listen_with_mtu(TcpServer::DEFAULT_CLIENT_MTU).await;
+            let started = started_runtime_on(tag, fake.listener.port).await;
+            fake.announce().await;
+            let runtime = started.runtime.clone();
+            wait_until("the runtime to file the propagation node", || {
+                runtime.propagation_nodes().select().is_ok()
+            })
+            .await;
+            (fake, started)
+        }
+
+        async fn wait_for_rounds(fake: &FakeNode, count: usize, within: Duration) {
+            let deadline = tokio::time::Instant::now() + within;
+            while fake.script.seen().len() < count {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "timed out waiting for {count} /get rounds; saw {}",
+                    fake.script.seen().len()
+                );
+                sleep(POLL).await;
+            }
+        }
+
+        fn propagation_lines(sink: &RecordingSink) -> Vec<String> {
+            sink.lines()
+                .into_iter()
+                .filter(|line| line.starts_with("[mesh:propagation]"))
+                .collect()
+        }
+
+        async fn tear_down(
+            driver: IdleDriver,
+            slot: &MeshSlot,
+            started: StartedRuntime,
+            fake: FakeNode,
+        ) {
+            driver.stop().await;
+            slot.stop().await.unwrap();
+            started.relay_handle.abort();
+            fake.stop().await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn installing_the_node_starts_a_sync_and_the_interval_runs_the_next_one() {
+            let ctx = sync_ctx(1);
+            let sink = install_sink(&ctx);
+            let driver = start_driver(&ctx);
+            let (fake, started) = runtime_with_node("idle-sync-interval").await;
+            fake.script
+                .reply_with([Value::Array(vec![]), Value::Array(vec![])]);
+
+            slot(&ctx).install(started.runtime.clone()).unwrap();
+
+            wait_for_rounds(&fake, 1, FETCH_TIMEOUT).await;
+            wait_for_rounds(&fake, 2, FETCH_TIMEOUT).await;
+            assert!(
+                propagation_lines(&sink).is_empty(),
+                "a fetch that received nothing says nothing: {:?}",
+                sink.lines()
+            );
+            tear_down(driver, &slot(&ctx), started, fake).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_zero_interval_never_fetches_automatically() {
+            let ctx = sync_ctx(0);
+            let driver = start_driver(&ctx);
+            let (fake, started) = runtime_with_node("idle-sync-zero").await;
+
+            slot(&ctx).install(started.runtime.clone()).unwrap();
+
+            sleep(Duration::from_millis(1500)).await;
+            assert!(
+                fake.script.seen().is_empty(),
+                "nothing is fetched on its own with a zero interval"
+            );
+            fake.script.reply_with([Value::Array(vec![])]);
+            let report = timeout(
+                FETCH_TIMEOUT,
+                started.runtime.fetch_propagated(&LoggingInboundSink),
+            )
+            .await
+            .expect("a manual fetch finishes within FETCH_TIMEOUT")
+            .unwrap();
+            assert_eq!(report.node, fake.hex());
+            assert_eq!(fake.script.seen().len(), 1);
+            tear_down(driver, &slot(&ctx), started, fake).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_sync_that_arrives_before_any_node_is_heard_is_retried_when_one_announces() {
+            let ctx = sync_ctx(1);
+            let driver = start_driver(&ctx);
+            let fake = FakeNode::listen_with_mtu(TcpServer::DEFAULT_CLIENT_MTU).await;
+            let started = started_runtime_on("idle-sync-no-node", fake.listener.port).await;
+            fake.script.reply_with([Value::Array(vec![])]);
+
+            slot(&ctx).install(started.runtime.clone()).unwrap();
+            sleep(Duration::from_millis(500)).await;
+            assert!(
+                fake.script.seen().is_empty(),
+                "nothing to fetch from before a node announces"
+            );
+
+            fake.announce().await;
+            let runtime = started.runtime.clone();
+            wait_until("the runtime to file the propagation node", || {
+                runtime.propagation_nodes().select().is_ok()
+            })
+            .await;
+            // The retry waits the shorter of the 1 s interval and the 15 s no-node retry,
+            // so a ceiling under 15 s proves the interval won.
+            assert!(PROPAGATION_SYNC_RETRY_WITHOUT_NODE > TEST_TIMEOUT);
+            wait_for_rounds(&fake, 1, TEST_TIMEOUT).await;
+            tear_down(driver, &slot(&ctx), started, fake).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn stopping_the_mesh_ends_the_schedule() {
+            let ctx = sync_ctx(1);
+            let driver = start_driver(&ctx);
+            let (fake, started) = runtime_with_node("idle-sync-stop").await;
+            fake.script.reply_with([Value::Array(vec![])]);
+
+            slot(&ctx).install(started.runtime.clone()).unwrap();
+            wait_for_rounds(&fake, 1, FETCH_TIMEOUT).await;
+
+            assert!(slot(&ctx).stop().await.unwrap());
+            let rounds = fake.script.seen().len();
+            sleep(Duration::from_millis(2500)).await;
+            assert_eq!(
+                fake.script.seen().len(),
+                rounds,
+                "no fetch runs once the node is off"
+            );
+            driver.stop().await;
+            started.relay_handle.abort();
+            fake.stop().await;
+        }
     }
 }

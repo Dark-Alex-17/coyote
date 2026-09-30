@@ -295,6 +295,15 @@ class ReferencePeer:
             "stamp_cost_flexibility": self.router.propagation_stamp_cost_flexibility,
         }
 
+    def cmd_pn_announce(self, args):
+        """Re-announces the propagation node, for a peer that restarted after `pn_start`."""
+        if self.router is None:
+            raise RuntimeError("no propagation node is running")
+        self.router.propagation_destination.announce(
+            app_data=self.router.get_propagation_node_app_data()
+        )
+        return {"destination_hash": self.router.propagation_destination.hash.hex()}
+
     def cmd_pn_count(self, args):
         if self.router is None:
             raise RuntimeError("no propagation node is running")

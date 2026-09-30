@@ -14,9 +14,9 @@ use crate::mesh::trust::{
     Verdict, decode_name_hash, parse_hash,
 };
 use crate::mesh::{
-    MESH_ALREADY_ON, MeshPaths, MeshRuntime, NodeOptions, PeerRecord, PropagationNodeRecord,
-    age_text, canonical_hash, destination_address, display_text, parse_rfc3339, redact_hashes,
-    short,
+    FetchError, FetchReport, LoggingInboundSink, MESH_ALREADY_ON, MeshPaths, MeshRuntime,
+    NodeOptions, PeerRecord, PropagationNodeRecord, age_text, canonical_hash, destination_address,
+    display_text, parse_rfc3339, redact_hashes, short,
 };
 use crate::supervisor::mailbox::EnvelopePayload;
 use crate::utils::{AbortSignal, drain_stale_tty_input, wait_user_interrupt};
@@ -125,6 +125,11 @@ pub(super) const VERBS: &[(&str, &str, &str)] = &[
         "Mint a new mesh identity while the node is off; peers must re-trust the new one",
         ".mesh rotate [--dry-run|--confirm rotate-<identity-short>]",
     ),
+    (
+        "fetch",
+        "Fetch the messages a propagation node holds for this node now",
+        ".mesh fetch",
+    ),
 ];
 
 pub(crate) const MESH_OFF: &str = "Mesh is off. Run `.mesh on` first.";
@@ -167,6 +172,7 @@ pub(crate) async fn run(
         "deny" => deny(ctx, rest),
         "undeny" => undeny(ctx, rest),
         "rotate" => rotate(ctx, rest),
+        "fetch" => fetch(ctx, rest).await,
         other => bail!("Unknown .mesh command '{other}'. Type `.mesh` for the list."),
     }
 }
@@ -638,6 +644,41 @@ async fn broadcast(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     let outcome = runtime.broadcast(&out).await?;
     out_text(&render_broadcast(&outcome));
     Ok(())
+}
+
+/// The automatic sync runs on the idle-time driver's interval; this runs one now. A
+/// fetch already running, here or in another process of this identity, is reported and
+/// left to finish rather than treated as a failure.
+async fn fetch(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
+    parse_args(rest, &[], "fetch")?;
+    let runtime = live(ctx)?;
+    out_text("Asking the nearest propagation node for held messages...");
+    match runtime.fetch_propagated(&LoggingInboundSink).await {
+        Ok(report) => out_text(&render_fetch(&report)),
+        Err(FetchError::AlreadyRunning) => {
+            out_text("A sync is already running; wait for it to finish.")
+        }
+        Err(err @ FetchError::HeldByOtherProcess { .. }) => out_text(&err.to_string()),
+        Err(err) => bail!(err.to_string()),
+    }
+    Ok(())
+}
+
+fn render_fetch(report: &FetchReport) -> String {
+    let node = short(&report.node);
+    if report.received == 0 {
+        return format!("Nothing held for this node at {node}.");
+    }
+    format!(
+        "Fetched from {node}: {} listed, {} wanted, {} received, {} delivered, {} duplicates, {} discarded, {} deferred.",
+        report.listed,
+        report.wanted,
+        report.received,
+        report.delivered,
+        report.duplicates,
+        report.discarded,
+        report.deferred
+    )
 }
 
 fn trust(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
@@ -3913,6 +3954,7 @@ mod tests {
                 ".mesh answer q1 text".to_string(),
                 format!(".mesh reply {hash} text"),
                 ".mesh broadcast text".to_string(),
+                ".mesh fetch".to_string(),
             ] {
                 let err = err_of(&mut ctx, &line);
                 assert!(err.contains(".mesh on"), "{line}: {err}");
@@ -4553,12 +4595,15 @@ mod tests {
                 Notification, NotificationSink, RenderedNotification, Source,
             };
             use crate::mesh::test_support::{
-                PeerSighting, loopback_relay, private_config, started_runtime,
+                FakeNode, PeerSighting, StartedRuntime, loopback_relay, private_config,
+                started_runtime, started_runtime_on, wait_until,
             };
             use crate::mesh::trust::{LiveMesh, TrustOptions};
             use crate::testing::EnvVarGuard;
             use crate::utils::get_env_name;
             use parking_lot::Mutex;
+            use rmpv::Value;
+            use rns_transport::iface::tcp_server::TcpServer;
             use std::sync::atomic::{AtomicUsize, Ordering};
 
             /// (destination, identity, name hash) of a freshly minted peer. Trusting verifies
@@ -4616,6 +4661,8 @@ mod tests {
                     self.0.lock().push(note.text);
                     Ok(())
                 }
+
+                fn request_sync(&self) {}
             }
 
             impl NotificationSink for Recording {
@@ -6908,6 +6955,106 @@ mod tests {
                     assert_eq!(prompt_script::prompts_asked(), 1);
                     assert!(trust_file(&trust).is_none());
                     assert_eq!(trust.authorize(&id, &dest).decision, Decision::Refuse);
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// A runtime joined to a fake propagation node that has announced itself.
+            async fn runtime_with_fake_node(tag: &str) -> (FakeNode, StartedRuntime) {
+                // A `MeshRuntime` joins with `TcpClient`'s default MTU, so the fake matches it.
+                let fake = FakeNode::listen_with_mtu(TcpServer::DEFAULT_CLIENT_MTU).await;
+                let started = started_runtime_on(tag, fake.listener.port).await;
+                fake.announce().await;
+                let runtime = started.runtime.clone();
+                wait_until("the runtime to file the propagation node", || {
+                    runtime.propagation_nodes().select().is_ok()
+                })
+                .await;
+                (fake, started)
+            }
+
+            #[test]
+            #[serial]
+            fn fetch_reports_the_counts_from_the_node() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-fetch");
+                let _capture = capture::install();
+                run_async(async {
+                    let (fake, started) = runtime_with_fake_node("repl-mesh-fetch").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    fake.script.reply_with([Value::Array(vec![])]);
+
+                    run(&mut ctx, ".mesh fetch").await.unwrap();
+
+                    let lines = stdout_lines();
+                    let asking = index_of(
+                        &lines,
+                        "Asking the nearest propagation node for held messages...",
+                    );
+                    let nothing = index_of(
+                        &lines,
+                        &format!("Nothing held for this node at {}.", short(&fake.hex())),
+                    );
+                    assert!(asking < nothing, "{lines:?}");
+                    assert_eq!(fake.script.seen().len(), 1);
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                    fake.stop().await;
+                });
+            }
+
+            #[test]
+            #[serial]
+            fn fetch_while_a_sync_is_running_prints_one_line_and_succeeds() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-fetch-busy");
+                let _capture = capture::install();
+                run_async(async {
+                    let (fake, started) = runtime_with_fake_node("repl-mesh-fetch-busy").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    // Nothing scripted: the fake stays silent and the fetch waits in round 1.
+                    let blocked = tokio::spawn({
+                        let runtime = started.runtime.clone();
+                        async move { runtime.fetch_propagated(&LoggingInboundSink).await }
+                    });
+                    wait_until("the blocked fetch to reach round 1", || {
+                        fake.script.seen().len() == 1
+                    })
+                    .await;
+
+                    run(&mut ctx, ".mesh fetch").await.unwrap();
+
+                    let lines = stdout_lines();
+                    index_of(&lines, "A sync is already running; wait for it to finish.");
+                    assert!(
+                        !lines.iter().any(|line| line.contains("Nothing held")),
+                        "{lines:?}"
+                    );
+
+                    blocked.abort();
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                    fake.stop().await;
+                });
+            }
+
+            #[test]
+            #[serial]
+            fn fetch_with_no_node_heard_is_a_teaching_error() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-fetch-no-node");
+                run_async(async {
+                    let started = started_runtime("repl-mesh-fetch-no-node").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+
+                    let err = refusal(&mut ctx, ".mesh fetch").await;
+                    assert!(
+                        err.starts_with("No LXMF propagation node has announced itself"),
+                        "{err}"
+                    );
 
                     assert!(ctx.app.mesh.stop().await.unwrap());
                     started.relay_handle.abort();

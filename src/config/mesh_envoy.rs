@@ -1088,6 +1088,8 @@ mod tests {
             self.pushed.lock().push(note);
             Ok(())
         }
+
+        fn request_sync(&self) {}
     }
 
     async fn wait_until(what: &str, f: impl Fn() -> bool) {

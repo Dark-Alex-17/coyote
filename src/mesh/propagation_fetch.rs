@@ -329,8 +329,6 @@ pub(crate) trait InboundSink: Send + Sync {
 
 /// Notes each delivered message in the debug log by its hashes and lengths; the title and
 /// content are the sender's bytes and are never logged raw.
-// Installed by the REPL mesh commands once they land.
-#[allow(dead_code)]
 pub(crate) struct LoggingInboundSink;
 
 impl InboundSink for LoggingInboundSink {
@@ -2749,136 +2747,22 @@ mod tests {
         use crate::config::Session;
         use crate::mesh::mesh_cache_dir;
         use crate::mesh::node::{MeshRuntime, MeshSlot, NodeOptions};
-        use crate::mesh::propagation::pn_announce_app_data;
-        use crate::mesh::r3::{
-            Admission, InboundRequest, NAME_HASH_LEN, R3Server, Reply, RequestHandler,
-        };
+        use crate::mesh::r3::NAME_HASH_LEN;
         use crate::mesh::test_support::{
-            Connector, INTEROP_TIMEOUT, LEGACY_LINK_MTU, Listener, POLL, mesh_paths,
+            Connector, FakeNode, INTEROP_TIMEOUT, LEGACY_LINK_MTU, POLL, mesh_paths,
             private_config, started_runtime, wait_until,
         };
 
         use rns_transport::destination::DestinationName;
-        use rns_transport::destination::link::LinkId;
         use rns_transport::identity::PrivateIdentity as TransportIdentity;
         use rns_transport::iface::InterfaceSharedConfig;
         use rns_transport::iface::tcp_server::TcpServer;
-        use std::collections::VecDeque;
         use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::time::{Instant, sleep, timeout};
 
         /// Ceiling on one whole fetch against the fake node: a link, an identify and up to
         /// three rounds over loopback.
         const FETCH_DEADLINE: Duration = Duration::from_secs(30);
-
-        /// One `/get` round as the fake node saw it.
-        #[derive(Clone)]
-        struct Seen {
-            request_id: String,
-            identity: Option<AddressHash>,
-            branch: SizeBranch,
-            data: Value,
-        }
-
-        /// Answers each round with the next scripted value and records what arrived. A
-        /// listening post, not a propagation node: it never reads the request.
-        #[derive(Default)]
-        struct Script {
-            seen: Mutex<Vec<Seen>>,
-            replies: Mutex<VecDeque<Value>>,
-        }
-
-        impl Script {
-            fn reply_with(&self, values: impl IntoIterator<Item = Value>) {
-                self.replies.lock().extend(values);
-            }
-
-            fn seen(&self) -> Vec<Seen> {
-                self.seen.lock().clone()
-            }
-        }
-
-        #[async_trait]
-        impl RequestHandler for Script {
-            fn admit(&self, _link_id: LinkId, _identity: Option<&Identity>) -> Admission {
-                Admission::Admit
-            }
-
-            async fn handle(&self, request: InboundRequest) -> Reply {
-                self.seen.lock().push(Seen {
-                    request_id: request.request_id.to_hex_string(),
-                    identity: request.identity.map(|identity| identity.address_hash),
-                    branch: request.branch,
-                    data: request.data,
-                });
-                let next = self.replies.lock().pop_front();
-                match next {
-                    Some(value) => Reply::Value(value),
-                    None => Reply::Silent,
-                }
-            }
-        }
-
-        /// A `Listener` on `lxmf.propagation` with a `Script` behind it.
-        struct FakeNode {
-            listener: Listener,
-            script: Arc<Script>,
-        }
-
-        impl FakeNode {
-            async fn listen() -> Self {
-                Self::listen_with_mtu(LEGACY_LINK_MTU).await
-            }
-
-            async fn listen_with_mtu(client_mtu: usize) -> Self {
-                let script = Arc::new(Script::default());
-                let listener = Listener::listen(
-                    Arc::new(R3Server::new()),
-                    script.clone(),
-                    client_mtu,
-                    TransportIdentity::new_from_rand(OsRng),
-                    DestinationName::new("lxmf", "propagation"),
-                )
-                .await;
-                Self { listener, script }
-            }
-
-            async fn announce(&self) {
-                self.listener
-                    .announce(Some(&pn_announce_app_data(
-                        true,
-                        0,
-                        FETCH_TRANSFER_LIMIT_KB as i64,
-                    )))
-                    .await;
-            }
-
-            /// Announces `identity`'s `name` destination from the node's transport, the way
-            /// a peer's own announce reaches us through the mesh, and returns its hash.
-            async fn announce_as(
-                &self,
-                identity: TransportIdentity,
-                name: DestinationName,
-            ) -> AddressHash {
-                let dest = self
-                    .listener
-                    .transport
-                    .add_destination(identity, name)
-                    .await;
-                let mut dest = dest.lock().await;
-                let packet = dest.announce(OsRng, None).unwrap();
-                self.listener.transport.send_packet(packet).await;
-                dest.desc.address_hash
-            }
-
-            fn hex(&self) -> String {
-                self.listener.desc.address_hash.to_hex_string()
-            }
-
-            async fn stop(self) {
-                self.listener.stop().await;
-            }
-        }
 
         /// Our side: a `Connector` joined to the fake, the fake as the `PropagationNode` its
         /// announce described, and a peer table, trust list, store path and sink of its own.

@@ -5276,6 +5276,8 @@ pub(crate) mod network {
             self.0.lock().push(note);
             Ok(())
         }
+
+        fn request_sync(&self) {}
     }
 
     /// Node A installed into a slot with a recording idle sink in front of it.

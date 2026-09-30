@@ -34,6 +34,7 @@ pub(crate) mod trust;
 
 pub(crate) use node::{MESH_ALREADY_ON, MeshPaths, MeshRuntime, MeshSlot, NodeOptions};
 pub(crate) use peers::PeerRecord;
+pub(crate) use propagation_fetch::{FetchError, FetchReport, LoggingInboundSink};
 pub(crate) use propagation_nodes::PropagationNodeRecord;
 pub(crate) use r3::{RequestOptions, redact_hashes, short};
 
@@ -173,14 +174,20 @@ pub(crate) mod test_support {
     #[cfg(unix)]
     pub(crate) use super::peers::PeerSighting;
     pub(crate) use super::propagation::PropagationNode;
+    #[cfg(unix)]
+    use super::propagation::pn_announce_app_data;
+    #[cfg(unix)]
+    use super::propagation_fetch::FETCH_TRANSFER_LIMIT_KB;
     pub(crate) use super::propagation_fetch::{InboundMessage, InboundSink};
     pub(crate) use super::protocol::Compatibility;
+    #[cfg(unix)]
+    use super::r3::{
+        Admission, Dispatcher, InboundRequest, LoggingKnockSink, R3Client, R3Server, RequestHandler,
+    };
     pub(crate) use super::r3::{
         AdmittedRequest, Handler, MESSAGE_PATH, NAME_HASH_LEN, OriginName, PathHash, RefusalCode,
         Reply, RequestId, SizeBranch,
     };
-    #[cfg(unix)]
-    use super::r3::{Dispatcher, LoggingKnockSink, R3Client, R3Server, RequestHandler};
     use super::snapshot::{BriefState, MeshSnapshot, SessionInfo, TurnState};
     use super::trust::TrustStore;
     use super::{mesh_config_dir, rfc3339_utc};
@@ -197,17 +204,23 @@ pub(crate) mod test_support {
     #[cfg(unix)]
     use rand_core::OsRng;
     #[cfg(unix)]
+    use rmpv::Value;
+    #[cfg(unix)]
+    use rns_transport::destination::link::LinkId;
+    #[cfg(unix)]
     use rns_transport::destination::{DestinationDesc, DestinationName, SingleInputDestination};
     #[cfg(unix)]
     use rns_transport::hash::AddressHash;
     #[cfg(unix)]
-    use rns_transport::identity::PrivateIdentity as TransportIdentity;
+    use rns_transport::identity::{Identity, PrivateIdentity as TransportIdentity};
     #[cfg(unix)]
     use rns_transport::iface::tcp_client::TcpClient;
     #[cfg(unix)]
     use rns_transport::iface::tcp_server::TcpServer;
     #[cfg(unix)]
     use rns_transport::transport::{AnnounceEvent, Transport, TransportConfig};
+    #[cfg(unix)]
+    use std::collections::VecDeque;
     #[cfg(unix)]
     use std::net::SocketAddr;
     use std::path::{Path, PathBuf};
@@ -505,6 +518,121 @@ pub(crate) mod test_support {
                 .lock()
                 .await
                 .stop_interface(self.iface);
+        }
+    }
+
+    /// One `/get` round as the fake propagation node saw it.
+    #[cfg(unix)]
+    #[derive(Clone)]
+    pub(crate) struct Seen {
+        pub(crate) request_id: String,
+        pub(crate) identity: Option<AddressHash>,
+        pub(crate) branch: SizeBranch,
+        pub(crate) data: Value,
+    }
+
+    /// Answers each round with the next scripted value and records what arrived. A
+    /// listening post, not a propagation node: it never reads the request.
+    #[cfg(unix)]
+    #[derive(Default)]
+    pub(crate) struct Script {
+        seen: Mutex<Vec<Seen>>,
+        replies: Mutex<VecDeque<Value>>,
+    }
+
+    #[cfg(unix)]
+    impl Script {
+        pub(crate) fn reply_with(&self, values: impl IntoIterator<Item = Value>) {
+            self.replies.lock().extend(values);
+        }
+
+        pub(crate) fn seen(&self) -> Vec<Seen> {
+            self.seen.lock().clone()
+        }
+    }
+
+    #[cfg(unix)]
+    #[async_trait]
+    impl RequestHandler for Script {
+        fn admit(&self, _link_id: LinkId, _identity: Option<&Identity>) -> Admission {
+            Admission::Admit
+        }
+
+        async fn handle(&self, request: InboundRequest) -> Reply {
+            self.seen.lock().push(Seen {
+                request_id: request.request_id.to_hex_string(),
+                identity: request.identity.map(|identity| identity.address_hash),
+                branch: request.branch,
+                data: request.data,
+            });
+            let next = self.replies.lock().pop_front();
+            match next {
+                Some(value) => Reply::Value(value),
+                None => Reply::Silent,
+            }
+        }
+    }
+
+    /// A `Listener` on `lxmf.propagation` with a `Script` behind it.
+    #[cfg(unix)]
+    pub(crate) struct FakeNode {
+        pub(crate) listener: Listener,
+        pub(crate) script: Arc<Script>,
+    }
+
+    #[cfg(unix)]
+    impl FakeNode {
+        pub(crate) async fn listen() -> Self {
+            Self::listen_with_mtu(LEGACY_LINK_MTU).await
+        }
+
+        pub(crate) async fn listen_with_mtu(client_mtu: usize) -> Self {
+            let script = Arc::new(Script::default());
+            let listener = Listener::listen(
+                Arc::new(R3Server::new()),
+                script.clone(),
+                client_mtu,
+                TransportIdentity::new_from_rand(OsRng),
+                DestinationName::new("lxmf", "propagation"),
+            )
+            .await;
+            Self { listener, script }
+        }
+
+        pub(crate) async fn announce(&self) {
+            self.listener
+                .announce(Some(&pn_announce_app_data(
+                    true,
+                    0,
+                    FETCH_TRANSFER_LIMIT_KB as i64,
+                )))
+                .await;
+        }
+
+        /// Announces `identity`'s `name` destination from the node's transport, the way a
+        /// peer's own announce reaches us through the mesh, and returns its hash.
+        pub(crate) async fn announce_as(
+            &self,
+            identity: TransportIdentity,
+            name: DestinationName,
+        ) -> AddressHash {
+            let dest = self
+                .listener
+                .transport
+                .add_destination(identity, name)
+                .await;
+            let mut dest = dest.lock().await;
+            let packet = dest.announce(OsRng, None).unwrap();
+            self.listener.transport.send_packet(packet).await;
+            dest.desc.address_hash
+        }
+
+        pub(crate) fn hex(&self) -> String {
+            self.listener.desc.address_hash.to_hex_string()
+        }
+
+        pub(crate) async fn stop(self) {
+            self.listener.stop().await;
         }
     }
 

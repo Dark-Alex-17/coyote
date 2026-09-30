@@ -828,8 +828,6 @@ impl MeshRuntime {
     /// message survives a restart between the two as a remembered id rather than a second
     /// delivery. One fetch runs at a time across every Coyote process of this identity;
     /// stopping the node cancels it.
-    // Reached by the REPL mesh commands once they land.
-    #[allow(dead_code)]
     pub(crate) async fn fetch_propagated(
         &self,
         sink: &dyn InboundSink,
@@ -1796,6 +1794,7 @@ impl MeshSlot {
         // Fired outside the lock: the sink is not the slot's to trust with it.
         drop(slot);
         self.hooks.fire(MeshEvent::Started(facts));
+        self.request_sync();
         Ok(())
     }
 
@@ -2048,6 +2047,14 @@ impl MeshSlot {
 
     pub(crate) fn clear_idle(&self) {
         self.idle.store(None);
+    }
+
+    /// Asks the idle-time driver for a propagation fetch; without a driver nothing is
+    /// fetched until `.mesh fetch`.
+    pub(crate) fn request_sync(&self) {
+        if let Some(sink) = self.idle.load_full() {
+            sink.request_sync();
+        }
     }
 
     /// Installs the envoy that answers inbound messages and questions. Its owner is the
@@ -3145,6 +3152,8 @@ mod tests {
                 Err(note)
             }
         }
+
+        fn request_sync(&self) {}
     }
 
     fn idle_note(text: &str) -> IdleNotify {

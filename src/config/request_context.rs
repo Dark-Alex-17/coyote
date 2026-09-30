@@ -6379,11 +6379,11 @@ mod tests {
         let (flat, mesh) = info.split_once("\nmesh:\n").expect("mesh: header present");
         assert!(flat.contains("function_calling_support"), "{flat}");
         assert!(
-            mesh.starts_with("  enabled                     false\n"),
+            mesh.starts_with("  enabled                         false\n"),
             "{mesh}"
         );
         assert!(
-            mesh.contains("  interfaces[0]               lan\n"),
+            mesh.contains("  interfaces[0]                   lan\n"),
             "{mesh}"
         );
     }

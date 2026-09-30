@@ -4,6 +4,8 @@
 //! session context; nothing here does.
 
 use crate::mesh::notify::{Notification, Source};
+use crate::mesh::propagation_fetch::{FetchError, FetchReport};
+use crate::mesh::r3::{R3Error, redact_hashes, short};
 use crate::supervisor::notification::SystemNotification;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -26,6 +28,9 @@ pub(crate) const IDLE_COALESCE_MAX_PEERS: usize = 8;
 /// alike. Past this many the closing line says the cap followed by `+` rather than
 /// growing a set keyed by whatever a flood chooses to send.
 pub(crate) const IDLE_COALESCE_MAX_OTHER_PEERS: usize = 64;
+/// How soon an automatic propagation fetch is tried again when no propagation node has
+/// announced itself yet, when that is sooner than the configured interval.
+pub(crate) const PROPAGATION_SYNC_RETRY_WITHOUT_NODE: Duration = Duration::from_secs(15);
 
 /// Who produced an event, which decides whether flood control applies. `Local` events
 /// are minted by this crate (child completions, node lifecycle) and are bounded by what
@@ -48,10 +53,13 @@ pub(crate) struct IdleNotify {
     pub(crate) model_note: Option<Box<SystemNotification>>,
 }
 
-/// Where producers push. Returns the note when it could not be queued; the driver
+/// Where producers push. `push` returns the note when it could not be queued; the driver
 /// counts overflow itself, so the caller decides what, if anything, to do with it.
+/// `request_sync` asks for a propagation fetch at the driver's next chance; a request
+/// that cannot be queued is dropped, since the driver's own interval asks again.
 pub(crate) trait IdleSink: Send + Sync {
     fn push(&self, note: IdleNotify) -> Result<(), IdleNotify>;
+    fn request_sync(&self);
 }
 
 /// Per-source token bucket. The clock is a parameter so admission is a pure function of
@@ -197,6 +205,138 @@ impl Coalescer {
         }
         lines
     }
+}
+
+/// When the automatic propagation fetch runs next and what its outcome is worth telling
+/// the user. The clock is a parameter, as for `RateLimiter`; the driver owns the fetch
+/// task and the slot, and consults this for every decision about them. One fetch at a
+/// time: a request made while one runs is dropped, and the interval re-arms from the
+/// moment the fetch ends rather than from when it was asked for.
+pub(crate) struct SyncSchedule {
+    interval: Option<Duration>,
+    due_at: Option<Instant>,
+    in_flight: Option<String>,
+    last_failure: Option<String>,
+}
+
+impl SyncSchedule {
+    /// `interval_secs` of 0 means fetch only on `.mesh fetch`: no request is accepted and
+    /// no timer is armed.
+    pub(crate) fn new(interval_secs: u64) -> Self {
+        Self {
+            interval: (interval_secs > 0).then(|| Duration::from_secs(interval_secs)),
+            due_at: None,
+            in_flight: None,
+            last_failure: None,
+        }
+    }
+
+    pub(crate) fn due_at(&self) -> Option<Instant> {
+        self.due_at
+    }
+
+    /// Whether a request, from the node joining or from the timer, may start a fetch now.
+    /// The timer is disarmed either way: a refused request is not owed a retry, and an
+    /// accepted one ends in `started`, `no_node` or `mesh_off`, which each decide the next.
+    pub(crate) fn accepts_request(&mut self) -> bool {
+        self.due_at = None;
+        self.interval.is_some() && self.in_flight.is_none()
+    }
+
+    /// The slot is empty: nothing to fetch from and nothing to wait for, since the next
+    /// install asks again.
+    pub(crate) fn mesh_off(&mut self) {
+        self.due_at = None;
+    }
+
+    /// No propagation node has announced itself yet: ask again after the shorter of the
+    /// interval and `PROPAGATION_SYNC_RETRY_WITHOUT_NODE`.
+    pub(crate) fn no_node(&mut self, now: Instant) {
+        self.due_at = self
+            .interval
+            .map(|interval| now + interval.min(PROPAGATION_SYNC_RETRY_WITHOUT_NODE));
+    }
+
+    /// A fetch from `node` (lower-hex destination hash) is running.
+    pub(crate) fn started(&mut self, node: String) {
+        self.in_flight = Some(node);
+        self.due_at = None;
+    }
+
+    /// The fetch ended. Re-arms the interval and returns the one line the user gets, if
+    /// any: a summary when something arrived, or the failure text unless it repeats the
+    /// failure already shown, so a node that stays dead is reported once. Refusals from
+    /// a fetch already running elsewhere, cancellation and a stopped node say nothing;
+    /// a fetch that found no node yet retries as `no_node` does.
+    pub(crate) fn finished(
+        &mut self,
+        outcome: &Result<FetchReport, FetchError>,
+        now: Instant,
+    ) -> Option<String> {
+        let node = self.in_flight.take().unwrap_or_default();
+        match outcome {
+            Ok(report) => {
+                self.due_at = self.interval.map(|interval| now + interval);
+                self.last_failure = None;
+                (report.received > 0).then(|| synced_line(report))
+            }
+            Err(FetchError::NoPropagationNode) => {
+                self.no_node(now);
+                None
+            }
+            Err(
+                FetchError::AlreadyRunning
+                | FetchError::HeldByOtherProcess { .. }
+                | FetchError::Cancelled
+                | FetchError::Link(R3Error::NotRunning | R3Error::Shutdown),
+            ) => {
+                self.due_at = self.interval.map(|interval| now + interval);
+                None
+            }
+            Err(err) => {
+                self.due_at = self.interval.map(|interval| now + interval);
+                let text = format!(
+                    "sync from {} failed: {}",
+                    short(&node),
+                    redact_hashes(&err.to_string())
+                );
+                if self.last_failure.as_deref() == Some(text.as_str()) {
+                    return None;
+                }
+                self.last_failure = Some(text.clone());
+                Some(text)
+            }
+        }
+    }
+}
+
+/// `synced 3 messages from deadbeef: 2 delivered, 1 duplicate`, naming only the non-zero
+/// outcomes.
+fn synced_line(report: &FetchReport) -> String {
+    let outcomes: Vec<String> = [
+        (report.delivered, "delivered", "delivered"),
+        (report.duplicates, "duplicate", "duplicates"),
+        (report.discarded, "discarded", "discarded"),
+        (report.deferred, "deferred", "deferred"),
+    ]
+    .into_iter()
+    .filter(|(count, _, _)| *count > 0)
+    .map(|(count, one, many)| plural(count, one, many))
+    .collect();
+    let mut line = format!(
+        "synced {} from {}",
+        plural(report.received, "message", "messages"),
+        short(&report.node)
+    );
+    if !outcomes.is_empty() {
+        line.push_str(": ");
+        line.push_str(&outcomes.join(", "));
+    }
+    line
+}
+
+fn plural(count: usize, one: &str, many: &str) -> String {
+    format!("{count} {}", if count == 1 { one } else { many })
 }
 
 #[cfg(test)]
@@ -367,5 +507,178 @@ mod tests {
             !coalescer.other_peers.is_saturated(),
             "the flush resets the saturation with the set"
         );
+    }
+
+    const NODE: &str = "deadbeefdeadbeefdeadbeefdeadbeef";
+
+    fn report(received: usize, delivered: usize, duplicates: usize) -> FetchReport {
+        FetchReport {
+            node: NODE.to_string(),
+            listed: received,
+            wanted: received,
+            received,
+            delivered,
+            duplicates,
+            discarded: 0,
+            deferred: 0,
+            acknowledged: received,
+            response_branch: None,
+        }
+    }
+
+    fn link_failure(text: &str) -> Result<FetchReport, FetchError> {
+        Err(FetchError::Link(R3Error::LinkFailed(text.to_string())))
+    }
+
+    #[test]
+    fn sync_schedule_re_arms_the_interval_from_the_end_of_a_fetch() {
+        let mut schedule = SyncSchedule::new(300);
+        let now = Instant::now();
+        assert_eq!(schedule.due_at(), None);
+        assert!(schedule.accepts_request());
+        schedule.started(NODE.to_string());
+        assert!(
+            !schedule.accepts_request(),
+            "a request while a fetch runs is dropped"
+        );
+        let later = now + Duration::from_secs(40);
+        assert_eq!(schedule.finished(&Ok(report(0, 0, 0)), later), None);
+        assert_eq!(schedule.due_at(), Some(later + Duration::from_secs(300)));
+        assert!(schedule.accepts_request());
+        assert_eq!(
+            schedule.due_at(),
+            None,
+            "accepting a request takes the timer"
+        );
+    }
+
+    #[test]
+    fn sync_schedule_with_a_zero_interval_never_accepts_and_never_arms() {
+        let mut schedule = SyncSchedule::new(0);
+        let now = Instant::now();
+        assert!(!schedule.accepts_request());
+        schedule.no_node(now);
+        assert_eq!(schedule.due_at(), None);
+        assert!(!schedule.accepts_request());
+    }
+
+    #[test]
+    fn sync_schedule_retries_sooner_while_no_node_has_announced() {
+        let now = Instant::now();
+        let mut schedule = SyncSchedule::new(300);
+        schedule.no_node(now);
+        assert_eq!(
+            schedule.due_at(),
+            Some(now + PROPAGATION_SYNC_RETRY_WITHOUT_NODE)
+        );
+        let mut short_interval = SyncSchedule::new(5);
+        short_interval.no_node(now);
+        assert_eq!(
+            short_interval.due_at(),
+            Some(now + Duration::from_secs(5)),
+            "the interval wins when it is the shorter wait"
+        );
+        let mut raced = SyncSchedule::new(300);
+        raced.started(NODE.to_string());
+        assert_eq!(
+            raced.finished(&Err(FetchError::NoPropagationNode), now),
+            None
+        );
+        assert_eq!(
+            raced.due_at(),
+            Some(now + PROPAGATION_SYNC_RETRY_WITHOUT_NODE),
+            "a node that vanished between the check and the fetch is waited for the same way"
+        );
+    }
+
+    #[test]
+    fn sync_schedule_stops_when_the_mesh_is_off() {
+        let now = Instant::now();
+        let mut schedule = SyncSchedule::new(300);
+        schedule.no_node(now);
+        assert!(schedule.due_at().is_some());
+        schedule.mesh_off();
+        assert_eq!(schedule.due_at(), None);
+    }
+
+    #[test]
+    fn sync_schedule_reports_what_arrived_and_stays_quiet_otherwise() {
+        let now = Instant::now();
+        let mut schedule = SyncSchedule::new(300);
+        schedule.started(NODE.to_string());
+        assert_eq!(
+            schedule.finished(&Ok(report(3, 2, 1)), now),
+            Some("synced 3 messages from deadbeef: 2 delivered, 1 duplicate".to_string())
+        );
+        schedule.started(NODE.to_string());
+        assert_eq!(
+            schedule.finished(&Ok(report(1, 1, 0)), now),
+            Some("synced 1 message from deadbeef: 1 delivered".to_string())
+        );
+        schedule.started(NODE.to_string());
+        assert_eq!(schedule.finished(&Ok(report(0, 0, 0)), now), None);
+    }
+
+    #[test]
+    fn sync_schedule_says_a_failure_once_until_it_changes_or_a_fetch_succeeds() {
+        let now = Instant::now();
+        let mut schedule = SyncSchedule::new(300);
+        let hash = "ab".repeat(16);
+        let failure = format!("no known path to destination {hash}");
+        schedule.started(NODE.to_string());
+        let line = schedule.finished(&link_failure(&failure), now).unwrap();
+        assert_eq!(
+            line,
+            "sync from deadbeef failed: The mesh link failed: no known path to destination abababab"
+        );
+        assert_eq!(schedule.due_at(), Some(now + Duration::from_secs(300)));
+
+        schedule.started(NODE.to_string());
+        assert_eq!(
+            schedule.finished(&link_failure(&failure), now),
+            None,
+            "the same failure again is not repeated"
+        );
+        schedule.started(NODE.to_string());
+        assert!(
+            schedule
+                .finished(&link_failure("the relay hung up"), now)
+                .is_some(),
+            "a different failure is said"
+        );
+        schedule.started(NODE.to_string());
+        assert_eq!(schedule.finished(&Ok(report(0, 0, 0)), now), None);
+        schedule.started(NODE.to_string());
+        assert!(
+            schedule
+                .finished(&link_failure("the relay hung up"), now)
+                .is_some(),
+            "a success in between makes the failure news again"
+        );
+    }
+
+    #[test]
+    fn sync_schedule_is_silent_about_a_fetch_running_elsewhere_or_a_stopped_node() {
+        let now = Instant::now();
+        for err in [
+            FetchError::AlreadyRunning,
+            FetchError::HeldByOtherProcess {
+                path: std::path::PathBuf::from("/x/propagation.json"),
+                pid: Some(7),
+            },
+            FetchError::Cancelled,
+            FetchError::Link(R3Error::NotRunning),
+            FetchError::Link(R3Error::Shutdown),
+        ] {
+            let mut schedule = SyncSchedule::new(300);
+            schedule.started(NODE.to_string());
+            assert_eq!(schedule.finished(&Err(err.clone()), now), None, "{err:?}");
+            assert_eq!(
+                schedule.due_at(),
+                Some(now + Duration::from_secs(300)),
+                "{err:?}"
+            );
+            assert!(schedule.accepts_request(), "{err:?}");
+        }
     }
 }

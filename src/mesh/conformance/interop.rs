@@ -14,13 +14,16 @@ use crate::config::Session;
 use crate::mesh::hex_lower;
 use crate::mesh::message::{OutboundPeer, PeerKind, PeerVia};
 use crate::mesh::node::{MeshRuntime, MeshSlot, NodeOptions};
+use crate::mesh::notify::{NotificationSink, RenderedNotification};
 use crate::mesh::test_support::{
     Compatibility, OriginName, TempDir, TrustList, disable_ingress_control, mesh_paths,
     private_config, wait_until,
 };
 use crate::mesh::trust::TrustOptions;
+use crate::repl::idle::testing::driver_on_a_fresh_state;
 use crate::supervisor::mailbox::EnvelopePayload;
 
+use parking_lot::RwLock;
 use rns_transport::destination::DestinationName;
 use serde_json::{Value, json};
 use std::collections::VecDeque;
@@ -397,33 +400,50 @@ struct Node {
     runtime: Arc<MeshRuntime>,
     slot: Arc<MeshSlot>,
     instance_id: String,
-    _tmp: TempDir,
+    port: u16,
+    session: Session,
+    tmp: TempDir,
 }
 
 impl Node {
     /// `session` already carries the instance id, so a caller may have told the reference
     /// which aspect to watch before the start announce goes out.
-    async fn start(tag: &str, port: u16, mut session: Session, trust: &TrustList) -> Self {
+    async fn start(tag: &str, port: u16, session: Session, trust: &TrustList) -> Self {
+        Self::start_on(Arc::new(MeshSlot::default()), tag, port, session, trust).await
+    }
+
+    /// `start` on a slot the caller holds, such as an `AppState`'s.
+    async fn start_on(
+        slot: Arc<MeshSlot>,
+        tag: &str,
+        port: u16,
+        session: Session,
+        trust: &TrustList,
+    ) -> Self {
         let tmp = TempDir::new(tag);
-        let paths = mesh_paths(&tmp);
-        trust.write(&paths.config_dir);
+        trust.write(&mesh_paths(&tmp).config_dir);
+        Self::join(slot, port, session, tmp).await
+    }
+
+    async fn join(slot: Arc<MeshSlot>, port: u16, mut session: Session, tmp: TempDir) -> Self {
         let runtime = MeshRuntime::start(
             &private_config(port),
             true,
             &mut session,
-            paths,
+            mesh_paths(&tmp),
             NodeOptions::default(),
         )
         .await
         .unwrap();
         disable_ingress_control(&runtime).await;
-        let slot = Arc::new(MeshSlot::default());
         slot.install(runtime.clone()).unwrap();
         Self {
             instance_id: runtime.current_instance_id(),
             runtime,
             slot,
-            _tmp: tmp,
+            port,
+            session,
+            tmp,
         }
     }
 
@@ -452,6 +472,33 @@ impl Node {
 
     async fn stop(self) {
         assert!(self.slot.stop().await.unwrap());
+    }
+
+    /// Stops the node and keeps what a rejoin needs: the slot, the session with its
+    /// instance id, and the identity and cache on disk.
+    async fn leave(self) -> Parked {
+        assert!(self.slot.stop().await.unwrap());
+        Parked {
+            slot: self.slot,
+            port: self.port,
+            session: self.session,
+            tmp: self.tmp,
+        }
+    }
+}
+
+/// A node between `leave` and `rejoin`.
+struct Parked {
+    slot: Arc<MeshSlot>,
+    port: u16,
+    session: Session,
+    tmp: TempDir,
+}
+
+impl Parked {
+    /// The same node again: same destination, same slot, a fresh transport.
+    async fn rejoin(self) -> Node {
+        Node::join(self.slot, self.port, self.session, self.tmp).await
     }
 }
 
@@ -777,6 +824,180 @@ async fn the_reference_announce_is_filed_and_it_derives_our_destination_from_our
     drop(reference);
 }
 
+/// Ceiling on the automatic fetch after a rejoin: the join-time sync finds no node yet and
+/// asks again after `PROPAGATION_SYNC_RETRY_WITHOUT_NODE`, by when the node is filed.
+const AUTOMATIC_SYNC_TIMEOUT: Duration = Duration::from_secs(60);
+
+#[derive(Default)]
+struct Printed(parking_lot::Mutex<Vec<String>>);
+
+impl NotificationSink for Printed {
+    fn notify(&self, rendered: RenderedNotification) {
+        self.0.lock().extend(rendered.lines().iter().cloned());
+    }
+}
+
+/// Trusts `destination` on `node` once its announce has been filed.
+async fn trust_peer(node: &Node, destination: &str) {
+    let peers = node.runtime.peers();
+    wait_until("the node to file the peer", || {
+        peers.get(destination).is_some()
+    })
+    .await;
+    node.runtime
+        .trust()
+        .trust_destination(
+            node.slot.as_ref(),
+            destination,
+            TrustOptions::default(),
+            SystemTime::now(),
+        )
+        .unwrap();
+}
+
+async fn wait_for_propagation_node(node: &Node, pn_hash: &str) {
+    let nodes = node.runtime.propagation_nodes();
+    wait_until("the propagation node to be filed", || {
+        nodes
+            .snapshot()
+            .iter()
+            .any(|record| record.node.destination.address_hash.to_hex_string() == pn_hash)
+    })
+    .await;
+}
+
+async fn wait_for_pn_count(reference: &mut Reference, expected: u64) {
+    let deadline = Instant::now() + LINK_TIMEOUT;
+    loop {
+        let count = reference.send("pn_count", json!({}), REQUEST_TIMEOUT).await;
+        if count["count"] == json!(expected) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the propagation node never held {expected} messages: {count}"
+        );
+        sleep(POLL).await;
+    }
+}
+
+/// The receiver runs under an `AppState` with the REPL's idle-time driver on its slot, so
+/// what fetches the held message is the sync the driver runs when the node joins and its
+/// retry once a propagation node is heard, not a call from the test.
+///
+/// Ids: `PROPAGATION_IDS`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs COYOTE_MESH_INTEROP=1 and scripts/mesh-interop/setup.sh"]
+async fn a_message_spooled_while_the_receiver_is_off_is_delivered_after_it_rejoins_without_a_command()
+ {
+    let Some(mut reference) = Reference::spawn().await else {
+        return;
+    };
+    let (session, _) = session_with_instance_id();
+    let sender = Node::start(
+        "interop-sync-sender",
+        reference.ready.relay_port,
+        session,
+        &TrustList::default(),
+    )
+    .await;
+
+    let (app, driver) = driver_on_a_fresh_state();
+    let printed = Arc::new(Printed::default());
+    app.mesh
+        .set_notifier(Arc::clone(&printed) as Arc<dyn NotificationSink>);
+    let (session, _) = session_with_instance_id();
+    let receiver = Node::start_on(
+        Arc::clone(&app.mesh),
+        "interop-sync-receiver",
+        reference.ready.relay_port,
+        session,
+        &TrustList::default(),
+    )
+    .await;
+    let receiver_destination = receiver.runtime.current_destination_hash();
+    // Announces reach only the nodes joined when they are sent: the sender, up first, hears
+    // the receiver's; the receiver hears the sender's after both have restarted below.
+    trust_peer(&sender, &receiver_destination).await;
+
+    let pn = reference
+        .send("pn_start", json!({ "cost": 0 }), REQUEST_TIMEOUT)
+        .await;
+    let pn_hash = pn["destination_hash"].as_str().unwrap().to_string();
+    wait_for_propagation_node(&sender, &pn_hash).await;
+    wait_for_propagation_node(&receiver, &pn_hash).await;
+
+    let parked = receiver.leave().await;
+    assert!(app.mesh.get().is_none());
+
+    let message = OutboundPeer {
+        kind: PeerKind::Message,
+        id: "held-1".to_string(),
+        in_reply_to: None,
+        title: None,
+        content: "words for later".to_string(),
+        fields: None,
+    };
+    let sent = tokio::time::timeout(
+        STORE_AND_FORWARD_TIMEOUT,
+        sender.runtime.send_peer(&receiver_destination, &message),
+    )
+    .await
+    .expect("the send falls back before the suite's ceiling")
+    .unwrap();
+    assert_eq!(sent.via, PeerVia::StoreAndForward, "{PROPAGATION_IDS:?}");
+    wait_for_pn_count(&mut reference, 1).await;
+
+    let receiver = parked.rejoin().await;
+    assert!(app.mesh.get().is_some());
+    // The rejoined transport knows no identities yet; the sender's start announce brings
+    // back the key the held message was signed with.
+    let sender = sender.leave().await.rejoin().await;
+    trust_peer(&receiver, &sender.runtime.current_destination_hash()).await;
+    reference
+        .send("pn_announce", json!({}), REQUEST_TIMEOUT)
+        .await;
+    wait_for_propagation_node(&receiver, &pn_hash).await;
+
+    let inbox = app.mesh.peer_inbox();
+    let deadline = Instant::now() + AUTOMATIC_SYNC_TIMEOUT;
+    while inbox.len() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the driver never fetched the held message; printed: {:?}",
+            printed.0.lock()
+        );
+        sleep(POLL).await;
+    }
+    let (envelopes, dropped) = inbox.drain();
+    assert_eq!(dropped, 0);
+    assert_eq!(envelopes.len(), 1, "{envelopes:?}");
+    let EnvelopePayload::Peer(received) = &envelopes[0].payload else {
+        panic!("not a peer envelope: {:?}", envelopes[0].payload);
+    };
+    assert_eq!(received.message_id, "held-1");
+    assert_eq!(received.content, "words for later");
+    assert_eq!(received.via, PeerVia::StoreAndForward);
+    assert_eq!(
+        received.source_destination,
+        sender.runtime.current_destination_hash()
+    );
+    wait_until("the sync line to be printed", || {
+        printed
+            .0
+            .lock()
+            .iter()
+            .any(|line| line.contains("[mesh:propagation] synced 1 message"))
+    })
+    .await;
+    wait_for_pn_count(&mut reference, 0).await;
+
+    driver.stop().await;
+    assert!(app.mesh.stop().await.unwrap());
+    sender.stop().await;
+    drop(reference);
+}
+
 /// Ids: `REPLY_VALID_IDS` and `REPLY_INVALID_IDS`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs COYOTE_MESH_INTEROP=1 and scripts/mesh-interop/setup.sh"]
@@ -1038,18 +1259,7 @@ async fn a_propagation_node_demanding_a_raised_stamp_cost_still_takes_our_messag
     .unwrap();
     assert_eq!(sent.via, PeerVia::StoreAndForward, "{PROPAGATION_IDS:?}");
 
-    let deadline = Instant::now() + LINK_TIMEOUT;
-    loop {
-        let count = reference.send("pn_count", json!({}), REQUEST_TIMEOUT).await;
-        if count["count"] == json!(1) {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the propagation node never stored the message: {count}"
-        );
-        sleep(POLL).await;
-    }
+    wait_for_pn_count(&mut reference, 1).await;
     let stored = reference
         .send("pn_messages", json!({}), REQUEST_TIMEOUT)
         .await;
