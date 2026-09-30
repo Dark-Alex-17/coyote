@@ -7,6 +7,15 @@
 //! to stdout while the terminal is in cooked mode, so the tests never have to parse the
 //! escape sequences reedline paints in between.
 //!
+//! After the `TARGET-READY` line (and `ARMED:ctrlc`, when it applies) the target blocks
+//! on one line from stdin before it enters the editor. The harness sends that line only
+//! once it has finished setting up the pty, in particular the window size: `TIOCSWINSZ`
+//! raises `SIGWINCH`, and if that signal reaches crossterm's event reader in the same
+//! wake-up as the terminal's reply to the cursor position query, crossterm returns the
+//! resize without draining the tty and, with edge-triggered polling, never sees the reply;
+//! `read_line` then fails after crossterm's two-second timeout. While the target waits
+//! here no handler is installed, so the signal is discarded and the race cannot start.
+//!
 //! Injection is driven by what the user types, not by time: when the buffer first
 //! equals the marker text (`PTY_TARGET_INJECT_WHEN_BUFFER`), the line in
 //! `PTY_TARGET_INJECT_LINE` is pushed through the external printer, exactly once.
@@ -24,6 +33,7 @@
 
 use std::borrow::Cow;
 use std::env;
+use std::io::{self, BufRead};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use nu_ansi_term::Style;
@@ -113,6 +123,11 @@ fn main() {
         println!("ARMED:ctrlc");
     }
 
+    let mut go = String::new();
+    io::stdin()
+        .lock()
+        .read_line(&mut go)
+        .expect("read the go line from the harness");
     loop {
         match editor.read_line(&FixedPrompt) {
             Ok(Signal::Success(buffer)) => println!("READ:{buffer}"),

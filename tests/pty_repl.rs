@@ -19,6 +19,7 @@
 
 #![cfg(unix)]
 
+use std::cell::RefCell;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
@@ -53,6 +54,24 @@ const INJECT_ON_CTRLC_ENV: &str = "PTY_TARGET_INJECT_ON_CTRLC";
 const INJECTED_LINE: &str = "[mesh] peer said hi";
 const INJECTED_ON_CTRLC_LINE: &str = "[mesh] envoy finished while you were away";
 
+thread_local! {
+    /// Everything this test consumed from or sent to its target, tagged, for the failure
+    /// report: an `EOF` from `expect` carries no bytes of its own, and the target's last
+    /// words (its `ERROR:` line, usually) are what tell a harness fault from a target one.
+    /// Tests run one per thread, so a thread-local is per session.
+    static TRANSCRIPT: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+fn record(tag: &str, bytes: &[u8]) {
+    TRANSCRIPT.with(|transcript| {
+        let mut transcript = transcript.borrow_mut();
+        transcript.extend_from_slice(b"\n<");
+        transcript.extend_from_slice(tag.as_bytes());
+        transcript.extend_from_slice(b">");
+        transcript.extend_from_slice(bytes);
+    });
+}
+
 /// Path of the example binary `cargo test` builds alongside the test executable.
 fn target_binary() -> PathBuf {
     let mut path = std::env::current_exe().expect("test executable path");
@@ -85,6 +104,17 @@ fn target_command() -> Command {
     command
 }
 
+/// Spawns the target, sizes its window, and releases it into the editor once
+/// `TARGET-READY` has been read.
+///
+/// The order matters. Setting the window size raises `SIGWINCH` in the target, and
+/// crossterm's event reader (mio backend, edge-triggered) returns a resize without
+/// draining the tty when the signal and the reply to a cursor position query land in
+/// the same wake-up; the reply is then never read and `read_line` fails after
+/// crossterm's two-second timeout. The target does not install a handler until it
+/// enters the editor, and it waits for a line on stdin before doing so, so sending that
+/// line here, after the resize, guarantees the signal was discarded before the reader
+/// existed. Sending it before the resize, or resizing later, reopens the race.
 fn spawn_target(command: Command) -> Target {
     let mut session = Session::spawn(command).expect("spawn pty target");
     session
@@ -92,7 +122,15 @@ fn spawn_target(command: Command) -> Target {
         .set_window_size(TERMINAL_COLUMNS, TERMINAL_ROWS)
         .expect("set pty window size");
     session.set_expect_timeout(Some(EXPECT_TIMEOUT));
+    wait_for(&mut session, "TARGET-READY");
+    send(&mut session, "\n");
     session
+}
+
+/// Sends `bytes` to the target and records them in the transcript.
+fn send(session: &mut Target, bytes: &str) {
+    session.send(bytes).expect("send to the pty target");
+    record("SEND", bytes.as_bytes());
 }
 
 /// Waits for `needle`, answering every cursor position query that arrives first.
@@ -104,17 +142,34 @@ fn spawn_target(command: Command) -> Target {
 /// is first-needle-wins rather than earliest-offset; that is safe here because
 /// crossterm blocks on the position query until it is answered, so a query and later
 /// output never share a read.
+///
+/// On failure the panic carries the whole transcript plus whatever the target wrote
+/// after the last match, so an `EOF` shows the target's final `ERROR:` line.
 fn wait_for(session: &mut Target, needle: &str) -> Vec<u8> {
     let mut before = Vec::new();
     loop {
-        let captures = session
-            .expect(Any([needle, CURSOR_POSITION_QUERY]))
-            .unwrap_or_else(|err| panic!("waiting for {needle:?}: {err}"));
+        let captures = match session.expect(Any([needle, CURSOR_POSITION_QUERY])) {
+            Ok(captures) => captures,
+            Err(err) => {
+                let mut leftover = Vec::new();
+                let mut chunk = [0u8; 4096];
+                while let Ok(n) = session.try_read(&mut chunk) {
+                    if n == 0 {
+                        break;
+                    }
+                    leftover.extend_from_slice(&chunk[..n]);
+                }
+                record("LEFTOVER", &leftover);
+                let transcript = TRANSCRIPT
+                    .with(|transcript| String::from_utf8_lossy(&transcript.borrow()).into_owned());
+                panic!("waiting for {needle:?}: {err}\ntranscript:{transcript}");
+            }
+        };
+        record("before", captures.before());
+        record("match", captures.get(0).unwrap_or_default());
         before.extend_from_slice(captures.before());
         if captures.get(0) == Some(CURSOR_POSITION_QUERY.as_bytes()) {
-            session
-                .send(CURSOR_POSITION_REPLY)
-                .expect("reply to the cursor position query");
+            send(session, CURSOR_POSITION_REPLY);
             continue;
         }
         return before;
@@ -146,10 +201,9 @@ fn strip_csi(bytes: &[u8]) -> String {
 fn a_typed_line_is_read_back_through_the_pty() {
     let mut session = spawn_target(target_command());
 
-    wait_for(&mut session, "TARGET-READY");
     wait_for(&mut session, "pty");
-    session.send("hello").expect("type the line");
-    session.send("\r").expect("press enter");
+    send(&mut session, "hello");
+    send(&mut session, "\r");
     wait_for(&mut session, "READ:hello");
 }
 
@@ -168,9 +222,8 @@ fn a_multi_row_injection_paints_each_row_at_column_one_above_the_prompt() {
     command.env(INJECT_LINE_ENV, format!("{FIRST_ROW}\n{SECOND_ROW}"));
     let mut session = spawn_target(command);
 
-    wait_for(&mut session, "TARGET-READY");
     wait_for(&mut session, "pty");
-    session.send("hel").expect("type half the word");
+    send(&mut session, "hel");
 
     let before_first = strip_csi(&wait_for(&mut session, FIRST_ROW));
     assert!(
@@ -201,8 +254,8 @@ fn a_multi_row_injection_paints_each_row_at_column_one_above_the_prompt() {
         "prompt was not redrawn with the partial text and the cursor at its end: {redrawn:?}"
     );
 
-    session.send("lo").expect("type the rest of the word");
-    session.send("\r").expect("press enter");
+    send(&mut session, "lo");
+    send(&mut session, "\r");
     wait_for(&mut session, "READ:hello");
 }
 
@@ -218,11 +271,10 @@ fn ctrl_c_with_a_line_queued_across_the_interrupt_leaves_the_prompt_usable() {
     command.env(INJECT_ON_CTRLC_ENV, INJECTED_ON_CTRLC_LINE);
     let mut session = spawn_target(command);
 
-    wait_for(&mut session, "TARGET-READY");
     wait_for(&mut session, "ARMED:ctrlc");
     wait_for(&mut session, "pty");
 
-    session.send("\x03").expect("press ctrl-c");
+    send(&mut session, "\x03");
     wait_for(&mut session, "SIGNAL:ctrl-c");
     let before = strip_csi(&wait_for(&mut session, INJECTED_ON_CTRLC_LINE));
     assert!(
@@ -231,9 +283,7 @@ fn ctrl_c_with_a_line_queued_across_the_interrupt_leaves_the_prompt_usable() {
     );
     wait_for(&mut session, "pty");
 
-    session
-        .send("hello\r")
-        .expect("type a line and press enter");
+    send(&mut session, "hello\r");
     wait_for(&mut session, "READ:hello");
 }
 
@@ -248,18 +298,15 @@ fn ctrl_c_after_a_line_painted_over_a_half_typed_buffer_leaves_the_prompt_usable
     command.env(CONTINUE_ON_CTRLC_ENV, "1");
     let mut session = spawn_target(command);
 
-    wait_for(&mut session, "TARGET-READY");
     wait_for(&mut session, "pty");
-    session.send("hel").expect("type half the word");
+    send(&mut session, "hel");
     wait_for(&mut session, INJECTED_LINE);
 
-    session.send("\x03").expect("press ctrl-c");
+    send(&mut session, "\x03");
     wait_for(&mut session, "SIGNAL:ctrl-c");
     wait_for(&mut session, "pty");
 
-    session
-        .send("hello\r")
-        .expect("type a line and press enter");
+    send(&mut session, "hello\r");
     wait_for(&mut session, "READ:hello");
 }
 
@@ -276,9 +323,8 @@ fn an_injected_line_leaves_the_half_typed_buffer_and_cursor_intact() {
     command.env(INJECT_LINE_ENV, INJECTED_LINE);
     let mut session = spawn_target(command);
 
-    wait_for(&mut session, "TARGET-READY");
     wait_for(&mut session, "pty");
-    session.send("hel").expect("type half the word");
+    send(&mut session, "hel");
 
     wait_for(&mut session, INJECTED_LINE);
     // The repaint that follows the injected line ends with the cursor being
@@ -293,7 +339,7 @@ fn an_injected_line_leaves_the_half_typed_buffer_and_cursor_intact() {
         "prompt was not redrawn with the partial text and the cursor at its end: {redrawn:?}"
     );
 
-    session.send("lo").expect("type the rest of the word");
-    session.send("\r").expect("press enter");
+    send(&mut session, "lo");
+    send(&mut session, "\r");
     wait_for(&mut session, "READ:hello");
 }
