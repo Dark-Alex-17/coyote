@@ -500,23 +500,49 @@ fn the_passed_over_win32_crates_stay_recorded() {
 }
 
 /// These dependencies cost compile time, and the Windows figure cannot be taken from
-/// a unix host. The measurement therefore lives in a tracked file with the Windows
-/// row explicitly outstanding, so the gap stays visible instead of reading as zero.
+/// a unix host, so it was read off the first green `windows-latest` CI run and written
+/// into the tracked guide. The row used to carry `TBD`; a placeholder there would now
+/// mean the record regressed, so this pins the filled figures, the verdict the task
+/// required, and the three-OS green result.
 #[test]
-fn the_dependency_cost_record_is_tracked_and_names_the_windows_gap() {
-    let guide = read_prose("CONTRIBUTING.md");
+fn the_dependency_cost_record_carries_the_measured_windows_figures_and_a_verdict() {
+    let raw = read_tracked("CONTRIBUTING.md");
+    let guide = squash(&raw);
 
     assert!(
         guide.contains("cargo test --all`, test execution only"),
         "the full-suite wall clock must be recorded in the tracked guide"
     );
+
+    let windows_rows: Vec<&str> = raw
+        .lines()
+        .filter(|line| line.starts_with("| `windows-latest` CI leg"))
+        .collect();
+    assert_eq!(
+        windows_rows.len(),
+        2,
+        "the build-cost table must carry the job-duration row and the Test-step row for \
+         windows-latest; found {windows_rows:?}"
+    );
+    for row in &windows_rows {
+        assert!(
+            !row.contains("TBD") && !row.contains("not measured"),
+            "the windows-latest rows were filled from CI and must not regress to a \
+             placeholder; found {row:?}"
+        );
+    }
     assert!(
-        guide.contains("windows-latest` CI leg"),
-        "the record must carry a Windows row, the one figure a unix host cannot measure"
+        windows_rows[0].contains("1h02m41s") && windows_rows[1].contains("3m13s"),
+        "the windows-latest rows must carry the figures read off the first green run"
+    );
+
+    assert!(
+        guide.contains("Verdict: acceptable"),
+        "the record must state whether the Windows cost is acceptable, not only what it is"
     );
     assert!(
-        guide.contains("cannot be measured outside CI"),
-        "the record must say why the Windows row is outstanding rather than leaving it blank"
+        guide.contains("green under `-D warnings` on all three OSes"),
+        "the record must carry the three-OS green result for `cargo build` and `cargo test --all`"
     );
 }
 
@@ -742,8 +768,8 @@ fn usage_probe_contributing_retired_the_interim_pin_prose_and_kept_the_records()
     }
     assert!(
         raw.lines()
-            .any(|line| { line.starts_with("| `windows-latest` CI leg") && line.contains("TBD") }),
-        "the build-cost table must keep its outstanding windows-latest row until CI fills it"
+            .any(|line| { line.starts_with("| `windows-latest` CI leg") && !line.contains("TBD") }),
+        "the build-cost table must keep its windows-latest row, filled from CI"
     );
 }
 

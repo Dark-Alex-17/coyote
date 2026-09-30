@@ -119,10 +119,11 @@ the license expression for the combined work, is the license owner's call and is
 ### Dependency build-cost records
 
 A point-in-time record for the LXMF-rs and windows-sys dependency addition of 2026-09, not a
-standing benchmark. Fill the Windows row from the first CI run that includes those dependencies,
-then leave the table as history. Figures measured 2026-09-23 on Linux aarch64 with 18 cores,
-debug profile, populated `target/`. Treat them as an order of magnitude, not a budget: CI runners
-have far fewer cores, so expect several times these numbers there.
+standing benchmark. The Windows rows were filled from the first green CI run that included those
+dependencies; the table is history now, not a target to hold later runs to. Local figures measured
+2026-09-23 on Linux aarch64 with 18 cores, debug profile, populated `target/`. Treat them as an
+order of magnitude, not a budget: CI runners have far fewer cores, so expect several times these
+numbers there.
 
 The matching functional record, which release of the mesh crates the conformance, interop and fuzz
 suites were last run against and with what result, lives in `scripts/mesh-interop/README.md`.
@@ -133,7 +134,8 @@ suites were last run against and with what result, lives in `scripts/mesh-intero
 | `cargo test --all` including the recompile the change forces | 64s | 77s |
 | Clean rebuild of the 24 dependency crates the change adds | n/a | 8s |
 | Of which the bundled SQLite C amalgamation | n/a | 2s |
-| `windows-latest` CI leg, total job duration | not measured | TBD, fill from the first CI run |
+| `windows-latest` CI leg, total job duration | 9m13s (warm caches) | 1h02m41s (cold caches, see breakdown below) |
+| `windows-latest` CI leg, `Test` step only | 5m02s (compile included, warm cache) | 3m13s (incremental after a full compile) |
 
 The suite itself does not get slower, and what the table measures is compile time: compile time
 now, binary size once the mesh code lands. Nothing under `src/` consumes these crates yet, so the
@@ -146,13 +148,33 @@ bundled SQLite in, so the SQLite C amalgamation is now compiled on every platfor
 Windows and anywhere pkg-config finds no system libbz2. A C toolchain was already required
 everywhere for `duckdb`'s bundled build, so this adds compile time but no new prerequisite.
 
-The Windows figure is the one that matters most, because Windows is where the C compile is
+The Windows figure was the one that mattered most, because Windows is where the C compile is
 slowest and where nothing previously exercised `rusqlite`. It cannot be measured outside CI from a
-non-Windows host: read it off the `windows-latest` leg of the first CI run that includes these
-dependencies, and raise it if that leg regresses materially against its previous duration.
+non-Windows host, so it was read off the `windows-latest` leg of the first green CI run that
+included these dependencies, on head `dc10206` of PR #32, 2026-09-30. The "before" column is the
+`main` run of 2026-09-26 (`36275883120`) with warm caches.
+
+Verdict: acceptable. The 1h02m41s wall is not the cost of the mesh dependencies. It breaks down as
+rust-cache restore 3m09s, `Install DuckDB Extensions` 17m18s, `Test` 3m13s, Clippy and Format
+about 2m, rust-cache save 27m58s. The two large items are one-time cache effects that any
+`Cargo.lock` change incurs: the DuckDB step is `cargo test --all duckdb`, a full workspace compile
+that missed its cache on this branch and takes 0s on `main` where it hits, and the save is the
+first write of a populated `target/` under the new cache key, not re-incurred while the key is
+stable. The comparable number is the `Test` step, 3m13s against 5m02s on `main`; the branch's step
+was incremental after the DuckDB compile while `main`'s carried the compile itself, so the
+comparison is not exact, but it is not slower. The bundled SQLite compile sits inside the 17m18s
+full-workspace compile and cannot be isolated on CI; the 2s local figure above is the only
+measurement of it. The escape hatch, turning the `storage` feature off, stays documented in the
+mesh plan and was not needed.
+
+On the same run `cargo build` and `cargo test --all` were green under `-D warnings` on all three
+OSes: `ubuntu-latest` 7m28s, `macos-latest` 10m16s, `windows-latest` as above, with `Merge Gates`
+and `Mesh Interop` green alongside. PR #32's Windows leg was the first msvc compile of the
+`cfg(windows)` call-site test in `tests/mesh_dependencies.rs` and of `src/utils/windows_acl.rs`;
+on this run both compiled and the test passed.
 
 The eight-target release matrix in `.github/workflows/release.yaml`, four of whose legs build
-through `cross` including the musl targets, is not exercised before merge either. `duckdb`'s
+through `cross` including the musl targets, is not exercised before merge. `duckdb`'s
 bundled build already forces a C toolchain onto those images, so the two new C compiles should
 follow, but the first release is where that is actually tested.
 
@@ -197,14 +219,15 @@ and `HLOCAL` in `Win32/Foundation`, `ACL` in `Win32/Security`,
 `cfg(windows)` test in `tests/mesh_dependencies.rs` names those items, so the windows-latest leg
 checks the feature-to-call mapping itself instead of the manifest text that claims it.
 
-**Not** checked, and unverified until the first CI run: anything that compiles for the msvc
-target, or links or runs for any Windows target. `cargo check --target x86_64-pc-windows-msvc`
-cannot run from a Linux host here at all. It exits 101 inside dependency build scripts, long
-before reaching this crate, because the host C compiler cannot target Windows:
+**Not** checked from the Linux host, and left to CI: anything that compiles for the msvc target,
+or links or runs for any Windows target. `cargo check --target x86_64-pc-windows-msvc` cannot run
+from a Linux host here at all. It exits 101 inside dependency build scripts, long before reaching
+this crate, because the host C compiler cannot target Windows:
 `cc: error: unrecognized command-line option '-m64'`, from `ring`'s `cc-rs` invocation, with
 `rusqlite`, `bzip2-sys` and `duckdb` against the same wall. Whether the windows tests pass, and
-whether `cargo build` and `cargo test --all` pass on `macos-latest` and `windows-latest`, are
-answered by the first CI run that includes these dependencies and by nothing before it.
+whether `cargo build` and `cargo test --all` pass on `macos-latest` and `windows-latest`, were
+answered by the first green CI run that included these dependencies, recorded under
+[Dependency build-cost records](#dependency-build-cost-records) above: yes on all three.
 
 The gnu target does compile from Linux, which is how the `cfg(windows)` code was type-checked and
 linted before that run. With the target added (`rustup target add x86_64-pc-windows-gnu`),
