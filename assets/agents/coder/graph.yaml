@@ -39,7 +39,7 @@ settings:
 initial_state:
   project_dir: ''
   fix_attempts: 0
-  max_fix_attempts: 3
+  max_fix_attempts: 5
   fix_instructions: ''
   build_output: ''
   tests_output: ''

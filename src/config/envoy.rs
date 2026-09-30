@@ -1435,7 +1435,7 @@ mod tests {
         assert!(ctx.session.is_none());
 
         run_async(ctx.use_session(&app, None, create_abort_signal())).unwrap();
-        let err = ctx.save_session(Some("notes")).unwrap_err();
+        let err = ctx.save_session(Some("notes"), None).unwrap_err();
         assert!(
             err.to_string().contains("does not keep sessions"),
             "{err:#}"

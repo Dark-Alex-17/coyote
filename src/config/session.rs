@@ -12,8 +12,10 @@ use inquire::{Confirm, Text, validator::Validation};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
-use std::fs::{read_to_string, write};
-use std::path::Path;
+use std::fmt;
+use std::fs::{OpenOptions, read_to_string, remove_file, rename};
+use std::io::{self, Write as _};
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 static RE_AUTONAME_PREFIX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\d{8}T\d{6}-").unwrap());
@@ -39,6 +41,62 @@ fn mint_mesh_instance_id() -> String {
 pub struct ForkRekey {
     pub original_instance_id: Option<String>,
     pub fork_instance_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SessionScope {
+    #[default]
+    Global,
+    Workspace,
+}
+
+impl fmt::Display for SessionScope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SessionScope::Global => write!(f, "global"),
+            SessionScope::Workspace => write!(f, "workspace"),
+        }
+    }
+}
+
+pub fn session_scope_dirs(agent: Option<&str>) -> (PathBuf, PathBuf) {
+    match agent {
+        Some(agent) => (
+            paths::workspace_agent_sessions_dir(agent),
+            paths::agent_sessions_dir(agent),
+        ),
+        None => (paths::workspace_sessions_dir(), default_sessions_dir()),
+    }
+}
+
+/// Session names across both scope dirs, workspace first, deduped by name so
+/// a workspace session shadows a global one with the same name.
+pub fn labeled_session_names(
+    workspace_dir: &Path,
+    global_dir: &Path,
+) -> Vec<(String, SessionScope)> {
+    let mut values = Vec::new();
+    let mut seen = HashSet::new();
+    for (dir, scope) in [
+        (workspace_dir, SessionScope::Workspace),
+        (global_dir, SessionScope::Global),
+    ] {
+        for name in list_file_names(dir, ".yaml") {
+            if seen.insert(name.clone()) {
+                values.push((name, scope));
+            }
+        }
+    }
+    values
+}
+
+pub fn merged_session_names(workspace_dir: &Path, global_dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = labeled_session_names(workspace_dir, global_dir)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    names.sort_unstable();
+    names
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -134,6 +192,8 @@ pub struct Session {
     #[serde(skip)]
     path: Option<String>,
     #[serde(skip)]
+    scope: SessionScope,
+    #[serde(skip)]
     dirty: bool,
     #[serde(skip)]
     save_session_this_time: bool,
@@ -187,6 +247,7 @@ impl Session {
         app: &AppConfig,
         name: &str,
         path: &Path,
+        scope: SessionScope,
     ) -> Result<Self> {
         let content = read_to_string(path)
             .with_context(|| format!("Failed to load session {} at {}", name, path.display()))?;
@@ -194,6 +255,7 @@ impl Session {
             serde_yaml::from_str(&content).with_context(|| format!("Invalid session {name}"))?;
 
         session.model = Model::retrieve_model(app, &session.model_id, ModelType::Chat)?;
+        session.scope = scope;
 
         if let Some(autoname) = name.strip_prefix("_/") {
             session.name = TEMP_SESSION_NAME.to_string();
@@ -268,6 +330,14 @@ impl Session {
 
     pub fn set_name(&mut self, name: String) {
         self.name = name;
+    }
+
+    pub fn scope(&self) -> SessionScope {
+        self.scope
+    }
+
+    pub fn set_scope(&mut self, scope: SessionScope) {
+        self.scope = scope;
     }
 
     pub fn clear_autoname(&mut self) {
@@ -398,6 +468,7 @@ impl Session {
     pub fn export(&self) -> Result<String> {
         let mut data = json!({
             "path": self.path,
+            "scope": self.scope.to_string(),
             "model": self.model().id(),
         });
         if let Some(temperature) = self.temperature() {
@@ -488,6 +559,7 @@ impl Session {
         if let Some(path) = &self.path {
             items.push(("path", path.to_string()));
         }
+        items.push(("scope", self.scope.to_string()));
 
         if let Some(autoname) = self.autoname() {
             items.push(("autoname", autoname.to_string()));
@@ -971,17 +1043,52 @@ impl Session {
     pub fn save(&mut self, session_name: &str, session_path: &Path, is_repl: bool) -> Result<()> {
         ensure_parent_exists(session_path)?;
 
-        self.path = Some(session_path.display().to_string());
-
         let content = serde_yaml::to_string(&self)
             .with_context(|| format!("Failed to serde session '{}'", self.name))?;
-        write(session_path, content).with_context(|| {
+        // Write through a sibling temp file and rename it over the target so a
+        // symlink planted at the session path is replaced, never followed. The
+        // temp file is opened with create_new so a symlink planted at the temp
+        // path is not followed either; a stale entry there is removed and the
+        // open retried once.
+        let mut tmp_name = session_path.as_os_str().to_os_string();
+        tmp_name.push(format!(".{}.tmp", process::id()));
+        let tmp_path = PathBuf::from(tmp_name);
+        let write_context = || {
             format!(
                 "Failed to write session '{}' to '{}'",
                 self.name,
                 session_path.display()
             )
-        })?;
+        };
+        let open_tmp = || {
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp_path)
+        };
+        let mut tmp_file = match open_tmp() {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                remove_file(&tmp_path).with_context(write_context)?;
+                open_tmp().with_context(write_context)?
+            }
+            Err(error) => return Err(error).with_context(write_context),
+        };
+        if let Err(error) = tmp_file
+            .write_all(content.as_bytes())
+            .and_then(|_| tmp_file.flush())
+        {
+            drop(tmp_file);
+            let _ = remove_file(&tmp_path);
+            return Err(error).with_context(write_context);
+        }
+        drop(tmp_file);
+        if let Err(error) = rename(&tmp_path, session_path) {
+            let _ = remove_file(&tmp_path);
+            return Err(error).with_context(write_context);
+        }
+
+        self.path = Some(session_path.display().to_string());
 
         if is_repl {
             println!("✓ Saved the session to '{}'.", session_path.display());
@@ -1546,6 +1653,16 @@ mod tests {
     }
 
     #[test]
+    fn session_scope_is_not_serialized() {
+        let mut session = Session::default();
+        session.set_scope(SessionScope::Workspace);
+
+        let yaml = serde_yaml::to_string(&session).unwrap();
+
+        assert!(!yaml.contains("scope"));
+    }
+
+    #[test]
     fn session_deserialization_ignores_injected_role_hooks() {
         // A session file is attacker-writable data: a `role_hooks:` key
         // crafted into it must never deserialize into executable hook
@@ -1584,8 +1701,10 @@ mod tests {
     fn session_export_includes_real_usage_only_when_reported() {
         let empty = Session::default().export().unwrap();
         assert!(!empty.contains("real_input_tokens"));
+        assert!(empty.contains("scope: global"));
 
         let mut session = Session::default();
+        session.set_scope(SessionScope::Workspace);
         session.accumulate_token_usage(&TokenUsage {
             input_tokens: Some(5),
             output_tokens: Some(7),
@@ -1593,10 +1712,95 @@ mod tests {
             cache_read_input_tokens: Some(3),
         });
         let exported = session.export().unwrap();
+        assert!(exported.contains("scope: workspace"));
         assert!(exported.contains("real_input_tokens: 5"));
         assert!(exported.contains("real_output_tokens: 7"));
         assert!(exported.contains("cache_read_tokens: 3"));
         assert!(!exported.contains("cache_creation_tokens"));
+    }
+
+    fn rendered_lines(session: &Session) -> Vec<String> {
+        let options = crate::render::RenderOptions {
+            raw_markdown: true,
+            ..Default::default()
+        };
+        let mut render = MarkdownRender::init(options).unwrap();
+        session
+            .render(&mut render, &None)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn session_render_reports_scope_line() {
+        let mut session = Session::default();
+        assert!(
+            rendered_lines(&session)
+                .iter()
+                .any(|line| line.starts_with("scope") && line.ends_with("global"))
+        );
+
+        session.set_scope(SessionScope::Workspace);
+        assert!(
+            rendered_lines(&session)
+                .iter()
+                .any(|line| line.starts_with("scope") && line.ends_with("workspace"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_save_replaces_a_symlink_instead_of_following_it() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("coyote-session-save-symlink-{unique}"));
+        let sessions_dir = dir.join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let target = dir.join("target.txt");
+        std::fs::write(&target, "untouched").unwrap();
+        let link = sessions_dir.join("link.yaml");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let mut session = Session::default();
+        session.save("link", &link, false).unwrap();
+
+        assert_eq!(read_to_string(&target).unwrap(), "untouched");
+        assert!(link.symlink_metadata().unwrap().is_file());
+        assert!(read_to_string(&link).unwrap().contains("model:"));
+        assert_eq!(session.name(), "link");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_save_does_not_follow_a_symlink_planted_at_the_temp_path() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("coyote-session-save-tmp-symlink-{unique}"));
+        let sessions_dir = dir.join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let target = dir.join("target.txt");
+        std::fs::write(&target, "untouched").unwrap();
+        let destination = sessions_dir.join("notes.yaml");
+        let mut tmp_name = destination.as_os_str().to_os_string();
+        tmp_name.push(format!(".{}.tmp", process::id()));
+        let tmp_path = PathBuf::from(tmp_name);
+        std::os::unix::fs::symlink(&target, &tmp_path).unwrap();
+
+        let mut session = Session::default();
+        session.save("notes", &destination, false).unwrap();
+
+        assert_eq!(read_to_string(&target).unwrap(), "untouched");
+        assert!(destination.symlink_metadata().unwrap().is_file());
+        assert!(read_to_string(&destination).unwrap().contains("model:"));
+        assert!(!tmp_path.exists(), "temp file must not be left behind");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

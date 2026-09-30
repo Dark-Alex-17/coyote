@@ -205,8 +205,25 @@ nodes:
       confirm the change makes the criterion true, confirm the test targets
       BEHAVIOR (not implementation echo), use ast_grep for structural claims.
       Watch for gamed evidence: a test weakened/deleted so it passes, hardcoded
-      values shaped to the criterion's example, TODO/stub presented as done —
+      values shaped to the criterion's example, TODO/stub presented as done, a
+      mock expectation whose count is relaxed (`AnyTimes`, `MinTimes`, ignored
+      request body) AND whose matcher is permissive (`gomock.Any()`,
+      `mock.Anything`) — it proves a call happened, never that it carried the
+      criterion's values, so it is not a proving test —
       those are PARTIAL or DIVERGED with the gaming named in the complaint.
+
+      Retry / redelivery / idempotency demands: before you mark a criterion PARTIAL
+      or UNMET for lacking a retry, re-run, or "second attempt emits nothing" spec,
+      classify the handler. STATEFUL — it carries something across attempts (emits
+      events, calls an external system, performs an unconditional write, keeps an
+      in-memory or ledger record) — a retry spec is a legitimate demand. STATELESS —
+      each attempt is a pure function of the request plus a conditional store
+      predicate (`WHERE status = 'pending'`, `ended_at IS NULL`, `INSERT … ON
+      CONFLICT DO NOTHING`) and nothing is emitted or ledgered outside that
+      predicate — then "retry produces no event" is a tautology of the mechanism,
+      not a missing behavior: demand at most one test of the predicate itself,
+      never a retry spec. Name the classification and its file:line evidence in
+      the complaint either way.
 
       Execution criteria ("tests pass", "lint clean", "build succeeds") are
       judged ONLY against the recorded verification runs in your prompt — you
@@ -297,7 +314,10 @@ nodes:
       The checklist (each hit becomes one complaint with kind, file:line
       location, the violation, and the fix):
       - **Absence** — something the PLAN requires that maps to no criterion and
-        never showed up in the diff (the dog that didn't bark).
+        never showed up in the diff (the dog that didn't bark). A missing
+        retry/redelivery spec is an absence ONLY for a handler that carries state
+        or side effects across attempts; a handler that is a pure function of the
+        request plus a conditional store predicate owes none.
       - **Scope drift / out-of-scope** — the diff touches what the plan's scope
         notes say not to touch, or quietly does extra unplanned work.
       - **Interface/approach substitution** — the plan named an interface,

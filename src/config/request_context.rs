@@ -2,19 +2,24 @@ use super::bundles::installed_bundle_names;
 use super::mcp_tool_policy::{McpToolPolicy, SkillMcpLayer, ToolFilter, expand_mcp_server_alias};
 use super::mesh_config::{MeshBrief, render_mesh_info};
 use super::rag_cache::{RagCache, RagKey};
-use super::session::{ForkRekey, INTERRUPTED_RESPONSE_TEXT, Session};
+use super::session::{
+    ForkRekey, INTERRUPTED_RESPONSE_TEXT, Session, SessionScope, labeled_session_names,
+    merged_session_names, session_scope_dirs,
+};
 use super::skill::{SKILL_SCAFFOLD, Skill};
 use super::skill_policy::SkillPolicy;
 use super::skill_registry::SkillRegistry;
 use super::todo::TodoList;
-use super::tool_scope::{McpPromptCompletion, McpRuntime, ToolScope, format_prompt_arguments};
+use super::tool_scope::{
+    McpPromptCompletion, McpRuntime, ToolScope, format_prompt_arguments, sanitize_display_text,
+};
 use super::{
     AGENTS_DIR_NAME, Agent, AgentVariables, AppConfig, AppState, AssetCategory, CREATE_TITLE_ROLE,
     Input, InstallFilter, LEFT_PROMPT, LastMessage, MESSAGES_FILE_NAME, MacroAllowlistLevel,
     MacroPolicy, MacroSource, MacroState, RESERVED_MACRO_NAMES, RIGHT_PROMPT, ResolvedMacro, Role,
-    RoleLike, SESSIONS_DIR_NAME, SUMMARIZATION_PROMPT, SUMMARY_CONTEXT_PROMPT, StateFlags,
-    TEMP_ROLE_NAME, TEMP_SESSION_NAME, WorkingMode, agent_sessions_dir, bundles,
-    ensure_parent_exists, list_agents_for_humans, memory, paths,
+    RoleLike, SUMMARIZATION_PROMPT, SUMMARY_CONTEXT_PROMPT, StateFlags, TEMP_ROLE_NAME,
+    TEMP_SESSION_NAME, WORKSPACE_COYOTE_DIR_NAME, WorkingMode, bundles, ensure_parent_exists,
+    list_agents_for_humans, memory, paths,
 };
 use super::{MessageContentToolCalls, prompts};
 use crate::client::{
@@ -873,12 +878,14 @@ impl RequestContext {
     }
 
     pub fn sessions_dir(&self) -> PathBuf {
-        match &self.agent {
-            None => match env::var(get_env_name("sessions_dir")) {
-                Ok(value) => PathBuf::from(value),
-                Err(_) => paths::local_dir(SESSIONS_DIR_NAME),
-            },
-            Some(agent) => paths::agent_data_dir(agent.name()).join(SESSIONS_DIR_NAME),
+        self.sessions_dir_for(SessionScope::Global)
+    }
+
+    pub fn sessions_dir_for(&self, scope: SessionScope) -> PathBuf {
+        let (workspace, global) = session_scope_dirs(self.agent.as_ref().map(|a| a.name()));
+        match scope {
+            SessionScope::Workspace => workspace,
+            SessionScope::Global => global,
         }
     }
 
@@ -890,10 +897,28 @@ impl RequestContext {
     }
 
     pub fn session_file(&self, name: &str) -> PathBuf {
+        self.session_file_for(name, SessionScope::Global)
+    }
+
+    pub fn session_file_for(&self, name: &str, scope: SessionScope) -> PathBuf {
+        let dir = self.sessions_dir_for(scope);
         match name.split_once("/") {
-            Some((dir, name)) => self.sessions_dir().join(dir).join(format!("{name}.yaml")),
-            None => self.sessions_dir().join(format!("{name}.yaml")),
+            Some((subdir, name)) => dir.join(subdir).join(format!("{name}.yaml")),
+            None => dir.join(format!("{name}.yaml")),
         }
+    }
+
+    /// Workspace shadows global; a name found in neither resolves to the
+    /// global path so new sessions default to the global scope.
+    pub fn resolve_session_file(&self, name: &str) -> (PathBuf, SessionScope) {
+        let workspace = self.session_file_for(name, SessionScope::Workspace);
+        if workspace.exists() {
+            return (workspace, SessionScope::Workspace);
+        }
+        (
+            self.session_file_for(name, SessionScope::Global),
+            SessionScope::Global,
+        )
     }
 
     pub fn rag_file(&self, name: &str) -> PathBuf {
@@ -1135,11 +1160,37 @@ impl RequestContext {
     }
 
     pub fn list_sessions(&self) -> Vec<String> {
-        list_file_names(self.sessions_dir(), ".yaml")
+        merged_session_names(
+            &self.sessions_dir_for(SessionScope::Workspace),
+            &self.sessions_dir_for(SessionScope::Global),
+        )
     }
 
-    pub fn list_autoname_sessions(&self) -> Vec<String> {
-        list_file_names(self.sessions_dir().join("_"), ".yaml")
+    fn labeled_sessions(&self) -> Vec<(String, Option<String>)> {
+        labeled_session_names(
+            &self.sessions_dir_for(SessionScope::Workspace),
+            &self.sessions_dir_for(SessionScope::Global),
+        )
+        .into_iter()
+        .map(|(name, scope)| (sanitize_display_text(&name), Some(scope.to_string())))
+        .collect()
+    }
+
+    fn labeled_autoname_sessions(&self) -> Vec<(String, Option<String>)> {
+        let mut values = labeled_session_names(
+            &self.sessions_dir_for(SessionScope::Workspace).join("_"),
+            &self.sessions_dir_for(SessionScope::Global).join("_"),
+        );
+        values.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        values
+            .into_iter()
+            .map(|(name, scope)| {
+                (
+                    format!("_/{}", sanitize_display_text(&name)),
+                    Some(scope.to_string()),
+                )
+            })
+            .collect()
     }
 
     pub fn is_compressing_session(&self) -> bool {
@@ -1229,7 +1280,7 @@ impl RequestContext {
             // saving (or asking to) would only produce a file that vanishes
             // moments later; the session is discarded outright.
             if !self.agent.as_ref().is_some_and(Agent::is_builtin) {
-                let sessions_dir = self.sessions_dir();
+                let sessions_dir = self.sessions_dir_for(session.scope());
                 session.exit(&sessions_dir, self.working_mode.is_repl())?;
             }
             self.discontinuous_last_message();
@@ -1247,21 +1298,33 @@ impl RequestContext {
     /// Two processes opening both copies with the mesh on are serialised by `InstanceLock`:
     /// the second acquire is refused, and that process has to run `.mesh on --fresh` to mint
     /// its own id. Only `.fork` gives the new session a lineage of its own.
-    pub fn save_session(&mut self, name: Option<&str>) -> Result<()> {
-        let session_name = match &self.session {
-            Some(session) => match name {
-                Some(v) => v.to_string(),
-                None => session
-                    .autoname()
-                    .unwrap_or_else(|| session.name())
-                    .to_string(),
-            },
-            None => bail!("No session"),
+    pub fn save_session(&mut self, name: Option<&str>, scope: Option<SessionScope>) -> Result<()> {
+        let Some(session) = self.session.as_ref() else {
+            bail!("No session");
+        };
+        let session_name = match name {
+            Some(v) => v.to_string(),
+            None => session
+                .autoname()
+                .unwrap_or_else(|| session.name())
+                .to_string(),
         };
         self.refuse_builtin_named_session(Some(&session_name))?;
-        let session_path = self.session_file(&session_name);
-        if let Some(session) = self.session.as_mut() {
-            session.save(&session_name, &session_path, self.working_mode.is_repl())?;
+        let scope = scope.unwrap_or_else(|| session.scope());
+        if scope == SessionScope::Workspace && session_name == TEMP_SESSION_NAME {
+            bail!("Name the session first: .save session <name> --{scope}");
+        }
+        let session_path = self.session_file_for(&session_name, scope);
+        let is_repl = self.working_mode.is_repl();
+        let session = self.session.as_mut().unwrap();
+        session.save(&session_name, &session_path, is_repl)?;
+        session.set_scope(scope);
+        let (resolved_path, resolved_scope) = self.resolve_session_file(&session_name);
+        if is_repl && resolved_path != session_path {
+            println!(
+                "{}",
+                shadow_warning(scope, resolved_scope, &sanitize_display_text(&session_name))
+            );
         }
         Ok(())
     }
@@ -1271,8 +1334,8 @@ impl RequestContext {
     /// succeeded, or `abandon_fork` if it did not. The context is unchanged either way until
     /// the fork is committed.
     pub fn prepare_fork(&mut self, fork_name: Option<&str>) -> Result<PendingFork> {
-        let current_name = match &self.session {
-            Some(s) => s.name().to_string(),
+        let (current_name, scope) = match &self.session {
+            Some(s) => (s.name().to_string(), s.scope()),
             None => bail!("No active session to fork"),
         };
 
@@ -1280,10 +1343,9 @@ impl RequestContext {
             Some(name) => name.to_string(),
             None => {
                 let base = fork_base_name(&current_name);
-                let sessions_dir = self.sessions_dir();
                 (1_u32..)
                     .map(|n| format!("{base}-fork-{n}"))
-                    .find(|name| !sessions_dir.join(format!("{name}.yaml")).exists())
+                    .find(|name| !self.resolve_session_file(name).0.exists())
                     .unwrap()
             }
         };
@@ -1292,12 +1354,15 @@ impl RequestContext {
         if fork_name == current_name {
             bail!("Cannot fork '{current_name}' onto its own name; pick a different fork name");
         }
-        let fork_path = self.session_file(&fork_name);
-        if fork_path.exists() {
+        if fork_name == TEMP_SESSION_NAME {
+            bail!("'{TEMP_SESSION_NAME}' is a reserved session name");
+        }
+        if self.resolve_session_file(&fork_name).0.exists() {
             bail!("Session '{}' already exists", fork_name);
         }
+        let fork_path = self.session_file_for(&fork_name, scope);
 
-        self.save_session(None)?;
+        self.save_session(None, None)?;
 
         let session = self.session.as_ref().unwrap();
         let (mut fork, rekey) = session.fork(fork_name.clone());
@@ -2349,6 +2414,10 @@ impl RequestContext {
             ("roles_dir", display_path(&paths::roles_dir())),
             ("skills_dir", display_path(&paths::skills_dir())),
             ("sessions_dir", display_path(&self.sessions_dir())),
+            (
+                "workspace_sessions_dir",
+                display_path(&self.sessions_dir_for(SessionScope::Workspace)),
+            ),
             ("memory_dir", display_path(&paths::global_memory_dir())),
             ("rags_dir", display_path(&paths::rags_dir())),
             ("macros_dir", display_path(&paths::macros_dir())),
@@ -3087,12 +3156,12 @@ impl RequestContext {
     }
 
     pub fn edit_session(&mut self, app: &AppConfig) -> Result<()> {
-        let name = match &self.session {
-            Some(session) => session.name().to_string(),
+        let (name, scope) = match &self.session {
+            Some(session) => (session.name().to_string(), session.scope()),
             None => bail!("No session"),
         };
-        let session_path = self.session_file(&name);
-        self.save_session(Some(&name))?;
+        let session_path = self.session_file_for(&name, scope);
+        self.save_session(Some(&name), None)?;
         let editor = app.editor()?;
         edit_file(&editor, &session_path).with_context(|| {
             format!(
@@ -3101,7 +3170,13 @@ impl RequestContext {
                 editor
             )
         })?;
-        self.session = Some(Session::load_from_ctx(self, app, &name, &session_path)?);
+        self.session = Some(Session::load_from_ctx(
+            self,
+            app,
+            &name,
+            &session_path,
+            scope,
+        )?);
         self.discontinuous_last_message();
         Ok(())
     }
@@ -3287,7 +3362,24 @@ impl RequestContext {
     pub fn list_assets(&self, kind: &str) -> Result<()> {
         match kind {
             "roles" => print_asset_names("roles", &paths::list_roles(true)),
-            "sessions" => print_asset_names("sessions", &self.list_sessions()),
+            "sessions" => {
+                let rows = self.session_list_rows();
+                if rows.is_empty() {
+                    println!("No sessions found.");
+                    return Ok(());
+                }
+
+                let mut table = asset_table(&["name", "scope", "state"]);
+                for (name, scope, shadowed) in &rows {
+                    let scope = scope.to_string();
+                    let state = if *shadowed { "shadowed" } else { "-" };
+                    table.add_row(vec![name.as_str(), &scope, state]);
+                }
+
+                println!("Sessions:");
+                println!("{table}");
+                Ok(())
+            }
             "rags" => print_asset_names("RAGs", &paths::list_rags()),
             "macros" => {
                 let policy = self.macro_policy();
@@ -3505,9 +3597,11 @@ impl RequestContext {
     }
 
     pub fn delete(&self, kind: &str) -> Result<()> {
+        if kind == "session" {
+            return self.delete_sessions();
+        }
         let (dir, file_ext) = match kind {
             "role" => (paths::roles_dir(), Some(".md")),
-            "session" => (self.sessions_dir(), Some(".yaml")),
             "rag" => (paths::rags_dir(), Some(".yaml")),
             "macro" => (paths::macros_dir(), Some(".yaml")),
             "skill" => (paths::skills_dir(), None),
@@ -3586,6 +3680,82 @@ impl RequestContext {
             }
         }
         println!("✓ Successfully deleted {kind}.");
+        Ok(())
+    }
+
+    fn delete_sessions(&self) -> Result<()> {
+        let entries = self.session_delete_entries();
+        if entries.is_empty() {
+            bail!("No session to delete")
+        }
+        let labels: Vec<String> = entries
+            .iter()
+            .map(|(name, scope)| session_delete_label(name, *scope))
+            .collect();
+
+        let selected = MultiSelect::new("Select session to delete:", labels)
+            .with_validator(|list: &[ListOption<&String>]| {
+                if list.is_empty() {
+                    Ok(Validation::Invalid(
+                        "At least one item must be selected".into(),
+                    ))
+                } else {
+                    Ok(Validation::Valid)
+                }
+            })
+            .raw_prompt()?;
+
+        for option in selected {
+            let (name, scope) = &entries[option.index];
+            self.delete_session_at(name, *scope)?;
+        }
+        println!("✓ Successfully deleted session.");
+        Ok(())
+    }
+
+    /// Every session in both scopes, workspace first and NOT deduped: a
+    /// shadowed global twin must stay deletable.
+    fn session_delete_entries(&self) -> Vec<(String, SessionScope)> {
+        [SessionScope::Workspace, SessionScope::Global]
+            .into_iter()
+            .flat_map(|scope| {
+                list_file_names(self.sessions_dir_for(scope), ".yaml")
+                    .into_iter()
+                    .map(move |name| (name, scope))
+            })
+            .collect()
+    }
+
+    /// Display rows for `.list sessions`: every file in both scopes, workspace
+    /// first, with a global twin flagged as shadowed. Names are sanitized for
+    /// terminal output.
+    fn session_list_rows(&self) -> Vec<(String, SessionScope, bool)> {
+        let entries = self.session_delete_entries();
+        let workspace_names: HashSet<&str> = entries
+            .iter()
+            .filter(|(_, scope)| *scope == SessionScope::Workspace)
+            .map(|(name, _)| name.as_str())
+            .collect();
+        entries
+            .iter()
+            .map(|(name, scope)| {
+                let shadowed =
+                    *scope == SessionScope::Global && workspace_names.contains(name.as_str());
+                (sanitize_display_text(name), *scope, shadowed)
+            })
+            .collect()
+    }
+
+    fn delete_session_at(&self, name: &str, scope: SessionScope) -> Result<()> {
+        let path = self.session_file_for(name, scope);
+        let shown = sanitize_display_text(name);
+        remove_file(&path).with_context(|| {
+            format!(
+                "Failed to delete {scope} session '{shown}' at '{}'",
+                path.display()
+            )
+        })?;
+        println!("Deleted {scope} session '{shown}'");
         Ok(())
     }
 
@@ -4076,15 +4246,9 @@ impl RequestContext {
                     .collect(),
                 ".session" => {
                     if args[0].starts_with("_/") {
-                        super::map_completion_values(
-                            self.list_autoname_sessions()
-                                .iter()
-                                .rev()
-                                .map(|v| format!("_/{v}"))
-                                .collect::<Vec<String>>(),
-                        )
+                        self.labeled_autoname_sessions()
                     } else {
-                        super::map_completion_values(self.list_sessions())
+                        self.labeled_sessions()
                     }
                 }
                 ".rag" => super::map_completion_values(paths::list_rags()),
@@ -4588,14 +4752,26 @@ impl RequestContext {
                 .collect();
         } else if cmd == ".agent" {
             if args.len() == 2 {
-                values = agent_sessions_dir(args[0])
-                    .map(|dir| list_file_names(dir, ".yaml"))
-                    .unwrap_or_default()
+                let (workspace_dir, global_dir) = session_scope_dirs(Some(args[0]));
+                values = labeled_session_names(&workspace_dir, &global_dir)
                     .into_iter()
-                    .map(|v| (v, None))
+                    .map(|(name, scope)| (sanitize_display_text(&name), Some(scope.to_string())))
                     .collect();
             }
             values.extend(super::complete_agent_variables(args[0]));
+        } else if cmd == ".save" && args.first() == Some(&"session") {
+            if !args.contains(&"--workspace") && !args.contains(&"--global") {
+                values.push((
+                    "--workspace".to_string(),
+                    Some(format!(
+                        "Save the session under {WORKSPACE_COYOTE_DIR_NAME}/ in the current workspace"
+                    )),
+                ));
+                values.push((
+                    "--global".to_string(),
+                    Some("Save the session under the global config dir".to_string()),
+                ));
+            }
         } else if args.len() >= 2 {
             values = self.macro_variable_completions(cmd, &args[..args.len() - 1]);
         };
@@ -5231,12 +5407,18 @@ impl RequestContext {
                 created_new_session = true;
             }
             Some(name) => {
-                let session_path = self.session_file(name);
+                let (session_path, scope) = self.resolve_session_file(name);
                 if !session_path.exists() {
                     session = Some(Session::new_from_ctx(self, app, name)?);
                     created_new_session = true;
                 } else {
-                    session = Some(Session::load_from_ctx(self, app, name, &session_path)?);
+                    session = Some(Session::load_from_ctx(
+                        self,
+                        app,
+                        name,
+                        &session_path,
+                        scope,
+                    )?);
                 }
             }
         }
@@ -6172,6 +6354,16 @@ fn fork_base_name(name: &str) -> &str {
     name
 }
 
+fn shadow_warning(scope: SessionScope, resolved_scope: SessionScope, name: &str) -> String {
+    format!(
+        "⚠ Saved to {scope}, but a {resolved_scope} session '{name}' shadows it. '.session {name}' will load the {resolved_scope} copy."
+    )
+}
+
+fn session_delete_label(name: &str, scope: SessionScope) -> String {
+    format!("{} ({scope})", sanitize_display_text(name))
+}
+
 /// Assumed summarizer window when neither the compression model nor the
 /// session model declares `max_input_tokens`.
 pub(super) const SUMMARIZATION_WINDOW_FALLBACK_TOKENS: usize = 200_000;
@@ -6248,7 +6440,6 @@ mod tests {
     use super::super::mcp_factory::McpFactory;
     use super::*;
     use crate::client::ModelData;
-    use crate::config::AppState;
     use crate::config::agent::AgentConfig;
     use crate::config::bundles::BundleStore;
     use crate::config::conflict::InstallMode;
@@ -6258,6 +6449,7 @@ mod tests {
         BuiltinAgentUnavailable, BuiltinSourceGuard, FixedDirSource,
     };
     use crate::config::tool_scope::test_fixtures::{FixtureServer, fixture_runtime};
+    use crate::config::{AppState, SESSIONS_DIR_NAME, WORKSPACE_COYOTE_DIR_NAME};
     use crate::function::jobs::RingBuf;
     use crate::function::{ToolCall, skill};
     use crate::hooks::{HookDef, HooksMap, test_sink};
@@ -6323,45 +6515,74 @@ mod tests {
         let _ = list_all_models(&config);
     }
 
+    /// Pins both the config dir and the workspace config dir to absolute
+    /// temp paths so no `.coyote/` under the real CWD leaks into the test,
+    /// and clears the sessions-dir overrides (`COYOTE_SESSIONS_DIR`, plus
+    /// `HELPER_DATA_DIR` for the `helper` fixture agent) so Global-scope
+    /// writes cannot escape into the developer's real sessions dir.
     struct TestConfigDirGuard {
-        key: String,
-        previous: Option<std::ffi::OsString>,
+        keys: [(String, Option<std::ffi::OsString>); 4],
         path: PathBuf,
+        workspace_root: PathBuf,
     }
 
     impl TestConfigDirGuard {
         fn new() -> Self {
-            let key = get_env_name("config_dir");
-            let previous = env::var_os(&key);
             let unique = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
             let path = env::temp_dir().join(format!("coyote-request-context-tests-{unique}"));
             create_dir_all(&path).unwrap();
-            unsafe {
-                env::set_var(&key, &path);
-            }
+            let workspace_root =
+                env::temp_dir().join(format!("coyote-request-context-ws-{unique}"));
+            let workspace_path = workspace_root.join(WORKSPACE_COYOTE_DIR_NAME);
+            create_dir_all(&workspace_path).unwrap();
+            let keys = [
+                (get_env_name("config_dir"), Some(path.as_os_str())),
+                (
+                    get_env_name("workspace_config_dir"),
+                    Some(workspace_path.as_os_str()),
+                ),
+                (get_env_name("sessions_dir"), None),
+                (
+                    format!("{}_DATA_DIR", utils::normalize_env_name("helper")),
+                    None,
+                ),
+            ]
+            .map(|(key, value)| {
+                let previous = env::var_os(&key);
+                unsafe {
+                    match value {
+                        Some(value) => env::set_var(&key, value),
+                        None => env::remove_var(&key),
+                    }
+                }
+                (key, previous)
+            });
             Self {
-                key,
-                previous,
+                keys,
                 path,
+                workspace_root,
             }
         }
     }
 
     impl Drop for TestConfigDirGuard {
         fn drop(&mut self) {
-            if let Some(previous) = &self.previous {
-                unsafe {
-                    env::set_var(&self.key, previous);
-                }
-            } else {
-                unsafe {
-                    env::remove_var(&self.key);
+            for (key, previous) in &self.keys {
+                if let Some(previous) = previous {
+                    unsafe {
+                        env::set_var(key, previous);
+                    }
+                } else {
+                    unsafe {
+                        env::remove_var(key);
+                    }
                 }
             }
             let _ = remove_dir_all(&self.path);
+            let _ = remove_dir_all(&self.workspace_root);
         }
     }
 
@@ -9869,6 +10090,966 @@ mod tests {
         assert_eq!(ctx.session.as_ref().unwrap().name(), "my-session");
     }
 
+    fn write_session_file(ctx: &RequestContext, name: &str, scope: SessionScope, body: &str) {
+        let path = ctx.session_file_for(name, scope);
+        ensure_parent_exists(&path).unwrap();
+        write(&path, format!("model: test-seeded:test-chat\n{body}")).unwrap();
+    }
+
+    /// `fork_session` became `prepare_fork` + `commit_fork` so the REPL can re-key the mesh
+    /// node between the two; these tests only care about the committed end state.
+    fn fork_session(ctx: &mut RequestContext, fork_name: Option<&str>) -> Result<()> {
+        let pending = ctx.prepare_fork(fork_name)?;
+        ctx.commit_fork(pending);
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn use_session_prefers_workspace_file_over_global() {
+        let _config = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        write_session_file(
+            &ctx,
+            "shared",
+            SessionScope::Global,
+            "messages: []\ntodo_list:\n  goal: global goal\n",
+        );
+        write_session_file(
+            &ctx,
+            "shared",
+            SessionScope::Workspace,
+            "messages: []\ntodo_list:\n  goal: workspace goal\n",
+        );
+        let app = ctx.app.config.clone();
+
+        run_async(ctx.use_session(&app, Some("shared"), utils::create_abort_signal())).unwrap();
+
+        let session = ctx.session.as_ref().unwrap();
+        assert_eq!(session.scope(), SessionScope::Workspace);
+        assert_eq!(session.todo_list().goal, "workspace goal");
+    }
+
+    #[test]
+    #[serial]
+    fn use_session_new_name_defaults_to_global_scope() {
+        let _config = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+
+        run_async(ctx.use_session(&app, Some("fresh"), utils::create_abort_signal())).unwrap();
+
+        assert_eq!(ctx.session.as_ref().unwrap().scope(), SessionScope::Global);
+        ctx.save_session(None, None).unwrap();
+        assert!(ctx.session_file_for("fresh", SessionScope::Global).exists());
+        assert!(
+            !ctx.session_file_for("fresh", SessionScope::Workspace)
+                .exists()
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn save_session_workspace_flag_rehomes_session() {
+        let _config = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        write_session_file(&ctx, "notes", SessionScope::Global, "messages: []\n");
+        let app = ctx.app.config.clone();
+        run_async(ctx.use_session(&app, Some("notes"), utils::create_abort_signal())).unwrap();
+        assert_eq!(ctx.session.as_ref().unwrap().scope(), SessionScope::Global);
+
+        ctx.save_session(None, Some(SessionScope::Workspace))
+            .unwrap();
+
+        let workspace_file = ctx.session_file_for("notes", SessionScope::Workspace);
+        assert!(workspace_file.exists());
+        assert!(ctx.session_file_for("notes", SessionScope::Global).exists());
+        assert_eq!(
+            ctx.session.as_ref().unwrap().scope(),
+            SessionScope::Workspace
+        );
+
+        remove_file(&workspace_file).unwrap();
+        ctx.save_session(None, None).unwrap();
+        assert!(workspace_file.exists());
+    }
+
+    #[test]
+    #[serial]
+    fn fork_session_preserves_workspace_scope() {
+        let _config = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        write_session_file(&ctx, "base", SessionScope::Workspace, "messages: []\n");
+        let app = ctx.app.config.clone();
+        run_async(ctx.use_session(&app, Some("base"), utils::create_abort_signal())).unwrap();
+
+        fork_session(&mut ctx, None).unwrap();
+
+        let session = ctx.session.as_ref().unwrap();
+        assert_eq!(session.name(), "base-fork-1");
+        assert_eq!(session.scope(), SessionScope::Workspace);
+        assert!(
+            ctx.session_file_for("base-fork-1", SessionScope::Workspace)
+                .exists()
+        );
+        assert!(
+            !ctx.session_file_for("base-fork-1", SessionScope::Global)
+                .exists()
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn exit_session_autosaves_to_session_scope() {
+        let _config = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        write_session_file(&ctx, "ws-exit", SessionScope::Workspace, "messages: []\n");
+        let app = ctx.app.config.clone();
+        run_async(ctx.use_session(&app, Some("ws-exit"), utils::create_abort_signal())).unwrap();
+        ctx.set_save_session_this_time().unwrap();
+        ctx.init_todo_list("persist me");
+
+        ctx.exit_session().unwrap();
+
+        let saved =
+            read_to_string(ctx.session_file_for("ws-exit", SessionScope::Workspace)).unwrap();
+        assert!(saved.contains("persist me"));
+        assert!(
+            !ctx.session_file_for("ws-exit", SessionScope::Global)
+                .exists()
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn list_sessions_merges_scopes_workspace_first() {
+        let _config = TestConfigDirGuard::new();
+        let ctx = create_test_ctx();
+        write_session_file(&ctx, "both", SessionScope::Global, "messages: []\n");
+        write_session_file(&ctx, "both", SessionScope::Workspace, "messages: []\n");
+        write_session_file(&ctx, "only-global", SessionScope::Global, "messages: []\n");
+        write_session_file(&ctx, "only-ws", SessionScope::Workspace, "messages: []\n");
+
+        assert_eq!(ctx.list_sessions(), vec!["both", "only-global", "only-ws"]);
+        assert_eq!(
+            ctx.resolve_session_file("both"),
+            (
+                ctx.session_file_for("both", SessionScope::Workspace),
+                SessionScope::Workspace
+            )
+        );
+        assert_eq!(
+            ctx.resolve_session_file("only-global"),
+            (
+                ctx.session_file_for("only-global", SessionScope::Global),
+                SessionScope::Global
+            )
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn repl_complete_session_labels_workspace_and_global() {
+        let _config = TestConfigDirGuard::new();
+        let ctx = create_test_ctx();
+        write_session_file(&ctx, "both", SessionScope::Global, "messages: []\n");
+        write_session_file(&ctx, "both", SessionScope::Workspace, "messages: []\n");
+        write_session_file(&ctx, "only-global", SessionScope::Global, "messages: []\n");
+
+        let mut values = ctx.repl_complete(".session", &[""], "");
+        values.sort_unstable();
+
+        assert_eq!(
+            values,
+            vec![
+                ("both".to_string(), Some("workspace".to_string())),
+                ("only-global".to_string(), Some("global".to_string())),
+            ]
+        );
+    }
+
+    #[test]
+    fn repl_complete_save_session_offers_scope_flags() {
+        let ctx = create_test_ctx();
+
+        let names = |args: &[&str]| -> Vec<String> {
+            let mut names: Vec<String> = ctx
+                .repl_complete(".save", args, "")
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect();
+            names.sort_unstable();
+            names
+        };
+
+        assert_eq!(names(&["session", ""]), vec!["--global", "--workspace"]);
+        assert_eq!(names(&["session", "notes", "--g"]), vec!["--global"]);
+        assert!(names(&["session", "--workspace", ""]).is_empty());
+        assert!(names(&["session", "notes", "--global", ""]).is_empty());
+
+        for (name, description) in ctx.repl_complete(".save", &["session", ""], "") {
+            assert!(
+                description.as_deref().is_some_and(|d| !d.is_empty()),
+                "{name} has no description"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn save_session_failed_write_leaves_scope_and_path_untouched() {
+        let _config = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        write_session_file(&ctx, "notes", SessionScope::Global, "messages: []\n");
+        let app = ctx.app.config.clone();
+        run_async(ctx.use_session(&app, Some("notes"), utils::create_abort_signal())).unwrap();
+        let before = ctx.session.as_ref().unwrap().export().unwrap();
+        write(
+            ctx.sessions_dir_for(SessionScope::Workspace),
+            "not a directory",
+        )
+        .unwrap();
+
+        assert!(
+            ctx.save_session(None, Some(SessionScope::Workspace))
+                .is_err()
+        );
+
+        let session = ctx.session.as_ref().unwrap();
+        assert_eq!(session.scope(), SessionScope::Global);
+        assert_eq!(session.export().unwrap(), before);
+    }
+
+    #[test]
+    #[serial]
+    fn save_session_global_copy_stays_shadowed_by_workspace_twin() {
+        let _config = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        run_async(ctx.use_session(&app, Some("notes"), utils::create_abort_signal())).unwrap();
+        write_session_file(&ctx, "notes", SessionScope::Workspace, "messages: []\n");
+
+        ctx.save_session(None, None).unwrap();
+
+        let session_path = ctx.session_file_for("notes", SessionScope::Global);
+        assert!(session_path.exists());
+        assert_eq!(ctx.session.as_ref().unwrap().scope(), SessionScope::Global);
+        let (resolved_path, resolved_scope) = ctx.resolve_session_file("notes");
+        assert_ne!(resolved_path, session_path);
+        assert_eq!(resolved_scope, SessionScope::Workspace);
+    }
+
+    #[test]
+    #[serial]
+    fn save_session_scoped_temp_session_demands_a_name() {
+        let _config = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        run_async(ctx.use_session(&app, None, utils::create_abort_signal())).unwrap();
+
+        let err = ctx
+            .save_session(None, Some(SessionScope::Workspace))
+            .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "Name the session first: .save session <name> --workspace"
+        );
+        assert!(
+            !ctx.session_file_for(TEMP_SESSION_NAME, SessionScope::Workspace)
+                .exists()
+        );
+        // A Workspace-scoped temp session hits the same guard with no flag.
+        ctx.session
+            .as_mut()
+            .unwrap()
+            .set_scope(SessionScope::Workspace);
+        let err = ctx.save_session(None, None).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Name the session first: .save session <name> --workspace"
+        );
+        assert!(
+            !ctx.session_file_for(TEMP_SESSION_NAME, SessionScope::Workspace)
+                .exists()
+        );
+        ctx.save_session(Some("named"), Some(SessionScope::Workspace))
+            .unwrap();
+        assert!(
+            ctx.session_file_for("named", SessionScope::Workspace)
+                .exists()
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn fork_session_rejects_name_taken_in_other_scope() {
+        let _config = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        write_session_file(&ctx, "base", SessionScope::Global, "messages: []\n");
+        write_session_file(&ctx, "taken", SessionScope::Workspace, "messages: []\n");
+        write_session_file(
+            &ctx,
+            "base-fork-1",
+            SessionScope::Workspace,
+            "messages: []\n",
+        );
+        let app = ctx.app.config.clone();
+        run_async(ctx.use_session(&app, Some("base"), utils::create_abort_signal())).unwrap();
+
+        let err = fork_session(&mut ctx, Some("taken")).unwrap_err();
+        assert_eq!(err.to_string(), "Session 'taken' already exists");
+        assert!(!ctx.session_file_for("taken", SessionScope::Global).exists());
+
+        fork_session(&mut ctx, None).unwrap();
+        let session = ctx.session.as_ref().unwrap();
+        assert_eq!(session.name(), "base-fork-2");
+        assert_eq!(session.scope(), SessionScope::Global);
+    }
+
+    #[test]
+    #[serial]
+    fn fork_session_rejects_the_reserved_temp_name() {
+        let _config = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        write_session_file(&ctx, "base", SessionScope::Workspace, "messages: []\n");
+        let app = ctx.app.config.clone();
+        run_async(ctx.use_session(&app, Some("base"), utils::create_abort_signal())).unwrap();
+
+        let err = fork_session(&mut ctx, Some(TEMP_SESSION_NAME)).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("'{TEMP_SESSION_NAME}' is a reserved session name")
+        );
+        assert!(
+            !ctx.session_file_for(TEMP_SESSION_NAME, SessionScope::Workspace)
+                .exists()
+        );
+        assert!(
+            !ctx.session_file_for(TEMP_SESSION_NAME, SessionScope::Global)
+                .exists()
+        );
+        assert_eq!(ctx.session.as_ref().unwrap().name(), "base");
+    }
+
+    #[test]
+    #[serial]
+    fn use_session_autoname_prefers_workspace() {
+        let _config = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        write_session_file(
+            &ctx,
+            "_/20260101T000000-x",
+            SessionScope::Global,
+            "messages: []\n",
+        );
+        write_session_file(
+            &ctx,
+            "_/20260101T000000-x",
+            SessionScope::Workspace,
+            "messages: []\n",
+        );
+        let app = ctx.app.config.clone();
+
+        run_async(ctx.use_session(
+            &app,
+            Some("_/20260101T000000-x"),
+            utils::create_abort_signal(),
+        ))
+        .unwrap();
+
+        let session = ctx.session.as_ref().unwrap();
+        assert_eq!(session.scope(), SessionScope::Workspace);
+        assert_eq!(session.autoname(), Some("x"));
+    }
+
+    #[test]
+    #[serial]
+    fn use_session_temp_branch_stays_global_when_workspace_temp_exists() {
+        let _config = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        write_session_file(
+            &ctx,
+            TEMP_SESSION_NAME,
+            SessionScope::Workspace,
+            "messages: []\ntodo_list:\n  goal: workspace goal\n",
+        );
+        let app = ctx.app.config.clone();
+
+        run_async(ctx.use_session(&app, None, utils::create_abort_signal())).unwrap();
+
+        let session = ctx.session.as_ref().unwrap();
+        assert_eq!(session.name(), TEMP_SESSION_NAME);
+        assert_eq!(session.scope(), SessionScope::Global);
+        assert!(session.todo_list().goal.is_empty());
+        assert!(
+            ctx.session_file_for(TEMP_SESSION_NAME, SessionScope::Workspace)
+                .exists()
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn repl_complete_agent_sessions_labels_workspace_and_global() {
+        let _config = TestConfigDirGuard::new();
+        let ctx = create_test_ctx();
+        for (dir, name) in [
+            (paths::workspace_agent_sessions_dir("helper"), "both"),
+            (paths::agent_sessions_dir("helper"), "both"),
+            (paths::agent_sessions_dir("helper"), "only-global"),
+        ] {
+            create_dir_all(&dir).unwrap();
+            write(dir.join(format!("{name}.yaml")), "model: x\n").unwrap();
+        }
+
+        let mut values = ctx.repl_complete(".agent", &["helper", ""], "");
+        values.sort_unstable();
+
+        assert_eq!(
+            values,
+            vec![
+                ("both".to_string(), Some("workspace".to_string())),
+                ("only-global".to_string(), Some("global".to_string())),
+            ]
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn repl_complete_autoname_sessions_labels_and_orders_newest_first() {
+        let _config = TestConfigDirGuard::new();
+        let ctx = create_test_ctx();
+        write_session_file(
+            &ctx,
+            "_/20260101T000000-old",
+            SessionScope::Global,
+            "messages: []\n",
+        );
+        write_session_file(
+            &ctx,
+            "_/20260102T000000-mid",
+            SessionScope::Global,
+            "messages: []\n",
+        );
+        write_session_file(
+            &ctx,
+            "_/20260102T000000-mid",
+            SessionScope::Workspace,
+            "messages: []\n",
+        );
+        write_session_file(
+            &ctx,
+            "_/20260103T000000-new",
+            SessionScope::Workspace,
+            "messages: []\n",
+        );
+
+        let expected = vec![
+            (
+                "_/20260103T000000-new".to_string(),
+                Some("workspace".to_string()),
+            ),
+            (
+                "_/20260102T000000-mid".to_string(),
+                Some("workspace".to_string()),
+            ),
+            (
+                "_/20260101T000000-old".to_string(),
+                Some("global".to_string()),
+            ),
+        ];
+        assert_eq!(ctx.labeled_autoname_sessions(), expected);
+
+        // The fuzzy filter re-sorts by score, so only membership is checked here.
+        let mut completed = ctx.repl_complete(".session", &["_/"], "");
+        completed.sort_unstable();
+        let mut expected_sorted = expected;
+        expected_sorted.sort_unstable();
+        assert_eq!(completed, expected_sorted);
+    }
+
+    #[test]
+    #[serial]
+    fn sysinfo_reports_both_sessions_dirs() {
+        let _config = TestConfigDirGuard::new();
+        let ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+
+        let info = ctx.sysinfo(&app).unwrap();
+
+        assert!(info.contains("sessions_dir"));
+        assert!(info.contains("workspace_sessions_dir"));
+    }
+
+    // --- usage-probe (spec-first) coverage for the workspace-sessions surface ---
+
+    #[test]
+    #[serial]
+    fn usage_probe_sessions_dir_for_is_agent_aware_in_both_scopes() {
+        let _config = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        ctx.agent = Some(Agent::test_new(AgentConfig {
+            name: "helper".to_string(),
+            ..AgentConfig::default()
+        }));
+
+        assert_eq!(
+            ctx.sessions_dir_for(SessionScope::Workspace),
+            paths::workspace_agent_sessions_dir("helper")
+        );
+        assert_eq!(
+            ctx.sessions_dir_for(SessionScope::Global),
+            paths::agent_sessions_dir("helper")
+        );
+        // `sessions_dir()` / `session_file()` still mean Global.
+        assert_eq!(
+            ctx.sessions_dir(),
+            ctx.sessions_dir_for(SessionScope::Global)
+        );
+        assert_eq!(
+            ctx.session_file("notes"),
+            ctx.session_file_for("notes", SessionScope::Global)
+        );
+        // Autoname subdir layout is preserved in the workspace scope.
+        assert_eq!(
+            ctx.session_file_for("_/x", SessionScope::Workspace),
+            paths::workspace_agent_sessions_dir("helper")
+                .join("_")
+                .join("x.yaml")
+        );
+        assert!(
+            ctx.sessions_dir_for(SessionScope::Workspace)
+                .starts_with(paths::workspace_config_dir()),
+            "agent workspace sessions must live under the workspace .coyote dir"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn usage_probe_agent_session_loads_and_autosaves_in_workspace_scope() {
+        let _config = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        ctx.agent = Some(Agent::test_new(AgentConfig {
+            name: "helper".to_string(),
+            ..AgentConfig::default()
+        }));
+        write_session_file(
+            &ctx,
+            "agent-notes",
+            SessionScope::Workspace,
+            "messages: []\n",
+        );
+        let app = ctx.app.config.clone();
+
+        run_async(ctx.use_session(&app, Some("agent-notes"), utils::create_abort_signal()))
+            .unwrap();
+        assert_eq!(
+            ctx.session.as_ref().unwrap().scope(),
+            SessionScope::Workspace
+        );
+        ctx.set_save_session_this_time().unwrap();
+        ctx.init_todo_list("agent persist");
+
+        ctx.exit_agent_session().unwrap();
+
+        let workspace_file = paths::workspace_agent_sessions_dir("helper").join("agent-notes.yaml");
+        assert!(
+            read_to_string(&workspace_file)
+                .unwrap()
+                .contains("agent persist")
+        );
+        assert!(
+            !paths::agent_sessions_dir("helper")
+                .join("agent-notes.yaml")
+                .exists()
+        );
+        assert!(
+            !paths::workspace_sessions_dir()
+                .join("agent-notes.yaml")
+                .exists()
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn usage_probe_save_session_global_flag_rehomes_workspace_session_back() {
+        let _config = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        write_session_file(&ctx, "notes", SessionScope::Workspace, "messages: []\n");
+        let app = ctx.app.config.clone();
+        run_async(ctx.use_session(&app, Some("notes"), utils::create_abort_signal())).unwrap();
+        assert_eq!(
+            ctx.session.as_ref().unwrap().scope(),
+            SessionScope::Workspace
+        );
+
+        ctx.save_session(None, Some(SessionScope::Global)).unwrap();
+
+        let global_file = ctx.session_file_for("notes", SessionScope::Global);
+        let workspace_file = ctx.session_file_for("notes", SessionScope::Workspace);
+        assert!(global_file.exists());
+        assert!(
+            workspace_file.exists(),
+            "re-homing must not delete the old file"
+        );
+        assert_eq!(ctx.session.as_ref().unwrap().scope(), SessionScope::Global);
+
+        // Subsequent flagless saves follow the new home.
+        remove_file(&global_file).unwrap();
+        ctx.save_session(None, None).unwrap();
+        assert!(global_file.exists());
+
+        // The workspace twin still shadows the global copy on load.
+        assert_eq!(
+            ctx.resolve_session_file("notes"),
+            (workspace_file, SessionScope::Workspace)
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn usage_probe_save_session_rename_without_flag_keeps_workspace_scope() {
+        let _config = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        write_session_file(&ctx, "draft", SessionScope::Workspace, "messages: []\n");
+        let app = ctx.app.config.clone();
+        run_async(ctx.use_session(&app, Some("draft"), utils::create_abort_signal())).unwrap();
+
+        ctx.save_session(Some("final"), None).unwrap();
+
+        assert!(
+            ctx.session_file_for("final", SessionScope::Workspace)
+                .exists()
+        );
+        assert!(!ctx.session_file_for("final", SessionScope::Global).exists());
+        assert_eq!(
+            ctx.session.as_ref().unwrap().scope(),
+            SessionScope::Workspace
+        );
+
+        // Saving with the same scope it already has is a no-op re-home.
+        ctx.save_session(None, Some(SessionScope::Workspace))
+            .unwrap();
+        assert_eq!(
+            ctx.session.as_ref().unwrap().scope(),
+            SessionScope::Workspace
+        );
+        assert!(!ctx.session_file_for("final", SessionScope::Global).exists());
+    }
+
+    #[test]
+    #[serial]
+    fn usage_probe_no_workspace_dir_behaves_like_before_and_creates_none() {
+        let _config = TestConfigDirGuard::new();
+        let ctx_probe = create_test_ctx();
+        write_session_file(&ctx_probe, "solo", SessionScope::Global, "messages: []\n");
+        // A user with no `.coyote/` at all.
+        remove_dir_all(paths::workspace_config_dir()).unwrap();
+        assert!(!paths::workspace_config_dir().exists());
+
+        let mut ctx = create_test_ctx();
+        assert_eq!(ctx.list_sessions(), vec!["solo"]);
+        assert_eq!(
+            ctx.resolve_session_file("solo"),
+            (
+                ctx.session_file_for("solo", SessionScope::Global),
+                SessionScope::Global
+            )
+        );
+        assert_eq!(
+            ctx.repl_complete(".session", &[""], ""),
+            vec![("solo".to_string(), Some("global".to_string()))]
+        );
+
+        // Load existing, save, exit: all global, no workspace dir materialises.
+        let app = ctx.app.config.clone();
+        run_async(ctx.use_session(&app, Some("solo"), utils::create_abort_signal())).unwrap();
+        assert_eq!(ctx.session.as_ref().unwrap().scope(), SessionScope::Global);
+        ctx.save_session(None, None).unwrap();
+        ctx.set_save_session_this_time().unwrap();
+        ctx.exit_session().unwrap();
+
+        // Brand-new named session + temp session likewise.
+        run_async(ctx.use_session(&app, Some("fresh"), utils::create_abort_signal())).unwrap();
+        assert_eq!(ctx.session.as_ref().unwrap().scope(), SessionScope::Global);
+        ctx.save_session(None, None).unwrap();
+        fork_session(&mut ctx, None).unwrap();
+        ctx.exit_session().unwrap();
+        run_async(ctx.use_session(&app, None, utils::create_abort_signal())).unwrap();
+        ctx.exit_session().unwrap();
+
+        assert!(ctx.session_file_for("fresh", SessionScope::Global).exists());
+        assert!(
+            ctx.session_file_for("fresh-fork-1", SessionScope::Global)
+                .exists()
+        );
+        assert!(
+            !paths::workspace_config_dir().exists(),
+            "no session operation may create the workspace .coyote dir"
+        );
+        assert_eq!(ctx.list_sessions(), vec!["fresh", "fresh-fork-1", "solo"]);
+    }
+
+    #[test]
+    #[serial]
+    fn usage_probe_session_info_reports_scope() {
+        let _config = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        write_session_file(&ctx, "ws-info", SessionScope::Workspace, "messages: []\n");
+        let app = ctx.app.config.clone();
+        run_async(ctx.use_session(&app, Some("ws-info"), utils::create_abort_signal())).unwrap();
+
+        let info = ctx.session_info(&app).unwrap();
+        assert!(
+            info.contains("scope"),
+            "session info missing scope key: {info}"
+        );
+        assert!(
+            info.contains("workspace"),
+            "session info missing scope value: {info}"
+        );
+        ctx.exit_session().unwrap();
+
+        run_async(ctx.use_session(&app, Some("new-global"), utils::create_abort_signal())).unwrap();
+        let info = ctx.session_info(&app).unwrap();
+        assert!(
+            info.contains("scope"),
+            "session info missing scope key: {info}"
+        );
+        assert!(
+            info.contains("global"),
+            "session info missing scope value: {info}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn usage_probe_workspace_temp_twin_is_ignored_and_untouched_on_exit() {
+        let _config = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        write_session_file(
+            &ctx,
+            TEMP_SESSION_NAME,
+            SessionScope::Workspace,
+            "messages: []\ntodo_list:\n  goal: keep me\n",
+        );
+        let app = ctx.app.config.clone();
+
+        run_async(ctx.use_session(&app, None, utils::create_abort_signal())).unwrap();
+        ctx.set_save_session_this_time().unwrap();
+        ctx.init_todo_list("temp global");
+        ctx.exit_session().unwrap();
+
+        let workspace_temp = ctx.session_file_for(TEMP_SESSION_NAME, SessionScope::Workspace);
+        assert!(read_to_string(&workspace_temp).unwrap().contains("keep me"));
+        // A saved temp session is autonamed under `_/` in its own (global) scope.
+        let autonamed = ctx.labeled_autoname_sessions();
+        assert_eq!(
+            autonamed.len(),
+            1,
+            "expected one autonamed session: {autonamed:?}"
+        );
+        assert_eq!(autonamed[0].1.as_deref(), Some("global"));
+        let saved = ctx.session_file_for(&autonamed[0].0, SessionScope::Global);
+        assert!(read_to_string(&saved).unwrap().contains("temp global"));
+        assert!(
+            !ctx.sessions_dir_for(SessionScope::Workspace)
+                .join("_")
+                .exists()
+        );
+        // The workspace twin still doesn't hijack the next temp session.
+        run_async(ctx.use_session(&app, None, utils::create_abort_signal())).unwrap();
+        assert_eq!(ctx.session.as_ref().unwrap().scope(), SessionScope::Global);
+        assert!(ctx.session.as_ref().unwrap().todo_list().goal.is_empty());
+    }
+
+    // Usage probe (spec-first, criteria 3+4): the reserved `temp` name can
+    // never land in Workspace scope — not via the bare flag, and not by
+    // spelling the name out either. The rejection is a no-op: no workspace
+    // `temp.yaml`, and the live session keeps its Global scope/path so a
+    // later re-home under a real name still works.
+    #[test]
+    #[serial]
+    fn usage_probe_explicit_temp_name_into_workspace_is_rejected_without_side_effects() {
+        let _config = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        run_async(ctx.use_session(&app, None, utils::create_abort_signal())).unwrap();
+        let before = ctx.session.as_ref().unwrap().export().unwrap();
+
+        let err = ctx
+            .save_session(Some(TEMP_SESSION_NAME), Some(SessionScope::Workspace))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("--workspace") && err.to_string().contains("<name>"),
+            "teaching error should point at the flag grammar: {err}"
+        );
+        assert!(
+            !ctx.session_file_for(TEMP_SESSION_NAME, SessionScope::Workspace)
+                .exists()
+        );
+        assert!(
+            !ctx.sessions_dir_for(SessionScope::Workspace).exists(),
+            "a rejected save must not even create the workspace sessions dir"
+        );
+        let session = ctx.session.as_ref().unwrap();
+        assert_eq!(session.name(), TEMP_SESSION_NAME);
+        assert_eq!(session.scope(), SessionScope::Global);
+        assert_eq!(
+            session.export().unwrap(),
+            before,
+            "rejected save must leave name/scope/path untouched"
+        );
+
+        // The same session can still be re-homed under a real name.
+        ctx.save_session(Some("real"), Some(SessionScope::Workspace))
+            .unwrap();
+        let session = ctx.session.as_ref().unwrap();
+        assert_eq!(session.scope(), SessionScope::Workspace);
+        assert!(
+            ctx.session_file_for("real", SessionScope::Workspace)
+                .exists()
+        );
+        assert!(!ctx.session_file_for("real", SessionScope::Global).exists());
+    }
+
+    #[test]
+    #[serial]
+    fn config_dir_guard_clears_and_restores_the_sessions_dir_override() {
+        let key = get_env_name("sessions_dir");
+        let junk = PathBuf::from("/nonexistent/junk-sessions");
+        let _outer = crate::testing::EnvVarGuard::set(&key, &junk);
+        let _outer_agent = crate::testing::EnvVarGuard::set("HELPER_DATA_DIR", &junk);
+        {
+            let guard = TestConfigDirGuard::new();
+            assert!(crate::config::default_sessions_dir().starts_with(&guard.path));
+            assert!(
+                paths::agent_sessions_dir("helper").starts_with(&guard.path),
+                "guard must clear the fixture agent's data-dir override"
+            );
+        }
+        assert_eq!(crate::config::default_sessions_dir(), junk);
+        assert_eq!(paths::agent_data_dir("helper"), junk);
+    }
+
+    #[test]
+    #[serial]
+    fn session_delete_entries_list_both_twins_and_delete_one_scope_at_a_time() {
+        let _config = TestConfigDirGuard::new();
+        let ctx = create_test_ctx();
+        write_session_file(&ctx, "both", SessionScope::Global, "messages: []\n");
+        write_session_file(&ctx, "both", SessionScope::Workspace, "messages: []\n");
+        write_session_file(&ctx, "only-global", SessionScope::Global, "messages: []\n");
+
+        let entries = ctx.session_delete_entries();
+        assert_eq!(
+            entries,
+            vec![
+                ("both".to_string(), SessionScope::Workspace),
+                ("both".to_string(), SessionScope::Global),
+                ("only-global".to_string(), SessionScope::Global),
+            ]
+        );
+        let labels: Vec<String> = entries
+            .iter()
+            .map(|(name, scope)| session_delete_label(name, *scope))
+            .collect();
+        assert_eq!(labels[..2], ["both (workspace)", "both (global)"]);
+
+        ctx.delete_session_at("both", SessionScope::Workspace)
+            .unwrap();
+        assert!(
+            !ctx.session_file_for("both", SessionScope::Workspace)
+                .exists()
+        );
+        assert!(ctx.session_file_for("both", SessionScope::Global).exists());
+    }
+
+    #[test]
+    #[serial]
+    fn session_list_rows_show_both_twins_and_mark_the_shadowed_global() {
+        let _config = TestConfigDirGuard::new();
+        let ctx = create_test_ctx();
+        write_session_file(&ctx, "both", SessionScope::Global, "messages: []\n");
+        write_session_file(&ctx, "both", SessionScope::Workspace, "messages: []\n");
+        write_session_file(&ctx, "only-ws", SessionScope::Workspace, "messages: []\n");
+        write_session_file(&ctx, "only-global", SessionScope::Global, "messages: []\n");
+
+        assert_eq!(
+            ctx.session_list_rows(),
+            vec![
+                ("both".to_string(), SessionScope::Workspace, false),
+                ("only-ws".to_string(), SessionScope::Workspace, false),
+                ("both".to_string(), SessionScope::Global, true),
+                ("only-global".to_string(), SessionScope::Global, false),
+            ]
+        );
+    }
+
+    // Windows rejects control characters (0x00-0x1F) in filenames, so a session
+    // file named with an ESC byte cannot exist there; the scenario is Unix-only.
+    #[test]
+    #[serial]
+    #[cfg(not(windows))]
+    fn session_list_rows_strip_terminal_escapes() {
+        let _config = TestConfigDirGuard::new();
+        let ctx = create_test_ctx();
+        write_session_file(
+            &ctx,
+            "evil\x1b[31mred",
+            SessionScope::Global,
+            "messages: []\n",
+        );
+
+        assert_eq!(
+            ctx.session_list_rows(),
+            vec![("evilred".to_string(), SessionScope::Global, false)]
+        );
+    }
+
+    #[test]
+    fn session_labels_strip_terminal_escapes() {
+        let label = session_delete_label("evil\x1b[31mred", SessionScope::Global);
+        assert!(!label.contains('\x1b'));
+        assert_eq!(label, "evilred (global)");
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(not(windows))]
+    fn repl_complete_session_strips_terminal_escapes_from_names() {
+        let _config = TestConfigDirGuard::new();
+        let ctx = create_test_ctx();
+        write_session_file(
+            &ctx,
+            "evil\x1b[31mred",
+            SessionScope::Workspace,
+            "messages: []\n",
+        );
+
+        let values = ctx.repl_complete(".session", &[""], "");
+        assert_eq!(
+            values,
+            vec![("evilred".to_string(), Some("workspace".to_string()))]
+        );
+    }
+
+    #[test]
+    fn shadow_warning_names_both_scopes_and_the_load_command() {
+        assert_eq!(
+            shadow_warning(SessionScope::Global, SessionScope::Workspace, "notes"),
+            "⚠ Saved to global, but a workspace session 'notes' shadows it. '.session notes' will load the workspace copy."
+        );
+    }
+
+    #[test]
+    fn shadow_warning_call_site_strips_terminal_escapes_from_names() {
+        let shown = sanitize_display_text("evil\x1b[31mred");
+        let warning = shadow_warning(SessionScope::Global, SessionScope::Workspace, &shown);
+        assert!(!warning.contains('\x1b'), "got: {warning:?}");
+        assert!(warning.contains("'evilred'"), "got: {warning:?}");
+    }
+
     #[test]
     #[serial]
     fn exit_session_roundtrip() {
@@ -11406,8 +12587,8 @@ mod tests {
         let id = session.ensure_mesh_instance_id().to_string();
         ctx.session = Some(session);
 
-        ctx.save_session(None).unwrap();
-        ctx.save_session(Some("copy")).unwrap();
+        ctx.save_session(None, None).unwrap();
+        ctx.save_session(Some("copy"), None).unwrap();
 
         for name in ["orig", "copy"] {
             let yaml = std::fs::read_to_string(sessions_dir.join(format!("{name}.yaml"))).unwrap();

@@ -1,7 +1,9 @@
 use crate::client::{ModelType, list_models};
 use crate::config::paths;
-use crate::config::{AppConfig, Config, agent_sessions_dir, list_agents_for_humans, list_sessions};
-use crate::utils::list_file_names;
+use crate::config::{
+    AppConfig, Config, labeled_session_names, list_agents_for_humans, sanitize_display_text,
+    session_scope_dirs,
+};
 use crate::vault::Vault;
 use clap_complete::{CompletionCandidate, Shell, generate};
 use clap_complete_nushell::Nushell;
@@ -111,7 +113,11 @@ pub(super) fn bundle_completer(current: &OsStr) -> Vec<CompletionCandidate> {
 }
 
 fn extract_agent_from_args() -> Option<String> {
-    let args: Vec<String> = env::args().collect();
+    extract_agent_from_args_in(env::args())
+}
+
+fn extract_agent_from_args_in<I: IntoIterator<Item = String>>(args: I) -> Option<String> {
+    let args: Vec<String> = args.into_iter().collect();
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
@@ -130,23 +136,21 @@ fn extract_agent_from_args() -> Option<String> {
 }
 
 pub(super) fn session_completer(current: &OsStr) -> Vec<CompletionCandidate> {
-    session_candidates(extract_agent_from_args().as_deref(), current)
+    session_candidates(
+        &current.to_string_lossy(),
+        extract_agent_from_args().as_deref(),
+    )
 }
 
-fn session_candidates(agent: Option<&str>, current: &OsStr) -> Vec<CompletionCandidate> {
-    let cur = current.to_string_lossy();
-
-    let sessions = match agent {
-        Some(agent) => agent_sessions_dir(agent)
-            .map(|dir| list_file_names(dir, ".yaml"))
-            .unwrap_or_default(),
-        None => list_sessions(),
-    };
-
-    sessions
+fn session_candidates(cur: &str, agent: Option<&str>) -> Vec<CompletionCandidate> {
+    let (workspace_dir, global_dir) = session_scope_dirs(agent);
+    labeled_session_names(&workspace_dir, &global_dir)
         .into_iter()
-        .filter(|s| s.starts_with(&*cur))
-        .map(CompletionCandidate::new)
+        .filter(|(name, _)| name.starts_with(cur))
+        .map(|(name, scope)| {
+            CompletionCandidate::new(sanitize_display_text(&name))
+                .help(Some(scope.to_string().into()))
+        })
         .collect()
 }
 
@@ -198,8 +202,9 @@ pub(super) fn secrets_completer(current: &OsStr) -> Vec<CompletionCandidate> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::default_sessions_dir;
     use crate::config::reserved_agents::{BuiltinSourceGuard, FixedDirSource};
-    use crate::testing::TestConfigDirGuard;
+    use crate::testing::{EnvVarGuard, TestConfigDirGuard};
     use serial_test::serial;
     use std::path::Path;
     use std::sync::Arc;
@@ -215,6 +220,23 @@ mod tests {
         let sessions = dir.join("sessions");
         fs::create_dir_all(&sessions).unwrap();
         fs::write(sessions.join(format!("{name}.yaml")), "").unwrap();
+    }
+
+    fn seed(dir: &Path, name: &str) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join(format!("{name}.yaml")), "model: x\n").unwrap();
+    }
+
+    fn labeled(candidates: Vec<CompletionCandidate>) -> Vec<(String, Option<String>)> {
+        candidates
+            .into_iter()
+            .map(|c| {
+                (
+                    c.get_value().to_string_lossy().into_owned(),
+                    c.get_help().map(|h| h.to_string()),
+                )
+            })
+            .collect()
     }
 
     #[test]
@@ -246,11 +268,37 @@ mod tests {
 
     #[test]
     #[serial]
+    fn session_completer_labels_scope_and_prefers_workspace() {
+        let _guard = TestConfigDirGuard::new("cli-session-completer");
+        seed(&paths::workspace_sessions_dir(), "both");
+        seed(&default_sessions_dir(), "both");
+        seed(&default_sessions_dir(), "only-global");
+        seed(&paths::workspace_sessions_dir(), "only-ws");
+
+        assert_eq!(
+            labeled(session_completer(OsStr::new(""))),
+            vec![
+                ("both".to_string(), Some("workspace".to_string())),
+                ("only-ws".to_string(), Some("workspace".to_string())),
+                ("only-global".to_string(), Some("global".to_string())),
+            ]
+        );
+        assert_eq!(
+            labeled(session_completer(OsStr::new("on"))),
+            vec![
+                ("only-ws".to_string(), Some("workspace".to_string())),
+                ("only-global".to_string(), Some("global".to_string())),
+            ]
+        );
+    }
+
+    #[test]
+    #[serial]
     fn session_candidates_never_list_shadow_reserved_dir() {
         let _guard = TestConfigDirGuard::new("completer-shadow-sessions");
         write_session(&paths::agents_data_dir().join("envoy"), "leak");
 
-        let names = candidate_names(&session_candidates(Some("envoy"), OsStr::new("")));
+        let names = candidate_names(&session_candidates("", Some("envoy")));
 
         assert!(!names.contains(&"leak".to_string()), "got: {names:?}");
     }
@@ -264,7 +312,7 @@ mod tests {
         write_session(&dir, "real");
         let _source = BuiltinSourceGuard::new(Arc::new(FixedDirSource(dir)));
 
-        let names = candidate_names(&session_candidates(Some("Envoy"), OsStr::new("")));
+        let names = candidate_names(&session_candidates("", Some("Envoy")));
 
         assert_eq!(names, vec!["real".to_string()]);
     }
@@ -276,13 +324,70 @@ mod tests {
         write_session(&paths::agents_data_dir().join("other"), "mine");
         write_session(&paths::agents_data_dir().join("other"), "yours");
 
-        let mut names = candidate_names(&session_candidates(Some("other"), OsStr::new("")));
+        let mut names = candidate_names(&session_candidates("", Some("other")));
         names.sort();
         assert_eq!(names, vec!["mine".to_string(), "yours".to_string()]);
 
         assert_eq!(
-            candidate_names(&session_candidates(Some("other"), OsStr::new("m"))),
+            candidate_names(&session_candidates("m", Some("other"))),
             vec!["mine".to_string()]
         );
+    }
+
+    #[test]
+    #[serial]
+    fn session_candidates_use_the_agent_scope_dirs() {
+        let _guard = TestConfigDirGuard::new("cli-agent-session-completer");
+        let _agent_data_dir = EnvVarGuard::unset("A_DATA_DIR");
+        seed(&paths::workspace_agent_sessions_dir("a"), "both");
+        seed(&paths::agent_sessions_dir("a"), "both");
+        seed(&paths::agent_sessions_dir("a"), "agent-global");
+        seed(&default_sessions_dir(), "plain-global");
+
+        assert_eq!(
+            labeled(session_candidates("", Some("a"))),
+            vec![
+                ("both".to_string(), Some("workspace".to_string())),
+                ("agent-global".to_string(), Some("global".to_string())),
+            ]
+        );
+        assert_eq!(
+            labeled(session_candidates("", None)),
+            vec![("plain-global".to_string(), Some("global".to_string()))]
+        );
+    }
+
+    #[test]
+    fn extract_agent_from_args_in_reads_both_flag_forms() {
+        fn args(s: &str) -> Vec<String> {
+            s.split_whitespace().map(str::to_string).collect()
+        }
+        assert_eq!(
+            extract_agent_from_args_in(args("coyote --agent a --session x")),
+            Some("a".to_string())
+        );
+        assert_eq!(
+            extract_agent_from_args_in(args("coyote -a b")),
+            Some("b".to_string())
+        );
+        assert_eq!(
+            extract_agent_from_args_in(args("coyote --agent=c")),
+            Some("c".to_string())
+        );
+        assert_eq!(extract_agent_from_args_in(args("coyote --agent")), None);
+        assert_eq!(extract_agent_from_args_in(args("coyote --session x")), None);
+    }
+
+    #[test]
+    #[serial]
+    fn config_dir_guard_clears_and_restores_the_sessions_dir_override() {
+        let key = crate::utils::get_env_name("sessions_dir");
+        let junk = std::path::PathBuf::from("/nonexistent/junk-sessions");
+        let _outer = EnvVarGuard::set(&key, &junk);
+        {
+            let guard = TestConfigDirGuard::new("cli-sessions-dir-guard");
+            assert!(default_sessions_dir().starts_with(&guard.path));
+        }
+        assert_eq!(default_sessions_dir(), junk);
     }
 }

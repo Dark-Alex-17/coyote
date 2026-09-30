@@ -56,6 +56,16 @@ If no posture is given, assume `standard` and say so in the report.
 8. **Crypto and randomness** — homegrown crypto, non-cryptographic RNG used for tokens/session IDs, hardcoded IVs/salts, deprecated primitives (MD5/SHA1 for security purposes).
 9. **Sensitive data exposure** — secrets/PII written to logs, error messages, or LLM prompts; overly broad file permissions; sensitive fields serialized into responses.
 10. **Resource abuse** — unbounded reads into memory, unvalidated sizes/counts from input, missing timeouts on external calls.
+11. **Error-text passthrough on a NEW surface** — a new mount, gateway, adapter, or endpoint that
+    writes an upstream/middleware error's text (`err.Error()`, connect/gRPC `Message()`, a wrapped
+    library message) into its own response body. `fs_grep` the new surface's response writers for
+    interpolated error strings. Default expectation: fixed strings per error class; passthrough
+    needs POSITIVE justification (the upstream text is a documented, stable, caller-facing
+    contract). "The same principal already sees this text on another surface" is NOT a clearance
+    — upstream strings are not a stable contract, grow internal detail over time (verifier
+    internals, allow-list names, hostnames), and the new surface may acquire callers with
+    different trust. Medium by default; High when the passed-through source is an authorizer,
+    token verifier, or anything that names internal identifiers.
 
 ## Ground-truth verification (verify, don't pattern-match)
 

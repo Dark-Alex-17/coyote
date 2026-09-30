@@ -89,6 +89,15 @@ These are review findings that only surface in a diff context, not in a whole-fi
   finding (dead weight or a forgotten wiring step). Used in SOME applicable in-diff sites but
   not others = a finding naming the sites that didn't adopt it — half-adopted artifacts are how
   two mechanisms for the same job end up coexisting forever.
+- **"Ignored / redundant request field" claims need a wire-validation check first** — before
+  calling a request/message field ignored, redundant, or dead on some code path because the
+  handler never reads it there, `fs_grep` the boundary contract for that field: proto validation
+  rules (`(validate.rules)`, `buf.validate`), OpenAPI/JSON-schema `required`, struct-tag
+  `required`/`binding`/serde attributes, or a hand-written validator/interceptor. A field the
+  validator MANDATES is load-bearing at the boundary even when the handler ignores it — the
+  honest finding (if any) is "validator requires `<field>` on the `<path>` path that never reads
+  it (`path:line`); relax with `ignore_empty`/`oneof` or document why", never "`<field>` is
+  ignored". No validation found ⇒ the ignored-field finding stands, citing the grep you ran.
 - **Version-literal consistency and freshness** — when the diff bumps a version (image tag,
   tool version, dependency pin), `fs_grep` the repo for other occurrences of the OLD version
   string (compose files, workflows, docs, sibling Dockerfiles) — stragglers are findings. For
@@ -143,6 +152,21 @@ Named adequacy anti-patterns — each is a finding even when coverage looks gree
 - **Leaky fixture** — an integration test against a shared/persistent database inserts fixture
   rows directly with no paired cleanup (deferred delete/teardown/transaction rollback). The
   test passes today and leaves a primary-key landmine for the next run.
+- **Struct-typed args against an inferred schema** — when a struct drives an inferred wire schema
+  (MCP go-sdk, OpenAPI/JSON-schema generators, serde-derived schemas), every field without
+  `omitempty`/pointer/`Option` becomes schema-REQUIRED. Cross-check the optionality the doc
+  strings promise ("X as an alternative to Y") against the tags — a documented-optional field
+  without the omission marker is a live validation bug, not a style nit. And tests that build the
+  request from the typed struct serialize EVERY field (zero values included), so they can never
+  exercise the required-ness check: demand raw-JSON / map-typed tests that OMIT each
+  documented-optional field.
+- **Relaxed call count with a permissive matcher** — a mock expectation whose COUNT is relaxed
+  (`AnyTimes()`, `MinTimes(1)`, `Maybe()`, "called at least once") leaves the ARGUMENT matcher as
+  the only thing asserted; pair it with `gomock.Any()` / `mock.Anything` / `mock.ANY` /
+  `expect.anything()` / an ignored request body and the expectation proves nothing — a call with
+  the wrong ID, wrong quantity, or wrong principal satisfies it. Flag every relaxed-count
+  expectation whose matcher is permissive; the fix pins the load-bearing fields in the matcher
+  (or exact count + captured args).
 
 ## 3. Clarity
 

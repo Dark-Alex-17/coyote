@@ -1705,17 +1705,6 @@ pub fn load_agent_variables(name: &str) -> Vec<AgentVariable> {
     Vec::new()
 }
 
-/// Sessions dir for a session completer to list. A reserved name resolves
-/// through the registered built-in (or to `None` while unregistered) so a
-/// shadow `agents/<name>/sessions` never surfaces as a completion.
-pub fn agent_sessions_dir(name: &str) -> Option<PathBuf> {
-    let dir = match reserved_agent(name) {
-        Some(canonical) => builtin_agent_dir(canonical)?,
-        None => paths::agent_data_dir(name),
-    };
-    Some(dir.join(SESSIONS_DIR_NAME))
-}
-
 pub fn complete_agent_variables(agent_name: &str) -> Vec<(String, Option<String>)> {
     load_agent_variables(agent_name)
         .iter()

@@ -18,8 +18,9 @@ use crate::client::{
 };
 use crate::config::{
     AgentVariables, AppConfig, AssertState, EnvoyRunner, Input, LastMessage, MacroState,
-    MeshDigestDriver, MeshHookBridge, RequestContext, StateFlags, flatten_prompt_messages,
-    macro_execute, publish_mesh_snapshot, resolve_prompt_args, sanitize_display_text,
+    MeshDigestDriver, MeshHookBridge, RequestContext, SessionScope, StateFlags,
+    flatten_prompt_messages, macro_execute, publish_mesh_snapshot, resolve_prompt_args,
+    sanitize_display_text,
 };
 use crate::config::{AssetCategory, paths};
 use crate::function::agents::{GuardrailAction, check_pending_tasks_guardrail};
@@ -1290,11 +1291,24 @@ pub async fn run_repl_command(
                 Some(("role", name)) => {
                     ctx.save_role(name)?;
                 }
-                Some(("session", name)) => {
-                    ctx.save_session(name)?;
-                }
+                Some(("session", rest)) => match parse_repl_save_session(rest) {
+                    ReplSaveSessionDispatch::Run { name, scope } => {
+                        ctx.save_session(name.as_deref(), scope)?;
+                    }
+                    ReplSaveSessionDispatch::Help => println!("{}", repl_save_session_help()),
+                    ReplSaveSessionDispatch::Conflict => {
+                        println!("--workspace and --global are mutually exclusive")
+                    }
+                    ReplSaveSessionDispatch::Usage => {
+                        println!(
+                            "Usage: .save session [name] [--workspace|--global] (see `.save session --help`)"
+                        )
+                    }
+                },
                 _ => {
-                    println!(r#"Usage: .save <role|session> [name]"#)
+                    println!(
+                        r#"Usage: .save role [name] | .save session [name] [--workspace|--global]"#
+                    )
                 }
             },
             ".edit" => {
@@ -2140,6 +2154,61 @@ fn parse_repl_uninstall(args: Option<&str>) -> ReplUninstallDispatch {
         [name] => ReplUninstallDispatch::Run(name.to_string(), assume_yes),
         _ => ReplUninstallDispatch::Usage,
     }
+}
+
+fn repl_save_session_help() -> String {
+    r#"Save the current session to a file.
+
+Usage:
+  .save session [name] [--workspace|--global]
+
+Flags:
+  --workspace   Save under .coyote/ in the current workspace
+  --global      Save under the global config dir
+
+Without a flag the session is re-saved wherever it currently lives; a brand-new
+session lives in the global scope. Re-homing a session never deletes the old file."#
+        .to_string()
+}
+
+#[derive(Debug, PartialEq)]
+enum ReplSaveSessionDispatch {
+    Run {
+        name: Option<String>,
+        scope: Option<SessionScope>,
+    },
+    Help,
+    Conflict,
+    Usage,
+}
+
+fn parse_repl_save_session(args: Option<&str>) -> ReplSaveSessionDispatch {
+    let tokens: Vec<&str> = args.unwrap_or("").split_whitespace().collect();
+    if tokens
+        .iter()
+        .any(|token| *token == "--help" || *token == "-h")
+    {
+        return ReplSaveSessionDispatch::Help;
+    }
+    let mut scope = None;
+    let mut names = Vec::new();
+    for token in tokens {
+        let requested = match token {
+            "--workspace" => SessionScope::Workspace,
+            "--global" => SessionScope::Global,
+            other if other.starts_with('-') => return ReplSaveSessionDispatch::Usage,
+            other => {
+                names.push(other);
+                continue;
+            }
+        };
+        if scope.is_some_and(|current| current != requested) {
+            return ReplSaveSessionDispatch::Conflict;
+        }
+        scope = Some(requested);
+    }
+    let name = (!names.is_empty()).then(|| names.join(" "));
+    ReplSaveSessionDispatch::Run { name, scope }
 }
 
 pub fn builtin_command_names() -> Vec<&'static str> {
@@ -3568,6 +3637,144 @@ mod tests {
             ReplUninstallDispatch::Usage
         );
         assert_eq!(parse_repl_uninstall(None), ReplUninstallDispatch::Usage);
+    }
+
+    #[test]
+    fn parse_repl_save_session_routes_name_and_scope_in_either_order() {
+        assert_eq!(
+            parse_repl_save_session(None),
+            ReplSaveSessionDispatch::Run {
+                name: None,
+                scope: None
+            }
+        );
+        assert_eq!(
+            parse_repl_save_session(Some("notes")),
+            ReplSaveSessionDispatch::Run {
+                name: Some("notes".to_string()),
+                scope: None
+            }
+        );
+        assert_eq!(
+            parse_repl_save_session(Some("notes --workspace")),
+            ReplSaveSessionDispatch::Run {
+                name: Some("notes".to_string()),
+                scope: Some(SessionScope::Workspace)
+            }
+        );
+        assert_eq!(
+            parse_repl_save_session(Some("--global notes")),
+            ReplSaveSessionDispatch::Run {
+                name: Some("notes".to_string()),
+                scope: Some(SessionScope::Global)
+            }
+        );
+        assert_eq!(
+            parse_repl_save_session(Some("--workspace")),
+            ReplSaveSessionDispatch::Run {
+                name: None,
+                scope: Some(SessionScope::Workspace)
+            }
+        );
+    }
+
+    #[test]
+    fn parse_repl_save_session_rejects_conflicts_and_unknown_flags_but_joins_spaced_names() {
+        assert_eq!(
+            parse_repl_save_session(Some("--workspace --global")),
+            ReplSaveSessionDispatch::Conflict
+        );
+        assert_eq!(
+            parse_repl_save_session(Some("notes --force")),
+            ReplSaveSessionDispatch::Usage
+        );
+        assert_eq!(
+            parse_repl_save_session(Some("one two")),
+            ReplSaveSessionDispatch::Run {
+                name: Some("one two".to_string()),
+                scope: None
+            }
+        );
+        assert_eq!(
+            parse_repl_save_session(Some("--help")),
+            ReplSaveSessionDispatch::Help
+        );
+        assert_eq!(
+            parse_repl_save_session(Some("notes -h")),
+            ReplSaveSessionDispatch::Help
+        );
+        assert_eq!(
+            parse_repl_save_session(Some("--workspace --global -h")),
+            ReplSaveSessionDispatch::Help
+        );
+        assert_eq!(
+            parse_repl_save_session(Some("--global notes --global")),
+            ReplSaveSessionDispatch::Run {
+                name: Some("notes".to_string()),
+                scope: Some(SessionScope::Global)
+            }
+        );
+    }
+
+    #[test]
+    fn repl_save_session_help_text_covers_the_full_surface() {
+        let help = repl_save_session_help();
+        for needle in [
+            "--workspace",
+            "--global",
+            "[name]",
+            "never deletes the old file",
+        ] {
+            assert!(help.contains(needle), "save session help missing {needle}");
+        }
+    }
+
+    // Usage probe (spec-first, criterion 5): `-h/--help` wins from ANY
+    // position — including when it is preceded by a token that would
+    // otherwise route to Usage (unknown `-` flag) or Conflict (both scope
+    // flags) — while, absent help, an unknown `-` token still routes to
+    // Usage even when a valid scope flag is present, and a repeated
+    // identical flag stays idempotent for `--workspace` too.
+    #[test]
+    fn usage_probe_save_session_help_prescan_beats_usage_and_conflict() {
+        for input in [
+            "--bogus -h",
+            "-h --bogus",
+            "notes --bogus --help",
+            "--workspace --global notes -h",
+            "--help --workspace --global",
+            "one -h two",
+        ] {
+            assert_eq!(
+                parse_repl_save_session(Some(input)),
+                ReplSaveSessionDispatch::Help,
+                "help must win for {input:?}"
+            );
+        }
+
+        assert_eq!(
+            parse_repl_save_session(Some("--workspace --bogus notes")),
+            ReplSaveSessionDispatch::Usage
+        );
+        assert_eq!(
+            parse_repl_save_session(Some("-x")),
+            ReplSaveSessionDispatch::Usage
+        );
+        assert_eq!(
+            parse_repl_save_session(Some("--workspace notes --workspace")),
+            ReplSaveSessionDispatch::Run {
+                name: Some("notes".to_string()),
+                scope: Some(SessionScope::Workspace)
+            }
+        );
+        // Non-flag tokens join into ONE name even when a flag sits between them.
+        assert_eq!(
+            parse_repl_save_session(Some("one --global two")),
+            ReplSaveSessionDispatch::Run {
+                name: Some("one two".to_string()),
+                scope: Some(SessionScope::Global)
+            }
+        );
     }
 
     #[test]

@@ -82,6 +82,8 @@ RUN set -euo pipefail; \
     chown 1000:1000 /home/agent/.cargo/bin/coyote; \
     rm -rf "$TMPDIR"
 
+COPY --chmod=0755 scripts/docker-entrypoint.sh /usr/local/bin/coyote-entrypoint
+
 FROM scratch
 
 ARG COYOTE_VERSION
@@ -107,4 +109,7 @@ WORKDIR /home/agent/workspace
 
 USER 1000
 
-ENTRYPOINT ["coyote"]
+# tini as PID 1 (as in the sandbox-templates base) reaps orphans and forwards
+# signals; coyote-entrypoint runs coyote by default, or the given command
+# (e.g. the Docker Sandboxes keep-alive) when the first arg is sh/bash/a path.
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/coyote-entrypoint"]
