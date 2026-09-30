@@ -1412,10 +1412,21 @@ mod tests {
     /// Under `current_thread` a mine run inline would starve the ticker; `Skip` keeps a
     /// starved ticker from making its count up in a burst afterwards. Together they make
     /// the tick count tell an offloaded mine from an inline one.
+    ///
+    /// The period must be coarser than any platform timer: Windows wakes sleepers on a
+    /// ~15.6 ms system tick, so a 10 ms interval fires at most ~64 % of `elapsed / TICK`
+    /// times even on an idle runtime and fell under the half-count bar there (91 of 198).
+    /// At 50 ms the same granularity costs at most one 15.6 ms slot per tick (~80 % of
+    /// the count), and the half-count bar tolerates a full period of scheduling delay on
+    /// every tick besides. An inline mine would hold the count to about one tick per mine,
+    /// a few over the window against a bar of at least five, while
+    /// `mining_stops_with_cancelled_when_the_token_fires` stays the deterministic proof.
+    /// `MINIMUM_RUN` is a floor on the window, not its length: the last mine finishes
+    /// past it, so the window is long enough for the count to mean something anywhere.
     #[tokio::test(flavor = "current_thread")]
     async fn mining_does_not_starve_the_runtime() {
-        const TICK: Duration = Duration::from_millis(10);
-        const MINIMUM_RUN: Duration = Duration::from_millis(300);
+        const TICK: Duration = Duration::from_millis(50);
+        const MINIMUM_RUN: Duration = Duration::from_millis(500);
         let ticks = Arc::new(AtomicUsize::new(0));
         let counter = ticks.clone();
         let ticker = tokio::spawn(async move {
