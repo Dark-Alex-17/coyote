@@ -116,6 +116,12 @@ mesh crates and BSD 3-Clause for the dalek crates and `subtle`, are not in this 
 them, or drop the dependencies, before cutting a release that contains them. The second, settling
 the license expression for the combined work, is the license owner's call and is tracked separately.
 
+### Small single-purpose dependencies
+
+`unicode-normalization` exists for one call: the `nfc` rule of `WirePath::parse` in
+`src/mesh/wire_path.rs`, which refuses a wire path that is not already NFC rather than
+normalising it. `globset` follows in TASK-109 on the same terms: one caller, named here.
+
 ### Dependency build-cost records
 
 A point-in-time record for the LXMF-rs and windows-sys dependency addition of 2026-09, not a

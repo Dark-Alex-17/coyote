@@ -11,6 +11,9 @@ pub(crate) mod events;
 mod fuzz;
 pub(crate) mod identity;
 pub(crate) mod idle;
+// Read by the file-transfer message path once it lands.
+#[allow(dead_code)]
+pub(crate) mod inbox;
 pub(crate) mod knock;
 pub(crate) mod knocks;
 pub(crate) mod limits;
@@ -31,6 +34,9 @@ pub(crate) mod snapshot;
 #[cfg(test)]
 mod spec_pins;
 pub(crate) mod trust;
+// Read by the file-transfer message path once it lands.
+#[allow(dead_code)]
+pub(crate) mod wire_path;
 
 #[cfg(test)]
 pub(crate) use node::session_destination_name;

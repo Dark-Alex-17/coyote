@@ -62,6 +62,9 @@ shell-words = "1.1.0"
 sha2 = "0.10.8"
 subtle = "2.6.1"
 unicode-width = "0.2.0"
+# Only the NFC check in `WirePath::parse` (`src/mesh/wire_path.rs`) uses it; a path that is
+# not already NFC is refused there, never normalised.
+unicode-normalization = "0.1.25"
 async-recursion = "1.1.1"
 http = "1.1.0"
 indexmap = { version = "2.2.6", features = ["serde"] }
