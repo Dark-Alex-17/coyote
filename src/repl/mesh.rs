@@ -179,6 +179,39 @@ pub(crate) async fn run(
 
 async fn turn_on(ctx: &mut RequestContext, rest: Option<&str>) -> Result<()> {
     let args = parse_args(rest, &["--yes", "--fresh"], "on")?;
+    join(
+        ctx,
+        JoinOptions {
+            yes: args.has("--yes"),
+            fresh: args.has("--fresh"),
+        },
+    )
+    .await
+}
+
+/// Joins the mesh for this session because config.yaml asked for it; the only
+/// difference from `.mesh on --yes` is the line saying where the decision came from.
+pub(crate) async fn autostart(ctx: &mut RequestContext) -> Result<()> {
+    out_text(
+        "mesh.enabled is true in config.yaml: joining the mesh for this session (`.mesh off` leaves it).",
+    );
+    join(
+        ctx,
+        JoinOptions {
+            yes: true,
+            fresh: false,
+        },
+    )
+    .await
+}
+
+struct JoinOptions {
+    yes: bool,
+    fresh: bool,
+}
+
+async fn join(ctx: &mut RequestContext, options: JoinOptions) -> Result<()> {
+    let JoinOptions { yes, fresh } = options;
     if ctx.app.mesh.get().is_some() {
         bail!(MESH_ALREADY_ON);
     }
@@ -197,12 +230,11 @@ async fn turn_on(ctx: &mut RequestContext, rest: Option<&str>) -> Result<()> {
         );
     };
     let cwd = env::current_dir()?;
-    let fresh = args.has("--fresh");
     out_text(&render_on_preview(&config, &session_name, fresh));
     if let Some(warning) = cwd_warning(&cwd, dirs::home_dir().as_deref()) {
         err_text(&warning);
     }
-    if !confirm_or_flag(&on_question(&config), "--yes", args.has("--yes"))? {
+    if !confirm_or_flag(&on_question(&config), "--yes", yes)? {
         out_text("Mesh stays off.");
         return Ok(());
     }
@@ -4297,6 +4329,25 @@ mod tests {
             assert!(!ctx.app.config.mesh.enabled);
         }
 
+        #[test]
+        fn autostart_without_a_session_prints_the_mesh_on_refusal_and_stays_off() {
+            let enabled = MeshConfig {
+                enabled: true,
+                ..MeshConfig::default()
+            };
+            let mut ctx = ctx_with(enabled.clone(), true);
+            let err = run_async(autostart(&mut ctx)).unwrap_err().to_string();
+            assert_eq!(
+                err,
+                "Mesh needs a session: this node's destination is derived from an id kept in the session file. Run `.session <name>` first."
+            );
+            assert!(ctx.app.mesh.get().is_none());
+
+            let mut by_command = ctx_with(enabled, true);
+            assert_eq!(err_of(&mut by_command, ".mesh on --yes"), err);
+            assert!(by_command.app.mesh.get().is_none());
+        }
+
         /// Criterion (b): an unmatched `.mesh` verb is refused by the mesh family itself
         /// and never falls through to the macro path's generic "Unknown command".
         #[test]
@@ -4840,6 +4891,66 @@ mod tests {
                     run(&mut ctx, ".mesh off --yes").await.unwrap();
                     assert!(slot.get().is_none());
                     relay_handle.abort();
+                });
+            }
+
+            #[test]
+            #[serial]
+            fn autostart_joins_the_mesh_without_a_prompt() {
+                let guard = TestConfigDirGuard::new("repl-mesh-autostart");
+                let _cache = EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
+                let _script = prompt_script::install_non_interactive();
+                let _capture = capture::install();
+                run_async(async {
+                    let (addr, relay_handle, _) = loopback_relay().await;
+                    let mut ctx = ctx_with(
+                        MeshConfig {
+                            enabled: true,
+                            ..private_config(addr.port())
+                        },
+                        true,
+                    );
+                    ctx.session = Some(Session::default());
+
+                    autostart(&mut ctx).await.unwrap();
+
+                    assert!(ctx.app.mesh.get().is_some());
+                    assert!(ctx.app.config.mesh.enabled);
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+                    let out = stdout_lines();
+                    let notice = index_of(&out, "mesh.enabled is true in config.yaml");
+                    let preview = index_of(&out, "What leaves this machine");
+                    let summary = index_of(&out, "Mesh is on for this session");
+                    assert!(notice < preview && preview < summary, "{out:?}");
+
+                    run(&mut ctx, ".mesh off --yes").await.unwrap();
+                    assert!(ctx.app.mesh.get().is_none());
+                    relay_handle.abort();
+                });
+            }
+
+            #[test]
+            #[serial]
+            fn autostart_when_the_mesh_is_already_on_is_the_mesh_on_refusal() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-autostart-already-on");
+                run_async(async {
+                    let started = started_runtime("repl-mesh-autostart-already-on").await;
+                    let mut ctx = ctx_with(
+                        MeshConfig {
+                            enabled: true,
+                            ..MeshConfig::default()
+                        },
+                        true,
+                    );
+                    ctx.session = Some(Session::default());
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+
+                    let err = autostart(&mut ctx).await.unwrap_err().to_string();
+                    assert_eq!(err, MESH_ALREADY_ON);
+                    assert!(ctx.app.mesh.get().is_some());
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
                 });
             }
 

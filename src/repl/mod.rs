@@ -625,6 +625,21 @@ Type ".help" for additional help.
         // OSC 11 / DA1 responses) so they don't get injected into the prompt.
         drain_stale_tty_input();
 
+        if self.ctx.read().app.config.mesh.enabled {
+            let result = {
+                let mut ctx = self.ctx.write();
+                publish_mesh_snapshot(&ctx, TurnState::working_now());
+                let result = mesh::autostart(&mut ctx).await;
+                self.envoy.refresh(&ctx.app);
+                self.mesh_hooks.refresh(&ctx.app);
+                publish_mesh_snapshot(&ctx, TurnState::idle_now());
+                result
+            };
+            if let Err(err) = result {
+                render_error(err);
+            }
+        }
+
         print_pause_banner(&self.ctx.read());
 
         loop {
@@ -3340,8 +3355,16 @@ mod tests {
             assert_eq!(source.rfind(needle), Some(first), "{needle} not unique");
             first
         };
+        // The autostart block refreshes the same hooks, so the refresh is located
+        // relative to the per-turn command rather than as a unique needle.
+        let position_after = |start: usize, needle: &str| {
+            start
+                + source[start..]
+                    .find(needle)
+                    .unwrap_or_else(|| panic!("{needle} missing after {start}"))
+        };
         let command_at = position(&command);
-        let refresh_at = position(&refresh);
+        let refresh_at = position_after(command_at, &refresh);
         let observe_at = position(&observe);
         assert!(
             command_at < refresh_at,
@@ -3365,6 +3388,52 @@ mod tests {
         assert!(
             !source[run_at..mesh_stop_at].contains(&replay_propagated),
             "a replay failure in Repl::run must not skip the shutdown"
+        );
+    }
+
+    #[test]
+    fn the_mesh_autostarts_inside_repl_run_before_the_first_prompt() {
+        let strip = |s: &str| s.split_whitespace().collect::<String>();
+        let source = strip(include_str!("mod.rs"));
+        let run_start = strip(&["pub async fn run(", "&mut self)"].concat());
+        let gate = strip(&["if self.ctx.read().app.config.mesh.", "enabled {"].concat());
+        let autostart = strip(&["mesh::auto", "start(&mut ctx).await"].concat());
+        let surfaced = strip(&["if let Err(err) = result {", "render_error(err);"].concat());
+        let banner = strip(&["print_pause_", "banner(&self.ctx.read());"].concat());
+        let read_line = strip(&["self.editor.", "read_line(&self.prompt)"].concat());
+
+        let position = |needle: &str| {
+            let first = source
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle} missing"));
+            assert_eq!(source.rfind(needle), Some(first), "{needle} not unique");
+            first
+        };
+        let run_at = position(&run_start);
+        let gate_at = position(&gate);
+        let autostart_at = position(&autostart);
+        let surfaced_at = position(&surfaced);
+        let banner_at = position(&banner);
+        assert!(
+            run_at < gate_at && gate_at < autostart_at,
+            "Repl::run joins only when config.yaml enables the mesh"
+        );
+        assert!(
+            autostart_at < surfaced_at && surfaced_at < banner_at,
+            "an autostart failure is rendered and the REPL goes on to its banner"
+        );
+        assert!(
+            banner_at < position(&read_line),
+            "the join must settle before the first prompt is read"
+        );
+    }
+
+    #[test]
+    fn one_shot_entry_points_never_autostart_the_mesh() {
+        let main = include_str!("../main.rs");
+        assert!(
+            !main.contains("autostart"),
+            "main.rs must reach the mesh autostart only through Repl::run"
         );
     }
 

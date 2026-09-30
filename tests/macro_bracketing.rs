@@ -72,6 +72,12 @@ fn marker_command(marker: &str, dir: &Path) -> String {
 /// `probe-macro` agent that whitelists everything, and a `probe` macro with
 /// the given YAML body.
 fn write_fixture(dir: &Path, macro_yaml: &str) {
+    write_fixture_with(dir, macro_yaml, "");
+}
+
+/// `extra_config` is appended right after the `hooks:` block, so it may open
+/// with further two-space-indented hook entries before any top-level keys.
+fn write_fixture_with(dir: &Path, macro_yaml: &str, extra_config: &str) {
     // Without IS_SANDBOX (scrubbed below) a run insists on a vault password
     // file, so the fixture provides one.
     let vault_pass = dir.join("vault-pass");
@@ -108,7 +114,8 @@ fn write_fixture(dir: &Path, macro_yaml: &str) {
              \x20     command: '{failed}'\n\
              \x20 agent.interrupted:\n\
              \x20   - name: mark\n\
-             \x20     command: '{interrupted}'\n",
+             \x20     command: '{interrupted}'\n\
+             {extra_config}",
             vault_pass = vault_pass.display(),
             started = marker_command("STARTED", dir),
             completed = marker_command("COMPLETED", dir),
@@ -250,6 +257,44 @@ fn agent_macro_failure_closes_the_bracket_with_exactly_one_failed() {
         "steps:\n  - \".agent no-such-agent-zz\"\n",
         &["--agent", "probe-macro", "--macro", "probe"],
         false,
+    );
+}
+
+/// A macro run never constructs a REPL, so `mesh.enabled: true` must not
+/// start a node: no `mesh.started` hook fires and no joining notice prints.
+#[test]
+fn a_macro_run_with_mesh_enabled_never_starts_a_node() {
+    let dir = fresh_config_dir("mesh-enabled-macro");
+    let _cleanup = TempDirGuard(dir.clone());
+    let mesh_started = marker_command("MESH_STARTED", &dir);
+    write_fixture_with(
+        &dir,
+        "steps:\n  - \".set temperature 0.5\"\n",
+        &format!(
+            "  mesh.started:\n\
+             \x20   - name: mark\n\
+             \x20     command: '{mesh_started}'\n\
+             function_calling_support: true\n\
+             mesh:\n\
+             \x20 enabled: true\n"
+        ),
+    );
+
+    let output = run_coyote(&dir, &["--agent", "probe-macro", "--macro", "probe"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "unexpected exit {:?}\nstdout: {stdout}\nstderr: {stderr}",
+        output.status
+    );
+    wait_for_markers(&dir, &["STARTED", "COMPLETED"]);
+    assert_started_and_single_terminal(&dir, "COMPLETED");
+    assert_marker_count(&dir, "MESH_STARTED", 0);
+    assert!(
+        !stdout.contains("joining the mesh") && !stderr.contains("joining the mesh"),
+        "stdout: {stdout}\nstderr: {stderr}"
     );
 }
 

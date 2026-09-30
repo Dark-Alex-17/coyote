@@ -250,7 +250,7 @@ document_loaders: {}
 # Mesh needs function calling on both sides; enabled: true with function_calling_support: false is refused at load.
 # See the [Mesh documentation](https://github.com/Dark-Alex-17/coyote/wiki/Mesh) for more information
 mesh:
-  enabled: false                 # Join the mesh at startup (default: false). Nothing leaves the machine while this is false
+  enabled: false                 # Join the mesh when the REPL starts (default: false); one-shot runs (--macro, a prompt on the command line) never join. Nothing leaves the machine while this is false
   announce: true                 # Announce this node so peers can see it (default: true); false = outbound-only, see peers without being seen
   display_name: null             # Opt-in plaintext label carried in the announce (default: null = nothing but the protocol version is announced)
   display_name_on_public: false  # Also carry display_name when any interface is type public (default: false; public presence is world-visible)
