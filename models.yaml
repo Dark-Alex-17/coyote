@@ -3,6 +3,22 @@
 # Hand-owned behavior lives in quirks.yaml; this file is the embedded offline fallback.
 - provider: openai
   models:
+  - name: gpt-6.1-sol
+    type: chat
+    max_input_tokens: 1050000
+    input_price: 2.0
+    output_price: 10.0
+    cache_read_price: 0.1
+    cache_write_price: 2.5
+    max_output_tokens: 128000
+    supports_vision: true
+    supports_function_calling: true
+    reasoning_levels:
+    - low
+    - medium
+    - high
+    - xhigh
+    - max
   - name: gpt-6-luna
     type: chat
     max_input_tokens: 1050000
@@ -897,9 +913,9 @@
   - name: gemma-4-26b-a4b-it
     type: chat
     max_input_tokens: 262144
-    input_price: 0.09
-    output_price: 0.3
-    cache_read_price: 0.05
+    input_price: 0.0765
+    output_price: 0.255
+    cache_read_price: 0.0425
     max_output_tokens: 32768
     supports_vision: true
     supports_function_calling: true
@@ -3347,6 +3363,34 @@
     - high
     - xhigh
     - max
+  - name: global.xai.grok-4.7
+    type: chat
+    max_input_tokens: 500000
+    input_price: 2.0
+    output_price: 6.0
+    cache_read_price: 0.5
+    max_output_tokens: 500000
+    supports_vision: true
+    supports_function_calling: true
+    reasoning_levels:
+    - low
+    - medium
+    - high
+    - xhigh
+  - name: us.xai.grok-4.7
+    type: chat
+    max_input_tokens: 500000
+    input_price: 2.2
+    output_price: 6.6
+    cache_read_price: 0.55
+    max_output_tokens: 500000
+    supports_vision: true
+    supports_function_calling: true
+    reasoning_levels:
+    - low
+    - medium
+    - high
+    - xhigh
   - name: global.openai.gpt-6-astra
     type: chat
     max_input_tokens: 1050000
@@ -7498,7 +7542,7 @@
     supports_function_calling: true
   - name: deepseek/deepseek-v4-flash-0731
     type: chat
-    max_input_tokens: 1310720
+    max_input_tokens: 1048576
     input_price: 0.018
     output_price: 0.32
     cache_read_price: 0.018
@@ -7524,10 +7568,10 @@
   - name: deepseek/deepseek-v4-pro-0813
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.48
-    output_price: 4.2
-    cache_read_price: 0.384
-    max_output_tokens: 943718
+    input_price: 0.66
+    output_price: 1.98
+    cache_read_price: 0.022
+    max_output_tokens: 393216
     supports_function_calling: true
   - name: deepseek/deepseek-v4.1-flash
     type: chat
@@ -7919,9 +7963,9 @@
   - name: google/gemma-4-26b-a4b-it
     type: chat
     max_input_tokens: 262144
-    input_price: 0.09
-    output_price: 0.3
-    cache_read_price: 0.05
+    input_price: 0.0765
+    output_price: 0.255
+    cache_read_price: 0.0425
     max_output_tokens: 235929
     supports_vision: true
     supports_function_calling: true
@@ -8135,10 +8179,10 @@
   - name: meta/muse-glimmer-30b
     type: chat
     max_input_tokens: 131072
-    input_price: 0.3
-    output_price: 1.2
+    input_price: 0.35
+    output_price: 1.5
     cache_read_price: 0.04
-    max_output_tokens: 16384
+    max_output_tokens: 117964
     supports_vision: true
     supports_function_calling: true
   - name: meta/muse-spark-1.1
@@ -9535,6 +9579,46 @@
     max_output_tokens: 128000
     supports_vision: true
     supports_function_calling: true
+  - name: openai/gpt-6.1-sol
+    type: chat
+    max_input_tokens: 1050000
+    input_price: 2.0
+    output_price: 10.0
+    cache_read_price: 0.1
+    cache_write_price: 2.5
+    max_output_tokens: 128000
+    supports_vision: true
+    supports_function_calling: true
+  - name: openai/gpt-6.1-sol-pro
+    type: chat
+    max_input_tokens: 1050000
+    input_price: 2.0
+    output_price: 10.0
+    cache_read_price: 0.1
+    cache_write_price: 2.5
+    max_output_tokens: 128000
+    supports_vision: true
+    supports_function_calling: true
+  - name: openai/gpt-6.1-sol-pro:batch
+    type: chat
+    max_input_tokens: 1050000
+    input_price: 1.0
+    output_price: 5.0
+    cache_read_price: 0.05
+    cache_write_price: 1.25
+    max_output_tokens: 128000
+    supports_vision: true
+    supports_function_calling: true
+  - name: openai/gpt-6.1-sol:batch
+    type: chat
+    max_input_tokens: 1050000
+    input_price: 1.0
+    output_price: 5.0
+    cache_read_price: 0.05
+    cache_write_price: 1.25
+    max_output_tokens: 128000
+    supports_vision: true
+    supports_function_calling: true
   - name: openai/gpt-audio
     type: chat
     max_input_tokens: 128000
@@ -9884,9 +9968,9 @@
   - name: qwen/qwen3-30b-a3b
     type: chat
     max_input_tokens: 131072
-    input_price: 0.12
-    output_price: 0.5
-    max_output_tokens: 16384
+    input_price: 0.13
+    output_price: 0.52
+    max_output_tokens: 8192
     supports_function_calling: true
   - name: qwen/qwen3-30b-a3b-instruct-2507
     type: chat
@@ -10194,10 +10278,10 @@
   - name: qwen/qwen3.8-27b
     type: chat
     max_input_tokens: 1000000
-    input_price: 0.0428
-    output_price: 4.4
-    cache_read_price: 0.0342
-    max_output_tokens: 235929
+    input_price: 0.42
+    output_price: 3.0
+    cache_read_price: 0.085
+    max_output_tokens: 131072
     supports_vision: true
     supports_function_calling: true
   - name: qwen/qwen3.8-27b:free
@@ -10656,7 +10740,7 @@
     max_input_tokens: 131072
     input_price: 0.3
     output_price: 0.9
-    cache_read_price: 0.05
+    cache_read_price: 0.055
     max_output_tokens: 32768
     supports_vision: true
     supports_function_calling: true
@@ -10702,14 +10786,14 @@
   - name: z-ai/glm-5.2
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.1949
-    output_price: 4.4
-    cache_read_price: 0.1559
+    input_price: 0.1449
+    output_price: 3.99
+    cache_read_price: 0.1159
     max_output_tokens: 943718
     supports_function_calling: true
   - name: z-ai/glm-5.3
     type: chat
-    max_input_tokens: 1310720
+    max_input_tokens: 1048576
     input_price: 1.4
     output_price: 4.4
     cache_read_price: 0.26
@@ -10717,7 +10801,7 @@
     supports_function_calling: true
   - name: z-ai/glm-5.3-flash
     type: chat
-    max_input_tokens: 1310720
+    max_input_tokens: 1048576
     input_price: 0.15
     output_price: 0.5
     cache_read_price: 0.03
@@ -10819,14 +10903,14 @@
   - name: ~deepseek/deepseek-pro-latest
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.096
-    output_price: 1.9584
-    cache_read_price: 0.0749
-    max_output_tokens: 943718
+    input_price: 0.15
+    output_price: 3.5
+    cache_read_price: 0.15
+    max_output_tokens: 393216
     supports_function_calling: true
   - name: ~deepseek/deepseek-v4-flash-latest
     type: chat
-    max_input_tokens: 1310720
+    max_input_tokens: 1048576
     input_price: 0.012
     output_price: 1.25
     cache_read_price: 0.01
@@ -10856,7 +10940,7 @@
     type: chat
     max_input_tokens: 1048576
     input_price: 0.4
-    output_price: 10.0
+    output_price: 9.0
     cache_read_price: 0.4
     max_output_tokens: 943718
     supports_vision: true
@@ -10895,7 +10979,7 @@
     max_input_tokens: 1050000
     input_price: 2.0
     output_price: 10.0
-    cache_read_price: 0.2
+    cache_read_price: 0.1
     cache_write_price: 2.5
     max_output_tokens: 128000
     supports_vision: true
@@ -10921,7 +11005,7 @@
     supports_function_calling: true
   - name: ~z-ai/glm-flash-latest
     type: chat
-    max_input_tokens: 1310720
+    max_input_tokens: 1048576
     input_price: 0.02
     output_price: 0.3
     cache_read_price: 0.01
@@ -10930,10 +11014,10 @@
     supports_function_calling: true
   - name: ~z-ai/glm-latest
     type: chat
-    max_input_tokens: 1310720
-    input_price: 0.19
+    max_input_tokens: 1048576
+    input_price: 0.12
     output_price: 4.0
-    cache_read_price: 0.19
+    cache_read_price: 0.12
     max_output_tokens: 131072
     supports_function_calling: true
 - provider: github
@@ -11042,7 +11126,7 @@
   - name: XiaomiMiMo/MiMo-V2.6-Flash
     type: chat
     max_input_tokens: 1048576
-    input_price: 0.14
+    input_price: 0.08
     output_price: 0.28
     cache_read_price: 0.0028
     max_output_tokens: 131072
