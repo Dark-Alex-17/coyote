@@ -91,28 +91,53 @@ pub async fn wait_user_interrupt(session: Option<&AbortSignal>) {
     }
 }
 
-pub fn poll_abort_signal(abort_signal: &AbortSignal) -> Result<bool> {
-    if event::poll(Duration::from_millis(25))?
-        && let Event::Key(key) = event::read()?
-    {
-        match key.code {
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DrainOutcome {
+    pub aborted: bool,
+    pub resized: bool,
+}
+
+/// Drains queued terminal events until an abort key is seen; `timeout` applies
+/// to the first poll only.
+pub fn drain_terminal_events(
+    abort_signal: &AbortSignal,
+    timeout: Duration,
+) -> Result<DrainOutcome> {
+    let mut outcome = DrainOutcome::default();
+    let mut timeout = timeout;
+    while !outcome.aborted && event::poll(timeout)? {
+        timeout = Duration::ZERO;
+        classify_event(&event::read()?, abort_signal, &mut outcome);
+    }
+    Ok(outcome)
+}
+
+fn classify_event(event: &Event, abort_signal: &AbortSignal, outcome: &mut DrainOutcome) {
+    match event {
+        Event::Key(key) => match key.code {
             KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => {
                 abort_signal.set_ctrlc();
-                return Ok(true);
+                outcome.aborted = true;
             }
             KeyCode::Char('d') if key.modifiers == KeyModifiers::CONTROL => {
                 abort_signal.set_ctrld();
-                return Ok(true);
+                outcome.aborted = true;
             }
             _ => {}
-        }
+        },
+        Event::Resize(..) => outcome.resized = true,
+        _ => {}
     }
-    Ok(false)
+}
+
+pub fn poll_abort_signal(abort_signal: &AbortSignal) -> Result<bool> {
+    Ok(drain_terminal_events(abort_signal, Duration::from_millis(25))?.aborted)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::KeyEvent;
 
     #[tokio::test]
     async fn wait_user_interrupt_returns_promptly_on_preset_session_signal() {
@@ -122,5 +147,63 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), wait_user_interrupt(Some(&signal)))
             .await
             .expect("must return promptly when the session signal is already set");
+    }
+
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> Event {
+        Event::Key(KeyEvent::new(code, modifiers))
+    }
+
+    #[test]
+    fn classify_event_ignores_plain_keys_and_notes_resizes() {
+        let signal = create_abort_signal();
+        let mut outcome = DrainOutcome::default();
+
+        classify_event(
+            &key(KeyCode::Char('c'), KeyModifiers::NONE),
+            &signal,
+            &mut outcome,
+        );
+        assert_eq!(outcome, DrainOutcome::default());
+        assert!(!signal.aborted());
+
+        classify_event(&Event::Resize(80, 24), &signal, &mut outcome);
+        assert_eq!(
+            outcome,
+            DrainOutcome {
+                aborted: false,
+                resized: true
+            }
+        );
+        assert!(!signal.aborted());
+    }
+
+    #[test]
+    fn classify_event_ctrl_c_sets_ctrlc_and_aborts() {
+        let signal = create_abort_signal();
+        let mut outcome = DrainOutcome::default();
+        classify_event(
+            &key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            &signal,
+            &mut outcome,
+        );
+        assert!(outcome.aborted);
+        assert!(!outcome.resized);
+        assert!(signal.aborted_ctrlc());
+        assert!(!signal.aborted_ctrld());
+    }
+
+    #[test]
+    fn classify_event_ctrl_d_sets_ctrld_and_aborts() {
+        let signal = create_abort_signal();
+        let mut outcome = DrainOutcome::default();
+        classify_event(
+            &key(KeyCode::Char('d'), KeyModifiers::CONTROL),
+            &signal,
+            &mut outcome,
+        );
+        assert!(outcome.aborted);
+        assert!(!outcome.resized);
+        assert!(signal.aborted_ctrld());
+        assert!(!signal.aborted_ctrlc());
     }
 }
