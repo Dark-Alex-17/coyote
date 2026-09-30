@@ -5,11 +5,10 @@
 
 use std::ffi::c_void;
 use std::fmt;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io;
 use std::iter::once;
 use std::os::windows::ffi::OsStrExt;
-use std::os::windows::fs::OpenOptionsExt;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::path::Path;
 use std::ptr::null_mut;
@@ -18,9 +17,11 @@ use windows_sys::Win32::Foundation::{
     ERROR_INSUFFICIENT_BUFFER, GENERIC_WRITE, HANDLE, HLOCAL, INVALID_HANDLE_VALUE, LocalFree,
     MAX_PATH,
 };
+#[cfg(test)]
+use windows_sys::Win32::Security::Authorization::SetNamedSecurityInfoW;
 use windows_sys::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
-    SDDL_REVISION_1, SE_FILE_OBJECT,
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+    GetNamedSecurityInfoW, GetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT,
 };
 use windows_sys::Win32::Security::{
     ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
@@ -29,10 +30,13 @@ use windows_sys::Win32::Security::{
     SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR_CONTROL, TOKEN_QUERY, TOKEN_USER, TokenUser,
 };
 #[cfg(test)]
-use windows_sys::Win32::Security::{OBJECT_SECURITY_INFORMATION, SetFileSecurityW};
+use windows_sys::Win32::Security::{
+    GetSecurityDescriptorDacl, PROTECTED_DACL_SECURITY_INFORMATION, SetFileSecurityW,
+    UNPROTECTED_DACL_SECURITY_INFORMATION,
+};
 use windows_sys::Win32::Storage::FileSystem::{
     CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT,
-    GetVolumeInformationByHandleW, READ_CONTROL,
+    GetVolumeInformationByHandleW,
 };
 use windows_sys::Win32::System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, FILE_PERSISTENT_ACLS};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
@@ -271,14 +275,6 @@ pub(crate) fn create_owner_only(path: &Path) -> io::Result<File> {
     Ok(unsafe { File::from_raw_handle(handle) })
 }
 
-/// Opens `path` with `READ_CONTROL` alone, enough for `inspect` and nothing else. The
-/// owner is implicitly granted that right unless an `OWNER RIGHTS` ACE overrides it, so a
-/// key whose DACL denies its owner the read `File::open` asks for can still have that DACL
-/// reported; a key owned by someone else may not open even for this.
-pub(crate) fn open_for_security_read(path: &Path) -> io::Result<File> {
-    OpenOptions::new().access_mode(READ_CONTROL).open(path)
-}
-
 pub(crate) fn volume_acls(file: &File) -> io::Result<VolumeAcls> {
     let mut flags = 0u32;
     let mut name = [0u16; MAX_PATH as usize + 1];
@@ -311,10 +307,10 @@ pub(crate) fn volume_acls(file: &File) -> io::Result<VolumeAcls> {
 
 /// Reads back the owner and DACL of the file `file` is open on, so the verdict is about
 /// the same file whose bytes the handle reads and not whatever the name resolves to by
-/// then. The handle must carry `READ_CONTROL`, which every `File::open`,
-/// `create_owner_only` and `open_for_security_read` handle does. Only ACE types this
-/// module writes are looked into; any other type is reported as not allowing the current
-/// user without its layout being interpreted.
+/// then. The handle must carry `READ_CONTROL`, which every `File::open` and
+/// `create_owner_only` handle does. Only ACE types this module writes are looked into; any
+/// other type is reported as not allowing the current user without its layout being
+/// interpreted.
 pub(crate) fn inspect(file: &File) -> io::Result<DaclSummary> {
     let user = CurrentUser::query()?;
     let mut owner: PSID = null_mut();
@@ -340,10 +336,61 @@ pub(crate) fn inspect(file: &File) -> io::Result<DaclSummary> {
         return Err(io::Error::from_raw_os_error(code as i32));
     }
     let _descriptor = LocalAllocation(psd);
+    // SAFETY: `psd` is valid until `_descriptor` drops, and `owner` and `dacl` were just
+    // returned pointing into it.
+    unsafe { summarize(psd, owner, dacl, &user) }
+}
 
+/// Reads back the owner and DACL of whatever `path` names right now, for explaining a
+/// `File::open` that was refused. `CreateFileW` adds `SYNCHRONIZE | FILE_READ_ATTRIBUTES`
+/// to whatever access is asked for, so a handle cannot be opened with `READ_CONTROL`
+/// alone; `GetNamedSecurityInfoW` opens with exactly that, which an owner always holds
+/// unless an `OWNER RIGHTS` ACE overrides it. A key owned by someone else may be refused
+/// even this.
+pub(crate) fn inspect_named(path: &Path) -> io::Result<DaclSummary> {
+    let user = CurrentUser::query()?;
+    let wide = wide_path(path);
+    let mut owner: PSID = null_mut();
+    let mut dacl: *mut ACL = null_mut();
+    let mut psd: PSECURITY_DESCRIPTOR = null_mut();
+    // SAFETY: `wide` is NUL-terminated and outlives the call; the group and SACL
+    // out-parameters are optional and the requested information does not include them.
+    // On success `psd` is one allocation that `owner` and `dacl` point into, released by
+    // the guard below.
+    let code = unsafe {
+        GetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner,
+            null_mut(),
+            &mut dacl,
+            null_mut(),
+            &mut psd,
+        )
+    };
+    if code != 0 {
+        return Err(io::Error::from_raw_os_error(code as i32));
+    }
+    let _descriptor = LocalAllocation(psd);
+    // SAFETY: `psd` is valid until `_descriptor` drops, and `owner` and `dacl` were just
+    // returned pointing into it.
+    unsafe { summarize(psd, owner, dacl, &user) }
+}
+
+/// # Safety
+///
+/// `psd` must be a valid security descriptor that stays allocated for the call, and
+/// `owner` and `dacl` must each be null or point into it.
+unsafe fn summarize(
+    psd: PSECURITY_DESCRIPTOR,
+    owner: PSID,
+    dacl: *mut ACL,
+    user: &CurrentUser,
+) -> io::Result<DaclSummary> {
     let mut control: SECURITY_DESCRIPTOR_CONTROL = 0;
     let mut revision = 0u32;
-    // SAFETY: `psd` is a valid descriptor until `_descriptor` drops.
+    // SAFETY: the caller keeps `psd` valid for the call.
     let read = unsafe { GetSecurityDescriptorControl(psd, &mut control, &mut revision) };
     if read == 0 {
         return Err(io::Error::last_os_error());
@@ -419,6 +466,12 @@ pub(crate) fn check_owner_only(file: &File) -> io::Result<Result<(), OwnerOnlyPr
     Ok(owner_only_problem(&summary).map_or(Ok(()), Err))
 }
 
+/// `check_owner_only` for whatever `path` names, through `inspect_named`.
+pub(crate) fn check_owner_only_named(path: &Path) -> io::Result<Result<(), OwnerOnlyProblem>> {
+    let summary = inspect_named(path)?;
+    Ok(owner_only_problem(&summary).map_or(Ok(()), Err))
+}
+
 fn owner_only_problem(summary: &DaclSummary) -> Option<OwnerOnlyProblem> {
     if !summary.owner_is_current_user {
         return Some(OwnerOnlyProblem::OwnerIsNotCurrentUser);
@@ -443,11 +496,63 @@ fn owner_only_problem(summary: &DaclSummary) -> Option<OwnerOnlyProblem> {
 }
 
 /// Replaces the DACL of `path` with the one `sddl` describes, leaving the owner alone.
-/// Written through `SetFileSecurityW` so a test that widens a key does not go through the
-/// same calls the check under test reads with.
+/// Written through `SetNamedSecurityInfoW`, whose `SECURITY_INFORMATION` flags decide the
+/// file's `SE_DACL_PROTECTED` bit: `UNPROTECTED_DACL_SECURITY_INFORMATION` clears it and
+/// merges the directory's inheritable ACEs in, `PROTECTED_DACL_SECURITY_INFORMATION` sets
+/// it and stores the ACL as given, and a null `pDacl` under `DACL_SECURITY_INFORMATION`
+/// assigns no DACL at all. The flag is taken from the SDDL's `P`, so the file ends up with
+/// the control the string says. `SetFileSecurityW` was dropped for this: it left the bit
+/// `create_owner_only` had set in place for an SDDL without `P`, and the check under test
+/// then reported `ForeignAce` where `DaclInherits` had been written.
 #[cfg(test)]
 pub(crate) fn widen_with_sddl(path: &Path, sddl: &str) -> io::Result<()> {
-    set_security_with_sddl(path, sddl, DACL_SECURITY_INFORMATION)
+    let descriptor = Descriptor::from_sddl(sddl)?;
+    let mut control: SECURITY_DESCRIPTOR_CONTROL = 0;
+    let mut revision = 0u32;
+    // SAFETY: the descriptor is valid until `descriptor` drops.
+    let read =
+        unsafe { GetSecurityDescriptorControl(descriptor.as_ptr(), &mut control, &mut revision) };
+    if read == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut present = 0;
+    let mut dacl: *mut ACL = null_mut();
+    let mut defaulted = 0;
+    // SAFETY: as above; `dacl` comes back null or pointing into the descriptor.
+    let queried = unsafe {
+        GetSecurityDescriptorDacl(descriptor.as_ptr(), &mut present, &mut dacl, &mut defaulted)
+    };
+    if queried == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // A null DACL is written protected: merged unprotected, the directory's inheritable
+    // ACEs would become an ACL where the SDDL asked for none. `inspect` reports it as
+    // `dacl_present: false` either way.
+    let protected = control & SE_DACL_PROTECTED != 0 || dacl.is_null();
+    let flag = if protected {
+        PROTECTED_DACL_SECURITY_INFORMATION
+    } else {
+        UNPROTECTED_DACL_SECURITY_INFORMATION
+    };
+    let wide = wide_path(path);
+    // SAFETY: `wide` is NUL-terminated and `dacl` stays valid until `descriptor` drops,
+    // both past the call; the owner, group and SACL arguments are unused under a
+    // DACL-only `securityinfo`.
+    let code = unsafe {
+        SetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | flag,
+            null_mut(),
+            null_mut(),
+            dacl,
+            null_mut(),
+        )
+    };
+    if code != 0 {
+        return Err(io::Error::from_raw_os_error(code as i32));
+    }
+    Ok(())
 }
 
 /// Replaces the owner of `path` with the one `sddl` names, leaving the DACL alone. Only a
@@ -456,19 +561,16 @@ pub(crate) fn widen_with_sddl(path: &Path, sddl: &str) -> io::Result<()> {
 /// `BUILTIN\Administrators`; anything else fails with `ERROR_INVALID_OWNER`.
 #[cfg(test)]
 pub(crate) fn set_owner_with_sddl(path: &Path, sddl: &str) -> io::Result<()> {
-    set_security_with_sddl(path, sddl, OWNER_SECURITY_INFORMATION)
-}
-
-#[cfg(test)]
-fn set_security_with_sddl(
-    path: &Path,
-    sddl: &str,
-    security_information: OBJECT_SECURITY_INFORMATION,
-) -> io::Result<()> {
     let descriptor = Descriptor::from_sddl(sddl)?;
     let wide = wide_path(path);
     // SAFETY: `wide` is NUL-terminated and the descriptor outlives the call.
-    let set = unsafe { SetFileSecurityW(wide.as_ptr(), security_information, descriptor.as_ptr()) };
+    let set = unsafe {
+        SetFileSecurityW(
+            wide.as_ptr(),
+            OWNER_SECURITY_INFORMATION,
+            descriptor.as_ptr(),
+        )
+    };
     if set == 0 {
         return Err(io::Error::last_os_error());
     }

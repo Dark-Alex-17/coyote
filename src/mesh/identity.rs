@@ -491,10 +491,12 @@ fn load_identity(path: &Path) -> Result<PrivateIdentity> {
 /// warn-and-proceed the mint made on the same volume; the warning is repeated instead and
 /// the DACL check skipped. A key the current user cannot read at all (an empty protected
 /// DACL, one that names other users only, or one whose single entry for the current user
-/// lacks read) is inspected through a `READ_CONTROL`-only handle, so its refusal names the
-/// DACL and the remedy rather than a bare access error. When even that handle is refused
-/// the key belongs to another user, since an owner always holds `READ_CONTROL`, and the
-/// refusal says so and leads with `takeown`.
+/// lacks read) has its security queried by name, asking for `READ_CONTROL` alone, so its
+/// refusal names the DACL and the remedy rather than a bare access error. When even that
+/// query is refused the key belongs to another user, since an owner always holds
+/// `READ_CONTROL`, and the refusal says so and leads with `takeown`. The by-name query may
+/// resolve a symlink differently from the `File::open` that failed, which is acceptable
+/// here: this path only explains a refusal and never reads the key.
 #[cfg(windows)]
 fn read_owner_only_key(path: &Path) -> Result<Vec<u8>> {
     use std::io::Read;
@@ -503,17 +505,17 @@ fn read_owner_only_key(path: &Path) -> Result<Vec<u8>> {
     let mut file = match File::open(path) {
         Ok(file) => file,
         Err(err) if err.kind() == ErrorKind::PermissionDenied => {
-            let handle = match windows_acl::open_for_security_read(path) {
-                Ok(handle) => handle,
-                Err(open_err) => {
+            let verdict = match windows_acl::check_owner_only_named(path) {
+                Ok(verdict) => verdict,
+                Err(query_err) => {
                     let advice = owner_only_advice(path, true)?;
-                    return Err(open_err).context(format!(
+                    return Err(query_err).context(format!(
                         "Mesh identity file '{}' refused even to report its permissions, a right its owner always holds, so another user owns it. {advice}",
                         path.display()
                     ));
                 }
             };
-            if let Err(problem) = owner_only_verdict(path, &handle)? {
+            if let Err(problem) = verdict {
                 bail!(owner_only_refusal(path, problem)?);
             }
             let advice = owner_only_advice(path, false)?;
@@ -1003,11 +1005,7 @@ mod tests {
         load_or_mint_identity(&path).unwrap();
         let sid = windows_acl::current_user_sid_string().unwrap();
         windows_acl::widen_with_sddl(&path, &format!("D:P(A;;RC;;;{sid})")).unwrap();
-        assert_eq!(
-            windows_acl::check_owner_only(&windows_acl::open_for_security_read(&path).unwrap())
-                .unwrap(),
-            Ok(())
-        );
+        assert_eq!(windows_acl::check_owner_only_named(&path).unwrap(), Ok(()));
 
         let err = load_error(&path);
 
@@ -1028,6 +1026,12 @@ mod tests {
         use windows_acl::OwnerOnlyProblem;
 
         let sid = windows_acl::current_user_sid_string().unwrap();
+        // `widen_with_sddl` writes the first row protected, the second unprotected (so the
+        // directory's ACEs merge in and `protected` reads false), the third as a null DACL,
+        // and the fourth as an empty protected DACL. The fourth denies its owner every
+        // right `File::open` asks for, so only the by-name query can reach its verdict;
+        // `apply_remedy` then relies on the owner's implicit `WRITE_DAC` for
+        // `icacls /reset`.
         let cases = [
             (
                 format!("D:P(A;;GA;;;WD)(A;;GA;;;{sid})"),
@@ -1046,9 +1050,8 @@ mod tests {
             let path = dir.path.join("identity.key");
             let minted = load_or_mint_identity(&path).unwrap();
             windows_acl::widen_with_sddl(&path, &sddl).unwrap();
-            let handle = windows_acl::open_for_security_read(&path).unwrap();
             assert_eq!(
-                windows_acl::check_owner_only(&handle).unwrap(),
+                windows_acl::check_owner_only_named(&path).unwrap(),
                 Err(expected),
                 "{sddl}"
             );
@@ -1088,8 +1091,7 @@ mod tests {
             panic!("set_owner_with_sddl failed: {err}");
         }
         assert_eq!(
-            windows_acl::check_owner_only(&windows_acl::open_for_security_read(&path).unwrap())
-                .unwrap(),
+            windows_acl::check_owner_only_named(&path).unwrap(),
             Err(windows_acl::OwnerOnlyProblem::OwnerIsNotCurrentUser)
         );
 
