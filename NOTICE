@@ -141,6 +141,12 @@ is distributed under `MIT OR Apache-2.0`, Copyright (c) 2015 The Rust Project
 Developers; Coyote uses it under the MIT License, whose shared permission text
 is in the LICENSE-MIT file.
 
+`globset`, a direct dependency for the mesh share-set patterns, is
+distributed under `Unlicense OR MIT`, Copyright (c) 2015 Andrew Gallant; it
+brings `bstr` into the tree, distributed under `MIT OR Apache-2.0`, Copyright
+(c) 2018-2019 Andrew Gallant. Coyote uses both under the MIT License, whose
+shared permission text is in the LICENSE-MIT file.
+
 --------------------------------------------------------------------------------
 Windows platform bindings
 --------------------------------------------------------------------------------

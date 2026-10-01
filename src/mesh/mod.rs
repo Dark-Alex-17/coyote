@@ -28,6 +28,9 @@ mod protocol;
 mod r3;
 // pub(crate): the REPL pins the shared refusal wording in its tests.
 pub(crate) mod schema;
+// Test-only until the fetch handler and the `.mesh` share verbs read it.
+#[cfg(test)]
+pub(crate) mod shares;
 pub(crate) mod snapshot;
 #[cfg(test)]
 mod spec_pins;

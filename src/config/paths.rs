@@ -218,15 +218,19 @@ pub fn skill_file(name: &str) -> PathBuf {
     skill_dir(name).join("SKILL.md")
 }
 
-pub fn workspace_config_dir() -> PathBuf {
-    let workspace_dir_name = match env::var(get_env_name("workspace_config_dir")) {
+/// The name the workspace config directory goes by under a workspace root; the env
+/// override is returned as given, so it may be a relative or an absolute path.
+pub fn workspace_config_dir_name() -> String {
+    match env::var(get_env_name("workspace_config_dir")) {
         Ok(value) => value,
         Err(_) => WORKSPACE_COYOTE_DIR_NAME.to_string(),
-    };
+    }
+}
 
+pub fn workspace_config_dir() -> PathBuf {
     env::current_dir()
         .unwrap_or_default()
-        .join(workspace_dir_name)
+        .join(workspace_config_dir_name())
 }
 
 pub fn workspace_skills_dir() -> PathBuf {
@@ -634,6 +638,26 @@ mod tests {
                 "has_skill({absent:?}) should be false for a missing skill"
             );
         }
+    }
+
+    #[test]
+    #[serial]
+    fn workspace_config_dir_name_is_the_env_override_or_the_default() {
+        let env_name = get_env_name("workspace_config_dir");
+        {
+            let _unset = EnvVarGuard::unset(&env_name);
+            assert_eq!(workspace_config_dir_name(), WORKSPACE_COYOTE_DIR_NAME);
+            assert_eq!(
+                workspace_config_dir(),
+                env::current_dir().unwrap().join(WORKSPACE_COYOTE_DIR_NAME)
+            );
+        }
+        let absolute = env::temp_dir().join("coyote-ws-name-override");
+        let _set = EnvVarGuard::set(&env_name, &absolute);
+        assert_eq!(workspace_config_dir_name(), absolute.to_str().unwrap());
+        assert_eq!(workspace_config_dir(), absolute);
+        let _relative = EnvVarGuard::set(&env_name, "conf/.hidden");
+        assert_eq!(workspace_config_dir_name(), "conf/.hidden");
     }
 
     mod sandbox_home_translation {

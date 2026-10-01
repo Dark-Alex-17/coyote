@@ -128,6 +128,10 @@ mod tests {
                 "CursorRecord",
             ],
         ),
+        (
+            "shares.rs",
+            &["SharesFile", "AllowEntry", "DenyEntry", "OverrideEntry"],
+        ),
     ];
 
     /// Types that derive `Deserialize` but need no `deny_unknown_fields`: a fieldless enum
@@ -408,6 +412,11 @@ mod tests {
             (
                 "PROPAGATION_STORE_VERSION",
                 crate::mesh::propagation_fetch::PROPAGATION_STORE_VERSION,
+                1,
+            ),
+            (
+                "SHARES_FILE_VERSION",
+                crate::mesh::shares::SHARES_FILE_VERSION,
                 1,
             ),
         ];

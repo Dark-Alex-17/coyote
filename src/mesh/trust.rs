@@ -615,7 +615,7 @@ struct State {
 /// Equality of two hashes that takes the same time whether they differ in the first byte
 /// or the last. The length check folds into the same `Choice` rather than short-circuiting;
 /// both sides are canonical 32-hex in practice, so it only ever guards a malformed input.
-fn same_hash(left: &str, right: &str) -> bool {
+pub(crate) fn same_hash(left: &str, right: &str) -> bool {
     let (left, right) = (left.as_bytes(), right.as_bytes());
     let same_len = left.len().ct_eq(&right.len());
     let shorter = left.len().min(right.len());
