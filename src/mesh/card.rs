@@ -487,7 +487,7 @@ impl CardSource for MeshSlot {
             .and_then(|runtime| runtime.about().map(str::to_string))
     }
 
-    // TASK-111 advertises "fetch" once the /fetch handler exists.
+    // "fetch" is advertised once the /fetch handler exists.
     fn caps(&self) -> Vec<String> {
         Vec::new()
     }

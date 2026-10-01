@@ -1150,7 +1150,7 @@ mod tests {
 
     #[test]
     fn a_version_1_pending_line_from_before_the_parts_bump_is_refused() {
-        // TASK-108 bumped the pending store 1 -> 2 (thread, escalated state). A
+        // The pending store moved 1 -> 2 (thread, escalated state). A
         // `pending-<id>.jsonl` from the build before it is spelled with a literal
         // `"version":1` here, not the constant: there is no migration, so the line is
         // refused whole rather than loaded with a guessed thread.
@@ -1192,7 +1192,7 @@ mod tests {
 
     #[test]
     fn a_version_1_inbound_line_from_before_the_parts_bump_is_refused() {
-        // Same as the pending store: TASK-108 bumped the inbound record 1 -> 2 (thread,
+        // Same as the pending store: the inbound record moved 1 -> 2 (thread,
         // kind, paths, reason) and a pre-bump line is refused, not migrated.
         let tmp = TempDir::new("inbound-v1-before-bump");
         let store = InboundStore::new(&tmp.path, "inst");
@@ -2119,7 +2119,7 @@ mod tests {
         );
     }
 
-    // ---- usage probe (TASK-108): spec-first patterns not pinned above ----
+    // ---- usage-probe tests: spec-first patterns not pinned above ----
 
     /// Criterion (g): both record versions moved 1 → 2 under the refuse-only regime, so a
     /// file the PREVIOUS build wrote (version 1, no `thread`) is refused whole with the

@@ -4259,7 +4259,7 @@ mod tests {
         );
     }
 
-    // ---- usage probe (TASK-108): spec-first patterns not pinned above ----
+    // ---- usage-probe tests: spec-first patterns not pinned above ----
 
     /// User ruling amending (a)/(f): the receiver drops parts from the TAIL until the
     /// msgpack-encoded `parts` list fits `MAX_PARTS_BYTES`, counting each; the message and

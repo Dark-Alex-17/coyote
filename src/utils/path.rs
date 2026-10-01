@@ -34,10 +34,14 @@ pub fn safe_join_path<T1: AsRef<Path>, T2: AsRef<Path>>(
     }
 }
 
-/// Whether `name`'s stem (the text before the first `.`, less the trailing spaces Windows
-/// strips before matching) is a device name Windows reserves in every directory,
-/// whatever the extension: `CON`, `PRN`, `AUX`, `NUL`, `COM0`–`COM9`, `LPT0`–`LPT9` and
-/// the same with a superscript `¹ ² ³` as the digit, case-insensitively.
+/// Whether `name` is a device name Windows reserves in every directory: `CON`, `PRN`,
+/// `AUX`, `NUL`, `COM0`–`COM9`, `LPT0`–`LPT9` and the same with a superscript `¹ ² ³`
+/// as the digit — case-insensitively, with any extension, and after the trailing dots
+/// and spaces Win32 silently drops from a name before matching. Only the stem (the text
+/// before the first `.`) is compared, so `NUL.txt` and `con .txt` are reserved too.
+///
+/// Bundle installs (`install_remote::is_safe_component`) and mesh wire paths share this
+/// one predicate on purpose: both guard filenames that must be creatable on Windows.
 pub fn is_windows_reserved_name(name: &str) -> bool {
     let stem = name.split('.').next().unwrap_or("").trim_end_matches(' ');
     let lower = stem.to_ascii_lowercase();

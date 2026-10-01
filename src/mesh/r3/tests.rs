@@ -5264,7 +5264,7 @@ pub(crate) mod network {
     /// Usage probe, criterion (e) and the "no `caps` advertisement yet" MUST-NOT, on the
     /// production path: node A started from a config with `mesh.about` serves a card whose
     /// `about` is that text through the one `display_text` sanitiser (trimmed, control
-    /// sequences stripped) and advertises no `caps` key at all until TASK-111.
+    /// sequences stripped) and advertises no `caps` key at all until the /fetch handler exists.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_started_node_serves_its_configured_about_sanitised_and_advertises_no_caps() {
         let b_identity = TransportIdentity::new_from_rand(OsRng);
