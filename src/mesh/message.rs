@@ -303,7 +303,7 @@ impl PeerMessage {
         limits: &PartLimits,
         staging: Option<&InboxStaging>,
     ) -> Self {
-        let (admitted, dropped) = admit_parts(raw.parts, limits);
+        let (admitted, dropped) = admit_parts(raw.parts, limits, &raw.source_destination);
         let mut dropped_parts = raw.dropped_parts.saturating_add(dropped);
         let mut parts = Vec::with_capacity(admitted.len());
         for part in admitted {
@@ -649,8 +649,12 @@ fn inline_size(part: &RawPart) -> u64 {
 
 /// The receiver's admission: the parts that pass, in order, and how many did not. A part
 /// past `MAX_PARTS` or breaking a rule goes; then parts go from the tail until the encoded
-/// list fits `MAX_PARTS_BYTES`. A hash mismatch earns one warning per message.
-fn admit_parts(parts: Vec<RawPart>, limits: &PartLimits) -> (Vec<RawPart>, u32) {
+/// list fits `MAX_PARTS_BYTES`. A hash mismatch is noted once per message.
+fn admit_parts(
+    parts: Vec<RawPart>,
+    limits: &PartLimits,
+    source_destination: &str,
+) -> (Vec<RawPart>, u32) {
     let mut admitted = Vec::new();
     let mut dropped = 0u32;
     let mut inline_so_far = 0u64;
@@ -672,9 +676,9 @@ fn admit_parts(parts: Vec<RawPart>, limits: &PartLimits) -> (Vec<RawPart>, u32) 
         }
     }
     if hash_mismatch {
-        warn!(
-            "Mesh message part dropped: {}",
-            redact_hashes(SHA256_MISMATCH)
+        debug!(
+            "Mesh message part from instance {} dropped: {SHA256_MISMATCH}",
+            short(source_destination)
         );
     }
     while !admitted.is_empty() && packed_len(&encode_parts(&admitted)) > MAX_PARTS_BYTES {
@@ -730,8 +734,9 @@ fn keep_part(
                     reference: None,
                 }),
                 Err(err) => {
-                    debug!(
-                        "Mesh file part dropped: {}",
+                    warn!(
+                        "Mesh file part from instance {} dropped: {}",
+                        short(source_destination),
                         redact_hashes(&err.to_string())
                     );
                     None
@@ -1762,13 +1767,15 @@ impl MeshRuntime {
 
 /// One inbound message put to the surface for admission: who signed it, the instance a
 /// refusal would be answered to, its id for the correlation, its kind, the question it
-/// replies to if it is itself a reply (a refusal never answers one), and the path it took.
+/// replies to if it is itself a reply (a refusal never answers one), the thread a refusal
+/// inherits, and the path it took.
 pub(crate) struct PeerAdmission<'a> {
     pub source_identity: &'a str,
     pub source_destination: &'a str,
     pub message_id: &'a str,
     pub kind: PeerKind,
     pub in_reply_to: Option<&'a str>,
+    pub thread: Option<&'a str>,
     pub via: PeerVia,
 }
 
@@ -1842,6 +1849,7 @@ impl Handler for PeerMessageHandler {
             message_id: &body.id,
             kind: body.kind,
             in_reply_to: body.in_reply_to.as_deref(),
+            thread: body.thread.as_deref(),
             via: PeerVia::Direct,
         };
         if let Err(refusal) = surface.admit_peer_message(&admission) {
@@ -1983,6 +1991,7 @@ impl InboundSink for PeerRouting<'_> {
             message_id: &raw.message_id,
             kind,
             in_reply_to: raw.in_reply_to.as_deref(),
+            thread: raw.thread.as_deref(),
             via: PeerVia::StoreAndForward,
         };
         let admitted = surface.admit_peer_message(&admission);
@@ -4560,5 +4569,149 @@ mod tests {
             ),
             pack(stored.fields.as_ref().unwrap())
         );
+    }
+
+    /// Usage probe, criterion (b): the staging path is keyed by the sending peer, so two
+    /// peers sending a file under the same name each get their own copy under their own
+    /// `<peer-dest8>` directory, neither suffixed and neither overwriting the other.
+    #[test]
+    fn two_peers_sending_the_same_file_name_land_in_separate_directories() {
+        let tmp = TempDir::new("message-two-peers");
+        let inbox = staging(&tmp);
+        let mut from_a = with_parts(vec![inline_file("docs/a.md", b"from a".to_vec())]);
+        from_a.source_destination = hash_of("alpha-peer");
+        let mut from_b = with_parts(vec![inline_file("docs/a.md", b"from b".to_vec())]);
+        from_b.source_destination = hash_of("bravo-peer");
+
+        let a = PeerMessage::new_with(from_a, &PartLimits::default(), Some(&inbox));
+        let b = PeerMessage::new_with(from_b, &PartLimits::default(), Some(&inbox));
+
+        assert_eq!((a.dropped_parts, b.dropped_parts), (0, 0));
+        let staged_of = |message: &PeerMessage| match message.parts.as_slice() {
+            [
+                Part::File {
+                    staged: Some(path), ..
+                },
+            ] => path.clone(),
+            other => panic!("{other:?}"),
+        };
+        let (path_a, path_b) = (staged_of(&a), staged_of(&b));
+        let root = dunce::canonicalize(tmp.path.join("inbox")).unwrap();
+        assert_eq!(
+            path_a,
+            root.join(&hash_of("alpha-peer")[..8])
+                .join("docs")
+                .join("a.md")
+        );
+        assert_eq!(
+            path_b,
+            root.join(&hash_of("bravo-peer")[..8])
+                .join("docs")
+                .join("a.md")
+        );
+        assert_eq!(std::fs::read(&path_a).unwrap(), b"from a");
+        assert_eq!(std::fs::read(&path_b).unwrap(), b"from b");
+    }
+
+    /// Usage probe, criterion (b) collision rule as amended (hard-link publish, never
+    /// overwrite): a second message from the same peer under a taken name lands beside
+    /// the first as `<stem>-<sha8><ext>`; when that sibling name is also taken by other
+    /// bytes the part is dropped and counted, the message still lands with its content
+    /// and neither file on disk changes.
+    #[test]
+    fn a_colliding_file_part_is_dropped_and_counted_while_the_message_and_earlier_files_stay() {
+        let tmp = TempDir::new("message-collision");
+        let inbox = staging(&tmp);
+        let limits = PartLimits::default();
+        let b_sha: [u8; 32] = Sha256::digest(b"bytes b").into();
+        let suffixed = format!("a-{}.md", hex_lower(&b_sha[..4]));
+
+        let first = PeerMessage::new_with(
+            with_parts(vec![inline_file("a.md", b"bytes a".to_vec())]),
+            &limits,
+            Some(&inbox),
+        );
+        let second = PeerMessage::new_with(
+            with_parts(vec![inline_file("a.md", b"bytes b".to_vec())]),
+            &limits,
+            Some(&inbox),
+        );
+        let squatter = PeerMessage::new_with(
+            with_parts(vec![inline_file(&suffixed, b"bytes c".to_vec())]),
+            &limits,
+            Some(&inbox),
+        );
+        let third = PeerMessage::new_with(
+            RawPeerMessage {
+                message_id: "id-3".to_string(),
+                ..with_parts(vec![inline_file("a.md", b"bytes b".to_vec())])
+            },
+            &limits,
+            Some(&inbox),
+        );
+
+        let staged_of = |message: &PeerMessage| match message.parts.as_slice() {
+            [
+                Part::File {
+                    staged: Some(path), ..
+                },
+            ] => path.clone(),
+            other => panic!("{other:?}"),
+        };
+        let path_a = staged_of(&first);
+        let path_b = staged_of(&second);
+        assert_eq!(
+            path_b,
+            path_a.with_file_name(&suffixed),
+            "{}",
+            path_b.display()
+        );
+        assert_eq!(std::fs::read(&path_b).unwrap(), b"bytes b");
+        // The squatter's name is the suffixed slot a later "bytes c" would otherwise take
+        // beside `a.md`; its own staging reuses the existing identical path only when the
+        // bytes match, which they do not here, so it lands under its own hash suffix.
+        let path_c = staged_of(&squatter);
+        assert_ne!(path_c, path_b);
+        assert_eq!(std::fs::read(&path_c).unwrap(), b"bytes c");
+        // Identical bytes under a taken name reuse the earlier path with no new file.
+        assert_eq!(staged_of(&third), path_b);
+        assert_eq!(third.dropped_parts, 0);
+
+        // Now a genuine collision: both `a.md` and its `-<sha8>` sibling hold other bytes.
+        let d_sha: [u8; 32] = Sha256::digest(b"bytes d").into();
+        let d_suffixed = format!("a-{}.md", hex_lower(&d_sha[..4]));
+        let blocker = PeerMessage::new_with(
+            with_parts(vec![inline_file(&d_suffixed, b"blocker".to_vec())]),
+            &limits,
+            Some(&inbox),
+        );
+        assert_eq!(blocker.dropped_parts, 0);
+        let collided = PeerMessage::new_with(
+            RawPeerMessage {
+                message_id: "id-5".to_string(),
+                ..with_parts(vec![inline_file("a.md", b"bytes d".to_vec())])
+            },
+            &limits,
+            Some(&inbox),
+        );
+        assert_eq!(collided.content, "hello");
+        assert_eq!(collided.message_id, "id-5");
+        assert!(collided.parts.is_empty(), "{:?}", collided.parts);
+        assert_eq!(collided.dropped_parts, 1);
+        assert_eq!(std::fs::read(&path_a).unwrap(), b"bytes a");
+        assert_eq!(
+            std::fs::read(path_a.with_file_name(&d_suffixed)).unwrap(),
+            b"blocker"
+        );
+        let mut names: Vec<_> = std::fs::read_dir(path_a.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert!(
+            names.iter().all(|name| !name.starts_with(".tmp-")),
+            "{names:?}"
+        );
+        assert_eq!(names.len(), 4, "{names:?}");
     }
 }

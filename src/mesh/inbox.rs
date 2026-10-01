@@ -449,6 +449,61 @@ mod tests {
         );
     }
 
+    /// Usage probe, criterion (b): a peer's two names may clash as a file and a directory
+    /// (`docs` after `docs/a.md`, or `a.md/b.md` after `a.md`). Neither direction may
+    /// replace or remove what is already staged; the later stage is refused with an error
+    /// that names no path, and the inbox holds exactly the files it held before.
+    #[test]
+    fn a_name_clashing_with_a_staged_directory_or_file_is_refused_without_touching_either() {
+        let tmp = TempDir::new("inbox-file-dir-clash");
+        let inbox = staging(&tmp);
+
+        let nested = inbox
+            .stage(
+                PEER,
+                &WirePath::parse("docs/a.md").unwrap(),
+                &digest(b"nested"),
+                b"nested",
+            )
+            .unwrap();
+        let err = inbox
+            .stage(
+                PEER,
+                &WirePath::parse("docs").unwrap(),
+                &digest(b"flat"),
+                b"flat",
+            )
+            .unwrap_err();
+        assert!(!matches!(err, StageError::Escaped), "{err}");
+        assert!(!err.to_string().contains("docs"), "{err}");
+        assert!(nested.parent().unwrap().is_dir());
+        assert_eq!(fs::read(&nested).unwrap(), b"nested");
+
+        let flat = inbox
+            .stage(
+                PEER,
+                &WirePath::parse("b.md").unwrap(),
+                &digest(b"flat"),
+                b"flat",
+            )
+            .unwrap();
+        let err = inbox
+            .stage(
+                PEER,
+                &WirePath::parse("b.md/c.md").unwrap(),
+                &digest(b"under"),
+                b"under",
+            )
+            .unwrap_err();
+        assert!(!matches!(err, StageError::Escaped), "{err}");
+        assert!(flat.is_file());
+        assert_eq!(fs::read(&flat).unwrap(), b"flat");
+
+        let mut found = files_under(&inbox.root);
+        found.sort();
+        assert_eq!(found, [flat, nested]);
+    }
+
     #[test]
     fn the_peer_directory_is_the_lower_cased_first_eight_characters() {
         assert_eq!(peer_dest8(PEER), DEST8);

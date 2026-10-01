@@ -5261,6 +5261,54 @@ pub(crate) mod network {
         pair.responder.stop().await;
     }
 
+    /// Usage probe, criterion (e) and the "no `caps` advertisement yet" MUST-NOT, on the
+    /// production path: node A started from a config with `mesh.about` serves a card whose
+    /// `about` is that text through the one `display_text` sanitiser (trimmed, control
+    /// sequences stripped) and advertises no `caps` key at all until TASK-111.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_started_node_serves_its_configured_about_sanitised_and_advertises_no_caps() {
+        let b_identity = TransportIdentity::new_from_rand(OsRng);
+        let b_identity_hash = b_identity.as_identity().address_hash;
+        let pair = NodePair::start_with(
+            "r3-status-about",
+            |config| {
+                config.display_name = Some("Ada".into());
+                config.about = Some("  Ask me about the \u{1b}[31mmesh\u{1b}[0m  ".into());
+            },
+            |responder| {
+                let b_destination = destination_address(&responder.origin().0, &b_identity_hash);
+                TrustList::default().destination(
+                    &b_destination.to_hex_string(),
+                    &b_identity_hash.to_hex_string(),
+                )
+            },
+        )
+        .await;
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(pair.node_a.clone()).unwrap();
+        slot.publish(snapshot_fixture());
+
+        let card = pair.status_of_a(&b_identity, Value::Nil).await;
+        assert_eq!(card.display_name.as_deref(), Some("Ada"));
+        assert_eq!(card.about.as_deref(), Some("Ask me about the mesh"));
+        assert!(card.caps.is_empty(), "{:?}", card.caps);
+        let Value::Map(entries) = card.to_value() else {
+            panic!("a card is a map");
+        };
+        assert!(
+            entries.iter().all(|(key, _)| key.as_str() != Some("caps")),
+            "an empty caps list is never on the wire"
+        );
+        assert!(
+            entries.iter().any(|(key, _)| key.as_str() == Some("about")),
+            "about is on the wire"
+        );
+
+        assert!(slot.stop().await.unwrap());
+        pair.cancel_b.cancel();
+        pair.responder.stop().await;
+    }
+
     /// Node A's trust list with node B's own instance on it, which is what B's requests
     /// derive to when B asks as itself, and what A's sends to B check.
     fn trusting_b(responder: &Responder) -> TrustList {

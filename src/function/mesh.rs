@@ -13,7 +13,7 @@ use crate::mesh::pending::{
 };
 use crate::mesh::trust::{Decision, Rule, Verdict};
 use crate::mesh::{
-    MeshRuntime, MeshSlot, RequestOptions, canonical_hash, display_text, rfc3339_utc,
+    MeshRuntime, MeshSlot, RequestOptions, canonical_hash, display_text, redact_hashes, rfc3339_utc,
 };
 use crate::supervisor::mailbox::EnvelopePayload;
 use crate::utils::wait_user_interrupt;
@@ -21,6 +21,7 @@ use crate::utils::wait_user_interrupt;
 use anyhow::{Result, anyhow, bail};
 use futures_util::{StreamExt, stream};
 use indexmap::IndexMap;
+use log::debug;
 use serde_json::{Value, json};
 use std::time::{Duration, SystemTime};
 
@@ -351,8 +352,9 @@ pub(crate) fn outbound_from_args(
 
 /// A reply that names no thread inherits the answered message's, so the wire carries
 /// it and the receiver need not infer: the filed inbound's thread when `.mesh answer`
-/// still has it on record, otherwise the answered id, which is the root of any thread
-/// this node never saw. A root message keeps `None` for the receiver to read as its id.
+/// still has it on record, the open question's when the reply answers one of ours,
+/// otherwise the answered id, which is the root of any thread this node never saw. A
+/// root message keeps `None` for the receiver to read as its id.
 fn inherit_reply_thread(slot: &MeshSlot, out: OutboundPeer) -> Result<OutboundPeer, SendError> {
     let Some(id) = out.in_reply_to.as_deref() else {
         return Ok(out);
@@ -360,10 +362,18 @@ fn inherit_reply_thread(slot: &MeshSlot, out: OutboundPeer) -> Result<OutboundPe
     if out.thread.is_some() {
         return Ok(out);
     }
-    let thread = slot
-        .inbound_store()
-        .and_then(|store| store.get(id).ok().flatten())
-        .map(|record| record.thread)
+    let filed = slot.inbound_store().and_then(|store| match store.get(id) {
+        Ok(record) => record.map(|record| record.thread),
+        Err(err) => {
+            debug!(
+                "Mesh reply to {id} could not read the inbound store for its thread: {}",
+                redact_hashes(&err.to_string())
+            );
+            None
+        }
+    });
+    let thread = filed
+        .or_else(|| slot.correlations().thread_of(id))
         .unwrap_or_else(|| id.to_string());
     out.with_thread(Some(thread))
 }
@@ -607,8 +617,8 @@ async fn handle_collect(ctx: &RequestContext, args: &Value) -> Result<Value> {
 /// Nothing here cancels: a timeout or a Ctrl-C leaves the question open for the reply
 /// to answer later. The wait is sliced so a child blocked on a `user__*` escalation is
 /// not starved while this call blocks; the pending escalations come back instead. A
-/// question the peer's human has been asked keeps waiting like any other until the
-/// deadline, then says so.
+/// question the peer's human has been asked comes back at once as escalated: the
+/// question stays open, and the reply's arrival is notified like any other.
 async fn collect_reply(ctx: &RequestContext, id: &str, timeout: Duration) -> Value {
     let correlations = ctx.app.mesh.correlations();
     let deadline = tokio::time::Instant::now() + timeout;
@@ -625,7 +635,7 @@ async fn collect_reply(ctx: &RequestContext, id: &str, timeout: Duration) -> Val
                 });
             }
         };
-        if !matches!(outcome, WaitOutcome::Pending | WaitOutcome::Escalated) {
+        if outcome != WaitOutcome::Pending {
             break outcome;
         }
         if let Some(queue) = ctx.root_escalation_queue()
@@ -969,6 +979,7 @@ mod tests {
             send_params["in_reply_to"].type_value.as_deref(),
             Some("string")
         );
+        assert_eq!(send_params["thread"].type_value.as_deref(), Some("string"));
         assert!(
             send_params["message"]
                 .description
@@ -977,6 +988,7 @@ mod tests {
                 .contains(&format!("at most {PEER_CONTENT_MAX_CHARS} characters"))
         );
         let ask_params = by_name("ask").parameters.properties.as_ref().unwrap();
+        assert_eq!(ask_params["thread"].type_value.as_deref(), Some("string"));
         assert_eq!(
             ask_params["timeout_secs"].type_value.as_deref(),
             Some("integer")
@@ -1107,6 +1119,35 @@ mod tests {
         let root = reply(json!({}));
         assert_eq!(root.thread, None, "a root message is its own thread");
         assert_eq!(body_thread(&root), None);
+    }
+
+    #[test]
+    fn a_reply_to_our_own_open_question_inherits_the_question_thread() {
+        let slot = MeshSlot::default();
+        let now = SystemTime::now();
+        slot.correlations()
+            .open(PendingRecord {
+                version: PENDING_RECORD_VERSION,
+                id: "q-1".into(),
+                peer_destination: hex_lower(&[0xab; 16]),
+                peer_identity: hex_lower(&[0xcd; 16]),
+                thread: "t-ours".into(),
+                question: "what now?".into(),
+                sent_at: rfc3339_utc(now),
+                timeout_at: rfc3339_utc(now + DEFAULT_COLLECT_TIMEOUT),
+                state: PendingState::Open,
+                reply: None,
+            })
+            .unwrap();
+
+        let out = inherit_reply_thread(
+            &slot,
+            outbound_from_args(PeerKind::Message, "more", &json!({"in_reply_to": "q-1"})).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(out.thread.as_deref(), Some("t-ours"));
+        assert_eq!(body_thread(&out).as_deref(), Some("t-ours"));
     }
 
     #[test]
@@ -1382,9 +1423,15 @@ mod tests {
             ..raw_message(PeerKind::Reply, "r1", Some("q1"))
         }));
 
-        let escalated = handle_collect(&ctx, &json!({"id": "q1", "timeout_secs": 1}))
+        let started = std::time::Instant::now();
+        let escalated = handle_collect(&ctx, &json!({"id": "q1", "timeout_secs": 600}))
             .await
             .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "an escalated question comes back at once, not at the deadline: {:?}",
+            started.elapsed()
+        );
         assert_eq!(escalated["status"], "escalated", "{escalated}");
         assert_eq!(escalated["id"], "q1");
         assert_eq!(escalated["next_action"], "mesh__collect --id q1");
@@ -1735,8 +1782,12 @@ mod tests {
     #[cfg(unix)]
     mod with_a_node {
         use super::*;
-        use crate::mesh::test_support::{Compatibility, PeerSighting, started_runtime};
+        use crate::mesh::test_support::{
+            Compatibility, PeerSighting, PeerStub, started_runtime, started_runtime_on, wait_until,
+        };
+        use crate::mesh::trust::TrustOptions;
         use crate::testing::TestConfigDirGuard;
+        use rns_transport::iface::tcp_server::TcpServer;
         use serial_test::serial;
         use std::time::SystemTime;
 
@@ -1805,6 +1856,59 @@ mod tests {
 
             assert!(ctx.app.mesh.stop().await.unwrap());
             started.relay_handle.abort();
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial]
+        async fn ask_with_a_thread_sends_it_opens_the_question_in_it_and_reports_it() {
+            let _guard = TestConfigDirGuard::new("mesh-tool-ask-thread");
+            let stub =
+                PeerStub::listen("mesh-tool-ask-thread-stub", TcpServer::DEFAULT_CLIENT_MTU).await;
+            let started = started_runtime_on("mesh-tool-ask-thread", stub.port()).await;
+            let runtime = started.runtime.clone();
+            let mut ctx = plain_ctx();
+            ctx.app.mesh.install(runtime.clone()).unwrap();
+            stub.trust(&runtime.current_destination_hash(), runtime.fingerprint());
+            stub.announce(Some("Stub")).await;
+            let to = stub.destination_hex();
+            let peers = runtime.peers();
+            wait_until("the node to file the stub", || peers.get(&to).is_some()).await;
+            runtime
+                .trust()
+                .trust_destination(
+                    ctx.app.mesh.as_ref(),
+                    &to,
+                    TrustOptions::default(),
+                    SystemTime::now(),
+                )
+                .unwrap();
+
+            let asked = handle_mesh_tool(
+                &mut ctx,
+                &format!("{MESH_FUNCTION_PREFIX}ask"),
+                &json!({"to": to, "message": "and then?", "thread": "t-1"}),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(asked["status"], "asked", "{asked}");
+            assert_eq!(asked["thread"], "t-1", "{asked}");
+            let id = asked["id"].as_str().unwrap();
+            let question = ctx
+                .app
+                .mesh
+                .correlations()
+                .get(id)
+                .expect("the ask opens a correlation");
+            assert_eq!(question.record.thread, "t-1");
+            let seen = stub.seen();
+            assert_eq!(seen.len(), 1, "{seen:?}");
+            assert_eq!(seen[0].kind, PeerKind::Ask);
+            assert_eq!(seen[0].id, id);
+            assert_eq!(seen[0].thread.as_deref(), Some("t-1"));
+
+            assert!(ctx.app.mesh.stop().await.unwrap());
+            stub.stop().await;
         }
     }
 }

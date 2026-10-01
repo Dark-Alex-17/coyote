@@ -120,7 +120,8 @@ the license expression for the combined work, is the license owner's call and is
 
 `unicode-normalization` exists for one call: the `nfc` rule of `WirePath::parse` in
 `src/mesh/wire_path.rs`, which refuses a wire path that is not already NFC rather than
-normalising it. `globset` follows in TASK-109 on the same terms: one caller, named here.
+normalising it. Any later dependency of this kind is added on the same terms: one caller,
+named here.
 
 ### Dependency build-cost records
 

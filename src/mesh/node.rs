@@ -2452,12 +2452,16 @@ impl MeshSlot {
     }
 
     /// Matches a reply to the question of ours it answers; a reply that named no thread
-    /// inherits the question's. A reply that answers nothing is downgraded to a message,
-    /// since to this node it is one; `true` when it matched.
+    /// inherits the question's, but only once it is known to be the answer we await. A
+    /// reply that answers nothing is downgraded to a message, since to this node it is
+    /// one, and sheds the disposition a message cannot carry; `true` when it matched.
     fn answer_correlation(&self, message: &mut PeerMessage) -> bool {
         if message.kind == PeerKind::Reply
             && message.thread.is_none()
             && let Some(id) = message.in_reply_to.as_deref()
+            && self
+                .correlations
+                .accepts_reply_from(id, &message.source_identity)
         {
             message.thread = self.correlations.thread_of(id);
         }
@@ -2473,6 +2477,8 @@ impl MeshSlot {
                 short(&message.source_identity)
             );
             message.kind = PeerKind::Message;
+            message.disposition = None;
+            message.retry_after = None;
         }
         answered
     }
@@ -2560,7 +2566,7 @@ impl MeshSlot {
 /// disposition says whether waiting out a budget window or a capacity limit is the
 /// remedy, `retry_after` how long, and `fields` repeats both for readers of the old
 /// shape. The reply inherits `thread`, or names the original as its own root.
-fn refusal_reply(
+pub(crate) fn refusal_reply(
     id: &str,
     thread: Option<&str>,
     refusal: &PeerRefusal,
@@ -2771,7 +2777,7 @@ impl PeerSurface for MeshSlot {
                     self.send_refusal_reply(
                         request.source_destination,
                         request.message_id,
-                        None,
+                        request.thread,
                         &refusal,
                     );
                 }
@@ -4118,6 +4124,7 @@ mod tests {
                     message_id: id,
                     kind: PeerKind::Message,
                     in_reply_to: in_reply_to.then_some("a-question-nobody-here-asked"),
+                    thread: None,
                     via,
                 },
             )
@@ -4234,6 +4241,7 @@ mod tests {
                     message_id: id,
                     kind,
                     in_reply_to,
+                    thread: None,
                     via: PeerVia::Direct,
                 },
             )
@@ -4591,6 +4599,71 @@ mod tests {
         stub.stop().await;
     }
 
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_store_and_forward_refusal_reply_inherits_the_refused_message_thread() {
+        use crate::mesh::trust::TrustOptions;
+
+        let stub =
+            PeerStub::listen("node-refusal-thread-stub", TcpServer::DEFAULT_CLIENT_MTU).await;
+        let started = started_runtime_on("node-refusal-thread", stub.port()).await;
+        let runtime = started.runtime.clone();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime.clone()).unwrap();
+        slot.limits().configure(PeerLimitConfig {
+            messages_per_hour: 1,
+            ..PeerLimitConfig::default()
+        });
+        stub.trust(&runtime.current_destination_hash(), runtime.fingerprint());
+        stub.announce(Some("Stub")).await;
+        let to = stub.destination_hex();
+        let peers = runtime.peers();
+        wait_until("the node to file the stub", || peers.get(&to).is_some()).await;
+        runtime
+            .trust()
+            .trust_destination(
+                slot.as_ref(),
+                &to,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        let identity = stub.identity_hex();
+        let admit = |id: &str, thread: Option<&str>| {
+            PeerSurface::admit_peer_message(
+                slot.as_ref(),
+                &PeerAdmission {
+                    source_identity: &identity,
+                    source_destination: &to,
+                    message_id: id,
+                    kind: PeerKind::Message,
+                    in_reply_to: None,
+                    thread,
+                    via: PeerVia::StoreAndForward,
+                },
+            )
+        };
+
+        assert!(admit("stored-0", Some("t-9")).is_ok());
+        assert_eq!(
+            admit("stored-1", Some("t-9")).unwrap_err().reason,
+            RefusalReason::RateLimited
+        );
+
+        wait_until("the stub to receive the refusal", || {
+            !stub.seen().is_empty()
+        })
+        .await;
+        let seen = stub.seen();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert_eq!(seen[0].kind, PeerKind::Reply);
+        assert_eq!(seen[0].in_reply_to.as_deref(), Some("stored-1"));
+        assert_eq!(seen[0].thread.as_deref(), Some("t-9"));
+        assert_eq!(seen[0].disposition, Some(Disposition::Refused));
+        assert!(slot.stop().await.unwrap());
+        stub.stop().await;
+    }
+
     #[test]
     fn record_human_answer_files_the_reply_with_one_note_and_one_line() {
         let slot = MeshSlot::default();
@@ -4660,6 +4733,66 @@ mod tests {
         assert_eq!(delivered.kind, PeerKind::Reply);
         assert_eq!(delivered.in_reply_to.as_deref(), Some("q-1"));
         assert_eq!(slot.take_model_notes()[0].event, "peer_reply");
+    }
+
+    #[test]
+    fn an_accepted_reply_without_a_thread_inherits_the_question_thread() {
+        let slot = MeshSlot::default();
+        slot.correlations()
+            .open(PendingRecord {
+                thread: "t-root".to_string(),
+                ..pending("q-1")
+            })
+            .unwrap();
+
+        slot.deliver_peer(peer_message(PeerKind::Reply, "r-1", Some("q-1")));
+
+        let (envelopes, _) = slot.peer_inbox().drain();
+        let delivered = peer_payload(&envelopes[0]);
+        assert_eq!(delivered.kind, PeerKind::Reply);
+        assert_eq!(delivered.thread.as_deref(), Some("t-root"));
+        assert_eq!(
+            slot.correlations()
+                .get("q-1")
+                .unwrap()
+                .record
+                .reply
+                .unwrap()
+                .thread
+                .as_deref(),
+            Some("t-root"),
+            "the filed answer carries the inherited thread too"
+        );
+    }
+
+    #[test]
+    fn a_reply_from_another_identity_is_a_message_with_neither_thread_nor_disposition() {
+        let slot = MeshSlot::default();
+        slot.correlations()
+            .open(PendingRecord {
+                thread: "t-root".to_string(),
+                ..pending("q-1")
+            })
+            .unwrap();
+        let mut forged = peer_message(PeerKind::Reply, "r-1", Some("q-1"));
+        forged.source_identity = hex_lower(&[0x77; 16]);
+        forged.disposition = Some(Disposition::Refused);
+        forged.retry_after = Some(30);
+
+        slot.deliver_peer(forged);
+
+        let (envelopes, _) = slot.peer_inbox().drain();
+        let delivered = peer_payload(&envelopes[0]);
+        assert_eq!(delivered.kind, PeerKind::Message);
+        assert_eq!(delivered.in_reply_to.as_deref(), Some("q-1"));
+        assert_eq!(delivered.thread, None);
+        assert_eq!(delivered.disposition, None);
+        assert_eq!(delivered.retry_after, None);
+        assert!(
+            slot.correlations()
+                .accepts_reply_from("q-1", &hex_lower(&PEER_IDENTITY)),
+            "the question stays open for the identity it was asked of"
+        );
     }
 
     #[test]

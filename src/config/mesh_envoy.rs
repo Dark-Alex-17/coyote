@@ -31,7 +31,7 @@ use crate::mesh::pending::{
     INBOUND_ENVOY_QUESTION_MAX_CHARS, INBOUND_RECORD_VERSION, InboundKind, InboundRecord,
     PENDING_QUESTION_MAX_CHARS,
 };
-use crate::mesh::{display_text, redact_hashes, rfc3339_utc, short};
+use crate::mesh::{display_text, redact_hashes, refusal_reply, rfc3339_utc, short};
 use crate::supervisor::escalation::{EscalationQueue, EscalationRequest};
 use crate::utils::{AbortSignal, create_abort_signal};
 
@@ -924,8 +924,10 @@ fn strip_tool_tag(question: &str) -> &str {
 /// What the peer hears for `outcome`, in the thread of the message it answers: the
 /// human's words when they took the question, else `reply_text`. Only a final outcome
 /// goes out as a `Reply`; the escalation hand-off is a `Message` naming the question, so
-/// the asker's correlation stays open for the human's answer. Words and, on a refusal,
-/// the refusal's fields: the envoy never attaches a part.
+/// the asker's correlation stays open for the human's answer. The envoy's own answers
+/// carry no disposition; a refusal is not its answer, so that one goes out as the typed
+/// refusal reply with its fields and retry hint. Words only: the envoy never attaches a
+/// part.
 fn envoy_reply(
     outcome: &EnvoyOutcome,
     human_answer: Option<&str>,
@@ -935,13 +937,12 @@ fn envoy_reply(
     let (kind, reply_text) = match (outcome, human_answer) {
         (_, Some(text)) => (PeerKind::Reply, text.to_string()),
         (EnvoyOutcome::Escalated { .. }, None) => (PeerKind::Message, reply_text),
+        (EnvoyOutcome::Refused(refusal), None) => {
+            return refusal_reply(&message.message_id, Some(message.thread()), refusal);
+        }
         _ => (PeerKind::Reply, reply_text),
     };
-    let fields = match (outcome, human_answer) {
-        (EnvoyOutcome::Refused(refusal), None) => Some(refusal.fields()),
-        _ => None,
-    };
-    OutboundPeer::new(kind, &reply_text, None, Some(&message.message_id), fields)?
+    OutboundPeer::new(kind, &reply_text, None, Some(&message.message_id), None)?
         .with_thread(Some(message.thread().to_string()))
 }
 
@@ -964,8 +965,8 @@ mod tests {
     #[cfg(unix)]
     use crate::mesh::message::PeerBody;
     use crate::mesh::message::{
-        PeerMessageHandler, PeerRouting, PeerSurface, RawPeerMessage, is_received_reply,
-        peer_lxmf_message, to_r3_body,
+        Disposition, PeerMessageHandler, PeerRouting, PeerSurface, RawPeerMessage,
+        is_received_reply, peer_lxmf_message, to_r3_body,
     };
     use crate::mesh::pending::InboundStore;
     use crate::mesh::test_support::{
@@ -1211,7 +1212,8 @@ mod tests {
 
     /// I7: file bytes never traverse a model. Whatever the run came to, and whether or
     /// not the human took the question, what goes back is words in the asker's thread
-    /// with no part, no disposition and no retry hint.
+    /// with no part. Only a refusal the human did not override carries a disposition and
+    /// a retry hint, since it is not the envoy's answer.
     #[test]
     fn the_envoy_never_attaches_a_part_whatever_the_outcome() {
         let outcomes = [
@@ -1278,8 +1280,28 @@ mod tests {
                         .unwrap_or_else(|err| panic!("{label} / {human_answer:?}: {err}"));
                     let case = format!("{label} / {human_answer:?} -> {out:?}");
                     assert!(out.parts.is_empty(), "{case}");
-                    assert!(out.disposition.is_none(), "{case}");
-                    assert!(out.retry_after.is_none(), "{case}");
+                    match (outcome, human_answer) {
+                        (EnvoyOutcome::Refused(refusal), None) => {
+                            let expected = match refusal.reason {
+                                RefusalReason::TokenCeiling | RefusalReason::CostCeiling => {
+                                    Disposition::BudgetExhausted
+                                }
+                                _ => Disposition::Refused,
+                            };
+                            assert_eq!(out.disposition, Some(expected), "{case}");
+                            assert_eq!(
+                                out.retry_after,
+                                Some(u32::try_from(refusal.retry_after_secs()).unwrap()),
+                                "{case}"
+                            );
+                            assert_eq!(out.fields, Some(refusal.fields()), "{case}");
+                        }
+                        _ => {
+                            assert!(out.disposition.is_none(), "{case}");
+                            assert!(out.retry_after.is_none(), "{case}");
+                            assert!(out.fields.is_none(), "{case}");
+                        }
+                    }
                     assert_eq!(out.thread.as_deref(), Some(message.thread()), "{case}");
                     assert_eq!(
                         out.in_reply_to.as_deref(),
@@ -3979,6 +4001,7 @@ mod tests {
                     message_id: id,
                     kind: PeerKind::Message,
                     in_reply_to: None,
+                    thread: None,
                     via: PeerVia::StoreAndForward,
                 },
             )

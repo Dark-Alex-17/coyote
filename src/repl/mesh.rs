@@ -9,8 +9,8 @@ use crate::mesh::idle::plural;
 use crate::mesh::knock::{KnockIntro, KnockOutcome, KnockVia};
 use crate::mesh::knocks::KnockRecord;
 use crate::mesh::message::{
-    BroadcastOutcome, OutboundPeer, PEER_CONTENT_MAX_CHARS, Part, PeerKind, PeerMessage, PeerVia,
-    RecipientOutcome,
+    BroadcastOutcome, Disposition, OutboundPeer, PEER_CONTENT_MAX_CHARS, Part, PeerKind,
+    PeerMessage, PeerVia, RecipientOutcome,
 };
 use crate::mesh::pending::{Correlation, InboundRecord, PendingState};
 use crate::mesh::trust::{
@@ -589,7 +589,7 @@ async fn answer(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         (AnswerRoute::Outbound, _, Some(correlation)) => {
             let destination = &correlation.record.peer_destination;
             out_text(&sending_notice(destination));
-            let out = OutboundPeer::new(PeerKind::Reply, text, None, Some(id), None)?;
+            let out = outbound_answer(&correlation, text)?;
             let outcome = runtime.send_peer(destination, &out).await?;
             out_text(&format!(
                 "Sent {} to {} as a reply to {} (via {}).",
@@ -604,6 +604,17 @@ async fn answer(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         ),
     }
     Ok(())
+}
+
+/// The human's reply into one of this node's own open questions, in that question's
+/// thread, worded as answered like a reply from `answer_inbound`.
+fn outbound_answer(correlation: &Correlation, text: &str) -> Result<OutboundPeer> {
+    let record = &correlation.record;
+    Ok(
+        OutboundPeer::new(PeerKind::Reply, text, None, Some(&record.id), None)?
+            .with_thread(Some(record.thread.clone()))?
+            .with_disposition(Disposition::Answered, None),
+    )
 }
 
 async fn reply(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
@@ -3828,6 +3839,33 @@ mod tests {
         assert_eq!(answer_route(true, true), AnswerRoute::Inbound);
         assert_eq!(answer_route(false, true), AnswerRoute::Outbound);
         assert_eq!(answer_route(false, false), AnswerRoute::Unknown);
+    }
+
+    #[test]
+    fn an_answer_into_our_own_question_carries_its_thread_and_disposition_on_the_wire() {
+        use crate::mesh::message::to_r3_body;
+
+        let mut correlation = correlation("q1", PendingState::Open);
+        correlation.record.thread = "t-root".to_string();
+
+        let out = outbound_answer(&correlation, "yes, go ahead").unwrap();
+
+        assert_eq!(out.kind, PeerKind::Reply);
+        assert_eq!(out.in_reply_to.as_deref(), Some("q1"));
+        assert_eq!(out.thread.as_deref(), Some("t-root"));
+        assert_eq!(out.disposition, Some(Disposition::Answered));
+        assert_eq!(out.retry_after, None);
+        let rmpv::Value::Map(entries) = to_r3_body(&out, 1.0) else {
+            panic!("a map body");
+        };
+        let field = |name: &str| {
+            entries
+                .iter()
+                .find(|(key, _)| key.as_str() == Some(name))
+                .map(|(_, value)| value.as_str().unwrap().to_string())
+        };
+        assert_eq!(field("thread").as_deref(), Some("t-root"));
+        assert_eq!(field("disposition").as_deref(), Some("answered"));
     }
 
     #[test]
