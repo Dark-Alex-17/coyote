@@ -2167,5 +2167,96 @@ mod tests {
             assert!(ctx.app.mesh.stop().await.unwrap());
             stub.stop().await;
         }
+
+        /// Usage probe, amendment (d): the two cases the three-case test leaves out. A
+        /// `thread` the caller names is the one that goes on the wire and the one the
+        /// result reports, both on a root message and on a reply whose answered message
+        /// this node filed under a different thread; neither carries the "receiver files
+        /// it" note, and the inherited thread is overridden, not merged.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial]
+        async fn usage_probe_send_puts_a_named_thread_on_the_wire_for_a_root_and_over_an_inherited_one()
+         {
+            let _guard = TestConfigDirGuard::new("mesh-tool-send-named-thread");
+            let stub = PeerStub::listen(
+                "mesh-tool-send-named-thread-stub",
+                TcpServer::DEFAULT_CLIENT_MTU,
+            )
+            .await;
+            let started = started_runtime_on("mesh-tool-send-named-thread", stub.port()).await;
+            let runtime = started.runtime.clone();
+            let mut ctx = plain_ctx();
+            ctx.app.mesh.install(runtime.clone()).unwrap();
+            stub.trust(&runtime.current_destination_hash(), runtime.fingerprint());
+            stub.announce(Some("Stub")).await;
+            let to = stub.destination_hex();
+            let peers = runtime.peers();
+            wait_until("the node to file the stub", || peers.get(&to).is_some()).await;
+            runtime
+                .trust()
+                .trust_destination(
+                    ctx.app.mesh.as_ref(),
+                    &to,
+                    TrustOptions::default(),
+                    SystemTime::now(),
+                )
+                .unwrap();
+            ctx.app
+                .mesh
+                .inbound_store()
+                .unwrap()
+                .upsert(
+                    InboundRecord {
+                        version: INBOUND_RECORD_VERSION,
+                        id: "a-1".into(),
+                        peer_destination: to.clone(),
+                        peer_identity: stub.identity_hex(),
+                        thread: "t-root".into(),
+                        question: "may I?".into(),
+                        envoy_question: String::new(),
+                        received_at: rfc3339_utc(SystemTime::now()),
+                        kind: InboundKind::Question,
+                        paths: Vec::new(),
+                        reason: String::new(),
+                    },
+                    SystemTime::now(),
+                )
+                .unwrap();
+            let send = format!("{MESH_FUNCTION_PREFIX}send");
+
+            let root = handle_mesh_tool(
+                &mut ctx,
+                &send,
+                &json!({"to": to, "message": "hello", "thread": "t-named"}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(root["status"], "sent", "{root}");
+            assert_eq!(root["thread"], "t-named", "{root}");
+            assert_ne!(root["thread"], root["id"], "{root}");
+            assert!(root.get("note").is_none(), "{root}");
+
+            let overridden = handle_mesh_tool(
+                &mut ctx,
+                &send,
+                &json!({"to": to, "message": "yes", "in_reply_to": "a-1", "thread": "t-other"}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(overridden["status"], "sent", "{overridden}");
+            assert_eq!(overridden["thread"], "t-other", "{overridden}");
+            assert!(overridden.get("note").is_none(), "{overridden}");
+
+            let seen = stub.seen();
+            assert_eq!(seen.len(), 2, "{seen:?}");
+            assert_eq!(seen[0].kind, PeerKind::Message);
+            assert_eq!(seen[0].thread.as_deref(), Some("t-named"));
+            assert_eq!(seen[0].in_reply_to, None);
+            assert_eq!(seen[1].thread.as_deref(), Some("t-other"));
+            assert_eq!(seen[1].in_reply_to.as_deref(), Some("a-1"));
+
+            assert!(ctx.app.mesh.stop().await.unwrap());
+            stub.stop().await;
+        }
     }
 }

@@ -1071,6 +1071,71 @@ mod tests {
         assert_eq!(StatusCard::from_value(&card.to_value()), Ok(card));
     }
 
+    /// Usage probe, amendment "ignore-on-receipt (card)": the lenient readers must hold
+    /// for the shapes a non-Rust peer can put on the wire that are not `rmpv` strings —
+    /// msgpack `bin` and a `str` holding bytes that are not UTF-8 — and must hold after a
+    /// real encode→decode, not only on a hand-built `Value`. A wrong-typed `about` is
+    /// absent, every non-text `caps` entry is skipped, and the card's required keys read
+    /// as served.
+    #[test]
+    fn usage_probe_binary_and_invalid_utf8_about_and_caps_read_as_absent_through_msgpack_bytes() {
+        // `rmpv` only builds a `Utf8String` from valid text, so the invalid `str` is made
+        // the way a peer would make it: a 3-byte fixstr whose bytes are not UTF-8,
+        // patched over a 3-byte marker after encoding.
+        const MARKER: &str = "QQQ";
+        fn patch_marker(bytes: &mut [u8]) {
+            let needle = [0xa3, b'Q', b'Q', b'Q'];
+            let at = bytes.windows(4).position(|w| w == needle).unwrap();
+            bytes[at + 1..at + 4].copy_from_slice(&[0xff, 0xfe, 0x41]);
+            assert!(!bytes.windows(4).any(|w| w == needle));
+        }
+        let value = Value::Map(vec![
+            (Value::from("v"), Value::from(1u64)),
+            (Value::from("display_name"), Value::from("Alex")),
+            (
+                Value::from("state"),
+                Value::Map(vec![(Value::from("code"), Value::from(STATE_IDLE))]),
+            ),
+            (
+                Value::from("about"),
+                Value::Binary(b"about as bytes".to_vec()),
+            ),
+            (
+                Value::from("caps"),
+                Value::Array(vec![
+                    Value::Binary(b"fetch".to_vec()),
+                    Value::from(MARKER),
+                    Value::Boolean(true),
+                    Value::from("fetch"),
+                    Value::Nil,
+                    Value::Array(vec![Value::from("nested")]),
+                    Value::from("sync"),
+                ]),
+            ),
+            (Value::from("served_at_secs"), Value::from(5u64)),
+        ]);
+        let mut bytes = Vec::new();
+        rmpv::encode::write_value(&mut bytes, &value).unwrap();
+        patch_marker(&mut bytes);
+        let decoded = rmpv::decode::read_value(&mut bytes.as_slice()).unwrap();
+
+        let card = StatusCard::from_value(&decoded).unwrap();
+
+        assert_eq!(card.about, None, "msgpack bin is not a string");
+        assert_eq!(card.caps, vec!["fetch".to_string(), "sync".to_string()]);
+        assert_eq!(card.display_name.as_deref(), Some("Alex"));
+        assert_eq!(card.state.code, STATE_IDLE);
+        assert_eq!(card.served_at_secs, 5);
+        assert_eq!(StatusCard::from_value(&card.to_value()), Ok(card));
+
+        let mut bytes = Vec::new();
+        rmpv::encode::write_value(&mut bytes, &card_with("about", Value::from(MARKER))).unwrap();
+        patch_marker(&mut bytes);
+        let decoded = rmpv::decode::read_value(&mut bytes.as_slice()).unwrap();
+        let card = StatusCard::from_value(&decoded).unwrap();
+        assert_eq!(card.about, None, "a str that is not UTF-8 reads as absent");
+    }
+
     #[test]
     fn unknown_caps_are_kept_and_the_maximal_card_round_trips_about_and_caps() {
         let card = StatusCard::from_value(&card_with(

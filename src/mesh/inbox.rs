@@ -80,7 +80,9 @@ impl InboxStaging {
     /// the new bytes land beside it as `<stem>-<sha256[..8]><ext>`. When that name too
     /// holds other bytes, or a file appears at the target between the check and the
     /// write, nothing is overwritten: `Collision`. A root that is gone again by the time
-    /// its ancestors are walked is `Io(NotFound)`, not `Escaped`.
+    /// its ancestors are walked is `Io(NotFound)`, not `Escaped`; a root that is not a
+    /// directory fails at the first `create_dir_all` with the filesystem's own kind,
+    /// before any path is resolved.
     pub(crate) fn stage(
         &self,
         peer_destination: &str,
@@ -91,20 +93,32 @@ impl InboxStaging {
         let dest8 = peer_dest8(peer_destination);
         fs::create_dir_all(self.root.join(&dest8))?;
         let canonical_root = dunce::canonicalize(&self.root)?;
+        Self::stage_under(&canonical_root, &dest8, rel, sha256, bytes)
+    }
+
+    /// `stage` after the root has been created and canonicalised; separate so the walk
+    /// can be exercised against a root that no longer exists.
+    fn stage_under(
+        canonical_root: &Path,
+        dest8: &str,
+        rel: &WirePath,
+        sha256: &[u8; 32],
+        bytes: &[u8],
+    ) -> Result<PathBuf, StageError> {
         let relative = rel.to_relative_path();
-        let peer_dir = canonical_root.join(&dest8);
+        let peer_dir = canonical_root.join(dest8);
         let parent = peer_dir.join(relative.parent().unwrap_or(Path::new("")));
         let target = peer_dir.join(&relative);
         let Some(existing) = parent
             .ancestors()
-            .take_while(|path| path.starts_with(&canonical_root))
+            .take_while(|path| path.starts_with(canonical_root))
             .find(|path| path.exists())
         else {
             return Err(StageError::Io(io::Error::from(io::ErrorKind::NotFound)));
         };
-        ensure_inside(&canonical_root, existing)?;
+        ensure_inside(canonical_root, existing)?;
         fs::create_dir_all(&parent)?;
-        ensure_inside(&canonical_root, &parent)?;
+        ensure_inside(canonical_root, &parent)?;
 
         let target = match existing_matches(&target, sha256)? {
             Some(true) => return Ok(target),
@@ -394,7 +408,35 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, StageError::Io(_)), "{err}");
+        assert!(
+            !matches!(&err, StageError::Io(io) if io.kind() == io::ErrorKind::NotFound),
+            "a root that exists as a file is not reported as missing: {err}"
+        );
         assert_eq!(fs::read(&inbox.root).unwrap(), b"not a directory");
+    }
+
+    /// The root was created and canonicalised, then removed before its ancestors were
+    /// walked: nothing under it exists, so the walk stops at the root boundary and
+    /// reports the root as missing rather than the deepest existing ancestor outside
+    /// it as an escape.
+    #[test]
+    fn a_root_removed_after_canonicalisation_is_not_found_not_an_escape() {
+        let tmp = TempDir::new("inbox-root-vanished");
+        let inbox = staging(&tmp);
+        fs::create_dir_all(inbox.root.join(DEST8)).unwrap();
+        let canonical_root = dunce::canonicalize(&inbox.root).unwrap();
+        fs::remove_dir_all(&inbox.root).unwrap();
+
+        let rel = WirePath::parse("docs/a.md").unwrap();
+        let err = InboxStaging::stage_under(&canonical_root, DEST8, &rel, &digest(b"x"), b"x")
+            .unwrap_err();
+
+        assert!(
+            matches!(&err, StageError::Io(io) if io.kind() == io::ErrorKind::NotFound),
+            "{err}"
+        );
+        assert!(!inbox.root.exists());
+        assert!(tmp.path.exists());
     }
 
     #[test]
@@ -635,5 +677,60 @@ mod tests {
     fn the_peer_directory_is_the_lower_cased_first_eight_characters() {
         assert_eq!(peer_dest8(PEER), DEST8);
         assert_eq!(peer_dest8("AbC"), "abc");
+    }
+
+    /// Usage probe, amendment (b): a root that is "gone again" is reported as an I/O
+    /// failure of the inbox, never as a path leading outside it. The deterministic shapes
+    /// of a gone root are a symlink whose target does not exist and a symlink to a file:
+    /// both are refused as `Io`, nothing appears at the link's target, and the file a
+    /// link points at keeps its bytes.
+    #[cfg(unix)]
+    #[test]
+    fn usage_probe_a_root_that_is_a_dangling_symlink_or_links_to_a_file_is_an_io_error_not_an_escape()
+     {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new("inbox-root-dangling");
+        let gone = tmp.path.join("gone");
+        let root = tmp.path.join("inbox");
+        symlink(&gone, &root).unwrap();
+        let inbox = InboxStaging::new(root.clone());
+        let rel = WirePath::parse("docs/a.md").unwrap();
+
+        let err = inbox.stage(PEER, &rel, &digest(b"x"), b"x").unwrap_err();
+
+        assert!(matches!(err, StageError::Io(_)), "{err}");
+        assert!(
+            !gone.exists(),
+            "nothing may be created at the link's target"
+        );
+        assert!(root.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(
+            fs::read_dir(&tmp.path)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>(),
+            ["inbox"],
+            "the temp dir holds only the link itself"
+        );
+
+        let tmp = TempDir::new("inbox-root-links-file");
+        let file = tmp.path.join("plain");
+        fs::write(&file, b"not a directory").unwrap();
+        let root = tmp.path.join("inbox");
+        symlink(&file, &root).unwrap();
+        let inbox = InboxStaging::new(root);
+
+        let err = inbox.stage(PEER, &rel, &digest(b"x"), b"x").unwrap_err();
+
+        assert!(matches!(err, StageError::Io(_)), "{err}");
+        assert!(!err.to_string().contains("docs"), "{err}");
+        assert_eq!(fs::read(&file).unwrap(), b"not a directory");
+        let mut names = fs::read_dir(&tmp.path)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(names, ["inbox", "plain"]);
     }
 }
