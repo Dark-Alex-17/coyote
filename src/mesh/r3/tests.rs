@@ -480,6 +480,7 @@ pub(crate) mod network {
         PLAN_TITLE_MAX_CHARS, REPO_NAME_MAX_CHARS, STATE_IDLE, StatusCard, StatusError,
         StatusHandler, TODO_GOAL_MAX_CHARS, build_card,
     };
+    use crate::mesh::envoy::{EnvoyJob, EnvoySink};
     use crate::mesh::events::MeshHooks;
     use crate::mesh::idle::{IdleNotify, IdleSink, Origin};
     use crate::mesh::knock::{
@@ -487,9 +488,11 @@ pub(crate) mod network {
         KnockOutcome, KnockSurface, KnockVia, decode_knock_message, drain_knocks,
     };
     use crate::mesh::knocks::KnockCache;
+    use crate::mesh::limits::{PeerRefusal, RefusalReason};
     use crate::mesh::message::{
-        LxmfPeer, OutboundPeer, PeerKind, PeerLxmf, PeerSendOptions, PeerVia, RecipientOutcome,
-        SendError, SendOutcome, decode_peer_lxmf, is_received_reply, received_reply, to_r3_body,
+        Disposition, LxmfPeer, OutboundPeer, Part, PartLimits, PeerKind, PeerLxmf, PeerSendOptions,
+        PeerVia, RawPart, RecipientOutcome, SendError, SendOutcome, decode_peer_lxmf, from_r3_body,
+        is_received_reply, received_reply, to_r3_body,
     };
     use crate::mesh::node::{
         KnockOptions, MeshRuntime, MeshSlot, NodeOptions, REKEY_GRACE, SHUTDOWN_GRACE,
@@ -510,7 +513,7 @@ pub(crate) mod network {
     use crate::mesh::trust::{
         IdentityStanding, Rule, TRUST_FILE_VERSION, TrustChange, TrustOptions,
     };
-    use crate::mesh::{destination_address, mesh_config_dir, rfc3339_utc};
+    use crate::mesh::{destination_address, hex_lower, mesh_config_dir, rfc3339_utc};
     use crate::supervisor::mailbox::EnvelopePayload;
     use crate::testing::{debug_snapshot, install_log_collector, warn_snapshot};
 
@@ -530,6 +533,7 @@ pub(crate) mod network {
     use rns_transport::iface::tcp_server::TcpServer;
     use rns_transport::resource::{LINK_PACKET_MDU, ResourceEvent, ResourceEventKind};
     use rns_transport::transport::{AnnounceEvent, Transport};
+    use sha2::{Digest as _, Sha256};
     use std::collections::VecDeque;
     use std::fs;
     use std::path::PathBuf;
@@ -598,6 +602,7 @@ pub(crate) mod network {
     #[derive(Default)]
     pub(crate) struct Recorder {
         seen: Mutex<Vec<Seen>>,
+        bodies: Mutex<Vec<Value>>,
         script: Mutex<VecDeque<Script>>,
         abandoned: AtomicUsize,
     }
@@ -623,8 +628,18 @@ pub(crate) mod network {
                 .expect("a request was seen")
         }
 
+        /// The body of the last request, out of its envelope.
+        pub(crate) fn last_body(&self) -> Value {
+            self.bodies
+                .lock()
+                .last()
+                .cloned()
+                .expect("a request was seen")
+        }
+
         async fn record(&self, seen: Seen, body: Value) -> Reply {
             self.seen.lock().push(seen);
+            self.bodies.lock().push(body.clone());
             let next = self.script.lock().pop_front();
             match next {
                 Some(Script::Reply(reply)) => reply,
@@ -5498,6 +5513,133 @@ pub(crate) mod network {
             None,
             "an answer is handed over once"
         );
+        pair.stop_node_a().await;
+    }
+
+    /// Node B sends node A a threaded message with an inline file. A's slot stages the
+    /// bytes under its own instance's inbox, keyed by B's instance, and the inbox
+    /// envelope carries the thread, the staged path and no dropped count.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_threaded_message_with_an_inline_file_is_staged_under_the_installed_slots_inbox() {
+        let pair = NodePair::start_with("r3-peer-file-part", |_| {}, trusting_b).await;
+        let (slot, _idle) = installed_slot(&pair);
+        let bytes = b"# notes\n".to_vec();
+        let message = OutboundPeer::with_parts(
+            PeerKind::Message,
+            "see attached",
+            None,
+            None,
+            None,
+            vec![RawPart::File {
+                name: "docs/notes.md".into(),
+                size: bytes.len() as u64,
+                sha256: Sha256::digest(&bytes).into(),
+                bytes: Some(bytes.clone()),
+                reference: None,
+            }],
+            &PartLimits::default(),
+        )
+        .unwrap()
+        .with_thread(Some("t-1".into()))
+        .unwrap();
+
+        let outcome = b_sends_to_a(&pair, &message).await.unwrap();
+
+        assert!(is_received_reply(&outcome.value, &message.id));
+        let (envelopes, dropped) = slot.peer_inbox().drain();
+        assert_eq!(dropped, 0);
+        let received = only_peer(&envelopes);
+        assert_eq!(received.thread.as_deref(), Some("t-1"));
+        assert_eq!(received.dropped_parts, 0);
+        let [
+            Part::File {
+                name,
+                size,
+                sha256,
+                staged: Some(staged),
+                reference: None,
+            },
+        ] = received.parts.as_slice()
+        else {
+            panic!("one staged file part: {:?}", received.parts);
+        };
+        assert_eq!(name, "docs/notes.md");
+        assert_eq!(*size, bytes.len() as u64);
+        assert_eq!(*sha256, hex_lower(&Sha256::digest(&bytes)));
+        let inbox_root = dunce::canonicalize(
+            pair.node_a
+                .cache_dir()
+                .join("mesh")
+                .join("inbox")
+                .join(pair.node_a.current_instance_id()),
+        )
+        .unwrap();
+        assert!(
+            staged.starts_with(&inbox_root),
+            "{staged:?} under {inbox_root:?}"
+        );
+        let b_instance = pair.responder.desc.address_hash.to_hex_string();
+        assert!(
+            staged.ends_with(
+                PathBuf::from(&b_instance[..8])
+                    .join("docs")
+                    .join("notes.md")
+            ),
+            "{staged:?}"
+        );
+        assert_eq!(fs::read(staged).unwrap(), bytes);
+        pair.stop_node_a().await;
+    }
+
+    /// An envoy whose queue is always full, so every message offered to it comes back as
+    /// a typed refusal and the slot tells the peer.
+    struct BusyEnvoy;
+
+    impl EnvoySink for BusyEnvoy {
+        fn accept(&self, _job: EnvoyJob) -> Result<(), PeerRefusal> {
+            Err(PeerRefusal::capacity(RefusalReason::EnvoyBusy))
+        }
+
+        fn answer(&self, _id: &str, _text: &str) -> bool {
+            false
+        }
+
+        fn interrupt(&self) {}
+    }
+
+    /// Node A's envoy refuses node B's message, so A files it and sends B a reply that
+    /// closes the message with the refusal: its thread, a `refused` disposition and how
+    /// long to wait, with the typed reason still in `fields`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_message_is_answered_with_a_refused_disposition_and_retry_after() {
+        let pair = NodePair::start_with("r3-peer-refusal-reply", |_| {}, trusting_b).await;
+        pair.introduce_b_to_a().await;
+        let (slot, _idle) = installed_slot(&pair);
+        slot.set_envoy(Arc::new(BusyEnvoy) as Arc<dyn EnvoySink>);
+        let message = OutboundPeer::new(PeerKind::Message, "anyone free?", None, None, None)
+            .unwrap()
+            .with_thread(Some("t-1".into()))
+            .unwrap();
+
+        let outcome = b_sends_to_a(&pair, &message).await.unwrap();
+
+        assert!(is_received_reply(&outcome.value, &message.id));
+        wait_until("node A to send node B the refusal", || {
+            pair.recorder_b.seen_count() == 1
+        })
+        .await;
+        assert_eq!(pair.recorder_b.last().path_hash, PathHash::of(MESSAGE_PATH));
+        let reply = from_r3_body(&pair.recorder_b.last_body()).unwrap();
+        assert_eq!(reply.kind, PeerKind::Reply);
+        assert_eq!(reply.in_reply_to.as_deref(), Some(message.id.as_str()));
+        assert_eq!(reply.thread.as_deref(), Some("t-1"));
+        assert_eq!(reply.disposition, Some(Disposition::Refused));
+        assert!(reply.retry_after.is_some_and(|secs| secs >= 1), "{reply:?}");
+        let refusal = PeerRefusal::capacity(RefusalReason::EnvoyBusy);
+        assert_eq!(reply.fields, Some(refusal.fields()));
+        assert_eq!(reply.content, RefusalReason::EnvoyBusy.peer_text());
+        let (envelopes, _) = slot.peer_inbox().drain();
+        assert_eq!(only_peer(&envelopes).message_id, message.id);
         pair.stop_node_a().await;
     }
 

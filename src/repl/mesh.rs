@@ -2522,21 +2522,35 @@ fn render_inbox(rows: &[InboxRow], awaiting_collect: &[String]) -> String {
             row.received.format("%H:%M UTC"),
         ));
         for part in &message.parts {
-            if let Part::File {
-                name,
-                size,
-                staged,
-                reference,
-                ..
-            } = part
-            {
-                let location = match (staged, reference) {
-                    (Some(path), _) => format!("staged at {}", path.display()),
-                    (None, Some(path)) => format!("fetchable as {path}"),
-                    (None, None) => "not kept".to_string(),
-                };
-                lines.push(format!("  file: {name} ({size} B) {location}"));
+            match part {
+                Part::Text { text } => {
+                    let text = peer_line(Some(text), PEER_CONTENT_MAX_CHARS).unwrap_or_default();
+                    lines.push(format!("  text: {text}"));
+                }
+                Part::Data { data } => {
+                    lines.push(format!("  data: {} bytes", data.to_string().len()));
+                }
+                Part::File {
+                    name,
+                    size,
+                    staged,
+                    reference,
+                    ..
+                } => {
+                    let location = match (staged, reference) {
+                        (Some(path), _) => format!("staged at {}", path.display()),
+                        (None, Some(path)) => format!("fetchable as {path}"),
+                        (None, None) => "not kept".to_string(),
+                    };
+                    lines.push(format!("  file: {name} ({size} B) {location}"));
+                }
             }
+        }
+        if message.dropped_parts > 0 {
+            lines.push(format!(
+                "  ({} dropped)",
+                plural(message.dropped_parts as usize, "part", "parts")
+            ));
         }
     }
     if !awaiting_collect.is_empty() {
@@ -3679,6 +3693,38 @@ mod tests {
             .len();
         assert_eq!(content_len, PEER_CONTENT_MAX_CHARS, "{text}");
         assert_eq!(lines[2], "answered awaiting collect: q1");
+    }
+
+    #[test]
+    fn inbox_lines_render_every_part_shape_and_count_the_dropped_ones() {
+        let mut with_parts = message(PeerKind::Message, "see attached", None);
+        with_parts.parts = vec![
+            Part::Text {
+                text: "first line\nsecond line".into(),
+            },
+            Part::Data {
+                data: serde_json::json!({"k": "v"}),
+            },
+            Part::File {
+                name: "docs/notes.md".into(),
+                size: 8,
+                sha256: "ab".repeat(32),
+                staged: Some(PathBuf::from("/tmp/inbox/abcdef01/docs/notes.md")),
+                reference: None,
+            },
+        ];
+        with_parts.dropped_parts = 2;
+
+        let text = render_inbox(&[inbox_row(with_parts)], &[]);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 5, "{text}");
+        assert_eq!(lines[1], "  text: first line second line");
+        assert_eq!(lines[2], "  data: 9 bytes");
+        assert_eq!(
+            lines[3],
+            "  file: docs/notes.md (8 B) staged at /tmp/inbox/abcdef01/docs/notes.md"
+        );
+        assert_eq!(lines[4], "  (2 parts dropped)");
     }
 
     fn correlation(id: &str, state: PendingState) -> Correlation {

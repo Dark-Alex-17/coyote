@@ -23,7 +23,7 @@ use crate::mesh::lock::InstanceLock;
 use crate::mesh::message::{
     CHECK_INBOX_NEXT_ACTION, Disposition, ModelNotes, OutboundPeer, PEER_LINE_MAX_CHARS,
     PartLimits, PeerAdmission, PeerInbox, PeerKind, PeerMessage, PeerMessageHandler, PeerRouting,
-    PeerSurface, PeerVia, RawPeerMessage, collect_next_action, unix_now,
+    PeerSurface, PeerVia, RawPeerMessage, SendError, collect_next_action, unix_now,
 };
 use crate::mesh::notify::{Notification, NotificationSink, Source};
 use crate::mesh::peers::{PEER_TABLE_MAX_ENTRIES, PeerChange, PeerSighting, PeerTable};
@@ -2175,24 +2175,26 @@ impl MeshSlot {
     pub(crate) fn refuse_for_envoy(&self, message: PeerMessage, refusal: PeerRefusal) {
         let destination = message.source_destination.clone();
         let id = message.message_id.clone();
+        let thread = message.thread().to_string();
         self.record_envoy_refusal(message, &refusal);
         if refusal.reason != RefusalReason::LoopGuard {
-            self.send_refusal_reply(&destination, &id, &refusal);
+            self.send_refusal_reply(&destination, &id, Some(&thread), &refusal);
         }
     }
 
     /// Sends the peer at `destination` the typed refusal of its message `id`, off the
     /// request path since this runs where nothing may await. A reply that cannot go is
-    /// logged; the REPL has its line and the inbox the original.
-    fn send_refusal_reply(&self, destination: &str, id: &str, refusal: &PeerRefusal) {
+    /// logged; the REPL has its line and the inbox the original. `thread` is the
+    /// original's when the caller still has it; `None` means the original was its own.
+    fn send_refusal_reply(
+        &self,
+        destination: &str,
+        id: &str,
+        thread: Option<&str>,
+        refusal: &PeerRefusal,
+    ) {
         let dest8 = short(destination).to_string();
-        let out = match OutboundPeer::new(
-            PeerKind::Reply,
-            refusal.reason.peer_text(),
-            None,
-            Some(id),
-            Some(refusal.fields()),
-        ) {
+        let out = match refusal_reply(id, thread, refusal) {
             Ok(out) => out,
             Err(err) => {
                 warn!(
@@ -2506,13 +2508,20 @@ impl MeshSlot {
     /// and what to call, and the person at the keyboard gets one line. The id in the
     /// model's note is minted here from the sending instance, never the peer's own: an
     /// answered question is named by our correlation id, anything else (a message, an
-    /// ask or a bulletin, each its own event) by `peer:<instance>`, so no peer-chosen
-    /// text reaches the note.
+    /// ask or a bulletin, each its own event) by `peer:<instance>`, so no peer-chosen text
+    /// reaches the note. An escalated reply has no answer to collect yet, so its note
+    /// points at the inbox rather than at a `mesh__collect` that would block for its
+    /// whole timeout.
     fn deliver_to_inbox(&self, message: PeerMessage, answered: bool) {
         let id8 = short(&message.source_identity).to_string();
         let text = message.summary_line(self.display_name_of(&message).as_deref());
         let local_id = format!("peer:{}", short(&message.source_destination));
         let (event, id, next_action) = match (answered, message.kind) {
+            (true, _) if message.disposition == Some(Disposition::Escalated) => (
+                "peer_escalated",
+                message.in_reply_to.clone().unwrap_or_default(),
+                CHECK_INBOX_NEXT_ACTION.to_string(),
+            ),
             (true, _) => {
                 let id = message.in_reply_to.clone().unwrap_or_default();
                 let next_action = collect_next_action(&id);
@@ -2545,6 +2554,32 @@ impl MeshSlot {
             model_note: None,
         });
     }
+}
+
+/// The correlated reply that closes a peer's message `id` with a typed refusal: the
+/// disposition says whether waiting out a budget window or a capacity limit is the
+/// remedy, `retry_after` how long, and `fields` repeats both for readers of the old
+/// shape. The reply inherits `thread`, or names the original as its own root.
+fn refusal_reply(
+    id: &str,
+    thread: Option<&str>,
+    refusal: &PeerRefusal,
+) -> Result<OutboundPeer, SendError> {
+    let disposition = match refusal.reason {
+        RefusalReason::TokenCeiling | RefusalReason::CostCeiling => Disposition::BudgetExhausted,
+        _ => Disposition::Refused,
+    };
+    let retry_after = u32::try_from(refusal.retry_after_secs()).unwrap_or(u32::MAX);
+    let text = refusal.reason.peer_text();
+    OutboundPeer::new(
+        PeerKind::Reply,
+        text,
+        None,
+        Some(id),
+        Some(refusal.fields()),
+    )?
+    .with_thread(Some(thread.unwrap_or(id).to_string()))
+    .map(|out| out.with_disposition(disposition, Some(retry_after)))
 }
 
 fn non_blank(value: Option<String>) -> Option<Arc<String>> {
@@ -2736,6 +2771,7 @@ impl PeerSurface for MeshSlot {
                     self.send_refusal_reply(
                         request.source_destination,
                         request.message_id,
+                        None,
                         &refusal,
                     );
                 }
@@ -4624,6 +4660,64 @@ mod tests {
         assert_eq!(delivered.kind, PeerKind::Reply);
         assert_eq!(delivered.in_reply_to.as_deref(), Some("q-1"));
         assert_eq!(slot.take_model_notes()[0].event, "peer_reply");
+    }
+
+    #[test]
+    fn an_escalated_reply_tells_the_model_to_check_the_inbox_rather_than_collect() {
+        let slot = MeshSlot::default();
+        let idle = RecordingIdleSink::new(true);
+        slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+        slot.correlations().open(pending("q-1")).unwrap();
+        let mut escalated = peer_message(PeerKind::Reply, "r-1", Some("q-1"));
+        escalated.disposition = Some(Disposition::Escalated);
+
+        slot.deliver_peer(escalated);
+
+        let notes = slot.take_model_notes();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].event, "peer_escalated");
+        assert_eq!(notes[0].id, "q-1");
+        assert_eq!(notes[0].next_action, CHECK_INBOX_NEXT_ACTION);
+        assert_eq!(idle.pushed.lock()[0].source, Source::Reply);
+        assert_eq!(
+            slot.correlations().get("q-1").unwrap().record.state,
+            PendingState::Escalated,
+            "the question stays open for the human's answer"
+        );
+    }
+
+    #[test]
+    fn a_refusal_reply_closes_the_original_with_its_disposition_thread_and_retry_after() {
+        let refusal = PeerRefusal {
+            reason: RefusalReason::RateLimited,
+            retry_after: Duration::from_millis(90_500),
+        };
+
+        let reply = refusal_reply("m-1", Some("t-root"), &refusal).unwrap();
+        assert_eq!(reply.kind, PeerKind::Reply);
+        assert_eq!(reply.in_reply_to.as_deref(), Some("m-1"));
+        assert_eq!(reply.thread.as_deref(), Some("t-root"));
+        assert_eq!(reply.disposition, Some(Disposition::Refused));
+        assert_eq!(reply.retry_after, Some(91), "rounded up like the fields");
+        assert_eq!(reply.fields, Some(refusal.fields()));
+        assert_eq!(reply.content, RefusalReason::RateLimited.peer_text());
+
+        let rooted = refusal_reply("m-1", None, &refusal).unwrap();
+        assert_eq!(
+            rooted.thread.as_deref(),
+            Some("m-1"),
+            "an original with no thread of its own is the root"
+        );
+
+        for reason in [RefusalReason::TokenCeiling, RefusalReason::CostCeiling] {
+            let reply = refusal_reply("m-1", None, &PeerRefusal::capacity(reason)).unwrap();
+            assert_eq!(reply.disposition, Some(Disposition::BudgetExhausted));
+            assert!(reply.retry_after.is_some_and(|secs| secs >= 1));
+        }
+        for reason in [RefusalReason::EnvoyBusy, RefusalReason::PeerConcurrency] {
+            let reply = refusal_reply("m-1", None, &PeerRefusal::capacity(reason)).unwrap();
+            assert_eq!(reply.disposition, Some(Disposition::Refused));
+        }
     }
 
     #[test]

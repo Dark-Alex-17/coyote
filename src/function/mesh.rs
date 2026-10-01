@@ -205,7 +205,8 @@ pub fn mesh_function_declarations() -> Vec<FunctionDeclaration> {
             name: format!("{MESH_FUNCTION_PREFIX}check_inbox"),
             description: format!(
                 "Drain the messages and bulletins trusted mesh peers have sent this node since the last \
-                 check, oldest first, plus the ids of answered questions still awaiting mesh__collect. \
+                 check, oldest first, grouped under `threads` by sender and thread, plus the ids of \
+                 answered questions still awaiting mesh__collect. \
                  To answer a message with `kind: \"ask\"`, call mesh__send to its `from` with its \
                  `message_id` as `in_reply_to`. A reply that did not answer an open question of \
                  yours arrives as `kind: \"message\"` with `in_reply_to` set. {PEER_TEXT_IS_DATA} \
@@ -273,7 +274,7 @@ pub async fn handle_mesh_tool(
 
     match action {
         "peers" => handle_peers(&runtime, args).await,
-        "send" => handle_send(&runtime, args).await,
+        "send" => handle_send(&ctx.app.mesh, &runtime, args).await,
         "ask" => handle_ask(ctx, &runtime, args).await,
         "collect" => handle_collect(ctx, args).await,
         "check_inbox" => Ok(handle_check_inbox(&ctx.app.mesh)),
@@ -348,6 +349,25 @@ pub(crate) fn outbound_from_args(
     OutboundPeer::new(kind, message, title, in_reply_to, None)?.with_thread(thread)
 }
 
+/// A reply that names no thread inherits the answered message's, so the wire carries
+/// it and the receiver need not infer: the filed inbound's thread when `.mesh answer`
+/// still has it on record, otherwise the answered id, which is the root of any thread
+/// this node never saw. A root message keeps `None` for the receiver to read as its id.
+fn inherit_reply_thread(slot: &MeshSlot, out: OutboundPeer) -> Result<OutboundPeer, SendError> {
+    let Some(id) = out.in_reply_to.as_deref() else {
+        return Ok(out);
+    };
+    if out.thread.is_some() {
+        return Ok(out);
+    }
+    let thread = slot
+        .inbound_store()
+        .and_then(|store| store.get(id).ok().flatten())
+        .map(|record| record.thread)
+        .unwrap_or_else(|| id.to_string());
+    out.with_thread(Some(thread))
+}
+
 pub(crate) fn trust_label(verdict: Verdict) -> &'static str {
     match (verdict.decision, verdict.rule) {
         (Decision::Allow, _) => "trusted",
@@ -405,6 +425,8 @@ fn card_value(card: &StatusCard) -> Value {
             "done": todo.done,
             "total": todo.total,
         })),
+        "about": card.about,
+        "caps": card.caps,
         "age_secs": card.snapshot_age_secs,
         "served_at_secs": card.served_at_secs,
     })
@@ -480,11 +502,13 @@ async fn handle_peers(runtime: &MeshRuntime, args: &Value) -> Result<Value> {
     Ok(result)
 }
 
-async fn handle_send(runtime: &MeshRuntime, args: &Value) -> Result<Value> {
+async fn handle_send(slot: &MeshSlot, runtime: &MeshRuntime, args: &Value) -> Result<Value> {
     let to = required_str(args, "to")?;
     let message = required_str(args, "message")?;
 
-    let out = match outbound_from_args(PeerKind::Message, message, args) {
+    let out = match outbound_from_args(PeerKind::Message, message, args)
+        .and_then(|out| inherit_reply_thread(slot, out))
+    {
         Ok(out) => out,
         Err(err) => return Ok(send_error(&err)),
     };
@@ -668,16 +692,20 @@ async fn collect_reply(ctx: &RequestContext, id: &str, timeout: Duration) -> Val
 }
 
 /// The inbox as the model reads it: every envelope, the drained messages grouped by
-/// thread in first-seen order, and the questions of ours whose answer waits to be
-/// collected or whose peer has asked its human.
+/// sender and thread in first-seen order, since a thread id is the peer's own text and
+/// one peer must not file into another's conversation, and the questions of ours whose
+/// answer waits to be collected or whose peer has asked its human.
 fn handle_check_inbox(slot: &MeshSlot) -> Value {
     let (envelopes, dropped) = slot.peer_inbox().drain();
-    let mut threads: IndexMap<String, Vec<String>> = IndexMap::new();
+    let mut threads: IndexMap<(String, String), Vec<String>> = IndexMap::new();
     let mut messages = Vec::with_capacity(envelopes.len());
     for envelope in envelopes {
         if let EnvelopePayload::Peer(message) = &envelope.payload {
             threads
-                .entry(message.thread().to_string())
+                .entry((
+                    message.source_destination.clone(),
+                    message.thread().to_string(),
+                ))
                 .or_default()
                 .push(message.message_id.clone());
         }
@@ -690,7 +718,7 @@ fn handle_check_inbox(slot: &MeshSlot) -> Value {
     }
     let threads: Vec<Value> = threads
         .into_iter()
-        .map(|(thread, ids)| json!({ "thread": thread, "ids": ids }))
+        .map(|((from, thread), ids)| json!({ "from": from, "thread": thread, "ids": ids }))
         .collect();
     let correlations = slot.correlations().list();
     let answered_awaiting_collect: Vec<&str> = correlations
@@ -764,11 +792,14 @@ mod tests {
     use super::*;
     use crate::config::{AppConfig, AppState, WorkingMode, mesh_tools_available};
     use crate::function::{ToolCall, ToolResult, drain_live_notifications, merge_system_channel};
+    use crate::mesh::card::CardState;
     use crate::mesh::hex_lower;
     use crate::mesh::message::{
         Disposition, PEER_INBOX_CAPACITY, Part, PeerMessage, PeerVia, RawPeerMessage, to_r3_body,
     };
     use crate::mesh::notify::{NotificationSink, RenderedNotification};
+    use crate::mesh::pending::{INBOUND_RECORD_VERSION, InboundKind, InboundRecord, InboundStore};
+    use crate::mesh::test_support::TempDir;
     use crate::supervisor::escalation::EscalationRequest;
 
     use parking_lot::RwLock;
@@ -997,19 +1028,22 @@ mod tests {
         assert!(matches!(too_long, SendError::ContentTooLong { .. }));
     }
 
+    fn body_thread(out: &OutboundPeer) -> Option<String> {
+        let rmpv::Value::Map(entries) = to_r3_body(out, 1.0) else {
+            panic!("a map body");
+        };
+        entries
+            .iter()
+            .find(|(key, _)| key.as_str() == Some("thread"))
+            .map(|(_, value)| value.as_str().unwrap().to_string())
+    }
+
     #[test]
     fn send_with_thread_puts_it_on_the_wire_body() {
         let out = outbound_from_args(PeerKind::Message, "still here", &json!({"thread": " t-1 "}))
             .unwrap();
         assert_eq!(out.thread.as_deref(), Some("t-1"));
-        let rmpv::Value::Map(entries) = to_r3_body(&out, 1.0) else {
-            panic!("a map body");
-        };
-        let thread = entries
-            .iter()
-            .find(|(key, _)| key.as_str() == Some("thread"))
-            .map(|(_, value)| value.as_str());
-        assert_eq!(thread, Some(Some("t-1")));
+        assert_eq!(body_thread(&out).as_deref(), Some("t-1"));
 
         let untied = outbound_from_args(PeerKind::Message, "hi", &json!({"thread": ""})).unwrap();
         assert_eq!(untied.thread, None);
@@ -1021,6 +1055,86 @@ mod tests {
             .unwrap_err();
         assert_eq!(err, SendError::InvalidFields("thread is not a message id"));
         assert_eq!(send_error(&err)["kind"], "invalid_fields");
+    }
+
+    #[test]
+    fn a_reply_with_no_thread_inherits_the_answered_messages_and_carries_it_on_the_wire() {
+        let tmp = TempDir::new("mesh-tool-reply-thread");
+        let slot = MeshSlot::default();
+        let store = Arc::new(InboundStore::new(&tmp.path, "inst"));
+        store
+            .upsert(
+                InboundRecord {
+                    version: INBOUND_RECORD_VERSION,
+                    id: "a-1".into(),
+                    peer_destination: hex_lower(&[0xab; 16]),
+                    peer_identity: hex_lower(&[0xcd; 16]),
+                    thread: "t-root".into(),
+                    question: "may I?".into(),
+                    envoy_question: String::new(),
+                    received_at: rfc3339_utc(SystemTime::now()),
+                    kind: InboundKind::Question,
+                    paths: Vec::new(),
+                    reason: String::new(),
+                },
+                SystemTime::now(),
+            )
+            .unwrap();
+        slot.set_inbound_store_for_tests(store);
+        let reply = |args: Value| {
+            inherit_reply_thread(
+                &slot,
+                outbound_from_args(PeerKind::Message, "yes", &args).unwrap(),
+            )
+            .unwrap()
+        };
+
+        let filed = reply(json!({"in_reply_to": "a-1"}));
+        assert_eq!(filed.thread.as_deref(), Some("t-root"));
+        assert_eq!(body_thread(&filed).as_deref(), Some("t-root"));
+
+        let unknown = reply(json!({"in_reply_to": "m-9"}));
+        assert_eq!(
+            unknown.thread.as_deref(),
+            Some("m-9"),
+            "an answered message this node never filed is the root of its thread"
+        );
+        assert_ne!(unknown.thread.as_deref(), Some(unknown.id.as_str()));
+
+        let chosen = reply(json!({"in_reply_to": "a-1", "thread": "t-other"}));
+        assert_eq!(chosen.thread.as_deref(), Some("t-other"));
+
+        let root = reply(json!({}));
+        assert_eq!(root.thread, None, "a root message is its own thread");
+        assert_eq!(body_thread(&root), None);
+    }
+
+    #[test]
+    fn card_value_carries_about_and_caps_and_leaves_them_empty_when_absent() {
+        let mut card = StatusCard {
+            display_name: Some("Alex".into()),
+            objective: None,
+            state: CardState {
+                code: STATE_IDLE,
+                since_secs: None,
+            },
+            repo: None,
+            plan: None,
+            todo: None,
+            about: None,
+            caps: Vec::new(),
+            snapshot_age_secs: None,
+            served_at_secs: 1,
+        };
+        let bare = card_value(&card);
+        assert_eq!(bare["about"], Value::Null);
+        assert_eq!(bare["caps"], json!([]));
+
+        card.about = Some("reviews Rust".into());
+        card.caps = vec!["review".into(), "rust".into()];
+        let full = card_value(&card);
+        assert_eq!(full["about"], "reviews Rust");
+        assert_eq!(full["caps"], json!(["review", "rust"]));
     }
 
     #[test]
@@ -1431,11 +1545,12 @@ mod tests {
 
         let inbox = handle_check_inbox(&slot);
         assert_eq!(inbox["count"], 3);
+        let from = hex_lower(&[0xab; 16]);
         assert_eq!(
             inbox["threads"],
             json!([
-                { "thread": "m1", "ids": ["m1", "m2"] },
-                { "thread": "m3", "ids": ["m3"] },
+                { "from": from, "thread": "m1", "ids": ["m1", "m2"] },
+                { "from": from, "thread": "m3", "ids": ["m3"] },
             ]),
             "{inbox}"
         );
@@ -1449,6 +1564,32 @@ mod tests {
             again["escalated"],
             json!(["q1"]),
             "still asked of the human"
+        );
+    }
+
+    #[test]
+    fn check_inbox_keeps_two_peers_who_share_a_thread_id_in_separate_groups() {
+        let slot = MeshSlot::default();
+        let (a, b) = (hex_lower(&[0xab; 16]), hex_lower(&[0xbb; 16]));
+        slot.deliver_peer(peer_message(PeerKind::Message, "m1", None));
+        slot.deliver_peer(PeerMessage::new(RawPeerMessage {
+            source_destination: b.clone(),
+            thread: Some("m1".into()),
+            ..raw_message(PeerKind::Message, "m2", None)
+        }));
+        slot.deliver_peer(PeerMessage::new(RawPeerMessage {
+            thread: Some("m1".into()),
+            ..raw_message(PeerKind::Message, "m3", None)
+        }));
+
+        let inbox = handle_check_inbox(&slot);
+        assert_eq!(
+            inbox["threads"],
+            json!([
+                { "from": a, "thread": "m1", "ids": ["m1", "m3"] },
+                { "from": b, "thread": "m1", "ids": ["m2"] },
+            ]),
+            "a peer naming another's thread id does not join its group: {inbox}"
         );
     }
 

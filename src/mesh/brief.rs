@@ -133,6 +133,12 @@ fn render_card(card: &StatusCard) -> Option<String> {
     if let Some(objective) = &card.objective {
         lines.push(format!("Objective: {objective}"));
     }
+    if let Some(about) = &card.about {
+        lines.push(format!("About: {about}"));
+    }
+    if !card.caps.is_empty() {
+        lines.push(format!("Caps: {}", card.caps.join(", ")));
+    }
     // These labels mirror the STATE_* codes in card.rs; a new code needs a label here.
     let state = match card.state.code {
         STATE_IDLE => Some("idle"),
@@ -388,6 +394,30 @@ mod tests {
             "{text}"
         );
         assert_eq!(brief.digest_generated_at, Some(digest().generated_at));
+    }
+
+    #[test]
+    fn the_card_section_names_about_and_caps_after_the_objective_when_the_card_has_them() {
+        let mut described = card();
+        described.about = Some("reviews Rust and writes docs".into());
+        described.caps = vec!["review".into(), "docs".into()];
+        let text = assemble_brief(MeshBrief::Manual, Some(&described), None, None, &todo())
+            .unwrap()
+            .text;
+        assert!(
+            text.contains(
+                "Objective: ship it\nAbout: reviews Rust and writes docs\nCaps: review, docs\nState: working"
+            ),
+            "{text}"
+        );
+
+        let bare = assemble_brief(MeshBrief::Manual, Some(&card()), None, None, &todo())
+            .unwrap()
+            .text;
+        assert!(
+            !bare.contains("About:") && !bare.contains("Caps:"),
+            "{bare}"
+        );
     }
 
     #[test]
