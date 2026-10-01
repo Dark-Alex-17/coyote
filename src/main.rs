@@ -744,6 +744,7 @@ async fn start_interactive(ctx: RequestContext) -> Result<()> {
     repl.run().await
 }
 
+#[allow(clippy::double_must_use)]
 #[async_recursion::async_recursion]
 async fn shell_execute(
     ctx: &mut RequestContext,

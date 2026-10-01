@@ -15,6 +15,7 @@ use std::sync::Arc;
 #[folder = "assets/macros"]
 struct MacroAssets;
 
+#[allow(clippy::double_must_use)]
 #[async_recursion::async_recursion]
 pub async fn macro_execute(
     ctx: &mut RequestContext,

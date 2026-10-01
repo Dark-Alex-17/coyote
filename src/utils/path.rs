@@ -168,6 +168,7 @@ fn parse_glob(path_str: &str) -> Result<ParseGlobResult> {
     }
 }
 
+#[allow(clippy::double_must_use)]
 #[async_recursion::async_recursion]
 async fn list_files(
     files: &mut IndexSet<String>,
