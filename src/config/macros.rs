@@ -17,7 +17,6 @@ use std::sync::Arc;
 #[folder = "assets/macros"]
 struct MacroAssets;
 
-#[async_recursion::async_recursion]
 pub async fn macro_execute(
     ctx: &mut RequestContext,
     name: &str,

@@ -180,7 +180,6 @@ fn parse_glob(path_str: &str) -> Result<ParseGlobResult> {
     }
 }
 
-#[async_recursion::async_recursion]
 async fn list_files(
     files: &mut IndexSet<String>,
     entry_path: &Path,
@@ -204,19 +203,26 @@ async fn list_files(
                 if !current_only {
                     if let Some(remaining_depth) = depth {
                         if remaining_depth > 0 {
-                            list_files(
+                            Box::pin(list_files(
                                 files,
                                 &path,
                                 suffixes,
                                 current_only,
                                 bail_non_exist,
                                 Some(remaining_depth - 1),
-                            )
+                            ))
                             .await?;
                         }
                     } else {
-                        list_files(files, &path, suffixes, current_only, bail_non_exist, None)
-                            .await?;
+                        Box::pin(list_files(
+                            files,
+                            &path,
+                            suffixes,
+                            current_only,
+                            bail_non_exist,
+                            None,
+                        ))
+                        .await?;
                     }
                 }
             } else {
