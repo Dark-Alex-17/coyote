@@ -44,6 +44,7 @@ use reedline::{
 };
 use reedline::{MenuBuilder, Signal};
 use std::collections::HashMap;
+use std::io::{self, Write};
 use std::sync::LazyLock;
 use std::time::Duration;
 use std::{env, process, sync::Arc};
@@ -116,7 +117,7 @@ pub const DEFAULT_CONTINUATION_PROMPT: &str = indoc! {"
     5. Otherwise, continue with the next pending item now. Call tools immediately."
 };
 
-static REPL_COMMANDS: LazyLock<[ReplCommand; 63]> = LazyLock::new(|| {
+static REPL_COMMANDS: LazyLock<[ReplCommand; 65]> = LazyLock::new(|| {
     [
         ReplCommand::new(".help", "Show this help guide", AssertState::pass()),
         ReplCommand::new(".info", "Show system info", AssertState::pass()),
@@ -367,6 +368,16 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 63]> = LazyLock::new(|| {
             AssertState::pass(),
         ),
         ReplCommand::new(".copy", "Copy last response", AssertState::pass()),
+        ReplCommand::new(
+            ".redraw",
+            "Clear the screen and reprint the last conversation turn",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".redraw session",
+            "Clear the screen and replay the whole session",
+            AssertState::True(StateFlags::SESSION_EMPTY | StateFlags::SESSION),
+        ),
         ReplCommand::new(".set", "Modify runtime settings", AssertState::pass()),
         ReplCommand::new(
             ".reasoning",
@@ -1388,6 +1399,51 @@ pub async fn run_repl_command(
                     _ => bail!("No chat response to copy"),
                 }
             }
+            ".redraw" => match args {
+                None => {
+                    let messages = ctx
+                        .session
+                        .as_ref()
+                        .and_then(|session| {
+                            let (compressed, active) = replay::snapshot(session);
+                            replay::last_turn(&compressed, &active)
+                        })
+                        .or_else(|| {
+                            ctx.last_message
+                                .as_ref()
+                                .filter(|v| !v.output.is_empty())
+                                .map(replay::synthesize)
+                        });
+                    let Some(messages) = messages else {
+                        bail!("Nothing to redraw yet");
+                    };
+                    let app = Arc::clone(&ctx.app.config);
+                    replay::clear_viewport()?;
+                    replay::render_messages(app.as_ref(), &messages)?;
+                    println!("{}", dimmed_text("─── ↑ redrawn ↑ ───"));
+                    println!();
+                    io::stdout().flush()?;
+                    print_pause_banner(ctx);
+                }
+                Some("session") => {
+                    let Some(session) = &ctx.session else {
+                        bail!(
+                            "No active session to redraw (use \".redraw\" for the last conversation turn)"
+                        );
+                    };
+                    let (compressed, active) = replay::snapshot(session);
+                    if compressed.is_empty() && active.is_empty() {
+                        println!("Session is empty.");
+                    } else {
+                        let app = Arc::clone(&ctx.app.config);
+                        replay::clear_viewport()?;
+                        replay::render(app.as_ref(), &compressed, &active)?;
+                        io::stdout().flush()?;
+                        print_pause_banner(ctx);
+                    }
+                }
+                _ => unknown_command()?,
+            },
             ".exit" => match args {
                 Some("role") => {
                     ctx.exit_role()?;
@@ -2020,12 +2076,16 @@ pub fn builtin_command_names() -> Vec<&'static str> {
 }
 
 fn dump_repl_help() {
+    println!("{}", repl_help_text());
+}
+
+fn repl_help_text() -> String {
     let head = REPL_COMMANDS
         .iter()
         .map(|cmd| format!("{:<24} {}", cmd.name, cmd.description))
         .collect::<Vec<String>>()
         .join("\n");
-    println!(
+    format!(
         r###"{head}
 {:<24} Run an arbitrary shell command (stdout/stderr stream to your terminal; Ctrl+C interrupts)
 
@@ -2035,9 +2095,10 @@ List them with ".list macros"; toggle them with ".macro enable|disable <name>".
 
 Type ::: to start multi-line editing, type ::: to finish it.
 Press Ctrl+O to open an editor for editing the input buffer.
+Press Ctrl+L to clear the screen; type ".redraw" to clear it and bring the last conversation turn back.
 Press Ctrl+C to cancel the response, Ctrl+D to exit the REPL."###,
         "!<command>",
-    );
+    )
 }
 
 fn parse_command(line: &str) -> Option<(&str, Option<&str>)> {
@@ -3158,8 +3219,96 @@ mod tests {
     }
 
     #[test]
-    fn repl_commands_has_63_entries() {
-        assert_eq!(REPL_COMMANDS.len(), 63);
+    fn repl_commands_has_65_entries() {
+        assert_eq!(REPL_COMMANDS.len(), 65);
+    }
+
+    #[test]
+    fn redraw_without_history_fails_and_rejects_unknown_args() {
+        run_async(async {
+            let mut ctx = ctx_with_hooks(&[], "redraw");
+            let abort_signal = create_abort_signal();
+
+            let result =
+                Box::pin(run_repl_command(&mut ctx, abort_signal.clone(), ".redraw")).await;
+            let err = result.expect_err("nothing to redraw without a session or last message");
+            assert!(err.to_string().contains("Nothing to redraw"), "{err}");
+
+            let result = Box::pin(run_repl_command(&mut ctx, abort_signal, ".redraw bogus")).await;
+            let err = result.expect_err("unknown sub-command must be rejected");
+            assert!(err.to_string().contains("Unknown command"), "{err}");
+        });
+    }
+
+    #[test]
+    fn redraw_reprints_the_last_message_without_a_session() {
+        run_async(async {
+            let mut ctx = ctx_with_hooks(&[], "redraw");
+            ctx.macro_flag = true;
+            let input = Input::from_str(&ctx, "what time is it", None).unwrap();
+            ctx.last_message = Some(LastMessage::new(input, "noon".to_string()));
+            let abort_signal = create_abort_signal();
+
+            let result = Box::pin(run_repl_command(&mut ctx, abort_signal, ".redraw")).await;
+
+            assert!(result.is_ok(), "{result:?}");
+        });
+    }
+
+    #[test]
+    fn redraw_session_without_a_session_fails() {
+        run_async(async {
+            let mut ctx = ctx_with_hooks(&[], "redraw");
+            let abort_signal = create_abort_signal();
+
+            let result =
+                Box::pin(run_repl_command(&mut ctx, abort_signal, ".redraw session")).await;
+
+            let err = result.expect_err("no session to replay");
+            assert!(err.to_string().contains(".redraw"), "{err}");
+        });
+    }
+
+    #[test]
+    fn redraw_session_with_an_empty_session_succeeds() {
+        run_async(async {
+            let mut ctx = ctx_with_hooks(&[], "redraw");
+            ctx.session = Some(Session::default());
+            let abort_signal = create_abort_signal();
+
+            let result =
+                Box::pin(run_repl_command(&mut ctx, abort_signal, ".redraw session")).await;
+
+            assert!(result.is_ok(), "{result:?}");
+        });
+    }
+
+    #[test]
+    fn redraw_session_replays_a_populated_session() {
+        run_async(async {
+            let mut ctx = ctx_with_hooks(&[], "redraw");
+            let input = Input::from_str(&ctx, "what time is it", None).unwrap();
+            let mut session = Session::default();
+            session.add_message(&input, "noon").unwrap();
+            ctx.session = Some(session);
+            let abort_signal = create_abort_signal();
+
+            let result =
+                Box::pin(run_repl_command(&mut ctx, abort_signal, ".redraw session")).await;
+
+            assert!(result.is_ok(), "{result:?}");
+        });
+    }
+
+    #[test]
+    fn repl_help_mentions_ctrl_l_and_redraw_together() {
+        let help = repl_help_text();
+
+        let lines: Vec<&str> = help
+            .lines()
+            .filter(|line| line.contains("Ctrl+L") && line.contains("\".redraw\""))
+            .collect();
+        assert_eq!(lines.len(), 1, "{help}");
     }
 
     #[test]
