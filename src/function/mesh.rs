@@ -39,6 +39,9 @@ const MAX_COLLECT_TIMEOUT: Duration = Duration::from_secs(600);
 
 const COLLECT_WAIT_SLICE: Duration = Duration::from_millis(200);
 
+const REPLY_THREAD_IS_THE_RECEIVERS: &str =
+    "the receiver files this reply under the thread of the message it answers";
+
 pub fn mesh_function_declarations() -> Vec<FunctionDeclaration> {
     let message_schema = |what: &str| JsonSchema {
         type_value: Some("string".to_string()),
@@ -526,18 +529,35 @@ async fn handle_send(slot: &MeshSlot, runtime: &MeshRuntime, args: &Value) -> Re
         Ok(out) => out,
         Err(err) => return Ok(send_error(&err)),
     };
-    let thread = out.thread.clone().unwrap_or_else(|| out.id.clone());
     match runtime.send_peer(to, &out).await {
-        Ok(outcome) => Ok(json!({
-            "status": "sent",
-            "id": outcome.id,
-            "via": outcome.via,
-            "to": canonical_hash(to).unwrap_or_else(|| to.to_string()),
-            "kind": out.kind,
-            "in_reply_to": out.in_reply_to,
-            "thread": thread,
-        })),
+        Ok(outcome) => {
+            let thread = sent_thread(&out);
+            let mut result = json!({
+                "status": "sent",
+                "id": outcome.id,
+                "via": outcome.via,
+                "to": canonical_hash(to).unwrap_or_else(|| to.to_string()),
+                "kind": out.kind,
+                "in_reply_to": out.in_reply_to,
+                "thread": thread,
+            });
+            if thread.is_none() {
+                result["note"] = json!(REPLY_THREAD_IS_THE_RECEIVERS);
+            }
+            Ok(result)
+        }
         Err(err) => Ok(send_error(&err)),
+    }
+}
+
+/// The thread the result may claim: the one on the wire, or a root message's own id,
+/// which the receiver reads the same way. A reply that carries none is filed by the
+/// receiver under a thread this node does not know, so nothing is claimed.
+fn sent_thread(out: &OutboundPeer) -> Option<&str> {
+    match (&out.thread, &out.in_reply_to) {
+        (Some(thread), _) => Some(thread),
+        (None, None) => Some(&out.id),
+        (None, Some(_)) => None,
     }
 }
 
@@ -1534,6 +1554,86 @@ mod tests {
         assert!(slot.correlations().get("q1").is_none(), "collected");
     }
 
+    /// Usage probe, criterion (c) as amended: a final reply while the question is
+    /// `Escalated` closes it. `budget_exhausted` with a retry hint collects as `replied`
+    /// with the disposition and `retry_after` surfaced in the question's thread, the
+    /// correlation is gone and the inbox no longer lists it as escalated; a reply that
+    /// arrives after that answers nothing and lands as a plain message with no thread,
+    /// disposition or retry hint, whatever the peer put on it.
+    #[tokio::test]
+    async fn usage_probe_a_budget_exhausted_reply_closes_an_escalated_question_and_a_late_reply_is_a_message()
+     {
+        let ctx = plain_ctx();
+        let slot = Arc::clone(&ctx.app.mesh);
+        open_question(&slot, "q1");
+        slot.deliver_peer(PeerMessage::new(RawPeerMessage {
+            disposition: Some(Disposition::Escalated),
+            ..raw_message(PeerKind::Reply, "r-esc", Some("q1"))
+        }));
+        let escalated = handle_collect(&ctx, &json!({"id": "q1", "timeout_secs": 600}))
+            .await
+            .unwrap();
+        assert_eq!(escalated["status"], "escalated", "{escalated}");
+        assert_eq!(handle_check_inbox(&slot)["escalated"], json!(["q1"]));
+
+        slot.deliver_peer(PeerMessage::new(RawPeerMessage {
+            disposition: Some(Disposition::BudgetExhausted),
+            retry_after: Some(120),
+            ..raw_message(PeerKind::Reply, "r-final", Some("q1"))
+        }));
+        let replied = handle_collect(&ctx, &json!({"id": "q1", "timeout_secs": 5}))
+            .await
+            .unwrap();
+        assert_eq!(replied["status"], "replied", "{replied}");
+        assert_eq!(replied["disposition"], "budget_exhausted");
+        assert_eq!(replied["retry_after"], 120);
+        assert_eq!(replied["thread"], "q1");
+        assert_eq!(replied["reply"]["message_id"], "r-final");
+        assert_eq!(replied["reply"]["disposition"], "budget_exhausted");
+        assert_eq!(replied["reply"]["retry_after"], 120);
+        assert!(
+            slot.correlations().get("q1").is_none(),
+            "closed and collected"
+        );
+
+        let inbox = handle_check_inbox(&slot);
+        assert_eq!(inbox["escalated"], json!([]), "{inbox}");
+        assert_eq!(inbox["answered_awaiting_collect"], json!([]), "{inbox}");
+        let again = handle_collect(&ctx, &json!({"id": "q1", "timeout_secs": 1}))
+            .await
+            .unwrap();
+        assert_ne!(
+            again["status"], "replied",
+            "nothing left to collect: {again}"
+        );
+        assert_ne!(again["status"], "escalated", "{again}");
+
+        slot.deliver_peer(PeerMessage::new(RawPeerMessage {
+            disposition: Some(Disposition::Answered),
+            retry_after: Some(7),
+            thread: Some("q1".into()),
+            ..raw_message(PeerKind::Reply, "r-late", Some("q1"))
+        }));
+        let inbox = handle_check_inbox(&slot);
+        let late = inbox["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| &entry["payload"])
+            .find(|payload| payload["message_id"] == "r-late")
+            .unwrap_or_else(|| panic!("the late reply lands in the inbox: {inbox}"));
+        assert_eq!(late["kind"], "message", "{late}");
+        assert!(late.get("thread").is_none_or(Value::is_null), "{late}");
+        assert!(late.get("disposition").is_none_or(Value::is_null), "{late}");
+        assert!(late.get("retry_after").is_none_or(Value::is_null), "{late}");
+        assert_eq!(
+            inbox["threads"],
+            json!([{ "from": hex_lower(&[0xab; 16]), "thread": "r-late", "ids": ["r-late"] }]),
+            "a downgraded reply roots its own thread in the inbox grouping: {inbox}"
+        );
+        assert!(slot.correlations().get("q1").is_none(), "nothing reopened");
+    }
+
     #[tokio::test]
     async fn collect_returns_early_with_the_pending_escalations_and_keeps_the_question_open() {
         let mut ctx = plain_ctx();
@@ -1964,6 +2064,105 @@ mod tests {
             assert_eq!(seen[0].kind, PeerKind::Ask);
             assert_eq!(seen[0].id, id);
             assert_eq!(seen[0].thread.as_deref(), Some("t-1"));
+
+            assert!(ctx.app.mesh.stop().await.unwrap());
+            stub.stop().await;
+        }
+
+        /// The result claims a thread only where the receiver will file the message under
+        /// it: a root message is its own thread, a reply to a question this node filed
+        /// carries that question's thread, and a reply to an id this node never saw
+        /// carries none and says why.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial]
+        async fn send_reports_the_thread_it_set_and_none_for_a_reply_to_an_unknown_id() {
+            let _guard = TestConfigDirGuard::new("mesh-tool-send-thread");
+            let stub =
+                PeerStub::listen("mesh-tool-send-thread-stub", TcpServer::DEFAULT_CLIENT_MTU).await;
+            let started = started_runtime_on("mesh-tool-send-thread", stub.port()).await;
+            let runtime = started.runtime.clone();
+            let mut ctx = plain_ctx();
+            ctx.app.mesh.install(runtime.clone()).unwrap();
+            stub.trust(&runtime.current_destination_hash(), runtime.fingerprint());
+            stub.announce(Some("Stub")).await;
+            let to = stub.destination_hex();
+            let peers = runtime.peers();
+            wait_until("the node to file the stub", || peers.get(&to).is_some()).await;
+            runtime
+                .trust()
+                .trust_destination(
+                    ctx.app.mesh.as_ref(),
+                    &to,
+                    TrustOptions::default(),
+                    SystemTime::now(),
+                )
+                .unwrap();
+            ctx.app
+                .mesh
+                .inbound_store()
+                .unwrap()
+                .upsert(
+                    InboundRecord {
+                        version: INBOUND_RECORD_VERSION,
+                        id: "a-1".into(),
+                        peer_destination: to.clone(),
+                        peer_identity: stub.identity_hex(),
+                        thread: "t-root".into(),
+                        question: "may I?".into(),
+                        envoy_question: String::new(),
+                        received_at: rfc3339_utc(SystemTime::now()),
+                        kind: InboundKind::Question,
+                        paths: Vec::new(),
+                        reason: String::new(),
+                    },
+                    SystemTime::now(),
+                )
+                .unwrap();
+            let send = format!("{MESH_FUNCTION_PREFIX}send");
+
+            let root = handle_mesh_tool(&mut ctx, &send, &json!({"to": to, "message": "hello"}))
+                .await
+                .unwrap();
+            assert_eq!(root["status"], "sent", "{root}");
+            assert_eq!(
+                root["thread"], root["id"],
+                "a root message is its own thread"
+            );
+            assert!(root.get("note").is_none(), "{root}");
+
+            let filed = handle_mesh_tool(
+                &mut ctx,
+                &send,
+                &json!({"to": to, "message": "yes", "in_reply_to": "a-1"}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(filed["status"], "sent", "{filed}");
+            assert_eq!(filed["thread"], "t-root", "{filed}");
+            assert!(filed.get("note").is_none(), "{filed}");
+
+            let unknown = handle_mesh_tool(
+                &mut ctx,
+                &send,
+                &json!({"to": to, "message": "yes", "in_reply_to": "m-9"}),
+            )
+            .await
+            .unwrap();
+            assert_eq!(unknown["status"], "sent", "{unknown}");
+            assert!(unknown["thread"].is_null(), "{unknown}");
+            assert_eq!(unknown["note"], REPLY_THREAD_IS_THE_RECEIVERS, "{unknown}");
+
+            let seen = stub.seen();
+            assert_eq!(seen.len(), 3, "{seen:?}");
+            assert_eq!(
+                seen[0].thread, None,
+                "the wire carries no thread for a root"
+            );
+            assert_eq!(seen[1].thread.as_deref(), Some("t-root"));
+            assert_eq!(
+                seen[2].thread, None,
+                "a reply to an unknown id leaves the thread to the receiver"
+            );
 
             assert!(ctx.app.mesh.stop().await.unwrap());
             stub.stop().await;

@@ -79,9 +79,8 @@ impl InboxStaging {
     /// `sha256` is reused without a write; one with a different hash keeps its place and
     /// the new bytes land beside it as `<stem>-<sha256[..8]><ext>`. When that name too
     /// holds other bytes, or a file appears at the target between the check and the
-    /// write, nothing is overwritten: `Collision`. A target with no parent, or none of
-    /// whose ancestors exist, means the root itself vanished after canonicalisation:
-    /// `NotFound`.
+    /// write, nothing is overwritten: `Collision`. A root that is gone again by the time
+    /// its ancestors are walked is `Io(NotFound)`, not `Escaped`.
     pub(crate) fn stage(
         &self,
         peer_destination: &str,
@@ -92,16 +91,20 @@ impl InboxStaging {
         let dest8 = peer_dest8(peer_destination);
         fs::create_dir_all(self.root.join(&dest8))?;
         let canonical_root = dunce::canonicalize(&self.root)?;
-        let target = canonical_root.join(&dest8).join(rel.to_relative_path());
-        let Some(parent) = target.parent() else {
-            return Err(StageError::Io(io::Error::from(io::ErrorKind::NotFound)));
-        };
-        let Some(existing) = parent.ancestors().find(|path| path.exists()) else {
+        let relative = rel.to_relative_path();
+        let peer_dir = canonical_root.join(&dest8);
+        let parent = peer_dir.join(relative.parent().unwrap_or(Path::new("")));
+        let target = peer_dir.join(&relative);
+        let Some(existing) = parent
+            .ancestors()
+            .take_while(|path| path.starts_with(&canonical_root))
+            .find(|path| path.exists())
+        else {
             return Err(StageError::Io(io::Error::from(io::ErrorKind::NotFound)));
         };
         ensure_inside(&canonical_root, existing)?;
-        fs::create_dir_all(parent)?;
-        ensure_inside(&canonical_root, parent)?;
+        fs::create_dir_all(&parent)?;
+        ensure_inside(&canonical_root, &parent)?;
 
         let target = match existing_matches(&target, sha256)? {
             Some(true) => return Ok(target),
@@ -320,6 +323,80 @@ mod tests {
         assert_eq!(found, [third, first]);
     }
 
+    /// The target and its hash-suffixed sibling were put there by something other than
+    /// a stage; the refusal is the same and neither is touched.
+    #[test]
+    fn a_pre_planted_target_and_sibling_holding_other_bytes_are_a_collision() {
+        let tmp = TempDir::new("inbox-planted-collision");
+        let inbox = staging(&tmp);
+        let peer_dir = inbox.root.join(DEST8);
+        fs::create_dir_all(peer_dir.join("docs")).unwrap();
+        let sha = digest(b"third");
+        let target = peer_dir.join("docs").join("a.md");
+        let suffixed = peer_dir
+            .join("docs")
+            .join(format!("a-{}.md", hex_lower(&sha[..4])));
+        fs::write(&target, b"first").unwrap();
+        fs::write(&suffixed, b"second").unwrap();
+
+        let err = inbox
+            .stage(PEER, &WirePath::parse("docs/a.md").unwrap(), &sha, b"third")
+            .unwrap_err();
+
+        assert!(matches!(err, StageError::Collision), "{err}");
+        assert_eq!(fs::read(&target).unwrap(), b"first");
+        assert_eq!(fs::read(&suffixed).unwrap(), b"second");
+        let mut found = files_under(&inbox.root);
+        found.sort();
+        let mut planted = vec![target, suffixed];
+        planted.sort();
+        assert_eq!(found, planted);
+    }
+
+    #[test]
+    fn a_pre_planted_target_holding_the_same_bytes_is_reused_without_a_write() {
+        let tmp = TempDir::new("inbox-planted-reuse");
+        let inbox = staging(&tmp);
+        let peer_dir = inbox.root.join(DEST8);
+        fs::create_dir_all(peer_dir.join("docs")).unwrap();
+        let target = peer_dir.join("docs").join("a.md");
+        fs::write(&target, b"same").unwrap();
+
+        let staged = inbox
+            .stage(
+                PEER,
+                &WirePath::parse("docs/a.md").unwrap(),
+                &digest(b"same"),
+                b"same",
+            )
+            .unwrap();
+
+        assert_eq!(staged, dunce::canonicalize(&target).unwrap());
+        assert_eq!(fs::read(&staged).unwrap(), b"same");
+        assert_eq!(files_under(&inbox.root), [target]);
+    }
+
+    /// A root that is not a directory cannot hold a peer directory; that is an I/O
+    /// failure of the inbox, not a path leading outside it.
+    #[test]
+    fn a_root_that_is_a_file_is_an_io_error_not_an_escape() {
+        let tmp = TempDir::new("inbox-root-file");
+        let inbox = staging(&tmp);
+        fs::write(&inbox.root, b"not a directory").unwrap();
+
+        let err = inbox
+            .stage(
+                PEER,
+                &WirePath::parse("docs/a.md").unwrap(),
+                &digest(b"x"),
+                b"x",
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, StageError::Io(_)), "{err}");
+        assert_eq!(fs::read(&inbox.root).unwrap(), b"not a directory");
+    }
+
     #[test]
     fn the_publish_step_never_replaces_a_file_already_at_the_target() {
         let tmp = TempDir::new("inbox-no-clobber");
@@ -424,6 +501,53 @@ mod tests {
         }
         assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
         assert_eq!(files_under(&inbox.root), Vec::<PathBuf>::new());
+    }
+
+    /// Usage probe, criterion (b) "canonicalise the inbox root": an operator whose cache
+    /// directory is itself a symlink (a relocated `~/.cache`) stages normally. The staged
+    /// path is absolute, resolved through the link and under the real root, the file holds
+    /// the bytes, and the same file reached through the link and through the real path is
+    /// one file — a second stage of the same bytes either way reuses it.
+    #[cfg(unix)]
+    #[test]
+    fn usage_probe_a_symlinked_inbox_root_stages_normally_under_the_resolved_root() {
+        let tmp = TempDir::new("inbox-symlinked-root");
+        let real_cache = tmp.path.join("real-cache");
+        fs::create_dir_all(&real_cache).unwrap();
+        let linked_cache = tmp.path.join("cache");
+        std::os::unix::fs::symlink(&real_cache, &linked_cache).unwrap();
+
+        let through_link = InboxStaging::for_instance(&linked_cache, "inst");
+        let rel = WirePath::parse("docs/a.md").unwrap();
+        let staged = through_link
+            .stage(PEER, &rel, &digest(b"x"), b"x")
+            .expect("a symlinked root is a valid root");
+
+        assert!(staged.is_absolute());
+        assert_eq!(fs::read(&staged).unwrap(), b"x");
+        let resolved_root = dunce::canonicalize(inbox_root(&real_cache, "inst")).unwrap();
+        assert_eq!(
+            staged,
+            resolved_root.join(DEST8).join("docs").join("a.md"),
+            "resolved through the link, under the real root"
+        );
+        assert!(
+            !staged.starts_with(&linked_cache),
+            "the returned path does not go through the link: {staged:?}"
+        );
+        assert_eq!(files_under(&resolved_root), vec![staged.clone()]);
+
+        let through_real = InboxStaging::for_instance(&real_cache, "inst");
+        assert_eq!(
+            through_real.stage(PEER, &rel, &digest(b"x"), b"x").unwrap(),
+            staged,
+            "the same bytes under the same name are one file whichever way the root is named"
+        );
+        assert_eq!(
+            through_link.stage(PEER, &rel, &digest(b"x"), b"x").unwrap(),
+            staged
+        );
+        assert_eq!(files_under(&resolved_root), vec![staged]);
     }
 
     #[test]

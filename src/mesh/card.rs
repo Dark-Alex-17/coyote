@@ -193,8 +193,8 @@ impl StatusCard {
             repo,
             plan,
             todo,
-            about: card.text("about", ABOUT_MAX_CHARS)?,
-            caps: card.text_list("caps", CAPS_MAX_ENTRIES, CAP_MAX_CHARS)?,
+            about: card.text_or_absent("about", ABOUT_MAX_CHARS),
+            caps: card.text_list_or_empty("caps", CAPS_MAX_ENTRIES, CAP_MAX_CHARS),
             snapshot_age_secs: card.u64("snapshot_age_secs")?,
             served_at_secs: card
                 .u64("served_at_secs")?
@@ -220,7 +220,8 @@ fn malformed(reason: &str) -> StatusError {
 }
 
 /// One msgpack map being read as a card or one of its sub-maps. A missing key and a nil
-/// value both read as absent; a present value of the wrong type is malformed.
+/// value both read as absent; a present value of the wrong type is malformed, except
+/// under the `_or_absent` and `_or_empty` readers, which keep the rest of the card.
 struct Fields<'a>(&'a [(Value, Value)]);
 
 impl<'a> Fields<'a> {
@@ -247,29 +248,42 @@ impl<'a> Fields<'a> {
         }
     }
 
-    /// The strings in the list at `key`, each as `display_text` leaves it. Entries that
-    /// are not strings or come out blank are skipped rather than refused, and entries past
-    /// `max_entries` are dropped; only a value that is not a list is malformed.
-    fn text_list(
-        &self,
-        key: &str,
-        max_entries: usize,
-        max_chars: usize,
-    ) -> Result<Vec<String>, StatusError> {
-        match self.get(key) {
-            None => Ok(Vec::new()),
-            Some(value) => value
-                .as_array()
-                .map(|entries| {
-                    entries
-                        .iter()
-                        .take(max_entries)
-                        .filter_map(Value::as_str)
-                        .filter_map(|text| display_text(text, max_chars))
-                        .collect()
-                })
-                .ok_or_else(|| malformed(&format!("`{key}` is not a list"))),
+    /// `text` for a key added after `v: 1` shipped: a value that is not a string reads as
+    /// absent, since a reader from before the key would have accepted the card.
+    fn text_or_absent(&self, key: &str, max_chars: usize) -> Option<String> {
+        let value = self.get(key)?;
+        match value.as_str() {
+            Some(text) => display_text(text, max_chars),
+            None => {
+                debug!("Mesh status card `{key}` is not a string; read as absent");
+                None
+            }
         }
+    }
+
+    /// The strings in the list at `key`, each as `display_text` leaves it, for a key added
+    /// after `v: 1` shipped. A value that is not a list reads as no entries, an entry that
+    /// is not a string or comes out blank is skipped, and entries past `max_entries` are
+    /// dropped; nothing here refuses the card.
+    fn text_list_or_empty(&self, key: &str, max_entries: usize, max_chars: usize) -> Vec<String> {
+        let Some(value) = self.get(key) else {
+            return Vec::new();
+        };
+        let Some(entries) = value.as_array() else {
+            debug!("Mesh status card `{key}` is not a list; read as empty");
+            return Vec::new();
+        };
+        entries
+            .iter()
+            .take(max_entries)
+            .filter_map(|entry| match entry.as_str() {
+                Some(text) => display_text(text, max_chars),
+                None => {
+                    debug!("Mesh status card `{key}` entry is not a string; skipped");
+                    None
+                }
+            })
+            .collect()
     }
 
     fn u64(&self, key: &str) -> Result<Option<u64>, StatusError> {
@@ -979,9 +993,10 @@ mod tests {
         assert_eq!(about.len(), ABOUT_MAX_CHARS * 2);
         assert!(about.chars().all(|c| c == '\u{e9}'), "{about:?}");
 
+        let numeric = StatusCard::from_value(&card_with("about", Value::from(7u64))).unwrap();
         assert_eq!(
-            StatusCard::from_value(&card_with("about", Value::from(7u64))).unwrap_err(),
-            StatusError::Malformed("`about` is not a string".into())
+            numeric.about, None,
+            "an `about` that is not a string reads as absent, not as a malformed card"
         );
         let blank = StatusCard::from_value(&card_with("about", Value::from(" \u{200B} "))).unwrap();
         assert_eq!(blank.about, None);
@@ -1019,17 +1034,41 @@ mod tests {
     }
 
     #[test]
-    fn caps_that_are_not_a_list_are_malformed() {
+    fn caps_that_are_not_a_list_read_as_no_caps() {
         for wrong in [
             Value::Map(vec![(Value::from("fetch"), Value::Boolean(true))]),
             Value::from("fetch"),
             Value::from(1u64),
         ] {
-            assert_eq!(
-                StatusCard::from_value(&card_with("caps", wrong)).unwrap_err(),
-                StatusError::Malformed("`caps` is not a list".into())
-            );
+            let card = StatusCard::from_value(&card_with("caps", wrong)).unwrap();
+            assert!(card.caps.is_empty(), "{:?}", card.caps);
         }
+    }
+
+    /// The keys a `v: 1` reader from before `about` and `caps` would have ignored may
+    /// not refuse the card now; the rest of the card reads as if they were absent.
+    #[test]
+    fn a_card_with_a_malformed_about_and_caps_still_reads_the_rest_intact() {
+        let value = Value::Map(vec![
+            (Value::from("v"), Value::from(1u64)),
+            (Value::from("display_name"), Value::from("Alex")),
+            (
+                Value::from("state"),
+                Value::Map(vec![(Value::from("code"), Value::from(STATE_IDLE))]),
+            ),
+            (Value::from("about"), Value::Array(vec![Value::from("x")])),
+            (Value::from("caps"), Value::from("fetch")),
+            (Value::from("served_at_secs"), Value::from(5u64)),
+        ]);
+
+        let card = StatusCard::from_value(&value).unwrap();
+
+        assert_eq!(card.display_name.as_deref(), Some("Alex"));
+        assert_eq!(card.state.code, STATE_IDLE);
+        assert_eq!(card.served_at_secs, 5);
+        assert_eq!(card.about, None);
+        assert!(card.caps.is_empty());
+        assert_eq!(StatusCard::from_value(&card.to_value()), Ok(card));
     }
 
     #[test]

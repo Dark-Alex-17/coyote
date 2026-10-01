@@ -5,6 +5,7 @@
 //! text; a check that could only fail on a panic is not an oracle and is not here.
 
 use super::SplitMix;
+use crate::config::mesh_config::MAX_INLINE_FILE_TOTAL;
 use crate::mesh::announce::{
     ANNOUNCE_MAGIC, AnnounceAppData, MAX_DISPLAY_NAME_BYTES, is_control_or_invisible,
 };
@@ -12,9 +13,10 @@ use crate::mesh::card::{STATUS_CARD_VERSION, StatusCard, StatusError};
 use crate::mesh::knock::{KNOCK_TYPE, KnockMessage, decode_knock_message, intro_from_r3_body};
 use crate::mesh::knocks::KNOCK_INTRO_MAX_CHARS;
 use crate::mesh::message::{
-    Disposition, LxmfPeer, MAX_PARTS, OutboundPeer, PEER_MESSAGE_TYPE, PEER_WIRE_VERSION, PeerBody,
-    PeerKind, PeerLxmf, PeerMessage, PeerVia, decode_peer_lxmf, from_r3_body, is_wire_id,
-    to_r3_body,
+    Disposition, LxmfPeer, MAX_PARTS, MAX_PARTS_BYTES, OutboundPeer, PEER_MESSAGE_TYPE,
+    PEER_WIRE_VERSION, Part, PartLimits, PeerBody, PeerKind, PeerLxmf, PeerMessage, PeerVia,
+    RawPart, RawPeerMessage, admit_parts, decode_peer_lxmf, encode_parts, from_r3_body,
+    inline_size, is_wire_id, packed_len, to_r3_body,
 };
 use crate::mesh::pending::{
     PENDING_RECORD_VERSION, PENDING_TTL, PendingRecord, PendingState, PendingStore,
@@ -33,6 +35,7 @@ use crate::mesh::r3::{
 };
 use crate::mesh::test_support::{TempDir, TrustList};
 use crate::mesh::trust::TrustStore;
+use crate::mesh::wire_path::{WIRE_PATH_MAX_BYTES, WIRE_PATH_MAX_SEGMENTS, WirePath};
 use crate::mesh::{destination_address, display_text, hex_lower, parse_rfc3339, rfc3339_utc};
 
 use arbitrary::{Arbitrary, Unstructured};
@@ -49,6 +52,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::Cursor;
+use std::path::Component;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -1881,8 +1885,9 @@ pub(super) const TAG_REFUSAL_CODE: u8 = 0x07;
 const TAG_VERSION_REFUSAL: u8 = 0x08;
 const TAG_DISPATCH_ERROR: u8 = 0x09;
 pub(super) const TAG_PENDING: u8 = 0x0a;
+const TAG_WIRE_PATH: u8 = 0x0b;
 /// Every tag, for the README table check.
-pub(super) const CODEC_TAGS: [u8; 10] = [
+pub(super) const CODEC_TAGS: [u8; 11] = [
     TAG_CARD,
     TAG_BODY,
     TAG_INTRO,
@@ -1893,6 +1898,7 @@ pub(super) const CODEC_TAGS: [u8; 10] = [
     TAG_VERSION_REFUSAL,
     TAG_DISPATCH_ERROR,
     TAG_PENDING,
+    TAG_WIRE_PATH,
 ];
 
 pub(super) struct CodecFixture {
@@ -1929,6 +1935,7 @@ pub(super) struct CodecBundle {
     version_refusal: VersionRefusalGen,
     dispatch_error: DispatchErrorGen,
     pending: Unlikely<JsonlGen>,
+    wire_path: WirePathGen,
 }
 
 impl CodecBundle {
@@ -1949,6 +1956,7 @@ impl CodecBundle {
                 TAG_DISPATCH_ERROR,
                 packed(&self.dispatch_error.into_value()),
             ),
+            tagged(TAG_WIRE_PATH, self.wire_path.into_text().into_bytes()),
         ];
         if let Some(pending) = self.pending.0 {
             inputs.push(tagged(TAG_PENDING, pending.into_text().into_bytes()));
@@ -1985,6 +1993,7 @@ pub(super) fn check_codec_bytes(fx: &CodecFixture, bytes: &[u8]) -> Result<(), S
         TAG_VERSION_REFUSAL => with_value(payload, check_version_refusal),
         TAG_DISPATCH_ERROR => with_value(payload, check_dispatch_error),
         TAG_PENDING => check_pending(fx, payload),
+        TAG_WIRE_PATH => check_wire_path(payload),
         other => Err(format!("unknown codec tag {other:#04x}")),
     }
 }
@@ -2152,6 +2161,152 @@ fn check_card(value: &Value) -> Result<(), String> {
         (class, observed) => Err(format!(
             "MESH-STATUS-002..004: the predicate says {class:?}, the decoder says {observed:?}"
         )),
+    }
+}
+
+// --- wire path (the file part name grammar) --------------------------------------------
+
+/// The rule ids `WirePath::parse` may refuse with, as the `invalid_path` reply carries
+/// them; a new rule is a wire vocabulary change and lands here deliberately.
+const WIRE_PATH_RULES: [&str; 14] = [
+    "empty",
+    "length",
+    "control",
+    "invisible",
+    "backslash",
+    "leading_slash",
+    "drive_letter",
+    "colon",
+    "nfc",
+    "segments",
+    "segment",
+    "trailing_dot",
+    "trailing_space",
+    "reserved_name",
+];
+
+/// One run of a generated path: plain name characters, the separators and punctuation
+/// the rules look at, characters from the ranges that trip NFC, the invisible and the
+/// control checks, and the names Windows reserves.
+#[derive(Debug, Arbitrary)]
+enum PathPiece {
+    Word(u8, u8),
+    Slash,
+    Backslash,
+    Colon,
+    Dot,
+    DotDot,
+    Space,
+    Control(u8),
+    Latin(u8),
+    Combining(u8),
+    Cjk(u8),
+    Invisible(u8),
+    Reserved(u8),
+    Any(char),
+}
+
+impl PathPiece {
+    fn push_onto(self, text: &mut String) {
+        const WORD: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-";
+        const CONTROLS: [char; 4] = ['\0', '\u{7}', '\n', '\u{7f}'];
+        const LATIN: [char; 4] = ['\u{e9}', '\u{fc}', '\u{f1}', '\u{c5}'];
+        const COMBINING: [char; 3] = ['\u{301}', '\u{308}', '\u{30a}'];
+        const CJK: [char; 3] = ['\u{4e2d}', '\u{6587}', '\u{3042}'];
+        const INVISIBLE: [char; 5] = ['\u{200B}', '\u{200D}', '\u{202E}', '\u{2028}', '\u{FEFF}'];
+        const RESERVED: [&str; 6] = ["CON", "con", "NUL", "COM1", "lpt9", "AUX"];
+        match self {
+            Self::Word(start, len) => {
+                let start = usize::from(start) % WORD.len();
+                for i in 0..usize::from(len % 8) + 1 {
+                    text.push(char::from(WORD[(start + i) % WORD.len()]));
+                }
+            }
+            Self::Slash => text.push('/'),
+            Self::Backslash => text.push('\\'),
+            Self::Colon => text.push(':'),
+            Self::Dot => text.push('.'),
+            Self::DotDot => text.push_str(".."),
+            Self::Space => text.push(' '),
+            Self::Control(i) => text.push(CONTROLS[usize::from(i) % CONTROLS.len()]),
+            Self::Latin(i) => text.push(LATIN[usize::from(i) % LATIN.len()]),
+            Self::Combining(i) => text.push(COMBINING[usize::from(i) % COMBINING.len()]),
+            Self::Cjk(i) => text.push(CJK[usize::from(i) % CJK.len()]),
+            Self::Invisible(i) => text.push(INVISIBLE[usize::from(i) % INVISIBLE.len()]),
+            Self::Reserved(i) => text.push_str(RESERVED[usize::from(i) % RESERVED.len()]),
+            Self::Any(c) => text.push(c),
+        }
+    }
+}
+
+/// A path from pieces, or one built to straddle the byte or the segment cap.
+#[derive(Debug, Arbitrary)]
+enum WirePathGen {
+    Pieces(Vec<PathPiece>),
+    Long(u8),
+    ManySegments(u8),
+}
+
+impl WirePathGen {
+    fn into_text(self) -> String {
+        match self {
+            Self::Pieces(pieces) => {
+                let mut text = String::new();
+                for piece in pieces.into_iter().take(4 * MAX_CHILDREN) {
+                    piece.push_onto(&mut text);
+                }
+                text
+            }
+            Self::Long(n) => "a".repeat(WIRE_PATH_MAX_BYTES - 2 + usize::from(n) % 4),
+            Self::ManySegments(n) => {
+                vec!["a"; WIRE_PATH_MAX_SEGMENTS - 2 + usize::from(n) % 4].join("/")
+            }
+        }
+    }
+}
+
+/// Every refusal names a rule in `WIRE_PATH_RULES`; every accepted path is relative, has
+/// no empty, `.` or `..` segment, and maps to a path of plain components only, one per
+/// segment, so what the inbox joins under its root is what the peer named.
+fn check_wire_path(payload: &[u8]) -> Result<(), String> {
+    let Ok(text) = std::str::from_utf8(payload) else {
+        return Err("a wire path payload is UTF-8 text; this one did not decode".to_string());
+    };
+    match WirePath::parse(text) {
+        Err(invalid) => ensure(WIRE_PATH_RULES.contains(&invalid.rule), || {
+            format!(
+                "wire path: `{}` is not one of the {} rule ids the grammar names",
+                invalid.rule,
+                WIRE_PATH_RULES.len()
+            )
+        }),
+        Ok(path) => {
+            ensure(
+                path.segments()
+                    .all(|segment| !matches!(segment, "" | "." | "..")),
+                || {
+                    format!(
+                        "wire path: an accepted path has no empty, `.` or `..` segment, got {text:?}"
+                    )
+                },
+            )?;
+            let relative = path.to_relative_path();
+            ensure(relative.is_relative(), || {
+                format!("wire path: an accepted path is relative, got {relative:?}")
+            })?;
+            let components = relative.components().collect::<Vec<_>>();
+            ensure(
+                components.len() == path.segments().count()
+                    && components
+                        .iter()
+                        .all(|component| matches!(component, Component::Normal(_))),
+                || {
+                    format!(
+                        "wire path: one plain component per segment, got {components:?} for {text:?}"
+                    )
+                },
+            )
+        }
     }
 }
 
@@ -2584,9 +2739,108 @@ fn check_body(value: &Value) -> Result<(), String> {
                 format!(
                     "MESH-MSG round trip: from_r3_body(to_r3_body(body)) must equal body with nothing dropped; got {again:?} for {body:?}"
                 )
-            })
+            })?;
+            check_admission(&body.parts, body.dropped_parts)
         }
     }
+}
+
+/// The receiver's part admission on what a codec read, with no inbox to stage into
+/// (section 10.7): what `admit_parts` keeps fits every cap and `PeerMessage::new_with`
+/// keeps only what passed, every file name and reference still a wire path, no inline
+/// file kept as a path, and every part the sender attached either kept or counted.
+fn check_admission(parts: &[RawPart], dropped_on_read: u32) -> Result<(), String> {
+    let source_destination = "0b".repeat(ADDRESS_HASH_SIZE);
+    let (admitted, dropped) =
+        admit_parts(parts.to_vec(), &PartLimits::default(), &source_destination);
+    ensure(admitted.len() <= MAX_PARTS, || {
+        format!(
+            "MESH-MSG parts: at most {MAX_PARTS} parts are admitted, got {}",
+            admitted.len()
+        )
+    })?;
+    let encoded = packed_len(&encode_parts(&admitted));
+    ensure(encoded <= MAX_PARTS_BYTES, || {
+        format!(
+            "MESH-MSG parts: the admitted parts encode to {encoded} bytes, over {MAX_PARTS_BYTES}"
+        )
+    })?;
+    let inline_total: u64 = admitted.iter().map(inline_size).sum();
+    ensure(inline_total <= MAX_INLINE_FILE_TOTAL, || {
+        format!(
+            "MESH-MSG parts: {inline_total} inline bytes admitted, over {MAX_INLINE_FILE_TOTAL}"
+        )
+    })?;
+    let listed = u32::try_from(parts.len()).map_err(|err| err.to_string())?;
+    let kept_by_admission = u32::try_from(admitted.len()).map_err(|err| err.to_string())?;
+    ensure(kept_by_admission + dropped == listed, || {
+        format!(
+            "MESH-MSG parts: {listed} parts read, {kept_by_admission} admitted and {dropped} dropped"
+        )
+    })?;
+
+    let message = PeerMessage::new_with(
+        RawPeerMessage {
+            source_identity: "0a".repeat(ADDRESS_HASH_SIZE),
+            source_destination,
+            destination: "0c".repeat(ADDRESS_HASH_SIZE),
+            title: None,
+            content: "hello".to_string(),
+            fields: None,
+            timestamp: FIXED_NOW_SECS as f64,
+            message_id: "m-1".to_string(),
+            in_reply_to: None,
+            kind: PeerKind::Message,
+            via: PeerVia::Direct,
+            thread: None,
+            disposition: None,
+            retry_after: None,
+            parts: parts.to_vec(),
+            dropped_parts: dropped_on_read,
+        },
+        &PartLimits::default(),
+        None,
+    );
+    ensure(message.parts.len() <= admitted.len(), || {
+        format!(
+            "MESH-MSG parts: the message keeps {} parts of {} admitted",
+            message.parts.len(),
+            admitted.len()
+        )
+    })?;
+    for part in &message.parts {
+        let Part::File {
+            name,
+            staged,
+            reference,
+            ..
+        } = part
+        else {
+            continue;
+        };
+        ensure(WirePath::parse(name).is_ok(), || {
+            format!("MESH-MSG parts: a kept file name is a wire path, got {name:?}")
+        })?;
+        ensure(
+            reference
+                .as_deref()
+                .is_none_or(|path| WirePath::parse(path).is_ok()),
+            || format!("MESH-MSG parts: a kept file reference is a wire path, got {reference:?}"),
+        )?;
+        ensure(staged.is_none(), || {
+            format!("MESH-MSG parts: nothing is staged without an inbox, got {staged:?}")
+        })?;
+    }
+    let kept = u32::try_from(message.parts.len()).map_err(|err| err.to_string())?;
+    ensure(
+        kept + message.dropped_parts == listed + dropped_on_read,
+        || {
+            format!(
+                "MESH-MSG parts: {listed} read and {dropped_on_read} unreadable, but {kept} kept and {} dropped",
+                message.dropped_parts
+            )
+        },
+    )
 }
 
 // --- /knock body (section 8) -----------------------------------------------------------
@@ -2903,7 +3157,8 @@ fn check_peer_fields(fields: &Value) -> Result<(), String> {
             })?;
             let data = custom_data(fields)
                 .ok_or_else(|| "MESH-MSG-052: a peer came from a custom data map".to_string())?;
-            check_extras(data, &DecodedExtras::of_peer(peer))
+            check_extras(data, &DecodedExtras::of_peer(peer))?;
+            check_admission(&peer.parts, peer.dropped_parts)
         }
         (expected, observed) => Err(format!(
             "MESH-PROP-038/MESH-MSG-052: typed={expected:?} by the predicate, decoded as {observed:?}"

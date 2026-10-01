@@ -483,7 +483,7 @@ fn rmpv_from_json(value: &serde_json::Value) -> Value {
 
 /// The msgpack size of `value`. The only error source is the writer, and a `Vec` never
 /// fails to grow; should it, the value reads as past every cap.
-fn packed_len(value: &Value) -> usize {
+pub(crate) fn packed_len(value: &Value) -> usize {
     let mut packed = Vec::new();
     match rmpv::encode::write_value(&mut packed, value) {
         Ok(()) => packed.len(),
@@ -493,7 +493,7 @@ fn packed_len(value: &Value) -> usize {
 
 /// `parts` as both routes carry it: a list of string-keyed maps, each with a `type`. A
 /// file carries `sha256` as 32 binary bytes and either `bytes` (inline) or `ref: {path}`.
-fn encode_parts(parts: &[RawPart]) -> Value {
+pub(crate) fn encode_parts(parts: &[RawPart]) -> Value {
     Value::Array(
         parts
             .iter()
@@ -655,7 +655,7 @@ fn part_violation(part: &RawPart, limits: &PartLimits, inline_so_far: u64) -> Op
     }
 }
 
-fn inline_size(part: &RawPart) -> u64 {
+pub(crate) fn inline_size(part: &RawPart) -> u64 {
     match part {
         RawPart::File {
             size,
@@ -669,7 +669,7 @@ fn inline_size(part: &RawPart) -> u64 {
 /// The receiver's admission: the parts that pass, in order, and how many did not. A part
 /// past `MAX_PARTS` or breaking a rule goes; then parts go from the tail until the encoded
 /// list fits `MAX_PARTS_BYTES`. A hash mismatch is noted once per message.
-fn admit_parts(
+pub(crate) fn admit_parts(
     parts: Vec<RawPart>,
     limits: &PartLimits,
     source_destination: &str,
@@ -4672,6 +4672,93 @@ mod tests {
             ),
             pack(stored.fields.as_ref().unwrap())
         );
+    }
+
+    /// Usage probe, criterion (a) as amended: the sender normalises `text` and `data`
+    /// parts BEFORE the caps, so a message whose parts are over the char, fields and
+    /// encoded-size caps only by invisibles the receiver strips anyway is accepted — and
+    /// what the sender puts on the wire is a fixed point for the receiver on both routes:
+    /// nothing dropped, every part kept as sent.
+    #[test]
+    fn usage_probe_parts_over_a_cap_only_by_invisibles_are_accepted_and_kept_by_the_receiver() {
+        let clean_text = "x".repeat(PEER_CONTENT_MAX_CHARS);
+        let padded_text = format!("{clean_text}{}", "\u{1b}[2J".repeat(4_000));
+        let clean_value = "x".repeat(PEER_FIELDS_MAX_BYTES - 64);
+        let padded_value = format!("{clean_value}{}", "\u{200B}".repeat(PEER_FIELDS_MAX_BYTES));
+
+        let mut parts: Vec<RawPart> = (0..MAX_PARTS - 1)
+            .map(|_| text_part(&padded_text))
+            .collect();
+        parts.push(RawPart::Data {
+            data: serde_json::json!({ "k": padded_value }),
+        });
+        assert!(
+            padded_text.chars().count() > PEER_CONTENT_MAX_CHARS
+                && padded_text.len() * (MAX_PARTS - 1) > MAX_PARTS_BYTES
+                && padded_value.len() > PEER_FIELDS_MAX_BYTES,
+            "raw, every cap is exceeded"
+        );
+
+        let out = OutboundPeer::with_parts(
+            PeerKind::Message,
+            "hello",
+            None,
+            None,
+            None,
+            parts,
+            &PartLimits::default(),
+        )
+        .expect("over the caps only by invisibles");
+        assert_eq!(out.parts.len(), MAX_PARTS);
+        assert_eq!(out.parts[0], text_part(&clean_text));
+        assert_eq!(
+            out.parts[MAX_PARTS - 1],
+            RawPart::Data {
+                data: serde_json::json!({ "k": clean_value })
+            }
+        );
+
+        let body = to_r3_body(&out, 1.0);
+        let decoded = from_r3_body(&round_trip(&body)).unwrap();
+        assert_eq!(decoded.dropped_parts, 0);
+        assert_eq!(decoded.parts, out.parts);
+        let message = PeerMessage::new(RawPeerMessage {
+            parts: decoded.parts,
+            ..raw(&decoded.content)
+        });
+        assert_eq!(message.dropped_parts, 0, "{:?}", message.parts.len());
+        assert_eq!(message.parts.len(), MAX_PARTS);
+        assert_eq!(
+            message.parts[0],
+            Part::Text {
+                text: clean_text.clone()
+            }
+        );
+        assert_eq!(
+            message.parts[MAX_PARTS - 1],
+            Part::Data {
+                data: serde_json::json!({ "k": clean_value })
+            }
+        );
+
+        let origin = OriginName([7u8; NAME_HASH_LEN]);
+        let stored = peer_lxmf_message(&out, &origin);
+        let PeerLxmf::Peer(peer) = decode_peer_lxmf(&inbound(
+            Some(round_trip(stored.fields.as_ref().unwrap())),
+            stored.title.clone(),
+            Some(stored.content.clone()),
+            &hash_of("signer"),
+        )) else {
+            panic!("a peer message");
+        };
+        assert_eq!(peer.dropped_parts, 0);
+        assert_eq!(peer.parts, out.parts);
+        let landed = PeerMessage::new(RawPeerMessage {
+            parts: peer.parts,
+            ..raw(&peer.content)
+        });
+        assert_eq!(landed.dropped_parts, 0);
+        assert_eq!(landed.parts, message.parts);
     }
 
     /// Usage probe, criterion (b): the staging path is keyed by the sending peer, so two

@@ -50,6 +50,7 @@ within the frame decoder's nesting budget is a violation, not a skip.
 | `0x08` | `VersionRefusal::from_value` (section 7) | msgpack map |
 | `0x09` | `DispatchError::from_value` (section 6.7) | msgpack map |
 | `0x0a` | `PendingStore::load_pending` (section 10.5) | jsonl text |
+| `0x0b` | `WirePath::parse`, the file part name grammar (`wire_path.rs`) | UTF-8 text |
 
 ## Replay
 
