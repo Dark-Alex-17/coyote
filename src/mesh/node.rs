@@ -2283,6 +2283,7 @@ impl MeshSlot {
             disposition: None,
             retry_after: None,
             parts: Vec::new(),
+            dropped_parts: 0,
         });
         let who = self.peer_name(original);
         let asked = match original.kind {
@@ -2425,6 +2426,7 @@ impl MeshSlot {
             disposition: None,
             retry_after: None,
             parts: Vec::new(),
+            dropped_parts: 0,
         });
         let dest8 = short(&record.peer_destination).to_string();
         let text = format!(
@@ -6298,6 +6300,7 @@ mod tests {
             disposition: None,
             retry_after: None,
             parts: Vec::new(),
+            dropped_parts: 0,
         });
 
         slot.deliver_peer(message);

@@ -131,14 +131,19 @@ impl PeerRefusal {
         }
     }
 
-    /// `{"refusal": "<reason>", "retry_after_secs": <seconds, rounded up, at least 1>}` for
-    /// the correlated reply's `fields`.
-    pub(crate) fn fields(&self) -> serde_json::Value {
+    /// Seconds the peer is told to wait: rounded up, at least 1.
+    pub(crate) fn retry_after_secs(&self) -> u64 {
         let whole = self.retry_after.as_secs();
         let secs = whole + u64::from(self.retry_after.subsec_nanos() > 0);
+        secs.max(1)
+    }
+
+    /// `{"refusal": "<reason>", "retry_after_secs": <retry_after_secs>}` for the
+    /// correlated reply's `fields`.
+    pub(crate) fn fields(&self) -> serde_json::Value {
         json!({
             "refusal": self.reason.as_str(),
-            "retry_after_secs": secs.max(1),
+            "retry_after_secs": self.retry_after_secs(),
         })
     }
 }

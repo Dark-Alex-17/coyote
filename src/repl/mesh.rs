@@ -3628,6 +3628,7 @@ mod tests {
             disposition: None,
             retry_after: None,
             parts: Vec::new(),
+            dropped_parts: 0,
         })
     }
 
@@ -4580,6 +4581,7 @@ mod tests {
                     disposition: None,
                     retry_after: None,
                     parts: Vec::new(),
+                    dropped_parts: 0,
                 })
             };
             let _capture = capture::install();

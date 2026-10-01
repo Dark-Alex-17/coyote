@@ -12,8 +12,9 @@ use crate::mesh::card::{STATUS_CARD_VERSION, StatusCard, StatusError};
 use crate::mesh::knock::{KNOCK_TYPE, KnockMessage, decode_knock_message, intro_from_r3_body};
 use crate::mesh::knocks::KNOCK_INTRO_MAX_CHARS;
 use crate::mesh::message::{
-    OutboundPeer, PEER_MESSAGE_TYPE, PEER_WIRE_VERSION, PeerKind, PeerLxmf, PeerMessage, PeerVia,
-    decode_peer_lxmf, from_r3_body, to_r3_body,
+    Disposition, LxmfPeer, MAX_PARTS, OutboundPeer, PEER_MESSAGE_TYPE, PEER_WIRE_VERSION, PeerBody,
+    PeerKind, PeerLxmf, PeerMessage, PeerVia, decode_peer_lxmf, from_r3_body, is_wire_id,
+    to_r3_body,
 };
 use crate::mesh::pending::{
     PENDING_RECORD_VERSION, PENDING_TTL, PendingRecord, PendingState, PendingStore,
@@ -2266,6 +2267,202 @@ impl FieldsValue {
     }
 }
 
+const DISPOSITIONS: [&str; 4] = ["answered", "escalated", "refused", "budget_exhausted"];
+
+#[derive(Debug, Arbitrary)]
+enum DispositionGen {
+    Known(u8),
+    Unknown(String),
+    Odd(Scalar),
+}
+
+impl DispositionGen {
+    fn into_value(self) -> Value {
+        match self {
+            Self::Known(i) => Value::from(DISPOSITIONS[usize::from(i) % DISPOSITIONS.len()]),
+            Self::Unknown(name) => Value::from(name),
+            Self::Odd(odd) => odd.into_value(),
+        }
+    }
+}
+
+const PART_TYPES: [&str; 3] = ["text", "data", "file"];
+
+/// One `parts` element: a well-formed part of each shape, a known type missing its
+/// fields, a type this build does not know, or no map at all.
+#[derive(Debug, Arbitrary)]
+enum PartGen {
+    Text(TextField),
+    Data(ArbValue),
+    Inline {
+        name: TextField,
+        bytes: Vec<u8>,
+        honest_hash: bool,
+    },
+    Reference {
+        name: TextField,
+        path: TextField,
+        size: u64,
+    },
+    MissingFields(u8),
+    UnknownType(String, Vec<(String, Scalar)>),
+    NotAMap(Scalar),
+}
+
+impl PartGen {
+    fn into_value(self) -> Value {
+        let typed = |name: &str, mut rest: Vec<(Value, Value)>| {
+            rest.insert(0, (key("type"), Value::from(name)));
+            Value::Map(rest)
+        };
+        match self {
+            Self::Text(field) => typed("text", vec![(key("text"), text(field))]),
+            Self::Data(value) => typed("data", vec![(key("data"), value.into_value())]),
+            Self::Inline {
+                name,
+                bytes,
+                honest_hash,
+            } => {
+                let sha256 = if honest_hash {
+                    Sha256::digest(&bytes).to_vec()
+                } else {
+                    vec![0; 32]
+                };
+                typed(
+                    "file",
+                    vec![
+                        (key("name"), text(name)),
+                        (key("size"), Value::from(bytes.len() as u64)),
+                        (key("sha256"), Value::Binary(sha256)),
+                        (key("bytes"), Value::Binary(bytes)),
+                    ],
+                )
+            }
+            Self::Reference { name, path, size } => typed(
+                "file",
+                vec![
+                    (key("name"), text(name)),
+                    (key("size"), Value::from(size)),
+                    (key("sha256"), Value::Binary(vec![9; 32])),
+                    (key("ref"), Value::Map(vec![(key("path"), text(path))])),
+                ],
+            ),
+            Self::MissingFields(i) => {
+                typed(PART_TYPES[usize::from(i) % PART_TYPES.len()], Vec::new())
+            }
+            Self::UnknownType(name, entries) => typed(
+                &name,
+                entries
+                    .into_iter()
+                    .take(MAX_CHILDREN)
+                    .map(|(name, value)| (Value::from(name), value.into_value()))
+                    .collect(),
+            ),
+            Self::NotAMap(odd) => odd.into_value(),
+        }
+    }
+}
+
+/// The `parts` value: a list, one part repeated to past `MAX_PARTS`, or no list at all.
+#[derive(Debug, Arbitrary)]
+enum PartsGen {
+    List(Vec<PartGen>),
+    Repeated(u8, PartGen),
+    NotAList(Scalar),
+}
+
+impl PartsGen {
+    fn into_value(self) -> Value {
+        match self {
+            Self::List(parts) => Value::Array(
+                parts
+                    .into_iter()
+                    .take(MAX_CHILDREN)
+                    .map(PartGen::into_value)
+                    .collect(),
+            ),
+            Self::Repeated(n, part) => {
+                Value::Array(vec![part.into_value(); usize::from(n) % (3 * MAX_PARTS)])
+            }
+            Self::NotAList(odd) => odd.into_value(),
+        }
+    }
+}
+
+/// What a decoded body promises of its optional keys on either route: a `thread` is an id
+/// or absent, a disposition is carried by a reply and only a reply, `retry_after` only by
+/// a reply, and `parts` keeps at most what was listed, counting a non-list as one dropped.
+/// Nothing in these keys refuses a body; that is the reason lists' job to pin.
+struct DecodedExtras<'a> {
+    kind: PeerKind,
+    thread: Option<&'a str>,
+    disposition: Option<Disposition>,
+    retry_after: Option<u32>,
+    parts: usize,
+    dropped_parts: u32,
+}
+
+impl<'a> DecodedExtras<'a> {
+    fn of_body(body: &'a PeerBody) -> Self {
+        Self {
+            kind: body.kind,
+            thread: body.thread.as_deref(),
+            disposition: body.disposition,
+            retry_after: body.retry_after,
+            parts: body.parts.len(),
+            dropped_parts: body.dropped_parts,
+        }
+    }
+
+    fn of_peer(peer: &'a LxmfPeer) -> Self {
+        Self {
+            kind: peer.kind,
+            thread: peer.thread.as_deref(),
+            disposition: peer.disposition,
+            retry_after: peer.retry_after,
+            parts: peer.parts.len(),
+            dropped_parts: peer.dropped_parts,
+        }
+    }
+}
+
+fn check_extras(entries: &[(Value, Value)], extras: &DecodedExtras<'_>) -> Result<(), String> {
+    ensure(extras.thread.is_none_or(is_wire_id), || {
+        format!(
+            "MESH-MSG: a thread that is not a message id reads as absent, got {:?}",
+            extras.thread
+        )
+    })?;
+    let is_reply = extras.kind == PeerKind::Reply;
+    ensure(extras.disposition.is_some() == is_reply, || {
+        format!(
+            "MESH-MSG: a reply always has a disposition and nothing else carries one, got {:?} on {:?}",
+            extras.disposition, extras.kind
+        )
+    })?;
+    ensure(extras.retry_after.is_none() || is_reply, || {
+        format!(
+            "MESH-MSG: only a reply carries retry_after, got {:?} on {:?}",
+            extras.retry_after, extras.kind
+        )
+    })?;
+    let parts = first(entries, "parts");
+    let listed = parts.and_then(Value::as_array).map_or(0, Vec::len);
+    ensure(extras.parts <= listed, || {
+        format!(
+            "MESH-MSG: {} parts decoded from a list of {listed}",
+            extras.parts
+        )
+    })?;
+    let expected_dropped = u32::from(parts.is_some_and(|value| !value.is_array()));
+    ensure(extras.dropped_parts == expected_dropped, || {
+        format!(
+            "MESH-MSG: a parts that is not a list counts one dropped, else none; got {} for {parts:?}",
+            extras.dropped_parts
+        )
+    })
+}
+
 #[derive(Debug, Arbitrary)]
 struct BodyGen {
     v: Likely<Version1>,
@@ -2276,6 +2473,10 @@ struct BodyGen {
     content: Likely<TextField>,
     fields: Unlikely<FieldsValue>,
     ts: Likely<TsGen>,
+    thread: Unlikely<IdGen>,
+    disposition: Unlikely<DispositionGen>,
+    retry_after: Unlikely<UintField>,
+    parts: Unlikely<PartsGen>,
     shape: Shape,
     replace: Unlikely<ArbValue>,
 }
@@ -2294,6 +2495,13 @@ impl BodyGen {
             (key("content"), present(self.content, text)),
             (key("fields"), rare(self.fields, FieldsValue::into_value)),
             (key("ts"), present(self.ts, TsGen::into_value)),
+            (key("thread"), rare(self.thread, IdGen::into_value)),
+            (
+                key("disposition"),
+                rare(self.disposition, DispositionGen::into_value),
+            ),
+            (key("retry_after"), rare(self.retry_after, uint)),
+            (key("parts"), rare(self.parts, PartsGen::into_value)),
         ]);
         or_replaced(map, self.replace)
     }
@@ -2330,6 +2538,10 @@ fn check_body(value: &Value) -> Result<(), String> {
                     "MESH-MSG-012: a body that is not a map or not version 1 must be refused, got {body:?}"
                 )
             })?;
+            let entries = value
+                .as_map()
+                .ok_or_else(|| "MESH-MSG-012: a decoded body came from a map".to_string())?;
+            check_extras(entries, &DecodedExtras::of_body(&body))?;
             let peer = OutboundPeer {
                 kind: body.kind,
                 id: body.id.clone(),
@@ -2343,9 +2555,13 @@ fn check_body(value: &Value) -> Result<(), String> {
                 retry_after: body.retry_after,
             };
             let again = from_r3_body(&to_r3_body(&peer, body.timestamp));
-            ensure(again.as_ref() == Ok(&body), || {
+            let re_sent = PeerBody {
+                dropped_parts: 0,
+                ..body.clone()
+            };
+            ensure(again.as_ref() == Ok(&re_sent), || {
                 format!(
-                    "MESH-MSG round trip: from_r3_body(to_r3_body(body)) must equal body; got {again:?} for {body:?}"
+                    "MESH-MSG round trip: from_r3_body(to_r3_body(body)) must equal body with nothing dropped; got {again:?} for {body:?}"
                 )
             })
         }
@@ -2542,6 +2758,10 @@ struct DataGen {
     id: Unlikely<IdGen>,
     in_reply_to: Unlikely<IdGen>,
     fields: Unlikely<FieldsValue>,
+    thread: Unlikely<IdGen>,
+    disposition: Unlikely<DispositionGen>,
+    retry_after: Unlikely<UintField>,
+    parts: Unlikely<PartsGen>,
     shape: Shape,
     replace: Unlikely<Scalar>,
 }
@@ -2570,6 +2790,13 @@ impl FieldsGen {
                     rare(data.in_reply_to, IdGen::into_value),
                 ),
                 (key("fields"), rare(data.fields, FieldsValue::into_value)),
+                (key("thread"), rare(data.thread, IdGen::into_value)),
+                (
+                    key("disposition"),
+                    rare(data.disposition, DispositionGen::into_value),
+                ),
+                (key("retry_after"), rare(data.retry_after, uint)),
+                (key("parts"), rare(data.parts, PartsGen::into_value)),
             ]);
             sub_map(map, data.replace)
         };
@@ -2617,6 +2844,16 @@ fn expect_typed(fields: &Value, tag: &str) -> Option<Option<[u8; NAME_HASH_LEN]>
     Some(name_hash)
 }
 
+/// The first `0xFC` map's entries, when the fields carry one.
+fn custom_data(fields: &Value) -> Option<&[(Value, Value)]> {
+    fields
+        .as_map()?
+        .iter()
+        .find(|(name, _)| name.as_u64() == Some(u64::from(FIELD_CUSTOM_DATA)))
+        .and_then(|(_, value)| value.as_map())
+        .map(Vec::as_slice)
+}
+
 pub(super) fn inbound_with(fields: Value) -> InboundMessage {
     InboundMessage {
         transient_id: [1u8; 32],
@@ -2638,10 +2875,15 @@ fn check_peer_fields(fields: &Value) -> Result<(), String> {
         (Some(_), PeerLxmf::Malformed(reason)) => ensure(PEER_REASONS.contains(reason), || {
             format!("MESH-MSG-049..052: `{reason}` is not a refusal section 10.8 names")
         }),
-        (Some(Some(expected)), PeerLxmf::Peer(peer)) => ensure(peer.name_hash == expected, || {
-            "MESH-MSG-052: the peer's name_hash is the 10-byte bin under the custom data"
-                .to_string()
-        }),
+        (Some(Some(expected)), PeerLxmf::Peer(peer)) => {
+            ensure(peer.name_hash == expected, || {
+                "MESH-MSG-052: the peer's name_hash is the 10-byte bin under the custom data"
+                    .to_string()
+            })?;
+            let data = custom_data(fields)
+                .ok_or_else(|| "MESH-MSG-052: a peer came from a custom data map".to_string())?;
+            check_extras(data, &DecodedExtras::of_peer(peer))
+        }
         (expected, observed) => Err(format!(
             "MESH-PROP-038/MESH-MSG-052: typed={expected:?} by the predicate, decoded as {observed:?}"
         )),

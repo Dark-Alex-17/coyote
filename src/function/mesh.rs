@@ -828,6 +828,7 @@ mod tests {
             disposition: None,
             retry_after: None,
             parts: Vec::new(),
+            dropped_parts: 0,
         }
     }
 

@@ -200,10 +200,15 @@ mod tests {
             "lpt9.txt",
             "aux",
             "PRN.x.y",
+            "com0",
+            "LPT0",
+            "COM\u{B9}",
+            "lpt\u{B2}.txt",
+            "com\u{B3}",
         ] {
             assert_eq!(rule(text), "reserved_name", "{text:?}");
         }
-        for text in ["com0", "com10", "console.md"] {
+        for text in ["com10", "console.md", "com\u{B9}1", "lpt", "comm1"] {
             assert!(WirePath::parse(text).is_ok(), "{text:?}");
         }
     }

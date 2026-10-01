@@ -981,7 +981,7 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::{TempDir, rust_sources};
+    use super::test_support::{TempDir, read_source, rust_sources};
     use super::*;
 
     #[test]
@@ -1142,6 +1142,45 @@ mod tests {
                 "{expected} must be among the scanned sources"
             );
         }
+    }
+
+    /// A staged file is the peer's and stays until a person removes it: no production line
+    /// under `src/mesh`, nor in the mesh-facing tool and REPL files, removes a file or
+    /// directory it names through the inbox. The inbox's own removal is of its temp file.
+    #[test]
+    fn no_mesh_source_removes_an_inbox_path() {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut sources: Vec<PathBuf> = rust_sources()
+            .into_iter()
+            .filter(|path| {
+                !path.components().any(|c| c.as_os_str() == "conformance")
+                    && path.file_name().is_some_and(|name| name != "tests.rs")
+            })
+            .collect();
+        sources.push(src.join("function").join("mesh.rs"));
+        sources.push(src.join("repl").join("mesh.rs"));
+        let removals = ["remove_file(", "remove_dir_all(", "remove_dir("];
+        let inbox_tokens = ["inbox", "Inbox", ".staged", "Part::File"];
+        let mut hits = Vec::new();
+        let mut inbox_removals = Vec::new();
+        for path in &sources {
+            for (index, line) in production_code(&read_source(path)).iter().enumerate() {
+                if !removals.iter().any(|call| line.contains(call)) {
+                    continue;
+                }
+                if path.ends_with("inbox.rs") {
+                    inbox_removals.push(line.trim().to_string());
+                } else if inbox_tokens.iter().any(|token| line.contains(token)) {
+                    hits.push(format!("{}:{}: {}", path.display(), index + 1, line.trim()));
+                }
+            }
+        }
+        assert_eq!(hits, Vec::<String>::new());
+        assert_eq!(
+            inbox_removals,
+            ["let _ = fs::remove_file(&tmp);"],
+            "inbox.rs removes only its own temp file"
+        );
     }
 
     #[test]

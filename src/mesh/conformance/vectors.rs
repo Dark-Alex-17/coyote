@@ -746,6 +746,7 @@ fn body() -> PeerBody {
         disposition: None,
         retry_after: None,
         parts: Vec::new(),
+        dropped_parts: 0,
     }
 }
 
@@ -861,6 +862,7 @@ fn peer_text(
         disposition: (kind == PeerKind::Reply).then_some(Disposition::Answered),
         retry_after: None,
         parts: Vec::new(),
+        dropped_parts: 0,
     }))
 }
 
@@ -885,6 +887,7 @@ fn raw(fields: Option<serde_json::Value>, title: Option<&str>, content: &str) ->
         disposition: None,
         retry_after: None,
         parts: Vec::new(),
+        dropped_parts: 0,
     }
 }
 

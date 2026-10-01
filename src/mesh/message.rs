@@ -282,6 +282,8 @@ pub(crate) struct RawPeerMessage {
     pub disposition: Option<Disposition>,
     pub retry_after: Option<u32>,
     pub parts: Vec<RawPart>,
+    /// Parts the codec could not read at all: a `parts` that was not a list counts one.
+    pub dropped_parts: u32,
 }
 
 impl PeerMessage {
@@ -301,7 +303,8 @@ impl PeerMessage {
         limits: &PartLimits,
         staging: Option<&InboxStaging>,
     ) -> Self {
-        let (admitted, mut dropped_parts) = admit_parts(raw.parts, limits);
+        let (admitted, dropped) = admit_parts(raw.parts, limits);
+        let mut dropped_parts = raw.dropped_parts.saturating_add(dropped);
         let mut parts = Vec::with_capacity(admitted.len());
         for part in admitted {
             match keep_part(part, &raw.source_destination, staging) {
@@ -533,12 +536,15 @@ fn encode_parts(parts: &[RawPart]) -> Value {
     )
 }
 
-/// Reads `parts`. Only a value that is not a list is an error; an element that is not a
-/// map, names no known `type` or lacks that type's fields is skipped, so a part this
-/// build does not know never costs the message its words.
-fn decode_parts(value: &Value) -> Result<Vec<RawPart>, &'static str> {
-    let items = value.as_array().ok_or("parts is not a list")?;
-    Ok(items.iter().filter_map(decode_part).collect())
+/// Reads `parts`: the parts read, and how many were lost to the shape. A value that is
+/// not a list reads as no parts with one dropped; an element that is not a map, names no
+/// known `type` or lacks that type's fields is skipped, so a part this build does not
+/// know never costs the message its words.
+fn decode_parts(value: &Value) -> (Vec<RawPart>, u32) {
+    match value.as_array() {
+        Some(items) => (items.iter().filter_map(decode_part).collect(), 0),
+        None => (Vec::new(), 1),
+    }
 }
 
 fn decode_part(value: &Value) -> Option<RawPart> {
@@ -549,7 +555,7 @@ fn decode_part(value: &Value) -> Option<RawPart> {
             text: entry(entries, "text").and_then(text_of)?,
         }),
         "data" => Some(RawPart::Data {
-            data: json_from_rmpv(entry(entries, "data")?, 1)?,
+            data: json_from_rmpv(entry_or_nil(entries, "data")?, 1)?,
         }),
         "file" => {
             let name = entry(entries, "name").and_then(text_of)?;
@@ -754,6 +760,8 @@ pub(crate) struct OutboundPeer {
 }
 
 impl OutboundPeer {
+    /// A message without parts; `with_parts` takes them, with the limits to check them
+    /// against.
     pub(crate) fn new(
         kind: PeerKind,
         content: &str,
@@ -927,6 +935,7 @@ pub(crate) struct PeerBody {
     pub disposition: Option<Disposition>,
     pub retry_after: Option<u32>,
     pub parts: Vec<RawPart>,
+    pub dropped_parts: u32,
 }
 
 /// A string or its bytes, since msgpack encoders differ on which they emit; bytes that
@@ -945,6 +954,14 @@ fn entry<'a>(entries: &'a [(Value, Value)], key: &str) -> Option<&'a Value> {
         .find(|(name, _)| name.as_str() == Some(key))
         .map(|(_, value)| value)
         .filter(|value| !value.is_nil())
+}
+
+/// `entry` for a value that may legitimately be nil: a `data` part's JSON null.
+fn entry_or_nil<'a>(entries: &'a [(Value, Value)], key: &str) -> Option<&'a Value> {
+    entries
+        .iter()
+        .find(|(name, _)| name.as_str() == Some(key))
+        .map(|(_, value)| value)
 }
 
 /// A message id as a peer may send one: non-empty, at most `PEER_ID_MAX_CHARS`, drawn from
@@ -969,20 +986,18 @@ struct BodyExtras {
     disposition: Option<Disposition>,
     retry_after: Option<u32>,
     parts: Vec<RawPart>,
+    dropped_parts: u32,
 }
 
-/// `thread` must be an id when present. A reply always has a disposition, `Answered`
-/// when it names none or one this build does not know; nothing else carries one, nor a
-/// `retry_after`. `parts` is optional and only refused when it is not a list.
-fn body_extras(entries: &[(Value, Value)], kind: PeerKind) -> Result<BodyExtras, &'static str> {
-    let thread = match entry(entries, "thread") {
-        None => None,
-        Some(value) => Some(
-            text_of(value)
-                .filter(|id| is_wire_id(id))
-                .ok_or("thread is not a message id")?,
-        ),
-    };
+/// Every key here is optional under `v: 1` and never refuses the body. A `thread` that is
+/// not an id reads as absent, so the message is its own thread. A reply always has a
+/// disposition, `Answered` when it names none or one this build does not know; nothing
+/// else carries one, nor a `retry_after`. A `parts` that is not a list reads as no parts
+/// with one dropped.
+fn body_extras(entries: &[(Value, Value)], kind: PeerKind) -> BodyExtras {
+    let thread = entry(entries, "thread")
+        .and_then(text_of)
+        .filter(|id| is_wire_id(id));
     let is_reply = kind == PeerKind::Reply;
     let disposition = is_reply.then(|| {
         entry(entries, "disposition")
@@ -994,16 +1009,17 @@ fn body_extras(entries: &[(Value, Value)], kind: PeerKind) -> Result<BodyExtras,
         .then(|| entry(entries, "retry_after").and_then(Value::as_u64))
         .flatten()
         .and_then(|secs| u32::try_from(secs).ok());
-    let parts = match entry(entries, "parts") {
-        None => Vec::new(),
-        Some(value) => decode_parts(value)?,
+    let (parts, dropped_parts) = match entry(entries, "parts") {
+        None => (Vec::new(), 0),
+        Some(value) => decode_parts(value),
     };
-    Ok(BodyExtras {
+    BodyExtras {
         thread,
         disposition,
         retry_after,
         parts,
-    })
+        dropped_parts,
+    }
 }
 
 /// Reads a `/message` body. Anything the sender's own `OutboundPeer::new` would have
@@ -1055,7 +1071,8 @@ pub(crate) fn from_r3_body(body: &Value) -> Result<PeerBody, &'static str> {
         disposition,
         retry_after,
         parts,
-    } = body_extras(entries, kind)?;
+        dropped_parts,
+    } = body_extras(entries, kind);
     Ok(PeerBody {
         kind,
         id,
@@ -1068,6 +1085,7 @@ pub(crate) fn from_r3_body(body: &Value) -> Result<PeerBody, &'static str> {
         disposition,
         retry_after,
         parts,
+        dropped_parts,
     })
 }
 
@@ -1136,6 +1154,7 @@ pub(crate) struct LxmfPeer {
     pub disposition: Option<Disposition>,
     pub retry_after: Option<u32>,
     pub parts: Vec<RawPart>,
+    pub dropped_parts: u32,
 }
 
 /// Reads a fetched message as a peer message. Text is returned as sent: the recipient
@@ -1193,10 +1212,8 @@ pub(crate) fn decode_peer_lxmf(message: &InboundMessage) -> PeerLxmf {
         disposition,
         retry_after,
         parts,
-    } = match body_extras(data, kind) {
-        Ok(extras) => extras,
-        Err(why) => return PeerLxmf::Malformed(why),
-    };
+        dropped_parts,
+    } = body_extras(data, kind);
     let bytes_text = |bytes: &Option<Vec<u8>>| {
         bytes
             .as_deref()
@@ -1214,6 +1231,7 @@ pub(crate) fn decode_peer_lxmf(message: &InboundMessage) -> PeerLxmf {
         disposition,
         retry_after,
         parts,
+        dropped_parts,
     }))
 }
 
@@ -1856,6 +1874,7 @@ impl Handler for PeerMessageHandler {
             disposition: body.disposition,
             retry_after: body.retry_after,
             parts: body.parts,
+            dropped_parts: body.dropped_parts,
         };
         debug!("Mesh {kind} {id} from {id8} (instance {dest8}) received on link {link}");
         // Staging an inline file writes to disk, so the sanitising runs off the request
@@ -1931,6 +1950,7 @@ impl InboundSink for PeerRouting<'_> {
                         disposition: peer.disposition,
                         retry_after: peer.retry_after,
                         parts: peer.parts,
+                        dropped_parts: peer.dropped_parts,
                     },
                 )
             }
@@ -2111,6 +2131,7 @@ mod tests {
             disposition: None,
             retry_after: None,
             parts: Vec::new(),
+            dropped_parts: 0,
         }
     }
 
@@ -2381,6 +2402,7 @@ mod tests {
                 disposition: Some(Disposition::Answered),
                 retry_after: None,
                 parts: Vec::new(),
+                dropped_parts: 0,
             }
         );
         let bare =
@@ -2643,6 +2665,7 @@ mod tests {
                 disposition: None,
                 retry_after: None,
                 parts: Vec::new(),
+                dropped_parts: 0,
             }))
         );
 
@@ -2786,6 +2809,7 @@ mod tests {
                 disposition: None,
                 retry_after: None,
                 parts: Vec::new(),
+                dropped_parts: 0,
             })),
             "invalid UTF-8 is read lossily, never refused"
         );
@@ -3543,6 +3567,27 @@ mod tests {
         entries.push((Value::from(key), value));
     }
 
+    /// `body_entries` for the LXMF route: the fetched message with its custom data edited.
+    fn lxmf_data(kind: PeerKind, edit: impl FnOnce(&mut Vec<(Value, Value)>)) -> InboundMessage {
+        let stored = peer_lxmf_message(&outbound(kind, "hi"), &OriginName([7u8; NAME_HASH_LEN]));
+        let Some(Value::Map(mut fields)) = stored.fields else {
+            unreachable!()
+        };
+        let Some((_, Value::Map(data))) = fields
+            .iter_mut()
+            .find(|(key, _)| key.as_u64() == Some(u64::from(FIELD_CUSTOM_DATA)))
+        else {
+            unreachable!()
+        };
+        edit(data);
+        inbound(
+            Some(round_trip(&Value::Map(fields))),
+            stored.title,
+            Some(stored.content),
+            &hash_of("s"),
+        )
+    }
+
     #[test]
     fn an_unknown_part_type_is_skipped_and_the_message_still_lands_with_its_content() {
         let body = body_entries(PeerKind::Message, |entries| {
@@ -3774,19 +3819,64 @@ mod tests {
     }
 
     #[test]
-    fn parts_that_is_a_map_is_refused() {
+    fn parts_that_is_not_a_list_reads_as_no_parts_with_one_dropped_on_both_routes() {
         let body = body_entries(PeerKind::Message, |entries| {
             set_entry(entries, "parts", Value::Map(vec![]));
         });
-        assert_eq!(from_r3_body(&body), Err("parts is not a list"));
+        let decoded = from_r3_body(&round_trip(&body)).unwrap();
+        assert_eq!(decoded.content, "hi");
+        assert!(decoded.parts.is_empty());
+        assert_eq!(decoded.dropped_parts, 1);
+
+        let PeerLxmf::Peer(peer) = decode_peer_lxmf(&lxmf_data(PeerKind::Message, |data| {
+            set_entry(data, "parts", Value::from("not a list"));
+        })) else {
+            panic!("a peer message");
+        };
+        assert_eq!(peer.content, "hi");
+        assert!(peer.parts.is_empty());
+        assert_eq!(peer.dropped_parts, 1);
+
+        let message = PeerMessage::new(RawPeerMessage {
+            dropped_parts: decoded.dropped_parts,
+            ..raw(&decoded.content)
+        });
+        assert_eq!(message.content, "hi");
+        assert_eq!(
+            message.dropped_parts, 1,
+            "the codec's drop reaches the count"
+        );
     }
 
     #[test]
-    fn a_thread_that_is_not_a_wire_id_is_refused() {
-        let body = body_entries(PeerKind::Message, |entries| {
-            set_entry(entries, "thread", Value::from("has a space"));
-        });
-        assert_eq!(from_r3_body(&body), Err("thread is not a message id"));
+    fn a_thread_that_is_not_a_wire_id_reads_as_absent_so_the_message_is_its_own_thread() {
+        for bad in [
+            Value::from("has a space"),
+            Value::from(""),
+            Value::from("t".repeat(PEER_ID_MAX_CHARS + 1)),
+            Value::from(7),
+            Value::Map(vec![]),
+        ] {
+            let body = body_entries(PeerKind::Message, |entries| {
+                set_entry(entries, "thread", bad.clone());
+            });
+            let decoded = from_r3_body(&round_trip(&body)).unwrap();
+            assert_eq!(decoded.thread, None, "{bad:?}");
+
+            let PeerLxmf::Peer(peer) = decode_peer_lxmf(&lxmf_data(PeerKind::Message, |data| {
+                set_entry(data, "thread", bad.clone());
+            })) else {
+                panic!("{bad:?}: a peer message");
+            };
+            assert_eq!(peer.thread, None, "{bad:?}");
+
+            let message = PeerMessage::new(RawPeerMessage {
+                message_id: decoded.id.clone(),
+                thread: decoded.thread,
+                ..raw(&decoded.content)
+            });
+            assert_eq!(message.thread(), decoded.id, "{bad:?}");
+        }
     }
 
     #[test]
@@ -3872,12 +3962,13 @@ mod tests {
         assert!(decoded.parts.is_empty());
     }
 
-    /// Plan criterion (f): with content, title, both ids, fields and parts all at their
-    /// caps at once, the message still fits under both receivers' bounds and every field
-    /// survives encode→decode byte-for-byte on both routes.
+    /// Plan criterion (f): with content, title, both ids, fields and parts of all four
+    /// shapes (text, data, inline file, reference file) at their caps at once, the message
+    /// still fits under both receivers' bounds and every field survives encode→decode
+    /// byte-for-byte on both routes.
     #[test]
     fn a_message_at_every_cap_fits_under_both_receiver_bounds_on_both_routes() {
-        const TEXT_PARTS: usize = 6;
+        const TEXT_PARTS: usize = 4;
         let ts = 1_700_000_000.5;
         let content = "\u{10000}".repeat(PEER_CONTENT_MAX_CHARS);
         let title = "\u{10000}".repeat(PEER_TITLE_MAX_CHARS);
@@ -3895,12 +3986,22 @@ mod tests {
         let name = "n".repeat(1_024);
         let large = usize::try_from(DEFAULT_INLINE_MAX_BYTES).unwrap();
         let small = usize::try_from(MAX_INLINE_FILE_TOTAL).unwrap() - large;
-        let files = vec![
+        let fixed = vec![
             inline_file(&name, vec![0xAB; large]),
             inline_file(&name, vec![0xCD; small]),
+            RawPart::Data {
+                data: fields.clone(),
+            },
+            RawPart::File {
+                name: "report.pdf".into(),
+                size: u64::MAX,
+                sha256: [0xEE; 32],
+                bytes: None,
+                reference: Some(name.clone()),
+            },
         ];
         let assemble = |texts: &[String]| {
-            let mut parts = files.clone();
+            let mut parts = fixed.clone();
             parts.extend(texts.iter().map(|text| text_part(text)));
             parts
         };
@@ -4006,6 +4107,7 @@ mod tests {
                 disposition: Some(Disposition::Refused),
                 retry_after: Some(u32::MAX),
                 parts: parts.clone(),
+                dropped_parts: 0,
             }
         );
         let rebuilt = OutboundPeer {
@@ -4044,6 +4146,7 @@ mod tests {
                 disposition: Some(Disposition::Refused),
                 retry_after: Some(u32::MAX),
                 parts: parts.clone(),
+                dropped_parts: 0,
             }
         );
         let peer = *peer;
@@ -4064,6 +4167,397 @@ mod tests {
         assert_eq!(restored.content, stored.content);
         assert_eq!(
             pack(restored.fields.as_ref().unwrap()),
+            pack(stored.fields.as_ref().unwrap())
+        );
+    }
+
+    // ---- usage probe (TASK-108): spec-first patterns not pinned above ----
+
+    /// User ruling amending (a)/(f): the receiver drops parts from the TAIL until the
+    /// msgpack-encoded `parts` list fits `MAX_PARTS_BYTES`, counting each; the message and
+    /// its `content` land. Eight text parts each at the per-part cap pass every per-part
+    /// rule yet encode past the aggregate cap, so only the aggregate rule can bite.
+    #[test]
+    fn a_parts_list_over_the_encoded_cap_sheds_trailing_parts_and_the_sender_refuses_it() {
+        let parts: Vec<RawPart> = (0..MAX_PARTS)
+            .map(|n| {
+                text_part(&format!(
+                    "{n}{}",
+                    "\u{10000}".repeat(PEER_CONTENT_MAX_CHARS - 1)
+                ))
+            })
+            .collect();
+        assert!(
+            parts
+                .iter()
+                .all(|part| part_violation(part, &PartLimits::default(), 0).is_none()),
+            "every part passes its own rule"
+        );
+        let encoded = packed_len(&encode_parts(&parts));
+        assert!(encoded > MAX_PARTS_BYTES, "{encoded} must exceed the cap");
+
+        let message = PeerMessage::new(with_parts(parts.clone()));
+
+        assert_eq!(message.content, "hello", "the message still lands");
+        assert!(!message.parts.is_empty(), "something is kept");
+        assert!(message.parts.len() < MAX_PARTS, "something is dropped");
+        assert_eq!(
+            message.dropped_parts as usize,
+            MAX_PARTS - message.parts.len(),
+            "each dropped part is counted"
+        );
+        let kept: Vec<RawPart> = parts[..message.parts.len()].to_vec();
+        let expected: Vec<Part> = kept
+            .iter()
+            .map(|part| match part {
+                RawPart::Text { text } => Part::Text { text: text.clone() },
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            message.parts, expected,
+            "the kept parts are the leading ones, in order"
+        );
+        assert!(packed_len(&encode_parts(&kept)) <= MAX_PARTS_BYTES);
+        assert!(
+            packed_len(&encode_parts(&parts[..message.parts.len() + 1])) > MAX_PARTS_BYTES,
+            "one more part would not have fit"
+        );
+
+        let err = OutboundPeer::with_parts(
+            PeerKind::Message,
+            "hello",
+            None,
+            None,
+            None,
+            parts,
+            &PartLimits::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, SendError::InvalidParts(_)), "{err:?}");
+        let text = err.to_string();
+        assert!(text.contains(&MAX_PARTS_BYTES.to_string()), "{text}");
+        assert!(text.contains(&MAX_PARTS.to_string()), "{text}");
+    }
+
+    /// Plan table: a `data` part is capped "as `fields`" — 4 096 B serialised AND depth 8.
+    /// The byte half is pinned above; this is the depth half, on both sides.
+    #[test]
+    fn a_data_part_nesting_past_the_depth_cap_is_dropped_and_the_sender_refuses_it() {
+        let too_deep = (0..PEER_FIELDS_MAX_DEPTH + 1).fold(
+            serde_json::json!(1),
+            |inner, _| serde_json::json!({ "d": inner }),
+        );
+        let at_depth = (0..PEER_FIELDS_MAX_DEPTH - 1).fold(
+            serde_json::json!(1),
+            |inner, _| serde_json::json!({ "d": inner }),
+        );
+        assert!(
+            sanitize_fields(at_depth.clone()).is_ok(),
+            "the control nests to the cap and is admitted"
+        );
+
+        let message = PeerMessage::new(with_parts(vec![
+            RawPart::Data {
+                data: too_deep.clone(),
+            },
+            RawPart::Data {
+                data: at_depth.clone(),
+            },
+        ]));
+        assert_eq!(message.content, "hello");
+        assert_eq!(message.parts, vec![Part::Data { data: at_depth }]);
+        assert_eq!(message.dropped_parts, 1);
+
+        let err = OutboundPeer::with_parts(
+            PeerKind::Message,
+            "hello",
+            None,
+            None,
+            None,
+            vec![RawPart::Data { data: too_deep }],
+            &PartLimits::default(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            SendError::InvalidParts("data part is too large or nests too deeply")
+        );
+    }
+
+    /// Criterion (b): the four spec'd negative names (`../../.bashrc`, `C:\x`, NUL,
+    /// non-NFC) plus the hardened grammar's reserved-name and absolute forms. On receipt
+    /// the part is dropped and counted BEFORE the inbox root exists and nothing lands in
+    /// cwd; on send the same name is refused outright, so the receiver never sees it.
+    #[test]
+    fn every_spec_negative_file_name_drops_the_part_before_the_inbox_or_cwd_is_touched() {
+        let names: &[&str] = &[
+            "../../.bashrc",
+            "C:\\x",
+            "a\0b",
+            "e\u{301}.txt",
+            "CON.md",
+            "/etc/passwd",
+            "docs\\notes.md",
+            "docs/./notes.md",
+            "docs//notes.md",
+        ];
+        for name in names {
+            let tmp = TempDir::new("message-negative-name");
+            let safe_cwd_probe =
+                !name.contains('\0') && !name.starts_with("..") && !name.starts_with('/');
+            let existed_before = safe_cwd_probe && std::path::Path::new(name).exists();
+
+            let message = PeerMessage::new_with(
+                with_parts(vec![inline_file(name, b"payload".to_vec())]),
+                &PartLimits::default(),
+                Some(&staging(&tmp)),
+            );
+
+            assert_eq!(message.content, "hello", "{name:?}: the message lands");
+            assert!(message.parts.is_empty(), "{name:?}: {:?}", message.parts);
+            assert_eq!(message.dropped_parts, 1, "{name:?}");
+            assert!(
+                !tmp.path.join("inbox").exists(),
+                "{name:?}: the inbox root was created"
+            );
+            if safe_cwd_probe {
+                assert_eq!(
+                    std::path::Path::new(name).exists(),
+                    existed_before,
+                    "{name:?}: cwd was touched"
+                );
+            }
+
+            let err = OutboundPeer::with_parts(
+                PeerKind::Message,
+                "hello",
+                None,
+                None,
+                None,
+                vec![inline_file(name, b"payload".to_vec())],
+                &PartLimits::default(),
+            )
+            .unwrap_err();
+            assert_eq!(
+                err,
+                SendError::InvalidParts("file part name is not a wire path"),
+                "{name:?}"
+            );
+        }
+    }
+
+    /// Plan table (reference `file`): `ref.path` is a wire path too, since it is what the
+    /// receiver will later put on a `/fetch`. Both sides apply the one grammar.
+    #[test]
+    fn a_reference_part_whose_ref_path_breaks_the_grammar_is_dropped_and_refused() {
+        let reference = |path: &str| RawPart::File {
+            name: "report.pdf".into(),
+            size: 10,
+            sha256: [9; 32],
+            bytes: None,
+            reference: Some(path.into()),
+        };
+        for bad in ["../secret", "/etc/passwd", "C:\\share\\x", "a\0b"] {
+            let message = PeerMessage::new(with_parts(vec![reference(bad), reference("ok/a.pdf")]));
+            assert_eq!(message.dropped_parts, 1, "{bad:?}");
+            assert!(
+                matches!(
+                    message.parts.as_slice(),
+                    [Part::File { reference: Some(path), staged: None, .. }] if path == "ok/a.pdf"
+                ),
+                "{bad:?}: {:?}",
+                message.parts
+            );
+            let err = OutboundPeer::with_parts(
+                PeerKind::Message,
+                "hello",
+                None,
+                None,
+                None,
+                vec![reference(bad)],
+                &PartLimits::default(),
+            )
+            .unwrap_err();
+            assert_eq!(
+                err,
+                SendError::InvalidParts("file part ref is not a wire path"),
+                "{bad:?}"
+            );
+        }
+    }
+
+    /// Criterion (a), sender half: `OutboundPeer` refuses on EVERY rule the receiver would
+    /// drop a part for, not only the encoded total. One case per rule; each `Err` names the
+    /// rule and nothing of the part.
+    #[test]
+    fn the_sender_refuses_each_part_rule_the_receiver_would_drop() {
+        let limits = PartLimits {
+            inline_max_bytes: 16,
+        };
+        let send = |parts: Vec<RawPart>, limits: &PartLimits| {
+            OutboundPeer::with_parts(PeerKind::Message, "hello", None, None, None, parts, limits)
+        };
+
+        let nine = (0..MAX_PARTS + 1)
+            .map(|n| text_part(&n.to_string()))
+            .collect();
+        assert_eq!(
+            send(nine, &limits).unwrap_err(),
+            SendError::InvalidParts("too many parts")
+        );
+
+        assert_eq!(
+            send(
+                vec![text_part(&"x".repeat(PEER_CONTENT_MAX_CHARS + 1))],
+                &limits
+            )
+            .unwrap_err(),
+            SendError::InvalidParts("text part is too long")
+        );
+
+        assert_eq!(
+            send(vec![inline_file("big.bin", vec![1; 17])], &limits).unwrap_err(),
+            SendError::InvalidParts("file part is over the inline cap")
+        );
+
+        let wide = PartLimits {
+            inline_max_bytes: MAX_INLINE_FILE_TOTAL,
+        };
+        let half = usize::try_from(MAX_INLINE_FILE_TOTAL / 2 + 1).unwrap();
+        assert_eq!(
+            send(
+                vec![
+                    inline_file("a.bin", vec![1; half]),
+                    inline_file("b.bin", vec![2; half])
+                ],
+                &wide
+            )
+            .unwrap_err(),
+            SendError::InvalidParts("file parts are over the per-message inline total")
+        );
+
+        let RawPart::File {
+            name, size, bytes, ..
+        } = inline_file("a.bin", b"hello".to_vec())
+        else {
+            unreachable!()
+        };
+        let err = send(
+            vec![RawPart::File {
+                name,
+                size,
+                sha256: [0; 32],
+                bytes,
+                reference: None,
+            }],
+            &limits,
+        )
+        .unwrap_err();
+        assert_eq!(err, SendError::InvalidParts(SHA256_MISMATCH));
+        assert!(!err.to_string().contains("a.bin"), "{err}");
+
+        let wide_data = serde_json::json!({ "k": "x".repeat(PEER_FIELDS_MAX_BYTES) });
+        assert_eq!(
+            send(vec![RawPart::Data { data: wide_data }], &limits).unwrap_err(),
+            SendError::InvalidParts("data part is too large or nests too deeply")
+        );
+
+        let over_encoded = (0..MAX_PARTS)
+            .map(|n| {
+                text_part(&format!(
+                    "{n}{}",
+                    "\u{10000}".repeat(PEER_CONTENT_MAX_CHARS - 1)
+                ))
+            })
+            .collect();
+        assert_eq!(
+            send(over_encoded, &limits).unwrap_err(),
+            SendError::InvalidParts("parts are too large once encoded")
+        );
+
+        // The positive control: the same shapes inside every cap are accepted.
+        let ok = send(
+            vec![
+                text_part("fits"),
+                inline_file("a.bin", vec![1; 16]),
+                RawPart::Data {
+                    data: serde_json::json!({ "n": 1 }),
+                },
+            ],
+            &limits,
+        )
+        .unwrap();
+        assert_eq!(ok.parts.len(), 3);
+    }
+
+    /// Criterion (f) at working sizes: text, `data` (a map and a bare JSON null), an
+    /// inline file and a reference file go through both routes as the same `RawPart`s and
+    /// re-encode byte-for-byte.
+    #[test]
+    fn every_part_shape_round_trips_on_both_routes_byte_for_byte() {
+        let parts = vec![
+            text_part("first"),
+            RawPart::Data {
+                data: serde_json::json!({ "n": [1, 2.5, "s", null], "neg": -3 }),
+            },
+            RawPart::Data {
+                data: serde_json::Value::Null,
+            },
+            inline_file("docs/notes.md", b"# notes\n".to_vec()),
+            RawPart::File {
+                name: "report.pdf".into(),
+                size: 1 << 20,
+                sha256: [0xEE; 32],
+                bytes: None,
+                reference: Some("shared/2024/report.pdf".into()),
+            },
+        ];
+        let out = OutboundPeer::with_parts(
+            PeerKind::Message,
+            "hello",
+            None,
+            None,
+            None,
+            parts.clone(),
+            &PartLimits::default(),
+        )
+        .unwrap();
+        let ts = 1_700_000_000.5;
+
+        let body = to_r3_body(&out, ts);
+        let decoded = from_r3_body(&round_trip(&body)).unwrap();
+        assert_eq!(decoded.parts, parts);
+        assert_eq!(decoded.dropped_parts, 0);
+        let rebuilt = OutboundPeer {
+            parts: decoded.parts,
+            ..out.clone()
+        };
+        assert_eq!(pack(&to_r3_body(&rebuilt, ts)), pack(&body));
+
+        let origin = OriginName([7u8; NAME_HASH_LEN]);
+        let stored = peer_lxmf_message(&out, &origin);
+        let PeerLxmf::Peer(peer) = decode_peer_lxmf(&inbound(
+            Some(round_trip(stored.fields.as_ref().unwrap())),
+            stored.title.clone(),
+            Some(stored.content.clone()),
+            &hash_of("signer"),
+        )) else {
+            panic!("a peer message");
+        };
+        assert_eq!(peer.parts, parts);
+        assert_eq!(peer.dropped_parts, 0);
+        let rebuilt = OutboundPeer {
+            parts: peer.parts,
+            ..out
+        };
+        assert_eq!(
+            pack(
+                peer_lxmf_message(&rebuilt, &origin)
+                    .fields
+                    .as_ref()
+                    .unwrap()
+            ),
             pack(stored.fields.as_ref().unwrap())
         );
     }

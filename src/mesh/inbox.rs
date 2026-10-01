@@ -4,7 +4,8 @@
 //! directory is created under it and again before the file is written, so a symlink
 //! planted under the inbox cannot lead a write outside it. Nothing here logs: the path and
 //! the bytes are the peer's. A file is written through a randomly named `.tmp-<uuid>`
-//! sibling and renamed into place, so no name a peer chooses can alias the temp file.
+//! sibling and hard-linked into place, so no name a peer chooses can alias the temp file
+//! and nothing already at the target is ever overwritten.
 
 use crate::mesh::wire_path::WirePath;
 use crate::mesh::{hex_lower, mesh_cache_dir};
@@ -23,6 +24,8 @@ pub(crate) fn inbox_root(cache_dir: &Path, instance_id: &str) -> PathBuf {
 pub(crate) enum StageError {
     /// The staging directory resolves outside the inbox root; nothing was written.
     Escaped,
+    /// The target and its hash-suffixed sibling both hold other bytes; nothing was written.
+    Collision,
     Io(io::Error),
 }
 
@@ -33,6 +36,10 @@ impl fmt::Display for StageError {
                 f,
                 "The staging path resolves outside the inbox; nothing was written"
             ),
+            Self::Collision => write!(
+                f,
+                "The staging path and its hash-suffixed sibling already hold other content; nothing was written"
+            ),
             Self::Io(err) => write!(f, "The file could not be staged: {}", err.kind()),
         }
     }
@@ -41,7 +48,7 @@ impl fmt::Display for StageError {
 impl std::error::Error for StageError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Escaped => None,
+            Self::Escaped | Self::Collision => None,
             Self::Io(err) => Some(err),
         }
     }
@@ -70,7 +77,9 @@ impl InboxStaging {
     /// path. `peer_destination` is the peer's destination hash; its first eight characters,
     /// lower-cased, name the peer's directory. A file already at the target with the same
     /// `sha256` is reused without a write; one with a different hash keeps its place and
-    /// the new bytes land beside it as `<stem>-<sha256[..8]><ext>`.
+    /// the new bytes land beside it as `<stem>-<sha256[..8]><ext>`. When that name too
+    /// holds other bytes, or a file appears at the target between the check and the
+    /// write, nothing is overwritten: `Collision`.
     pub(crate) fn stage(
         &self,
         peer_destination: &str,
@@ -97,14 +106,23 @@ impl InboxStaging {
             None => target,
             Some(false) => {
                 let suffixed = with_hash_suffix(&target, sha256);
-                if existing_matches(&suffixed, sha256)? == Some(true) {
-                    return Ok(suffixed);
+                match existing_matches(&suffixed, sha256)? {
+                    Some(true) => return Ok(suffixed),
+                    Some(false) => return Err(StageError::Collision),
+                    None => suffixed,
                 }
-                suffixed
             }
         };
-        write_staged(&target, bytes)?;
-        Ok(target)
+        match write_staged(&target, bytes) {
+            Ok(()) => Ok(target),
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                match existing_matches(&target, sha256)? {
+                    Some(true) => Ok(target),
+                    _ => Err(StageError::Collision),
+                }
+            }
+            Err(err) => Err(err.into()),
+        }
     }
 }
 
@@ -143,8 +161,9 @@ fn with_hash_suffix(target: &Path, sha256: &[u8; 32]) -> PathBuf {
     target.with_file_name(name)
 }
 
-/// Writes `bytes` to `.tmp-<uuid>` beside `target`, syncs and renames it into place; on
-/// any failure the temp file is removed best-effort and the error returned.
+/// Writes `bytes` to `.tmp-<uuid>` beside `target`, syncs and hard-links it into place,
+/// which fails with `AlreadyExists` rather than replacing a file already at `target`. The
+/// temp name is removed either way, best-effort.
 fn write_staged(target: &Path, bytes: &[u8]) -> io::Result<()> {
     let Some(parent) = target.parent() else {
         return Err(io::Error::other("the staging target has no parent"));
@@ -155,10 +174,8 @@ fn write_staged(target: &Path, bytes: &[u8]) -> io::Result<()> {
             file.write_all(bytes)?;
             file.sync_all()
         })
-        .and_then(|()| fs::rename(&tmp, target));
-    if written.is_err() {
-        let _ = fs::remove_file(&tmp);
-    }
+        .and_then(|()| fs::hard_link(&tmp, target));
+    let _ = fs::remove_file(&tmp);
     written
 }
 
@@ -265,6 +282,83 @@ mod tests {
         let dotfile = inbox.stage(PEER, &bare, &digest(b"x"), b"x").unwrap();
         let clash = inbox.stage(PEER, &bare, &other_sha, b"other").unwrap();
         assert_eq!(clash, dotfile.with_file_name(format!(".bashrc-{suffix}")));
+    }
+
+    /// Three contents meeting at one name: `first` holds `<name>`, `third` was staged
+    /// under the `<stem>-<hash8><ext>` that `second` would take, so `second` finds both
+    /// names holding other bytes and is refused with neither file touched.
+    #[test]
+    fn a_third_content_whose_suffixed_name_is_also_taken_is_a_collision_not_an_overwrite() {
+        let tmp = TempDir::new("inbox-collision");
+        let inbox = staging(&tmp);
+        let rel = WirePath::parse("docs/a.md").unwrap();
+        let second_sha = digest(b"second");
+        let suffixed =
+            WirePath::parse(&format!("docs/a-{}.md", hex_lower(&second_sha[..4]))).unwrap();
+
+        let first = inbox
+            .stage(PEER, &rel, &digest(b"first"), b"first")
+            .unwrap();
+        let third = inbox
+            .stage(PEER, &suffixed, &digest(b"third"), b"third")
+            .unwrap();
+        assert_eq!(
+            third,
+            first.with_file_name(suffixed.to_relative_path().file_name().unwrap())
+        );
+
+        let err = inbox.stage(PEER, &rel, &second_sha, b"second").unwrap_err();
+
+        assert!(matches!(err, StageError::Collision), "{err}");
+        assert!(!err.to_string().contains("docs"), "{err}");
+        assert_eq!(fs::read(&first).unwrap(), b"first");
+        assert_eq!(fs::read(&third).unwrap(), b"third");
+        let mut found = files_under(&inbox.root);
+        found.sort();
+        assert_eq!(found, [third, first]);
+    }
+
+    #[test]
+    fn the_publish_step_never_replaces_a_file_already_at_the_target() {
+        let tmp = TempDir::new("inbox-no-clobber");
+        let target = tmp.path.join("a.md");
+        fs::write(&target, b"already here").unwrap();
+
+        let err = write_staged(&target, b"new").unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&target).unwrap(), b"already here");
+        assert_eq!(files_under(&tmp.path), [target]);
+    }
+
+    /// The inbox is reopened per message; nothing on the way in may clear what an earlier
+    /// message staged.
+    #[test]
+    fn reopening_the_inbox_for_the_instance_keeps_what_was_staged_before() {
+        let tmp = TempDir::new("inbox-restage");
+        let first = InboxStaging::for_instance(&tmp.path, "inst")
+            .stage(
+                PEER,
+                &WirePath::parse("docs/a.md").unwrap(),
+                &digest(b"first"),
+                b"first",
+            )
+            .unwrap();
+
+        let second = InboxStaging::for_instance(&tmp.path, "inst")
+            .stage(
+                PEER,
+                &WirePath::parse("docs/b.md").unwrap(),
+                &digest(b"second"),
+                b"second",
+            )
+            .unwrap();
+
+        assert_eq!(fs::read(&first).unwrap(), b"first");
+        assert_eq!(fs::read(&second).unwrap(), b"second");
+        let mut found = files_under(&inbox_root(&tmp.path, "inst"));
+        found.sort();
+        assert_eq!(found, [first, second]);
     }
 
     #[test]

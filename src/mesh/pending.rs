@@ -2046,4 +2046,68 @@ mod tests {
             "the oldest, still awaiting a reply, stays"
         );
     }
+
+    // ---- usage probe (TASK-108): spec-first patterns not pinned above ----
+
+    /// Criterion (g): both record versions moved 1 → 2 under the refuse-only regime, so a
+    /// file the PREVIOUS build wrote (version 1, no `thread`) is refused whole with the
+    /// `schema::version_refusal` wording naming both versions and "no migration" — never
+    /// read as a store with zero records, never migrated in place.
+    #[test]
+    fn a_version_one_pending_or_inbound_file_from_the_previous_build_is_refused_not_migrated() {
+        assert_eq!(PENDING_RECORD_VERSION, 2);
+        assert_eq!(INBOUND_RECORD_VERSION, 2);
+        let tmp = TempDir::new("pending-v1-previous-build");
+        let now = t(1_000);
+
+        let mut v1_pending = serde_json::to_value(record("q1", now, PendingState::Open)).unwrap();
+        v1_pending["version"] = serde_json::json!(1);
+        v1_pending.as_object_mut().unwrap().remove("thread");
+        let pending = PendingStore::new(&tmp.path, "inst");
+        fs::create_dir_all(pending.path().parent().unwrap()).unwrap();
+        fs::write(pending.path(), format!("{v1_pending}\n")).unwrap();
+
+        let mut v1_inbound = serde_json::to_value(inbound("peer-q", now)).unwrap();
+        v1_inbound["version"] = serde_json::json!(1);
+        for placeholder in ["thread", "kind", "paths", "reason"] {
+            v1_inbound.as_object_mut().unwrap().remove(placeholder);
+        }
+        let inbound_store = InboundStore::new(&tmp.path, "inst");
+        fs::create_dir_all(inbound_store.path().parent().unwrap()).unwrap();
+        fs::write(inbound_store.path(), format!("{v1_inbound}\n")).unwrap();
+        let before = fs::read(inbound_store.path()).unwrap();
+
+        let err = pending.list(now).unwrap_err().to_string();
+        assert!(err.contains("line 1"), "{err}");
+        assert!(
+            err.contains("is version 1 but this Coyote writes version 2"),
+            "{err}"
+        );
+        assert!(
+            err.contains("no migration exists for versions before 2"),
+            "{err}"
+        );
+        assert!(!err.contains("upgrade Coyote"), "{err}");
+
+        let err = inbound_store.list(now).unwrap_err().to_string();
+        assert!(err.contains("line 1"), "{err}");
+        assert!(
+            err.contains("is version 1 but this Coyote writes version 2"),
+            "{err}"
+        );
+        assert!(
+            err.contains("no migration exists for versions before 2"),
+            "{err}"
+        );
+        assert!(inbound_store.get("peer-q").is_err(), "a lookup refuses too");
+        assert_eq!(
+            fs::read(inbound_store.path()).unwrap(),
+            before,
+            "refusal leaves the old file byte-for-byte as it was"
+        );
+        assert!(
+            Correlations::new().attach_store(pending, now).is_err(),
+            "attaching the refused store surfaces the refusal rather than an empty store"
+        );
+    }
 }

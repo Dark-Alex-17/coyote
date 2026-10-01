@@ -5596,6 +5596,7 @@ pub(crate) mod network {
                 disposition: None,
                 retry_after: None,
                 parts: Vec::new(),
+                dropped_parts: 0,
             }))
         );
         node.nothing_else_received();
