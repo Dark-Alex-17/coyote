@@ -349,6 +349,8 @@ mesh:
   propagation_sync_interval_secs: 300 # Seconds between automatic fetches of the messages a propagation node holds for this node; the first fetch runs once a propagation node is heard after the node joins (default: 300; 0 = fetch only on .mesh fetch; at most 31536000); off while `announce` is false
   fetch:                         # File sharing between trusted peers (more keys arrive with the share set)
     inline_max_bytes: 65536      # Largest file a peer may attach inline to a message; larger files are dropped by the receiver (default: 65536; must be 1 to 98304, the per-message total)
+    max_bytes: 4194304           # Largest file this node serves to a peer that fetches it; a larger one is refused (default: 4194304; must be 1 to 4194304, 4 MiB)
+    inbox_dir: null              # Absolute directory where fetched files are staged, under <inbox_dir>/<instance id> (default: null = <cache dir>/mesh/inbox/<instance id>)
 
 # ---- Clients ----
 # See the [Clients documentation](https://github.com/Dark-Alex-17/coyote/wiki/Clients) for more details

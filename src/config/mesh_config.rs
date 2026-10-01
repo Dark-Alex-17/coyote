@@ -2,6 +2,7 @@ use crate::mesh::card::ABOUT_MAX_CHARS;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::path::PathBuf;
 
 pub const DEFAULT_KNOCK_RETENTION_HOURS: u64 = 24;
 pub const DEFAULT_PEER_MAX_CONCURRENT: u32 = 1;
@@ -14,6 +15,10 @@ pub const MAX_PROPAGATION_SYNC_INTERVAL_SECS: u64 = 31_536_000;
 pub const DEFAULT_INLINE_MAX_BYTES: u64 = 64 * 1024;
 /// Σ inline file bytes one message may carry; `inline_max_bytes` cannot exceed it.
 pub const MAX_INLINE_FILE_TOTAL: u64 = 96 * 1024;
+pub const DEFAULT_FETCH_MAX_BYTES: u64 = 4 * 1024 * 1024;
+/// Largest file a fetch may serve; `max_bytes` cannot exceed it, so a fetch response frame
+/// is bounded by this plus its framing.
+pub const MAX_FETCH_FILE_BYTES: u64 = 4 * 1024 * 1024;
 /// Width of the label column in `.mesh info`, shared by every row so the values line up
 /// whichever module renders them.
 pub const MESH_INFO_LABEL_WIDTH: usize = 32;
@@ -88,12 +93,20 @@ pub struct MeshConfig {
 pub struct MeshFetch {
     /// Largest file a peer may attach inline to a message; the receiver drops larger ones.
     pub inline_max_bytes: u64,
+    /// Largest file this node serves to a peer that fetches it; a larger one is refused.
+    pub max_bytes: u64,
+    /// Where fetched files are staged, under `<inbox_dir>/<instance id>`; unset stages them
+    /// under the cache dir.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inbox_dir: Option<PathBuf>,
 }
 
 impl Default for MeshFetch {
     fn default() -> Self {
         Self {
             inline_max_bytes: DEFAULT_INLINE_MAX_BYTES,
+            max_bytes: DEFAULT_FETCH_MAX_BYTES,
+            inbox_dir: None,
         }
     }
 }
@@ -199,6 +212,20 @@ impl MeshConfig {
         if !(1..=MAX_INLINE_FILE_TOTAL).contains(&inline) {
             bail!(
                 "mesh.fetch.inline_max_bytes is {inline}, which is out of range; use 1 to {MAX_INLINE_FILE_TOTAL}"
+            );
+        }
+        let max = self.fetch.max_bytes;
+        if !(1..=MAX_FETCH_FILE_BYTES).contains(&max) {
+            bail!(
+                "mesh.fetch.max_bytes is {max}, which is out of range; use 1 to {MAX_FETCH_FILE_BYTES}"
+            );
+        }
+        if let Some(dir) = &self.fetch.inbox_dir
+            && !dir.is_absolute()
+        {
+            bail!(
+                "mesh.fetch.inbox_dir is '{}', which is not absolute; use an absolute path",
+                dir.display()
             );
         }
         Ok(())
@@ -388,6 +415,14 @@ pub fn render_mesh_info(mesh: &MeshConfig) -> String {
         "fetch.inline_max_bytes",
         mesh.fetch.inline_max_bytes.to_string(),
     );
+    row("fetch.max_bytes", mesh.fetch.max_bytes.to_string());
+    row(
+        "fetch.inbox_dir",
+        mesh.fetch
+            .inbox_dir
+            .as_ref()
+            .map_or_else(|| "(default)".to_string(), |dir| dir.display().to_string()),
+    );
     output
 }
 
@@ -423,8 +458,12 @@ mod tests {
         assert_eq!(mesh.peer_max_cost_usd_per_hour, 0.0);
         assert_eq!(mesh.propagation_sync_interval_secs, 300);
         assert_eq!(mesh.fetch.inline_max_bytes, 65_536);
+        assert_eq!(mesh.fetch.max_bytes, 4_194_304);
+        assert_eq!(mesh.fetch.inbox_dir, None);
         assert_eq!(DEFAULT_INLINE_MAX_BYTES, 65_536);
         assert_eq!(MAX_INLINE_FILE_TOTAL, 98_304);
+        assert_eq!(DEFAULT_FETCH_MAX_BYTES, 4_194_304);
+        assert_eq!(MAX_FETCH_FILE_BYTES, 4_194_304);
     }
 
     #[test]
@@ -894,6 +933,7 @@ mod tests {
             let mesh = MeshConfig {
                 fetch: MeshFetch {
                     inline_max_bytes: accepted,
+                    ..Default::default()
                 },
                 ..enabled.clone()
             };
@@ -903,6 +943,7 @@ mod tests {
             let mesh = MeshConfig {
                 fetch: MeshFetch {
                     inline_max_bytes: refused,
+                    ..Default::default()
                 },
                 ..enabled.clone()
             };
@@ -914,6 +955,87 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[test]
+    fn validate_keeps_fetch_max_bytes_between_one_and_the_file_ceiling() {
+        let enabled = MeshConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        for accepted in [1, DEFAULT_FETCH_MAX_BYTES, MAX_FETCH_FILE_BYTES] {
+            let mesh = MeshConfig {
+                fetch: MeshFetch {
+                    max_bytes: accepted,
+                    ..Default::default()
+                },
+                ..enabled.clone()
+            };
+            mesh.validate(true).unwrap();
+        }
+        for refused in [0, MAX_FETCH_FILE_BYTES + 1, u64::MAX] {
+            let mesh = MeshConfig {
+                fetch: MeshFetch {
+                    max_bytes: refused,
+                    ..Default::default()
+                },
+                ..enabled.clone()
+            };
+            let err = mesh.validate(true).unwrap_err().to_string();
+            assert_eq!(
+                err,
+                format!(
+                    "mesh.fetch.max_bytes is {refused}, which is out of range; use 1 to 4194304"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn validate_requires_an_absolute_inbox_dir_when_one_is_set() {
+        let enabled = MeshConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let absolute = std::env::temp_dir();
+        let mesh = MeshConfig {
+            fetch: MeshFetch {
+                inbox_dir: Some(absolute.clone()),
+                ..Default::default()
+            },
+            ..enabled.clone()
+        };
+        mesh.validate(true).unwrap();
+
+        let relative = MeshConfig {
+            fetch: MeshFetch {
+                inbox_dir: Some(PathBuf::from("relative/inbox")),
+                ..Default::default()
+            },
+            ..enabled
+        };
+        let err = relative.validate(true).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "mesh.fetch.inbox_dir is 'relative/inbox', which is not absolute; use an absolute path"
+        );
+    }
+
+    #[test]
+    fn fetch_block_reads_max_bytes_and_inbox_dir_and_omits_an_unset_inbox_dir() {
+        let cfg: Config = serde_yaml::from_str(
+            "mesh:\n  fetch:\n    max_bytes: 1024\n    inbox_dir: /srv/inbox\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.mesh.fetch.max_bytes, 1024);
+        assert_eq!(cfg.mesh.fetch.inbox_dir, Some(PathBuf::from("/srv/inbox")));
+        assert_eq!(cfg.mesh.fetch.inline_max_bytes, DEFAULT_INLINE_MAX_BYTES);
+
+        let serialized = serde_yaml::to_string(&MeshFetch::default()).unwrap();
+        assert!(!serialized.contains("inbox_dir"), "{serialized}");
+        assert!(serialized.contains("max_bytes: 4194304\n"), "{serialized}");
+        let null: Config = serde_yaml::from_str("mesh:\n  fetch:\n    inbox_dir: null\n").unwrap();
+        assert_eq!(null.mesh.fetch, MeshFetch::default());
     }
 
     #[test]
@@ -1023,7 +1145,31 @@ mod tests {
             "{info}"
         );
         assert!(
-            info.ends_with("  fetch.inline_max_bytes          65536\n"),
+            info.contains("  fetch.inline_max_bytes          65536\n"),
+            "{info}"
+        );
+        assert!(
+            info.ends_with(
+                "  fetch.max_bytes                 4194304\n  fetch.inbox_dir                 (default)\n"
+            ),
+            "{info}"
+        );
+    }
+
+    #[test]
+    fn render_mesh_info_shows_a_configured_inbox_dir() {
+        let mesh = MeshConfig {
+            fetch: MeshFetch {
+                inbox_dir: Some(PathBuf::from("/srv/inbox")),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let info = render_mesh_info(&mesh);
+
+        assert!(
+            info.ends_with("  fetch.inbox_dir                 /srv/inbox\n"),
             "{info}"
         );
     }

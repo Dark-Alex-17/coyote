@@ -69,8 +69,17 @@ impl InboxStaging {
         Self { root }
     }
 
-    pub(crate) fn for_instance(cache_dir: &Path, instance_id: &str) -> Self {
-        Self::new(inbox_root(cache_dir, instance_id))
+    /// The instance's inbox: `<root_override>/<instance_id>` when `mesh.fetch.inbox_dir`
+    /// is set, else `inbox_root` under the cache dir.
+    pub(crate) fn for_instance_under(
+        root_override: Option<&Path>,
+        cache_dir: &Path,
+        instance_id: &str,
+    ) -> Self {
+        Self::new(root_override.map_or_else(
+            || inbox_root(cache_dir, instance_id),
+            |root| root.join(instance_id),
+        ))
     }
 
     /// Writes `bytes` under `<root>/<peer-dest8>/<rel>` and returns the absolute staged
@@ -235,9 +244,20 @@ mod tests {
             cache_dir.join("mesh").join("inbox").join("inst")
         );
         assert_eq!(
-            InboxStaging::for_instance(cache_dir, "inst").root,
+            InboxStaging::for_instance_under(None, cache_dir, "inst").root,
             inbox_root(cache_dir, "inst")
         );
+    }
+
+    #[test]
+    fn a_configured_inbox_dir_replaces_the_cache_root_but_keeps_the_instance_directory() {
+        let cache_dir = Path::new("cache");
+        let configured = Path::new("/srv/coyote-inbox");
+
+        let staging = InboxStaging::for_instance_under(Some(configured), cache_dir, "inst");
+
+        assert_eq!(staging.root, configured.join("inst"));
+        assert!(!staging.root.starts_with(cache_dir));
     }
 
     #[test]
@@ -457,7 +477,7 @@ mod tests {
     #[test]
     fn reopening_the_inbox_for_the_instance_keeps_what_was_staged_before() {
         let tmp = TempDir::new("inbox-restage");
-        let first = InboxStaging::for_instance(&tmp.path, "inst")
+        let first = InboxStaging::for_instance_under(None, &tmp.path, "inst")
             .stage(
                 PEER,
                 &WirePath::parse("docs/a.md").unwrap(),
@@ -466,7 +486,7 @@ mod tests {
             )
             .unwrap();
 
-        let second = InboxStaging::for_instance(&tmp.path, "inst")
+        let second = InboxStaging::for_instance_under(None, &tmp.path, "inst")
             .stage(
                 PEER,
                 &WirePath::parse("docs/b.md").unwrap(),
@@ -559,7 +579,7 @@ mod tests {
         let linked_cache = tmp.path.join("cache");
         std::os::unix::fs::symlink(&real_cache, &linked_cache).unwrap();
 
-        let through_link = InboxStaging::for_instance(&linked_cache, "inst");
+        let through_link = InboxStaging::for_instance_under(None, &linked_cache, "inst");
         let rel = WirePath::parse("docs/a.md").unwrap();
         let staged = through_link
             .stage(PEER, &rel, &digest(b"x"), b"x")
@@ -579,7 +599,7 @@ mod tests {
         );
         assert_eq!(files_under(&resolved_root), vec![staged.clone()]);
 
-        let through_real = InboxStaging::for_instance(&real_cache, "inst");
+        let through_real = InboxStaging::for_instance_under(None, &real_cache, "inst");
         assert_eq!(
             through_real.stage(PEER, &rel, &digest(b"x"), b"x").unwrap(),
             staged,

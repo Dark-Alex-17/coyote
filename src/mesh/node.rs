@@ -231,6 +231,8 @@ pub(crate) struct MeshRuntime {
     about: Option<String>,
     peer_limits: PeerLimitConfig,
     inline_max_bytes: u64,
+    /// `mesh.fetch.inbox_dir`; `None` stages under the cache dir.
+    inbox_dir: Option<PathBuf>,
     cache_dir: PathBuf,
     interface_labels: Vec<String>,
     interface_kinds: Vec<&'static str>,
@@ -389,6 +391,7 @@ impl MeshRuntime {
             about: config.about.clone(),
             peer_limits: PeerLimitConfig::from(config),
             inline_max_bytes: config.fetch.inline_max_bytes,
+            inbox_dir: config.fetch.inbox_dir.clone(),
             cache_dir: paths.cache_dir,
             interface_labels: plans.iter().map(InterfacePlan::label).collect(),
             interface_kinds: plans.iter().map(InterfacePlan::kind).collect(),
@@ -2816,7 +2819,11 @@ impl PeerSurface for MeshSlot {
     /// The running instance's inbox; with the mesh off there is nowhere to stage a file.
     fn inbox_staging(&self) -> Option<InboxStaging> {
         self.get().map(|runtime| {
-            InboxStaging::for_instance(runtime.cache_dir(), &runtime.current_instance_id())
+            InboxStaging::for_instance_under(
+                runtime.inbox_dir.as_deref(),
+                runtime.cache_dir(),
+                &runtime.current_instance_id(),
+            )
         })
     }
 }
