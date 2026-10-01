@@ -82,7 +82,7 @@ pub struct MeshConfig {
     pub fetch: MeshFetch,
 }
 
-/// File-sharing knobs. TASK-108 creates the block with one key; TASK-109 adds the rest.
+/// File-sharing knobs; later work adds the rest of the block, the name is fixed.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MeshFetch {

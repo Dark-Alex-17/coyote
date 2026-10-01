@@ -350,12 +350,16 @@ pub(crate) fn outbound_from_args(
     OutboundPeer::new(kind, message, title, in_reply_to, None)?.with_thread(thread)
 }
 
-/// A reply that names no thread inherits the answered message's, so the wire carries
-/// it and the receiver need not infer: the filed inbound's thread when `.mesh answer`
-/// still has it on record, the open question's when the reply answers one of ours,
-/// otherwise the answered id, which is the root of any thread this node never saw. A
-/// root message keeps `None` for the receiver to read as its id.
-fn inherit_reply_thread(slot: &MeshSlot, out: OutboundPeer) -> Result<OutboundPeer, SendError> {
+/// A reply that names no thread inherits the answered message's when this node knows
+/// it: the filed inbound's thread when `.mesh answer` still has it on record, the open
+/// question's when the reply answers one of ours. Otherwise the wire carries no thread
+/// and the receiver inherits from its own correlation, which knows the thread the ask
+/// was sent in where this node does not. A root message keeps `None` for the receiver
+/// to read as its id.
+pub(crate) fn inherit_reply_thread(
+    slot: &MeshSlot,
+    out: OutboundPeer,
+) -> Result<OutboundPeer, SendError> {
     let Some(id) = out.in_reply_to.as_deref() else {
         return Ok(out);
     };
@@ -372,10 +376,10 @@ fn inherit_reply_thread(slot: &MeshSlot, out: OutboundPeer) -> Result<OutboundPe
             None
         }
     });
-    let thread = filed
-        .or_else(|| slot.correlations().thread_of(id))
-        .unwrap_or_else(|| id.to_string());
-    out.with_thread(Some(thread))
+    match filed.or_else(|| slot.correlations().thread_of(id)) {
+        Some(thread) => out.with_thread(Some(thread)),
+        None => Ok(out),
+    }
 }
 
 pub(crate) fn trust_label(verdict: Verdict) -> &'static str {
@@ -1107,11 +1111,10 @@ mod tests {
 
         let unknown = reply(json!({"in_reply_to": "m-9"}));
         assert_eq!(
-            unknown.thread.as_deref(),
-            Some("m-9"),
-            "an answered message this node never filed is the root of its thread"
+            unknown.thread, None,
+            "an answered message this node never filed leaves the thread to the receiver"
         );
-        assert_ne!(unknown.thread.as_deref(), Some(unknown.id.as_str()));
+        assert_eq!(body_thread(&unknown), None);
 
         let chosen = reply(json!({"in_reply_to": "a-1", "thread": "t-other"}));
         assert_eq!(chosen.thread.as_deref(), Some("t-other"));
@@ -1448,6 +1451,61 @@ mod tests {
             PendingState::Escalated
         );
         assert_eq!(handle_check_inbox(&slot)["escalated"], json!(["q1"]));
+    }
+
+    /// Usage probe: the realistic order. The asker is already blocked in `mesh__collect`
+    /// with a long timeout when the peer's escalation lands; the call must come back as
+    /// `escalated` promptly rather than at the deadline, every later collect says the same
+    /// at once while the question waits on, and the human's eventual answer still collects
+    /// as `replied` in the question's thread.
+    #[tokio::test]
+    async fn usage_probe_an_escalation_landing_mid_wait_returns_collect_promptly_and_the_answer_still_lands()
+     {
+        let ctx = plain_ctx();
+        let slot = Arc::clone(&ctx.app.mesh);
+        open_question(&slot, "q1");
+
+        let deliver_to = Arc::clone(&slot);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            deliver_to.deliver_peer(PeerMessage::new(RawPeerMessage {
+                disposition: Some(Disposition::Escalated),
+                ..raw_message(PeerKind::Reply, "r-esc", Some("q1"))
+            }));
+        });
+
+        let started = std::time::Instant::now();
+        let escalated = handle_collect(&ctx, &json!({"id": "q1", "timeout_secs": 600}))
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(escalated["status"], "escalated", "{escalated}");
+        assert!(
+            elapsed >= Duration::from_millis(250) && elapsed < Duration::from_secs(3),
+            "collect returned {elapsed:?}: it must wait for the escalation, then come back promptly"
+        );
+        assert!(slot.correlations().is_open("q1"), "the question waits on");
+
+        let started = std::time::Instant::now();
+        let again = handle_collect(&ctx, &json!({"id": "q1", "timeout_secs": 600}))
+            .await
+            .unwrap();
+        assert_eq!(again["status"], "escalated", "{again}");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+
+        slot.deliver_peer(peer_message(PeerKind::Reply, "r-human", Some("q1")));
+        let replied = handle_collect(&ctx, &json!({"id": "q1", "timeout_secs": 5}))
+            .await
+            .unwrap();
+        assert_eq!(replied["status"], "replied", "{replied}");
+        assert_eq!(replied["reply"]["message_id"], "r-human");
+        assert_eq!(replied["disposition"], "answered");
+        assert_eq!(replied["thread"], "q1");
+        assert!(slot.correlations().get("q1").is_none(), "collected");
     }
 
     #[tokio::test]

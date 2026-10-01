@@ -2398,6 +2398,7 @@ mod tests {
         assert!(is_windows_reserved_name("com1"));
         assert!(is_windows_reserved_name("com0"));
         assert!(is_windows_reserved_name("LPT\u{B9}.txt"));
+        assert!(is_windows_reserved_name("con .txt"));
         assert!(!is_windows_reserved_name("com10"));
         assert!(!is_windows_reserved_name("console"));
         assert!(!is_windows_reserved_name("nullable.yaml"));

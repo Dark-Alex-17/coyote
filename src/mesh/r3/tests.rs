@@ -472,7 +472,7 @@ pub(crate) mod network {
     };
     use crate::config::mesh_config::MeshInterface;
     use crate::config::{ForkRekey, MeshConfig, Session};
-    use crate::function::mesh::outbound_from_args;
+    use crate::function::mesh::{inherit_reply_thread, outbound_from_args};
     use crate::mesh::announce::AnnounceAppData;
     use crate::mesh::brief::Digest;
     use crate::mesh::card::{
@@ -5560,6 +5560,65 @@ pub(crate) mod network {
             slot.correlations().take_answer(&ask.id),
             None,
             "an answer is handed over once"
+        );
+        pair.stop_node_a().await;
+    }
+
+    /// Node A asks in thread `t-1`; node B answers through the send tool without naming
+    /// a thread and knows nothing of the ask beyond its id, so the wire carries none.
+    /// A files the answer under `t-1` from its own correlation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reply_naming_no_thread_lands_in_the_thread_the_ask_was_sent_in() {
+        let pair = NodePair::start_with("r3-peer-reply-thread", |_| {}, trusting_b).await;
+        pair.introduce_b_to_a().await;
+        let (slot, _idle) = installed_slot(&pair);
+        let b_instance = pair.responder.desc.address_hash.to_hex_string();
+        let ask = OutboundPeer::new(PeerKind::Ask, "which thread", None, None, None)
+            .unwrap()
+            .with_thread(Some("t-1".into()))
+            .unwrap();
+        pair.recorder_b
+            .queue(Script::Reply(Reply::Value(received_reply(&ask.id))));
+        slot.correlations()
+            .open(PendingRecord {
+                thread: "t-1".into(),
+                ..pending_for(&ask, &pair.responder)
+            })
+            .unwrap();
+        pair.node_a
+            .send_peer_with(&b_instance, &ask, peer_send_options())
+            .await
+            .unwrap();
+
+        let reply = inherit_reply_thread(
+            &MeshSlot::default(),
+            outbound_from_args(
+                PeerKind::Message,
+                "this one",
+                &serde_json::json!({ "in_reply_to": ask.id }),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(reply.thread, None, "B knows no thread to put on the wire");
+        let outcome = b_sends_to_a(&pair, &reply).await.unwrap();
+        assert!(is_received_reply(&outcome.value, &reply.id));
+
+        let waited = slot
+            .correlations()
+            .wait(&ask.id, Duration::from_secs(5))
+            .await;
+        let WaitOutcome::Replied(answer) = waited else {
+            panic!("the reply must answer the question: {waited:?}");
+        };
+        assert_eq!(answer.thread(), "t-1");
+        let (envelopes, _) = slot.peer_inbox().drain();
+        assert_eq!(only_peer(&envelopes).thread.as_deref(), Some("t-1"));
+        assert_eq!(
+            slot.correlations()
+                .take_answer(&ask.id)
+                .and_then(|answer| answer.thread),
+            Some("t-1".to_string())
         );
         pair.stop_node_a().await;
     }

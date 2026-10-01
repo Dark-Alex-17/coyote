@@ -65,6 +65,7 @@ pub(crate) const MAX_PARTS: usize = 8;
 /// the store-and-forward route, with room for the LXMF header (user ruling 2026-09-30).
 pub(crate) const MAX_PARTS_BYTES: usize = 104 * 1024;
 const SHA256_MISMATCH: &str = "file part sha256 does not match its bytes";
+const DATA_PART_RULE: &str = "data part is too large or nests too deeply";
 /// Peer envelopes the inbox holds before the oldest is dropped; the loss is counted.
 pub(crate) const PEER_INBOX_CAPACITY: usize = 64;
 /// Ceiling on the direct attempt. The handler answers before anything slow happens, so a
@@ -537,56 +538,74 @@ fn encode_parts(parts: &[RawPart]) -> Value {
 }
 
 /// Reads `parts`: the parts read, and how many were lost to the shape. A value that is
-/// not a list reads as no parts with one dropped; an element that is not a map, names no
-/// known `type` or lacks that type's fields is skipped, so a part this build does not
-/// know never costs the message its words.
+/// not a list reads as no parts with one dropped; an element that is not a map or names
+/// no known `type` is skipped, so a part this build does not know never costs the
+/// message its words; one of a known type whose fields do not decode is dropped and
+/// counted, since the sender meant it and the receiver can tell.
 fn decode_parts(value: &Value) -> (Vec<RawPart>, u32) {
-    match value.as_array() {
-        Some(items) => (items.iter().filter_map(decode_part).collect(), 0),
-        None => (Vec::new(), 1),
+    let Some(items) = value.as_array() else {
+        return (Vec::new(), 1);
+    };
+    let mut parts = Vec::new();
+    let mut dropped = 0u32;
+    for item in items {
+        let Some(entries) = item.as_map() else {
+            continue;
+        };
+        let Some(kind) = entry(entries, "type").and_then(text_of) else {
+            continue;
+        };
+        match decode_part(&kind, entries) {
+            Some(Some(part)) => parts.push(part),
+            Some(None) => dropped += 1,
+            None => {}
+        }
     }
+    (parts, dropped)
 }
 
-fn decode_part(value: &Value) -> Option<RawPart> {
-    let entries = value.as_map()?;
-    let kind = entry(entries, "type").and_then(text_of)?;
-    match kind.as_str() {
-        "text" => Some(RawPart::Text {
-            text: entry(entries, "text").and_then(text_of)?,
-        }),
-        "data" => Some(RawPart::Data {
-            data: json_from_rmpv(entry_or_nil(entries, "data")?, 1)?,
-        }),
-        "file" => {
-            let name = entry(entries, "name").and_then(text_of)?;
-            let size = entry(entries, "size").and_then(Value::as_u64)?;
-            let Value::Binary(digest) = entry(entries, "sha256")? else {
-                return None;
-            };
-            let sha256 = <[u8; 32]>::try_from(digest.as_slice()).ok()?;
-            let bytes = match entry(entries, "bytes") {
-                None => None,
-                Some(Value::Binary(bytes)) => Some(bytes.clone()),
-                Some(_) => return None,
-            };
-            let reference = match entry(entries, "ref") {
-                None => None,
-                Some(Value::Map(reference)) => Some(entry(reference, "path").and_then(text_of)?),
-                Some(_) => return None,
-            };
-            if bytes.is_some() == reference.is_some() {
-                return None;
-            }
-            Some(RawPart::File {
-                name,
-                size,
-                sha256,
-                bytes,
-                reference,
-            })
-        }
-        _ => None,
+/// `None` for a `type` this build does not know; `Some(None)` for a known type whose
+/// fields do not decode.
+fn decode_part(kind: &str, entries: &[(Value, Value)]) -> Option<Option<RawPart>> {
+    Some(match kind {
+        "text" => entry(entries, "text")
+            .and_then(text_of)
+            .map(|text| RawPart::Text { text }),
+        "data" => entry_or_nil(entries, "data")
+            .and_then(|data| json_from_rmpv(data, 1))
+            .map(|data| RawPart::Data { data }),
+        "file" => decode_file_part(entries),
+        _ => return None,
+    })
+}
+
+fn decode_file_part(entries: &[(Value, Value)]) -> Option<RawPart> {
+    let name = entry(entries, "name").and_then(text_of)?;
+    let size = entry(entries, "size").and_then(Value::as_u64)?;
+    let Value::Binary(digest) = entry(entries, "sha256")? else {
+        return None;
+    };
+    let sha256 = <[u8; 32]>::try_from(digest.as_slice()).ok()?;
+    let bytes = match entry(entries, "bytes") {
+        None => None,
+        Some(Value::Binary(bytes)) => Some(bytes.clone()),
+        Some(_) => return None,
+    };
+    let reference = match entry(entries, "ref") {
+        None => None,
+        Some(Value::Map(reference)) => Some(entry(reference, "path").and_then(text_of)?),
+        Some(_) => return None,
+    };
+    if bytes.is_some() == reference.is_some() {
+        return None;
     }
+    Some(RawPart::File {
+        name,
+        size,
+        sha256,
+        bytes,
+        reference,
+    })
 }
 
 /// The rule `part` breaks, if any, given the inline bytes already admitted before it.
@@ -599,7 +618,7 @@ fn part_violation(part: &RawPart, limits: &PartLimits, inline_so_far: u64) -> Op
         }
         RawPart::Data { data } => sanitize_fields(data.clone())
             .is_err()
-            .then_some("data part is too large or nests too deeply"),
+            .then_some(DATA_PART_RULE),
         RawPart::File {
             name,
             size,
@@ -686,6 +705,21 @@ fn admit_parts(
         dropped += 1;
     }
     (admitted, dropped)
+}
+
+/// `part` as the receiver would keep it, so the sender's caps measure what travels: text
+/// cleaned, data sanitised. Text that cleans to nothing is refused rather than sent for
+/// the receiver to drop.
+fn normalise_part(part: RawPart) -> Result<RawPart, &'static str> {
+    Ok(match part {
+        RawPart::Text { text } => RawPart::Text {
+            text: display_text(&text, usize::MAX).ok_or("text part is blank")?,
+        },
+        RawPart::Data { data } => RawPart::Data {
+            data: sanitize_fields(data).map_err(|_| DATA_PART_RULE)?,
+        },
+        file @ RawPart::File { .. } => file,
+    })
 }
 
 /// An admitted part as the message keeps it, or `None` for one nothing can be kept of:
@@ -825,6 +859,11 @@ impl OutboundPeer {
         if parts.len() > MAX_PARTS {
             return Err(SendError::InvalidParts("too many parts"));
         }
+        let parts = parts
+            .into_iter()
+            .map(normalise_part)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(SendError::InvalidParts)?;
         let mut inline_so_far = 0u64;
         for part in &parts {
             if let Some(rule) = part_violation(part, limits, inline_so_far) {
@@ -1776,6 +1815,7 @@ pub(crate) struct PeerAdmission<'a> {
     pub kind: PeerKind,
     pub in_reply_to: Option<&'a str>,
     pub thread: Option<&'a str>,
+    pub disposition: Option<Disposition>,
     pub via: PeerVia,
 }
 
@@ -1850,6 +1890,7 @@ impl Handler for PeerMessageHandler {
             kind: body.kind,
             in_reply_to: body.in_reply_to.as_deref(),
             thread: body.thread.as_deref(),
+            disposition: body.disposition,
             via: PeerVia::Direct,
         };
         if let Err(refusal) = surface.admit_peer_message(&admission) {
@@ -1992,6 +2033,7 @@ impl InboundSink for PeerRouting<'_> {
             kind,
             in_reply_to: raw.in_reply_to.as_deref(),
             thread: raw.thread.as_deref(),
+            disposition: raw.disposition,
             via: PeerVia::StoreAndForward,
         };
         let admitted = surface.admit_peer_message(&admission);
@@ -3633,6 +3675,43 @@ mod tests {
     }
 
     #[test]
+    fn a_known_part_that_does_not_decode_is_dropped_and_counted_on_the_wire() {
+        let too_deep = (0..PEER_FIELDS_MAX_DEPTH + 1).fold(Value::from(1), |inner, _| {
+            Value::Map(vec![(Value::from("n"), inner)])
+        });
+        let body = body_entries(PeerKind::Message, |entries| {
+            set_entry(
+                entries,
+                "parts",
+                Value::Array(vec![
+                    Value::Map(vec![
+                        (Value::from("type"), Value::from("data")),
+                        (Value::from("data"), too_deep.clone()),
+                    ]),
+                    Value::Map(vec![(Value::from("type"), Value::from("text"))]),
+                    Value::Map(vec![
+                        (Value::from("type"), Value::from("file")),
+                        (Value::from("name"), Value::from("a.bin")),
+                    ]),
+                    Value::Map(vec![(Value::from("type"), Value::from("sticker"))]),
+                ]),
+            );
+        });
+        let decoded = from_r3_body(&round_trip(&body)).unwrap();
+        assert_eq!(decoded.parts, vec![]);
+        assert_eq!(
+            decoded.dropped_parts, 3,
+            "each known type that does not decode counts; the unknown one is skipped"
+        );
+        let message = PeerMessage::new(RawPeerMessage {
+            dropped_parts: decoded.dropped_parts,
+            ..raw(&decoded.content)
+        });
+        assert_eq!(message.content, "hi");
+        assert_eq!(message.dropped_parts, 3);
+    }
+
+    #[test]
     fn a_ninth_part_is_dropped_and_counted() {
         let parts = (0..MAX_PARTS + 1)
             .map(|n| text_part(&format!("part {n}")))
@@ -4469,8 +4548,24 @@ mod tests {
         let wide_data = serde_json::json!({ "k": "x".repeat(PEER_FIELDS_MAX_BYTES) });
         assert_eq!(
             send(vec![RawPart::Data { data: wide_data }], &limits).unwrap_err(),
-            SendError::InvalidParts("data part is too large or nests too deeply")
+            SendError::InvalidParts(DATA_PART_RULE)
         );
+        let too_deep = (0..PEER_FIELDS_MAX_DEPTH + 1).fold(
+            serde_json::json!(1),
+            |inner, _| serde_json::json!({ "n": inner }),
+        );
+        assert_eq!(
+            send(vec![RawPart::Data { data: too_deep }], &limits).unwrap_err(),
+            SendError::InvalidParts(DATA_PART_RULE)
+        );
+
+        for blank in ["", "   ", "\u{1b}[2J", "\u{200B}"] {
+            assert_eq!(
+                send(vec![text_part(blank)], &limits).unwrap_err(),
+                SendError::InvalidParts("text part is blank"),
+                "{blank:?}"
+            );
+        }
 
         let over_encoded = (0..MAX_PARTS)
             .map(|n| {
@@ -4485,18 +4580,26 @@ mod tests {
             SendError::InvalidParts("parts are too large once encoded")
         );
 
-        // The positive control: the same shapes inside every cap are accepted.
+        // The positive control: the same shapes inside every cap are accepted, stored as
+        // the receiver would keep them.
         let ok = send(
             vec![
-                text_part("fits"),
+                text_part("  fits\u{1b}[2J "),
                 inline_file("a.bin", vec![1; 16]),
                 RawPart::Data {
-                    data: serde_json::json!({ "n": 1 }),
+                    data: serde_json::json!({ "n": 1, " k\u{200B}": "\u{1b}[31mred " }),
                 },
             ],
             &limits,
         )
         .unwrap();
+        assert_eq!(ok.parts[0], text_part("fits"));
+        assert_eq!(
+            ok.parts[2],
+            RawPart::Data {
+                data: serde_json::json!({ "n": 1, "k": "red" })
+            }
+        );
         assert_eq!(ok.parts.len(), 3);
     }
 

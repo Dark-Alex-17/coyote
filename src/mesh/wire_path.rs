@@ -205,6 +205,8 @@ mod tests {
             "COM\u{B9}",
             "lpt\u{B2}.txt",
             "com\u{B3}",
+            "con .txt",
+            "docs/nul  .md",
         ] {
             assert_eq!(rule(text), "reserved_name", "{text:?}");
         }

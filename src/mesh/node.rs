@@ -2452,31 +2452,37 @@ impl MeshSlot {
     }
 
     /// Matches a reply to the question of ours it answers; a reply that named no thread
-    /// inherits the question's, but only once it is known to be the answer we await. A
-    /// reply that answers nothing is downgraded to a message, since to this node it is
-    /// one, and sheds the disposition a message cannot carry; `true` when it matched.
+    /// inherits the question's, on the filed answer and the delivered copy alike, but
+    /// only once `answer` has taken it. A reply that answers nothing is downgraded to a
+    /// message, since to this node it is one, and sheds the thread, disposition and
+    /// retry hint a reply earns and a message cannot carry; `true` when it matched.
     fn answer_correlation(&self, message: &mut PeerMessage) -> bool {
-        if message.kind == PeerKind::Reply
-            && message.thread.is_none()
-            && let Some(id) = message.in_reply_to.as_deref()
-            && self
-                .correlations
-                .accepts_reply_from(id, &message.source_identity)
-        {
-            message.thread = self.correlations.thread_of(id);
+        if message.kind != PeerKind::Reply {
+            return false;
         }
-        let answered = message.kind == PeerKind::Reply
-            && message
-                .in_reply_to
-                .as_deref()
-                .is_some_and(|id| self.correlations.answer(id, message.clone()));
-        if message.kind == PeerKind::Reply && !answered {
+        let answered = match message.in_reply_to.as_deref() {
+            Some(id) => {
+                let mut reply = message.clone();
+                if reply.thread.is_none() {
+                    reply.thread = self.correlations.thread_of(id);
+                }
+                let thread = reply.thread.clone();
+                let answered = self.correlations.answer(id, reply);
+                if answered {
+                    message.thread = thread;
+                }
+                answered
+            }
+            None => false,
+        };
+        if !answered {
             debug!(
                 "Mesh reply {} from {} answers no open question of ours; delivering it as a message",
                 message.message_id,
                 short(&message.source_identity)
             );
             message.kind = PeerKind::Message;
+            message.thread = None;
             message.disposition = None;
             message.retry_after = None;
         }
@@ -2744,19 +2750,21 @@ impl KnockSurface for MeshSlot {
 impl PeerSurface for MeshSlot {
     /// A reply to a question this Coyote asked is admitted without being counted: a peer
     /// past its limit must still be able to answer a `mesh__ask`, and the correlation
-    /// only accepts the one reply, from the identity it was asked of, so the exemption
-    /// is spent with it. A refusal on the store-and-forward path also earns the
-    /// peer one typed reply per identity, per reason, per hour, since no link carries a
-    /// code back; on a link the caller's code is the typed refusal. A refused reply
-    /// neither earns nor spends one: a reply to a reply is the loop the envoy guards
-    /// against. The REPL line is folded on its own count, so it prints whether or not the
-    /// peer is told.
+    /// only accepts the one reply (one escalation, then the answer), from the identity
+    /// it was asked of, so the exemption is spent with it. A refusal on the
+    /// store-and-forward path also earns the peer one typed reply per identity, per
+    /// reason, per hour, since no link carries a code back; on a link the caller's code
+    /// is the typed refusal. A refused reply neither earns nor spends one: a reply to a
+    /// reply is the loop the envoy guards against. The REPL line is folded on its own
+    /// count, so it prints whether or not the peer is told.
     fn admit_peer_message(&self, request: &PeerAdmission) -> Result<(), PeerRefusal> {
         if request.kind == PeerKind::Reply
             && let Some(id) = request.in_reply_to
-            && self
-                .correlations
-                .accepts_reply_from(id, request.source_identity)
+            && self.correlations.accepts_reply_from(
+                id,
+                request.source_identity,
+                request.disposition.unwrap_or_default(),
+            )
         {
             return Ok(());
         }
@@ -4125,6 +4133,7 @@ mod tests {
                     kind: PeerKind::Message,
                     in_reply_to: in_reply_to.then_some("a-question-nobody-here-asked"),
                     thread: None,
+                    disposition: None,
                     via,
                 },
             )
@@ -4232,7 +4241,11 @@ mod tests {
         slot.correlations().open(pending("q-ours")).unwrap();
         let identity = hex_lower(&PEER_IDENTITY);
         let instance = hex_lower(&PEER_INSTANCE);
-        let admit_kind = |identity: &str, kind: PeerKind, id: &str, in_reply_to: Option<&str>| {
+        let admit_with = |identity: &str,
+                          kind: PeerKind,
+                          id: &str,
+                          in_reply_to: Option<&str>,
+                          disposition: Option<Disposition>| {
             PeerSurface::admit_peer_message(
                 &slot,
                 &PeerAdmission {
@@ -4242,9 +4255,13 @@ mod tests {
                     kind,
                     in_reply_to,
                     thread: None,
+                    disposition,
                     via: PeerVia::Direct,
                 },
             )
+        };
+        let admit_kind = |identity: &str, kind: PeerKind, id: &str, in_reply_to: Option<&str>| {
+            admit_with(identity, kind, id, in_reply_to, None)
         };
         let admit_as = |identity: &str, id: &str, in_reply_to: Option<&str>| {
             let kind = if in_reply_to.is_some() {
@@ -4270,7 +4287,8 @@ mod tests {
             "an ask naming our open question is not a reply to it and is counted like any message"
         );
         assert!(
-            slot.correlations().accepts_reply_from("q-ours", &identity),
+            slot.correlations()
+                .accepts_reply_from("q-ours", &identity, Disposition::Answered),
             "the refused ask leaves the question open"
         );
         assert!(
@@ -4290,6 +4308,31 @@ mod tests {
                 .reason,
             RefusalReason::RateLimited,
             "citing our open question from another identity spends that identity's own count"
+        );
+        let escalated = |id: &str| {
+            admit_with(
+                &identity,
+                PeerKind::Reply,
+                id,
+                Some("q-ours"),
+                Some(Disposition::Escalated),
+            )
+        };
+        assert!(escalated("esc-1").is_ok());
+        let mut escalation = peer_message(PeerKind::Reply, "esc-1", Some("q-ours"));
+        escalation.disposition = Some(Disposition::Escalated);
+        assert!(
+            slot.correlations().answer("q-ours", escalation),
+            "the asked identity's escalation is the one it earns"
+        );
+        assert_eq!(
+            escalated("esc-2").unwrap_err().reason,
+            RefusalReason::RateLimited,
+            "a second escalation of an escalated question is counted like any message"
+        );
+        assert!(
+            admit("reply-1", Some("q-ours")).is_ok(),
+            "the answer to an escalated question is still admitted"
         );
         assert!(
             slot.correlations().answer(
@@ -4639,6 +4682,7 @@ mod tests {
                     kind: PeerKind::Message,
                     in_reply_to: None,
                     thread,
+                    disposition: None,
                     via: PeerVia::StoreAndForward,
                 },
             )
@@ -4776,6 +4820,7 @@ mod tests {
             .unwrap();
         let mut forged = peer_message(PeerKind::Reply, "r-1", Some("q-1"));
         forged.source_identity = hex_lower(&[0x77; 16]);
+        forged.thread = Some("t-forged".to_string());
         forged.disposition = Some(Disposition::Refused);
         forged.retry_after = Some(30);
 
@@ -4785,14 +4830,90 @@ mod tests {
         let delivered = peer_payload(&envelopes[0]);
         assert_eq!(delivered.kind, PeerKind::Message);
         assert_eq!(delivered.in_reply_to.as_deref(), Some("q-1"));
-        assert_eq!(delivered.thread, None);
+        assert_eq!(
+            delivered.thread, None,
+            "a reply that answers nothing sheds the thread it claimed"
+        );
         assert_eq!(delivered.disposition, None);
         assert_eq!(delivered.retry_after, None);
         assert!(
-            slot.correlations()
-                .accepts_reply_from("q-1", &hex_lower(&PEER_IDENTITY)),
+            slot.correlations().accepts_reply_from(
+                "q-1",
+                &hex_lower(&PEER_IDENTITY),
+                Disposition::Answered
+            ),
             "the question stays open for the identity it was asked of"
         );
+    }
+
+    #[test]
+    fn usage_probe_a_forged_reply_carrying_its_own_thread_never_inherits_ours() {
+        let slot = MeshSlot::default();
+        slot.correlations()
+            .open(PendingRecord {
+                thread: "t-root".to_string(),
+                ..pending("q-1")
+            })
+            .unwrap();
+        let mut forged = peer_message(PeerKind::Reply, "r-1", Some("q-1"));
+        forged.source_identity = hex_lower(&[0x77; 16]);
+        forged.thread = Some("t-forged".to_string());
+        forged.disposition = Some(Disposition::BudgetExhausted);
+        forged.retry_after = Some(120);
+
+        slot.deliver_peer(forged);
+
+        let (envelopes, _) = slot.peer_inbox().drain();
+        let delivered = peer_payload(&envelopes[0]);
+        assert_eq!(delivered.kind, PeerKind::Message);
+        assert_eq!(delivered.disposition, None);
+        assert_eq!(delivered.retry_after, None);
+        assert_eq!(delivered.thread, None);
+        assert!(
+            slot.correlations().accepts_reply_from(
+                "q-1",
+                &hex_lower(&PEER_IDENTITY),
+                Disposition::Answered
+            ),
+            "the question stays open for the identity it was asked of"
+        );
+    }
+
+    /// Usage probe: a second reply to a question already answered is a message to this
+    /// node; the first answer stays filed for `collect`, untouched by the late one.
+    #[test]
+    fn usage_probe_a_late_duplicate_reply_is_a_message_and_the_first_answer_stays() {
+        let slot = MeshSlot::default();
+        slot.correlations()
+            .open(PendingRecord {
+                thread: "t-root".to_string(),
+                ..pending("q-1")
+            })
+            .unwrap();
+
+        slot.deliver_peer(peer_message(PeerKind::Reply, "r-first", Some("q-1")));
+        let mut late = peer_message(PeerKind::Reply, "r-late", Some("q-1"));
+        late.disposition = Some(Disposition::Refused);
+        late.retry_after = Some(5);
+        slot.deliver_peer(late);
+
+        let (envelopes, _) = slot.peer_inbox().drain();
+        assert_eq!(envelopes.len(), 2, "{envelopes:?}");
+        let first = peer_payload(&envelopes[0]);
+        assert_eq!(
+            (first.kind, first.thread.as_deref()),
+            (PeerKind::Reply, Some("t-root"))
+        );
+        let second = peer_payload(&envelopes[1]);
+        assert_eq!(second.kind, PeerKind::Message);
+        assert_eq!(second.disposition, None);
+        assert_eq!(second.retry_after, None);
+        let filed = slot
+            .correlations()
+            .take_answer("q-1")
+            .expect("the first answer is filed");
+        assert_eq!(filed.message_id, "r-first");
+        assert_eq!(filed.disposition(), Disposition::Answered);
     }
 
     #[test]
@@ -4816,6 +4937,46 @@ mod tests {
             slot.correlations().get("q-1").unwrap().record.state,
             PendingState::Escalated,
             "the question stays open for the human's answer"
+        );
+    }
+
+    #[test]
+    fn a_second_escalated_reply_is_a_message_and_the_store_is_written_once() {
+        let tmp = TempDir::new("slot-escalated-twice");
+        let slot = MeshSlot::default();
+        slot.correlations()
+            .attach_store(PendingStore::new(&tmp.path, "inst"), SystemTime::now())
+            .unwrap();
+        slot.correlations().open(pending("q-1")).unwrap();
+        let escalated = |id: &str| {
+            let mut reply = peer_message(PeerKind::Reply, id, Some("q-1"));
+            reply.disposition = Some(Disposition::Escalated);
+            reply
+        };
+        slot.deliver_peer(escalated("r-1"));
+        let store_file = mesh_cache_dir(&tmp.path).join("pending-inst.jsonl");
+        assert!(store_file.is_file());
+        std::fs::remove_file(&store_file).unwrap();
+        assert_eq!(slot.take_model_notes().len(), 1);
+
+        slot.deliver_peer(escalated("r-2"));
+
+        let (envelopes, _) = slot.peer_inbox().drain();
+        assert_eq!(peer_ids(&envelopes), ["r-1", "r-2"]);
+        let second = peer_payload(&envelopes[1]);
+        assert_eq!(second.kind, PeerKind::Message);
+        assert_eq!(second.thread, None);
+        assert_eq!(second.disposition, None);
+        let notes = slot.take_model_notes();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert_eq!(notes[0].event, "peer_message");
+        assert!(
+            !store_file.exists(),
+            "the second escalation is not recorded"
+        );
+        assert_eq!(
+            slot.correlations().get("q-1").unwrap().record.state,
+            PendingState::Escalated
         );
     }
 

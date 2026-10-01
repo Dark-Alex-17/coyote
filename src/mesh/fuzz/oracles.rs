@@ -2391,8 +2391,9 @@ impl PartsGen {
 
 /// What a decoded body promises of its optional keys on either route: a `thread` is an id
 /// or absent, a disposition is carried by a reply and only a reply, `retry_after` only by
-/// a reply, and `parts` keeps at most what was listed, counting a non-list as one dropped.
-/// Nothing in these keys refuses a body; that is the reason lists' job to pin.
+/// a reply, and `parts` keeps at most what was listed, counting a non-list as one dropped
+/// and otherwise every element of a known `type` either read or dropped, an unknown one
+/// neither. Nothing in these keys refuses a body; that is the reason lists' job to pin.
 struct DecodedExtras<'a> {
     kind: PeerKind,
     thread: Option<&'a str>,
@@ -2447,17 +2448,37 @@ fn check_extras(entries: &[(Value, Value)], extras: &DecodedExtras<'_>) -> Resul
         )
     })?;
     let parts = first(entries, "parts");
-    let listed = parts.and_then(Value::as_array).map_or(0, Vec::len);
-    ensure(extras.parts <= listed, || {
+    let known_typed = parts.and_then(Value::as_array).map_or(0, |items| {
+        items
+            .iter()
+            .filter(|item| {
+                item.as_map()
+                    .and_then(|entries| first(entries, "type"))
+                    .is_some_and(|kind| {
+                        let kind = match kind {
+                            Value::String(text) => text.as_bytes(),
+                            Value::Binary(bytes) => bytes.as_slice(),
+                            _ => return false,
+                        };
+                        PART_TYPES.iter().any(|known| known.as_bytes() == kind)
+                    })
+            })
+            .count()
+    });
+    ensure(extras.parts <= known_typed, || {
         format!(
-            "MESH-MSG: {} parts decoded from a list of {listed}",
+            "MESH-MSG: {} parts decoded from a list naming {known_typed} known types",
             extras.parts
         )
     })?;
-    let expected_dropped = u32::from(parts.is_some_and(|value| !value.is_array()));
+    let expected_dropped = if parts.is_some_and(|value| !value.is_array()) {
+        1
+    } else {
+        u32::try_from(known_typed - extras.parts).map_err(|err| err.to_string())?
+    };
     ensure(extras.dropped_parts == expected_dropped, || {
         format!(
-            "MESH-MSG: a parts that is not a list counts one dropped, else none; got {} for {parts:?}",
+            "MESH-MSG: a parts that is not a list counts one dropped, else every known type not read; got {} for {parts:?}",
             extras.dropped_parts
         )
     })

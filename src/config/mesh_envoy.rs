@@ -3199,6 +3199,16 @@ mod tests {
                 .is_some_and(|secs| secs >= 1),
             "{fields}"
         );
+        // Usage probe (c): a run-time refusal is not the envoy's answer, so on the wire it
+        // carries the typed disposition, the retry hint and the refused message's thread
+        // (a root message's thread is its own id).
+        assert_eq!(refusal.disposition, Some(Disposition::BudgetExhausted));
+        assert_eq!(
+            refusal.retry_after.map(u64::from),
+            fields["retry_after_secs"].as_u64(),
+            "{refusal:?}"
+        );
+        assert_eq!(refusal.thread.as_deref(), Some("live-c2"), "{refusal:?}");
         assert_eq!(
             runs.load(Ordering::SeqCst),
             1,
@@ -3435,6 +3445,13 @@ mod tests {
             Some(PEER_RETRY_AFTER_CAPACITY.as_secs()),
             "{fields}"
         );
+        // Usage probe (c): the admission refusal carries disposition, retry hint and thread.
+        assert_eq!(refusal.disposition, Some(Disposition::Refused));
+        assert_eq!(
+            refusal.retry_after.map(u64::from),
+            fields["retry_after_secs"].as_u64()
+        );
+        assert_eq!(refusal.thread.as_deref(), Some("live-r2"), "{refusal:?}");
         assert_eq!(runs.load(Ordering::SeqCst), 1);
 
         gate.add_permits(1);
@@ -3444,6 +3461,21 @@ mod tests {
                 .any(|body| body.in_reply_to.as_deref() == Some("live-r1"))
         })
         .await;
+        // Usage probe (c): the envoy's own answer sets no disposition (a receiver reads a
+        // reply that names none as `answered`) and no retry hint, in the asker's thread.
+        let seen = stub.seen();
+        let answer = seen
+            .iter()
+            .find(|body| body.in_reply_to.as_deref() == Some("live-r1"))
+            .unwrap();
+        assert_eq!(answer.kind, PeerKind::Reply);
+        assert_eq!(
+            answer.disposition,
+            Some(Disposition::Answered),
+            "{answer:?}"
+        );
+        assert_eq!(answer.retry_after, None);
+        assert_eq!(answer.thread.as_deref(), Some("live-r1"), "{answer:?}");
         runner.stop().await;
         assert!(app.mesh.stop().await.unwrap());
         stub.stop().await;
@@ -4002,6 +4034,7 @@ mod tests {
                     kind: PeerKind::Message,
                     in_reply_to: None,
                     thread: None,
+                    disposition: None,
                     via: PeerVia::StoreAndForward,
                 },
             )

@@ -51,6 +51,17 @@ impl PendingState {
     fn awaits_reply(self) -> bool {
         matches!(self, Self::Open | Self::Escalated)
     }
+
+    /// Whether a reply carrying `disposition` from the asked identity answers the
+    /// question. Escalation is one-shot: a second `escalated` reply to a question
+    /// already `Escalated` is a message, not an answer.
+    fn accepts(self, disposition: Disposition) -> bool {
+        match self {
+            Self::Open => true,
+            Self::Escalated => disposition != Disposition::Escalated,
+            Self::Answered => false,
+        }
+    }
 }
 
 /// One line of `pending-<instance_id>.jsonl`. The shape is a stable on-disk record other
@@ -695,31 +706,43 @@ impl Correlations {
             .is_some_and(|entry| entry.record.state.awaits_reply())
     }
 
-    /// Whether a reply naming `id` from `identity` is the answer this node is still
-    /// waiting for: the same test `answer` applies, so admission and correlation agree.
-    pub(crate) fn accepts_reply_from(&self, id: &str, identity: &str) -> bool {
+    /// Whether a reply naming `id` from `identity` with `disposition` is the answer this
+    /// node is still waiting for: the same test `answer` applies, so admission and
+    /// correlation agree.
+    pub(crate) fn accepts_reply_from(
+        &self,
+        id: &str,
+        identity: &str,
+        disposition: Disposition,
+    ) -> bool {
         self.state.lock().entries.get(id).is_some_and(|entry| {
-            entry.record.state.awaits_reply()
+            entry.record.state.accepts(disposition)
                 && entry.record.peer_identity.eq_ignore_ascii_case(identity)
         })
     }
 
     /// `true` when `in_reply_to` named a question still awaiting a reply, asked of
-    /// `reply`'s identity. An `Escalated` reply moves the question to `Escalated` and
-    /// keeps waiting; any other closes it with `reply` as its answer, on disk too so it
-    /// survives to the next process uncollected. A reply from any other identity, or one
-    /// to a question already answered, does not match: it is an ordinary message.
+    /// `reply`'s identity. An `Escalated` reply moves an `Open` question to `Escalated`
+    /// and keeps waiting; any other closes it with `reply` as its answer, on disk too so
+    /// it survives to the next process uncollected. A reply from any other identity, one
+    /// to a question already answered, or a second `Escalated` reply to a question
+    /// already escalated does not match: it is an ordinary message.
     pub(crate) fn answer(&self, in_reply_to: &str, reply: PeerMessage) -> bool {
         let mut state = self.state.lock();
         let CorrelationState { store, entries } = &mut *state;
         let Some(entry) = entries.get_mut(in_reply_to) else {
             return false;
         };
-        if !entry.record.state.awaits_reply() {
+        if !entry.record.state.accepts(reply.disposition()) {
             debug!(
-                "Mesh reply {} from {} names question {in_reply_to}, which is already answered; treating it as a message",
+                "Mesh reply {} from {} names question {in_reply_to}, which is already {}; treating it as a message",
                 reply.message_id,
-                short(&reply.source_identity)
+                short(&reply.source_identity),
+                if entry.record.state == PendingState::Escalated {
+                    "escalated"
+                } else {
+                    "answered"
+                }
             );
             return false;
         }
@@ -1910,7 +1933,7 @@ mod tests {
             WaitOutcome::Escalated
         );
         assert!(first.is_open("q1"));
-        assert!(first.accepts_reply_from("q1", &identity));
+        assert!(first.accepts_reply_from("q1", &identity, Disposition::Answered));
         assert_eq!(first.take_answer("q1"), None, "nothing to collect yet");
         drop(first);
 
@@ -1927,7 +1950,7 @@ mod tests {
             second.wait("q1", Duration::from_millis(10)).await,
             WaitOutcome::Escalated
         );
-        assert!(second.accepts_reply_from("q1", &identity));
+        assert!(second.accepts_reply_from("q1", &identity, Disposition::Answered));
 
         let answer = reply_with("q1", Disposition::Answered, None);
         assert!(second.answer("q1", answer.clone()));
@@ -1935,8 +1958,57 @@ mod tests {
             second.wait("q1", Duration::from_millis(10)).await,
             WaitOutcome::Replied(Box::new(answer.clone()))
         );
-        assert!(!second.accepts_reply_from("q1", &identity));
+        assert!(!second.accepts_reply_from("q1", &identity, Disposition::Answered));
         assert_eq!(second.take_answer("q1"), Some(answer));
+    }
+
+    #[test]
+    fn a_second_escalated_reply_to_an_escalated_question_is_not_an_answer_and_is_not_recorded() {
+        let tmp = TempDir::new("pending-escalated-twice");
+        let now = SystemTime::now();
+        let identity = hex_lower(&[0xcd; 16]);
+        let correlations = Correlations::new();
+        correlations
+            .attach_store(PendingStore::new(&tmp.path, "inst"), now)
+            .unwrap();
+        correlations
+            .open(record("q1", now, PendingState::Open))
+            .unwrap();
+        assert!(correlations.answer("q1", reply_with("q1", Disposition::Escalated, None)));
+        let store_file = mesh_cache_dir(&tmp.path).join("pending-inst.jsonl");
+        assert!(store_file.is_file());
+        fs::remove_file(&store_file).unwrap();
+
+        assert!(!correlations.accepts_reply_from("q1", &identity, Disposition::Escalated));
+        assert!(
+            !correlations.answer("q1", reply_with("q1", Disposition::Escalated, None)),
+            "escalation is one-shot"
+        );
+        assert!(
+            !store_file.exists(),
+            "a reply that answers nothing does not touch the store"
+        );
+        assert_eq!(
+            correlations.get("q1").unwrap().record.state,
+            PendingState::Escalated
+        );
+
+        for disposition in [
+            Disposition::Answered,
+            Disposition::Refused,
+            Disposition::BudgetExhausted,
+        ] {
+            assert!(
+                correlations.accepts_reply_from("q1", &identity, disposition),
+                "{disposition:?} still closes an escalated question"
+            );
+        }
+        assert!(correlations.answer("q1", reply_with("q1", Disposition::Answered, None)));
+        assert_eq!(
+            correlations.get("q1").unwrap().record.state,
+            PendingState::Answered
+        );
+        assert!(store_file.is_file(), "the answer is recorded");
     }
 
     fn a_closing_disposition_ends_the_question(disposition: Disposition, retry_after: u32) {

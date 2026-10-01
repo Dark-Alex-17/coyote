@@ -136,6 +136,11 @@ Copyright (c) 2019 Manish Goregaokar, are dev-dependencies of the mesh fuzz
 harness under `src/mesh/fuzz` and never ship; the harness uses them under the
 MIT License, whose shared permission text is in the LICENSE-MIT file.
 
+`unicode-normalization`, a direct dependency for the mesh file-name grammar,
+is distributed under `MIT OR Apache-2.0`, Copyright (c) 2015 The Rust Project
+Developers; Coyote uses it under the MIT License, whose shared permission text
+is in the LICENSE-MIT file.
+
 --------------------------------------------------------------------------------
 Windows platform bindings
 --------------------------------------------------------------------------------

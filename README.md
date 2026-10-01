@@ -364,6 +364,7 @@ guide covers a ready-to-run LXMF propagation node for store-and-forward between 
 | `mesh.announce`                   | `true`          | Announce this node so peers can see it; `false` is outbound-only (see peers without being seen); also turns the automatic propagation sync off (`.mesh fetch` still works) |
 | `mesh.display_name`               | `null`          | Opt-in plaintext label carried in the announce                                                                                                                               |
 | `mesh.display_name_on_public`     | `false`         | Also carry `display_name` when any interface is `type: public`, where presence is world-visible                                                                              |
+| `mesh.about`                      | `null`          | One human-written line on what this node's envoy can help with, at most 200 characters; shown on the status card to trusted peers, never in the announce                   |
 | `mesh.interfaces`                 | `[{type: lan}]` | Interfaces the node joins: `lan` (link-local only; takes no `host`/`port`, at most once), or `private`/`public` with `host` and `port` for a relay. No auto-detection, no fallback |
 | `mesh.brief`                      | `auto`          | `auto` (status card + session digest + user brief), `manual` (card + user brief; no digest, so no model spend), or `off` (status card only)                                  |
 | `mesh.digest_prompt`              | `null`          | Prompt used to build the shareable session digest; `null` or blank uses the built-in default                                                                                 |
@@ -376,6 +377,7 @@ guide covers a ready-to-run LXMF propagation node for store-and-forward between 
 | `mesh.peer_max_tokens_per_hour`   | `100000`        | Model tokens one sending identity may cost per hour, counted after each envoy run, so the runs in flight may overshoot the ceiling by at most `peer_max_concurrent` runs before the next is refused; must be `1` or more. The message is still filed in the inbox for the human |
 | `mesh.peer_max_cost_usd_per_hour` | `0`             | USD one sending identity may cost per hour, counted like the token ceiling and enforced only when the envoy model's prices are known; `0` = no cost ceiling, otherwise a positive amount. The message is still filed in the inbox for the human |
 | `mesh.propagation_sync_interval_secs` | `300`       | Seconds between automatic fetches of the messages a propagation node holds for this node; the first fetch runs once a propagation node is heard after the node joins; `0` = fetch only on `.mesh fetch`; at most `31536000`; off while `announce` is false |
+| `mesh.fetch.inline_max_bytes`     | `65536`         | Largest file a peer may attach inline to one message; larger ones are dropped from the message and counted; `1` to `98304`, the per-message inline total                      |
 
 ---
 

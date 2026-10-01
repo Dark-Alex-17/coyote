@@ -79,7 +79,9 @@ impl InboxStaging {
     /// `sha256` is reused without a write; one with a different hash keeps its place and
     /// the new bytes land beside it as `<stem>-<sha256[..8]><ext>`. When that name too
     /// holds other bytes, or a file appears at the target between the check and the
-    /// write, nothing is overwritten: `Collision`.
+    /// write, nothing is overwritten: `Collision`. A target with no parent, or none of
+    /// whose ancestors exist, means the root itself vanished after canonicalisation:
+    /// `NotFound`.
     pub(crate) fn stage(
         &self,
         peer_destination: &str,
@@ -92,10 +94,10 @@ impl InboxStaging {
         let canonical_root = dunce::canonicalize(&self.root)?;
         let target = canonical_root.join(&dest8).join(rel.to_relative_path());
         let Some(parent) = target.parent() else {
-            return Err(StageError::Escaped);
+            return Err(StageError::Io(io::Error::from(io::ErrorKind::NotFound)));
         };
         let Some(existing) = parent.ancestors().find(|path| path.exists()) else {
-            return Err(StageError::Escaped);
+            return Err(StageError::Io(io::Error::from(io::ErrorKind::NotFound)));
         };
         ensure_inside(&canonical_root, existing)?;
         fs::create_dir_all(parent)?;
@@ -436,6 +438,7 @@ mod tests {
             ("C:x", "drive_letter"),
             ("a\0b", "control"),
             ("docs/he\u{301}llo.md", "nfc"),
+            ("con .txt", "reserved_name"),
         ] {
             assert_eq!(WirePath::parse(text).unwrap_err().rule, rule, "{text:?}");
             assert_eq!(files_under(&inbox.root), Vec::<PathBuf>::new());
