@@ -733,4 +733,176 @@ mod tests {
         names.sort();
         assert_eq!(names, ["inbox", "plain"]);
     }
+
+    /// Usage probe, criterion (b) "lexically join the validated `rel`, `create_dir_all`
+    /// the parent": a name several directories deep lands into an empty peer directory
+    /// with every intermediate directory created, and a second name whose parents only
+    /// partly exist is written beside it. Both paths are absolute and under the resolved
+    /// root; the inbox holds exactly those two files.
+    #[test]
+    fn usage_probe_a_deep_name_creates_every_missing_parent_and_reuses_the_ones_present() {
+        let tmp = TempDir::new("inbox-deep");
+        let inbox = staging(&tmp);
+
+        let deep = inbox
+            .stage(
+                PEER,
+                &WirePath::parse("a/b/c/d.txt").unwrap(),
+                &digest(b"deep"),
+                b"deep",
+            )
+            .unwrap();
+        let beside = inbox
+            .stage(
+                PEER,
+                &WirePath::parse("a/b/x/y/e.txt").unwrap(),
+                &digest(b"beside"),
+                b"beside",
+            )
+            .unwrap();
+
+        let canonical_root = dunce::canonicalize(&inbox.root).unwrap();
+        let peer_dir = canonical_root.join(DEST8);
+        assert!(deep.is_absolute() && beside.is_absolute());
+        assert_eq!(deep, peer_dir.join("a").join("b").join("c").join("d.txt"));
+        assert_eq!(
+            beside,
+            peer_dir
+                .join("a")
+                .join("b")
+                .join("x")
+                .join("y")
+                .join("e.txt")
+        );
+        assert_eq!(fs::read(&deep).unwrap(), b"deep");
+        assert_eq!(fs::read(&beside).unwrap(), b"beside");
+        let mut found = files_under(&inbox.root);
+        found.sort();
+        assert_eq!(found, [deep, beside]);
+    }
+
+    /// Usage probe, criterion (b) layout `<peer-dest8>/<rel>`: two peers staging the same
+    /// name with different bytes do not collide — each lands under its own directory with
+    /// no hash suffix and its own bytes, and a peer's directory is named by *its*
+    /// destination, not the other's.
+    #[test]
+    fn usage_probe_two_peers_staging_the_same_name_land_in_their_own_directories_without_a_suffix()
+    {
+        const OTHER: &str = "FEDCBA9876543210fedcba9876543210";
+        let tmp = TempDir::new("inbox-two-peers");
+        let inbox = staging(&tmp);
+        let rel = WirePath::parse("docs/a.md").unwrap();
+
+        let first = inbox.stage(PEER, &rel, &digest(b"mine"), b"mine").unwrap();
+        let second = inbox
+            .stage(OTHER, &rel, &digest(b"theirs"), b"theirs")
+            .unwrap();
+
+        let canonical_root = dunce::canonicalize(&inbox.root).unwrap();
+        assert_eq!(first, canonical_root.join(DEST8).join("docs").join("a.md"));
+        assert_eq!(
+            second,
+            canonical_root.join("fedcba98").join("docs").join("a.md")
+        );
+        assert_eq!(
+            first.file_name(),
+            second.file_name(),
+            "no hash suffix on either"
+        );
+        assert_eq!(fs::read(&first).unwrap(), b"mine");
+        assert_eq!(fs::read(&second).unwrap(), b"theirs");
+        let mut found = files_under(&inbox.root);
+        found.sort();
+        let mut expected = vec![first, second];
+        expected.sort();
+        assert_eq!(found, expected);
+    }
+
+    /// Usage probe, criterion (b) "prefix-check the parent's canonical path": the guard
+    /// holds at the shallowest level a peer-named path can reach. When the peer's own
+    /// `<dest8>` directory is a symlink leading outside the root, a stage of any name
+    /// (one level or deep) is `Escaped` before anything is created or written at the
+    /// link's target, and the error names no path.
+    #[cfg(unix)]
+    #[test]
+    fn usage_probe_a_peer_directory_that_is_itself_a_link_outside_the_root_is_refused_before_any_write()
+     {
+        let tmp = TempDir::new("inbox-peer-dir-link");
+        let inbox = staging(&tmp);
+        let outside = tmp.path.join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::create_dir_all(&inbox.root).unwrap();
+        std::os::unix::fs::symlink(&outside, inbox.root.join(DEST8)).unwrap();
+
+        for text in ["a.md", "docs/a.md", "docs/deep/er/a.md"] {
+            let rel = WirePath::parse(text).unwrap();
+            let err = inbox.stage(PEER, &rel, &digest(b"x"), b"x").unwrap_err();
+            assert!(matches!(err, StageError::Escaped), "{text}: {err}");
+            assert!(!err.to_string().contains("docs"), "{err}");
+            assert!(
+                !err.to_string().contains(tmp.path.to_str().unwrap()),
+                "{err}"
+            );
+        }
+        assert_eq!(
+            fs::read_dir(&outside).unwrap().count(),
+            0,
+            "nothing created or written through the link"
+        );
+        assert!(
+            inbox
+                .root
+                .join(DEST8)
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the planted link is left as it was"
+        );
+        assert_eq!(files_under(&inbox.root), Vec::<PathBuf>::new());
+    }
+
+    /// Usage probe, criterion (b) "same sha256 ⇒ reuse" at the degenerate size: an empty
+    /// inline file stages to an empty file at its name, a second stage of the same empty
+    /// content reuses that path, and other bytes under the same name take the hash-suffixed
+    /// sibling rather than filling the empty file in.
+    #[test]
+    fn usage_probe_an_empty_inline_file_stages_and_is_reused_like_any_other() {
+        let tmp = TempDir::new("inbox-empty");
+        let inbox = staging(&tmp);
+        let rel = WirePath::parse("docs/empty.md").unwrap();
+        let empty_sha = digest(b"");
+
+        let first = inbox.stage(PEER, &rel, &empty_sha, b"").unwrap();
+        let again = inbox.stage(PEER, &rel, &empty_sha, b"").unwrap();
+
+        assert_eq!(first, again);
+        assert_eq!(fs::read(&first).unwrap(), b"");
+        assert_eq!(
+            first,
+            dunce::canonicalize(&inbox.root)
+                .unwrap()
+                .join(DEST8)
+                .join("docs")
+                .join("empty.md")
+        );
+
+        let other_sha = digest(b"filled");
+        let filled = inbox.stage(PEER, &rel, &other_sha, b"filled").unwrap();
+        assert_eq!(
+            filled,
+            first.with_file_name(format!("empty-{}.md", hex_lower(&other_sha[..4])))
+        );
+        assert_eq!(
+            fs::read(&first).unwrap(),
+            b"",
+            "the empty file is not filled in"
+        );
+        assert_eq!(fs::read(&filled).unwrap(), b"filled");
+        let mut found = files_under(&inbox.root);
+        found.sort();
+        let mut expected = vec![first, filled];
+        expected.sort();
+        assert_eq!(found, expected);
+    }
 }
