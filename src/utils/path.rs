@@ -34,6 +34,18 @@ pub fn safe_join_path<T1: AsRef<Path>, T2: AsRef<Path>>(
     }
 }
 
+/// Whether `name`'s stem (the text before the first `.`) is a device name Windows
+/// reserves in every directory, whatever the extension: `CON`, `PRN`, `AUX`, `NUL`,
+/// `COM1`–`COM9`, `LPT1`–`LPT9`, case-insensitively.
+pub fn is_windows_reserved_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or("");
+    let lower = stem.to_ascii_lowercase();
+    matches!(lower.as_str(), "con" | "prn" | "aux" | "nul")
+        || (lower.len() == 4
+            && (lower.starts_with("com") || lower.starts_with("lpt"))
+            && matches!(lower.as_bytes()[3], b'1'..=b'9'))
+}
+
 pub async fn expand_glob_paths<T: AsRef<str>>(
     paths: &[T],
     bail_non_exist: bool,

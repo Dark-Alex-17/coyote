@@ -2,8 +2,13 @@
 //! relative path; `WirePath::parse` is the one gate every such string passes before the
 //! filesystem is touched, and the `rule` it refuses with is what the `invalid_path` reply
 //! carries. A path that is not already NFC is refused, never normalised, so the name the
-//! peer sent and the name on disk are the same bytes.
+//! peer sent and the name on disk are the same bytes. Invisible characters (bidi
+//! overrides, zero-width joiners, line separators) are refused here rather than at
+//! render, so a file's `name` and its `reference` pass the same gate and neither can
+//! carry text that reads as something it is not.
 
+use crate::mesh::announce::is_control_or_invisible;
+use crate::utils::is_windows_reserved_name;
 use std::fmt;
 use std::path::PathBuf;
 use unicode_normalization::is_nfc;
@@ -14,18 +19,25 @@ pub(crate) const WIRE_PATH_MAX_SEGMENTS: usize = 64;
 type Rule = (&'static str, fn(&str) -> bool);
 
 /// The rules in the order they are checked; the first one a string breaks names the
-/// refusal. `backslash` comes before `drive_letter` so `C:\x` is refused for the separator
-/// it carries, and `nfc` before the segment rules so a decomposed name is never split.
-const RULES: [Rule; 9] = [
+/// refusal. `control` comes before `invisible` so a `\0` keeps its name, `backslash`
+/// before `drive_letter` so `C:\x` is refused for the separator it carries, `drive_letter`
+/// before `colon` so `C:x` is a drive and not a data stream, `nfc` before the segment
+/// rules so a decomposed name is never split, and `segment` before the Windows name
+/// rules so `.` and `..` are traversal, not a trailing dot.
+const RULES: [Rule; 14] = [
     ("empty", str::is_empty),
     ("length", |text| text.len() > WIRE_PATH_MAX_BYTES),
     ("control", |text| text.chars().any(char::is_control)),
+    ("invisible", |text| {
+        text.chars().any(is_control_or_invisible)
+    }),
     ("backslash", |text| text.contains('\\')),
     ("leading_slash", |text| text.starts_with('/')),
     ("drive_letter", |text| {
         let bytes = text.as_bytes();
         bytes.first().is_some_and(u8::is_ascii_alphabetic) && bytes.get(1) == Some(&b':')
     }),
+    ("colon", |text| text.contains(':')),
     ("nfc", |text| !is_nfc(text)),
     ("segments", |text| {
         text.split('/').count() > WIRE_PATH_MAX_SEGMENTS
@@ -34,10 +46,20 @@ const RULES: [Rule; 9] = [
         text.split('/')
             .any(|segment| matches!(segment, "" | "." | ".."))
     }),
+    ("trailing_dot", |text| {
+        text.split('/').any(|segment| segment.ends_with('.'))
+    }),
+    ("trailing_space", |text| {
+        text.split('/').any(|segment| segment.ends_with(' '))
+    }),
+    ("reserved_name", |text| {
+        text.split('/').any(is_windows_reserved_name)
+    }),
 ];
 
 /// A path string that has passed every rule in `RULES`, so it is relative, NFC, and free of
-/// empty, `.` and `..` segments.
+/// invisible characters, colons, empty, `.` and `..` segments, trailing dots and spaces,
+/// and Windows reserved names.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct WirePath(String);
 
@@ -102,6 +124,13 @@ mod tests {
     }
 
     #[test]
+    fn a_path_with_an_invisible_character_is_refused_with_rule_invisible() {
+        for text in ["a\u{202E}b.md", "a\u{200B}b", "a\u{2028}b"] {
+            assert_eq!(rule(text), "invisible", "{text:?}");
+        }
+    }
+
+    #[test]
     fn a_path_with_a_backslash_is_refused_with_rule_backslash() {
         assert_eq!(rule("docs\\a.md"), "backslash");
         assert_eq!(rule("C:\\x"), "backslash");
@@ -116,7 +145,13 @@ mod tests {
     fn a_path_with_a_drive_letter_is_refused_with_rule_drive_letter() {
         assert_eq!(rule("C:x"), "drive_letter");
         assert_eq!(rule("c:/x"), "drive_letter");
-        assert!(WirePath::parse("1:x").is_ok());
+    }
+
+    #[test]
+    fn a_path_with_a_colon_is_refused_with_rule_colon() {
+        for text in ["ab:c.md", "docs/x:Zone.Identifier", "1:x"] {
+            assert_eq!(rule(text), "colon", "{text:?}");
+        }
     }
 
     #[test]
@@ -140,10 +175,47 @@ mod tests {
     }
 
     #[test]
+    fn a_segment_with_a_trailing_dot_is_refused_with_rule_trailing_dot() {
+        for text in ["docs/a.", "a./b"] {
+            assert_eq!(rule(text), "trailing_dot", "{text:?}");
+        }
+        assert!(WirePath::parse("a.b/c.d").is_ok());
+    }
+
+    #[test]
+    fn a_segment_with_a_trailing_space_is_refused_with_rule_trailing_space() {
+        for text in ["docs/a ", "a /b"] {
+            assert_eq!(rule(text), "trailing_space", "{text:?}");
+        }
+        assert!(WirePath::parse("a b/c").is_ok());
+    }
+
+    #[test]
+    fn a_windows_reserved_name_is_refused_with_rule_reserved_name() {
+        for text in [
+            "CON",
+            "con.md",
+            "docs/NUL.md.tmp",
+            "COM1",
+            "lpt9.txt",
+            "aux",
+            "PRN.x.y",
+        ] {
+            assert_eq!(rule(text), "reserved_name", "{text:?}");
+        }
+        for text in ["com0", "com10", "console.md"] {
+            assert!(WirePath::parse(text).is_ok(), "{text:?}");
+        }
+    }
+
+    #[test]
     fn the_first_broken_rule_in_order_names_the_refusal() {
         let long_and_traversing = format!("../{}", "a".repeat(WIRE_PATH_MAX_BYTES));
         assert_eq!(rule(&long_and_traversing), "length");
         assert_eq!(rule("\\.."), "backslash");
+        assert_eq!(rule("a\0\u{200B}"), "control");
+        assert_eq!(rule("C:CON"), "drive_letter");
+        assert_eq!(rule("a/./CON"), "segment");
     }
 
     #[test]

@@ -1967,14 +1967,14 @@ impl InboundSink for PeerRouting<'_> {
         };
         let admitted = surface.admit_peer_message(&admission);
         raw.destination = surface.local_destination().unwrap_or_default();
-        let peer = PeerMessage::new_with(
-            raw,
-            &surface.part_limits(),
-            surface.inbox_staging().as_ref(),
-        );
+        let staging = match admitted {
+            Ok(()) => surface.inbox_staging(),
+            Err(_) => None,
+        };
+        let peer = PeerMessage::new_with(raw, &surface.part_limits(), staging.as_ref());
         if let Err(refusal) = admitted {
             debug!(
-                "Propagated {kind} {} from {id8} (instance {dest8}) over its limit: {}; filed in the inbox without an envoy run, the surface answers the first refusal of the hour",
+                "Propagated {kind} {} from {id8} (instance {dest8}) over its limit: {}; filed in the inbox without an envoy run and without staging its inline files, the surface answers the first refusal of the hour",
                 peer.message_id,
                 refusal.reason.as_str()
             );
@@ -3103,12 +3103,14 @@ mod tests {
     }
 
     /// Records what the routing asks and hands over, standing in for the slot; admits
-    /// every sender until `admit_up_to` messages have been offered, whoever sent them.
+    /// every sender until `admit_up_to` messages have been offered, whoever sent them,
+    /// and stages inline files under `staging_root` when one is set.
     struct RecordingSurface {
         delivered: Mutex<Vec<PeerMessage>>,
         filed: Mutex<Vec<PeerMessage>>,
         offered: Mutex<Vec<(String, String, String, PeerVia)>>,
         admit_up_to: usize,
+        staging_root: Option<PathBuf>,
     }
 
     impl Default for RecordingSurface {
@@ -3124,7 +3126,13 @@ mod tests {
                 filed: Mutex::new(Vec::new()),
                 offered: Mutex::new(Vec::new()),
                 admit_up_to,
+                staging_root: None,
             }
+        }
+
+        fn with_staging(mut self, root: PathBuf) -> Self {
+            self.staging_root = Some(root);
+            self
         }
 
         fn offered(&self) -> usize {
@@ -3160,6 +3168,10 @@ mod tests {
 
         fn local_destination(&self) -> Option<String> {
             Some(hash_of("local"))
+        }
+
+        fn inbox_staging(&self) -> Option<InboxStaging> {
+            self.staging_root.clone().map(InboxStaging::new)
         }
     }
 
@@ -3417,6 +3429,72 @@ mod tests {
         assert_eq!(fresh.offered(), 2);
         assert_eq!(fresh.delivered.lock().len(), 1);
         assert_eq!(fresh.filed.lock().len(), 1);
+    }
+
+    /// A propagated message from a sender over its limit is filed, but its inline
+    /// files never touch the staging inbox: the throttle is consulted before any peer
+    /// bytes land on disk, and the dropped part is counted. The same message from an
+    /// admitted sender is staged, so the fixture is shown to route staging at all.
+    #[test]
+    fn a_throttled_propagated_message_is_filed_without_staging_its_inline_files() {
+        let tmp = TempDir::new("message-throttled-staging");
+        let identity = PrivateIdentity::new_from_rand(OsRng);
+        let identity_hex = identity.address_hash().to_hex_string();
+        let origin = OriginName([6u8; NAME_HASH_LEN]);
+        let destination = destination_address(&origin.0, identity.address_hash()).to_hex_string();
+        let (trust, _trust_tmp) = TrustList::default()
+            .destination(&destination, &identity_hex)
+            .open("peer-routing-throttled-staging");
+        let inner = CountingSink::default();
+        let out = OutboundPeer::with_parts(
+            PeerKind::Message,
+            "stored",
+            None,
+            None,
+            None,
+            vec![inline_file("docs/notes.md", b"# notes\n".to_vec())],
+            &PartLimits::default(),
+        )
+        .unwrap();
+        let stored = peer_lxmf_message(&out, &origin);
+        let deliver = |surface: &Arc<RecordingSurface>| {
+            PeerRouting {
+                trust: &trust,
+                surface: Some(surface.clone() as Arc<dyn PeerSurface>),
+                inner: &inner,
+            }
+            .deliver(inbound(
+                stored.fields.clone(),
+                None,
+                Some(stored.content.clone()),
+                &identity_hex,
+            ));
+        };
+
+        let root = tmp.path.join("inbox");
+        let throttled = Arc::new(RecordingSurface::admitting(0).with_staging(root.clone()));
+        deliver(&throttled);
+        assert!(throttled.delivered.lock().is_empty());
+        let filed = throttled.filed.lock();
+        assert_eq!(filed.len(), 1);
+        assert_eq!(filed[0].message_id, out.id);
+        assert!(filed[0].parts.is_empty());
+        assert_eq!(filed[0].dropped_parts, 1);
+        drop(filed);
+        assert!(!root.exists(), "{}", root.display());
+
+        let admitted = Arc::new(RecordingSurface::admitting(1).with_staging(root.clone()));
+        deliver(&admitted);
+        let delivered = admitted.delivered.lock();
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].dropped_parts, 0);
+        assert!(matches!(
+            delivered[0].parts.as_slice(),
+            [Part::File {
+                staged: Some(staged),
+                ..
+            }] if staged.starts_with(dunce::canonicalize(&root).unwrap())
+        ));
     }
 
     fn pack(value: &Value) -> Vec<u8> {

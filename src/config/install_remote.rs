@@ -10,7 +10,7 @@ use crate::config::{
 };
 use crate::mcp::{McpServer, McpServersConfig};
 use crate::utils;
-use crate::utils::IS_STDOUT_TERMINAL;
+use crate::utils::{IS_STDOUT_TERMINAL, is_windows_reserved_name};
 use crate::vault::{SECRET_RE, Vault, create_vault_password_file, interpolate_secrets};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::ValueEnum;
@@ -813,15 +813,6 @@ pub(crate) fn is_safe_component(name: &str) -> bool {
         && !name.ends_with('.')
         && !name.ends_with(' ')
         && !is_windows_reserved_name(name)
-}
-
-fn is_windows_reserved_name(name: &str) -> bool {
-    let stem = name.split('.').next().unwrap_or("");
-    let lower = stem.to_ascii_lowercase();
-    matches!(lower.as_str(), "con" | "prn" | "aux" | "nul")
-        || (lower.len() == 4
-            && (lower.starts_with("com") || lower.starts_with("lpt"))
-            && matches!(lower.as_bytes()[3], b'1'..=b'9'))
 }
 
 fn uninstall_owned_files(

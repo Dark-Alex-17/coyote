@@ -3,12 +3,15 @@
 //! a file will be written into must resolve inside the inbox root, checked before any
 //! directory is created under it and again before the file is written, so a symlink
 //! planted under the inbox cannot lead a write outside it. Nothing here logs: the path and
-//! the bytes are the peer's.
+//! the bytes are the peer's. A file is written through a randomly named `.tmp-<uuid>`
+//! sibling and renamed into place, so no name a peer chooses can alias the temp file.
 
 use crate::mesh::wire_path::WirePath;
-use crate::mesh::{hex_lower, mesh_cache_dir, write_atomically};
+use crate::mesh::{hex_lower, mesh_cache_dir};
 
 use sha2::{Digest, Sha256};
+use std::fs::File;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::{fmt, fs, io};
 
@@ -100,9 +103,7 @@ impl InboxStaging {
                 suffixed
             }
         };
-        write_atomically(&target, bytes).map_err(|err| {
-            StageError::Io(err.downcast::<io::Error>().unwrap_or_else(io::Error::other))
-        })?;
+        write_staged(&target, bytes)?;
         Ok(target)
     }
 }
@@ -140,6 +141,25 @@ fn with_hash_suffix(target: &Path, sha256: &[u8; 32]) -> PathBuf {
         name.push(ext);
     }
     target.with_file_name(name)
+}
+
+/// Writes `bytes` to `.tmp-<uuid>` beside `target`, syncs and renames it into place; on
+/// any failure the temp file is removed best-effort and the error returned.
+fn write_staged(target: &Path, bytes: &[u8]) -> io::Result<()> {
+    let Some(parent) = target.parent() else {
+        return Err(io::Error::other("the staging target has no parent"));
+    };
+    let tmp = parent.join(format!(".tmp-{}", uuid::Uuid::new_v4().simple()));
+    let written = File::create(&tmp)
+        .and_then(|mut file| {
+            file.write_all(bytes)?;
+            file.sync_all()
+        })
+        .and_then(|()| fs::rename(&tmp, target));
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    written
 }
 
 #[cfg(test)]
@@ -245,6 +265,45 @@ mod tests {
         let dotfile = inbox.stage(PEER, &bare, &digest(b"x"), b"x").unwrap();
         let clash = inbox.stage(PEER, &bare, &other_sha, b"other").unwrap();
         assert_eq!(clash, dotfile.with_file_name(format!(".bashrc-{suffix}")));
+    }
+
+    #[test]
+    fn a_file_named_like_a_temp_file_survives_the_next_stage_beside_it() {
+        let tmp = TempDir::new("inbox-tmp-name");
+        let inbox = staging(&tmp);
+        let dot_tmp = WirePath::parse("x.tmp").unwrap();
+        let bare = WirePath::parse("x").unwrap();
+
+        let first = inbox
+            .stage(PEER, &dot_tmp, &digest(b"first"), b"first")
+            .unwrap();
+        let second = inbox
+            .stage(PEER, &bare, &digest(b"second"), b"second")
+            .unwrap();
+
+        assert_eq!(fs::read(&first).unwrap(), b"first");
+        assert_eq!(fs::read(&second).unwrap(), b"second");
+        let mut found = files_under(&inbox.root);
+        found.sort();
+        assert_eq!(found, [second, first]);
+    }
+
+    #[test]
+    fn a_stage_leaves_no_temp_file_behind() {
+        let tmp = TempDir::new("inbox-no-temp");
+        let inbox = staging(&tmp);
+        let rel = WirePath::parse("docs/a.md").unwrap();
+
+        inbox.stage(PEER, &rel, &digest(b"x"), b"x").unwrap();
+
+        let found = files_under(&inbox.root);
+        assert_eq!(found.len(), 1);
+        assert!(
+            found.iter().all(|path| !path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(".tmp-"))),
+            "{found:?}"
+        );
     }
 
     #[cfg(unix)]
