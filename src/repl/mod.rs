@@ -40,6 +40,7 @@ use reedline::{
     ColumnarMenu, EditCommand, EditMode, Emacs, FileBackedHistory, KeyCode, KeyModifiers,
     Keybindings, Reedline, ReedlineEvent, ReedlineMenu, ValidationResult, Validator, Vi,
     default_emacs_keybindings, default_vi_insert_keybindings, default_vi_normal_keybindings,
+    default_vi_visual_keybindings,
 };
 use reedline::{MenuBuilder, Signal};
 use std::collections::HashMap;
@@ -556,7 +557,7 @@ Type ".help" for additional help.
         let cursor_config = CursorConfig {
             vi_insert: Some(SetCursorStyle::BlinkingBar),
             vi_normal: Some(SetCursorStyle::SteadyBlock),
-            emacs: None,
+            ..CursorConfig::default()
         };
         let mut editor = Reedline::create()
             .with_completer(Box::new(completer))
@@ -617,7 +618,11 @@ Type ".help" for additional help.
         let edit_mode: Box<dyn EditMode> = if app.keybindings == "vi" {
             let mut insert_keybindings = default_vi_insert_keybindings();
             Self::extra_keybindings(&mut insert_keybindings);
-            Box::new(Vi::new(insert_keybindings, default_vi_normal_keybindings()))
+            Box::new(Vi::new(
+                insert_keybindings,
+                default_vi_normal_keybindings(),
+                default_vi_visual_keybindings(),
+            ))
         } else {
             let mut keybindings = default_emacs_keybindings();
             Self::extra_keybindings(&mut keybindings);

@@ -5,7 +5,7 @@ use crate::mcp::ConnectedServer;
 use crate::utils::fuzzy_filter;
 
 use parking_lot::RwLock;
-use reedline::{Completer, Span, Suggestion};
+use reedline::{Completer, CompletionResult, Span, Suggestion};
 use rmcp::model::Prompt;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -14,7 +14,13 @@ use std::time::Duration;
 const PROMPT_COMPLETION_RPC_TIMEOUT: Duration = Duration::from_secs(2);
 
 impl Completer for ReplCompleter {
-    fn complete(&mut self, line: &str, pos: usize) -> Vec<Suggestion> {
+    fn complete(&mut self, line: &str, pos: usize) -> CompletionResult {
+        CompletionResult::fresh(self.suggestions_for(line, pos))
+    }
+}
+
+impl ReplCompleter {
+    fn suggestions_for(&mut self, line: &str, pos: usize) -> Vec<Suggestion> {
         let mut suggestions = vec![];
         let line = &line[0..pos];
         let mut parts = split_line(line);

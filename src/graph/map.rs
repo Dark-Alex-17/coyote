@@ -2209,23 +2209,43 @@ nodes:
         )
     }
 
-    async fn run_echo_inputs_chain(parent_yaml: &str) -> StateManager {
-        let h = Harness::new(parent_yaml);
-        let mut state = StateManager::new(HashMap::from([("n".to_string(), json!(3))]));
-        let mut ctx = silent_ctx();
+    /// Runs the parent chain through a real child agent graph and returns the
+    /// child's `output`. Driven on a thread with extra stack headroom: the
+    /// nested parent-executor → agent-node → child-executor poll frames are
+    /// deep in debug builds and overflow the 2 MiB default test-thread stack.
+    fn run_echo_inputs_chain(parent_yaml: &str) -> Option<serde_json::Value> {
+        std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .stack_size(8 * 1024 * 1024)
+                .spawn_scoped(scope, || {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap()
+                        .block_on(async {
+                            let h = Harness::new(parent_yaml);
+                            let mut state =
+                                StateManager::new(HashMap::from([("n".to_string(), json!(3))]));
+                            let mut ctx = silent_ctx();
 
-        h.run("worker", None, &mut state, &mut ctx)
-            .await
-            .unwrap_or_else(|e| panic!("chain failed: {e:#}"));
+                            h.run("worker", None, &mut state, &mut ctx)
+                                .await
+                                .unwrap_or_else(|e| panic!("chain failed: {e:#}"));
 
-        state
+                            state.state().get("output").cloned()
+                        })
+                })
+                .unwrap()
+                .join()
+                .unwrap()
+        })
     }
 
     /// The child's `width` default is overlaid by the parent's `inputs`
     /// before the child graph starts, so its script sees the parent's value.
-    #[tokio::test]
+    #[test]
     #[serial]
-    async fn agent_node_inputs_seed_the_child_graph_state() {
+    fn agent_node_inputs_seed_the_child_graph_state() {
         if !cmd_available("python3") {
             eprintln!("skipping: python3 not available");
             return;
@@ -2234,17 +2254,17 @@ nodes:
         materialize_echo_inputs_agent();
         let parent = echo_inputs_parent_graph("    inputs:\n      width: \"{{n}}\"\n");
 
-        let state = run_echo_inputs_chain(&parent).await;
+        let output = run_echo_inputs_chain(&parent);
 
-        assert_eq!(state.state().get("output"), Some(&json!("3")));
+        assert_eq!(output, Some(json!("3")));
     }
 
     /// Control for the test above: the same child with no `inputs` on the
     /// parent node keeps its YAML default, so an override in the sibling
     /// test cannot be the child ignoring its own `initial_state`.
-    #[tokio::test]
+    #[test]
     #[serial]
-    async fn agent_node_without_inputs_leaves_the_child_graph_defaults() {
+    fn agent_node_without_inputs_leaves_the_child_graph_defaults() {
         if !cmd_available("python3") {
             eprintln!("skipping: python3 not available");
             return;
@@ -2253,9 +2273,9 @@ nodes:
         materialize_echo_inputs_agent();
         let parent = echo_inputs_parent_graph("");
 
-        let state = run_echo_inputs_chain(&parent).await;
+        let output = run_echo_inputs_chain(&parent);
 
-        assert_eq!(state.state().get("output"), Some(&json!("1")));
+        assert_eq!(output, Some(json!("1")));
     }
 
     #[tokio::test]
