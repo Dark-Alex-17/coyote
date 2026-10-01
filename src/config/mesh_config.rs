@@ -418,10 +418,7 @@ pub fn render_mesh_info(mesh: &MeshConfig) -> String {
     row("fetch.max_bytes", mesh.fetch.max_bytes.to_string());
     row(
         "fetch.inbox_dir",
-        mesh.fetch
-            .inbox_dir
-            .as_ref()
-            .map_or_else(|| "(default)".to_string(), |dir| dir.display().to_string()),
+        super::format_option_value(&mesh.fetch.inbox_dir.as_ref().map(|dir| dir.display())),
     );
     output
 }
@@ -1150,7 +1147,7 @@ mod tests {
         );
         assert!(
             info.ends_with(
-                "  fetch.max_bytes                 4194304\n  fetch.inbox_dir                 (default)\n"
+                "  fetch.max_bytes                 4194304\n  fetch.inbox_dir                 null\n"
             ),
             "{info}"
         );

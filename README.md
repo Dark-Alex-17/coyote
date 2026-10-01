@@ -379,7 +379,7 @@ guide covers a ready-to-run LXMF propagation node for store-and-forward between 
 | `mesh.propagation_sync_interval_secs` | `300`       | Seconds between automatic fetches of the messages a propagation node holds for this node; the first fetch runs once a propagation node is heard after the node joins; `0` = fetch only on `.mesh fetch`; at most `31536000`; off while `announce` is false |
 | `mesh.fetch.inline_max_bytes`     | `65536`         | Largest file a peer may attach inline to one message; larger ones are dropped from the message and counted; `1` to `98304`, the per-message inline total                      |
 | `mesh.fetch.max_bytes`            | `4194304`       | Largest file this node serves to a peer that fetches it; a larger one is refused; `1` to `4194304` (4 MiB)                                                                      |
-| `mesh.fetch.inbox_dir`            | `null`          | Absolute directory where fetched files are staged, under `<inbox_dir>/<instance id>`; `null` stages them under `<cache dir>/mesh/inbox/<instance id>`                           |
+| `mesh.fetch.inbox_dir`            | `null`          | Absolute directory where fetched files are staged, under `<inbox_dir>/<instance id>`; `null` stages them under `<cache dir>/mesh/inbox/<instance id>`; keep it outside any workspace you share, or peers could fetch each other's staged files |
 
 ---
 
