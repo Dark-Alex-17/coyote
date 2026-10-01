@@ -1239,7 +1239,9 @@ pub async fn run_repl_command(
                     let policy = ctx.macro_policy();
                     match policy.find(name).map(|row| &row.state) {
                         Some(state) if state.is_invocable() => {
-                            macro_execute(ctx, name, extra, abort_signal.clone()).await?;
+                            // macro_execute recurses back into run_repl_command; boxing here
+                            // keeps its future out of this already-huge state machine.
+                            Box::pin(macro_execute(ctx, name, extra, abort_signal.clone())).await?;
                         }
                         Some(MacroState::DisabledRuntime) => bail!(
                             r#"Macro '{name}' is disabled. Re-enable it with ".macro enable {name}""#
@@ -1256,7 +1258,8 @@ pub async fn run_repl_command(
                                 let app = Arc::clone(&ctx.app.config);
                                 ctx.new_macro(app.as_ref(), name)?;
                             } else {
-                                macro_execute(ctx, name, extra, abort_signal.clone()).await?;
+                                Box::pin(macro_execute(ctx, name, extra, abort_signal.clone()))
+                                    .await?;
                             }
                         }
                     }
@@ -1536,7 +1539,7 @@ pub async fn run_repl_command(
                 let policy = ctx.macro_policy();
                 match policy.find(name).map(|row| &row.state) {
                     Some(MacroState::Enabled) => {
-                        macro_execute(ctx, name, args, abort_signal.clone()).await?;
+                        Box::pin(macro_execute(ctx, name, args, abort_signal.clone())).await?;
                     }
                     Some(MacroState::DisabledRuntime) => bail!(
                         r#"Macro '{name}' is disabled. Re-enable it with ".macro enable {name}""#

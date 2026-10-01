@@ -744,8 +744,6 @@ async fn start_interactive(ctx: RequestContext) -> Result<()> {
     repl.run().await
 }
 
-#[allow(clippy::double_must_use)]
-#[async_recursion::async_recursion]
 async fn shell_execute(
     ctx: &mut RequestContext,
     shell: &Shell,
@@ -790,7 +788,7 @@ async fn shell_execute(
                     let revision = Text::new("Enter your revision:").prompt()?;
                     let text = format!("{}\n{revision}", input.text());
                     input.set_text(text);
-                    return shell_execute(ctx, shell, input, abort_signal.clone()).await;
+                    return Box::pin(shell_execute(ctx, shell, input, abort_signal.clone())).await;
                 }
                 'd' => {
                     let role = ctx.retrieve_role(app.as_ref(), EXPLAIN_SHELL_ROLE)?;
