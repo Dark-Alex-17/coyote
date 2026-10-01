@@ -124,9 +124,10 @@ normalising it. Any later dependency of this kind is added on the same terms: on
 named here.
 
 `globset` exists for the share-set patterns in `src/mesh/shares.rs`: the allow, deny and
-built-in deny lists are compiled there with `literal_separator` so only `**` crosses a `/`,
-and matched against a wire path only after `WirePath::parse` has accepted it. No other
-module compiles a glob.
+built-in deny lists are compiled there with `literal_separator` so only `**` crosses a `/`.
+Deny and built-in deny are judged on both the name the peer sent, a parsed `WirePath`, and
+the path it resolved to under the share root; allow and override are judged on the resolved
+path alone. No other module uses `globset`.
 
 ### Dependency build-cost records
 

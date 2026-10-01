@@ -220,8 +220,8 @@ pub fn skill_file(name: &str) -> PathBuf {
 
 /// The name the workspace config directory goes by under a workspace root; the env
 /// override is returned as given, so it may be a relative or an absolute path. Sessions,
-/// skills and macros live under this name; workspace memory and the sbx mixin always use
-/// the literal `.coyote`.
+/// agent sessions, skills, macros and the workspace mcp.json live under this name;
+/// workspace memory and the sbx mixin always use the literal `.coyote`.
 pub fn workspace_config_dir_name() -> String {
     match env::var(get_env_name("workspace_config_dir")) {
         Ok(value) => value,

@@ -8,13 +8,13 @@
 //!
 //! Evaluation is deny-first and judged on the file that is actually on disk. A candidate
 //! inside the workspace config directory is refused before any list is consulted, and
-//! nothing lifts that; then a user deny from either layer, matched against both the name
-//! the peer sent and the path it resolved to under the root; then the built-in deny of
-//! secrets and `.git` at any depth, matched the same way, which an `override` lifts for one
-//! exact resolved file; only then does an allow, matched against the resolved path alone,
-//! serve it. An override grants nothing on its own: an allow must still match. Patterns are
-//! globs anchored at the share root where `**` alone crosses a `/`, and only a parsed
-//! `WirePath` reaches them. The root is the caller's, never the current directory.
+//! nothing lifts that; then a user deny from either layer; then the built-in deny of
+//! secrets and `.git` at any depth, which an `override` lifts for one exact resolved file;
+//! only then does an allow serve it. Deny and built-in deny are judged on both the name
+//! the peer sent, a parsed `WirePath`, and the path it resolved to under the share root;
+//! allow and override are judged on the resolved path alone. An override grants nothing on
+//! its own: an allow must still match. Patterns are globs anchored at the share root where
+//! `**` alone crosses a `/`. The root is the caller's, never the current directory.
 
 use crate::config::{WORKSPACE_COYOTE_DIR_NAME, paths};
 use crate::mesh::schema::{Remedy, VersionProbe, unversioned_refusal, version_refusal};
@@ -27,7 +27,7 @@ use globset::{Glob, GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 pub(crate) const SHARES_FILE_VERSION: u64 = 1;
 /// The share list is the human's own decisions, so a refusal says what starting fresh costs.
@@ -207,22 +207,26 @@ pub(crate) struct ShareSet {
 
 impl ShareSet {
     /// Never fails and never creates a file; a refused file is warned about once here and
-    /// its refusal kept for `apply` to repeat.
+    /// its refusal kept for `apply` to repeat. The warning is the outer context alone, the
+    /// file and the remedy; the offending entry is the user's own text and stays in the
+    /// refusal.
     pub(crate) fn load(locations: ShareLocations) -> Self {
         let mut refusals = Vec::new();
+        let mut warnings = Vec::new();
         let mut read = |path: &Path| match read_shares_file(path) {
             Ok(Some(file)) => (file, true),
             Ok(None) => (SharesFile::default(), false),
             Err(err) => {
                 refusals.push(redact_hashes(&format!("{err:#}")));
+                warnings.push(redact_hashes(&format!("{err}")));
                 (SharesFile::default(), true)
             }
         };
         let (global, _) = read(&locations.global);
         let (workspace, workspace_exists) = read(&locations.workspace);
         let poisoned = (!refusals.is_empty()).then(|| refusals.join(" "));
-        if let Some(refusal) = &poisoned {
-            warn!("{refusal} Nothing is shared until then.");
+        if !warnings.is_empty() {
+            warn!("{} Nothing is shared until then.", warnings.join(" "));
         }
         Self {
             locations,
@@ -397,13 +401,18 @@ impl ShareRules {
         self.allow.is_match(&resolved)
     }
 
-    /// The `/`-separated path of `canonical` under the share root.
+    /// The `/`-separated path of `canonical` under the share root; `None` for a path that
+    /// is not plain segments below it, since `..` or a root here means the caller did not
+    /// resolve it.
     fn resolved(&self, canonical: &Path) -> Option<String> {
         let segments = canonical
             .strip_prefix(&self.canonical_root)
             .ok()?
             .components()
-            .map(|component| component.as_os_str().to_str())
+            .map(|component| match component {
+                Component::Normal(segment) => segment.to_str(),
+                _ => None,
+            })
             .collect::<Option<Vec<_>>>()?;
         Some(segments.join("/"))
     }
@@ -420,7 +429,7 @@ impl ShareRules {
 }
 
 /// Every built-in pattern at the share root and at any depth below it, plus the workspace
-/// config directory under each name it goes by.
+/// config directory under each name it goes by, escaped so a name is matched literally.
 fn builtin_deny_patterns(workspace_config_dir_name: &str) -> Vec<String> {
     BUILTIN_DENY
         .iter()
@@ -428,7 +437,7 @@ fn builtin_deny_patterns(workspace_config_dir_name: &str) -> Vec<String> {
         .chain(
             workspace_config_dir_names(workspace_config_dir_name)
                 .into_iter()
-                .map(|name| format!("{name}/**")),
+                .map(|name| format!("{}/**", globset::escape(name))),
         )
         .flat_map(|pattern| [format!("**/{pattern}"), pattern])
         .collect()
@@ -588,7 +597,9 @@ fn read_shares_file(path: &Path) -> Result<Option<SharesFile>> {
 
 /// Reads the version alone first so a file from a newer Coyote gets a precise message
 /// rather than an unknown-field error from whatever the newer layout added. A hand-edited
-/// entry the write path would have refused is refused here too, so it is never inert.
+/// pattern or override path the write path would have refused is refused here too, so
+/// neither is ever inert; a `peer` that is not canonical can only narrow an allow, so it
+/// loads and matches nobody.
 fn parse_shares_file(path: &Path, text: &str) -> Result<SharesFile> {
     let probe: VersionProbe = serde_yaml::from_str(text).with_context(|| {
         unversioned_refusal(
@@ -618,8 +629,9 @@ fn parse_shares_file(path: &Path, text: &str) -> Result<SharesFile> {
     })?;
     validate_entries(&file).with_context(|| {
         format!(
-            "Mesh share list '{}' has an entry to fix or remove",
-            path.display()
+            "Mesh share list '{}' has an entry to fix or remove. {}",
+            path.display(),
+            SHARES_FILE_REMEDY.sentence()
         )
     })?;
     Ok(file)
@@ -1529,26 +1541,35 @@ mod tests {
         let table = [
             (
                 "shares-load-absolute",
+                "/secrets/**",
                 "version: 1\ndeny:\n- pattern: /secrets/**\n",
                 "relative to the workspace root",
             ),
             (
                 "shares-load-dotted",
+                "docs/../**",
                 "version: 1\nallow:\n- pattern: docs/../**\n",
                 "`..` segment",
             ),
             (
                 "shares-load-override-glob",
+                "docs/*",
                 "version: 1\noverride:\n- path: docs/*\n",
                 "is a pattern",
             ),
+            (
+                "shares-load-override-absolute",
+                "/etc/.env",
+                "version: 1\noverride:\n- path: /etc/.env\n",
+                "names one exact file",
+            ),
         ];
-        for (tag, text, teaching) in table {
+        for (tag, offending, text, teaching) in table {
             let fx = Fixture::new(tag);
             let path = fx.write(Layer::Global, text);
             fx.write(Layer::Workspace, "version: 1\nallow:\n- pattern: '**'\n");
 
-            let set = fx.load();
+            let mut set = fx.load();
 
             let refusal = set.poisoned.clone().unwrap();
             assert!(
@@ -1557,12 +1578,73 @@ mod tests {
             );
             assert!(refusal.contains(teaching), "{tag}: {refusal}");
             assert!(!served(&set, &fx, "README.md"), "{tag}");
+            let err = set
+                .apply(allow("src/**"), WriteScope::Auto)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(teaching), "{tag}: {err}");
+            assert!(err.contains(offending), "{tag}: {err}");
             let warned: Vec<String> = warn_snapshot()
                 .into_iter()
                 .filter(|line| line.contains(&path.display().to_string()))
                 .collect();
             assert_eq!(warned.len(), 1, "{tag}: {warned:#?}");
+            assert!(
+                warned[0].contains("entry to fix or remove"),
+                "{tag}: {warned:#?}"
+            );
+            assert!(
+                warned[0].contains("move the file aside"),
+                "{tag}: {warned:#?}"
+            );
+            assert!(
+                !warned[0].contains(offending),
+                "{tag}: the log must not carry the hand-edited text: {warned:#?}"
+            );
         }
+    }
+
+    #[test]
+    fn a_config_dir_name_with_glob_metacharacters_is_still_denied_by_name() {
+        let fx = Fixture::new("shares-protected-metacharacters");
+        let mut set = ShareSet::load(ShareLocations::with_dir_name(
+            &fx.config_dir,
+            &fx.root,
+            "cfg[dev]".to_string(),
+        ));
+        set.apply(allow("**"), WriteScope::Global).unwrap();
+        let inside = fx.file("cfg[dev]/sessions/x.md");
+
+        let rules = rules_for_anyone(&set);
+
+        assert!(!rules.permits(&wire("cfg[dev]/sessions/x.md"), &inside));
+        assert!(rules.builtin.is_match("cfg[dev]/sessions/x.md"));
+        assert!(rules.permits(&wire("README.md"), &fx.file("README.md")));
+        compile(
+            builtin_deny_patterns("cfg[").iter().map(String::as_str),
+            false,
+        )
+        .expect("an unclosed bracket in the name must not break every share");
+    }
+
+    #[test]
+    fn a_candidate_that_is_not_canonical_is_refused_rather_than_matched() {
+        let fx = Fixture::new("shares-dotted-candidate");
+        let mut set = fx.load();
+        set.apply(allow("**"), WriteScope::Auto).unwrap();
+        let readme = fx.file("README.md");
+        // Built on the canonical root so the `..` alone is what refuses it.
+        let dotted = readme
+            .parent()
+            .unwrap()
+            .join("docs")
+            .join("..")
+            .join("README.md");
+
+        let rules = rules_for_anyone(&set);
+
+        assert!(!rules.permits(&wire("README.md"), &dotted));
+        assert!(rules.permits(&wire("README.md"), &readme));
     }
 
     #[test]

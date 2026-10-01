@@ -16,8 +16,7 @@ pub const DEFAULT_INLINE_MAX_BYTES: u64 = 64 * 1024;
 /// Σ inline file bytes one message may carry; `inline_max_bytes` cannot exceed it.
 pub const MAX_INLINE_FILE_TOTAL: u64 = 96 * 1024;
 pub const DEFAULT_FETCH_MAX_BYTES: u64 = 4 * 1024 * 1024;
-/// Largest file a fetch may serve; `max_bytes` cannot exceed it, so a fetch response frame
-/// is bounded by this plus its framing.
+/// Largest file a fetch may serve; `max_bytes` cannot exceed it.
 pub const MAX_FETCH_FILE_BYTES: u64 = 4 * 1024 * 1024;
 /// Width of the label column in `.mesh info`, shared by every row so the values line up
 /// whichever module renders them.
@@ -97,7 +96,6 @@ pub struct MeshFetch {
     pub max_bytes: u64,
     /// Where fetched files are staged, under `<inbox_dir>/<instance id>`; unset stages them
     /// under the cache dir.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub inbox_dir: Option<PathBuf>,
 }
 
@@ -1019,7 +1017,7 @@ mod tests {
     }
 
     #[test]
-    fn fetch_block_reads_max_bytes_and_inbox_dir_and_omits_an_unset_inbox_dir() {
+    fn fetch_block_reads_max_bytes_and_inbox_dir_and_serialises_an_unset_inbox_dir_as_null() {
         let cfg: Config = serde_yaml::from_str(
             "mesh:\n  fetch:\n    max_bytes: 1024\n    inbox_dir: /srv/inbox\n",
         )
@@ -1029,7 +1027,7 @@ mod tests {
         assert_eq!(cfg.mesh.fetch.inline_max_bytes, DEFAULT_INLINE_MAX_BYTES);
 
         let serialized = serde_yaml::to_string(&MeshFetch::default()).unwrap();
-        assert!(!serialized.contains("inbox_dir"), "{serialized}");
+        assert!(serialized.contains("inbox_dir: null"), "{serialized}");
         assert!(serialized.contains("max_bytes: 4194304\n"), "{serialized}");
         let null: Config = serde_yaml::from_str("mesh:\n  fetch:\n    inbox_dir: null\n").unwrap();
         assert_eq!(null.mesh.fetch, MeshFetch::default());

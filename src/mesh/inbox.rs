@@ -1,11 +1,12 @@
 //! The staging inbox, where a peer's file lands before anyone looks at it. One layout,
-//! `<cache_dir>/mesh/inbox/<instance_id>/<peer-dest8>/<rel>`, and one guard: the directory
-//! a file will be written into must resolve inside the inbox root, checked before any
-//! directory is created under it and again before the file is written, so a symlink
-//! planted under the inbox cannot lead a write outside it. Nothing here logs: the path and
-//! the bytes are the peer's. A file is written through a randomly named `.tmp-<uuid>`
-//! sibling and hard-linked into place, so no name a peer chooses can alias the temp file
-//! and nothing already at the target is ever overwritten.
+//! `<root>/<peer-dest8>/<rel>` where the root is `<cache_dir>/mesh/inbox/<instance_id>` or
+//! `<mesh.fetch.inbox_dir>/<instance_id>`, and one guard: the directory a file will be
+//! written into must resolve inside the inbox root, checked before any directory is
+//! created under it and again before the file is written, so a symlink planted under the
+//! inbox cannot lead a write outside it. Nothing here logs: the path and the bytes are the
+//! peer's. A file is written through a randomly named `.tmp-<uuid>` sibling and
+//! hard-linked into place, so no name a peer chooses can alias the temp file and nothing
+//! already at the target is ever overwritten.
 
 use crate::mesh::wire_path::WirePath;
 use crate::mesh::{hex_lower, mesh_cache_dir};
