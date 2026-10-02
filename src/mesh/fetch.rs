@@ -139,12 +139,21 @@ impl FetchServing {
         }
     }
 
-    /// Opens the grant store of `instance_id` and serves from it; a store that cannot be
-    /// opened leaves the current one in place.
-    pub(crate) fn rebind_grants(&self, instance_id: &str, now: SystemTime) -> anyhow::Result<()> {
+    /// Opens the grant store of `instance_id` and serves from it, handing back the store it
+    /// displaces so a caller that has to undo the switch can put it back without touching
+    /// the disk; a store that cannot be opened leaves the current one in place.
+    pub(crate) fn rebind_grants(
+        &self,
+        instance_id: &str,
+        now: SystemTime,
+    ) -> anyhow::Result<Arc<GrantStore>> {
         let grants = GrantStore::open(&self.cache_dir, instance_id, now)?;
-        self.grants.store(Arc::new(grants));
-        Ok(())
+        Ok(self.grants.swap(Arc::new(grants)))
+    }
+
+    /// Serves from `grants` again: the infallible half of `rebind_grants`.
+    pub(crate) fn restore_grants(&self, grants: Arc<GrantStore>) {
+        self.grants.store(grants);
     }
 
     #[cfg(test)]
@@ -1873,7 +1882,10 @@ mod tests {
     /// A share list the node refuses is the operator's problem, said once; the peers whose
     /// requests keep finding it broken do not get to repeat the warning. Fixing the file
     /// and breaking it again warns again.
+    // Serialized with its sibling below: both count the marker-less
+    // "Mesh share list still refused" debug line in the binary-wide log buffer.
     #[cfg(unix)]
+    #[serial_test::serial(mesh_share_list_logs)]
     #[tokio::test]
     async fn a_refused_share_list_is_warned_about_once_per_root_not_per_request() {
         install_log_collector();
@@ -2006,7 +2018,10 @@ mod tests {
     /// list fixed and then broken again with the very same mistake is a new refusal and
     /// is warned about again, and the requests that keep finding it broken in between
     /// say so at `debug!`, never at `warn!`.
+    // Serialized with `a_refused_share_list_is_warned_about_once_per_root_not_per_request`:
+    // the "still refused" debug line carries no marker, so only one of them may count it.
     #[cfg(unix)]
+    #[serial_test::serial(mesh_share_list_logs)]
     #[tokio::test]
     async fn usage_probe_a_list_broken_again_with_the_same_text_warns_again_and_repeats_only_at_debug()
      {
@@ -2018,10 +2033,15 @@ mod tests {
         );
         fx.file("docs/a.md", b"a");
         let shares = mesh_config_dir(&fx._tmp.path.join("config")).join("shares.yaml");
+        // The warning names the share file, so the fixture's directory keeps a sibling's
+        // identical refusal out of the count.
+        let marker = fx._tmp.path.to_string_lossy().into_owned();
         let refusal_warns = || {
             warn_snapshot()
                 .iter()
-                .filter(|line| line.ends_with("Nothing is shared until then."))
+                .filter(|line| {
+                    line.contains(&marker) && line.ends_with("Nothing is shared until then.")
+                })
                 .count()
         };
         let still_refused = || {
@@ -2624,6 +2644,140 @@ mod tests {
         let leaked: Vec<String> = debug_snapshot()
             .into_iter()
             .filter(|line| line.contains("probe-q9"))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "a refusal line carried the path: {leaked:?}"
+        );
+    }
+
+    /// A granted file the operating system refuses to open is refused `not_shared` byte for
+    /// byte like a missing one, the refusal is logged with its rule and without the path,
+    /// and the grant's use is not spent by a fetch that served nothing: once the file is
+    /// readable again the same grant serves it exactly once.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn usage_probe_an_unreadable_granted_file_is_not_shared_byte_for_byte_and_keeps_its_use()
+    {
+        use std::os::unix::fs::PermissionsExt;
+        install_log_collector();
+        let fx = Fixture::new("fetch-probe-unreadable-grant", MAX_FETCH_FILE_BYTES, &[]);
+        let relative = "docs/locked-probe-u7.md";
+        fx.file(relative, b"locked");
+        let on_disk = fx.root.join(relative);
+        fs::set_permissions(&on_disk, fs::Permissions::from_mode(0o000)).unwrap();
+        fx.grant(&[relative]);
+        let store = fx.serving.grants();
+        assert_eq!(uses_left(&store), 1);
+        let identity_hex = fx.identity.as_identity().address_hash.to_hex_string();
+        let destination = fx.destination.clone();
+        let mine =
+            |line: &String| line.contains(&identity_hex[..8]) || line.contains(&destination[..8]);
+
+        let before = debug_snapshot().iter().filter(|line| mine(line)).count();
+        let refused = fx.fetch(relative, None).await;
+        assert_eq!(status_of(&refused), "not_shared");
+        let lines: Vec<String> = debug_snapshot().into_iter().filter(mine).collect();
+        assert!(
+            lines
+                .iter()
+                .skip(before)
+                .any(|line| line.contains("refused: not_shared")),
+            "no debug line names the rule for the unreadable file: {lines:?}"
+        );
+        assert_eq!(
+            encoded(refused),
+            encoded(fx.fetch("docs/missing-probe-u7.md", None).await),
+            "an unreadable file and a missing one answer byte for byte alike"
+        );
+        assert_eq!(
+            uses_left(&store),
+            1,
+            "a fetch that served nothing spends nothing"
+        );
+
+        fs::set_permissions(&on_disk, fs::Permissions::from_mode(0o644)).unwrap();
+        let served = fx.fetch(relative, None).await;
+        assert_eq!(status_of(&served), "ok");
+        let value = sent(served);
+        assert_eq!(
+            field_of(&value, "bytes").and_then(|bytes| bytes.as_slice()),
+            Some(&b"locked"[..])
+        );
+        assert_eq!(uses_left(&store), 0);
+        assert_eq!(status_of(&fx.fetch(relative, None).await), "not_shared");
+
+        let leaked: Vec<String> = debug_snapshot()
+            .into_iter()
+            .filter(|line| line.contains("probe-u7"))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "a refusal line carried the path: {leaked:?}"
+        );
+    }
+
+    /// A read that fails after the share list served the file answers the peer with the
+    /// shared `not_shared` bytes and tells the operator why at `debug!`: the line names the
+    /// rule, carries the read error with any full hash in it cut short, and never the
+    /// path. The share rule is untouched, so the next fetch with a working reader serves.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn usage_probe_a_read_that_fails_after_the_share_list_served_logs_why_without_the_path() {
+        struct HashyReader;
+        impl FileReader for HashyReader {
+            fn read_bounded(&self, _file: fs::File, _limit: u64) -> std::io::Result<Vec<u8>> {
+                Err(std::io::Error::other(
+                    "block 0123456789abcdef0123456789abcdef vanished",
+                ))
+            }
+        }
+        install_log_collector();
+        let fx = Fixture::new(
+            "fetch-probe-read-failed-log",
+            MAX_FETCH_FILE_BYTES,
+            &["docs/**"],
+        );
+        let relative = "docs/served-probe-u8.md";
+        fx.file(relative, b"served");
+        let identity_hex = fx.identity.as_identity().address_hash.to_hex_string();
+        let destination = fx.destination.clone();
+        let mine =
+            |line: &String| line.contains(&identity_hex[..8]) || line.contains(&destination[..8]);
+
+        let before = debug_snapshot().iter().filter(|line| mine(line)).count();
+        let failing = FetchHandler::with_reader(fx.weak_source(), Arc::new(HashyReader));
+        let refused = fx.fetch_with(failing, relative, None).await;
+        assert_eq!(status_of(&refused), "not_shared");
+        let lines: Vec<String> = debug_snapshot().into_iter().filter(mine).collect();
+        let why = "not_shared (read failed: block 01234567 vanished)";
+        assert!(
+            lines.iter().skip(before).any(|line| line.contains(why)),
+            "no debug line says {why:?}: {lines:?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .skip(before)
+                .any(|line| line.contains("0123456789abcdef0123456789abcdef")),
+            "the read error's full hash reached the log: {lines:?}"
+        );
+        assert_eq!(
+            encoded(refused),
+            encoded(fx.fetch("docs/missing-probe-u8.md", None).await),
+            "a failed read and a missing file answer byte for byte alike"
+        );
+
+        let served = fx.fetch(relative, None).await;
+        assert_eq!(status_of(&served), "ok", "the share rule still serves");
+        assert_eq!(
+            field_of(&sent(served), "bytes").and_then(|bytes| bytes.as_slice()),
+            Some(&b"served"[..])
+        );
+
+        let leaked: Vec<String> = debug_snapshot()
+            .into_iter()
+            .filter(|line| line.contains("probe-u8"))
             .collect();
         assert!(
             leaked.is_empty(),

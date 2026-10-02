@@ -1888,10 +1888,9 @@ impl MeshSlot {
             .context(
                 "The fork's grant store could not be opened, so the node still serves the original instance",
             );
-        let rollback_grants = grants_rebound.is_ok();
-        let rekeyed = match grants_rebound {
-            Ok(()) => runtime.rekey(rekey).await,
-            Err(err) => Err(err),
+        let (rekeyed, displaced_grants) = match grants_rebound {
+            Ok(displaced) => (runtime.rekey(rekey).await, Some(displaced)),
+            Err(err) => (Err(err), None),
         };
         if rekeyed.is_err() {
             let instance_id = runtime.current_instance_id();
@@ -1902,15 +1901,9 @@ impl MeshSlot {
                 runtime.cache_dir(),
                 &instance_id,
             )));
-            if rollback_grants
-                && let Err(err) = runtime
-                    .serving()
-                    .rebind_grants(&instance_id, SystemTime::now())
-            {
-                warn!(
-                    "The original instance's grant store could not be reopened after the failed re-key, so the fork's grants stay in force: {}",
-                    redact_hashes(&format!("{err:#}"))
-                );
+            // The original's store was never closed, so putting it back cannot fail.
+            if let Some(original_grants) = displaced_grants {
+                runtime.serving().restore_grants(original_grants);
             }
         }
         rekeyed
