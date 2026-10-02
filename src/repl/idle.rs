@@ -862,14 +862,16 @@ fn is_completion(note: &SystemNotification) -> bool {
     note.event == AGENT_COMPLETED_EVENT || note.event == AGENT_FAILED_EVENT
 }
 
-/// Knock lines and reply lines are never folded into a summary. A knock is admitted by
-/// the gate once per identity per process, and only for an identity already trusted at
-/// the identity tier (`KnockGate::admit` drops unknown ones), which is what bounds them;
-/// its line carries the full hash the `.mesh trust` hint needs, which a fold would lose.
-/// A reply answers an open question this node asked, so replies are bounded by our own
-/// asks. Folding either would hide a line the peer cannot earn again.
+/// Knock, reply and access lines are never folded into a summary. A knock is admitted
+/// by the gate once per identity per process, and only for an identity already trusted
+/// at the identity tier (`KnockGate::admit` drops unknown ones), which is what bounds
+/// them; its line carries the full hash the `.mesh trust` hint needs, which a fold would
+/// lose. A reply answers an open question this node asked, so replies are bounded by our
+/// own asks. An access request is capped per identity by the pending-request rule and
+/// its line carries the id the grant verb needs. Folding any would hide a line the peer
+/// cannot earn again.
 fn exempt_from_folding(source: Source) -> bool {
-    matches!(source, Source::Knock | Source::Reply)
+    matches!(source, Source::Knock | Source::Reply | Source::Access)
 }
 
 /// Pushes a note into the queue the context holds now. A completion points the model at
@@ -2027,17 +2029,18 @@ mod tests {
             .collect()
     }
 
-    /// Knocks are gated per identity upstream and replies by this node's own asks, so a
-    /// burst of either past the bucket's capacity shows every line and folds none.
+    /// Knocks are gated per identity upstream, replies by this node's own asks and access
+    /// requests by the pending cap, so a burst of any past the bucket's capacity shows
+    /// every line and folds none.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn knock_and_reply_lines_are_never_folded() {
+    async fn knock_reply_and_access_lines_are_never_folded() {
         let ctx = test_ctx(None);
         let sink = install_sink(&ctx);
         let driver = start_driver(&ctx);
 
         let per_source = IDLE_NOTIFY_BURST as usize + 3;
         let mut expected = Vec::new();
-        for source in [Source::Knock, Source::Reply] {
+        for source in [Source::Knock, Source::Reply, Source::Access] {
             for i in 0..per_source {
                 let peer = format!("{:08x}", i + 1);
                 let text = format!("{source:?} {i}");
@@ -2058,7 +2061,7 @@ mod tests {
         let lines = sink.lines();
         assert!(
             fold_summaries(&lines).is_empty(),
-            "a knock or reply line was folded: {lines:?}"
+            "a knock, reply or access line was folded: {lines:?}"
         );
         assert_eq!(lines, expected);
         driver.stop().await;

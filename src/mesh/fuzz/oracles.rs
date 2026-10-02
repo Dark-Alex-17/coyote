@@ -29,8 +29,8 @@ use crate::mesh::propagation_fetch::{
 };
 use crate::mesh::protocol::{MESH_PROTOCOL_MIN_SUPPORTED, MESH_PROTOCOL_VERSION, VersionRefusal};
 use crate::mesh::r3::{
-    AdmittedRequest, DispatchError, Dispatcher, Envelope, EnvelopeError, FETCH_PATH, Handler,
-    InboundRequest, KNOCK_PATH, KNOWN_PATHS, KnockEvent, KnockSink, LIST_PATH,
+    ACCESS_PATH, AdmittedRequest, DispatchError, Dispatcher, Envelope, EnvelopeError, FETCH_PATH,
+    Handler, InboundRequest, KNOCK_PATH, KNOWN_PATHS, KnockEvent, KnockSink, LIST_PATH,
     MAX_R3_NESTING_DEPTH, MESSAGE_PATH, NAME_HASH_LEN, PathHash, R3Error, RefusalCode, Reply,
     RequestFrame, RequestHandler, RequestId, STATUS_PATH, SizeBranch,
 };
@@ -668,6 +668,7 @@ enum PathGen {
     Knock,
     List,
     Fetch,
+    Access,
     Other(String),
     RawHash([u8; ADDRESS_HASH_SIZE]),
 }
@@ -680,6 +681,7 @@ impl PathGen {
             Self::Knock => PathHash::of(KNOCK_PATH),
             Self::List => PathHash::of(LIST_PATH),
             Self::Fetch => PathHash::of(FETCH_PATH),
+            Self::Access => PathHash::of(ACCESS_PATH),
             Self::Other(path) => PathHash::of(&path),
             Self::RawHash(bytes) => PathHash::from(bytes),
         }
@@ -3359,6 +3361,7 @@ enum PathTextGen {
     Knock,
     List,
     Fetch,
+    Access,
     Other(String),
     Odd(Scalar),
 }
@@ -3403,6 +3406,7 @@ impl DispatchErrorGen {
                     PathTextGen::Knock => Value::from(KNOCK_PATH),
                     PathTextGen::List => Value::from(LIST_PATH),
                     PathTextGen::Fetch => Value::from(FETCH_PATH),
+                    PathTextGen::Access => Value::from(ACCESS_PATH),
                     PathTextGen::Other(path) => Value::from(path),
                     PathTextGen::Odd(odd) => odd.into_value(),
                 }),

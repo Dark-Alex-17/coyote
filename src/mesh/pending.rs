@@ -5,9 +5,11 @@
 //! this node that the envoy escalated to the person at the keyboard, kept apart so a
 //! peer's reply can never be matched against one.
 
+use crate::mesh::access::{ACCESS_MAX_PATHS, ACCESS_REASON_MAX_CHARS};
 use crate::mesh::message::{Disposition, PEER_ID_MAX_CHARS, PeerMessage};
 use crate::mesh::r3::{redact_hashes, short};
 use crate::mesh::schema::{Remedy, VersionProbe, unversioned_refusal, version_refusal};
+use crate::mesh::wire_path::WirePath;
 use crate::mesh::{canonical_hash, mesh_cache_dir, parse_rfc3339, write_atomically};
 
 use anyhow::{Context, Result, bail};
@@ -393,6 +395,7 @@ impl InboundStore {
                 "An inbound question's envoy question is longer than {INBOUND_ENVOY_QUESTION_MAX_CHARS} characters; refusing to store it."
             );
         }
+        validate_kind_shape(&record)?;
         let _guard = self.write_lock.lock();
         let _file_lock = file_lock(&self.path, INBOUND_NAMES)?;
         let mut records = self.read_all()?;
@@ -473,6 +476,44 @@ impl InboundStore {
             |record: &InboundRecord| ("received_at", &record.received_at),
         )
     }
+}
+
+/// The access fields have to agree with `kind`: a question carries none of them, an
+/// access request carries what the wire handler accepted, so a stored record can be
+/// granted without being validated again.
+fn validate_kind_shape(record: &InboundRecord) -> Result<()> {
+    match record.kind {
+        InboundKind::Question => {
+            if !record.paths.is_empty() || !record.reason.is_empty() {
+                bail!(
+                    "An inbound question carries paths or a reason, which only an access request may; refusing to store it."
+                );
+            }
+        }
+        InboundKind::Access => {
+            if record.paths.is_empty() || record.paths.len() > ACCESS_MAX_PATHS {
+                bail!(
+                    "An inbound access request names between 1 and {ACCESS_MAX_PATHS} paths, not {}; refusing to store it.",
+                    record.paths.len()
+                );
+            }
+            for (index, path) in record.paths.iter().enumerate() {
+                WirePath::parse(path).with_context(|| {
+                    format!(
+                        "Requested path {} of {} is not a wire path",
+                        index + 1,
+                        record.paths.len()
+                    )
+                })?;
+            }
+            if record.reason.chars().count() > ACCESS_REASON_MAX_CHARS {
+                bail!(
+                    "An inbound access request's reason is longer than {ACCESS_REASON_MAX_CHARS} characters; refusing to store it."
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Whether `stamp`, an RFC 3339 time the reader has already accepted, is `PENDING_TTL`
@@ -1574,6 +1615,72 @@ mod tests {
         assert_eq!(listed[0].kind, InboundKind::Access);
         assert_eq!(listed[0].paths, vec!["src/x.rs".to_string()]);
         assert_eq!(listed[0].reason, "need it");
+    }
+
+    #[test]
+    fn inbound_upsert_holds_the_access_fields_to_the_record_kind() {
+        let tmp = TempDir::new("inbound-kind-shape");
+        let store = InboundStore::new(&tmp.path, "inst");
+        let question = inbound("q", t(1_000));
+        let access = InboundRecord {
+            kind: InboundKind::Access,
+            question: String::new(),
+            envoy_question: String::new(),
+            paths: vec!["src/x.rs".to_string()],
+            reason: "need it".to_string(),
+            ..inbound("a", t(1_000))
+        };
+        store.upsert(question.clone(), t(1_000)).unwrap();
+        store.upsert(access.clone(), t(1_000)).unwrap();
+
+        let cases = [
+            (
+                "a question with paths",
+                InboundRecord {
+                    paths: vec!["src/x.rs".to_string()],
+                    ..question.clone()
+                },
+            ),
+            (
+                "a question with a reason",
+                InboundRecord {
+                    reason: "why".to_string(),
+                    ..question.clone()
+                },
+            ),
+            (
+                "an access request without paths",
+                InboundRecord {
+                    paths: Vec::new(),
+                    ..access.clone()
+                },
+            ),
+            (
+                "an access request past the path cap",
+                InboundRecord {
+                    paths: (0..=ACCESS_MAX_PATHS).map(|i| format!("p{i}.rs")).collect(),
+                    ..access.clone()
+                },
+            ),
+            (
+                "an access request with a path that is not a wire path",
+                InboundRecord {
+                    paths: vec!["../x.rs".to_string()],
+                    ..access.clone()
+                },
+            ),
+            (
+                "an access request with a reason past the cap",
+                InboundRecord {
+                    reason: "r".repeat(ACCESS_REASON_MAX_CHARS + 1),
+                    ..access.clone()
+                },
+            ),
+        ];
+        for (what, broken) in cases {
+            assert!(store.upsert(broken, t(1_000)).is_err(), "{what} was stored");
+        }
+        assert_eq!(inbound_ids(&store.list(t(1_000)).unwrap()), vec!["a", "q"]);
     }
 
     #[test]

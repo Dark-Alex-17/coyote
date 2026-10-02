@@ -23,11 +23,18 @@ pub(crate) const STATUS_PATH: &str = "/status";
 pub(crate) const MESSAGE_PATH: &str = "/message";
 pub(crate) const LIST_PATH: &str = "/list";
 pub(crate) const FETCH_PATH: &str = "/fetch";
+pub(crate) const ACCESS_PATH: &str = "/access";
 /// Every path this dispatcher knows by name: `/knock` served by the dispatcher itself, the
 /// rest pre-seeded without a provider until the slot registers one. The one list every
 /// path check and generator reads, so none of them can drift from the routes.
-pub(crate) const KNOWN_PATHS: [&str; 5] =
-    [KNOCK_PATH, STATUS_PATH, MESSAGE_PATH, LIST_PATH, FETCH_PATH];
+pub(crate) const KNOWN_PATHS: [&str; 6] = [
+    KNOCK_PATH,
+    STATUS_PATH,
+    MESSAGE_PATH,
+    LIST_PATH,
+    FETCH_PATH,
+    ACCESS_PATH,
+];
 
 fn path_name(path_hash: PathHash) -> Option<&'static str> {
     KNOWN_PATHS
@@ -485,7 +492,14 @@ mod tests {
     fn usage_probe_every_known_path_is_named_and_its_no_provider_refusal_round_trips() {
         assert_eq!(
             KNOWN_PATHS,
-            [KNOCK_PATH, STATUS_PATH, MESSAGE_PATH, LIST_PATH, FETCH_PATH]
+            [
+                KNOCK_PATH,
+                STATUS_PATH,
+                MESSAGE_PATH,
+                LIST_PATH,
+                FETCH_PATH,
+                ACCESS_PATH
+            ]
         );
         for path in KNOWN_PATHS {
             assert_eq!(describe_path(PathHash::of(path)), path);
