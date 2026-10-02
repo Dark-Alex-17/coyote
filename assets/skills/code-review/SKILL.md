@@ -167,6 +167,14 @@ Named adequacy anti-patterns — each is a finding even when coverage looks gree
   the wrong ID, wrong quantity, or wrong principal satisfies it. Flag every relaxed-count
   expectation whose matcher is permissive; the fix pins the load-bearing fields in the matcher
   (or exact count + captured args).
+- **New clamp / default-fallback logic without boundary tests** — for each new bound-enforcing
+  expression in the diff (`if v <= 0 { v = default }`, `if v > max { v = max }`, `min`/`max(v,
+  bound)` against a configured limit, a config value narrowed `int`→`uint32` etc.), require a test
+  that invokes the constructor/function with a below-min, an above-max, and an in-range value and
+  asserts the result. Decidable check: would reverting the clamp to a constant fail any test? Flag
+  🟡 when no test passes an out-of-range value; stay silent when the diff adds no clamp. Unlike a
+  guard, a clamp coerces instead of rejecting, so the "missing negative case" rule does not catch
+  it — an untested clamp is how a bypass of the bound ships unnoticed.
 
 ## 3. Clarity
 
