@@ -11,22 +11,27 @@ use crate::mesh::events::{AccessDecision, MeshEvent};
 use crate::mesh::fetch::{FetchServing, ShareSource, field, versioned_map};
 use crate::mesh::grants::DEFAULT_GRANT_TTL;
 use crate::mesh::idle::{IdleNotify, Origin};
-use crate::mesh::message::{PEER_WIRE_VERSION, PeerVia, is_wire_id};
-use crate::mesh::node::MeshSlot;
+use crate::mesh::message::{
+    Disposition, OutboundPeer, PEER_WIRE_VERSION, PartLimits, PeerKind, PeerVia, RawPart,
+    SendError, is_wire_id,
+};
+use crate::mesh::node::{MeshRuntime, MeshSlot};
 use crate::mesh::notify::Source;
-use crate::mesh::pending::{INBOUND_RECORD_VERSION, InboundKind, InboundRecord};
+use crate::mesh::pending::{INBOUND_RECORD_VERSION, InboundKind, InboundRecord, InboundStore};
 use crate::mesh::r3::{AdmittedRequest, Handler, RefusalCode, Reply};
-use crate::mesh::shares::PeerRef;
+use crate::mesh::shares::{Mutation, PeerRef, ShareSet, WriteScope};
 use crate::mesh::wire_path::WirePath;
-use crate::mesh::{display_text, redact_hashes, rfc3339_utc, short};
+use crate::mesh::{display_text, parse_rfc3339, redact_hashes, rfc3339_utc, short};
 
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use rmpv::Value;
+use serde_json::json;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
-use std::sync::Weak;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Weak};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Matches `GRANT_MAX_PATHS`: a request for more is a share list by another name.
 pub(crate) const ACCESS_MAX_PATHS: usize = 16;
@@ -361,6 +366,248 @@ fn via_word(via: PeerVia) -> &'static str {
     }
 }
 
+/// The human's side of a pending access request: grant it once or for good, or refuse
+/// it. Either way the peer hears a reply and the request leaves the inbound store.
+pub(crate) struct AccessStore<'a> {
+    slot: &'a MeshSlot,
+}
+
+impl MeshSlot {
+    // Reached by the human's grant and refuse verbs once they land.
+    #[allow(dead_code)]
+    pub(crate) fn access(&self) -> AccessStore<'_> {
+        AccessStore { slot: self }
+    }
+}
+
+/// What a decision did, for the line the human reads back.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct AccessDecisionReport {
+    pub id: String,
+    pub peer_destination: String,
+    pub path_count: usize,
+    pub decision: AccessDecision,
+    /// When a one-off grant runs out; a standing grant and a refusal have no end.
+    pub expires: Option<SystemTime>,
+    pub standing: bool,
+    pub via: PeerVia,
+}
+
+// Reached by the human's grant and refuse verbs once they land.
+#[allow(dead_code)]
+impl AccessStore<'_> {
+    /// Lets the requesting peer read every path it asked for: once, through a grant that
+    /// lends each path one use until `ttl` (the default when `None`) runs out, or
+    /// standing, through an allow entry per path in the share list scoped to the
+    /// requesting identity. The reply goes to the peer before the request is removed, so
+    /// a send that fails leaves it pending to decide again; a one-off grant written by
+    /// then stays until it expires.
+    pub(crate) async fn grant(
+        &self,
+        id: &str,
+        standing: bool,
+        ttl: Option<Duration>,
+    ) -> Result<AccessDecisionReport> {
+        let (store, record, runtime) = self.pending(id)?;
+        let expires = if standing {
+            self.share_standing(&runtime, &record)?;
+            None
+        } else {
+            let granted = runtime.serving().grants().grant(
+                id,
+                &record.peer_destination,
+                &record.paths,
+                ttl,
+                SystemTime::now(),
+            )?;
+            Some(
+                parse_rfc3339(&granted.expires)
+                    .context("The grant was written with an expiry that does not read back")?,
+            )
+        };
+        self.decide(
+            &store,
+            record,
+            &runtime,
+            AccessDecision::Granted,
+            expires,
+            standing,
+        )
+        .await
+    }
+
+    /// Tells the requesting peer no. Nothing is written to the grants or the share list.
+    pub(crate) async fn refuse(&self, id: &str) -> Result<AccessDecisionReport> {
+        let (store, record, runtime) = self.pending(id)?;
+        self.decide(
+            &store,
+            record,
+            &runtime,
+            AccessDecision::Denied,
+            None,
+            false,
+        )
+        .await
+    }
+
+    fn pending(&self, id: &str) -> Result<(Arc<InboundStore>, InboundRecord, Arc<MeshRuntime>)> {
+        let Some(store) = self.slot.inbound_store() else {
+            bail!("Mesh is off; turn it on with `.mesh on` before deciding {id}");
+        };
+        let Some(record) = store.get(id)? else {
+            bail!("no open access request {id}");
+        };
+        if record.kind == InboundKind::Question {
+            bail!(
+                "`{id}` is a question, not an access request; answer it with `.mesh answer {id}`"
+            );
+        }
+        let Some(runtime) = self.slot.get() else {
+            bail!(
+                "Mesh is off, so the decision on {id} cannot be sent to {}",
+                short(&record.peer_destination)
+            );
+        };
+        Ok((store, record, runtime))
+    }
+
+    /// An allow entry per requested path, each matching that path literally and only for
+    /// the requesting identity, in whichever share list the write rule picks. A share
+    /// list that does not load is left as it is.
+    fn share_standing(&self, runtime: &MeshRuntime, record: &InboundRecord) -> Result<()> {
+        let Some(root) = ShareSource::share_root(self.slot) else {
+            bail!(
+                "A standing grant writes to the share list under the workspace root, which is unknown until a turn completes; grant {id} once with `.mesh grant {id}` instead",
+                id = record.id
+            );
+        };
+        let (mut shares, warning) =
+            ShareSet::load_quietly(runtime.serving().share_locations(&root));
+        if let Some(warning) = warning {
+            bail!("{warning} Nothing was written.");
+        }
+        for path in &record.paths {
+            shares.apply(
+                Mutation::Allow {
+                    pattern: globset::escape(path),
+                    peer: Some(record.peer_identity.clone()),
+                },
+                WriteScope::Auto,
+            )?;
+        }
+        Ok(())
+    }
+
+    async fn decide(
+        &self,
+        store: &InboundStore,
+        record: InboundRecord,
+        runtime: &MeshRuntime,
+        decision: AccessDecision,
+        expires: Option<SystemTime>,
+        standing: bool,
+    ) -> Result<AccessDecisionReport> {
+        let reply = decision_reply(
+            &record.id,
+            &record.thread,
+            record.paths.len(),
+            decision,
+            expires,
+            standing,
+            &runtime.part_limits(),
+        )?;
+        let sent = runtime.send_peer(&record.peer_destination, &reply).await?;
+        store.remove(&record.id)?;
+        let InboundRecord {
+            id,
+            peer_destination,
+            peer_identity,
+            paths,
+            ..
+        } = record;
+        debug!(
+            "Mesh access {} (instance {}) {} on {} paths via {}",
+            short(&peer_identity),
+            short(&peer_destination),
+            decision_word(decision),
+            paths.len(),
+            via_word(sent.via)
+        );
+        self.slot.hooks().fire(MeshEvent::AccessDecided {
+            identity: peer_identity,
+            destination: peer_destination.clone(),
+            access_id: id.clone(),
+            decision,
+        });
+        Ok(AccessDecisionReport {
+            id,
+            peer_destination,
+            path_count: paths.len(),
+            decision,
+            expires,
+            standing,
+            via: sent.via,
+        })
+    }
+}
+
+fn decision_word(decision: AccessDecision) -> &'static str {
+    match decision {
+        AccessDecision::Granted => "granted",
+        AccessDecision::Denied => "denied",
+    }
+}
+
+/// The reply that settles an admitted access request, on this route and the
+/// store-and-forward one alike: a reply in the request's thread, marked answered, whose
+/// one data part says `{"access": {"status", "expires"?}}`. `expires` is carried as unix
+/// seconds and only for a one-off grant. The paths are never repeated back: the peer
+/// knows what it asked for, and the reply may travel through a propagation node.
+pub(crate) fn decision_reply(
+    record_id: &str,
+    thread: &str,
+    path_count: usize,
+    decision: AccessDecision,
+    expires: Option<SystemTime>,
+    standing: bool,
+    limits: &PartLimits,
+) -> Result<OutboundPeer, SendError> {
+    let plural = if path_count == 1 { "" } else { "s" };
+    let counted = format!("{path_count} path{plural}");
+    let content = match (decision, expires) {
+        (AccessDecision::Denied, _) => format!("access denied: {counted}"),
+        (AccessDecision::Granted, Some(expires)) => {
+            format!("access granted: {counted} until {}", rfc3339_utc(expires))
+        }
+        (AccessDecision::Granted, None) if standing => {
+            format!("access granted: {counted}, standing")
+        }
+        (AccessDecision::Granted, None) => format!("access granted: {counted}"),
+    };
+    let mut access = json!({ "status": decision_word(decision) });
+    if let Some(expires) = expires {
+        access["expires"] = json!(
+            expires
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs_f64()
+        );
+    }
+    Ok(OutboundPeer::with_parts(
+        PeerKind::Reply,
+        &content,
+        None,
+        Some(record_id),
+        None,
+        vec![RawPart::Data {
+            data: json!({ "access": access }),
+        }],
+        limits,
+    )?
+    .with_thread(Some(thread.to_string()))?
+    .with_disposition(Disposition::Answered, None))
+}
+
 /// Whether the share rules already serve every path to `peer`. A root whose case could
 /// not be probed shares nothing, as it does for a fetch.
 fn already_shared(
@@ -475,10 +722,11 @@ mod tests {
     use super::*;
     use crate::hooks::HookEvent;
     use crate::mesh::events::{RecordingHookSink, env_value};
-    use crate::mesh::grants::GRANT_MAX_PATHS;
+    use crate::mesh::grants::{DEFAULT_GRANT_USES, GRANT_MAX_PATHS};
     use crate::mesh::hex_lower;
     use crate::mesh::idle::IdleSink;
-    use crate::mesh::pending::InboundStore;
+    use crate::mesh::message::{Part, PeerMessage, RawPeerMessage, from_r3_body, to_r3_body};
+    use crate::mesh::pending::{PENDING_RECORD_VERSION, PendingRecord, PendingState};
     use crate::mesh::r3::{ACCESS_PATH, PathHash, RequestId, SizeBranch};
     use crate::mesh::test_support::{TempDir, snapshot_fixture};
     use rand_core::OsRng;
@@ -493,9 +741,13 @@ mod tests {
     #[cfg(unix)]
     use crate::mesh::envoy::{EnvoyJob, EnvoySink};
     #[cfg(unix)]
+    use crate::mesh::grants::GrantRecord;
+    #[cfg(unix)]
     use crate::mesh::limits::PeerRefusal;
     #[cfg(unix)]
     use crate::mesh::mesh_config_dir;
+    #[cfg(unix)]
+    use crate::mesh::message::PeerBody;
     #[cfg(unix)]
     use crate::mesh::node::{MeshRuntime, NodeOptions};
     #[cfg(unix)]
@@ -505,7 +757,13 @@ mod tests {
     #[cfg(unix)]
     use crate::mesh::r3::NAME_HASH_LEN;
     #[cfg(unix)]
-    use crate::mesh::test_support::{loopback_relay, mesh_paths, private_config};
+    use crate::mesh::test_support::{
+        PeerStub, loopback_relay, mesh_paths, private_config, wait_until,
+    };
+    #[cfg(unix)]
+    use crate::mesh::trust::TrustOptions;
+    #[cfg(unix)]
+    use rns_transport::iface::tcp_server::TcpServer;
     #[cfg(unix)]
     use std::sync::atomic::{AtomicUsize, Ordering};
     #[cfg(unix)]
@@ -627,6 +885,70 @@ mod tests {
 
     fn access_records(slot: &MeshSlot) -> Vec<InboundRecord> {
         store_of(slot).list(SystemTime::now()).unwrap()
+    }
+
+    fn question_record(id: &str) -> InboundRecord {
+        InboundRecord {
+            version: INBOUND_RECORD_VERSION,
+            id: id.to_string(),
+            peer_destination: destination(),
+            peer_identity: identity(),
+            thread: id.to_string(),
+            question: "may I?".to_string(),
+            envoy_question: String::new(),
+            received_at: rfc3339_utc(SystemTime::now()),
+            kind: InboundKind::Question,
+            paths: Vec::new(),
+            reason: String::new(),
+        }
+    }
+
+    /// Whether any map in `value`, at any depth, has a key named `key`.
+    fn has_key(value: &Value, key: &str) -> bool {
+        match value {
+            Value::Map(entries) => entries
+                .iter()
+                .any(|(name, inner)| name.as_str() == Some(key) || has_key(inner, key)),
+            Value::Array(items) => items.iter().any(|item| has_key(item, key)),
+            _ => false,
+        }
+    }
+
+    const EXPIRES_SECS: u64 = 1_790_000_900;
+
+    fn expires() -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(EXPIRES_SECS)
+    }
+
+    fn granted_data(expires: Option<SystemTime>) -> serde_json::Value {
+        let mut access = json!({ "status": "granted" });
+        if let Some(expires) = expires {
+            access["expires"] = json!(expires.duration_since(UNIX_EPOCH).unwrap().as_secs_f64());
+        }
+        json!({ "access": access })
+    }
+
+    /// `reply` as the requester's node sees it once it has crossed the wire.
+    fn delivered(reply: &OutboundPeer) -> PeerMessage {
+        let body = from_r3_body(&to_r3_body(reply, 1_700_000_000.0)).unwrap();
+        PeerMessage::new(RawPeerMessage {
+            source_identity: identity(),
+            source_destination: destination(),
+            destination: hex_lower(&[0x11; 16]),
+            title: body.title,
+            content: body.content,
+            fields: body.fields,
+            timestamp: body.timestamp,
+            message_id: body.id,
+            in_reply_to: body.in_reply_to,
+            kind: body.kind,
+            via: PeerVia::Direct,
+            thread: body.thread,
+            disposition: body.disposition,
+            retry_after: body.retry_after,
+            parts: body.parts,
+            dropped_parts: body.dropped_parts,
+        })
     }
 
     #[test]
@@ -970,6 +1292,192 @@ mod tests {
         assert_eq!(human_size(2_500_000_000), "2.5 GB");
     }
 
+    #[test]
+    fn a_grant_sends_an_answered_reply_with_one_data_part_and_no_paths() {
+        let reply = decision_reply(
+            "a-1",
+            "a-1",
+            2,
+            AccessDecision::Granted,
+            Some(expires()),
+            false,
+            &PartLimits::default(),
+        )
+        .unwrap();
+
+        assert_eq!(reply.kind, PeerKind::Reply);
+        assert_eq!(reply.in_reply_to.as_deref(), Some("a-1"));
+        assert_eq!(reply.thread.as_deref(), Some("a-1"));
+        assert_eq!(reply.disposition, Some(Disposition::Answered));
+        assert_eq!(reply.retry_after, None);
+        assert_eq!(reply.title, None);
+        assert_eq!(reply.fields, None);
+        assert_eq!(
+            reply.parts,
+            vec![RawPart::Data {
+                data: json!({ "access": { "status": "granted", "expires": 1_790_000_900.0 } })
+            }]
+        );
+        assert_eq!(
+            reply.content,
+            "access granted: 2 paths until 2026-09-21T14:28:20Z"
+        );
+        let body = to_r3_body(&reply, 1_700_000_000.0);
+        assert!(!has_key(&body, "paths"), "{body}");
+        assert!(has_key(&body, "expires"));
+        let Value::Map(entries) = &body else {
+            panic!("not a map");
+        };
+        let content = entries
+            .iter()
+            .find(|(key, _)| key.as_str() == Some("content"))
+            .map(|(_, value)| value.as_str().unwrap())
+            .unwrap();
+        assert_eq!(
+            content,
+            "access granted: 2 paths until 2026-09-21T14:28:20Z"
+        );
+    }
+
+    #[test]
+    fn a_standing_grant_reply_carries_no_expires() {
+        let reply = decision_reply(
+            "a-1",
+            "a-1",
+            1,
+            AccessDecision::Granted,
+            None,
+            true,
+            &PartLimits::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            reply.parts,
+            vec![RawPart::Data {
+                data: json!({ "access": { "status": "granted" } })
+            }]
+        );
+        assert_eq!(reply.content, "access granted: 1 path, standing");
+        assert_eq!(reply.disposition, Some(Disposition::Answered));
+        let body = to_r3_body(&reply, 1_700_000_000.0);
+        assert!(!has_key(&body, "expires"), "{body}");
+        assert!(!has_key(&body, "paths"), "{body}");
+    }
+
+    #[test]
+    fn a_refusal_sends_the_same_shape_with_status_denied() {
+        let reply = decision_reply(
+            "a-1",
+            "t-9",
+            3,
+            AccessDecision::Denied,
+            None,
+            false,
+            &PartLimits::default(),
+        )
+        .unwrap();
+
+        assert_eq!(reply.kind, PeerKind::Reply);
+        assert_eq!(reply.in_reply_to.as_deref(), Some("a-1"));
+        assert_eq!(reply.thread.as_deref(), Some("t-9"));
+        assert_eq!(reply.disposition, Some(Disposition::Answered));
+        assert_eq!(
+            reply.parts,
+            vec![RawPart::Data {
+                data: json!({ "access": { "status": "denied" } })
+            }]
+        );
+        assert_eq!(reply.content, "access denied: 3 paths");
+        let body = to_r3_body(&reply, 1_700_000_000.0);
+        assert!(!has_key(&body, "paths"), "{body}");
+        assert!(!has_key(&body, "expires"), "{body}");
+    }
+
+    #[test]
+    fn a_requester_collects_the_decision_under_the_access_id() {
+        let slot = MeshSlot::default();
+        let now = SystemTime::now();
+        slot.correlations()
+            .open(PendingRecord {
+                version: PENDING_RECORD_VERSION,
+                id: "a-1".to_string(),
+                peer_destination: destination(),
+                peer_identity: identity(),
+                thread: "a-1".to_string(),
+                question: "access to src/x.rs".to_string(),
+                sent_at: rfc3339_utc(now),
+                timeout_at: rfc3339_utc(now + Duration::from_secs(60)),
+                state: PendingState::Open,
+                reply: None,
+            })
+            .unwrap();
+        let reply = decision_reply(
+            "a-1",
+            "a-1",
+            1,
+            AccessDecision::Granted,
+            Some(expires()),
+            false,
+            &PartLimits::default(),
+        )
+        .unwrap();
+
+        slot.deliver_peer(delivered(&reply));
+
+        let answer = slot.correlations().take_answer("a-1").unwrap();
+        assert_eq!(
+            answer.parts,
+            vec![Part::Data {
+                data: granted_data(Some(expires()))
+            }]
+        );
+        assert_eq!(answer.disposition, Some(Disposition::Answered));
+        assert_eq!(answer.kind, PeerKind::Reply);
+        assert_eq!(answer.in_reply_to.as_deref(), Some("a-1"));
+        assert_eq!(answer.thread.as_deref(), Some("a-1"));
+        assert_eq!(answer.dropped_parts, 0);
+        assert!(slot.correlations().take_answer("a-1").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_grant_or_refusal_for_a_question_id_is_refused_with_the_cross_hint() {
+        let fixture = bare_slot("access-question-id");
+        store_of(&fixture.slot)
+            .upsert(question_record("q-1"), SystemTime::now())
+            .unwrap();
+
+        let grant = fixture
+            .slot
+            .access()
+            .grant("q-1", false, None)
+            .await
+            .unwrap_err()
+            .to_string();
+        let refuse = fixture
+            .slot
+            .access()
+            .refuse("q-1")
+            .await
+            .unwrap_err()
+            .to_string();
+
+        for err in [&grant, &refuse] {
+            assert!(err.contains("`q-1` is a question"), "{err}");
+            assert!(err.contains(".mesh answer q-1"), "{err}");
+        }
+        assert!(store_of(&fixture.slot).get("q-1").unwrap().is_some());
+        let unknown = fixture
+            .slot
+            .access()
+            .refuse("a-9")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(unknown.contains("no open access request a-9"), "{unknown}");
+        assert!(fixture.hooks.snapshot().is_empty());
+    }
+
     /// An envoy that counts what it is offered; an access request must never reach it.
     #[cfg(unix)]
     #[derive(Default)]
@@ -1000,20 +1508,81 @@ mod tests {
         root: PathBuf,
         relay: JoinHandle<()>,
         tmp: TempDir,
+        session: Session,
+        port: u16,
     }
 
     #[cfg(unix)]
     impl Installed {
         async fn start(tag: &str) -> Self {
+            let installed = Self::unrooted(tag).await;
+            installed.publish_root();
+            installed
+        }
+
+        /// Joined to a relay with no snapshot published, so there is no share root.
+        async fn unrooted(tag: &str) -> Self {
             let (addr, relay, _) = loopback_relay().await;
-            let tmp = TempDir::new(tag);
+            Self::start_in(TempDir::new(tag), Session::default(), addr.port(), relay).await
+        }
+
+        /// Joined to `stub` as its one peer, each trusting the other, so a decision
+        /// reply has somewhere to land.
+        async fn beside(tag: &str, stub: &PeerStub) -> Self {
+            let installed = Self::start_in(
+                TempDir::new(tag),
+                Session::default(),
+                stub.port(),
+                tokio::spawn(std::future::ready(())),
+            )
+            .await;
+            installed.publish_root();
+            stub.trust(
+                &installed.runtime.current_destination_hash(),
+                installed.runtime.fingerprint(),
+            );
+            installed.learn(stub).await;
+            installed
+                .runtime
+                .trust()
+                .trust_destination(
+                    installed.slot.as_ref(),
+                    &stub.destination_hex(),
+                    TrustOptions::default(),
+                    SystemTime::now(),
+                )
+                .unwrap();
+            installed.hooks.drain();
+            installed
+        }
+
+        /// The same instance up again on the same config and cache, which is what the
+        /// inbound store, the grants and the trust list are keyed by.
+        async fn restart(self, stub: &PeerStub) -> Self {
+            assert!(self.slot.stop().await.unwrap());
+            let Self {
+                tmp, session, port, ..
+            } = self;
+            let installed =
+                Self::start_in(tmp, session, port, tokio::spawn(std::future::ready(()))).await;
+            installed.publish_root();
+            installed.learn(stub).await;
+            installed.hooks.drain();
+            installed
+        }
+
+        async fn start_in(
+            tmp: TempDir,
+            mut session: Session,
+            port: u16,
+            relay: JoinHandle<()>,
+        ) -> Self {
             let root = tmp.path.join("ws");
             fs::create_dir_all(root.join("src")).unwrap();
             let slot = Arc::new(MeshSlot::default());
             let hooks = RecordingHookSink::attach(&slot.hooks());
-            let mut session = Session::default();
             let runtime = MeshRuntime::start(
-                &private_config(addr.port()),
+                &private_config(port),
                 true,
                 &mut session,
                 mesh_paths(&tmp),
@@ -1027,10 +1596,6 @@ mod tests {
             slot.install(Arc::clone(&runtime)).unwrap();
             let idle = Arc::new(RecordingIdleSink::default());
             slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
-            slot.publish(crate::mesh::snapshot::MeshSnapshot {
-                cwd: root.clone(),
-                ..snapshot_fixture()
-            });
             hooks.drain();
             Self {
                 slot,
@@ -1040,7 +1605,49 @@ mod tests {
                 root,
                 relay,
                 tmp,
+                session,
+                port,
             }
+        }
+
+        fn publish_root(&self) {
+            self.slot.publish(crate::mesh::snapshot::MeshSnapshot {
+                cwd: self.root.clone(),
+                ..snapshot_fixture()
+            });
+        }
+
+        /// Hears `stub` announce, which is what gives the node a path to it.
+        async fn learn(&self, stub: &PeerStub) {
+            stub.announce(Some("Stub")).await;
+            let peers = self.runtime.peers();
+            let to = stub.destination_hex();
+            wait_until("the node to file the stub", || peers.get(&to).is_some()).await;
+        }
+
+        /// Files a pending access request from `stub` for `paths`.
+        async fn ask(&self, stub: &PeerStub, id: &str, paths: &[&str]) {
+            let request = InboundAccess {
+                identity_hash: stub.identity_hex(),
+                destination_hash: stub.destination_hex(),
+                request: validate_access(id, strings(paths), "").unwrap(),
+                via: PeerVia::Direct,
+            };
+            let slot = Arc::clone(&self.slot);
+            let outcome = tokio::task::spawn_blocking(move || slot.admit_access(request))
+                .await
+                .unwrap();
+            assert!(matches!(outcome, AccessOutcome::Pending));
+            self.hooks.drain();
+        }
+
+        fn grants(&self) -> Vec<GrantRecord> {
+            self.runtime.serving().grants().list().unwrap()
+        }
+
+        fn shares_yaml(&self) -> serde_yaml::Value {
+            let path = mesh_config_dir(&self.tmp.path.join("config")).join("shares.yaml");
+            serde_yaml::from_str(&fs::read_to_string(path).unwrap()).unwrap()
         }
 
         /// Shares `pattern` with the peer whose identity is `peer` through the global list.
@@ -1233,5 +1840,328 @@ mod tests {
             }
         }
         installed.stop().await;
+    }
+
+    /// The one decision the stub has heard, with its shape checked.
+    #[cfg(unix)]
+    fn decision_seen(stub: &PeerStub, id: &str) -> PeerBody {
+        let mut seen = stub.seen();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        let body = seen.remove(0);
+        assert_eq!(body.kind, PeerKind::Reply);
+        assert_eq!(body.in_reply_to.as_deref(), Some(id));
+        assert_eq!(body.thread.as_deref(), Some(id));
+        assert_eq!(body.disposition, Some(Disposition::Answered));
+        assert_eq!(body.parts.len(), 1);
+        assert_eq!(body.dropped_parts, 0);
+        body
+    }
+
+    /// One `MeshAccessDecided` for `id` saying `decision`, fired after the reply's own
+    /// `MeshMessageSent`: the peer hears first, then the hook.
+    #[cfg(unix)]
+    fn decided_once(hooks: &RecordingHookSink, id: &str, decision: &str) {
+        let fired = hooks.drain();
+        let events: Vec<HookEvent> = fired.iter().map(|(event, _)| *event).collect();
+        let sent = events
+            .iter()
+            .position(|event| *event == HookEvent::MeshMessageSent)
+            .unwrap_or_else(|| panic!("no send among {events:?}"));
+        let decided: Vec<usize> = (0..events.len())
+            .filter(|index| events[*index] == HookEvent::MeshAccessDecided)
+            .collect();
+        assert_eq!(decided.len(), 1, "{events:?}");
+        assert!(decided[0] > sent, "{events:?}");
+        let envs = &fired[decided[0]].1;
+        assert_eq!(env_value(envs, "COYOTE_MESH_ACCESS_ID"), Some(id));
+        assert_eq!(env_value(envs, "COYOTE_MESH_DECISION"), Some(decision));
+    }
+
+    #[cfg(unix)]
+    fn within(expires: SystemTime, from: SystemTime, ttl: Duration) {
+        let floor = from + ttl - Duration::from_secs(1);
+        assert!(
+            expires >= floor && expires < floor + Duration::from_secs(61),
+            "{expires:?} is not about {ttl:?} after {from:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_one_off_grant_writes_one_use_per_path_with_the_default_ttl() {
+        let stub = PeerStub::listen("access-grant-once-stub", TcpServer::DEFAULT_CLIENT_MTU).await;
+        let installed = Installed::beside("access-grant-once", &stub).await;
+        installed
+            .ask(&stub, "a-1", &["src/x.rs", "docs/y.md"])
+            .await;
+        let before = SystemTime::now();
+
+        let report = installed
+            .slot
+            .access()
+            .grant("a-1", false, None)
+            .await
+            .unwrap();
+
+        let expires = report.expires.unwrap();
+        within(expires, before, DEFAULT_GRANT_TTL);
+        assert_eq!(
+            report,
+            AccessDecisionReport {
+                id: "a-1".to_string(),
+                peer_destination: stub.destination_hex(),
+                path_count: 2,
+                decision: AccessDecision::Granted,
+                expires: Some(expires),
+                standing: false,
+                via: PeerVia::Direct,
+            }
+        );
+        let grants = installed.grants();
+        assert_eq!(grants.len(), 1, "{grants:?}");
+        assert_eq!(grants[0].id, "a-1");
+        assert_eq!(grants[0].peer, stub.destination_hex());
+        assert_eq!(grants[0].expires, rfc3339_utc(expires));
+        let paths: Vec<(&str, u32, u32)> = grants[0]
+            .paths
+            .iter()
+            .map(|path| (path.path.as_str(), path.uses, path.uses_left))
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                ("src/x.rs", DEFAULT_GRANT_USES, DEFAULT_GRANT_USES),
+                ("docs/y.md", DEFAULT_GRANT_USES, DEFAULT_GRANT_USES),
+            ]
+        );
+        assert!(access_records(&installed.slot).is_empty());
+        decided_once(&installed.hooks, "a-1", "granted");
+        let body = decision_seen(&stub, "a-1");
+        assert_eq!(
+            body.parts,
+            vec![RawPart::Data {
+                data: granted_data(Some(expires))
+            }]
+        );
+        assert_eq!(
+            body.content,
+            format!("access granted: 2 paths until {}", rfc3339_utc(expires))
+        );
+        installed.stop().await;
+        stub.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_grant_for_a_duration_overrides_the_ttl() {
+        let stub = PeerStub::listen("access-grant-ttl-stub", TcpServer::DEFAULT_CLIENT_MTU).await;
+        let installed = Installed::beside("access-grant-ttl", &stub).await;
+        installed.ask(&stub, "a-1", &["src/x.rs"]).await;
+        let before = SystemTime::now();
+
+        let report = installed
+            .slot
+            .access()
+            .grant("a-1", false, Some(Duration::from_secs(60)))
+            .await
+            .unwrap();
+
+        let expires = report.expires.unwrap();
+        within(expires, before, Duration::from_secs(60));
+        let grants = installed.grants();
+        assert_eq!(grants.len(), 1, "{grants:?}");
+        assert_eq!(grants[0].expires, rfc3339_utc(expires));
+        let body = decision_seen(&stub, "a-1");
+        assert_eq!(
+            body.content,
+            format!("access granted: 1 path until {}", rfc3339_utc(expires))
+        );
+        installed.stop().await;
+        stub.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_standing_grant_writes_an_allow_entry_per_path_scoped_to_the_requesting_identity() {
+        let stub = PeerStub::listen("access-standing-stub", TcpServer::DEFAULT_CLIENT_MTU).await;
+        let installed = Installed::beside("access-standing", &stub).await;
+        for name in ["a.rs", "we*ird.rs", "weXird.rs"] {
+            fs::write(installed.root.join("src").join(name), b"x").unwrap();
+        }
+        installed
+            .ask(&stub, "a-1", &["src/a.rs", "src/we*ird.rs"])
+            .await;
+
+        let report = installed
+            .slot
+            .access()
+            .grant("a-1", true, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            report,
+            AccessDecisionReport {
+                id: "a-1".to_string(),
+                peer_destination: stub.destination_hex(),
+                path_count: 2,
+                decision: AccessDecision::Granted,
+                expires: None,
+                standing: true,
+                via: PeerVia::Direct,
+            }
+        );
+        let yaml = installed.shares_yaml();
+        let allow = yaml["allow"].as_sequence().unwrap();
+        let entries: Vec<(&str, &str)> = allow
+            .iter()
+            .map(|entry| {
+                (
+                    entry["pattern"].as_str().unwrap(),
+                    entry["peer"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        let peer = stub.identity_hex();
+        assert_eq!(
+            entries,
+            vec![
+                ("src/a.rs", peer.as_str()),
+                ("src/we[*]ird.rs", peer.as_str())
+            ]
+        );
+        assert_eq!(globset::escape("src/we*ird.rs"), "src/we[*]ird.rs");
+        assert!(
+            yaml["override"].as_sequence().is_none_or(Vec::is_empty),
+            "{yaml:?}"
+        );
+        assert!(installed.grants().is_empty());
+        let shares = installed.runtime.serving().shares_under(&installed.root);
+        let destination = stub.destination_hex();
+        let peer = PeerRef {
+            identity: &peer,
+            destination: &destination,
+        };
+        assert!(shares.is_allowed(&peer, "src/a.rs", false));
+        assert!(shares.is_allowed(&peer, "src/we*ird.rs", false));
+        assert!(!shares.is_allowed(&peer, "src/weXird.rs", false));
+        let stranger = hex_lower(&[0xcd; 16]);
+        let other = PeerRef {
+            identity: &stranger,
+            destination: &destination,
+        };
+        assert!(!shares.is_allowed(&other, "src/a.rs", false));
+        assert!(access_records(&installed.slot).is_empty());
+        decided_once(&installed.hooks, "a-1", "granted");
+        let body = decision_seen(&stub, "a-1");
+        assert_eq!(
+            body.parts,
+            vec![RawPart::Data {
+                data: granted_data(None)
+            }]
+        );
+        assert_eq!(body.content, "access granted: 2 paths, standing");
+        installed.stop().await;
+        stub.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_standing_grant_without_a_share_root_is_refused_with_a_one_off_hint() {
+        let installed = Installed::unrooted("access-standing-no-root").await;
+        tokio::task::spawn_blocking({
+            let slot = Arc::clone(&installed.slot);
+            move || slot.admit_access(inbound(&identity(), "a-1", &["src/x.rs"], ""))
+        })
+        .await
+        .unwrap();
+        installed.hooks.drain();
+
+        let err = installed
+            .slot
+            .access()
+            .grant("a-1", true, None)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("unknown until a turn completes"), "{err}");
+        assert!(
+            err.contains("grant a-1 once with `.mesh grant a-1` instead"),
+            "{err}"
+        );
+        assert_eq!(access_records(&installed.slot).len(), 1);
+        assert!(installed.grants().is_empty());
+        assert!(installed.hooks.snapshot().is_empty());
+        installed.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refusal_removes_the_request_and_writes_no_grant() {
+        let stub = PeerStub::listen("access-refuse-stub", TcpServer::DEFAULT_CLIENT_MTU).await;
+        let installed = Installed::beside("access-refuse", &stub).await;
+        installed.ask(&stub, "a-1", &["src/x.rs"]).await;
+
+        let report = installed.slot.access().refuse("a-1").await.unwrap();
+
+        assert_eq!(
+            report,
+            AccessDecisionReport {
+                id: "a-1".to_string(),
+                peer_destination: stub.destination_hex(),
+                path_count: 1,
+                decision: AccessDecision::Denied,
+                expires: None,
+                standing: false,
+                via: PeerVia::Direct,
+            }
+        );
+        assert!(access_records(&installed.slot).is_empty());
+        assert!(installed.grants().is_empty());
+        assert!(
+            !mesh_config_dir(&installed.tmp.path.join("config"))
+                .join("shares.yaml")
+                .exists()
+        );
+        decided_once(&installed.hooks, "a-1", "denied");
+        let body = decision_seen(&stub, "a-1");
+        assert_eq!(
+            body.parts,
+            vec![RawPart::Data {
+                data: json!({ "access": { "status": "denied" } })
+            }]
+        );
+        assert_eq!(body.content, "access denied: 1 path");
+        installed.stop().await;
+        stub.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pending_access_request_survives_a_restart_and_can_still_be_granted() {
+        let stub = PeerStub::listen("access-restart-stub", TcpServer::DEFAULT_CLIENT_MTU).await;
+        let installed = Installed::beside("access-restart", &stub).await;
+        installed.ask(&stub, "a-1", &["src/x.rs"]).await;
+
+        let installed = installed.restart(&stub).await;
+
+        let records = access_records(&installed.slot);
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(records[0].id, "a-1");
+        assert_eq!(records[0].kind, InboundKind::Access);
+        let report = installed
+            .slot
+            .access()
+            .grant("a-1", false, None)
+            .await
+            .unwrap();
+        assert_eq!(report.via, PeerVia::Direct);
+        assert!(access_records(&installed.slot).is_empty());
+        assert_eq!(installed.grants().len(), 1);
+        decided_once(&installed.hooks, "a-1", "granted");
+        decision_seen(&stub, "a-1");
+        installed.stop().await;
+        stub.stop().await;
     }
 }

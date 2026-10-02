@@ -86,8 +86,6 @@ pub(crate) enum BriefUpdateSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AccessDecision {
     Granted,
-    // Reached by the human's refuse verb once it lands.
-    #[allow(dead_code)]
     Denied,
 }
 

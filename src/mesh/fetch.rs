@@ -156,7 +156,6 @@ impl FetchServing {
         self.grants.store(grants);
     }
 
-    #[cfg(test)]
     pub(crate) fn grants(&self) -> Arc<GrantStore> {
         self.grants.load_full()
     }
@@ -191,16 +190,22 @@ impl FetchServing {
         answer
     }
 
-    /// Loads the share set for `root`. A refused share list is the operator's to fix and
-    /// is warned about when its refusal first appears or changes; the requests that keep
-    /// finding it broken say so at `debug!`.
-    pub(crate) fn shares_under(&self, root: &Path) -> ShareSet {
+    /// Where the share lists for `root` live, with the cache and any configured inbox
+    /// protected from serving.
+    pub(crate) fn share_locations(&self, root: &Path) -> ShareLocations {
         let mut locations =
             ShareLocations::new(&self.config_dir, root).with_cache_dir(&self.cache_dir);
         if let Some(inbox_dir) = &self.inbox_dir {
             locations = locations.with_protected(inbox_dir);
         }
-        let (shares, warning) = ShareSet::load_quietly(locations);
+        locations
+    }
+
+    /// Loads the share set for `root`. A refused share list is the operator's to fix and
+    /// is warned about when its refusal first appears or changes; the requests that keep
+    /// finding it broken say so at `debug!`.
+    pub(crate) fn shares_under(&self, root: &Path) -> ShareSet {
+        let (shares, warning) = ShareSet::load_quietly(self.share_locations(root));
         let mut refused = self.refused.lock();
         match warning {
             Some(warning) if refused.as_deref() == Some(warning.as_str()) => {
