@@ -6714,7 +6714,7 @@ pub(crate) mod network {
             assert!(
                 notes[0]
                     .text
-                    .contains("asks for 1 path: src/secret.rs (exists,"),
+                    .contains("asks for 1 path: `src/secret.rs` (exists,"),
                 "{}",
                 notes[0].text
             );
@@ -6770,7 +6770,6 @@ pub(crate) mod network {
         .await;
         assert_eq!(wire_status(&spent.value), "not_shared");
 
-        assert_eq!(envoy.0.load(Ordering::SeqCst), 0);
         wait_until("the served fetch to fire mesh.fetch.served", || {
             sink.snapshot()
                 .iter()
@@ -6788,6 +6787,7 @@ pub(crate) mod network {
             Some("granted")
         );
         assert_eq!(fires_of(&fired, HookEvent::MeshFetchServed).len(), 1);
+        assert_eq!(envoy.0.load(Ordering::SeqCst), 0);
         pair.stop_node_a().await;
     }
 

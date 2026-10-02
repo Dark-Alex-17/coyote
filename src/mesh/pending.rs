@@ -16,6 +16,7 @@ use anyhow::{Context, Result, bail};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -293,6 +294,15 @@ pub(crate) enum InboundKind {
     Access,
 }
 
+impl InboundKind {
+    fn with_article(self) -> &'static str {
+        match self {
+            Self::Question => "a question",
+            Self::Access => "an access request",
+        }
+    }
+}
+
 /// One line of `inbound-<instance_id>.jsonl`: a question a peer asked that the envoy
 /// could not answer on its own, waiting on the person at the keyboard. The same on-disk
 /// discipline as `PendingRecord`: unknown fields are rejected and any layout change bumps
@@ -353,12 +363,45 @@ impl InboundStore {
         &self.path
     }
 
-    /// Adds `record` or replaces the record with its id in place, evicting the expired and
-    /// the oldest over the cap in the same write. Refuses, with the file untouched,
-    /// anything the reader would refuse on the way back, and a record whose id another
-    /// peer's open question already carries: an answer is routed by id, so a second
-    /// peer reusing one could otherwise have the human's answer sent to it.
+    /// Adds `record` or replaces the question with its id in place, evicting the expired
+    /// and the oldest over the cap in the same write. Refuses, with the file untouched,
+    /// anything the reader would refuse on the way back, a record whose id another
+    /// peer's open question already carries (an answer is routed by id, so a second
+    /// peer reusing one could otherwise have the human's answer sent to it), a record
+    /// that would change the kind filed under its id, and any rewrite of an access
+    /// request: the human grants the paths they read, so those are never swapped.
     pub(crate) fn upsert(&self, record: InboundRecord, now: SystemTime) -> Result<()> {
+        match self.file_unless(record, now, |_| None::<Infallible>)? {
+            Ok(()) => Ok(()),
+            Err(never) => match never {},
+        }
+    }
+
+    /// `upsert` behind a rule judged on the store's live contents: `refused_by` sees the
+    /// unexpired records under the same lock the insert takes, so what it counts cannot
+    /// change between its answer and the write. `Ok(Err(refusal))` is its answer when it
+    /// refuses; nothing is written then.
+    pub(crate) fn file_unless<E>(
+        &self,
+        record: InboundRecord,
+        now: SystemTime,
+        refused_by: impl FnOnce(&[InboundRecord]) -> Option<E>,
+    ) -> Result<Result<(), E>> {
+        let _guard = self.write_lock.lock();
+        let _file_lock = file_lock(&self.path, INBOUND_NAMES)?;
+        let mut records = self.read_all()?;
+        records.retain(|record| !is_stale(&record.received_at, now));
+        if let Some(refusal) = refused_by(&records) {
+            return Ok(Err(refusal));
+        }
+        self.insert_under_lock(&mut records, record).map(Ok)
+    }
+
+    fn insert_under_lock(
+        &self,
+        records: &mut Vec<InboundRecord>,
+        record: InboundRecord,
+    ) -> Result<()> {
         if record.version != INBOUND_RECORD_VERSION {
             bail!(
                 "An inbound question is version {} but this Coyote writes version {INBOUND_RECORD_VERSION}; refusing to store it.",
@@ -396,20 +439,26 @@ impl InboundStore {
             );
         }
         validate_kind_shape(&record)?;
-        let _guard = self.write_lock.lock();
-        let _file_lock = file_lock(&self.path, INBOUND_NAMES)?;
-        let mut records = self.read_all()?;
-        records.retain(|record| !is_stale(&record.received_at, now));
         match records.iter_mut().find(|existing| existing.id == record.id) {
             Some(existing) if existing.peer_destination != record.peer_destination => bail!(
                 "An open question with id {} belongs to another peer; refusing to store it.",
+                record.id
+            ),
+            Some(existing) if existing.kind != record.kind => bail!(
+                "`{}` is already filed as {}; refusing to rewrite it as {}.",
+                record.id,
+                existing.kind.with_article(),
+                record.kind.with_article()
+            ),
+            Some(_) if record.kind == InboundKind::Access => bail!(
+                "An access request is decided, never rewritten; refusing to replace `{}`.",
                 record.id
             ),
             Some(existing) => *existing = record,
             None => records.insert(0, record),
         }
         records.truncate(INBOUND_MAX_ENTRIES);
-        write_jsonl(&self.path, &records, INBOUND_NAMES)
+        write_jsonl(&self.path, records, INBOUND_NAMES)
     }
 
     /// The record with `id`, expired or not; the file is not touched.
@@ -1701,6 +1750,109 @@ mod tests {
         store.upsert(same_peer.clone(), t(1_002)).unwrap();
         assert_eq!(store.get("shared").unwrap(), Some(same_peer));
         assert_eq!(store.list(t(1_002)).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn inbound_upsert_never_rewrites_an_access_request_or_changes_a_records_kind() {
+        let tmp = TempDir::new("inbound-no-rewrite");
+        let store = InboundStore::new(&tmp.path, "inst");
+        let access = InboundRecord {
+            kind: InboundKind::Access,
+            question: String::new(),
+            envoy_question: String::new(),
+            paths: vec!["README.md".to_string()],
+            reason: "the readme".to_string(),
+            ..inbound("a", t(1_000))
+        };
+        let question = inbound("q", t(1_000));
+        store.upsert(access.clone(), t(1_000)).unwrap();
+        store.upsert(question.clone(), t(1_000)).unwrap();
+
+        let swapped = InboundRecord {
+            paths: vec!["src/secrets.rs".to_string()],
+            received_at: rfc3339_utc(t(1_001)),
+            ..access.clone()
+        };
+        let err = store.upsert(swapped, t(1_001)).unwrap_err().to_string();
+        assert!(
+            err.contains("An access request is decided, never rewritten; refusing to replace `a`"),
+            "{err}"
+        );
+        assert_eq!(store.get("a").unwrap(), Some(access.clone()));
+
+        let question_as_access = InboundRecord {
+            id: "q".to_string(),
+            thread: "q".to_string(),
+            ..access.clone()
+        };
+        let err = store
+            .upsert(question_as_access, t(1_001))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(
+                "`q` is already filed as a question; refusing to rewrite it as an access request"
+            ),
+            "{err}"
+        );
+        assert_eq!(store.get("q").unwrap(), Some(question.clone()));
+
+        let access_as_question = InboundRecord {
+            id: "a".to_string(),
+            thread: "a".to_string(),
+            ..question.clone()
+        };
+        let err = store
+            .upsert(access_as_question, t(1_001))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(
+                "`a` is already filed as an access request; refusing to rewrite it as a question"
+            ),
+            "{err}"
+        );
+        assert_eq!(store.get("a").unwrap(), Some(access));
+
+        let mut reworded = question.clone();
+        reworded.envoy_question = "asked again".into();
+        store.upsert(reworded.clone(), t(1_002)).unwrap();
+        assert_eq!(store.get("q").unwrap(), Some(reworded));
+        assert_eq!(store.list(t(1_002)).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn file_unless_judges_the_rule_on_the_live_records_and_writes_nothing_when_it_refuses() {
+        let tmp = TempDir::new("inbound-file-unless");
+        let store = InboundStore::new(&tmp.path, "inst");
+        let now = t(1_000_000);
+        store
+            .upsert(
+                inbound("stale", now - PENDING_TTL - Duration::from_secs(1)),
+                now - PENDING_TTL,
+            )
+            .unwrap();
+        store.upsert(inbound("fresh", now), now).unwrap();
+
+        let mut seen = Vec::new();
+        let refused = store
+            .file_unless(inbound("next", now), now, |open| {
+                seen = inbound_ids(open).into_iter().map(str::to_string).collect();
+                Some("full")
+            })
+            .unwrap();
+        assert_eq!(refused, Err("full"));
+        assert_eq!(seen, vec!["fresh".to_string()]);
+        assert_eq!(inbound_ids(&store.list(now).unwrap()), vec!["fresh"]);
+
+        let filed = store
+            .file_unless(inbound("next", now), now, |_| None::<&str>)
+            .unwrap();
+        assert_eq!(filed, Ok(()));
+        assert_eq!(
+            inbound_ids(&store.list(now).unwrap()),
+            vec!["next", "fresh"]
+        );
     }
 
     #[test]

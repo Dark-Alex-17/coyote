@@ -573,10 +573,12 @@ impl ShareSet {
         })
     }
 
-    /// Whether the share rules alone already let `peer` fetch `wire_text`: the resolve
-    /// and judge half of `is_served`, without the grant store, the stat or the open, so
-    /// an access request for a path the rules serve can be answered without spending or
-    /// touching anything. Every error reads as not allowed.
+    /// Whether the share rules alone already let `peer` fetch `wire_text`: the resolve,
+    /// judge and regular-file half of `is_served`, without the grant store, the size
+    /// rule or the open, so an access request for a path the rules serve can be answered
+    /// without spending or touching anything. A directory an allow matches is not
+    /// allowed, since a fetch of it would not be served. Every error reads as not
+    /// allowed.
     pub(crate) fn is_allowed(
         &self,
         peer: &PeerRef<'_>,
@@ -590,6 +592,9 @@ impl ShareSet {
         let Ok(canonical) = dunce::canonicalize(candidate) else {
             return false;
         };
+        if !fs::metadata(&canonical).is_ok_and(|metadata| metadata.is_file()) {
+            return false;
+        }
         let Ok(rules) = self.rules(peer, case_insensitive) else {
             return false;
         };
@@ -2588,6 +2593,74 @@ mod tests {
         let verdict = fetch(&set, "docs");
 
         assert!(is_not_shared(&verdict), "{verdict:?}");
+    }
+
+    fn allowed_to_anyone(set: &ShareSet, wire_text: &str) -> bool {
+        let (identity, destination) = anyone();
+        let peer = PeerRef {
+            identity: &identity,
+            destination: &destination,
+        };
+        set.is_allowed(&peer, wire_text, false)
+    }
+
+    #[test]
+    fn is_allowed_answers_yes_only_for_a_regular_file_the_rules_serve() {
+        let fx = Fixture::new("allowed-file");
+        let mut set = fx.load();
+        set.apply(allow("**"), WriteScope::Global).unwrap();
+        set.apply(deny("docs/private.md"), WriteScope::Global)
+            .unwrap();
+        fx.file("docs/a.md");
+        fx.file("docs/private.md");
+
+        assert!(allowed_to_anyone(&set, "docs/a.md"));
+        assert!(!allowed_to_anyone(&set, "docs/private.md"));
+        assert!(!allowed_to_anyone(&set, "docs/missing.md"));
+        assert!(
+            !allowed_to_anyone(&set, "docs"),
+            "a directory is never allowed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn is_allowed_refuses_a_path_that_leaves_the_root_through_a_symlink() {
+        let fx = Fixture::new("allowed-escape");
+        let outside = fx._tmp.path.join("outside.md");
+        fs::write(&outside, "outside").unwrap();
+        fx.link("docs/escape", "../../outside.md");
+        let mut set = fx.load();
+        set.apply(allow("**"), WriteScope::Global).unwrap();
+
+        assert!(!allowed_to_anyone(&set, "docs/escape"));
+    }
+
+    #[test]
+    fn is_allowed_holds_a_peer_scoped_allow_to_that_peer() {
+        let fx = Fixture::new("allowed-scoped");
+        let (identity, destination, other) = (fake_hash(0x1a), fake_hash(0x2b), fake_hash(0x3c));
+        let mut set = fx.load();
+        set.apply(
+            Mutation::Allow {
+                pattern: "docs/a.md".into(),
+                peer: Some(other.clone()),
+            },
+            WriteScope::Global,
+        )
+        .unwrap();
+        fx.file("docs/a.md");
+        let requester = PeerRef {
+            identity: &identity,
+            destination: &destination,
+        };
+        let scoped = PeerRef {
+            identity: &other,
+            destination: &destination,
+        };
+
+        assert!(!set.is_allowed(&requester, "docs/a.md", false));
+        assert!(set.is_allowed(&scoped, "docs/a.md", false));
     }
 
     #[cfg(unix)]

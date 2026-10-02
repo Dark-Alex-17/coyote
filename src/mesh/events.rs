@@ -91,6 +91,17 @@ pub(crate) enum AccessDecision {
     Denied,
 }
 
+impl AccessDecision {
+    /// The status word the decision reply and the hook environment both carry.
+    pub(crate) fn wire_name(self) -> &'static str {
+        match self {
+            Self::Granted => "granted",
+            #[cfg(test)]
+            Self::Denied => "denied",
+        }
+    }
+}
+
 pub(crate) enum MeshEvent {
     Started(NodeFacts),
     Stopped(NodeFacts),
@@ -563,15 +574,10 @@ impl MeshEvent {
                 access_id,
                 decision,
             } => {
-                let decision = match decision {
-                    AccessDecision::Granted => "granted",
-                    #[cfg(test)]
-                    AccessDecision::Denied => "denied",
-                };
                 envs.push((PEER_IDENTITY, identity.clone()));
                 envs.push((PEER_DESTINATION, destination.clone()));
                 envs.push((ACCESS_ID, access_id.clone()));
-                envs.push((DECISION, decision.to_string()));
+                envs.push((DECISION, decision.wire_name().to_string()));
             }
         }
         envs

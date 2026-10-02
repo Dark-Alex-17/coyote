@@ -20,6 +20,8 @@ use crate::mesh::grants::DEFAULT_GRANT_TTL;
 use crate::mesh::idle::{IdleNotify, Origin};
 #[cfg(all(test, unix))]
 use crate::mesh::message::PEER_REQUEST_TIMEOUT;
+#[cfg(test)]
+use crate::mesh::message::SendOutcome;
 use crate::mesh::message::{
     Disposition, OutboundPeer, PEER_WIRE_VERSION, PartLimits, PeerKind, PeerVia, RawPart,
     SendError, is_wire_id,
@@ -43,7 +45,7 @@ use crate::mesh::propagation_fetch::{InboundMessage, InboundSink};
 #[cfg(test)]
 use crate::mesh::protocol::describe_version;
 #[cfg(test)]
-use crate::mesh::r3::{ACCESS_PATH, OriginName, R3Error};
+use crate::mesh::r3::{ACCESS_PATH, DispatchError, OriginName, R3Error};
 use crate::mesh::r3::{AdmittedRequest, Handler, NAME_HASH_LEN, RefusalCode, Reply};
 #[cfg(all(test, unix))]
 use crate::mesh::r3::{DEFAULT_LINK_TIMEOUT, RequestOptions};
@@ -350,6 +352,8 @@ pub(crate) enum AccessError {
     NotFiled(String),
     /// The peer answered with a refusal code; nothing is stored for a peer that said no.
     Refused(RefusalCode),
+    /// The peer let the request through but nothing there serves `/access`.
+    NotServed(DispatchError),
     /// The peer answered with a status or a refusal reason this Coyote does not know.
     UnknownStatus,
     /// The peer answered, but not with an access reply to this request; the text names
@@ -390,9 +394,13 @@ impl fmt::Display for AccessError {
                 "The access request was not sent because it could not be filed as pending: {reason}"
             ),
             Self::Refused(code) => write!(f, "The peer refused the access request: {code}"),
+            Self::NotServed(_) => write!(
+                f,
+                "The peer does not take access requests; it may be running an older Coyote without an access provider"
+            ),
             Self::UnknownStatus => write!(
                 f,
-                "The peer answered the access request with a status this Coyote does not know; it may be running a newer Coyote"
+                "The peer sent an unknown status in its answer to the access request; it may be running a newer Coyote"
             ),
             Self::Malformed(why) => write!(
                 f,
@@ -522,7 +530,7 @@ impl MeshRuntime {
             .await
         {
             Ok(outcome) => {
-                let status = decode_access_response(&outcome.value, id)?;
+                let status = read_access_reply(&outcome.value, id)?;
                 debug!(
                     "Mesh access request {id} to {dest8} was answered {} over a link",
                     status.status()
@@ -611,9 +619,20 @@ fn wire_paths(paths: &[String]) -> Value {
     )
 }
 
-/// Reads the peer's answer to the request sent as `sent_id`. Keys the peer adds are
-/// ignored; a status or refusal reason this Coyote does not know is a typed error, so a
-/// newer peer's answer is reported rather than guessed at.
+/// Reads what came back for the request sent as `sent_id`: a peer with nothing behind
+/// `/access` answers with a dispatch error, which is told apart from a malformed access
+/// reply before the reply is decoded.
+#[cfg(test)]
+fn read_access_reply(value: &Value, sent_id: &str) -> Result<AccessOutcome, AccessError> {
+    if let Some(error) = DispatchError::from_value(value) {
+        return Err(AccessError::NotServed(error));
+    }
+    decode_access_response(value, sent_id)
+}
+
+/// Reads the peer's access reply to the request sent as `sent_id`. Keys the peer adds
+/// are ignored; a status or refusal reason this Coyote does not know is a typed error,
+/// so a newer peer's answer is reported rather than guessed at.
 #[cfg(test)]
 pub(crate) fn decode_access_response(
     value: &Value,
@@ -693,24 +712,6 @@ impl AccessSurface for MeshSlot {
             warn!("Mesh /access from {id8} (instance {dest8}) was not filed: the mesh is off");
             return AccessOutcome::Refused(AccessRefusal::TooManyPending);
         };
-        let open = match store.list(now) {
-            Ok(records) => records,
-            Err(err) => {
-                warn!(
-                    "Mesh /access from {id8} (instance {dest8}) was not filed: {}",
-                    redact_hashes(&format!("{err:#}"))
-                );
-                return AccessOutcome::Refused(AccessRefusal::TooManyPending);
-            }
-        };
-        if let Some(refusal) = rate_rule(&open, &identity_hash, &request.paths) {
-            debug!(
-                "Mesh /access from {id8} (instance {dest8}) via {} refused: {}",
-                via_word(via),
-                refusal.wire_name()
-            );
-            return AccessOutcome::Refused(refusal);
-        }
         let record = InboundRecord {
             version: INBOUND_RECORD_VERSION,
             id: request.id.clone(),
@@ -724,12 +725,27 @@ impl AccessSurface for MeshSlot {
             paths: request.paths.clone(),
             reason: request.reason.clone(),
         };
-        if let Err(err) = store.upsert(record, now) {
-            warn!(
-                "Mesh /access from {id8} (instance {dest8}) was not filed: {}",
-                redact_hashes(&format!("{err:#}"))
-            );
-            return AccessOutcome::Refused(AccessRefusal::TooManyPending);
+        // The rule is judged and the record filed under one lock, so a burst of
+        // requests from one identity cannot each see the cap unreached and all be filed.
+        match store.file_unless(record, now, |open| {
+            rate_rule(open, &identity_hash, &request.id, &request.paths)
+        }) {
+            Ok(Ok(())) => {}
+            Ok(Err(refusal)) => {
+                debug!(
+                    "Mesh /access from {id8} (instance {dest8}) via {} refused: {}",
+                    via_word(via),
+                    refusal.wire_name()
+                );
+                return AccessOutcome::Refused(refusal);
+            }
+            Err(err) => {
+                warn!(
+                    "Mesh /access from {id8} (instance {dest8}) was not filed: {}",
+                    redact_hashes(&format!("{err:#}"))
+                );
+                return AccessOutcome::Refused(AccessRefusal::TooManyPending);
+            }
         }
         hooks.fire(MeshEvent::AccessRequested {
             identity: identity_hash.clone(),
@@ -1020,9 +1036,11 @@ impl AccessStore<'_> {
     /// Lets the requesting peer read every path it asked for: once, through a grant that
     /// lends each path one use until `ttl` (the default when `None`) runs out, or
     /// standing, through an allow entry per path in the share list scoped to the
-    /// requesting identity. The reply goes to the peer before the request is removed, so
-    /// a send that fails leaves it pending to decide again; a one-off grant written by
-    /// then stays until it expires.
+    /// requesting identity. Either way the request is removed only once the peer has
+    /// the reply, so a send that fails leaves it pending to decide again. A one-off
+    /// grant is written before the send: one the peer never heard of expires on its
+    /// own. The standing entries are written after it: they would outlive a reply that
+    /// never arrived and a later refusal alike, so the peer must have heard yes first.
     pub(crate) async fn grant(
         &self,
         id: &str,
@@ -1030,45 +1048,50 @@ impl AccessStore<'_> {
         ttl: Option<Duration>,
     ) -> Result<AccessDecisionReport> {
         let (store, record, runtime) = self.pending(id)?;
-        let expires = if standing {
-            self.share_standing(&runtime, &record)?;
-            None
-        } else {
-            let granted = runtime.serving().grants().grant(
-                id,
-                &record.peer_destination,
-                &record.paths,
-                ttl,
-                SystemTime::now(),
-            )?;
-            Some(
-                parse_rfc3339(&granted.expires)
-                    .context("The grant was written with an expiry that does not read back")?,
-            )
-        };
-        self.decide(
+        if standing {
+            let mut shares = self.standing_shares(&runtime, &record)?;
+            let sent = self
+                .send_decision(&record, &runtime, AccessDecision::Granted, None, true)
+                .await?;
+            if let Err(err) = share_standing(&mut shares, &record) {
+                bail!(
+                    "{} was already told yes, but the share list could not be written: {err:#}. Run `.mesh grant {id} --standing` again once the share list is writable; the request stays pending until then.",
+                    short(&record.peer_destination)
+                );
+            }
+            return self.settle(&store, record, AccessDecision::Granted, None, true, sent);
+        }
+        let granted = runtime.serving().grants().grant(
+            id,
+            &record.peer_destination,
+            &record.paths,
+            ttl,
+            SystemTime::now(),
+        )?;
+        let expires = Some(
+            parse_rfc3339(&granted.expires)
+                .context("The grant was written with an expiry that does not read back")?,
+        );
+        let sent = self
+            .send_decision(&record, &runtime, AccessDecision::Granted, expires, false)
+            .await?;
+        self.settle(
             &store,
             record,
-            &runtime,
             AccessDecision::Granted,
             expires,
-            standing,
+            false,
+            sent,
         )
-        .await
     }
 
     /// Tells the requesting peer no. Nothing is written to the grants or the share list.
     pub(crate) async fn refuse(&self, id: &str) -> Result<AccessDecisionReport> {
         let (store, record, runtime) = self.pending(id)?;
-        self.decide(
-            &store,
-            record,
-            &runtime,
-            AccessDecision::Denied,
-            None,
-            false,
-        )
-        .await
+        let sent = self
+            .send_decision(&record, &runtime, AccessDecision::Denied, None, false)
+            .await?;
+        self.settle(&store, record, AccessDecision::Denied, None, false, sent)
     }
 
     fn pending(&self, id: &str) -> Result<(Arc<InboundStore>, InboundRecord, Arc<MeshRuntime>)> {
@@ -1092,42 +1115,31 @@ impl AccessStore<'_> {
         Ok((store, record, runtime))
     }
 
-    /// An allow entry per requested path, each matching that path literally and only for
-    /// the requesting identity, in whichever share list the write rule picks. A share
-    /// list that does not load is left as it is.
-    fn share_standing(&self, runtime: &MeshRuntime, record: &InboundRecord) -> Result<()> {
+    /// The share list a standing grant for `record` writes to, loaded before anything is
+    /// sent: a list that does not load is left as it is, and the peer is not told yes
+    /// about entries that cannot be written.
+    fn standing_shares(&self, runtime: &MeshRuntime, record: &InboundRecord) -> Result<ShareSet> {
         let Some(root) = ShareSource::share_root(self.slot) else {
             bail!(
                 "A standing grant writes to the share list under the workspace root, which is unknown until a turn completes; grant {id} once with `.mesh grant {id}` instead",
                 id = record.id
             );
         };
-        let (mut shares, warning) =
-            ShareSet::load_quietly(runtime.serving().share_locations(&root));
+        let (shares, warning) = ShareSet::load_quietly(runtime.serving().share_locations(&root));
         if let Some(warning) = warning {
             bail!("{warning} Nothing was written.");
         }
-        for path in &record.paths {
-            shares.apply(
-                Mutation::Allow {
-                    pattern: globset::escape(path),
-                    peer: Some(record.peer_identity.clone()),
-                },
-                WriteScope::Auto,
-            )?;
-        }
-        Ok(())
+        Ok(shares)
     }
 
-    async fn decide(
+    async fn send_decision(
         &self,
-        store: &InboundStore,
-        record: InboundRecord,
+        record: &InboundRecord,
         runtime: &MeshRuntime,
         decision: AccessDecision,
         expires: Option<SystemTime>,
         standing: bool,
-    ) -> Result<AccessDecisionReport> {
+    ) -> Result<SendOutcome> {
         let reply = decision_reply(
             &record.id,
             &record.thread,
@@ -1137,7 +1149,20 @@ impl AccessStore<'_> {
             standing,
             &runtime.part_limits(),
         )?;
-        let sent = runtime.send_peer(&record.peer_destination, &reply).await?;
+        Ok(runtime.send_peer(&record.peer_destination, &reply).await?)
+    }
+
+    /// Closes a request the peer has heard the decision on: it leaves the store and the
+    /// hook fires.
+    fn settle(
+        &self,
+        store: &InboundStore,
+        record: InboundRecord,
+        decision: AccessDecision,
+        expires: Option<SystemTime>,
+        standing: bool,
+        sent: SendOutcome,
+    ) -> Result<AccessDecisionReport> {
         store.remove(&record.id)?;
         let InboundRecord {
             id,
@@ -1150,7 +1175,7 @@ impl AccessStore<'_> {
             "Mesh access {} (instance {}) {} on {} paths via {}",
             short(&peer_identity),
             short(&peer_destination),
-            decision_word(decision),
+            decision.wire_name(),
             paths.len(),
             via_word(sent.via)
         );
@@ -1172,12 +1197,20 @@ impl AccessStore<'_> {
     }
 }
 
-fn decision_word(decision: AccessDecision) -> &'static str {
-    match decision {
-        AccessDecision::Granted => "granted",
-        #[cfg(test)]
-        AccessDecision::Denied => "denied",
+/// An allow entry per requested path, each matching that path literally and only for
+/// the requesting identity, in whichever share list the write rule picks.
+#[cfg(test)]
+fn share_standing(shares: &mut ShareSet, record: &InboundRecord) -> Result<()> {
+    for path in &record.paths {
+        shares.apply(
+            Mutation::Allow {
+                pattern: globset::escape(path),
+                peer: Some(record.peer_identity.clone()),
+            },
+            WriteScope::Auto,
+        )?;
     }
+    Ok(())
 }
 
 /// The reply that settles an admitted access request, on this route and the
@@ -1207,7 +1240,7 @@ pub(crate) fn decision_reply(
         }
         (AccessDecision::Granted, None) => format!("access granted: {counted}"),
     };
-    let mut access = json!({ "status": decision_word(decision) });
+    let mut access = json!({ "status": decision.wire_name() });
     if let Some(expires) = expires {
         access["expires"] = json!(
             expires
@@ -1249,9 +1282,16 @@ fn already_shared(
 }
 
 /// The refusal, if any, that `identity`'s open access requests earn a new one for
-/// `paths`: the same set of paths already waiting, in any order, is a duplicate, and past
-/// `ACCESS_MAX_PENDING_PER_IDENTITY` open requests nothing more is filed.
-fn rate_rule(open: &[InboundRecord], identity: &str, paths: &[String]) -> Option<AccessRefusal> {
+/// `paths` under `id`: an open request under the same id is a duplicate whatever it
+/// names, so the paths the human read stand; the same set of paths already waiting, in
+/// any order, is a duplicate; and past `ACCESS_MAX_PENDING_PER_IDENTITY` open requests
+/// nothing more is filed.
+fn rate_rule(
+    open: &[InboundRecord],
+    identity: &str,
+    id: &str,
+    paths: &[String],
+) -> Option<AccessRefusal> {
     let mine: Vec<&InboundRecord> = open
         .iter()
         .filter(|record| {
@@ -1259,6 +1299,9 @@ fn rate_rule(open: &[InboundRecord], identity: &str, paths: &[String]) -> Option
                 && record.peer_identity.eq_ignore_ascii_case(identity)
         })
         .collect();
+    if mine.iter().any(|record| record.id == id) {
+        return Some(AccessRefusal::Duplicate);
+    }
     let asked = path_set(paths);
     if mine.iter().any(|record| path_set(&record.paths) == asked) {
         return Some(AccessRefusal::Duplicate);
@@ -1275,8 +1318,9 @@ fn path_set(paths: &[String]) -> BTreeSet<&str> {
 
 /// The one line the person at the keyboard sees: who asks, each path with whether it is
 /// here and how big, the reason, and the two verbs that settle it. The label and the
-/// reason are quoted and any quote inside them becomes an apostrophe, so peer text
-/// cannot close its own quotes and pose as the frame.
+/// reason are quoted and each path is in backticks, with any quote or backtick inside
+/// them made an apostrophe, so peer text cannot close its own quotes and pose as the
+/// frame.
 fn access_text(label: &str, request: &ValidAccess, root: Option<&Path>) -> String {
     let who = label.replace('"', "'");
     let count = request.paths.len();
@@ -1284,7 +1328,7 @@ fn access_text(label: &str, request: &ValidAccess, root: Option<&Path>) -> Strin
     let listed = request
         .paths
         .iter()
-        .map(|path| format!("{path} ({})", path_state(root, path)))
+        .map(|path| format!("`{}` ({})", path.replace('`', "'"), path_state(root, path)))
         .collect::<Vec<String>>()
         .join(", ");
     let reason = if request.reason.is_empty() {
@@ -1372,7 +1416,7 @@ mod tests {
     #[cfg(unix)]
     use crate::mesh::mesh_config_dir;
     #[cfg(unix)]
-    use crate::mesh::message::PeerBody;
+    use crate::mesh::message::{PeerBody, received_reply};
     #[cfg(unix)]
     use crate::mesh::node::{MeshRuntime, NodeOptions};
     #[cfg(unix)]
@@ -1381,6 +1425,8 @@ mod tests {
     use crate::mesh::pending::PendingStore;
     #[cfg(unix)]
     use crate::mesh::protocol::MESH_PROTOCOL_VERSION;
+    #[cfg(unix)]
+    use crate::mesh::r3::MESSAGE_PATH;
     #[cfg(unix)]
     use crate::mesh::test_support::{
         PeerStub, derived_sighting, loopback_relay, mesh_paths, private_config, wait_until,
@@ -1762,6 +1808,42 @@ mod tests {
     }
 
     #[test]
+    fn a_second_request_reusing_a_pending_id_with_other_paths_is_refused_as_duplicate_and_the_first_paths_stand()
+     {
+        let fixture = bare_slot("access-duplicate-id");
+        let first = fixture.slot.admit_access(inbound(
+            &identity(),
+            "a-1",
+            &["README.md"],
+            "just the readme",
+        ));
+        assert_eq!(first, AccessOutcome::Pending);
+
+        let swapped = fixture.slot.admit_access(inbound(
+            &identity(),
+            "a-1",
+            &["src/secrets.rs"],
+            "just the readme",
+        ));
+
+        assert_eq!(swapped, AccessOutcome::Refused(AccessRefusal::Duplicate));
+        let records = access_records(&fixture.slot);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id, "a-1");
+        assert_eq!(records[0].paths, strings(&["README.md"]));
+        assert_eq!(fixture.idle.texts().len(), 1);
+        assert_eq!(fixture.hooks.snapshot().len(), 1);
+        assert_eq!(
+            rate_rule(&records, &identity(), "a-1", &strings(&["src/secrets.rs"])),
+            Some(AccessRefusal::Duplicate)
+        );
+        assert_eq!(
+            rate_rule(&records, &identity(), "a-2", &strings(&["src/secrets.rs"])),
+            None
+        );
+    }
+
+    #[test]
     fn a_removed_access_record_frees_its_path_set_to_be_asked_again() {
         let fixture = bare_slot("access-removed");
         let first = fixture
@@ -1811,6 +1893,47 @@ mod tests {
     }
 
     #[test]
+    fn a_burst_of_concurrent_requests_from_one_identity_never_files_more_than_the_cap() {
+        const BURST: usize = 16;
+        let fixture = bare_slot("access-burst");
+        let outcomes: Vec<AccessOutcome> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..BURST)
+                .map(|n| {
+                    let slot = &fixture.slot;
+                    scope.spawn(move || {
+                        let path = format!("src/{n}.rs");
+                        slot.admit_access(inbound(&identity(), &format!("a-{n}"), &[&path], ""))
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().unwrap())
+                .collect()
+        });
+
+        let refused = outcomes
+            .iter()
+            .filter(|outcome| **outcome == AccessOutcome::Refused(AccessRefusal::TooManyPending))
+            .count();
+        let pending = outcomes
+            .iter()
+            .filter(|outcome| **outcome == AccessOutcome::Pending)
+            .count();
+        assert_eq!(pending, ACCESS_MAX_PENDING_PER_IDENTITY, "{outcomes:?}");
+        assert_eq!(
+            refused,
+            BURST - ACCESS_MAX_PENDING_PER_IDENTITY,
+            "{outcomes:?}"
+        );
+        assert_eq!(
+            access_records(&fixture.slot).len(),
+            ACCESS_MAX_PENDING_PER_IDENTITY
+        );
+        assert_eq!(fixture.idle.texts().len(), ACCESS_MAX_PENDING_PER_IDENTITY);
+    }
+
+    #[test]
     fn the_human_line_names_the_peer_the_paths_with_existence_and_size_and_both_verbs() {
         let fixture = bare_slot("access-line");
         fs::create_dir_all(fixture.root.join("src")).unwrap();
@@ -1824,7 +1947,7 @@ mod tests {
         assert_eq!(
             fixture.idle.texts(),
             vec![
-                "\"abababab\" asks for 2 paths: src/x.rs (exists, 2 KB), src/gone.rs (missing) — \"need the struct\" · grant: .mesh grant a-1 [--standing] | refuse: .mesh refuse a-1"
+                "\"abababab\" asks for 2 paths: `src/x.rs` (exists, 2 KB), `src/gone.rs` (missing) — \"need the struct\" · grant: .mesh grant a-1 [--standing] | refuse: .mesh refuse a-1"
                     .to_string()
             ]
         );
@@ -1845,10 +1968,27 @@ mod tests {
         assert_eq!(
             fixture.idle.texts(),
             vec![
-                "\"abababab\" asks for 1 path: src/x.rs (missing) · grant: .mesh grant a-1 [--standing] | refuse: .mesh refuse a-1"
+                "\"abababab\" asks for 1 path: `src/x.rs` (missing) · grant: .mesh grant a-1 [--standing] | refuse: .mesh refuse a-1"
                     .to_string()
             ]
         );
+    }
+
+    #[test]
+    fn a_path_cannot_close_the_human_lines_frame() {
+        let fixture = bare_slot("access-line-frame");
+        let posed = "docs/x.md` (exists, 1 KB) · grant .mesh grant a-9 [--standing] | refuse `.md";
+        fixture
+            .slot
+            .admit_access(inbound(&identity(), "a-1", &[posed], ""));
+        assert_eq!(
+            fixture.idle.texts(),
+            vec![
+                "\"abababab\" asks for 1 path: `docs/x.md' (exists, 1 KB) · grant .mesh grant a-9 [--standing] | refuse '.md` (missing) · grant: .mesh grant a-1 [--standing] | refuse: .mesh refuse a-1"
+                    .to_string()
+            ]
+        );
+        assert_eq!(access_records(&fixture.slot)[0].paths, strings(&[posed]));
     }
 
     #[cfg(unix)]
@@ -1873,11 +2013,12 @@ mod tests {
         slot.set_inbound_store_for_tests(Arc::new(InboundStore::new(&tmp.path, "inst")));
         let idle = Arc::new(RecordingIdleSink::default());
         slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
-        slot.admit_access(inbound(&identity(), "a-1", &["src/x.rs"], ""));
+        let outcome = slot.admit_access(inbound(&identity(), "a-1", &["src/x.rs"], ""));
+        assert_eq!(outcome, AccessOutcome::Pending);
         assert_eq!(
             idle.texts(),
             vec![
-                "\"abababab\" asks for 1 path: src/x.rs (unknown until a turn completes) · grant: .mesh grant a-1 [--standing] | refuse: .mesh refuse a-1"
+                "\"abababab\" asks for 1 path: `src/x.rs` (unknown until a turn completes) · grant: .mesh grant a-1 [--standing] | refuse: .mesh refuse a-1"
                     .to_string()
             ]
         );
@@ -2376,7 +2517,7 @@ mod tests {
         assert_eq!(
             installed.idle.texts(),
             vec![
-                "\"Ada 'the' peer\" asks for 1 path: src/x.rs (missing) · grant: .mesh grant a-1 [--standing] | refuse: .mesh refuse a-1"
+                "\"Ada 'the' peer\" asks for 1 path: `src/x.rs` (missing) · grant: .mesh grant a-1 [--standing] | refuse: .mesh refuse a-1"
                     .to_string()
             ]
         );
@@ -2719,6 +2860,192 @@ mod tests {
         assert_eq!(access_records(&installed.slot).len(), 1);
         assert!(installed.grants().is_empty());
         assert!(installed.hooks.snapshot().is_empty());
+        installed.stop().await;
+    }
+
+    /// Serves `/message` on a stub in the recorder's place and refuses every message,
+    /// so a decision reply fails at once.
+    #[cfg(unix)]
+    struct Throttling;
+
+    #[cfg(unix)]
+    #[async_trait]
+    impl Handler for Throttling {
+        async fn handle(&self, _request: AdmittedRequest) -> Reply {
+            Reply::Code(RefusalCode::Throttled)
+        }
+    }
+
+    /// Serves `/message` on a stub in the recorder's place: acknowledges each message
+    /// and notes whether the share list at `shares` existed when it arrived.
+    #[cfg(unix)]
+    struct SharesWitness {
+        shares: PathBuf,
+        heard: parking_lot::Mutex<Vec<(PeerBody, bool)>>,
+    }
+
+    #[cfg(unix)]
+    #[async_trait]
+    impl Handler for SharesWitness {
+        async fn handle(&self, request: AdmittedRequest) -> Reply {
+            let Ok(body) = from_r3_body(&request.body) else {
+                return Reply::Code(RefusalCode::InvalidData);
+            };
+            let reply = received_reply(&body.id);
+            self.heard.lock().push((body, self.shares.exists()));
+            Reply::Value(reply)
+        }
+    }
+
+    #[cfg(unix)]
+    fn global_shares_path(installed: &Installed) -> PathBuf {
+        mesh_config_dir(&installed.tmp.path.join("config")).join("shares.yaml")
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_standing_grant_whose_decision_cannot_be_sent_writes_nothing_to_the_share_list() {
+        let stub =
+            PeerStub::listen("access-standing-unsent-stub", TcpServer::DEFAULT_CLIENT_MTU).await;
+        stub.serve(MESSAGE_PATH, Arc::new(Throttling) as Arc<dyn Handler>);
+        let installed = Installed::beside("access-standing-unsent", &stub).await;
+        fs::write(installed.root.join("src/x.rs"), b"x").unwrap();
+        installed.ask(&stub, "a-1", &["src/x.rs"]).await;
+
+        let err = installed
+            .slot
+            .access()
+            .grant("a-1", true, None)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(!err.contains("already told yes"), "{err}");
+        assert!(!global_shares_path(&installed).exists());
+        let identity = stub.identity_hex();
+        let destination = stub.destination_hex();
+        let peer = PeerRef {
+            identity: &identity,
+            destination: &destination,
+        };
+        assert!(
+            !installed
+                .runtime
+                .serving()
+                .shares_under(&installed.root)
+                .is_allowed(&peer, "src/x.rs", false)
+        );
+        let records = access_records(&installed.slot);
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(records[0].id, "a-1");
+        assert!(installed.grants().is_empty());
+        assert!(stub.seen().is_empty());
+        let events: Vec<HookEvent> = installed
+            .hooks
+            .drain()
+            .iter()
+            .map(|(event, _)| *event)
+            .collect();
+        assert!(
+            !events.contains(&HookEvent::MeshAccessDecided),
+            "{events:?}"
+        );
+        installed.stop().await;
+        stub.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_standing_grant_writes_the_share_list_only_after_the_peer_heard_yes() {
+        let stub =
+            PeerStub::listen("access-standing-order-stub", TcpServer::DEFAULT_CLIENT_MTU).await;
+        let installed = Installed::beside("access-standing-order", &stub).await;
+        let witness = Arc::new(SharesWitness {
+            shares: global_shares_path(&installed),
+            heard: parking_lot::Mutex::new(Vec::new()),
+        });
+        stub.serve(MESSAGE_PATH, Arc::clone(&witness) as Arc<dyn Handler>);
+        fs::write(installed.root.join("src/x.rs"), b"x").unwrap();
+        installed.ask(&stub, "a-1", &["src/x.rs"]).await;
+
+        let report = installed
+            .slot
+            .access()
+            .grant("a-1", true, None)
+            .await
+            .unwrap();
+
+        assert!(report.standing);
+        let heard = witness.heard.lock().clone();
+        assert_eq!(heard.len(), 1, "{heard:?}");
+        let (body, shares_existed) = &heard[0];
+        assert!(
+            !shares_existed,
+            "the share list was written before the peer had the reply"
+        );
+        assert_eq!(body.in_reply_to.as_deref(), Some("a-1"));
+        assert_eq!(
+            body.parts,
+            vec![RawPart::Data {
+                data: granted_data(None)
+            }]
+        );
+        let yaml = installed.shares_yaml();
+        let allow = yaml["allow"].as_sequence().unwrap();
+        assert_eq!(allow.len(), 1, "{yaml:?}");
+        assert_eq!(allow[0]["pattern"].as_str(), Some("src/x.rs"));
+        assert_eq!(
+            allow[0]["peer"].as_str(),
+            Some(stub.identity_hex().as_str())
+        );
+        assert!(access_records(&installed.slot).is_empty());
+        decided_once(&installed.hooks, "a-1", "granted");
+        installed.stop().await;
+        stub.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_path_shared_with_another_identity_is_not_granted_at_once() {
+        let installed = Installed::start("access-scoped-elsewhere").await;
+        fs::write(installed.root.join("src/x.rs"), b"struct X;").unwrap();
+        installed.share_with("src/x.rs", &hex_lower(&[0xcd; 16]));
+
+        let outcome = tokio::task::spawn_blocking({
+            let slot = Arc::clone(&installed.slot);
+            move || slot.admit_access(inbound(&identity(), "a-1", &["src/x.rs"], ""))
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, AccessOutcome::Pending);
+        assert_eq!(access_records(&installed.slot).len(), 1);
+        assert_eq!(installed.idle.texts().len(), 1);
+        installed.stop().await;
+    }
+
+    /// `granted` at once says a path is already fetchable, which the peer could learn
+    /// by fetching; it never says a path the rules would cover exists.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rule_covered_path_that_is_missing_is_pending_not_granted() {
+        let installed = Installed::start("access-covered-missing").await;
+        installed.share_with("src/x.rs", &identity());
+
+        let outcome = tokio::task::spawn_blocking({
+            let slot = Arc::clone(&installed.slot);
+            move || slot.admit_access(inbound(&identity(), "a-1", &["src/x.rs"], ""))
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, AccessOutcome::Pending);
+        assert_eq!(access_records(&installed.slot).len(), 1);
+        assert!(
+            installed.idle.texts()[0].contains("`src/x.rs` (missing)"),
+            "{:?}",
+            installed.idle.texts()
+        );
         installed.stop().await;
     }
 
@@ -3268,6 +3595,37 @@ mod tests {
     }
 
     #[test]
+    fn a_peer_without_an_access_provider_is_reported_as_not_serving_access_not_as_malformed() {
+        let no_provider = DispatchError::NoProvider {
+            path: ACCESS_PATH.to_string(),
+        };
+        assert_eq!(
+            read_access_reply(&no_provider.to_value(), "a-1"),
+            Err(AccessError::NotServed(no_provider.clone()))
+        );
+        let unknown_path = DispatchError::UnknownPath {
+            path_hash: hex_lower(&[0x77; 16]),
+        };
+        assert_eq!(
+            read_access_reply(&unknown_path.to_value(), "a-1"),
+            Err(AccessError::NotServed(unknown_path))
+        );
+        assert!(
+            AccessError::NotServed(no_provider)
+                .to_string()
+                .contains("peer does not take access requests")
+        );
+        assert_eq!(
+            read_access_reply(&access_reply("a-1", &AccessOutcome::Pending), "a-1"),
+            Ok(AccessOutcome::Pending)
+        );
+        assert_eq!(
+            read_access_reply(&Value::from("pending"), "a-1"),
+            Err(AccessError::Malformed("the body is not a map"))
+        );
+    }
+
+    #[test]
     fn every_access_error_reads_as_prose_with_the_next_step() {
         for err in [
             AccessError::NotRunning,
@@ -3276,6 +3634,9 @@ mod tests {
             AccessError::Invalid("a path is not a wire path"),
             AccessError::NotFiled("the pending store is read-only".to_string()),
             AccessError::Refused(RefusalCode::InvalidData),
+            AccessError::NotServed(DispatchError::NoProvider {
+                path: ACCESS_PATH.to_string(),
+            }),
             AccessError::UnknownStatus,
             AccessError::Malformed("status is missing or not text"),
             AccessError::Direct(R3Error::LinkClosed),
@@ -3297,6 +3658,11 @@ mod tests {
             AccessError::UnknownDestination
                 .to_string()
                 .contains(".mesh peers")
+        );
+        assert!(
+            AccessError::UnknownStatus
+                .to_string()
+                .contains("peer sent an unknown status")
         );
         assert_eq!(
             AccessError::Invalid("paths is empty").to_string(),
@@ -3659,7 +4025,7 @@ mod tests {
         assert_eq!(texts.len(), 1, "{texts:?}");
         assert!(
             texts[0].contains(
-                "asks for 2 paths: src/x.rs (unknown until a turn completes), docs/y.md (unknown until a turn completes)"
+                "asks for 2 paths: `src/x.rs` (unknown until a turn completes), `docs/y.md` (unknown until a turn completes)"
             ),
             "{}",
             texts[0]
