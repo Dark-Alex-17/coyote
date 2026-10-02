@@ -337,7 +337,7 @@ async fn run_dispatch(
         branch: SizeBranch::Packet,
     };
     let observed = match RequestHandler::handle(&dispatcher, request).await {
-        Reply::Value(value) => Answer::Value(value),
+        Reply::Value(value) | Reply::Settled { value, .. } => Answer::Value(value),
         Reply::Code(code) => Answer::Code(code.to_wire()),
         Reply::Silent => Answer::Silent,
     };

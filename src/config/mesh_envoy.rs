@@ -3005,7 +3005,7 @@ mod tests {
                 .handle(admitted_request(&a, &a_destination, &out))
                 .await
             {
-                Reply::Value(value) => {
+                Reply::Value(value) | Reply::Settled { value, .. } => {
                     assert!(is_received_reply(&value, &out.id), "{value}");
                     acked += 1;
                 }

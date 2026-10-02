@@ -151,6 +151,12 @@ pub(crate) enum MeshEvent {
         source: BriefUpdateSource,
         chars: usize,
     },
+    FetchServed {
+        identity: String,
+        destination: String,
+        size: u64,
+        hash_prefix: String,
+    },
 }
 
 const INSTANCE_ID: &str = "COYOTE_MESH_INSTANCE_ID";
@@ -182,6 +188,8 @@ const UNREACHABLE: &str = "COYOTE_MESH_UNREACHABLE";
 const REFUSED: &str = "COYOTE_MESH_REFUSED";
 const BRIEF_SOURCE: &str = "COYOTE_MESH_BRIEF_SOURCE";
 const BRIEF_CHARS: &str = "COYOTE_MESH_BRIEF_CHARS";
+const SIZE: &str = "COYOTE_MESH_SIZE";
+const HASH_PREFIX: &str = "COYOTE_MESH_HASH_PREFIX";
 
 const ERROR_MAX_CHARS: usize = 512;
 
@@ -266,6 +274,10 @@ pub(crate) const MESH_HOOK_ENVS: &[(HookEvent, &[&str])] = &[
         ],
     ),
     (HookEvent::MeshBriefUpdated, &[BRIEF_SOURCE, BRIEF_CHARS]),
+    (
+        HookEvent::MeshFetchServed,
+        &[PEER_IDENTITY, PEER_DESTINATION, SIZE, HASH_PREFIX],
+    ),
 ];
 
 fn allowed_envs(event: HookEvent) -> &'static [&'static str] {
@@ -321,6 +333,7 @@ impl MeshEvent {
             Self::BulletinReceived { .. } => HookEvent::MeshBulletinReceived,
             Self::BulletinSent { .. } => HookEvent::MeshBulletinSent,
             Self::BriefUpdated { .. } => HookEvent::MeshBriefUpdated,
+            Self::FetchServed { .. } => HookEvent::MeshFetchServed,
         }
     }
 
@@ -488,6 +501,17 @@ impl MeshEvent {
                 };
                 envs.push((BRIEF_SOURCE, source.to_string()));
                 envs.push((BRIEF_CHARS, chars.to_string()));
+            }
+            Self::FetchServed {
+                identity,
+                destination,
+                size,
+                hash_prefix,
+            } => {
+                envs.push((PEER_IDENTITY, identity.clone()));
+                envs.push((PEER_DESTINATION, destination.clone()));
+                envs.push((SIZE, size.to_string()));
+                envs.push((HASH_PREFIX, hash_prefix.clone()));
             }
         }
         envs
@@ -666,6 +690,12 @@ mod tests {
                 source: BriefUpdateSource::Digest,
                 chars: 42,
             },
+            MeshEvent::FetchServed {
+                identity: fingerprint.clone(),
+                destination: destination.clone(),
+                size: 1_024,
+                hash_prefix: "0123456789abcdef".to_string(),
+            },
         ]
     }
 
@@ -678,7 +708,7 @@ mod tests {
         let identity = PrivateIdentity::from_private_key_bytes(&[9u8; 64]).unwrap();
         let fixtures = fixtures(&identity);
         assert_eq!(fixtures.len(), MESH_HOOK_ENVS.len());
-        assert_eq!(fixtures.len(), 12);
+        assert_eq!(fixtures.len(), 13);
 
         let mut seen = BTreeSet::new();
         for event in &fixtures {

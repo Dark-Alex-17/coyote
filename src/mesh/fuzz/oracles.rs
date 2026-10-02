@@ -897,6 +897,7 @@ impl DispatchFixture {
 fn describe_reply(reply: &Reply) -> String {
     match reply {
         Reply::Value(value) => format!("Value({value})"),
+        Reply::Settled { value, .. } => format!("Settled({value})"),
         Reply::Code(code) => format!("Code({code})"),
         Reply::Silent => "Silent".to_string(),
     }

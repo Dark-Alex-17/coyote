@@ -3417,7 +3417,9 @@ mod tests {
 
         let (first_id, first) = request("first");
         match handler.handle(first).await {
-            Reply::Value(value) => assert!(is_received_reply(&value, &first_id), "{value}"),
+            Reply::Value(value) | Reply::Settled { value, .. } => {
+                assert!(is_received_reply(&value, &first_id), "{value}")
+            }
             Reply::Code(code) => panic!("the first message is refused: {code:?}"),
             Reply::Silent => panic!("the first message is not acknowledged"),
         }

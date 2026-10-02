@@ -26,11 +26,15 @@ use crate::mesh::grants::GrantStore;
 use crate::mesh::schema::{Remedy, VersionProbe, unversioned_refusal, version_refusal};
 use crate::mesh::trust::same_hash;
 use crate::mesh::wire_path::WirePath;
+#[cfg(test)]
+use crate::mesh::write_atomically;
 use crate::mesh::{
-    canonical_hash, hex_lower, mesh_config_dir, redact_hashes, short, write_atomically,
+    canonical_hash, hex_lower, mesh_cache_dir, mesh_config_dir, redact_hashes, short,
 };
 
-use anyhow::{Context, Result, anyhow, bail};
+#[cfg(test)]
+use anyhow::anyhow;
+use anyhow::{Context, Result, bail};
 use globset::{Glob, GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -131,6 +135,10 @@ pub(crate) struct Entry {
     pub layer: Layer,
 }
 
+// The mutation half, `apply` and what it alone uses, is test-only until the `.mesh share`
+// verbs write the files.
+
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WriteScope {
     Auto,
@@ -138,6 +146,7 @@ pub(crate) enum WriteScope {
     Workspace,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Mutation {
     Allow {
@@ -156,6 +165,7 @@ pub(crate) enum Mutation {
     },
 }
 
+#[cfg(test)]
 impl Mutation {
     fn kind(&self) -> &'static str {
         match self {
@@ -192,6 +202,7 @@ pub(crate) enum Served {
 #[derive(Debug)]
 pub(crate) struct ServedFile {
     pub file: fs::File,
+    #[cfg(test)]
     pub canonical: PathBuf,
     pub size: u64,
     pub via: Via,
@@ -232,9 +243,11 @@ pub(crate) struct Listing {
     pub next: Option<String>,
 }
 
-/// Where the two files live for one share root. Path arithmetic only; nothing is read. The
-/// workspace config directory's name is taken from the process once, here, so every rule
-/// derived from it agrees with where the workspace file was looked up.
+/// Where the two files live for one share root, and the directories nothing may serve out
+/// of. Path arithmetic only; nothing is read. The workspace config directory's name is
+/// taken from the process once, here, so every rule derived from it agrees with where the
+/// workspace file was looked up. `with_cache_dir` adds the mesh cache directory, where
+/// grants, the inbox and pending questions live, to what is protected.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ShareLocations {
     pub global: PathBuf,
@@ -242,6 +255,7 @@ pub(crate) struct ShareLocations {
     config_dir: PathBuf,
     workspace_root: PathBuf,
     workspace_config_dir_name: String,
+    mesh_cache_dir: Option<PathBuf>,
 }
 
 impl ShareLocations {
@@ -266,7 +280,13 @@ impl ShareLocations {
             config_dir: config_dir.to_path_buf(),
             workspace_root: workspace_root.to_path_buf(),
             workspace_config_dir_name,
+            mesh_cache_dir: None,
         }
+    }
+
+    pub(crate) fn with_cache_dir(mut self, cache_dir: &Path) -> Self {
+        self.mesh_cache_dir = Some(mesh_cache_dir(cache_dir));
+        self
     }
 }
 
@@ -279,6 +299,7 @@ pub(crate) struct ShareSet {
     locations: ShareLocations,
     global: SharesFile,
     workspace: SharesFile,
+    #[cfg(test)]
     workspace_exists: bool,
     poisoned: Option<String>,
 }
@@ -301,7 +322,7 @@ impl ShareSet {
             }
         };
         let (global, _) = read(&locations.global);
-        let (workspace, workspace_exists) = read(&locations.workspace);
+        let workspace = read(&locations.workspace);
         let poisoned = (!refusals.is_empty()).then(|| refusals.join(" "));
         if !warnings.is_empty() {
             warn!("{} Nothing is shared until then.", warnings.join(" "));
@@ -309,8 +330,9 @@ impl ShareSet {
         Self {
             locations,
             global,
-            workspace,
-            workspace_exists,
+            workspace: workspace.0,
+            #[cfg(test)]
+            workspace_exists: workspace.1,
             poisoned,
         }
     }
@@ -341,6 +363,7 @@ impl ShareSet {
     /// The override entries the workspace file carries, which lift nothing: a repository
     /// can ship that file, so an override there is read and kept but never applied. The
     /// REPL shows them so the human knows to move one to the global file.
+    #[cfg(test)]
     pub(crate) fn inert_overrides(&self) -> &[OverrideEntry] {
         if self.poisoned.is_some() {
             return &[];
@@ -521,6 +544,7 @@ impl ShareSet {
         );
         Served::File(ServedFile {
             file,
+            #[cfg(test)]
             canonical,
             size,
             via,
@@ -611,6 +635,7 @@ impl ShareSet {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn write_target(&self, scope: WriteScope) -> Layer {
         write_target(self.workspace_exists, scope)
     }
@@ -619,6 +644,7 @@ impl ShareSet {
     /// memory, returning the file written. A mutation the file already holds is `Ok`
     /// without a write. Refused while poisoned, with the load's refusal, so a corrupt
     /// file is never replaced by a fresh one.
+    #[cfg(test)]
     pub(crate) fn apply(&mut self, mutation: Mutation, scope: WriteScope) -> Result<PathBuf> {
         if let Some(refusal) = &self.poisoned {
             bail!("{refusal} Nothing was written.");
@@ -649,6 +675,7 @@ impl ShareSet {
 
 /// The layer a mutation lands in: under `Auto` the workspace file when it exists, else the
 /// global one; `Global` and `Workspace` pick outright, and `Workspace` creates the file.
+#[cfg(test)]
 pub(crate) fn write_target(workspace_exists: bool, scope: WriteScope) -> Layer {
     match scope {
         WriteScope::Auto if workspace_exists => Layer::Workspace,
@@ -675,6 +702,7 @@ pub(crate) struct ShareRules {
 }
 
 impl ShareRules {
+    #[cfg(test)]
     pub(crate) fn permits(&self, wire: &WirePath, canonical: &Path) -> bool {
         self.judge(wire, canonical) == Judgement::Allowed
     }
@@ -968,12 +996,14 @@ fn workspace_config_dir_names(workspace_config_dir_name: &str) -> Vec<&str> {
 /// The directories nothing lifts, as they resolve on disk: the workspace config directory
 /// under each name it goes by, since an absolute env override lands where a name glob
 /// would miss, and the global config directory, which a share root above it would
-/// otherwise serve. A directory that does not resolve holds nothing to protect.
+/// otherwise serve, and the mesh cache directory when the caller named one. A directory
+/// that does not resolve holds nothing to protect.
 fn protected_dirs(locations: &ShareLocations) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = workspace_config_dir_names(&locations.workspace_config_dir_name)
         .into_iter()
         .map(|name| locations.workspace_root.join(name))
         .chain([locations.config_dir.clone()])
+        .chain(locations.mesh_cache_dir.clone())
         .filter_map(|dir| dunce::canonicalize(dir).ok())
         .collect();
     dirs.sort();
@@ -1007,6 +1037,7 @@ fn is_canonical(hash: &str) -> bool {
 
 /// Applies `mutation` to `file`, which lives at `path`; `Ok(false)` means the file already
 /// says so and nothing needs writing.
+#[cfg(test)]
 fn mutate(file: &mut SharesFile, path: &Path, mutation: &Mutation) -> Result<bool> {
     match mutation {
         Mutation::Allow { pattern, peer } => {
@@ -1046,6 +1077,7 @@ fn mutate(file: &mut SharesFile, path: &Path, mutation: &Mutation) -> Result<boo
     }
 }
 
+#[cfg(test)]
 fn push_unless_present<T: PartialEq>(entries: &mut Vec<T>, entry: T) -> bool {
     if entries.contains(&entry) {
         return false;
@@ -1054,6 +1086,7 @@ fn push_unless_present<T: PartialEq>(entries: &mut Vec<T>, entry: T) -> bool {
     true
 }
 
+#[cfg(test)]
 fn canonical_peer(peer: &str) -> Result<String> {
     canonical_hash(peer).ok_or_else(|| {
         anyhow!(
@@ -2105,6 +2138,42 @@ mod tests {
             !rules.builtin.is_match("config/mesh/trust.yaml"),
             "no name glob knows the global config dir; the prefix check must"
         );
+    }
+
+    /// A share root above the cache dir, as a REPL started from `$HOME` has it: the grants
+    /// file and a staged inbox file under `<cache>/mesh` are neither served nor listed,
+    /// while the same `allow **` still serves the rest of the tree.
+    #[test]
+    fn a_file_under_the_mesh_cache_dir_is_never_served_or_listed() {
+        let fx = Fixture::new("shares-protected-cache");
+        let cache_dir = fx.root.join("cache");
+        fx.write(Layer::Global, "version: 1\nallow:\n- pattern: '**'\n");
+        let set = ShareSet::load(fx.locations().with_cache_dir(&cache_dir));
+        fx.file("cache/mesh/grants-inst.jsonl");
+        fx.file("cache/mesh/inbox/inst/0123abcd/docs/a.md");
+        fx.file("README.md");
+        let (identity, destination) = anyone();
+        let peer = PeerRef {
+            identity: &identity,
+            destination: &destination,
+        };
+
+        for hidden in [
+            "cache/mesh/grants-inst.jsonl",
+            "cache/mesh/inbox/inst/0123abcd/docs/a.md",
+        ] {
+            assert!(
+                is_not_shared(&set.is_served(&peer, hidden, false, MAX_FETCH_FILE_BYTES, None)),
+                "{hidden}"
+            );
+        }
+        assert!(matches!(
+            set.is_served(&peer, "README.md", false, MAX_FETCH_FILE_BYTES, None),
+            Served::File(_)
+        ));
+        let listing = set.list(&peer, None, None, false, DEFAULT_LIST_WALK_BOUND);
+        assert_eq!(listed_paths(&listing), ["README.md"]);
+        assert!(!listing.truncated);
     }
 
     #[cfg(unix)]

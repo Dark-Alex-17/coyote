@@ -487,9 +487,8 @@ impl CardSource for MeshSlot {
             .and_then(|runtime| runtime.about().map(str::to_string))
     }
 
-    // "fetch" is advertised once the /fetch handler exists.
     fn caps(&self) -> Vec<String> {
-        Vec::new()
+        vec!["fetch".to_string()]
     }
 }
 
@@ -597,7 +596,8 @@ impl MeshRuntime {
     }
 
     /// `request_status` with the caller's timeouts. The request goes to the peer directly
-    /// and fails typed when it cannot be answered now; it is never held for later.
+    /// and fails typed when it cannot be answered now; it is never held for later. A card
+    /// that was read is remembered for `last_card`.
     pub(crate) async fn request_status_with(
         &self,
         destination: &DestinationDesc,
@@ -610,7 +610,10 @@ impl MeshRuntime {
         if let Some(error) = DispatchError::from_value(&outcome.value) {
             return Err(StatusError::NotServed(error));
         }
-        StatusCard::from_value(&outcome.value)
+        let card = StatusCard::from_value(&outcome.value)?;
+        self.memory()
+            .remember_card(&destination.address_hash.to_hex_string(), card.clone());
+        Ok(card)
     }
 }
 
@@ -784,16 +787,25 @@ mod tests {
     }
 
     #[test]
-    fn a_slot_without_a_runtime_has_no_about_and_advertises_no_caps() {
+    fn a_slot_without_a_runtime_has_no_about() {
         let slot = Arc::new(MeshSlot::default());
         slot.publish(snapshot_fixture());
         assert_eq!(CardSource::about(slot.as_ref()), None);
-        assert!(CardSource::caps(slot.as_ref()).is_empty());
         let handler = StatusHandler::new(Arc::downgrade(&slot) as Weak<dyn CardSource>);
         let card = handler.card(now());
         assert_eq!(card.objective.as_deref(), Some("ship it"));
         assert_eq!(card.about, None);
-        assert!(card.caps.is_empty());
+    }
+
+    #[test]
+    fn the_status_card_always_advertises_the_fetch_capability() {
+        let slot = Arc::new(MeshSlot::default());
+        assert_eq!(CardSource::caps(slot.as_ref()), ["fetch"]);
+        let handler = StatusHandler::new(Arc::downgrade(&slot) as Weak<dyn CardSource>);
+        assert_eq!(handler.card(now()).caps, ["fetch"]);
+
+        slot.publish(snapshot_fixture());
+        assert_eq!(handler.card(now()).caps, ["fetch"]);
     }
 
     #[test]

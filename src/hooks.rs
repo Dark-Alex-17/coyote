@@ -149,6 +149,7 @@ pub enum HookEvent {
     MeshBulletinReceived,
     MeshBulletinSent,
     MeshBriefUpdated,
+    MeshFetchServed,
 }
 
 impl HookEvent {
@@ -197,10 +198,11 @@ impl HookEvent {
             HookEvent::MeshBulletinReceived => "mesh.bulletin.received",
             HookEvent::MeshBulletinSent => "mesh.bulletin.sent",
             HookEvent::MeshBriefUpdated => "mesh.brief.updated",
+            HookEvent::MeshFetchServed => "mesh.fetch.served",
         }
     }
 
-    pub(crate) const ALL: [HookEvent; 43] = [
+    pub(crate) const ALL: [HookEvent; 44] = [
         HookEvent::TurnStarted,
         HookEvent::TurnCompleted,
         HookEvent::TurnInterrupted,
@@ -244,6 +246,7 @@ impl HookEvent {
         HookEvent::MeshBulletinReceived,
         HookEvent::MeshBulletinSent,
         HookEvent::MeshBriefUpdated,
+        HookEvent::MeshFetchServed,
     ];
 }
 
@@ -1649,6 +1652,7 @@ mod tests {
             (HookEvent::MeshBulletinReceived, "mesh.bulletin.received"),
             (HookEvent::MeshBulletinSent, "mesh.bulletin.sent"),
             (HookEvent::MeshBriefUpdated, "mesh.brief.updated"),
+            (HookEvent::MeshFetchServed, "mesh.fetch.served"),
         ];
         for (event, name) in cases {
             assert_eq!(event.as_str(), name);
@@ -1687,7 +1691,7 @@ mod tests {
             .map(|event| event.as_str())
             .filter(|name| name.starts_with("mesh."))
             .collect();
-        assert_eq!(mesh_events.len(), 12);
+        assert_eq!(mesh_events.len(), 13);
         for event in mesh_events {
             assert!(
                 entry_is_valid_wildcard(&format!("{event}.*")),
@@ -1717,7 +1721,7 @@ mod tests {
             .copied()
             .filter(|event| event.as_str().starts_with("mesh."))
             .collect();
-        assert_eq!(mesh_events.len(), 12);
+        assert_eq!(mesh_events.len(), 13);
         let mut global = HooksMap::default();
         for event in &mesh_events {
             global.extend(hooks_map(event.as_str(), &[("watch", "cmd-mesh")]));

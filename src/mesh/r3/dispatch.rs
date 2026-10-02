@@ -21,9 +21,11 @@ use std::time::SystemTime;
 pub(crate) const KNOCK_PATH: &str = "/knock";
 pub(crate) const STATUS_PATH: &str = "/status";
 pub(crate) const MESSAGE_PATH: &str = "/message";
+pub(crate) const LIST_PATH: &str = "/list";
+pub(crate) const FETCH_PATH: &str = "/fetch";
 
 fn path_name(path_hash: PathHash) -> Option<&'static str> {
-    [KNOCK_PATH, STATUS_PATH, MESSAGE_PATH]
+    [KNOCK_PATH, STATUS_PATH, MESSAGE_PATH, LIST_PATH, FETCH_PATH]
         .into_iter()
         .find(|path| PathHash::of(path) == path_hash)
 }
@@ -139,7 +141,8 @@ impl DispatchError {
             }
             "no_provider" => {
                 let path = field("path")?;
-                let known = [KNOCK_PATH, STATUS_PATH, MESSAGE_PATH].contains(&path);
+                let known =
+                    [KNOCK_PATH, STATUS_PATH, MESSAGE_PATH, LIST_PATH, FETCH_PATH].contains(&path);
                 known.then(|| Self::NoProvider {
                     path: path.to_string(),
                 })
@@ -200,7 +203,7 @@ impl Dispatcher {
             PathHash::of(KNOCK_PATH),
             Route::Provided(Arc::new(KnockHandler)),
         );
-        for path in [STATUS_PATH, MESSAGE_PATH] {
+        for path in [STATUS_PATH, MESSAGE_PATH, LIST_PATH, FETCH_PATH] {
             routes.insert(PathHash::of(path), Route::NoProvider(path));
         }
         Self {

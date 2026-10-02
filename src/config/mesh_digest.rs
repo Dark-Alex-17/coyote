@@ -2147,7 +2147,7 @@ mod tests {
                 digest_objective_for(&snapshot, mesh.digest().as_deref()).as_deref(),
                 None,
                 None,
-                &[],
+                &["fetch".to_string()],
                 now
             ),
             "the served card is the digest-aware one"

@@ -9,6 +9,8 @@ use crate::mesh::envoy::{EnvoyJob, EnvoySink};
 use crate::mesh::events::{
     BriefUpdateSource, MeshEvent, MeshHookSink, MeshHooks, NodeFacts, Routed, TrustHookObserver,
 };
+use crate::mesh::fetch::{FetchHandler, FetchServing, ListHandler, PeerMemory, ShareSource};
+use crate::mesh::grants::GrantStore;
 use crate::mesh::identity::IdentityLock;
 use crate::mesh::idle::{IdleNotify, IdleSink, Origin};
 use crate::mesh::inbox::InboxStaging;
@@ -39,8 +41,9 @@ use crate::mesh::protocol::{Compatibility, MESH_PROTOCOL_MIN_SUPPORTED, MESH_PRO
 #[cfg(all(test, unix))]
 use crate::mesh::r3::RequestHandler;
 use crate::mesh::r3::{
-    Dispatcher, Envelope, KNOCK_PATH, MESSAGE_PATH, OriginName, R3Client, R3Error, R3Server,
-    RefusalCode, RequestOptions, RequestOutcome, STATUS_PATH, redact_hashes, short,
+    Dispatcher, Envelope, FETCH_PATH, KNOCK_PATH, LIST_PATH, MESSAGE_PATH, OriginName, R3Client,
+    R3Error, R3Server, RefusalCode, RequestOptions, RequestOutcome, STATUS_PATH, redact_hashes,
+    short,
 };
 use crate::mesh::snapshot::MeshSnapshot;
 use crate::mesh::trust::TrustStore;
@@ -234,6 +237,8 @@ pub(crate) struct MeshRuntime {
     /// `mesh.fetch.inbox_dir`; `None` stages under the cache dir.
     inbox_dir: Option<PathBuf>,
     cache_dir: PathBuf,
+    serving: Arc<FetchServing>,
+    memory: PeerMemory,
     interface_labels: Vec<String>,
     interface_kinds: Vec<&'static str>,
     hooks: MeshHooks,
@@ -300,6 +305,14 @@ impl MeshRuntime {
             mesh_cache_dir(&paths.cache_dir).join("peers.json"),
             SystemTime::now(),
         )?);
+        let grants = GrantStore::open(&paths.cache_dir, &instance_id, SystemTime::now())?;
+        let serving = Arc::new(FetchServing::new(
+            paths.config_dir,
+            paths.cache_dir.clone(),
+            config.fetch.max_bytes,
+            grants,
+            options.hooks.clone(),
+        ));
 
         let transport = Transport::new(TransportConfig::new(
             SCOPE_APP_NAME,
@@ -393,6 +406,8 @@ impl MeshRuntime {
             inline_max_bytes: config.fetch.inline_max_bytes,
             inbox_dir: config.fetch.inbox_dir.clone(),
             cache_dir: paths.cache_dir,
+            serving,
+            memory: PeerMemory::default(),
             interface_labels: plans.iter().map(InterfacePlan::label).collect(),
             interface_kinds: plans.iter().map(InterfacePlan::kind).collect(),
             hooks: options.hooks,
@@ -483,6 +498,27 @@ impl MeshRuntime {
 
     pub(crate) fn cache_dir(&self) -> &Path {
         &self.cache_dir
+    }
+
+    /// The share root's serving state: the local size limit, the grant store and the
+    /// case probe the `/list` and `/fetch` providers read.
+    pub(crate) fn serving(&self) -> &Arc<FetchServing> {
+        &self.serving
+    }
+
+    /// What this node last heard from each peer: status cards and listing pages.
+    pub(crate) fn memory(&self) -> &PeerMemory {
+        &self.memory
+    }
+
+    /// Where a file fetched from a peer is staged: under `mesh.fetch.inbox_dir` when set,
+    /// else under the cache dir, keyed by the instance this node speaks for right now.
+    pub(crate) fn inbox_staging(&self) -> InboxStaging {
+        InboxStaging::for_instance_under(
+            self.inbox_dir.as_deref(),
+            &self.cache_dir,
+            &self.current_instance_id(),
+        )
     }
 
     pub(crate) fn fingerprint(&self) -> &str {
@@ -1749,6 +1785,13 @@ impl MeshSlot {
             MESSAGE_PATH,
             Arc::new(PeerMessageHandler::new(surface.clone())),
         )?;
+        let shares = Arc::downgrade(self) as Weak<dyn ShareSource>;
+        runtime
+            .dispatcher()
+            .register(LIST_PATH, Arc::new(ListHandler::new(shares.clone())))?;
+        runtime
+            .dispatcher()
+            .register(FETCH_PATH, Arc::new(FetchHandler::new(shares)))?;
         runtime.attach_peer_surface(surface);
         runtime
             .knock_gate()
@@ -2818,13 +2861,21 @@ impl PeerSurface for MeshSlot {
 
     /// The running instance's inbox; with the mesh off there is nowhere to stage a file.
     fn inbox_staging(&self) -> Option<InboxStaging> {
-        self.get().map(|runtime| {
-            InboxStaging::for_instance_under(
-                runtime.inbox_dir.as_deref(),
-                runtime.cache_dir(),
-                &runtime.current_instance_id(),
-            )
-        })
+        self.get().map(|runtime| runtime.inbox_staging())
+    }
+}
+
+impl ShareSource for MeshSlot {
+    /// A relative or empty working directory names nothing on purpose: the share set
+    /// resolves against its root, and the process's own directory is not the session's.
+    fn share_root(&self) -> Option<PathBuf> {
+        self.snapshot()
+            .map(|snapshot| snapshot.cwd.clone())
+            .filter(|cwd| cwd.is_absolute())
+    }
+
+    fn serving(&self) -> Option<Arc<FetchServing>> {
+        self.get().map(|runtime| Arc::clone(runtime.serving()))
     }
 }
 
@@ -3047,7 +3098,7 @@ mod tests {
         assert!(
             brief
                 .text
-                .starts_with("## Status\nObjective: ship it\nState: idle"),
+                .starts_with("## Status\nObjective: ship it\nCaps: fetch\nState: idle"),
             "{}",
             brief.text
         );
@@ -3893,7 +3944,9 @@ mod tests {
             })
             .await;
         match reply {
-            Reply::Value(value) => assert!(is_received_reply(&value, &direct.id), "{value}"),
+            Reply::Value(value) | Reply::Settled { value, .. } => {
+                assert!(is_received_reply(&value, &direct.id), "{value}")
+            }
             Reply::Code(code) => panic!("refused: {code:?}"),
             Reply::Silent => panic!("the message was not acknowledged"),
         }
@@ -3992,7 +4045,7 @@ mod tests {
                 .handle(admitted_request(&a, &a_destination, &out))
                 .await
             {
-                Reply::Value(value) => {
+                Reply::Value(value) | Reply::Settled { value, .. } => {
                     assert!(is_received_reply(&value, &out.id), "{value}");
                     acked.push(out.id.clone());
                 }

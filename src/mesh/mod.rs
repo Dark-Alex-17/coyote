@@ -7,10 +7,9 @@ pub(crate) mod card;
 mod conformance;
 pub(crate) mod envoy;
 pub(crate) mod events;
+pub(crate) mod fetch;
 #[cfg(test)]
 mod fuzz;
-// Test-only until the access handler and the fetch handler read it.
-#[cfg(test)]
 pub(crate) mod grants;
 pub(crate) mod identity;
 pub(crate) mod idle;
@@ -31,8 +30,6 @@ mod protocol;
 mod r3;
 // pub(crate): the REPL pins the shared refusal wording in its tests.
 pub(crate) mod schema;
-// Test-only until the fetch handler and the `.mesh` share verbs read it.
-#[cfg(test)]
 pub(crate) mod shares;
 pub(crate) mod snapshot;
 #[cfg(test)]

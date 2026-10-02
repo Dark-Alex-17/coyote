@@ -21,14 +21,15 @@ pub(crate) use client::{
 #[cfg(all(test, unix))]
 pub(crate) use dispatch::LoggingKnockSink;
 pub(crate) use dispatch::{
-    AdmittedRequest, DispatchError, Dispatcher, Handler, KNOCK_PATH, KnockEvent, KnockSink,
-    MESSAGE_PATH, STATUS_PATH, describe_path,
+    AdmittedRequest, DispatchError, Dispatcher, FETCH_PATH, Handler, KNOCK_PATH, KnockEvent,
+    KnockSink, LIST_PATH, MESSAGE_PATH, STATUS_PATH, describe_path,
 };
 pub(crate) use error::{R3Error, RefusalCode};
 pub(crate) use frame::{Envelope, MAX_R3_PAYLOAD_BYTES, NAME_HASH_LEN, OriginName};
 #[cfg(test)]
 pub(crate) use frame::{
-    EnvelopeError, MAX_R3_NESTING_DEPTH, PathHash, RequestFrame, RequestId, ResponseFrame,
+    EnvelopeError, MAX_FETCH_RESPONSE_BYTES, MAX_R3_NESTING_DEPTH, PathHash, RequestFrame,
+    RequestId, ResponseFrame,
 };
 #[cfg(test)]
 pub(crate) use server::{

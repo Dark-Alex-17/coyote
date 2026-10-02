@@ -458,13 +458,13 @@ pub(crate) mod network {
         RequestOutcome, SizeBranch, identify, open_link,
     };
     use super::super::dispatch::{
-        AdmittedRequest, DispatchError, Dispatcher, Handler, KNOCK_PATH, KnockEvent, KnockSink,
-        LoggingKnockSink, MESSAGE_PATH, ReservedPath, STATUS_PATH,
+        AdmittedRequest, DispatchError, Dispatcher, FETCH_PATH, Handler, KNOCK_PATH, KnockEvent,
+        KnockSink, LIST_PATH, LoggingKnockSink, MESSAGE_PATH, ReservedPath, STATUS_PATH,
     };
     use super::super::error::{R3Error, RefusalCode};
     use super::super::frame::{
-        Envelope, MAX_R3_PAYLOAD_BYTES, NAME_HASH_LEN, OriginName, PathHash, RequestFrame,
-        RequestId, ResponseFrame,
+        Envelope, MAX_FETCH_RESPONSE_BYTES, MAX_R3_PAYLOAD_BYTES, NAME_HASH_LEN, OriginName,
+        PathHash, RequestFrame, RequestId, ResponseFrame,
     };
     use super::super::receipt::{ReceiptState, RequestReceipt};
     use super::super::server::{
@@ -473,6 +473,7 @@ pub(crate) mod network {
     use crate::config::mesh_config::MeshInterface;
     use crate::config::{ForkRekey, MeshConfig, Session};
     use crate::function::mesh::{inherit_reply_thread, outbound_from_args};
+    use crate::hooks::HookEvent;
     use crate::mesh::announce::AnnounceAppData;
     use crate::mesh::brief::Digest;
     use crate::mesh::card::{
@@ -481,7 +482,10 @@ pub(crate) mod network {
         StatusHandler, TODO_GOAL_MAX_CHARS, build_card,
     };
     use crate::mesh::envoy::{EnvoyJob, EnvoySink};
-    use crate::mesh::events::MeshHooks;
+    use crate::mesh::events::{MeshHooks, RecordingHookSink};
+    use crate::mesh::fetch::{
+        FETCH_REQUEST_TIMEOUT, FetchError, Fetched, SINGLE_SEGMENT_FETCH_CEILING,
+    };
     use crate::mesh::idle::{IdleNotify, IdleSink, Origin};
     use crate::mesh::knock::{
         ChannelKnockSink, KNOCK_QUEUE_CAPACITY, KnockError, KnockGate, KnockIntro, KnockMessage,
@@ -490,9 +494,10 @@ pub(crate) mod network {
     use crate::mesh::knocks::KnockCache;
     use crate::mesh::limits::{PeerRefusal, RefusalReason};
     use crate::mesh::message::{
-        Disposition, LxmfPeer, OutboundPeer, Part, PartLimits, PeerKind, PeerLxmf, PeerSendOptions,
-        PeerVia, RawPart, RecipientOutcome, SendError, SendOutcome, decode_peer_lxmf, from_r3_body,
-        is_received_reply, received_reply, to_r3_body,
+        Disposition, LxmfPeer, OutboundPeer, PEER_LINK_TIMEOUT, PEER_WIRE_VERSION, Part,
+        PartLimits, PeerKind, PeerLxmf, PeerSendOptions, PeerVia, RawPart, RecipientOutcome,
+        SendError, SendOutcome, decode_peer_lxmf, from_r3_body, is_received_reply, received_reply,
+        to_r3_body,
     };
     use crate::mesh::node::{
         KnockOptions, MeshRuntime, MeshSlot, NodeOptions, REKEY_GRACE, SHUTDOWN_GRACE,
@@ -1097,12 +1102,23 @@ pub(crate) mod network {
         ])
     }
 
-    /// Sends a request the responder is scripted to hang on, with `SHORT_REQUEST_TIMEOUT`,
-    /// and returns the in-flight request with what the responder saw of it.
+    /// Sends a `/slow` request the responder is scripted to hang on, with
+    /// `SHORT_REQUEST_TIMEOUT`, and returns the in-flight request with what the responder
+    /// saw of it.
     pub(crate) async fn hanging_request(
         requester: &Requester,
         recorder: &Recorder,
         desc: &DestinationDesc,
+    ) -> (JoinHandle<Result<RequestOutcome, R3Error>>, Seen) {
+        hanging_request_on(requester, recorder, desc, "/slow").await
+    }
+
+    /// `hanging_request` on `path`, for tests where the path decides the response bound.
+    async fn hanging_request_on(
+        requester: &Requester,
+        recorder: &Recorder,
+        desc: &DestinationDesc,
+        path: &'static str,
     ) -> (JoinHandle<Result<RequestOutcome, R3Error>>, Seen) {
         recorder.queue(Script::Hang);
         let before = recorder.seen_count();
@@ -1117,7 +1133,7 @@ pub(crate) mod network {
                     &transport,
                     &identity,
                     &desc,
-                    "/slow",
+                    path,
                     Envelope::new(origin, Value::Nil),
                     RequestOptions {
                         request_timeout: SHORT_REQUEST_TIMEOUT,
@@ -1348,6 +1364,11 @@ pub(crate) mod network {
             self.cancel_b.cancel();
             self.responder.stop().await;
             stopped_in
+        }
+
+        /// Node A's config dir, where its global share list lives.
+        fn config_dir_a(&self) -> PathBuf {
+            mesh_paths(&self._tmp).config_dir
         }
     }
 
@@ -1828,6 +1849,173 @@ pub(crate) mod network {
         assert_eq!(requester.client.pending_len(), 1);
         let result = timeout(INTEROP_TIMEOUT, in_flight).await.unwrap().unwrap();
         assert_eq!(result.unwrap_err(), timed_out_slow_request());
+        requester.stop().await;
+        responder.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fetch_response_between_the_two_bounds_is_delivered_and_a_status_response_of_that_size_is_dropped()
+     {
+        install_log_collector();
+        let recorder = Arc::new(Recorder::default());
+        let responder = Responder::listen(recorder.clone(), TcpServer::DEFAULT_CLIENT_MTU).await;
+        let mut requester = Requester::connect(responder.port, TcpClient::DEFAULT_MTU).await;
+        responder.announce(None).await;
+        let desc = requester.learn(&responder.desc.address_hash).await;
+
+        let (in_flight, seen) = hanging_request_on(&requester, &recorder, &desc, FETCH_PATH).await;
+        let body = incompressible_response_body();
+        responder
+            .transport
+            .send_response_resource(
+                &seen.link_id,
+                seen.request_id.to_vec(),
+                oversize_response(seen.request_id, body.clone()),
+                None,
+            )
+            .await
+            .unwrap();
+        let outcome = timeout(INTEROP_TIMEOUT, in_flight)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome.value, Value::Binary(body));
+        assert_eq!(outcome.response_branch, SizeBranch::Resource);
+        assert_eq!(requester.client.pending_len(), 0);
+
+        let (in_flight, seen) = hanging_request_on(&requester, &recorder, &desc, STATUS_PATH).await;
+        responder
+            .transport
+            .send_response_resource(
+                &seen.link_id,
+                seen.request_id.to_vec(),
+                oversize_response(seen.request_id, incompressible_response_body()),
+                None,
+            )
+            .await
+            .unwrap();
+        let dropped = format!(
+            "Dropped an oversize mesh response on link {} ({} bytes, max {MAX_R3_PAYLOAD_BYTES})",
+            seen.link_id.to_hex_string(),
+            MAX_R3_PAYLOAD_BYTES + 1
+        );
+        wait_until("the requester to drop the oversize status response", || {
+            debug_snapshot().contains(&dropped)
+        })
+        .await;
+        let result = timeout(INTEROP_TIMEOUT, in_flight).await.unwrap().unwrap();
+        assert_eq!(result.unwrap_err(), timed_out(STATUS_PATH));
+        requester.stop().await;
+        responder.stop().await;
+    }
+
+    #[test]
+    fn a_response_whose_prefix_is_not_a_frame_falls_back_to_the_coarse_bound() {
+        install_log_collector();
+        let client = R3Client::new();
+        let link_id = LinkId::new_from_rand(OsRng);
+        let oversize_line = |len: usize, max: usize| {
+            format!(
+                "Dropped an oversize mesh response on link {} ({len} bytes, max {max})",
+                link_id.to_hex_string()
+            )
+        };
+
+        // msgpack `nil` repeated: no frame prefix, so no path to bound by.
+        client.deliver(
+            link_id,
+            &vec![0xc0; MAX_FETCH_RESPONSE_BYTES + 1],
+            SizeBranch::Resource,
+        );
+        assert!(debug_snapshot().contains(&oversize_line(
+            MAX_FETCH_RESPONSE_BYTES + 1,
+            MAX_FETCH_RESPONSE_BYTES
+        )));
+
+        client.deliver(link_id, &[0xc0; 64], SizeBranch::Resource);
+        assert!(
+            debug_snapshot()
+                .iter()
+                .any(|message| message
+                    .starts_with("Dropped an undecodable mesh response (Resource)"))
+        );
+
+        // A well-formed frame for an id nothing is pending on gets the coarse bound too, so
+        // one byte over the fine bound reaches the decoder and fails to match.
+        let request_id = RequestId::from([7u8; 16]);
+        client.deliver(
+            link_id,
+            &oversize_response(
+                request_id,
+                vec![0xc0; MAX_R3_PAYLOAD_BYTES + 1 - RESPONSE_FRAME_OVERHEAD],
+            ),
+            SizeBranch::Resource,
+        );
+        let snapshot = debug_snapshot();
+        assert!(!snapshot.contains(&oversize_line(
+            MAX_R3_PAYLOAD_BYTES + 1,
+            MAX_R3_PAYLOAD_BYTES
+        )));
+        assert!(snapshot.contains(&format!(
+            "Unmatched mesh response {} (Resource); the request timed out or was never ours",
+            request_id.to_hex_string()
+        )));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_settled_reply_calls_on_failure_only_when_the_send_fails() {
+        install_log_collector();
+        let recorder = Arc::new(Recorder::default());
+        let (responder, requester, desc) = pair(recorder.clone()).await;
+        let settled = |value: Value, failed: &Arc<AtomicBool>| {
+            let failed = failed.clone();
+            Reply::Settled {
+                value,
+                on_failure: Box::new(move || failed.store(true, Ordering::SeqCst)),
+            }
+        };
+
+        let sent_failed = Arc::new(AtomicBool::new(false));
+        recorder.queue(Script::Reply(settled(Value::from("settled"), &sent_failed)));
+        let outcome = requester.request(&desc, "/echo", Value::Nil).await.unwrap();
+        assert_eq!(outcome.value, Value::from("settled"));
+        assert!(!sent_failed.load(Ordering::SeqCst));
+
+        let oversize_failed = Arc::new(AtomicBool::new(false));
+        let body = Value::Binary(vec![
+            0xcd;
+            MAX_R3_PAYLOAD_BYTES + 1 - RESPONSE_FRAME_OVERHEAD
+        ]);
+        recorder.queue(Script::Reply(settled(body, &oversize_failed)));
+        let err = requester
+            .client
+            .request(
+                &requester.transport,
+                &requester.identity,
+                &desc,
+                "/echo",
+                requester.envelope(Value::Nil),
+                short_options(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err, timed_out("/echo"));
+        let seen = recorder.last();
+        let warned = format!(
+            "Failed to send mesh response {} on link {}: {}",
+            seen.request_id.to_hex_string(),
+            seen.link_id.to_hex_string(),
+            R3Error::Oversize {
+                len: MAX_R3_PAYLOAD_BYTES + 1,
+                max: MAX_R3_PAYLOAD_BYTES,
+            }
+        );
+        assert!(
+            warn_snapshot().iter().any(|message| message == &warned),
+            "expected {warned:?}"
+        );
+        assert!(oversize_failed.load(Ordering::SeqCst));
         requester.stop().await;
         responder.stop().await;
     }
@@ -5145,6 +5333,13 @@ pub(crate) mod network {
         assert_eq!(handler.calls(), 1);
         assert_eq!(card.display_name.as_deref(), Some("Bea"));
         assert_eq!(card.objective.as_deref(), Some("OBJ-SECRET-7"));
+        // The card a peer last answered with is kept for completion, keyed by destination.
+        let b_hex = pair.responder.desc.address_hash.to_hex_string();
+        assert_eq!(pair.node_a.last_card(&b_hex), Some(card));
+        assert_eq!(
+            pair.node_a.last_card("0000000000000000000000000000dead"),
+            None
+        );
 
         let (handler, _tmp) = status_gate(
             &pair.responder,
@@ -5261,12 +5456,12 @@ pub(crate) mod network {
         pair.responder.stop().await;
     }
 
-    /// Usage probe, criterion (e) and the "no `caps` advertisement yet" MUST-NOT, on the
-    /// production path: node A started from a config with `mesh.about` serves a card whose
-    /// `about` is that text through the one `display_text` sanitiser (trimmed, control
-    /// sequences stripped) and advertises no `caps` key at all until the /fetch handler exists.
+    /// Usage probe, criterion (e), on the production path: node A started from a config
+    /// with `mesh.about` serves a card whose `about` is that text through the one
+    /// `display_text` sanitiser (trimmed, control sequences stripped) and advertises
+    /// `fetch` in `caps`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_started_node_serves_its_configured_about_sanitised_and_advertises_no_caps() {
+    async fn a_started_node_serves_its_configured_about_sanitised_and_advertises_fetch() {
         let b_identity = TransportIdentity::new_from_rand(OsRng);
         let b_identity_hash = b_identity.as_identity().address_hash;
         let pair = NodePair::start_with(
@@ -5291,13 +5486,13 @@ pub(crate) mod network {
         let card = pair.status_of_a(&b_identity, Value::Nil).await;
         assert_eq!(card.display_name.as_deref(), Some("Ada"));
         assert_eq!(card.about.as_deref(), Some("Ask me about the mesh"));
-        assert!(card.caps.is_empty(), "{:?}", card.caps);
+        assert_eq!(card.caps, ["fetch"]);
         let Value::Map(entries) = card.to_value() else {
             panic!("a card is a map");
         };
         assert!(
-            entries.iter().all(|(key, _)| key.as_str() != Some("caps")),
-            "an empty caps list is never on the wire"
+            entries.iter().any(|(key, _)| key.as_str() == Some("caps")),
+            "caps is on the wire"
         );
         assert!(
             entries.iter().any(|(key, _)| key.as_str() == Some("about")),
@@ -6015,5 +6210,339 @@ pub(crate) mod network {
         );
         pair.stop_node_a().await;
         responder_c.stop().await;
+    }
+
+    /// An envoy that takes everything and counts what it was offered.
+    #[derive(Default)]
+    struct CountingEnvoy(AtomicUsize);
+
+    impl EnvoySink for CountingEnvoy {
+        fn accept(&self, _job: EnvoyJob) -> Result<(), PeerRefusal> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn answer(&self, _id: &str, _text: &str) -> bool {
+            false
+        }
+
+        fn interrupt(&self) {}
+    }
+
+    /// Node A's global share list allows `docs/**`, and its slot publishes a fresh
+    /// workspace as the share root with `docs/` empty and `src/x.rs` outside every allow.
+    fn share_docs_from_a(pair: &NodePair, slot: &MeshSlot, tag: &str) -> TempDir {
+        let shares = mesh_config_dir(&pair.config_dir_a()).join("shares.yaml");
+        fs::create_dir_all(shares.parent().unwrap()).unwrap();
+        fs::write(shares, "version: 1\nallow:\n- pattern: 'docs/**'\n").unwrap();
+        let workspace = TempDir::new(tag);
+        fs::create_dir_all(workspace.path.join("docs")).unwrap();
+        fs::create_dir_all(workspace.path.join("src")).unwrap();
+        fs::write(workspace.path.join("src").join("x.rs"), b"fn main() {}\n").unwrap();
+        let mut snapshot = snapshot_fixture();
+        snapshot.cwd = workspace.path.clone();
+        slot.publish(snapshot);
+        workspace
+    }
+
+    fn wire_map(entries: Vec<(&str, Value)>) -> Value {
+        Value::Map(
+            entries
+                .into_iter()
+                .map(|(key, value)| (Value::from(key), value))
+                .collect(),
+        )
+    }
+
+    fn fetch_body(path: &str, if_sha256: Option<[u8; 32]>) -> Value {
+        wire_map(vec![
+            ("v", Value::from(PEER_WIRE_VERSION)),
+            ("path", Value::from(path)),
+            (
+                "if_sha256",
+                if_sha256.map_or(Value::Nil, |hash| Value::Binary(hash.to_vec())),
+            ),
+        ])
+    }
+
+    fn wire_field<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
+        value
+            .as_map()
+            .unwrap()
+            .iter()
+            .find(|(name, _)| name.as_str() == Some(key))
+            .map(|(_, value)| value)
+    }
+
+    fn wire_status(value: &Value) -> &str {
+        wire_field(value, "status").and_then(Value::as_str).unwrap()
+    }
+
+    /// Node B asks node A's `path` as itself.
+    async fn b_asks_a(
+        pair: &NodePair,
+        path: &str,
+        body: Value,
+        options: RequestOptions,
+    ) -> RequestOutcome {
+        pair.client_b
+            .request(
+                &pair.responder.transport,
+                &pair.responder.identity,
+                &pair.a_desc,
+                path,
+                pair.responder.envelope(body),
+                options,
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_full_list_and_fetch_cycle_over_a_live_pair_never_calls_the_envoy() {
+        let pair = NodePair::start_with("r3-fetch-cycle", |_| {}, trusting_b).await;
+        let (slot, _idle) = installed_slot(&pair);
+        let envoy = Arc::new(CountingEnvoy::default());
+        slot.set_envoy(envoy.clone() as Arc<dyn EnvoySink>);
+        let sink = RecordingHookSink::attach(pair.node_a.hooks());
+        let workspace = share_docs_from_a(&pair, &slot, "r3-fetch-cycle-root");
+        let bytes = b"# a\n".to_vec();
+        fs::write(workspace.path.join("docs").join("a.md"), &bytes).unwrap();
+        let digest: [u8; 32] = Sha256::digest(&bytes).into();
+
+        let listed = b_asks_a(
+            &pair,
+            LIST_PATH,
+            wire_map(vec![("v", Value::from(PEER_WIRE_VERSION))]),
+            short_options(),
+        )
+        .await;
+        let paths: Vec<&str> = wire_field(&listed.value, "entries")
+            .and_then(Value::as_array)
+            .unwrap()
+            .iter()
+            .map(|entry| wire_field(entry, "path").and_then(Value::as_str).unwrap())
+            .collect();
+        assert_eq!(paths, ["docs/a.md"]);
+
+        let served = b_asks_a(
+            &pair,
+            FETCH_PATH,
+            fetch_body("docs/a.md", None),
+            short_options(),
+        )
+        .await;
+        assert_eq!(wire_status(&served.value), "ok");
+        assert_eq!(
+            wire_field(&served.value, "sha256"),
+            Some(&Value::Binary(digest.to_vec()))
+        );
+        assert_eq!(
+            wire_field(&served.value, "bytes"),
+            Some(&Value::Binary(bytes))
+        );
+        assert_eq!(served.response_branch, SizeBranch::Packet);
+
+        let unchanged = b_asks_a(
+            &pair,
+            FETCH_PATH,
+            fetch_body("docs/a.md", Some(digest)),
+            short_options(),
+        )
+        .await;
+        assert_eq!(wire_status(&unchanged.value), "not_modified");
+
+        let missing = b_asks_a(
+            &pair,
+            FETCH_PATH,
+            fetch_body("docs/missing.md", None),
+            short_options(),
+        )
+        .await;
+        let unshared = b_asks_a(
+            &pair,
+            FETCH_PATH,
+            fetch_body("src/x.rs", None),
+            short_options(),
+        )
+        .await;
+        assert_eq!(wire_status(&missing.value), "not_shared");
+        assert_eq!(missing.value, unshared.value);
+
+        let traversal =
+            b_asks_a(&pair, FETCH_PATH, fetch_body("../x", None), short_options()).await;
+        assert_eq!(wire_status(&traversal.value), "invalid_path");
+
+        assert_eq!(envoy.0.load(Ordering::SeqCst), 0);
+        let fetch_fires = sink
+            .drain()
+            .into_iter()
+            .filter(|(event, _)| *event == HookEvent::MeshFetchServed)
+            .count();
+        assert_eq!(fetch_fires, 1);
+        pair.stop_node_a().await;
+    }
+
+    /// The largest file the responder serves today rides one Resource segment; the split
+    /// (multi-segment) case waits on the upstream fix `SINGLE_SEGMENT_FETCH_CEILING`
+    /// documents. The ceiling is one byte away from the next segment, so a response here
+    /// also proves the ceiling's framing allowance against a real link.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fetch_response_at_the_single_segment_ceiling_arrives_as_one_resource() {
+        install_log_collector();
+        let pair = NodePair::start_with("r3-fetch-big", |_| {}, trusting_b).await;
+        let (slot, _idle) = installed_slot(&pair);
+        let workspace = share_docs_from_a(&pair, &slot, "r3-fetch-big-root");
+        let mut bytes = vec![0u8; usize::try_from(SINGLE_SEGMENT_FETCH_CEILING).unwrap()];
+        rand_core::RngCore::fill_bytes(&mut OsRng, &mut bytes);
+        fs::write(workspace.path.join("docs").join("big.bin"), &bytes).unwrap();
+
+        let outcome = pair
+            .client_b
+            .request(
+                &pair.responder.transport,
+                &pair.responder.identity,
+                &pair.a_desc,
+                FETCH_PATH,
+                pair.responder.envelope(fetch_body("docs/big.bin", None)),
+                RequestOptions {
+                    request_timeout: FETCH_REQUEST_TIMEOUT,
+                    link_timeout: PEER_LINK_TIMEOUT,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(wire_status(&outcome.value), "ok");
+        assert_eq!(
+            wire_field(&outcome.value, "bytes"),
+            Some(&Value::Binary(bytes))
+        );
+        assert_eq!(outcome.response_branch, SizeBranch::Resource);
+        pair.stop_node_a().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fetch_file_stages_the_bytes_under_the_peer_inbox_and_surfaces_a_peer_without_fetch() {
+        let pair = NodePair::start_with("r3-fetch-file", |_| {}, trusting_b).await;
+        pair.introduce_b_to_a().await;
+        let b_desc = &pair.responder.desc;
+        let b_hex = b_desc.address_hash.to_hex_string();
+        let bytes = b"# a\n".to_vec();
+        let digest: [u8; 32] = Sha256::digest(&bytes).into();
+        let ok_body = |sha256: [u8; 32]| {
+            wire_map(vec![
+                ("v", Value::from(PEER_WIRE_VERSION)),
+                ("status", Value::from("ok")),
+                ("size", Value::from(bytes.len() as u64)),
+                ("sha256", Value::Binary(sha256.to_vec())),
+                ("bytes", Value::Binary(bytes.clone())),
+            ])
+        };
+
+        pair.recorder_b
+            .queue(Script::Reply(Reply::Value(ok_body(digest))));
+        let fetched = pair
+            .node_a
+            .fetch_file(b_desc, "docs/a.md", None)
+            .await
+            .unwrap();
+        let Fetched::Staged { path, size, sha256 } = fetched else {
+            panic!("not staged: {fetched:?}");
+        };
+        assert_eq!(size, bytes.len() as u64);
+        assert_eq!(sha256, digest);
+        let inbox_root = dunce::canonicalize(
+            pair.node_a
+                .cache_dir()
+                .join("mesh")
+                .join("inbox")
+                .join(pair.node_a.current_instance_id()),
+        )
+        .unwrap();
+        assert_eq!(
+            path,
+            inbox_root
+                .join(b_hex[..8].to_lowercase())
+                .join("docs")
+                .join("a.md")
+        );
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(pair.recorder_b.last().path_hash, PathHash::of(FETCH_PATH));
+
+        pair.recorder_b.queue(Script::Reply(Reply::Value(
+            DispatchError::NoProvider {
+                path: FETCH_PATH.to_string(),
+            }
+            .to_value(),
+        )));
+        let err = pair
+            .node_a
+            .fetch_file(b_desc, "docs/a.md", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FetchError::NotServed), "{err:?}");
+        assert_eq!(err.to_string(), "peer does not share files");
+
+        pair.recorder_b
+            .queue(Script::Reply(Reply::Value(wire_map(vec![
+                ("v", Value::from(PEER_WIRE_VERSION)),
+                ("status", Value::from("weird")),
+            ]))));
+        let err = pair
+            .node_a
+            .fetch_file(b_desc, "docs/a.md", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FetchError::UnknownStatus), "{err:?}");
+        assert_eq!(err.to_string(), "peer sent an unknown status");
+
+        pair.recorder_b
+            .queue(Script::Reply(Reply::Value(ok_body([0; 32]))));
+        let err = pair
+            .node_a
+            .fetch_file(b_desc, "docs/a.md", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FetchError::Corrupt), "{err:?}");
+
+        pair.recorder_b
+            .queue(Script::Reply(Reply::Value(wire_map(vec![
+                ("v", Value::from(PEER_WIRE_VERSION)),
+                (
+                    "entries",
+                    Value::Array(vec![wire_map(vec![
+                        ("path", Value::from("docs/a.md")),
+                        ("size", Value::from(bytes.len() as u64)),
+                        ("sha256", Value::Binary(digest.to_vec())),
+                        ("mtime", Value::F64(1_700_000_000.0)),
+                    ])]),
+                ),
+                ("next", Value::Nil),
+            ]))));
+        let page = pair.node_a.list_shares(b_desc, None, None).await.unwrap();
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].path, "docs/a.md");
+        assert_eq!(page.next, None);
+        assert_eq!(pair.recorder_b.last().path_hash, PathHash::of(LIST_PATH));
+        assert_eq!(
+            pair.node_a.last_list(&b_hex),
+            Some(vec!["docs/a.md".to_string()])
+        );
+
+        let seen = pair.recorder_b.seen_count();
+        let refused = pair.node_a.fetch_file(b_desc, "../x", None).await.unwrap();
+        assert_eq!(
+            refused,
+            Fetched::InvalidPath {
+                rule: "segment".into()
+            }
+        );
+        assert_eq!(
+            pair.recorder_b.seen_count(),
+            seen,
+            "a path this node's own grammar refuses never reaches the peer"
+        );
+        pair.stop_node_a().await;
     }
 }

@@ -1011,15 +1011,16 @@ mod tests {
     use super::*;
     use crate::config::mesh_config::{
         DEFAULT_PEER_MAX_CONCURRENT, DEFAULT_PEER_MAX_MESSAGES_PER_HOUR,
-        DEFAULT_PEER_MAX_TOKENS_PER_HOUR,
+        DEFAULT_PEER_MAX_TOKENS_PER_HOUR, MAX_FETCH_FILE_BYTES,
     };
     use crate::config::mesh_envoy::ENVOY_RUN_TIMEOUT_SECS;
-    use crate::mesh::r3::RefusalCode;
+    use crate::mesh::r3::{MAX_FETCH_RESPONSE_BYTES, RefusalCode, RequestId, ResponseFrame};
     use crate::mesh::{
         announce, card, identity, knock, knocks, limits, message, peers, pending, propagation,
         propagation_fetch, propagation_nodes, protocol, r3, trust,
     };
     use lxmf_core::constants::{FIELD_CUSTOM_DATA, FIELD_CUSTOM_TYPE};
+    use rmpv::Value;
     use rns_transport::hash::ADDRESS_HASH_SIZE;
     use std::time::Duration;
 
@@ -2512,5 +2513,34 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
             .filter(|path| !root.join(path).is_file())
             .collect();
         assert_eq!(missing, Vec::<&String>::new());
+    }
+
+    /// The fetch response bound is the largest file plus framing, and a reply carrying
+    /// exactly the largest file fits under it.
+    #[test]
+    fn fetch_response_bound_is_the_file_bound_plus_framing() {
+        assert_eq!(
+            MAX_FETCH_RESPONSE_BYTES,
+            MAX_FETCH_FILE_BYTES as usize + 4096
+        );
+        let largest = ResponseFrame {
+            request_id: RequestId::from([0; 16]),
+            data: Value::Map(vec![
+                (Value::from("v"), Value::from(1)),
+                (Value::from("status"), Value::from("ok")),
+                (Value::from("size"), Value::from(MAX_FETCH_FILE_BYTES)),
+                (Value::from("sha256"), Value::Binary(vec![0; 32])),
+                (
+                    Value::from("bytes"),
+                    Value::Binary(vec![0; MAX_FETCH_FILE_BYTES as usize]),
+                ),
+            ]),
+        }
+        .encode();
+        assert!(
+            largest.len() <= MAX_FETCH_RESPONSE_BYTES,
+            "{} bytes, max {MAX_FETCH_RESPONSE_BYTES}",
+            largest.len()
+        );
     }
 }
