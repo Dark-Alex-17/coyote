@@ -176,12 +176,15 @@ pub(crate) struct PeerRef<'a> {
 
 /// The verdict on one fetch. `NotShared` covers a file that does not exist, one outside
 /// every allow and one a deny refuses alike, so a peer learns nothing about the tree from
-/// the answer; only a name the grammar refuses is told which rule it broke.
+/// the answer; only a name the grammar refuses is told which rule it broke, and only a
+/// file the peer could otherwise fetch is told it is too large, so a size never leaks
+/// for a file the rules would not serve.
 #[derive(Debug)]
 pub(crate) enum Served {
     File(ServedFile),
     NotShared,
     InvalidPath { rule: &'static str },
+    TooLarge { size: u64 },
 }
 
 /// The open handle the verdict was reached on, so the reader reads the very file that was
@@ -268,8 +271,10 @@ impl ShareLocations {
 }
 
 /// Both files as loaded. A missing file is an empty layer; a file that cannot be read as
-/// this version poisons the whole set: `effective` is empty, every `permits` is false and
-/// `apply` refuses, so a corrupt file is never served around nor written over.
+/// this version poisons the whole set: `effective` is empty, `rules` refuses, and so
+/// does `apply`, so a corrupt file is never served around nor written over. Refusing
+/// the rules outright, rather than serving on empty allows, is what keeps a grant from
+/// slipping past a deny the refused file carried.
 pub(crate) struct ShareSet {
     locations: ShareLocations,
     global: SharesFile,
@@ -351,6 +356,9 @@ impl ShareSet {
     /// caches: a `ShareSet` is loaded per evaluation or REPL verb, and a caller that holds
     /// one must reload to see a repaired file.
     pub(crate) fn rules(&self, peer: &PeerRef<'_>, case_insensitive: bool) -> Result<ShareRules> {
+        if let Some(refusal) = &self.poisoned {
+            bail!("{refusal}");
+        }
         let canonical_root = dunce::canonicalize(&self.locations.workspace_root)
             .context("Failed to resolve the share root")?;
         let allow = compile(
@@ -394,16 +402,21 @@ impl ShareSet {
     /// before it is opened. The grammar is checked before anything is resolved, so a
     /// traversal never reaches the filesystem; the path is then resolved under the share
     /// root, refused when it resolved elsewhere, and judged against the rules. A file no
-    /// rule names is served only on a grant, whose use is reserved here, before the open,
-    /// so two fetches racing for one use cannot both be served; a grant never lifts a
-    /// deny. Only a verdict of served opens the file, since opening a FIFO waits for a
-    /// writer that never comes, and a reserved use goes back when that open fails. Every
-    /// error on the way is `NotShared`, the same answer an unshared file gets.
+    /// rule names is served only on a grant, and a grant never lifts a deny; the grant is
+    /// previewed here, not spent. The file is then stat'ed: one that is not a regular
+    /// file is `NotShared`, and one over `max_bytes` is `TooLarge`, both before any use
+    /// is spent, so a grant for a file too large to carry keeps its use. Only then is the
+    /// grant's use reserved, before the open, so two fetches racing for one use cannot
+    /// both be served; it goes back when the open fails or the handle turns out larger
+    /// than the stat said. Only a verdict of served opens the file, since opening a FIFO
+    /// waits for a writer that never comes. Every error on the way is `NotShared`, the
+    /// same answer an unshared file gets.
     pub(crate) fn is_served(
         &self,
         peer: &PeerRef<'_>,
         wire_text: &str,
         case_insensitive: bool,
+        max_bytes: u64,
         grants: Option<(&GrantStore, SystemTime)>,
     ) -> Served {
         let wire = match WirePath::parse(wire_text) {
@@ -427,15 +440,15 @@ impl ShareSet {
         if rules.resolved(&canonical).is_none() {
             return Served::NotShared;
         }
-        let via = match rules.judge(&wire, &canonical) {
+        let grant = match rules.judge(&wire, &canonical) {
             Judgement::Denied => return Served::NotShared,
-            Judgement::Allowed => Via::Allow,
+            Judgement::Allowed => None,
             Judgement::NotAllowed => {
                 let Some((store, now)) = grants else {
                     return Served::NotShared;
                 };
-                match store.consume(peer, wire_text, now) {
-                    Ok(true) => Via::Grant,
+                match store.is_granted(peer, wire_text, now) {
+                    Ok(true) => Some((store, now)),
                     Ok(false) => return Served::NotShared,
                     Err(err) => {
                         debug!(
@@ -447,15 +460,54 @@ impl ShareSet {
                 }
             }
         };
-        let Some((file, metadata)) = open_regular(&canonical) else {
-            if via == Via::Grant
-                && let Some((store, now)) = grants
-            {
-                let _ = store.refund(peer, wire_text, now);
+        let Ok(metadata) = fs::metadata(&canonical) else {
+            return Served::NotShared;
+        };
+        if !metadata.is_file() {
+            return Served::NotShared;
+        }
+        if metadata.len() > max_bytes {
+            return Served::TooLarge {
+                size: metadata.len(),
+            };
+        }
+        if let Some((store, now)) = grant {
+            match store.consume(peer, wire_text, now) {
+                Ok(true) => {}
+                Ok(false) => return Served::NotShared,
+                Err(err) => {
+                    debug!(
+                        "Mesh grant store could not be read, so no grant applies: {}",
+                        redact_hashes(&format!("{err:#}"))
+                    );
+                    return Served::NotShared;
+                }
             }
+        }
+        let refund = || {
+            if let Some((store, now)) = grant
+                && let Err(err) = store.refund(peer, wire_text, now)
+            {
+                debug!(
+                    "Mesh grant use could not be refunded: {}",
+                    redact_hashes(&format!("{err:#}"))
+                );
+            }
+        };
+        let Some((file, metadata)) = open_regular(&canonical) else {
+            refund();
             return Served::NotShared;
         };
         let size = metadata.len();
+        if size > max_bytes {
+            refund();
+            return Served::TooLarge { size };
+        }
+        let via = if grant.is_some() {
+            Via::Grant
+        } else {
+            Via::Allow
+        };
         debug!(
             "Mesh share served: {} ({} bytes)",
             short(&hex_lower(&Sha256::digest(
@@ -477,7 +529,10 @@ impl ShareSet {
     /// `walk_bound` entries before it stops and says so. Only the page returned is opened
     /// and hashed, so a listing of a large tree costs one walk, not one read of every
     /// file. Grants never appear: a listing is what the share set says, not what one peer
-    /// was handed once. A set whose rules cannot be built lists nothing.
+    /// was handed once. A set whose rules cannot be built lists nothing. `next` names the
+    /// last entry returned, so a client resumes after what it saw; only when every
+    /// candidate on a page fell off during hydration does it name the last candidate
+    /// instead, so the client can still move past them.
     pub(crate) fn list(
         &self,
         peer: &PeerRef<'_>,
@@ -527,6 +582,11 @@ impl ShareSet {
         candidates.dedup_by(|left, right| left.path == right.path);
         let (page, next) = paginate(candidates, cursor, LIST_PAGE_SIZE);
         let entries = hydrate(page);
+        let next = next.map(|cursor| {
+            entries
+                .last()
+                .map_or(cursor, |last| list_cursor(&last.path))
+        });
         debug!(
             "Mesh share listed: {} entries on this page, truncated: {truncated}",
             entries.len()
@@ -1095,6 +1155,7 @@ fn validate_entries(file: &SharesFile) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::mesh_config::MAX_FETCH_FILE_BYTES;
     use crate::mesh::hex_lower;
     use crate::mesh::test_support::TempDir;
     use crate::testing::{EnvVarGuard, debug_snapshot, install_log_collector, warn_snapshot};
@@ -1241,7 +1302,13 @@ mod tests {
             identity: &identity,
             destination: &destination,
         };
-        set.is_served(&peer, wire_text, case_insensitive, grants)
+        set.is_served(
+            &peer,
+            wire_text,
+            case_insensitive,
+            MAX_FETCH_FILE_BYTES,
+            grants,
+        )
     }
 
     fn is_not_shared(verdict: &Served) -> bool {
@@ -1344,7 +1411,8 @@ mod tests {
         let mut set = fx.load();
 
         assert!(set.effective(&peer).is_empty());
-        assert!(!served(&set, &fx, "README.md"));
+        fx.file("README.md");
+        assert!(is_not_shared(&fetch(&set, "README.md")));
         let err = set
             .apply(allow("docs/**"), WriteScope::Auto)
             .unwrap_err()
@@ -1409,7 +1477,8 @@ mod tests {
         let refusal = set.poisoned.clone().unwrap();
         assert!(refusal.contains(&path.display().to_string()), "{refusal}");
         assert!(refusal.contains("no readable `version` field"), "{refusal}");
-        assert!(!served(&set, &fx, "README.md"));
+        fx.file("README.md");
+        assert!(is_not_shared(&fetch(&set, "README.md")));
     }
 
     #[test]
@@ -1427,7 +1496,8 @@ mod tests {
             refusal.contains("could not be parsed as version 1"),
             "{refusal}"
         );
-        assert!(!served(&set, &fx, "docs/a.md"));
+        fx.file("docs/a.md");
+        assert!(is_not_shared(&fetch(&set, "docs/a.md")));
     }
 
     #[test]
@@ -2177,7 +2247,8 @@ mod tests {
                 "{tag}: {refusal}"
             );
             assert!(refusal.contains(teaching), "{tag}: {refusal}");
-            assert!(!served(&set, &fx, "README.md"), "{tag}");
+            fx.file("README.md");
+            assert!(is_not_shared(&fetch(&set, "README.md")), "{tag}");
             let err = set
                 .apply(allow("src/**"), WriteScope::Auto)
                 .unwrap_err()
@@ -2541,6 +2612,7 @@ mod tests {
             &stranger,
             "src/x.rs",
             false,
+            MAX_FETCH_FILE_BYTES,
             Some((&store, now))
         )));
     }
@@ -2646,7 +2718,13 @@ mod tests {
             .unwrap();
 
         for path in granted {
-            let verdict = set.is_served(&peer, path, false, Some((&store, now)));
+            let verdict = set.is_served(
+                &peer,
+                path,
+                false,
+                MAX_FETCH_FILE_BYTES,
+                Some((&store, now)),
+            );
             let Served::File(file) = verdict else {
                 panic!("{path}: {verdict:?}");
             };
@@ -2654,7 +2732,13 @@ mod tests {
         }
 
         for path in granted {
-            let verdict = set.is_served(&peer, path, false, Some((&store, now)));
+            let verdict = set.is_served(
+                &peer,
+                path,
+                false,
+                MAX_FETCH_FILE_BYTES,
+                Some((&store, now)),
+            );
             assert!(is_not_shared(&verdict), "{path}: {verdict:?}");
         }
     }
@@ -2679,7 +2763,15 @@ mod tests {
         let verdicts: Vec<Served> = std::thread::scope(|scope| {
             let fetches: Vec<_> = (0..8)
                 .map(|_| {
-                    scope.spawn(|| set.is_served(&peer, "src/x.rs", false, Some((&store, now))))
+                    scope.spawn(|| {
+                        set.is_served(
+                            &peer,
+                            "src/x.rs",
+                            false,
+                            MAX_FETCH_FILE_BYTES,
+                            Some((&store, now)),
+                        )
+                    })
                 })
                 .collect();
             fetches
@@ -2701,6 +2793,13 @@ mod tests {
                 .count(),
             7
         );
+        let records = store.list().unwrap();
+        assert_eq!(records.len(), 1, "{records:#?}");
+        assert_eq!(records[0].paths[0].path, "src/x.rs");
+        assert_eq!(
+            records[0].paths[0].uses_left, 0,
+            "the one serve spent the one use and no loser refunded it"
+        );
     }
 
     #[test]
@@ -2720,12 +2819,116 @@ mod tests {
             .grant("req", &destination, &["docs".to_string()], None, now)
             .unwrap();
 
-        let verdict = set.is_served(&peer, "docs", false, Some((&store, now)));
+        let verdict = set.is_served(
+            &peer,
+            "docs",
+            false,
+            MAX_FETCH_FILE_BYTES,
+            Some((&store, now)),
+        );
 
         assert!(is_not_shared(&verdict), "{verdict:?}");
         assert!(
             store.is_granted(&peer, "docs", now).unwrap(),
-            "the use went back when the open was refused"
+            "nothing was spent on a path that is not a regular file"
+        );
+    }
+
+    #[test]
+    fn a_file_over_the_limit_is_too_large_and_a_granted_one_keeps_its_use() {
+        let fx = Fixture::new("serve-too-large");
+        let mut set = fx.load();
+        set.apply(allow("docs/**"), WriteScope::Global).unwrap();
+        fx.file("docs/a.md");
+        fx.file("src/x.rs");
+        let store = grant_store(&fx);
+        let now = now();
+        let (identity, destination) = anyone();
+        let peer = PeerRef {
+            identity: &identity,
+            destination: &destination,
+        };
+        store
+            .grant("req", &destination, &["src/x.rs".to_string()], None, now)
+            .unwrap();
+
+        let allowed = set.is_served(&peer, "docs/a.md", false, 5, None);
+        let granted = set.is_served(&peer, "src/x.rs", false, 5, Some((&store, now)));
+
+        let Served::TooLarge { size } = allowed else {
+            panic!("{allowed:?}");
+        };
+        assert_eq!(size, "docs/a.md".len() as u64);
+        let Served::TooLarge { size } = granted else {
+            panic!("{granted:?}");
+        };
+        assert_eq!(size, "src/x.rs".len() as u64);
+        assert!(
+            store.is_granted(&peer, "src/x.rs", now).unwrap(),
+            "a fetch refused for size spends nothing"
+        );
+        assert!(matches!(
+            set.is_served(&peer, "src/x.rs", false, size, Some((&store, now))),
+            Served::File(ServedFile {
+                via: Via::Grant,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_too_large_verdict_is_only_reached_for_a_file_the_peer_may_fetch() {
+        let fx = Fixture::new("serve-too-large-unshared");
+        let mut set = fx.load();
+        set.apply(allow("docs/**"), WriteScope::Global).unwrap();
+        set.apply(deny("docs/vault/**"), WriteScope::Global)
+            .unwrap();
+        fx.file("src/x.rs");
+        fx.file("docs/vault/seed.txt");
+        let store = grant_store(&fx);
+        let now = now();
+        let (identity, destination) = anyone();
+        let peer = PeerRef {
+            identity: &identity,
+            destination: &destination,
+        };
+
+        for path in ["src/x.rs", "docs/vault/seed.txt"] {
+            let verdict = set.is_served(&peer, path, false, 5, Some((&store, now)));
+            assert!(is_not_shared(&verdict), "{path}: {verdict:?}");
+        }
+    }
+
+    #[test]
+    fn a_poisoned_set_serves_nothing_even_on_a_grant() {
+        let fx = Fixture::new("serve-poisoned-grant");
+        fx.write(Layer::Workspace, "version: 1\nallow: [\n");
+        fx.file("src/x.rs");
+        let set = fx.load();
+        assert!(set.poisoned.is_some());
+        let store = grant_store(&fx);
+        let now = now();
+        let (identity, destination) = anyone();
+        let peer = PeerRef {
+            identity: &identity,
+            destination: &destination,
+        };
+        store
+            .grant("req", &destination, &["src/x.rs".to_string()], None, now)
+            .unwrap();
+
+        let verdict = set.is_served(
+            &peer,
+            "src/x.rs",
+            false,
+            MAX_FETCH_FILE_BYTES,
+            Some((&store, now)),
+        );
+
+        assert!(is_not_shared(&verdict), "{verdict:?}");
+        assert!(
+            store.is_granted(&peer, "src/x.rs", now).unwrap(),
+            "a refused set spends nothing"
         );
     }
 

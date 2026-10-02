@@ -53,6 +53,8 @@ pub(crate) struct GrantRecord {
 #[serde(deny_unknown_fields)]
 pub(crate) struct GrantedPath {
     pub path: String,
+    /// How many uses the grant lent, the ceiling a `refund` may raise `uses_left` to.
+    pub uses: u32,
     pub uses_left: u32,
 }
 
@@ -88,11 +90,16 @@ impl GrantRecord {
         }
     }
 
-    /// Gives one use of `path` back; `false` when this grant never named it.
+    /// Gives one use of `path` back; `false` when this grant never named it or already
+    /// holds every use it lent.
     fn restore(&mut self, path: &str) -> bool {
-        match self.paths.iter_mut().find(|granted| granted.path == path) {
+        match self
+            .paths
+            .iter_mut()
+            .find(|granted| granted.path == path && granted.uses_left < granted.uses)
+        {
             Some(granted) => {
-                granted.uses_left = granted.uses_left.saturating_add(1);
+                granted.uses_left += 1;
                 true
             }
             None => false,
@@ -170,6 +177,7 @@ impl GrantStore {
             if !granted.iter().any(|existing| existing.path == *path) {
                 granted.push(GrantedPath {
                     path: path.clone(),
+                    uses: DEFAULT_GRANT_USES,
                     uses_left: DEFAULT_GRANT_USES,
                 });
             }
@@ -244,8 +252,10 @@ impl GrantStore {
 
     /// Hands back a use `consume` reserved, when the fetch it was reserved for could not
     /// be served after all, to the first unexpired grant for `peer` that names exactly
-    /// this text. `Ok(false)` when no such grant remains: it expired in between, and the
-    /// use went with it.
+    /// this text and is below what it lent. Each call pairs with exactly one prior
+    /// `consume`: a refund never mints a use the grant did not lend, and `Ok(false)`
+    /// says nothing was restored, either because every grant already holds its full
+    /// count or because the grant expired in between and the use went with it.
     pub(crate) fn refund(&self, peer: &PeerRef<'_>, path: &str, now: SystemTime) -> Result<bool> {
         if !self.path.exists() {
             return Ok(false);
@@ -317,8 +327,9 @@ impl GrantStore {
     }
 
     /// Every record in the file, refusing the whole file on the first line that is not a
-    /// grant of this version with a readable expiry: a grant whose expiry does not parse
-    /// would otherwise read as one that never expires.
+    /// grant of this version with a readable expiry and no path holding more uses than
+    /// it was lent: a grant whose expiry does not parse would otherwise read as one that
+    /// never expires, and one with surplus uses as one a refund may keep growing.
     fn read_all(&self) -> Result<Vec<GrantRecord>> {
         let text = match fs::read_to_string(&self.path) {
             Ok(text) => text,
@@ -366,6 +377,18 @@ impl GrantStore {
             if parse_rfc3339(&record.expires).is_none() {
                 bail!(
                     "Mesh grant store '{}' line {} has an `expires` that is not an RFC 3339 timestamp. {}",
+                    self.path.display(),
+                    index + 1,
+                    Remedy::Cache.sentence()
+                );
+            }
+            if record
+                .paths
+                .iter()
+                .any(|granted| granted.uses_left > granted.uses)
+            {
+                bail!(
+                    "Mesh grant store '{}' line {} has a path with more uses left than were granted. {}",
                     self.path.display(),
                     index + 1,
                     Remedy::Cache.sentence()
@@ -472,6 +495,7 @@ mod tests {
             record.paths,
             [GrantedPath {
                 path: "docs/a.md".into(),
+                uses: 1,
                 uses_left: 1,
             }]
         );
@@ -711,10 +735,12 @@ mod tests {
             [
                 GrantedPath {
                     path: "docs/a.md".into(),
+                    uses: 1,
                     uses_left: 0,
                 },
                 GrantedPath {
                     path: "docs/b.md".into(),
+                    uses: 1,
                     uses_left: 1,
                 },
             ]
@@ -754,6 +780,32 @@ mod tests {
         assert!(!store.refund(&peer, "docs/a.md", t(1_010)).unwrap());
         assert!(store.list().unwrap().is_empty());
         assert!(!store.consume(&peer, "docs/a.md", t(1_010)).unwrap());
+    }
+
+    #[test]
+    fn refund_never_raises_uses_above_what_was_granted() {
+        let (store, _tmp) = store("grants-refund-bounded");
+        let destination = fake_hash(0x2b);
+        let peer = PeerRef {
+            identity: &fake_hash(0x1a),
+            destination: &destination,
+        };
+        store
+            .grant("req", &destination, &paths(&["docs/a.md"]), None, t(1_000))
+            .unwrap();
+        assert!(store.consume(&peer, "docs/a.md", t(1_001)).unwrap());
+
+        assert!(store.refund(&peer, "docs/a.md", t(1_002)).unwrap());
+        assert!(
+            !store.refund(&peer, "docs/a.md", t(1_002)).unwrap(),
+            "a second refund has no consume to pair with"
+        );
+
+        let granted = &store.list().unwrap()[0].paths[0];
+        assert_eq!(granted.uses, 1);
+        assert_eq!(granted.uses_left, 1);
+        assert!(store.consume(&peer, "docs/a.md", t(1_003)).unwrap());
+        assert!(!store.consume(&peer, "docs/a.md", t(1_003)).unwrap());
     }
 
     #[test]
@@ -1001,6 +1053,30 @@ mod tests {
     }
 
     #[test]
+    fn a_grant_line_with_more_uses_left_than_granted_is_refused() {
+        let (store, _tmp) = store("grants-surplus-uses");
+        let destination = fake_hash(0x2b);
+        let record = store
+            .grant("req", &destination, &paths(&["docs/a.md"]), None, t(1_000))
+            .unwrap();
+        let mut surplus = serde_json::to_value(&record).unwrap();
+        surplus["paths"][0]["uses_left"] = serde_json::json!(2);
+        write_line(&store, &surplus);
+        let peer = PeerRef {
+            identity: &fake_hash(0x1a),
+            destination: &destination,
+        };
+
+        let err = store.list().unwrap_err().to_string();
+
+        assert!(err.contains("line 1"), "{err}");
+        assert!(err.contains("more uses left than were granted"), "{err}");
+        assert!(err.contains("move the file aside"), "{err}");
+        assert!(store.is_granted(&peer, "docs/a.md", t(1_000)).is_err());
+        assert!(store.consume(&peer, "docs/a.md", t(1_000)).is_err());
+    }
+
+    #[test]
     fn the_writer_refuses_a_record_of_another_version() {
         let (store, _tmp) = store("grants-writer-version");
         let record = GrantRecord {
@@ -1009,6 +1085,7 @@ mod tests {
             peer: fake_hash(0x2b),
             paths: vec![GrantedPath {
                 path: "docs/a.md".into(),
+                uses: 1,
                 uses_left: 1,
             }],
             expires: rfc3339_utc(t(2_000)),
