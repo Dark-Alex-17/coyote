@@ -6866,7 +6866,7 @@ pub(crate) mod network {
         pair.stop_node_a().await;
     }
 
-    // ---- usage-probe (TASK-112): spec-first tests derived from the T30 acceptance text ----
+    // ---- spec-first tests written from the wire contract, not from the handler ----
 
     /// G8 + I4 (MESH-ENV-027): `/access` is always registered, so an instance whose
     /// identity this node has no standing for meets the trust gate, not an unknown-path
@@ -7046,8 +7046,8 @@ pub(crate) mod network {
         pair.stop_node_a().await;
     }
 
-    /// (e), first half: the requester has a path but never answers at decision time, so
-    /// the decision reply takes the T16 store-and-forward route: typed `coyote.peer`,
+    /// The requester has a path but never answers at decision time, so the decision
+    /// reply takes the store-and-forward route: typed `scope.peer/1`,
     /// signed by A, decryptable by B alone, a `reply` in the access thread marked
     /// `answered` with the one `{access: {status, expires}}` data part and no `paths`.
     /// Read back on a requester whose pending store still holds the access id (what a

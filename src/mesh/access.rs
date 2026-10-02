@@ -3961,9 +3961,9 @@ mod tests {
         stub.stop().await;
     }
 
-    // ---- usage-probe (TASK-112): spec-first tests derived from the T30 acceptance text ----
+    // ---- spec-first tests written from the wire contract, not from the handler ----
 
-    /// G3: "Unknown keys ignored on receipt". A body with keys the receiver has never
+    /// Unknown keys are ignored on receipt. A body with keys the receiver has never
     /// heard of, at the top level and inside the list, is admitted exactly as the bare
     /// body would be: `pending`, filed, surfaced once.
     #[tokio::test]
@@ -3995,7 +3995,7 @@ mod tests {
         assert_eq!(fixture.idle.texts().len(), 1);
     }
 
-    /// G7 on the wire: with no snapshot published the request is still answered
+    /// On the wire, with no snapshot published, the request is still answered
     /// `pending` (never refused, never granted) and filed, and the human line says the
     /// paths are unknown until a turn completes.
     #[cfg(unix)]
