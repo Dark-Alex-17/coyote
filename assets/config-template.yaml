@@ -276,7 +276,7 @@ mesh:
   propagation_sync_interval_secs: 300 # Seconds between automatic fetches of the messages a propagation node holds for this node; the first fetch runs once a propagation node is heard after the node joins (default: 300; 0 = fetch only on .mesh fetch; at most 31536000); off while `announce` is false
   fetch:                         # File sharing between trusted peers (more keys arrive with the share set)
     inline_max_bytes: 65536      # Largest file a peer may attach inline to a message; larger files are dropped by the receiver (default: 65536; must be 1 to 98304, the per-message total)
-    max_bytes: 4194304           # Largest file this node serves to a peer that fetches it; a larger one is refused (default: 4194304; must be 1 to 4194304, 4 MiB)
+    max_bytes: 4194304           # Largest file this node serves to a peer that fetches it; a larger one is refused (default: 4194304; must be 1 to 4194304, 4 MiB; served limit is currently capped near 1 MiB by a transport workaround, see the README)
     inbox_dir: null              # Absolute directory where files peers send inline, and files this node fetches, are staged, under <inbox_dir>/<instance id>; keep it outside any workspace you share, or peers could fetch each other's staged files (default: null = <cache dir>/mesh/inbox/<instance id>)
 
 # ---- Appearance ----

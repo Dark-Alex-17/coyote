@@ -471,8 +471,9 @@ pub(crate) mod network {
         RequestOutcome, SizeBranch, identify, open_link,
     };
     use super::super::dispatch::{
-        AdmittedRequest, DispatchError, Dispatcher, FETCH_PATH, Handler, KNOCK_PATH, KnockEvent,
-        KnockSink, LIST_PATH, LoggingKnockSink, MESSAGE_PATH, ReservedPath, STATUS_PATH,
+        AdmittedRequest, DispatchError, Dispatcher, FETCH_PATH, Handler, KNOCK_PATH, KNOWN_PATHS,
+        KnockEvent, KnockSink, LIST_PATH, LoggingKnockSink, MESSAGE_PATH, ReservedPath,
+        STATUS_PATH,
     };
     use super::super::error::{R3Error, RefusalCode};
     use super::super::frame::{
@@ -2124,7 +2125,11 @@ pub(crate) mod network {
             "expected {warned:?}"
         );
         assert!(!sent.load(Ordering::SeqCst));
-        assert!(dropped.load(Ordering::SeqCst));
+        // The unsent settlement is dropped on a blocking thread, a moment after the warning.
+        wait_until("the unsent settlement to be dropped", || {
+            dropped.load(Ordering::SeqCst)
+        })
+        .await;
         requester.stop().await;
         responder.stop().await;
     }
@@ -3101,7 +3106,7 @@ pub(crate) mod network {
         let (trust, tmp) = list.open(tag);
         let sink = Arc::new(SpySink::default());
         let dispatcher = Dispatcher::new(trust, sink.clone());
-        for path in [STATUS_PATH, MESSAGE_PATH] {
+        for path in KNOWN_PATHS.into_iter().filter(|path| *path != KNOCK_PATH) {
             assert!(
                 dispatcher
                     .register(path, recorder.clone())
@@ -3143,7 +3148,7 @@ pub(crate) mod network {
         let link_id = *link.lock().await.id();
         let newer = MESH_PROTOCOL_VERSION + 1;
 
-        for path in [KNOCK_PATH, STATUS_PATH, MESSAGE_PATH, "/nope"] {
+        for path in KNOWN_PATHS.into_iter().chain(["/nope"]) {
             let err = requester
                 .client
                 .request_on_link(

@@ -85,7 +85,8 @@ const RULE_MAX_CHARS: usize = 32;
 /// waits out its deadline. Removal condition: the upstream release that sends follow-up
 /// advertisements the way it sends the first. Then `mesh.fetch.max_bytes` applies alone,
 /// this constant and `an_ok_reply_at_the_ceiling_fits_one_resource_segment` go, and the
-/// multi-segment reassembly test returns.
+/// multi-segment reassembly test returns; the ceiling clauses on the `mesh.fetch.max_bytes`
+/// row of README.md and in the config template and example go with it.
 pub(crate) const SINGLE_SEGMENT_FETCH_CEILING: u64 =
     (MAX_EFFICIENT_SIZE - OK_REPLY_FRAMING_BYTES) as u64;
 /// Room for the response frame (19 bytes), the map header and the `v`, `status`, `size`,
@@ -562,7 +563,17 @@ fn serve_fetch(
             );
         }
         Ok(bytes) => bytes,
-        Err(_) => return refused(not_shared(), "not_shared"),
+        // The peer hears the same `not_shared` as for a missing file; the operator, whose
+        // share list did serve this one, hears why.
+        Err(err) => {
+            return refused(
+                not_shared(),
+                &format!(
+                    "not_shared (read failed: {})",
+                    redact_hashes(&err.to_string())
+                ),
+            );
+        }
     };
     let digest: [u8; 32] = Sha256::digest(&bytes).into();
     if fetch.if_sha256 == Some(digest) {
@@ -1873,10 +1884,15 @@ mod tests {
         );
         fx.file("docs/a.md", b"a");
         let shares = mesh_config_dir(&fx._tmp.path.join("config")).join("shares.yaml");
+        // The buffer is shared by every test in the binary; the fixture's directory name is
+        // the marker that keeps a sibling's identical refusal out of the count.
+        let marker = fx._tmp.path.to_string_lossy().into_owned();
         let refusal_warns = || {
             warn_snapshot()
                 .iter()
-                .filter(|line| line.ends_with("Nothing is shared until then."))
+                .filter(|line| {
+                    line.contains(&marker) && line.ends_with("Nothing is shared until then.")
+                })
                 .count()
         };
         let before = refusal_warns();
@@ -2046,6 +2062,149 @@ mod tests {
             "the same mistake made again after a fix is warned about again"
         );
         assert_eq!(still_refused(), debugs_before + 2);
+    }
+
+    /// `uses_left` of the one grant `store` holds for the fixture's path.
+    fn uses_left(store: &GrantStore) -> u32 {
+        let records = store.list().unwrap();
+        let [record] = records.as_slice() else {
+            panic!("one grant record, got {}", records.len());
+        };
+        let [granted] = record.paths.as_slice() else {
+            panic!("one granted path, got {}", record.paths.len());
+        };
+        granted.uses_left
+    }
+
+    /// Installs a fork grant store on the fixture's serving state that already lent and
+    /// spent one use of `path` to the fixture's peer, so a refund landing in the wrong
+    /// store would show as a use the fork never lent coming back.
+    fn rekey_to_a_fork_whose_use_is_spent(
+        fx: &Fixture,
+        path: &str,
+        now: SystemTime,
+    ) -> Arc<GrantStore> {
+        fx.serving.rebind_grants("fork", now).unwrap();
+        let fork = fx.serving.grants();
+        fork.grant(GRANT_ID, &fx.destination, &[path.to_string()], None, now)
+            .unwrap();
+        let identity_hex = fx.identity.as_identity().address_hash.to_hex_string();
+        let peer = crate::mesh::shares::PeerRef {
+            identity: &identity_hex,
+            destination: &fx.destination,
+        };
+        assert!(fork.consume(&peer, path, now).unwrap());
+        assert_eq!(uses_left(&fork), 0);
+        fork
+    }
+
+    /// A use spent before the node re-keyed is paid back to the store it came out of: a
+    /// handler future dropped after `is_served` restores the original's grant, and the
+    /// fork's grant for the same peer and path, which lent nothing to this fetch, stays
+    /// spent. The next fetch is judged by the fork's store and refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_a_fetch_dropped_after_a_rekey_refunds_the_store_the_use_came_from() {
+        use std::time::Duration;
+        let fx = Fixture::new(
+            "fetch-probe-refund-origin-dropped",
+            MAX_FETCH_FILE_BYTES,
+            &[],
+        );
+        fx.file("src/secret.rs", b"s");
+        fx.grant(&["src/secret.rs"]);
+        let original = fx.serving.grants();
+        assert_eq!(uses_left(&original), 1);
+
+        let (reached, mut reached_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release, release_rx) = tokio::sync::oneshot::channel();
+        let held = FetchHandler::with_reader(
+            fx.weak_source(),
+            Arc::new(HeldReader {
+                reached,
+                release: parking_lot::Mutex::new(Some(release_rx)),
+            }),
+        );
+        let mut handling = held.handle(fx.admitted(FETCH_PATH, fetch_body("src/secret.rs", None)));
+        tokio::select! {
+            _ = &mut handling => panic!("the read is held until the test releases it"),
+            reached = reached_rx.recv() => assert!(reached.is_some()),
+        }
+        assert_eq!(
+            uses_left(&original),
+            0,
+            "is_served spent the original's use"
+        );
+
+        let now = SystemTime::now();
+        let fork = rekey_to_a_fork_whose_use_is_spent(&fx, "src/secret.rs", now);
+        assert!(!Arc::ptr_eq(&fork, &original));
+
+        drop(handling);
+        release.send(()).unwrap();
+        let refunded = tokio::time::timeout(Duration::from_secs(5), async {
+            while uses_left(&original) != 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            refunded.is_ok(),
+            "the dropped fetch paid the use back to the original's store"
+        );
+        assert_eq!(
+            uses_left(&fork),
+            0,
+            "the fork lent nothing to that fetch and is paid nothing"
+        );
+        assert_eq!(
+            status_of(&fx.fetch("src/secret.rs", None).await),
+            "not_shared",
+            "the node now serves on the fork's grants, whose use is spent"
+        );
+    }
+
+    /// The same, for the other failure before dispatch: an `ok` reply built on the
+    /// original's grant and dropped unsent after the re-key refunds the original, not the
+    /// fork.
+    #[tokio::test]
+    async fn usage_probe_an_ok_reply_dropped_unsent_after_a_rekey_refunds_the_store_the_use_came_from()
+     {
+        let fx = Fixture::new(
+            "fetch-probe-refund-origin-unsent",
+            MAX_FETCH_FILE_BYTES,
+            &[],
+        );
+        fx.file("src/secret.rs", b"s");
+        fx.grant(&["src/secret.rs"]);
+        let original = fx.serving.grants();
+
+        let reply = fx.fetch("src/secret.rs", None).await;
+        assert_eq!(status_of(&reply), "ok");
+        assert_eq!(uses_left(&original), 0);
+
+        let now = SystemTime::now();
+        let fork = rekey_to_a_fork_whose_use_is_spent(&fx, "src/secret.rs", now);
+
+        drop(reply);
+        assert_eq!(
+            uses_left(&original),
+            1,
+            "the unsent reply paid the use back to the original's store"
+        );
+        assert_eq!(uses_left(&fork), 0, "the fork is paid nothing");
+
+        // Re-keyed back to the original instance (a store over the same file), the
+        // restored use serves one more fetch; a reply that goes out keeps it spent.
+        fx.serving.rebind_grants("inst", now).unwrap();
+        let reply = fx.fetch("src/secret.rs", None).await;
+        assert_eq!(
+            status_of(&reply),
+            "ok",
+            "served on the original's restored use"
+        );
+        sent(reply);
+        assert_eq!(uses_left(&original), 0);
+        assert_eq!(uses_left(&fork), 0);
     }
 
     #[tokio::test]
@@ -2370,8 +2529,8 @@ mod tests {
         let handler = FetchHandler::new(fx.weak_source());
         let refusals = [
             ("../probe-q9", "invalid_path", "segment"),
-            ("src/hidden-probe-q9.rs", "not_shared", ""),
-            ("docs/missing-probe-q9.md", "not_shared", ""),
+            ("src/hidden-probe-q9.rs", "not_shared", "not_shared"),
+            ("docs/missing-probe-q9.md", "not_shared", "not_shared"),
             ("docs/big-probe-q9.md", "too_large", "too_large"),
         ];
 
@@ -2399,6 +2558,69 @@ mod tests {
                 "no debug line names the rule {rule_word:?} for {path}: {lines:?}"
             );
         }
+
+        // The decode refusals of both paths and the no-snapshot `not_shared` log too, each
+        // naming what was wrong and never the body's text.
+        let decode_refusals: [(&str, Value, &str); 3] = [
+            (
+                FETCH_PATH,
+                map(vec![
+                    ("v", Value::from(PEER_WIRE_VERSION)),
+                    ("path", Value::from(7u8)),
+                ]),
+                "path is missing or not text",
+            ),
+            (
+                LIST_PATH,
+                map(vec![
+                    ("v", Value::from(PEER_WIRE_VERSION)),
+                    ("prefix", Value::from("probe-q9/")),
+                    ("cursor", Value::from(3u8)),
+                ]),
+                "cursor is not text or is too long",
+            ),
+            (LIST_PATH, Value::from("probe-q9"), "the body is not a map"),
+        ];
+        for (path, body, why) in decode_refusals {
+            let before = debug_snapshot().iter().filter(|line| mine(line)).count();
+            let reply = if path == FETCH_PATH {
+                handler
+                    .handle(admitted(path, body, &identity, &destination))
+                    .await
+            } else {
+                ListHandler::new(fx.weak_source())
+                    .handle(admitted(path, body, &identity, &destination))
+                    .await
+            };
+            assert!(matches!(reply, Reply::Code(RefusalCode::InvalidData)));
+            let lines: Vec<String> = debug_snapshot().into_iter().filter(mine).collect();
+            assert!(
+                lines.iter().skip(before).any(|line| line.contains(why)),
+                "no debug line says {why:?} for {path}: {lines:?}"
+            );
+        }
+        let no_snapshot = Arc::new(TestSource {
+            root: None,
+            serving: Some(Arc::clone(&fx.serving)),
+        });
+        let before = debug_snapshot().iter().filter(|line| mine(line)).count();
+        let reply = FetchHandler::new(Arc::downgrade(&no_snapshot) as Weak<dyn ShareSource>)
+            .handle(admitted(
+                FETCH_PATH,
+                fetch_body("docs/probe-q9.md", None),
+                &identity,
+                &destination,
+            ))
+            .await;
+        assert_eq!(status_of(&reply), "not_shared");
+        let lines: Vec<String> = debug_snapshot().into_iter().filter(mine).collect();
+        assert!(
+            lines
+                .iter()
+                .skip(before)
+                .any(|line| line.contains("refused: not_shared"))
+        );
+
         let leaked: Vec<String> = debug_snapshot()
             .into_iter()
             .filter(|line| line.contains("probe-q9"))

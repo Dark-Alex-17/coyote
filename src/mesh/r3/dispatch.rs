@@ -476,4 +476,36 @@ mod tests {
             assert_eq!(DispatchError::from_value(&error.to_value()), Some(error));
         }
     }
+
+    /// `/list` and `/fetch` are paths this node knows by name alongside the first three:
+    /// each is named in the log, and a `no_provider` refusal naming any of them decodes
+    /// to the typed error the client maps to "peer does not share files", while a path
+    /// outside the list is logged by hash and refused as a dispatch error.
+    #[test]
+    fn usage_probe_every_known_path_is_named_and_its_no_provider_refusal_round_trips() {
+        assert_eq!(
+            KNOWN_PATHS,
+            [KNOCK_PATH, STATUS_PATH, MESSAGE_PATH, LIST_PATH, FETCH_PATH]
+        );
+        for path in KNOWN_PATHS {
+            assert_eq!(describe_path(PathHash::of(path)), path);
+            let error = DispatchError::NoProvider {
+                path: path.to_string(),
+            };
+            assert_eq!(
+                DispatchError::from_value(&error.to_value()),
+                Some(error),
+                "{path}"
+            );
+        }
+        let unknown = "/shares";
+        assert_eq!(
+            describe_path(PathHash::of(unknown)),
+            format!("hash {}", PathHash::of(unknown).to_hex_string())
+        );
+        let error = DispatchError::NoProvider {
+            path: unknown.to_string(),
+        };
+        assert_eq!(DispatchError::from_value(&error.to_value()), None);
+    }
 }

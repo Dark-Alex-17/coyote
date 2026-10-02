@@ -71,7 +71,10 @@ pub(crate) enum Reply {
 /// was dispatched, since `send_response_resource` returns once that is done and a transfer
 /// that fails mid-flight is not observable here. Dropping the settlement unsent means
 /// failure, whatever the cause: a send error or send timeout, or a handler that was
-/// cancelled or timed out while it still held the reply.
+/// cancelled or timed out while it still held the reply. `sent` runs on the server's
+/// async task and must not block; an unsent settlement is dropped on a blocking thread
+/// where the server can arrange it, and wherever the dropped handler future happens to be
+/// otherwise, so a `Drop` that writes to disk should stay small.
 pub(crate) trait Settlement: Send {
     fn sent(self: Box<Self>);
 }
@@ -407,6 +410,8 @@ impl R3Server {
                             settlement.sent();
                         }
                     }
+                    // The settlement is dropped unsent off this task: an implementor may
+                    // settle its accounts on disk, and that must not stall the link loop.
                     Ok(Err(err)) => {
                         warn!(
                             "Failed to send mesh response {} on link {}: {}",
@@ -414,6 +419,9 @@ impl R3Server {
                             link_id.to_hex_string(),
                             redact_hashes(&err.to_string())
                         );
+                        if let Some(settlement) = settlement {
+                            tokio::task::spawn_blocking(move || drop(settlement));
+                        }
                     }
                     Err(_) => {
                         warn!(
@@ -422,6 +430,9 @@ impl R3Server {
                             link_id.to_hex_string(),
                             DEFAULT_RESPONSE_SEND_TIMEOUT.as_secs()
                         );
+                        if let Some(settlement) = settlement {
+                            tokio::task::spawn_blocking(move || drop(settlement));
+                        }
                     }
                 }
             };

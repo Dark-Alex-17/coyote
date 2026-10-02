@@ -6756,6 +6756,32 @@ mod tests {
         started.relay_handle.abort();
     }
 
+    /// The slot names a share root only from a published snapshot whose `cwd` is absolute:
+    /// no snapshot, an empty `cwd` (a failed `current_dir()` at capture) and a relative one
+    /// all share nothing, so a share list can never resolve against the process's own
+    /// directory by accident.
+    #[test]
+    fn the_slot_names_a_share_root_only_from_an_absolute_snapshot_cwd() {
+        let slot = MeshSlot::default();
+        assert_eq!(slot.share_root(), None, "nothing published");
+
+        let mut snapshot = snapshot_fixture();
+        snapshot.cwd = PathBuf::new();
+        slot.publish(snapshot);
+        assert_eq!(slot.share_root(), None, "an empty cwd");
+
+        let mut snapshot = snapshot_fixture();
+        snapshot.cwd = PathBuf::from("relative/dir");
+        slot.publish(snapshot);
+        assert_eq!(slot.share_root(), None, "a relative cwd");
+
+        let root = std::env::temp_dir();
+        let mut snapshot = snapshot_fixture();
+        snapshot.cwd = root.clone();
+        slot.publish(snapshot);
+        assert_eq!(slot.share_root(), Some(root));
+    }
+
     /// A fork serves from its own grants file: a path granted to the fork's instance is
     /// honoured after the re-key, one granted to the original is not, and a refund after
     /// the re-key lands in the fork's file.
