@@ -7,14 +7,15 @@
 //! the load says so once.
 //!
 //! Evaluation is deny-first and judged on the file that is actually on disk. A candidate
-//! inside the workspace config directory is refused before any list is consulted, and
-//! nothing lifts that; then a user deny from either layer; then the built-in deny of
-//! secrets and `.git` at any depth, which an `override` lifts for one exact resolved file;
-//! only then does an allow serve it. Deny and built-in deny are judged on both the name
-//! the peer sent, a parsed `WirePath`, and the path it resolved to under the share root;
-//! allow and override are judged on the resolved path alone. An override grants nothing on
-//! its own: an allow must still match. Patterns are globs anchored at the share root where
-//! `**` alone crosses a `/`. The root is the caller's, never the current directory.
+//! inside either config directory, the workspace's or the global one, is refused before
+//! any list is consulted, and nothing lifts that; then a user deny from either layer; then
+//! the built-in deny of secrets and `.git` at any depth, which an `override` lifts for one
+//! exact resolved file; only then does an allow serve it. Deny and built-in deny are judged
+//! on both the name the peer sent, a parsed `WirePath`, and the path it resolved to under
+//! the share root; allow and override are judged on the resolved path alone. An override
+//! grants nothing on its own: an allow must still match. Patterns are globs anchored at the
+//! share root where `**` alone crosses a `/`. The root is the caller's, never the current
+//! directory.
 
 use crate::config::{WORKSPACE_COYOTE_DIR_NAME, paths};
 use crate::mesh::schema::{Remedy, VersionProbe, unversioned_refusal, version_refusal};
@@ -165,6 +166,7 @@ pub(crate) struct PeerRef<'a> {
 pub(crate) struct ShareLocations {
     pub global: PathBuf,
     pub workspace: PathBuf,
+    config_dir: PathBuf,
     workspace_root: PathBuf,
     workspace_config_dir_name: String,
 }
@@ -188,6 +190,7 @@ impl ShareLocations {
             workspace: workspace_root
                 .join(&workspace_config_dir_name)
                 .join("mesh-shares.yaml"),
+            config_dir: config_dir.to_path_buf(),
             workspace_root: workspace_root.to_path_buf(),
             workspace_config_dir_name,
         }
@@ -303,10 +306,7 @@ impl ShareSet {
             builtin,
             overrides,
             case_insensitive,
-            protected_dirs: protected_dirs(
-                &self.locations.workspace_root,
-                &self.locations.workspace_config_dir_name,
-            ),
+            protected_dirs: protected_dirs(&self.locations),
             canonical_root,
         })
     }
@@ -375,9 +375,10 @@ pub(crate) struct ShareRules {
 }
 
 impl ShareRules {
-    /// `wire` is the path as the peer sent it; `canonical` is where `root/wire` resolved
-    /// to on disk, which a symlink may have taken anywhere. A candidate outside the share
-    /// root, or whose resolved path is not UTF-8, is refused.
+    /// `wire` is the path as the peer sent it; `canonical` is `dunce::canonicalize` of
+    /// `root/wire`, which a symlink may have taken anywhere. A `std::fs::canonicalize`
+    /// `\\?\` path on Windows fails the root prefix check. A candidate outside the share
+    /// root, the root itself, or one whose resolved path is not UTF-8, is refused.
     pub(crate) fn permits(&self, wire: &WirePath, canonical: &Path) -> bool {
         if self
             .protected_dirs
@@ -402,8 +403,8 @@ impl ShareRules {
     }
 
     /// The `/`-separated path of `canonical` under the share root; `None` for a path that
-    /// is not plain segments below it, since `..` or a root here means the caller did not
-    /// resolve it.
+    /// is not plain segments below it: the root itself is no file to serve, and `..` or
+    /// a root here means the caller did not resolve it.
     fn resolved(&self, canonical: &Path) -> Option<String> {
         let segments = canonical
             .strip_prefix(&self.canonical_root)
@@ -414,7 +415,7 @@ impl ShareRules {
                 _ => None,
             })
             .collect::<Option<Vec<_>>>()?;
-        Some(segments.join("/"))
+        (!segments.is_empty()).then(|| segments.join("/"))
     }
 
     fn overridden(&self, resolved: &str) -> bool {
@@ -451,14 +452,18 @@ fn workspace_config_dir_names(workspace_config_dir_name: &str) -> Vec<&str> {
     names
 }
 
-/// The workspace config directories as they resolve on disk under the share root, one per
-/// name, since an absolute env override lands where a name glob would miss. A directory
-/// that does not resolve holds nothing to protect.
-fn protected_dirs(workspace_root: &Path, workspace_config_dir_name: &str) -> Vec<PathBuf> {
-    let mut dirs: Vec<PathBuf> = workspace_config_dir_names(workspace_config_dir_name)
+/// The directories nothing lifts, as they resolve on disk: the workspace config directory
+/// under each name it goes by, since an absolute env override lands where a name glob
+/// would miss, and the global config directory, which a share root above it would
+/// otherwise serve. A directory that does not resolve holds nothing to protect.
+fn protected_dirs(locations: &ShareLocations) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = workspace_config_dir_names(&locations.workspace_config_dir_name)
         .into_iter()
-        .filter_map(|name| dunce::canonicalize(workspace_root.join(name)).ok())
+        .map(|name| locations.workspace_root.join(name))
+        .chain([locations.config_dir.clone()])
+        .filter_map(|dir| dunce::canonicalize(dir).ok())
         .collect();
+    dirs.sort();
     dirs.dedup();
     dirs
 }
@@ -466,6 +471,7 @@ fn protected_dirs(workspace_root: &Path, workspace_config_dir_name: &str) -> Vec
 fn glob(pattern: &str, case_insensitive: bool) -> Result<Glob> {
     GlobBuilder::new(pattern)
         .literal_separator(true)
+        .backslash_escape(false)
         .case_insensitive(case_insensitive)
         .build()
         .with_context(|| format!("Share pattern `{pattern}` is not a valid glob"))
@@ -665,6 +671,18 @@ mod tests {
             let tmp = TempDir::new(tag);
             let config_dir = tmp.path.join("config");
             let root = tmp.path.join("workspace");
+            Self::at(tmp, config_dir, root)
+        }
+
+        /// The global config dir inside the share root, as a REPL started from `$HOME`
+        /// has it.
+        fn enclosing(tag: &str) -> Self {
+            let tmp = TempDir::new(tag);
+            let root = tmp.path.join("workspace");
+            Self::at(tmp, root.join("config"), root)
+        }
+
+        fn at(tmp: TempDir, config_dir: PathBuf, root: PathBuf) -> Self {
             fs::create_dir_all(&root).unwrap();
             Self {
                 _tmp: tmp,
@@ -1424,6 +1442,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_global_config_dir_is_never_served_when_the_share_root_encloses_it() {
+        let fx = Fixture::enclosing("shares-protected-global");
+        let mut set = fx.load();
+        set.apply(allow("**"), WriteScope::Global).unwrap();
+        let shares = dunce::canonicalize(fx.locations().global).unwrap();
+        let trust = fx.file("config/mesh/trust.yaml");
+        let readme = fx.file("README.md");
+
+        let rules = rules_for_anyone(&set);
+
+        assert!(
+            !rules.permits(&wire("config/mesh/shares.yaml"), &shares),
+            "the share list itself must not be served"
+        );
+        assert!(
+            !rules.permits(&wire("config/mesh/trust.yaml"), &trust),
+            "the trust list must not be served"
+        );
+        assert!(rules.permits(&wire("README.md"), &readme));
+        assert!(
+            !rules.builtin.is_match("config/mesh/trust.yaml"),
+            "no name glob knows the global config dir; the prefix check must"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_symlink_alias_inside_the_root_cannot_reach_a_built_in_denied_file() {
@@ -1644,6 +1688,11 @@ mod tests {
         let rules = rules_for_anyone(&set);
 
         assert!(!rules.permits(&wire("README.md"), &dotted));
+        let root = readme.parent().unwrap();
+        assert!(
+            !rules.permits(&wire("docs"), root),
+            "the share root itself is no file to serve"
+        );
         assert!(rules.permits(&wire("README.md"), &readme));
     }
 
