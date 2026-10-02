@@ -13,7 +13,9 @@
 //! exact resolved file; only then does an allow serve it. Deny and built-in deny are judged
 //! on both the name the peer sent, a parsed `WirePath`, and the path it resolved to under
 //! the share root; allow and override are judged on the resolved path alone. An override
-//! grants nothing on its own: an allow must still match. Patterns are globs anchored at the
+//! grants nothing on its own: an allow must still match, and only the global file's
+//! overrides count, since the workspace file arrives with a cloned repository and must not
+//! be able to lift the deny on `.env` by itself. Patterns are globs anchored at the
 //! share root where `**` alone crosses a `/`. The root is the caller's, never the current
 //! directory. A grant from the `GrantStore` lets one peer fetch a named file no allow
 //! reaches, after every deny has had its say; `is_served` is the one path a fetch takes
@@ -331,6 +333,16 @@ impl ShareSet {
         .collect()
     }
 
+    /// The override entries the workspace file carries, which lift nothing: a repository
+    /// can ship that file, so an override there is read and kept but never applied. The
+    /// REPL shows them so the human knows to move one to the global file.
+    pub(crate) fn inert_overrides(&self) -> &[OverrideEntry] {
+        if self.poisoned.is_some() {
+            return &[];
+        }
+        &self.workspace.overrides
+    }
+
     /// The compiled policy for `peer`. `case_insensitive` must be the probe result for the
     /// share root's filesystem: `false` is only safe on a case-sensitive root, since a
     /// folding one serves `DOCS/x` past a deny on `docs/**`. A pattern on disk that is not
@@ -365,7 +377,6 @@ impl ShareSet {
             .global
             .overrides
             .iter()
-            .chain(&self.workspace.overrides)
             .map(|entry| entry.path.clone())
             .collect();
         Ok(ShareRules {
@@ -575,8 +586,8 @@ pub(crate) fn write_target(workspace_exists: bool, scope: WriteScope) -> Layer {
 
 /// The compiled policy, applied after the caller has resolved `root/path` on disk. Deny
 /// always wins: a protected directory first, which nothing lifts; then a user deny from
-/// either layer; then the built-in deny unless an override names this exact file; and
-/// only then does an allow serve the file. Deny is judged on both the name the peer sent
+/// either layer; then the built-in deny unless a global override names this exact file;
+/// and only then does an allow serve the file. Deny is judged on both the name the peer sent
 /// and the path it resolved to under the share root, so no alias dodges one; allow and
 /// override are judged on the resolved path alone, so a symlink serves only what an allow
 /// names on disk. An override lifts the built-in layer alone and grants nothing.
@@ -1536,6 +1547,48 @@ mod tests {
             !served(&set, &fx, ".env.example"),
             "an override never lifts a user deny"
         );
+    }
+
+    /// The workspace file travels with a cloned repository, so an override there must
+    /// not be what lifts the deny on a secret.
+    #[test]
+    fn a_workspace_override_is_inert_and_only_a_global_one_lifts_the_builtin_deny() {
+        let fx = Fixture::new("shares-override-workspace-inert");
+        let mut set = fx.load();
+        set.apply(allow("**"), WriteScope::Global).unwrap();
+        set.apply(lift(".env.example"), WriteScope::Workspace)
+            .unwrap();
+        assert!(
+            !served(&set, &fx, ".env.example"),
+            "a workspace override lifts nothing"
+        );
+
+        set.apply(lift(".env.example"), WriteScope::Global).unwrap();
+        assert!(
+            served(&set, &fx, ".env.example"),
+            "the same override in the global file lifts the built-in deny"
+        );
+        assert!(!served(&set, &fx, ".env"), "the override is for one file");
+    }
+
+    #[test]
+    fn inert_overrides_lists_the_workspace_entries_and_nothing_while_poisoned() {
+        let fx = Fixture::new("shares-inert-overrides");
+        let mut set = fx.load();
+        assert!(set.inert_overrides().is_empty());
+        set.apply(lift(".env.example"), WriteScope::Global).unwrap();
+        assert!(set.inert_overrides().is_empty(), "global overrides apply");
+        set.apply(lift("id_rsa.pub"), WriteScope::Workspace)
+            .unwrap();
+        assert_eq!(
+            set.inert_overrides(),
+            [OverrideEntry {
+                path: "id_rsa.pub".to_string(),
+            }]
+        );
+
+        fx.write(Layer::Workspace, "version: 1\nallow: [\n");
+        assert!(fx.load().inert_overrides().is_empty());
     }
 
     #[test]
