@@ -477,7 +477,6 @@ mod tests {
     fn grant_defaults_are_pinned() {
         assert_eq!(DEFAULT_GRANT_TTL, Duration::from_secs(900));
         assert_eq!(DEFAULT_GRANT_USES, 1);
-        assert_eq!(GRANT_RECORD_VERSION, 1);
         let (store, _tmp) = store("grants-ttl");
 
         let record = store

@@ -3117,6 +3117,68 @@ mod tests {
         assert!(!listing.truncated);
     }
 
+    /// Absence from the listing cannot tell a walk that never enters `.git` and the
+    /// workspace config dir from one that enters them and denies each file; the bound
+    /// can. The legitimate tree costs six visits (the root, `a.md`, `docs`, `.git`,
+    /// `.coyote`, `docs/c.md`); either hidden directory holds ten more, so a bound of
+    /// eight is only met by a walk that descends neither.
+    #[test]
+    fn listing_never_descends_into_git_or_the_workspace_config_dir() {
+        let fx = Fixture::new("list-no-descent");
+        let mut set = fx.load();
+        set.apply(allow("**"), WriteScope::Global).unwrap();
+        fx.file("a.md");
+        fx.file("docs/c.md");
+        for n in 0..10 {
+            fx.file(&format!(".git/objects/{n}"));
+            fx.file(&format!("{WORKSPACE_COYOTE_DIR_NAME}/sessions/{n}.md"));
+        }
+
+        let listing = listing(&set, None, 8);
+
+        assert!(
+            !listing.truncated,
+            "a walk that entered `.git` or `{WORKSPACE_COYOTE_DIR_NAME}` would have spent the bound there"
+        );
+        assert_eq!(listed_paths(&listing), ["a.md", "docs/c.md"]);
+        assert!(listing.next.is_none());
+    }
+
+    /// A share root above the global config dir, as a REPL started from `$HOME` has it:
+    /// nothing under the config dir is listed, and the bound shows the walk never went in.
+    /// The legitimate tree costs three visits (the root, `README.md`, `config`); the config
+    /// dir holds the share list, the trust list and ten more files below that.
+    #[test]
+    fn listing_never_descends_into_an_enclosed_global_config_dir() {
+        let fx = Fixture::enclosing("list-protected-global");
+        let mut set = fx.load();
+        set.apply(allow("**"), WriteScope::Global).unwrap();
+        fx.file("README.md");
+        fx.file("config/mesh/trust.yaml");
+        for n in 0..10 {
+            fx.file(&format!("config/agents/{n}/config.yaml"));
+        }
+        assert!(
+            fx.locations().global.starts_with(&fx.root),
+            "the fixture must put the share list inside the root"
+        );
+
+        let listing = listing(&set, None, 5);
+
+        assert!(
+            !listing.truncated,
+            "a walk that entered the global config dir would have spent the bound there"
+        );
+        assert_eq!(listed_paths(&listing), ["README.md"]);
+        assert!(
+            listed_paths(&listing)
+                .iter()
+                .all(|path| !path.starts_with("config/")),
+            "{:?}",
+            listed_paths(&listing)
+        );
+    }
+
     #[test]
     fn listing_entries_carry_a_streamed_hash_size_and_mtime() {
         let fx = Fixture::new("list-hash");
@@ -3376,6 +3438,20 @@ mod tests {
         assert_eq!(cursor, list_cursor("docs/a.md"));
         assert_ne!(cursor, list_cursor("docs/b.md"));
         assert!(!cursor.contains("docs"));
+    }
+
+    /// A remote client computes the same cursor, so the digest is pinned to a value
+    /// worked out independently: `printf 'docs/a.md' | sha256sum`, first 32 hex
+    /// characters. Any other 128-bit digest of the path fails here.
+    #[test]
+    fn a_list_cursor_is_the_first_half_of_the_sha256_of_the_path() {
+        assert_eq!(list_cursor("docs/a.md"), "5231f8a11b65145a1b0727cb8d209819");
+        assert_eq!(
+            hex_lower(&Sha256::digest(b"docs/a.md")),
+            "5231f8a11b65145a1b0727cb8d209819\
+             e95360a5f1e17e4f757b61dbda1af3cc",
+            "the literal above is the first half of this full digest"
+        );
     }
 
     #[test]
