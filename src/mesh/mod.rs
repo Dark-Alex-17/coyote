@@ -682,6 +682,10 @@ pub(crate) mod test_support {
         listener: Listener,
         identity: TransportIdentity,
         recorder: Arc<MessageRecorder>,
+        /// The trust list in force and the handlers beside the recorder; the dispatcher
+        /// is rebuilt from both whenever either changes.
+        list: Mutex<TrustList>,
+        extra: Mutex<Vec<(&'static str, Arc<dyn Handler>)>>,
         trust_dir: TempDir,
     }
 
@@ -691,7 +695,7 @@ pub(crate) mod test_support {
             let identity = TransportIdentity::new_from_rand(OsRng);
             let recorder = Arc::new(MessageRecorder::default());
             let trust_dir = TempDir::new(tag);
-            let handler = Self::gate(&TrustList::default(), &trust_dir, recorder.clone());
+            let handler = Self::gate(&TrustList::default(), &trust_dir, recorder.clone(), &[]);
             let listener = Listener::listen(
                 Arc::new(R3Server::new()),
                 handler,
@@ -704,6 +708,8 @@ pub(crate) mod test_support {
                 listener,
                 identity,
                 recorder,
+                list: Mutex::new(TrustList::default()),
+                extra: Mutex::new(Vec::new()),
                 trust_dir,
             }
         }
@@ -712,34 +718,45 @@ pub(crate) mod test_support {
             list: &TrustList,
             trust_dir: &TempDir,
             recorder: Arc<MessageRecorder>,
+            extra: &[(&'static str, Arc<dyn Handler>)],
         ) -> Arc<dyn RequestHandler> {
             list.write(&trust_dir.path);
             let trust = Arc::new(TrustStore::open(&trust_dir.path).unwrap());
             let dispatcher = Dispatcher::new(trust, Arc::new(LoggingKnockSink));
             dispatcher.register(MESSAGE_PATH, recorder).unwrap();
+            for (path, handler) in extra {
+                dispatcher.register(path, handler.clone()).unwrap();
+            }
             Arc::new(dispatcher)
+        }
+
+        fn regate(&self) {
+            self.listener.server.set_handler(Self::gate(
+                &self.list.lock(),
+                &self.trust_dir,
+                self.recorder.clone(),
+                &self.extra.lock(),
+            ));
+        }
+
+        /// Serves `path` with `handler` beside the recorder.
+        pub(crate) fn serve(&self, path: &'static str, handler: Arc<dyn Handler>) {
+            self.extra.lock().push((path, handler));
+            self.regate();
         }
 
         /// Trusts the instance at `destination_hex` bound to `identity_hex`, so its requests
         /// reach the recorder instead of knocking.
         pub(crate) fn trust(&self, destination_hex: &str, identity_hex: &str) {
-            let list = TrustList::default().destination(destination_hex, identity_hex);
-            self.listener.server.set_handler(Self::gate(
-                &list,
-                &self.trust_dir,
-                self.recorder.clone(),
-            ));
+            *self.list.lock() = TrustList::default().destination(destination_hex, identity_hex);
+            self.regate();
         }
 
         /// Knows `identity_hex` without trusting any of its instances: a knock from one
         /// of them is admitted and refused `NoAccess`, which is the knock landing.
         pub(crate) fn know_identity(&self, identity_hex: &str) {
-            let list = TrustList::default().identity(identity_hex, false);
-            self.listener.server.set_handler(Self::gate(
-                &list,
-                &self.trust_dir,
-                self.recorder.clone(),
-            ));
+            *self.list.lock() = TrustList::default().identity(identity_hex, false);
+            self.regate();
         }
 
         /// Announces as a Coyote node, which is what gets this stub into a runtime's peer
@@ -764,6 +781,11 @@ pub(crate) mod test_support {
 
         pub(crate) fn identity_hex(&self) -> String {
             self.identity.address_hash().to_hex_string()
+        }
+
+        /// The name this stub's instance is derived from, as a stored message names it.
+        pub(crate) fn origin(&self) -> OriginName {
+            OriginName::of(&self.listener.desc.name)
         }
 
         /// Every well-formed `/message` body received so far, in arrival order.

@@ -86,6 +86,8 @@ pub(crate) enum BriefUpdateSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AccessDecision {
     Granted,
+    // Test-only until the human's refuse verb lands.
+    #[cfg(test)]
     Denied,
 }
 
@@ -563,6 +565,7 @@ impl MeshEvent {
             } => {
                 let decision = match decision {
                     AccessDecision::Granted => "granted",
+                    #[cfg(test)]
                     AccessDecision::Denied => "denied",
                 };
                 envs.push((PEER_IDENTITY, identity.clone()));

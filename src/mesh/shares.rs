@@ -26,12 +26,15 @@ use crate::mesh::grants::GrantStore;
 use crate::mesh::schema::{Remedy, VersionProbe, unversioned_refusal, version_refusal};
 use crate::mesh::trust::same_hash;
 use crate::mesh::wire_path::WirePath;
+#[cfg(test)]
+use crate::mesh::write_atomically;
 use crate::mesh::{
     canonical_hash, hex_lower, mesh_cache_dir, mesh_config_dir, redact_hashes, short,
-    write_atomically,
 };
 
-use anyhow::{Context, Result, anyhow, bail};
+#[cfg(test)]
+use anyhow::anyhow;
+use anyhow::{Context, Result, bail};
 use globset::{Glob, GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -132,42 +135,43 @@ pub(crate) struct Entry {
     pub layer: Layer,
 }
 
-// The scopes and mutations only the `.mesh share` verbs choose stay test-only until those
-// verbs write the files; a standing access grant adds an allow under `Auto`.
+// The mutation half, `apply` and what it alone uses, is test-only until the `.mesh share`
+// verbs write the files or a standing access grant adds an allow entry.
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WriteScope {
     Auto,
-    #[cfg(test)]
     Global,
-    #[cfg(test)]
     Workspace,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Mutation {
     Allow {
         pattern: String,
         peer: Option<String>,
     },
-    #[cfg(test)]
-    Deny { pattern: String },
+    Deny {
+        pattern: String,
+    },
     /// Removes every allow entry with exactly this pattern text from the target layer.
-    #[cfg(test)]
-    Unshare { pattern: String },
-    #[cfg(test)]
-    Override { path: String },
+    Unshare {
+        pattern: String,
+    },
+    Override {
+        path: String,
+    },
 }
 
+#[cfg(test)]
 impl Mutation {
     fn kind(&self) -> &'static str {
         match self {
             Self::Allow { .. } => "allow",
-            #[cfg(test)]
             Self::Deny { .. } => "deny",
-            #[cfg(test)]
             Self::Unshare { .. } => "unshare",
-            #[cfg(test)]
             Self::Override { .. } => "override",
         }
     }
@@ -303,6 +307,7 @@ pub(crate) struct ShareSet {
     locations: ShareLocations,
     global: SharesFile,
     workspace: SharesFile,
+    #[cfg(test)]
     workspace_exists: bool,
     poisoned: Option<String>,
 }
@@ -346,6 +351,7 @@ impl ShareSet {
                 locations,
                 global,
                 workspace: workspace.0,
+                #[cfg(test)]
                 workspace_exists: workspace.1,
                 poisoned,
             },
@@ -674,6 +680,7 @@ impl ShareSet {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn write_target(&self, scope: WriteScope) -> Layer {
         write_target(self.workspace_exists, scope)
     }
@@ -682,6 +689,7 @@ impl ShareSet {
     /// memory, returning the file written. A mutation the file already holds is `Ok`
     /// without a write. Refused while poisoned, with the load's refusal, so a corrupt
     /// file is never replaced by a fresh one.
+    #[cfg(test)]
     pub(crate) fn apply(&mut self, mutation: Mutation, scope: WriteScope) -> Result<PathBuf> {
         if let Some(refusal) = &self.poisoned {
             bail!("{refusal} Nothing was written.");
@@ -692,12 +700,7 @@ impl ShareSet {
             Layer::Workspace => (&self.locations.workspace, &mut self.workspace),
         };
         let mut next = file.clone();
-        let changed = match &mutation {
-            #[cfg(test)]
-            Mutation::Unshare { pattern } => unshare(&mut next, path, pattern)?,
-            other => mutate(&mut next, other)?,
-        };
-        if changed {
+        if mutate(&mut next, path, &mutation)? {
             let yaml =
                 serde_yaml::to_string(&next).context("Failed to serialize the mesh share list")?;
             write_atomically(path, yaml.as_bytes())?;
@@ -717,13 +720,11 @@ impl ShareSet {
 
 /// The layer a mutation lands in: under `Auto` the workspace file when it exists, else the
 /// global one; `Global` and `Workspace` pick outright, and `Workspace` creates the file.
+#[cfg(test)]
 pub(crate) fn write_target(workspace_exists: bool, scope: WriteScope) -> Layer {
     match scope {
         WriteScope::Auto if workspace_exists => Layer::Workspace,
-        WriteScope::Auto => Layer::Global,
-        #[cfg(test)]
-        WriteScope::Global => Layer::Global,
-        #[cfg(test)]
+        WriteScope::Auto | WriteScope::Global => Layer::Global,
         WriteScope::Workspace => Layer::Workspace,
     }
 }
@@ -1080,9 +1081,10 @@ fn is_canonical(hash: &str) -> bool {
     canonical_hash(hash).as_deref() == Some(hash)
 }
 
-/// Applies `mutation` to `file`; `Ok(false)` means the file already says so and nothing
-/// needs writing.
-fn mutate(file: &mut SharesFile, mutation: &Mutation) -> Result<bool> {
+/// Applies `mutation` to `file`, which lives at `path`; `Ok(false)` means the file already
+/// says so and nothing needs writing.
+#[cfg(test)]
+fn mutate(file: &mut SharesFile, path: &Path, mutation: &Mutation) -> Result<bool> {
     match mutation {
         Mutation::Allow { pattern, peer } => {
             validate_pattern(pattern)?;
@@ -1093,7 +1095,6 @@ fn mutate(file: &mut SharesFile, mutation: &Mutation) -> Result<bool> {
             };
             Ok(push_unless_present(&mut file.allow, entry))
         }
-        #[cfg(test)]
         Mutation::Deny { pattern } => {
             validate_pattern(pattern)?;
             let entry = DenyEntry {
@@ -1101,9 +1102,17 @@ fn mutate(file: &mut SharesFile, mutation: &Mutation) -> Result<bool> {
             };
             Ok(push_unless_present(&mut file.deny, entry))
         }
-        #[cfg(test)]
-        Mutation::Unshare { .. } => unreachable!("apply routes an unshare to `unshare`"),
-        #[cfg(test)]
+        Mutation::Unshare { pattern } => {
+            let before = file.allow.len();
+            file.allow.retain(|entry| entry.pattern != *pattern);
+            if file.allow.len() == before {
+                bail!(
+                    "No allow entry in mesh share list '{}' has the pattern `{pattern}`; nothing was changed.",
+                    path.display()
+                );
+            }
+            Ok(true)
+        }
         Mutation::Override { path: file_path } => {
             validate_override(file_path)?;
             let entry = OverrideEntry {
@@ -1114,20 +1123,7 @@ fn mutate(file: &mut SharesFile, mutation: &Mutation) -> Result<bool> {
     }
 }
 
-/// Drops every allow entry of `file`, which lives at `path`, whose pattern is `pattern`.
 #[cfg(test)]
-fn unshare(file: &mut SharesFile, path: &Path, pattern: &str) -> Result<bool> {
-    let before = file.allow.len();
-    file.allow.retain(|entry| entry.pattern != pattern);
-    if file.allow.len() == before {
-        bail!(
-            "No allow entry in mesh share list '{}' has the pattern `{pattern}`; nothing was changed.",
-            path.display()
-        );
-    }
-    Ok(true)
-}
-
 fn push_unless_present<T: PartialEq>(entries: &mut Vec<T>, entry: T) -> bool {
     if entries.contains(&entry) {
         return false;
@@ -1136,6 +1132,7 @@ fn push_unless_present<T: PartialEq>(entries: &mut Vec<T>, entry: T) -> bool {
     true
 }
 
+#[cfg(test)]
 fn canonical_peer(peer: &str) -> Result<String> {
     canonical_hash(peer).ok_or_else(|| {
         anyhow!(

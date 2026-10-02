@@ -471,9 +471,9 @@ pub(crate) mod network {
         RequestOutcome, SizeBranch, identify, open_link,
     };
     use super::super::dispatch::{
-        AdmittedRequest, DispatchError, Dispatcher, FETCH_PATH, Handler, KNOCK_PATH, KNOWN_PATHS,
-        KnockEvent, KnockSink, LIST_PATH, LoggingKnockSink, MESSAGE_PATH, ReservedPath,
-        STATUS_PATH,
+        ACCESS_PATH, AdmittedRequest, DispatchError, Dispatcher, FETCH_PATH, Handler, KNOCK_PATH,
+        KNOWN_PATHS, KnockEvent, KnockSink, LIST_PATH, LoggingKnockSink, MESSAGE_PATH,
+        ReservedPath, STATUS_PATH,
     };
     use super::super::error::{R3Error, RefusalCode};
     use super::super::frame::{
@@ -489,6 +489,10 @@ pub(crate) mod network {
     use crate::config::{ForkRekey, MeshConfig, Session};
     use crate::function::mesh::{inherit_reply_thread, outbound_from_args};
     use crate::hooks::HookEvent;
+    use crate::mesh::access::{
+        AccessError, AccessMessage, AccessOptions, AccessOutcome, AccessRequestOutcome,
+        ValidAccess, decode_access_message, validate_access,
+    };
     use crate::mesh::announce::AnnounceAppData;
     use crate::mesh::brief::Digest;
     use crate::mesh::card::{
@@ -497,7 +501,7 @@ pub(crate) mod network {
         StatusHandler, TODO_GOAL_MAX_CHARS, build_card,
     };
     use crate::mesh::envoy::{EnvoyJob, EnvoySink};
-    use crate::mesh::events::{MeshHooks, RecordingHookSink};
+    use crate::mesh::events::{MeshHookSink, MeshHooks, RecordingHookSink};
     use crate::mesh::fetch::{
         FILE_FETCH_REQUEST_TIMEOUT, FetchError, Fetched, SINGLE_SEGMENT_FETCH_CEILING,
     };
@@ -559,7 +563,7 @@ pub(crate) mod network {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier, Weak};
-    use std::time::{Duration, Instant, SystemTime};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
     use tokio::sync::broadcast;
     use tokio::task::JoinHandle;
     use tokio::time::{sleep, timeout};
@@ -602,6 +606,8 @@ pub(crate) mod network {
 
     pub(crate) enum Script {
         Reply(Reply),
+        /// Acknowledges whatever `/message` body arrives by its own id, as a node would.
+        Acknowledge,
         Hang,
     }
 
@@ -663,6 +669,10 @@ pub(crate) mod network {
             let next = self.script.lock().pop_front();
             match next {
                 Some(Script::Reply(reply)) => reply,
+                Some(Script::Acknowledge) => match from_r3_body(&body) {
+                    Ok(peer) => Reply::Value(received_reply(&peer.id)),
+                    Err(_) => Reply::Code(RefusalCode::InvalidData),
+                },
                 Some(Script::Hang) => {
                     let _abandoned = Abandoned(&self.abandoned);
                     std::future::pending().await
@@ -4827,6 +4837,145 @@ pub(crate) mod network {
         started.relay_handle.abort();
     }
 
+    /// `fallback_knock_options` for an access request.
+    fn fallback_access_options() -> AccessOptions {
+        AccessOptions {
+            request: short_options(),
+            propagation: PropagationOptions {
+                reject_window: Duration::from_millis(300),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn access_request(id: &str, paths: &[&str], reason: &str) -> ValidAccess {
+        validate_access(
+            id,
+            paths.iter().map(|path| (*path).to_string()).collect(),
+            reason,
+        )
+        .unwrap()
+    }
+
+    /// The access request the fake node was handed, read as `ghost`'s node would read it
+    /// off a fetch: decrypted with the ghost's key, checked against `requester`'s
+    /// signature and then decoded as the fetch path decodes it.
+    fn stored_access(
+        bytes: &[u8],
+        ghost: &TransportIdentity,
+        requester: &Identity,
+    ) -> AccessMessage {
+        let wire = stored_message(bytes, &to_core_private_identity(ghost));
+        assert_eq!(wire.verify(&to_core_identity(requester)), Ok(true));
+        decode_access_message(&InboundMessage {
+            transient_id: [0u8; 32],
+            message_id: [0u8; 32],
+            source_identity_hash: requester.address_hash.to_hex_string(),
+            source_delivery_hash: String::new(),
+            timestamp: wire.payload.timestamp,
+            title: wire.payload.title.map(|bytes| bytes.into_vec()),
+            content: wire.payload.content.map(|bytes| bytes.into_vec()),
+            fields: wire.payload.fields,
+            stamp_value: None,
+        })
+    }
+
+    /// Node A asks a destination it has no path to for access, with a propagation node
+    /// learned: the request is stored there, signed by A, decryptable by the ghost alone,
+    /// carrying the id, the paths and the reason, and naming A's origin so the ghost
+    /// recomputes A's instance from it. The requester reads it as pending.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unreachable_access_request_falls_back_to_the_propagation_node() {
+        let (pair, mut node) = pair_with_propagation_node("r3-access-fallback").await;
+        let (ghost, ghost_desc) = ghost_destination();
+        let request = access_request("acc-1", &["src/x.rs", "docs/y.md"], "need the struct");
+
+        let outcome = pair
+            .node_a
+            .request_access_wire(&ghost_desc, &request, fallback_access_options())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            AccessRequestOutcome {
+                id: "acc-1".to_string(),
+                status: AccessOutcome::Pending,
+                via: PeerVia::StoreAndForward,
+            }
+        );
+        let received = node.next_received().await;
+        let stored = stored_access(received.bytes(), &ghost, &pair.a_desc.identity);
+        let origin = OriginName::of(&pair.a_desc.name);
+        assert_eq!(
+            stored,
+            AccessMessage::Access {
+                name_hash: origin.0,
+                request,
+            }
+        );
+        assert_eq!(
+            destination_address(&origin.0, &pair.a_desc.identity.address_hash).to_hex_string(),
+            pair.node_a.destination_hash().await
+        );
+        node.nothing_else_received();
+        pair.stop_node_a().await;
+        node.stop().await;
+    }
+
+    /// A reachable peer answering `/access` with a refusal code did not file the request
+    /// and is not unreachable either: the requester gets the refusal back as a typed
+    /// failure, and the propagation node known to it is never posted to.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_access_request_is_a_direct_failure_and_never_stored() {
+        let (pair, mut node) = pair_with_propagation_node("r3-access-refused-no-fallback").await;
+        pair.introduce_b_to_a().await;
+        pair.recorder_b
+            .queue(Script::Reply(Reply::Code(RefusalCode::Throttled)));
+        let request = access_request("acc-1", &["src/x.rs"], "");
+
+        let err = pair
+            .node_a
+            .request_access_wire(&pair.responder.desc, &request, fallback_access_options())
+            .await
+            .unwrap_err();
+
+        assert_eq!(err, AccessError::Refused(RefusalCode::Throttled));
+        assert!(
+            err.to_string()
+                .starts_with("The peer refused the access request: "),
+            "{err}"
+        );
+        assert_eq!(pair.recorder_b.last().path_hash, PathHash::of(ACCESS_PATH));
+        sleep(Duration::from_millis(500)).await;
+        node.nothing_else_received();
+        pair.stop_node_a().await;
+        node.stop().await;
+    }
+
+    /// With no path to the peer and no propagation node heard, the request fails by name
+    /// and points at the command that lists the nodes heard.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unreachable_access_request_with_no_propagation_node_fails_by_name() {
+        let started = started_runtime("r3-access-no-node").await;
+        let (_, ghost_desc) = ghost_destination();
+        assert!(started.runtime.propagation_nodes().select().is_err());
+        let request = access_request("acc-1", &["src/x.rs"], "");
+
+        let err = started
+            .runtime
+            .request_access_wire(&ghost_desc, &request, fallback_access_options())
+            .await
+            .unwrap_err();
+
+        assert_eq!(err, AccessError::NoPropagationNode);
+        assert!(err.to_string().contains(".mesh peers"), "{err}");
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(started.runtime.clone()).unwrap();
+        assert!(slot.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
     /// A knock is refused without waiting for the gate: X's knock holds the surface behind
     /// the gate on a barrier, and Y's knock, timed while X's is still stalled there, is
     /// refused within the request timeout all the same.
@@ -6494,6 +6643,226 @@ pub(crate) mod network {
             .filter(|(event, _)| *event == HookEvent::MeshFetchServed)
             .count();
         assert_eq!(fetch_fires, 1);
+        pair.stop_node_a().await;
+    }
+
+    fn access_body(id: &str, paths: &[&str], reason: &str) -> Value {
+        wire_map(vec![
+            ("v", Value::from(PEER_WIRE_VERSION)),
+            ("id", Value::from(id)),
+            (
+                "paths",
+                Value::Array(paths.iter().map(|path| Value::from(*path)).collect()),
+            ),
+            ("reason", Value::from(reason)),
+        ])
+    }
+
+    /// The hook sink on both the node and its slot, since admission fires from the slot
+    /// and a served fetch from the node.
+    fn hook_sink_for(pair: &NodePair, slot: &MeshSlot) -> Arc<RecordingHookSink> {
+        let sink = RecordingHookSink::attach(pair.node_a.hooks());
+        slot.hooks().set(sink.clone() as Arc<dyn MeshHookSink>);
+        sink
+    }
+
+    fn fires_of<'a>(
+        fired: &'a [(HookEvent, Vec<(&'static str, String)>)],
+        event: HookEvent,
+    ) -> Vec<&'a Vec<(&'static str, String)>> {
+        fired
+            .iter()
+            .filter(|(fired, _)| *fired == event)
+            .map(|(_, envs)| envs)
+            .collect()
+    }
+
+    /// Node B asks node A for a path A does not share: A's human sees one line and B
+    /// hears `pending`; A's grant reaches B as the decision reply, with no path in it;
+    /// B's next fetch of the path is served on the grant and the one after is not. The
+    /// envoy is never consulted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_full_access_grant_and_fetch_cycle_over_a_live_pair_never_calls_the_envoy() {
+        use crate::mesh::events::env_value;
+
+        let pair = NodePair::start_with("r3-access-cycle", |_| {}, trusting_b).await;
+        pair.introduce_b_to_a().await;
+        let (slot, idle) = installed_slot(&pair);
+        let envoy = Arc::new(CountingEnvoy::default());
+        slot.set_envoy(envoy.clone() as Arc<dyn EnvoySink>);
+        let sink = hook_sink_for(&pair, &slot);
+        let workspace = share_docs_from_a(&pair, &slot, "r3-access-cycle-root");
+        let secret = b"struct Secret;\n".to_vec();
+        fs::write(workspace.path.join("src").join("secret.rs"), &secret).unwrap();
+
+        let asked = b_asks_a(
+            &pair,
+            ACCESS_PATH,
+            access_body("acc-1", &["src/secret.rs"], "need the struct"),
+            short_options(),
+        )
+        .await;
+        assert_eq!(wire_status(&asked.value), "pending");
+        assert_eq!(
+            wire_field(&asked.value, "id").and_then(Value::as_str),
+            Some("acc-1")
+        );
+        {
+            let notes = idle.0.lock();
+            assert_eq!(notes.len(), 1, "{notes:?}");
+            assert_eq!(notes[0].source, Source::Access);
+            assert!(
+                notes[0]
+                    .text
+                    .contains("asks for 1 path: src/secret.rs (exists,"),
+                "{}",
+                notes[0].text
+            );
+            assert!(
+                notes[0].text.contains(".mesh grant acc-1"),
+                "{}",
+                notes[0].text
+            );
+        }
+
+        pair.recorder_b.queue(Script::Acknowledge);
+        let report = slot.access().grant("acc-1", false, None).await.unwrap();
+        assert_eq!(report.via, PeerVia::Direct);
+        assert_eq!(pair.recorder_b.seen_count(), 1);
+        assert_eq!(pair.recorder_b.last().path_hash, PathHash::of(MESSAGE_PATH));
+        let reply = from_r3_body(&pair.recorder_b.last_body()).unwrap();
+        assert_eq!(reply.kind, PeerKind::Reply);
+        assert_eq!(reply.in_reply_to.as_deref(), Some("acc-1"));
+        assert_eq!(reply.thread.as_deref(), Some("acc-1"));
+        assert_eq!(reply.disposition, Some(Disposition::Answered));
+        assert_eq!(reply.fields, None);
+        assert_eq!(reply.parts.len(), 1, "{:?}", reply.parts);
+        let RawPart::Data { data } = &reply.parts[0] else {
+            panic!("not a data part: {:?}", reply.parts);
+        };
+        let expires = data["access"]["expires"]
+            .as_f64()
+            .unwrap_or_else(|| panic!("no expires in {data}"));
+        assert_eq!(
+            *data,
+            serde_json::json!({ "access": { "status": "granted", "expires": expires } })
+        );
+        assert!(!reply.content.contains("secret"), "{}", reply.content);
+
+        let served = b_asks_a(
+            &pair,
+            FETCH_PATH,
+            fetch_body("src/secret.rs", None),
+            short_options(),
+        )
+        .await;
+        assert_eq!(wire_status(&served.value), "ok");
+        assert_eq!(
+            wire_field(&served.value, "bytes"),
+            Some(&Value::Binary(secret))
+        );
+        let spent = b_asks_a(
+            &pair,
+            FETCH_PATH,
+            fetch_body("src/secret.rs", None),
+            short_options(),
+        )
+        .await;
+        assert_eq!(wire_status(&spent.value), "not_shared");
+
+        assert_eq!(envoy.0.load(Ordering::SeqCst), 0);
+        wait_until("the served fetch to fire mesh.fetch.served", || {
+            sink.snapshot()
+                .iter()
+                .any(|(event, _)| *event == HookEvent::MeshFetchServed)
+        })
+        .await;
+        let fired = sink.drain();
+        let requested = fires_of(&fired, HookEvent::MeshAccessRequested);
+        assert_eq!(requested.len(), 1, "{fired:?}");
+        assert_eq!(env_value(requested[0], "COYOTE_MESH_PATH_COUNT"), Some("1"));
+        let decided = fires_of(&fired, HookEvent::MeshAccessDecided);
+        assert_eq!(decided.len(), 1, "{fired:?}");
+        assert_eq!(
+            env_value(decided[0], "COYOTE_MESH_DECISION"),
+            Some("granted")
+        );
+        assert_eq!(fires_of(&fired, HookEvent::MeshFetchServed).len(), 1);
+        pair.stop_node_a().await;
+    }
+
+    /// A request for paths the share rules already serve to node B is granted on the
+    /// wire at once: nothing is filed, nobody is asked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_access_request_already_covered_by_the_share_rules_is_granted_on_the_wire_without_a_record()
+     {
+        let pair = NodePair::start_with("r3-access-covered", |_| {}, trusting_b).await;
+        let (slot, idle) = installed_slot(&pair);
+        let workspace = share_docs_from_a(&pair, &slot, "r3-access-covered-root");
+        fs::write(workspace.path.join("docs").join("a.md"), b"# a\n").unwrap();
+        let before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+
+        let asked = b_asks_a(
+            &pair,
+            ACCESS_PATH,
+            access_body("acc-1", &["docs/a.md"], ""),
+            short_options(),
+        )
+        .await;
+
+        assert_eq!(wire_status(&asked.value), "granted");
+        let expires = wire_field(&asked.value, "expires")
+            .and_then(Value::as_f64)
+            .unwrap();
+        assert!(
+            expires >= before + 15.0 * 60.0 - 1.0 && expires < before + 15.0 * 60.0 + 60.0,
+            "{expires}"
+        );
+        assert!(
+            slot.inbound_store()
+                .unwrap()
+                .list(SystemTime::now())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(idle.0.lock().is_empty());
+        pair.stop_node_a().await;
+    }
+
+    /// A request naming a path that is not a wire path is refused as invalid data, as
+    /// the fetch of such a path would be.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_access_request_with_a_bad_path_earns_invalid_data_on_the_wire() {
+        let pair = NodePair::start_with("r3-access-bad-path", |_| {}, trusting_b).await;
+        let (slot, idle) = installed_slot(&pair);
+        let _workspace = share_docs_from_a(&pair, &slot, "r3-access-bad-path-root");
+
+        let err = pair
+            .client_b
+            .request(
+                &pair.responder.transport,
+                &pair.responder.identity,
+                &pair.a_desc,
+                ACCESS_PATH,
+                pair.responder
+                    .envelope(access_body("acc-1", &["../secret.rs"], "")),
+                short_options(),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(err, R3Error::Refused(RefusalCode::InvalidData));
+        assert!(
+            slot.inbound_store()
+                .unwrap()
+                .list(SystemTime::now())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(idle.0.lock().is_empty());
         pair.stop_node_a().await;
     }
 

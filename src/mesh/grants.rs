@@ -9,12 +9,16 @@
 //! to land. Every read parses the whole file and refuses it on the first bad line, as the
 //! pending store does, and the file is cache, so the remedy is to move it aside.
 
+#[cfg(test)]
 use crate::mesh::message::{PEER_ID_MAX_CHARS, is_wire_id};
 use crate::mesh::schema::{Remedy, VersionProbe, unversioned_refusal, version_refusal};
 use crate::mesh::shares::PeerRef;
 use crate::mesh::trust::same_hash;
+#[cfg(test)]
 use crate::mesh::wire_path::WirePath;
-use crate::mesh::{canonical_hash, mesh_cache_dir, parse_rfc3339, rfc3339_utc, write_atomically};
+#[cfg(test)]
+use crate::mesh::{canonical_hash, rfc3339_utc};
+use crate::mesh::{mesh_cache_dir, parse_rfc3339, write_atomically};
 
 use anyhow::{Context, Result, bail};
 use parking_lot::Mutex;
@@ -24,12 +28,16 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 pub(crate) const GRANT_RECORD_VERSION: u64 = 1;
+// `grant`, its use count and its path cap are test-only until the human's grant verb
+// writes a record.
 /// Long enough for the peer to fetch what it asked for after the human said yes, short
 /// enough that a forgotten grant does not outlive the conversation.
 pub(crate) const DEFAULT_GRANT_TTL: Duration = Duration::from_secs(15 * 60);
+#[cfg(test)]
 pub(crate) const DEFAULT_GRANT_USES: u32 = 1;
 /// An access request names a handful of files; a grant for more than this is a share
 /// list by another name and belongs in the share set.
+#[cfg(test)]
 pub(crate) const GRANT_MAX_PATHS: usize = 16;
 
 /// One line of `grants-<instance_id>.jsonl`. The shape is a stable on-disk record other
@@ -143,6 +151,7 @@ impl GrantStore {
     /// twice does not double the uses; two peers may ask under the same id, since each
     /// chooses its own. The id must be a wire id, the peer a canonical 32-hex hash and
     /// every path a wire path, since `consume` compares against the text a peer sends.
+    #[cfg(test)]
     pub(crate) fn grant(
         &self,
         id: &str,

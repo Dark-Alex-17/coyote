@@ -1,6 +1,6 @@
 use crate::config::mesh_config::{MeshConfig, MeshInterface};
 use crate::config::{ForkRekey, Session, paths};
-use crate::mesh::access::{AccessHandler, AccessSurface};
+use crate::mesh::access::{AccessHandler, AccessRouting, AccessSurface};
 use crate::mesh::announce::{
     AnnounceAppData, HEARTBEAT_SECS, REANNOUNCE_FLOOR_SECS, announce_app_data,
 };
@@ -611,7 +611,6 @@ impl MeshRuntime {
         *self.access_surface.lock() = Some(surface);
     }
 
-    #[cfg(all(test, unix))]
     pub(crate) fn access_surface(&self) -> Option<Arc<dyn AccessSurface>> {
         self.access_surface.lock().as_ref().and_then(Weak::upgrade)
     }
@@ -867,9 +866,14 @@ impl MeshRuntime {
             surface: self.peer_surface.lock().as_ref().and_then(Weak::upgrade),
             inner: sink,
         };
+        let access = AccessRouting {
+            trust: &self.trust,
+            surface: self.access_surface(),
+            inner: &peers,
+        };
         let routing = KnockRouting {
             gate: &self.knock_gate,
-            inner: &peers,
+            inner: &access,
         };
         propagation_fetch::fetch(
             &transport,

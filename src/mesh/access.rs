@@ -3,6 +3,11 @@
 //! when the same peer is already waiting on the same set or on too many, and otherwise
 //! held in the inbound store until the person at the keyboard grants or refuses it.
 //!
+//! Outbound, a request tries the peer over a link first and falls back to an LXMF
+//! propagation node only when the peer cannot be reached; the fetch path routes such a
+//! stored request into the same admission, and a grant it earns at once is sent back as
+//! the decision reply the human's grant would send.
+//!
 //! Only the person at the keyboard sees what was asked for: the paths and the reason go
 //! to the inbound record and the human line and nowhere else, never to the envoy, a
 //! model note or a log line.
@@ -11,23 +16,52 @@ use crate::mesh::events::{AccessDecision, MeshEvent};
 use crate::mesh::fetch::{FetchServing, ShareSource, field, versioned_map};
 use crate::mesh::grants::DEFAULT_GRANT_TTL;
 use crate::mesh::idle::{IdleNotify, Origin};
+#[cfg(test)]
+use crate::mesh::message::PEER_REQUEST_TIMEOUT;
 use crate::mesh::message::{
     Disposition, OutboundPeer, PEER_WIRE_VERSION, PartLimits, PeerKind, PeerVia, RawPart,
     SendError, is_wire_id,
 };
-use crate::mesh::node::{MeshRuntime, MeshSlot};
+#[cfg(test)]
+use crate::mesh::node::MeshRuntime;
+use crate::mesh::node::MeshSlot;
 use crate::mesh::notify::Source;
-use crate::mesh::pending::{INBOUND_RECORD_VERSION, InboundKind, InboundRecord, InboundStore};
-use crate::mesh::r3::{AdmittedRequest, Handler, RefusalCode, Reply};
-use crate::mesh::shares::{Mutation, PeerRef, ShareSet, WriteScope};
+#[cfg(test)]
+use crate::mesh::pending::{
+    DEFAULT_COLLECT_TIMEOUT, InboundStore, PENDING_QUESTION_MAX_CHARS, PENDING_RECORD_VERSION,
+    PendingRecord, PendingState,
+};
+use crate::mesh::pending::{INBOUND_RECORD_VERSION, InboundKind, InboundRecord};
+#[cfg(test)]
+use crate::mesh::propagation::{OutboundMessage, PropagationError, PropagationOptions};
+use crate::mesh::propagation_fetch::{InboundMessage, InboundSink};
+#[cfg(test)]
+use crate::mesh::protocol::describe_version;
+#[cfg(test)]
+use crate::mesh::r3::{ACCESS_PATH, DEFAULT_LINK_TIMEOUT, OriginName, R3Error, RequestOptions};
+use crate::mesh::r3::{AdmittedRequest, Handler, NAME_HASH_LEN, RefusalCode, Reply};
+use crate::mesh::shares::PeerRef;
+#[cfg(test)]
+use crate::mesh::shares::{Mutation, ShareSet, WriteScope};
+use crate::mesh::trust::{Decision, TrustStore};
 use crate::mesh::wire_path::WirePath;
-use crate::mesh::{display_text, parse_rfc3339, redact_hashes, rfc3339_utc, short};
+#[cfg(test)]
+use crate::mesh::{canonical_hash, parse_rfc3339};
+use crate::mesh::{destination_address, display_text, redact_hashes, rfc3339_utc, short};
 
-use anyhow::{Context, Result, bail};
+use anyhow::Result;
+#[cfg(test)]
+use anyhow::{Context, bail};
 use async_trait::async_trait;
+use lxmf_core::constants::{FIELD_CUSTOM_DATA, FIELD_CUSTOM_TYPE};
 use rmpv::Value;
+#[cfg(test)]
+use rns_transport::destination::DestinationDesc;
+use rns_transport::hash::AddressHash;
 use serde_json::json;
 use std::collections::BTreeSet;
+#[cfg(test)]
+use std::fmt;
 use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Weak};
@@ -42,6 +76,7 @@ pub(crate) const ACCESS_MAX_PENDING_PER_IDENTITY: usize = 5;
 
 /// A request body that passed every rule: a wire id, one to `ACCESS_MAX_PATHS` wire
 /// paths with exact repeats dropped, and a reason cleaned for display.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ValidAccess {
     pub id: String,
     pub paths: Vec<String>,
@@ -56,6 +91,7 @@ pub(crate) struct InboundAccess {
     pub via: PeerVia,
 }
 
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum AccessOutcome {
     Pending,
     /// `expires` is unix seconds, the grant's end as the peer should plan around it.
@@ -94,6 +130,17 @@ impl AccessRefusal {
 /// store, so it is called off the request loop.
 pub(crate) trait AccessSurface: Send + Sync {
     fn admit_access(&self, request: InboundAccess) -> AccessOutcome;
+
+    /// Sends the peer the decision reply for a request admission granted at once, on the
+    /// route that has no link to answer over. The reply is what the human's grant would
+    /// send; the peer collects it under the request's id either way.
+    fn settle_granted_at_once(
+        &self,
+        identity_hash: &str,
+        destination_hash: &str,
+        request: &ValidAccess,
+        expires: f64,
+    );
 }
 
 /// Serves `/access`. The surface is held weakly because the slot owns the runtime that
@@ -249,6 +296,348 @@ pub(crate) fn validate_access(
     })
 }
 
+// The requester half is test-only until the tool that asks a peer for access lands.
+
+/// Timeouts for one access request: the direct attempt, then the fallback post.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AccessOptions {
+    pub request: RequestOptions,
+    pub propagation: PropagationOptions,
+}
+
+#[cfg(test)]
+impl Default for AccessOptions {
+    fn default() -> Self {
+        Self {
+            request: RequestOptions {
+                request_timeout: PEER_REQUEST_TIMEOUT,
+                link_timeout: DEFAULT_LINK_TIMEOUT,
+            },
+            propagation: PropagationOptions::default(),
+        }
+    }
+}
+
+/// What a sent request came back as, and by which route. A stored request is pending by
+/// definition: the peer has not seen it yet.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct AccessRequestOutcome {
+    pub id: String,
+    pub status: AccessOutcome,
+    pub via: PeerVia,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum AccessError {
+    NotRunning,
+    /// Unknown to the peer table, known but untrusted, denied or blocked: one text for
+    /// all four, as for a send.
+    Untrusted,
+    /// Trusted, but its identity has not announced since this node started, so there is
+    /// no description to link to.
+    UnknownDestination,
+    /// The request breaks a rule the peer would refuse it for; the text names the rule.
+    Invalid(&'static str),
+    /// The pending store would not file the request, so nothing was sent.
+    NotFiled(String),
+    /// The peer answered with a refusal code; nothing is stored for a peer that said no.
+    Refused(RefusalCode),
+    /// The peer answered with a status or a refusal reason this Coyote does not know.
+    UnknownStatus,
+    /// The peer answered, but not with an access reply to this request; the text names
+    /// what was wrong with it.
+    Malformed(&'static str),
+    /// The direct attempt failed for a reason that is not the peer being unreachable, so
+    /// nothing was stored for it.
+    Direct(R3Error),
+    IncompatibleVersion {
+        destination: String,
+        found: Option<u16>,
+        min: u16,
+        max: u16,
+    },
+    NoPropagationNode,
+    Propagation(PropagationError),
+}
+
+#[cfg(test)]
+impl fmt::Display for AccessError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotRunning => write!(
+                f,
+                "The mesh node has been stopped; run `.mesh on` to start it again"
+            ),
+            Self::Untrusted => write!(
+                f,
+                "The destination is not trusted for an access request. Trust it first with `.mesh trust <destination>`; `.mesh peers` lists what this Coyote has heard from."
+            ),
+            Self::UnknownDestination => write!(
+                f,
+                "The destination is trusted but has not announced since this node started, so there is no path to it yet. Wait for its next announce; `.mesh peers` shows when it was last heard."
+            ),
+            Self::Invalid(rule) => write!(f, "The access request was refused: {rule}"),
+            Self::NotFiled(reason) => write!(
+                f,
+                "The access request was not sent because it could not be filed as pending: {reason}"
+            ),
+            Self::Refused(code) => write!(f, "The peer refused the access request: {code}"),
+            Self::UnknownStatus => write!(
+                f,
+                "The peer answered the access request with a status this Coyote does not know; it may be running a newer Coyote"
+            ),
+            Self::Malformed(why) => write!(
+                f,
+                "The peer answered the access request with something that is not an access reply: {why}"
+            ),
+            Self::Direct(err) => write!(f, "The access request could not be sent: {err}"),
+            Self::IncompatibleVersion {
+                destination,
+                found,
+                min,
+                max,
+            } => write!(
+                f,
+                "Destination {destination} and this Coyote speak incompatible mesh protocol versions: version {} was refused by the side that supports {min}..={max}. One of the two needs upgrading before they can talk; the peer listing names which.",
+                describe_version(*found)
+            ),
+            Self::NoPropagationNode => write!(
+                f,
+                "The peer is unreachable and no propagation node is known yet to hold the access request for it. Run `.mesh peers` to see which nodes this Coyote has heard from."
+            ),
+            Self::Propagation(err) => write!(
+                f,
+                "The peer is unreachable and the access request could not be stored: {err}"
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+impl std::error::Error for AccessError {}
+
+#[cfg(test)]
+impl MeshSlot {
+    /// Asks the trusted instance at `peer_destination` to let this node read `paths`.
+    /// The correlation is opened before the send so a decision that beats the reply's
+    /// acknowledgement still matches, and closed again unless the peer left the request
+    /// pending: a grant or refusal on the wire is the whole answer, and a failed send
+    /// asked nothing. The paths stay with the caller; the pending record keeps only the
+    /// first words of what was asked.
+    pub(crate) async fn request_access(
+        &self,
+        peer_destination: &str,
+        paths: &[String],
+        reason: &str,
+    ) -> Result<AccessRequestOutcome, AccessError> {
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let request = validate_access(&id, paths.to_vec(), reason).map_err(AccessError::Invalid)?;
+        let Some(runtime) = self.get() else {
+            return Err(AccessError::NotRunning);
+        };
+        let Some(destination) = canonical_hash(peer_destination) else {
+            return Err(AccessError::Untrusted);
+        };
+        let Some(peer) = runtime.peers().get(&destination) else {
+            return Err(AccessError::Untrusted);
+        };
+        if runtime
+            .trust()
+            .authorize(&peer.identity_hash, &destination)
+            .decision
+            != Decision::Allow
+        {
+            return Err(AccessError::Untrusted);
+        }
+        let desc = runtime
+            .resolve_destination(&destination)
+            .await
+            .ok_or(AccessError::UnknownDestination)?;
+        let now = SystemTime::now();
+        self.correlations()
+            .open(PendingRecord {
+                version: PENDING_RECORD_VERSION,
+                id: id.clone(),
+                peer_destination: destination,
+                peer_identity: peer.identity_hash,
+                thread: id.clone(),
+                question: display_text(
+                    &format!("access: {}", request.paths.join(", ")),
+                    PENDING_QUESTION_MAX_CHARS,
+                )
+                .unwrap_or_default(),
+                sent_at: rfc3339_utc(now),
+                timeout_at: rfc3339_utc(now + DEFAULT_COLLECT_TIMEOUT),
+                state: PendingState::Open,
+                reply: None,
+            })
+            .map_err(|err| AccessError::NotFiled(format!("{err:#}")))?;
+        let outcome = runtime
+            .request_access_wire(&desc, &request, AccessOptions::default())
+            .await;
+        if !matches!(
+            outcome,
+            Ok(AccessRequestOutcome {
+                status: AccessOutcome::Pending,
+                ..
+            })
+        ) {
+            self.correlations().abandon(&id);
+        }
+        outcome
+    }
+}
+
+#[cfg(test)]
+impl MeshRuntime {
+    /// Puts `request` to `destination` over a link and reads the answer. Only the
+    /// peer-unreachable errors fall back to store-and-forward: a refusal of any code
+    /// means the peer heard and said no, and an oversize or undecodable frame is this
+    /// node's fault. Posts to the propagation node queue behind `posting`, since
+    /// `propagate` needs one caller per node at a time.
+    pub(crate) async fn request_access_wire(
+        &self,
+        destination: &DestinationDesc,
+        request: &ValidAccess,
+        options: AccessOptions,
+    ) -> Result<AccessRequestOutcome, AccessError> {
+        let dest_hex = destination.address_hash.to_hex_string();
+        let dest8 = short(&dest_hex);
+        let id = request.id.as_str();
+        let unreachable = match self
+            .request(
+                destination,
+                ACCESS_PATH,
+                access_body(request),
+                options.request,
+            )
+            .await
+        {
+            Ok(outcome) => {
+                let status = decode_access_response(&outcome.value, id)?;
+                debug!(
+                    "Mesh access request {id} to {dest8} was answered {} over a link",
+                    status.status()
+                );
+                return Ok(AccessRequestOutcome {
+                    id: request.id.clone(),
+                    status,
+                    via: PeerVia::Direct,
+                });
+            }
+            Err(err @ (R3Error::Timeout { .. } | R3Error::LinkFailed(_) | R3Error::LinkClosed)) => {
+                err
+            }
+            Err(R3Error::Refused(code)) => {
+                debug!("Mesh access request {id} to {dest8} was refused: {code}");
+                return Err(AccessError::Refused(code));
+            }
+            Err(R3Error::NotRunning | R3Error::Shutdown) => return Err(AccessError::NotRunning),
+            Err(R3Error::UnsupportedVersion { found, min, max }) => {
+                return Err(AccessError::IncompatibleVersion {
+                    destination: dest_hex,
+                    found,
+                    min,
+                    max,
+                });
+            }
+            Err(err) => {
+                debug!(
+                    "Mesh access request {id} to {dest8} was not sent over the link: {}",
+                    redact_hashes(&err.to_string())
+                );
+                return Err(AccessError::Direct(err));
+            }
+        };
+        // Selected before queueing behind another post: a requester with no node to fall
+        // back on is told so at once rather than after someone else's transfer.
+        let node = self
+            .propagation_nodes()
+            .select_for_posting()
+            .map_err(|_| AccessError::NoPropagationNode)?;
+        let node_hex = node.destination.address_hash.to_hex_string();
+        debug!(
+            "Mesh access request {id} to {dest8} could not be delivered over a link ({}); storing it with propagation node {}",
+            redact_hashes(&unreachable.to_string()),
+            short(&node_hex)
+        );
+        self.post_to_node(
+            &destination.identity,
+            &node,
+            |origin| access_message(request, origin),
+            &options.propagation,
+        )
+        .await
+        .map_err(|err| match err {
+            PropagationError::Cancelled
+            | PropagationError::Link(R3Error::Shutdown | R3Error::NotRunning) => {
+                AccessError::NotRunning
+            }
+            other => AccessError::Propagation(other),
+        })?;
+        Ok(AccessRequestOutcome {
+            id: request.id.clone(),
+            status: AccessOutcome::Pending,
+            via: PeerVia::StoreAndForward,
+        })
+    }
+}
+
+#[cfg(test)]
+fn access_body(request: &ValidAccess) -> Value {
+    Value::Map(vec![
+        (Value::from("v"), Value::from(PEER_WIRE_VERSION)),
+        (Value::from("id"), Value::from(request.id.as_str())),
+        (Value::from("paths"), wire_paths(&request.paths)),
+        (Value::from("reason"), Value::from(request.reason.as_str())),
+    ])
+}
+
+#[cfg(test)]
+fn wire_paths(paths: &[String]) -> Value {
+    Value::Array(
+        paths
+            .iter()
+            .map(|path| Value::from(path.as_str()))
+            .collect(),
+    )
+}
+
+/// Reads the peer's answer to the request sent as `sent_id`. Keys the peer adds are
+/// ignored; a status or refusal reason this Coyote does not know is a typed error, so a
+/// newer peer's answer is reported rather than guessed at.
+#[cfg(test)]
+pub(crate) fn decode_access_response(
+    value: &Value,
+    sent_id: &str,
+) -> Result<AccessOutcome, AccessError> {
+    let entries = versioned_map(value).map_err(AccessError::Malformed)?;
+    if field(entries, "id").and_then(Value::as_str) != Some(sent_id) {
+        return Err(AccessError::Malformed("id is missing or not the one sent"));
+    }
+    let status = field(entries, "status")
+        .and_then(Value::as_str)
+        .ok_or(AccessError::Malformed("status is missing or not text"))?;
+    match status {
+        "pending" => Ok(AccessOutcome::Pending),
+        "granted" => {
+            let expires = field(entries, "expires")
+                .and_then(Value::as_f64)
+                .ok_or(AccessError::Malformed("expires is missing or not a number"))?;
+            Ok(AccessOutcome::Granted { expires })
+        }
+        "refused" => match field(entries, "reason").and_then(Value::as_str) {
+            Some("duplicate") => Ok(AccessOutcome::Refused(AccessRefusal::Duplicate)),
+            Some("too_many_pending") => Ok(AccessOutcome::Refused(AccessRefusal::TooManyPending)),
+            _ => Err(AccessError::UnknownStatus),
+        },
+        _ => Err(AccessError::UnknownStatus),
+    }
+}
+
 impl AccessSurface for MeshSlot {
     fn admit_access(&self, request: InboundAccess) -> AccessOutcome {
         let InboundAccess {
@@ -357,6 +746,63 @@ impl AccessSurface for MeshSlot {
         );
         AccessOutcome::Pending
     }
+
+    /// Sent off the fetch path, which runs where nothing may await, the way a refusal
+    /// reply is. A reply that cannot go is logged: the peer's own request has timed out
+    /// by then and it asks again.
+    fn settle_granted_at_once(
+        &self,
+        identity_hash: &str,
+        destination_hash: &str,
+        request: &ValidAccess,
+        expires: f64,
+    ) {
+        let id8 = short(identity_hash).to_string();
+        let dest8 = short(destination_hash).to_string();
+        let id = request.id.clone();
+        let Some(runtime) = self.get() else {
+            warn!(
+                "Mesh access {id} from {id8} (instance {dest8}) was granted but the grant could not be sent: the mesh is off"
+            );
+            return;
+        };
+        let expires = Duration::try_from_secs_f64(expires)
+            .ok()
+            .and_then(|since_epoch| UNIX_EPOCH.checked_add(since_epoch));
+        let out = match decision_reply(
+            &request.id,
+            &request.id,
+            request.paths.len(),
+            AccessDecision::Granted,
+            expires,
+            false,
+            &runtime.part_limits(),
+        ) {
+            Ok(out) => out,
+            Err(err) => {
+                warn!(
+                    "Mesh access {id} from {id8} (instance {dest8}) was granted but the grant could not be built: {}",
+                    redact_hashes(&err.to_string())
+                );
+                return;
+            }
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            warn!(
+                "Mesh access {id} from {id8} (instance {dest8}) was granted but the grant could not be sent: no async runtime to send it with"
+            );
+            return;
+        };
+        let destination = destination_hash.to_string();
+        handle.spawn(async move {
+            if let Err(err) = runtime.send_peer(&destination, &out).await {
+                warn!(
+                    "Mesh access {id} from {id8} (instance {dest8}) was granted but the grant could not be sent: {}",
+                    redact_hashes(&err.to_string())
+                );
+            }
+        });
+    }
 }
 
 fn via_word(via: PeerVia) -> &'static str {
@@ -366,21 +812,192 @@ fn via_word(via: PeerVia) -> &'static str {
     }
 }
 
+/// The LXMF custom type a stored access request carries in `FIELD_CUSTOM_TYPE`, so a
+/// fetch can tell it from a knock or a peer message before it reads anything else.
+/// Versioned in the name: a later layout gets a new type, and a node that does not know
+/// it treats the payload as a message.
+pub(crate) const ACCESS_TYPE: &str = "scope.access/1";
+
+/// An access request as a propagation node stores it: the reason as the content, the
+/// type, this node's origin name, the id and the paths in the custom fields. The
+/// recipient recomputes the asking destination from that name and the signer's
+/// identity, exactly as the dispatcher does for a link request, so a stored request can
+/// only ever name one of the requester's own instances.
+#[cfg(test)]
+pub(crate) fn access_message(request: &ValidAccess, origin: &OriginName) -> OutboundMessage {
+    OutboundMessage {
+        title: None,
+        content: request.reason.as_bytes().to_vec(),
+        fields: Some(Value::Map(vec![
+            (Value::from(FIELD_CUSTOM_TYPE), Value::from(ACCESS_TYPE)),
+            (
+                Value::from(FIELD_CUSTOM_DATA),
+                Value::Map(vec![
+                    (Value::from("name_hash"), Value::Binary(origin.0.to_vec())),
+                    (Value::from("id"), Value::from(request.id.as_str())),
+                    (Value::from("paths"), wire_paths(&request.paths)),
+                ]),
+            ),
+        ])),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AccessMessage {
+    NotAnAccess,
+    /// Typed as an access request but not laid out as one, or breaking a rule the link
+    /// route refuses; never a message either.
+    Malformed(&'static str),
+    Access {
+        name_hash: [u8; NAME_HASH_LEN],
+        request: ValidAccess,
+    },
+}
+
+/// Reads a fetched message as an access request, held to the same rules as one off a
+/// link. The custom type is accepted as a string or as its UTF-8 bytes, since msgpack
+/// encoders differ on which they emit.
+pub(crate) fn decode_access_message(message: &InboundMessage) -> AccessMessage {
+    let Some(Value::Map(fields)) = &message.fields else {
+        return AccessMessage::NotAnAccess;
+    };
+    let custom = |key: u8| {
+        fields
+            .iter()
+            .find(|(field, _)| field.as_u64() == Some(u64::from(key)))
+            .map(|(_, value)| value)
+    };
+    let Some(kind) = custom(FIELD_CUSTOM_TYPE) else {
+        return AccessMessage::NotAnAccess;
+    };
+    let is_access = match kind {
+        Value::String(text) => text.as_str() == Some(ACCESS_TYPE),
+        Value::Binary(bytes) => bytes == ACCESS_TYPE.as_bytes(),
+        _ => false,
+    };
+    if !is_access {
+        return AccessMessage::NotAnAccess;
+    }
+    let Some(Value::Map(data)) = custom(FIELD_CUSTOM_DATA) else {
+        return AccessMessage::Malformed("custom data is missing or not a map");
+    };
+    let Some(Value::Binary(bytes)) = field(data, "name_hash") else {
+        return AccessMessage::Malformed("name_hash is missing or not binary");
+    };
+    let Ok(name_hash) = <[u8; NAME_HASH_LEN]>::try_from(bytes.as_slice()) else {
+        return AccessMessage::Malformed("name_hash is not 10 bytes");
+    };
+    let Some(id) = field(data, "id").and_then(Value::as_str) else {
+        return AccessMessage::Malformed("id is missing or not text");
+    };
+    let Some(paths) = field(data, "paths").and_then(Value::as_array) else {
+        return AccessMessage::Malformed("paths is missing or not a list");
+    };
+    let Ok(paths) = paths
+        .iter()
+        .map(|path| path.as_str().map(str::to_string).ok_or(()))
+        .collect::<Result<Vec<String>, ()>>()
+    else {
+        return AccessMessage::Malformed("a path is not text");
+    };
+    let reason = message
+        .content
+        .as_deref()
+        .map(String::from_utf8_lossy)
+        .unwrap_or_default();
+    match validate_access(id, paths, &reason) {
+        Ok(request) => AccessMessage::Access { name_hash, request },
+        Err(rule) => AccessMessage::Malformed(rule),
+    }
+}
+
+/// An `InboundSink` in front of another: fetched access requests go to the surface,
+/// everything else to `inner`. A payload typed as an access request is never a message,
+/// so a malformed or untrusted one is dropped rather than forwarded. Store-and-forward
+/// has no link to answer over, so a request granted at once is answered with the
+/// decision reply and a refused one is not answered at all: the peer's own request has
+/// timed out by then and it asks again.
+pub(crate) struct AccessRouting<'a> {
+    pub trust: &'a TrustStore,
+    pub surface: Option<Arc<dyn AccessSurface>>,
+    pub inner: &'a dyn InboundSink,
+}
+
+impl InboundSink for AccessRouting<'_> {
+    fn deliver(&self, message: InboundMessage) {
+        let id8 = short(&message.source_identity_hash).to_string();
+        let (name_hash, request) = match decode_access_message(&message) {
+            AccessMessage::NotAnAccess => return self.inner.deliver(message),
+            AccessMessage::Malformed(why) => {
+                debug!(
+                    "Propagated access request from {id8} dropped: {}",
+                    redact_hashes(why)
+                );
+                return;
+            }
+            AccessMessage::Access { name_hash, request } => (name_hash, request),
+        };
+        let Ok(identity) = AddressHash::new_from_hex_string(&message.source_identity_hash) else {
+            debug!("Propagated access request from {id8} dropped: the signer's hash is malformed");
+            return;
+        };
+        let source_destination = destination_address(&name_hash, &identity).to_hex_string();
+        let dest8 = short(&source_destination).to_string();
+        if self
+            .trust
+            .authorize(&message.source_identity_hash, &source_destination)
+            .decision
+            != Decision::Allow
+        {
+            debug!("Propagated access request from {id8} dropped: instance {dest8} is not trusted");
+            return;
+        }
+        let Some(surface) = &self.surface else {
+            debug!(
+                "Propagated access request from {id8} (instance {dest8}) dropped: the session slot is gone"
+            );
+            return;
+        };
+        let asked = request.clone();
+        let outcome = surface.admit_access(InboundAccess {
+            identity_hash: message.source_identity_hash.clone(),
+            destination_hash: source_destination.clone(),
+            request,
+            via: PeerVia::StoreAndForward,
+        });
+        match outcome {
+            AccessOutcome::Pending => {}
+            AccessOutcome::Refused(refusal) => debug!(
+                "Propagated access request from {id8} (instance {dest8}) refused: {}; there is no link to say so over",
+                refusal.wire_name()
+            ),
+            AccessOutcome::Granted { expires } => surface.settle_granted_at_once(
+                &message.source_identity_hash,
+                &source_destination,
+                &asked,
+                expires,
+            ),
+        }
+    }
+}
+
 /// The human's side of a pending access request: grant it once or for good, or refuse
 /// it. Either way the peer hears a reply and the request leaves the inbound store.
+// The decision half is test-only until the human's grant and refuse verbs land.
+#[cfg(test)]
 pub(crate) struct AccessStore<'a> {
     slot: &'a MeshSlot,
 }
 
+#[cfg(test)]
 impl MeshSlot {
-    // Reached by the human's grant and refuse verbs once they land.
-    #[allow(dead_code)]
     pub(crate) fn access(&self) -> AccessStore<'_> {
         AccessStore { slot: self }
     }
 }
 
 /// What a decision did, for the line the human reads back.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct AccessDecisionReport {
     pub id: String,
@@ -393,8 +1010,7 @@ pub(crate) struct AccessDecisionReport {
     pub via: PeerVia,
 }
 
-// Reached by the human's grant and refuse verbs once they land.
-#[allow(dead_code)]
+#[cfg(test)]
 impl AccessStore<'_> {
     /// Lets the requesting peer read every path it asked for: once, through a grant that
     /// lends each path one use until `ttl` (the default when `None`) runs out, or
@@ -554,6 +1170,7 @@ impl AccessStore<'_> {
 fn decision_word(decision: AccessDecision) -> &'static str {
     match decision {
         AccessDecision::Granted => "granted",
+        #[cfg(test)]
         AccessDecision::Denied => "denied",
     }
 }
@@ -575,6 +1192,7 @@ pub(crate) fn decision_reply(
     let plural = if path_count == 1 { "" } else { "s" };
     let counted = format!("{path_count} path{plural}");
     let content = match (decision, expires) {
+        #[cfg(test)]
         (AccessDecision::Denied, _) => format!("access denied: {counted}"),
         (AccessDecision::Granted, Some(expires)) => {
             format!("access granted: {counted} until {}", rfc3339_utc(expires))
@@ -725,10 +1343,12 @@ mod tests {
     use crate::mesh::grants::{DEFAULT_GRANT_USES, GRANT_MAX_PATHS};
     use crate::mesh::hex_lower;
     use crate::mesh::idle::IdleSink;
-    use crate::mesh::message::{Part, PeerMessage, RawPeerMessage, from_r3_body, to_r3_body};
-    use crate::mesh::pending::{PENDING_RECORD_VERSION, PendingRecord, PendingState};
-    use crate::mesh::r3::{ACCESS_PATH, PathHash, RequestId, SizeBranch};
-    use crate::mesh::test_support::{TempDir, snapshot_fixture};
+    use crate::mesh::knock::{KnockIntro, knock_message};
+    use crate::mesh::message::{
+        Part, PeerMessage, RawPeerMessage, from_r3_body, peer_lxmf_message, to_r3_body,
+    };
+    use crate::mesh::r3::{PathHash, RequestId, SizeBranch};
+    use crate::mesh::test_support::{TempDir, TrustList, snapshot_fixture};
     use rand_core::OsRng;
     use rns_transport::destination::link::LinkId;
     use rns_transport::hash::AddressHash;
@@ -753,12 +1373,12 @@ mod tests {
     #[cfg(unix)]
     use crate::mesh::peers::PeerSighting;
     #[cfg(unix)]
+    use crate::mesh::pending::PendingStore;
+    #[cfg(unix)]
     use crate::mesh::protocol::MESH_PROTOCOL_VERSION;
     #[cfg(unix)]
-    use crate::mesh::r3::NAME_HASH_LEN;
-    #[cfg(unix)]
     use crate::mesh::test_support::{
-        PeerStub, loopback_relay, mesh_paths, private_config, wait_until,
+        PeerStub, derived_sighting, loopback_relay, mesh_paths, private_config, wait_until,
     };
     #[cfg(unix)]
     use crate::mesh::trust::TrustOptions;
@@ -2161,6 +2781,810 @@ mod tests {
         assert_eq!(installed.grants().len(), 1);
         decided_once(&installed.hooks, "a-1", "granted");
         decision_seen(&stub, "a-1");
+        installed.stop().await;
+        stub.stop().await;
+    }
+
+    /// `message` as a fetch hands it on once the signer is verified.
+    fn fetched(message: &OutboundMessage, source_identity: &str) -> InboundMessage {
+        InboundMessage {
+            transient_id: [1u8; 32],
+            message_id: [2u8; 32],
+            source_identity_hash: source_identity.to_string(),
+            source_delivery_hash: hex_lower(&[3u8; 16]),
+            timestamp: 1_700_000_000.0,
+            title: message.title.clone(),
+            content: Some(message.content.clone()),
+            fields: message.fields.clone(),
+            stamp_value: None,
+        }
+    }
+
+    fn typed(kind: Value, data: Value) -> OutboundMessage {
+        OutboundMessage {
+            title: None,
+            content: b"need the struct".to_vec(),
+            fields: Some(Value::Map(vec![
+                (Value::from(FIELD_CUSTOM_TYPE), kind),
+                (Value::from(FIELD_CUSTOM_DATA), data),
+            ])),
+        }
+    }
+
+    #[test]
+    fn scope_access_lxmf_round_trips_and_a_knock_is_not_an_access() {
+        let origin = OriginName([7u8; NAME_HASH_LEN]);
+        let request = validate_access(
+            "a-1",
+            strings(&["src/x.rs", "docs/y.md"]),
+            "need the struct",
+        )
+        .unwrap();
+        let message = access_message(&request, &origin);
+        assert_eq!(message.title, None);
+        assert_eq!(message.content, b"need the struct");
+        assert_eq!(
+            decode_access_message(&fetched(&message, &identity())),
+            AccessMessage::Access {
+                name_hash: origin.0,
+                request: request.clone(),
+            }
+        );
+
+        let knock = knock_message(&KnockIntro::new("hello").unwrap(), &origin);
+        assert_eq!(
+            decode_access_message(&fetched(&knock, &identity())),
+            AccessMessage::NotAnAccess
+        );
+        let peer = peer_lxmf_message(
+            &OutboundPeer::new(PeerKind::Message, "hi", None, None, None).unwrap(),
+            &origin,
+        );
+        assert_eq!(
+            decode_access_message(&fetched(&peer, &identity())),
+            AccessMessage::NotAnAccess
+        );
+        let plain = OutboundMessage {
+            title: None,
+            content: b"hi".to_vec(),
+            fields: None,
+        };
+        assert_eq!(
+            decode_access_message(&fetched(&plain, &identity())),
+            AccessMessage::NotAnAccess
+        );
+
+        let data = map(vec![
+            ("name_hash", Value::Binary(origin.0.to_vec())),
+            ("id", Value::from("a-1")),
+            ("paths", list(&["src/x.rs", "docs/y.md"])),
+        ]);
+        let as_bytes = typed(Value::Binary(ACCESS_TYPE.as_bytes().to_vec()), data.clone());
+        assert_eq!(
+            decode_access_message(&fetched(&as_bytes, &identity())),
+            AccessMessage::Access {
+                name_hash: origin.0,
+                request,
+            }
+        );
+        let later_layout = typed(Value::from("scope.access/2"), data);
+        assert_eq!(
+            decode_access_message(&fetched(&later_layout, &identity())),
+            AccessMessage::NotAnAccess
+        );
+        let without_paths = typed(
+            Value::from(ACCESS_TYPE),
+            map(vec![
+                ("name_hash", Value::Binary(origin.0.to_vec())),
+                ("id", Value::from("a-1")),
+            ]),
+        );
+        assert_eq!(
+            decode_access_message(&fetched(&without_paths, &identity())),
+            AccessMessage::Malformed("paths is missing or not a list")
+        );
+        let without_data = typed(Value::from(ACCESS_TYPE), Value::from("src/x.rs"));
+        assert_eq!(
+            decode_access_message(&fetched(&without_data, &identity())),
+            AccessMessage::Malformed("custom data is missing or not a map")
+        );
+    }
+
+    #[test]
+    fn a_stored_access_request_is_held_to_the_link_rules() {
+        let origin = OriginName([7u8; NAME_HASH_LEN]);
+        let long_reason = "r".repeat(ACCESS_REASON_MAX_CHARS + 1);
+        let unchecked = |id: &str, paths: Vec<String>, reason: &str| ValidAccess {
+            id: id.to_string(),
+            paths,
+            reason: reason.to_string(),
+        };
+        let cases = [
+            (
+                unchecked("a-1", strings(&["../x.rs"]), ""),
+                "a path is not a wire path",
+            ),
+            (
+                unchecked("a-1", (0..17).map(|n| format!("src/{n}.rs")).collect(), ""),
+                "paths names more than the cap allows",
+            ),
+            (
+                unchecked("a-1", strings(&["src/x.rs"]), &long_reason),
+                "reason is longer than the cap allows",
+            ),
+            (
+                unchecked("a 1", strings(&["src/x.rs"]), ""),
+                "id is not a wire id",
+            ),
+            (unchecked("a-1", Vec::new(), ""), "paths is empty"),
+        ];
+        for (request, rule) in cases {
+            let message = access_message(&request, &origin);
+            assert_eq!(
+                decode_access_message(&fetched(&message, &identity())),
+                AccessMessage::Malformed(rule),
+                "{rule}"
+            );
+        }
+    }
+
+    struct Admitted {
+        identity: String,
+        destination: String,
+        request: ValidAccess,
+        via: PeerVia,
+    }
+
+    /// A surface that answers every admission with `outcome` and keeps what it was given.
+    struct ScriptedSurface {
+        outcome: AccessOutcome,
+        admitted: parking_lot::Mutex<Vec<Admitted>>,
+        settled: parking_lot::Mutex<Vec<(String, String, ValidAccess, f64)>>,
+    }
+
+    impl ScriptedSurface {
+        fn answering(outcome: AccessOutcome) -> Arc<Self> {
+            Arc::new(Self {
+                outcome,
+                admitted: parking_lot::Mutex::new(Vec::new()),
+                settled: parking_lot::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn admissions(&self) -> usize {
+            self.admitted.lock().len()
+        }
+    }
+
+    impl AccessSurface for ScriptedSurface {
+        fn admit_access(&self, request: InboundAccess) -> AccessOutcome {
+            self.admitted.lock().push(Admitted {
+                identity: request.identity_hash,
+                destination: request.destination_hash,
+                request: request.request,
+                via: request.via,
+            });
+            self.outcome.clone()
+        }
+
+        fn settle_granted_at_once(
+            &self,
+            identity_hash: &str,
+            destination_hash: &str,
+            request: &ValidAccess,
+            expires: f64,
+        ) {
+            self.settled.lock().push((
+                identity_hash.to_string(),
+                destination_hash.to_string(),
+                request.clone(),
+                expires,
+            ));
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingSink(parking_lot::Mutex<Vec<InboundMessage>>);
+
+    impl CountingSink {
+        fn count(&self) -> usize {
+            self.0.lock().len()
+        }
+    }
+
+    impl InboundSink for CountingSink {
+        fn deliver(&self, message: InboundMessage) {
+            self.0.lock().push(message);
+        }
+    }
+
+    /// The destination a stored request signed by `identity()` from `origin` names.
+    fn origin_destination(origin: &OriginName) -> String {
+        destination_address(
+            &origin.0,
+            &AddressHash::new_from_hex_string(&identity()).unwrap(),
+        )
+        .to_hex_string()
+    }
+
+    #[test]
+    fn a_propagated_access_request_from_an_untrusted_instance_is_dropped_before_admission() {
+        let origin = OriginName([7u8; NAME_HASH_LEN]);
+        let request = validate_access("a-1", strings(&["src/x.rs"]), "please").unwrap();
+        let message = fetched(&access_message(&request, &origin), &identity());
+        let surface = ScriptedSurface::answering(AccessOutcome::Pending);
+        let inner = CountingSink::default();
+        let (known_only, _known_dir) = TrustList::default()
+            .identity(&identity(), false)
+            .open("access-route-untrusted");
+        let routing = AccessRouting {
+            trust: &known_only,
+            surface: Some(Arc::clone(&surface) as Arc<dyn AccessSurface>),
+            inner: &inner,
+        };
+
+        routing.deliver(message.clone());
+        assert_eq!(surface.admissions(), 0);
+        assert_eq!(inner.count(), 0);
+
+        let knock = knock_message(&KnockIntro::new("hello").unwrap(), &origin);
+        routing.deliver(fetched(&knock, &identity()));
+        assert_eq!(surface.admissions(), 0);
+        assert_eq!(inner.count(), 1);
+
+        let destination = origin_destination(&origin);
+        let (trusting, _trusting_dir) = TrustList::default()
+            .destination(&destination, &identity())
+            .open("access-route-trusted");
+        let without_surface = AccessRouting {
+            trust: &trusting,
+            surface: None,
+            inner: &inner,
+        };
+        without_surface.deliver(message.clone());
+        assert_eq!(inner.count(), 1);
+
+        let routing = AccessRouting {
+            trust: &trusting,
+            surface: Some(Arc::clone(&surface) as Arc<dyn AccessSurface>),
+            inner: &inner,
+        };
+        let unchecked = ValidAccess {
+            id: "a-2".to_string(),
+            paths: strings(&["../x.rs"]),
+            reason: String::new(),
+        };
+        routing.deliver(fetched(&access_message(&unchecked, &origin), &identity()));
+        assert_eq!(surface.admissions(), 0);
+        assert_eq!(inner.count(), 1);
+
+        routing.deliver(message);
+        let admitted = surface.admitted.lock();
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(admitted[0].identity, identity());
+        assert_eq!(admitted[0].destination, destination);
+        assert_eq!(admitted[0].request, request);
+        assert_eq!(admitted[0].via, PeerVia::StoreAndForward);
+        assert!(surface.settled.lock().is_empty());
+        assert_eq!(inner.count(), 1);
+    }
+
+    #[test]
+    fn a_propagated_request_that_is_already_shared_sends_the_decision_reply() {
+        let origin = OriginName([8u8; NAME_HASH_LEN]);
+        let destination = origin_destination(&origin);
+        let request = validate_access("a-1", strings(&["src/x.rs"]), "").unwrap();
+        let message = fetched(&access_message(&request, &origin), &identity());
+        let inner = CountingSink::default();
+        let (trust, _dir) = TrustList::default()
+            .destination(&destination, &identity())
+            .open("access-route-granted");
+
+        let granting = ScriptedSurface::answering(AccessOutcome::Granted {
+            expires: 1_790_000_900.0,
+        });
+        AccessRouting {
+            trust: &trust,
+            surface: Some(Arc::clone(&granting) as Arc<dyn AccessSurface>),
+            inner: &inner,
+        }
+        .deliver(message.clone());
+        assert_eq!(granting.admissions(), 1);
+        assert_eq!(
+            *granting.settled.lock(),
+            vec![(
+                identity(),
+                destination.clone(),
+                request.clone(),
+                1_790_000_900.0
+            )]
+        );
+
+        let refusing =
+            ScriptedSurface::answering(AccessOutcome::Refused(AccessRefusal::TooManyPending));
+        AccessRouting {
+            trust: &trust,
+            surface: Some(Arc::clone(&refusing) as Arc<dyn AccessSurface>),
+            inner: &inner,
+        }
+        .deliver(message);
+        assert_eq!(refusing.admissions(), 1);
+        assert!(refusing.settled.lock().is_empty());
+        assert_eq!(inner.count(), 0);
+    }
+
+    fn reply_with(entries: Vec<(&str, Value)>) -> Value {
+        let mut all = vec![
+            ("v", Value::from(PEER_WIRE_VERSION)),
+            ("id", Value::from("a-1")),
+        ];
+        all.extend(entries);
+        map(all)
+    }
+
+    #[test]
+    fn a_reply_with_an_unknown_status_is_a_typed_error_never_a_panic() {
+        for outcome in [
+            AccessOutcome::Pending,
+            AccessOutcome::Granted {
+                expires: 1_790_000_900.0,
+            },
+            AccessOutcome::Refused(AccessRefusal::Duplicate),
+            AccessOutcome::Refused(AccessRefusal::TooManyPending),
+        ] {
+            assert_eq!(
+                decode_access_response(&access_reply("a-1", &outcome), "a-1"),
+                Ok(outcome)
+            );
+        }
+        assert_eq!(
+            decode_access_response(&reply_with(vec![("status", Value::from("later"))]), "a-1"),
+            Err(AccessError::UnknownStatus)
+        );
+        assert_eq!(
+            decode_access_response(
+                &reply_with(vec![
+                    ("status", Value::from("refused")),
+                    ("reason", Value::from("busy")),
+                ]),
+                "a-1"
+            ),
+            Err(AccessError::UnknownStatus)
+        );
+        assert_eq!(
+            decode_access_response(&reply_with(vec![("status", Value::from("refused"))]), "a-1"),
+            Err(AccessError::UnknownStatus)
+        );
+        assert_eq!(
+            decode_access_response(&reply_with(vec![("status", Value::from(2u64))]), "a-1"),
+            Err(AccessError::Malformed("status is missing or not text"))
+        );
+        assert_eq!(
+            decode_access_response(
+                &reply_with(vec![
+                    ("status", Value::from("pending")),
+                    ("eta", Value::from(90u64)),
+                    ("note", Value::from("the human is away")),
+                ]),
+                "a-1"
+            ),
+            Ok(AccessOutcome::Pending)
+        );
+        assert_eq!(
+            decode_access_response(&reply_with(vec![("status", Value::from("granted"))]), "a-1"),
+            Err(AccessError::Malformed("expires is missing or not a number"))
+        );
+        assert_eq!(
+            decode_access_response(
+                &reply_with(vec![
+                    ("status", Value::from("granted")),
+                    ("expires", Value::from("soon")),
+                ]),
+                "a-1"
+            ),
+            Err(AccessError::Malformed("expires is missing or not a number"))
+        );
+        assert_eq!(
+            decode_access_response(
+                &reply_with(vec![
+                    ("status", Value::from("granted")),
+                    ("expires", Value::from(EXPIRES_SECS)),
+                ]),
+                "a-1"
+            ),
+            Ok(AccessOutcome::Granted {
+                expires: 1_790_000_900.0
+            }),
+            "an integer expires reads as the number it is"
+        );
+    }
+
+    #[test]
+    fn a_reply_whose_id_differs_is_malformed() {
+        let wrong_id = Err(AccessError::Malformed("id is missing or not the one sent"));
+        assert_eq!(
+            decode_access_response(&access_reply("a-2", &AccessOutcome::Pending), "a-1"),
+            wrong_id
+        );
+        assert_eq!(
+            decode_access_response(
+                &map(vec![
+                    ("v", Value::from(PEER_WIRE_VERSION)),
+                    ("status", Value::from("pending")),
+                ]),
+                "a-1"
+            ),
+            wrong_id
+        );
+        assert_eq!(
+            decode_access_response(
+                &map(vec![
+                    ("v", Value::from(PEER_WIRE_VERSION)),
+                    ("id", Value::from(1u64)),
+                    ("status", Value::from("pending")),
+                ]),
+                "a-1"
+            ),
+            wrong_id
+        );
+    }
+
+    #[test]
+    fn a_reply_without_a_version_is_malformed() {
+        let unversioned = Err(AccessError::Malformed(
+            "v is missing or not the supported version",
+        ));
+        assert_eq!(
+            decode_access_response(
+                &map(vec![
+                    ("id", Value::from("a-1")),
+                    ("status", Value::from("pending")),
+                ]),
+                "a-1"
+            ),
+            unversioned
+        );
+        assert_eq!(
+            decode_access_response(
+                &map(vec![
+                    ("v", Value::from(PEER_WIRE_VERSION + 1)),
+                    ("id", Value::from("a-1")),
+                    ("status", Value::from("pending")),
+                ]),
+                "a-1"
+            ),
+            unversioned
+        );
+        assert_eq!(
+            decode_access_response(&Value::from("pending"), "a-1"),
+            Err(AccessError::Malformed("the body is not a map"))
+        );
+    }
+
+    #[test]
+    fn every_access_error_reads_as_prose_with_the_next_step() {
+        for err in [
+            AccessError::NotRunning,
+            AccessError::Untrusted,
+            AccessError::UnknownDestination,
+            AccessError::Invalid("a path is not a wire path"),
+            AccessError::NotFiled("the pending store is read-only".to_string()),
+            AccessError::Refused(RefusalCode::InvalidData),
+            AccessError::UnknownStatus,
+            AccessError::Malformed("status is missing or not text"),
+            AccessError::Direct(R3Error::LinkClosed),
+            AccessError::IncompatibleVersion {
+                destination: destination(),
+                found: Some(9),
+                min: 1,
+                max: 1,
+            },
+            AccessError::NoPropagationNode,
+            AccessError::Propagation(PropagationError::StampExhausted),
+        ] {
+            let text = err.to_string();
+            assert!(!text.is_empty(), "{err:?}");
+            assert!(!text.ends_with('\n'), "{text}");
+        }
+        assert!(AccessError::Untrusted.to_string().contains(".mesh trust"));
+        assert!(
+            AccessError::UnknownDestination
+                .to_string()
+                .contains(".mesh peers")
+        );
+        assert_eq!(
+            AccessError::Invalid("paths is empty").to_string(),
+            "The access request was refused: paths is empty"
+        );
+        assert_eq!(
+            AccessError::NotFiled("disk full".to_string()).to_string(),
+            "The access request was not sent because it could not be filed as pending: disk full"
+        );
+    }
+
+    #[cfg(unix)]
+    enum Script {
+        Answer(AccessOutcome),
+        Refuse(RefusalCode),
+    }
+
+    /// Serves `/access` on a stub with whatever the script says, keeping each request
+    /// it was asked.
+    #[cfg(unix)]
+    struct ScriptedAccess {
+        script: parking_lot::Mutex<Script>,
+        asked: parking_lot::Mutex<Vec<ValidAccess>>,
+    }
+
+    #[cfg(unix)]
+    impl ScriptedAccess {
+        fn answering(outcome: AccessOutcome) -> Arc<Self> {
+            Arc::new(Self {
+                script: parking_lot::Mutex::new(Script::Answer(outcome)),
+                asked: parking_lot::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn set(&self, script: Script) {
+            *self.script.lock() = script;
+        }
+
+        fn asked(&self) -> Vec<ValidAccess> {
+            self.asked.lock().clone()
+        }
+    }
+
+    #[cfg(unix)]
+    #[async_trait]
+    impl Handler for ScriptedAccess {
+        async fn handle(&self, request: AdmittedRequest) -> Reply {
+            let Ok(access) = decode_access(&request.body) else {
+                return Reply::Code(RefusalCode::InvalidData);
+            };
+            let id = access.id.clone();
+            self.asked.lock().push(access);
+            match &*self.script.lock() {
+                Script::Answer(outcome) => Reply::Value(access_reply(&id, outcome)),
+                Script::Refuse(code) => Reply::Code(*code),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn pending_store(installed: &Installed) -> PendingStore {
+        PendingStore::new(
+            installed.runtime.cache_dir(),
+            &installed.runtime.current_instance_id(),
+        )
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn request_access_opens_a_correlation_only_while_the_answer_is_pending() {
+        let stub = PeerStub::listen("access-request-stub", TcpServer::DEFAULT_CLIENT_MTU).await;
+        let responder = ScriptedAccess::answering(AccessOutcome::Pending);
+        stub.serve(ACCESS_PATH, Arc::clone(&responder) as Arc<dyn Handler>);
+        let installed = Installed::beside("access-request", &stub).await;
+        let to = stub.destination_hex();
+        let paths = strings(&["src/x.rs", "docs/y.md"]);
+
+        let pending = installed
+            .slot
+            .request_access(&to, &paths, "need the struct")
+            .await
+            .unwrap();
+
+        assert!(is_wire_id(&pending.id), "{}", pending.id);
+        assert_eq!(pending.status, AccessOutcome::Pending);
+        assert_eq!(pending.via, PeerVia::Direct);
+        let correlation = installed.slot.correlations().get(&pending.id).unwrap();
+        assert_eq!(correlation.record.thread, pending.id);
+        assert_eq!(correlation.record.question, "access: src/x.rs, docs/y.md");
+        assert_eq!(correlation.record.peer_destination, to);
+        assert_eq!(correlation.record.peer_identity, stub.identity_hex());
+        assert_eq!(correlation.record.state, PendingState::Open);
+        assert!(correlation.reply.is_none());
+        let on_disk = pending_store(&installed).list(SystemTime::now()).unwrap();
+        assert_eq!(on_disk.len(), 1);
+        assert_eq!(on_disk[0].id, pending.id);
+        assert_eq!(
+            responder.asked(),
+            vec![ValidAccess {
+                id: pending.id.clone(),
+                paths: paths.clone(),
+                reason: "need the struct".to_string(),
+            }]
+        );
+
+        responder.set(Script::Answer(AccessOutcome::Granted {
+            expires: 1_790_000_900.0,
+        }));
+        let granted = installed
+            .slot
+            .request_access(&to, &paths[..1], "")
+            .await
+            .unwrap();
+        assert_eq!(
+            granted.status,
+            AccessOutcome::Granted {
+                expires: 1_790_000_900.0
+            }
+        );
+        assert_eq!(granted.via, PeerVia::Direct);
+        assert!(installed.slot.correlations().get(&granted.id).is_none());
+
+        responder.set(Script::Answer(AccessOutcome::Refused(
+            AccessRefusal::Duplicate,
+        )));
+        let refused = installed
+            .slot
+            .request_access(&to, &paths, "")
+            .await
+            .unwrap();
+        assert_eq!(
+            refused.status,
+            AccessOutcome::Refused(AccessRefusal::Duplicate)
+        );
+        assert!(installed.slot.correlations().get(&refused.id).is_none());
+
+        responder.set(Script::Refuse(RefusalCode::InvalidData));
+        let err = installed
+            .slot
+            .request_access(&to, &paths, "")
+            .await
+            .unwrap_err();
+        assert_eq!(err, AccessError::Refused(RefusalCode::InvalidData));
+
+        let open: Vec<String> = installed
+            .slot
+            .correlations()
+            .list()
+            .iter()
+            .map(|correlation| correlation.record.id.clone())
+            .collect();
+        assert_eq!(open, vec![pending.id.clone()]);
+        let on_disk = pending_store(&installed).list(SystemTime::now()).unwrap();
+        assert_eq!(on_disk.len(), 1);
+        assert_eq!(responder.asked().len(), 4);
+        assert!(stub.seen().is_empty());
+        installed.stop().await;
+        stub.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn request_access_refuses_an_untrusted_or_unknown_destination_before_sending() {
+        let stub = PeerStub::listen("access-refused-stub", TcpServer::DEFAULT_CLIENT_MTU).await;
+        let responder = ScriptedAccess::answering(AccessOutcome::Pending);
+        stub.serve(ACCESS_PATH, Arc::clone(&responder) as Arc<dyn Handler>);
+        let installed = Installed::beside("access-refused", &stub).await;
+        let to = stub.destination_hex();
+        let paths = strings(&["src/x.rs"]);
+        let slot = &installed.slot;
+
+        let invalid = slot
+            .request_access(&to, &strings(&["../x.rs"]), "")
+            .await
+            .unwrap_err();
+        assert_eq!(invalid, AccessError::Invalid("a path is not a wire path"));
+
+        let stranger = hex_lower(&[0x5a; 16]);
+        let unknown = slot
+            .request_access(&stranger, &paths, "")
+            .await
+            .unwrap_err();
+        assert_eq!(unknown, AccessError::Untrusted);
+        let garbled = slot
+            .request_access("not a hash", &paths, "")
+            .await
+            .unwrap_err();
+        assert_eq!(garbled, AccessError::Untrusted);
+
+        let silent = derived_sighting("access-silent", None);
+        let silent_destination = silent.destination_hash.clone();
+        installed.runtime.peers().observe(silent, SystemTime::now());
+        installed
+            .runtime
+            .trust()
+            .trust_destination(
+                slot.as_ref(),
+                &silent_destination,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        let unannounced = slot
+            .request_access(&silent_destination, &paths, "")
+            .await
+            .unwrap_err();
+        assert_eq!(unannounced, AccessError::UnknownDestination);
+
+        let store = pending_store(&installed);
+        fs::create_dir_all(store.path().parent().unwrap()).unwrap();
+        fs::write(store.path(), "not a pending question\n").unwrap();
+        let not_filed = slot.request_access(&to, &paths, "").await.unwrap_err();
+        let AccessError::NotFiled(reason) = not_filed else {
+            panic!("{not_filed:?}");
+        };
+        assert!(reason.contains("pending store"), "{reason}");
+        fs::remove_file(store.path()).unwrap();
+
+        installed
+            .runtime
+            .trust()
+            .untrust_destination(slot.as_ref(), &to)
+            .unwrap();
+        let withdrawn = slot.request_access(&to, &paths, "").await.unwrap_err();
+        assert_eq!(withdrawn, AccessError::Untrusted);
+
+        assert!(responder.asked().is_empty());
+        assert!(slot.correlations().list().is_empty());
+        installed.stop().await;
+        stub.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_grant_a_stored_request_earns_at_once_reaches_the_peer_as_a_decision_reply() {
+        let stub =
+            PeerStub::listen("access-stored-grant-stub", TcpServer::DEFAULT_CLIENT_MTU).await;
+        let installed = Installed::beside("access-stored-grant", &stub).await;
+        fs::write(installed.root.join("src/x.rs"), b"struct X;").unwrap();
+        installed.share_with("src/x.rs", &stub.identity_hex());
+        let request = validate_access("a-1", strings(&["src/x.rs"]), "").unwrap();
+        let message = fetched(
+            &access_message(&request, &stub.origin()),
+            &stub.identity_hex(),
+        );
+        let inner = Arc::new(CountingSink::default());
+        let before = SystemTime::now();
+
+        tokio::task::spawn_blocking({
+            let trust = installed.runtime.trust();
+            let slot = Arc::clone(&installed.slot);
+            let inner = Arc::clone(&inner);
+            move || {
+                AccessRouting {
+                    trust: &trust,
+                    surface: Some(slot as Arc<dyn AccessSurface>),
+                    inner: inner.as_ref(),
+                }
+                .deliver(message);
+            }
+        })
+        .await
+        .unwrap();
+
+        wait_until("the stub to hear the grant", || stub.seen().len() == 1).await;
+        let body = decision_seen(&stub, "a-1");
+        let RawPart::Data { data } = &body.parts[0] else {
+            panic!("{:?}", body.parts);
+        };
+        assert_eq!(data["access"]["status"], json!("granted"));
+        let expires = Duration::from_secs_f64(data["access"]["expires"].as_f64().unwrap());
+        within(UNIX_EPOCH + expires, before, DEFAULT_GRANT_TTL);
+        assert!(
+            body.content.starts_with("access granted: 1 path until "),
+            "{}",
+            body.content
+        );
+        assert_eq!(inner.count(), 0);
+        assert!(access_records(&installed.slot).is_empty());
+        assert!(installed.idle.texts().is_empty());
+        let events: Vec<HookEvent> = installed
+            .hooks
+            .drain()
+            .iter()
+            .map(|(event, _)| *event)
+            .collect();
+        assert_eq!(
+            events,
+            vec![
+                HookEvent::MeshAccessRequested,
+                HookEvent::MeshAccessDecided,
+                HookEvent::MeshMessageSent,
+            ]
+        );
         installed.stop().await;
         stub.stop().await;
     }

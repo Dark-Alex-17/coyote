@@ -156,6 +156,7 @@ impl FetchServing {
         self.grants.store(grants);
     }
 
+    #[cfg(test)]
     pub(crate) fn grants(&self) -> Arc<GrantStore> {
         self.grants.load_full()
     }
