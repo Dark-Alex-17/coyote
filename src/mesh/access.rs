@@ -736,6 +736,8 @@ impl AccessSurface for MeshSlot {
         };
         // The rule is judged and the record filed under one lock, so a burst of
         // requests from one identity cannot each see the cap unreached and all be filed.
+        // Every open record is judged, whatever its kind or peer, so a re-used id is a
+        // duplicate and never a filing failure the peer would hear as `too_many_pending`.
         match store.file_unless(record, now, |open| {
             rate_rule(open, &identity_hash, &request.id, &request.paths)
         }) {
@@ -749,7 +751,9 @@ impl AccessSurface for MeshSlot {
                 return AccessOutcome::Refused(refusal);
             }
             Err(err) => {
-                warn!(
+                // Logged at debug: the store's own guards are all judged by the rule
+                // first, so what reaches here is I/O, never something a peer can trigger.
+                debug!(
                     "Mesh /access from {id8} (instance {dest8}) was not filed: {}",
                     redact_hashes(&format!("{err:#}"))
                 );
@@ -1297,26 +1301,27 @@ fn already_shared(
         .all(|path| shares.is_allowed(peer, path, case_insensitive))
 }
 
-/// The refusal, if any, that `identity`'s open access requests earn a new one for
-/// `paths` under `id`: an open request under the same id is a duplicate whatever it
-/// names, so the paths the human read stand; the same set of paths already waiting, in
-/// any order, is a duplicate; and past `ACCESS_MAX_PENDING_PER_IDENTITY` open requests
-/// nothing more is filed.
+/// The refusal, if any, that the open records earn a new access request for `paths`
+/// under `id`: any open record under the same id, of either kind and from any peer, is
+/// a duplicate whatever the new one names, so the paths the human read stand and an id
+/// is never filed twice; among `identity`'s own open access requests the same set of
+/// paths already waiting, in any order, is a duplicate; and past
+/// `ACCESS_MAX_PENDING_PER_IDENTITY` of them nothing more is filed.
 fn rate_rule(
     open: &[InboundRecord],
     identity: &str,
     id: &str,
     paths: &[String],
 ) -> Option<AccessRefusal> {
+    if open.iter().any(|record| record.id == id) {
+        return Some(AccessRefusal::Duplicate);
+    }
     let mine: Vec<&InboundRecord> = open
         .iter()
         .filter(|record| {
             record.kind == InboundKind::Access && same_hash(&record.peer_identity, identity)
         })
         .collect();
-    if mine.iter().any(|record| record.id == id) {
-        return Some(AccessRefusal::Duplicate);
-    }
     let asked = path_set(paths);
     if mine.iter().any(|record| path_set(&record.paths) == asked) {
         return Some(AccessRefusal::Duplicate);
@@ -1941,7 +1946,8 @@ mod tests {
     }
 
     /// Both sides of the identity compare are canonical lowercase hex, so the serving
-    /// path neither case-folds nor short-circuits on them.
+    /// path neither case-folds nor short-circuits on them. The per-identity rule is the
+    /// path-set one: a re-used id is a duplicate whoever sends it.
     #[test]
     fn rate_rule_compares_identities_in_constant_time_shape() {
         let source = include_str!("access.rs");
@@ -1960,12 +1966,16 @@ mod tests {
             ..question_record("a-1")
         }];
         assert_eq!(
-            rate_rule(&open, &"AB".repeat(16), "a-1", &["x".to_string()]),
+            rate_rule(&open, &"AB".repeat(16), "a-2", &["src/x.rs".to_string()]),
             None,
             "mixed case is another identity under the canonical compare"
         );
         assert_eq!(
-            rate_rule(&open, &"ab".repeat(16), "a-1", &["x".to_string()]),
+            rate_rule(&open, &"ab".repeat(16), "a-2", &["src/x.rs".to_string()]),
+            Some(AccessRefusal::Duplicate)
+        );
+        assert_eq!(
+            rate_rule(&open, &"AB".repeat(16), "a-1", &["x".to_string()]),
             Some(AccessRefusal::Duplicate)
         );
     }
