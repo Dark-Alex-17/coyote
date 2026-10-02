@@ -3594,4 +3594,240 @@ mod tests {
         installed.stop().await;
         stub.stop().await;
     }
+
+    // ---- usage-probe (TASK-112): spec-first tests derived from the T30 acceptance text ----
+
+    /// G3: "Unknown keys ignored on receipt". A body with keys the receiver has never
+    /// heard of, at the top level and inside the list, is admitted exactly as the bare
+    /// body would be: `pending`, filed, surfaced once.
+    #[tokio::test]
+    async fn usage_probe_unknown_keys_in_an_access_body_are_ignored_on_receipt() {
+        let fixture = bare_slot("usage-probe-access-unknown-keys");
+        let handler = AccessHandler::new(Arc::downgrade(&fixture.slot) as Weak<dyn AccessSurface>);
+        let peer = TransportIdentity::new_from_rand(OsRng);
+        let body = map(vec![
+            ("v", Value::from(PEER_WIRE_VERSION)),
+            ("id", Value::from("a-1")),
+            ("paths", list(&["src/x.rs"])),
+            ("reason", Value::from("need the struct")),
+            ("priority", Value::from("urgent")),
+            ("nested", map(vec![("deep", Value::from(1u64))])),
+            ("flags", Value::Array(vec![Value::from(true)])),
+        ]);
+
+        let reply = handler.handle(admitted(body, &peer)).await;
+
+        let Reply::Value(value) = reply else {
+            panic!("not a value reply");
+        };
+        assert_eq!(value, access_reply("a-1", &AccessOutcome::Pending));
+        assert!(!has_key(&value, "priority"));
+        let records = access_records(&fixture.slot);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].paths, strings(&["src/x.rs"]));
+        assert_eq!(records[0].reason, "need the struct");
+        assert_eq!(fixture.idle.texts().len(), 1);
+    }
+
+    /// G7 on the wire: with no snapshot published the request is still answered
+    /// `pending` (never refused, never granted) and filed, and the human line says the
+    /// paths are unknown until a turn completes.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_without_a_share_root_the_wire_answer_is_pending_and_the_request_is_filed()
+    {
+        let installed = Installed::unrooted("usage-probe-access-unrooted").await;
+        let handler =
+            AccessHandler::new(Arc::downgrade(&installed.slot) as Weak<dyn AccessSurface>);
+        let peer = TransportIdentity::new_from_rand(OsRng);
+
+        let reply = handler
+            .handle(admitted(
+                body("a-1", &["src/x.rs", "docs/y.md"], "why"),
+                &peer,
+            ))
+            .await;
+
+        let Reply::Value(value) = reply else {
+            panic!("not a value reply");
+        };
+        assert_eq!(value, access_reply("a-1", &AccessOutcome::Pending));
+        let records = access_records(&installed.slot);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].kind, InboundKind::Access);
+        let texts = installed.idle.texts();
+        assert_eq!(texts.len(), 1, "{texts:?}");
+        assert!(
+            texts[0].contains(
+                "asks for 2 paths: src/x.rs (unknown until a turn completes), docs/y.md (unknown until a turn completes)"
+            ),
+            "{}",
+            texts[0]
+        );
+        assert!(!texts[0].contains("exists"), "{}", texts[0]);
+        assert!(!texts[0].contains("missing"), "{}", texts[0]);
+        installed.stop().await;
+    }
+
+    /// (c)/(g): a request is decided once. A second `grant` or a `refuse` after the
+    /// grant is a typed error naming the id, the peer hears exactly one decision and the
+    /// `MeshAccessDecided` hook fires exactly once.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_a_decided_request_cannot_be_decided_again() {
+        let stub = PeerStub::listen(
+            "usage-probe-access-decided-twice-stub",
+            TcpServer::DEFAULT_CLIENT_MTU,
+        )
+        .await;
+        let installed = Installed::beside("usage-probe-access-decided-twice", &stub).await;
+        installed.ask(&stub, "a-1", &["src/x.rs"]).await;
+
+        installed
+            .slot
+            .access()
+            .grant("a-1", false, None)
+            .await
+            .unwrap();
+        let again = installed
+            .slot
+            .access()
+            .grant("a-1", false, None)
+            .await
+            .unwrap_err()
+            .to_string();
+        let refused = installed
+            .slot
+            .access()
+            .refuse("a-1")
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(again.contains("no open access request a-1"), "{again}");
+        assert!(refused.contains("no open access request a-1"), "{refused}");
+        assert_eq!(installed.grants().len(), 1);
+        decided_once(&installed.hooks, "a-1", "granted");
+        decision_seen(&stub, "a-1");
+        assert_eq!(stub.seen().len(), 1, "the peer heard one decision");
+        installed.stop().await;
+        stub.stop().await;
+    }
+
+    /// (a)+F8: the per-identity cap counts PENDING entries only. Once the sixth request
+    /// is refused as `too_many_pending`, refusing one of the five reopens the cap and the
+    /// next request is filed again.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_deciding_one_pending_request_reopens_the_per_identity_cap() {
+        let stub = PeerStub::listen(
+            "usage-probe-access-cap-reopens-stub",
+            TcpServer::DEFAULT_CLIENT_MTU,
+        )
+        .await;
+        let installed = Installed::beside("usage-probe-access-cap-reopens", &stub).await;
+        for n in 0..ACCESS_MAX_PENDING_PER_IDENTITY {
+            let path = format!("src/{n}.rs");
+            installed.ask(&stub, &format!("a-{n}"), &[&path]).await;
+        }
+        let admit = |id: &'static str, path: &'static str| {
+            let slot = Arc::clone(&installed.slot);
+            let identity = stub.identity_hex();
+            let destination = stub.destination_hex();
+            tokio::task::spawn_blocking(move || {
+                slot.admit_access(InboundAccess {
+                    identity_hash: identity,
+                    destination_hash: destination,
+                    request: validate_access(id, strings(&[path]), "").unwrap(),
+                    via: PeerVia::Direct,
+                })
+            })
+        };
+
+        let sixth = admit("a-6", "src/6.rs").await.unwrap();
+        assert!(
+            matches!(sixth, AccessOutcome::Refused(AccessRefusal::TooManyPending)),
+            "{sixth:?}"
+        );
+        installed.slot.access().refuse("a-0").await.unwrap();
+        let seventh = admit("a-7", "src/7.rs").await.unwrap();
+
+        assert!(matches!(seventh, AccessOutcome::Pending), "{seventh:?}");
+        let ids: Vec<String> = access_records(&installed.slot)
+            .into_iter()
+            .map(|record| record.id)
+            .collect();
+        assert_eq!(ids.len(), ACCESS_MAX_PENDING_PER_IDENTITY);
+        assert!(!ids.contains(&"a-0".to_string()), "{ids:?}");
+        assert!(!ids.contains(&"a-6".to_string()), "{ids:?}");
+        assert!(ids.contains(&"a-7".to_string()), "{ids:?}");
+        installed.stop().await;
+        stub.stop().await;
+    }
+
+    /// Spec tension, pinned as observed (advisory in the probe verdict): the Approach
+    /// says "immediate `granted` when every path is already served to that peer", and
+    /// `is_served` does count a live one-off grant. The admission rule consults the share
+    /// RULES only, so a peer that still holds an unspent one-off grant and asks again is
+    /// `pending` (the human is asked a second time) rather than `granted`; the earlier
+    /// grant is left untouched, so asking never spends a use.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_asking_again_while_holding_a_live_one_off_grant_is_pending_and_spends_nothing()
+     {
+        let stub = PeerStub::listen(
+            "usage-probe-access-reask-stub",
+            TcpServer::DEFAULT_CLIENT_MTU,
+        )
+        .await;
+        let installed = Installed::beside("usage-probe-access-reask", &stub).await;
+        fs::write(installed.root.join("src/x.rs"), b"struct X;").unwrap();
+        installed.ask(&stub, "a-1", &["src/x.rs"]).await;
+        installed
+            .slot
+            .access()
+            .grant("a-1", false, None)
+            .await
+            .unwrap();
+        installed.hooks.drain();
+        let destination = stub.destination_hex();
+        let identity = stub.identity_hex();
+        let peer = PeerRef {
+            identity: &identity,
+            destination: &destination,
+        };
+        assert!(
+            installed
+                .runtime
+                .serving()
+                .grants()
+                .is_granted(&peer, "src/x.rs", SystemTime::now())
+                .unwrap(),
+            "the one-off grant is live"
+        );
+
+        let again = tokio::task::spawn_blocking({
+            let slot = Arc::clone(&installed.slot);
+            let identity = identity.clone();
+            let destination = destination.clone();
+            move || {
+                slot.admit_access(InboundAccess {
+                    identity_hash: identity,
+                    destination_hash: destination,
+                    request: validate_access("a-2", strings(&["src/x.rs"]), "").unwrap(),
+                    via: PeerVia::Direct,
+                })
+            }
+        })
+        .await
+        .unwrap();
+
+        assert!(matches!(again, AccessOutcome::Pending), "{again:?}");
+        let grants = installed.grants();
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].paths[0].uses_left, DEFAULT_GRANT_USES);
+        assert_eq!(access_records(&installed.slot).len(), 1);
+        installed.stop().await;
+        stub.stop().await;
+    }
 }

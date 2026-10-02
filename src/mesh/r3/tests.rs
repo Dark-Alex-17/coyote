@@ -6866,6 +6866,329 @@ pub(crate) mod network {
         pair.stop_node_a().await;
     }
 
+    // ---- usage-probe (TASK-112): spec-first tests derived from the T30 acceptance text ----
+
+    /// G8 + I4 (MESH-ENV-027): `/access` is always registered, so an instance whose
+    /// identity this node has no standing for meets the trust gate, not an unknown-path
+    /// refusal: silence before a byte of the body is decoded, exactly as on `/status`,
+    /// `/list` and `/fetch`; nothing filed, no human line, no access hook. A shared path
+    /// and an unshared one are equally silent, so there is no oracle.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_an_untrusted_instances_access_request_is_silent_like_status_and_leaves_nothing_behind()
+     {
+        let pair = NodePair::start_with(
+            "usage-probe-r3-access-untrusted",
+            |_| {},
+            |_| TrustList::default(),
+        )
+        .await;
+        let (slot, idle) = installed_slot(&pair);
+        let sink = hook_sink_for(&pair, &slot);
+        let workspace = share_docs_from_a(&pair, &slot, "usage-probe-r3-access-untrusted-root");
+        fs::write(workspace.path.join("docs").join("a.md"), b"# a\n").unwrap();
+
+        let shared = pair
+            .client_b
+            .request(
+                &pair.responder.transport,
+                &pair.responder.identity,
+                &pair.a_desc,
+                ACCESS_PATH,
+                pair.responder
+                    .envelope(access_body("acc-1", &["docs/a.md"], "already shared")),
+                short_options(),
+            )
+            .await
+            .unwrap_err();
+        let unshared = pair
+            .client_b
+            .request(
+                &pair.responder.transport,
+                &pair.responder.identity,
+                &pair.a_desc,
+                ACCESS_PATH,
+                pair.responder
+                    .envelope(access_body("acc-2", &["src/x.rs"], "not shared")),
+                short_options(),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(shared, timed_out(ACCESS_PATH));
+        assert_eq!(unshared, timed_out(ACCESS_PATH));
+        assert!(
+            slot.inbound_store()
+                .unwrap()
+                .list(SystemTime::now())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            idle.0
+                .lock()
+                .iter()
+                .all(|note| note.source != Source::Access),
+            "{:?}",
+            idle.0.lock()
+        );
+        let fired = sink.drain();
+        assert!(
+            fires_of(&fired, HookEvent::MeshAccessRequested).is_empty(),
+            "{fired:?}"
+        );
+        assert!(
+            fires_of(&fired, HookEvent::MeshAccessDecided).is_empty(),
+            "{fired:?}"
+        );
+        pair.stop_node_a().await;
+    }
+
+    /// MESH-ENV-032: a known identity whose instance is not trusted (default closed) hears
+    /// the one shared `NoAccess` on `/access`, as on every other path; the request is not
+    /// filed as an access record, no human line is raised and no access hook fires.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_a_known_but_untrusted_instances_access_request_earns_no_access_and_is_never_filed()
+     {
+        let pair = NodePair::start_with(
+            "usage-probe-r3-access-default-closed",
+            |_| {},
+            |responder| {
+                TrustList::default()
+                    .identity(&responder.desc.identity.address_hash.to_hex_string(), false)
+            },
+        )
+        .await;
+        let (slot, idle) = installed_slot(&pair);
+        let sink = hook_sink_for(&pair, &slot);
+        let workspace =
+            share_docs_from_a(&pair, &slot, "usage-probe-r3-access-default-closed-root");
+        fs::write(workspace.path.join("docs").join("a.md"), b"# a\n").unwrap();
+
+        let err = pair
+            .client_b
+            .request(
+                &pair.responder.transport,
+                &pair.responder.identity,
+                &pair.a_desc,
+                ACCESS_PATH,
+                pair.responder
+                    .envelope(access_body("acc-1", &["docs/a.md"], "let me in")),
+                short_options(),
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(err, R3Error::Refused(RefusalCode::NoAccess));
+        assert!(
+            slot.inbound_store()
+                .unwrap()
+                .list(SystemTime::now())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            idle.0
+                .lock()
+                .iter()
+                .all(|note| note.source != Source::Access),
+            "{:?}",
+            idle.0.lock()
+        );
+        let fired = sink.drain();
+        assert!(
+            fires_of(&fired, HookEvent::MeshAccessRequested).is_empty(),
+            "{fired:?}"
+        );
+        pair.stop_node_a().await;
+    }
+
+    /// "Deny wins, always": a request for a built-in denied path is the human's to decide
+    /// (no on-wire oracle, so it is `pending`), but even a grant cannot make the node
+    /// serve it. The fetch after the grant is `not_shared`, byte-identical to the fetch
+    /// of a path that does not exist.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_a_grant_on_a_built_in_denied_path_never_serves_it() {
+        let pair =
+            NodePair::start_with("usage-probe-r3-access-deny-wins", |_| {}, trusting_b).await;
+        pair.introduce_b_to_a().await;
+        let (slot, idle) = installed_slot(&pair);
+        let envoy = Arc::new(CountingEnvoy::default());
+        slot.set_envoy(envoy.clone() as Arc<dyn EnvoySink>);
+        let workspace = share_docs_from_a(&pair, &slot, "usage-probe-r3-access-deny-wins-root");
+        fs::write(workspace.path.join(".env"), b"SECRET=hunter2\n").unwrap();
+
+        let asked = b_asks_a(
+            &pair,
+            ACCESS_PATH,
+            access_body("acc-env", &[".env"], "need the secrets"),
+            short_options(),
+        )
+        .await;
+        assert_eq!(wire_status(&asked.value), "pending");
+        assert_eq!(idle.0.lock().len(), 1);
+
+        pair.recorder_b.queue(Script::Acknowledge);
+        let granted = slot.access().grant("acc-env", false, None).await;
+        assert!(granted.is_ok(), "{granted:?}");
+
+        let fetched = b_asks_a(&pair, FETCH_PATH, fetch_body(".env", None), short_options()).await;
+        let missing = b_asks_a(
+            &pair,
+            FETCH_PATH,
+            fetch_body("docs/nope.md", None),
+            short_options(),
+        )
+        .await;
+
+        assert_eq!(wire_status(&fetched.value), "not_shared");
+        assert_eq!(fetched.value, missing.value);
+        assert_eq!(envoy.0.load(Ordering::SeqCst), 0);
+        pair.stop_node_a().await;
+    }
+
+    /// (e), first half: the requester has a path but never answers at decision time, so
+    /// the decision reply takes the T16 store-and-forward route: typed `coyote.peer`,
+    /// signed by A, decryptable by B alone, a `reply` in the access thread marked
+    /// `answered` with the one `{access: {status, expires}}` data part and no `paths`.
+    /// Read back on a requester whose pending store still holds the access id (what a
+    /// restart reloads), it is collected under that id. Takes PEER_REQUEST_TIMEOUT.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_a_decision_for_an_unreachable_requester_is_stored_with_the_propagation_node_and_collects_under_the_access_id()
+     {
+        let (pair, mut node) = pair_with_propagation_node_trusting(
+            "usage-probe-r3-access-decision-fallback",
+            trusting_b,
+        )
+        .await;
+        pair.introduce_b_to_a().await;
+        let (slot, idle) = installed_slot(&pair);
+        let sink = hook_sink_for(&pair, &slot);
+        let workspace =
+            share_docs_from_a(&pair, &slot, "usage-probe-r3-access-decision-fallback-root");
+        fs::write(
+            workspace.path.join("src").join("secret.rs"),
+            b"struct Secret;\n",
+        )
+        .unwrap();
+
+        let asked = b_asks_a(
+            &pair,
+            ACCESS_PATH,
+            access_body("acc-sf", &["src/secret.rs"], "need the struct"),
+            short_options(),
+        )
+        .await;
+        assert_eq!(wire_status(&asked.value), "pending");
+        assert_eq!(idle.0.lock().len(), 1);
+        let before = SystemTime::now();
+
+        pair.recorder_b.queue(Script::Hang);
+        let report = slot.access().grant("acc-sf", false, None).await.unwrap();
+
+        assert_eq!(report.via, PeerVia::StoreAndForward);
+        let expires = report.expires.unwrap();
+        assert!(expires > before, "{expires:?}");
+        let received = node.next_received().await;
+        let stored = stored_peer(
+            received.bytes(),
+            &pair.responder.identity,
+            &pair.a_desc.identity,
+        );
+        let PeerLxmf::Peer(stored) = stored else {
+            panic!("not a peer message: {stored:?}");
+        };
+        assert_eq!(stored.name_hash, OriginName::of(&pair.a_desc.name).0);
+        assert_eq!(stored.kind, PeerKind::Reply);
+        assert_eq!(stored.in_reply_to.as_deref(), Some("acc-sf"));
+        assert_eq!(stored.thread.as_deref(), Some("acc-sf"));
+        assert_eq!(stored.disposition, Some(Disposition::Answered));
+        assert_eq!(stored.fields, None);
+        assert_eq!(stored.dropped_parts, 0);
+        let expires_secs = expires.duration_since(UNIX_EPOCH).unwrap().as_secs_f64();
+        assert_eq!(
+            stored.parts,
+            vec![RawPart::Data {
+                data: serde_json::json!({ "access": { "status": "granted", "expires": expires_secs } })
+            }]
+        );
+        assert!(!stored.content.contains("secret"), "{}", stored.content);
+        node.nothing_else_received();
+        assert!(
+            slot.inbound_store()
+                .unwrap()
+                .list(SystemTime::now())
+                .unwrap()
+                .is_empty(),
+            "the decided request is no longer pending on the responder"
+        );
+        assert_eq!(pair.node_a.serving().grants().list().unwrap().len(), 1);
+        let fired = sink.drain();
+        let decided = fires_of(&fired, HookEvent::MeshAccessDecided);
+        assert_eq!(decided.len(), 1, "{fired:?}");
+        assert_eq!(
+            crate::mesh::events::env_value(decided[0], "COYOTE_MESH_DECISION"),
+            Some("granted")
+        );
+
+        // The requester, up again with the access id still in its pending store, hears
+        // the stored reply as a fetched peer message and collects it under the id.
+        let requester = MeshSlot::default();
+        let now = SystemTime::now();
+        requester
+            .correlations()
+            .open(PendingRecord {
+                version: PENDING_RECORD_VERSION,
+                id: "acc-sf".to_string(),
+                peer_destination: pair.a_desc.address_hash.to_hex_string(),
+                peer_identity: pair.a_desc.identity.address_hash.to_hex_string(),
+                thread: "acc-sf".to_string(),
+                question: "access: src/secret.rs".to_string(),
+                sent_at: rfc3339_utc(now),
+                timeout_at: rfc3339_utc(now + Duration::from_secs(600)),
+                state: PendingState::Open,
+                reply: None,
+            })
+            .unwrap();
+        requester.deliver_peer(crate::mesh::message::PeerMessage::new(
+            crate::mesh::message::RawPeerMessage {
+                source_identity: pair.a_desc.identity.address_hash.to_hex_string(),
+                source_destination: pair.a_desc.address_hash.to_hex_string(),
+                destination: pair.responder.desc.address_hash.to_hex_string(),
+                title: stored.title.clone(),
+                content: stored.content.clone(),
+                fields: stored.fields.clone(),
+                timestamp: 1_700_000_000.0,
+                message_id: stored.id.clone(),
+                in_reply_to: stored.in_reply_to.clone(),
+                kind: stored.kind,
+                via: PeerVia::StoreAndForward,
+                thread: stored.thread.clone(),
+                disposition: stored.disposition,
+                retry_after: stored.retry_after,
+                parts: stored.parts.clone(),
+                dropped_parts: stored.dropped_parts,
+            },
+        ));
+        let answer = requester
+            .correlations()
+            .take_answer("acc-sf")
+            .expect("the decision collects under the access id");
+        assert_eq!(answer.kind, PeerKind::Reply);
+        assert_eq!(answer.in_reply_to.as_deref(), Some("acc-sf"));
+        assert_eq!(answer.disposition, Some(Disposition::Answered));
+        assert_eq!(answer.via, PeerVia::StoreAndForward);
+        assert_eq!(
+            answer.parts,
+            vec![Part::Data {
+                data: serde_json::json!({ "access": { "status": "granted", "expires": expires_secs } })
+            }]
+        );
+        assert!(requester.correlations().take_answer("acc-sf").is_none());
+
+        pair.stop_node_a().await;
+        node.stop().await;
+    }
+
     /// The largest file the responder serves today rides one Resource segment; the split
     /// (multi-segment) case waits on the upstream fix `SINGLE_SEGMENT_FETCH_CEILING`
     /// documents. The ceiling is one byte away from the next segment, so a response here
