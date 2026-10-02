@@ -7562,4 +7562,105 @@ mod tests {
         assert!(slot.stop().await.unwrap());
         stub.stop().await;
     }
+
+    /// Usage probe (spec-first, TASK-111 r5, pins c414858): when a re-key is refused, the
+    /// node goes on serving the ORIGINAL instance's grants even if the original's grant
+    /// file cannot be re-opened at that moment — the store that was displaced is the one
+    /// put back (same handle, same path), never the fork's. Before c414858 the rollback
+    /// re-opened the file, and a failed re-open left the fork's grants in force.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_a_refused_rekey_puts_back_the_displaced_grant_store_even_when_its_file_is_unreadable()
+     {
+        use crate::mesh::shares::PeerRef;
+        use std::os::unix::fs::PermissionsExt;
+
+        let started = started_runtime("node-probe-rekey-grants-no-reopen").await;
+        let cache_dir = started.runtime.cache_dir().to_path_buf();
+        let original_id = started.runtime.current_instance_id();
+        let fork_id = fresh_instance_id();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(started.runtime.clone()).unwrap();
+        let now = SystemTime::now();
+        let peer_destination = hex_lower(&[0x3f; 16]);
+        let peer = PeerRef {
+            identity: "ignored-by-grants",
+            destination: &peer_destination,
+        };
+        for (instance, path) in [
+            (&original_id, "docs/original.md"),
+            (&fork_id, "docs/fork.md"),
+        ] {
+            GrantStore::new(&cache_dir, instance)
+                .grant(
+                    "0123456789abcdef",
+                    &peer_destination,
+                    &[path.into()],
+                    None,
+                    now,
+                )
+                .unwrap();
+        }
+        let serving = started.runtime.serving();
+        let before = serving.grants();
+        let original_file = before.path().to_path_buf();
+        assert!(
+            original_file.to_string_lossy().contains(&original_id),
+            "{}",
+            original_file.display()
+        );
+        let set_mode = |mode| {
+            std::fs::set_permissions(&original_file, std::fs::Permissions::from_mode(mode))
+                .unwrap();
+        };
+        set_mode(0o000);
+        if std::fs::read(&original_file).is_ok() {
+            // Root reads anything; nothing to show here.
+            set_mode(0o600);
+            assert!(slot.stop().await.unwrap());
+            started.relay_handle.abort();
+            return;
+        }
+
+        let err = slot
+            .rekey(ForkRekey {
+                original_instance_id: Some(fresh_instance_id()),
+                fork_instance_id: fork_id.clone(),
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(".mesh off"), "{err}");
+
+        let after = serving.grants();
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "the displaced store itself is put back, not a re-opened copy"
+        );
+        assert_eq!(after.path(), original_file.as_path());
+        assert!(
+            !matches!(after.is_granted(&peer, "docs/fork.md", now), Ok(true)),
+            "the fork's grants are never in force on a node that did not re-key"
+        );
+
+        // Once the file is readable again the original's accounting resumes untouched.
+        set_mode(0o600);
+        assert!(
+            after.is_granted(&peer, "docs/original.md", now).unwrap(),
+            "the original's grant is still there"
+        );
+        assert!(
+            !after.is_granted(&peer, "docs/fork.md", now).unwrap(),
+            "the fork's grant file was never consulted"
+        );
+        assert_eq!(started.runtime.current_instance_id(), original_id);
+        assert!(
+            GrantStore::new(&cache_dir, &fork_id)
+                .is_granted(&peer, "docs/fork.md", now)
+                .unwrap(),
+            "the fork's own file still holds its grant: the rollback did not touch disk"
+        );
+        assert!(slot.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
 }

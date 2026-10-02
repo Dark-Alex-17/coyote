@@ -2795,4 +2795,62 @@ mod tests {
             "a refusal line carried the path: {leaked:?}"
         );
     }
+
+    /// Usage probe (spec-first, TASK-111 r5): cursor misuse at the handler. A cursor that
+    /// is well-formed but unknown (right alphabet and length, names no entry) starts the
+    /// listing over at the first page; so does a cursor that named an entry which has
+    /// since vanished from the share root — a stale page token never yields an error, a
+    /// gap, or a leak of other files.
+    #[tokio::test]
+    async fn usage_probe_an_unknown_or_stale_cursor_starts_the_listing_over() {
+        let fx = Fixture::new("fetch-probe-cursor", MAX_FETCH_FILE_BYTES, &["docs/**"]);
+        let names = ["docs/a.md", "docs/b.md", "docs/c.md"];
+        for name in names {
+            fx.file(name, name.as_bytes());
+        }
+        // Also an unshared sibling that no cursor may ever surface.
+        fx.file("src/x.rs", b"x");
+
+        let first = fx.list(None, None).await;
+        assert_eq!(entry_paths(&first), names);
+        assert_eq!(next_of(&first), None);
+
+        // A well-formed cursor that matches nothing: 32 lowercase hex, like a real one.
+        let unknown = "0".repeat(32);
+        let restarted = fx.list(None, Some(&unknown)).await;
+        assert_eq!(
+            entry_paths(&restarted),
+            names,
+            "an unknown cursor starts over at the first page"
+        );
+        assert_eq!(next_of(&restarted), None);
+
+        // A real cursor resumes after the entry it names...
+        let after_a = fx.list(None, Some(&shares::list_cursor("docs/a.md"))).await;
+        assert_eq!(entry_paths(&after_a), ["docs/b.md", "docs/c.md"]);
+
+        // ...and once that entry is gone the same cursor is stale and starts over.
+        fs::remove_file(fx.root.join("docs").join("a.md")).unwrap();
+        let stale = fx.list(None, Some(&shares::list_cursor("docs/a.md"))).await;
+        assert_eq!(
+            entry_paths(&stale),
+            ["docs/b.md", "docs/c.md"],
+            "a stale cursor starts over, which is now the whole remaining set"
+        );
+        assert_eq!(next_of(&stale), None);
+
+        // A cursor built from an unshared file's path reveals nothing about it: it is
+        // simply unknown and starts over.
+        let unshared = fx.list(None, Some(&shares::list_cursor("src/x.rs"))).await;
+        assert_eq!(entry_paths(&unshared), ["docs/b.md", "docs/c.md"]);
+
+        // Spec worked example: a prefix combined with an unknown cursor still filters.
+        let prefixed = fx.list(Some("docs/c"), Some(&unknown)).await;
+        assert_eq!(entry_paths(&prefixed), ["docs/c.md"]);
+        assert!(
+            !entry_paths(&prefixed).iter().any(|p| p.starts_with("src/")),
+            "{:?}",
+            entry_paths(&prefixed)
+        );
+    }
 }

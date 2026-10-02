@@ -7003,4 +7003,246 @@ pub(crate) mod network {
         );
         pair.stop_node_a().await;
     }
+
+    /// Usage probe (spec-first, TASK-111 r5): over a real link, every served fetch fires
+    /// `mesh.fetch.served` exactly once, and the env names the REAL requester — node B's
+    /// identity hash and destination hash as A learned them from the link, not fixture
+    /// stand-ins — plus the served size and the first eight hex of the sha256; nothing in
+    /// the env carries the wire path or the file bytes, and `not_modified` / `not_shared`
+    /// answers fire nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_mesh_fetch_served_over_a_live_pair_names_the_real_requester_once_per_served_fetch()
+     {
+        use crate::mesh::events::env_value;
+
+        let pair = NodePair::start_with("r3-probe-hook-env", |_| {}, trusting_b).await;
+        let (slot, _idle) = installed_slot(&pair);
+        let sink = RecordingHookSink::attach(pair.node_a.hooks());
+        let workspace = share_docs_from_a(&pair, &slot, "r3-probe-hook-env-root");
+        let first = b"first file body, deliberately distinctive\n".to_vec();
+        let second = b"second body\n".to_vec();
+        fs::write(workspace.path.join("docs").join("one.md"), &first).unwrap();
+        fs::write(workspace.path.join("docs").join("two.md"), &second).unwrap();
+        let first_digest: [u8; 32] = Sha256::digest(&first).into();
+        let second_digest: [u8; 32] = Sha256::digest(&second).into();
+        let b_identity = pair.responder.desc.identity.address_hash.to_hex_string();
+        let b_destination = pair.responder.desc.address_hash.to_hex_string();
+
+        for path in ["docs/one.md", "docs/two.md"] {
+            let served = b_asks_a(&pair, FETCH_PATH, fetch_body(path, None), short_options()).await;
+            assert_eq!(wire_status(&served.value), "ok", "{path}");
+        }
+        let unchanged = b_asks_a(
+            &pair,
+            FETCH_PATH,
+            fetch_body("docs/one.md", Some(first_digest)),
+            short_options(),
+        )
+        .await;
+        assert_eq!(wire_status(&unchanged.value), "not_modified");
+        let unshared = b_asks_a(
+            &pair,
+            FETCH_PATH,
+            fetch_body("src/x.rs", None),
+            short_options(),
+        )
+        .await;
+        assert_eq!(wire_status(&unshared.value), "not_shared");
+
+        // The hook is dispatched after the reply is on the wire; give it a moment to land.
+        wait_until("both served fetches to fire mesh.fetch.served", || {
+            sink.snapshot()
+                .iter()
+                .filter(|(event, _)| *event == HookEvent::MeshFetchServed)
+                .count()
+                >= 2
+        })
+        .await;
+        let fires: Vec<Vec<(&'static str, String)>> = sink
+            .drain()
+            .into_iter()
+            .filter(|(event, _)| *event == HookEvent::MeshFetchServed)
+            .map(|(_, envs)| envs)
+            .collect();
+        assert_eq!(
+            fires.len(),
+            2,
+            "one fire per served fetch, none for refusals: {fires:?}"
+        );
+
+        let expected = [
+            (first.len(), &hex_lower(&first_digest)[..8]),
+            (second.len(), &hex_lower(&second_digest)[..8]),
+        ];
+        for (envs, (size, prefix)) in fires.iter().zip(expected) {
+            assert_eq!(
+                env_value(envs, "COYOTE_MESH_PEER_IDENTITY"),
+                Some(b_identity.as_str()),
+                "{envs:?}"
+            );
+            assert_eq!(
+                env_value(envs, "COYOTE_MESH_PEER_DESTINATION"),
+                Some(b_destination.as_str()),
+                "{envs:?}"
+            );
+            assert_eq!(
+                env_value(envs, "COYOTE_MESH_SIZE"),
+                Some(size.to_string().as_str())
+            );
+            assert_eq!(env_value(envs, "COYOTE_MESH_HASH_PREFIX"), Some(prefix));
+            let keys: Vec<&str> = envs.iter().map(|(key, _)| *key).collect();
+            assert_eq!(
+                keys.len(),
+                4,
+                "the env is exactly the four spec'd keys: {keys:?}"
+            );
+            for (_, value) in envs {
+                assert!(!value.contains("docs/"), "a path leaked: {value}");
+                assert!(
+                    !value.contains("one.md") && !value.contains("two.md"),
+                    "{value}"
+                );
+                assert!(
+                    !value.contains("distinctive") && !value.contains("second body"),
+                    "file bytes leaked: {value}"
+                );
+            }
+        }
+        pair.stop_node_a().await;
+    }
+
+    /// The msgpack bytes `value` puts on the wire, for byte-for-byte refusal comparisons.
+    fn wire_bytes(value: &Value) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        rmpv::encode::write_value(&mut bytes, value).unwrap();
+        bytes
+    }
+
+    /// Usage probe (spec-first, TASK-111 r5): grant + deny interplay over a real link. A
+    /// one-off grant makes a path OUTSIDE the share set fetchable exactly once, but a path
+    /// the share list denies is never served even when granted, and its refusal is the
+    /// same `not_shared` bytes a missing file gets. Neither granted path shows up in
+    /// `/list`, which is the effective share set only, and only the served fetch fires
+    /// the hook.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_a_granted_path_is_served_once_and_a_denied_one_never_over_a_live_pair() {
+        use crate::mesh::grants::GrantStore;
+
+        let pair = NodePair::start_with("r3-probe-grant-deny", |_| {}, trusting_b).await;
+        let (slot, _idle) = installed_slot(&pair);
+        let sink = RecordingHookSink::attach(pair.node_a.hooks());
+        let workspace = share_docs_from_a(&pair, &slot, "r3-probe-grant-deny-root");
+        // Tighten the share list written by the helper: docs/** allowed, docs/secret/** denied.
+        let shares = mesh_config_dir(&pair.config_dir_a()).join("shares.yaml");
+        fs::write(
+            &shares,
+            "version: 1\nallow:\n- pattern: 'docs/**'\ndeny:\n- pattern: 'docs/secret/**'\n",
+        )
+        .unwrap();
+        fs::create_dir_all(workspace.path.join("docs").join("secret")).unwrap();
+        fs::write(workspace.path.join("docs").join("a.md"), b"# a\n").unwrap();
+        fs::write(
+            workspace.path.join("docs").join("secret").join("s.md"),
+            b"top secret\n",
+        )
+        .unwrap();
+        let b_destination = pair.responder.desc.address_hash.to_hex_string();
+        GrantStore::new(pair.node_a.cache_dir(), &pair.node_a.current_instance_id())
+            .grant(
+                "0123456789abcdef",
+                &b_destination,
+                &["docs/secret/s.md".to_string(), "src/x.rs".to_string()],
+                None,
+                SystemTime::now(),
+            )
+            .unwrap();
+
+        let listed = b_asks_a(
+            &pair,
+            LIST_PATH,
+            wire_map(vec![("v", Value::from(PEER_WIRE_VERSION))]),
+            short_options(),
+        )
+        .await;
+        let paths: Vec<&str> = wire_field(&listed.value, "entries")
+            .and_then(Value::as_array)
+            .unwrap()
+            .iter()
+            .map(|entry| wire_field(entry, "path").and_then(Value::as_str).unwrap())
+            .collect();
+        assert_eq!(
+            paths,
+            ["docs/a.md"],
+            "grants and denied files never appear in /list"
+        );
+
+        let missing = b_asks_a(
+            &pair,
+            FETCH_PATH,
+            fetch_body("docs/nowhere.md", None),
+            short_options(),
+        )
+        .await;
+        assert_eq!(wire_status(&missing.value), "not_shared");
+        let denied_but_granted = b_asks_a(
+            &pair,
+            FETCH_PATH,
+            fetch_body("docs/secret/s.md", None),
+            short_options(),
+        )
+        .await;
+        assert_eq!(
+            wire_bytes(&denied_but_granted.value),
+            wire_bytes(&missing.value),
+            "a denied-but-granted path is refused byte for byte like a missing one"
+        );
+
+        let granted = b_asks_a(
+            &pair,
+            FETCH_PATH,
+            fetch_body("src/x.rs", None),
+            short_options(),
+        )
+        .await;
+        assert_eq!(wire_status(&granted.value), "ok");
+        assert_eq!(
+            wire_field(&granted.value, "bytes"),
+            Some(&Value::Binary(b"fn main() {}\n".to_vec()))
+        );
+        let spent = b_asks_a(
+            &pair,
+            FETCH_PATH,
+            fetch_body("src/x.rs", None),
+            short_options(),
+        )
+        .await;
+        assert_eq!(
+            wire_bytes(&spent.value),
+            wire_bytes(&missing.value),
+            "the second fetch of a one-off grant is not_shared byte for byte"
+        );
+        // The denied path is still refused after the grant's other use was spent.
+        let still_denied = b_asks_a(
+            &pair,
+            FETCH_PATH,
+            fetch_body("docs/secret/s.md", None),
+            short_options(),
+        )
+        .await;
+        assert_eq!(wire_status(&still_denied.value), "not_shared");
+
+        wait_until("the one served fetch to fire mesh.fetch.served", || {
+            sink.snapshot()
+                .iter()
+                .any(|(event, _)| *event == HookEvent::MeshFetchServed)
+        })
+        .await;
+        let fires = sink
+            .drain()
+            .into_iter()
+            .filter(|(event, _)| *event == HookEvent::MeshFetchServed)
+            .count();
+        assert_eq!(fires, 1, "only the granted src/x.rs fetch was served");
+        pair.stop_node_a().await;
+    }
 }
