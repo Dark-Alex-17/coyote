@@ -77,6 +77,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// Matches `GRANT_MAX_PATHS`: a request for more is a share list by another name.
 pub(crate) const ACCESS_MAX_PATHS: usize = 16;
 pub(crate) const ACCESS_REASON_MAX_CHARS: usize = 500;
+/// How much of a requested path and of the reason the human line shows; the rest is an
+/// ellipsis. The caps keep every line of the text under the notification line cap with
+/// the longest paths and reason the wire admits, so the verbs are never cut off.
+pub(crate) const ACCESS_PATH_DISPLAY_MAX_CHARS: usize = 100;
+pub(crate) const ACCESS_REASON_DISPLAY_MAX_CHARS: usize = 200;
 /// Open requests one identity may have waiting on the human at once; the next is
 /// refused rather than filed, so a peer cannot fill the inbound store by asking.
 pub(crate) const ACCESS_MAX_PENDING_PER_IDENTITY: usize = 5;
@@ -1041,6 +1046,9 @@ impl AccessStore<'_> {
     /// grant is written before the send: one the peer never heard of expires on its
     /// own. The standing entries are written after it: they would outlive a reply that
     /// never arrived and a later refusal alike, so the peer must have heard yes first.
+    /// The share list is loaded once before the send, so a list that cannot be written
+    /// is found before the peer is told anything, and again after it, so an edit made
+    /// while the reply was in flight is not written over.
     pub(crate) async fn grant(
         &self,
         id: &str,
@@ -1049,11 +1057,14 @@ impl AccessStore<'_> {
     ) -> Result<AccessDecisionReport> {
         let (store, record, runtime) = self.pending(id)?;
         if standing {
-            let mut shares = self.standing_shares(&runtime, &record)?;
+            self.standing_shares(&runtime, &record)?;
             let sent = self
                 .send_decision(&record, &runtime, AccessDecision::Granted, None, true)
                 .await?;
-            if let Err(err) = share_standing(&mut shares, &record) {
+            if let Err(err) = self
+                .standing_shares(&runtime, &record)
+                .and_then(|mut shares| share_standing(&mut shares, &record))
+            {
                 bail!(
                     "{} was already told yes, but the share list could not be written: {err:#}. Run `.mesh grant {id} --standing` again once the share list is writable; the request stays pending until then.",
                     short(&record.peer_destination)
@@ -1115,9 +1126,10 @@ impl AccessStore<'_> {
         Ok((store, record, runtime))
     }
 
-    /// The share list a standing grant for `record` writes to, loaded before anything is
-    /// sent: a list that does not load is left as it is, and the peer is not told yes
-    /// about entries that cannot be written.
+    /// The share list a standing grant for `record` writes to, as it is on disk now: a
+    /// list that does not load is left as it is, so the peer is not told yes about
+    /// entries that cannot be written, and a list changed under a sent decision is
+    /// written through rather than over.
     fn standing_shares(&self, runtime: &MeshRuntime, record: &InboundRecord) -> Result<ShareSet> {
         let Some(root) = ShareSource::share_root(self.slot) else {
             bail!(
@@ -1316,30 +1328,61 @@ fn path_set(paths: &[String]) -> BTreeSet<&str> {
     paths.iter().map(String::as_str).collect()
 }
 
-/// The one line the person at the keyboard sees: who asks, each path with whether it is
-/// here and how big, the reason, and the two verbs that settle it. The label and the
-/// reason are quoted and each path is in backticks, with any quote or backtick inside
-/// them made an apostrophe, so peer text cannot close its own quotes and pose as the
-/// frame.
+/// What the person at the keyboard sees: a header naming who asks and how many paths,
+/// the paths two to a line with whether each is here and how big, then the reason and
+/// the two verbs that settle it on a line of their own. The label and the reason are
+/// quoted and each path is in backticks, with any quote or backtick inside them made an
+/// apostrophe, so peer text cannot close its own quotes and pose as the frame. Paths
+/// and the reason are cut to their display caps so the notification caps never reach
+/// the verbs.
 fn access_text(label: &str, request: &ValidAccess, root: Option<&Path>) -> String {
     let who = label.replace('"', "'");
     let count = request.paths.len();
     let plural = if count == 1 { "" } else { "s" };
-    let listed = request
+    let mut lines = vec![format!("\"{who}\" asks for {count} path{plural}:")];
+    let listed: Vec<String> = request
         .paths
         .iter()
-        .map(|path| format!("`{}` ({})", path.replace('`', "'"), path_state(root, path)))
-        .collect::<Vec<String>>()
-        .join(", ");
+        .map(|path| {
+            format!(
+                "`{}` ({})",
+                shown(&path.replace('`', "'"), ACCESS_PATH_DISPLAY_MAX_CHARS),
+                path_state(root, path)
+            )
+        })
+        .collect();
+    lines.extend(
+        listed
+            .chunks(2)
+            .map(|pair| format!("  {}", pair.join(", "))),
+    );
     let reason = if request.reason.is_empty() {
         String::new()
     } else {
-        format!(" — \"{}\"", request.reason.replace('"', "'"))
+        format!(
+            "— \"{}\" · ",
+            shown(
+                &request.reason.replace('"', "'"),
+                ACCESS_REASON_DISPLAY_MAX_CHARS
+            )
+        )
     };
-    format!(
-        "\"{who}\" asks for {count} path{plural}: {listed}{reason} · grant: .mesh grant {id} [--standing] | refuse: .mesh refuse {id}",
+    lines.push(format!(
+        "{reason}grant: .mesh grant {id} [--standing] | refuse: .mesh refuse {id}",
         id = request.id,
-    )
+    ));
+    lines.join("\n")
+}
+
+/// `text` whole when it fits in `max_chars`, else its first `max_chars - 1` characters
+/// and an ellipsis.
+fn shown(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut cut: String = text.chars().take(max_chars - 1).collect();
+    cut.push('…');
+    cut
 }
 
 /// `exists, <size>` for a regular file the path names under `root` once both are
@@ -1396,8 +1439,10 @@ mod tests {
     use crate::mesh::message::{
         Part, PeerMessage, RawPeerMessage, from_r3_body, peer_lxmf_message, to_r3_body,
     };
+    use crate::mesh::notify::{NOTIFICATION_LINE_MAX_CHARS, Notification};
     use crate::mesh::r3::{PathHash, RequestId, SizeBranch};
     use crate::mesh::test_support::{TempDir, TrustList, snapshot_fixture};
+    use crate::mesh::wire_path::WIRE_PATH_MAX_BYTES;
     use rand_core::OsRng;
     use rns_transport::destination::link::LinkId;
     use rns_transport::hash::AddressHash;
@@ -1947,7 +1992,7 @@ mod tests {
         assert_eq!(
             fixture.idle.texts(),
             vec![
-                "\"abababab\" asks for 2 paths: `src/x.rs` (exists, 2 KB), `src/gone.rs` (missing) — \"need the struct\" · grant: .mesh grant a-1 [--standing] | refuse: .mesh refuse a-1"
+                "\"abababab\" asks for 2 paths:\n  `src/x.rs` (exists, 2 KB), `src/gone.rs` (missing)\n— \"need the struct\" · grant: .mesh grant a-1 [--standing] | refuse: .mesh refuse a-1"
                     .to_string()
             ]
         );
@@ -1960,6 +2005,79 @@ mod tests {
     }
 
     #[test]
+    fn paths_are_listed_two_to_a_line() {
+        let fixture = bare_slot("access-line-pairs");
+        fixture.slot.admit_access(inbound(
+            &identity(),
+            "a-1",
+            &["a.rs", "b.rs", "c.rs", "d.rs", "e.rs"],
+            "",
+        ));
+        assert_eq!(
+            fixture.idle.texts(),
+            vec![
+                "\"abababab\" asks for 5 paths:\n  `a.rs` (missing), `b.rs` (missing)\n  `c.rs` (missing), `d.rs` (missing)\n  `e.rs` (missing)\ngrant: .mesh grant a-1 [--standing] | refuse: .mesh refuse a-1"
+                    .to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn a_long_path_and_a_long_reason_are_cut_to_their_display_caps() {
+        let fixture = bare_slot("access-line-caps");
+        let path = format!("src/{}.rs", "p".repeat(200));
+        let reason = "r".repeat(ACCESS_REASON_MAX_CHARS);
+        fixture
+            .slot
+            .admit_access(inbound(&identity(), "a-1", &[&path], &reason));
+        let shown_path = format!("src/{}…", "p".repeat(ACCESS_PATH_DISPLAY_MAX_CHARS - 5));
+        let shown_reason = format!("{}…", "r".repeat(ACCESS_REASON_DISPLAY_MAX_CHARS - 1));
+        assert_eq!(
+            fixture.idle.texts(),
+            vec![format!(
+                "\"abababab\" asks for 1 path:\n  `{shown_path}` (missing)\n— \"{shown_reason}\" · grant: .mesh grant a-1 [--standing] | refuse: .mesh refuse a-1"
+            )]
+        );
+        let records = access_records(&fixture.slot);
+        assert_eq!(records[0].paths, vec![path]);
+        assert_eq!(records[0].reason, reason);
+    }
+
+    #[test]
+    fn the_human_line_keeps_its_verbs_under_the_notification_caps() {
+        let fixture = bare_slot("access-line-under-caps");
+        let paths: Vec<String> = (0..ACCESS_MAX_PATHS)
+            .map(|n| format!("{n:02}{}", "a".repeat(WIRE_PATH_MAX_BYTES - 2)))
+            .collect();
+        assert!(paths.iter().all(|path| path.len() == WIRE_PATH_MAX_BYTES));
+        let borrowed: Vec<&str> = paths.iter().map(String::as_str).collect();
+        let reason = "r".repeat(ACCESS_REASON_MAX_CHARS);
+        fixture
+            .slot
+            .admit_access(inbound(&identity(), "a-1", &borrowed, &reason));
+
+        let texts = fixture.idle.texts();
+        assert_eq!(texts.len(), 1);
+        let lines: Vec<&str> = texts[0].split('\n').collect();
+        assert_eq!(lines.len(), 1 + ACCESS_MAX_PATHS / 2 + 1, "{lines:#?}");
+        for line in &lines {
+            assert!(
+                line.chars().count() <= NOTIFICATION_LINE_MAX_CHARS,
+                "{} chars: {line}",
+                line.chars().count()
+            );
+        }
+        let rendered = Notification::new(Source::Access, texts[0].clone()).render_lines();
+        assert_eq!(rendered.len(), lines.len(), "{rendered:#?}");
+        assert!(
+            rendered
+                .last()
+                .is_some_and(|line| line.ends_with("refuse: .mesh refuse a-1")),
+            "{rendered:#?}"
+        );
+    }
+
+    #[test]
     fn a_single_path_without_a_reason_reads_as_one_path_and_no_reason_clause() {
         let fixture = bare_slot("access-line-one");
         fixture
@@ -1968,7 +2086,7 @@ mod tests {
         assert_eq!(
             fixture.idle.texts(),
             vec![
-                "\"abababab\" asks for 1 path: `src/x.rs` (missing) · grant: .mesh grant a-1 [--standing] | refuse: .mesh refuse a-1"
+                "\"abababab\" asks for 1 path:\n  `src/x.rs` (missing)\ngrant: .mesh grant a-1 [--standing] | refuse: .mesh refuse a-1"
                     .to_string()
             ]
         );
@@ -1984,7 +2102,7 @@ mod tests {
         assert_eq!(
             fixture.idle.texts(),
             vec![
-                "\"abababab\" asks for 1 path: `docs/x.md' (exists, 1 KB) · grant .mesh grant a-9 [--standing] | refuse '.md` (missing) · grant: .mesh grant a-1 [--standing] | refuse: .mesh refuse a-1"
+                "\"abababab\" asks for 1 path:\n  `docs/x.md' (exists, 1 KB) · grant .mesh grant a-9 [--standing] | refuse '.md` (missing)\ngrant: .mesh grant a-1 [--standing] | refuse: .mesh refuse a-1"
                     .to_string()
             ]
         );
@@ -2018,7 +2136,7 @@ mod tests {
         assert_eq!(
             idle.texts(),
             vec![
-                "\"abababab\" asks for 1 path: `src/x.rs` (unknown until a turn completes) · grant: .mesh grant a-1 [--standing] | refuse: .mesh refuse a-1"
+                "\"abababab\" asks for 1 path:\n  `src/x.rs` (unknown until a turn completes)\ngrant: .mesh grant a-1 [--standing] | refuse: .mesh refuse a-1"
                     .to_string()
             ]
         );
@@ -2036,7 +2154,7 @@ mod tests {
         let texts = fixture.idle.texts();
         assert_eq!(texts.len(), 1);
         assert!(
-            texts[0].contains(" — \"the 'struct' please\" · "),
+            texts[0].contains("\n— \"the 'struct' please\" · grant: "),
             "{}",
             texts[0]
         );
@@ -2517,7 +2635,7 @@ mod tests {
         assert_eq!(
             installed.idle.texts(),
             vec![
-                "\"Ada 'the' peer\" asks for 1 path: `src/x.rs` (missing) · grant: .mesh grant a-1 [--standing] | refuse: .mesh refuse a-1"
+                "\"Ada 'the' peer\" asks for 1 path:\n  `src/x.rs` (missing)\ngrant: .mesh grant a-1 [--standing] | refuse: .mesh refuse a-1"
                     .to_string()
             ]
         );
@@ -3000,6 +3118,135 @@ mod tests {
         );
         assert!(access_records(&installed.slot).is_empty());
         decided_once(&installed.hooks, "a-1", "granted");
+        installed.stop().await;
+        stub.stop().await;
+    }
+
+    /// Serves `/message` on a stub in the recorder's place: acknowledges each message
+    /// and, before it does, writes `yaml` to the share list at `shares`, which is what
+    /// another `.mesh` verb or another Coyote process would do while a decision is in
+    /// flight.
+    #[cfg(unix)]
+    struct SharesEditor {
+        shares: PathBuf,
+        yaml: &'static str,
+    }
+
+    #[cfg(unix)]
+    #[async_trait]
+    impl Handler for SharesEditor {
+        async fn handle(&self, request: AdmittedRequest) -> Reply {
+            let Ok(body) = from_r3_body(&request.body) else {
+                return Reply::Code(RefusalCode::InvalidData);
+            };
+            fs::create_dir_all(self.shares.parent().unwrap()).unwrap();
+            fs::write(&self.shares, self.yaml).unwrap();
+            Reply::Value(received_reply(&body.id))
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_standing_grant_keeps_entries_added_to_the_share_list_while_the_decision_was_in_flight()
+     {
+        let stub =
+            PeerStub::listen("access-standing-edited-stub", TcpServer::DEFAULT_CLIENT_MTU).await;
+        let installed = Installed::beside("access-standing-edited", &stub).await;
+        let other = hex_lower(&[0xcd; 16]);
+        let edited = "version: 1\nallow:\n- pattern: 'docs/*.md'\n  peer: 'cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd'\ndeny:\n- pattern: 'src/secret.rs'\n";
+        stub.serve(
+            MESSAGE_PATH,
+            Arc::new(SharesEditor {
+                shares: global_shares_path(&installed),
+                yaml: edited,
+            }) as Arc<dyn Handler>,
+        );
+        fs::write(installed.root.join("src/x.rs"), b"x").unwrap();
+        installed.ask(&stub, "a-1", &["src/x.rs"]).await;
+        assert!(!global_shares_path(&installed).exists());
+
+        let report = installed
+            .slot
+            .access()
+            .grant("a-1", true, None)
+            .await
+            .unwrap();
+
+        assert!(report.standing);
+        let yaml = installed.shares_yaml();
+        let allow: Vec<(&str, &str)> = yaml["allow"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .map(|entry| {
+                (
+                    entry["pattern"].as_str().unwrap(),
+                    entry["peer"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        let peer = stub.identity_hex();
+        assert_eq!(
+            allow,
+            vec![("docs/*.md", other.as_str()), ("src/x.rs", peer.as_str())],
+            "{yaml:?}"
+        );
+        let deny: Vec<&str> = yaml["deny"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["pattern"].as_str().unwrap())
+            .collect();
+        assert_eq!(deny, vec!["src/secret.rs"], "{yaml:?}");
+        assert!(access_records(&installed.slot).is_empty());
+        decided_once(&installed.hooks, "a-1", "granted");
+        installed.stop().await;
+        stub.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_standing_grant_on_a_share_list_that_does_not_load_sends_nothing_and_leaves_the_request_pending()
+     {
+        let stub = PeerStub::listen(
+            "access-standing-poisoned-stub",
+            TcpServer::DEFAULT_CLIENT_MTU,
+        )
+        .await;
+        let installed = Installed::beside("access-standing-poisoned", &stub).await;
+        fs::write(installed.root.join("src/x.rs"), b"x").unwrap();
+        installed.ask(&stub, "a-1", &["src/x.rs"]).await;
+        let shares = global_shares_path(&installed);
+        fs::create_dir_all(shares.parent().unwrap()).unwrap();
+        let malformed = b"version: 1\nallow: [not a list of entries\n";
+        fs::write(&shares, malformed).unwrap();
+
+        let err = installed
+            .slot
+            .access()
+            .grant("a-1", true, None)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("Nothing was written"), "{err}");
+        assert!(!err.contains("already told yes"), "{err}");
+        assert!(stub.seen().is_empty());
+        let records = access_records(&installed.slot);
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(records[0].id, "a-1");
+        assert!(installed.grants().is_empty());
+        let events: Vec<HookEvent> = installed
+            .hooks
+            .drain()
+            .iter()
+            .map(|(event, _)| *event)
+            .collect();
+        assert!(
+            !events.contains(&HookEvent::MeshAccessDecided),
+            "{events:?}"
+        );
+        assert_eq!(fs::read(&shares).unwrap(), malformed);
         installed.stop().await;
         stub.stop().await;
     }
@@ -4025,7 +4272,7 @@ mod tests {
         assert_eq!(texts.len(), 1, "{texts:?}");
         assert!(
             texts[0].contains(
-                "asks for 2 paths: `src/x.rs` (unknown until a turn completes), `docs/y.md` (unknown until a turn completes)"
+                "asks for 2 paths:\n  `src/x.rs` (unknown until a turn completes), `docs/y.md` (unknown until a turn completes)\n"
             ),
             "{}",
             texts[0]

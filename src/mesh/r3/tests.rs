@@ -6714,7 +6714,7 @@ pub(crate) mod network {
             assert!(
                 notes[0]
                     .text
-                    .contains("asks for 1 path: `src/secret.rs` (exists,"),
+                    .contains("asks for 1 path:\n  `src/secret.rs` (exists,"),
                 "{}",
                 notes[0].text
             );
@@ -7995,7 +7995,9 @@ pub(crate) mod network {
             let notes = idle.0.lock();
             assert_eq!(notes.len(), 1, "{notes:?}");
             assert!(
-                notes[0].text.contains("asks for 1 path: `src/secret.rs`"),
+                notes[0]
+                    .text
+                    .contains("asks for 1 path:\n  `src/secret.rs`"),
                 "{}",
                 notes[0].text
             );

@@ -527,9 +527,10 @@ impl InboundStore {
     }
 }
 
-/// The access fields have to agree with `kind`: a question carries none of them, an
-/// access request carries what the wire handler accepted, so a stored record can be
-/// granted without being validated again.
+/// The kind-specific fields have to agree with `kind`: a question carries no paths or
+/// reason, an access request carries no question text and the paths and reason the
+/// wire handler accepted, so a stored record can be granted without being validated
+/// again.
 fn validate_kind_shape(record: &InboundRecord) -> Result<()> {
     match record.kind {
         InboundKind::Question => {
@@ -540,6 +541,11 @@ fn validate_kind_shape(record: &InboundRecord) -> Result<()> {
             }
         }
         InboundKind::Access => {
+            if !record.question.is_empty() || !record.envoy_question.is_empty() {
+                bail!(
+                    "An inbound access request carries a question, which only a question may; refusing to store it."
+                );
+            }
             if record.paths.is_empty() || record.paths.len() > ACCESS_MAX_PATHS {
                 bail!(
                     "An inbound access request names between 1 and {ACCESS_MAX_PATHS} paths, not {}; refusing to store it.",
@@ -1725,8 +1731,27 @@ mod tests {
                     ..access.clone()
                 },
             ),
+            (
+                "an access request with a question",
+                InboundRecord {
+                    question: "may I?".to_string(),
+                    ..access.clone()
+                },
+            ),
+            (
+                "an access request with an envoy question",
+                InboundRecord {
+                    envoy_question: "should we?".to_string(),
+                    ..access.clone()
+                },
+            ),
         ];
-        for (what, broken) in cases {
+        // Each under its own id, so the shape rule and not the no-rewrite rule refuses it.
+        for (n, (what, broken)) in cases.into_iter().enumerate() {
+            let broken = InboundRecord {
+                id: format!("broken-{n}"),
+                ..broken
+            };
             assert!(store.upsert(broken, t(1_000)).is_err(), "{what} was stored");
         }
         assert_eq!(inbound_ids(&store.list(t(1_000)).unwrap()), vec!["a", "q"]);
