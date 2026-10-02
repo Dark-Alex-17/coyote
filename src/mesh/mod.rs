@@ -9,6 +9,9 @@ pub(crate) mod envoy;
 pub(crate) mod events;
 #[cfg(test)]
 mod fuzz;
+// Test-only until the access handler and the fetch handler read it.
+#[cfg(test)]
+pub(crate) mod grants;
 pub(crate) mod identity;
 pub(crate) mod idle;
 pub(crate) mod inbox;

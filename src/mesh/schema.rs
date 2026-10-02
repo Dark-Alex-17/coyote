@@ -132,6 +132,7 @@ mod tests {
             "shares.rs",
             &["SharesFile", "AllowEntry", "DenyEntry", "OverrideEntry"],
         ),
+        ("grants.rs", &["GrantRecord", "GrantedPath"]),
     ];
 
     /// Types that derive `Deserialize` but need no `deny_unknown_fields`: a fieldless enum
@@ -417,6 +418,11 @@ mod tests {
             (
                 "SHARES_FILE_VERSION",
                 crate::mesh::shares::SHARES_FILE_VERSION,
+                1,
+            ),
+            (
+                "GRANT_RECORD_VERSION",
+                crate::mesh::grants::GRANT_RECORD_VERSION,
                 1,
             ),
         ];

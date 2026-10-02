@@ -15,25 +15,38 @@
 //! the share root; allow and override are judged on the resolved path alone. An override
 //! grants nothing on its own: an allow must still match. Patterns are globs anchored at the
 //! share root where `**` alone crosses a `/`. The root is the caller's, never the current
-//! directory.
+//! directory. A grant from the `GrantStore` lets one peer fetch a named file no allow
+//! reaches, after every deny has had its say; `is_served` is the one path a fetch takes
+//! through all of this, and `list` walks only what the allows name.
 
 use crate::config::{WORKSPACE_COYOTE_DIR_NAME, paths};
+use crate::mesh::grants::GrantStore;
 use crate::mesh::schema::{Remedy, VersionProbe, unversioned_refusal, version_refusal};
 use crate::mesh::trust::same_hash;
 use crate::mesh::wire_path::WirePath;
-use crate::mesh::{canonical_hash, mesh_config_dir, redact_hashes, write_atomically};
+use crate::mesh::{
+    canonical_hash, hex_lower, mesh_config_dir, redact_hashes, short, write_atomically,
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use globset::{Glob, GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub(crate) const SHARES_FILE_VERSION: u64 = 1;
 /// The share list is the human's own decisions, so a refusal says what starting fresh costs.
 const SHARES_FILE_REMEDY: Remedy =
     Remedy::UserFile("is the share list, and a fresh one shares nothing");
+/// How many entries, files and directories alike, one listing visits before it stops
+/// and says it was cut short; a workspace with a `node_modules` under `**` would otherwise
+/// hash for minutes on a peer's request.
+pub(crate) const DEFAULT_LIST_WALK_BOUND: usize = 100_000;
+/// Entries per listing page, the wire's cap.
+pub(crate) const LIST_PAGE_SIZE: usize = 1_000;
 
 /// What no allow reaches, at any depth, unless an `override` names the exact file: secrets
 /// by their usual names, and `.git` as a directory or as the file a worktree or submodule
@@ -157,6 +170,52 @@ impl Mutation {
 pub(crate) struct PeerRef<'a> {
     pub identity: &'a str,
     pub destination: &'a str,
+}
+
+/// The verdict on one fetch. `NotShared` covers a file that does not exist, one outside
+/// every allow and one a deny refuses alike, so a peer learns nothing about the tree from
+/// the answer; only a name the grammar refuses is told which rule it broke.
+#[derive(Debug)]
+pub(crate) enum Served {
+    File(ServedFile),
+    NotShared,
+    InvalidPath { rule: &'static str },
+}
+
+/// The open handle the verdict was reached on, so the reader reads the very file that was
+/// judged and not whatever the path names by then.
+#[derive(Debug)]
+pub(crate) struct ServedFile {
+    pub file: fs::File,
+    pub canonical: PathBuf,
+    pub size: u64,
+}
+
+/// Where a candidate stands against the policy: `Denied` is what nothing lifts, `Allowed`
+/// is served, and `NotAllowed` is a file no rule names, which only a grant lets through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Judgement {
+    Denied,
+    Allowed,
+    NotAllowed,
+}
+
+/// One file in a listing, named by the wire path a peer fetches it with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Listed {
+    pub path: String,
+    pub size: u64,
+    pub sha256: [u8; 32],
+    pub mtime: SystemTime,
+}
+
+/// One page of a listing. `truncated` says the walk hit its bound, so files may be
+/// missing from every page; `next` is the cursor for the page after this one.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct Listing {
+    pub entries: Vec<Listed>,
+    pub truncated: bool,
+    pub next: Option<String>,
 }
 
 /// Where the two files live for one share root. Path arithmetic only; nothing is read. The
@@ -311,6 +370,155 @@ impl ShareSet {
         })
     }
 
+    /// Whether `peer` may fetch `wire_text`, judged on the file as it is on disk. The
+    /// grammar is checked before anything is resolved, so a traversal never reaches the
+    /// filesystem; the path is then resolved under the share root and refused before it
+    /// is opened when it resolved elsewhere or to anything but a regular file, since
+    /// opening a FIFO waits for a writer that never comes. The open handle's own metadata
+    /// is checked again, so a swap between the check and the read changes nothing. A
+    /// grant lets a file no rule names through, never one a deny refuses; it is not spent
+    /// here, since the read may still fail. Every error on the way is `NotShared`, the
+    /// same answer an unshared file gets.
+    pub(crate) fn is_served(
+        &self,
+        peer: &PeerRef<'_>,
+        wire_text: &str,
+        case_insensitive: bool,
+        grants: Option<(&GrantStore, SystemTime)>,
+    ) -> Served {
+        let wire = match WirePath::parse(wire_text) {
+            Ok(wire) => wire,
+            Err(invalid) => return Served::InvalidPath { rule: invalid.rule },
+        };
+        let candidate = self.locations.workspace_root.join(wire.to_relative_path());
+        let Ok(canonical) = dunce::canonicalize(candidate) else {
+            return Served::NotShared;
+        };
+        let rules = match self.rules(peer, case_insensitive) {
+            Ok(rules) => rules,
+            Err(err) => {
+                warn!(
+                    "Mesh share rules could not be built, so nothing is served: {}",
+                    redact_hashes(&format!("{err:#}"))
+                );
+                return Served::NotShared;
+            }
+        };
+        if rules.resolved(&canonical).is_none() {
+            return Served::NotShared;
+        }
+        if !fs::metadata(&canonical).is_ok_and(|metadata| metadata.is_file()) {
+            return Served::NotShared;
+        }
+        let Ok(file) = fs::File::open(&canonical) else {
+            return Served::NotShared;
+        };
+        let Ok(metadata) = file.metadata() else {
+            return Served::NotShared;
+        };
+        if !metadata.is_file() {
+            return Served::NotShared;
+        }
+        let granted = || {
+            grants.is_some_and(
+                |(store, now)| match store.is_granted(peer, wire_text, now) {
+                    Ok(granted) => granted,
+                    Err(err) => {
+                        warn!(
+                            "Mesh grant store could not be read, so no grant applies: {}",
+                            redact_hashes(&format!("{err:#}"))
+                        );
+                        false
+                    }
+                },
+            )
+        };
+        match rules.judge(&wire, &canonical) {
+            Judgement::Denied => return Served::NotShared,
+            Judgement::Allowed => {}
+            Judgement::NotAllowed if granted() => {}
+            Judgement::NotAllowed => return Served::NotShared,
+        }
+        let size = metadata.len();
+        debug!(
+            "Mesh share served: {} ({} bytes)",
+            short(&hex_lower(&Sha256::digest(
+                canonical.as_os_str().as_encoded_bytes()
+            ))),
+            size
+        );
+        Served::File(ServedFile {
+            file,
+            canonical,
+            size,
+        })
+    }
+
+    /// The files `peer` may fetch, one page at a time, sorted by wire path. The walk
+    /// starts at the literal head of each allow pattern rather than at the root, so a
+    /// share of `docs/**` never reads the rest of the tree, and it visits at most
+    /// `walk_bound` entries before it stops and says so. Grants never appear: a listing is
+    /// what the share set says, not what one peer was handed once. A set whose rules
+    /// cannot be built lists nothing.
+    pub(crate) fn list(
+        &self,
+        peer: &PeerRef<'_>,
+        prefix: Option<&str>,
+        cursor: Option<&str>,
+        case_insensitive: bool,
+        walk_bound: usize,
+    ) -> Listing {
+        let rules = match self.rules(peer, case_insensitive) {
+            Ok(rules) => rules,
+            Err(err) => {
+                warn!(
+                    "Mesh share rules could not be built, so nothing is listed: {}",
+                    redact_hashes(&format!("{err:#}"))
+                );
+                return Listing::default();
+            }
+        };
+        let mut walk = Walk {
+            rules: &rules,
+            remaining: walk_bound,
+            truncated: false,
+            entries: Vec::new(),
+        };
+        for start in start_dirs(
+            self.effective(peer)
+                .iter()
+                .map(|entry| entry.pattern.as_str()),
+        ) {
+            let start = start
+                .split('/')
+                .filter(|segment| !segment.is_empty())
+                .fold(rules.canonical_root.clone(), |path, segment| {
+                    path.join(segment)
+                });
+            walk.run(start);
+        }
+        let Walk {
+            mut entries,
+            truncated,
+            ..
+        } = walk;
+        if let Some(prefix) = prefix {
+            entries.retain(|entry| entry.path.starts_with(prefix));
+        }
+        entries.sort_by(|left, right| left.path.cmp(&right.path));
+        entries.dedup_by(|left, right| left.path == right.path);
+        let (entries, next) = paginate(entries, cursor, LIST_PAGE_SIZE);
+        debug!(
+            "Mesh share listed: {} entries on this page, truncated: {truncated}",
+            entries.len()
+        );
+        Listing {
+            entries,
+            truncated,
+            next,
+        }
+    }
+
     pub(crate) fn write_target(&self, scope: WriteScope) -> Layer {
         write_target(self.workspace_exists, scope)
     }
@@ -375,31 +583,42 @@ pub(crate) struct ShareRules {
 }
 
 impl ShareRules {
+    pub(crate) fn permits(&self, wire: &WirePath, canonical: &Path) -> bool {
+        self.judge(wire, canonical) == Judgement::Allowed
+    }
+
     /// `wire` is the path as the peer sent it; `canonical` is `dunce::canonicalize` of
     /// `root/wire`, which a symlink may have taken anywhere. A `std::fs::canonicalize`
     /// `\\?\` path on Windows fails the root prefix check. A candidate outside the share
-    /// root, the root itself, or one whose resolved path is not UTF-8, is refused.
-    pub(crate) fn permits(&self, wire: &WirePath, canonical: &Path) -> bool {
-        if self
-            .protected_dirs
-            .iter()
-            .any(|dir| canonical.starts_with(dir))
-        {
-            return false;
+    /// root, the root itself, or one whose resolved path is not UTF-8, is `Denied` like
+    /// anything a deny names, so no grant reaches it either.
+    pub(crate) fn judge(&self, wire: &WirePath, canonical: &Path) -> Judgement {
+        if self.is_protected(canonical) {
+            return Judgement::Denied;
         }
         let Some(resolved) = self.resolved(canonical) else {
-            return false;
+            return Judgement::Denied;
         };
         let alias = wire.segments().collect::<Vec<_>>().join("/");
         if self.deny.is_match(&alias) || self.deny.is_match(&resolved) {
-            return false;
+            return Judgement::Denied;
         }
         if (self.builtin.is_match(&alias) || self.builtin.is_match(&resolved))
             && !self.overridden(&resolved)
         {
-            return false;
+            return Judgement::Denied;
         }
-        self.allow.is_match(&resolved)
+        if self.allow.is_match(&resolved) {
+            Judgement::Allowed
+        } else {
+            Judgement::NotAllowed
+        }
+    }
+
+    fn is_protected(&self, canonical: &Path) -> bool {
+        self.protected_dirs
+            .iter()
+            .any(|dir| canonical.starts_with(dir))
     }
 
     /// The `/`-separated path of `canonical` under the share root; `None` for a path that
@@ -427,6 +646,187 @@ impl ShareRules {
             }
         })
     }
+}
+
+/// Whether `root`'s filesystem folds case, learned by creating a file there and looking
+/// for it under the other case. The answer is what `rules` and `is_served` take as
+/// `case_insensitive`, so a caller that cannot learn it fails closed rather than guessing
+/// `false`. The probe is the one file this module ever removes, and it refuses to touch a
+/// file that was already there under its name.
+pub(crate) fn probe_case_insensitive(root: &Path) -> Result<bool> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let name = format!(".coyote-case-probe-{}-{nanos}", std::process::id());
+    let probe = root.join(&name);
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .context("Failed to create a case probe file under the share root")?;
+    let folds = fs::symlink_metadata(root.join(name.to_ascii_uppercase())).is_ok();
+    let _ = fs::remove_file(&probe);
+    Ok(folds)
+}
+
+/// The directory walk behind `list`: an explicit stack, a budget of entries to visit, and
+/// the files that passed. Symlinked directories are never entered, since a link can take
+/// the walk anywhere and `**` is the user's promise about this tree alone; a symlinked
+/// file is judged on what it resolves to, as a fetch of it would be.
+struct Walk<'a> {
+    rules: &'a ShareRules,
+    remaining: usize,
+    truncated: bool,
+    entries: Vec<Listed>,
+}
+
+impl Walk<'_> {
+    fn run(&mut self, start: PathBuf) {
+        let mut stack = vec![start];
+        while let Some(path) = stack.pop() {
+            if self.remaining == 0 {
+                self.truncated = true;
+                return;
+            }
+            self.remaining -= 1;
+            let Ok(metadata) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if metadata.is_dir() {
+                if path.file_name().is_some_and(|name| name == ".git")
+                    || self.rules.is_protected(&path)
+                {
+                    continue;
+                }
+                let Ok(children) = fs::read_dir(&path) else {
+                    continue;
+                };
+                stack.extend(children.flatten().map(|child| child.path()));
+            } else if metadata.is_file() || metadata.file_type().is_symlink() {
+                self.file(&path);
+            }
+        }
+    }
+
+    /// Lists `path` if its name under the root is a wire path the allow set serves once
+    /// resolved. A name the grammar refuses is left out, since no peer could fetch it.
+    fn file(&mut self, path: &Path) {
+        let Some(wire_text) = self.wire_text(path) else {
+            return;
+        };
+        let Ok(wire) = WirePath::parse(&wire_text) else {
+            return;
+        };
+        let Ok(canonical) = dunce::canonicalize(path) else {
+            return;
+        };
+        if self.rules.judge(&wire, &canonical) != Judgement::Allowed {
+            return;
+        }
+        if !fs::metadata(&canonical).is_ok_and(|metadata| metadata.is_file()) {
+            return;
+        }
+        let Ok(file) = fs::File::open(&canonical) else {
+            return;
+        };
+        let Ok(metadata) = file.metadata() else {
+            return;
+        };
+        if !metadata.is_file() {
+            return;
+        }
+        let Ok(sha256) = sha256_of(file) else {
+            return;
+        };
+        self.entries.push(Listed {
+            path: wire_text,
+            size: metadata.len(),
+            sha256,
+            mtime: metadata.modified().unwrap_or(UNIX_EPOCH),
+        });
+    }
+
+    fn wire_text(&self, path: &Path) -> Option<String> {
+        let segments = path
+            .strip_prefix(&self.rules.canonical_root)
+            .ok()?
+            .components()
+            .map(|component| match component {
+                Component::Normal(segment) => segment.to_str(),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(segments.join("/"))
+    }
+}
+
+/// Streams `file` through the hasher rather than reading it whole, since a listing may
+/// meet files far larger than anything the wire would carry.
+fn sha256_of(file: fs::File) -> io::Result<[u8; 32]> {
+    let mut hasher = Sha256::new();
+    io::copy(&mut io::BufReader::new(file), &mut hasher)?;
+    Ok(hasher.finalize().into())
+}
+
+/// Where the walk for each pattern begins: the longest run of leading segments with no
+/// glob metacharacter, so `docs/**` starts at `docs` and `**` at the root. A start under
+/// another start is dropped, since the outer walk reaches it.
+fn start_dirs<'a>(patterns: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut starts: Vec<String> = patterns
+        .into_iter()
+        .map(|pattern| {
+            pattern
+                .split('/')
+                .take_while(|segment| !segment.contains(GLOB_METACHARACTERS))
+                .collect::<Vec<_>>()
+                .join("/")
+        })
+        .collect();
+    starts.sort();
+    starts.dedup();
+    let all = starts.clone();
+    starts.retain(|start| {
+        !all.iter().any(|outer| {
+            outer != start
+                && (outer.is_empty()
+                    || start
+                        .strip_prefix(outer.as_str())
+                        .is_some_and(|rest| rest.starts_with('/')))
+        })
+    });
+    starts
+}
+
+/// The page of `entries` after the one `cursor` ends, or the first page when there is no
+/// cursor or none matches: a cursor from a listing that has since changed starts over
+/// rather than skipping an unknown amount.
+fn paginate(
+    entries: Vec<Listed>,
+    cursor: Option<&str>,
+    page_size: usize,
+) -> (Vec<Listed>, Option<String>) {
+    let from = cursor
+        .and_then(|cursor| {
+            entries
+                .iter()
+                .position(|entry| list_cursor(&entry.path) == cursor)
+        })
+        .map_or(0, |at| at + 1);
+    let mut page: Vec<Listed> = entries.into_iter().skip(from).collect();
+    let next = if page.len() > page_size {
+        page.truncate(page_size);
+        page.last().map(|entry| list_cursor(&entry.path))
+    } else {
+        None
+    };
+    (page, next)
+}
+
+/// The cursor that names the page ending at `path`: a hash rather than the path itself,
+/// so a cursor on the wire never carries a file name.
+pub(crate) fn list_cursor(path: &str) -> String {
+    hex_lower(&Sha256::digest(path.as_bytes()))[..32].to_string()
 }
 
 /// Every built-in pattern at the share root and at any depth below it, plus the workspace
@@ -779,6 +1179,63 @@ mod tests {
     /// peer nothing is scoped to.
     fn served(set: &ShareSet, fx: &Fixture, relative: &str) -> bool {
         rules_for_anyone(set).permits(&wire(relative), &fx.file(relative))
+    }
+
+    /// The destination every grant in these tests is for.
+    fn anyone() -> (String, String) {
+        (fake_hash(0x1a), fake_hash(0x2b))
+    }
+
+    fn fetch(set: &ShareSet, wire_text: &str) -> Served {
+        fetch_with(set, wire_text, false, None)
+    }
+
+    fn fetch_with(
+        set: &ShareSet,
+        wire_text: &str,
+        case_insensitive: bool,
+        grants: Option<(&GrantStore, SystemTime)>,
+    ) -> Served {
+        let (identity, destination) = anyone();
+        let peer = PeerRef {
+            identity: &identity,
+            destination: &destination,
+        };
+        set.is_served(&peer, wire_text, case_insensitive, grants)
+    }
+
+    fn is_not_shared(verdict: &Served) -> bool {
+        matches!(verdict, Served::NotShared)
+    }
+
+    fn listing(set: &ShareSet, prefix: Option<&str>, walk_bound: usize) -> Listing {
+        let (identity, destination) = anyone();
+        let peer = PeerRef {
+            identity: &identity,
+            destination: &destination,
+        };
+        set.list(&peer, prefix, None, false, walk_bound)
+    }
+
+    fn listed_paths(listing: &Listing) -> Vec<&str> {
+        listing
+            .entries
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect()
+    }
+
+    fn listed(path: &str) -> Listed {
+        Listed {
+            path: path.to_string(),
+            size: 0,
+            sha256: [0; 32],
+            mtime: UNIX_EPOCH,
+        }
+    }
+
+    fn grant_store(fx: &Fixture) -> GrantStore {
+        GrantStore::new(&fx._tmp.path.join("cache"), "inst")
     }
 
     #[test]
@@ -1718,5 +2175,747 @@ mod tests {
                 assert!(!line.contains(text), "{line}");
             }
         }
+    }
+
+    #[test]
+    fn an_invalid_wire_path_is_refused_before_the_filesystem_is_touched() {
+        let fx = Fixture::new("serve-invalid-first");
+        let mut set = fx.load();
+        set.apply(allow("**"), WriteScope::Global).unwrap();
+        fs::remove_dir_all(&fx.root).unwrap();
+
+        for (text, rule) in [
+            ("../../.bashrc", "segment"),
+            ("docs\\a.md", "backslash"),
+            ("/etc/passwd", "leading_slash"),
+            ("", "empty"),
+        ] {
+            let verdict = fetch(&set, text);
+            assert!(
+                matches!(verdict, Served::InvalidPath { rule: broken } if broken == rule),
+                "{text:?}: {verdict:?}"
+            );
+        }
+        assert!(!fx.root.exists(), "the refusal must not create the root");
+    }
+
+    #[test]
+    fn a_path_with_a_nul_byte_is_an_invalid_path() {
+        let fx = Fixture::new("serve-nul");
+        let mut set = fx.load();
+        set.apply(allow("**"), WriteScope::Global).unwrap();
+        fx.file("docs/a.md");
+
+        let verdict = fetch(&set, "docs/a\0.md");
+
+        assert!(
+            matches!(verdict, Served::InvalidPath { rule: "control" }),
+            "{verdict:?}"
+        );
+    }
+
+    #[test]
+    fn a_decomposed_name_is_an_invalid_path() {
+        let fx = Fixture::new("serve-nfc");
+        let mut set = fx.load();
+        set.apply(allow("**"), WriteScope::Global).unwrap();
+        fx.file("docs/\u{e9}.md");
+
+        let verdict = fetch(&set, "docs/e\u{301}.md");
+
+        assert!(
+            matches!(verdict, Served::InvalidPath { rule: "nfc" }),
+            "{verdict:?}"
+        );
+        assert!(matches!(fetch(&set, "docs/\u{e9}.md"), Served::File(_)));
+    }
+
+    #[test]
+    fn a_nonexistent_file_and_an_unshared_file_are_both_not_shared() {
+        let fx = Fixture::new("serve-not-shared");
+        let mut set = fx.load();
+        set.apply(allow("docs/**"), WriteScope::Global).unwrap();
+        let canonical = fx.file("docs/a.md");
+        fx.file("src/x.rs");
+
+        let missing = fetch(&set, "docs/missing.md");
+        let unshared = fetch(&set, "src/x.rs");
+        let served = fetch(&set, "docs/a.md");
+
+        assert!(is_not_shared(&missing), "{missing:?}");
+        assert!(is_not_shared(&unshared), "{unshared:?}");
+        assert_eq!(format!("{missing:?}"), format!("{unshared:?}"));
+        let Served::File(file) = served else {
+            panic!("{served:?}");
+        };
+        assert_eq!(file.canonical, canonical);
+        assert_eq!(file.size, "docs/a.md".len() as u64);
+        assert_eq!(file.file.metadata().unwrap().len(), file.size);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_that_leaves_the_root_is_not_shared() {
+        let fx = Fixture::new("serve-escape");
+        let outside = fx._tmp.path.join("outside.md");
+        fs::write(&outside, "outside").unwrap();
+        fx.link("docs/escape", "../../outside.md");
+        let mut set = fx.load();
+        set.apply(allow("**"), WriteScope::Global).unwrap();
+
+        let verdict = fetch(&set, "docs/escape");
+
+        assert!(is_not_shared(&verdict), "{verdict:?}");
+    }
+
+    #[test]
+    fn a_directory_under_an_allow_is_not_shared() {
+        let fx = Fixture::new("serve-directory");
+        let mut set = fx.load();
+        set.apply(allow("**"), WriteScope::Global).unwrap();
+        fx.file("docs/a.md");
+
+        let verdict = fetch(&set, "docs");
+
+        assert!(is_not_shared(&verdict), "{verdict:?}");
+    }
+
+    /// Opening a FIFO waits for a writer, so a fetch that opened before it judged would
+    /// hang here; the test finishing is the proof of the order.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_reached_through_an_escaping_link_is_refused_before_it_is_opened() {
+        let fx = Fixture::new("serve-fifo-escape");
+        let fifo = fx._tmp.path.join("outside.fifo");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(made.success(), "{made}");
+        fx.link("docs/pipe", "../../outside.fifo");
+        let mut set = fx.load();
+        set.apply(allow("**"), WriteScope::Global).unwrap();
+
+        let verdict = fetch(&set, "docs/pipe");
+
+        assert!(is_not_shared(&verdict), "{verdict:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_socket_under_an_allow_is_neither_served_nor_listed() {
+        let fx = Fixture::new("serve-socket");
+        let _listener = std::os::unix::net::UnixListener::bind(fx.root.join("sock")).unwrap();
+        fx.file("docs/a.md");
+        let mut set = fx.load();
+        set.apply(allow("**"), WriteScope::Global).unwrap();
+
+        let verdict = fetch(&set, "sock");
+        let listed = listing(&set, None, DEFAULT_LIST_WALK_BOUND);
+
+        assert!(is_not_shared(&verdict), "{verdict:?}");
+        assert_eq!(
+            listed
+                .entries
+                .iter()
+                .map(|entry| entry.path.as_str())
+                .collect::<Vec<_>>(),
+            ["docs/a.md"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_share_root_itself_is_not_shared_even_through_a_link() {
+        let fx = Fixture::new("serve-root");
+        let mut set = fx.load();
+        set.apply(allow("**"), WriteScope::Global).unwrap();
+        fx.file("docs/a.md");
+        fx.link("docs/root", "..");
+
+        let verdict = fetch(&set, "docs/root");
+
+        assert!(is_not_shared(&verdict), "{verdict:?}");
+    }
+
+    #[test]
+    fn a_case_flipped_name_cannot_dodge_a_deny_under_either_fold_flag() {
+        let fx = Fixture::new("serve-case-flip");
+        let mut set = fx.load();
+        set.apply(allow("**"), WriteScope::Global).unwrap();
+        set.apply(deny("src/vault/*"), WriteScope::Global).unwrap();
+        fx.file("src/vault/seed.txt");
+        fx.file("src/open/seed.txt");
+
+        let folded = fetch_with(&set, "src/vault/Seed.txt", true, None);
+        let exact = fetch_with(&set, "src/vault/Seed.txt", false, None);
+
+        assert!(is_not_shared(&folded), "{folded:?}");
+        assert!(is_not_shared(&exact), "{exact:?}");
+        assert!(matches!(
+            fetch_with(&set, "src/open/seed.txt", true, None),
+            Served::File(_)
+        ));
+    }
+
+    #[test]
+    fn a_file_whose_real_name_is_upper_case_is_served_until_a_deny_names_its_directory() {
+        let fx = Fixture::new("serve-case-control");
+        let mut set = fx.load();
+        set.apply(allow("**"), WriteScope::Global).unwrap();
+        fx.file("src/vault/Seed.txt");
+
+        assert!(matches!(
+            fetch_with(&set, "src/vault/Seed.txt", false, None),
+            Served::File(_)
+        ));
+        set.apply(deny("src/vault/*"), WriteScope::Global).unwrap();
+        let verdict = fetch_with(&set, "src/vault/Seed.txt", false, None);
+
+        assert!(is_not_shared(&verdict), "{verdict:?}");
+    }
+
+    #[test]
+    fn a_granted_path_outside_every_allow_is_served() {
+        let fx = Fixture::new("serve-grant-outside");
+        let mut set = fx.load();
+        set.apply(allow("docs/**"), WriteScope::Global).unwrap();
+        fx.file("src/x.rs");
+        let store = grant_store(&fx);
+        let now = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+
+        assert!(is_not_shared(&fetch_with(
+            &set,
+            "src/x.rs",
+            false,
+            Some((&store, now))
+        )));
+        store
+            .grant(
+                "req",
+                &fake_hash(0x2b),
+                &["src/x.rs".to_string()],
+                None,
+                now,
+            )
+            .unwrap();
+
+        let verdict = fetch_with(&set, "src/x.rs", false, Some((&store, now)));
+
+        assert!(matches!(verdict, Served::File(_)), "{verdict:?}");
+        assert!(
+            is_not_shared(&fetch(&set, "src/x.rs")),
+            "without the store the grant is not consulted"
+        );
+        let other = (fake_hash(0x3c), fake_hash(0x4d));
+        let stranger = PeerRef {
+            identity: &other.0,
+            destination: &other.1,
+        };
+        assert!(is_not_shared(&set.is_served(
+            &stranger,
+            "src/x.rs",
+            false,
+            Some((&store, now))
+        )));
+    }
+
+    #[test]
+    fn a_granted_path_under_a_user_deny_is_not_served() {
+        let fx = Fixture::new("serve-grant-denied");
+        let mut set = fx.load();
+        set.apply(allow("**"), WriteScope::Global).unwrap();
+        set.apply(deny("src/vault/**"), WriteScope::Global).unwrap();
+        fx.file("src/vault/seed.txt");
+        let store = grant_store(&fx);
+        let now = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        store
+            .grant(
+                "req",
+                &fake_hash(0x2b),
+                &["src/vault/seed.txt".to_string()],
+                None,
+                now,
+            )
+            .unwrap();
+
+        let verdict = fetch_with(&set, "src/vault/seed.txt", false, Some((&store, now)));
+
+        assert!(is_not_shared(&verdict), "{verdict:?}");
+    }
+
+    #[test]
+    fn a_granted_builtin_denied_file_is_not_served() {
+        let fx = Fixture::new("serve-grant-builtin");
+        let mut set = fx.load();
+        set.apply(allow("**"), WriteScope::Global).unwrap();
+        fx.file(".env");
+        let store = grant_store(&fx);
+        let now = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        store
+            .grant("req", &fake_hash(0x2b), &[".env".to_string()], None, now)
+            .unwrap();
+
+        let verdict = fetch_with(&set, ".env", false, Some((&store, now)));
+
+        assert!(is_not_shared(&verdict), "{verdict:?}");
+    }
+
+    #[test]
+    fn an_unreadable_grant_store_grants_nothing() {
+        install_log_collector();
+        let fx = Fixture::new("serve-grant-unreadable");
+        let mut set = fx.load();
+        set.apply(allow("docs/**"), WriteScope::Global).unwrap();
+        fx.file("src/x.rs");
+        let store = grant_store(&fx);
+        let now = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        store
+            .grant(
+                "req",
+                &fake_hash(0x2b),
+                &["src/x.rs".to_string()],
+                None,
+                now,
+            )
+            .unwrap();
+        fs::write(store.path(), "not json\n").unwrap();
+
+        let verdict = fetch_with(&set, "src/x.rs", false, Some((&store, now)));
+
+        assert!(is_not_shared(&verdict), "{verdict:?}");
+        assert!(
+            warn_snapshot()
+                .iter()
+                .any(|line| line.contains("no grant applies")),
+            "{:#?}",
+            warn_snapshot()
+        );
+    }
+
+    #[test]
+    fn three_granted_files_outside_every_allow_are_served_once_each_and_a_fourth_fetch_is_not() {
+        let fx = Fixture::new("serve-grant-three");
+        let mut set = fx.load();
+        set.apply(allow("docs/**"), WriteScope::Global).unwrap();
+        let granted = ["src/a.rs", "src/b.rs", "notes/c.txt"];
+        for path in granted {
+            fx.file(path);
+        }
+        let store = grant_store(&fx);
+        let now = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        let (identity, destination) = anyone();
+        let peer = PeerRef {
+            identity: &identity,
+            destination: &destination,
+        };
+        store
+            .grant("req", &destination, &granted.map(str::to_string), None, now)
+            .unwrap();
+
+        for path in granted {
+            let verdict = set.is_served(&peer, path, false, Some((&store, now)));
+            assert!(matches!(verdict, Served::File(_)), "{path}: {verdict:?}");
+            assert!(store.consume(&peer, path, now).unwrap(), "{path}");
+        }
+
+        for path in granted {
+            let verdict = set.is_served(&peer, path, false, Some((&store, now)));
+            assert!(is_not_shared(&verdict), "{path}: {verdict:?}");
+        }
+    }
+
+    #[test]
+    fn serving_a_file_logs_a_hash_prefix_and_size_but_never_the_path() {
+        install_log_collector();
+        let fx = Fixture::new("serve-log");
+        let mut set = fx.load();
+        set.apply(allow("**"), WriteScope::Global).unwrap();
+        // The size is the only thing that tells this serve apart from every other test's
+        // in the shared log, so the name is long enough to make it unique.
+        let relative = "docs/served-once-under-a-name-no-other-test-uses.md";
+        let canonical = fx.file(relative);
+
+        assert!(matches!(fetch(&set, relative), Served::File(_)));
+
+        let size = format!("({} bytes)", relative.len());
+        let logged: Vec<String> = debug_snapshot()
+            .into_iter()
+            .filter(|line| line.contains("Mesh share served") && line.ends_with(&size))
+            .collect();
+        assert_eq!(logged.len(), 1, "{logged:#?}");
+        assert!(!logged[0].contains("served-once"), "{logged:#?}");
+        assert!(
+            !logged[0].contains(&canonical.display().to_string()),
+            "{logged:#?}"
+        );
+    }
+
+    #[test]
+    fn the_case_probe_leaves_no_file_behind() {
+        let fx = Fixture::new("probe-clean");
+        fx.file("README.md");
+
+        probe_case_insensitive(&fx.root).unwrap();
+
+        let names: Vec<String> = fs::read_dir(&fx.root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["README.md"]);
+    }
+
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    fn the_case_probe_reports_a_folding_filesystem() {
+        let fx = Fixture::new("probe-folding");
+        assert!(probe_case_insensitive(&fx.root).unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_case_probe_reports_a_case_sensitive_filesystem() {
+        let fx = Fixture::new("probe-sensitive");
+        assert!(!probe_case_insensitive(&fx.root).unwrap());
+    }
+
+    #[test]
+    fn the_case_probe_fails_closed_when_the_root_cannot_take_a_file() {
+        let fx = Fixture::new("probe-missing");
+        fs::remove_dir_all(&fx.root).unwrap();
+
+        let err = probe_case_insensitive(&fx.root).unwrap_err().to_string();
+
+        assert!(err.contains("case probe"), "{err}");
+        assert!(!fx.root.exists());
+    }
+
+    #[test]
+    fn listing_walks_only_under_the_allow_patterns() {
+        let fx = Fixture::new("list-start-dirs");
+        let mut set = fx.load();
+        set.apply(allow("docs/**"), WriteScope::Global).unwrap();
+        fx.file("docs/a.md");
+        fx.file("secrets-elsewhere/x.md");
+        #[cfg(unix)]
+        let restore = {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = fx.root.join("secrets-elsewhere");
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).unwrap();
+            dir
+        };
+
+        let listing = listing(&set, None, DEFAULT_LIST_WALK_BOUND);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&restore, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert_eq!(listed_paths(&listing), ["docs/a.md"]);
+        assert!(!listing.truncated);
+        assert!(listing.next.is_none());
+        assert_eq!(
+            start_dirs(["docs/**", "docs/*.md", "docs/sub/**", "**", "src/a.rs"]),
+            [""],
+            "the root swallows every other start"
+        );
+        assert_eq!(
+            start_dirs(["docs/**", "docs/sub/**", "docs2/*", "src/[ab]/**"]),
+            ["docs", "docs2", "src"]
+        );
+    }
+
+    #[test]
+    fn listing_everything_visits_the_whole_tree_except_git_and_secrets() {
+        let fx = Fixture::new("list-everything");
+        let mut set = fx.load();
+        set.apply(allow("**"), WriteScope::Global).unwrap();
+        for path in [
+            "b.md",
+            "a.md",
+            "docs/c.md",
+            ".git/config",
+            ".env",
+            "deep/er/d.rs",
+        ] {
+            fx.file(path);
+        }
+
+        let listing = listing(&set, None, DEFAULT_LIST_WALK_BOUND);
+
+        assert_eq!(
+            listed_paths(&listing),
+            ["a.md", "b.md", "deep/er/d.rs", "docs/c.md"],
+            "sorted bytewise, `.git` never entered, `.env` never listed"
+        );
+        assert!(!listing.truncated);
+    }
+
+    #[test]
+    fn listing_entries_carry_a_streamed_hash_size_and_mtime() {
+        let fx = Fixture::new("list-hash");
+        let mut set = fx.load();
+        set.apply(allow("**"), WriteScope::Global).unwrap();
+        let bytes: Vec<u8> = (0..(4 * 1024 * 1024 + 1))
+            .map(|n| (n % 251) as u8)
+            .collect();
+        let path = fx.root.join("big.bin");
+        fs::write(&path, &bytes).unwrap();
+
+        let listing = listing(&set, None, DEFAULT_LIST_WALK_BOUND);
+
+        assert_eq!(listing.entries.len(), 1);
+        let entry = &listing.entries[0];
+        assert_eq!(entry.path, "big.bin");
+        assert_eq!(entry.size, bytes.len() as u64);
+        assert_eq!(entry.sha256, <[u8; 32]>::from(Sha256::digest(&bytes)));
+        assert_eq!(
+            entry.mtime,
+            fs::metadata(&path).unwrap().modified().unwrap()
+        );
+    }
+
+    #[test]
+    fn a_tiny_walk_bound_truncates_the_listing() {
+        let fx = Fixture::new("list-bound");
+        let mut set = fx.load();
+        set.apply(allow("**"), WriteScope::Global).unwrap();
+        for path in ["a.md", "b.md", "c.md", "d.md"] {
+            fx.file(path);
+        }
+
+        let bounded = listing(&set, None, 3);
+        let whole = listing(&set, None, DEFAULT_LIST_WALK_BOUND);
+
+        assert!(bounded.truncated);
+        assert!(bounded.entries.len() <= 2, "{:?}", listed_paths(&bounded));
+        assert!(!whole.truncated);
+        assert_eq!(whole.entries.len(), 4);
+        assert_eq!(DEFAULT_LIST_WALK_BOUND, 100_000);
+        assert_eq!(LIST_PAGE_SIZE, 1_000);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn listing_never_follows_a_symlinked_directory() {
+        let fx = Fixture::new("list-linked-dir");
+        let mut set = fx.load();
+        set.apply(allow("**"), WriteScope::Global).unwrap();
+        fx.file("src/x.rs");
+        fx.link("docs/linked", "../src");
+
+        let listing = listing(&set, None, DEFAULT_LIST_WALK_BOUND);
+
+        assert_eq!(listed_paths(&listing), ["src/x.rs"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_file_is_listed_only_where_it_resolves_inside_the_root_and_an_allow() {
+        let fx = Fixture::new("list-linked-file-allowed");
+        let mut set = fx.load();
+        set.apply(allow("src/**"), WriteScope::Global).unwrap();
+        set.apply(allow("docs/**"), WriteScope::Global).unwrap();
+        fx.file("src/x.rs");
+        fx.link("docs/link", "../src/x.rs");
+        let outside = fx._tmp.path.join("outside.md");
+        fs::write(&outside, "outside").unwrap();
+        fx.link("docs/escape", "../../outside.md");
+        assert_eq!(
+            listed_paths(&listing(&set, None, DEFAULT_LIST_WALK_BOUND)),
+            ["docs/link", "src/x.rs"]
+        );
+
+        let fx = Fixture::new("list-linked-file-unallowed");
+        let mut set = fx.load();
+        set.apply(allow("docs/**"), WriteScope::Global).unwrap();
+        fx.file("src/x.rs");
+        fx.link("docs/link", "../src/x.rs");
+        assert_eq!(
+            listed_paths(&listing(&set, None, DEFAULT_LIST_WALK_BOUND)),
+            Vec::<&str>::new(),
+            "the alias is under docs/ but the file is not"
+        );
+    }
+
+    #[test]
+    fn a_name_the_grammar_refuses_is_left_out_of_the_listing() {
+        let fx = Fixture::new("list-nfc");
+        let mut set = fx.load();
+        set.apply(allow("**"), WriteScope::Global).unwrap();
+        fx.file("docs/ok.md");
+        fx.file("docs/e\u{301}.md");
+
+        let listing = listing(&set, None, DEFAULT_LIST_WALK_BOUND);
+
+        let paths = listed_paths(&listing);
+        assert!(paths.contains(&"docs/ok.md"), "{paths:?}");
+        assert!(
+            paths.iter().all(|path| unicode_normalization::is_nfc(path)),
+            "{paths:?}"
+        );
+        assert!(!paths.contains(&"docs/e\u{301}.md"), "{paths:?}");
+    }
+
+    #[test]
+    fn a_prefix_keeps_only_the_paths_that_start_with_it() {
+        let fx = Fixture::new("list-prefix");
+        let mut set = fx.load();
+        set.apply(allow("**"), WriteScope::Global).unwrap();
+        for path in ["docs/a.md", "docs/sub/b.md", "documents/c.md", "src/d.rs"] {
+            fx.file(path);
+        }
+
+        assert_eq!(
+            listed_paths(&listing(&set, Some("docs/"), DEFAULT_LIST_WALK_BOUND)),
+            ["docs/a.md", "docs/sub/b.md"]
+        );
+        assert_eq!(
+            listed_paths(&listing(&set, Some("doc"), DEFAULT_LIST_WALK_BOUND)),
+            ["docs/a.md", "docs/sub/b.md", "documents/c.md"]
+        );
+        assert!(
+            listing(&set, Some("../"), DEFAULT_LIST_WALK_BOUND)
+                .entries
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_granted_file_never_appears_in_a_listing() {
+        let fx = Fixture::new("list-grant");
+        let mut set = fx.load();
+        set.apply(allow("docs/**"), WriteScope::Global).unwrap();
+        fx.file("docs/a.md");
+        fx.file("src/x.rs");
+        let store = grant_store(&fx);
+        let now = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        store
+            .grant(
+                "req",
+                &fake_hash(0x2b),
+                &["src/x.rs".to_string()],
+                None,
+                now,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            fetch_with(&set, "src/x.rs", false, Some((&store, now))),
+            Served::File(_)
+        ));
+        assert_eq!(
+            listed_paths(&listing(&set, None, DEFAULT_LIST_WALK_BOUND)),
+            ["docs/a.md"]
+        );
+    }
+
+    #[test]
+    fn a_poisoned_or_rootless_set_lists_nothing() {
+        install_log_collector();
+        let fx = Fixture::new("list-poisoned");
+        fx.write(Layer::Global, "version: 1\nallow: [\n");
+        fx.write(Layer::Workspace, "version: 1\nallow:\n- pattern: '**'\n");
+        fx.file("docs/a.md");
+        let set = fx.load();
+        assert_eq!(
+            listing(&set, None, DEFAULT_LIST_WALK_BOUND),
+            Listing::default()
+        );
+
+        let fx = Fixture::new("list-rootless");
+        let mut set = fx.load();
+        set.apply(allow("**"), WriteScope::Global).unwrap();
+        fs::remove_dir_all(&fx.root).unwrap();
+        assert_eq!(
+            listing(&set, None, DEFAULT_LIST_WALK_BOUND),
+            Listing::default()
+        );
+        assert!(
+            warn_snapshot()
+                .iter()
+                .any(|line| line.contains("nothing is listed")),
+            "{:#?}",
+            warn_snapshot()
+        );
+    }
+
+    #[test]
+    fn a_list_cursor_is_thirty_two_lowercase_hex_characters() {
+        let cursor = list_cursor("docs/a.md");
+
+        assert_eq!(cursor.len(), 32);
+        assert!(
+            cursor
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "{cursor}"
+        );
+        assert_eq!(cursor, list_cursor("docs/a.md"));
+        assert_ne!(cursor, list_cursor("docs/b.md"));
+        assert!(!cursor.contains("docs"));
+    }
+
+    #[test]
+    fn paging_resumes_after_the_cursor_and_an_unknown_cursor_starts_over() {
+        let entries: Vec<Listed> = ["a", "b", "c", "d", "e"].into_iter().map(listed).collect();
+        let paths = |page: &[Listed]| {
+            page.iter()
+                .map(|entry| entry.path.clone())
+                .collect::<Vec<_>>()
+        };
+
+        let (first, next) = paginate(entries.clone(), None, 2);
+        assert_eq!(paths(&first), ["a", "b"]);
+        assert_eq!(next.as_deref(), Some(list_cursor("b").as_str()));
+
+        let (second, next) = paginate(entries.clone(), next.as_deref(), 2);
+        assert_eq!(paths(&second), ["c", "d"]);
+        assert_eq!(next.as_deref(), Some(list_cursor("d").as_str()));
+
+        let (last, next) = paginate(entries.clone(), next.as_deref(), 2);
+        assert_eq!(paths(&last), ["e"]);
+        assert!(next.is_none());
+
+        let (restarted, next) = paginate(entries.clone(), Some("not-a-cursor"), 2);
+        assert_eq!(paths(&restarted), ["a", "b"]);
+        assert!(next.is_some());
+
+        let (exact, next) = paginate(entries.clone(), Some(&list_cursor("c")), 2);
+        assert_eq!(paths(&exact), ["d", "e"]);
+        assert!(next.is_none(), "a page that fills exactly has no next");
+
+        let (whole, next) = paginate(entries, None, LIST_PAGE_SIZE);
+        assert_eq!(whole.len(), 5);
+        assert!(next.is_none());
+    }
+
+    #[test]
+    fn a_listing_pages_through_list_with_its_own_cursor() {
+        let fx = Fixture::new("list-cursor");
+        let mut set = fx.load();
+        set.apply(allow("**"), WriteScope::Global).unwrap();
+        for path in ["a.md", "b.md", "c.md"] {
+            fx.file(path);
+        }
+        let (identity, destination) = anyone();
+        let peer = PeerRef {
+            identity: &identity,
+            destination: &destination,
+        };
+
+        let after_a = set.list(
+            &peer,
+            None,
+            Some(&list_cursor("a.md")),
+            false,
+            DEFAULT_LIST_WALK_BOUND,
+        );
+        let unknown = set.list(&peer, None, Some("unknown"), false, DEFAULT_LIST_WALK_BOUND);
+
+        assert_eq!(listed_paths(&after_a), ["b.md", "c.md"]);
+        assert_eq!(listed_paths(&unknown), ["a.md", "b.md", "c.md"]);
+        assert!(unknown.next.is_none());
     }
 }
