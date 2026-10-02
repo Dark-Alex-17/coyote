@@ -183,12 +183,21 @@ pub(crate) enum Served {
 }
 
 /// The open handle the verdict was reached on, so the reader reads the very file that was
-/// judged and not whatever the path names by then.
+/// judged and not whatever the path names by then. `via` says which layer let it through.
 #[derive(Debug)]
 pub(crate) struct ServedFile {
     pub file: fs::File,
     pub canonical: PathBuf,
     pub size: u64,
+    pub via: Via,
+}
+
+/// What let a served file through: an allow in the share set, or a one-shot grant whose
+/// use the serve has spent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Via {
+    Allow,
+    Grant,
 }
 
 /// Where a candidate stands against the policy: `Denied` is what nothing lifts, `Allowed`
@@ -370,15 +379,15 @@ impl ShareSet {
         })
     }
 
-    /// Whether `peer` may fetch `wire_text`, judged on the file as it is on disk. The
-    /// grammar is checked before anything is resolved, so a traversal never reaches the
-    /// filesystem; the path is then resolved under the share root and refused before it
-    /// is opened when it resolved elsewhere or to anything but a regular file, since
-    /// opening a FIFO waits for a writer that never comes. The open handle's own metadata
-    /// is checked again, so a swap between the check and the read changes nothing. A
-    /// grant lets a file no rule names through, never one a deny refuses; it is not spent
-    /// here, since the read may still fail. Every error on the way is `NotShared`, the
-    /// same answer an unshared file gets.
+    /// Whether `peer` may fetch `wire_text`, judged on the file as it is on disk and
+    /// before it is opened. The grammar is checked before anything is resolved, so a
+    /// traversal never reaches the filesystem; the path is then resolved under the share
+    /// root, refused when it resolved elsewhere, and judged against the rules. A file no
+    /// rule names is served only on a grant, whose use is reserved here, before the open,
+    /// so two fetches racing for one use cannot both be served; a grant never lifts a
+    /// deny. Only a verdict of served opens the file, since opening a FIFO waits for a
+    /// writer that never comes, and a reserved use goes back when that open fails. Every
+    /// error on the way is `NotShared`, the same answer an unshared file gets.
     pub(crate) fn is_served(
         &self,
         peer: &PeerRef<'_>,
@@ -397,7 +406,7 @@ impl ShareSet {
         let rules = match self.rules(peer, case_insensitive) {
             Ok(rules) => rules,
             Err(err) => {
-                warn!(
+                debug!(
                     "Mesh share rules could not be built, so nothing is served: {}",
                     redact_hashes(&format!("{err:#}"))
                 );
@@ -407,38 +416,34 @@ impl ShareSet {
         if rules.resolved(&canonical).is_none() {
             return Served::NotShared;
         }
-        if !fs::metadata(&canonical).is_ok_and(|metadata| metadata.is_file()) {
-            return Served::NotShared;
-        }
-        let Ok(file) = fs::File::open(&canonical) else {
-            return Served::NotShared;
-        };
-        let Ok(metadata) = file.metadata() else {
-            return Served::NotShared;
-        };
-        if !metadata.is_file() {
-            return Served::NotShared;
-        }
-        let granted = || {
-            grants.is_some_and(
-                |(store, now)| match store.is_granted(peer, wire_text, now) {
-                    Ok(granted) => granted,
+        let via = match rules.judge(&wire, &canonical) {
+            Judgement::Denied => return Served::NotShared,
+            Judgement::Allowed => Via::Allow,
+            Judgement::NotAllowed => {
+                let Some((store, now)) = grants else {
+                    return Served::NotShared;
+                };
+                match store.consume(peer, wire_text, now) {
+                    Ok(true) => Via::Grant,
+                    Ok(false) => return Served::NotShared,
                     Err(err) => {
-                        warn!(
+                        debug!(
                             "Mesh grant store could not be read, so no grant applies: {}",
                             redact_hashes(&format!("{err:#}"))
                         );
-                        false
+                        return Served::NotShared;
                     }
-                },
-            )
+                }
+            }
         };
-        match rules.judge(&wire, &canonical) {
-            Judgement::Denied => return Served::NotShared,
-            Judgement::Allowed => {}
-            Judgement::NotAllowed if granted() => {}
-            Judgement::NotAllowed => return Served::NotShared,
-        }
+        let Some((file, metadata)) = open_regular(&canonical) else {
+            if via == Via::Grant
+                && let Some((store, now)) = grants
+            {
+                let _ = store.refund(peer, wire_text, now);
+            }
+            return Served::NotShared;
+        };
         let size = metadata.len();
         debug!(
             "Mesh share served: {} ({} bytes)",
@@ -451,15 +456,17 @@ impl ShareSet {
             file,
             canonical,
             size,
+            via,
         })
     }
 
     /// The files `peer` may fetch, one page at a time, sorted by wire path. The walk
     /// starts at the literal head of each allow pattern rather than at the root, so a
     /// share of `docs/**` never reads the rest of the tree, and it visits at most
-    /// `walk_bound` entries before it stops and says so. Grants never appear: a listing is
-    /// what the share set says, not what one peer was handed once. A set whose rules
-    /// cannot be built lists nothing.
+    /// `walk_bound` entries before it stops and says so. Only the page returned is opened
+    /// and hashed, so a listing of a large tree costs one walk, not one read of every
+    /// file. Grants never appear: a listing is what the share set says, not what one peer
+    /// was handed once. A set whose rules cannot be built lists nothing.
     pub(crate) fn list(
         &self,
         peer: &PeerRef<'_>,
@@ -471,7 +478,7 @@ impl ShareSet {
         let rules = match self.rules(peer, case_insensitive) {
             Ok(rules) => rules,
             Err(err) => {
-                warn!(
+                debug!(
                     "Mesh share rules could not be built, so nothing is listed: {}",
                     redact_hashes(&format!("{err:#}"))
                 );
@@ -482,7 +489,7 @@ impl ShareSet {
             rules: &rules,
             remaining: walk_bound,
             truncated: false,
-            entries: Vec::new(),
+            candidates: Vec::new(),
         };
         for start in start_dirs(
             self.effective(peer)
@@ -498,16 +505,17 @@ impl ShareSet {
             walk.run(start);
         }
         let Walk {
-            mut entries,
+            mut candidates,
             truncated,
             ..
         } = walk;
         if let Some(prefix) = prefix {
-            entries.retain(|entry| entry.path.starts_with(prefix));
+            candidates.retain(|candidate| candidate.path.starts_with(prefix));
         }
-        entries.sort_by(|left, right| left.path.cmp(&right.path));
-        entries.dedup_by(|left, right| left.path == right.path);
-        let (entries, next) = paginate(entries, cursor, LIST_PAGE_SIZE);
+        candidates.sort_by(|left, right| left.path.cmp(&right.path));
+        candidates.dedup_by(|left, right| left.path == right.path);
+        let (page, next) = paginate(candidates, cursor, LIST_PAGE_SIZE);
+        let entries = hydrate(page);
         debug!(
             "Mesh share listed: {} entries on this page, truncated: {truncated}",
             entries.len()
@@ -625,15 +633,7 @@ impl ShareRules {
     /// is not plain segments below it: the root itself is no file to serve, and `..` or
     /// a root here means the caller did not resolve it.
     fn resolved(&self, canonical: &Path) -> Option<String> {
-        let segments = canonical
-            .strip_prefix(&self.canonical_root)
-            .ok()?
-            .components()
-            .map(|component| match component {
-                Component::Normal(segment) => segment.to_str(),
-                _ => None,
-            })
-            .collect::<Option<Vec<_>>>()?;
+        let segments = segments_under(&self.canonical_root, canonical)?;
         (!segments.is_empty()).then(|| segments.join("/"))
     }
 
@@ -671,14 +671,21 @@ pub(crate) fn probe_case_insensitive(root: &Path) -> Result<bool> {
 }
 
 /// The directory walk behind `list`: an explicit stack, a budget of entries to visit, and
-/// the files that passed. Symlinked directories are never entered, since a link can take
-/// the walk anywhere and `**` is the user's promise about this tree alone; a symlinked
-/// file is judged on what it resolves to, as a fetch of it would be.
+/// the files that passed, unopened. Symlinked directories are never entered, since a link
+/// can take the walk anywhere and `**` is the user's promise about this tree alone; a
+/// symlinked file is judged on what it resolves to, as a fetch of it would be.
 struct Walk<'a> {
     rules: &'a ShareRules,
     remaining: usize,
     truncated: bool,
-    entries: Vec<Listed>,
+    candidates: Vec<Candidate>,
+}
+
+/// A file the walk passed, named by its wire path and where it resolved to, kept unopened
+/// until `hydrate` reads the page it lands on.
+struct Candidate {
+    path: String,
+    canonical: PathBuf,
 }
 
 impl Walk<'_> {
@@ -709,8 +716,9 @@ impl Walk<'_> {
         }
     }
 
-    /// Lists `path` if its name under the root is a wire path the allow set serves once
-    /// resolved. A name the grammar refuses is left out, since no peer could fetch it.
+    /// Keeps `path` if its name under the root is a wire path the allow set serves once
+    /// resolved to a regular file. A name the grammar refuses is left out, since no peer
+    /// could fetch it.
     fn file(&mut self, path: &Path) {
         let Some(wire_text) = self.wire_text(path) else {
             return;
@@ -727,38 +735,59 @@ impl Walk<'_> {
         if !fs::metadata(&canonical).is_ok_and(|metadata| metadata.is_file()) {
             return;
         }
-        let Ok(file) = fs::File::open(&canonical) else {
-            return;
-        };
-        let Ok(metadata) = file.metadata() else {
-            return;
-        };
-        if !metadata.is_file() {
-            return;
-        }
-        let Ok(sha256) = sha256_of(file) else {
-            return;
-        };
-        self.entries.push(Listed {
+        self.candidates.push(Candidate {
             path: wire_text,
-            size: metadata.len(),
-            sha256,
-            mtime: metadata.modified().unwrap_or(UNIX_EPOCH),
+            canonical,
         });
     }
 
     fn wire_text(&self, path: &Path) -> Option<String> {
-        let segments = path
-            .strip_prefix(&self.rules.canonical_root)
-            .ok()?
-            .components()
-            .map(|component| match component {
-                Component::Normal(segment) => segment.to_str(),
-                _ => None,
-            })
-            .collect::<Option<Vec<_>>>()?;
-        Some(segments.join("/"))
+        Some(segments_under(&self.rules.canonical_root, path)?.join("/"))
     }
+}
+
+/// The plain segments of `path` below `root`; `None` when `path` is not under `root` or
+/// has anything but UTF-8 normal segments there, since `..` or a root prefix means the
+/// caller did not resolve it.
+fn segments_under<'a>(root: &Path, path: &'a Path) -> Option<Vec<&'a str>> {
+    path.strip_prefix(root)
+        .ok()?
+        .components()
+        .map(|component| match component {
+            Component::Normal(segment) => segment.to_str(),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `canonical` opened, with the metadata of that very handle, or `None` for anything but
+/// a regular file. The path is checked before the open because opening a FIFO waits for a
+/// writer that never comes, and the handle after it so a swap between the two changes
+/// nothing.
+fn open_regular(canonical: &Path) -> Option<(fs::File, fs::Metadata)> {
+    if !fs::metadata(canonical).ok()?.is_file() {
+        return None;
+    }
+    let file = fs::File::open(canonical).ok()?;
+    let metadata = file.metadata().ok()?;
+    metadata.is_file().then_some((file, metadata))
+}
+
+/// Opens and hashes the one page a peer will see. A candidate that is no longer a regular
+/// file, or cannot be read, is left off the page rather than failing it.
+fn hydrate(page: Vec<Candidate>) -> Vec<Listed> {
+    page.into_iter()
+        .filter_map(|candidate| {
+            let (file, metadata) = open_regular(&candidate.canonical)?;
+            let sha256 = sha256_of(file).ok()?;
+            Some(Listed {
+                path: candidate.path,
+                size: metadata.len(),
+                sha256,
+                mtime: metadata.modified().unwrap_or(UNIX_EPOCH),
+            })
+        })
+        .collect()
 }
 
 /// Streams `file` through the hasher rather than reading it whole, since a listing may
@@ -798,25 +827,25 @@ fn start_dirs<'a>(patterns: impl IntoIterator<Item = &'a str>) -> Vec<String> {
     starts
 }
 
-/// The page of `entries` after the one `cursor` ends, or the first page when there is no
+/// The page of `candidates` after the one `cursor` ends, or the first page when there is no
 /// cursor or none matches: a cursor from a listing that has since changed starts over
 /// rather than skipping an unknown amount.
 fn paginate(
-    entries: Vec<Listed>,
+    candidates: Vec<Candidate>,
     cursor: Option<&str>,
     page_size: usize,
-) -> (Vec<Listed>, Option<String>) {
+) -> (Vec<Candidate>, Option<String>) {
     let from = cursor
         .and_then(|cursor| {
-            entries
+            candidates
                 .iter()
-                .position(|entry| list_cursor(&entry.path) == cursor)
+                .position(|candidate| list_cursor(&candidate.path) == cursor)
         })
         .map_or(0, |at| at + 1);
-    let mut page: Vec<Listed> = entries.into_iter().skip(from).collect();
+    let mut page: Vec<Candidate> = candidates.into_iter().skip(from).collect();
     let next = if page.len() > page_size {
         page.truncate(page_size);
-        page.last().map(|entry| list_cursor(&entry.path))
+        page.last().map(|candidate| list_cursor(&candidate.path))
     } else {
         None
     };
@@ -1225,17 +1254,34 @@ mod tests {
             .collect()
     }
 
-    fn listed(path: &str) -> Listed {
-        Listed {
+    fn candidate(path: &str) -> Candidate {
+        Candidate {
             path: path.to_string(),
-            size: 0,
-            sha256: [0; 32],
-            mtime: UNIX_EPOCH,
+            canonical: PathBuf::new(),
         }
     }
 
     fn grant_store(fx: &Fixture) -> GrantStore {
         GrantStore::new(&fx._tmp.path.join("cache"), "inst")
+    }
+
+    fn now() -> SystemTime {
+        SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000)
+    }
+
+    #[cfg(unix)]
+    fn mkfifo(path: &Path) {
+        let made = std::process::Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .unwrap();
+        assert!(made.success(), "{made}");
+    }
+
+    #[cfg(unix)]
+    fn set_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
     }
 
     #[test]
@@ -2251,6 +2297,7 @@ mod tests {
         assert_eq!(file.canonical, canonical);
         assert_eq!(file.size, "docs/a.md".len() as u64);
         assert_eq!(file.file.metadata().unwrap().len(), file.size);
+        assert_eq!(file.via, Via::Allow);
     }
 
     #[cfg(unix)]
@@ -2280,18 +2327,12 @@ mod tests {
         assert!(is_not_shared(&verdict), "{verdict:?}");
     }
 
-    /// Opening a FIFO waits for a writer, so a fetch that opened before it judged would
-    /// hang here; the test finishing is the proof of the order.
     #[cfg(unix)]
     #[test]
-    fn a_fifo_reached_through_an_escaping_link_is_refused_before_it_is_opened() {
+    fn a_fifo_reached_through_an_escaping_link_is_refused_at_the_root_boundary() {
         let fx = Fixture::new("serve-fifo-escape");
         let fifo = fx._tmp.path.join("outside.fifo");
-        let made = std::process::Command::new("mkfifo")
-            .arg(&fifo)
-            .status()
-            .unwrap();
-        assert!(made.success(), "{made}");
+        mkfifo(&fifo);
         fx.link("docs/pipe", "../../outside.fifo");
         let mut set = fx.load();
         set.apply(allow("**"), WriteScope::Global).unwrap();
@@ -2299,6 +2340,37 @@ mod tests {
         let verdict = fetch(&set, "docs/pipe");
 
         assert!(is_not_shared(&verdict), "{verdict:?}");
+    }
+
+    /// Opening a FIFO waits for a writer, so a fetch that opened before it judged the
+    /// kind of file would hang here; the test finishing is the proof of the order.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_inside_the_root_under_an_allow_is_refused_before_it_is_opened() {
+        let fx = Fixture::new("serve-fifo-inside");
+        fs::create_dir_all(fx.root.join("docs")).unwrap();
+        mkfifo(&fx.root.join("docs/pipe"));
+        let mut set = fx.load();
+        set.apply(allow("**"), WriteScope::Global).unwrap();
+
+        let verdict = fetch(&set, "docs/pipe");
+
+        assert!(is_not_shared(&verdict), "{verdict:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_inside_the_root_is_left_out_of_a_listing() {
+        let fx = Fixture::new("list-fifo-inside");
+        fx.file("docs/a.md");
+        mkfifo(&fx.root.join("docs/pipe"));
+        fx.link("docs/link", "pipe");
+        let mut set = fx.load();
+        set.apply(allow("**"), WriteScope::Global).unwrap();
+
+        let listing = listing(&set, None, DEFAULT_LIST_WALK_BOUND);
+
+        assert_eq!(listed_paths(&listing), ["docs/a.md"]);
     }
 
     #[cfg(unix)]
@@ -2338,24 +2410,21 @@ mod tests {
         assert!(is_not_shared(&verdict), "{verdict:?}");
     }
 
+    /// The deny is spelled in lower case and the file lives under `Vault`, so the request
+    /// matches the on-disk name on every filesystem and only the fold flag decides.
     #[test]
     fn a_case_flipped_name_cannot_dodge_a_deny_under_either_fold_flag() {
         let fx = Fixture::new("serve-case-flip");
         let mut set = fx.load();
         set.apply(allow("**"), WriteScope::Global).unwrap();
         set.apply(deny("src/vault/*"), WriteScope::Global).unwrap();
-        fx.file("src/vault/seed.txt");
-        fx.file("src/open/seed.txt");
+        fx.file("src/Vault/seed.txt");
 
-        let folded = fetch_with(&set, "src/vault/Seed.txt", true, None);
-        let exact = fetch_with(&set, "src/vault/Seed.txt", false, None);
+        let folded = fetch_with(&set, "src/Vault/seed.txt", true, None);
+        let exact = fetch_with(&set, "src/Vault/seed.txt", false, None);
 
         assert!(is_not_shared(&folded), "{folded:?}");
-        assert!(is_not_shared(&exact), "{exact:?}");
-        assert!(matches!(
-            fetch_with(&set, "src/open/seed.txt", true, None),
-            Served::File(_)
-        ));
+        assert!(matches!(exact, Served::File(_)), "{exact:?}");
     }
 
     #[test]
@@ -2382,7 +2451,7 @@ mod tests {
         set.apply(allow("docs/**"), WriteScope::Global).unwrap();
         fx.file("src/x.rs");
         let store = grant_store(&fx);
-        let now = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        let now = now();
 
         assert!(is_not_shared(&fetch_with(
             &set,
@@ -2402,7 +2471,10 @@ mod tests {
 
         let verdict = fetch_with(&set, "src/x.rs", false, Some((&store, now)));
 
-        assert!(matches!(verdict, Served::File(_)), "{verdict:?}");
+        let Served::File(file) = verdict else {
+            panic!("{verdict:?}");
+        };
+        assert_eq!(file.via, Via::Grant);
         assert!(
             is_not_shared(&fetch(&set, "src/x.rs")),
             "without the store the grant is not consulted"
@@ -2428,7 +2500,7 @@ mod tests {
         set.apply(deny("src/vault/**"), WriteScope::Global).unwrap();
         fx.file("src/vault/seed.txt");
         let store = grant_store(&fx);
-        let now = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        let now = now();
         store
             .grant(
                 "req",
@@ -2451,7 +2523,7 @@ mod tests {
         set.apply(allow("**"), WriteScope::Global).unwrap();
         fx.file(".env");
         let store = grant_store(&fx);
-        let now = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        let now = now();
         store
             .grant("req", &fake_hash(0x2b), &[".env".to_string()], None, now)
             .unwrap();
@@ -2469,7 +2541,7 @@ mod tests {
         set.apply(allow("docs/**"), WriteScope::Global).unwrap();
         fx.file("src/x.rs");
         let store = grant_store(&fx);
-        let now = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        let now = now();
         store
             .grant(
                 "req",
@@ -2485,10 +2557,17 @@ mod tests {
 
         assert!(is_not_shared(&verdict), "{verdict:?}");
         assert!(
-            warn_snapshot()
+            debug_snapshot()
                 .iter()
                 .any(|line| line.contains("no grant applies")),
             "{:#?}",
+            debug_snapshot()
+        );
+        assert!(
+            !warn_snapshot()
+                .iter()
+                .any(|line| line.contains("no grant applies")),
+            "a peer's fetch is not a warning: {:#?}",
             warn_snapshot()
         );
     }
@@ -2503,7 +2582,7 @@ mod tests {
             fx.file(path);
         }
         let store = grant_store(&fx);
-        let now = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        let now = now();
         let (identity, destination) = anyone();
         let peer = PeerRef {
             identity: &identity,
@@ -2515,14 +2594,86 @@ mod tests {
 
         for path in granted {
             let verdict = set.is_served(&peer, path, false, Some((&store, now)));
-            assert!(matches!(verdict, Served::File(_)), "{path}: {verdict:?}");
-            assert!(store.consume(&peer, path, now).unwrap(), "{path}");
+            let Served::File(file) = verdict else {
+                panic!("{path}: {verdict:?}");
+            };
+            assert_eq!(file.via, Via::Grant, "{path}");
         }
 
         for path in granted {
             let verdict = set.is_served(&peer, path, false, Some((&store, now)));
             assert!(is_not_shared(&verdict), "{path}: {verdict:?}");
         }
+    }
+
+    #[test]
+    fn concurrent_fetches_of_a_single_use_path_serve_exactly_one() {
+        let fx = Fixture::new("serve-grant-race");
+        let mut set = fx.load();
+        set.apply(allow("docs/**"), WriteScope::Global).unwrap();
+        fx.file("src/x.rs");
+        let store = grant_store(&fx);
+        let now = now();
+        let (identity, destination) = anyone();
+        let peer = PeerRef {
+            identity: &identity,
+            destination: &destination,
+        };
+        store
+            .grant("req", &destination, &["src/x.rs".to_string()], None, now)
+            .unwrap();
+
+        let verdicts: Vec<Served> = std::thread::scope(|scope| {
+            let fetches: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| set.is_served(&peer, "src/x.rs", false, Some((&store, now))))
+                })
+                .collect();
+            fetches
+                .into_iter()
+                .map(|fetch| fetch.join().unwrap())
+                .collect()
+        });
+
+        let served: Vec<&Served> = verdicts
+            .iter()
+            .filter(|verdict| matches!(verdict, Served::File(_)))
+            .collect();
+        assert_eq!(served.len(), 1, "{verdicts:?}");
+        assert!(matches!(served[0], Served::File(file) if file.via == Via::Grant));
+        assert_eq!(
+            verdicts
+                .iter()
+                .filter(|verdict| is_not_shared(verdict))
+                .count(),
+            7
+        );
+    }
+
+    #[test]
+    fn a_granted_path_that_is_not_a_regular_file_is_not_served_and_keeps_its_use() {
+        let fx = Fixture::new("serve-grant-directory");
+        let mut set = fx.load();
+        set.apply(allow("src/**"), WriteScope::Global).unwrap();
+        fx.file("docs/a.md");
+        let store = grant_store(&fx);
+        let now = now();
+        let (identity, destination) = anyone();
+        let peer = PeerRef {
+            identity: &identity,
+            destination: &destination,
+        };
+        store
+            .grant("req", &destination, &["docs".to_string()], None, now)
+            .unwrap();
+
+        let verdict = set.is_served(&peer, "docs", false, Some((&store, now)));
+
+        assert!(is_not_shared(&verdict), "{verdict:?}");
+        assert!(
+            store.is_granted(&peer, "docs", now).unwrap(),
+            "the use went back when the open was refused"
+        );
     }
 
     #[test]
@@ -2590,30 +2741,22 @@ mod tests {
         assert!(!fx.root.exists());
     }
 
+    /// Ten files sit outside the allow and the bound admits four visits; a walk that
+    /// began at the root would spend them there and report itself cut short.
     #[test]
     fn listing_walks_only_under_the_allow_patterns() {
         let fx = Fixture::new("list-start-dirs");
         let mut set = fx.load();
         set.apply(allow("docs/**"), WriteScope::Global).unwrap();
         fx.file("docs/a.md");
-        fx.file("secrets-elsewhere/x.md");
-        #[cfg(unix)]
-        let restore = {
-            use std::os::unix::fs::PermissionsExt;
-            let dir = fx.root.join("secrets-elsewhere");
-            fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).unwrap();
-            dir
-        };
-
-        let listing = listing(&set, None, DEFAULT_LIST_WALK_BOUND);
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&restore, fs::Permissions::from_mode(0o755)).unwrap();
+        for n in 0..10 {
+            fx.file(&format!("secrets-elsewhere/{n}.md"));
         }
-        assert_eq!(listed_paths(&listing), ["docs/a.md"]);
+
+        let listing = listing(&set, None, 4);
+
         assert!(!listing.truncated);
+        assert_eq!(listed_paths(&listing), ["docs/a.md"]);
         assert!(listing.next.is_none());
         assert_eq!(
             start_dirs(["docs/**", "docs/*.md", "docs/sub/**", "**", "src/a.rs"]),
@@ -2694,6 +2837,62 @@ mod tests {
         assert_eq!(whole.entries.len(), 4);
         assert_eq!(DEFAULT_LIST_WALK_BOUND, 100_000);
         assert_eq!(LIST_PAGE_SIZE, 1_000);
+    }
+
+    /// `hydrate` drops what it cannot read, and `list` runs it on the returned page alone:
+    /// a cursor on the unreadable `b.md` resolves to `[c.md]`, where a walk that hashed as
+    /// it went would have lost `b.md`, failed to find the cursor and started over at
+    /// `[a.md, c.md]`.
+    #[cfg(unix)]
+    #[test]
+    fn a_listing_hashes_only_the_page_it_returns() {
+        let fx = Fixture::new("list-page-hash");
+        let mut set = fx.load();
+        set.apply(allow("**"), WriteScope::Global).unwrap();
+        let names = ["a.md", "b.md", "c.md"];
+        let files = names.map(|name| fx.file(name));
+        set_mode(&files[1], 0o000);
+        let (identity, destination) = anyone();
+        let peer = PeerRef {
+            identity: &identity,
+            destination: &destination,
+        };
+
+        let hydrated = hydrate(
+            files
+                .iter()
+                .zip(names)
+                .map(|(canonical, name)| Candidate {
+                    path: name.to_string(),
+                    canonical: canonical.clone(),
+                })
+                .collect(),
+        );
+        let after_b = set.list(
+            &peer,
+            None,
+            Some(&list_cursor("b.md")),
+            false,
+            DEFAULT_LIST_WALK_BOUND,
+        );
+        let first = set.list(&peer, None, None, false, DEFAULT_LIST_WALK_BOUND);
+        set_mode(&files[1], 0o644);
+
+        assert_eq!(
+            hydrated
+                .iter()
+                .map(|entry| entry.path.as_str())
+                .collect::<Vec<_>>(),
+            ["a.md", "c.md"]
+        );
+        assert_eq!(
+            hydrated[1].sha256,
+            <[u8; 32]>::from(Sha256::digest(b"c.md"))
+        );
+        assert_eq!(listed_paths(&after_b), ["c.md"]);
+        assert_eq!(after_b.entries[0].sha256, hydrated[1].sha256);
+        assert_eq!(listed_paths(&first), ["a.md", "c.md"]);
+        assert!(first.next.is_none());
     }
 
     #[cfg(unix)]
@@ -2833,11 +3032,11 @@ mod tests {
             Listing::default()
         );
         assert!(
-            warn_snapshot()
+            debug_snapshot()
                 .iter()
                 .any(|line| line.contains("nothing is listed")),
             "{:#?}",
-            warn_snapshot()
+            debug_snapshot()
         );
     }
 
@@ -2859,34 +3058,39 @@ mod tests {
 
     #[test]
     fn paging_resumes_after_the_cursor_and_an_unknown_cursor_starts_over() {
-        let entries: Vec<Listed> = ["a", "b", "c", "d", "e"].into_iter().map(listed).collect();
-        let paths = |page: &[Listed]| {
+        let entries = || {
+            ["a", "b", "c", "d", "e"]
+                .into_iter()
+                .map(candidate)
+                .collect::<Vec<Candidate>>()
+        };
+        let paths = |page: &[Candidate]| {
             page.iter()
                 .map(|entry| entry.path.clone())
                 .collect::<Vec<_>>()
         };
 
-        let (first, next) = paginate(entries.clone(), None, 2);
+        let (first, next) = paginate(entries(), None, 2);
         assert_eq!(paths(&first), ["a", "b"]);
         assert_eq!(next.as_deref(), Some(list_cursor("b").as_str()));
 
-        let (second, next) = paginate(entries.clone(), next.as_deref(), 2);
+        let (second, next) = paginate(entries(), next.as_deref(), 2);
         assert_eq!(paths(&second), ["c", "d"]);
         assert_eq!(next.as_deref(), Some(list_cursor("d").as_str()));
 
-        let (last, next) = paginate(entries.clone(), next.as_deref(), 2);
+        let (last, next) = paginate(entries(), next.as_deref(), 2);
         assert_eq!(paths(&last), ["e"]);
         assert!(next.is_none());
 
-        let (restarted, next) = paginate(entries.clone(), Some("not-a-cursor"), 2);
+        let (restarted, next) = paginate(entries(), Some("not-a-cursor"), 2);
         assert_eq!(paths(&restarted), ["a", "b"]);
         assert!(next.is_some());
 
-        let (exact, next) = paginate(entries.clone(), Some(&list_cursor("c")), 2);
+        let (exact, next) = paginate(entries(), Some(&list_cursor("c")), 2);
         assert_eq!(paths(&exact), ["d", "e"]);
         assert!(next.is_none(), "a page that fills exactly has no next");
 
-        let (whole, next) = paginate(entries, None, LIST_PAGE_SIZE);
+        let (whole, next) = paginate(entries(), None, LIST_PAGE_SIZE);
         assert_eq!(whole.len(), 5);
         assert!(next.is_none());
     }

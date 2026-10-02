@@ -3,10 +3,13 @@
 //! id, names the requesting instance by destination hash, and lends each path a small
 //! number of uses before a short expiry, so a path a peer was handed once is not a share
 //! forever. A grant sits after every deny and before the allow: it lets a path outside the
-//! share set through, never one a deny or the built-in deny refuses. Every read parses the
-//! whole file and refuses it on the first bad line, as the pending store does, and the
-//! file is cache, so the remedy is to move it aside.
+//! share set through, never one a deny or the built-in deny refuses. A fetch reserves a
+//! use with `consume` before it opens the file and hands it back with `refund` when the
+//! open fails, so a spent grant stays on file until it expires and a refund has somewhere
+//! to land. Every read parses the whole file and refuses it on the first bad line, as the
+//! pending store does, and the file is cache, so the remedy is to move it aside.
 
+use crate::mesh::message::{PEER_ID_MAX_CHARS, is_wire_id};
 use crate::mesh::schema::{Remedy, VersionProbe, unversioned_refusal, version_refusal};
 use crate::mesh::shares::PeerRef;
 use crate::mesh::trust::same_hash;
@@ -60,14 +63,6 @@ impl GrantRecord {
         parse_rfc3339(&self.expires).is_none_or(|at| now >= at)
     }
 
-    fn is_exhausted(&self) -> bool {
-        self.paths.iter().all(|path| path.uses_left == 0)
-    }
-
-    fn is_live(&self, now: SystemTime) -> bool {
-        !self.is_expired(now) && !self.is_exhausted()
-    }
-
     fn is_for(&self, peer: &PeerRef<'_>) -> bool {
         same_hash(&self.peer, peer.destination)
     }
@@ -87,6 +82,17 @@ impl GrantRecord {
         {
             Some(granted) => {
                 granted.uses_left -= 1;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Gives one use of `path` back; `false` when this grant never named it.
+    fn restore(&mut self, path: &str) -> bool {
+        match self.paths.iter_mut().find(|granted| granted.path == path) {
+            Some(granted) => {
+                granted.uses_left = granted.uses_left.saturating_add(1);
                 true
             }
             None => false,
@@ -125,10 +131,11 @@ impl GrantStore {
     }
 
     /// Records `paths` as fetchable by the instance at `peer_destination`, each
-    /// `DEFAULT_GRANT_USES` times until `now + ttl`. A grant with the same `id` replaces
-    /// the earlier one rather than adding to it, so answering a request twice does not
-    /// double the uses. The peer must be a canonical 32-hex hash and every path must pass
-    /// the wire grammar, since `is_granted` compares against the text a peer sends.
+    /// `DEFAULT_GRANT_USES` times until `now + ttl`. A grant with the same `id` for the
+    /// same peer replaces the earlier one rather than adding to it, so answering a request
+    /// twice does not double the uses; two peers may ask under the same id, since each
+    /// chooses its own. The id must be a wire id, the peer a canonical 32-hex hash and
+    /// every path a wire path, since `consume` compares against the text a peer sends.
     pub(crate) fn grant(
         &self,
         id: &str,
@@ -137,6 +144,11 @@ impl GrantStore {
         ttl: Option<Duration>,
         now: SystemTime,
     ) -> Result<GrantRecord> {
+        if !is_wire_id(id) {
+            bail!(
+                "A grant answers an access request by its id, 1 to {PEER_ID_MAX_CHARS} characters from `[0-9A-Za-z_.:-]`; refusing to store one under any other id."
+            );
+        }
         let Some(peer) = canonical_hash(peer_destination) else {
             bail!("A grant names its peer by a 32-hex destination hash; refusing to store it.");
         };
@@ -147,9 +159,14 @@ impl GrantStore {
             );
         }
         let mut granted: Vec<GrantedPath> = Vec::new();
-        for path in paths {
-            WirePath::parse(path)
-                .with_context(|| format!("A granted path `{path}` is not a wire path"))?;
+        for (index, path) in paths.iter().enumerate() {
+            WirePath::parse(path).with_context(|| {
+                format!(
+                    "Granted path {} of {} is not a wire path",
+                    index + 1,
+                    paths.len()
+                )
+            })?;
             if !granted.iter().any(|existing| existing.path == *path) {
                 granted.push(GrantedPath {
                     path: path.clone(),
@@ -157,26 +174,32 @@ impl GrantStore {
                 });
             }
         }
+        let Some(expires) = now.checked_add(ttl.unwrap_or(DEFAULT_GRANT_TTL)) else {
+            bail!("A grant's expiry lies beyond what a timestamp can hold; refusing to store it.");
+        };
         let record = GrantRecord {
             version: GRANT_RECORD_VERSION,
             id: id.to_string(),
             peer,
             paths: granted,
-            expires: rfc3339_utc(now + ttl.unwrap_or(DEFAULT_GRANT_TTL)),
+            expires: rfc3339_utc(expires),
         };
         let _guard = self.write_lock.lock();
         let _file_lock = self.file_lock()?;
         let mut records = self.read_all()?;
-        records.retain(|existing| existing.id != record.id && existing.is_live(now));
+        records.retain(|existing| {
+            !existing.is_expired(now)
+                && !(existing.id == record.id && same_hash(&existing.peer, &record.peer))
+        });
         records.push(record.clone());
         self.write_all(&records)?;
         Ok(record)
     }
 
-    /// Whether `peer` may fetch `path` right now: a live grant for its destination names
-    /// exactly this text with a use left. Expired grants are swept first, so the file
-    /// never serves a stale answer twice; nothing is consumed here, the caller does that
-    /// once the read has succeeded.
+    /// A preview of whether `peer` could fetch `path` right now: an unexpired grant for
+    /// its destination names exactly this text with a use left. Nothing is reserved, so
+    /// another fetch may spend that use before this caller acts; a fetch that means to
+    /// serve calls `consume`. Expired grants are swept first.
     pub(crate) fn is_granted(
         &self,
         peer: &PeerRef<'_>,
@@ -197,8 +220,10 @@ impl GrantStore {
             .any(|record| record.is_for(peer) && record.has_use_for(path)))
     }
 
-    /// Spends one use of `path` for `peer`, on the first grant that still has one, and
-    /// drops a grant whose every path is spent. `Ok(false)` when there was nothing to spend.
+    /// Reserves one use of `path` for `peer`, on the first unexpired grant that still has
+    /// one. `Ok(false)` means the path was never granted, the grant expired, or every use
+    /// is already spent; a caller serving on a grant must refuse the fetch on it. A grant
+    /// whose every use is spent stays on file until it expires, so `refund` has a record.
     pub(crate) fn consume(&self, peer: &PeerRef<'_>, path: &str, now: SystemTime) -> Result<bool> {
         if !self.path.exists() {
             return Ok(false);
@@ -211,14 +236,35 @@ impl GrantStore {
             .iter_mut()
             .filter(|record| record.is_for(peer))
             .any(|record| record.spend(path));
-        records.retain(|record| !record.is_exhausted());
         if spent || swept > 0 {
             self.write_all(&records)?;
         }
         Ok(spent)
     }
 
-    /// Drops expired and spent grants and returns how many went; writes only if any did.
+    /// Hands back a use `consume` reserved, when the fetch it was reserved for could not
+    /// be served after all, to the first unexpired grant for `peer` that names exactly
+    /// this text. `Ok(false)` when no such grant remains: it expired in between, and the
+    /// use went with it.
+    pub(crate) fn refund(&self, peer: &PeerRef<'_>, path: &str, now: SystemTime) -> Result<bool> {
+        if !self.path.exists() {
+            return Ok(false);
+        }
+        let _guard = self.write_lock.lock();
+        let _file_lock = self.file_lock()?;
+        let mut records = self.read_all()?;
+        let swept = evict(&mut records, now);
+        let restored = records
+            .iter_mut()
+            .filter(|record| record.is_for(peer))
+            .any(|record| record.restore(path));
+        if restored || swept > 0 {
+            self.write_all(&records)?;
+        }
+        Ok(restored)
+    }
+
+    /// Drops expired grants and returns how many went; writes only if any did.
     pub(crate) fn prune(&self, now: SystemTime) -> Result<usize> {
         // Nothing to prune means nothing to lock: taking the file lock would create the
         // cache directory for a store that does not exist yet.
@@ -348,10 +394,11 @@ impl GrantStore {
     }
 }
 
-/// Drops expired and spent grants; returns how many went.
+/// Drops expired grants; returns how many went. A spent grant is kept until then so a
+/// `refund` after a failed open has a record to land on.
 fn evict(records: &mut Vec<GrantRecord>, now: SystemTime) -> usize {
     let before = records.len();
-    records.retain(|record| record.is_live(now));
+    records.retain(|record| !record.is_expired(now));
     before - records.len()
 }
 
@@ -404,7 +451,7 @@ mod tests {
     }
 
     #[test]
-    fn default_ttl_is_fifteen_minutes() {
+    fn grant_defaults_are_pinned() {
         assert_eq!(DEFAULT_GRANT_TTL, Duration::from_secs(900));
         assert_eq!(DEFAULT_GRANT_USES, 1);
         assert_eq!(GRANT_RECORD_VERSION, 1);
@@ -500,8 +547,83 @@ mod tests {
                     .unwrap_err()
             );
             assert!(err.contains("not a wire path"), "{bad:?}: {err}");
+            assert!(err.contains("path 1 of 1"), "{err}");
+            assert!(!err.contains("bashrc") && !err.contains("passwd"), "{err}");
         }
         assert!(!store.path().exists());
+    }
+
+    #[test]
+    fn a_grant_refuses_an_id_outside_the_wire_alphabet() {
+        let (store, _tmp) = store("grants-id");
+
+        for bad in [
+            "",
+            "req 1",
+            "req/1",
+            "réq",
+            &"x".repeat(PEER_ID_MAX_CHARS + 1),
+        ] {
+            let err = store
+                .grant(bad, &fake_hash(0x2b), &paths(&["docs/a.md"]), None, t(0))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("[0-9A-Za-z_.:-]"), "{bad:?}: {err}");
+        }
+        for good in ["req-1", "a.b:c_d", &"x".repeat(PEER_ID_MAX_CHARS)] {
+            store
+                .grant(good, &fake_hash(0x2b), &paths(&["docs/a.md"]), None, t(0))
+                .unwrap();
+        }
+        assert_eq!(store.list().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn two_peers_may_hold_grants_under_the_same_request_id() {
+        let (store, _tmp) = store("grants-two-peers");
+        let (first, second) = (fake_hash(0x2b), fake_hash(0x3c));
+        store
+            .grant("req", &first, &paths(&["docs/a.md"]), None, t(1_000))
+            .unwrap();
+        store
+            .grant("req", &second, &paths(&["docs/b.md"]), None, t(1_000))
+            .unwrap();
+
+        let records = store.list().unwrap();
+
+        assert_eq!(records.len(), 2, "{records:#?}");
+        let identity = fake_hash(0x1a);
+        let first_peer = PeerRef {
+            identity: &identity,
+            destination: &first,
+        };
+        let second_peer = PeerRef {
+            identity: &identity,
+            destination: &second,
+        };
+        assert!(
+            store
+                .is_granted(&first_peer, "docs/a.md", t(1_000))
+                .unwrap()
+        );
+        assert!(
+            store
+                .is_granted(&second_peer, "docs/b.md", t(1_000))
+                .unwrap()
+        );
+        store
+            .grant("req", &second, &paths(&["docs/c.md"]), None, t(1_000))
+            .unwrap();
+        assert!(
+            store
+                .is_granted(&first_peer, "docs/a.md", t(1_000))
+                .unwrap()
+        );
+        assert!(
+            !store
+                .is_granted(&second_peer, "docs/b.md", t(1_000))
+                .unwrap()
+        );
     }
 
     #[test]
@@ -553,9 +675,13 @@ mod tests {
             assert!(!store.is_granted(&peer, path, t(1_002)).unwrap(), "{path}");
             assert!(!store.consume(&peer, path, t(1_002)).unwrap(), "{path}");
         }
+        let records = store.list().unwrap();
+        assert_eq!(records.len(), 1, "{records:#?}");
         assert!(
-            store.list().unwrap().is_empty(),
-            "a grant whose every path is spent leaves the file"
+            records[0]
+                .paths
+                .iter()
+                .all(|granted| granted.uses_left == 0)
         );
     }
 
@@ -595,6 +721,61 @@ mod tests {
         );
         assert!(!store.is_granted(&peer, "docs/a.md", t(1_000)).unwrap());
         assert!(store.is_granted(&peer, "docs/b.md", t(1_000)).unwrap());
+    }
+
+    #[test]
+    fn refund_restores_one_use_and_a_refund_after_expiry_restores_nothing() {
+        let (store, _tmp) = store("grants-refund");
+        let destination = fake_hash(0x2b);
+        let peer = PeerRef {
+            identity: &fake_hash(0x1a),
+            destination: &destination,
+        };
+        store
+            .grant(
+                "req",
+                &destination,
+                &paths(&["docs/a.md"]),
+                Some(Duration::from_secs(10)),
+                t(1_000),
+            )
+            .unwrap();
+        assert!(store.consume(&peer, "docs/a.md", t(1_001)).unwrap());
+        assert!(!store.consume(&peer, "docs/a.md", t(1_001)).unwrap());
+
+        assert!(store.refund(&peer, "docs/a.md", t(1_002)).unwrap());
+
+        assert_eq!(store.list().unwrap()[0].paths[0].uses_left, 1);
+        assert!(
+            !store.refund(&peer, "docs/b.md", t(1_002)).unwrap(),
+            "a path the grant never named takes no refund"
+        );
+        assert!(store.consume(&peer, "docs/a.md", t(1_003)).unwrap());
+        assert!(!store.refund(&peer, "docs/a.md", t(1_010)).unwrap());
+        assert!(store.list().unwrap().is_empty());
+        assert!(!store.consume(&peer, "docs/a.md", t(1_010)).unwrap());
+    }
+
+    #[test]
+    fn an_exhausted_grant_survives_until_it_expires_so_a_refund_has_somewhere_to_land() {
+        let (store, _tmp) = store("grants-exhausted");
+        let destination = fake_hash(0x2b);
+        let peer = PeerRef {
+            identity: &fake_hash(0x1a),
+            destination: &destination,
+        };
+        store
+            .grant("req", &destination, &paths(&["docs/a.md"]), None, t(1_000))
+            .unwrap();
+        assert!(store.consume(&peer, "docs/a.md", t(1_000)).unwrap());
+
+        let records = store.list().unwrap();
+        assert_eq!(records.len(), 1, "{records:#?}");
+        assert_eq!(records[0].paths[0].uses_left, 0);
+        assert_eq!(store.prune(t(1_000)).unwrap(), 0);
+        assert_eq!(store.list().unwrap().len(), 1);
+        assert_eq!(store.prune(t(1_000 + 15 * 60)).unwrap(), 1);
+        assert!(store.list().unwrap().is_empty());
     }
 
     #[test]
@@ -646,7 +827,7 @@ mod tests {
     }
 
     #[test]
-    fn prune_drops_expired_and_spent_grants_and_counts_them() {
+    fn prune_drops_expired_grants_and_counts_them_but_keeps_a_spent_one() {
         let (store, _tmp) = store("grants-prune");
         let destination = fake_hash(0x2b);
         let peer = PeerRef {
@@ -680,7 +861,7 @@ mod tests {
         assert_eq!(store.prune(t(1_001)).unwrap(), 0);
 
         let ids: Vec<String> = store.list().unwrap().into_iter().map(|r| r.id).collect();
-        assert_eq!(ids, ["live"]);
+        assert_eq!(ids, ["spent", "live"]);
     }
 
     #[test]
