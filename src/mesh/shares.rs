@@ -356,8 +356,12 @@ impl ShareSet {
     /// caches: a `ShareSet` is loaded per evaluation or REPL verb, and a caller that holds
     /// one must reload to see a repaired file.
     pub(crate) fn rules(&self, peer: &PeerRef<'_>, case_insensitive: bool) -> Result<ShareRules> {
-        if let Some(refusal) = &self.poisoned {
-            bail!("{refusal}");
+        if self.poisoned.is_some() {
+            // The refusal itself quotes the hand-edited entry, which `apply` may show the
+            // human but a per-request log line must not carry; `load` already warned.
+            bail!(
+                "A mesh share list was refused when it was loaded, so nothing is shared until it is fixed."
+            );
         }
         let canonical_root = dunce::canonicalize(&self.locations.workspace_root)
             .context("Failed to resolve the share root")?;
@@ -432,7 +436,7 @@ impl ShareSet {
             Err(err) => {
                 debug!(
                     "Mesh share rules could not be built, so nothing is served: {}",
-                    redact_hashes(&format!("{err:#}"))
+                    redact_hashes(&format!("{err}"))
                 );
                 return Served::NotShared;
             }
@@ -453,7 +457,7 @@ impl ShareSet {
                     Err(err) => {
                         debug!(
                             "Mesh grant store could not be read, so no grant applies: {}",
-                            redact_hashes(&format!("{err:#}"))
+                            redact_hashes(&format!("{err}"))
                         );
                         return Served::NotShared;
                     }
@@ -478,7 +482,7 @@ impl ShareSet {
                 Err(err) => {
                     debug!(
                         "Mesh grant store could not be read, so no grant applies: {}",
-                        redact_hashes(&format!("{err:#}"))
+                        redact_hashes(&format!("{err}"))
                     );
                     return Served::NotShared;
                 }
@@ -490,7 +494,7 @@ impl ShareSet {
             {
                 debug!(
                     "Mesh grant use could not be refunded: {}",
-                    redact_hashes(&format!("{err:#}"))
+                    redact_hashes(&format!("{err}"))
                 );
             }
         };
@@ -546,7 +550,7 @@ impl ShareSet {
             Err(err) => {
                 debug!(
                     "Mesh share rules could not be built, so nothing is listed: {}",
-                    redact_hashes(&format!("{err:#}"))
+                    redact_hashes(&format!("{err}"))
                 );
                 return Listing::default();
             }
@@ -568,6 +572,15 @@ impl ShareSet {
                 .fold(rules.canonical_root.clone(), |path, segment| {
                     path.join(segment)
                 });
+            // A pattern's literal head may itself pass through a link, and the walk only
+            // refuses links it meets on the way down; so the start is resolved and must
+            // still lie in the root, or there is nothing under it an allow could name.
+            let Ok(start) = dunce::canonicalize(start) else {
+                continue;
+            };
+            if !start.starts_with(&rules.canonical_root) || rules.is_protected(&start) {
+                continue;
+            }
             walk.run(start);
         }
         let Walk {
@@ -2272,6 +2285,17 @@ mod tests {
                 !warned[0].contains(offending),
                 "{tag}: the log must not carry the hand-edited text: {warned:#?}"
             );
+            let fetch_lines: Vec<String> = debug_snapshot()
+                .into_iter()
+                .filter(|line| line.contains("nothing is served"))
+                .collect();
+            assert!(
+                !fetch_lines.is_empty(),
+                "{tag}: the refused fetch is logged"
+            );
+            for line in &fetch_lines {
+                assert!(!line.contains(offending), "{tag}: {line}");
+            }
         }
     }
 
@@ -2832,6 +2856,48 @@ mod tests {
             store.is_granted(&peer, "docs", now).unwrap(),
             "nothing was spent on a path that is not a regular file"
         );
+    }
+
+    /// The use is spent before the open, so an open that then fails must give it back;
+    /// a mode of `000` is the one way to make a regular file stat but not open. Root
+    /// opens anything, so under root the test proves the serve instead.
+    #[cfg(unix)]
+    #[test]
+    fn a_granted_file_that_fails_to_open_after_the_spend_gets_its_use_back() {
+        let fx = Fixture::new("serve-grant-refund-on-open");
+        let set = fx.load();
+        let locked = fx.file("src/x.rs");
+        set_mode(&locked, 0o000);
+        let store = grant_store(&fx);
+        let now = now();
+        let (identity, destination) = anyone();
+        let peer = PeerRef {
+            identity: &identity,
+            destination: &destination,
+        };
+        store
+            .grant("req", &destination, &["src/x.rs".to_string()], None, now)
+            .unwrap();
+
+        let verdict = set.is_served(
+            &peer,
+            "src/x.rs",
+            false,
+            MAX_FETCH_FILE_BYTES,
+            Some((&store, now)),
+        );
+        set_mode(&locked, 0o600);
+
+        let records = store.list().unwrap();
+        let uses_left = records[0].paths[0].uses_left;
+        match verdict {
+            Served::File(_) => assert_eq!(uses_left, 0, "root opened it, so the use is spent"),
+            Served::NotShared => {
+                assert_eq!(uses_left, 1, "the failed open gave the use back");
+                assert!(store.is_granted(&peer, "src/x.rs", now).unwrap());
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
