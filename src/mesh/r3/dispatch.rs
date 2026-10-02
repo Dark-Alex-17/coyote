@@ -23,9 +23,14 @@ pub(crate) const STATUS_PATH: &str = "/status";
 pub(crate) const MESSAGE_PATH: &str = "/message";
 pub(crate) const LIST_PATH: &str = "/list";
 pub(crate) const FETCH_PATH: &str = "/fetch";
+/// Every path this dispatcher knows by name: `/knock` served by the dispatcher itself, the
+/// rest pre-seeded without a provider until the slot registers one. The one list every
+/// path check and generator reads, so none of them can drift from the routes.
+pub(crate) const KNOWN_PATHS: [&str; 5] =
+    [KNOCK_PATH, STATUS_PATH, MESSAGE_PATH, LIST_PATH, FETCH_PATH];
 
 fn path_name(path_hash: PathHash) -> Option<&'static str> {
-    [KNOCK_PATH, STATUS_PATH, MESSAGE_PATH, LIST_PATH, FETCH_PATH]
+    KNOWN_PATHS
         .into_iter()
         .find(|path| PathHash::of(path) == path_hash)
 }
@@ -141,8 +146,7 @@ impl DispatchError {
             }
             "no_provider" => {
                 let path = field("path")?;
-                let known =
-                    [KNOCK_PATH, STATUS_PATH, MESSAGE_PATH, LIST_PATH, FETCH_PATH].contains(&path);
+                let known = KNOWN_PATHS.contains(&path);
                 known.then(|| Self::NoProvider {
                     path: path.to_string(),
                 })
@@ -203,7 +207,7 @@ impl Dispatcher {
             PathHash::of(KNOCK_PATH),
             Route::Provided(Arc::new(KnockHandler)),
         );
-        for path in [STATUS_PATH, MESSAGE_PATH, LIST_PATH, FETCH_PATH] {
+        for path in KNOWN_PATHS.into_iter().filter(|path| *path != KNOCK_PATH) {
             routes.insert(PathHash::of(path), Route::NoProvider(path));
         }
         Self {

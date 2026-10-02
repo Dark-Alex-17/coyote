@@ -459,9 +459,10 @@ impl Settlement for FetchSettlement {
 
 /// The use `is_served` spent on a grant, paid back when this is dropped unless the file
 /// was delivered and `disarm` ran. Armed on creation, so every exit after `is_served`,
-/// including a handler future dropped mid-flight, refunds without naming the case.
+/// including a handler future dropped mid-flight, refunds without naming the case. The
+/// refund goes to the store the use came out of, whatever store a re-key installed since.
 struct GrantRefund {
-    serving: Arc<FetchServing>,
+    grants: Arc<GrantStore>,
     identity_hex: String,
     destination_hex: String,
     path: String,
@@ -484,12 +485,7 @@ impl Drop for GrantRefund {
             identity: &self.identity_hex,
             destination: &self.destination_hex,
         };
-        if let Err(err) = self
-            .serving
-            .grants
-            .load()
-            .refund(&peer, &self.path, self.now)
-        {
+        if let Err(err) = self.grants.refund(&peer, &self.path, self.now) {
             debug!(
                 "Mesh grant use could not be refunded: {}",
                 redact_hashes(&err.to_string())
@@ -527,7 +523,7 @@ fn serve_fetch(
     };
     let limit = serving.serving_limit();
     let shares = serving.shares_under(root);
-    let grants = serving.grants.load();
+    let grants = serving.grants.load_full();
     let served = shares.is_served(
         &requester.peer(),
         &fetch.path,
@@ -549,7 +545,7 @@ fn serve_fetch(
         }
     };
     let refund = (via == Via::Grant).then(|| GrantRefund {
-        serving: Arc::clone(&serving),
+        grants: Arc::clone(&grants),
         identity_hex: requester.identity_hex.clone(),
         destination_hex: requester.destination_hex.clone(),
         path: fetch.path.clone(),
@@ -1923,6 +1919,133 @@ mod tests {
         );
         assert_eq!(status_of(&fx.fetch("README.md", None).await), "ok");
         assert_eq!(entry_paths(&fx.list(None, None).await), ["README.md"]);
+    }
+
+    /// A `not_modified` answer is a fetch: the grant use it spent stays spent, so the
+    /// peer that already holds the bytes cannot keep the grant alive by re-asking.
+    #[tokio::test]
+    async fn usage_probe_a_not_modified_answer_under_a_grant_keeps_the_use_spent() {
+        let fx = Fixture::new("fetch-probe-grant-not-modified", MAX_FETCH_FILE_BYTES, &[]);
+        let bytes = b"granted once";
+        fx.file("src/secret.rs", bytes);
+        fx.grant(&["src/secret.rs"]);
+
+        let reply = fx.fetch("src/secret.rs", Some(sha256_of(bytes))).await;
+        assert_eq!(status_of(&reply), "not_modified");
+        assert!(
+            matches!(reply, Reply::Value(_)),
+            "not_modified carries nothing to settle"
+        );
+
+        assert_eq!(
+            status_of(&fx.fetch("src/secret.rs", None).await),
+            "not_shared",
+            "the use spent on the not_modified answer is not paid back"
+        );
+    }
+
+    /// A reader that hands back more bytes than the file had when `is_served` stat'ed
+    /// it, standing in for a file that grew between the stat and the read.
+    struct GrownReader(usize);
+
+    impl FileReader for GrownReader {
+        fn read_bounded(&self, _file: fs::File, limit: u64) -> std::io::Result<Vec<u8>> {
+            Ok(vec![b'g'; self.0.min(usize::try_from(limit).unwrap())])
+        }
+    }
+
+    /// A file that grew past the limit between the stat and the read is refused
+    /// `too_large` with the applied limit, and the grant use `is_served` spent comes back,
+    /// exactly once: the next fetch is served and the one after that is not.
+    #[tokio::test]
+    async fn usage_probe_a_grant_use_is_refunded_when_the_file_grew_past_the_limit_before_the_read()
+    {
+        let limit = 4;
+        let fx = Fixture::new("fetch-probe-grant-grew", limit, &[]);
+        fx.file("src/secret.rs", b"abc");
+        fx.grant(&["src/secret.rs"]);
+
+        let grown = FetchHandler::with_reader(
+            fx.weak_source(),
+            Arc::new(GrownReader(usize::try_from(limit).unwrap() + 1)),
+        );
+        let reply = fx.fetch_with(grown, "src/secret.rs", None).await;
+        assert_eq!(status_of(&reply), "too_large");
+        assert_eq!(
+            field_of(&value_of(reply), "limit").and_then(Value::as_u64),
+            Some(limit)
+        );
+
+        let reply = fx.fetch("src/secret.rs", None).await;
+        assert_eq!(status_of(&reply), "ok", "the use was paid back");
+        sent(reply);
+        assert_eq!(
+            status_of(&fx.fetch("src/secret.rs", None).await),
+            "not_shared",
+            "paid back once, not twice"
+        );
+    }
+
+    /// The warn-once rule keys on the refusal text while it stands, not on the file: a
+    /// list fixed and then broken again with the very same mistake is a new refusal and
+    /// is warned about again, and the requests that keep finding it broken in between
+    /// say so at `debug!`, never at `warn!`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn usage_probe_a_list_broken_again_with_the_same_text_warns_again_and_repeats_only_at_debug()
+     {
+        install_log_collector();
+        let fx = Fixture::new(
+            "fetch-probe-refused-list-same-text",
+            MAX_FETCH_FILE_BYTES,
+            &["docs/**"],
+        );
+        fx.file("docs/a.md", b"a");
+        let shares = mesh_config_dir(&fx._tmp.path.join("config")).join("shares.yaml");
+        let refusal_warns = || {
+            warn_snapshot()
+                .iter()
+                .filter(|line| line.ends_with("Nothing is shared until then."))
+                .count()
+        };
+        let still_refused = || {
+            debug_snapshot()
+                .iter()
+                .filter(|line| line.contains("Mesh share list still refused"))
+                .count()
+        };
+        let (warns_before, debugs_before) = (refusal_warns(), still_refused());
+        let broken = "version: 1\nallow: not-a-list\n";
+
+        fs::write(&shares, broken).unwrap();
+        assert_eq!(status_of(&fx.fetch("docs/a.md", None).await), "not_shared");
+        assert_eq!(refusal_warns(), warns_before + 1);
+        assert_eq!(
+            still_refused(),
+            debugs_before,
+            "the first refusal is the warning"
+        );
+
+        assert_eq!(status_of(&fx.fetch("docs/a.md", None).await), "not_shared");
+        assert!(entry_paths(&fx.list(None, None).await).is_empty());
+        assert_eq!(refusal_warns(), warns_before + 1);
+        assert_eq!(
+            still_refused(),
+            debugs_before + 2,
+            "each request that finds the same refusal says so at debug"
+        );
+
+        fs::write(&shares, "version: 1\nallow:\n- pattern: 'docs/**'\n").unwrap();
+        assert_eq!(status_of(&fx.fetch("docs/a.md", None).await), "ok");
+
+        fs::write(&shares, broken).unwrap();
+        assert_eq!(status_of(&fx.fetch("docs/a.md", None).await), "not_shared");
+        assert_eq!(
+            refusal_warns(),
+            warns_before + 2,
+            "the same mistake made again after a fix is warned about again"
+        );
+        assert_eq!(still_refused(), debugs_before + 2);
     }
 
     #[tokio::test]

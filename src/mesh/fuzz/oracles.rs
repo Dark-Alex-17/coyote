@@ -29,9 +29,10 @@ use crate::mesh::propagation_fetch::{
 };
 use crate::mesh::protocol::{MESH_PROTOCOL_MIN_SUPPORTED, MESH_PROTOCOL_VERSION, VersionRefusal};
 use crate::mesh::r3::{
-    AdmittedRequest, DispatchError, Dispatcher, Envelope, EnvelopeError, Handler, InboundRequest,
-    KNOCK_PATH, KnockEvent, KnockSink, MAX_R3_NESTING_DEPTH, MESSAGE_PATH, NAME_HASH_LEN, PathHash,
-    R3Error, RefusalCode, Reply, RequestFrame, RequestHandler, RequestId, STATUS_PATH, SizeBranch,
+    AdmittedRequest, DispatchError, Dispatcher, Envelope, EnvelopeError, FETCH_PATH, Handler,
+    InboundRequest, KNOCK_PATH, KNOWN_PATHS, KnockEvent, KnockSink, LIST_PATH,
+    MAX_R3_NESTING_DEPTH, MESSAGE_PATH, NAME_HASH_LEN, PathHash, R3Error, RefusalCode, Reply,
+    RequestFrame, RequestHandler, RequestId, STATUS_PATH, SizeBranch,
 };
 use crate::mesh::test_support::{TempDir, TrustList};
 use crate::mesh::trust::TrustStore;
@@ -665,6 +666,8 @@ enum PathGen {
     Status,
     Message,
     Knock,
+    List,
+    Fetch,
     Other(String),
     RawHash([u8; ADDRESS_HASH_SIZE]),
 }
@@ -675,6 +678,8 @@ impl PathGen {
             Self::Status => PathHash::of(STATUS_PATH),
             Self::Message => PathHash::of(MESSAGE_PATH),
             Self::Knock => PathHash::of(KNOCK_PATH),
+            Self::List => PathHash::of(LIST_PATH),
+            Self::Fetch => PathHash::of(FETCH_PATH),
             Self::Other(path) => PathHash::of(&path),
             Self::RawHash(bytes) => PathHash::from(bytes),
         }
@@ -1115,11 +1120,15 @@ fn check_tier(
                                 "MESH-ENV-036: the dispatcher's own /knock handler answers nil to a trusted instance, got {value}"
                             )
                         })
-                    } else if path_hash == PathHash::of(MESSAGE_PATH) {
+                    } else if let Some(unprovided) = KNOWN_PATHS
+                        .into_iter()
+                        .filter(|path| *path != KNOCK_PATH && *path != STATUS_PATH)
+                        .find(|path| PathHash::of(path) == path_hash)
+                    {
                         ensure(
                             DispatchError::from_value(value)
                                 == Some(DispatchError::NoProvider {
-                                    path: MESSAGE_PATH.to_string(),
+                                    path: unprovided.to_string(),
                                 }),
                             || {
                                 format!(
@@ -3348,6 +3357,8 @@ enum PathTextGen {
     Status,
     Message,
     Knock,
+    List,
+    Fetch,
     Other(String),
     Odd(Scalar),
 }
@@ -3390,6 +3401,8 @@ impl DispatchErrorGen {
                     PathTextGen::Status => Value::from(STATUS_PATH),
                     PathTextGen::Message => Value::from(MESSAGE_PATH),
                     PathTextGen::Knock => Value::from(KNOCK_PATH),
+                    PathTextGen::List => Value::from(LIST_PATH),
+                    PathTextGen::Fetch => Value::from(FETCH_PATH),
                     PathTextGen::Other(path) => Value::from(path),
                     PathTextGen::Odd(odd) => odd.into_value(),
                 }),
@@ -3400,8 +3413,8 @@ impl DispatchErrorGen {
 }
 
 /// MESH-ENV-040 (`error` a `str` naming one of the two kinds), MESH-ENV-041 (`path_hash`
-/// exactly 32 hex digits), MESH-ENV-042 (`path` one of the three known paths); first
-/// occurrence wins (MESH-CANON-012).
+/// exactly 32 hex digits), MESH-ENV-042 (`path` one of the known paths, `KNOWN_PATHS`);
+/// first occurrence wins (MESH-CANON-012).
 fn expect_dispatch_error(value: &Value) -> Option<DispatchError> {
     let entries = value.as_map()?;
     let field = |name: &str| {
@@ -3421,7 +3434,7 @@ fn expect_dispatch_error(value: &Value) -> Option<DispatchError> {
         }
         "no_provider" => {
             let path = field("path")?;
-            [KNOCK_PATH, STATUS_PATH, MESSAGE_PATH]
+            KNOWN_PATHS
                 .contains(&path)
                 .then(|| DispatchError::NoProvider {
                     path: path.to_string(),

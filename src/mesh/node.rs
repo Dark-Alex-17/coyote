@@ -6823,6 +6823,138 @@ mod tests {
         started.relay_handle.abort();
     }
 
+    /// The grant store is rebound before the runtime re-keys; when the runtime then
+    /// refuses (here: the caller named the wrong original instance), the store rolls back
+    /// with the pending store, so the node keeps serving the original's grants and never
+    /// the fork's.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_a_refused_rekey_rolls_the_grant_store_back_to_the_original() {
+        use crate::mesh::shares::PeerRef;
+
+        let started = started_runtime("node-probe-rekey-grants-rollback").await;
+        let cache_dir = started.runtime.cache_dir().to_path_buf();
+        let original_id = started.runtime.current_instance_id();
+        let fork_id = fresh_instance_id();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(started.runtime.clone()).unwrap();
+        let now = SystemTime::now();
+        let peer_destination = hex_lower(&[0x3d; 16]);
+        let peer = PeerRef {
+            identity: "ignored-by-grants",
+            destination: &peer_destination,
+        };
+        for (instance, path) in [
+            (&original_id, "docs/original.md"),
+            (&fork_id, "docs/fork.md"),
+        ] {
+            GrantStore::new(&cache_dir, instance)
+                .grant(
+                    "0123456789abcdef",
+                    &peer_destination,
+                    &[path.into()],
+                    None,
+                    now,
+                )
+                .unwrap();
+        }
+        let serving = started.runtime.serving();
+
+        let err = slot
+            .rekey(ForkRekey {
+                original_instance_id: Some(fresh_instance_id()),
+                fork_instance_id: fork_id.clone(),
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains(".mesh off"), "{err}");
+        assert_eq!(started.runtime.current_instance_id(), original_id);
+        let grants = serving.grants();
+        assert!(
+            grants.is_granted(&peer, "docs/original.md", now).unwrap(),
+            "the original's grants are back in force"
+        );
+        assert!(
+            !grants.is_granted(&peer, "docs/fork.md", now).unwrap(),
+            "the fork's grants are not served by a node that never re-keyed"
+        );
+        assert!(slot.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    /// A fork grants file that cannot be read refuses the re-key the way it would refuse
+    /// `start`: the error names the store, the node stays the original instance, keeps
+    /// serving the original's grants, and its pending questions are still open.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_an_unreadable_fork_grants_file_refuses_the_rekey_and_keeps_the_original() {
+        use crate::mesh::shares::PeerRef;
+
+        let started = started_runtime("node-probe-rekey-grants-unreadable").await;
+        let cache_dir = started.runtime.cache_dir().to_path_buf();
+        let original_id = started.runtime.current_instance_id();
+        let original_hash = started.runtime.destination_hash().await;
+        let fork_id = fresh_instance_id();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(started.runtime.clone()).unwrap();
+        slot.correlations().open(pending("q-original")).unwrap();
+        let now = SystemTime::now();
+        let peer_destination = hex_lower(&[0x3e; 16]);
+        let peer = PeerRef {
+            identity: "ignored-by-grants",
+            destination: &peer_destination,
+        };
+        GrantStore::new(&cache_dir, &original_id)
+            .grant(
+                "0123456789abcdef",
+                &peer_destination,
+                &["docs/original.md".into()],
+                None,
+                now,
+            )
+            .unwrap();
+        let fork_store = GrantStore::new(&cache_dir, &fork_id);
+        std::fs::create_dir_all(fork_store.path().parent().unwrap()).unwrap();
+        std::fs::write(fork_store.path(), "not a grant record\n").unwrap();
+
+        let err = slot
+            .rekey(ForkRekey {
+                original_instance_id: Some(original_id.clone()),
+                fork_instance_id: fork_id.clone(),
+            })
+            .await
+            .unwrap_err();
+        let chain = format!("{err:#}");
+
+        assert!(
+            chain.contains("The fork's grant store could not be opened"),
+            "{chain}"
+        );
+        assert_eq!(started.runtime.current_instance_id(), original_id);
+        assert_eq!(started.runtime.destination_hash().await, original_hash);
+        assert!(
+            started
+                .runtime
+                .serving()
+                .grants()
+                .is_granted(&peer, "docs/original.md", now)
+                .unwrap(),
+            "the original's grants are still served"
+        );
+        assert!(
+            slot.correlations().is_open("q-original"),
+            "the original's pending questions are reopened after the refused re-key"
+        );
+        assert!(
+            InstanceLock::acquire(&cache_dir, &original_id).is_err(),
+            "a refused re-key keeps the original instance lock"
+        );
+        assert!(slot.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
     #[test]
     fn deliver_peer_notes_name_the_sending_instance_never_the_peers_own_id() {
         let slot = MeshSlot::default();

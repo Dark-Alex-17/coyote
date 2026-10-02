@@ -18,6 +18,8 @@ pub(crate) use client::{
     DEFAULT_LINK_TIMEOUT, Deadline, R3Client, RequestOptions, RequestOutcome, SizeBranch, link_to,
     open_link,
 };
+#[cfg(test)]
+pub(crate) use dispatch::KNOWN_PATHS;
 #[cfg(all(test, unix))]
 pub(crate) use dispatch::LoggingKnockSink;
 pub(crate) use dispatch::{

@@ -457,7 +457,7 @@ impl R3Client {
 
     /// `Shutdown` once `run` has exited: a link may outlive the client loop, and a request
     /// filed after the drain would otherwise wait out its full timeout.
-    fn insert_pending(
+    pub(super) fn insert_pending(
         &self,
         request_id: RequestId,
         link_id: LinkId,

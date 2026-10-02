@@ -1977,6 +1977,77 @@ pub(crate) mod network {
         )));
     }
 
+    /// The `/fetch` bound is held at its own limit, not merely somewhere above the common
+    /// one: a pending `/fetch` takes a frame of exactly `MAX_FETCH_RESPONSE_BYTES` and drops
+    /// one byte more with the pinned line, naming that bound; the request stays pending.
+    #[tokio::test]
+    async fn a_fetch_response_at_its_bound_is_delivered_and_one_byte_over_is_dropped() {
+        install_log_collector();
+        let client = R3Client::new();
+        let link_id = LinkId::new_from_rand(OsRng);
+        let frame_of = |request_id: RequestId, total: usize| {
+            let bytes = ResponseFrame {
+                request_id,
+                data: Value::Binary(vec![0x5a; total - RESPONSE_FRAME_OVERHEAD]),
+            }
+            .encode();
+            assert_eq!(bytes.len(), total);
+            bytes
+        };
+
+        let over_id = RequestId::from([0xa1u8; 16]);
+        let over = client
+            .insert_pending(over_id, link_id, FETCH_PATH, None)
+            .unwrap();
+        client.deliver(
+            link_id,
+            &frame_of(over_id, MAX_FETCH_RESPONSE_BYTES + 1),
+            SizeBranch::Resource,
+        );
+        assert!(debug_snapshot().contains(&format!(
+            "Dropped an oversize mesh response on link {} ({} bytes, max {MAX_FETCH_RESPONSE_BYTES})",
+            link_id.to_hex_string(),
+            MAX_FETCH_RESPONSE_BYTES + 1
+        )));
+        assert_eq!(
+            client.pending_len(),
+            1,
+            "a dropped response leaves the request pending"
+        );
+        drop(over);
+
+        let at_id = RequestId::from([0xa2u8; 16]);
+        let at = client
+            .insert_pending(at_id, link_id, FETCH_PATH, None)
+            .unwrap();
+        client.deliver(
+            link_id,
+            &frame_of(at_id, MAX_FETCH_RESPONSE_BYTES),
+            SizeBranch::Resource,
+        );
+        let (value, branch) = at.await.unwrap().unwrap();
+        assert_eq!(branch, SizeBranch::Resource);
+        assert_eq!(
+            value.as_slice().map(<[u8]>::len),
+            Some(MAX_FETCH_RESPONSE_BYTES - RESPONSE_FRAME_OVERHEAD)
+        );
+
+        // The same frame answering a pending `/status` is one byte over THAT bound by far.
+        let status_id = RequestId::from([0xa3u8; 16]);
+        let _status = client
+            .insert_pending(status_id, link_id, STATUS_PATH, None)
+            .unwrap();
+        client.deliver(
+            link_id,
+            &frame_of(status_id, MAX_FETCH_RESPONSE_BYTES),
+            SizeBranch::Resource,
+        );
+        assert!(debug_snapshot().contains(&format!(
+            "Dropped an oversize mesh response on link {} ({MAX_FETCH_RESPONSE_BYTES} bytes, max {MAX_R3_PAYLOAD_BYTES})",
+            link_id.to_hex_string()
+        )));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_settled_reply_is_sent_on_success_and_dropped_unsent_when_the_send_fails() {
         install_log_collector();
@@ -6825,6 +6896,106 @@ pub(crate) mod network {
             }
         );
         assert_eq!(fs::read(&staged_at).unwrap(), bytes);
+        pair.stop_node_a().await;
+    }
+
+    /// `mesh.fetch.inbox_dir` pointed inside the shared workspace, end to end: the node's
+    /// own staging helper files a peer's bytes there, and under `allow **` a second request
+    /// over the wire neither lists nor fetches them. The refusal is the one `not_shared`
+    /// a missing path gets, byte for byte, while the rest of the tree is served.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_a_configured_inbox_under_the_share_root_is_protected_over_a_live_pair() {
+        use crate::mesh::wire_path::WirePath;
+
+        let workspace = TempDir::new("r3-probe-inbox-root");
+        let inbox_dir = workspace.path.join("inbox");
+        let pair = NodePair::start_with(
+            "r3-probe-inbox",
+            |config| config.fetch.inbox_dir = Some(inbox_dir.clone()),
+            trusting_b,
+        )
+        .await;
+        let (slot, _idle) = installed_slot(&pair);
+        let shares = mesh_config_dir(&pair.config_dir_a()).join("shares.yaml");
+        fs::create_dir_all(shares.parent().unwrap()).unwrap();
+        fs::write(shares, "version: 1\nallow:\n- pattern: '**'\n").unwrap();
+        fs::write(workspace.path.join("README.md"), b"ours\n").unwrap();
+        let mut snapshot = snapshot_fixture();
+        snapshot.cwd = workspace.path.clone();
+        slot.publish(snapshot);
+
+        let theirs = b"theirs\n".to_vec();
+        let digest: [u8; 32] = Sha256::digest(&theirs).into();
+        let b_hex = pair.responder.desc.address_hash.to_hex_string();
+        let staged = pair
+            .node_a
+            .inbox_staging()
+            .stage(
+                &b_hex,
+                &WirePath::parse("docs/theirs.md").unwrap(),
+                &digest,
+                &theirs,
+            )
+            .unwrap();
+        let staged_rel = staged
+            .strip_prefix(dunce::canonicalize(&workspace.path).unwrap())
+            .expect("the configured inbox lies under the share root")
+            .to_str()
+            .unwrap()
+            .replace('\\', "/");
+        assert!(staged_rel.starts_with("inbox/"), "{staged_rel}");
+
+        let listed = b_asks_a(
+            &pair,
+            LIST_PATH,
+            wire_map(vec![("v", Value::from(PEER_WIRE_VERSION))]),
+            short_options(),
+        )
+        .await;
+        let paths: Vec<&str> = wire_field(&listed.value, "entries")
+            .and_then(Value::as_array)
+            .unwrap()
+            .iter()
+            .map(|entry| wire_field(entry, "path").and_then(Value::as_str).unwrap())
+            .collect();
+        assert_eq!(paths, ["README.md"], "the staged file is not listed");
+
+        let inbox_fetch = b_asks_a(
+            &pair,
+            FETCH_PATH,
+            fetch_body(&staged_rel, None),
+            short_options(),
+        )
+        .await;
+        let missing = b_asks_a(
+            &pair,
+            FETCH_PATH,
+            fetch_body("docs/missing.md", None),
+            short_options(),
+        )
+        .await;
+        assert_eq!(wire_status(&inbox_fetch.value), "not_shared");
+        assert_eq!(
+            inbox_fetch.value, missing.value,
+            "a staged file and a missing one are refused with the same bytes"
+        );
+
+        let served = b_asks_a(
+            &pair,
+            FETCH_PATH,
+            fetch_body("README.md", None),
+            short_options(),
+        )
+        .await;
+        assert_eq!(wire_status(&served.value), "ok");
+        assert_eq!(
+            wire_field(&served.value, "bytes"),
+            Some(&Value::Binary(b"ours\n".to_vec()))
+        );
+        assert!(
+            fs::read(&staged).unwrap() == theirs,
+            "the staged file is untouched by the refusals"
+        );
         pair.stop_node_a().await;
     }
 }
