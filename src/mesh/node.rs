@@ -309,6 +309,7 @@ impl MeshRuntime {
         let serving = Arc::new(FetchServing::new(
             paths.config_dir,
             paths.cache_dir.clone(),
+            config.fetch.inbox_dir.clone(),
             config.fetch.max_bytes,
             grants,
             options.hooks.clone(),
@@ -1842,15 +1843,18 @@ impl MeshSlot {
         }
     }
 
-    /// Re-keys the running node for a forked session and binds the pending questions to
-    /// the fork's own file, since a fork asks its own questions and must not collect the
-    /// original's; a no-op while the mesh is off. The fork's questions are adopted before
-    /// the node re-keys so a reply the fork's destination serves at once finds them, and
-    /// a re-key that fails puts the original's back, since the original is what stays
+    /// Re-keys the running node for a forked session and binds the pending questions and
+    /// the grants to the fork's own files, since a fork asks its own questions and answers
+    /// its own access requests and must not collect or hand out the original's; a no-op
+    /// while the mesh is off. The fork's questions and grants are adopted before the node
+    /// re-keys so a reply or fetch the fork's destination serves at once finds them, and a
+    /// re-key that fails puts the original's back, since the original is what stays
     /// served. Questions peers escalated before the fork are copied into the fork's
-    /// inbound file so `.mesh answer` still finds them after the switch. A fork file this
-    /// Coyote cannot read is logged and the fork starts with no questions pending, as
-    /// `install` does: the node must not be reported as failed for a cache file.
+    /// inbound file so `.mesh answer` still finds them after the switch. A fork pending
+    /// file this Coyote cannot read is logged and the fork starts with no questions
+    /// pending, as `install` does: the node must not be reported as failed for a cache
+    /// file. A fork grants file that cannot be opened refuses the re-key, as it would
+    /// refuse `start`.
     pub(crate) async fn rekey(&self, rekey: ForkRekey) -> Result<()> {
         let Some(runtime) = self.get() else {
             return Ok(());
@@ -1878,7 +1882,17 @@ impl MeshSlot {
         // A record filed into the old store between the first carry and the swap would
         // otherwise be lost; adoption is by id, so repeating it is harmless.
         carry();
-        let rekeyed = runtime.rekey(rekey).await;
+        let grants_rebound = runtime
+            .serving()
+            .rebind_grants(&rekey.fork_instance_id, SystemTime::now())
+            .context(
+                "The fork's grant store could not be opened, so the node still serves the original instance",
+            );
+        let rollback_grants = grants_rebound.is_ok();
+        let rekeyed = match grants_rebound {
+            Ok(()) => runtime.rekey(rekey).await,
+            Err(err) => Err(err),
+        };
         if rekeyed.is_err() {
             let instance_id = runtime.current_instance_id();
             let original = PendingStore::new(runtime.cache_dir(), &instance_id);
@@ -1888,6 +1902,16 @@ impl MeshSlot {
                 runtime.cache_dir(),
                 &instance_id,
             )));
+            if rollback_grants
+                && let Err(err) = runtime
+                    .serving()
+                    .rebind_grants(&instance_id, SystemTime::now())
+            {
+                warn!(
+                    "The original instance's grant store could not be reopened after the failed re-key, so the fork's grants stay in force: {}",
+                    redact_hashes(&format!("{err:#}"))
+                );
+            }
         }
         rekeyed
     }
@@ -2866,8 +2890,11 @@ impl PeerSurface for MeshSlot {
 }
 
 impl ShareSource for MeshSlot {
-    /// A relative or empty working directory names nothing on purpose: the share set
+    /// The snapshot's `cwd` is `std::env::current_dir()` at capture (the session's
+    /// snapshot publisher), so in production it is absolute or, when that call failed,
+    /// empty. An empty or relative root names nothing: the share set
     /// resolves against its root, and the process's own directory is not the session's.
+    /// A hand-built snapshot with a relative `cwd` is refused by the same check.
     fn share_root(&self) -> Option<PathBuf> {
         self.snapshot()
             .map(|snapshot| snapshot.cwd.clone())
@@ -6724,6 +6751,73 @@ mod tests {
             }),
             "{:#?}",
             warn_snapshot()
+        );
+        assert!(slot.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    /// A fork serves from its own grants file: a path granted to the fork's instance is
+    /// honoured after the re-key, one granted to the original is not, and a refund after
+    /// the re-key lands in the fork's file.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rekey_rebinds_the_grant_store_to_the_fork_instance() {
+        use crate::mesh::shares::PeerRef;
+
+        let started = started_runtime("node-rekey-grants").await;
+        let cache_dir = started.runtime.cache_dir().to_path_buf();
+        let original_id = started.runtime.current_instance_id();
+        let fork_id = fresh_instance_id();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(started.runtime.clone()).unwrap();
+        let now = SystemTime::now();
+        let peer_destination = hex_lower(&[0x3c; 16]);
+        let peer = PeerRef {
+            identity: "ignored-by-grants",
+            destination: &peer_destination,
+        };
+        let grant = |instance: &str, path: &str| {
+            GrantStore::new(&cache_dir, instance)
+                .grant(
+                    "0123456789abcdef",
+                    &peer_destination,
+                    &[path.into()],
+                    None,
+                    now,
+                )
+                .unwrap();
+        };
+        grant(&original_id, "docs/original.md");
+        grant(&fork_id, "docs/fork.md");
+        let serving = started.runtime.serving();
+        assert!(
+            serving
+                .grants()
+                .is_granted(&peer, "docs/original.md", now)
+                .unwrap()
+        );
+
+        slot.rekey(ForkRekey {
+            original_instance_id: Some(original_id.clone()),
+            fork_instance_id: fork_id.clone(),
+        })
+        .await
+        .unwrap();
+
+        let grants = serving.grants();
+        assert!(grants.is_granted(&peer, "docs/fork.md", now).unwrap());
+        assert!(
+            !grants.is_granted(&peer, "docs/original.md", now).unwrap(),
+            "the fork does not serve the original instance's grants"
+        );
+        assert!(grants.consume(&peer, "docs/fork.md", now).unwrap());
+        assert!(!grants.is_granted(&peer, "docs/fork.md", now).unwrap());
+        assert!(grants.refund(&peer, "docs/fork.md", now).unwrap());
+        assert!(
+            GrantStore::new(&cache_dir, &fork_id)
+                .is_granted(&peer, "docs/fork.md", now)
+                .unwrap(),
+            "the refund landed in the fork's own file"
         );
         assert!(slot.stop().await.unwrap());
         started.relay_handle.abort();

@@ -22,7 +22,9 @@ use crate::mesh::message::PEER_WIRE_VERSION;
 use crate::mesh::message::{PEER_LINK_TIMEOUT, PEER_REQUEST_TIMEOUT};
 #[cfg(all(test, unix))]
 use crate::mesh::node::MeshRuntime;
-use crate::mesh::r3::{AdmittedRequest, Handler, MAX_R3_PAYLOAD_BYTES, RefusalCode, Reply};
+use crate::mesh::r3::{
+    AdmittedRequest, Handler, MAX_R3_PAYLOAD_BYTES, RefusalCode, Reply, Settlement,
+};
 #[cfg(all(test, unix))]
 use crate::mesh::r3::{DispatchError, FETCH_PATH, LIST_PATH, R3Error, RequestOptions};
 #[cfg(all(test, unix))]
@@ -36,6 +38,7 @@ use crate::mesh::wire_path::WIRE_PATH_MAX_BYTES;
 use crate::mesh::wire_path::WirePath;
 use crate::mesh::{hex_lower, redact_hashes, short};
 
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use rmpv::Value;
 #[cfg(all(test, unix))]
@@ -59,7 +62,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// How long a fetch waits for its answer: a `MAX_FETCH_FILE_BYTES` Resource on a slow
 /// interface takes minutes, where a status card takes a round trip.
 #[cfg(all(test, unix))]
-pub(crate) const FETCH_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+pub(crate) const FILE_FETCH_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// How many peers' last status card and last listing are kept, oldest out first.
 pub(crate) const LAST_CARD_CACHE_PEERS: usize = 32;
 #[cfg(test)]
@@ -95,22 +98,30 @@ const _: () =
 
 /// What the node serves files from: the local limits, the grant store and the case probe
 /// of the share root. `max_bytes` is `mesh.fetch.max_bytes` and never a peer's number;
-/// `serving_limit` is what a request is actually held to.
+/// `serving_limit` is what a request is actually held to. `inbox_dir` is
+/// `mesh.fetch.inbox_dir`, protected from serving along with the cache dir so a peer
+/// cannot fetch what another peer sent. The grant store is swapped by `rebind_grants`
+/// when the node re-keys, so a fork honours its own grants and not the original's.
 pub(crate) struct FetchServing {
     config_dir: PathBuf,
     cache_dir: PathBuf,
+    inbox_dir: Option<PathBuf>,
     max_bytes: u64,
-    grants: GrantStore,
+    grants: ArcSwap<GrantStore>,
     hooks: MeshHooks,
     /// The last root probed and what the probe said; `None` inside means the probe
     /// failed and that root serves nothing until the root changes.
     probe: parking_lot::Mutex<Option<(PathBuf, Option<bool>)>>,
+    /// The share-list refusal last warned about, so a list that stays broken is warned
+    /// about once and not once per peer request.
+    refused: parking_lot::Mutex<Option<String>>,
 }
 
 impl FetchServing {
     pub(crate) fn new(
         config_dir: PathBuf,
         cache_dir: PathBuf,
+        inbox_dir: Option<PathBuf>,
         max_bytes: u64,
         grants: GrantStore,
         hooks: MeshHooks,
@@ -118,11 +129,26 @@ impl FetchServing {
         Self {
             config_dir,
             cache_dir,
+            inbox_dir,
             max_bytes,
-            grants,
+            grants: ArcSwap::from_pointee(grants),
             hooks,
             probe: parking_lot::Mutex::new(None),
+            refused: parking_lot::Mutex::new(None),
         }
+    }
+
+    /// Opens the grant store of `instance_id` and serves from it; a store that cannot be
+    /// opened leaves the current one in place.
+    pub(crate) fn rebind_grants(&self, instance_id: &str, now: SystemTime) -> anyhow::Result<()> {
+        let grants = GrantStore::open(&self.cache_dir, instance_id, now)?;
+        self.grants.store(Arc::new(grants));
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn grants(&self) -> Arc<GrantStore> {
+        self.grants.load_full()
     }
 
     /// The size a served file is held to: the configured limit, capped at what one
@@ -155,8 +181,28 @@ impl FetchServing {
         answer
     }
 
+    /// Loads the share set for `root`. A refused share list is the operator's to fix and
+    /// is warned about when its refusal first appears or changes; the requests that keep
+    /// finding it broken say so at `debug!`.
     fn shares_under(&self, root: &Path) -> ShareSet {
-        ShareSet::load(ShareLocations::new(&self.config_dir, root).with_cache_dir(&self.cache_dir))
+        let mut locations =
+            ShareLocations::new(&self.config_dir, root).with_cache_dir(&self.cache_dir);
+        if let Some(inbox_dir) = &self.inbox_dir {
+            locations = locations.with_protected(inbox_dir);
+        }
+        let (shares, warning) = ShareSet::load_quietly(locations);
+        let mut refused = self.refused.lock();
+        match warning {
+            Some(warning) if refused.as_deref() == Some(warning.as_str()) => {
+                debug!("Mesh share list still refused; nothing is shared");
+            }
+            Some(warning) => {
+                warn!("{warning}");
+                *refused = Some(warning);
+            }
+            None => *refused = None,
+        }
+        shares
     }
 }
 
@@ -284,7 +330,7 @@ impl Handler for ListHandler {
 }
 
 /// Serves `/fetch`. Everything that touches the filesystem, from loading the share set to
-/// reading the file and refunding a grant, runs off the request loop.
+/// reading the file, runs off the request loop.
 pub(crate) struct FetchHandler {
     source: Weak<dyn ShareSource>,
     reader: Arc<dyn FileReader>,
@@ -356,23 +402,13 @@ impl Handler for FetchHandler {
                 debug!("Mesh /fetch from {id8} (instance {dest8}) answered not_modified");
                 Reply::Value(value)
             }
-            FetchOutcome::Served {
-                value,
-                size,
-                digest,
-                refund,
-            } => {
+            FetchOutcome::Served { value, settlement } => {
                 debug!(
-                    "Mesh /fetch from {id8} (instance {dest8}) served {size} bytes ({})",
-                    short(&hex_lower(&digest))
+                    "Mesh /fetch from {id8} (instance {dest8}) served {} bytes ({})",
+                    settlement.size,
+                    short(&hex_lower(&settlement.digest))
                 );
-                match refund {
-                    Some(refund) => Reply::Settled {
-                        value,
-                        on_failure: Box::new(move || refund.run()),
-                    },
-                    None => Reply::Value(value),
-                }
+                Reply::Settled { value, settlement }
             }
         }
     }
@@ -389,7 +425,7 @@ struct FetchRequest {
 }
 
 /// What the blocking half of a fetch decided. `Refused` carries the status word for the
-/// log; `Served` carries the one-shot refund of a grant use when a grant let it through.
+/// log; `Served` carries what happens once the reply is on the wire.
 enum FetchOutcome {
     Refused {
         value: Value,
@@ -398,29 +434,62 @@ enum FetchOutcome {
     NotModified(Value),
     Served {
         value: Value,
-        size: u64,
-        digest: [u8; 32],
-        refund: Option<GrantRefund>,
+        settlement: Box<FetchSettlement>,
     },
 }
 
-/// The use `is_served` spent on a grant, owed back if the file is not delivered after
-/// all. Consumed by `run`, so the read failure and the send failure cannot both pay it.
+/// The `ok` reply's settlement: `sent` keeps the grant use spent and fires
+/// `MeshEvent::FetchServed`; dropped unsent, the refund pays the use back and nothing fires.
+struct FetchSettlement {
+    size: u64,
+    digest: [u8; 32],
+    refund: Option<GrantRefund>,
+    hooks: MeshHooks,
+    event: MeshEvent,
+}
+
+impl Settlement for FetchSettlement {
+    fn sent(self: Box<Self>) {
+        if let Some(refund) = self.refund {
+            refund.disarm();
+        }
+        self.hooks.fire(self.event);
+    }
+}
+
+/// The use `is_served` spent on a grant, paid back when this is dropped unless the file
+/// was delivered and `disarm` ran. Armed on creation, so every exit after `is_served`,
+/// including a handler future dropped mid-flight, refunds without naming the case.
 struct GrantRefund {
     serving: Arc<FetchServing>,
     identity_hex: String,
     destination_hex: String,
     path: String,
     now: SystemTime,
+    armed: bool,
 }
 
 impl GrantRefund {
-    fn run(self) {
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for GrantRefund {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
         let peer = PeerRef {
             identity: &self.identity_hex,
             destination: &self.destination_hex,
         };
-        if let Err(err) = self.serving.grants.refund(&peer, &self.path, self.now) {
+        if let Err(err) = self
+            .serving
+            .grants
+            .load()
+            .refund(&peer, &self.path, self.now)
+        {
             debug!(
                 "Mesh grant use could not be refunded: {}",
                 redact_hashes(&err.to_string())
@@ -429,6 +498,8 @@ impl GrantRefund {
     }
 }
 
+/// A request whose `if_sha256` matches is answered `not_modified` and still counts as a
+/// fetch: a grant use it spent stays spent.
 fn serve_fetch(
     serving: Arc<FetchServing>,
     root: &Path,
@@ -456,12 +527,13 @@ fn serve_fetch(
     };
     let limit = serving.serving_limit();
     let shares = serving.shares_under(root);
+    let grants = serving.grants.load();
     let served = shares.is_served(
         &requester.peer(),
         &fetch.path,
         case_insensitive,
         limit,
-        Some((&serving.grants, now)),
+        Some((&grants, now)),
     );
     let ServedFile {
         file, size, via, ..
@@ -482,41 +554,31 @@ fn serve_fetch(
         destination_hex: requester.destination_hex.clone(),
         path: fetch.path.clone(),
         now,
+        armed: true,
     });
     // One byte past the limit tells a file that grew since `is_served` stat'ed it from one
     // that fits.
     let bytes = match reader.read_bounded(file, limit + 1) {
         Ok(bytes) if bytes.len() as u64 > limit => {
-            if let Some(refund) = refund {
-                refund.run();
-            }
             return refused(
                 too_large(limit),
                 &format!("too_large (grew from {size} bytes past the limit {limit})"),
             );
         }
         Ok(bytes) => bytes,
-        Err(_) => {
-            if let Some(refund) = refund {
-                refund.run();
-            }
-            return refused(not_shared(), "not_shared");
-        }
+        Err(_) => return refused(not_shared(), "not_shared"),
     };
     let digest: [u8; 32] = Sha256::digest(&bytes).into();
     if fetch.if_sha256 == Some(digest) {
+        if let Some(refund) = refund {
+            refund.disarm();
+        }
         return FetchOutcome::NotModified(status_reply(
             "not_modified",
             vec![("sha256", Value::Binary(digest.to_vec()))],
         ));
     }
     let size = bytes.len() as u64;
-    serving.hooks.fire(MeshEvent::FetchServed {
-        identity: requester.identity_hex,
-        destination: requester.destination_hex,
-        size,
-        hash_prefix: hex_lower(&digest)[..8].to_string(),
-    });
     FetchOutcome::Served {
         value: status_reply(
             "ok",
@@ -526,9 +588,18 @@ fn serve_fetch(
                 ("bytes", Value::Binary(bytes)),
             ],
         ),
-        size,
-        digest,
-        refund,
+        settlement: Box::new(FetchSettlement {
+            size,
+            digest,
+            refund,
+            hooks: serving.hooks.clone(),
+            event: MeshEvent::FetchServed {
+                identity: requester.identity_hex,
+                destination: requester.destination_hex,
+                size,
+                hash_prefix: hex_lower(&digest)[..8].to_string(),
+            },
+        }),
     }
 }
 
@@ -954,7 +1025,7 @@ impl MeshRuntime {
             ),
         ]);
         let options = RequestOptions {
-            request_timeout: FETCH_REQUEST_TIMEOUT,
+            request_timeout: FILE_FETCH_REQUEST_TIMEOUT,
             link_timeout: PEER_LINK_TIMEOUT,
         };
         let outcome = self
@@ -1057,7 +1128,7 @@ mod tests {
     use crate::mesh::test_support::TempDir;
     use crate::mesh::wire_path::WIRE_PATH_MAX_BYTES;
     #[cfg(unix)]
-    use crate::testing::{install_log_collector, warn_snapshot};
+    use crate::testing::{debug_snapshot, install_log_collector, warn_snapshot};
     use rand_core::OsRng;
     use rns_transport::destination::link::LinkId;
     use rns_transport::hash::AddressHash;
@@ -1112,11 +1183,22 @@ mod tests {
 
     impl Fixture {
         fn new(tag: &str, max_bytes: u64, allow: &[&str]) -> Self {
+            Self::with_inbox_dir(tag, max_bytes, allow, None)
+        }
+
+        /// `inbox_dir` is relative to the share root, standing in for a
+        /// `mesh.fetch.inbox_dir` the operator pointed inside a shared workspace.
+        fn with_inbox_dir(
+            tag: &str,
+            max_bytes: u64,
+            allow: &[&str],
+            inbox_dir: Option<&str>,
+        ) -> Self {
             let tmp = TempDir::new(tag);
             let root = tmp.path.join("workspace");
             fs::create_dir_all(&root).unwrap();
             write_allow(&tmp, allow);
-            let serving = serving_for(&tmp, max_bytes);
+            let serving = serving_for(&tmp, max_bytes, inbox_dir.map(|dir| root.join(dir)));
             let source = Arc::new(TestSource {
                 root: Some(root.clone()),
                 serving: Some(Arc::clone(&serving)),
@@ -1172,17 +1254,18 @@ mod tests {
         fn grant(&self, paths: &[&str]) {
             let paths: Vec<String> = paths.iter().map(|path| (*path).to_string()).collect();
             self.serving
-                .grants
+                .grants()
                 .grant(GRANT_ID, &self.destination, &paths, None, SystemTime::now())
                 .unwrap();
         }
     }
 
-    fn serving_for(tmp: &TempDir, max_bytes: u64) -> Arc<FetchServing> {
+    fn serving_for(tmp: &TempDir, max_bytes: u64, inbox_dir: Option<PathBuf>) -> Arc<FetchServing> {
         let cache_dir = tmp.path.join("cache");
         Arc::new(FetchServing::new(
             tmp.path.join("config"),
             cache_dir.clone(),
+            inbox_dir,
             max_bytes,
             GrantStore::new(&cache_dir, "inst"),
             MeshHooks::default(),
@@ -1262,6 +1345,15 @@ mod tests {
             Reply::Code(code) => panic!("refused with {code:?}"),
             Reply::Silent => panic!("answered with silence"),
         }
+    }
+
+    /// The value of a settled reply once the server has reported it sent.
+    fn sent(reply: Reply) -> Value {
+        let Reply::Settled { value, settlement } = reply else {
+            panic!("an ok reply settles on send");
+        };
+        settlement.sent();
+        value
     }
 
     fn field_of<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
@@ -1565,8 +1657,8 @@ mod tests {
         fx.grant(&["src/secret.rs"]);
 
         let first = fx.fetch("src/secret.rs", None).await;
-        assert!(matches!(first, Reply::Settled { .. }));
         assert_eq!(status_of(&first), "ok");
+        sent(first);
 
         let second = fx.fetch("src/secret.rs", None).await;
         assert_eq!(status_of(&second), "not_shared");
@@ -1583,8 +1675,8 @@ mod tests {
 
         for path in paths {
             let reply = fx.fetch(path, None).await;
-            assert!(matches!(reply, Reply::Settled { .. }), "{path}");
             assert_eq!(status_of(&reply), "ok", "{path}");
+            sent(reply);
         }
         for path in paths {
             assert_eq!(
@@ -1607,31 +1699,82 @@ mod tests {
 
         let reply = fx.fetch("src/secret.rs", None).await;
         assert_eq!(status_of(&reply), "ok");
+        sent(reply);
         let reply = fx.fetch("src/secret.rs", None).await;
         assert_eq!(status_of(&reply), "not_shared");
     }
 
     #[tokio::test]
-    async fn a_grant_use_is_refunded_when_the_send_fails_and_only_once() {
+    async fn a_grant_use_is_refunded_when_the_settlement_is_dropped_unsent_and_kept_when_sent() {
         let fx = Fixture::new("fetch-grant-refund-send", MAX_FETCH_FILE_BYTES, &[]);
         fx.file("src/secret.rs", b"s");
         fx.grant(&["src/secret.rs"]);
 
-        let Reply::Settled { on_failure, .. } = fx.fetch("src/secret.rs", None).await else {
-            panic!("a grant-served fetch settles on send");
-        };
-        on_failure();
+        let first = fx.fetch("src/secret.rs", None).await;
+        assert_eq!(status_of(&first), "ok");
+        drop(first);
 
         let second = fx.fetch("src/secret.rs", None).await;
-        assert!(matches!(second, Reply::Settled { .. }));
         assert_eq!(status_of(&second), "ok");
-        drop(second);
+        sent(second);
 
         assert_eq!(
             status_of(&fx.fetch("src/secret.rs", None).await),
             "not_shared",
-            "dropping the settlement unspent is not a refund"
+            "a sent reply keeps the use spent"
         );
+    }
+
+    /// A `FileReader` that holds the fetch open until the test lets it go, so the handler
+    /// future can be dropped after `is_served` has spent the grant use.
+    struct HeldReader {
+        reached: tokio::sync::mpsc::UnboundedSender<()>,
+        release: parking_lot::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    }
+
+    impl FileReader for HeldReader {
+        fn read_bounded(&self, file: fs::File, limit: u64) -> std::io::Result<Vec<u8>> {
+            let _ = self.reached.send(());
+            if let Some(release) = self.release.lock().take() {
+                let _ = release.blocking_recv();
+            }
+            ReadToEnd.read_bounded(file, limit)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_grant_use_is_refunded_when_the_handler_future_is_dropped_before_it_replies() {
+        use std::time::Duration;
+        let fx = Fixture::new("fetch-grant-refund-dropped", MAX_FETCH_FILE_BYTES, &[]);
+        fx.file("src/secret.rs", b"s");
+        fx.grant(&["src/secret.rs"]);
+        let (reached, mut reached_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release, release_rx) = tokio::sync::oneshot::channel();
+        let held = FetchHandler::with_reader(
+            fx.weak_source(),
+            Arc::new(HeldReader {
+                reached,
+                release: parking_lot::Mutex::new(Some(release_rx)),
+            }),
+        );
+
+        let mut handling = held.handle(fx.admitted(FETCH_PATH, fetch_body("src/secret.rs", None)));
+        tokio::select! {
+            _ = &mut handling => panic!("the read is held until the test releases it"),
+            reached = reached_rx.recv() => assert!(reached.is_some()),
+        }
+        drop(handling);
+        release.send(()).unwrap();
+        let refunded = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if status_of(&fx.fetch("src/secret.rs", None).await) == "ok" {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(refunded.is_ok(), "the dropped fetch refunded its grant use");
     }
 
     #[tokio::test]
@@ -1641,7 +1784,12 @@ mod tests {
         fx.file("docs/a.md", bytes);
         let sink = RecordingHookSink::attach(&fx.serving.hooks);
 
-        assert_eq!(status_of(&fx.fetch("docs/a.md", None).await), "ok");
+        let unsent = fx.fetch("docs/a.md", None).await;
+        assert_eq!(status_of(&unsent), "ok");
+        drop(unsent);
+        assert!(sink.drain().is_empty(), "an unsent reply fires nothing");
+
+        sent(fx.fetch("docs/a.md", None).await);
 
         let envs = one_fire(&sink, HookEvent::MeshFetchServed);
         assert_eq!(
@@ -1715,6 +1863,68 @@ mod tests {
         set_mode(0o700);
     }
 
+    /// A share list the node refuses is the operator's problem, said once; the peers whose
+    /// requests keep finding it broken do not get to repeat the warning. Fixing the file
+    /// and breaking it again warns again.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_refused_share_list_is_warned_about_once_per_root_not_per_request() {
+        install_log_collector();
+        let fx = Fixture::new(
+            "fetch-refused-list-once",
+            MAX_FETCH_FILE_BYTES,
+            &["docs/**"],
+        );
+        fx.file("docs/a.md", b"a");
+        let shares = mesh_config_dir(&fx._tmp.path.join("config")).join("shares.yaml");
+        let refusal_warns = || {
+            warn_snapshot()
+                .iter()
+                .filter(|line| line.ends_with("Nothing is shared until then."))
+                .count()
+        };
+        let before = refusal_warns();
+
+        fs::write(&shares, "version: 1\nallow: not-a-list\n").unwrap();
+        assert_eq!(status_of(&fx.fetch("docs/a.md", None).await), "not_shared");
+        assert!(entry_paths(&fx.list(None, None).await).is_empty());
+        assert_eq!(status_of(&fx.fetch("docs/a.md", None).await), "not_shared");
+        assert_eq!(refusal_warns(), before + 1, "three requests, one warning");
+
+        fs::write(&shares, "version: 1\nallow:\n- pattern: 'docs/**'\n").unwrap();
+        assert_eq!(status_of(&fx.fetch("docs/a.md", None).await), "ok");
+        assert_eq!(refusal_warns(), before + 1);
+
+        fs::write(&shares, "version: 1\nallow: still-not-a-list\n").unwrap();
+        assert_eq!(status_of(&fx.fetch("docs/a.md", None).await), "not_shared");
+        assert_eq!(
+            refusal_warns(),
+            before + 2,
+            "a list broken again is warned about again"
+        );
+    }
+
+    /// A `mesh.fetch.inbox_dir` pointed inside a shared workspace: what peers staged
+    /// there is neither served nor listed under `allow **`, while the rest of the tree is.
+    #[tokio::test]
+    async fn a_file_under_a_configured_inbox_dir_is_never_served_or_listed() {
+        let fx = Fixture::with_inbox_dir(
+            "fetch-protected-inbox",
+            MAX_FETCH_FILE_BYTES,
+            &["**"],
+            Some("inbox"),
+        );
+        fx.file("inbox/inst/0123abcd/docs/a.md", b"theirs");
+        fx.file("README.md", b"ours");
+
+        assert_eq!(
+            status_of(&fx.fetch("inbox/inst/0123abcd/docs/a.md", None).await),
+            "not_shared"
+        );
+        assert_eq!(status_of(&fx.fetch("README.md", None).await), "ok");
+        assert_eq!(entry_paths(&fx.list(None, None).await), ["README.md"]);
+    }
+
     #[tokio::test]
     async fn an_absent_snapshot_serves_nothing() {
         let tmp = TempDir::new("fetch-absent-snapshot");
@@ -1722,7 +1932,7 @@ mod tests {
         let sources = [
             TestSource {
                 root: None,
-                serving: Some(serving_for(&tmp, MAX_FETCH_FILE_BYTES)),
+                serving: Some(serving_for(&tmp, MAX_FETCH_FILE_BYTES, None)),
             },
             TestSource {
                 root: Some(tmp.path.clone()),
@@ -1888,5 +2098,191 @@ mod tests {
             .map(|entry| entry.path.as_str())
             .collect();
         assert_eq!(paths, ["docs/b.md"]);
+    }
+
+    /// The `/list` worked example: `prefix` narrows the page to one subtree, entries are
+    /// sorted bytewise by path and carry `path`/`size`/`sha256`(bin32)/`mtime`(f64), the
+    /// empty page is exactly `{v, entries: [], next: nil}`, and a directory is neither
+    /// listed nor fetchable (its `not_shared` is byte-identical to a missing file's).
+    #[tokio::test]
+    async fn usage_probe_list_prefix_filters_sorts_and_shapes_entries_per_the_worked_example() {
+        let fx = Fixture::new(
+            "fetch-probe-list-shape",
+            MAX_FETCH_FILE_BYTES,
+            &["docs/**", "notes/**"],
+        );
+        let z = b"zz".to_vec();
+        let a = vec![b'a'; 1204];
+        let m = b"m".to_vec();
+        fx.file("docs/z.md", &z);
+        fx.file("notes/n.md", b"n");
+        fx.file("docs/sub/m.md", &m);
+        fx.file("docs/a.md", &a);
+        fx.file("src/x.rs", b"x");
+        let before = unix_secs_f64(SystemTime::now());
+
+        let page = fx.list(Some("docs/"), None).await;
+
+        assert_eq!(
+            field_of(&page, "v").and_then(Value::as_u64),
+            Some(PEER_WIRE_VERSION)
+        );
+        // `field` reads a nil as absent, so the raw map is what proves `next` is on the wire.
+        let raw = |value: &Value, key: &str| -> Option<Value> {
+            value
+                .as_map()
+                .unwrap()
+                .iter()
+                .find(|(name, _)| name.as_str() == Some(key))
+                .map(|(_, value)| value.clone())
+        };
+        assert_eq!(
+            raw(&page, "next"),
+            Some(Value::Nil),
+            "next is present and nil"
+        );
+        assert_eq!(
+            entry_paths(&page),
+            ["docs/a.md", "docs/sub/m.md", "docs/z.md"],
+            "bytewise order, no directory entry, nothing outside the prefix"
+        );
+        let entries = field_of(&page, "entries")
+            .and_then(Value::as_array)
+            .unwrap();
+        for (entry, bytes) in entries.iter().zip([&a, &m, &z]) {
+            assert_eq!(entry.as_map().unwrap().len(), 4, "{entry:?}");
+            assert_eq!(
+                field_of(entry, "size").and_then(Value::as_u64),
+                Some(bytes.len() as u64)
+            );
+            assert_eq!(
+                field_of(entry, "sha256"),
+                Some(&Value::Binary(sha256_of(bytes).to_vec()))
+            );
+            let mtime = field_of(entry, "mtime").and_then(Value::as_f64).unwrap();
+            assert!(
+                mtime.is_finite() && (mtime - before).abs() < 60.0,
+                "mtime {mtime} is not seconds since the epoch near {before}"
+            );
+        }
+
+        assert_eq!(
+            entry_paths(&fx.list(Some("notes/"), None).await),
+            ["notes/n.md"]
+        );
+        assert_eq!(
+            entry_paths(&fx.list(None, None).await),
+            ["docs/a.md", "docs/sub/m.md", "docs/z.md", "notes/n.md"]
+        );
+
+        let empty = fx.list(Some("nothing/"), None).await;
+        let keys: Vec<&str> = empty
+            .as_map()
+            .unwrap()
+            .iter()
+            .map(|(key, _)| key.as_str().unwrap())
+            .collect();
+        assert_eq!(keys, ["v", "entries", "next"], "{empty:?}");
+        assert_eq!(raw(&empty, "entries"), Some(Value::Array(Vec::new())));
+        assert_eq!(raw(&empty, "next"), Some(Value::Nil));
+
+        let directory = fx.fetch("docs", None).await;
+        assert_eq!(status_of(&directory), "not_shared");
+        let nested_directory = fx.fetch("docs/sub", None).await;
+        assert_eq!(status_of(&nested_directory), "not_shared");
+        let missing = encoded(fx.fetch("docs/missing.md", None).await);
+        assert_eq!(encoded(directory), missing);
+        assert_eq!(encoded(nested_directory), missing);
+    }
+
+    /// A page holds at most 1 000 entries even when the wire would take more: the first
+    /// page of 1 001 short paths is exactly 1 000 with a cursor, and the cursor resumes
+    /// at the one left over with no gap, overlap, or further page.
+    #[tokio::test]
+    async fn usage_probe_a_list_page_holds_at_most_one_thousand_entries() {
+        let fx = Fixture::new("fetch-probe-list-cap", MAX_FETCH_FILE_BYTES, &["docs/**"]);
+        let all: Vec<String> = (0..=1_000).map(|n| format!("docs/f{n:04}.md")).collect();
+        for path in &all {
+            fx.file(path, b"x");
+        }
+
+        let first = fx.list(None, None).await;
+
+        let frame = ResponseFrame {
+            request_id: RequestId::from([1u8; 16]),
+            data: first.clone(),
+        }
+        .encode();
+        assert!(
+            frame.len() <= MAX_R3_PAYLOAD_BYTES,
+            "{} bytes: the cut must come from the count, not the wire",
+            frame.len()
+        );
+        let kept = entry_paths(&first);
+        assert_eq!(kept.len(), 1_000);
+        assert_eq!(kept, all[..1_000]);
+        let cursor = next_of(&first).expect("a cut page carries a cursor");
+        assert!(cursor.len() <= 64, "{cursor}");
+
+        let second = fx.list(None, Some(&cursor)).await;
+
+        assert_eq!(entry_paths(&second), all[1_000..]);
+        assert_eq!(next_of(&second), None);
+    }
+
+    /// Every refusal leaves one `debug!` line naming the peer and the rule that fired, and
+    /// none of those lines carries the requested path.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn usage_probe_every_refusal_is_logged_at_debug_with_its_rule_and_without_the_path() {
+        install_log_collector();
+        let fx = Fixture::new("fetch-probe-refusal-log", 16, &["docs/**"]);
+        fx.file("docs/big-probe-q9.md", &[b'x'; 17]);
+        fx.file("src/hidden-probe-q9.rs", b"s");
+        let identity = TransportIdentity::new_from_rand(OsRng);
+        let destination = hex_lower(&[0x7e; 16]);
+        let identity_hex = identity.as_identity().address_hash.to_hex_string();
+        let mine =
+            |line: &String| line.contains(&identity_hex[..8]) || line.contains(&destination[..8]);
+        let handler = FetchHandler::new(fx.weak_source());
+        let refusals = [
+            ("../probe-q9", "invalid_path", "segment"),
+            ("src/hidden-probe-q9.rs", "not_shared", ""),
+            ("docs/missing-probe-q9.md", "not_shared", ""),
+            ("docs/big-probe-q9.md", "too_large", "too_large"),
+        ];
+
+        for (path, status, rule_word) in refusals {
+            let before = debug_snapshot().iter().filter(|line| mine(line)).count();
+            let reply = handler
+                .handle(admitted(
+                    FETCH_PATH,
+                    fetch_body(path, None),
+                    &identity,
+                    &destination,
+                ))
+                .await;
+            assert_eq!(status_of(&reply), status, "{path}");
+            let lines: Vec<String> = debug_snapshot().into_iter().filter(mine).collect();
+            assert!(
+                lines.len() > before,
+                "no debug line for the {status} refusal of {path}: {lines:?}"
+            );
+            assert!(
+                lines
+                    .iter()
+                    .skip(before)
+                    .any(|line| line.contains(rule_word)),
+                "no debug line names the rule {rule_word:?} for {path}: {lines:?}"
+            );
+        }
+        let leaked: Vec<String> = debug_snapshot()
+            .into_iter()
+            .filter(|line| line.contains("probe-q9"))
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "a refusal line carried the path: {leaked:?}"
+        );
     }
 }

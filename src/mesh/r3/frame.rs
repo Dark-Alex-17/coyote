@@ -35,6 +35,11 @@ pub(crate) const MAX_R3_NESTING_DEPTH: usize = 128;
 /// derive a destination address.
 pub(crate) const NAME_HASH_LEN: usize = NAME_HASH_LENGTH;
 
+/// The fixed opening of every encoded `ResponseFrame`: a 2-element array header and the
+/// `bin 8` header of its 16-byte request id. The requester reads a response's id straight
+/// off these bytes before it decodes anything.
+pub(crate) const RESPONSE_FRAME_PREFIX: [u8; 3] = [0x92, 0xc4, 0x10];
+
 const NAME_HASH_KEY: &str = "name_hash";
 const BODY_KEY: &str = "body";
 const VERSION_KEY: &str = "v";

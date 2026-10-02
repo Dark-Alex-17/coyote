@@ -53,20 +53,28 @@ pub(crate) struct InboundRequest {
 }
 
 /// What the handler answers with. `Silent` sends nothing, the way a `None` response does
-/// in RNS `Link.handle_request`. `Settled` is a value whose producer must hear if it was
-/// not sent: `on_failure` is called on any send failure or send timeout and dropped
-/// uncalled on success. "Sent" is what the transport reports: a packet put on its
-/// interface, or a resource whose advertisement was dispatched, since
-/// `send_response_resource` returns once that is done and a transfer that fails
-/// mid-flight is not observable here.
+/// in RNS `Link.handle_request`. `Settled` is a value whose producer must hear whether it
+/// went out: `settlement.sent()` is called once the transport reports the reply
+/// dispatched, and the settlement is dropped unsent on every other outcome.
 pub(crate) enum Reply {
     Value(Value),
     Code(RefusalCode),
     Silent,
-    Settled { value: Value, on_failure: OnFailure },
+    Settled {
+        value: Value,
+        settlement: Box<dyn Settlement>,
+    },
 }
 
-type OnFailure = Box<dyn FnOnce() + Send>;
+/// The producer's side of a `Reply::Settled`. `sent` is called once the transport reports
+/// the reply dispatched: a packet put on its interface, or a resource whose advertisement
+/// was dispatched, since `send_response_resource` returns once that is done and a transfer
+/// that fails mid-flight is not observable here. Dropping the settlement unsent means
+/// failure, whatever the cause: a send error or send timeout, or a handler that was
+/// cancelled or timed out while it still held the reply.
+pub(crate) trait Settlement: Send {
+    fn sent(self: Box<Self>);
+}
 
 /// Whether a request's bytes may be decoded at all.
 pub(crate) enum Admission {
@@ -382,11 +390,11 @@ impl R3Server {
                     );
                     return;
                 };
-                let (value, on_failure): (Value, Option<OnFailure>) = match reply {
+                let (value, settlement): (Value, Option<Box<dyn Settlement>>) = match reply {
                     Reply::Value(value) => (value, None),
                     Reply::Code(code) => (code.to_wire(), None),
                     Reply::Silent => return,
-                    Reply::Settled { value, on_failure } => (value, Some(on_failure)),
+                    Reply::Settled { value, settlement } => (value, Some(settlement)),
                 };
                 match timeout(
                     DEFAULT_RESPONSE_SEND_TIMEOUT,
@@ -394,7 +402,11 @@ impl R3Server {
                 )
                 .await
                 {
-                    Ok(Ok(())) => {}
+                    Ok(Ok(())) => {
+                        if let Some(settlement) = settlement {
+                            settlement.sent();
+                        }
+                    }
                     Ok(Err(err)) => {
                         warn!(
                             "Failed to send mesh response {} on link {}: {}",
@@ -402,9 +414,6 @@ impl R3Server {
                             link_id.to_hex_string(),
                             redact_hashes(&err.to_string())
                         );
-                        if let Some(on_failure) = on_failure {
-                            on_failure();
-                        }
                     }
                     Err(_) => {
                         warn!(
@@ -413,9 +422,6 @@ impl R3Server {
                             link_id.to_hex_string(),
                             DEFAULT_RESPONSE_SEND_TIMEOUT.as_secs()
                         );
-                        if let Some(on_failure) = on_failure {
-                            on_failure();
-                        }
                     }
                 }
             };

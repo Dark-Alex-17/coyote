@@ -247,7 +247,8 @@ pub(crate) struct Listing {
 /// of. Path arithmetic only; nothing is read. The workspace config directory's name is
 /// taken from the process once, here, so every rule derived from it agrees with where the
 /// workspace file was looked up. `with_cache_dir` adds the mesh cache directory, where
-/// grants, the inbox and pending questions live, to what is protected.
+/// grants, the inbox and pending questions live, to what is protected; `with_protected`
+/// adds any other directory, such as a configured inbox that lies outside the cache.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ShareLocations {
     pub global: PathBuf,
@@ -256,6 +257,7 @@ pub(crate) struct ShareLocations {
     workspace_root: PathBuf,
     workspace_config_dir_name: String,
     mesh_cache_dir: Option<PathBuf>,
+    protected: Vec<PathBuf>,
 }
 
 impl ShareLocations {
@@ -281,11 +283,17 @@ impl ShareLocations {
             workspace_root: workspace_root.to_path_buf(),
             workspace_config_dir_name,
             mesh_cache_dir: None,
+            protected: Vec::new(),
         }
     }
 
     pub(crate) fn with_cache_dir(mut self, cache_dir: &Path) -> Self {
         self.mesh_cache_dir = Some(mesh_cache_dir(cache_dir));
+        self
+    }
+
+    pub(crate) fn with_protected(mut self, dir: &Path) -> Self {
+        self.protected.push(dir.to_path_buf());
         self
     }
 }
@@ -308,8 +316,20 @@ impl ShareSet {
     /// Never fails and never creates a file; a refused file is warned about once here and
     /// its refusal kept for `apply` to repeat. The warning is the outer context alone, the
     /// file and the remedy; the offending entry is the user's own text and stays in the
-    /// refusal.
+    /// refusal. The REPL's share verbs are the callers; the wire path uses
+    /// `load_quietly` and owns the warning.
+    #[cfg(test)]
     pub(crate) fn load(locations: ShareLocations) -> Self {
+        let (set, warning) = Self::load_quietly(locations);
+        if let Some(warning) = warning {
+            warn!("{warning}");
+        }
+        set
+    }
+
+    /// `load` with the warning returned instead of logged, for a caller that loads per
+    /// request and must not let a peer make the operator's log repeat itself.
+    pub(crate) fn load_quietly(locations: ShareLocations) -> (Self, Option<String>) {
         let mut refusals = Vec::new();
         let mut warnings = Vec::new();
         let mut read = |path: &Path| match read_shares_file(path) {
@@ -324,17 +344,19 @@ impl ShareSet {
         let (global, _) = read(&locations.global);
         let workspace = read(&locations.workspace);
         let poisoned = (!refusals.is_empty()).then(|| refusals.join(" "));
-        if !warnings.is_empty() {
-            warn!("{} Nothing is shared until then.", warnings.join(" "));
-        }
-        Self {
-            locations,
-            global,
-            workspace: workspace.0,
-            #[cfg(test)]
-            workspace_exists: workspace.1,
-            poisoned,
-        }
+        let warning = (!warnings.is_empty())
+            .then(|| format!("{} Nothing is shared until then.", warnings.join(" ")));
+        (
+            Self {
+                locations,
+                global,
+                workspace: workspace.0,
+                #[cfg(test)]
+                workspace_exists: workspace.1,
+                poisoned,
+            },
+            warning,
+        )
     }
 
     /// The allow entries of both layers that apply to `peer`; empty while poisoned.
@@ -996,14 +1018,15 @@ fn workspace_config_dir_names(workspace_config_dir_name: &str) -> Vec<&str> {
 /// The directories nothing lifts, as they resolve on disk: the workspace config directory
 /// under each name it goes by, since an absolute env override lands where a name glob
 /// would miss, and the global config directory, which a share root above it would
-/// otherwise serve, and the mesh cache directory when the caller named one. A directory
-/// that does not resolve holds nothing to protect.
+/// otherwise serve, the mesh cache directory when the caller named one, and whatever else
+/// `with_protected` added. A directory that does not resolve holds nothing to protect.
 fn protected_dirs(locations: &ShareLocations) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = workspace_config_dir_names(&locations.workspace_config_dir_name)
         .into_iter()
         .map(|name| locations.workspace_root.join(name))
         .chain([locations.config_dir.clone()])
         .chain(locations.mesh_cache_dir.clone())
+        .chain(locations.protected.iter().cloned())
         .filter_map(|dir| dunce::canonicalize(dir).ok())
         .collect();
     dirs.sort();

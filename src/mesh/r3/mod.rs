@@ -36,7 +36,7 @@ pub(crate) use server::{
     Admission, DEFAULT_RESPONSE_SEND_TIMEOUT, HANDLER_TIMEOUT, InboundRequest,
     MAX_CONCURRENT_INBOUND_REQUESTS, PEER_RESOLVE_TIMEOUT, RequestHandler,
 };
-pub(crate) use server::{R3Server, Reply};
+pub(crate) use server::{R3Server, Reply, Settlement};
 #[cfg(all(test, unix))]
 pub(crate) use tests::network;
 

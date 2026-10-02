@@ -2,8 +2,8 @@ use crate::mesh::protocol::VersionRefusal;
 use crate::mesh::r3::dispatch::FETCH_PATH;
 use crate::mesh::r3::error::{R3Error, RefusalCode};
 use crate::mesh::r3::frame::{
-    Envelope, MAX_FETCH_RESPONSE_BYTES, MAX_R3_PAYLOAD_BYTES, RequestFrame, RequestId,
-    ResponseFrame,
+    Envelope, MAX_FETCH_RESPONSE_BYTES, MAX_R3_PAYLOAD_BYTES, RESPONSE_FRAME_PREFIX, RequestFrame,
+    RequestId, ResponseFrame,
 };
 #[cfg(all(test, unix))]
 use crate::mesh::r3::receipt::RequestReceipt;
@@ -662,11 +662,10 @@ impl R3Client {
     }
 
     /// The path of the pending request `bytes` answers, read from the frame's fixed prefix
-    /// (`0x92 0xc4 0x10` then the 16-byte request id); `None` when the bytes do not start
-    /// that way or nothing pending has that id.
+    /// (`RESPONSE_FRAME_PREFIX` then the 16-byte request id); `None` when the bytes do not
+    /// start that way or nothing pending has that id.
     fn pending_path(&self, bytes: &[u8]) -> Option<String> {
-        const PREFIX: [u8; 3] = [0x92, 0xc4, 0x10];
-        let id_bytes = bytes.strip_prefix(&PREFIX)?.get(..16)?;
+        let id_bytes = bytes.strip_prefix(&RESPONSE_FRAME_PREFIX)?.get(..16)?;
         let request_id = RequestId::from(<[u8; 16]>::try_from(id_bytes).ok()?);
         self.pending
             .lock()

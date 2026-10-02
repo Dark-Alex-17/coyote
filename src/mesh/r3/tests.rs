@@ -2,7 +2,7 @@ use super::dispatch::DispatchError;
 use super::error::{R3Error, RefusalCode};
 use super::frame::{
     Envelope, EnvelopeError, MAX_R3_NESTING_DEPTH, NAME_HASH_LEN, OriginName, PathHash,
-    RequestFrame, RequestId, ResponseFrame,
+    RESPONSE_FRAME_PREFIX, RequestFrame, RequestId, ResponseFrame,
 };
 use crate::mesh::protocol::MESH_PROTOCOL_VERSION;
 
@@ -53,6 +53,19 @@ fn response_frame_is_accepted_by_upstream_envelope_unpacker() {
     assert_eq!(RequestId::from(upstream_id), request_id);
     assert_eq!(upstream_value, frame.data);
     assert_eq!(ResponseFrame::decode(&bytes).unwrap(), frame);
+}
+
+#[test]
+fn a_response_frame_starts_with_the_pinned_prefix_and_its_request_id() {
+    let request_id = RequestId::from([0xa5u8; 16]);
+    let bytes = ResponseFrame {
+        request_id,
+        data: Value::from("ok"),
+    }
+    .encode();
+
+    assert_eq!(bytes[..3], RESPONSE_FRAME_PREFIX);
+    assert_eq!(bytes[3..19], [0xa5u8; 16]);
 }
 
 #[test]
@@ -468,7 +481,8 @@ pub(crate) mod network {
     };
     use super::super::receipt::{ReceiptState, RequestReceipt};
     use super::super::server::{
-        Admission, InboundRequest, MAX_CONCURRENT_INBOUND_REQUESTS, R3Server, Reply, RequestHandler,
+        Admission, InboundRequest, MAX_CONCURRENT_INBOUND_REQUESTS, R3Server, Reply,
+        RequestHandler, Settlement,
     };
     use crate::config::mesh_config::MeshInterface;
     use crate::config::{ForkRekey, MeshConfig, Session};
@@ -484,7 +498,7 @@ pub(crate) mod network {
     use crate::mesh::envoy::{EnvoyJob, EnvoySink};
     use crate::mesh::events::{MeshHooks, RecordingHookSink};
     use crate::mesh::fetch::{
-        FETCH_REQUEST_TIMEOUT, FetchError, Fetched, SINGLE_SEGMENT_FETCH_CEILING,
+        FILE_FETCH_REQUEST_TIMEOUT, FetchError, Fetched, SINGLE_SEGMENT_FETCH_CEILING,
     };
     use crate::mesh::idle::{IdleNotify, IdleSink, Origin};
     use crate::mesh::knock::{
@@ -1964,30 +1978,53 @@ pub(crate) mod network {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_settled_reply_calls_on_failure_only_when_the_send_fails() {
+    async fn a_settled_reply_is_sent_on_success_and_dropped_unsent_when_the_send_fails() {
         install_log_collector();
         let recorder = Arc::new(Recorder::default());
         let (responder, requester, desc) = pair(recorder.clone()).await;
-        let settled = |value: Value, failed: &Arc<AtomicBool>| {
-            let failed = failed.clone();
-            Reply::Settled {
-                value,
-                on_failure: Box::new(move || failed.store(true, Ordering::SeqCst)),
+        struct Flags {
+            sent: Arc<AtomicBool>,
+            dropped: Arc<AtomicBool>,
+        }
+        impl Settlement for Flags {
+            fn sent(self: Box<Self>) {
+                self.sent.store(true, Ordering::SeqCst);
             }
+        }
+        impl Drop for Flags {
+            fn drop(&mut self) {
+                self.dropped.store(true, Ordering::SeqCst);
+            }
+        }
+        let settled = |value: Value| {
+            let sent = Arc::new(AtomicBool::new(false));
+            let dropped = Arc::new(AtomicBool::new(false));
+            let reply = Reply::Settled {
+                value,
+                settlement: Box::new(Flags {
+                    sent: sent.clone(),
+                    dropped: dropped.clone(),
+                }),
+            };
+            (reply, sent, dropped)
         };
 
-        let sent_failed = Arc::new(AtomicBool::new(false));
-        recorder.queue(Script::Reply(settled(Value::from("settled"), &sent_failed)));
+        let (reply, sent, dropped) = settled(Value::from("settled"));
+        recorder.queue(Script::Reply(reply));
         let outcome = requester.request(&desc, "/echo", Value::Nil).await.unwrap();
         assert_eq!(outcome.value, Value::from("settled"));
-        assert!(!sent_failed.load(Ordering::SeqCst));
+        assert!(sent.load(Ordering::SeqCst));
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "`sent` consumes the settlement"
+        );
 
-        let oversize_failed = Arc::new(AtomicBool::new(false));
         let body = Value::Binary(vec![
             0xcd;
             MAX_R3_PAYLOAD_BYTES + 1 - RESPONSE_FRAME_OVERHEAD
         ]);
-        recorder.queue(Script::Reply(settled(body, &oversize_failed)));
+        let (reply, sent, dropped) = settled(body);
+        recorder.queue(Script::Reply(reply));
         let err = requester
             .client
             .request(
@@ -2015,7 +2052,8 @@ pub(crate) mod network {
             warn_snapshot().iter().any(|message| message == &warned),
             "expected {warned:?}"
         );
-        assert!(oversize_failed.load(Ordering::SeqCst));
+        assert!(!sent.load(Ordering::SeqCst));
+        assert!(dropped.load(Ordering::SeqCst));
         requester.stop().await;
         responder.stop().await;
     }
@@ -6406,7 +6444,7 @@ pub(crate) mod network {
                 FETCH_PATH,
                 pair.responder.envelope(fetch_body("docs/big.bin", None)),
                 RequestOptions {
-                    request_timeout: FETCH_REQUEST_TIMEOUT,
+                    request_timeout: FILE_FETCH_REQUEST_TIMEOUT,
                     link_timeout: PEER_LINK_TIMEOUT,
                 },
             )
@@ -6543,6 +6581,250 @@ pub(crate) mod network {
             seen,
             "a path this node's own grammar refuses never reaches the peer"
         );
+        pair.stop_node_a().await;
+    }
+
+    /// Trust comes before the share set: a peer node A does not trust hears nothing on
+    /// `/list` or `/fetch`, exactly as on `/status`, and a shared path is as silent as an
+    /// unshared one, so the refusal cannot tell the two apart. Nothing is served, so the
+    /// `mesh.fetch.served` hook never fires.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_list_and_fetch_from_an_untrusted_peer_are_silent_like_status_whatever_the_path()
+     {
+        let pair =
+            NodePair::start_with("r3-probe-fetch-untrusted", |_| {}, |_| TrustList::default())
+                .await;
+        let (slot, _idle) = installed_slot(&pair);
+        let sink = RecordingHookSink::attach(pair.node_a.hooks());
+        let workspace = share_docs_from_a(&pair, &slot, "r3-probe-fetch-untrusted-root");
+        fs::write(workspace.path.join("docs").join("a.md"), b"# a\n").unwrap();
+
+        let asks = [
+            (STATUS_PATH, Value::Nil),
+            (
+                LIST_PATH,
+                wire_map(vec![("v", Value::from(PEER_WIRE_VERSION))]),
+            ),
+            (FETCH_PATH, fetch_body("docs/a.md", None)),
+            (FETCH_PATH, fetch_body("src/x.rs", None)),
+            (FETCH_PATH, fetch_body("docs/missing.md", None)),
+        ];
+        for (path, body) in asks {
+            let err = pair
+                .client_b
+                .request(
+                    &pair.responder.transport,
+                    &pair.responder.identity,
+                    &pair.a_desc,
+                    path,
+                    pair.responder.envelope(body.clone()),
+                    short_options(),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(err, timed_out(path), "{path} {body:?}");
+        }
+
+        assert!(
+            sink.drain()
+                .into_iter()
+                .all(|(event, _)| event != HookEvent::MeshFetchServed),
+            "nothing was served to an untrusted peer"
+        );
+        pair.stop_node_a().await;
+    }
+
+    /// A trusted peer of a node with no share list at all gets the empty listing
+    /// `{v, entries: [], next: nil}` and `not_shared` for a file that exists under the
+    /// root, over the live wire.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_a_node_without_a_share_list_lists_nothing_and_shares_nothing() {
+        let pair = NodePair::start_with("r3-probe-fetch-noshares", |_| {}, trusting_b).await;
+        let (slot, _idle) = installed_slot(&pair);
+        let workspace = TempDir::new("r3-probe-fetch-noshares-root");
+        fs::create_dir_all(workspace.path.join("docs")).unwrap();
+        fs::write(workspace.path.join("docs").join("a.md"), b"# a\n").unwrap();
+        let mut snapshot = snapshot_fixture();
+        snapshot.cwd = workspace.path.clone();
+        slot.publish(snapshot);
+
+        let listed = b_asks_a(
+            &pair,
+            LIST_PATH,
+            wire_map(vec![("v", Value::from(PEER_WIRE_VERSION))]),
+            short_options(),
+        )
+        .await;
+        assert_eq!(
+            wire_field(&listed.value, "v").and_then(Value::as_u64),
+            Some(PEER_WIRE_VERSION)
+        );
+        assert_eq!(
+            wire_field(&listed.value, "entries"),
+            Some(&Value::Array(Vec::new()))
+        );
+        assert_eq!(wire_field(&listed.value, "next"), Some(&Value::Nil));
+
+        let fetched = b_asks_a(
+            &pair,
+            FETCH_PATH,
+            fetch_body("docs/a.md", None),
+            short_options(),
+        )
+        .await;
+        assert_eq!(wire_status(&fetched.value), "not_shared");
+        assert_eq!(wire_field(&fetched.value, "bytes"), None);
+        pair.stop_node_a().await;
+    }
+
+    /// The requester maps every status of the worked examples to its typed `Fetched`,
+    /// stages nothing for any of them or for bytes that fail their hash, reads an `ok`
+    /// with an unknown key, and reports a peer answering `UnknownPath` (not only
+    /// `NoProvider`) as one that does not share files, on `/fetch` and `/list` alike.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_fetch_file_maps_each_peer_status_and_stages_nothing_for_refusals() {
+        let pair = NodePair::start_with("r3-probe-fetch-statuses", |_| {}, trusting_b).await;
+        pair.introduce_b_to_a().await;
+        let b_desc = &pair.responder.desc;
+        let b_hex = b_desc.address_hash.to_hex_string();
+        let bytes = b"# c\n".to_vec();
+        let digest: [u8; 32] = Sha256::digest(&bytes).into();
+        let v = || ("v", Value::from(PEER_WIRE_VERSION));
+        // The inbox does not exist before the first staging, so only the cache dir can be
+        // canonicalised up front.
+        let staged_at = dunce::canonicalize(pair.node_a.cache_dir())
+            .unwrap()
+            .join("mesh")
+            .join("inbox")
+            .join(pair.node_a.current_instance_id())
+            .join(b_hex[..8].to_lowercase())
+            .join("docs")
+            .join("c.md");
+
+        let answers: Vec<(Value, Fetched)> = vec![
+            (
+                wire_map(vec![v(), ("status", Value::from("not_shared"))]),
+                Fetched::NotShared,
+            ),
+            (
+                wire_map(vec![
+                    v(),
+                    ("status", Value::from("too_large")),
+                    ("limit", Value::from(4_194_304u64)),
+                ]),
+                Fetched::TooLarge { limit: 4_194_304 },
+            ),
+            (
+                wire_map(vec![
+                    v(),
+                    ("status", Value::from("not_modified")),
+                    ("sha256", Value::Binary(digest.to_vec())),
+                ]),
+                Fetched::NotModified { sha256: digest },
+            ),
+            (
+                wire_map(vec![
+                    v(),
+                    ("status", Value::from("invalid_path")),
+                    ("rule", Value::from("segment")),
+                ]),
+                Fetched::InvalidPath {
+                    rule: "segment".into(),
+                },
+            ),
+        ];
+        for (answer, expected) in answers {
+            pair.recorder_b
+                .queue(Script::Reply(Reply::Value(answer.clone())));
+            let fetched = pair
+                .node_a
+                .fetch_file(b_desc, "docs/c.md", Some(digest))
+                .await
+                .unwrap();
+            assert_eq!(fetched, expected, "{answer:?}");
+            assert!(!staged_at.exists(), "{answer:?} staged a file");
+        }
+
+        pair.recorder_b
+            .queue(Script::Reply(Reply::Value(wire_map(vec![
+                v(),
+                ("status", Value::from("ok")),
+                ("size", Value::from(bytes.len() as u64)),
+                ("sha256", Value::Binary([0x11; 32].to_vec())),
+                ("bytes", Value::Binary(bytes.clone())),
+            ]))));
+        let err = pair
+            .node_a
+            .fetch_file(b_desc, "docs/c.md", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FetchError::Corrupt), "{err:?}");
+        assert!(
+            !staged_at.exists(),
+            "bytes that fail their hash were left in the inbox"
+        );
+
+        pair.recorder_b.queue(Script::Reply(Reply::Value(
+            DispatchError::UnknownPath {
+                path_hash: PathHash::of(FETCH_PATH).to_hex_string(),
+            }
+            .to_value(),
+        )));
+        let err = pair
+            .node_a
+            .fetch_file(b_desc, "docs/c.md", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FetchError::NotServed), "{err:?}");
+        assert_eq!(err.to_string(), "peer does not share files");
+
+        for refusal in [
+            DispatchError::UnknownPath {
+                path_hash: PathHash::of(LIST_PATH).to_hex_string(),
+            },
+            DispatchError::NoProvider {
+                path: LIST_PATH.to_string(),
+            },
+        ] {
+            pair.recorder_b
+                .queue(Script::Reply(Reply::Value(refusal.to_value())));
+            let err = pair
+                .node_a
+                .list_shares(b_desc, Some("docs/"), None)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, FetchError::NotServed), "{err:?}");
+            assert_eq!(err.to_string(), "peer does not share files");
+        }
+        assert_eq!(
+            pair.node_a.last_list(&b_hex),
+            None,
+            "a refused listing is not remembered"
+        );
+
+        pair.recorder_b
+            .queue(Script::Reply(Reply::Value(wire_map(vec![
+                v(),
+                ("status", Value::from("ok")),
+                ("size", Value::from(bytes.len() as u64)),
+                ("sha256", Value::Binary(digest.to_vec())),
+                ("bytes", Value::Binary(bytes.clone())),
+                ("colour", Value::from("blue")),
+            ]))));
+        let fetched = pair
+            .node_a
+            .fetch_file(b_desc, "docs/c.md", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            fetched,
+            Fetched::Staged {
+                path: staged_at.clone(),
+                size: bytes.len() as u64,
+                sha256: digest,
+            }
+        );
+        assert_eq!(fs::read(&staged_at).unwrap(), bytes);
         pair.stop_node_a().await;
     }
 }
