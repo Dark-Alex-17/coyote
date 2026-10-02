@@ -4080,7 +4080,7 @@ mod tests {
         stub.stop().await;
     }
 
-    /// (a)+F8: the per-identity cap counts PENDING entries only. Once the sixth request
+    /// The per-identity cap counts PENDING entries only. Once the sixth request
     /// is refused as `too_many_pending`, refusing one of the five reopens the cap and the
     /// next request is filed again.
     #[cfg(unix)]
@@ -4193,6 +4193,204 @@ mod tests {
         assert_eq!(grants.len(), 1);
         assert_eq!(grants[0].paths[0].uses_left, DEFAULT_GRANT_USES);
         assert_eq!(access_records(&installed.slot).len(), 1);
+        installed.stop().await;
+        stub.stop().await;
+    }
+
+    // ---- spec-first probes of the admission hardening, read from its contract ----
+
+    /// "granted at once" means every asked path is fetchable by that peer now. A rule
+    /// such as `src/**` covers a directory's NAME, but a directory is not fetchable, so a
+    /// request naming one, alone or mixed with a served regular file, is `pending` and
+    /// goes to the human (grant-all-or-nothing on the immediate answer).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_a_rule_covered_directory_alone_or_mixed_with_a_served_file_is_pending() {
+        let installed = Installed::start("usage-probe-access-dir").await;
+        fs::create_dir_all(installed.root.join("src/sub")).unwrap();
+        fs::write(installed.root.join("src/sub/f.rs"), b"fn f() {}").unwrap();
+        fs::write(installed.root.join("src/x.rs"), b"struct X;").unwrap();
+        installed.share_with("src/**", &identity());
+
+        let admit = |id: &'static str, paths: &'static [&'static str]| {
+            let slot = Arc::clone(&installed.slot);
+            tokio::task::spawn_blocking(move || {
+                slot.admit_access(inbound(&identity(), id, paths, ""))
+            })
+        };
+        // Positive control: the rule does grant a regular file at once.
+        let file = admit("a-0", &["src/x.rs"]).await.unwrap();
+        assert!(matches!(file, AccessOutcome::Granted { .. }), "{file:?}");
+
+        let directory = admit("a-1", &["src/sub"]).await.unwrap();
+        let mixed = admit("a-2", &["src/x.rs", "src/sub"]).await.unwrap();
+
+        assert_eq!(directory, AccessOutcome::Pending);
+        assert_eq!(mixed, AccessOutcome::Pending);
+        let records = access_records(&installed.slot);
+        let mut ids: Vec<&str> = records.iter().map(|record| record.id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, ["a-1", "a-2"]);
+        let texts = installed.idle.texts();
+        assert_eq!(texts.len(), 2, "{texts:?}");
+        assert!(
+            texts.iter().all(|text| text.contains("`src/sub`")),
+            "{texts:?}"
+        );
+        installed.stop().await;
+    }
+
+    /// Standing grant, write failure AFTER the peer heard yes (the decision is sent
+    /// first by contract): the peer holds a `granted` standing reply, the decided hook
+    /// and the returned error tells the human the peer was already told yes and to run
+    /// the grant again — so the request must still be open for that re-run, and the
+    /// re-run must then write the allow entry. Observed and pinned: `mesh.access.decided`
+    /// does NOT fire for the yes the peer already holds; it fires once, on the re-run
+    /// that settles the request (which also sends the peer a second `granted` reply).
+    /// A hook consumer therefore never hears of a yes the human does not re-run.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_a_standing_grant_whose_share_list_cannot_be_written_says_the_peer_already_heard_yes()
+     {
+        use std::os::unix::fs::PermissionsExt;
+
+        let stub = PeerStub::listen(
+            "usage-probe-access-standing-ro-stub",
+            TcpServer::DEFAULT_CLIENT_MTU,
+        )
+        .await;
+        let installed = Installed::beside("usage-probe-access-standing-ro", &stub).await;
+        fs::write(installed.root.join("src/x.rs"), b"struct X;").unwrap();
+        installed.ask(&stub, "a-1", &["src/x.rs"]).await;
+        let config_dir = mesh_config_dir(&installed.tmp.path.join("config"));
+        fs::create_dir_all(&config_dir).unwrap();
+        let writable = fs::metadata(&config_dir).unwrap().permissions();
+        fs::set_permissions(&config_dir, fs::Permissions::from_mode(0o555)).unwrap();
+
+        let err = installed
+            .slot
+            .access()
+            .grant("a-1", true, None)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        fs::set_permissions(&config_dir, writable).unwrap();
+        assert!(err.contains("already told yes"), "{err}");
+        assert!(err.contains("a-1"), "{err}");
+        assert!(!global_shares_path(&installed).exists(), "{err}");
+        assert!(installed.grants().is_empty());
+        let body = decision_seen(&stub, "a-1");
+        assert_eq!(
+            body.parts,
+            vec![RawPart::Data {
+                data: granted_data(None)
+            }]
+        );
+        let fired: Vec<HookEvent> = installed
+            .hooks
+            .drain()
+            .iter()
+            .map(|(event, _)| *event)
+            .collect();
+        assert_eq!(fired, vec![HookEvent::MeshMessageSent], "{fired:?}");
+        let records = access_records(&installed.slot);
+        assert_eq!(
+            records.len(),
+            1,
+            "the request must stay open for the re-run the error asks for: {records:?}"
+        );
+
+        // The re-run the error asks for: the allow entry lands this time.
+        let report = installed
+            .slot
+            .access()
+            .grant("a-1", true, None)
+            .await
+            .unwrap();
+        assert!(report.standing);
+        assert_eq!(
+            stub.seen().len(),
+            2,
+            "the re-run told the peer yes a second time"
+        );
+        decided_once(&installed.hooks, "a-1", "granted");
+        let yaml = installed.shares_yaml();
+        let allow = yaml["allow"].as_sequence().unwrap();
+        assert_eq!(allow.len(), 1, "{yaml:?}");
+        assert_eq!(allow[0]["pattern"].as_str(), Some("src/x.rs"));
+        assert_eq!(
+            allow[0]["peer"].as_str(),
+            Some(stub.identity_hex().as_str())
+        );
+        assert!(access_records(&installed.slot).is_empty());
+        installed.stop().await;
+        stub.stop().await;
+    }
+
+    /// `refused` carries its `reason` as a SIBLING key, and the duplicate
+    /// rule to pending entries: the same path set asked under a NEW id while the first is
+    /// pending is `duplicate`; after the first is refused by the human the same set is
+    /// admitted again and the human sees a second line.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_a_refused_request_frees_its_path_set_for_a_fresh_ask() {
+        let stub = PeerStub::listen(
+            "usage-probe-access-refree-stub",
+            TcpServer::DEFAULT_CLIENT_MTU,
+        )
+        .await;
+        let installed = Installed::beside("usage-probe-access-refree", &stub).await;
+        installed
+            .ask(&stub, "a-1", &["src/x.rs", "docs/y.md"])
+            .await;
+        let admit = |id: &'static str| {
+            let slot = Arc::clone(&installed.slot);
+            let identity = stub.identity_hex();
+            let destination = stub.destination_hex();
+            tokio::task::spawn_blocking(move || {
+                slot.admit_access(InboundAccess {
+                    identity_hash: identity,
+                    destination_hash: destination,
+                    // Order and repeats must not defeat the set comparison.
+                    request: validate_access(
+                        id,
+                        strings(&["docs/y.md", "src/x.rs", "docs/y.md"]),
+                        "",
+                    )
+                    .unwrap(),
+                    via: PeerVia::Direct,
+                })
+            })
+        };
+
+        let duplicate = admit("a-2").await.unwrap();
+        assert_eq!(
+            duplicate,
+            AccessOutcome::Refused(AccessRefusal::Duplicate),
+            "{duplicate:?}"
+        );
+        let wire = access_reply("a-2", &duplicate);
+        let keys: Vec<&str> = wire
+            .as_map()
+            .unwrap()
+            .iter()
+            .map(|(key, _)| key.as_str().unwrap())
+            .collect();
+        assert!(
+            keys.contains(&"status") && keys.contains(&"reason"),
+            "{wire:?}"
+        );
+        assert_eq!(installed.idle.texts().len(), 1);
+
+        installed.slot.access().refuse("a-1").await.unwrap();
+        let fresh = admit("a-3").await.unwrap();
+
+        assert_eq!(fresh, AccessOutcome::Pending);
+        let records = access_records(&installed.slot);
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(records[0].id, "a-3");
+        assert_eq!(installed.idle.texts().len(), 2);
         installed.stop().await;
         stub.stop().await;
     }

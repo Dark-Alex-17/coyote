@@ -7937,4 +7937,300 @@ pub(crate) mod network {
         assert_eq!(fires, 1, "only the granted src/x.rs fetch was served");
         pair.stop_node_a().await;
     }
+
+    // ---- spec-first probes of the /access hardening, over a live pair ----
+
+    /// Re-sending a PENDING access id is `refused { duplicate }` on
+    /// the wire (`reason` beside `status`), whatever path set the re-send
+    /// carries, and the FIRST path set stands: the human saw one line, and a later
+    /// grant covers only the original path — the smuggled second path is still
+    /// `not_shared` and byte-identical to a missing file.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_a_re_sent_access_id_is_refused_duplicate_and_a_grant_covers_only_the_first_paths()
+     {
+        let pair = NodePair::start_with("usage-probe-r3-access-resend", |_| {}, trusting_b).await;
+        pair.introduce_b_to_a().await;
+        let (slot, idle) = installed_slot(&pair);
+        let sink = hook_sink_for(&pair, &slot);
+        let workspace = share_docs_from_a(&pair, &slot, "usage-probe-r3-access-resend-root");
+        fs::write(
+            workspace.path.join("src").join("secret.rs"),
+            b"struct Secret;\n",
+        )
+        .unwrap();
+        fs::write(
+            workspace.path.join("src").join("other.rs"),
+            b"struct Other;\n",
+        )
+        .unwrap();
+
+        let first = b_asks_a(
+            &pair,
+            ACCESS_PATH,
+            access_body("acc-1", &["src/secret.rs"], "need the struct"),
+            short_options(),
+        )
+        .await;
+        assert_eq!(wire_status(&first.value), "pending");
+
+        let again = b_asks_a(
+            &pair,
+            ACCESS_PATH,
+            access_body("acc-1", &["src/secret.rs", "src/other.rs"], "and the other"),
+            short_options(),
+        )
+        .await;
+
+        assert_eq!(wire_status(&again.value), "refused");
+        assert_eq!(
+            wire_field(&again.value, "reason").and_then(Value::as_str),
+            Some("duplicate")
+        );
+        assert_eq!(
+            wire_field(&again.value, "id").and_then(Value::as_str),
+            Some("acc-1")
+        );
+        assert_eq!(wire_field(&again.value, "expires"), None);
+        {
+            let notes = idle.0.lock();
+            assert_eq!(notes.len(), 1, "{notes:?}");
+            assert!(
+                notes[0].text.contains("asks for 1 path: `src/secret.rs`"),
+                "{}",
+                notes[0].text
+            );
+            assert!(!notes[0].text.contains("other.rs"), "{}", notes[0].text);
+        }
+        let records = slot
+            .inbound_store()
+            .unwrap()
+            .list(SystemTime::now())
+            .unwrap();
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(records[0].paths, vec!["src/secret.rs".to_string()]);
+
+        pair.recorder_b.queue(Script::Acknowledge);
+        let report = slot.access().grant("acc-1", false, None).await.unwrap();
+        assert_eq!(report.path_count, 1);
+
+        let served = b_asks_a(
+            &pair,
+            FETCH_PATH,
+            fetch_body("src/secret.rs", None),
+            short_options(),
+        )
+        .await;
+        let smuggled = b_asks_a(
+            &pair,
+            FETCH_PATH,
+            fetch_body("src/other.rs", None),
+            short_options(),
+        )
+        .await;
+        let missing = b_asks_a(
+            &pair,
+            FETCH_PATH,
+            fetch_body("src/nope.rs", None),
+            short_options(),
+        )
+        .await;
+        assert_eq!(wire_status(&served.value), "ok");
+        assert_eq!(wire_status(&smuggled.value), "not_shared");
+        assert_eq!(wire_bytes(&smuggled.value), wire_bytes(&missing.value));
+
+        let fired = sink.drain();
+        let requested = fires_of(&fired, HookEvent::MeshAccessRequested);
+        assert_eq!(
+            requested.len(),
+            1,
+            "the duplicate fired no second hook: {fired:?}"
+        );
+        assert_eq!(
+            crate::mesh::events::env_value(requested[0], "COYOTE_MESH_PATH_COUNT"),
+            Some("1")
+        );
+        pair.stop_node_a().await;
+    }
+
+    /// B6: a one-off grant is per PATH — one use each, spent independently. Fetching
+    /// the first path twice spends only that path; the second path is still served
+    /// once, then not.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_a_one_off_grant_spends_each_path_independently_on_the_wire() {
+        let pair = NodePair::start_with("usage-probe-r3-access-per-path", |_| {}, trusting_b).await;
+        pair.introduce_b_to_a().await;
+        let (slot, _idle) = installed_slot(&pair);
+        let workspace = share_docs_from_a(&pair, &slot, "usage-probe-r3-access-per-path-root");
+        fs::write(workspace.path.join("src").join("a.rs"), b"struct A;\n").unwrap();
+        fs::write(workspace.path.join("src").join("b.rs"), b"struct B;\n").unwrap();
+
+        let asked = b_asks_a(
+            &pair,
+            ACCESS_PATH,
+            access_body("acc-2", &["src/a.rs", "src/b.rs"], ""),
+            short_options(),
+        )
+        .await;
+        assert_eq!(wire_status(&asked.value), "pending");
+        pair.recorder_b.queue(Script::Acknowledge);
+        slot.access().grant("acc-2", false, None).await.unwrap();
+
+        let fetch = |path: &'static str| {
+            b_asks_a(&pair, FETCH_PATH, fetch_body(path, None), short_options())
+        };
+        let a_first = fetch("src/a.rs").await;
+        let a_second = fetch("src/a.rs").await;
+        let b_first = fetch("src/b.rs").await;
+        let b_second = fetch("src/b.rs").await;
+
+        assert_eq!(wire_status(&a_first.value), "ok");
+        assert_eq!(wire_status(&a_second.value), "not_shared");
+        assert_eq!(
+            wire_status(&b_first.value),
+            "ok",
+            "a.rs's spend did not touch b.rs"
+        );
+        assert_eq!(
+            wire_field(&b_first.value, "bytes"),
+            Some(&Value::Binary(b"struct B;\n".to_vec()))
+        );
+        assert_eq!(wire_status(&b_second.value), "not_shared");
+        pair.stop_node_a().await;
+    }
+
+    /// (d) + ruling 9 as a consumer sees it: a STANDING grant lands as an `allow` entry
+    /// scoped to the requesting IDENTITY (never an `override`), the decision reply says
+    /// `granted` with no `expires`, and the peer can then fetch the path again and
+    /// again — nothing is spent, no one-off grant exists. Asking for the same path a
+    /// second time is then `granted` on the wire at once with nobody asked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_a_standing_grant_serves_the_path_repeatedly_and_makes_the_next_ask_immediate()
+     {
+        let pair = NodePair::start_with("usage-probe-r3-access-standing", |_| {}, trusting_b).await;
+        pair.introduce_b_to_a().await;
+        let (slot, idle) = installed_slot(&pair);
+        let workspace = share_docs_from_a(&pair, &slot, "usage-probe-r3-access-standing-root");
+        fs::write(
+            workspace.path.join("src").join("secret.rs"),
+            b"struct Secret;\n",
+        )
+        .unwrap();
+        let b_identity = pair.responder.desc.identity.address_hash.to_hex_string();
+
+        let asked = b_asks_a(
+            &pair,
+            ACCESS_PATH,
+            access_body("acc-3", &["src/secret.rs"], "for keeps"),
+            short_options(),
+        )
+        .await;
+        assert_eq!(wire_status(&asked.value), "pending");
+        pair.recorder_b.queue(Script::Acknowledge);
+        let report = slot.access().grant("acc-3", true, None).await.unwrap();
+        assert!(report.standing);
+        assert_eq!(report.expires, None);
+
+        let reply = from_r3_body(&pair.recorder_b.last_body()).unwrap();
+        assert_eq!(reply.in_reply_to.as_deref(), Some("acc-3"));
+        assert_eq!(reply.disposition, Some(Disposition::Answered));
+        assert_eq!(
+            reply.parts,
+            vec![RawPart::Data {
+                data: serde_json::json!({ "access": { "status": "granted" } })
+            }]
+        );
+
+        let shares = mesh_config_dir(&pair.config_dir_a()).join("shares.yaml");
+        let yaml: serde_yaml::Value =
+            serde_yaml::from_str(&fs::read_to_string(shares).unwrap()).unwrap();
+        let allow = yaml["allow"].as_sequence().unwrap();
+        let scoped: Vec<(&str, Option<&str>)> = allow
+            .iter()
+            .map(|entry| (entry["pattern"].as_str().unwrap(), entry["peer"].as_str()))
+            .collect();
+        assert_eq!(
+            scoped,
+            vec![
+                ("docs/**", None),
+                ("src/secret.rs", Some(b_identity.as_str()))
+            ],
+            "{yaml:?}"
+        );
+        assert!(
+            yaml["override"].as_sequence().is_none_or(Vec::is_empty),
+            "{yaml:?}"
+        );
+        assert!(pair.node_a.serving().grants().list().unwrap().is_empty());
+
+        for round in 0..3 {
+            let served = b_asks_a(
+                &pair,
+                FETCH_PATH,
+                fetch_body("src/secret.rs", None),
+                short_options(),
+            )
+            .await;
+            assert_eq!(wire_status(&served.value), "ok", "fetch {round}");
+        }
+
+        let again = b_asks_a(
+            &pair,
+            ACCESS_PATH,
+            access_body("acc-4", &["src/secret.rs"], "again"),
+            short_options(),
+        )
+        .await;
+        assert_eq!(wire_status(&again.value), "granted");
+        assert!(
+            wire_field(&again.value, "expires")
+                .and_then(Value::as_f64)
+                .is_some()
+        );
+        assert_eq!(idle.0.lock().len(), 1, "the second ask asked nobody");
+        pair.stop_node_a().await;
+    }
+
+    /// On the wire, `too_many_pending` is the sixth DISTINCT path set from one
+    /// identity while five are pending, carried as `status: refused` + sibling
+    /// `reason`; the human saw exactly five lines and the sixth filed nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_a_sixth_pending_ask_is_refused_too_many_pending_on_the_wire() {
+        let pair = NodePair::start_with("usage-probe-r3-access-cap", |_| {}, trusting_b).await;
+        pair.introduce_b_to_a().await;
+        let (slot, idle) = installed_slot(&pair);
+        let _workspace = share_docs_from_a(&pair, &slot, "usage-probe-r3-access-cap-root");
+
+        for n in 0..5 {
+            let asked = b_asks_a(
+                &pair,
+                ACCESS_PATH,
+                access_body(&format!("acc-{n}"), &[&format!("src/{n}.rs")], ""),
+                short_options(),
+            )
+            .await;
+            assert_eq!(wire_status(&asked.value), "pending", "ask {n}");
+        }
+        let sixth = b_asks_a(
+            &pair,
+            ACCESS_PATH,
+            access_body("acc-5", &["src/5.rs"], ""),
+            short_options(),
+        )
+        .await;
+
+        assert_eq!(wire_status(&sixth.value), "refused");
+        assert_eq!(
+            wire_field(&sixth.value, "reason").and_then(Value::as_str),
+            Some("too_many_pending")
+        );
+        assert_eq!(idle.0.lock().len(), 5);
+        let records = slot
+            .inbound_store()
+            .unwrap()
+            .list(SystemTime::now())
+            .unwrap();
+        assert_eq!(records.len(), 5, "{records:?}");
+        assert!(records.iter().all(|record| record.id != "acc-5"));
+        pair.stop_node_a().await;
+    }
 }
