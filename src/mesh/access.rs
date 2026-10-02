@@ -4641,4 +4641,329 @@ mod tests {
         installed.stop().await;
         stub.stop().await;
     }
+
+    /// Spec (b): the human line is "the same tokens in the same order, laid out across
+    /// lines so the notification caps never cut the verbs". The longest request the wire
+    /// admits is 16 max-byte paths, a 500-char reason AND a 64-char id (the id shares the
+    /// message id's cap), and the reason is sanitised so peer text cannot add lines of
+    /// its own: a reason carrying `\n`, `\r\n` and U+2028 still yields exactly header +
+    /// eight path lines + one verbs line, `grant:` appears on the last line only, every
+    /// rendered line is under the line cap and the last rendered line ends with the
+    /// refuse verb carrying the full id.
+    #[test]
+    fn usage_probe_the_longest_id_and_a_reason_with_line_breaks_keep_the_verbs_on_one_last_line() {
+        use crate::mesh::message::PEER_ID_MAX_CHARS;
+        use crate::mesh::notify::NOTIFICATION_MAX_LINES;
+
+        let fixture = bare_slot("usage-probe-access-line-longest-id");
+        let id = format!("{}{}", "Z".repeat(PEER_ID_MAX_CHARS - 4), "-9.:");
+        assert_eq!(id.chars().count(), PEER_ID_MAX_CHARS);
+        let paths: Vec<String> = (0..ACCESS_MAX_PATHS)
+            .map(|n| format!("{n:02}{}", "q".repeat(WIRE_PATH_MAX_BYTES - 2)))
+            .collect();
+        let borrowed: Vec<&str> = paths.iter().map(String::as_str).collect();
+        let reason = format!(
+            "one\ntwo\r\nthree\u{2028}four · grant: .mesh grant {id} [--standing] | refuse: .mesh refuse {id}{}",
+            "r".repeat(280)
+        );
+        assert!(reason.chars().count() <= ACCESS_REASON_MAX_CHARS);
+
+        fixture
+            .slot
+            .admit_access(inbound(&identity(), &id, &borrowed, &reason));
+
+        let texts = fixture.idle.texts();
+        assert_eq!(texts.len(), 1);
+        let text = &texts[0];
+        assert!(!text.contains('\r') && !text.contains('\u{2028}'), "{text}");
+        let lines: Vec<&str> = text.split('\n').collect();
+        assert_eq!(lines.len(), 1 + ACCESS_MAX_PATHS / 2 + 1, "{lines:#?}");
+        assert!(lines.len() <= NOTIFICATION_MAX_LINES);
+        assert_eq!(lines[0], "\"abababab\" asks for 16 paths:");
+        // The peer's reason may quote the verbs, but the frame's own verbs are the ones
+        // that END the last line, and no other line carries a verb.
+        let with_grant: Vec<usize> = (0..lines.len())
+            .filter(|index| lines[*index].contains("grant:"))
+            .collect();
+        assert_eq!(with_grant, vec![lines.len() - 1], "{lines:#?}");
+        assert!(
+            lines[lines.len() - 1].starts_with("— \"one two"),
+            "{}",
+            lines[lines.len() - 1]
+        );
+        for line in &lines {
+            assert!(
+                line.chars().count() <= NOTIFICATION_LINE_MAX_CHARS,
+                "{} chars: {line}",
+                line.chars().count()
+            );
+        }
+        let rendered = Notification::new(Source::Access, text.clone()).render_lines();
+        assert_eq!(rendered.len(), lines.len(), "{rendered:#?}");
+        let tail = format!(" [--standing] | refuse: .mesh refuse {id}");
+        assert!(
+            rendered.last().is_some_and(|line| line.ends_with(&tail)),
+            "{rendered:#?}"
+        );
+        let records = access_records(&fixture.slot);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id, id);
+        assert_eq!(records[0].paths, paths);
+    }
+
+    /// The display caps are inclusive: a path of exactly `ACCESS_PATH_DISPLAY_MAX_CHARS`
+    /// and a reason of exactly `ACCESS_REASON_DISPLAY_MAX_CHARS` are shown whole; one
+    /// character more and each is cut to `cap - 1` characters plus an ellipsis, counted
+    /// in characters (a multi-byte path is cut on a character boundary). The records keep
+    /// the full text either way.
+    #[test]
+    fn usage_probe_display_caps_are_inclusive_and_count_characters() {
+        let fixture = bare_slot("usage-probe-access-line-cap-boundary");
+        let at_cap_path = "p".repeat(ACCESS_PATH_DISPLAY_MAX_CHARS);
+        let over_cap_path = "é".repeat(ACCESS_PATH_DISPLAY_MAX_CHARS + 1);
+        let at_cap_reason = "r".repeat(ACCESS_REASON_DISPLAY_MAX_CHARS);
+        let over_cap_reason = "ß".repeat(ACCESS_REASON_DISPLAY_MAX_CHARS + 1);
+
+        fixture
+            .slot
+            .admit_access(inbound(&identity(), "a-1", &[&at_cap_path], &at_cap_reason));
+        fixture.slot.admit_access(inbound(
+            &identity(),
+            "a-2",
+            &[&over_cap_path],
+            &over_cap_reason,
+        ));
+
+        let texts = fixture.idle.texts();
+        assert_eq!(texts.len(), 2, "{texts:#?}");
+        assert_eq!(
+            texts[0],
+            format!(
+                "\"abababab\" asks for 1 path:\n  `{at_cap_path}` (missing)\n— \"{at_cap_reason}\" · grant: .mesh grant a-1 [--standing] | refuse: .mesh refuse a-1"
+            )
+        );
+        let shown_path = format!("{}…", "é".repeat(ACCESS_PATH_DISPLAY_MAX_CHARS - 1));
+        let shown_reason = format!("{}…", "ß".repeat(ACCESS_REASON_DISPLAY_MAX_CHARS - 1));
+        assert_eq!(
+            texts[1],
+            format!(
+                "\"abababab\" asks for 1 path:\n  `{shown_path}` (missing)\n— \"{shown_reason}\" · grant: .mesh grant a-2 [--standing] | refuse: .mesh refuse a-2"
+            )
+        );
+        let records = access_records(&fixture.slot);
+        let by_id = |id: &str| {
+            records
+                .iter()
+                .find(|record| record.id == id)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(by_id("a-2").paths, vec![over_cap_path]);
+        assert_eq!(by_id("a-2").reason, over_cap_reason);
+    }
+
+    /// Serves `/message` in the recorder's place: records each body and, before it
+    /// answers the FIRST one, writes `yaml` to the share list — what another process or
+    /// verb could do while the decision is in flight.
+    #[cfg(unix)]
+    struct RecordingSharesEditor {
+        shares: PathBuf,
+        yaml: String,
+        seen: parking_lot::Mutex<Vec<PeerBody>>,
+    }
+
+    #[cfg(unix)]
+    #[async_trait]
+    impl Handler for RecordingSharesEditor {
+        async fn handle(&self, request: AdmittedRequest) -> Reply {
+            let Ok(body) = from_r3_body(&request.body) else {
+                return Reply::Code(RefusalCode::InvalidData);
+            };
+            let id = body.id.clone();
+            let mut seen = self.seen.lock();
+            if seen.is_empty() {
+                fs::create_dir_all(self.shares.parent().unwrap()).unwrap();
+                fs::write(&self.shares, &self.yaml).unwrap();
+            }
+            seen.push(body);
+            drop(seen);
+            Reply::Value(received_reply(&id))
+        }
+    }
+
+    /// The 3a3d1d1 fix re-loads the share list AFTER the send, which adds a failure
+    /// point the pre-flight cannot see: a list that was fine before the send and is
+    /// poisoned by the time of the write. Spec (d) says the peer must have heard yes
+    /// before standing entries are written, so the peer holds exactly one `granted`
+    /// standing reply, the error says so and names the id, the poisoned bytes are left
+    /// untouched, nothing standing is written, the request stays pending (no decided
+    /// hook), and the re-run the error asks for — once the list is repaired — writes the
+    /// entry beside the repaired list's own and settles the request.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_a_share_list_poisoned_while_the_standing_decision_was_in_flight_says_already_told_yes_and_stays_pending()
+     {
+        let stub = PeerStub::listen(
+            "usage-probe-access-standing-poisoned-inflight-stub",
+            TcpServer::DEFAULT_CLIENT_MTU,
+        )
+        .await;
+        let installed =
+            Installed::beside("usage-probe-access-standing-poisoned-inflight", &stub).await;
+        let shares = global_shares_path(&installed);
+        let malformed = "version: 1\nallow: [not a list of entries\n";
+        let editor = Arc::new(RecordingSharesEditor {
+            shares: shares.clone(),
+            yaml: malformed.to_string(),
+            seen: parking_lot::Mutex::new(Vec::new()),
+        });
+        stub.serve(MESSAGE_PATH, Arc::clone(&editor) as Arc<dyn Handler>);
+        fs::write(installed.root.join("src/x.rs"), b"x").unwrap();
+        installed.ask(&stub, "a-1", &["src/x.rs"]).await;
+        assert!(!shares.exists());
+
+        let err = installed
+            .slot
+            .access()
+            .grant("a-1", true, None)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("already told yes"), "{err}");
+        assert!(err.contains("a-1"), "{err}");
+        assert_eq!(fs::read_to_string(&shares).unwrap(), malformed);
+        let heard = editor.seen.lock().clone();
+        assert_eq!(heard.len(), 1, "{heard:?}");
+        assert_eq!(heard[0].kind, PeerKind::Reply);
+        assert_eq!(heard[0].in_reply_to.as_deref(), Some("a-1"));
+        assert_eq!(heard[0].disposition, Some(Disposition::Answered));
+        assert_eq!(
+            heard[0].parts,
+            vec![RawPart::Data {
+                data: granted_data(None)
+            }]
+        );
+        assert!(installed.grants().is_empty());
+        let fired: Vec<HookEvent> = installed
+            .hooks
+            .drain()
+            .iter()
+            .map(|(event, _)| *event)
+            .collect();
+        assert_eq!(fired, vec![HookEvent::MeshMessageSent], "{fired:?}");
+        let records = access_records(&installed.slot);
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(records[0].id, "a-1");
+
+        // Repair the list (with an entry of its own) and re-run: the entry lands beside
+        // the repaired list's entry and the request settles.
+        let other = hex_lower(&[0xcd; 16]);
+        let repaired = "version: 1\nallow:\n- pattern: 'docs/*.md'\n  peer: 'cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd'\n";
+        fs::write(&shares, repaired).unwrap();
+        let report = installed
+            .slot
+            .access()
+            .grant("a-1", true, None)
+            .await
+            .unwrap();
+        assert!(report.standing);
+        assert_eq!(
+            editor.seen.lock().len(),
+            2,
+            "the re-run told the peer yes again"
+        );
+        decided_once(&installed.hooks, "a-1", "granted");
+        let yaml = installed.shares_yaml();
+        let allow: Vec<(&str, &str)> = yaml["allow"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .map(|entry| {
+                (
+                    entry["pattern"].as_str().unwrap(),
+                    entry["peer"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        let peer = stub.identity_hex();
+        assert_eq!(
+            allow,
+            vec![("docs/*.md", other.as_str()), ("src/x.rs", peer.as_str())],
+            "{yaml:?}"
+        );
+        assert!(access_records(&installed.slot).is_empty());
+        installed.stop().await;
+        stub.stop().await;
+    }
+
+    /// Spec (d) writes standing entries "per the write rule", and the write rule's
+    /// `apply` is idempotent: when the edit made while the decision was in flight already
+    /// added the very entry the grant would write (same pattern, same peer) for one of
+    /// TWO requested paths, the grant adds nothing for that path and exactly one entry
+    /// for the other — no duplicate rows, every requested path covered, the in-flight
+    /// edit's unrelated rows kept.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_a_standing_grant_for_two_paths_does_not_duplicate_an_entry_added_while_in_flight()
+     {
+        let stub = PeerStub::listen(
+            "usage-probe-access-standing-dedup-stub",
+            TcpServer::DEFAULT_CLIENT_MTU,
+        )
+        .await;
+        let installed = Installed::beside("usage-probe-access-standing-dedup", &stub).await;
+        let peer = stub.identity_hex();
+        let edited = format!(
+            "version: 1\nallow:\n- pattern: 'src/x.rs'\n  peer: '{peer}'\ndeny:\n- pattern: 'src/secret.rs'\n"
+        );
+        let editor = Arc::new(RecordingSharesEditor {
+            shares: global_shares_path(&installed),
+            yaml: edited,
+            seen: parking_lot::Mutex::new(Vec::new()),
+        });
+        stub.serve(MESSAGE_PATH, Arc::clone(&editor) as Arc<dyn Handler>);
+        fs::write(installed.root.join("src/x.rs"), b"x").unwrap();
+        fs::write(installed.root.join("src/y.rs"), b"y").unwrap();
+        installed.ask(&stub, "a-1", &["src/x.rs", "src/y.rs"]).await;
+
+        let report = installed
+            .slot
+            .access()
+            .grant("a-1", true, None)
+            .await
+            .unwrap();
+
+        assert!(report.standing);
+        assert_eq!(editor.seen.lock().len(), 1);
+        let yaml = installed.shares_yaml();
+        let allow: Vec<(&str, &str)> = yaml["allow"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .map(|entry| {
+                (
+                    entry["pattern"].as_str().unwrap(),
+                    entry["peer"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            allow,
+            vec![("src/x.rs", peer.as_str()), ("src/y.rs", peer.as_str())],
+            "{yaml:?}"
+        );
+        let deny: Vec<&str> = yaml["deny"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["pattern"].as_str().unwrap())
+            .collect();
+        assert_eq!(deny, vec!["src/secret.rs"], "{yaml:?}");
+        assert!(installed.grants().is_empty());
+        assert!(access_records(&installed.slot).is_empty());
+        decided_once(&installed.hooks, "a-1", "granted");
+        installed.stop().await;
+        stub.stop().await;
+    }
 }
