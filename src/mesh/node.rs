@@ -1,5 +1,6 @@
 use crate::config::mesh_config::{MeshConfig, MeshInterface};
 use crate::config::{ForkRekey, Session, paths};
+use crate::mesh::access::{AccessHandler, AccessSurface};
 use crate::mesh::announce::{
     AnnounceAppData, HEARTBEAT_SECS, REANNOUNCE_FLOOR_SECS, announce_app_data,
 };
@@ -41,9 +42,9 @@ use crate::mesh::protocol::{Compatibility, MESH_PROTOCOL_MIN_SUPPORTED, MESH_PRO
 #[cfg(all(test, unix))]
 use crate::mesh::r3::RequestHandler;
 use crate::mesh::r3::{
-    Dispatcher, Envelope, FETCH_PATH, KNOCK_PATH, LIST_PATH, MESSAGE_PATH, OriginName, R3Client,
-    R3Error, R3Server, RefusalCode, RequestOptions, RequestOutcome, STATUS_PATH, redact_hashes,
-    short,
+    ACCESS_PATH, Dispatcher, Envelope, FETCH_PATH, KNOCK_PATH, LIST_PATH, MESSAGE_PATH, OriginName,
+    R3Client, R3Error, R3Server, RefusalCode, RequestOptions, RequestOutcome, STATUS_PATH,
+    redact_hashes, short,
 };
 use crate::mesh::snapshot::MeshSnapshot;
 use crate::mesh::trust::TrustStore;
@@ -262,6 +263,8 @@ pub(crate) struct MeshRuntime {
     knock_gate: Arc<KnockGate>,
     /// Where fetched peer messages go; attached by the slot the node is installed into.
     peer_surface: parking_lot::Mutex<Option<Weak<dyn PeerSurface>>>,
+    /// Where access requests are admitted; attached by the same slot.
+    access_surface: parking_lot::Mutex<Option<Weak<dyn AccessSurface>>>,
     /// Held for the length of one propagation fetch; a second caller is refused, never
     /// queued behind the first.
     fetching: Mutex<()>,
@@ -435,6 +438,7 @@ impl MeshRuntime {
             dispatcher,
             knock_gate,
             peer_surface: parking_lot::Mutex::new(None),
+            access_surface: parking_lot::Mutex::new(None),
             fetching: Mutex::new(()),
             posting: Mutex::new(()),
             cancel: CancellationToken::new(),
@@ -599,6 +603,17 @@ impl MeshRuntime {
     /// owns the runtime.
     pub(crate) fn attach_peer_surface(&self, surface: Weak<dyn PeerSurface>) {
         *self.peer_surface.lock() = Some(surface);
+    }
+
+    /// Where access requests are admitted, from a link or a propagation node. Held
+    /// weakly for the same reason as the peer surface.
+    pub(crate) fn attach_access_surface(&self, surface: Weak<dyn AccessSurface>) {
+        *self.access_surface.lock() = Some(surface);
+    }
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn access_surface(&self) -> Option<Arc<dyn AccessSurface>> {
+        self.access_surface.lock().as_ref().and_then(Weak::upgrade)
     }
 
     #[cfg(all(test, unix))]
@@ -1750,8 +1765,9 @@ impl MeshSlot {
 
     /// Refuses while a node is already running: two nodes in one process would fight over
     /// the same instance lock and identity. Installing also puts this slot behind the
-    /// node's `/status` and `/message` providers, knock gate and peer surface, held weakly
-    /// since the slot owns the node, and reopens the questions the node's instance left
+    /// node's `/status`, `/message`, `/list`, `/fetch` and `/access` providers, knock gate
+    /// and peer and access surfaces, held weakly since the slot owns the node, and
+    /// reopens the questions the node's instance left
     /// pending on disk, adopting them before the `/message` provider is registered so a
     /// reply admitted in between still finds its question. A pending file this Coyote
     /// cannot read is logged with its remedy and the node serves with no questions
@@ -1793,7 +1809,12 @@ impl MeshSlot {
         runtime
             .dispatcher()
             .register(FETCH_PATH, Arc::new(FetchHandler::new(shares)))?;
+        let access = Arc::downgrade(self) as Weak<dyn AccessSurface>;
+        runtime
+            .dispatcher()
+            .register(ACCESS_PATH, Arc::new(AccessHandler::new(access.clone())))?;
         runtime.attach_peer_surface(surface);
+        runtime.attach_access_surface(access);
         runtime
             .knock_gate()
             .attach(Arc::downgrade(self) as Weak<dyn KnockSurface>);
@@ -2573,7 +2594,7 @@ impl MeshSlot {
     /// The sender as a refusal line names it, the same on every path a refusal takes:
     /// the peer table's display name for its instance, cleaned, or the short hash of
     /// its identity.
-    fn peer_label(&self, identity: &str, destination: &str) -> String {
+    pub(crate) fn peer_label(&self, identity: &str, destination: &str) -> String {
         self.display_name_at(destination)
             .and_then(|name| display_text(&name, DISPLAY_NAME_MAX_CHARS))
             .unwrap_or_else(|| short(identity).to_string())

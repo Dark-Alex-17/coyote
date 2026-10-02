@@ -25,15 +25,13 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
-#[cfg(test)]
-use std::time::Duration;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 pub(crate) const GRANT_RECORD_VERSION: u64 = 1;
-// `grant` and its limits are test-only until the access handler answers a request.
+// `grant`, its use count and its path cap are test-only until the human's grant verb
+// writes a record.
 /// Long enough for the peer to fetch what it asked for after the human said yes, short
 /// enough that a forgotten grant does not outlive the conversation.
-#[cfg(test)]
 pub(crate) const DEFAULT_GRANT_TTL: Duration = Duration::from_secs(15 * 60);
 #[cfg(test)]
 pub(crate) const DEFAULT_GRANT_USES: u32 = 1;

@@ -573,6 +573,29 @@ impl ShareSet {
         })
     }
 
+    /// Whether the share rules alone already let `peer` fetch `wire_text`: the resolve
+    /// and judge half of `is_served`, without the grant store, the stat or the open, so
+    /// an access request for a path the rules serve can be answered without spending or
+    /// touching anything. Every error reads as not allowed.
+    pub(crate) fn is_allowed(
+        &self,
+        peer: &PeerRef<'_>,
+        wire_text: &str,
+        case_insensitive: bool,
+    ) -> bool {
+        let Ok(wire) = WirePath::parse(wire_text) else {
+            return false;
+        };
+        let candidate = self.locations.workspace_root.join(wire.to_relative_path());
+        let Ok(canonical) = dunce::canonicalize(candidate) else {
+            return false;
+        };
+        let Ok(rules) = self.rules(peer, case_insensitive) else {
+            return false;
+        };
+        rules.resolved(&canonical).is_some() && rules.judge(&wire, &canonical) == Judgement::Allowed
+    }
+
     /// The files `peer` may fetch, one page at a time, sorted by wire path. The walk
     /// starts at the literal head of each allow pattern rather than at the root, so a
     /// share of `docs/**` never reads the rest of the tree, and it visits at most

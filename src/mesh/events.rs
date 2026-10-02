@@ -83,6 +83,14 @@ pub(crate) enum BriefUpdateSource {
     Digest,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AccessDecision {
+    Granted,
+    // Reached by the human's refuse verb once it lands.
+    #[allow(dead_code)]
+    Denied,
+}
+
 pub(crate) enum MeshEvent {
     Started(NodeFacts),
     Stopped(NodeFacts),
@@ -157,6 +165,18 @@ pub(crate) enum MeshEvent {
         size: u64,
         hash_prefix: String,
     },
+    AccessRequested {
+        identity: String,
+        destination: String,
+        access_id: String,
+        path_count: usize,
+    },
+    AccessDecided {
+        identity: String,
+        destination: String,
+        access_id: String,
+        decision: AccessDecision,
+    },
 }
 
 const INSTANCE_ID: &str = "COYOTE_MESH_INSTANCE_ID";
@@ -190,6 +210,9 @@ const BRIEF_SOURCE: &str = "COYOTE_MESH_BRIEF_SOURCE";
 const BRIEF_CHARS: &str = "COYOTE_MESH_BRIEF_CHARS";
 const SIZE: &str = "COYOTE_MESH_SIZE";
 const HASH_PREFIX: &str = "COYOTE_MESH_HASH_PREFIX";
+const ACCESS_ID: &str = "COYOTE_MESH_ACCESS_ID";
+const PATH_COUNT: &str = "COYOTE_MESH_PATH_COUNT";
+const DECISION: &str = "COYOTE_MESH_DECISION";
 
 const ERROR_MAX_CHARS: usize = 512;
 
@@ -278,6 +301,14 @@ pub(crate) const MESH_HOOK_ENVS: &[(HookEvent, &[&str])] = &[
         HookEvent::MeshFetchServed,
         &[PEER_IDENTITY, PEER_DESTINATION, SIZE, HASH_PREFIX],
     ),
+    (
+        HookEvent::MeshAccessRequested,
+        &[PEER_IDENTITY, PEER_DESTINATION, ACCESS_ID, PATH_COUNT],
+    ),
+    (
+        HookEvent::MeshAccessDecided,
+        &[PEER_IDENTITY, PEER_DESTINATION, ACCESS_ID, DECISION],
+    ),
 ];
 
 fn allowed_envs(event: HookEvent) -> &'static [&'static str] {
@@ -334,6 +365,8 @@ impl MeshEvent {
             Self::BulletinSent { .. } => HookEvent::MeshBulletinSent,
             Self::BriefUpdated { .. } => HookEvent::MeshBriefUpdated,
             Self::FetchServed { .. } => HookEvent::MeshFetchServed,
+            Self::AccessRequested { .. } => HookEvent::MeshAccessRequested,
+            Self::AccessDecided { .. } => HookEvent::MeshAccessDecided,
         }
     }
 
@@ -512,6 +545,32 @@ impl MeshEvent {
                 envs.push((PEER_DESTINATION, destination.clone()));
                 envs.push((SIZE, size.to_string()));
                 envs.push((HASH_PREFIX, hash_prefix.clone()));
+            }
+            Self::AccessRequested {
+                identity,
+                destination,
+                access_id,
+                path_count,
+            } => {
+                envs.push((PEER_IDENTITY, identity.clone()));
+                envs.push((PEER_DESTINATION, destination.clone()));
+                envs.push((ACCESS_ID, access_id.clone()));
+                envs.push((PATH_COUNT, path_count.to_string()));
+            }
+            Self::AccessDecided {
+                identity,
+                destination,
+                access_id,
+                decision,
+            } => {
+                let decision = match decision {
+                    AccessDecision::Granted => "granted",
+                    AccessDecision::Denied => "denied",
+                };
+                envs.push((PEER_IDENTITY, identity.clone()));
+                envs.push((PEER_DESTINATION, destination.clone()));
+                envs.push((ACCESS_ID, access_id.clone()));
+                envs.push((DECISION, decision.to_string()));
             }
         }
         envs
@@ -696,6 +755,18 @@ mod tests {
                 size: 1_024,
                 hash_prefix: "0123456789abcdef".to_string(),
             },
+            MeshEvent::AccessRequested {
+                identity: fingerprint.clone(),
+                destination: destination.clone(),
+                access_id: "a-1".to_string(),
+                path_count: 3,
+            },
+            MeshEvent::AccessDecided {
+                identity: fingerprint.clone(),
+                destination: destination.clone(),
+                access_id: "a-1".to_string(),
+                decision: AccessDecision::Granted,
+            },
         ]
     }
 
@@ -708,7 +779,7 @@ mod tests {
         let identity = PrivateIdentity::from_private_key_bytes(&[9u8; 64]).unwrap();
         let fixtures = fixtures(&identity);
         assert_eq!(fixtures.len(), MESH_HOOK_ENVS.len());
-        assert_eq!(fixtures.len(), 13);
+        assert_eq!(fixtures.len(), 15);
 
         let mut seen = BTreeSet::new();
         for event in &fixtures {

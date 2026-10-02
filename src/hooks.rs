@@ -150,6 +150,8 @@ pub enum HookEvent {
     MeshBulletinSent,
     MeshBriefUpdated,
     MeshFetchServed,
+    MeshAccessRequested,
+    MeshAccessDecided,
 }
 
 impl HookEvent {
@@ -199,10 +201,12 @@ impl HookEvent {
             HookEvent::MeshBulletinSent => "mesh.bulletin.sent",
             HookEvent::MeshBriefUpdated => "mesh.brief.updated",
             HookEvent::MeshFetchServed => "mesh.fetch.served",
+            HookEvent::MeshAccessRequested => "mesh.access.requested",
+            HookEvent::MeshAccessDecided => "mesh.access.decided",
         }
     }
 
-    pub(crate) const ALL: [HookEvent; 44] = [
+    pub(crate) const ALL: [HookEvent; 46] = [
         HookEvent::TurnStarted,
         HookEvent::TurnCompleted,
         HookEvent::TurnInterrupted,
@@ -247,6 +251,8 @@ impl HookEvent {
         HookEvent::MeshBulletinSent,
         HookEvent::MeshBriefUpdated,
         HookEvent::MeshFetchServed,
+        HookEvent::MeshAccessRequested,
+        HookEvent::MeshAccessDecided,
     ];
 }
 
@@ -1653,6 +1659,8 @@ mod tests {
             (HookEvent::MeshBulletinSent, "mesh.bulletin.sent"),
             (HookEvent::MeshBriefUpdated, "mesh.brief.updated"),
             (HookEvent::MeshFetchServed, "mesh.fetch.served"),
+            (HookEvent::MeshAccessRequested, "mesh.access.requested"),
+            (HookEvent::MeshAccessDecided, "mesh.access.decided"),
         ];
         for (event, name) in cases {
             assert_eq!(event.as_str(), name);
@@ -1691,7 +1699,7 @@ mod tests {
             .map(|event| event.as_str())
             .filter(|name| name.starts_with("mesh."))
             .collect();
-        assert_eq!(mesh_events.len(), 13);
+        assert_eq!(mesh_events.len(), 15);
         for event in mesh_events {
             assert!(
                 entry_is_valid_wildcard(&format!("{event}.*")),
@@ -1721,7 +1729,7 @@ mod tests {
             .copied()
             .filter(|event| event.as_str().starts_with("mesh."))
             .collect();
-        assert_eq!(mesh_events.len(), 13);
+        assert_eq!(mesh_events.len(), 15);
         let mut global = HooksMap::default();
         for event in &mesh_events {
             global.extend(hooks_map(event.as_str(), &[("watch", "cmd-mesh")]));

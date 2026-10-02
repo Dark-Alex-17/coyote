@@ -170,7 +170,7 @@ impl FetchServing {
     /// Whether `root` folds case, learned once per root. The probe writes a file under
     /// the root, so it is never repeated per request; a probe that fails is remembered
     /// as failed, warned about once, and leaves that root serving nothing.
-    fn case_insensitive_for(&self, root: &Path) -> Option<bool> {
+    pub(crate) fn case_insensitive_for(&self, root: &Path) -> Option<bool> {
         let mut probe = self.probe.lock();
         if let Some((probed, answer)) = probe.as_ref()
             && probed == root
@@ -194,7 +194,7 @@ impl FetchServing {
     /// Loads the share set for `root`. A refused share list is the operator's to fix and
     /// is warned about when its refusal first appears or changes; the requests that keep
     /// finding it broken say so at `debug!`.
-    fn shares_under(&self, root: &Path) -> ShareSet {
+    pub(crate) fn shares_under(&self, root: &Path) -> ShareSet {
         let mut locations =
             ShareLocations::new(&self.config_dir, root).with_cache_dir(&self.cache_dir);
         if let Some(inbox_dir) = &self.inbox_dir {
@@ -677,7 +677,8 @@ fn decode_fetch(body: &Value) -> Result<FetchRequest, &'static str> {
     Ok(FetchRequest { path, if_sha256 })
 }
 
-fn versioned_map(body: &Value) -> Result<&[(Value, Value)], &'static str> {
+/// The entries of a request body that is a map carrying the supported `v`.
+pub(crate) fn versioned_map(body: &Value) -> Result<&[(Value, Value)], &'static str> {
     let entries = body.as_map().ok_or("the body is not a map")?;
     if field(entries, "v").and_then(Value::as_u64) != Some(PEER_WIRE_VERSION) {
         return Err("v is missing or not the supported version");
@@ -686,7 +687,7 @@ fn versioned_map(body: &Value) -> Result<&[(Value, Value)], &'static str> {
 }
 
 /// The value under `key`, a nil counting as absent.
-fn field<'a>(entries: &'a [(Value, Value)], key: &str) -> Option<&'a Value> {
+pub(crate) fn field<'a>(entries: &'a [(Value, Value)], key: &str) -> Option<&'a Value> {
     entries
         .iter()
         .find(|(name, _)| name.as_str() == Some(key))
