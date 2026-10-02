@@ -1651,6 +1651,17 @@ mod tests {
         assert!(MAX_EFFICIENT_SIZE - frame.len() < OK_REPLY_FRAMING_BYTES);
     }
 
+    /// `fetch_file` waits `FILE_FETCH_REQUEST_TIMEOUT` for its reply where `list_shares`
+    /// waits a status round trip: a file is a Resource that takes minutes on a slow
+    /// interface. Pinned here until the spec's constants table carries the row.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_fetch_waits_two_minutes_where_a_listing_waits_a_round_trip() {
+        assert_eq!(FILE_FETCH_REQUEST_TIMEOUT, Duration::from_secs(120));
+        assert_eq!(PEER_REQUEST_TIMEOUT, Duration::from_secs(15));
+        assert!(FILE_FETCH_REQUEST_TIMEOUT > PEER_REQUEST_TIMEOUT);
+    }
+
     #[tokio::test]
     async fn a_file_that_grew_past_the_limit_after_the_stat_is_too_large() {
         let fx = Fixture::new("fetch-grew", 16, &["docs/**"]);
