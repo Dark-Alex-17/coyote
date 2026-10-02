@@ -303,6 +303,13 @@ impl InboundKind {
     }
 }
 
+/// The refusal `.mesh answer` gives an access request, naming the verbs that decide one.
+pub(crate) fn access_not_a_question(id: &str) -> String {
+    format!(
+        "`{id}` is an access request, not a question; decide it with `.mesh grant {id}` or `.mesh refuse {id}`"
+    )
+}
+
 /// One line of `inbound-<instance_id>.jsonl`: a question a peer asked that the envoy
 /// could not answer on its own, waiting on the person at the keyboard. The same on-disk
 /// discipline as `PendingRecord`: unknown fields are rejected and any layout change bumps

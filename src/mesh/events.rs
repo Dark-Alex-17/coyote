@@ -86,7 +86,8 @@ pub(crate) enum BriefUpdateSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AccessDecision {
     Granted,
-    // Test-only until the human's refuse verb lands.
+    // Test-only until the human's refuse verb lands; until then the `COYOTE_MESH_DECISION`
+    // a production hook reads (via `wire_name()`) is only ever `granted`.
     #[cfg(test)]
     Denied,
 }

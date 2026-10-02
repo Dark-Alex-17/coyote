@@ -52,7 +52,7 @@ use crate::mesh::r3::{DEFAULT_LINK_TIMEOUT, RequestOptions};
 use crate::mesh::shares::PeerRef;
 #[cfg(test)]
 use crate::mesh::shares::{Mutation, ShareSet, WriteScope};
-use crate::mesh::trust::{Decision, TrustStore};
+use crate::mesh::trust::{Decision, TrustStore, same_hash};
 use crate::mesh::wire_path::WirePath;
 use crate::mesh::{destination_address, display_text, redact_hashes, rfc3339_utc, short};
 
@@ -668,6 +668,10 @@ pub(crate) fn decode_access_response(
 }
 
 impl AccessSurface for MeshSlot {
+    /// Admits a peer's access request: granted at once when every path is already
+    /// shared, otherwise filed in the inbound store for the human to decide. A missing
+    /// or unwritable store is reported to the peer as `too_many_pending`, the only
+    /// refusal word that means "try later".
     fn admit_access(&self, request: InboundAccess) -> AccessOutcome {
         let InboundAccess {
             identity_hash,
@@ -1307,8 +1311,7 @@ fn rate_rule(
     let mine: Vec<&InboundRecord> = open
         .iter()
         .filter(|record| {
-            record.kind == InboundKind::Access
-                && record.peer_identity.eq_ignore_ascii_case(identity)
+            record.kind == InboundKind::Access && same_hash(&record.peer_identity, identity)
         })
         .collect();
     if mine.iter().any(|record| record.id == id) {
@@ -1934,6 +1937,36 @@ mod tests {
         assert_eq!(
             fixture.idle.texts().len(),
             ACCESS_MAX_PENDING_PER_IDENTITY + 1
+        );
+    }
+
+    /// Both sides of the identity compare are canonical lowercase hex, so the serving
+    /// path neither case-folds nor short-circuits on them.
+    #[test]
+    fn rate_rule_compares_identities_in_constant_time_shape() {
+        let source = include_str!("access.rs");
+        let production = &source[..source.find("\nmod tests {").unwrap()];
+        let needle = ["eq_ignore_", "ascii_case"].concat();
+        assert!(
+            !production.contains(&needle),
+            "the serving path compares identities with same_hash, not {needle}"
+        );
+
+        let open = [InboundRecord {
+            peer_identity: "ab".repeat(16),
+            kind: InboundKind::Access,
+            paths: vec!["src/x.rs".to_string()],
+            question: String::new(),
+            ..question_record("a-1")
+        }];
+        assert_eq!(
+            rate_rule(&open, &"AB".repeat(16), "a-1", &["x".to_string()]),
+            None,
+            "mixed case is another identity under the canonical compare"
+        );
+        assert_eq!(
+            rate_rule(&open, &"ab".repeat(16), "a-1", &["x".to_string()]),
+            Some(AccessRefusal::Duplicate)
         );
     }
 

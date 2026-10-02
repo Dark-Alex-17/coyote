@@ -12,7 +12,9 @@ use crate::mesh::message::{
     BroadcastOutcome, Disposition, OutboundPeer, PEER_CONTENT_MAX_CHARS, Part, PeerKind,
     PeerMessage, PeerVia, RecipientOutcome,
 };
-use crate::mesh::pending::{Correlation, InboundRecord, PendingState};
+use crate::mesh::pending::{
+    Correlation, InboundKind, InboundRecord, PendingState, access_not_a_question,
+};
 use crate::mesh::trust::{
     Decision, KeyChange, LiveMesh, Rule, Tier, TrustChange, TrustOptions, TrustRecord, TrustStore,
     Verdict, decode_name_hash, parse_hash,
@@ -582,6 +584,9 @@ async fn answer(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     let route = answer_route(inbound.is_some(), outbound.is_some());
     match (route, inbound, outbound) {
         (AnswerRoute::Inbound, Some(record), _) => {
+            if record.kind == InboundKind::Access {
+                bail!(access_not_a_question(id));
+            }
             out_text(&sending_notice(&record.peer_destination));
             ctx.app.mesh.answer_inbound(id, text).await?;
             out_text(&format!("Answered {}.", short(id)));
@@ -2593,10 +2598,13 @@ fn render_pending(asked: &[Correlation], escalated: &[InboundRecord]) -> String 
         ));
     }
     lines.push("Questions peers asked (escalated to you):".to_string());
-    if escalated.is_empty() {
+    let (access, questions): (Vec<&InboundRecord>, Vec<&InboundRecord>) = escalated
+        .iter()
+        .partition(|record| record.kind == InboundKind::Access);
+    if questions.is_empty() {
         lines.push("  none".to_string());
     }
-    for record in escalated {
+    for record in questions {
         lines.push(format!(
             "  {}  {}  received {}  {}",
             record.id,
@@ -2609,6 +2617,20 @@ fn render_pending(asked: &[Correlation], escalated: &[InboundRecord]) -> String 
         }
     }
     lines.push("answer one with `.mesh answer <id> <text>`".to_string());
+    if !access.is_empty() {
+        lines.push("Access requests (decide with grant or refuse):".to_string());
+    }
+    for record in access {
+        lines.push(format!(
+            "  {}  {}  received {}  {} · grant: .mesh grant {} | refuse: .mesh refuse {}",
+            record.id,
+            short(&record.peer_destination),
+            record.received_at,
+            plural(record.paths.len(), "path", "paths"),
+            record.id,
+            record.id
+        ));
+    }
     lines.join("\n")
 }
 
@@ -3815,6 +3837,62 @@ mod tests {
         assert_eq!(lines[5], "    envoy asks: Share the plan?");
         assert!(lines[6].starts_with("  p2  "), "{text}");
         assert!(!lines[7].contains("envoy asks"), "{text}");
+    }
+
+    #[test]
+    fn pending_lists_access_requests_apart_from_questions_and_never_their_paths() {
+        let access = InboundRecord {
+            kind: InboundKind::Access,
+            question: String::new(),
+            paths: vec!["secret/plan.md".into(), "src/x.rs".into()],
+            reason: "need the struct".into(),
+            ..inbound("acc-1", "")
+        };
+        let question = inbound("p1", "");
+
+        let text = render_pending(&[], &[access, question.clone()]);
+        let lines: Vec<&str> = text.lines().collect();
+        let hint = lines
+            .iter()
+            .position(|line| line.starts_with("answer one with"))
+            .unwrap_or_else(|| panic!("{text}"));
+        assert!(
+            lines[..hint].iter().any(|line| line.starts_with("  p1  ")),
+            "{text}"
+        );
+        assert!(
+            !lines[..hint].iter().any(|line| line.contains("acc-1")),
+            "an access request is not listed among the questions: {text}"
+        );
+        assert_eq!(
+            lines[hint + 1],
+            "Access requests (decide with grant or refuse):",
+            "{text}"
+        );
+        let row = lines[hint + 2];
+        assert!(
+            row.starts_with(&format!(
+                "  acc-1  {}  received 2026-09-21T14:13:20Z",
+                "12".repeat(4)
+            )),
+            "{text}"
+        );
+        assert!(row.contains("2 paths"), "{text}");
+        assert!(row.contains("grant: .mesh grant acc-1"), "{text}");
+        assert!(row.contains("refuse: .mesh refuse acc-1"), "{text}");
+        for secret in ["secret/plan.md", "src/x.rs", "need the struct"] {
+            assert!(!text.contains(secret), "{secret} leaked: {text}");
+        }
+
+        let questions_only = render_pending(&[], &[question]);
+        assert!(
+            !questions_only.contains("Access requests"),
+            "{questions_only}"
+        );
+        assert!(
+            questions_only.ends_with("answer one with `.mesh answer <id> <text>`"),
+            "{questions_only}"
+        );
     }
 
     #[test]

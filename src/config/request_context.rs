@@ -42,7 +42,7 @@ use crate::mcp::{
     is_mcp_meta_function, mcp_meta_function_names,
 };
 use crate::mesh::card::DISPLAY_NAME_MAX_CHARS;
-use crate::mesh::pending::PENDING_QUESTION_MAX_CHARS;
+use crate::mesh::pending::{InboundKind, PENDING_QUESTION_MAX_CHARS};
 use crate::mesh::trust::{Tier, TrustRecord};
 use crate::mesh::{MeshSlot, age_text, display_text, parse_rfc3339, redact_hashes, short};
 use crate::rag::Rag;
@@ -5225,6 +5225,7 @@ impl RequestContext {
         };
         let mut values: Vec<(String, Option<String>)> = inbound
             .into_iter()
+            .filter(|record| record.kind != InboundKind::Access)
             .map(|record| {
                 (
                     record.id,
@@ -22510,6 +22511,38 @@ mod tests {
         );
         assert!(description.starts_with("line one"), "{description:?}");
         assert!(description.ends_with("tail"), "{description:?}");
+
+        ctx.app
+            .mesh
+            .inbound_store()
+            .unwrap()
+            .upsert(
+                InboundRecord {
+                    version: INBOUND_RECORD_VERSION,
+                    id: "acc-1".to_string(),
+                    peer_destination: hex_lower(&[0x14; 16]),
+                    peer_identity: hex_lower(&[0xed; 16]),
+                    thread: "acc-1".to_string(),
+                    question: String::new(),
+                    envoy_question: String::new(),
+                    received_at: rfc3339_utc(now),
+                    kind: InboundKind::Access,
+                    paths: vec!["src/x.rs".to_string()],
+                    reason: String::new(),
+                },
+                now,
+            )
+            .unwrap();
+        let ids: Vec<String> = ctx
+            .repl_complete(".mesh", &["answer", ""], "")
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert!(ids.contains(&"p1".to_string()), "{ids:?}");
+        assert!(
+            !ids.contains(&"acc-1".to_string()),
+            "an access request is decided, not answered: {ids:?}"
+        );
 
         assert!(ctx.app.mesh.stop().await.unwrap());
         started.relay_handle.abort();

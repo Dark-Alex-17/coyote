@@ -31,7 +31,8 @@ use crate::mesh::message::{
 use crate::mesh::notify::{Notification, NotificationSink, Source};
 use crate::mesh::peers::{PEER_TABLE_MAX_ENTRIES, PeerChange, PeerSighting, PeerTable};
 use crate::mesh::pending::{
-    Correlations, InboundRecord, InboundStore, PendingRecord, PendingStore,
+    Correlations, InboundKind, InboundRecord, InboundStore, PendingRecord, PendingStore,
+    access_not_a_question,
 };
 use crate::mesh::propagation::{
     self, OutboundMessage, PropagationError, PropagationNode, PropagationOptions,
@@ -2466,6 +2467,9 @@ impl MeshSlot {
         let Some(record) = store.get(id)? else {
             bail!("no open question {id}");
         };
+        if record.kind == InboundKind::Access {
+            bail!(access_not_a_question(id));
+        }
         if self
             .envoy
             .load_full()
@@ -4623,6 +4627,41 @@ mod tests {
         let err = slot.answer_inbound("a-2", "yes").await.unwrap_err();
         assert!(err.to_string().contains("no open question a-2"), "{err}");
         assert!(slot.inbound_store().unwrap().get("a-1").unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn answer_inbound_refuses_an_access_request_and_leaves_it_filed() {
+        let tmp = TempDir::new("slot-answer-access");
+        let slot = slot_with_inbound(&tmp);
+        let store = slot.inbound_store().unwrap();
+        store
+            .upsert(
+                InboundRecord {
+                    kind: InboundKind::Access,
+                    paths: vec!["src/x.rs".into()],
+                    question: String::new(),
+                    ..inbound_record("acc-1")
+                },
+                SystemTime::now(),
+            )
+            .unwrap();
+        let envoy = RecordingEnvoy::new(true, true);
+        slot.set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
+
+        let err = slot.answer_inbound("acc-1", "yes").await.unwrap_err();
+
+        assert!(
+            err.to_string().contains(
+                "`acc-1` is an access request, not a question; decide it with `.mesh grant acc-1` or `.mesh refuse acc-1`"
+            ),
+            "{err}"
+        );
+        assert!(
+            envoy.answers.lock().is_empty(),
+            "an access request is never handed to a run as an answer"
+        );
+        assert!(store.get("acc-1").unwrap().is_some());
+        assert!(slot.correlations().list().is_empty());
     }
 
     #[tokio::test]
