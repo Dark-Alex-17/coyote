@@ -2796,7 +2796,7 @@ mod tests {
         );
     }
 
-    /// Usage probe (spec-first, TASK-111 r5): cursor misuse at the handler. A cursor that
+    /// Usage probe: cursor misuse at the handler. A cursor that
     /// is well-formed but unknown (right alphabet and length, names no entry) starts the
     /// listing over at the first page; so does a cursor that named an entry which has
     /// since vanished from the share root — a stale page token never yields an error, a

@@ -7563,11 +7563,11 @@ mod tests {
         stub.stop().await;
     }
 
-    /// Usage probe (spec-first, TASK-111 r5, pins c414858): when a re-key is refused, the
+    /// Usage probe: when a re-key is refused, the
     /// node goes on serving the ORIGINAL instance's grants even if the original's grant
     /// file cannot be re-opened at that moment — the store that was displaced is the one
-    /// put back (same handle, same path), never the fork's. Before c414858 the rollback
-    /// re-opened the file, and a failed re-open left the fork's grants in force.
+    /// put back (same handle, same path), never the fork's. An earlier rollback re-opened
+    /// the original's file, and a failed re-open left the fork's grants in force.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn usage_probe_a_refused_rekey_puts_back_the_displaced_grant_store_even_when_its_file_is_unreadable()

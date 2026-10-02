@@ -7004,7 +7004,7 @@ pub(crate) mod network {
         pair.stop_node_a().await;
     }
 
-    /// Usage probe (spec-first, TASK-111 r5): over a real link, every served fetch fires
+    /// Usage probe: over a real link, every served fetch fires
     /// `mesh.fetch.served` exactly once, and the env names the REAL requester — node B's
     /// identity hash and destination hash as A learned them from the link, not fixture
     /// stand-ins — plus the served size and the first eight hex of the sha256; nothing in
@@ -7118,7 +7118,7 @@ pub(crate) mod network {
         bytes
     }
 
-    /// Usage probe (spec-first, TASK-111 r5): grant + deny interplay over a real link. A
+    /// Usage probe: grant + deny interplay over a real link. A
     /// one-off grant makes a path OUTSIDE the share set fetchable exactly once, but a path
     /// the share list denies is never served even when granted, and its refusal is the
     /// same `not_shared` bytes a missing file gets. Neither granted path shows up in
