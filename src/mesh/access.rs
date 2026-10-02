@@ -12,11 +12,13 @@
 //! to the inbound record and the human line and nowhere else, never to the envoy, a
 //! model note or a log line.
 
+#[cfg(all(test, unix))]
+use crate::mesh::canonical_hash;
 use crate::mesh::events::{AccessDecision, MeshEvent};
 use crate::mesh::fetch::{FetchServing, ShareSource, field, versioned_map};
 use crate::mesh::grants::DEFAULT_GRANT_TTL;
 use crate::mesh::idle::{IdleNotify, Origin};
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use crate::mesh::message::PEER_REQUEST_TIMEOUT;
 use crate::mesh::message::{
     Disposition, OutboundPeer, PEER_WIRE_VERSION, PartLimits, PeerKind, PeerVia, RawPart,
@@ -27,26 +29,29 @@ use crate::mesh::node::MeshRuntime;
 use crate::mesh::node::MeshSlot;
 use crate::mesh::notify::Source;
 #[cfg(test)]
-use crate::mesh::pending::{
-    DEFAULT_COLLECT_TIMEOUT, InboundStore, PENDING_QUESTION_MAX_CHARS, PENDING_RECORD_VERSION,
-    PendingRecord, PendingState,
-};
+use crate::mesh::parse_rfc3339;
+#[cfg(all(test, unix))]
+use crate::mesh::pending::{DEFAULT_COLLECT_TIMEOUT, PENDING_QUESTION_MAX_CHARS};
 use crate::mesh::pending::{INBOUND_RECORD_VERSION, InboundKind, InboundRecord};
 #[cfg(test)]
-use crate::mesh::propagation::{OutboundMessage, PropagationError, PropagationOptions};
+use crate::mesh::pending::{InboundStore, PENDING_RECORD_VERSION, PendingRecord, PendingState};
+#[cfg(all(test, unix))]
+use crate::mesh::propagation::PropagationOptions;
+#[cfg(test)]
+use crate::mesh::propagation::{OutboundMessage, PropagationError};
 use crate::mesh::propagation_fetch::{InboundMessage, InboundSink};
 #[cfg(test)]
 use crate::mesh::protocol::describe_version;
 #[cfg(test)]
-use crate::mesh::r3::{ACCESS_PATH, DEFAULT_LINK_TIMEOUT, OriginName, R3Error, RequestOptions};
+use crate::mesh::r3::{ACCESS_PATH, OriginName, R3Error};
 use crate::mesh::r3::{AdmittedRequest, Handler, NAME_HASH_LEN, RefusalCode, Reply};
+#[cfg(all(test, unix))]
+use crate::mesh::r3::{DEFAULT_LINK_TIMEOUT, RequestOptions};
 use crate::mesh::shares::PeerRef;
 #[cfg(test)]
 use crate::mesh::shares::{Mutation, ShareSet, WriteScope};
 use crate::mesh::trust::{Decision, TrustStore};
 use crate::mesh::wire_path::WirePath;
-#[cfg(test)]
-use crate::mesh::{canonical_hash, parse_rfc3339};
 use crate::mesh::{destination_address, display_text, redact_hashes, rfc3339_utc, short};
 
 use anyhow::Result;
@@ -55,7 +60,7 @@ use anyhow::{Context, bail};
 use async_trait::async_trait;
 use lxmf_core::constants::{FIELD_CUSTOM_DATA, FIELD_CUSTOM_TYPE};
 use rmpv::Value;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use rns_transport::destination::DestinationDesc;
 use rns_transport::hash::AddressHash;
 use serde_json::json;
@@ -299,14 +304,14 @@ pub(crate) fn validate_access(
 // The requester half is test-only until the tool that asks a peer for access lands.
 
 /// Timeouts for one access request: the direct attempt, then the fallback post.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct AccessOptions {
     pub request: RequestOptions,
     pub propagation: PropagationOptions,
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl Default for AccessOptions {
     fn default() -> Self {
         Self {
@@ -321,7 +326,7 @@ impl Default for AccessOptions {
 
 /// What a sent request came back as, and by which route. A stored request is pending by
 /// definition: the peer has not seen it yet.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct AccessRequestOutcome {
     pub id: String,
@@ -419,7 +424,7 @@ impl fmt::Display for AccessError {
 #[cfg(test)]
 impl std::error::Error for AccessError {}
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl MeshSlot {
     /// Asks the trusted instance at `peer_destination` to let this node read `paths`.
     /// The correlation is opened before the send so a decision that beats the reply's
@@ -491,7 +496,7 @@ impl MeshSlot {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl MeshRuntime {
     /// Puts `request` to `destination` over a link and reads the answer. Only the
     /// peer-unreachable errors fall back to store-and-forward: a refusal of any code
@@ -586,7 +591,7 @@ impl MeshRuntime {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn access_body(request: &ValidAccess) -> Value {
     Value::Map(vec![
         (Value::from("v"), Value::from(PEER_WIRE_VERSION)),
@@ -1340,7 +1345,7 @@ mod tests {
     use super::*;
     use crate::hooks::HookEvent;
     use crate::mesh::events::{RecordingHookSink, env_value};
-    use crate::mesh::grants::{DEFAULT_GRANT_USES, GRANT_MAX_PATHS};
+    use crate::mesh::grants::GRANT_MAX_PATHS;
     use crate::mesh::hex_lower;
     use crate::mesh::idle::IdleSink;
     use crate::mesh::knock::{KnockIntro, knock_message};
@@ -1361,7 +1366,7 @@ mod tests {
     #[cfg(unix)]
     use crate::mesh::envoy::{EnvoyJob, EnvoySink};
     #[cfg(unix)]
-    use crate::mesh::grants::GrantRecord;
+    use crate::mesh::grants::{DEFAULT_GRANT_USES, GrantRecord};
     #[cfg(unix)]
     use crate::mesh::limits::PeerRefusal;
     #[cfg(unix)]
@@ -1474,7 +1479,8 @@ mod tests {
         idle: Arc<RecordingIdleSink>,
         hooks: Arc<RecordingHookSink>,
         root: PathBuf,
-        tmp: TempDir,
+        /// Kept so the directory outlives the fixture.
+        _tmp: TempDir,
     }
 
     fn bare_slot(tag: &str) -> BareSlot {
@@ -1495,7 +1501,7 @@ mod tests {
             idle,
             hooks,
             root,
-            tmp,
+            _tmp: tmp,
         }
     }
 
@@ -1849,7 +1855,7 @@ mod tests {
     #[test]
     fn a_file_reached_through_a_link_out_of_the_root_reads_as_missing() {
         let fixture = bare_slot("access-line-link");
-        let outside = fixture.tmp.path.join("outside.txt");
+        let outside = fixture.root.parent().unwrap().join("outside.txt");
         fs::write(&outside, b"secret").unwrap();
         std::os::unix::fs::symlink(&outside, fixture.root.join("alias.txt")).unwrap();
         assert_eq!(path_state(Some(&fixture.root), "alias.txt"), "missing");
