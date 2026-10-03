@@ -1713,6 +1713,7 @@ fn unshare(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         ..
     } = args;
     refuse_directory_pattern(&pattern, "name what is under it with")?;
+    validate_pattern(&pattern)?;
     let (root, mut set, case_insensitive) = writable_share_set(ctx)?;
     let locations = set.locations().clone();
     let path_of = |layer: Layer| match layer {
@@ -13665,6 +13666,10 @@ mod tests {
                     for (line, teaching) in [
                         (
                             ".mesh allow /etc/passwd",
+                            "Share patterns are relative to the workspace root",
+                        ),
+                        (
+                            ".mesh unshare /etc/passwd",
                             "Share patterns are relative to the workspace root",
                         ),
                         (".mesh allow x --peer bob", "`bob` is not a peer hash"),
