@@ -7,19 +7,20 @@
 //! the load says so once.
 //!
 //! Evaluation is deny-first and judged on the file that is actually on disk. A candidate
-//! inside either config directory, the workspace's or the global one, is refused before
-//! any list is consulted, and nothing lifts that; then a user deny from either layer; then
-//! the built-in deny of secrets and `.git` at any depth, which an `override` lifts for one
-//! exact resolved file; only then does an allow serve it. Deny and built-in deny are judged
-//! on both the name the peer sent, a parsed `WirePath`, and the path it resolved to under
-//! the share root; allow and override are judged on the resolved path alone. An override
-//! grants nothing on its own: an allow must still match, and only the global file's
-//! overrides count, since the workspace file arrives with a cloned repository and must not
-//! be able to lift the deny on `.env` by itself. Patterns are globs anchored at the
-//! share root where `**` alone crosses a `/`. The root is the caller's, never the current
-//! directory. A grant from the `GrantStore` lets one peer fetch a named file no allow
-//! reaches, after every deny has had its say; `is_served` is the one path a fetch takes
-//! through all of this, and `list` walks only what the allows name.
+//! inside either config directory, the workspace's or the global one, or under a `.git`
+//! directory at any depth, is refused before any list is consulted, and nothing lifts
+//! that; then a user deny from either layer; then the built-in deny of secret names, which
+//! an `override` lifts for one exact resolved file; only then does an allow serve it. Deny
+//! and built-in deny are judged on both the name the peer sent, a parsed `WirePath`, and
+//! the path it resolved to under the share root; allow and override are judged on the
+//! resolved path alone. An override grants nothing on its own: an allow must still match,
+//! and only the global file's overrides count, since the workspace file arrives with a
+//! cloned repository and must not be able to lift the deny on `.env` by itself. Patterns
+//! are globs anchored at the share root where `**` alone crosses a `/`. The root is the
+//! caller's, never the current directory. A grant from the `GrantStore` lets one peer
+//! fetch a named file no allow reaches, after every deny has had its say; `is_served` is
+//! the one path a fetch takes through all of this, and `list` walks only what the allows
+//! name.
 
 use crate::config::{WORKSPACE_COYOTE_DIR_NAME, paths};
 use crate::mesh::grants::GrantStore;
@@ -238,9 +239,10 @@ pub(crate) enum Judgement {
 }
 
 /// `Judgement` with the reason a denial hides, for the human's own listing rather than a
-/// peer's answer. `Protected` is a file under a directory nothing lifts, and also one
-/// that did not resolve to plain segments under the share root, since no rule can serve
-/// either; `Denied` is a user deny; `BuiltinDenied` the built-in deny no override lifts.
+/// peer's answer. `Protected` is a file under a directory nothing lifts, a config
+/// directory or a `.git` at any depth, and also one that did not resolve to plain
+/// segments under the share root, since no rule can serve either; `Denied` is a user
+/// deny; `BuiltinDenied` the built-in deny no override lifts.
 /// `Shared` and `NotAllowed` are `Allowed` and `NotAllowed`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Verdict {
@@ -1101,6 +1103,9 @@ impl ShareRules {
         let Some(resolved) = self.resolved(canonical) else {
             return Verdict::Protected;
         };
+        if resolved.split('/').any(|segment| segment == ".git") {
+            return Verdict::Protected;
+        }
         let alias = wire.segments().collect::<Vec<_>>().join("/");
         if self.deny.is_match(&alias) || self.deny.is_match(&resolved) {
             return Verdict::Denied;
@@ -2377,6 +2382,69 @@ mod tests {
                 "{denied} as a worktree or submodule file must not be served"
             );
         }
+    }
+
+    /// A file under any `.git` directory is never served, even when a global exact-file
+    /// `override` names it: by ruling, `.git/` sits with the never-lifted protected set,
+    /// not the override-liftable built-in names. The human's view marks it `Protected`.
+    #[test]
+    fn usage_probe_an_override_never_lifts_a_file_under_any_git_directory() {
+        let fx = Fixture::new("shares-probe-override-nested-git");
+        let mut set = fx.load();
+        fx.file("vendor/dep/.git/HEAD");
+        fx.file("vendor/dep/.git/config");
+        fx.file(".git/HEAD");
+        fx.file("vendor/dep/src/lib.rs");
+        for exact in ["vendor/dep/.git/HEAD", ".git/HEAD"] {
+            set.apply(allow(exact), WriteScope::Global).unwrap();
+            set.apply(lift(exact), WriteScope::Global).unwrap();
+        }
+        set.apply(allow("vendor/dep/src/**"), WriteScope::Global)
+            .unwrap();
+
+        assert!(served(&set, &fx, "vendor/dep/src/lib.rs"), "control");
+        let leaked: Vec<&str> = [
+            "vendor/dep/.git/HEAD",
+            ".git/HEAD",
+            "vendor/dep/.git/config",
+        ]
+        .into_iter()
+        .filter(|under_git| served(&set, &fx, under_git))
+        .collect();
+        assert!(
+            leaked.is_empty(),
+            "served despite sitting under a `.git` directory, override or not: {leaked:?}"
+        );
+        let listing = listing(&set, None, DEFAULT_LIST_WALK_BOUND);
+        assert_eq!(
+            listed_paths(&listing),
+            ["vendor/dep/src/lib.rs"],
+            "nothing under a `.git` directory is listed"
+        );
+        let resolved = set.resolve(
+            &PeerRef::unscoped(),
+            false,
+            DEFAULT_LIST_WALK_BOUND,
+            LIST_PAGE_SIZE,
+        );
+        assert_eq!(
+            resolved.entries,
+            [
+                ResolvedEntry {
+                    path: ".git/HEAD".into(),
+                    verdict: Verdict::Protected,
+                },
+                ResolvedEntry {
+                    path: "vendor/dep/.git/HEAD".into(),
+                    verdict: Verdict::Protected,
+                },
+                ResolvedEntry {
+                    path: "vendor/dep/src/lib.rs".into(),
+                    verdict: Verdict::Shared,
+                },
+            ],
+            "the exact-allowed `.git` files show as protected, never as lifted"
+        );
     }
 
     #[test]
