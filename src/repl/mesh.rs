@@ -1476,6 +1476,12 @@ fn allow(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             "`--force` lifts the built-in deny for every peer whose allow names `{pattern}`, so it cannot be scoped with `--peer`; drop `--peer` (every trusted peer with a matching allow will see the file)."
         );
     }
+    if let Some(destination) = canonical_hash(&pattern) {
+        bail!(
+            "`.mesh allow` takes a file pattern, not a peer; to trust the instance {} run `.mesh trust {destination}`, or scope a share to it with `--peer {destination}`.",
+            short(&destination)
+        );
+    }
     refuse_directory_pattern(&pattern, "share what is under it with")?;
     validate_pattern(&pattern)?;
     let peer = peer.as_deref().map(canonical_peer).transpose()?;
@@ -13055,6 +13061,33 @@ mod tests {
 
                 #[test]
                 #[serial]
+                fn allow_of_a_destination_hash_teaches_trust_and_peer() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-allow-hash");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx =
+                            ShareFixture::new("repl-mesh-allow-hash", &["docs/a.md"]).await;
+                        let dest = "3f9c2a7b1d4e6f80a1b2c3d4e5f60718";
+
+                        let err =
+                            refusal(&mut fx.ctx, &format!(".mesh allow {}", dest.to_uppercase()))
+                                .await;
+
+                        assert_eq!(
+                            err,
+                            format!(
+                                "`.mesh allow` takes a file pattern, not a peer; to trust the instance {} run `.mesh trust {dest}`, or scope a share to it with `--peer {dest}`.",
+                                short(dest)
+                            )
+                        );
+                        assert!(!fx.locations.global.exists());
+                        fx.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
                 fn deny_of_a_destination_hash_teaches_untrust() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-deny-hash");
                     let _capture = capture::install();
@@ -13733,6 +13766,10 @@ mod tests {
                         (
                             ".mesh unshare /etc/passwd",
                             "Share patterns are relative to the workspace root",
+                        ),
+                        (
+                            ".mesh allow 3f9c2a7b1d4e6f80a1b2c3d4e5f60718",
+                            "takes a file pattern, not a peer",
                         ),
                         (".mesh allow x --peer bob", "`bob` is not a peer hash"),
                         (".mesh deny docs/", "`docs/` names a directory"),
