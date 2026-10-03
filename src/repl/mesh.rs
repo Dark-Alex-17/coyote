@@ -1504,9 +1504,12 @@ fn allow(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         }
         match set.builtin_denies(&pattern, case_insensitive)? {
             Some(BuiltinHit::ByText) => {}
-            Some(BuiltinHit::ByResolution { resolved }) => bail!(
-                "`{pattern}` resolves to `{resolved}`, which the built-in deny names; `.mesh allow {resolved} --force --global` lifts that file."
-            ),
+            Some(BuiltinHit::ByResolution { resolved }) => {
+                let resolved = shown_pattern(&resolved);
+                bail!(
+                    "`{pattern}` resolves to `{resolved}`, which the built-in deny names; `.mesh allow {resolved} --force --global` lifts that file."
+                )
+            }
             None => bail!(
                 "`{pattern}` is not under the built-in deny, so there is nothing for `--force` to lift; drop `--force`."
             ),
@@ -1516,9 +1519,12 @@ fn allow(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             Some(BuiltinHit::ByText) => bail!(
                 "`{pattern}` is under the built-in deny, so an allow alone would share nothing; `.mesh allow {pattern} --force --global` lifts it for this one file."
             ),
-            Some(BuiltinHit::ByResolution { resolved }) => bail!(
-                "`{pattern}` resolves to `{resolved}`, which the built-in deny names, so an allow alone would share nothing; `.mesh allow {resolved} --force --global` lifts that file."
-            ),
+            Some(BuiltinHit::ByResolution { resolved }) => {
+                let resolved = shown_pattern(&resolved);
+                bail!(
+                    "`{pattern}` resolves to `{resolved}`, which the built-in deny names, so an allow alone would share nothing; `.mesh allow {resolved} --force --global` lifts that file."
+                )
+            }
             None => {}
         }
     }
@@ -1791,7 +1797,10 @@ fn unshare(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
                 let scope = match &holder.peer {
                     None if holder.kind == "allow" => " (every trusted peer)".to_string(),
                     None => String::new(),
-                    Some(hash) => format!(" (peer {})", short(hash)),
+                    Some(hash) if is_canonical_peer(hash) => format!(" (peer {})", short(hash)),
+                    Some(text) => {
+                        format!(" (scoped to no peer: `{}`)", shown_pattern(text))
+                    }
                 };
                 out_text(&format!("  {}{scope} in {}", holder.kind, path_of(*layer)));
             }
@@ -1810,13 +1819,18 @@ fn unshare(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         return Ok(());
     }
     if total > 1 || matches.broad {
+        let breadth = if matches.broad {
+            format!(" ({} files)", matches.words)
+        } else {
+            String::new()
+        };
         let question = match targets.as_slice() {
             [(layer, held)] if total == 1 => format!(
-                "Remove the {} for `{pattern}` from {}?",
+                "Remove the {} for `{pattern}`{breadth} from {}?",
                 kind_list(held),
                 path_of(*layer)
             ),
-            _ => format!("Remove all {total} rules for `{pattern}`?"),
+            _ => format!("Remove all {total} rules for `{pattern}`{breadth}?"),
         };
         if !confirm_or_flag(&question, "--yes", yes)? {
             out_text(NOTHING_CHANGED);
@@ -11803,6 +11817,7 @@ mod tests {
             #[serial]
             fn usage_probe_untrust_sentence_precedes_a_failed_write_and_memory_stays_with_disk() {
                 use crate::mesh::events::{MeshHooks, RecordingHookSink, TrustHookObserver};
+                use crate::mesh::test_support::siblings_of;
 
                 let _guard = TestConfigDirGuard::new("repl-mesh-usage-probe-failed-write");
                 let _capture = capture::install();
@@ -11826,7 +11841,7 @@ mod tests {
                     let sink = RecordingHookSink::attach(&hooks);
                     trust.set_observer(Arc::new(TrustHookObserver(hooks)));
                     let mesh_dir = trust.path().parent().unwrap().to_path_buf();
-                    let tmp = trust.path().with_added_extension("tmp");
+                    let siblings = siblings_of(trust.path());
                     let sentence = format!(
                         "Tia's identity stays trusted; this instance is refused until `.mesh trust {dest}`."
                     );
@@ -11867,7 +11882,11 @@ mod tests {
                             "{verb}: memory agrees with disk"
                         );
                         assert!(trust.denied().is_empty(), "{verb}: {:?}", trust.denied());
-                        assert!(!tmp.exists(), "{verb}: no temp file left behind");
+                        assert_eq!(
+                            siblings_of(trust.path()),
+                            siblings,
+                            "{verb}: no temp file left behind"
+                        );
                     }
 
                     // Forget branch: the forgets line, then the error, record intact.
@@ -11919,7 +11938,7 @@ mod tests {
                     );
                     assert_eq!(trust.authorize(&id, &dest).rule, Rule::DestinationDenied);
                     assert_ne!(trust_file(&trust).as_deref(), Some(before.as_slice()));
-                    assert!(!tmp.exists());
+                    assert_eq!(siblings_of(trust.path()), siblings);
 
                     assert!(ctx.app.mesh.stop().await.unwrap());
                     started.relay_handle.abort();
@@ -13469,11 +13488,12 @@ mod tests {
                             ShareFixture::new("repl-mesh-unshare-scopes", &["docs/a.md"]).await;
                         let peer = "ab".repeat(16);
                         fx.write_global(&format!(
-                            "version: 1\nallow:\n- pattern: docs/**\n- pattern: docs/**\n  peer: {peer}\n"
+                            "version: 1\nallow:\n- pattern: docs/**\n- pattern: docs/**\n  peer: {peer}\n- pattern: docs/**\n  peer: nobody\n"
                         ));
                         let both = [
                             allow_entry(Layer::Global, "docs/**", None),
                             allow_entry(Layer::Global, "docs/**", Some(&peer)),
+                            allow_entry(Layer::Global, "docs/**", Some("nobody")),
                         ];
                         assert_eq!(fx.entries(), both);
 
@@ -13499,6 +13519,16 @@ mod tests {
                         assert!(
                             lines.contains(
                                 &format!(
+                                    "  allow (scoped to no peer: `nobody`) in {}",
+                                    fx.global()
+                                )
+                                .as_str()
+                            ),
+                            "a peer that is no hash is shown as text, not shortened: {out}"
+                        );
+                        assert!(
+                            lines.contains(
+                                &format!(
                                     "Will remove the allow for `docs/**` from {}.",
                                     fx.global()
                                 )
@@ -13509,6 +13539,46 @@ mod tests {
                         assert!(out.ends_with(NOTHING_CHANGED), "{out}");
                         assert_eq!(prompt_script::prompts_asked(), 1);
                         assert_eq!(fx.entries(), both);
+                        fx.stop().await;
+                    });
+                }
+
+                /// The question says how many files a broad pattern reaches, as allow and
+                /// deny do, and stays bare when only the holder count made it fire.
+                #[test]
+                #[serial]
+                fn unshare_of_a_broad_pattern_asks_with_the_breadth_words() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-unshare-breadth");
+                    let _capture = capture::install();
+                    run_async(async {
+                        let mut fx = ShareFixture::new(
+                            "repl-mesh-unshare-breadth",
+                            &["docs/a.md", "docs/b.md", "src/main.rs"],
+                        )
+                        .await;
+                        let quiet = prompt_script::install(&[]);
+                        out_of(&mut fx.ctx, ".mesh allow ** --yes").await.unwrap();
+                        out_of(&mut fx.ctx, ".mesh allow docs/**").await.unwrap();
+                        out_of(&mut fx.ctx, ".mesh allow docs/** --workspace")
+                            .await
+                            .unwrap();
+                        drop(quiet);
+
+                        let _non_tty = prompt_script::install_non_interactive();
+                        let err = refusal(&mut fx.ctx, ".mesh unshare ** --global").await;
+                        assert!(
+                            err.starts_with(&format!(
+                                "Remove the allow for `**` (3 files) from {}?",
+                                fx.global()
+                            )),
+                            "{err}"
+                        );
+                        let err = refusal(&mut fx.ctx, ".mesh unshare docs/**").await;
+                        assert!(
+                            err.starts_with("Remove all 2 rules for `docs/**`?"),
+                            "{err}"
+                        );
+                        assert_eq!(fx.entries().len(), 3);
                         fx.stop().await;
                     });
                 }
