@@ -21882,6 +21882,136 @@ mod tests {
                     });
                 }
 
+                /// Usage probe (R2 outbound-correlation route, the other three arms):
+                /// answering a question THIS node asked judges `--attach` like every other
+                /// route — (b) a file at or under `inline_max_bytes` travels INLINE with no
+                /// grant, (R8) protected and built-in-deny paths are refused in one line
+                /// before anything is printed, sent or lent, and (R3) a reference lend the
+                /// peer refuses takes its grant back — while the correlation stays open
+                /// throughout and an envoy hold on the id never refuses or sees anything.
+                #[test]
+                #[serial]
+                fn usage_probe_this_nodes_own_question_takes_a_small_attachment_inline_and_a_refused_lend_is_taken_back()
+                 {
+                    use crate::mesh::pending::PENDING_RECORD_VERSION;
+                    use crate::mesh::test_support::{Handler, MESSAGE_PATH};
+                    use lend_gate::Gate;
+                    use std::sync::atomic::Ordering;
+
+                    let _guard = TestConfigDirGuard::new("repl-mesh-attach-outbound-arms");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::with_config(
+                            "repl-mesh-attach-outbound-arms",
+                            with_inline_max(1024),
+                        )
+                        .await;
+                        let root = fx.root.path.clone();
+                        write(&root, "docs/notes.md", NOTES);
+                        write(&root, ".env", b"SECRET=1\n");
+                        write(&root, ".git/HEAD", b"ref: refs/heads/main\n");
+                        let big = vec![0x5A; 1025];
+                        write(&root, "big.bin", &big);
+                        let to = fx.stub.destination_hex();
+                        let now = SystemTime::now();
+                        fx.ctx
+                            .app
+                            .mesh
+                            .correlations()
+                            .open(crate::mesh::pending::PendingRecord {
+                                version: PENDING_RECORD_VERSION,
+                                id: "q1".to_string(),
+                                peer_destination: to.clone(),
+                                peer_identity: fx.stub.identity_hex(),
+                                thread: "q1".to_string(),
+                                question: "what now?".to_string(),
+                                sent_at: rfc3339_utc(now),
+                                timeout_at: rfc3339_utc(now + Duration::from_secs(600)),
+                                state: PendingState::Open,
+                                reply: None,
+                            })
+                            .unwrap();
+                        let envoy = RecordingEnvoy::new(true, true);
+                        *envoy.held.lock() = Some("q1".to_string());
+                        fx.ctx
+                            .app
+                            .mesh
+                            .set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
+
+                        // R8: judged before anything is printed, sent or lent.
+                        for (args, expected) in [
+                            (
+                                "--attach .git/HEAD --force",
+                                "`.git/HEAD` is under `.git/`, which is never shared, not even with `--force`; nothing was sent.",
+                            ),
+                            (
+                                "--attach .env",
+                                "`.env` is under the built-in deny (secret-looking name); `--force` attaches it anyway, since you named it.",
+                            ),
+                        ] {
+                            let line = format!(".mesh answer q1 \"x\" {args}");
+                            let printed = stdout_lines().len();
+                            assert_eq!(refusal(&mut fx.ctx, &line).await, expected, "{line}");
+                            assert_eq!(stdout_lines().len(), printed, "{line} prints nothing");
+                        }
+                        assert!(fx.stub.seen().is_empty(), "{:?}", fx.stub.seen());
+                        assert!(fx.grants().is_empty(), "{:?}", fx.grants());
+
+                        // R3: the peer refuses the reference; the lend is taken back and
+                        // the correlation is still open for a retry.
+                        let gate = Arc::new(Gate::default());
+                        gate.armed.store(true, Ordering::SeqCst);
+                        fx.stub
+                            .serve(MESSAGE_PATH, gate.clone() as Arc<dyn Handler>);
+                        let err =
+                            refusal(&mut fx.ctx, ".mesh answer q1 \"x\" --attach big.bin").await;
+                        assert_eq!(err.lines().count(), 1, "{err}");
+                        assert!(
+                            !err.contains("stands until")
+                                && !err.contains("could not be taken back")
+                                && !err.contains("another process")
+                                && !err.contains("R3Error"),
+                            "{err}"
+                        );
+                        assert!(fx.grants().is_empty(), "{:?}", fx.grants());
+                        assert!(gate.heard.lock().is_empty(), "{:?}", gate.heard.lock());
+                        assert!(fx.ctx.app.mesh.correlations().get("q1").is_some());
+
+                        // (b): at or under inline_max_bytes the file rides inline, lending
+                        // nothing, and the held envoy neither refuses nor sees it.
+                        gate.armed.store(false, Ordering::SeqCst);
+                        let out = out_of(
+                            &mut fx.ctx,
+                            ".mesh answer q1 \"here\" --attach docs/notes.md",
+                        )
+                        .await
+                        .unwrap();
+                        let lines: Vec<&str> = out.lines().collect();
+                        assert!(
+                            lines.contains(
+                                &inline_line("docs/notes.md", NOTES.len() as u64).as_str()
+                            ),
+                            "{out}"
+                        );
+                        assert!(
+                            !out.contains("may fetch it once"),
+                            "an inline part lends nothing: {out}"
+                        );
+                        let last = lines.last().unwrap();
+                        assert!(
+                            last.starts_with("Sent ")
+                                && last.contains("as a reply to q1 (via direct)."),
+                            "{out}"
+                        );
+                        assert_eq!(gate.heard.lock().as_slice(), ["here"], "sent exactly once");
+                        assert!(fx.grants().is_empty(), "{:?}", fx.grants());
+                        assert!(envoy.answers.lock().is_empty(), "the envoy saw nothing");
+                        assert!(fx.ctx.app.mesh.correlations().get("q1").is_some());
+                        fx.stop().await;
+                    });
+                }
+
                 #[test]
                 #[serial]
                 fn attach_never_hands_the_answer_or_the_file_to_the_envoy() {
