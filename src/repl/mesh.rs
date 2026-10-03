@@ -17622,6 +17622,469 @@ mod tests {
                         assert!(violations.is_empty(), "{}", violations.join("\n"));
                     });
                 }
+
+                /// (a)/(c) `.git/` with a trailing slash is a pure refusal ("never
+                /// shared") that fires BEFORE the mesh gate for `allow` and `deny`, at any
+                /// depth of a by-name `.git` component; `unshare` keeps the `<dir>/**`
+                /// teaching (a legacy rule under it is still removable); the bare `.git`
+                /// directory (no slash) needs the root and so waits behind the gate.
+                #[test]
+                #[serial]
+                fn usage_probe_git_slash_is_never_shared_before_the_gate_and_unshare_keeps_teaching()
+                 {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-git-slash-gate");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    let mut ctx = off_ctx();
+                    let root = TempDir::new("repl-mesh-probe-git-slash-gate-root");
+                    seed_files(&root.path, &[".git/HEAD", "vendor/dep/.git/HEAD"]);
+                    publish_root(&ctx, &root.path);
+                    let (_, locations) = share_locations(&ctx).unwrap();
+
+                    for line in [
+                        ".mesh allow .git/",
+                        ".mesh deny .git/",
+                        ".mesh allow .git/hooks/",
+                        ".mesh allow vendor/dep/.git/",
+                        ".mesh deny vendor/dep/.git/hooks/",
+                        ".mesh allow .git/ --force --global",
+                    ] {
+                        let err = err_of(&mut ctx, line);
+                        assert_ne!(err, MESH_OFF, "{line}: pure check fires before the gate");
+                        assert!(err.contains("never shared"), "{line}: {err}");
+                        assert!(
+                            !err.contains("/**`"),
+                            "{line}: no remedy under .git is taught: {err}"
+                        );
+                    }
+                    for (line, taught) in [
+                        (".mesh unshare .git/", ".git/**"),
+                        (".mesh unshare vendor/dep/.git/", "vendor/dep/.git/**"),
+                    ] {
+                        let err = err_of(&mut ctx, line);
+                        assert_ne!(err, MESH_OFF, "{line}");
+                        assert_eq!(taught_pattern(&err), taught, "{line}: {err}");
+                    }
+                    // The bare directory is judged against the root, which the gate guards.
+                    for line in [
+                        ".mesh allow .git",
+                        ".mesh deny .git",
+                        ".mesh allow vendor/dep/.git",
+                    ] {
+                        assert_eq!(err_of(&mut ctx, line), MESH_OFF, "{line}");
+                    }
+                    assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
+                    assert!(!locations.global.exists());
+                    assert!(!locations.workspace.exists());
+                }
+
+                /// (a) Every directory the walk never enters — the workspace config dir,
+                /// the configured inbox, and `.git` as ANY component of the resolved path
+                /// (a nested repository) — refuses a pattern whose head is a link into it,
+                /// by name or by resolution, for BOTH verbs, and teaches no remedy under
+                /// it; a nested link to an ordinary directory beside the nested `.git`
+                /// still teaches its resolved path, which the verb then accepts.
+                #[test]
+                #[serial]
+                fn usage_probe_a_link_into_any_skipped_directory_is_refused_for_both_verbs_without_a_remedy()
+                 {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-link-skipped");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = ShareFixture::with_inbox(
+                            "repl-mesh-probe-link-skipped",
+                            &[
+                                ".coyote/config.yaml",
+                                "inbox/fetched.md",
+                                "vendor/dep/.git/HEAD",
+                                "vendor/dep/.git/hooks/pre-commit",
+                                "vendor/dep/src/lib.rs",
+                                "docs/a.md",
+                            ],
+                            Some("inbox"),
+                        )
+                        .await;
+                        let root = &fx.root.path;
+                        std::os::unix::fs::symlink(".coyote", root.join("clink")).unwrap();
+                        std::os::unix::fs::symlink(".coyote/config.yaml", root.join("cfile"))
+                            .unwrap();
+                        std::os::unix::fs::symlink("inbox", root.join("ilink")).unwrap();
+                        std::os::unix::fs::symlink("vendor/dep/.git", root.join("nlink")).unwrap();
+                        std::os::unix::fs::symlink("vendor/dep/.git/hooks", root.join("hooks"))
+                            .unwrap();
+                        std::os::unix::fs::symlink("vendor/dep/.git/HEAD", root.join("nhead"))
+                            .unwrap();
+                        std::os::unix::fs::symlink("../vendor/dep/.git", root.join("docs/glink"))
+                            .unwrap();
+                        std::os::unix::fs::symlink("vendor/dep/src", root.join("srclink")).unwrap();
+
+                        let skipped = [
+                            (".mesh allow clink", ".coyote"),
+                            (".mesh allow clink/**", ".coyote"),
+                            (".mesh allow clink/config.yaml", ".coyote"),
+                            (".mesh allow cfile --force --global", ".coyote"),
+                            (".mesh deny clink/**", ".coyote"),
+                            (".mesh deny cfile", ".coyote"),
+                            (".mesh allow ilink", "inbox"),
+                            (".mesh allow ilink/**", "inbox"),
+                            (".mesh allow ilink/fetched.md --force --global", "inbox"),
+                            (".mesh deny ilink/fetched.md", "inbox"),
+                            (".mesh allow nlink", "vendor/dep/.git"),
+                            (".mesh allow nlink/**", "vendor/dep/.git"),
+                            (".mesh allow hooks/**", "vendor/dep/.git"),
+                            (".mesh allow hooks/pre-commit", "vendor/dep/.git"),
+                            (".mesh allow nhead", "vendor/dep/.git"),
+                            (".mesh allow nhead --force --global", "vendor/dep/.git"),
+                            (".mesh deny nlink/**", "vendor/dep/.git"),
+                            (".mesh deny nhead", "vendor/dep/.git"),
+                            (".mesh allow docs/glink/**", "vendor/dep/.git"),
+                            (".mesh deny docs/glink/HEAD", "vendor/dep/.git"),
+                        ];
+                        let mut violations = Vec::new();
+                        // By name, with no link at all: `.git` below the root is a
+                        // directory the walk never enters either.
+                        let by_name = [
+                            (".mesh allow vendor/dep/.git/**", "vendor/dep/.git"),
+                            (
+                                ".mesh allow vendor/dep/.git/HEAD --force --global",
+                                "vendor/dep/.git",
+                            ),
+                            (".mesh deny vendor/dep/.git/hooks/*", "vendor/dep/.git"),
+                            (".mesh allow vendor/dep/.git", "vendor/dep/.git"),
+                        ];
+                        for (line, under) in skipped.into_iter().chain(by_name) {
+                            let err = match out_of(&mut fx.ctx, line).await {
+                                Ok(out) => {
+                                    violations.push(format!(
+                                        "{line}: accepted instead of refused: {out:?} / stdout {:?}",
+                                        stdout_lines()
+                                    ));
+                                    continue;
+                                }
+                                Err(err) => err.to_string(),
+                            };
+                            if !err.contains("never shared") {
+                                violations
+                                    .push(format!("{line}: not refused as never shared: {err}"));
+                            }
+                            // No backticked remedy under the skipped directory is taught.
+                            let names_a_remedy_under = err
+                                .split('`')
+                                .enumerate()
+                                .filter(|(index, _)| index % 2 == 1)
+                                .any(|(_, token)| {
+                                    token.starts_with(&format!("{under}/")) && token.contains("**")
+                                        || token.starts_with(".mesh allow")
+                                        || token.starts_with(".mesh deny")
+                                });
+                            if names_a_remedy_under {
+                                violations.push(format!("{line}: teaches a refused remedy: {err}"));
+                            }
+                        }
+
+                        // Control: a nested link beside the nested `.git` resolves normally.
+                        for (line, taught) in [
+                            (".mesh allow srclink/**", "vendor/dep/src/**"),
+                            (".mesh allow srclink/lib.rs", "vendor/dep/src/lib.rs"),
+                            (".mesh deny srclink/*.rs", "vendor/dep/src/*.rs"),
+                        ] {
+                            let err = refusal(&mut fx.ctx, line).await;
+                            assert_eq!(taught_pattern(&err), taught, "{line}: {err}");
+                        }
+
+                        if !stdout_lines().is_empty() {
+                            violations.push(format!(
+                                "a refused pattern printed to stdout: {:?}",
+                                stdout_lines()
+                            ));
+                        }
+                        if !fx.entries().is_empty() {
+                            violations.push(format!(
+                                "rules were written for a skipped directory: {:?}",
+                                fx.entries()
+                            ));
+                            // The operator's own view must agree with what the wire
+                            // path serves for the rules that got written.
+                            let effective = out_of(&mut fx.ctx, ".mesh shares --effective")
+                                .await
+                                .unwrap();
+                            let listed = effective
+                                .lines()
+                                .any(|line| line.trim() == "vendor/dep/.git/HEAD");
+                            let identity = "1a".repeat(16);
+                            let destination = "2b".repeat(16);
+                            let peer = PeerRef {
+                                identity: &identity,
+                                destination: &destination,
+                            };
+                            let wire = ShareSet::load_quietly(fx.locations.clone()).0.is_allowed(
+                                &peer,
+                                "vendor/dep/.git/HEAD",
+                                false,
+                            );
+                            if listed != wire {
+                                violations.push(format!(
+                                    "`shares --effective` {} `vendor/dep/.git/HEAD` while the wire path {} it",
+                                    if listed { "lists" } else { "hides" },
+                                    if wire { "serves" } else { "withholds" }
+                                ));
+                            }
+                        }
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+
+                        let out = out_of(&mut fx.ctx, ".mesh allow vendor/dep/src/**")
+                            .await
+                            .unwrap();
+                        assert!(out.contains("written to"), "{out}");
+                        let out = out_of(&mut fx.ctx, ".mesh shares --effective")
+                            .await
+                            .unwrap();
+                        assert!(
+                            out.lines().any(|line| line == "  vendor/dep/src/lib.rs"),
+                            "{out}"
+                        );
+                        assert!(!out.contains(".git/"), "{out}");
+                        fx.stop().await;
+                        assert!(violations.is_empty(), "{}", violations.join("\n"));
+                    });
+                }
+
+                /// (a) "no teaching sentence ever names a path under such a directory as
+                /// a remedy": a pattern ending in `/` whose directory the walk never enters
+                /// (the workspace config dir, the configured inbox, a nested `.git`) is not
+                /// taught `<dir>/**` — the verb refuses that very pattern a moment later.
+                #[test]
+                #[serial]
+                fn usage_probe_a_trailing_slash_on_a_skipped_directory_never_teaches_a_refused_glob()
+                 {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-slash-skipped");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = ShareFixture::with_inbox(
+                            "repl-mesh-probe-slash-skipped",
+                            &[
+                                ".coyote/config.yaml",
+                                "inbox/fetched.md",
+                                "vendor/dep/.git/HEAD",
+                            ],
+                            Some("inbox"),
+                        )
+                        .await;
+
+                        let mut violations = Vec::new();
+                        for line in [
+                            ".mesh allow .coyote/",
+                            ".mesh deny .coyote/",
+                            ".mesh allow inbox/",
+                            ".mesh deny inbox/",
+                            ".mesh allow vendor/dep/.git/",
+                        ] {
+                            let err = refusal(&mut fx.ctx, line).await;
+                            let taught = err
+                                .split('`')
+                                .enumerate()
+                                .filter(|(index, _)| index % 2 == 1)
+                                .map(|(_, token)| token.to_string())
+                                .find(|token| token.ends_with("/**"));
+                            let Some(taught) = taught else { continue };
+                            // Whatever is taught must be a pattern the verb takes.
+                            let verb = line.split_whitespace().nth(1).unwrap();
+                            let probe = format!(".mesh {verb} {taught} --dry-run");
+                            if let Err(err2) = out_of(&mut fx.ctx, &probe).await {
+                                violations.push(format!(
+                                    "{line} ⇒ {err:?} teaches `{taught}`, which `{probe}` refuses: {err2}"
+                                ));
+                            }
+                        }
+                        assert!(fx.entries().is_empty());
+                        assert!(!fx.locations.global.exists());
+                        assert!(!fx.locations.workspace.exists());
+                        fx.stop().await;
+                        assert!(violations.is_empty(), "{}", violations.join("\n"));
+                    });
+                }
+
+                /// (a) `deny` judges a link exactly as `allow` does: dangling or escaping
+                /// ⇒ refused saying so (even when the link is named like a secret); a link
+                /// to the root or a chain of links ⇒ a remedy `deny` itself accepts; nothing
+                /// is written and nothing is asked.
+                #[test]
+                #[serial]
+                fn usage_probe_deny_judges_dangling_escaping_root_and_chained_links_like_allow() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-deny-links");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = ShareFixture::new(
+                            "repl-mesh-probe-deny-links",
+                            &["docs/a.md", "docs/b.md"],
+                        )
+                        .await;
+                        let elsewhere = TempDir::new("repl-mesh-probe-deny-links-elsewhere");
+                        fs::create_dir_all(elsewhere.path.join("dir")).unwrap();
+                        fs::write(elsewhere.path.join("dir/x.md"), "outside").unwrap();
+                        fs::write(elsewhere.path.join("file.md"), "outside").unwrap();
+                        let root = &fx.root.path;
+                        std::os::unix::fs::symlink("missing", root.join("gone")).unwrap();
+                        std::os::unix::fs::symlink("missing", root.join(".env")).unwrap();
+                        std::os::unix::fs::symlink(elsewhere.path.join("dir"), root.join("outdir"))
+                            .unwrap();
+                        std::os::unix::fs::symlink(
+                            elsewhere.path.join("file.md"),
+                            root.join("outfile"),
+                        )
+                        .unwrap();
+                        std::os::unix::fs::symlink(".", root.join("here")).unwrap();
+                        std::os::unix::fs::symlink("docs", root.join("dlink")).unwrap();
+                        std::os::unix::fs::symlink("dlink", root.join("chain")).unwrap();
+
+                        for line in [
+                            ".mesh deny gone",
+                            ".mesh deny gone/**",
+                            ".mesh deny .env",
+                            ".mesh deny outdir/**",
+                            ".mesh deny outdir",
+                            ".mesh deny outfile",
+                        ] {
+                            let err = refusal(&mut fx.ctx, line).await;
+                            assert!(
+                                err.contains("link") && err.contains("nothing was written"),
+                                "{line}: says it is a link and that nothing was written: {err}"
+                            );
+                            assert!(
+                                !err.contains("already holds back") && !err.contains(".mesh deny"),
+                                "{line}: a dead link is judged before the built-in deny and teaches nothing: {err}"
+                            );
+                            assert!(
+                                !err.contains(&elsewhere.path.display().to_string()),
+                                "{line}: never echoes a path outside the root: {err}"
+                            );
+                        }
+
+                        for (line, taught) in [
+                            (".mesh deny chain/**", "docs/**"),
+                            (".mesh deny chain/a.md", "docs/a.md"),
+                            (".mesh deny chain", "docs/**"),
+                        ] {
+                            let err = refusal(&mut fx.ctx, line).await;
+                            assert_eq!(taught_pattern(&err), taught, "{line}: {err}");
+                        }
+                        for line in [
+                            ".mesh deny here/docs/**",
+                            ".mesh deny here/docs/a.md",
+                            ".mesh deny here",
+                        ] {
+                            let err = refusal(&mut fx.ctx, line).await;
+                            let taught = taught_pattern(&err);
+                            let out =
+                                out_of(&mut fx.ctx, &format!(".mesh deny {taught} --dry-run"))
+                                    .await
+                                    .unwrap_or_else(|err2| {
+                                        panic!(
+                                            "{line}: taught `{taught}` is refused by deny: {err2}"
+                                        )
+                                    });
+                            assert!(!out.contains("written to"), "{out}");
+                        }
+
+                        assert!(
+                            stdout_lines()
+                                .iter()
+                                .all(|line| !line.contains("written to")),
+                            "{:?}",
+                            stdout_lines()
+                        );
+                        assert!(fx.entries().is_empty());
+                        assert!(!fx.locations.global.exists());
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        fx.stop().await;
+                    });
+                }
+
+                /// (h) The share-path completer never offers a directory the walk skips,
+                /// at any depth: a nested repository's `.git/` is neither listed under its
+                /// parent nor expanded as a typed prefix, the workspace config dir and the
+                /// inbox are hidden by name and as prefixes, and a prefix through a link
+                /// below the first segment lists nothing while its real sibling lists.
+                #[test]
+                #[serial]
+                fn usage_probe_completion_hides_skipped_directories_at_any_depth() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-complete-skipped");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = ShareFixture::with_inbox(
+                            "repl-mesh-probe-complete-skipped",
+                            &[
+                                ".coyote/config.yaml",
+                                "inbox/fetched.md",
+                                "vendor/dep/.git/HEAD",
+                                "vendor/dep/src/lib.rs",
+                                "docs/a.md",
+                                "docs/sub/b.md",
+                            ],
+                            Some("inbox"),
+                        )
+                        .await;
+                        let root = &fx.root.path;
+                        std::os::unix::fs::symlink("sub", root.join("docs/slink")).unwrap();
+                        std::os::unix::fs::symlink("../vendor/dep/src", root.join("docs/srclink"))
+                            .unwrap();
+
+                        let offered = |fx: &ShareFixture, prefix: &str| -> Vec<String> {
+                            fx.ctx
+                                .repl_complete(".mesh", &["allow", prefix], "")
+                                .into_iter()
+                                .map(|(candidate, _)| candidate)
+                                .filter(|candidate| !candidate.starts_with("--"))
+                                .collect()
+                        };
+
+                        let mut violations = Vec::new();
+                        for prefix in [
+                            ".git/",
+                            ".coyote/",
+                            ".coyote/con",
+                            "inbox/",
+                            "vendor/dep/.git/",
+                            "vendor/dep/.git/HE",
+                            "docs/slink/",
+                            "docs/srclink/",
+                            "docs/slink/b",
+                        ] {
+                            let rows = offered(&fx, prefix);
+                            if !rows.is_empty() {
+                                violations.push(format!(
+                                    "prefix {prefix:?} should list nothing: {rows:?}"
+                                ));
+                            }
+                        }
+                        assert_eq!(offered(&fx, "vendor/dep/"), ["vendor/dep/src/"]);
+                        assert_eq!(offered(&fx, "vendor/dep/."), Vec::<String>::new());
+                        assert_eq!(offered(&fx, "docs/"), ["docs/a.md", "docs/sub/"]);
+                        assert_eq!(offered(&fx, "docs/sub/"), ["docs/sub/b.md"]);
+                        assert_eq!(offered(&fx, "docs/s"), ["docs/sub/"]);
+                        let top = offered(&fx, "");
+                        assert_eq!(top, ["docs/", "vendor/"], "{top:?}");
+                        assert!(offered(&fx, ".").is_empty(), "{:?}", offered(&fx, "."));
+                        assert!(offered(&fx, "i").is_empty(), "{:?}", offered(&fx, "i"));
+
+                        // Each hidden prefix names something the verb refuses.
+                        for line in [
+                            ".mesh allow vendor/dep/.git/HEAD",
+                            ".mesh allow docs/slink/b.md",
+                            ".mesh allow inbox/fetched.md",
+                        ] {
+                            let err = refusal(&mut fx.ctx, line).await;
+                            assert!(!err.contains("written to"), "{line}: {err}");
+                        }
+                        assert!(fx.entries().is_empty());
+                        fx.stop().await;
+                        assert!(violations.is_empty(), "{}", violations.join("\n"));
+                    });
+                }
             }
         }
     }
