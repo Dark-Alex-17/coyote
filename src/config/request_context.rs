@@ -4529,6 +4529,7 @@ impl RequestContext {
             && args[1] == "--dry-run"
         {
             values = self.mesh_completion_trusted(false);
+            values.push(("--identity ".to_string(), None));
         } else if cmd == ".mesh" && args.len() == 2 && args[0] == "block" {
             values = self.mesh_completion_identities(true);
         } else if cmd == ".mesh" && args.len() == 2 && args[0] == "unblock" {
@@ -22575,8 +22576,8 @@ mod tests {
         );
         assert_eq!(
             completion_values(&dry_run),
-            [fixture.trusted_destination.as_str()],
-            "--dry-run first still completes the destination, flags aside"
+            [fixture.trusted_destination.as_str(), "--identity "],
+            "--dry-run first still completes the destination, then the identity flag"
         );
         let description = completion_description(&untrust, &fixture.trusted_destination);
         assert!(

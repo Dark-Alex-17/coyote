@@ -146,6 +146,7 @@ const STATUS_REFUSAL_TAIL: &str = "Status is only requested from trusted destina
 const KNOCK_REFUSAL_TAIL: &str = "A knock is not sent to a destination this node has denied or an identity it has blocked; `.mesh trust <destination>` / `.mesh unblock` lift that.";
 const INBOX_CONTENT_MAX_CHARS: usize = 200;
 const NOTHING_CHANGED: &str = "Nothing was changed.";
+const DRY_RUN_NOTHING_CHANGED: &str = "This was a dry run; nothing changed.";
 /// How long a trusted instance goes unheard before `.mesh trust --prune` lists it, when
 /// `--older-than` is not given.
 const PRUNE_DEFAULT_OLDER_THAN: Duration = Duration::from_secs(30 * 24 * 60 * 60);
@@ -1018,7 +1019,7 @@ fn prune(
             n => format!(", {n} of them marked key-changed"),
         };
         lines.push(format!(
-            "This was a dry run; nothing changed. To remove these {} instance(s){marked}, run: .mesh trust --prune{older_than_flag} --confirm prune-{}",
+            "{DRY_RUN_NOTHING_CHANGED} To remove these {} instance(s){marked}, run: .mesh trust --prune{older_than_flag} --confirm prune-{}",
             stale.len(),
             stale.len()
         ));
@@ -1096,7 +1097,7 @@ fn untrust(ctx: &RequestContext, verb: &str, rest: Option<&str>) -> Result<()> {
                         short(&destination)
                     ));
                     out_text(if dry_run {
-                        "This was a dry run; nothing changed."
+                        DRY_RUN_NOTHING_CHANGED
                     } else {
                         NOTHING_CHANGED
                     });
@@ -1116,7 +1117,7 @@ fn untrust(ctx: &RequestContext, verb: &str, rest: Option<&str>) -> Result<()> {
                 }
             };
             if dry_run {
-                out_text("This was a dry run; nothing changed.");
+                out_text(DRY_RUN_NOTHING_CHANGED);
                 return Ok(());
             }
             // Re-binding a record grants nothing and fires no hook, so it is not asked about.
@@ -1138,7 +1139,7 @@ fn untrust(ctx: &RequestContext, verb: &str, rest: Option<&str>) -> Result<()> {
                 } => out_text(&format!(
                     "Bound {}'s record to {}; it stays refused.",
                     short(&destination),
-                    short(&identity)
+                    identity_name(&store, mesh, &identity, &destination)
                 )),
                 UntrustOutcome::Refused { .. } => out_text(&format!(
                     "Refused {}; `.mesh trust {destination}` lifts that.",
@@ -1245,7 +1246,7 @@ fn untrust_identity(
                 String::new()
             };
             lines.push(format!(
-                "This was a dry run; nothing changed. To forget this identity and its {} instance(s){refused_clause}, run: .mesh {verb} --identity {identity} --confirm {expected}",
+                "{DRY_RUN_NOTHING_CHANGED} To forget this identity and its {} instance(s){refused_clause}, run: .mesh {verb} --identity {identity} --confirm {expected}",
                 bound.len()
             ));
             out_text(&lines.join("\n"));
@@ -1377,7 +1378,7 @@ fn rotate(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
                 "  rotation is refused while any session's node on this config dir is running: each running node holds mesh/identity.key.lock".to_string(),
                 "  every peer that trusted this identity or its instances now sees a stranger and must run .mesh trust again after verifying the new hash out of band; your own trust list is unchanged".to_string(),
                 format!(
-                    "This was a dry run; nothing changed. To rotate, run: .mesh rotate --confirm {expected}"
+                    "{DRY_RUN_NOTHING_CHANGED} To rotate, run: .mesh rotate --confirm {expected}"
                 ),
             ];
             out_text(&lines.join("\n"));
@@ -9349,9 +9350,17 @@ mod tests {
                         "under the trusted-all identity the instance stays refused"
                     );
 
-                    let out = out_of(&mut ctx, &format!(".mesh untrust {dest} --yes"))
+                    let out = out_of(&mut ctx, &format!(".mesh untrust {dest}"))
                         .await
                         .unwrap();
+                    assert_eq!(
+                        out,
+                        format!(
+                            "{short} is already refused; its record is bound to Tia again.\nBound {short}'s record to Tia; it stays refused.",
+                            short = short(&dest)
+                        )
+                    );
+                    assert_eq!(prompt_script::prompts_asked(), 0, "{out}");
                     let backfilled = trust
                         .records()
                         .into_iter()
@@ -9390,6 +9399,305 @@ mod tests {
                                 && line.ends_with("  refused")),
                         "{dry}"
                     );
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// Re-binding a legacy deny-only row from the verb is bookkeeping: the REPL
+            /// asks nothing, says what it bound, grants nothing and fires no `mesh.trust.*`
+            /// hook; the next repeat on the now-bound row is the plain no-op that rewrites
+            /// no file.
+            #[test]
+            #[serial]
+            fn usage_probe_rebind_through_the_repl_asks_nothing_fires_nothing_and_then_repeats_as_a_no_op()
+             {
+                use crate::mesh::events::{MeshHooks, RecordingHookSink, TrustHookObserver};
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-usage-probe-rebind-silent");
+                let _capture = capture::install();
+                let _script = prompt_script::install(&[]);
+                run_async(async {
+                    let started = started_runtime("repl-mesh-usage-probe-rebind-silent").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let trust = started.runtime.trust();
+                    let (dest, id) = heard_peer(&started.runtime, "Tia", SystemTime::now());
+                    for line in [
+                        format!(".mesh trust --identity {id} --yes"),
+                        format!(".mesh untrust {dest} --yes"),
+                        format!(".mesh block {id} --yes"),
+                        format!(".mesh unblock {id} --yes"),
+                        format!(".mesh trust --identity {id} --yes"),
+                    ] {
+                        out_of(&mut ctx, &line).await.unwrap();
+                    }
+                    let row = |trust: &TrustStore| {
+                        trust
+                            .records()
+                            .into_iter()
+                            .find(|record| record.hash == dest)
+                            .expect("the row is listed")
+                    };
+                    assert!(row(&trust).denied && row(&trust).identity.is_none());
+                    let hooks = MeshHooks::default();
+                    let sink = RecordingHookSink::attach(&hooks);
+                    trust.set_observer(Arc::new(TrustHookObserver(hooks)));
+
+                    // Bare form: with no `--yes`, a prompt here would be the failure.
+                    let out = out_of(&mut ctx, &format!(".mesh untrust {dest}"))
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        out,
+                        format!(
+                            "{short} is already refused; its record is bound to Tia again.\nBound {short}'s record to Tia; it stays refused.",
+                            short = short(&dest)
+                        )
+                    );
+                    assert_eq!(
+                        prompt_script::prompts_asked(),
+                        0,
+                        "re-binding is not asked about"
+                    );
+                    assert!(
+                        sink.drain().is_empty(),
+                        "re-binding grants nothing and fires nothing"
+                    );
+                    assert_eq!(row(&trust).identity.as_deref(), Some(id.as_str()));
+                    assert!(row(&trust).denied);
+                    assert_eq!(trust.authorize(&id, &dest).rule, Rule::DestinationDenied);
+                    let bound = trust_file(&trust);
+
+                    // Now that the record is bound, the same command is the plain repeat.
+                    let out = out_of(&mut ctx, &format!(".mesh untrust {dest}"))
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        out,
+                        format!(
+                            "{} is already refused; its identity stays trusted.\n{NOTHING_CHANGED}",
+                            short(&dest)
+                        )
+                    );
+                    assert_eq!(
+                        trust_file(&trust),
+                        bound,
+                        "a repeat on a bound row rewrites nothing"
+                    );
+                    assert!(sink.drain().is_empty());
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// `forget` re-binds a legacy deny-only row exactly as `untrust` does — dry run
+            /// first, then the write — the refused instance stays out of `untrust`/`forget`
+            /// completion, and forgetting the identity afterwards takes the record AND its
+            /// deny with it, so no orphan deny survives.
+            #[test]
+            #[serial]
+            fn usage_probe_forget_rebinds_a_legacy_deny_only_row_and_untrust_identity_then_takes_the_deny()
+             {
+                let _guard = TestConfigDirGuard::new("repl-mesh-usage-probe-forget-rebind");
+                let _capture = capture::install();
+                let _script = prompt_script::install(&[]);
+                run_async(async {
+                    let started = started_runtime("repl-mesh-usage-probe-forget-rebind").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let trust = started.runtime.trust();
+                    let (dest, id) = heard_peer(&started.runtime, "Tia", SystemTime::now());
+                    for line in [
+                        format!(".mesh trust --identity {id} --yes"),
+                        format!(".mesh untrust {dest} --yes"),
+                        format!(".mesh block {id} --yes"),
+                        format!(".mesh unblock {id} --yes"),
+                        format!(".mesh trust --identity {id} --yes"),
+                    ] {
+                        out_of(&mut ctx, &line).await.unwrap();
+                    }
+                    let row = |trust: &TrustStore| {
+                        trust
+                            .records()
+                            .into_iter()
+                            .find(|record| record.hash == dest)
+                    };
+                    assert_eq!(row(&trust).unwrap().identity, None, "legacy deny-only row");
+                    let before = trust_file(&trust);
+                    let offers = |ctx: &RequestContext, words: &[&str]| -> Vec<String> {
+                        ctx.repl_complete(".mesh", words, "")
+                            .into_iter()
+                            .map(|(candidate, _)| candidate)
+                            .collect()
+                    };
+
+                    let out = out_of(&mut ctx, &format!(".mesh forget {dest} --dry-run"))
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        out,
+                        format!(
+                            "{} is already refused; its record is bound to Tia again.\nThis was a dry run; nothing changed.",
+                            short(&dest)
+                        )
+                    );
+                    assert_eq!(trust_file(&trust), before, "a dry run writes nothing");
+                    assert_eq!(row(&trust).unwrap().identity, None);
+
+                    // Bare form: with no `--yes`, a prompt here would be the failure.
+                    let out = out_of(&mut ctx, &format!(".mesh forget {dest}"))
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        out,
+                        format!(
+                            "{short} is already refused; its record is bound to Tia again.\nBound {short}'s record to Tia; it stays refused.",
+                            short = short(&dest)
+                        )
+                    );
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+                    let bound = row(&trust).unwrap();
+                    assert!(bound.denied);
+                    assert_eq!(bound.identity.as_deref(), Some(id.as_str()));
+                    assert_eq!(bound.label, None);
+                    assert_eq!(trust.authorize(&id, &dest).rule, Rule::DestinationDenied);
+                    // Completion never offers what the verb refuses: the refused instance
+                    // stays off `untrust`/`forget` and on `trust`.
+                    assert!(!offers(&ctx, &["untrust", ""]).contains(&dest));
+                    assert!(!offers(&ctx, &["forget", ""]).contains(&dest));
+                    assert!(offers(&ctx, &["trust", ""]).contains(&dest));
+
+                    // Forgetting the identity takes the bound record and its deny together.
+                    let out = out_of(
+                        &mut ctx,
+                        &format!(
+                            ".mesh forget --identity {id} --confirm untrust-{}",
+                            short(&id)
+                        ),
+                    )
+                    .await
+                    .unwrap();
+                    assert!(row(&trust).is_none(), "{out}");
+                    assert!(
+                        trust.denied().is_empty(),
+                        "no orphan deny outlives the identity: {:?} / {out}",
+                        trust.denied()
+                    );
+                    assert!(!trust.is_trusted_identity(&id));
+                    assert_ne!(trust.authorize(&id, &dest).rule, Rule::DestinationDenied);
+                    assert!(!offers(&ctx, &["untrust", ""]).contains(&dest));
+                    assert!(!offers(&ctx, &["untrust", "--identity", ""]).contains(&id));
+                    assert_eq!(
+                        refusal(&mut ctx, &format!(".mesh untrust {dest}")).await,
+                        format!(
+                            "Destination {dest} is not in the trust list, so there is nothing to untrust."
+                        )
+                    );
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// The l′ sentence names the identity whose trust stays. When the peer table's
+            /// row for the destination has since been re-bound to another identity (a key
+            /// change the record does not follow), that row proves nothing about the trusted
+            /// identity and may not lend it a display name: the sentence falls back to the
+            /// identity's short hash.
+            #[test]
+            #[serial]
+            fn usage_probe_refusal_sentence_never_borrows_a_name_from_a_peer_row_bound_to_another_identity()
+             {
+                let _guard = TestConfigDirGuard::new("repl-mesh-usage-probe-refusal-name");
+                let _capture = capture::install();
+                let _script = prompt_script::install(&[]);
+                run_async(async {
+                    let started = started_runtime("repl-mesh-usage-probe-refusal-name").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let trust = started.runtime.trust();
+                    let now = SystemTime::now();
+                    let (dest, id) = heard_peer(&started.runtime, "Tia", now);
+                    out_of(&mut ctx, &format!(".mesh trust --identity {id} --yes"))
+                        .await
+                        .unwrap();
+
+                    // While the peer row proves the trusted identity, its name is used.
+                    let out = out_of(&mut ctx, &format!(".mesh untrust {dest} --yes"))
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        out,
+                        format!(
+                            "Tia's identity stays trusted; this instance is refused until `.mesh trust {dest}`.\nRefused {}; `.mesh trust {dest}` lifts that.",
+                            short(&dest)
+                        )
+                    );
+                    // Lift it on the intact, unlabelled record.
+                    out_of(&mut ctx, &format!(".mesh trust {dest} --yes"))
+                        .await
+                        .unwrap();
+                    assert_eq!(trust.authorize(&id, &dest).rule, Rule::DestinationTrusted);
+                    let record = trust
+                        .records()
+                        .into_iter()
+                        .find(|record| record.hash == dest)
+                        .unwrap();
+                    assert_eq!(record.label, None);
+                    assert_eq!(record.identity.as_deref(), Some(id.as_str()));
+
+                    // The peer table now shows the same destination under another identity.
+                    let (_, other, other_name_hash) = announced_peer();
+                    started.runtime.peers().observe(
+                        PeerSighting {
+                            destination_hash: dest.clone(),
+                            identity_hash: other.clone(),
+                            name_hash: other_name_hash,
+                            display_name: Some("Mallory".to_string()),
+                            protocol_version: 1,
+                            hops: 1,
+                        },
+                        SystemTime::now(),
+                    );
+                    assert_eq!(
+                        started.runtime.peers().get(&dest).unwrap().identity_hash,
+                        other
+                    );
+
+                    for line in [
+                        format!(".mesh untrust {dest} --dry-run"),
+                        format!(".mesh forget {dest} --dry-run"),
+                        format!(".mesh untrust {dest} --yes"),
+                    ] {
+                        let out = out_of(&mut ctx, &line).await.unwrap();
+                        let first = out.lines().next().unwrap();
+                        assert_eq!(
+                            first,
+                            format!(
+                                "{}'s identity stays trusted; this instance is refused until `.mesh trust {dest}`.",
+                                short(&id)
+                            ),
+                            "{line}: {out}"
+                        );
+                        assert!(
+                            !out.contains("Mallory") && !out.contains("Tia"),
+                            "{line}: {out}"
+                        );
+                    }
+                    // The refusal binds to the record's identity, not the re-bound row's.
+                    let record = trust
+                        .records()
+                        .into_iter()
+                        .find(|record| record.hash == dest)
+                        .unwrap();
+                    assert!(record.denied);
+                    assert_eq!(record.identity.as_deref(), Some(id.as_str()));
+                    assert_eq!(trust.authorize(&id, &dest).rule, Rule::DestinationDenied);
                     assert_eq!(prompt_script::prompts_asked(), 0);
 
                     assert!(ctx.app.mesh.stop().await.unwrap());

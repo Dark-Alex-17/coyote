@@ -1428,10 +1428,16 @@ fn usage_probe_docs_say_messages_are_posted_and_held_messages_are_fetched_back_a
         "root README must name `.mesh sync` as the manual fetch verb"
     );
     // A later file verb named `fetch` may appear here; only the sync sentence is pinned.
-    assert!(
-        !root.contains("on demand with `.mesh fetch`"),
-        "root README must not name the withdrawn `.mesh fetch` verb as the manual fetch"
-    );
+    for withdrawn in [
+        "on demand with `.mesh fetch`",
+        "(`.mesh fetch` still works)",
+        "fetch only on `.mesh fetch`",
+    ] {
+        assert!(
+            !root.contains(withdrawn),
+            "root README must not name the withdrawn `.mesh fetch` verb as the manual fetch: {withdrawn}"
+        );
+    }
     let readme = one_line(&read(deployment_dir().join("README.md")));
     assert!(
         readme.contains("it posts the message to a propagation node"),
@@ -1475,7 +1481,11 @@ fn usage_probe_docs_say_messages_are_posted_and_held_messages_are_fetched_back_a
         readme.contains("`.mesh sync` runs a fetch now"),
         "deployment README must name `.mesh sync` as the manual fetch verb"
     );
-    for withdrawn in ["`.mesh fetch` runs a fetch now", "`.mesh fetch` is refused"] {
+    for withdrawn in [
+        "`.mesh fetch` runs a fetch now",
+        "`.mesh fetch` is refused",
+        "`.mesh fetch` does",
+    ] {
         assert!(
             !readme.contains(withdrawn),
             "deployment README must not name the withdrawn `.mesh fetch` verb as the manual fetch: {withdrawn}"

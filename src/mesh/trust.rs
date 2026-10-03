@@ -1321,7 +1321,8 @@ impl TrustStore {
     /// record bound to the identity the peer table proves, written with the deny, so
     /// forgetting the identity forgets the refusal too. A knocker that never announced has
     /// no row to resolve through and cannot be refused until it is heard. `dry_run` reports
-    /// the outcome and writes nothing.
+    /// the outcome and writes nothing. Forgetting a record under a plain identity drops any
+    /// deny left on it, so no orphan deny survives the record.
     pub(crate) fn untrust_destination(
         &self,
         mesh: &dyn LiveMesh,
@@ -1403,7 +1404,8 @@ impl TrustStore {
         if dry_run {
             return Ok(UntrustOutcome::Forgotten { identity });
         }
-        if on_disk.is_some() {
+        let deny_dropped = file.denied_destinations.remove(&destination).is_some();
+        if on_disk.is_some() || deny_dropped {
             let mutation = TrustMutation::UntrustDestination {
                 destination: destination.clone(),
                 identity: identity.clone(),
@@ -5011,6 +5013,82 @@ mod tests {
         }
         assert_eq!(fx.file_bytes(), before);
         assert_eq!(fx.store.denied().len(), 2);
+    }
+
+    #[test]
+    fn untrust_of_a_denied_record_under_a_plain_identity_forgets_the_deny_too() {
+        let fx = Fixture::new("trust-untrust-denied-record-plain-identity");
+        let peer = announced("alpha");
+        fx.announce(&peer, t(2_000));
+        fx.trust_destination(&peer, t(2_000));
+        fx.store
+            .deny_destination(&fx.mesh, &peer.destination_hash, None, t(2_500))
+            .unwrap();
+        assert!(record(&fx.store, &peer.destination_hash).denied);
+        let sink = fx.observed();
+
+        let outcome = fx
+            .store
+            .untrust_destination(&fx.mesh, &peer.destination_hash, t(3_000), false)
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            UntrustOutcome::Forgotten {
+                identity: peer.identity_hash.clone()
+            }
+        );
+        assert!(
+            fx.store
+                .records()
+                .iter()
+                .all(|record| record.hash != peer.destination_hash),
+            "no orphan deny row survives the record"
+        );
+        assert!(fx.store.denied().is_empty());
+        assert_eq!(
+            fx.store
+                .authorize(&peer.identity_hash, &peer.destination_hash),
+            verdict(Decision::Refuse, Rule::DefaultClosed)
+        );
+        let envs = one_fire(&sink, HookEvent::MeshTrustRevoked);
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_TRUST_TIER"),
+            Some("destination")
+        );
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_PEER_DESTINATION"),
+            Some(peer.destination_hash.as_str())
+        );
+    }
+
+    #[test]
+    fn untrust_dry_run_of_a_denied_record_under_a_plain_identity_writes_nothing() {
+        let fx = Fixture::new("trust-untrust-denied-record-plain-identity-dry-run");
+        let peer = announced("alpha");
+        fx.announce(&peer, t(2_000));
+        fx.trust_destination(&peer, t(2_000));
+        fx.store
+            .deny_destination(&fx.mesh, &peer.destination_hash, None, t(2_500))
+            .unwrap();
+        let sink = fx.observed();
+        let before = fx.file_bytes();
+
+        let outcome = fx
+            .store
+            .untrust_destination(&fx.mesh, &peer.destination_hash, t(3_000), true)
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            UntrustOutcome::Forgotten {
+                identity: peer.identity_hash.clone()
+            }
+        );
+        assert_eq!(fx.file_bytes(), before);
+        assert!(record(&fx.store, &peer.destination_hash).denied);
+        assert_eq!(fx.store.denied().len(), 1);
+        assert!(sink.drain().is_empty());
     }
 
     #[test]
