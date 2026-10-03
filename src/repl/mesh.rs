@@ -16509,6 +16509,351 @@ mod tests {
                         fx.stop().await;
                     });
                 }
+
+                /// (e) The GLOBAL share file can be a link too: under Auto with no
+                /// workspace file the destination is global, and a broad pattern with
+                /// `--yes` would otherwise print the match count and "Will write to …"
+                /// before the write failed. The link is refused before the first line
+                /// of output, on every mutator, and the link target is never touched.
+                #[test]
+                #[serial]
+                fn usage_probe_global_share_file_link_is_refused_before_the_count_or_announcement()
+                {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-global-link");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = ShareFixture::new(
+                            "repl-mesh-probe-global-link",
+                            &["docs/a.md", "docs/b.md", "src/main.rs"],
+                        )
+                        .await;
+                        let elsewhere = TempDir::new("repl-mesh-probe-global-link-elsewhere");
+                        let victim = elsewhere.path.join("victim.yaml");
+                        let victim_yaml = "version: 1\nallow:\n- pattern: zzz/**\n";
+                        fs::write(&victim, victim_yaml).unwrap();
+                        fs::create_dir_all(fx.locations.global.parent().unwrap()).unwrap();
+                        std::os::unix::fs::symlink(&victim, &fx.locations.global).unwrap();
+
+                        for line in [
+                            ".mesh allow ** --yes",
+                            ".mesh deny ** --yes",
+                            ".mesh allow docs/a.md",
+                            ".mesh deny src/main.rs --global",
+                            ".mesh unshare zzz/**",
+                        ] {
+                            let err = refusal(&mut fx.ctx, line).await;
+                            assert!(err.contains("is a symlink"), "{line}: {err}");
+                            assert!(
+                                !err.contains("matches") && !err.contains("write to"),
+                                "{line}: refused before anything is announced: {err}"
+                            );
+                        }
+                        assert!(
+                            stdout_lines().is_empty(),
+                            "no count or target line precedes the refusal: {:?}",
+                            stdout_lines()
+                        );
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        assert_eq!(fs::read_to_string(&victim).unwrap(), victim_yaml);
+                        assert!(
+                            fs::symlink_metadata(&fx.locations.global)
+                                .unwrap()
+                                .file_type()
+                                .is_symlink(),
+                            "the link is neither replaced nor removed"
+                        );
+                        assert!(!fx.locations.workspace.exists(), "nothing fell through");
+                        fx.stop().await;
+                    });
+                }
+
+                /// (e) `--dry-run` names the destination it would write; a linked
+                /// destination is known at that point, so the dry run reports the link
+                /// refusal rather than a target the real write would refuse.
+                #[test]
+                #[serial]
+                fn usage_probe_dry_run_reports_a_linked_destination_as_refused() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-dry-run-link");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx =
+                            ShareFixture::new("repl-mesh-probe-dry-run-link", &["docs/a.md"]).await;
+                        let elsewhere = TempDir::new("repl-mesh-probe-dry-run-link-elsewhere");
+                        let victim = elsewhere.path.join("victim.yaml");
+                        fs::write(&victim, "version: 1\n").unwrap();
+                        fs::create_dir_all(fx.locations.global.parent().unwrap()).unwrap();
+                        std::os::unix::fs::symlink(&victim, &fx.locations.global).unwrap();
+
+                        for line in [
+                            ".mesh allow docs/** --dry-run",
+                            ".mesh deny docs/** --dry-run",
+                        ] {
+                            let err = refusal(&mut fx.ctx, line).await;
+                            assert!(err.contains("is a symlink"), "{line}: {err}");
+                        }
+                        assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
+                        assert_eq!(fs::read_to_string(&victim).unwrap(), "version: 1\n");
+                        fx.stop().await;
+                    });
+                }
+
+                /// (e) `unshare` writes every file that holds the pattern: when one holder
+                /// is a link the verb refuses before listing holders or asking, even with
+                /// a willing answerer; a layer flag that names only the real file still
+                /// works, because only the destinations that WOULD be written are judged.
+                #[test]
+                #[serial]
+                fn usage_probe_unshare_refuses_a_linked_holder_before_listing_or_asking_but_spares_the_other_layer()
+                 {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-unshare-linked-holder");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install_answering(|_| true);
+                    run_async(async {
+                        let mut fx = ShareFixture::new(
+                            "repl-mesh-probe-unshare-linked-holder",
+                            &["docs/a.md", "docs/b.md", "src/main.rs"],
+                        )
+                        .await;
+                        let holder_yaml = "version: 1\nallow:\n- pattern: '**'\n";
+                        fx.write_global(holder_yaml);
+                        let elsewhere = TempDir::new("repl-mesh-probe-unshare-linked-elsewhere");
+                        let victim = elsewhere.path.join("victim.yaml");
+                        fs::write(&victim, holder_yaml).unwrap();
+                        fs::create_dir_all(fx.locations.workspace.parent().unwrap()).unwrap();
+                        std::os::unix::fs::symlink(&victim, &fx.locations.workspace).unwrap();
+                        assert_eq!(fx.entries().len(), 2, "both layers hold `**`");
+
+                        for line in [".mesh unshare **", ".mesh unshare ** --workspace"] {
+                            let err = refusal(&mut fx.ctx, line).await;
+                            assert!(err.contains("is a symlink"), "{line}: {err}");
+                            assert!(
+                                !err.contains("Remove") && !err.contains("holds"),
+                                "{line}: no holder listing or question before the refusal: {err}"
+                            );
+                        }
+                        assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
+                        assert_eq!(prompt_script::prompts_asked(), 0, "nothing was asked");
+                        assert_eq!(fs::read_to_string(&victim).unwrap(), holder_yaml);
+                        assert_eq!(
+                            fs::read_to_string(&fx.locations.global).unwrap(),
+                            holder_yaml
+                        );
+
+                        let out = out_of(&mut fx.ctx, ".mesh unshare ** --global")
+                            .await
+                            .unwrap();
+                        assert!(out.contains("Removed"), "{out}");
+                        assert_eq!(
+                            fx.entries(),
+                            [allow_entry(Layer::Workspace, "**", None)],
+                            "only the global holder went; the linked one is untouched"
+                        );
+                        assert_eq!(fs::read_to_string(&victim).unwrap(), holder_yaml);
+                        fx.stop().await;
+                    });
+                }
+
+                /// (a) The bare-directory refusal reaches nested directories, holds under
+                /// `--dry-run`, and spares what it must: a bare FILE name writes, an absent
+                /// name writes (only an EXISTING directory is refused), and `unshare` of a
+                /// rule that happens to be spelled like a directory still removes it.
+                #[test]
+                #[serial]
+                fn usage_probe_bare_directory_refusal_covers_nested_dirs_and_dry_run_but_spares_files_absent_names_and_unshare()
+                 {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-bare-dir-edges");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = ShareFixture::new(
+                            "repl-mesh-probe-bare-dir-edges",
+                            &["docs/a.md", "docs/sub/c.md"],
+                        )
+                        .await;
+                        fx.write_global("version: 1\nallow:\n- pattern: docs\n");
+
+                        for line in [
+                            ".mesh allow docs/sub",
+                            ".mesh deny docs/sub",
+                            ".mesh allow docs/sub --dry-run",
+                            ".mesh deny docs/sub --dry-run",
+                            ".mesh allow docs/sub --global",
+                            ".mesh allow docs/sub --workspace",
+                        ] {
+                            let err = refusal(&mut fx.ctx, line).await;
+                            assert!(err.contains("`docs/sub/**`"), "{line}: {err}");
+                            assert!(err.contains("names a directory"), "{line}: {err}");
+                        }
+                        assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
+                        assert_eq!(fx.entries(), [allow_entry(Layer::Global, "docs", None)]);
+                        assert!(!fx.locations.workspace.exists());
+
+                        let out = out_of(&mut fx.ctx, ".mesh unshare docs").await.unwrap();
+                        assert!(out.contains("Removed"), "{out}");
+                        assert!(fx.entries().is_empty(), "{out}");
+
+                        let out = out_of(&mut fx.ctx, ".mesh allow docs/a.md").await.unwrap();
+                        assert!(out.contains("written to"), "a bare file name writes: {out}");
+                        let out = out_of(&mut fx.ctx, ".mesh allow nothing-here")
+                            .await
+                            .unwrap();
+                        assert!(out.contains("written to"), "an absent name writes: {out}");
+                        assert_eq!(
+                            fx.entries(),
+                            [
+                                allow_entry(Layer::Global, "docs/a.md", None),
+                                allow_entry(Layer::Global, "nothing-here", None),
+                            ]
+                        );
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        fx.stop().await;
+                    });
+                }
+
+                /// (c) The directory check needs the root, so it waits behind the mesh
+                /// gate (`MESH_OFF` first); the trailing-slash teaching is pure and fires
+                /// before it — same `<dir>/**` remedy, different place in the order.
+                #[test]
+                #[serial]
+                fn usage_probe_bare_directory_check_waits_behind_the_gate_while_trailing_slash_fires_before_it()
+                 {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-bare-dir-gate");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    let mut ctx = off_ctx();
+                    let root = TempDir::new("repl-mesh-probe-bare-dir-gate-root");
+                    seed_files(&root.path, &["docs/a.md"]);
+                    publish_root(&ctx, &root.path);
+                    let (_, locations) = share_locations(&ctx).unwrap();
+
+                    assert_eq!(err_of(&mut ctx, ".mesh allow docs"), MESH_OFF);
+                    assert_eq!(err_of(&mut ctx, ".mesh deny docs"), MESH_OFF);
+                    for line in [
+                        ".mesh allow docs/",
+                        ".mesh deny docs/",
+                        ".mesh unshare docs/",
+                    ] {
+                        let err = err_of(&mut ctx, line);
+                        assert_ne!(err, MESH_OFF, "{line}: pure check fires before the gate");
+                        assert!(err.contains("`docs/**`"), "{line}: {err}");
+                    }
+                    assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
+                    assert!(!locations.global.exists());
+                    assert!(!locations.workspace.exists());
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+                }
+
+                /// (a) A link is judged by what it resolves to. A link to a DIRECTORY
+                /// resolves to a name the directory rule refuses, and the walk never
+                /// follows a linked directory, so an allow of it could serve nothing;
+                /// the verb refuses instead of writing a dead rule.
+                #[test]
+                #[serial]
+                fn usage_probe_a_link_to_a_directory_is_refused_rather_than_written_as_a_dead_rule()
+                {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-dir-link");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx =
+                            ShareFixture::new("repl-mesh-probe-dir-link", &["docs/a.md"]).await;
+                        std::os::unix::fs::symlink("docs", fx.root.path.join("dlink")).unwrap();
+
+                        let result = run(&mut fx.ctx, ".mesh allow dlink").await;
+                        assert!(
+                            result.is_err(),
+                            "a rule for a linked directory serves nothing (the walk never follows a linked directory, so `dlink` and `dlink/**` both resolve to no file), yet the verb wrote it: {:?}",
+                            stdout_lines()
+                        );
+                        assert!(fx.entries().is_empty());
+                        assert!(!fx.locations.global.exists());
+                        fx.stop().await;
+                    });
+                }
+
+                /// (a) When only a link's OWN name is secret-like (`*.pem` here) and the
+                /// resolved file is plain, the refusal says so, teaches the plain allow of
+                /// the real file — never `--force` — and never claims the deny names the
+                /// real file; a link whose BOTH names the deny matches still teaches the
+                /// forced, global allow of the resolved file.
+                #[test]
+                #[serial]
+                fn usage_probe_link_named_like_a_secret_teaches_the_plain_allow_while_a_link_to_a_secret_teaches_force()
+                 {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-link-kinds");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = ShareFixture::new(
+                            "repl-mesh-probe-link-kinds",
+                            &["docs/a.txt", "secrets/id_rsa", "certs/.keep"],
+                        )
+                        .await;
+                        std::os::unix::fs::symlink(
+                            "../docs/a.txt",
+                            fx.root.path.join("certs/server.pem"),
+                        )
+                        .unwrap();
+                        std::os::unix::fs::symlink("secrets/id_rsa", fx.root.path.join(".env"))
+                            .unwrap();
+
+                        for line in [
+                            ".mesh allow certs/server.pem",
+                            ".mesh allow certs/server.pem --force --global",
+                        ] {
+                            let err = refusal(&mut fx.ctx, line).await;
+                            assert!(
+                                err.contains("`docs/a.txt`"),
+                                "{line}: names the real file: {err}"
+                            );
+                            assert!(
+                                err.contains("`.mesh allow docs/a.txt`"),
+                                "{line}: teaches the plain allow: {err}"
+                            );
+                            assert!(
+                                !err.contains("--force"),
+                                "{line}: no forced allow is taught for a plain file: {err}"
+                            );
+                            assert!(
+                                !err.contains("which the built-in deny names"),
+                                "{line}: never claims the deny names the real file: {err}"
+                            );
+                        }
+
+                        for line in [".mesh allow .env", ".mesh allow .env --force --global"] {
+                            let err = refusal(&mut fx.ctx, line).await;
+                            assert!(err.contains("`secrets/id_rsa`"), "{line}: {err}");
+                            assert!(
+                                err.contains("`.mesh allow secrets/id_rsa --force --global`"),
+                                "{line}: teaches the forced allow of the resolved secret: {err}"
+                            );
+                        }
+                        assert!(fx.entries().is_empty());
+                        assert!(!fx.locations.global.exists());
+                        assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
+
+                        // Both taught commands are accepted by the verb.
+                        let out = out_of(&mut fx.ctx, ".mesh allow docs/a.txt").await.unwrap();
+                        assert!(out.contains("written to"), "{out}");
+                        let out =
+                            out_of(&mut fx.ctx, ".mesh allow secrets/id_rsa --force --global")
+                                .await
+                                .unwrap();
+                        assert!(out.contains("written to"), "{out}");
+                        let out = out_of(&mut fx.ctx, ".mesh shares --effective")
+                            .await
+                            .unwrap();
+                        assert!(out.lines().any(|line| line == "  docs/a.txt"), "{out}");
+                        assert!(out.lines().any(|line| line == "  secrets/id_rsa"), "{out}");
+                        assert!(
+                            !out.contains("server.pem") && !out.contains(".env"),
+                            "{out}"
+                        );
+                        fx.stop().await;
+                    });
+                }
             }
         }
     }
