@@ -232,6 +232,8 @@ pub(crate) mod test_support {
     #[cfg(unix)]
     use super::message::{PeerBody, from_r3_body, received_reply};
     use super::node::MeshPaths;
+    #[cfg(all(test, unix))]
+    pub(crate) use super::node::RecordingEnvoy;
     #[cfg(unix)]
     use super::node::{MeshRuntime, NodeOptions};
     #[cfg(unix)]
@@ -243,6 +245,11 @@ pub(crate) mod test_support {
     use super::propagation_fetch::FETCH_TRANSFER_LIMIT_KB;
     pub(crate) use super::propagation_fetch::{InboundMessage, InboundSink};
     pub(crate) use super::protocol::Compatibility;
+    #[cfg(all(test, unix))]
+    pub(crate) use super::r3::network::{
+        NodePair, Script as ResponderScript, fetch_body, short_options, trusting_b, wire_field,
+        wire_status,
+    };
     #[cfg(unix)]
     pub(crate) use super::r3::{ACCESS_PATH, FETCH_PATH, LIST_PATH};
     #[cfg(unix)]
@@ -1054,12 +1061,19 @@ pub(crate) mod test_support {
     /// nothing.
     #[cfg(unix)]
     pub(crate) async fn started_runtime_on(tag: &str, port: u16) -> StartedRuntime {
-        started_runtime_at(
-            tag,
-            private_config(port),
-            tokio::spawn(std::future::ready(())),
-        )
-        .await
+        started_runtime_on_with(tag, port, |_| {}).await
+    }
+
+    /// `started_runtime_on` with the node's config adjusted first.
+    #[cfg(unix)]
+    pub(crate) async fn started_runtime_on_with(
+        tag: &str,
+        port: u16,
+        adjust: impl FnOnce(&mut MeshConfig),
+    ) -> StartedRuntime {
+        let mut config = private_config(port);
+        adjust(&mut config);
+        started_runtime_at(tag, config, tokio::spawn(std::future::ready(()))).await
     }
 
     #[cfg(unix)]

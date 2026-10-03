@@ -4922,6 +4922,77 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn answer_inbound_with_file_sends_without_the_envoy_and_removes_the_record() {
+        use sha2::{Digest as _, Sha256};
+
+        let stub = PeerStub::listen("node-answer-file-stub", TcpServer::DEFAULT_CLIENT_MTU).await;
+        let started = started_runtime_on("node-answer-file", stub.port()).await;
+        let runtime = started.runtime.clone();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime.clone()).unwrap();
+        let envoy = RecordingEnvoy::new(true, true);
+        slot.set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
+        stub.trust(&runtime.current_destination_hash(), runtime.fingerprint());
+        stub.announce(Some("Stub")).await;
+        let to = stub.destination_hex();
+        let peers = runtime.peers();
+        wait_until("the node to file the stub", || peers.get(&to).is_some()).await;
+        runtime
+            .trust()
+            .trust_destination(
+                slot.as_ref(),
+                &to,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        let store = slot.inbound_store().unwrap();
+        store
+            .upsert(
+                InboundRecord {
+                    peer_destination: to.clone(),
+                    peer_identity: stub.identity_hex(),
+                    ..inbound_record("a-1")
+                },
+                SystemTime::now(),
+            )
+            .unwrap();
+        let bytes = b"# notes\n".to_vec();
+        let part = RawPart::File {
+            name: "docs/notes.md".to_string(),
+            size: bytes.len() as u64,
+            sha256: Sha256::digest(&bytes).into(),
+            bytes: Some(bytes),
+            reference: None,
+        };
+
+        let outcome = slot
+            .answer_inbound_with_file("a-1", "see this", part.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.via, PeerVia::Direct);
+        let seen = stub.seen();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert_eq!(seen[0].kind, PeerKind::Reply);
+        assert_eq!(seen[0].id, outcome.id);
+        assert_eq!(seen[0].content, "see this");
+        assert_eq!(seen[0].in_reply_to.as_deref(), Some("a-1"));
+        assert_eq!(seen[0].thread.as_deref(), Some("a-1"));
+        assert_eq!(seen[0].disposition, Some(Disposition::Answered));
+        assert_eq!(seen[0].parts, [part]);
+        assert!(
+            envoy.answers.lock().is_empty(),
+            "the live run holding the question is never offered an answer that carries a file"
+        );
+        assert!(store.get("a-1").unwrap().is_none());
+        assert!(runtime.serving().grants().list().unwrap().is_empty());
+        assert!(slot.stop().await.unwrap());
+        stub.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_store_and_forward_refusal_reply_inherits_the_refused_message_thread() {
         use crate::mesh::trust::TrustOptions;
 

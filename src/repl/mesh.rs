@@ -7163,15 +7163,19 @@ mod tests {
             use super::*;
             use crate::mesh::brief::Digest;
             use crate::mesh::envoy::{EnvoyJob, EnvoySink};
+            use crate::mesh::grants::GrantRecord;
             use crate::mesh::hex_lower;
             use crate::mesh::idle::{IdleNotify, IdleSink, Origin};
             use crate::mesh::limits::{PeerRefusal, RefusalReason};
             use crate::mesh::notify::{
                 Notification, NotificationSink, RenderedNotification, Source,
             };
+            use crate::mesh::pending::INBOUND_RECORD_VERSION;
+            use crate::mesh::rfc3339_utc;
             use crate::mesh::test_support::{
-                FakeNode, PeerSighting, PeerStub, StartedRuntime, loopback_relay, private_config,
-                started_runtime, started_runtime_on, started_runtime_with, wait_until,
+                FakeNode, PeerSighting, PeerStub, StartedRuntime, TempDir, loopback_relay,
+                private_config, snapshot_fixture, started_runtime, started_runtime_on,
+                started_runtime_on_with, started_runtime_with, wait_until,
             };
             use crate::mesh::trust::{LiveMesh, TrustOptions};
             use crate::testing::EnvVarGuard;
@@ -13163,10 +13167,145 @@ mod tests {
                 });
             }
 
+            fn seed_files(root: &Path, files: &[&str]) {
+                for relative in files {
+                    let path = root.join(relative);
+                    fs::create_dir_all(path.parent().unwrap()).unwrap();
+                    fs::write(&path, relative).unwrap();
+                }
+            }
+
+            fn publish_root(ctx: &RequestContext, root: &Path) {
+                let mut snapshot = snapshot_fixture();
+                snapshot.cwd = root.to_path_buf();
+                ctx.app.mesh.publish(snapshot);
+            }
+
+            /// A node and a stub peer each trusting the other, the node's published
+            /// snapshot naming an empty temp workspace as the share root. `file`
+            /// puts a request from the stub in the inbound store as the dispatcher
+            /// would have.
+            struct PeerFixture {
+                stub: PeerStub,
+                started: StartedRuntime,
+                ctx: RequestContext,
+                root: TempDir,
+            }
+
+            impl PeerFixture {
+                async fn new(tag: &str) -> Self {
+                    Self::with_config(tag, |_| {}).await
+                }
+
+                /// `new` with the mesh config adjusted on the node and the REPL alike,
+                /// as a real start would have it.
+                async fn with_config(tag: &str, adjust: impl Fn(&mut MeshConfig)) -> Self {
+                    let stub =
+                        PeerStub::listen(&format!("{tag}-stub"), TcpServer::DEFAULT_CLIENT_MTU)
+                            .await;
+                    let started = started_runtime_on_with(tag, stub.port(), &adjust).await;
+                    let runtime = started.runtime.clone();
+                    let mut config = MeshConfig::default();
+                    adjust(&mut config);
+                    let ctx = ctx_with(config, true);
+                    ctx.app.mesh.install(runtime.clone()).unwrap();
+                    stub.trust(&runtime.current_destination_hash(), runtime.fingerprint());
+                    stub.announce(Some("Stub")).await;
+                    let to = stub.destination_hex();
+                    let peers = runtime.peers();
+                    wait_until("the node to file the stub", || peers.get(&to).is_some()).await;
+                    runtime
+                        .trust()
+                        .trust_destination(
+                            ctx.app.mesh.as_ref(),
+                            &to,
+                            TrustOptions::default(),
+                            SystemTime::now(),
+                        )
+                        .unwrap();
+                    let root = TempDir::new(&format!("{tag}-root"));
+                    publish_root(&ctx, &root.path);
+                    Self {
+                        stub,
+                        started,
+                        ctx,
+                        root,
+                    }
+                }
+
+                fn file(&self, id: &str, kind: InboundKind, paths: &[&str]) {
+                    let now = SystemTime::now();
+                    let (question, reason) = match kind {
+                        InboundKind::Question => ("which one?", ""),
+                        InboundKind::Access => ("", "need it"),
+                    };
+                    self.ctx
+                        .app
+                        .mesh
+                        .inbound_store()
+                        .unwrap()
+                        .upsert(
+                            InboundRecord {
+                                version: INBOUND_RECORD_VERSION,
+                                id: id.to_string(),
+                                peer_destination: self.stub.destination_hex(),
+                                peer_identity: self.stub.identity_hex(),
+                                thread: id.to_string(),
+                                question: question.to_string(),
+                                envoy_question: String::new(),
+                                received_at: rfc3339_utc(now),
+                                kind,
+                                paths: paths.iter().map(|path| path.to_string()).collect(),
+                                reason: reason.to_string(),
+                            },
+                            now,
+                        )
+                        .unwrap();
+                }
+
+                fn dest(&self) -> String {
+                    short(&self.stub.destination_hex()).to_string()
+                }
+
+                fn pending_ids(&self) -> Vec<String> {
+                    self.ctx
+                        .app
+                        .mesh
+                        .inbound_store()
+                        .unwrap()
+                        .list(SystemTime::now())
+                        .unwrap()
+                        .into_iter()
+                        .map(|record| record.id)
+                        .collect()
+                }
+
+                fn grants(&self) -> Vec<GrantRecord> {
+                    self.started.runtime.serving().grants().list().unwrap()
+                }
+
+                /// The one reply the stub heard, as its content.
+                fn heard(&self) -> String {
+                    let seen = self.stub.seen();
+                    assert_eq!(seen.len(), 1, "{seen:?}");
+                    assert_eq!(seen[0].kind, PeerKind::Reply);
+                    seen[0].content.clone()
+                }
+
+                async fn stop(self) {
+                    assert!(self.ctx.app.mesh.stop().await.unwrap());
+                    self.started.relay_handle.abort();
+                    self.stub.stop().await;
+                }
+            }
+
+            fn sending(fx: &PeerFixture) -> String {
+                format!("Sending your answer to {} over the mesh...", fx.dest())
+            }
+
             mod share_verbs {
                 use super::*;
                 use crate::mesh::shares::{RawEntry, ShareLocations};
-                use crate::mesh::test_support::{TempDir, snapshot_fixture};
 
                 /// A node whose published snapshot names `root`, a temp workspace seeded
                 /// with `files`, as the share root; `locations` are the two share files
@@ -13236,20 +13375,6 @@ mod tests {
                         assert!(self.ctx.app.mesh.stop().await.unwrap());
                         self.started.relay_handle.abort();
                     }
-                }
-
-                fn seed_files(root: &Path, files: &[&str]) {
-                    for relative in files {
-                        let path = root.join(relative);
-                        fs::create_dir_all(path.parent().unwrap()).unwrap();
-                        fs::write(&path, relative).unwrap();
-                    }
-                }
-
-                fn publish_root(ctx: &RequestContext, root: &Path) {
-                    let mut snapshot = snapshot_fixture();
-                    snapshot.cwd = root.to_path_buf();
-                    ctx.app.mesh.publish(snapshot);
                 }
 
                 fn write_share_file(path: &Path, yaml: &str) {
@@ -19964,127 +20089,8 @@ mod tests {
 
             mod access_verbs {
                 use super::*;
-                use crate::mesh::grants::GrantRecord;
-                use crate::mesh::pending::INBOUND_RECORD_VERSION;
+                use crate::mesh::mesh_config_dir;
                 use crate::mesh::shares::{RawEntry, RawKind};
-                use crate::mesh::test_support::{TempDir, snapshot_fixture};
-                use crate::mesh::{mesh_config_dir, rfc3339_utc};
-
-                /// A node and a stub peer each trusting the other, the node's published
-                /// snapshot naming an empty temp workspace as the share root. `file`
-                /// puts a request from the stub in the inbound store as the dispatcher
-                /// would have.
-                struct AccessFixture {
-                    stub: PeerStub,
-                    started: StartedRuntime,
-                    ctx: RequestContext,
-                    _root: TempDir,
-                }
-
-                impl AccessFixture {
-                    async fn new(tag: &str) -> Self {
-                        let stub =
-                            PeerStub::listen(&format!("{tag}-stub"), TcpServer::DEFAULT_CLIENT_MTU)
-                                .await;
-                        let started = started_runtime_on(tag, stub.port()).await;
-                        let runtime = started.runtime.clone();
-                        let ctx = ctx_with(MeshConfig::default(), true);
-                        ctx.app.mesh.install(runtime.clone()).unwrap();
-                        stub.trust(&runtime.current_destination_hash(), runtime.fingerprint());
-                        stub.announce(Some("Stub")).await;
-                        let to = stub.destination_hex();
-                        let peers = runtime.peers();
-                        wait_until("the node to file the stub", || peers.get(&to).is_some()).await;
-                        runtime
-                            .trust()
-                            .trust_destination(
-                                ctx.app.mesh.as_ref(),
-                                &to,
-                                TrustOptions::default(),
-                                SystemTime::now(),
-                            )
-                            .unwrap();
-                        let root = TempDir::new(&format!("{tag}-root"));
-                        let mut snapshot = snapshot_fixture();
-                        snapshot.cwd = root.path.clone();
-                        ctx.app.mesh.publish(snapshot);
-                        Self {
-                            stub,
-                            started,
-                            ctx,
-                            _root: root,
-                        }
-                    }
-
-                    fn file(&self, id: &str, kind: InboundKind, paths: &[&str]) {
-                        let now = SystemTime::now();
-                        let (question, reason) = match kind {
-                            InboundKind::Question => ("which one?", ""),
-                            InboundKind::Access => ("", "need it"),
-                        };
-                        self.ctx
-                            .app
-                            .mesh
-                            .inbound_store()
-                            .unwrap()
-                            .upsert(
-                                InboundRecord {
-                                    version: INBOUND_RECORD_VERSION,
-                                    id: id.to_string(),
-                                    peer_destination: self.stub.destination_hex(),
-                                    peer_identity: self.stub.identity_hex(),
-                                    thread: id.to_string(),
-                                    question: question.to_string(),
-                                    envoy_question: String::new(),
-                                    received_at: rfc3339_utc(now),
-                                    kind,
-                                    paths: paths.iter().map(|path| path.to_string()).collect(),
-                                    reason: reason.to_string(),
-                                },
-                                now,
-                            )
-                            .unwrap();
-                    }
-
-                    fn dest(&self) -> String {
-                        short(&self.stub.destination_hex()).to_string()
-                    }
-
-                    fn pending_ids(&self) -> Vec<String> {
-                        self.ctx
-                            .app
-                            .mesh
-                            .inbound_store()
-                            .unwrap()
-                            .list(SystemTime::now())
-                            .unwrap()
-                            .into_iter()
-                            .map(|record| record.id)
-                            .collect()
-                    }
-
-                    fn grants(&self) -> Vec<GrantRecord> {
-                        self.started.runtime.serving().grants().list().unwrap()
-                    }
-
-                    /// The one reply the stub heard, as its content.
-                    fn heard(&self) -> String {
-                        let seen = self.stub.seen();
-                        assert_eq!(seen.len(), 1, "{seen:?}");
-                        assert_eq!(seen[0].kind, PeerKind::Reply);
-                        seen[0].content.clone()
-                    }
-
-                    async fn stop(self) {
-                        assert!(self.ctx.app.mesh.stop().await.unwrap());
-                        self.started.relay_handle.abort();
-                        self.stub.stop().await;
-                    }
-                }
-
-                fn sending(fx: &AccessFixture) -> String {
-                    format!("Sending your answer to {} over the mesh...", fx.dest())
-                }
 
                 #[test]
                 #[serial]
@@ -20093,7 +20099,7 @@ mod tests {
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
                     run_async(async {
-                        let mut fx = AccessFixture::new("repl-mesh-grant-once").await;
+                        let mut fx = PeerFixture::new("repl-mesh-grant-once").await;
                         fx.file("a-1", InboundKind::Access, &["src/x.rs", "docs/y.md"]);
 
                         let out = out_of(&mut fx.ctx, ".mesh grant a-1").await.unwrap();
@@ -20139,7 +20145,7 @@ mod tests {
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
                     run_async(async {
-                        let mut fx = AccessFixture::new("repl-mesh-grant-for").await;
+                        let mut fx = PeerFixture::new("repl-mesh-grant-for").await;
                         fx.file("a-1", InboundKind::Access, &["src/x.rs"]);
                         let before = SystemTime::now();
 
@@ -20177,7 +20183,7 @@ mod tests {
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
                     run_async(async {
-                        let mut fx = AccessFixture::new("repl-mesh-grant-standing").await;
+                        let mut fx = PeerFixture::new("repl-mesh-grant-standing").await;
                         fx.file("a-1", InboundKind::Access, &["src/x.rs", "docs/y.md"]);
                         let global = mesh_config_dir(&fx.started.tmp.path.join("config"))
                             .join("shares.yaml");
@@ -20235,7 +20241,7 @@ mod tests {
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
                     run_async(async {
-                        let mut fx = AccessFixture::new("repl-mesh-refuse").await;
+                        let mut fx = PeerFixture::new("repl-mesh-refuse").await;
                         fx.file("a-1", InboundKind::Access, &["src/x.rs"]);
 
                         let out = out_of(&mut fx.ctx, ".mesh refuse a-1").await.unwrap();
@@ -20268,7 +20274,7 @@ mod tests {
                         assert_eq!(refusal(&mut off, ".mesh grant a-1").await, MESH_OFF);
                         assert_eq!(refusal(&mut off, ".mesh refuse a-1").await, MESH_OFF);
 
-                        let mut fx = AccessFixture::new("repl-mesh-grant-teaching").await;
+                        let mut fx = PeerFixture::new("repl-mesh-grant-teaching").await;
                         fx.file("a-1", InboundKind::Access, &["src/x.rs"]);
                         let usage = render_verb_help("grant");
                         for (line, expected) in [
@@ -20337,7 +20343,7 @@ mod tests {
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
                     run_async(async {
-                        let mut fx = AccessFixture::new("repl-mesh-access-cross-kind").await;
+                        let mut fx = PeerFixture::new("repl-mesh-access-cross-kind").await;
                         fx.file("a-1", InboundKind::Access, &["src/x.rs"]);
                         fx.file("q-1", InboundKind::Question, &[]);
                         let printed = stdout_lines().len();
@@ -20380,7 +20386,7 @@ mod tests {
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
                     run_async(async {
-                        let mut fx = AccessFixture::new("repl-mesh-grant-dash-id").await;
+                        let mut fx = PeerFixture::new("repl-mesh-grant-dash-id").await;
                         fx.file("-x1", InboundKind::Access, &["src/x.rs"]);
 
                         let out = out_of(&mut fx.ctx, ".mesh grant -x1").await.unwrap();
@@ -20399,6 +20405,391 @@ mod tests {
                         assert!(fx.heard().starts_with("access granted:"));
                         assert!(fx.pending_ids().is_empty());
                         fx.stop().await;
+                    });
+                }
+            }
+
+            mod attach {
+                use super::*;
+                use crate::config::mesh_config::MeshFetch;
+                use crate::mesh::grants::GrantedPath;
+                use crate::mesh::message::from_r3_body;
+                use crate::mesh::test_support::{
+                    FETCH_PATH, NodePair, RecordingEnvoy, ResponderScript as Script, fetch_body,
+                    short_options, trusting_b, wire_field, wire_status,
+                };
+                use sha2::{Digest as _, Sha256};
+
+                const NOTES: &[u8] = b"# notes\n\n";
+
+                fn with_inline_max(bytes: u64) -> impl Fn(&mut MeshConfig) {
+                    move |config| config.fetch.inline_max_bytes = bytes
+                }
+
+                fn write(root: &Path, relative: &str, bytes: &[u8]) {
+                    let path = root.join(relative);
+                    fs::create_dir_all(path.parent().unwrap()).unwrap();
+                    fs::write(path, bytes).unwrap();
+                }
+
+                fn inline_part(name: &str, bytes: &[u8]) -> RawPart {
+                    RawPart::File {
+                        name: name.to_string(),
+                        size: bytes.len() as u64,
+                        sha256: Sha256::digest(bytes).into(),
+                        bytes: Some(bytes.to_vec()),
+                        reference: None,
+                    }
+                }
+
+                fn reference_part(name: &str, bytes: &[u8]) -> RawPart {
+                    RawPart::File {
+                        name: name.to_string(),
+                        size: bytes.len() as u64,
+                        sha256: Sha256::digest(bytes).into(),
+                        bytes: None,
+                        reference: Some(name.to_string()),
+                    }
+                }
+
+                fn inline_line(name: &str, size: u64) -> String {
+                    format!("Attaching `{name}` ({}) inline.", human_size(size))
+                }
+
+                fn reference_line(name: &str, size: u64, destination: &str) -> String {
+                    format!(
+                        "Attaching `{name}` ({}) as a reference; {} may fetch it once within 15m.",
+                        human_size(size),
+                        short(destination)
+                    )
+                }
+
+                fn sent_line(fx: &PeerFixture) -> String {
+                    let seen = fx.stub.seen();
+                    assert_eq!(seen.len(), 1, "{seen:?}");
+                    format!("Sent {} to {} (via direct).", short(&seen[0].id), fx.dest())
+                }
+
+                #[test]
+                #[serial]
+                fn reply_with_a_small_attachment_sends_it_inline_and_says_so() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-attach-inline");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-attach-inline").await;
+                        write(&fx.root.path, "docs/notes.md", NOTES);
+                        let to = fx.stub.destination_hex();
+
+                        let out = out_of(
+                            &mut fx.ctx,
+                            &format!(".mesh reply {to} --yes \"see this\" --attach docs/notes.md"),
+                        )
+                        .await
+                        .unwrap();
+
+                        let lines: Vec<&str> = out.lines().collect();
+                        assert_eq!(lines.len(), 3, "{out}");
+                        assert!(
+                            lines[0].starts_with("This sends your text to Stub ("),
+                            "{out}"
+                        );
+                        assert_eq!(lines[1], "Attaching `docs/notes.md` (9 bytes) inline.");
+                        assert_eq!(lines[1], inline_line("docs/notes.md", 9));
+                        assert_eq!(lines[2], sent_line(&fx));
+                        let seen = fx.stub.seen();
+                        assert_eq!(seen[0].kind, PeerKind::Message);
+                        assert_eq!(seen[0].content, "see this");
+                        assert_eq!(seen[0].parts, [inline_part("docs/notes.md", NOTES)]);
+                        assert!(fx.grants().is_empty(), "{:?}", fx.grants());
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        fx.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn reply_with_a_large_attachment_sends_a_reference_and_a_one_off_grant() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-attach-reference");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::with_config(
+                            "repl-mesh-attach-reference",
+                            with_inline_max(1024),
+                        )
+                        .await;
+                        let big = vec![0x5A; 1025];
+                        write(&fx.root.path, "big.bin", &big);
+                        let to = fx.stub.destination_hex();
+                        let before = SystemTime::now();
+
+                        let out = out_of(
+                            &mut fx.ctx,
+                            &format!(".mesh reply {to} --yes \"take this\" --attach big.bin"),
+                        )
+                        .await
+                        .unwrap();
+
+                        let lines: Vec<&str> = out.lines().collect();
+                        assert_eq!(lines.len(), 3, "{out}");
+                        assert_eq!(human_size(1025), "1 KB");
+                        assert_eq!(
+                            lines[1],
+                            format!(
+                                "Attaching `big.bin` (1 KB) as a reference; {} may fetch it once within 15m.",
+                                fx.dest()
+                            )
+                        );
+                        assert_eq!(lines[1], reference_line("big.bin", 1025, &to));
+                        assert_eq!(lines[2], sent_line(&fx));
+                        let seen = fx.stub.seen();
+                        assert_eq!(seen[0].parts, [reference_part("big.bin", &big)]);
+                        let grants = fx.grants();
+                        assert_eq!(grants.len(), 1, "{grants:?}");
+                        assert_eq!(grants[0].id, seen[0].id);
+                        assert_eq!(grants[0].peer, to);
+                        assert_eq!(
+                            grants[0].paths,
+                            [GrantedPath {
+                                path: "big.bin".to_string(),
+                                uses: 1,
+                                uses_left: 1,
+                            }]
+                        );
+                        let expires = parse_rfc3339(&grants[0].expires).unwrap();
+                        let slack = Duration::from_secs(5);
+                        assert!(
+                            expires >= before + DEFAULT_GRANT_TTL - slack
+                                && expires <= before + DEFAULT_GRANT_TTL + slack,
+                            "{expires:?} is not about 15m after {before:?}"
+                        );
+                        fx.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn attach_never_hands_the_answer_or_the_file_to_the_envoy() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-attach-no-envoy");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-attach-no-envoy").await;
+                        write(&fx.root.path, "docs/notes.md", NOTES);
+                        fx.file("p1", InboundKind::Question, &[]);
+                        let envoy = RecordingEnvoy::new(true, true);
+                        fx.ctx
+                            .app
+                            .mesh
+                            .set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
+
+                        let out = out_of(
+                            &mut fx.ctx,
+                            ".mesh answer p1 \"here\" --attach docs/notes.md",
+                        )
+                        .await
+                        .unwrap();
+
+                        let lines: Vec<&str> = out.lines().collect();
+                        assert_eq!(
+                            lines,
+                            [
+                                sending(&fx),
+                                inline_line("docs/notes.md", 9),
+                                "Answered p1.".to_string(),
+                            ],
+                            "{out}"
+                        );
+                        let seen = fx.stub.seen();
+                        assert_eq!(seen.len(), 1, "{seen:?}");
+                        assert_eq!(seen[0].kind, PeerKind::Reply);
+                        assert_eq!(seen[0].in_reply_to.as_deref(), Some("p1"));
+                        assert_eq!(seen[0].content, "here");
+                        assert_eq!(seen[0].parts, [inline_part("docs/notes.md", NOTES)]);
+                        assert!(fx.pending_ids().is_empty());
+                        assert!(
+                            envoy.answers.lock().is_empty(),
+                            "a live run is never offered an answer that carries a file"
+                        );
+                        fx.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn attach_refusals_send_nothing_and_teach_in_one_line() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-attach-refusals");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-attach-refusals").await;
+                        let root = fx.root.path.clone();
+                        write(&root, "docs/notes.md", NOTES);
+                        write(&root, ".env", b"SECRET=1\n");
+                        write(&root, ".git/HEAD", b"ref: refs/heads/main\n");
+                        write(&root, ".coyote/config.yaml", b"model: x\n");
+                        write(&root, "empty.txt", b"");
+                        std::os::unix::fs::symlink("notes.md", root.join("docs").join("link.md"))
+                            .unwrap();
+                        fx.file("p1", InboundKind::Question, &[]);
+                        let to = fx.stub.destination_hex();
+                        let shown_root = root.display().to_string();
+                        let usage = render_verb_help("reply");
+
+                        for (args, expected) in [
+                            (
+                                "--attach .env",
+                                "`.env` is under the built-in deny (secret-looking name); `--force` attaches it anyway, since you named it.".to_string(),
+                            ),
+                            (
+                                "--attach .git/HEAD --force",
+                                "`.git/HEAD` is under `.git/`, which is never shared, not even with `--force`; nothing was sent.".to_string(),
+                            ),
+                            (
+                                "--attach .coyote/config.yaml",
+                                "`.coyote/config.yaml` is under `.coyote/`, which is never shared, not even with `--force`; nothing was sent.".to_string(),
+                            ),
+                            (
+                                "--attach /etc/passwd",
+                                format!(
+                                    "`--attach` takes a path relative to {shown_root}, as `.mesh allow` does; '/etc/passwd' is not one."
+                                ),
+                            ),
+                            (
+                                "--attach ../x",
+                                "`../x` breaks the `segment` rule of the wire path grammar, so it cannot travel as a file part; rename or move it first.".to_string(),
+                            ),
+                            (
+                                "--attach docs/missing.md",
+                                format!("`docs/missing.md` is not under {shown_root}; nothing was sent."),
+                            ),
+                            (
+                                "--attach docs",
+                                "`docs` is a directory; attach one file.".to_string(),
+                            ),
+                            (
+                                "--attach docs/link.md",
+                                "'docs/link.md' is a symlink; attach the file it points to instead.".to_string(),
+                            ),
+                            (
+                                "--attach empty.txt",
+                                "`empty.txt` is empty; nothing to attach.".to_string(),
+                            ),
+                            (
+                                "--attach docs/notes.md --force",
+                                "`docs/notes.md` is not under the built-in deny, so there is nothing for `--force` to lift; drop `--force`.".to_string(),
+                            ),
+                            (
+                                "--force",
+                                format!(
+                                    "`--force` only lifts the built-in deny for an attached file; pass `--attach <path>` or drop it. {usage}"
+                                ),
+                            ),
+                            ("--attach", format!("'--attach' needs a value. {usage}")),
+                        ] {
+                            let line = format!(".mesh reply {to} \"x\" {args}");
+                            let printed = stdout_lines().len();
+                            assert_eq!(refusal(&mut fx.ctx, &line).await, expected, "{line}");
+                            assert_eq!(stdout_lines().len(), printed, "{line} prints nothing");
+                        }
+                        let line = ".mesh answer p1 \"x\" --attach docs/missing.md";
+                        let printed = stdout_lines().len();
+                        assert_eq!(
+                            refusal(&mut fx.ctx, line).await,
+                            format!(
+                                "`docs/missing.md` is not under {shown_root}; nothing was sent."
+                            )
+                        );
+                        assert_eq!(stdout_lines().len(), printed, "{line} prints nothing");
+                        assert!(fx.stub.seen().is_empty(), "{:?}", fx.stub.seen());
+                        assert!(fx.grants().is_empty());
+                        assert_eq!(fx.pending_ids(), ["p1"]);
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+
+                        let out = out_of(
+                            &mut fx.ctx,
+                            &format!(".mesh reply {to} --yes \"x\" --attach .env --force"),
+                        )
+                        .await
+                        .unwrap();
+
+                        let lines: Vec<&str> = out.lines().collect();
+                        assert_eq!(lines.len(), 3, "{out}");
+                        assert_eq!(lines[1], inline_line(".env", 9));
+                        assert_eq!(lines[2], sent_line(&fx));
+                        assert_eq!(
+                            fx.stub.seen()[0].parts,
+                            [inline_part(".env", b"SECRET=1\n")]
+                        );
+                        fx.stop().await;
+                    });
+                }
+
+                /// Node A is the REPL's node and node B a scripted peer that can ask: the
+                /// reference B hears names the file, B's first fetch of it is served on the
+                /// one-off grant, and the one after is not.
+                #[test]
+                #[serial]
+                fn an_attached_reference_is_fetchable_exactly_once() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-attach-fetch-once");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let pair = NodePair::start_with(
+                            "repl-mesh-attach-fetch-once",
+                            with_inline_max(1024),
+                            trusting_b,
+                        )
+                        .await;
+                        pair.introduce_b_to_a().await;
+                        let mut ctx = ctx_with(
+                            MeshConfig {
+                                fetch: MeshFetch {
+                                    inline_max_bytes: 1024,
+                                    ..Default::default()
+                                },
+                                ..MeshConfig::default()
+                            },
+                            true,
+                        );
+                        ctx.app.mesh.install(pair.node_a.clone()).unwrap();
+                        let workspace = TempDir::new("repl-mesh-attach-fetch-once-root");
+                        let big = vec![0x5A; 1025];
+                        write(&workspace.path, "big.bin", &big);
+                        publish_root(&ctx, &workspace.path);
+                        let b_hex = pair.responder.desc.address_hash.to_hex_string();
+                        pair.recorder_b.queue(Script::Acknowledge);
+
+                        let out = out_of(
+                            &mut ctx,
+                            &format!(".mesh reply {b_hex} --yes \"x\" --attach big.bin"),
+                        )
+                        .await
+                        .unwrap();
+
+                        assert!(
+                            out.lines()
+                                .any(|line| line == reference_line("big.bin", 1025, &b_hex)),
+                            "{out}"
+                        );
+                        let heard = from_r3_body(&pair.recorder_b.last_body()).unwrap();
+                        assert_eq!(heard.kind, PeerKind::Message);
+                        assert_eq!(heard.parts, [reference_part("big.bin", &big)]);
+
+                        let served = pair
+                            .b_asks_a(FETCH_PATH, fetch_body("big.bin", None), short_options())
+                            .await;
+                        assert_eq!(wire_status(&served.value), "ok");
+                        assert_eq!(
+                            wire_field(&served.value, "bytes"),
+                            Some(&Value::Binary(big))
+                        );
+                        let spent = pair
+                            .b_asks_a(FETCH_PATH, fetch_body("big.bin", None), short_options())
+                            .await;
+                        assert_eq!(wire_status(&spent.value), "not_shared");
+                        pair.stop_node_a().await;
                     });
                 }
             }

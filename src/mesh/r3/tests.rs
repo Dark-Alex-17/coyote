@@ -5790,7 +5790,7 @@ pub(crate) mod network {
 
     /// Node A's trust list with node B's own instance on it, which is what B's requests
     /// derive to when B asks as itself, and what A's sends to B check.
-    fn trusting_b(responder: &Responder) -> TrustList {
+    pub(crate) fn trusting_b(responder: &Responder) -> TrustList {
         TrustList::default().destination(
             &responder.desc.address_hash.to_hex_string(),
             &responder.desc.identity.address_hash.to_hex_string(),
@@ -6538,7 +6538,7 @@ pub(crate) mod network {
         )
     }
 
-    fn fetch_body(path: &str, if_sha256: Option<[u8; 32]>) -> Value {
+    pub(crate) fn fetch_body(path: &str, if_sha256: Option<[u8; 32]>) -> Value {
         wire_map(vec![
             ("v", Value::from(PEER_WIRE_VERSION)),
             ("path", Value::from(path)),
@@ -6549,7 +6549,7 @@ pub(crate) mod network {
         ])
     }
 
-    fn wire_field<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
+    pub(crate) fn wire_field<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
         value
             .as_map()
             .unwrap()
@@ -6558,7 +6558,7 @@ pub(crate) mod network {
             .map(|(_, value)| value)
     }
 
-    fn wire_status(value: &Value) -> &str {
+    pub(crate) fn wire_status(value: &Value) -> &str {
         wire_field(value, "status").and_then(Value::as_str).unwrap()
     }
 
