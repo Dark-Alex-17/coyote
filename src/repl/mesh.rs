@@ -15053,6 +15053,232 @@ mod tests {
                         fx.stop().await;
                     });
                 }
+
+                /// Usage probe (d): `deny` keeps the layer it announced like `allow` does,
+                /// and a concurrent edit to the announced file made while the question
+                /// stands survives the write.
+                #[test]
+                #[serial]
+                fn usage_probe_deny_writes_the_layer_it_announced_and_keeps_a_concurrent_edit() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-deny-announced");
+                    let _capture = capture::install();
+                    run_async(async {
+                        let mut fx =
+                            ShareFixture::new("repl-mesh-probe-deny-announced", &["docs/a.md"])
+                                .await;
+                        let locations = fx.locations.clone();
+                        let _script = prompt_script::install_answering(move |question| {
+                            assert!(question.contains("**"), "{question}");
+                            // Auto would now resolve to the workspace layer...
+                            write_share_file(
+                                &locations.workspace,
+                                "version: 1\nallow:\n- pattern: docs/**\n",
+                            );
+                            // ...and the announced (global) file gained a rule meanwhile.
+                            ShareSet::load_quietly(locations.clone())
+                                .0
+                                .apply(
+                                    Mutation::Deny {
+                                        pattern: "secrets/**".to_string(),
+                                    },
+                                    WriteScope::Global,
+                                )
+                                .unwrap();
+                            true
+                        });
+
+                        let out = out_of(&mut fx.ctx, ".mesh deny **").await.unwrap();
+
+                        assert!(
+                            out.contains(&format!(
+                                "Will write to {}: deny `**` to every peer.",
+                                fx.global()
+                            )),
+                            "{out}"
+                        );
+                        assert!(
+                            out.ends_with(&format!(
+                                "Denied `**` to every peer; written to {}.",
+                                fx.global()
+                            )),
+                            "{out}"
+                        );
+                        assert_eq!(prompt_script::prompts_asked(), 1);
+                        assert_eq!(
+                            fx.entries(),
+                            [
+                                deny_entry(Layer::Global, "secrets/**"),
+                                deny_entry(Layer::Global, "**"),
+                                allow_entry(Layer::Workspace, "docs/**", None),
+                            ],
+                            "the concurrent deny survives, the new deny lands in the announced file, the workspace file is untouched"
+                        );
+                        fx.stop().await;
+                    });
+                }
+
+                /// Usage probe (d): the announced layer is kept in the other direction too —
+                /// a workspace file that vanishes while the question stands does not pull
+                /// the write back into the global file.
+                #[test]
+                #[serial]
+                fn usage_probe_allow_keeps_the_announced_workspace_layer_when_its_file_vanishes_during_the_prompt()
+                 {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-allow-ws-vanishes");
+                    let _capture = capture::install();
+                    run_async(async {
+                        let mut fx =
+                            ShareFixture::new("repl-mesh-probe-allow-ws-vanishes", &["docs/a.md"])
+                                .await;
+                        fx.write_workspace("version: 1\nallow:\n- pattern: notes/**\n");
+                        let workspace = fx.locations.workspace.clone();
+                        let _script = prompt_script::install_answering(move |_question| {
+                            fs::remove_file(&workspace).unwrap();
+                            true
+                        });
+
+                        let out = out_of(&mut fx.ctx, ".mesh allow **").await.unwrap();
+
+                        assert!(
+                            out.contains(&format!("Will write to {}:", fx.workspace())),
+                            "{out}"
+                        );
+                        let last = out.lines().last().unwrap_or_default();
+                        assert!(
+                            last.starts_with("Allowed `**` for every trusted peer; written to ")
+                                && last.contains(&fx.workspace()),
+                            "{out}"
+                        );
+                        assert!(
+                            !last.contains(&fx.global()),
+                            "never the layer re-resolved after the prompt: {out}"
+                        );
+                        assert_eq!(prompt_script::prompts_asked(), 1);
+                        assert!(!fx.locations.global.exists(), "global file untouched");
+                        assert_eq!(
+                            fx.entries(),
+                            [allow_entry(Layer::Workspace, "**", None)],
+                            "the vanished workspace file is re-created with the announced rule (the concurrent removal of notes/** is not undone)"
+                        );
+                        fx.stop().await;
+                    });
+                }
+
+                /// Usage probe (d): "holders changed" covers a holder that APPEARED in the
+                /// other layer while the question stood, not only one that went away — the
+                /// human confirmed removing it from one file, not from two.
+                #[test]
+                #[serial]
+                fn usage_probe_unshare_refuses_when_a_second_holder_appears_during_the_prompt() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-unshare-holder-appears");
+                    let _capture = capture::install();
+                    run_async(async {
+                        let mut fx = ShareFixture::new(
+                            "repl-mesh-probe-unshare-holder-appears",
+                            &["docs/a.md"],
+                        )
+                        .await;
+                        fx.write_global("version: 1\nallow:\n- pattern: '**'\n");
+                        let workspace = fx.locations.workspace.clone();
+                        let _script = prompt_script::install_answering(move |_question| {
+                            write_share_file(&workspace, "version: 1\ndeny:\n- pattern: '**'\n");
+                            true
+                        });
+
+                        let err = refusal(&mut fx.ctx, ".mesh unshare **").await;
+
+                        assert_eq!(
+                            err,
+                            "The share list changed while the prompt was open; run `.mesh unshare` again."
+                        );
+                        assert_eq!(prompt_script::prompts_asked(), 1);
+                        assert_eq!(
+                            fx.entries(),
+                            [
+                                allow_entry(Layer::Global, "**", None),
+                                deny_entry(Layer::Workspace, "**"),
+                            ],
+                            "nothing was removed from either file"
+                        );
+                        fx.stop().await;
+                    });
+                }
+
+                /// Usage probe (a)+(c): handing `allow` a destination hash is a pure
+                /// classification error — it fires with the mesh OFF (before `MESH_OFF`),
+                /// with `--peer` alongside, and writes nothing in either case.
+                #[test]
+                #[serial]
+                fn usage_probe_allow_of_a_hash_teaches_trust_before_the_mesh_gate_and_with_peer() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-allow-hash-off");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    let mut ctx = off_ctx();
+                    let root = TempDir::new("repl-mesh-probe-allow-hash-off-root");
+                    seed_files(&root.path, &["docs/a.md"]);
+                    publish_root(&ctx, &root.path);
+                    let dest = "3f9c2a7b1d4e6f80a1b2c3d4e5f60718";
+                    let other = "ab".repeat(16);
+
+                    let err = err_of(&mut ctx, &format!(".mesh allow {dest}"));
+                    assert_ne!(err, MESH_OFF, "a pure check fires before the mesh gate");
+                    assert!(err.contains(&format!(".mesh trust {dest}")), "{err}");
+                    assert!(err.contains(&format!("--peer {dest}")), "{err}");
+
+                    let err = err_of(&mut ctx, &format!(".mesh allow {dest} --peer {other}"));
+                    assert_ne!(err, MESH_OFF, "{err}");
+                    assert!(
+                        err.contains(&format!(".mesh trust {dest}")),
+                        "the positional is still a hash, whatever follows: {err}"
+                    );
+
+                    let err = err_of(&mut ctx, &format!(".mesh allow {dest} --dry-run"));
+                    assert_ne!(err, MESH_OFF, "{err}");
+                    assert!(err.contains(&format!(".mesh trust {dest}")), "{err}");
+
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+                    assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
+                    let (_, locations) = share_locations(&ctx).unwrap();
+                    assert!(!locations.global.exists());
+                    assert!(!locations.workspace.exists());
+
+                    // The same hash is a fine `--peer` VALUE: with the mesh off the verb then
+                    // reaches the gate, not the hash teaching.
+                    let err = err_of(&mut ctx, &format!(".mesh allow docs/** --peer {dest}"));
+                    assert_eq!(err, MESH_OFF);
+                }
+
+                /// Usage probe (g)+(b): `undeny` stays unknown and the three mutating verbs
+                /// print usage (never `MESH_OFF`, never a write) when bare while OFF.
+                #[test]
+                #[serial]
+                fn usage_probe_undeny_is_unknown_and_bare_mutators_print_usage_while_off() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-undeny-off");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    let mut ctx = off_ctx();
+                    let root = TempDir::new("repl-mesh-probe-undeny-off-root");
+                    seed_files(&root.path, &["docs/a.md"]);
+                    publish_root(&ctx, &root.path);
+
+                    let err = err_of(&mut ctx, ".mesh undeny docs/**");
+                    assert_ne!(err, MESH_OFF, "{err}");
+                    assert!(err.contains("undeny"), "{err}");
+
+                    for verb in ["allow", "deny", "unshare"] {
+                        run_async(run(&mut ctx, &format!(".mesh {verb}"))).unwrap();
+                    }
+                    let out = stdout_lines().join("\n");
+                    for verb in ["allow", "deny", "unshare"] {
+                        assert!(out.contains(&render_verb_help(verb)), "{verb}: {out}");
+                    }
+                    assert!(!out.contains(MESH_OFF), "{out}");
+                    assert!(stderr_lines().is_empty(), "{:?}", stderr_lines());
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+                    let (_, locations) = share_locations(&ctx).unwrap();
+                    assert!(!locations.global.exists());
+                    assert!(!locations.workspace.exists());
+                }
             }
         }
     }
