@@ -1260,7 +1260,7 @@ pub(crate) mod network {
 
         /// `start_as_started` with node A's config adjusted by `configure` and its trust
         /// list built from the responder, written before the start that loads it.
-        async fn start_with(
+        pub(crate) async fn start_with(
             tag: &str,
             configure: impl FnOnce(&mut MeshConfig),
             trust: impl FnOnce(&Responder) -> TrustList,
@@ -1347,6 +1347,26 @@ pub(crate) mod network {
                 .await
                 .unwrap();
             StatusCard::from_value(&outcome.value).unwrap()
+        }
+
+        /// Node B asks node A's `path` as itself.
+        pub(crate) async fn b_asks_a(
+            &self,
+            path: &str,
+            body: Value,
+            options: RequestOptions,
+        ) -> RequestOutcome {
+            self.client_b
+                .request(
+                    &self.responder.transport,
+                    &self.responder.identity,
+                    &self.a_desc,
+                    path,
+                    self.responder.envelope(body),
+                    options,
+                )
+                .await
+                .unwrap()
         }
 
         /// Arms node A's advertisement-time request cap, which production code leaves off,
@@ -6549,17 +6569,7 @@ pub(crate) mod network {
         body: Value,
         options: RequestOptions,
     ) -> RequestOutcome {
-        pair.client_b
-            .request(
-                &pair.responder.transport,
-                &pair.responder.identity,
-                &pair.a_desc,
-                path,
-                pair.responder.envelope(body),
-                options,
-            )
-            .await
-            .unwrap()
+        pair.b_asks_a(path, body, options).await
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

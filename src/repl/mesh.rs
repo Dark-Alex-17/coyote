@@ -1,5 +1,5 @@
 use crate::config::mesh_config::{
-    MESH_INFO_LABEL_WIDTH, MeshBrief, MeshInterface, render_mesh_info,
+    MAX_FETCH_FILE_BYTES, MESH_INFO_LABEL_WIDTH, MeshBrief, MeshInterface, render_mesh_info,
 };
 use crate::config::{MeshConfig, RequestContext, paths};
 use crate::function::mesh::trust_label;
@@ -8,13 +8,14 @@ use crate::mesh::card::{CardSource, DISPLAY_NAME_MAX_CHARS, StatusHandler, rende
 use crate::mesh::fetch::{
     FILE_FETCH_REQUEST_TIMEOUT, FetchError as FileFetchError, Fetched, SINGLE_SEGMENT_FETCH_CEILING,
 };
+use crate::mesh::grants::DEFAULT_GRANT_TTL;
 use crate::mesh::identity::{self, Predecessor, fingerprint};
 use crate::mesh::idle::plural;
 use crate::mesh::knock::{KnockIntro, KnockOutcome, KnockVia};
 use crate::mesh::knocks::KnockRecord;
 use crate::mesh::message::{
-    BroadcastOutcome, Disposition, OutboundPeer, PEER_CONTENT_MAX_CHARS, Part, PeerKind,
-    PeerMessage, PeerVia, RecipientOutcome,
+    BroadcastOutcome, Disposition, OutboundPeer, PEER_CONTENT_MAX_CHARS, Part, PartLimits,
+    PeerKind, PeerMessage, PeerVia, RawPart, RecipientOutcome,
 };
 use crate::mesh::pending::{
     Correlation, InboundKind, InboundRecord, PendingState, access_not_a_question,
@@ -30,20 +31,21 @@ use crate::mesh::trust::{
     Decision, KeyChange, LiveMesh, Rule, Tier, TrustChange, TrustOptions, TrustRecord, TrustStore,
     UntrustOutcome, Verdict, decode_name_hash, parse_hash,
 };
-use crate::mesh::wire_path::WIRE_PATH_MAX_BYTES;
+use crate::mesh::wire_path::{WIRE_PATH_MAX_BYTES, WirePath};
 use crate::mesh::{
     FetchError, FetchReport, LoggingInboundSink, MAX_WANTS_PER_FETCH, MESH_ALREADY_ON, MeshPaths,
     MeshRuntime, NodeOptions, PeerRecord, PropagationNodeRecord, age_text, canonical_hash,
-    decode_hex, destination_address, display_text, hex_lower, parse_rfc3339, redact_hashes,
-    refuse_symlink, rfc3339_utc, short,
+    decode_hex, destination_address, display_text, hex_lower, human_size, parse_rfc3339,
+    redact_hashes, refuse_symlink, rfc3339_utc, short,
 };
 use crate::supervisor::mailbox::EnvelopePayload;
 use crate::utils::{AbortSignal, drain_stale_tty_input, wait_user_interrupt};
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Utc};
 use inquire::Confirm;
 use log::debug;
+use sha2::{Digest, Sha256};
 use std::env;
 use std::fs;
 use std::io::IsTerminal;
@@ -97,12 +99,12 @@ pub(super) const VERBS: &[(&str, &str, &str)] = &[
     (
         "answer",
         "Answer an escalated question, or follow up on one this node asked",
-        ".mesh answer <id> \"text\"",
+        ".mesh answer <id> \"text\" [--attach <path> [--force]]",
     ),
     (
         "reply",
         "Send your own text to one peer, bypassing the model",
-        ".mesh reply <destination> [--yes] \"text\"",
+        ".mesh reply <destination> [--yes] \"text\" [--attach <path> [--force]]",
     ),
     (
         "broadcast",
@@ -630,7 +632,12 @@ fn pending(ctx: &RequestContext) -> Result<()> {
 }
 
 async fn answer(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
-    let Some((id, text)) = split_id_and_text(rest) else {
+    let Some((id, rest)) = rest.and_then(|rest| rest.split_once(char::is_whitespace)) else {
+        out_text(&render_verb_help("answer"));
+        return Ok(());
+    };
+    let (attach, rest) = take_attach(rest, "answer")?;
+    let Some(text) = message_text(&rest) else {
         out_text(&render_verb_help("answer"));
         return Ok(());
     };
@@ -646,15 +653,36 @@ async fn answer(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             if record.kind == InboundKind::Access {
                 bail!(access_not_a_question(id));
             }
+            let attachment = prepared_attachment(ctx, attach, &runtime)?;
             out_text(&sending_notice(&record.peer_destination));
-            ctx.app.mesh.answer_inbound(id, text).await?;
+            match attachment {
+                Some(attachment) => {
+                    out_text(&attaching_notice(&attachment, &record.peer_destination));
+                    ctx.app
+                        .mesh
+                        .answer_inbound_with_file(id, text, attachment.part)
+                        .await?;
+                }
+                None => ctx.app.mesh.answer_inbound(id, text).await?,
+            }
             out_text(&format!("Answered {}.", short(id)));
         }
         (AnswerRoute::Outbound, _, Some(correlation)) => {
             let destination = &correlation.record.peer_destination;
+            let attachment = prepared_attachment(ctx, attach, &runtime)?;
             out_text(&sending_notice(destination));
-            let out = outbound_answer(&correlation, text)?;
-            let outcome = runtime.send_peer(destination, &out).await?;
+            if let Some(attachment) = &attachment {
+                out_text(&attaching_notice(attachment, destination));
+            }
+            let out = outbound_answer(
+                &correlation,
+                text,
+                parts_of(attachment),
+                &runtime.part_limits(),
+            )?;
+            let outcome = runtime
+                .send_peer_lending_reference(destination, &out)
+                .await?;
             out_text(&format!(
                 "Sent {} to {} as a reply to {} (via {}).",
                 short(&outcome.id),
@@ -672,13 +700,24 @@ async fn answer(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
 
 /// The human's reply into one of this node's own open questions, in that question's
 /// thread, worded as answered like a reply from `answer_inbound`.
-fn outbound_answer(correlation: &Correlation, text: &str) -> Result<OutboundPeer> {
+fn outbound_answer(
+    correlation: &Correlation,
+    text: &str,
+    parts: Vec<RawPart>,
+    limits: &PartLimits,
+) -> Result<OutboundPeer> {
     let record = &correlation.record;
-    Ok(
-        OutboundPeer::new(PeerKind::Reply, text, None, Some(&record.id), None)?
-            .with_thread(Some(record.thread.clone()))?
-            .with_disposition(Disposition::Answered, None),
-    )
+    Ok(OutboundPeer::with_parts(
+        PeerKind::Reply,
+        text,
+        None,
+        Some(&record.id),
+        None,
+        parts,
+        limits,
+    )?
+    .with_thread(Some(record.thread.clone()))?
+    .with_disposition(Disposition::Answered, None))
 }
 
 async fn reply(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
@@ -696,12 +735,14 @@ async fn reply(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             "'{target}' is not a destination hash: expected 32 hex characters, as `.mesh peers` lists them."
         );
     };
-    let Some(outgoing) = parse_outgoing(rest) else {
+    let (attach, rest) = take_attach(rest, "reply")?;
+    let Some(outgoing) = parse_outgoing(&rest) else {
         out_text(&render_verb_help("reply"));
         return Ok(());
     };
     let runtime = live(ctx)?;
     let peer = peer_for_contact(&runtime, &destination, REPLY_REFUSAL_TAIL)?;
+    let attachment = prepared_attachment(ctx, attach, &runtime)?;
     let verdict = runtime.trust().authorize(&peer.identity_hash, &destination);
     out_text(&format!(
         "This sends your text to {} ({}, trust: {}) over the mesh.",
@@ -713,8 +754,21 @@ async fn reply(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         out_text("Nothing was sent.");
         return Ok(());
     }
-    let out = OutboundPeer::new(PeerKind::Message, outgoing.text, None, None, None)?;
-    let outcome = runtime.send_peer(&destination, &out).await?;
+    if let Some(attachment) = &attachment {
+        out_text(&attaching_notice(attachment, &destination));
+    }
+    let out = OutboundPeer::with_parts(
+        PeerKind::Message,
+        outgoing.text,
+        None,
+        None,
+        None,
+        parts_of(attachment),
+        &runtime.part_limits(),
+    )?;
+    let outcome = runtime
+        .send_peer_lending_reference(&destination, &out)
+        .await?;
     out_text(&format!(
         "Sent {} to {} (via {}).",
         short(&outcome.id),
@@ -737,6 +791,257 @@ fn peer_for_contact(runtime: &MeshRuntime, destination: &str, only: &str) -> Res
         bail!(refusal);
     }
     Ok(peer)
+}
+
+/// What `--attach <path>`, with or without `--force`, asked for.
+#[derive(Debug)]
+struct AttachArgs {
+    path: String,
+    force: bool,
+}
+
+/// `--attach <path>` and `--force` lifted out of `rest` from wherever they stand outside
+/// the quoted message, with the message left as typed. `--force` lifts only the
+/// built-in deny for an attached file, so alone it is refused rather than ignored.
+fn take_attach(rest: &str, verb: &str) -> Result<(Option<AttachArgs>, String)> {
+    let (path, rest) = take_option(rest, "--attach", verb)?;
+    let (force, rest) = take_switch(&rest, "--force");
+    match path {
+        Some(path) => Ok((Some(AttachArgs { path, force }), rest)),
+        None if force => bail!(
+            "`--force` only lifts the built-in deny for an attached file; pass `--attach <path>` or drop it. {}",
+            render_verb_help(verb)
+        ),
+        None => Ok((None, rest)),
+    }
+}
+
+/// `flag` and the word after it taken out of `text`; `Ok(None)` when the flag is absent,
+/// an error when it stands with no value, or another flag, after it.
+fn take_option(text: &str, flag: &str, verb: &str) -> Result<(Option<String>, String)> {
+    let Some(index) = unquoted_word(text, flag) else {
+        return Ok((None, text.to_string()));
+    };
+    let after = &text[index + flag.len()..];
+    let value = after.trim_start();
+    let value = &value[..value.find(char::is_whitespace).unwrap_or(value.len())];
+    if value.is_empty() || value.starts_with("--") {
+        bail!("'{flag}' needs a value. {}", render_verb_help(verb));
+    }
+    let end = text.len() - after.trim_start().len() + value.len();
+    Ok((Some(value.to_string()), without(text, index, end)))
+}
+
+/// Whether `flag` stands in `text`, and `text` without it.
+fn take_switch(text: &str, flag: &str) -> (bool, String) {
+    match unquoted_word(text, flag) {
+        Some(index) => (true, without(text, index, index + flag.len())),
+        None => (false, text.to_string()),
+    }
+}
+
+/// Where `word` stands whole in `text` outside double quotes: a flag after the quoted
+/// message is read, one inside it stays words to send.
+fn unquoted_word(text: &str, word: &str) -> Option<usize> {
+    let mut in_quotes = false;
+    let mut at_word_start = true;
+    for (index, ch) in text.char_indices() {
+        if ch == '"' {
+            in_quotes = !in_quotes;
+        } else if at_word_start && !in_quotes && text[index..].starts_with(word) {
+            let after = &text[index + word.len()..];
+            if after.is_empty() || after.starts_with(char::is_whitespace) {
+                return Some(index);
+            }
+        }
+        at_word_start = ch.is_whitespace();
+    }
+    None
+}
+
+fn without(text: &str, from: usize, to: usize) -> String {
+    format!("{} {}", text[..from].trim_end(), text[to..].trim_start())
+        .trim()
+        .to_string()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttachForm {
+    Inline,
+    Reference,
+}
+
+/// The one file `--attach` names, shaped as the part that carries it.
+struct Attachment {
+    part: RawPart,
+    name: String,
+    size: u64,
+    form: AttachForm,
+}
+
+fn prepared_attachment(
+    ctx: &RequestContext,
+    args: Option<AttachArgs>,
+    runtime: &MeshRuntime,
+) -> Result<Option<Attachment>> {
+    args.map(|args| attachment(ctx, &args.path, args.force, &runtime.part_limits()))
+        .transpose()
+}
+
+fn parts_of(attachment: Option<Attachment>) -> Vec<RawPart> {
+    attachment
+        .map(|attachment| vec![attachment.part])
+        .unwrap_or_default()
+}
+
+/// The file at `path_text` under the share root, read as a file part: inline up to the
+/// node's inline limit, by reference above it. The share rules are not consulted, since
+/// the human named the file; the directories nothing serves out of refuse all the same,
+/// and the built-in deny refuses until `--force` says the name was meant. Judged in the
+/// order `.mesh allow` judges a pattern: the text alone, then the protected directories,
+/// then the disk, then the built-in deny.
+fn attachment(
+    ctx: &RequestContext,
+    path_text: &str,
+    force: bool,
+    limits: &PartLimits,
+) -> Result<Attachment> {
+    let Some((root, locations)) = share_locations(ctx) else {
+        bail!(SHARE_ROOT_UNKNOWN);
+    };
+    let shown = shown_pattern(path_text);
+    if Path::new(path_text).is_absolute() || path_text.starts_with('/') || path_text.contains('\\')
+    {
+        bail!(
+            "`--attach` takes a path relative to {}, as `.mesh allow` does; '{shown}' is not one.",
+            root.display()
+        );
+    }
+    if let Err(invalid) = WirePath::parse(path_text) {
+        bail!(
+            "`{shown}` breaks the `{}` rule of the wire path grammar, so it cannot travel as a file part; rename or move it first.",
+            invalid.rule
+        );
+    }
+    let (set, _warning) = ShareSet::load_quietly(locations);
+    if let Some(head) = set.protected_head(path_text) {
+        bail!(never_sent_sentence(path_text, &head));
+    }
+    let file = root.join(path_text);
+    let metadata = match fs::symlink_metadata(&file) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            bail!(
+                "`{shown}` is not under {}; nothing was sent.",
+                root.display()
+            )
+        }
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("Failed to read metadata of '{}'", file.display()));
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        bail!("'{shown}' is a symlink; attach the file it points to instead.");
+    }
+    if metadata.is_dir() {
+        bail!("`{shown}` is a directory; attach one file.");
+    }
+    if !metadata.is_file() {
+        bail!("`{shown}` is not a regular file.");
+    }
+    let in_root = dunce::canonicalize(&root)
+        .and_then(|canonical_root| Ok(dunce::canonicalize(&file)?.starts_with(canonical_root)))
+        .unwrap_or(false);
+    if !in_root {
+        bail!(
+            "`{shown}` lies outside {} once its links are followed; nothing was sent.",
+            root.display()
+        );
+    }
+    let case_insensitive = root_case(ctx, &root)?.unwrap_or(false);
+    match (set.builtin_denies(path_text, case_insensitive)?, force) {
+        (Some(BuiltinHit::ByText), false) => bail!(
+            "`{shown}` is under the built-in deny (secret-looking name); `--force` attaches it anyway, since you named it."
+        ),
+        (Some(BuiltinHit::ByText), true) | (None, false) => {}
+        (Some(BuiltinHit::ByResolution { resolved }), _) => {
+            let resolved = shown_pattern(&resolved);
+            bail!(
+                "`{shown}` resolves to `{resolved}`, which the built-in deny names; attach that file by its own name with `--force` if you mean it."
+            )
+        }
+        (Some(BuiltinHit::LinkNamedLikeASecret { resolved }), _) => {
+            let resolved = shown_pattern(&resolved);
+            bail!(
+                "`{shown}` is a link to `{resolved}`, which the built-in deny does not name; attach `{resolved}` by that name; nothing was sent."
+            )
+        }
+        (Some(BuiltinHit::UnresolvableLink), _) => bail!(
+            "`{shown}` is reached through a link to nothing, so it cannot be sent; nothing was sent."
+        ),
+        (None, true) => bail!(
+            "`{shown}` is not under the built-in deny, so there is nothing for `--force` to lift; drop `--force`."
+        ),
+    }
+    let size = metadata.len();
+    if size == 0 {
+        bail!("`{shown}` is empty; nothing to attach.");
+    }
+    if size > MAX_FETCH_FILE_BYTES {
+        bail!(
+            "`{shown}` is {} and the peer can fetch at most {MAX_FETCH_FILE_BYTES} bytes by reference; nothing was sent.",
+            human_size(size)
+        );
+    }
+    let name = path_text.to_string();
+    if size <= limits.inline_max_bytes {
+        let bytes =
+            fs::read(&file).with_context(|| format!("Failed to read '{}'", file.display()))?;
+        let size = bytes.len() as u64;
+        return Ok(Attachment {
+            part: RawPart::File {
+                name: name.clone(),
+                size,
+                sha256: Sha256::digest(&bytes).into(),
+                bytes: Some(bytes),
+                reference: None,
+            },
+            name,
+            size,
+            form: AttachForm::Inline,
+        });
+    }
+    let mut hasher = Sha256::new();
+    fs::File::open(&file)
+        .and_then(|mut opened| std::io::copy(&mut opened, &mut hasher))
+        .with_context(|| format!("Failed to read '{}'", file.display()))?;
+    Ok(Attachment {
+        part: RawPart::File {
+            name: name.clone(),
+            size,
+            sha256: hasher.finalize().into(),
+            bytes: None,
+            reference: Some(name.clone()),
+        },
+        name,
+        size,
+        form: AttachForm::Reference,
+    })
+}
+
+/// Printed before the send, so the human sees what travels and how.
+fn attaching_notice(attachment: &Attachment, destination: &str) -> String {
+    let shown = shown_pattern(&attachment.name);
+    let size = human_size(attachment.size);
+    match attachment.form {
+        AttachForm::Inline => format!("Attaching `{shown}` ({size}) inline."),
+        AttachForm::Reference => format!(
+            "Attaching `{shown}` ({size}) as a reference; {} may fetch it once within {}m.",
+            short(destination),
+            DEFAULT_GRANT_TTL.as_secs() / 60
+        ),
+    }
 }
 
 /// Why a destination not in the peer table is refused: the trust list's denial of the
@@ -2452,13 +2757,23 @@ fn never_shared_sentence(pattern: &str, head: &str, verb: &str) -> String {
     } else {
         "not even with `--force`"
     };
+    never_shared_with(pattern, head, reason, "nothing was written.")
+}
+
+/// `never_shared_sentence` for a file to send: `--force` lifts the built-in deny, not
+/// this, and the outcome is a send that did not happen.
+fn never_sent_sentence(path: &str, head: &str) -> String {
+    never_shared_with(path, head, "not even with `--force`", "nothing was sent.")
+}
+
+fn never_shared_with(pattern: &str, head: &str, reason: &str, outcome: &str) -> String {
     if let Some(dir) = typed_protected_dir(pattern, head) {
         let rest = &pattern[dir.len()..];
         if rest.trim_start_matches('/').is_empty() || rest.contains(GLOB_METACHARACTERS) {
-            return format!("`{dir}/` is never shared, {reason}; nothing was written.");
+            return format!("`{dir}/` is never shared, {reason}; {outcome}");
         }
     }
-    format!("`{pattern}` is under `{head}/`, which is never shared, {reason}; nothing was written.")
+    format!("`{pattern}` is under `{head}/`, which is never shared, {reason}; {outcome}")
 }
 
 /// The typed path up to and including `head` where `pattern` spells it by name:
@@ -3231,12 +3546,6 @@ fn parse_outgoing(rest: &str) -> Option<Outgoing<'_>> {
     let (yes, rest) = take_flag(rest, "--yes");
     let text = message_text(rest)?;
     Some(Outgoing { yes, text })
-}
-
-/// `.mesh answer`'s id and the answer after it; `None` when either is missing.
-fn split_id_and_text(rest: Option<&str>) -> Option<(&str, &str)> {
-    let (id, text) = rest?.split_once(char::is_whitespace)?;
-    Some((id, message_text(text)?))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -5543,19 +5852,56 @@ mod tests {
     }
 
     #[test]
-    fn answer_splits_the_id_from_quoted_or_bare_text() {
+    fn attach_is_lifted_from_around_the_quoted_text_and_never_from_inside_it() {
+        let (attach, rest) = take_attach("\"see this\" --attach docs/notes.md", "reply").unwrap();
+        let attach = attach.unwrap();
         assert_eq!(
-            split_id_and_text(Some("q1 \"yes, go ahead\"")),
-            Some(("q1", "yes, go ahead"))
+            (attach.path.as_str(), attach.force),
+            ("docs/notes.md", false)
         );
+        assert_eq!(message_text(&rest), Some("see this"));
+
+        let (attach, rest) =
+            take_attach("--attach .env --force \"use --attach x\"", "answer").unwrap();
+        let attach = attach.unwrap();
+        assert_eq!((attach.path.as_str(), attach.force), (".env", true));
+        assert_eq!(message_text(&rest), Some("use --attach x"));
+
+        let (attach, rest) = take_attach("plain words --force --attach a.txt", "reply").unwrap();
+        assert!(attach.unwrap().force);
+        assert_eq!(message_text(&rest), Some("plain words"));
+
+        let (attach, rest) = take_attach("\"--attach inside\"", "reply").unwrap();
+        assert!(attach.is_none());
+        assert_eq!(message_text(&rest), Some("--attach inside"));
+
+        let (attach, rest) = take_attach("--attachments are words", "reply").unwrap();
+        assert!(attach.is_none());
+        assert_eq!(rest, "--attachments are words");
+    }
+
+    #[test]
+    fn attach_without_a_value_and_force_without_attach_are_refused_with_the_usage() {
+        for line in ["\"text\" --attach", "\"text\" --attach --force"] {
+            let err = take_attach(line, "reply").unwrap_err().to_string();
+            assert!(
+                err.starts_with(&format!(
+                    "'--attach' needs a value. {}",
+                    render_verb_help("reply")
+                )),
+                "{line}: {err}"
+            );
+        }
+        let err = take_attach("\"text\" --force", "answer")
+            .unwrap_err()
+            .to_string();
         assert_eq!(
-            split_id_and_text(Some("q1   plain words here")),
-            Some(("q1", "plain words here"))
+            err,
+            format!(
+                "`--force` only lifts the built-in deny for an attached file; pass `--attach <path>` or drop it. {}",
+                render_verb_help("answer")
+            )
         );
-        assert_eq!(split_id_and_text(Some("q1")), None);
-        assert_eq!(split_id_and_text(Some("q1 \"\"")), None);
-        assert_eq!(split_id_and_text(Some("q1   ")), None);
-        assert_eq!(split_id_and_text(None), None);
     }
 
     #[test]
@@ -5573,7 +5919,13 @@ mod tests {
         let mut correlation = correlation("q1", PendingState::Open);
         correlation.record.thread = "t-root".to_string();
 
-        let out = outbound_answer(&correlation, "yes, go ahead").unwrap();
+        let out = outbound_answer(
+            &correlation,
+            "yes, go ahead",
+            Vec::new(),
+            &PartLimits::default(),
+        )
+        .unwrap();
 
         assert_eq!(out.kind, PeerKind::Reply);
         assert_eq!(out.in_reply_to.as_deref(), Some("q1"));

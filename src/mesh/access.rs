@@ -41,7 +41,9 @@ use crate::mesh::shares::PeerRef;
 use crate::mesh::shares::{Mutation, ShareSet, WriteScope};
 use crate::mesh::trust::{Decision, TrustStore, same_hash};
 use crate::mesh::wire_path::WirePath;
-use crate::mesh::{destination_address, display_text, redact_hashes, rfc3339_utc, short};
+use crate::mesh::{
+    destination_address, display_text, human_size, redact_hashes, rfc3339_utc, short,
+};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -1408,26 +1410,6 @@ fn path_state(root: Option<&Path>, path: &str) -> String {
         )
 }
 
-/// `0 bytes`, `1 byte`, `512 bytes`, then decimal units: one decimal below ten of a unit
-/// (`1.2 KB`), whole above (`16 KB`, `3 MB`), with a `.0` dropped (`2 KB`).
-fn human_size(bytes: u64) -> String {
-    const UNITS: [(&str, f64); 3] = [("GB", 1e9), ("MB", 1e6), ("KB", 1e3)];
-    let size = bytes as f64;
-    match UNITS.iter().find(|(_, unit)| size >= *unit) {
-        None if bytes == 1 => "1 byte".to_string(),
-        None => format!("{bytes} bytes"),
-        Some((name, unit)) => {
-            let scaled = size / unit;
-            let shown = if scaled < 10.0 {
-                format!("{scaled:.1}")
-            } else {
-                format!("{scaled:.0}")
-            };
-            format!("{} {name}", shown.strip_suffix(".0").unwrap_or(&shown))
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2198,19 +2180,6 @@ mod tests {
             access_records(&fixture.slot)[0].reason,
             "the \"struct\" please"
         );
-    }
-
-    #[test]
-    fn sizes_read_in_bytes_then_decimal_units() {
-        assert_eq!(human_size(0), "0 bytes");
-        assert_eq!(human_size(1), "1 byte");
-        assert_eq!(human_size(512), "512 bytes");
-        assert_eq!(human_size(999), "999 bytes");
-        assert_eq!(human_size(1_200), "1.2 KB");
-        assert_eq!(human_size(2_048), "2 KB");
-        assert_eq!(human_size(16_384), "16 KB");
-        assert_eq!(human_size(3_000_000), "3 MB");
-        assert_eq!(human_size(2_500_000_000), "2.5 GB");
     }
 
     #[test]

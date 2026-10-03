@@ -93,6 +93,26 @@ pub(crate) fn age_text(now: SystemTime, then: SystemTime) -> String {
     }
 }
 
+/// `0 bytes`, `1 byte`, `512 bytes`, then decimal units: one decimal below ten of a unit
+/// (`1.2 KB`), whole above (`16 KB`, `3 MB`), with a `.0` dropped (`2 KB`).
+pub(crate) fn human_size(bytes: u64) -> String {
+    const UNITS: [(&str, f64); 3] = [("GB", 1e9), ("MB", 1e6), ("KB", 1e3)];
+    let size = bytes as f64;
+    match UNITS.iter().find(|(_, unit)| size >= *unit) {
+        None if bytes == 1 => "1 byte".to_string(),
+        None => format!("{bytes} bytes"),
+        Some((name, unit)) => {
+            let scaled = size / unit;
+            let shown = if scaled < 10.0 {
+                format!("{scaled:.1}")
+            } else {
+                format!("{scaled:.0}")
+            };
+            format!("{} {name}", shown.strip_suffix(".0").unwrap_or(&shown))
+        }
+    }
+}
+
 pub(crate) fn hex_lower(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -1087,6 +1107,19 @@ mod tests {
             mesh_config_dir(Path::new("/tmp/config")),
             PathBuf::from("/tmp/config/mesh")
         );
+    }
+
+    #[test]
+    fn sizes_read_in_bytes_then_decimal_units() {
+        assert_eq!(human_size(0), "0 bytes");
+        assert_eq!(human_size(1), "1 byte");
+        assert_eq!(human_size(512), "512 bytes");
+        assert_eq!(human_size(999), "999 bytes");
+        assert_eq!(human_size(1_200), "1.2 KB");
+        assert_eq!(human_size(2_048), "2 KB");
+        assert_eq!(human_size(16_384), "16 KB");
+        assert_eq!(human_size(3_000_000), "3 MB");
+        assert_eq!(human_size(2_500_000_000), "2.5 GB");
     }
 
     #[test]

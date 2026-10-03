@@ -26,7 +26,8 @@ use crate::mesh::lock::InstanceLock;
 use crate::mesh::message::{
     CHECK_INBOX_NEXT_ACTION, Disposition, ModelNotes, OutboundPeer, PEER_LINE_MAX_CHARS,
     PartLimits, PeerAdmission, PeerInbox, PeerKind, PeerMessage, PeerMessageHandler, PeerRouting,
-    PeerSurface, PeerVia, RawPeerMessage, SendError, collect_next_action, unix_now,
+    PeerSurface, PeerVia, RawPart, RawPeerMessage, SendError, SendOutcome, collect_next_action,
+    unix_now,
 };
 use crate::mesh::notify::{Notification, NotificationSink, Source};
 use crate::mesh::peers::{PEER_TABLE_MAX_ENTRIES, PeerChange, PeerSighting, PeerTable};
@@ -553,6 +554,56 @@ impl MeshRuntime {
     pub(crate) fn part_limits(&self) -> PartLimits {
         PartLimits {
             inline_max_bytes: self.inline_max_bytes,
+        }
+    }
+
+    /// `send_peer` for a message the human attached a file to: a file carried by
+    /// reference is first lent to the peer as a one-off grant under the message's id, so
+    /// the peer may fetch it once within the default TTL. Nothing takes a grant back, so
+    /// a send that then fails says the grant stands. A message with no reference part is
+    /// sent as it is.
+    pub(crate) async fn send_peer_lending_reference(
+        &self,
+        destination_hex: &str,
+        message: &OutboundPeer,
+    ) -> Result<SendOutcome> {
+        let references: Vec<String> = message
+            .parts
+            .iter()
+            .filter_map(|part| match part {
+                RawPart::File {
+                    reference: Some(reference),
+                    ..
+                } => Some(reference.clone()),
+                _ => None,
+            })
+            .collect();
+        let grant = if references.is_empty() {
+            None
+        } else {
+            Some(self.serving().grants().grant(
+                &message.id,
+                destination_hex,
+                &references,
+                None,
+                SystemTime::now(),
+            )?)
+        };
+        match self.send_peer(destination_hex, message).await {
+            Ok(outcome) => Ok(outcome),
+            Err(err) => match grant {
+                Some(grant) => bail!(
+                    "{err}; the one-off grant for {} to {} stands until {}",
+                    references
+                        .iter()
+                        .map(|path| format!("`{path}`"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    short(destination_hex),
+                    grant.expires
+                ),
+                None => Err(err.into()),
+            },
         }
     }
 
@@ -2462,6 +2513,45 @@ impl MeshSlot {
     /// recorded for the leader, whose earlier note said to wait for it.
     /// Never touches `correlations`: this answers a peer's question, not one of ours.
     pub(crate) async fn answer_inbound(&self, id: &str, text: &str) -> Result<()> {
+        let (store, record) = self.open_question(id)?;
+        if self
+            .envoy
+            .load_full()
+            .is_some_and(|sink| sink.answer(id, text))
+        {
+            return Ok(());
+        }
+        let runtime = self.runtime_to_answer(id, &record)?;
+        let reply = OutboundPeer::new(PeerKind::Reply, text, None, Some(id), None)?;
+        self.send_human_answer(&runtime, &store, &record, reply, text)
+            .await?;
+        Ok(())
+    }
+
+    /// `answer_inbound` carrying one file part, which goes to the peer from this node
+    /// alone: no live run is offered the answer, so the file's bytes never reach a model.
+    pub(crate) async fn answer_inbound_with_file(
+        &self,
+        id: &str,
+        text: &str,
+        part: RawPart,
+    ) -> Result<SendOutcome> {
+        let (store, record) = self.open_question(id)?;
+        let runtime = self.runtime_to_answer(id, &record)?;
+        let reply = OutboundPeer::with_parts(
+            PeerKind::Reply,
+            text,
+            None,
+            Some(id),
+            None,
+            vec![part],
+            &runtime.part_limits(),
+        )?;
+        self.send_human_answer(&runtime, &store, &record, reply, text)
+            .await
+    }
+
+    fn open_question(&self, id: &str) -> Result<(Arc<InboundStore>, InboundRecord)> {
         let Some(store) = self.inbound_store() else {
             bail!("Mesh is off; turn it on with `.mesh on` before answering {id}");
         };
@@ -2471,26 +2561,38 @@ impl MeshSlot {
         if record.kind == InboundKind::Access {
             bail!(access_not_a_question(id));
         }
-        if self
-            .envoy
-            .load_full()
-            .is_some_and(|sink| sink.answer(id, text))
-        {
-            return Ok(());
-        }
+        Ok((store, record))
+    }
+
+    fn runtime_to_answer(&self, id: &str, record: &InboundRecord) -> Result<Arc<MeshRuntime>> {
         let Some(runtime) = self.get() else {
             bail!(
                 "Mesh is off, so the answer to {id} cannot be sent to {}",
                 short(&record.peer_destination)
             );
         };
-        let reply = OutboundPeer::new(PeerKind::Reply, text, None, Some(id), None)?
+        Ok(runtime)
+    }
+
+    /// The tail both human answers share: in the question's thread, worded as answered,
+    /// sent with any reference lent, then dropped from the store and filed for the leader.
+    async fn send_human_answer(
+        &self,
+        runtime: &MeshRuntime,
+        store: &InboundStore,
+        record: &InboundRecord,
+        reply: OutboundPeer,
+        text: &str,
+    ) -> Result<SendOutcome> {
+        let reply = reply
             .with_thread(Some(record.thread.clone()))?
             .with_disposition(Disposition::Answered, None);
-        runtime.send_peer(&record.peer_destination, &reply).await?;
-        store.remove(id)?;
-        self.record_human_answer(&record, text);
-        Ok(())
+        let outcome = runtime
+            .send_peer_lending_reference(&record.peer_destination, &reply)
+            .await?;
+        store.remove(&record.id)?;
+        self.record_human_answer(record, text);
+        Ok(outcome)
     }
 
     /// The human's `.mesh answer` to `record` went to the peer with no live run. The
@@ -2957,6 +3059,67 @@ impl MeshSlot {
     }
 }
 
+/// An envoy that keeps every job it is offered, or refuses them all with one reason
+/// (a full queue unless told otherwise); answers are consumed or not as configured.
+#[cfg(test)]
+pub(crate) struct RecordingEnvoy {
+    refusal: Option<PeerRefusal>,
+    consume_answers: bool,
+    pub(crate) jobs: parking_lot::Mutex<Vec<PeerMessage>>,
+    pub(crate) answers: parking_lot::Mutex<Vec<(String, String)>>,
+    pub(crate) interrupts: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+impl RecordingEnvoy {
+    pub(crate) fn new(accept: bool, consume_answers: bool) -> Arc<Self> {
+        let refusal = (!accept).then(|| PeerRefusal::capacity(RefusalReason::EnvoyBusy));
+        Self::with_refusal(refusal, consume_answers)
+    }
+
+    pub(crate) fn refusing(reason: RefusalReason) -> Arc<Self> {
+        Self::with_refusal(Some(PeerRefusal::capacity(reason)), false)
+    }
+
+    fn with_refusal(refusal: Option<PeerRefusal>, consume_answers: bool) -> Arc<Self> {
+        Arc::new(Self {
+            refusal,
+            consume_answers,
+            jobs: parking_lot::Mutex::new(Vec::new()),
+            answers: parking_lot::Mutex::new(Vec::new()),
+            interrupts: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    pub(crate) fn job_ids(&self) -> Vec<String> {
+        self.jobs
+            .lock()
+            .iter()
+            .map(|message| message.message_id.clone())
+            .collect()
+    }
+}
+
+#[cfg(test)]
+impl EnvoySink for RecordingEnvoy {
+    fn accept(&self, job: EnvoyJob) -> Result<(), PeerRefusal> {
+        if let Some(refusal) = &self.refusal {
+            return Err(refusal.clone());
+        }
+        self.jobs.lock().push(job.message);
+        Ok(())
+    }
+
+    fn answer(&self, id: &str, text: &str) -> bool {
+        self.answers.lock().push((id.to_string(), text.to_string()));
+        self.consume_answers
+    }
+
+    fn interrupt(&self) {
+        self.interrupts.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 // Tests that start a runtime are unix-only: they run on the loopback fixtures under
 // `test_support`, which have only been run on unix so far. Lifting that gate is future work.
 #[cfg(test)]
@@ -2999,7 +3162,7 @@ mod tests {
     use rns_transport::iface::tcp_server::TcpServer;
     #[cfg(unix)]
     use std::sync::atomic::AtomicBool;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::Ordering;
     #[cfg(unix)]
     use tokio::net::TcpListener;
 
@@ -3547,64 +3710,6 @@ mod tests {
         match &envelope.payload {
             EnvelopePayload::Peer(message) => message,
             other => panic!("not a peer envelope: {other:?}"),
-        }
-    }
-
-    /// An envoy that keeps every job it is offered, or refuses them all with one reason
-    /// (a full queue unless told otherwise); answers are consumed or not as configured.
-    struct RecordingEnvoy {
-        refusal: Option<PeerRefusal>,
-        consume_answers: bool,
-        jobs: parking_lot::Mutex<Vec<PeerMessage>>,
-        answers: parking_lot::Mutex<Vec<(String, String)>>,
-        interrupts: AtomicUsize,
-    }
-
-    impl RecordingEnvoy {
-        fn new(accept: bool, consume_answers: bool) -> Arc<Self> {
-            let refusal = (!accept).then(|| PeerRefusal::capacity(RefusalReason::EnvoyBusy));
-            Self::with_refusal(refusal, consume_answers)
-        }
-
-        fn refusing(reason: RefusalReason) -> Arc<Self> {
-            Self::with_refusal(Some(PeerRefusal::capacity(reason)), false)
-        }
-
-        fn with_refusal(refusal: Option<PeerRefusal>, consume_answers: bool) -> Arc<Self> {
-            Arc::new(Self {
-                refusal,
-                consume_answers,
-                jobs: parking_lot::Mutex::new(Vec::new()),
-                answers: parking_lot::Mutex::new(Vec::new()),
-                interrupts: AtomicUsize::new(0),
-            })
-        }
-
-        fn job_ids(&self) -> Vec<String> {
-            self.jobs
-                .lock()
-                .iter()
-                .map(|message| message.message_id.clone())
-                .collect()
-        }
-    }
-
-    impl EnvoySink for RecordingEnvoy {
-        fn accept(&self, job: EnvoyJob) -> Result<(), PeerRefusal> {
-            if let Some(refusal) = &self.refusal {
-                return Err(refusal.clone());
-            }
-            self.jobs.lock().push(job.message);
-            Ok(())
-        }
-
-        fn answer(&self, id: &str, text: &str) -> bool {
-            self.answers.lock().push((id.to_string(), text.to_string()));
-            self.consume_answers
-        }
-
-        fn interrupt(&self) {
-            self.interrupts.fetch_add(1, Ordering::SeqCst);
         }
     }
 
