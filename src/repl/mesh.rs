@@ -20748,6 +20748,330 @@ mod tests {
                         fx.stop().await;
                     });
                 }
+
+                /// Usage probe (T32b (a), TASK-115 write rule): a standing grant lands in
+                /// the workspace share file when one exists, `--global` forces the global
+                /// file beside it, and `--workspace` creates the workspace file when it is
+                /// missing. Each entry is scoped to the requesting identity and the layer
+                /// is announced the way `.mesh allow` announces it.
+                #[test]
+                #[serial]
+                fn usage_probe_grant_standing_follows_the_share_write_rule_and_its_forcing_flags() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-grant-standing-rule");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-grant-standing-rule").await;
+                        let (_, locations) = share_locations(&fx.ctx).unwrap();
+                        let identity = fx.stub.identity_hex();
+                        let workspace = locations.workspace.clone();
+                        let global = locations.global.clone();
+                        fs::create_dir_all(workspace.parent().unwrap()).unwrap();
+                        fs::write(&workspace, "version: 1\nallow:\n- pattern: notes/**\n").unwrap();
+                        assert!(!global.exists());
+
+                        // Rule: a workspace file exists, so the grant is written there.
+                        fx.file("a-1", InboundKind::Access, &["src/x.rs"]);
+                        let out = out_of(&mut fx.ctx, ".mesh grant a-1 --standing")
+                            .await
+                            .unwrap();
+                        let lines: Vec<&str> = out.lines().collect();
+                        assert_eq!(lines.len(), 3, "{out}");
+                        assert!(
+                            lines[0].starts_with(&format!("Will write to {}", workspace.display())),
+                            "{out}"
+                        );
+                        assert!(
+                            lines[2]
+                                .contains(&format!("standing; written to {}", workspace.display())),
+                            "{out}"
+                        );
+                        assert!(
+                            !global.exists(),
+                            "the global file is not created by the rule"
+                        );
+                        assert_eq!(fx.stub.seen().len(), 1, "{:?}", fx.stub.seen());
+                        assert_eq!(
+                            fx.stub.seen()[0].content,
+                            "access granted: 1 path, standing"
+                        );
+
+                        // `--global` forces the global file although a workspace file exists.
+                        fx.file("a-2", InboundKind::Access, &["docs/y.md"]);
+                        let out = out_of(&mut fx.ctx, ".mesh grant a-2 --standing --global")
+                            .await
+                            .unwrap();
+                        assert!(
+                            out.lines()
+                                .last()
+                                .unwrap()
+                                .contains(&format!("standing; written to {}", global.display())),
+                            "{out}"
+                        );
+                        assert!(global.exists());
+
+                        let entries = ShareSet::load_quietly(locations.clone()).0.entries();
+                        let allow = |layer: Layer, pattern: &str, peer: Option<&str>| RawEntry {
+                            layer,
+                            kind: RawKind::Allow {
+                                pattern: pattern.to_string(),
+                                peer: peer.map(str::to_string),
+                            },
+                        };
+                        assert_eq!(
+                            entries,
+                            [
+                                allow(Layer::Global, "docs/y.md", Some(&identity)),
+                                allow(Layer::Workspace, "notes/**", None),
+                                allow(Layer::Workspace, "src/x.rs", Some(&identity)),
+                            ],
+                            "{entries:?}"
+                        );
+                        assert!(
+                            fx.grants().is_empty(),
+                            "a standing grant writes no one-off grant"
+                        );
+                        assert!(fx.pending_ids().is_empty());
+                        assert_eq!(fx.stub.seen().len(), 2, "{:?}", fx.stub.seen());
+                        assert_eq!(
+                            fx.stub.seen()[1].content,
+                            "access granted: 1 path, standing"
+                        );
+                        fx.stop().await;
+
+                        // `--workspace` creates the workspace file when none exists. (The
+                        // workspace config dir is the test guard's, shared by both fixtures
+                        // of this test, so the file the first part wrote is cleared first.)
+                        fs::remove_file(&workspace).unwrap();
+                        let mut fx = PeerFixture::new("repl-mesh-grant-standing-rule-ws").await;
+                        let (_, locations) = share_locations(&fx.ctx).unwrap();
+                        assert!(
+                            !locations.workspace.exists(),
+                            "{}",
+                            locations.workspace.display()
+                        );
+                        assert!(!locations.global.exists());
+                        fx.file("a-3", InboundKind::Access, &["src/z.rs"]);
+                        let out = out_of(&mut fx.ctx, ".mesh grant a-3 --standing --workspace")
+                            .await
+                            .unwrap();
+                        assert!(
+                            out.lines().last().unwrap().contains(&format!(
+                                "standing; written to {}",
+                                locations.workspace.display()
+                            )),
+                            "{out}"
+                        );
+                        assert!(locations.workspace.exists());
+                        assert!(!locations.global.exists());
+                        let entries = ShareSet::load_quietly(locations).0.entries();
+                        assert_eq!(
+                            entries,
+                            [RawEntry {
+                                layer: Layer::Workspace,
+                                kind: RawKind::Allow {
+                                    pattern: "src/z.rs".to_string(),
+                                    peer: Some(fx.stub.identity_hex()),
+                                },
+                            }]
+                        );
+                        assert_eq!(fx.heard(), "access granted: 1 path, standing");
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        fx.stop().await;
+                    });
+                }
+
+                /// Usage probe (R3): once a request is decided its record is gone, so a
+                /// second `grant` or `refuse` from the REPL teaches the unknown-id sentence,
+                /// sends nothing more and writes no second grant.
+                #[test]
+                #[serial]
+                fn usage_probe_a_decided_request_cannot_be_decided_again_from_the_repl() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-grant-twice");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-grant-twice").await;
+                        fx.file("a-1", InboundKind::Access, &["src/x.rs"]);
+                        out_of(&mut fx.ctx, ".mesh grant a-1").await.unwrap();
+                        assert_eq!(fx.grants().len(), 1);
+                        let heard_before = fx.stub.seen().len();
+                        let printed = stdout_lines().len();
+
+                        for line in [
+                            ".mesh grant a-1",
+                            ".mesh refuse a-1",
+                            ".mesh grant a-1 --standing",
+                        ] {
+                            assert_eq!(
+                                refusal(&mut fx.ctx, line).await,
+                                "No open access request has id a-1. `.mesh pending` lists the ones this node knows about.",
+                                "{line}"
+                            );
+                        }
+
+                        assert_eq!(stdout_lines().len(), printed, "{:?}", stdout_lines());
+                        assert_eq!(fx.stub.seen().len(), heard_before, "{:?}", fx.stub.seen());
+                        assert_eq!(fx.grants().len(), 1, "{:?}", fx.grants());
+                        assert!(fx.pending_ids().is_empty());
+                        fx.stop().await;
+                    });
+                }
+
+                /// Usage probe (R3 take-before-send): when the peer will not take the
+                /// decision, the request stays in `.mesh pending`, no grant is written, no
+                /// share entry lands, and the human reads one teaching error.
+                mod decision_gate {
+                    use crate::mesh::message::{from_r3_body, received_reply};
+                    use crate::mesh::test_support::{AdmittedRequest, Handler, RefusalCode, Reply};
+                    use async_trait::async_trait;
+                    use parking_lot::Mutex;
+                    use std::sync::atomic::{AtomicBool, Ordering};
+
+                    /// Refuses every `/message` while `armed`; afterwards acknowledges
+                    /// each body by id as a peer's slot would, keeping what it heard.
+                    #[derive(Default)]
+                    pub(super) struct Gate {
+                        pub(super) armed: AtomicBool,
+                        pub(super) heard: Mutex<Vec<String>>,
+                    }
+
+                    #[async_trait]
+                    impl Handler for Gate {
+                        async fn handle(&self, request: AdmittedRequest) -> Reply {
+                            if self.armed.load(Ordering::SeqCst) {
+                                return Reply::Code(RefusalCode::Throttled);
+                            }
+                            match from_r3_body(&request.body) {
+                                Ok(body) => {
+                                    self.heard.lock().push(body.content.clone());
+                                    Reply::Value(received_reply(&body.id))
+                                }
+                                Err(_) => Reply::Code(RefusalCode::InvalidData),
+                            }
+                        }
+                    }
+                }
+
+                #[test]
+                #[serial]
+                fn usage_probe_a_decision_the_peer_refuses_leaves_the_request_pending_and_writes_nothing()
+                 {
+                    use crate::mesh::test_support::{Handler, MESSAGE_PATH};
+                    use decision_gate::Gate;
+                    use std::sync::atomic::Ordering;
+
+                    let _guard = TestConfigDirGuard::new("repl-mesh-grant-unsent");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-grant-unsent").await;
+                        let gate = Arc::new(Gate::default());
+                        gate.armed.store(true, Ordering::SeqCst);
+                        fx.stub
+                            .serve(MESSAGE_PATH, gate.clone() as Arc<dyn Handler>);
+                        fx.file("a-1", InboundKind::Access, &["src/x.rs"]);
+                        fx.file("a-2", InboundKind::Access, &["docs/y.md"]);
+                        let (_, locations) = share_locations(&fx.ctx).unwrap();
+
+                        let one_off = refusal(&mut fx.ctx, ".mesh grant a-1").await;
+                        let standing = refusal(&mut fx.ctx, ".mesh grant a-2 --standing").await;
+                        let refused = refusal(&mut fx.ctx, ".mesh refuse a-1").await;
+
+                        for err in [&one_off, &standing, &refused] {
+                            assert_eq!(err.lines().count(), 1, "{err}");
+                            assert!(
+                                !err.contains("Granted") && !err.contains("Refused a-"),
+                                "no success sentence on a failed send: {err}"
+                            );
+                            assert!(
+                                !err.contains("Throttled") && !err.contains("R3Error"),
+                                "the human reads words, not a Debug dump: {err}"
+                            );
+                        }
+                        let mut ids = fx.pending_ids();
+                        ids.sort();
+                        assert_eq!(ids, ["a-1", "a-2"], "both requests are still pending");
+                        assert!(!locations.global.exists());
+                        assert!(!locations.workspace.exists());
+                        assert!(gate.heard.lock().is_empty(), "{:?}", gate.heard.lock());
+                        // Spec-first: a request that is pending again has not been granted;
+                        // a one-off grant the peer never heard of would outlive the human's
+                        // next decision. Recorded here, asserted below with its consequence.
+                        let orphan_after_failed_grant = fx.grants();
+
+                        // The records came back whole: the human now REFUSES a-1 and the
+                        // peer takes it; a refused request leaves no grant behind.
+                        gate.armed.store(false, Ordering::SeqCst);
+                        let out = out_of(&mut fx.ctx, ".mesh refuse a-1").await.unwrap();
+                        assert!(out.contains("Refused a-1: 1 path"), "{out}");
+                        assert_eq!(gate.heard.lock()[0], "access denied: 1 path");
+                        let grants_after_refusal = fx.grants();
+                        assert_eq!(fx.pending_ids(), ["a-2"]);
+
+                        // And a-2 granted standing succeeds on the second try, once.
+                        let out = out_of(&mut fx.ctx, ".mesh grant a-2 --standing")
+                            .await
+                            .unwrap();
+                        assert!(out.contains("Granted a-2: 1 path"), "{out}");
+                        assert_eq!(gate.heard.lock()[1], "access granted: 1 path, standing");
+                        assert!(fx.pending_ids().is_empty());
+                        assert!(locations.global.exists());
+                        fx.stop().await;
+
+                        assert!(
+                            grants_after_refusal.is_empty(),
+                            "the human refused a-1 and the peer heard `access denied`, yet a one-off grant for its paths is still live (written by the earlier grant whose decision the peer never heard, while the request went back to pending): {grants_after_refusal:?}"
+                        );
+                        assert!(
+                            orphan_after_failed_grant.is_empty(),
+                            "a one-off grant was written although the peer never heard yes and the request went back to pending: {orphan_after_failed_grant:?}"
+                        );
+                    });
+                }
+
+                /// Usage probe (R3 re-upsert): the request a failed send put back is whole,
+                /// so the same one-off decision succeeds on the next try and writes exactly
+                /// one grant.
+                #[test]
+                #[serial]
+                fn usage_probe_a_request_put_back_after_a_failed_send_is_granted_once_on_retry() {
+                    use crate::mesh::test_support::{Handler, MESSAGE_PATH};
+                    use decision_gate::Gate;
+                    use std::sync::atomic::Ordering;
+
+                    let _guard = TestConfigDirGuard::new("repl-mesh-grant-retry");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-grant-retry").await;
+                        let gate = Arc::new(Gate::default());
+                        gate.armed.store(true, Ordering::SeqCst);
+                        fx.stub
+                            .serve(MESSAGE_PATH, gate.clone() as Arc<dyn Handler>);
+                        fx.file("a-1", InboundKind::Access, &["src/x.rs"]);
+
+                        let _ = refusal(&mut fx.ctx, ".mesh grant a-1").await;
+                        assert_eq!(fx.pending_ids(), ["a-1"]);
+                        gate.armed.store(false, Ordering::SeqCst);
+                        let out = out_of(&mut fx.ctx, ".mesh grant a-1").await.unwrap();
+
+                        assert!(out.contains("Granted a-1: 1 path"), "{out}");
+                        assert!(
+                            gate.heard.lock()[0].starts_with("access granted:"),
+                            "{:?}",
+                            gate.heard.lock()
+                        );
+                        let grants = fx.grants();
+                        assert_eq!(
+                            grants.iter().filter(|g| g.id == "a-1").count(),
+                            1,
+                            "exactly one grant for the one decision the peer heard: {grants:?}"
+                        );
+                        assert!(fx.pending_ids().is_empty());
+                        fx.stop().await;
+                    });
+                }
             }
 
             mod attach {
@@ -21226,6 +21550,185 @@ mod tests {
                         pair.stop_node_a().await;
                     });
                 }
+
+                /// Usage probe (T32b (b): "size ≤ inline_max_bytes ⇒ inline"): a file of
+                /// exactly `inline_max_bytes` travels inline and earns no grant; one byte
+                /// more is a reference with a one-off grant.
+                #[test]
+                #[serial]
+                fn usage_probe_an_attachment_exactly_at_inline_max_bytes_travels_inline() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-attach-boundary");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::with_config(
+                            "repl-mesh-attach-boundary",
+                            with_inline_max(1024),
+                        )
+                        .await;
+                        let exact = vec![0x41; 1024];
+                        let over = vec![0x42; 1025];
+                        write(&fx.root.path, "exact.bin", &exact);
+                        write(&fx.root.path, "over.bin", &over);
+                        let to = fx.stub.destination_hex();
+
+                        let out = out_of(
+                            &mut fx.ctx,
+                            &format!(".mesh reply {to} --yes \"at the limit\" --attach exact.bin"),
+                        )
+                        .await
+                        .unwrap();
+                        assert!(
+                            out.lines()
+                                .any(|line| line == inline_line("exact.bin", 1024)),
+                            "{out}"
+                        );
+                        assert_eq!(fx.stub.seen()[0].parts, [inline_part("exact.bin", &exact)]);
+                        assert!(fx.grants().is_empty(), "{:?}", fx.grants());
+
+                        let out = out_of(
+                            &mut fx.ctx,
+                            &format!(".mesh reply {to} --yes \"over the limit\" --attach over.bin"),
+                        )
+                        .await
+                        .unwrap();
+                        assert!(
+                            out.lines()
+                                .any(|line| line == reference_line("over.bin", 1025, &to)),
+                            "{out}"
+                        );
+                        assert_eq!(fx.stub.seen()[1].parts, [reference_part("over.bin", &over)]);
+                        let grants = fx.grants();
+                        assert_eq!(grants.len(), 1, "{grants:?}");
+                        assert_eq!(grants[0].paths[0].path, "over.bin");
+                        fx.stop().await;
+                    });
+                }
+
+                /// Usage probe (T32b (b) on `answer`): a large attachment on an answer is a
+                /// reference part plus a one-off grant to the asking instance, the reply is
+                /// threaded to the question, the question is closed, and the envoy never
+                /// sees it.
+                #[test]
+                #[serial]
+                fn usage_probe_answer_with_a_large_attachment_sends_a_reference_and_closes_the_question()
+                 {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-attach-answer-reference");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::with_config(
+                            "repl-mesh-attach-answer-reference",
+                            with_inline_max(64),
+                        )
+                        .await;
+                        let big = vec![0x5A; 65];
+                        write(&fx.root.path, "docs/big.md", &big);
+                        fx.file("p1", InboundKind::Question, &[]);
+                        let envoy = RecordingEnvoy::new(true, true);
+                        fx.ctx
+                            .app
+                            .mesh
+                            .set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
+                        let to = fx.stub.destination_hex();
+
+                        let out = out_of(
+                            &mut fx.ctx,
+                            ".mesh answer p1 \"see the attached\" --attach docs/big.md",
+                        )
+                        .await
+                        .unwrap();
+
+                        let lines: Vec<&str> = out.lines().collect();
+                        assert_eq!(
+                            lines,
+                            [
+                                sending(&fx),
+                                reference_line("docs/big.md", 65, &to),
+                                "Answered p1.".to_string(),
+                            ],
+                            "{out}"
+                        );
+                        let seen = fx.stub.seen();
+                        assert_eq!(seen.len(), 1, "{seen:?}");
+                        assert_eq!(seen[0].kind, PeerKind::Reply);
+                        assert_eq!(seen[0].in_reply_to.as_deref(), Some("p1"));
+                        assert_eq!(seen[0].content, "see the attached");
+                        assert_eq!(seen[0].parts, [reference_part("docs/big.md", &big)]);
+                        let grants = fx.grants();
+                        assert_eq!(grants.len(), 1, "{grants:?}");
+                        assert_eq!(grants[0].peer, to);
+                        assert_eq!(
+                            grants[0].paths,
+                            [GrantedPath {
+                                path: "docs/big.md".to_string(),
+                                uses: 1,
+                                uses_left: 1,
+                            }]
+                        );
+                        assert!(fx.pending_ids().is_empty());
+                        assert!(envoy.answers.lock().is_empty());
+                        assert!(!out.contains("ZZZZ"), "file bytes are never printed: {out}");
+                        fx.stop().await;
+                    });
+                }
+
+                /// Usage probe (T32b (b): "the protected set (… inbox) refuses even with
+                /// `--force`"): with `mesh.fetch.inbox_dir` placed under the share root, a
+                /// staged peer file cannot be attached, forced or not, and nothing is sent.
+                #[test]
+                #[serial]
+                fn usage_probe_attach_refuses_the_configured_inbox_even_with_force() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-attach-inbox");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let root = TempDir::new("repl-mesh-attach-inbox-root");
+                        let inbox = root.path.join("inbox");
+                        let mut fx = PeerFixture::with_config("repl-mesh-attach-inbox", {
+                            let inbox = inbox.clone();
+                            move |config| config.fetch.inbox_dir = Some(inbox.clone())
+                        })
+                        .await;
+                        publish_root(&fx.ctx, &root.path);
+                        write(&root.path, "inbox/peer1/x.txt", b"theirs\n");
+                        write(&root.path, "docs/notes.md", NOTES);
+                        let to = fx.stub.destination_hex();
+                        let printed = stdout_lines().len();
+
+                        for args in [
+                            "--attach inbox/peer1/x.txt",
+                            "--attach inbox/peer1/x.txt --force",
+                        ] {
+                            let line = format!(".mesh reply {to} --yes \"x\" {args}");
+                            let err = refusal(&mut fx.ctx, &line).await;
+                            assert!(
+                                err.contains("never shared") && err.contains("`--force`"),
+                                "{line}: {err}"
+                            );
+                            assert!(!err.contains("theirs"), "{err}");
+                        }
+
+                        assert_eq!(stdout_lines().len(), printed, "{:?}", stdout_lines());
+                        assert!(fx.stub.seen().is_empty(), "{:?}", fx.stub.seen());
+                        assert!(fx.grants().is_empty());
+
+                        // A sibling outside the inbox still attaches: the refusal is the
+                        // inbox's, not the root's.
+                        let out = out_of(
+                            &mut fx.ctx,
+                            &format!(".mesh reply {to} --yes \"x\" --attach docs/notes.md"),
+                        )
+                        .await
+                        .unwrap();
+                        assert!(
+                            out.lines()
+                                .any(|line| line == inline_line("docs/notes.md", 9)),
+                            "{out}"
+                        );
+                        fx.stop().await;
+                    });
+                }
             }
 
             mod fetch_verb {
@@ -21629,6 +22132,131 @@ mod tests {
                         fx.stop().await;
                     });
                 }
+
+                /// Usage probe (T32b (a): "maps every `Fetched`/`FetchError` outcome to a
+                /// human teaching sentence carrying the same facts as `mesh__fetch`'s"):
+                /// bytes that do not hash as the peer said, a status word this Coyote does
+                /// not know, and a reply missing its bytes each end in one sentence that
+                /// names the fault; nothing is staged and no byte of the body is echoed.
+                #[test]
+                #[serial]
+                fn usage_probe_fetch_names_a_corrupt_unknown_or_malformed_reply_and_stages_nothing()
+                {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-fetch-bad-replies");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = FetchFixture::new("repl-mesh-fetch-bad-replies", true).await;
+                        let dest = fx.stub.destination_hex();
+                        let line = format!(".mesh fetch {dest} docs/a.md");
+                        let marker = b"MARKER-BYTES-NEVER-SHOWN";
+
+                        // ok, but the bytes do not hash to the sha256 the peer sent.
+                        fx.queue(
+                            "ok",
+                            vec![
+                                ("size", Value::from(marker.len() as u64)),
+                                ("sha256", Value::Binary(vec![0u8; 32])),
+                                ("bytes", Value::Binary(marker.to_vec())),
+                            ],
+                        );
+                        let corrupt = refusal(&mut fx.ctx, &line).await;
+                        assert!(
+                            corrupt.contains("do not match the hash"),
+                            "the mesh__fetch fact for a corrupt body: {corrupt}"
+                        );
+
+                        // A status word this Coyote does not read.
+                        fx.queue("teapot", vec![]);
+                        let unknown = refusal(&mut fx.ctx, &line).await;
+                        assert!(unknown.contains("unknown status"), "{unknown}");
+
+                        // ok without its bytes.
+                        fx.queue("ok", vec![("size", Value::from(4u64))]);
+                        let malformed = refusal(&mut fx.ctx, &line).await;
+                        assert!(malformed.contains("could not be read"), "{malformed}");
+
+                        for err in [&corrupt, &unknown, &malformed] {
+                            assert_eq!(err.lines().count(), 1, "{err}");
+                            assert!(
+                                !err.contains("MARKER")
+                                    && !err.contains("FetchError")
+                                    && !err.contains("Corrupt"),
+                                "words for a human, no bytes and no Debug: {err}"
+                            );
+                        }
+                        assert_eq!(fx.heard().len(), 3);
+                        assert!(!fx.inbox_root().exists(), "nothing was staged");
+                        assert!(
+                            !stdout_lines().iter().any(|l| l.contains("MARKER")),
+                            "{:?}",
+                            stdout_lines()
+                        );
+                        fx.stop().await;
+                    });
+                }
+
+                /// Usage probe (T32b (a): "into the SAME staging inbox the tool uses" +
+                /// "prints the staged absolute path"): a second fetch of a path whose bytes
+                /// changed lands beside the first copy under the inbox's hash-suffixed
+                /// name, the printed path is that real path, and an unchanged re-fetch
+                /// reuses the first copy.
+                #[test]
+                #[serial]
+                fn usage_probe_fetching_a_changed_file_again_stages_it_beside_and_prints_where() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-fetch-again");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = FetchFixture::new("repl-mesh-fetch-again", true).await;
+                        let dest = fx.stub.destination_hex();
+                        let line = format!(".mesh fetch {dest} docs/a.md");
+                        let first = b"# a v1\n";
+                        let second = b"# a v2\n";
+
+                        fx.queue("ok", ok_reply(first));
+                        let out1 = out_of(&mut fx.ctx, &line).await.unwrap();
+                        let peer_dir = dunce::canonicalize(fx.inbox_root())
+                            .unwrap()
+                            .join(dest[..8].to_lowercase());
+                        let staged1 = peer_dir.join("docs").join("a.md");
+                        assert!(
+                            out1.contains(&format!("at {}.", staged1.display())),
+                            "{out1}"
+                        );
+                        assert_eq!(fs::read(&staged1).unwrap(), first);
+
+                        fx.queue("ok", ok_reply(second));
+                        let out2 = out_of(&mut fx.ctx, &line).await.unwrap();
+                        let sha8 = &hex_lower(&Sha256::digest(second))[..8];
+                        let staged2 = peer_dir.join("docs").join(format!("a-{sha8}.md"));
+                        assert_eq!(
+                            fs::read(&staged1).unwrap(),
+                            first,
+                            "the first copy keeps its place"
+                        );
+                        assert_eq!(fs::read(&staged2).unwrap(), second, "{out2}");
+                        assert!(
+                            out2.contains(&format!("at {}.", staged2.display())),
+                            "the printed path is where the bytes really landed: {out2}"
+                        );
+                        assert!(out2.contains(&hex_lower(&Sha256::digest(second))), "{out2}");
+
+                        fx.queue("ok", ok_reply(second));
+                        let out3 = out_of(&mut fx.ctx, &line).await.unwrap();
+                        assert!(
+                            out3.contains(&format!("at {}.", staged2.display())),
+                            "an unchanged copy is reused, at the same path: {out3}"
+                        );
+                        let staged: Vec<String> = fs::read_dir(peer_dir.join("docs"))
+                            .unwrap()
+                            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                            .collect();
+                        assert_eq!(staged.len(), 2, "{staged:?}");
+                        assert_eq!(fx.heard().len(), 3);
+                        fx.stop().await;
+                    });
+                }
             }
 
             mod purge {
@@ -21967,6 +22595,129 @@ mod tests {
                     );
                     assert_eq!(prompt_script::prompts_asked(), 0);
                     assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
+                }
+
+                /// Usage probe (T32b (j): "a symlinked root or instance dir is never
+                /// followed"): when the inbox ROOT itself (`<cache>/mesh/inbox`) is a
+                /// symlink to a directory holding this instance's files, nothing behind
+                /// the link is counted, confirmed or removed.
+                #[test]
+                #[serial]
+                fn usage_probe_inbox_purge_files_never_follows_a_symlinked_inbox_root() {
+                    let _guard = TestConfigDirGuard::new(ROOT_TAG);
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[true]);
+                    run_async(async {
+                        let started = started_runtime(ROOT_TAG).await;
+                        let mut ctx = ctx_with(MeshConfig::default(), true);
+                        ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                        let instance_dir = started.runtime.inbox_staging().root().to_path_buf();
+                        let inbox_root = instance_dir.parent().unwrap().to_path_buf();
+                        let instance_id = instance_dir.file_name().unwrap().to_owned();
+                        let elsewhere = TempDir::new(&format!("{ROOT_TAG}-elsewhere"));
+                        let behind = elsewhere.path.join(&instance_id).join("aabbccdd");
+                        fs::create_dir_all(&behind).unwrap();
+                        fs::write(behind.join("a.md"), b"hello").unwrap();
+                        if inbox_root.exists() {
+                            fs::remove_dir_all(&inbox_root).unwrap();
+                        }
+                        fs::create_dir_all(inbox_root.parent().unwrap()).unwrap();
+                        std::os::unix::fs::symlink(&elsewhere.path, &inbox_root).unwrap();
+                        assert!(instance_dir.join("aabbccdd").join("a.md").exists());
+
+                        let before = stdout_lines().len();
+                        let text = match run(&mut ctx, ".mesh inbox --purge-files --yes").await {
+                            Ok(_) => stdout_lines()[before..].join("\n"),
+                            Err(err) => format!("Err: {err}"),
+                        };
+
+                        assert_eq!(
+                            fs::read(behind.join("a.md")).unwrap(),
+                            b"hello",
+                            "nothing behind the link was removed: {text}"
+                        );
+                        assert!(
+                            fs::symlink_metadata(&inbox_root)
+                                .unwrap()
+                                .file_type()
+                                .is_symlink(),
+                            "the link itself stays: {text}"
+                        );
+                        assert!(
+                            !text.starts_with("Removed"),
+                            "no removal is claimed: {text}"
+                        );
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+
+                        assert!(ctx.app.mesh.stop().await.unwrap());
+                        started.relay_handle.abort();
+                    });
+                }
+
+                /// Usage probe (T32b (j): "nothing else under the inbox root is touched"
+                /// + "never followed"): a directory symlink inside this instance's tree is
+                /// removed as a link; the directory it points to, and its files, survive
+                /// and are not part of the count or the byte total.
+                #[test]
+                #[serial]
+                fn usage_probe_inbox_purge_files_does_not_descend_into_a_symlinked_directory() {
+                    let _guard = TestConfigDirGuard::new(ROOT_TAG);
+                    let _capture = capture::install();
+                    let asked: Arc<Mutex<Vec<String>>> = Arc::default();
+                    let recorder = asked.clone();
+                    let _script = prompt_script::install_answering(move |question| {
+                        recorder.lock().push(question.to_string());
+                        true
+                    });
+                    run_async(async {
+                        let started = started_runtime(ROOT_TAG).await;
+                        let mut ctx = ctx_with(MeshConfig::default(), true);
+                        ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                        let root = started.runtime.inbox_staging().root().to_path_buf();
+                        let outside = TempDir::new(&format!("{ROOT_TAG}-outside-dir"));
+                        fs::write(outside.path.join("big.txt"), vec![b'x'; 1000]).unwrap();
+                        let peer_dir = root.join("aabbccdd");
+                        fs::create_dir_all(&peer_dir).unwrap();
+                        fs::write(peer_dir.join("b.bin"), b"1234567").unwrap();
+                        std::os::unix::fs::symlink(&outside.path, peer_dir.join("docs")).unwrap();
+
+                        let dry = out_of(&mut ctx, ".mesh inbox --purge-files --dry-run")
+                            .await
+                            .unwrap();
+                        assert!(
+                            !dry.contains("big.txt")
+                                && !dry.contains("1000")
+                                && !dry.contains("1007"),
+                            "the link's target is not walked: {dry}"
+                        );
+                        assert_eq!(fs::read(outside.path.join("big.txt")).unwrap().len(), 1000);
+
+                        let out = out_of(&mut ctx, ".mesh inbox --purge-files").await.unwrap();
+
+                        assert_eq!(prompt_script::prompts_asked(), 1);
+                        let question = asked.lock()[0].clone();
+                        assert!(
+                            question.contains("(7 bytes)")
+                                && !question.contains("1000")
+                                && !question.contains("1007"),
+                            "the byte total is this tree's own: {question}"
+                        );
+                        assert!(out.starts_with("Removed "), "{out}");
+                        assert!(
+                            out.contains("(7 bytes)"),
+                            "the removal line counts this tree's own bytes: {out}"
+                        );
+                        assert!(!root.exists(), "{}", root.display());
+                        assert_eq!(
+                            fs::read(outside.path.join("big.txt")).unwrap().len(),
+                            1000,
+                            "the directory behind the link survives"
+                        );
+                        assert!(outside.path.is_dir());
+
+                        assert!(ctx.app.mesh.stop().await.unwrap());
+                        started.relay_handle.abort();
+                    });
                 }
             }
         }
