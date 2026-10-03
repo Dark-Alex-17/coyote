@@ -2117,22 +2117,33 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
         }
     }
 
+    /// The sentences the withdrawn `.mesh fetch` spelling of the SYNC verb stood in.
+    /// `.mesh fetch` is now the file verb, so the pin below matches these sentences and
+    /// never the bare words; keep every needle a `.mesh fetch` sentence so the pin stays a
+    /// strict narrowing of the old bare-token tripwire.
+    const WITHDRAWN_SYNC_PHRASINGS: [&str; 5] = [
+        "`.mesh fetch` runs a fetch",
+        "on demand with `.mesh fetch`",
+        "from `.mesh fetch`;",
+        "only `.mesh fetch` runs",
+        "`.mesh fetch` is refused",
+    ];
+
+    fn names_fetch_as_the_sync_verb(line: &str) -> bool {
+        WITHDRAWN_SYNC_PHRASINGS
+            .iter()
+            .any(|phrase| line.contains(phrase))
+    }
+
     /// The verb that pulls held messages is `.mesh sync`; the spec names it and never
     /// its withdrawn name. `.mesh fetch` is the file verb, so the needle is the sync
     /// sentences the old spelling stood in, not the bare words.
     #[test]
     fn usage_probe_spec_names_the_sync_verb_not_the_fetch_verb() {
-        const WITHDRAWN: [&str; 5] = [
-            "`.mesh fetch` runs a fetch",
-            "on demand with `.mesh fetch`",
-            "from `.mesh fetch`;",
-            "only `.mesh fetch` runs",
-            "`.mesh fetch` is refused",
-        ];
         let hits: Vec<String> = SPEC
             .lines()
             .enumerate()
-            .filter(|(_, line)| WITHDRAWN.iter().any(|phrase| line.contains(phrase)))
+            .filter(|(_, line)| names_fetch_as_the_sync_verb(line))
             .map(|(index, _)| {
                 format!(
                     "docs/mesh/PROTOCOL.md:{}: names .mesh fetch as the sync verb",
@@ -2145,6 +2156,50 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
             SPEC.contains("`.mesh sync`"),
             "the spec no longer names `.mesh sync`"
         );
+    }
+
+    /// Usage probe (TASK-116 90e48e1): the narrowed needle is still red-capable for every
+    /// withdrawn SYNC sentence, is a strict narrowing of the old bare `.mesh fetch` pin, and
+    /// spares the sentences TASK-118 will write for the FILE verb.
+    #[test]
+    fn usage_probe_sync_needle_trips_the_withdrawn_sentences_and_spares_the_file_verb() {
+        for phrase in WITHDRAWN_SYNC_PHRASINGS {
+            assert!(
+                phrase.contains(".mesh fetch"),
+                "{phrase:?} would flag a line the old bare-token pin did not"
+            );
+            let line = format!("Some prose, {phrase} in the middle of a sentence.");
+            assert!(
+                names_fetch_as_the_sync_verb(&line),
+                "the withdrawn sentence {phrase:?} no longer trips the pin"
+            );
+        }
+        // The live spec line the sync sentences came from: with the sync verb swapped
+        // back to the old spelling it must trip, as written it must not.
+        let live = SPEC
+            .lines()
+            .find(|line| line.contains("only `.mesh sync` runs a fetch"))
+            .expect("the spec still carries the `.mesh sync` sentence");
+        assert!(!names_fetch_as_the_sync_verb(live));
+        assert!(names_fetch_as_the_sync_verb(
+            &live.replace("`.mesh sync`", "`.mesh fetch`")
+        ));
+        for file_verb in [
+            "`.mesh fetch <destination> <path> [--if-sha256 <hex>]` pulls one shared file into the staging inbox.",
+            "The operator pulls it with `.mesh fetch`; the staged path, size and sha256 are printed, never the bytes.",
+            "A `too_large` reply from `.mesh fetch` names the limit.",
+        ] {
+            assert!(
+                !names_fetch_as_the_sync_verb(file_verb),
+                "file-verb sentence {file_verb:?} trips the sync pin"
+            );
+        }
+        // Known collision the spec author must write around: the file verb also obeys
+        // the mesh gate, yet "`.mesh fetch` is refused" is one of the withdrawn sync
+        // sentences, so that exact spelling trips the pin whichever verb it describes.
+        assert!(names_fetch_as_the_sync_verb(
+            "`.mesh fetch` is refused while the node is off."
+        ));
     }
 
     /// Usage probe for T33 (a)/B2: section 5.1's layout line, every offset the field

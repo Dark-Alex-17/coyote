@@ -21807,6 +21807,81 @@ mod tests {
                     });
                 }
 
+                /// An answer to a question THIS node asked (an outbound correlation) also
+                /// takes `--attach`: the file rides the reply by reference with a one-off
+                /// grant lent to the asked peer, through the send path rather than the
+                /// inbound answer path, so an envoy hold on the same id — which only ever
+                /// guards a peer's question — never refuses it.
+                #[test]
+                #[serial]
+                fn answering_this_nodes_own_question_with_an_attachment_lends_by_reference() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-attach-outbound");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    use crate::mesh::pending::PENDING_RECORD_VERSION;
+                    run_async(async {
+                        let mut fx = PeerFixture::with_config(
+                            "repl-mesh-attach-outbound",
+                            with_inline_max(1024),
+                        )
+                        .await;
+                        let big = vec![0x5A; 1025];
+                        write(&fx.root.path, "big.bin", &big);
+                        let to = fx.stub.destination_hex();
+                        let now = SystemTime::now();
+                        fx.ctx
+                            .app
+                            .mesh
+                            .correlations()
+                            .open(crate::mesh::pending::PendingRecord {
+                                version: PENDING_RECORD_VERSION,
+                                id: "q1".to_string(),
+                                peer_destination: to.clone(),
+                                peer_identity: fx.stub.identity_hex(),
+                                thread: "q1".to_string(),
+                                question: "what now?".to_string(),
+                                sent_at: rfc3339_utc(now),
+                                timeout_at: rfc3339_utc(now + Duration::from_secs(600)),
+                                state: PendingState::Open,
+                                reply: None,
+                            })
+                            .unwrap();
+                        let envoy = RecordingEnvoy::new(true, true);
+                        *envoy.held.lock() = Some("q1".to_string());
+                        fx.ctx
+                            .app
+                            .mesh
+                            .set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
+
+                        let out = out_of(&mut fx.ctx, ".mesh answer q1 \"here\" --attach big.bin")
+                            .await
+                            .unwrap();
+
+                        let lines: Vec<&str> = out.lines().collect();
+                        assert!(
+                            lines.contains(&reference_line("big.bin", 1025, &to).as_str()),
+                            "{out}"
+                        );
+                        let last = lines.last().unwrap();
+                        assert!(
+                            last.starts_with("Sent ")
+                                && last.contains("as a reply to q1 (via direct)."),
+                            "{out}"
+                        );
+                        let seen = fx.stub.seen();
+                        assert_eq!(seen.len(), 1, "{seen:?}");
+                        assert_eq!(seen[0].kind, PeerKind::Reply);
+                        assert_eq!(seen[0].in_reply_to.as_deref(), Some("q1"));
+                        assert_eq!(seen[0].parts, [reference_part("big.bin", &big)]);
+                        let grants = fx.grants();
+                        assert_eq!(grants.len(), 1, "{grants:?}");
+                        assert_eq!(grants[0].id, seen[0].id);
+                        assert_eq!(grants[0].peer, to);
+                        assert!(envoy.answers.lock().is_empty(), "the envoy saw nothing");
+                        fx.stop().await;
+                    });
+                }
+
                 #[test]
                 #[serial]
                 fn attach_never_hands_the_answer_or_the_file_to_the_envoy() {
