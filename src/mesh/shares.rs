@@ -965,39 +965,48 @@ impl ShareSet {
             return Some(head.to_string());
         }
         let resolved = dunce::canonicalize(self.canonical_root().ok()?.join(head)).ok()?;
-        protected_dirs(&self.locations)
-            .iter()
-            .any(|dir| resolved.starts_with(dir))
-            .then(|| head.to_string())
+        // The walk skips `.git` by name, so a link to one is not among `protected_dirs`.
+        (resolved.file_name().is_some_and(|name| name == ".git")
+            || protected_dirs(&self.locations)
+                .iter()
+                .any(|dir| resolved.starts_with(dir)))
+        .then(|| head.to_string())
     }
 
     /// Whether the built-in deny, with the workspace config directory, names this one
     /// relative file: judged on the text, and on what it resolves to under the root when
     /// it exists, so a link to a secret is caught as a fetch of it would be. This is what
-    /// a forced allow of such a file has to be told about; a text match is reported over
-    /// a resolution match, since an override of the text lifts the former alone.
+    /// a forced allow of such a file has to be told about; a link is reported by its
+    /// resolution even when its own name matches, since an override of the text would
+    /// lift nothing: overrides are judged on the resolved name.
     pub(crate) fn builtin_denies(
         &self,
         path: &str,
         case_insensitive: bool,
     ) -> Result<Option<BuiltinHit>> {
         let builtin = self.builtin(case_insensitive)?;
-        if builtin.is_match(path) {
-            return Ok(Some(BuiltinHit::ByText));
+        let by_text = builtin.is_match(path);
+        let Some(resolved) = self.resolved_name(path) else {
+            return Ok(by_text.then_some(BuiltinHit::ByText));
+        };
+        let same_name = if case_insensitive {
+            path.to_lowercase() == resolved.to_lowercase()
+        } else {
+            path == resolved
+        };
+        if same_name {
+            return Ok(by_text.then_some(BuiltinHit::ByText));
         }
-        let Ok(root) = self.canonical_root() else {
-            return Ok(None);
-        };
-        let Ok(canonical) = dunce::canonicalize(root.join(path)) else {
-            return Ok(None);
-        };
-        let Some(segments) = segments_under(&root, &canonical) else {
-            return Ok(None);
-        };
-        let resolved = segments.join("/");
-        Ok(builtin
-            .is_match(&resolved)
+        Ok((by_text || builtin.is_match(&resolved))
             .then_some(BuiltinHit::ByResolution { resolved }))
+    }
+
+    /// The `/`-separated path under the root that `root/path` resolves to on disk; `None`
+    /// when it does not exist or lands outside the root.
+    fn resolved_name(&self, path: &str) -> Option<String> {
+        let root = self.canonical_root().ok()?;
+        let canonical = dunce::canonicalize(root.join(path)).ok()?;
+        Some(segments_under(&root, &canonical)?.join("/"))
     }
 }
 
@@ -2971,6 +2980,18 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn protected_head_names_a_link_that_resolves_to_the_git_dir() {
+        let fx = Fixture::new("protected-head-git-link");
+        fx.file(".git/HEAD");
+        fx.link("git-link", ".git");
+        let set = fx.load();
+
+        assert_eq!(set.protected_head("git-link/**"), Some("git-link".into()));
+        assert_eq!(set.protected_head("git-link"), Some("git-link".into()));
+    }
+
     #[test]
     fn builtin_denies_the_usual_secrets_git_and_the_workspace_config_dir_but_not_a_doc() {
         let fx = Fixture::new("builtin-denies");
@@ -3017,8 +3038,25 @@ mod tests {
         assert_eq!(set.builtin_denies("docs/missing", false).unwrap(), None);
         assert_eq!(
             set.builtin_denies("docs/.env.local", false).unwrap(),
+            Some(BuiltinHit::ByResolution {
+                resolved: ".env".to_string()
+            }),
+            "a link is judged by its resolution even when its own name matches"
+        );
+        fx.file("docs/.env.staging");
+        fx.file("real.key");
+        fx.link("certs/server.key", "../real.key");
+        assert_eq!(
+            set.builtin_denies("certs/server.key", false).unwrap(),
+            Some(BuiltinHit::ByResolution {
+                resolved: "real.key".to_string()
+            }),
+            "a secret-like link name pointing at a plain name is still reported by resolution"
+        );
+        assert_eq!(
+            set.builtin_denies("docs/.env.staging", false).unwrap(),
             Some(BuiltinHit::ByText),
-            "the text match is reported over the resolution"
+            "an existing non-link keeps the text judgement"
         );
     }
 

@@ -3083,18 +3083,23 @@ fn audience(interface: &MeshInterface) -> &'static str {
 fn shared_count(ctx: &RequestContext) -> Option<MatchCount> {
     let (root, locations) = share_locations(ctx)?;
     let (set, _warning) = ShareSet::load_quietly(locations);
-    let count = set.count_shared(
+    Some(preview_count(set.count_shared(
         &PeerRef::unscoped(),
         case_folding_hint(&root).unwrap_or(false),
         DEFAULT_LIST_WALK_BOUND,
         LIST_PAGE_SIZE + 1,
-    );
-    // The walk caps at `cap` files seen, so one past the page tells a full page from more.
-    Some(MatchCount {
+    )))
+}
+
+/// A walk counted up to one past the page, mapped to what the preview says. A cap
+/// reached on duplicate candidates leaves later start directories unwalked, so a capped
+/// count still within the page is a floor.
+fn preview_count(count: MatchCount) -> MatchCount {
+    MatchCount {
         files: count.files.min(LIST_PAGE_SIZE),
         capped: count.files > LIST_PAGE_SIZE,
-        truncated: count.truncated,
-    })
+        truncated: count.truncated || (count.capped && count.files <= LIST_PAGE_SIZE),
+    }
 }
 
 /// What `.mesh on` prints before anything leaves the machine.
@@ -12813,6 +12818,42 @@ mod tests {
                     });
                 }
 
+                /// A link whose own name the built-in deny matches is still judged by
+                /// what it resolves to: an override of `certs/server.key` would lift
+                /// nothing, since overrides are judged on the resolved name.
+                #[test]
+                #[serial]
+                fn allow_force_on_a_link_whose_own_name_is_secret_like_names_the_resolved_file() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-allow-force-secret-link");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = ShareFixture::new(
+                            "repl-mesh-allow-force-secret-link",
+                            &["real.key", "docs/a.md"],
+                        )
+                        .await;
+                        std::fs::create_dir_all(fx.root.path.join("certs")).unwrap();
+                        std::os::unix::fs::symlink(
+                            "../real.key",
+                            fx.root.path.join("certs/server.key"),
+                        )
+                        .unwrap();
+
+                        let err =
+                            refusal(&mut fx.ctx, ".mesh allow certs/server.key --force --global")
+                                .await;
+
+                        assert_eq!(
+                            err,
+                            "`certs/server.key` resolves to `real.key`, which the built-in deny names; `.mesh allow real.key --force --global` lifts that file."
+                        );
+                        assert!(!fx.locations.global.exists());
+                        assert!(fx.entries().is_empty());
+                        fx.stop().await;
+                    });
+                }
+
                 #[test]
                 #[serial]
                 fn allow_force_under_the_workspace_layer_teaches_global() {
@@ -14138,6 +14179,44 @@ mod tests {
                         "  files: 2 path(s) are shared with trusted peers (`.mesh shares`)",
                     );
                     assert!(files < index_of(&out, "Mesh stays off"), "{out:?}");
+                }
+
+                /// `Walk.capped` trips on candidates kept before dedup, so two heads
+                /// resolving to one directory can cap the walk within the page and leave
+                /// later starts unwalked; the preview then says "at least".
+                #[test]
+                fn on_preview_says_at_least_when_the_walk_capped_on_duplicate_candidates() {
+                    assert_eq!(
+                        preview_count(MatchCount {
+                            files: 600,
+                            capped: true,
+                            truncated: false,
+                        }),
+                        MatchCount {
+                            files: 600,
+                            capped: false,
+                            truncated: true,
+                        }
+                    );
+                    assert_eq!(
+                        preview_count(MatchCount {
+                            files: LIST_PAGE_SIZE + 1,
+                            capped: true,
+                            truncated: false,
+                        }),
+                        MatchCount {
+                            files: LIST_PAGE_SIZE,
+                            capped: true,
+                            truncated: false,
+                        },
+                        "one past the page is the cap, not a floor"
+                    );
+                    let exact = MatchCount {
+                        files: 3,
+                        capped: false,
+                        truncated: false,
+                    };
+                    assert_eq!(preview_count(exact.clone()), exact);
                 }
 
                 #[test]
