@@ -2138,11 +2138,7 @@ fn describe_matches(
         DEFAULT_LIST_WALK_BOUND,
         BROAD_MATCH_LIMIT + 1,
     )?;
-    let words = if count.capped || count.truncated {
-        format!("more than {BROAD_MATCH_LIMIT}")
-    } else {
-        count.files.to_string()
-    };
+    let words = breadth_words(&count);
     out_text(&format!(
         "`{pattern}` matches {words} file(s) under {}.",
         root.display()
@@ -2151,6 +2147,18 @@ fn describe_matches(
         broad: is_broad_pattern(pattern) || count.files > BROAD_MATCH_LIMIT || count.truncated,
         words,
     })
+}
+
+/// A walk that stopped at its bound before reaching the cap has seen a floor, not a
+/// count, and must not claim the limit was passed.
+fn breadth_words(count: &MatchCount) -> String {
+    if count.capped {
+        format!("more than {BROAD_MATCH_LIMIT}")
+    } else if count.truncated {
+        format!("at least {}", count.files)
+    } else {
+        count.files.to_string()
+    }
 }
 
 /// `(layer, kind)` for every entry whose text is exactly `pattern`, global first, in
@@ -12463,6 +12471,35 @@ mod tests {
                         );
                         fx.stop().await;
                     });
+                }
+
+                #[test]
+                fn breadth_words_say_more_than_the_limit_only_when_the_cap_was_reached() {
+                    assert_eq!(
+                        breadth_words(&MatchCount {
+                            files: BROAD_MATCH_LIMIT + 1,
+                            capped: true,
+                            truncated: false,
+                        }),
+                        "more than 100"
+                    );
+                    assert_eq!(
+                        breadth_words(&MatchCount {
+                            files: 7,
+                            capped: false,
+                            truncated: true,
+                        }),
+                        "at least 7",
+                        "a walk cut short before the cap names a floor, not the limit"
+                    );
+                    assert_eq!(
+                        breadth_words(&MatchCount {
+                            files: 3,
+                            capped: false,
+                            truncated: false,
+                        }),
+                        "3"
+                    );
                 }
 
                 #[test]
