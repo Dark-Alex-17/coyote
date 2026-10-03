@@ -25,7 +25,7 @@ use crate::mesh::shares::{
     self, DEFAULT_LIST_WALK_BOUND, LIST_PAGE_SIZE, Listed, PeerRef, Served, ServedFile,
     ShareLocations, ShareSet, Via,
 };
-use crate::mesh::wire_path::{WIRE_PATH_MAX_BYTES, WirePath};
+use crate::mesh::wire_path::{WIRE_PATH_MAX_BYTES, WirePath, is_rule_id};
 use crate::mesh::{hex_lower, redact_hashes, short};
 
 use arc_swap::ArcSwap;
@@ -52,8 +52,6 @@ pub(crate) const LAST_LIST_CACHE_PEERS: usize = 32;
 const LIST_PAGE_HEADROOM: usize = 2048;
 /// The longest cursor a peer may send or return; `shares::list_cursor` makes 32 bytes.
 const CURSOR_MAX_BYTES: usize = 64;
-/// The longest `invalid_path` rule a peer may name; the rule ids are a dozen characters.
-const RULE_MAX_CHARS: usize = 32;
 const UNKNOWN_RULE: &str = "unknown";
 /// Largest file an `ok` reply may carry while its response frame still fits ONE Resource
 /// segment: `MAX_EFFICIENT_SIZE` less the frame and the reply's other keys. An itemized
@@ -685,16 +683,11 @@ fn text_of(value: &Value) -> Option<&str> {
     value.as_str()
 }
 
-/// The rule a peer's `invalid_path` reply names, kept only when it is shaped like one of
+/// The rule a peer's `invalid_path` reply names, kept only when it is one of
 /// `wire_path::RULES`' ids; the model reads it, so a peer may not put words there.
 fn rule_of(value: &Value) -> Option<String> {
     let rule = text_of(value)?;
-    let shaped = !rule.is_empty()
-        && rule.chars().count() <= RULE_MAX_CHARS
-        && rule
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
-    Some(if shaped {
+    Some(if is_rule_id(rule) {
         rule.to_string()
     } else {
         UNKNOWN_RULE.to_string()
@@ -2338,7 +2331,7 @@ mod tests {
     }
 
     #[test]
-    fn a_peers_invalid_path_rule_is_kept_only_when_shaped_like_a_rule_id() {
+    fn a_peers_invalid_path_rule_is_kept_only_when_it_is_a_known_rule_id() {
         let reply = |rule: Value| status_reply("invalid_path", vec![("rule", rule)]);
         let rule_in = |reply: &Value| {
             field(reply.as_map().unwrap(), "rule")
@@ -2354,6 +2347,8 @@ mod tests {
         for rule in [
             "x\n=== y",
             "Segment",
+            "segment_",
+            "unknown",
             "run rm -rf",
             "",
             "é",
@@ -2369,6 +2364,13 @@ mod tests {
             rule_in(&reply(Value::from(7u8))),
             Err(FetchError::Malformed("rule"))
         ));
+    }
+
+    #[test]
+    fn every_wire_path_rule_id_passes_rule_of_unchanged() {
+        for (id, _) in crate::mesh::wire_path::RULES {
+            assert_eq!(rule_of(&Value::from(id)).as_deref(), Some(id));
+        }
     }
 
     #[cfg(unix)]

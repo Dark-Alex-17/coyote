@@ -1637,7 +1637,7 @@ mod tests {
         assert!(message.contains("interactive"));
     }
 
-    /// Spec-first usage probe: the three file tools are kept off `job__start` by the
+    /// The three file tools are kept off `job__start` by the
     /// same prefix refusal as the other six — `mesh__list`/`mesh__fetch` are already
     /// synchronous-with-a-timeout and `mesh__request_access` is already async+collect.
     #[test]

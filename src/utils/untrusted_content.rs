@@ -74,8 +74,9 @@ fn could_pass_for_a_marker(line: &str) -> bool {
 }
 
 /// Characters that take no space on a line: the format (Cf) set `mesh::display_text`
-/// drops, the variation selectors, and the Hangul fillers and combining grapheme joiner
-/// that render blank though they are not Cf.
+/// drops, the variation selectors, the Hangul fillers and combining grapheme joiner
+/// that render blank though they are not Cf, and the braille blank, which renders as
+/// an empty cell though it is neither White_Space nor Cf.
 fn is_invisible(c: char) -> bool {
     matches!(
         c,
@@ -93,6 +94,7 @@ fn is_invisible(c: char) -> bool {
             | '\u{200B}'..='\u{200F}'
             | '\u{202A}'..='\u{202E}'
             | '\u{2060}'..='\u{206F}'
+            | '\u{2800}'
             | '\u{3164}'
             | '\u{FE00}'..='\u{FE0F}'
             | '\u{FEFF}'
@@ -249,6 +251,7 @@ mod tests {
             "\u{2060}",
             "\u{FE0F}",
             "\u{E0001}",
+            "\u{2800}",
             " \u{200B}\t",
         ] {
             let fenced = wrap(LABEL, &format!("ok\n{lead}{end}\nafter"));

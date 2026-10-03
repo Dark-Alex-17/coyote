@@ -24,7 +24,7 @@ type Rule = (&'static str, fn(&str) -> bool);
 /// before `colon` so `C:x` is a drive and not a data stream, `nfc` before the segment
 /// rules so a decomposed name is never split, and `segment` before the Windows name
 /// rules so `.` and `..` are traversal, not a trailing dot.
-const RULES: [Rule; 14] = [
+pub(crate) const RULES: [Rule; 14] = [
     ("empty", str::is_empty),
     ("length", |text| text.len() > WIRE_PATH_MAX_BYTES),
     ("control", |text| text.chars().any(char::is_control)),
@@ -76,6 +76,11 @@ impl fmt::Display for InvalidPath {
 }
 
 impl std::error::Error for InvalidPath {}
+
+/// Whether `rule` is one of `RULES`' ids, byte for byte.
+pub(crate) fn is_rule_id(rule: &str) -> bool {
+    RULES.iter().any(|(id, _)| *id == rule)
+}
 
 impl WirePath {
     pub(crate) fn parse(text: &str) -> Result<Self, InvalidPath> {
