@@ -5279,4 +5279,170 @@ mod tests {
         );
         assert_eq!(fixture.idle.texts().len(), 1);
     }
+
+    /// Spec-first probe on the handler path: a colliding id — the same peer's pending
+    /// QUESTION, or ANOTHER identity's pending access request — earns the wire word
+    /// `duplicate`, a debug line naming that rule, and NO warn-level line: a re-used id
+    /// is judged by the rate rule, never a filing failure the peer could provoke.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_a_colliding_id_on_the_handler_path_is_duplicate_at_debug_and_never_a_warn()
+    {
+        use crate::testing::{debug_snapshot, install_log_collector, warn_snapshot};
+
+        install_log_collector();
+        let fixture = bare_slot("access-collide-log");
+        let handler = AccessHandler::new(Arc::downgrade(&fixture.slot) as Weak<dyn AccessSurface>);
+        let peer = TransportIdentity::new_from_rand(OsRng);
+        let peer_identity = peer.as_identity().address_hash.to_hex_string();
+        let id8 = short(&peer_identity).to_string();
+        let mine = |line: &String| line.contains(&id8) && line.contains("/access");
+        store_of(&fixture.slot)
+            .upsert(
+                InboundRecord {
+                    peer_identity: peer_identity.clone(),
+                    ..question_record("q-probe-same")
+                },
+                SystemTime::now(),
+            )
+            .unwrap();
+        store_of(&fixture.slot)
+            .upsert(
+                InboundRecord {
+                    id: "acc-probe-other".to_string(),
+                    thread: "acc-probe-other".to_string(),
+                    peer_identity: hex_lower(&[0x5c; 16]),
+                    peer_destination: hex_lower(&[0x5d; 16]),
+                    kind: InboundKind::Access,
+                    question: String::new(),
+                    paths: vec!["docs/probe-leak-theirs.md".to_string()],
+                    reason: "probe-leak-theirs".to_string(),
+                    ..question_record("acc-probe-other")
+                },
+                SystemTime::now(),
+            )
+            .unwrap();
+        let debug_before = debug_snapshot().iter().filter(|line| mine(line)).count();
+        let warn_before = warn_snapshot().iter().filter(|line| mine(line)).count();
+
+        for colliding in ["q-probe-same", "acc-probe-other"] {
+            let reply = handler
+                .handle(admitted(
+                    body(colliding, &["src/probe-leak-zq.rs"], "probe-leak-reason"),
+                    &peer,
+                ))
+                .await;
+            let Reply::Value(value) = &reply else {
+                panic!("{colliding}: not a wire reply");
+            };
+            assert_eq!(
+                value
+                    .as_map()
+                    .unwrap()
+                    .iter()
+                    .find(|(key, _)| key.as_str() == Some("reason"))
+                    .and_then(|(_, value)| value.as_str()),
+                Some("duplicate"),
+                "{colliding}"
+            );
+        }
+
+        let debug_lines: Vec<String> = debug_snapshot()
+            .into_iter()
+            .filter(mine)
+            .skip(debug_before)
+            .collect();
+        assert!(
+            debug_lines
+                .iter()
+                .filter(|line| line.ends_with("refused: duplicate"))
+                .count()
+                >= 2,
+            "each collision is logged under the rule the wire carries: {debug_lines:?}"
+        );
+        assert!(
+            !debug_lines
+                .iter()
+                .any(|line| line.contains("was not filed")),
+            "a collision is never a filing failure: {debug_lines:?}"
+        );
+        let warn_lines: Vec<String> = warn_snapshot()
+            .into_iter()
+            .filter(mine)
+            .skip(warn_before)
+            .collect();
+        assert!(warn_lines.is_empty(), "peer-triggered warn: {warn_lines:?}");
+        for line in debug_lines.iter().chain(warn_lines.iter()) {
+            assert!(
+                !line.contains("probe-leak"),
+                "a path or reason leaked: {line}"
+            );
+        }
+        let records = access_records(&fixture.slot);
+        assert_eq!(records.len(), 2, "{records:?}");
+        assert!(fixture.idle.texts().is_empty());
+        assert!(fixture.hooks.snapshot().is_empty());
+    }
+
+    /// When the inbound store itself cannot be read the request is refused as
+    /// `too_many_pending`, the I/O error is logged at debug with hashes redacted and
+    /// never a path or the reason, and nothing is filed, announced, or fired.
+    #[cfg(unix)]
+    #[test]
+    fn an_access_that_cannot_be_filed_is_refused_too_many_pending_at_debug_and_leaves_no_trace() {
+        use crate::testing::{debug_snapshot, install_log_collector, warn_snapshot};
+
+        install_log_collector();
+        let fixture = bare_slot("access-unfiled");
+        let id8 = short(&identity()).to_string();
+        let mine = |line: &String| line.contains(&id8) && line.contains("/access");
+        let store_path = store_of(&fixture.slot).path().to_path_buf();
+        fs::create_dir_all(&store_path).unwrap();
+        let debug_before = debug_snapshot().iter().filter(|line| mine(line)).count();
+        let warn_before = warn_snapshot().iter().filter(|line| mine(line)).count();
+
+        let outcome = fixture.slot.admit_access(inbound(
+            &identity(),
+            "acc-io",
+            &["src/probe-leak-io.rs"],
+            "probe-leak-reason",
+        ));
+        assert_eq!(
+            outcome,
+            AccessOutcome::Refused(AccessRefusal::TooManyPending)
+        );
+
+        let debug_lines: Vec<String> = debug_snapshot()
+            .into_iter()
+            .filter(mine)
+            .skip(debug_before)
+            .collect();
+        let unfiled: Vec<&String> = debug_lines
+            .iter()
+            .filter(|line| line.contains("was not filed: "))
+            .collect();
+        assert_eq!(unfiled.len(), 1, "{debug_lines:?}");
+        let (_, detail) = unfiled[0].split_once("was not filed: ").unwrap();
+        assert!(!detail.trim().is_empty(), "{debug_lines:?}");
+        assert!(
+            !unfiled[0].contains("probe-leak"),
+            "a path or reason leaked: {}",
+            unfiled[0]
+        );
+        assert!(
+            !unfiled[0].contains(&identity()),
+            "the full identity leaked: {}",
+            unfiled[0]
+        );
+        let warn_lines: Vec<String> = warn_snapshot()
+            .into_iter()
+            .filter(mine)
+            .skip(warn_before)
+            .collect();
+        assert!(warn_lines.is_empty(), "I/O failure warned: {warn_lines:?}");
+
+        fs::remove_dir(&store_path).unwrap();
+        assert!(access_records(&fixture.slot).is_empty());
+        assert!(fixture.idle.texts().is_empty());
+        assert!(fixture.hooks.snapshot().is_empty());
+    }
 }

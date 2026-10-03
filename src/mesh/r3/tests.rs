@@ -8523,4 +8523,135 @@ pub(crate) mod network {
         pair.stop_node_a().await;
         node.stop().await;
     }
+
+    /// Spec-first probe: an access id that collides with ANY open record — the same
+    /// peer's pending QUESTION, or ANOTHER identity's pending access request — is
+    /// `refused { duplicate }` on the wire (the spec's only word for a re-used id),
+    /// never `too_many_pending` (the peer has nothing pending). Nothing is filed over
+    /// the colliding record, no human line, no hook, no warn-level log line is earned
+    /// by the peer, and a fresh id from the same peer is still `pending` afterwards.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_an_access_id_colliding_with_any_open_record_is_duplicate_on_the_wire_without_a_warn()
+     {
+        use crate::mesh::pending::{INBOUND_RECORD_VERSION, InboundKind, InboundRecord};
+
+        install_log_collector();
+        let pair = NodePair::start_with("usage-probe-access-collide", |_| {}, trusting_b).await;
+        pair.introduce_b_to_a().await;
+        let (slot, idle) = installed_slot(&pair);
+        let sink = hook_sink_for(&pair, &slot);
+        let _workspace = share_docs_from_a(&pair, &slot, "usage-probe-access-collide-root");
+        let b_identity = pair.responder.desc.identity.address_hash.to_hex_string();
+        let b_destination = pair.responder.desc.address_hash.to_hex_string();
+        let b_id8 = super::super::short(&b_identity).to_string();
+        let other_identity = hex_lower(&[0x5c; 16]);
+        let now = SystemTime::now();
+        let store = slot.inbound_store().unwrap();
+        store
+            .upsert(
+                InboundRecord {
+                    version: INBOUND_RECORD_VERSION,
+                    id: "q-same".to_string(),
+                    peer_destination: b_destination.clone(),
+                    peer_identity: b_identity.clone(),
+                    thread: "q-same".to_string(),
+                    question: "may I?".to_string(),
+                    envoy_question: String::new(),
+                    received_at: rfc3339_utc(now),
+                    kind: InboundKind::Question,
+                    paths: Vec::new(),
+                    reason: String::new(),
+                },
+                now,
+            )
+            .unwrap();
+        store
+            .upsert(
+                InboundRecord {
+                    version: INBOUND_RECORD_VERSION,
+                    id: "acc-other".to_string(),
+                    peer_destination: hex_lower(&[0x5d; 16]),
+                    peer_identity: other_identity.clone(),
+                    thread: "acc-other".to_string(),
+                    question: String::new(),
+                    envoy_question: String::new(),
+                    received_at: rfc3339_utc(now),
+                    kind: InboundKind::Access,
+                    paths: vec!["docs/theirs.md".to_string()],
+                    reason: "theirs".to_string(),
+                },
+                now,
+            )
+            .unwrap();
+        let warns_before = warn_snapshot()
+            .iter()
+            .filter(|line| line.contains(&b_id8))
+            .count();
+
+        for colliding in ["q-same", "acc-other"] {
+            let reply = b_asks_a(
+                &pair,
+                ACCESS_PATH,
+                access_body(colliding, &["src/secret.rs"], "probe-leak-reason"),
+                short_options(),
+            )
+            .await;
+            assert_eq!(wire_status(&reply.value), "refused", "{colliding}");
+            assert_eq!(
+                wire_field(&reply.value, "reason").and_then(Value::as_str),
+                Some("duplicate"),
+                "{colliding}: a re-used id is a duplicate, whatever it collides with"
+            );
+            assert_eq!(
+                wire_field(&reply.value, "id").and_then(Value::as_str),
+                Some(colliding)
+            );
+            assert_eq!(wire_field(&reply.value, "expires"), None);
+        }
+
+        // The colliding records stand exactly as filed.
+        let mut records = store.list(SystemTime::now()).unwrap();
+        records.sort_by(|a, b| a.id.cmp(&b.id));
+        assert_eq!(records.len(), 2, "{records:?}");
+        assert_eq!(records[0].id, "acc-other");
+        assert_eq!(records[0].kind, InboundKind::Access);
+        assert_eq!(records[0].peer_identity, other_identity);
+        assert_eq!(records[0].paths, vec!["docs/theirs.md".to_string()]);
+        assert_eq!(records[1].id, "q-same");
+        assert_eq!(records[1].kind, InboundKind::Question);
+        assert!(records[1].paths.is_empty());
+        assert!(idle.0.lock().is_empty(), "no human line for a refusal");
+        assert!(
+            fires_of(&sink.drain(), HookEvent::MeshAccessRequested).is_empty(),
+            "a refusal fires no hook"
+        );
+        let warns: Vec<String> = warn_snapshot()
+            .into_iter()
+            .filter(|line| line.contains(&b_id8))
+            .skip(warns_before)
+            .collect();
+        assert!(
+            warns.is_empty(),
+            "a peer must not be able to earn a warn-level line with a re-used id: {warns:?}"
+        );
+        assert!(
+            !warn_snapshot()
+                .iter()
+                .any(|line| line.contains("/access") && line.contains("was not filed")),
+            "{:?}",
+            warn_snapshot()
+        );
+
+        let fresh = b_asks_a(
+            &pair,
+            ACCESS_PATH,
+            access_body("acc-fresh", &["src/secret.rs"], "probe-leak-reason"),
+            short_options(),
+        )
+        .await;
+        assert_eq!(wire_status(&fresh.value), "pending");
+        assert_eq!(store.list(SystemTime::now()).unwrap().len(), 3);
+        assert_eq!(idle.0.lock().len(), 1);
+        pair.stop_node_a().await;
+    }
 }

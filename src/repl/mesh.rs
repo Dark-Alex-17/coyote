@@ -6122,6 +6122,155 @@ mod tests {
                 });
             }
 
+            /// Spec-first probe: `.mesh answer <access-id> <text>`
+            /// is refused with a teaching error naming `.mesh grant <id>` and
+            /// `.mesh refuse <id>` — before any "Sending" notice, so nothing goes on the
+            /// wire and the request stays filed for the human to decide. `.mesh pending`
+            /// lists the access row apart from the questions, with its path COUNT and the
+            /// two verbs, and never a path or the reason (peer text goes to no model and,
+            /// on this surface, to no screen either). The question rows still answer.
+            #[test]
+            #[serial]
+            fn usage_probe_answer_refuses_an_access_id_and_pending_lists_it_without_paths() {
+                use crate::mesh::pending::{INBOUND_RECORD_VERSION, InboundKind};
+                use crate::mesh::rfc3339_utc;
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-answer-access");
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-answer-access").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let now = SystemTime::now();
+                    let asker_peer = "12".repeat(16);
+                    let store = ctx
+                        .app
+                        .mesh
+                        .inbound_store()
+                        .expect("install attaches a store");
+                    store
+                        .upsert(
+                            InboundRecord {
+                                version: INBOUND_RECORD_VERSION,
+                                id: "acc-1".to_string(),
+                                peer_destination: asker_peer.clone(),
+                                peer_identity: "ef".repeat(16),
+                                thread: "acc-1".to_string(),
+                                question: String::new(),
+                                envoy_question: String::new(),
+                                received_at: rfc3339_utc(now),
+                                kind: InboundKind::Access,
+                                paths: vec![
+                                    "secret/probe-leak-plan.md".to_string(),
+                                    "src/probe-leak-x.rs".to_string(),
+                                ],
+                                reason: "probe-leak-reason".to_string(),
+                            },
+                            now,
+                        )
+                        .unwrap();
+
+                    // Only an access row: the question section is empty, the access block
+                    // follows the answer hint, and nothing peer-supplied but the id shows.
+                    run(&mut ctx, ".mesh pending").await.unwrap();
+                    let text = stdout_lines().join("\n");
+                    let out: Vec<&str> = text.lines().collect();
+                    assert!(
+                        !text.contains("probe-leak"),
+                        "a path or the reason leaked into `.mesh pending`: {text}"
+                    );
+                    let hint = out
+                        .iter()
+                        .position(|line| line.starts_with("answer one with"))
+                        .unwrap_or_else(|| panic!("{text}"));
+                    assert!(
+                        out[..hint].iter().any(|line| line.trim() == "none"),
+                        "no question rows: {text}"
+                    );
+                    assert!(
+                        !out[..hint].iter().any(|line| line.contains("acc-1")),
+                        "an access request is not a question row: {text}"
+                    );
+                    assert_eq!(
+                        out[hint + 1],
+                        "Access requests (decide with grant or refuse):"
+                    );
+                    let row = out[hint + 2];
+                    assert!(row.starts_with("  acc-1  "), "{text}");
+                    assert!(row.contains(short(&asker_peer)), "{text}");
+                    assert!(row.contains("2 paths"), "{text}");
+                    assert!(row.contains("grant: .mesh grant acc-1"), "{text}");
+                    assert!(row.contains("refuse: .mesh refuse acc-1"), "{text}");
+
+                    // Answering the access id: teaching error, nothing sent, still filed.
+                    let err = run(&mut ctx, ".mesh answer acc-1 \"yes\"")
+                        .await
+                        .unwrap_err()
+                        .to_string();
+                    assert!(
+                        err.contains("`acc-1` is an access request, not a question"),
+                        "{err}"
+                    );
+                    assert!(err.contains(".mesh grant acc-1"), "{err}");
+                    assert!(err.contains(".mesh refuse acc-1"), "{err}");
+                    assert!(!err.contains("No open question"), "{err}");
+                    assert!(!err.contains("probe-leak"), "{err}");
+                    let out = stdout_lines();
+                    assert!(
+                        !out.iter()
+                            .any(|line| line.contains("Sending your answer to")),
+                        "an access id is refused before any send: {out:?}"
+                    );
+                    assert!(!out.iter().any(|line| line.contains("Answered")), "{out:?}");
+                    let filed = store.get("acc-1").unwrap().expect("still filed");
+                    assert_eq!(filed.kind, InboundKind::Access);
+                    assert_eq!(filed.paths.len(), 2);
+                    assert!(ctx.app.mesh.correlations().list().is_empty());
+
+                    // Bare `.mesh answer acc-1` (no text) is still the usage help, and a
+                    // question under another id still routes as a question.
+                    let before = stdout_lines().len();
+                    run(&mut ctx, ".mesh answer acc-1").await.unwrap();
+                    let after = stdout_lines();
+                    assert!(
+                        after[before..]
+                            .iter()
+                            .any(|t| t.contains("Usage: .mesh answer <id>")),
+                        "{after:?}"
+                    );
+                    store
+                        .upsert(
+                            InboundRecord {
+                                version: INBOUND_RECORD_VERSION,
+                                id: "p1".to_string(),
+                                peer_destination: asker_peer.clone(),
+                                peer_identity: "ef".repeat(16),
+                                thread: "p1".to_string(),
+                                question: "may I read the plan?".to_string(),
+                                envoy_question: String::new(),
+                                received_at: rfc3339_utc(now),
+                                kind: InboundKind::Question,
+                                paths: Vec::new(),
+                                reason: String::new(),
+                            },
+                            now,
+                        )
+                        .unwrap();
+                    let err = run(&mut ctx, ".mesh answer p1 \"no\"")
+                        .await
+                        .unwrap_err()
+                        .to_string();
+                    assert!(!err.contains("is an access request"), "{err}");
+                    assert!(
+                        err.contains(&asker_peer),
+                        "a question still routes to its asker: {err}"
+                    );
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
             /// Criterion (i), refused by the start itself rather than by `validate`: a
             /// private relay nobody listens on makes `MeshRuntime::start` fail after the
             /// trial id was minted. The session keeps its old id and stays clean, no node is
