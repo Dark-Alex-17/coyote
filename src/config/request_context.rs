@@ -24329,7 +24329,7 @@ mod tests {
             ["--if-sha256 "],
             "no listing heard yet"
         );
-        runtime.memory().remember_list(
+        runtime.memory().remember_list_for_tests(
             &trusted,
             vec!["docs/a.md".to_string(), "README.md".to_string()],
         );

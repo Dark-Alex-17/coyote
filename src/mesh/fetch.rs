@@ -929,9 +929,16 @@ impl PeerMemory {
             .remember(destination_hex, card, LAST_CARD_CACHE_PEERS);
     }
 
-    pub(crate) fn remember_list(&self, destination_hex: &str, paths: Vec<String>) {
+    fn remember_list(&self, destination_hex: &str, paths: Vec<String>) {
         self.lists
             .remember(destination_hex, paths, LAST_LIST_CACHE_PEERS);
+    }
+
+    /// Plants a listing as if `/list` had been heard, for the completion tests, which
+    /// start a node and so run only on unix.
+    #[cfg(all(test, unix))]
+    pub(crate) fn remember_list_for_tests(&self, destination_hex: &str, paths: Vec<String>) {
+        self.remember_list(destination_hex, paths);
     }
 }
 

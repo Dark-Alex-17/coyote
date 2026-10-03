@@ -890,6 +890,10 @@ impl EnvoySink for EnvoyRunner {
         taken
     }
 
+    fn holds(&self, id: &str) -> bool {
+        self.held.lock().as_ref().is_some_and(|held| held.id == id)
+    }
+
     fn interrupt(&self) {
         if let Some(cancel) = self.current_cancel.lock().take() {
             cancel.cancel();

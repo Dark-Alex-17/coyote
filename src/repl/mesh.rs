@@ -48,7 +48,7 @@ use log::debug;
 use sha2::{Digest, Sha256};
 use std::env;
 use std::fs;
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -205,6 +205,9 @@ const BROAD_MATCH_LIMIT: usize = 100;
 /// How long a trusted instance goes unheard before `.mesh trust --prune` lists it, when
 /// `--older-than` is not given.
 const PRUNE_DEFAULT_OLDER_THAN: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+/// The longest one-off grant `.mesh grant --for` writes; anything longer is a standing
+/// allow rule, which `.mesh shares` lists and `.mesh unshare` takes back.
+const GRANT_FOR_MAX: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 pub(crate) async fn run(
     ctx: &mut RequestContext,
@@ -935,12 +938,12 @@ async fn reply(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         short(&destination),
         trust_label(verdict)
     ));
+    if let Some(attachment) = &attachment {
+        out_text(&attaching_notice(attachment, &destination));
+    }
     if !confirm_or_flag("Send it?", "--yes", yes_first || outgoing.yes)? {
         out_text("Nothing was sent.");
         return Ok(());
-    }
-    if let Some(attachment) = &attachment {
-        out_text(&attaching_notice(attachment, &destination));
     }
     let out = OutboundPeer::with_parts(
         PeerKind::Message,
@@ -1123,8 +1126,8 @@ fn attachment(
     if let Some(head) = set.protected_head(path_text) {
         bail!(never_sent_sentence(path_text, &head));
     }
-    let file = root.join(path_text);
-    let metadata = match fs::symlink_metadata(&file) {
+    let file_path = root.join(path_text);
+    let metadata = match fs::symlink_metadata(&file_path) {
         Ok(metadata) => metadata,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             bail!(
@@ -1134,7 +1137,7 @@ fn attachment(
         }
         Err(err) => {
             return Err(err)
-                .with_context(|| format!("Failed to read metadata of '{}'", file.display()));
+                .with_context(|| format!("Failed to read metadata of '{}'", file_path.display()));
         }
     };
     if metadata.file_type().is_symlink() {
@@ -1146,8 +1149,12 @@ fn attachment(
     if !metadata.is_file() {
         bail!("`{shown}` is not a regular file.");
     }
+    let (file, metadata) = open_attachment(&file_path)?;
+    if !metadata.is_file() {
+        bail!("`{shown}` is not a regular file.");
+    }
     let in_root = dunce::canonicalize(&root)
-        .and_then(|canonical_root| Ok(dunce::canonicalize(&file)?.starts_with(canonical_root)))
+        .and_then(|canonical_root| Ok(dunce::canonicalize(&file_path)?.starts_with(canonical_root)))
         .unwrap_or(false);
     if !in_root {
         bail!(
@@ -1186,8 +1193,10 @@ fn attachment(
     }
     let name = path_text.to_string();
     if size <= limits.inline_max_bytes {
-        let bytes =
-            fs::read(&file).with_context(|| format!("Failed to read '{}'", file.display()))?;
+        let mut bytes = Vec::with_capacity(size as usize);
+        (&file)
+            .read_to_end(&mut bytes)
+            .with_context(|| format!("Failed to read '{}'", file_path.display()))?;
         let size = bytes.len() as u64;
         return Ok(Attachment {
             part: RawPart::File {
@@ -1217,9 +1226,8 @@ fn attachment(
         );
     }
     let mut hasher = Sha256::new();
-    fs::File::open(&file)
-        .and_then(|mut opened| std::io::copy(&mut opened, &mut hasher))
-        .with_context(|| format!("Failed to read '{}'", file.display()))?;
+    std::io::copy(&mut std::io::BufReader::new(file), &mut hasher)
+        .with_context(|| format!("Failed to read '{}'", file_path.display()))?;
     Ok(Attachment {
         part: RawPart::File {
             name: name.clone(),
@@ -1232,6 +1240,26 @@ fn attachment(
         size,
         form: AttachForm::Reference,
     })
+}
+
+/// `path` opened for reading, with the metadata of that very handle, so what is sized,
+/// hashed and sent is one file. On unix the open never follows a final symlink, so a link
+/// swapped in after `attachment` judged the path is refused rather than read.
+fn open_attachment(path: &Path) -> Result<(fs::File, fs::Metadata)> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options
+        .open(path)
+        .with_context(|| format!("Failed to read '{}'", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("Failed to read metadata of '{}'", path.display()))?;
+    Ok((file, metadata))
 }
 
 /// Why a fetch of a file would be refused, for a verdict no grant lifts; `None` for one a
@@ -2629,6 +2657,9 @@ async fn grant(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             "`--standing` has no end, so `--for` does not apply; drop one of them. {}",
             render_verb_help("grant")
         );
+    }
+    if args.for_.is_some_and(|ttl| ttl > GRANT_FOR_MAX) {
+        bail!("`--for` is capped at 30d; a longer grant is `--standing`.");
     }
     if !args.standing && (args.global || args.workspace) {
         bail!(
@@ -20428,6 +20459,61 @@ mod tests {
 
                 #[test]
                 #[serial]
+                fn grant_for_is_capped_at_thirty_days_and_takes_exactly_thirty() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-grant-for-cap");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-grant-for-cap").await;
+                        fx.file("a-1", InboundKind::Access, &["src/x.rs"]);
+
+                        for line in [
+                            ".mesh grant a-1 --for 31d",
+                            ".mesh grant a-1 --for 721h",
+                            ".mesh grant a-1 --for 43201m",
+                        ] {
+                            let printed = stdout_lines().len();
+                            assert_eq!(
+                                refusal(&mut fx.ctx, line).await,
+                                "`--for` is capped at 30d; a longer grant is `--standing`.",
+                                "{line}"
+                            );
+                            assert_eq!(stdout_lines().len(), printed, "{line} prints nothing");
+                        }
+                        assert!(fx.stub.seen().is_empty(), "{:?}", fx.stub.seen());
+                        assert!(fx.grants().is_empty());
+                        assert_eq!(fx.pending_ids(), ["a-1"]);
+
+                        let before = SystemTime::now();
+                        let out = out_of(&mut fx.ctx, ".mesh grant a-1 --for 30d")
+                            .await
+                            .unwrap();
+
+                        let grants = fx.grants();
+                        assert_eq!(grants.len(), 1, "{grants:?}");
+                        let expires = parse_rfc3339(&grants[0].expires).unwrap();
+                        let thirty_days = Duration::from_secs(30 * 86_400);
+                        let slack = Duration::from_secs(5);
+                        assert!(
+                            expires >= before + thirty_days - slack
+                                && expires <= before + thirty_days + slack,
+                            "{expires:?} is not about 30d after {before:?}"
+                        );
+                        assert!(
+                            out.ends_with(&format!(
+                                "Granted a-1: 1 path for {} until {}, each fetchable once (via direct).",
+                                fx.dest(),
+                                grants[0].expires
+                            )),
+                            "{out}"
+                        );
+                        assert!(fx.pending_ids().is_empty());
+                        fx.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
                 fn grant_standing_previews_then_writes_an_allow_per_path_to_the_global_file() {
                     let guard = TestConfigDirGuard::new("repl-mesh-grant-standing");
                     let _capture = capture::install();
@@ -21137,10 +21223,20 @@ mod tests {
 
                 #[test]
                 #[serial]
-                fn reply_with_a_small_attachment_sends_it_inline_and_says_so() {
+                fn reply_with_a_small_attachment_says_so_before_asking_and_sends_it_inline() {
                     let _guard = TestConfigDirGuard::new("repl-mesh-attach-inline");
                     let _capture = capture::install();
-                    let _script = prompt_script::install(&[]);
+                    let _script = prompt_script::install_answering(|question| {
+                        assert_eq!(question, "Send it?");
+                        let printed: Vec<String> =
+                            capture::lines().into_iter().map(|(_, line)| line).collect();
+                        assert_eq!(
+                            printed.get(1).map(String::as_str),
+                            Some("Attaching `docs/notes.md` (9 bytes) inline."),
+                            "what travels is said before the question stands: {printed:?}"
+                        );
+                        true
+                    });
                     run_async(async {
                         let mut fx = PeerFixture::new("repl-mesh-attach-inline").await;
                         write(&fx.root.path, "docs/notes.md", NOTES);
@@ -21148,7 +21244,7 @@ mod tests {
 
                         let out = out_of(
                             &mut fx.ctx,
-                            &format!(".mesh reply {to} --yes \"see this\" --attach docs/notes.md"),
+                            &format!(".mesh reply {to} \"see this\" --attach docs/notes.md"),
                         )
                         .await
                         .unwrap();
@@ -21167,7 +21263,7 @@ mod tests {
                         assert_eq!(seen[0].content, "see this");
                         assert_eq!(seen[0].parts, [inline_part("docs/notes.md", NOTES)]);
                         assert!(fx.grants().is_empty(), "{:?}", fx.grants());
-                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        assert_eq!(prompt_script::prompts_asked(), 1);
                         fx.stop().await;
                     });
                 }

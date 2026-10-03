@@ -2527,6 +2527,8 @@ impl MeshSlot {
 
     /// `answer_inbound` carrying one file part, which goes to the peer from this node
     /// alone: no live run is offered the answer, so the file's bytes never reach a model.
+    /// A run still holding the question is not bypassed either, since its own reply
+    /// would follow this one once the hold lapsed; the answer is refused until then.
     pub(crate) async fn answer_inbound_with_file(
         &self,
         id: &str,
@@ -2534,6 +2536,11 @@ impl MeshSlot {
         part: RawPart,
     ) -> Result<SendOutcome> {
         let (store, record) = self.open_question(id)?;
+        if self.envoy.load_full().is_some_and(|sink| sink.holds(id)) {
+            bail!(
+                "`{id}` is being answered by the envoy right now; answer without `--attach`, or wait for its hold to lapse."
+            );
+        }
         let runtime = self.runtime_to_answer(id, &record)?;
         let reply = OutboundPeer::with_parts(
             PeerKind::Reply,
@@ -3057,7 +3064,8 @@ impl MeshSlot {
 }
 
 /// An envoy that keeps every job it is offered, or refuses them all with one reason
-/// (a full queue unless told otherwise); answers are consumed or not as configured.
+/// (a full queue unless told otherwise); answers are consumed or not as configured, and
+/// it reports a hold on whichever question `held` names.
 #[cfg(test)]
 pub(crate) struct RecordingEnvoy {
     refusal: Option<PeerRefusal>,
@@ -3065,6 +3073,7 @@ pub(crate) struct RecordingEnvoy {
     pub(crate) jobs: parking_lot::Mutex<Vec<PeerMessage>>,
     pub(crate) answers: parking_lot::Mutex<Vec<(String, String)>>,
     pub(crate) interrupts: std::sync::atomic::AtomicUsize,
+    pub(crate) held: parking_lot::Mutex<Option<String>>,
 }
 
 #[cfg(test)]
@@ -3085,6 +3094,7 @@ impl RecordingEnvoy {
             jobs: parking_lot::Mutex::new(Vec::new()),
             answers: parking_lot::Mutex::new(Vec::new()),
             interrupts: std::sync::atomic::AtomicUsize::new(0),
+            held: parking_lot::Mutex::new(None),
         })
     }
 
@@ -3110,6 +3120,10 @@ impl EnvoySink for RecordingEnvoy {
     fn answer(&self, id: &str, text: &str) -> bool {
         self.answers.lock().push((id.to_string(), text.to_string()));
         self.consume_answers
+    }
+
+    fn holds(&self, id: &str) -> bool {
+        self.held.lock().as_deref() == Some(id)
     }
 
     fn interrupt(&self) {
@@ -4820,6 +4834,51 @@ mod tests {
         assert!(
             slot.correlations().list().is_empty(),
             "a peer's question is never one of ours"
+        );
+    }
+
+    #[tokio::test]
+    async fn answer_inbound_with_file_is_refused_while_a_live_run_holds_the_question() {
+        let tmp = TempDir::new("slot-answer-file-held");
+        let slot = slot_with_inbound(&tmp);
+        let store = slot.inbound_store().unwrap();
+        store
+            .upsert(inbound_record("a-1"), SystemTime::now())
+            .unwrap();
+        let envoy = RecordingEnvoy::new(true, true);
+        *envoy.held.lock() = Some("a-1".to_string());
+        slot.set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
+        let part = RawPart::File {
+            name: "docs/notes.md".to_string(),
+            size: 1,
+            sha256: [0; 32],
+            bytes: Some(b"x".to_vec()),
+            reference: None,
+        };
+
+        let err = slot
+            .answer_inbound_with_file("a-1", "see this", part.clone())
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "`a-1` is being answered by the envoy right now; answer without `--attach`, or wait for its hold to lapse."
+        );
+        assert!(
+            envoy.answers.lock().is_empty(),
+            "the hold is only looked at, never offered the file"
+        );
+        assert!(store.get("a-1").unwrap().is_some());
+
+        envoy.held.lock().take();
+        let err = slot
+            .answer_inbound_with_file("a-1", "see this", part)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Mesh is off"),
+            "once the hold lapses the answer goes the no-run way: {err}"
         );
     }
 
