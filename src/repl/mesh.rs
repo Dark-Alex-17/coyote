@@ -1536,6 +1536,7 @@ fn allow(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             out_text(NOTHING_CHANGED);
             return Ok(());
         }
+        set = loaded_for_writing(ctx)?.1;
     }
     let mut changed = set
         .apply(
@@ -1632,6 +1633,7 @@ fn deny(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             out_text(NOTHING_CHANGED);
             return Ok(());
         }
+        set = loaded_for_writing(ctx)?.1;
     }
     let applied = set.apply(
         Mutation::Deny {
@@ -1772,6 +1774,10 @@ fn unshare(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         if !confirm_or_flag(&question, "--yes", yes)? {
             out_text(NOTHING_CHANGED);
             return Ok(());
+        }
+        set = loaded_for_writing(ctx)?.1;
+        if share_holders(&set, &pattern) != holders {
+            bail!("The share list changed while the prompt was open; run `.mesh unshare` again.");
         }
     }
     for (layer, kinds) in &targets {
@@ -2018,12 +2024,21 @@ fn share_set(ctx: &RequestContext) -> Result<(PathBuf, ShareSet)> {
 /// about a node that is not there, then a refused file stops everything.
 fn writable_share_set(ctx: &RequestContext) -> Result<(PathBuf, ShareSet, bool)> {
     live(ctx)?;
+    let (root, set) = loaded_for_writing(ctx)?;
+    let case_insensitive = root_folds_case(ctx, &root);
+    Ok((root, set, case_insensitive))
+}
+
+/// `share_set` with a refused file stopping everything. A verb that asked a question
+/// reads the files again through this before it writes, since the copy it showed may be
+/// stale by the time the human answers; otherwise its write would drop whatever changed
+/// while the prompt was open.
+fn loaded_for_writing(ctx: &RequestContext) -> Result<(PathBuf, ShareSet)> {
     let (root, set) = share_set(ctx)?;
     if let Some(refusal) = set.refusal() {
         bail!("{refusal} Nothing was written.");
     }
-    let case_insensitive = root_folds_case(ctx, &root);
-    Ok((root, set, case_insensitive))
+    Ok((root, set))
 }
 
 /// The node's memoised probe of the share root; `false` while the mesh is off, since the
@@ -2709,8 +2724,9 @@ pub(crate) fn err_text(text: &str) {
 pub(crate) mod prompt_script {
     //! Scripted stand-in for the `.mesh` confirmations. `inquire::Confirm` cannot run
     //! under the test harness, so while a guard is installed `confirm_or_flag` takes its
-    //! terminal state from the guard and answers each prompt from a queue, counting every
-    //! prompt asked. The script is process-global: tests using it must be `#[serial]`.
+    //! terminal state from the guard and answers each prompt from a queue, or from a
+    //! closure that runs while the question stands, counting every prompt asked. The
+    //! script is process-global: tests using it must be `#[serial]`.
 
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2719,15 +2735,29 @@ pub(crate) mod prompt_script {
     const TTY: usize = 1;
     const NON_TTY: usize = 2;
 
+    type Answerer = Box<dyn Fn(&str) -> bool + Send + Sync>;
+
     static STATE: AtomicUsize = AtomicUsize::new(INACTIVE);
     static ASKED: AtomicUsize = AtomicUsize::new(0);
     static ANSWERS: Mutex<Vec<bool>> = Mutex::new(Vec::new());
+    static ANSWERER: Mutex<Option<Answerer>> = Mutex::new(None);
 
     /// Forces a terminal on stdin and answers the prompts from `answers`, front to back;
     /// a prompt beyond the scripted answers panics.
     #[must_use]
     pub fn install(answers: &[bool]) -> ScriptGuard {
         install_with_state(TTY, answers)
+    }
+
+    /// Forces a terminal on stdin and puts every question to `answer`, which runs
+    /// between the verb's prompt and its write, so a test can change the files it is
+    /// about to write while the question stands.
+    #[must_use]
+    pub fn install_answering(answer: impl Fn(&str) -> bool + Send + Sync + 'static) -> ScriptGuard {
+        *ANSWERER
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(answer));
+        install_with_state(TTY, &[])
     }
 
     /// Forces stdin to be no terminal, so the flag-naming refusal is pinned wherever the
@@ -2755,6 +2785,10 @@ pub(crate) mod prompt_script {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clear();
+            ANSWERER
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
         }
     }
 
@@ -2773,6 +2807,13 @@ pub(crate) mod prompt_script {
 
     pub(super) fn next_answer(question: &str) -> bool {
         ASKED.fetch_add(1, Ordering::SeqCst);
+        if let Some(answer) = ANSWERER
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+        {
+            return answer(question);
+        }
         let mut answers = ANSWERS
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -13221,6 +13262,91 @@ mod tests {
                         let yaml = fs::read_to_string(&fx.locations.global).unwrap();
                         assert!(!yaml.contains(".env"), "{yaml}");
                         drop(accepted);
+                        fx.stop().await;
+                    });
+                }
+
+                /// The write lands on the files as they are when the human answers, not on
+                /// the copy that was shown: an entry added while the question stood survives.
+                #[test]
+                #[serial]
+                fn allow_applies_to_the_share_list_as_it_is_after_the_prompt_not_before() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-allow-reload");
+                    let _capture = capture::install();
+                    run_async(async {
+                        let mut fx =
+                            ShareFixture::new("repl-mesh-allow-reload", &["docs/a.md"]).await;
+                        let locations = fx.locations.clone();
+                        let _script = prompt_script::install_answering(move |_question| {
+                            ShareSet::load_quietly(locations.clone())
+                                .0
+                                .apply(
+                                    Mutation::Allow {
+                                        pattern: "notes/**".to_string(),
+                                        peer: None,
+                                    },
+                                    WriteScope::Global,
+                                )
+                                .unwrap();
+                            true
+                        });
+
+                        let out = out_of(&mut fx.ctx, ".mesh allow **").await.unwrap();
+
+                        assert!(
+                            out.ends_with(&format!(
+                                "Allowed `**` for every trusted peer; written to {}.",
+                                fx.global()
+                            )),
+                            "{out}"
+                        );
+                        assert_eq!(prompt_script::prompts_asked(), 1);
+                        assert_eq!(
+                            fx.entries(),
+                            [
+                                allow_entry(Layer::Global, "notes/**", None),
+                                allow_entry(Layer::Global, "**", None),
+                            ]
+                        );
+                        fx.stop().await;
+                    });
+                }
+
+                /// What the human confirmed removing must still be there when the answer
+                /// comes; a holder that went away meanwhile means the question was stale.
+                #[test]
+                #[serial]
+                fn unshare_refuses_when_the_holders_changed_while_the_prompt_was_open() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-unshare-reload");
+                    let _capture = capture::install();
+                    run_async(async {
+                        let mut fx =
+                            ShareFixture::new("repl-mesh-unshare-reload", &["docs/a.md"]).await;
+                        fx.write_global(
+                            "version: 1\nallow:\n- pattern: '**'\n- pattern: docs/**\n",
+                        );
+                        let locations = fx.locations.clone();
+                        let _script = prompt_script::install_answering(move |_question| {
+                            ShareSet::load_quietly(locations.clone())
+                                .0
+                                .apply(
+                                    Mutation::Unshare {
+                                        pattern: "**".to_string(),
+                                    },
+                                    WriteScope::Global,
+                                )
+                                .unwrap();
+                            true
+                        });
+
+                        let err = refusal(&mut fx.ctx, ".mesh unshare **").await;
+
+                        assert_eq!(
+                            err,
+                            "The share list changed while the prompt was open; run `.mesh unshare` again."
+                        );
+                        assert_eq!(prompt_script::prompts_asked(), 1);
+                        assert_eq!(fx.entries(), [allow_entry(Layer::Global, "docs/**", None)]);
                         fx.stop().await;
                     });
                 }
