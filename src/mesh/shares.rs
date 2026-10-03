@@ -101,7 +101,7 @@ impl AllowEntry {
         match &self.peer {
             None => true,
             Some(scoped) => {
-                is_canonical(scoped)
+                is_canonical_peer(scoped)
                     && (same_hash(scoped, peer.identity) || same_hash(scoped, peer.destination))
             }
         }
@@ -135,8 +135,10 @@ pub(crate) struct Entry {
     pub layer: Layer,
 }
 
-// The mutation half, `apply` and what it alone uses, is test-only until the `.mesh share`
-// verbs write the files or a standing access grant adds an allow entry.
+// The mutation half, `apply` and what it alone uses, and the verb-side helpers after
+// `list` are test-only until the `.mesh` share verbs call them: this is a binary crate,
+// so an item only a test reaches is dead code to the build, and each gate falls with
+// its first caller.
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -156,7 +158,8 @@ pub(crate) enum Mutation {
     Deny {
         pattern: String,
     },
-    /// Removes every allow entry with exactly this pattern text from the target layer.
+    /// Removes every allow and deny entry with exactly this pattern text, and every
+    /// override naming exactly this path, from the target layer.
     Unshare {
         pattern: String,
     },
@@ -177,11 +180,33 @@ impl Mutation {
     }
 }
 
+/// What `apply` did: the file it targeted, and whether that file changed or already
+/// said so.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Applied {
+    pub path: PathBuf,
+    pub changed: bool,
+}
+
 /// The peer a share is evaluated for, both hashes canonical lowercase 32-hex.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PeerRef<'a> {
     pub identity: &'a str,
     pub destination: &'a str,
+}
+
+impl PeerRef<'static> {
+    /// The reference no scoped allow applies to, so `effective` and the walks answer for
+    /// every trusted peer at once: a scoped entry compares against a canonical 32-hex
+    /// hash, which an empty string never equals, so only peer-less entries match it.
+    #[cfg(test)]
+    pub(crate) const fn unscoped() -> Self {
+        Self {
+            identity: "",
+            destination: "",
+        }
+    }
 }
 
 /// The verdict on one fetch. `NotShared` covers a file that does not exist, one outside
@@ -225,6 +250,20 @@ pub(crate) enum Judgement {
     NotAllowed,
 }
 
+/// `Judgement` with the reason a denial hides, for the human's own listing rather than a
+/// peer's answer. `Protected` is a file under a directory nothing lifts, and also one
+/// that did not resolve to plain segments under the share root, since no rule can serve
+/// either; `Denied` is a user deny; `BuiltinDenied` the built-in deny no override lifts.
+/// `Shared` and `NotAllowed` are `Allowed` and `NotAllowed`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Verdict {
+    Shared,
+    Protected,
+    Denied,
+    BuiltinDenied,
+    NotAllowed,
+}
+
 /// One file in a listing, named by the wire path a peer fetches it with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Listed {
@@ -241,6 +280,58 @@ pub(crate) struct Listing {
     pub entries: Vec<Listed>,
     pub truncated: bool,
     pub next: Option<String>,
+}
+
+/// The human's view of what `list` serves a peer and what it holds back: every regular
+/// file an allow names, each with its verdict, so a deny that swallows an allow is
+/// visible. `truncated` says the walk hit its bound; `capped` that more than `cap`
+/// entries were found and the rest cut.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct Resolved {
+    pub entries: Vec<ResolvedEntry>,
+    pub truncated: bool,
+    pub capped: bool,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedEntry {
+    pub path: String,
+    pub verdict: Verdict,
+}
+
+/// How many regular files one pattern alone reaches under the share root, counted up to
+/// `cap`: `capped` says the count stopped there, `truncated` that the walk hit its bound.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MatchCount {
+    pub files: usize,
+    pub capped: bool,
+    pub truncated: bool,
+}
+
+/// One entry as a share file holds it, with the layer it came from.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RawEntry {
+    pub layer: Layer,
+    pub kind: RawKind,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RawKind {
+    Allow {
+        pattern: String,
+        peer: Option<String>,
+    },
+    Deny {
+        pattern: String,
+    },
+    Override {
+        path: String,
+    },
 }
 
 /// Where the two files live for one share root, and the directories nothing may serve out
@@ -269,7 +360,7 @@ impl ShareLocations {
         )
     }
 
-    fn with_dir_name(
+    pub(crate) fn with_dir_name(
         config_dir: &Path,
         workspace_root: &Path,
         workspace_config_dir_name: String,
@@ -408,8 +499,7 @@ impl ShareSet {
                 "A mesh share list was refused when it was loaded, so nothing is shared until it is fixed."
             );
         }
-        let canonical_root = dunce::canonicalize(&self.locations.workspace_root)
-            .context("Failed to resolve the share root")?;
+        let canonical_root = self.canonical_root()?;
         let allow = compile(
             self.effective(peer)
                 .iter()
@@ -424,12 +514,7 @@ impl ShareSet {
                 .map(|entry| entry.pattern.as_str()),
             case_insensitive,
         )?;
-        let builtin = compile(
-            builtin_deny_patterns(&self.locations.workspace_config_dir_name)
-                .iter()
-                .map(String::as_str),
-            case_insensitive,
-        )?;
+        let builtin = self.builtin(case_insensitive)?;
         let overrides = self
             .global
             .overrides
@@ -445,6 +530,20 @@ impl ShareSet {
             protected_dirs: protected_dirs(&self.locations),
             canonical_root,
         })
+    }
+
+    fn canonical_root(&self) -> Result<PathBuf> {
+        dunce::canonicalize(&self.locations.workspace_root)
+            .context("Failed to resolve the share root")
+    }
+
+    fn builtin(&self, case_insensitive: bool) -> Result<GlobSet> {
+        compile(
+            builtin_deny_patterns(&self.locations.workspace_config_dir_name)
+                .iter()
+                .map(String::as_str),
+            case_insensitive,
+        )
     }
 
     /// Whether `peer` may fetch `wire_text`, judged on the file as it is on disk and
@@ -629,44 +728,13 @@ impl ShareSet {
                 return Listing::default();
             }
         };
-        let mut walk = Walk {
-            rules: &rules,
-            remaining: walk_bound,
-            truncated: false,
-            candidates: Vec::new(),
-        };
-        for start in start_dirs(
-            self.effective(peer)
-                .iter()
-                .map(|entry| entry.pattern.as_str()),
-        ) {
-            let start = start
-                .split('/')
-                .filter(|segment| !segment.is_empty())
-                .fold(rules.canonical_root.clone(), |path, segment| {
-                    path.join(segment)
-                });
-            // A pattern's literal head may itself pass through a link, and the walk only
-            // refuses links it meets on the way down; so the start is resolved and must
-            // still lie in the root, or there is nothing under it an allow could name.
-            let Ok(start) = dunce::canonicalize(start) else {
-                continue;
-            };
-            if !start.starts_with(&rules.canonical_root) || rules.is_protected(&start) {
-                continue;
-            }
-            walk.run(start);
-        }
-        let Walk {
-            mut candidates,
-            truncated,
-            ..
-        } = walk;
+        let walk = self.walk_allows(&rules, peer, walk_bound);
+        let truncated = walk.truncated;
+        let mut candidates = walk.sorted();
+        candidates.retain(|candidate| candidate.verdict == Verdict::Shared);
         if let Some(prefix) = prefix {
             candidates.retain(|candidate| candidate.path.starts_with(prefix));
         }
-        candidates.sort_by(|left, right| left.path.cmp(&right.path));
-        candidates.dedup_by(|left, right| left.path == right.path);
         let (page, next) = paginate(candidates, cursor, LIST_PAGE_SIZE);
         let entries = hydrate(page);
         let next = next.map(|cursor| {
@@ -685,17 +753,34 @@ impl ShareSet {
         }
     }
 
+    /// The walk behind `list` and `resolve`: every regular file an allow for `peer`
+    /// names, with its verdict, from the literal head of each allow pattern.
+    fn walk_allows<'r>(
+        &self,
+        rules: &'r ShareRules,
+        peer: &PeerRef<'_>,
+        walk_bound: usize,
+    ) -> Walk<'r> {
+        let mut walk = Walk::new(rules, walk_bound, usize::MAX);
+        walk.run_from(
+            self.effective(peer)
+                .iter()
+                .map(|entry| entry.pattern.as_str()),
+        );
+        walk
+    }
+
     #[cfg(test)]
     pub(crate) fn write_target(&self, scope: WriteScope) -> Layer {
         write_target(self.workspace_exists, scope)
     }
 
     /// Validates `mutation`, writes the target file atomically and only then updates
-    /// memory, returning the file written. A mutation the file already holds is `Ok`
-    /// without a write. Refused while poisoned, with the load's refusal, so a corrupt
-    /// file is never replaced by a fresh one.
+    /// memory. A mutation the file already holds is `Ok` without a write, and `Applied`
+    /// says which. Refused while poisoned, with the load's refusal, so a corrupt file is
+    /// never replaced by a fresh one.
     #[cfg(test)]
-    pub(crate) fn apply(&mut self, mutation: Mutation, scope: WriteScope) -> Result<PathBuf> {
+    pub(crate) fn apply(&mut self, mutation: Mutation, scope: WriteScope) -> Result<Applied> {
         if let Some(refusal) = &self.poisoned {
             bail!("{refusal} Nothing was written.");
         }
@@ -705,7 +790,8 @@ impl ShareSet {
             Layer::Workspace => (&self.locations.workspace, &mut self.workspace),
         };
         let mut next = file.clone();
-        if mutate(&mut next, path, &mutation)? {
+        let changed = mutate(&mut next, path, &mutation)?;
+        if changed {
             let yaml =
                 serde_yaml::to_string(&next).context("Failed to serialize the mesh share list")?;
             write_atomically(path, yaml.as_bytes())?;
@@ -719,7 +805,154 @@ impl ShareSet {
                 mutation.kind()
             );
         }
-        Ok(path.clone())
+        Ok(Applied {
+            path: path.clone(),
+            changed,
+        })
+    }
+}
+
+#[cfg(test)]
+impl ShareSet {
+    /// Every entry of both files as written, global first, in file order; empty while
+    /// poisoned, like `effective`.
+    pub(crate) fn entries(&self) -> Vec<RawEntry> {
+        if self.poisoned.is_some() {
+            return Vec::new();
+        }
+        [
+            (Layer::Global, &self.global),
+            (Layer::Workspace, &self.workspace),
+        ]
+        .into_iter()
+        .flat_map(|(layer, file)| {
+            let allow = file.allow.iter().map(|entry| RawKind::Allow {
+                pattern: entry.pattern.clone(),
+                peer: entry.peer.clone(),
+            });
+            let deny = file.deny.iter().map(|entry| RawKind::Deny {
+                pattern: entry.pattern.clone(),
+            });
+            let overrides = file.overrides.iter().map(|entry| RawKind::Override {
+                path: entry.path.clone(),
+            });
+            allow
+                .chain(deny)
+                .chain(overrides)
+                .map(move |kind| RawEntry { layer, kind })
+        })
+        .collect()
+    }
+
+    pub(crate) fn locations(&self) -> &ShareLocations {
+        &self.locations
+    }
+
+    /// Whether the workspace file was on disk at load or has been written since.
+    pub(crate) fn workspace_exists(&self) -> bool {
+        self.workspace_exists
+    }
+
+    /// The refusal a file earned at load, for the verbs to show; `None` when both read.
+    pub(crate) fn refusal(&self) -> Option<&str> {
+        self.poisoned.as_deref()
+    }
+
+    /// `list` with the reasons: every regular file an allow for `peer` names, with the
+    /// verdict a fetch of it would get, so the human sees which of their allows a deny or
+    /// the built-in list holds back. A file no allow names is no entry at all. Nothing is
+    /// opened or hashed. Sorted by wire path and cut at `cap`; a set whose rules cannot
+    /// be built resolves nothing, and `refusal` says why when a file was refused.
+    pub(crate) fn resolve(
+        &self,
+        peer: &PeerRef<'_>,
+        case_insensitive: bool,
+        walk_bound: usize,
+        cap: usize,
+    ) -> Resolved {
+        let Ok(rules) = self.rules(peer, case_insensitive) else {
+            return Resolved::default();
+        };
+        let walk = self.walk_allows(&rules, peer, walk_bound);
+        let truncated = walk.truncated;
+        let mut entries: Vec<ResolvedEntry> = walk
+            .sorted()
+            .into_iter()
+            .map(|candidate| ResolvedEntry {
+                path: candidate.path,
+                verdict: candidate.verdict,
+            })
+            .collect();
+        let capped = entries.len() > cap;
+        entries.truncate(cap);
+        Resolved {
+            entries,
+            truncated,
+            capped,
+        }
+    }
+
+    /// How many regular files under the share root `pattern` alone reaches, counting up
+    /// to `cap` and no further, so a verb can ask whether the pattern a human is about to
+    /// write is broad before it writes it. Independent of every allow and deny on disk;
+    /// `.git` and the protected directories are never entered and a symlinked directory
+    /// never followed, as in `list`. Fails only for a pattern the files would refuse or a
+    /// root that does not resolve.
+    pub(crate) fn count_matches(
+        &self,
+        pattern: &str,
+        case_insensitive: bool,
+        walk_bound: usize,
+        cap: usize,
+    ) -> Result<MatchCount> {
+        validate_pattern(pattern)?;
+        let rules = ShareRules {
+            allow: compile([pattern], case_insensitive)?,
+            deny: GlobSet::empty(),
+            builtin: GlobSet::empty(),
+            overrides: Vec::new(),
+            case_insensitive,
+            protected_dirs: protected_dirs(&self.locations),
+            canonical_root: self.canonical_root()?,
+        };
+        let mut walk = Walk::new(&rules, walk_bound, cap);
+        walk.run_from([pattern]);
+        Ok(MatchCount {
+            files: walk.candidates.len(),
+            capped: walk.capped,
+            truncated: walk.truncated,
+        })
+    }
+
+    /// The first segment of `pattern` when it names a directory nothing may serve out of,
+    /// so `allow` and `deny` refuse it before anything is walked or written: `.git`, or
+    /// the workspace config directory under either name it goes by. The global config
+    /// directory is not addressable by a relative pattern, so it is not checked here.
+    pub(crate) fn protected_head(&self, pattern: &str) -> Option<String> {
+        let head = pattern.split('/').next()?;
+        let protected = head == ".git"
+            || workspace_config_dir_names(&self.locations.workspace_config_dir_name)
+                .contains(&head);
+        protected.then(|| head.to_string())
+    }
+
+    /// Whether the built-in deny, with the workspace config directory, names this one
+    /// relative file: judged on the text, and on what it resolves to under the root when
+    /// it exists, so a link to a secret is caught as a fetch of it would be. This is what
+    /// a forced allow of such a file has to be told about.
+    pub(crate) fn builtin_denies(&self, path: &str, case_insensitive: bool) -> Result<bool> {
+        let builtin = self.builtin(case_insensitive)?;
+        if builtin.is_match(path) {
+            return Ok(true);
+        }
+        let Ok(root) = self.canonical_root() else {
+            return Ok(false);
+        };
+        let Ok(canonical) = dunce::canonicalize(root.join(path)) else {
+            return Ok(false);
+        };
+        Ok(segments_under(&root, &canonical)
+            .is_some_and(|segments| builtin.is_match(segments.join("/"))))
     }
 }
 
@@ -763,26 +996,41 @@ impl ShareRules {
     /// root, the root itself, or one whose resolved path is not UTF-8, is `Denied` like
     /// anything a deny names, so no grant reaches it either.
     pub(crate) fn judge(&self, wire: &WirePath, canonical: &Path) -> Judgement {
+        match self.verdict(wire, canonical) {
+            Verdict::Shared => Judgement::Allowed,
+            Verdict::NotAllowed => Judgement::NotAllowed,
+            Verdict::Protected | Verdict::Denied | Verdict::BuiltinDenied => Judgement::Denied,
+        }
+    }
+
+    /// `judge` with the reason kept; the one place the order of the rules is written.
+    pub(crate) fn verdict(&self, wire: &WirePath, canonical: &Path) -> Verdict {
         if self.is_protected(canonical) {
-            return Judgement::Denied;
+            return Verdict::Protected;
         }
         let Some(resolved) = self.resolved(canonical) else {
-            return Judgement::Denied;
+            return Verdict::Protected;
         };
         let alias = wire.segments().collect::<Vec<_>>().join("/");
         if self.deny.is_match(&alias) || self.deny.is_match(&resolved) {
-            return Judgement::Denied;
+            return Verdict::Denied;
         }
         if (self.builtin.is_match(&alias) || self.builtin.is_match(&resolved))
             && !self.overridden(&resolved)
         {
-            return Judgement::Denied;
+            return Verdict::BuiltinDenied;
         }
         if self.allow.is_match(&resolved) {
-            Judgement::Allowed
+            Verdict::Shared
         } else {
-            Judgement::NotAllowed
+            Verdict::NotAllowed
         }
+    }
+
+    /// Whether an allow names what `canonical` resolved to, whatever the denies say.
+    fn allow_names(&self, canonical: &Path) -> bool {
+        self.resolved(canonical)
+            .is_some_and(|resolved| self.allow.is_match(&resolved))
     }
 
     fn is_protected(&self, canonical: &Path) -> bool {
@@ -832,28 +1080,72 @@ pub(crate) fn probe_case_insensitive(root: &Path) -> Result<bool> {
     Ok(folds)
 }
 
-/// The directory walk behind `list`: an explicit stack, a budget of entries to visit, and
-/// the files that passed, unopened. Symlinked directories are never entered, since a link
-/// can take the walk anywhere and `**` is the user's promise about this tree alone; a
-/// symlinked file is judged on what it resolves to, as a fetch of it would be.
+/// The directory walk behind `list`, `resolve` and `count_matches`: an explicit stack, a
+/// budget of entries to visit, a cap on the files kept, and every regular file an allow
+/// names, unopened and with its verdict, so one traversal serves a peer's listing and
+/// the human's view of what the denies hold back. Symlinked directories are never
+/// entered, since a link can take the walk anywhere and `**` is the user's promise about
+/// this tree alone; a symlinked file is judged on what it resolves to, as a fetch of it
+/// would be.
 struct Walk<'a> {
     rules: &'a ShareRules,
     remaining: usize,
     truncated: bool,
+    /// Files kept before the walk stops; `usize::MAX` keeps them all.
+    cap: usize,
+    capped: bool,
     candidates: Vec<Candidate>,
 }
 
-/// A file the walk passed, named by its wire path and where it resolved to, kept unopened
-/// until `hydrate` reads the page it lands on.
+/// A file an allow names, by its wire path and where it resolved to, kept unopened until
+/// `hydrate` reads the page it lands on, with the verdict a fetch of it would get.
 struct Candidate {
     path: String,
     canonical: PathBuf,
+    verdict: Verdict,
 }
 
-impl Walk<'_> {
+impl<'a> Walk<'a> {
+    fn new(rules: &'a ShareRules, walk_bound: usize, cap: usize) -> Self {
+        Self {
+            rules,
+            remaining: walk_bound,
+            truncated: false,
+            cap,
+            capped: false,
+            candidates: Vec::new(),
+        }
+    }
+
+    /// Walks from the literal head of each pattern rather than from the root, so a share
+    /// of `docs/**` never reads the rest of the tree.
+    fn run_from<'p>(&mut self, patterns: impl IntoIterator<Item = &'p str>) {
+        for start in start_dirs(patterns) {
+            let start = start
+                .split('/')
+                .filter(|segment| !segment.is_empty())
+                .fold(self.rules.canonical_root.clone(), |path, segment| {
+                    path.join(segment)
+                });
+            // A pattern's literal head may itself pass through a link, and the walk only
+            // refuses links it meets on the way down; so the start is resolved and must
+            // still lie in the root, or there is nothing under it an allow could name.
+            let Ok(start) = dunce::canonicalize(start) else {
+                continue;
+            };
+            if !start.starts_with(&self.rules.canonical_root) || self.rules.is_protected(&start) {
+                continue;
+            }
+            self.run(start);
+        }
+    }
+
     fn run(&mut self, start: PathBuf) {
         let mut stack = vec![start];
         while let Some(path) = stack.pop() {
+            if self.capped {
+                return;
+            }
             if self.remaining == 0 {
                 self.truncated = true;
                 return;
@@ -878,8 +1170,8 @@ impl Walk<'_> {
         }
     }
 
-    /// Keeps `path` if its name under the root is a wire path the allow set serves once
-    /// resolved to a regular file. A name the grammar refuses is left out, since no peer
+    /// Keeps `path` if its name under the root is a wire path and an allow names what it
+    /// resolves to, a regular file. A name the grammar refuses is left out, since no peer
     /// could fetch it.
     fn file(&mut self, path: &Path) {
         let Some(wire_text) = self.wire_text(path) else {
@@ -891,20 +1183,31 @@ impl Walk<'_> {
         let Ok(canonical) = dunce::canonicalize(path) else {
             return;
         };
-        if self.rules.judge(&wire, &canonical) != Judgement::Allowed {
+        if !self.rules.allow_names(&canonical) {
             return;
         }
         if !fs::metadata(&canonical).is_ok_and(|metadata| metadata.is_file()) {
             return;
         }
+        let verdict = self.rules.verdict(&wire, &canonical);
         self.candidates.push(Candidate {
             path: wire_text,
             canonical,
+            verdict,
         });
+        self.capped = self.candidates.len() >= self.cap;
     }
 
     fn wire_text(&self, path: &Path) -> Option<String> {
         Some(segments_under(&self.rules.canonical_root, path)?.join("/"))
+    }
+
+    /// The files kept, by wire path, a path reached twice kept once.
+    fn sorted(self) -> Vec<Candidate> {
+        let mut candidates = self.candidates;
+        candidates.sort_by(|left, right| left.path.cmp(&right.path));
+        candidates.dedup_by(|left, right| left.path == right.path);
+        candidates
     }
 }
 
@@ -1082,8 +1385,33 @@ fn compile<'a>(
     set.build().context("Failed to compile the share patterns")
 }
 
-fn is_canonical(hash: &str) -> bool {
-    canonical_hash(hash).as_deref() == Some(hash)
+/// Whether `peer` is the canonical lowercase 32-hex an allow entry's `peer` must be to
+/// scope it to anyone; any other text scopes the entry to nobody.
+pub(crate) fn is_canonical_peer(peer: &str) -> bool {
+    canonical_hash(peer).as_deref() == Some(peer)
+}
+
+/// Whether `pattern` reaches the whole tree: its first segment is `**`, so `**`,
+/// `**/*.md` and `**/x` are broad where `docs/**` is not.
+#[cfg(test)]
+pub(crate) fn is_broad_pattern(pattern: &str) -> bool {
+    pattern.split('/').next() == Some("**")
+}
+
+/// Whether a root-relative name must not be offered as a completion for `allow` or
+/// `deny`: `.git`, the workspace config directory under either name it goes by, or
+/// anything the built-in deny matches by name. No I/O. The built-in set is this module's
+/// own constants, so one that fails to compile is a bug and hides everything.
+#[cfg(test)]
+pub(crate) fn hidden_from_completion(relative: &str, workspace_config_dir_name: &str) -> bool {
+    workspace_config_dir_names(workspace_config_dir_name).contains(&relative)
+        || compile(
+            builtin_deny_patterns(workspace_config_dir_name)
+                .iter()
+                .map(String::as_str),
+            false,
+        )
+        .map_or(true, |builtin| builtin.is_match(relative))
 }
 
 /// Applies `mutation` to `file`, which lives at `path`; `Ok(false)` means the file already
@@ -1108,11 +1436,13 @@ fn mutate(file: &mut SharesFile, path: &Path, mutation: &Mutation) -> Result<boo
             Ok(push_unless_present(&mut file.deny, entry))
         }
         Mutation::Unshare { pattern } => {
-            let before = file.allow.len();
+            let before = (file.allow.len(), file.deny.len(), file.overrides.len());
             file.allow.retain(|entry| entry.pattern != *pattern);
-            if file.allow.len() == before {
+            file.deny.retain(|entry| entry.pattern != *pattern);
+            file.overrides.retain(|entry| entry.path != *pattern);
+            if (file.allow.len(), file.deny.len(), file.overrides.len()) == before {
                 bail!(
-                    "No allow entry in mesh share list '{}' has the pattern `{pattern}`; nothing was changed.",
+                    "No share entry in '{}' has the pattern `{pattern}`; nothing was changed.",
                     path.display()
                 );
             }
@@ -1151,7 +1481,9 @@ fn has_drive_prefix(pattern: &str) -> bool {
     bytes.first().is_some_and(u8::is_ascii_alphabetic) && bytes.get(1) == Some(&b':')
 }
 
-fn validate_pattern(pattern: &str) -> Result<()> {
+/// The teaching refusals for a pattern as the share files take it; the verbs run them
+/// before anything is walked so the human hears the rule, not a glob error.
+pub(crate) fn validate_pattern(pattern: &str) -> Result<()> {
     if pattern.contains('\\') {
         bail!(
             "Share patterns use `/` between segments on every platform; `{pattern}` carries a `\\`. Write it with `/`."
@@ -1174,7 +1506,7 @@ fn validate_pattern(pattern: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_override(path: &str) -> Result<()> {
+pub(crate) fn validate_override(path: &str) -> Result<()> {
     if path.contains(GLOB_METACHARACTERS) {
         bail!(
             "An override lifts the built-in deny for one exact file; `{path}` is a pattern. Name the file."
@@ -1433,6 +1765,7 @@ mod tests {
         Candidate {
             path: path.to_string(),
             canonical: PathBuf::new(),
+            verdict: Verdict::Shared,
         }
     }
 
@@ -1620,7 +1953,11 @@ mod tests {
     fn apply_writes_the_file_write_target_names_and_leaves_the_other_alone() {
         let fx = Fixture::new("shares-apply-auto-global");
         let locations = fx.locations();
-        let written = fx.load().apply(allow("docs/**"), WriteScope::Auto).unwrap();
+        let written = fx
+            .load()
+            .apply(allow("docs/**"), WriteScope::Auto)
+            .unwrap()
+            .path;
         assert_eq!(written, locations.global);
         assert!(locations.global.exists());
         assert!(!locations.workspace.exists());
@@ -1629,7 +1966,11 @@ mod tests {
         let fx = Fixture::new("shares-apply-auto-workspace");
         let locations = fx.locations();
         fx.write(Layer::Workspace, "version: 1\n");
-        let written = fx.load().apply(allow("docs/**"), WriteScope::Auto).unwrap();
+        let written = fx
+            .load()
+            .apply(allow("docs/**"), WriteScope::Auto)
+            .unwrap()
+            .path;
         assert_eq!(written, locations.workspace);
         assert!(!locations.global.exists());
 
@@ -1639,7 +1980,8 @@ mod tests {
         let written = fx
             .load()
             .apply(allow("docs/**"), WriteScope::Global)
-            .unwrap();
+            .unwrap()
+            .path;
         assert_eq!(written, locations.global);
         assert_eq!(
             fs::read_to_string(&locations.workspace).unwrap(),
@@ -1649,7 +1991,10 @@ mod tests {
         let fx = Fixture::new("shares-apply-forced-workspace");
         let locations = fx.locations();
         let mut set = fx.load();
-        let written = set.apply(allow("docs/**"), WriteScope::Workspace).unwrap();
+        let written = set
+            .apply(allow("docs/**"), WriteScope::Workspace)
+            .unwrap()
+            .path;
         assert_eq!(written, locations.workspace);
         assert!(!locations.global.exists());
         assert!(set.workspace_exists);
@@ -1994,7 +2339,7 @@ mod tests {
     fn repeating_a_mutation_is_a_no_op_that_writes_nothing() {
         let fx = Fixture::new("shares-idempotent");
         let mut set = fx.load();
-        let path = set.apply(allow("docs/**"), WriteScope::Auto).unwrap();
+        let path = set.apply(allow("docs/**"), WriteScope::Auto).unwrap().path;
         set.apply(deny("docs/private/**"), WriteScope::Auto)
             .unwrap();
         set.apply(lift(".env.example"), WriteScope::Auto).unwrap();
@@ -2038,7 +2383,8 @@ mod tests {
                 },
                 WriteScope::Auto,
             )
-            .unwrap();
+            .unwrap()
+            .path;
 
         assert_eq!(
             set.global.allow,
@@ -2059,6 +2405,461 @@ mod tests {
             .to_string();
         assert!(err.contains(&path.display().to_string()), "{err}");
         assert!(err.contains("docs/**"), "{err}");
+    }
+
+    #[test]
+    fn unshare_removes_a_deny_and_an_override_with_that_text_too() {
+        let fx = Fixture::new("shares-unshare-any-kind");
+        let mut set = fx.load();
+        set.apply(deny("src/vault/*"), WriteScope::Auto).unwrap();
+        set.apply(lift(".env.example"), WriteScope::Auto).unwrap();
+        set.apply(allow("docs/**"), WriteScope::Auto).unwrap();
+        let unshare = |pattern: &str| Mutation::Unshare {
+            pattern: pattern.into(),
+        };
+
+        assert!(
+            set.apply(unshare("src/vault/*"), WriteScope::Auto)
+                .unwrap()
+                .changed
+        );
+        assert!(
+            set.apply(unshare(".env.example"), WriteScope::Auto)
+                .unwrap()
+                .changed
+        );
+
+        assert!(set.global.deny.is_empty());
+        assert!(set.global.overrides.is_empty());
+        assert_eq!(set.global.allow.len(), 1, "the allow is untouched");
+        assert_eq!(fx.load().global, set.global);
+        let err = set
+            .apply(unshare("src/vault/*"), WriteScope::Auto)
+            .unwrap_err()
+            .to_string();
+        assert!(err.starts_with("No share entry in '"), "{err}");
+        assert!(
+            err.ends_with("has the pattern `src/vault/*`; nothing was changed."),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn apply_says_whether_the_file_changed() {
+        let fx = Fixture::new("shares-applied");
+        let mut set = fx.load();
+
+        let first = set.apply(allow("docs/**"), WriteScope::Auto).unwrap();
+        let again = set.apply(allow("docs/**"), WriteScope::Auto).unwrap();
+
+        assert_eq!(first.path, fx.locations().global);
+        assert!(first.changed);
+        assert_eq!(again.path, first.path);
+        assert!(!again.changed);
+    }
+
+    #[test]
+    fn entries_lists_every_entry_of_both_files_global_first_and_nothing_while_poisoned() {
+        let fx = Fixture::new("shares-entries");
+        let peer = fake_hash(0x1a);
+        let mut set = fx.load();
+        set.apply(lift(".env.example"), WriteScope::Global).unwrap();
+        set.apply(allow("docs/**"), WriteScope::Global).unwrap();
+        set.apply(deny("docs/private/**"), WriteScope::Global)
+            .unwrap();
+        set.apply(
+            Mutation::Allow {
+                pattern: "src/**".into(),
+                peer: Some(peer.clone()),
+            },
+            WriteScope::Workspace,
+        )
+        .unwrap();
+
+        assert_eq!(
+            set.entries(),
+            [
+                RawEntry {
+                    layer: Layer::Global,
+                    kind: RawKind::Allow {
+                        pattern: "docs/**".into(),
+                        peer: None,
+                    },
+                },
+                RawEntry {
+                    layer: Layer::Global,
+                    kind: RawKind::Deny {
+                        pattern: "docs/private/**".into(),
+                    },
+                },
+                RawEntry {
+                    layer: Layer::Global,
+                    kind: RawKind::Override {
+                        path: ".env.example".into(),
+                    },
+                },
+                RawEntry {
+                    layer: Layer::Workspace,
+                    kind: RawKind::Allow {
+                        pattern: "src/**".into(),
+                        peer: Some(peer),
+                    },
+                },
+            ]
+        );
+        fx.write(Layer::Global, "version: 1\nallow: [\n");
+        assert!(fx.load().entries().is_empty());
+    }
+
+    #[test]
+    fn the_read_accessors_say_where_the_files_are_and_what_the_load_found() {
+        let fx = Fixture::new("shares-accessors");
+        let set = fx.load();
+        assert_eq!(*set.locations(), fx.locations());
+        assert!(!set.workspace_exists());
+        assert_eq!(set.refusal(), None);
+
+        let mut set = fx.load();
+        set.apply(allow("docs/**"), WriteScope::Workspace).unwrap();
+        assert!(set.workspace_exists(), "a write creates the workspace file");
+
+        let corrupt = fx.write(Layer::Workspace, "version: 1\nallow: [\n");
+        let set = fx.load();
+        assert!(set.workspace_exists());
+        let refusal = set.refusal().unwrap();
+        assert!(
+            refusal.contains(&corrupt.display().to_string()),
+            "{refusal}"
+        );
+    }
+
+    #[test]
+    fn is_canonical_peer_accepts_lowercase_32_hex_alone() {
+        assert!(is_canonical_peer(&fake_hash(0xab)));
+        assert!(!is_canonical_peer(&fake_hash(0xab).to_uppercase()));
+        assert!(!is_canonical_peer(&fake_hash(0xab)[..31]));
+        assert!(!is_canonical_peer("alice"));
+        assert!(!is_canonical_peer(""));
+    }
+
+    #[test]
+    fn an_unscoped_peer_sees_only_the_peer_less_allow_entries() {
+        let fx = Fixture::new("shares-unscoped");
+        let mut set = fx.load();
+        set.apply(
+            Mutation::Allow {
+                pattern: "private/**".into(),
+                peer: Some(fake_hash(0x1a)),
+            },
+            WriteScope::Auto,
+        )
+        .unwrap();
+        set.apply(allow("public/**"), WriteScope::Auto).unwrap();
+
+        assert!(!same_hash(&fake_hash(0x1a), ""));
+        assert_eq!(
+            patterns(&set.effective(&PeerRef::unscoped())),
+            ["public/**"]
+        );
+    }
+
+    #[test]
+    fn verdict_keeps_the_reason_judge_folds_into_denied() {
+        let fx = Fixture::new("shares-verdict");
+        let mut set = fx.load();
+        set.apply(allow("**"), WriteScope::Global).unwrap();
+        set.apply(deny("src/vault/*"), WriteScope::Global).unwrap();
+        set.apply(lift(".env.example"), WriteScope::Global).unwrap();
+        let table = [
+            ("docs/a.md", Verdict::Shared, Judgement::Allowed),
+            (".coyote/notes.md", Verdict::Protected, Judgement::Denied),
+            ("src/vault/k", Verdict::Denied, Judgement::Denied),
+            (".env", Verdict::BuiltinDenied, Judgement::Denied),
+            (".env.example", Verdict::Shared, Judgement::Allowed),
+        ];
+        let files: Vec<PathBuf> = table
+            .iter()
+            .map(|(relative, ..)| fx.file(relative))
+            .collect();
+        // Built after the files, so the workspace config dir exists to be protected.
+        let rules = rules_for_anyone(&set);
+
+        for ((relative, verdict, judgement), canonical) in table.into_iter().zip(&files) {
+            let canonical = canonical.as_path();
+            assert_eq!(
+                rules.verdict(&wire(relative), canonical),
+                verdict,
+                "{relative}"
+            );
+            assert_eq!(
+                rules.judge(&wire(relative), canonical),
+                judgement,
+                "{relative}"
+            );
+        }
+        let outside = fx.file("docs/b.md");
+        let narrow = {
+            let mut set = fx.load();
+            set.apply(
+                Mutation::Unshare {
+                    pattern: "**".into(),
+                },
+                WriteScope::Global,
+            )
+            .unwrap();
+            set.apply(allow("docs/a.md"), WriteScope::Global).unwrap();
+            rules_for_anyone(&set)
+        };
+        assert_eq!(
+            narrow.verdict(&wire("docs/b.md"), &outside),
+            Verdict::NotAllowed
+        );
+        assert_eq!(
+            narrow.judge(&wire("docs/b.md"), &outside),
+            Judgement::NotAllowed
+        );
+    }
+
+    /// `allow **` with a workspace deny on the vault: the human's view names the shared
+    /// file and both held-back files with their reasons, while the directories the walk
+    /// never enters contribute nothing.
+    fn resolve_fixture(tag: &str) -> (Fixture, ShareSet) {
+        let fx = Fixture::new(tag);
+        let mut set = fx.load();
+        set.apply(allow("**"), WriteScope::Global).unwrap();
+        set.apply(deny("src/vault/*"), WriteScope::Workspace)
+            .unwrap();
+        for path in ["docs/a.md", ".env", "src/vault/k", ".git/config"] {
+            fx.file(path);
+        }
+        (fx, set)
+    }
+
+    #[test]
+    fn resolve_marks_a_built_in_denied_and_a_denied_file_under_an_allow_everything_pattern() {
+        let (_fx, set) = resolve_fixture("resolve-reasons");
+
+        let resolved = set.resolve(
+            &PeerRef::unscoped(),
+            false,
+            DEFAULT_LIST_WALK_BOUND,
+            LIST_PAGE_SIZE,
+        );
+
+        assert_eq!(
+            resolved.entries,
+            [
+                ResolvedEntry {
+                    path: ".env".into(),
+                    verdict: Verdict::BuiltinDenied,
+                },
+                ResolvedEntry {
+                    path: "docs/a.md".into(),
+                    verdict: Verdict::Shared,
+                },
+                ResolvedEntry {
+                    path: "src/vault/k".into(),
+                    verdict: Verdict::Denied,
+                },
+            ],
+            "nothing under `.git/` or the workspace config dir"
+        );
+        assert!(!resolved.truncated);
+        assert!(!resolved.capped);
+    }
+
+    #[test]
+    fn resolve_cuts_at_the_cap_and_says_so() {
+        let (_fx, set) = resolve_fixture("resolve-cap");
+
+        let resolved = set.resolve(&PeerRef::unscoped(), false, DEFAULT_LIST_WALK_BOUND, 2);
+
+        assert_eq!(
+            resolved
+                .entries
+                .iter()
+                .map(|entry| entry.path.as_str())
+                .collect::<Vec<_>>(),
+            [".env", "docs/a.md"]
+        );
+        assert!(resolved.capped);
+    }
+
+    #[test]
+    fn resolve_reports_a_walk_cut_short_and_resolves_nothing_while_poisoned() {
+        let (fx, set) = resolve_fixture("resolve-bound");
+
+        assert!(
+            set.resolve(&PeerRef::unscoped(), false, 2, LIST_PAGE_SIZE)
+                .truncated
+        );
+        fx.write(Layer::Global, "version: 1\nallow: [\n");
+        assert_eq!(
+            fx.load().resolve(
+                &PeerRef::unscoped(),
+                false,
+                DEFAULT_LIST_WALK_BOUND,
+                LIST_PAGE_SIZE
+            ),
+            Resolved::default()
+        );
+    }
+
+    #[test]
+    fn listing_the_resolve_fixture_serves_only_the_shared_file() {
+        let (_fx, set) = resolve_fixture("resolve-vs-list");
+
+        let listing = listing(&set, None, DEFAULT_LIST_WALK_BOUND);
+
+        assert_eq!(listed_paths(&listing), ["docs/a.md"]);
+        assert!(!listing.truncated);
+    }
+
+    #[test]
+    fn count_matches_counts_the_files_one_pattern_reaches_and_stops_at_the_cap() {
+        let fx = Fixture::new("count-matches");
+        let set = fx.load();
+        for path in [
+            "docs/a.md",
+            "docs/b.md",
+            "docs/deep/c.md",
+            "src/x.rs",
+            ".env",
+        ] {
+            fx.file(path);
+        }
+
+        let docs = set
+            .count_matches("docs/**", false, DEFAULT_LIST_WALK_BOUND, LIST_PAGE_SIZE)
+            .unwrap();
+        let capped = set
+            .count_matches("docs/**", false, DEFAULT_LIST_WALK_BOUND, 2)
+            .unwrap();
+        let everything = set
+            .count_matches("**", false, DEFAULT_LIST_WALK_BOUND, LIST_PAGE_SIZE)
+            .unwrap();
+
+        assert_eq!(
+            docs,
+            MatchCount {
+                files: 3,
+                capped: false,
+                truncated: false,
+            }
+        );
+        assert_eq!(
+            capped,
+            MatchCount {
+                files: 2,
+                capped: true,
+                truncated: false,
+            }
+        );
+        assert_eq!(
+            everything.files, 5,
+            "the count is about the pattern alone, not the deny lists"
+        );
+        assert!(
+            set.count_matches("docs/**", false, 2, LIST_PAGE_SIZE)
+                .unwrap()
+                .truncated
+        );
+        let err = set
+            .count_matches("/docs/**", false, DEFAULT_LIST_WALK_BOUND, LIST_PAGE_SIZE)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("relative to the workspace root"), "{err}");
+    }
+
+    #[test]
+    fn is_broad_pattern_is_true_only_when_the_first_segment_is_a_double_star() {
+        for (pattern, broad) in [
+            ("**", true),
+            ("**/*.md", true),
+            ("**/x", true),
+            ("docs/**", false),
+            ("*", false),
+            ("*.md", false),
+            ("docs/**/x.md", false),
+        ] {
+            assert_eq!(is_broad_pattern(pattern), broad, "{pattern}");
+        }
+    }
+
+    #[test]
+    fn protected_head_names_git_and_the_workspace_config_dir_at_the_first_segment_only() {
+        let fx = Fixture::new("protected-head");
+        let set = fx.load();
+        let dir = WORKSPACE_COYOTE_DIR_NAME;
+
+        assert_eq!(set.protected_head(".git"), Some(".git".into()));
+        assert_eq!(set.protected_head(".git/**"), Some(".git".into()));
+        assert_eq!(set.protected_head(dir), Some(dir.into()));
+        assert_eq!(
+            set.protected_head(&format!("{dir}/mesh-shares.yaml")),
+            Some(dir.into())
+        );
+        assert_eq!(set.protected_head("docs/**"), None);
+        assert_eq!(set.protected_head("**"), None);
+        assert_eq!(
+            set.protected_head("docs/.git/**"),
+            None,
+            "the built-in deny, not this check, covers a nested `.git`"
+        );
+    }
+
+    #[test]
+    fn builtin_denies_the_usual_secrets_git_and_the_workspace_config_dir_but_not_a_doc() {
+        let fx = Fixture::new("builtin-denies");
+        let set = fx.load();
+        let in_config_dir = format!("{WORKSPACE_COYOTE_DIR_NAME}/x");
+
+        for path in [
+            ".env",
+            "docs/.env.local",
+            "a/b.pem",
+            "id_rsa",
+            ".git/config",
+            in_config_dir.as_str(),
+        ] {
+            assert!(set.builtin_denies(path, false).unwrap(), "{path}");
+        }
+        assert!(!set.builtin_denies("docs/a.md", false).unwrap());
+        assert!(set.builtin_denies("docs/.ENV", true).unwrap());
+        assert!(!set.builtin_denies("docs/.ENV", false).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn builtin_denies_a_plain_name_that_resolves_to_a_secret() {
+        let fx = Fixture::new("builtin-denies-link");
+        let set = fx.load();
+        fx.file(".env");
+        fx.link("docs/settings", "../.env");
+
+        assert!(set.builtin_denies("docs/settings", false).unwrap());
+        assert!(!set.builtin_denies("docs/missing", false).unwrap());
+    }
+
+    #[test]
+    fn hidden_from_completion_hides_git_the_config_dir_and_built_in_denied_names() {
+        for (name, hidden) in [
+            (".git", true),
+            (".coyote", true),
+            (".coyote-custom", true),
+            (".env", true),
+            (".env.local", true),
+            ("x.pem", true),
+            ("id_rsa", true),
+            ("docs", false),
+            ("README.md", false),
+        ] {
+            assert_eq!(
+                hidden_from_completion(name, ".coyote-custom"),
+                hidden,
+                "{name}"
+            );
+        }
     }
 
     #[test]
@@ -3437,6 +4238,7 @@ mod tests {
                 .map(|(canonical, name)| Candidate {
                     path: name.to_string(),
                     canonical: canonical.clone(),
+                    verdict: Verdict::Shared,
                 })
                 .collect(),
         );

@@ -47,6 +47,8 @@ use crate::mesh::r3::{
     R3Client, R3Error, R3Server, RefusalCode, RequestOptions, RequestOutcome, STATUS_PATH,
     redact_hashes, short,
 };
+#[cfg(test)]
+use crate::mesh::shares::ShareLocations;
 use crate::mesh::snapshot::MeshSnapshot;
 use crate::mesh::trust::TrustStore;
 use crate::mesh::{display_text, hex_lower, identity, mesh_cache_dir};
@@ -2925,6 +2927,26 @@ impl ShareSource for MeshSlot {
 
     fn serving(&self) -> Option<Arc<FetchServing>> {
         self.get().map(|runtime| Arc::clone(runtime.serving()))
+    }
+}
+
+impl MeshSlot {
+    /// The share root, the published snapshot's `cwd`, and where its two share files
+    /// live; `None` before a snapshot exists. With a running node this is the node's own
+    /// `FetchServing::share_locations`, cache dir and configured inbox protected; while
+    /// the mesh is off it is built from `MeshPaths::from_env()`, so `.mesh shares` and
+    /// the `.mesh on` preview read the files the node will serve from.
+    #[cfg(test)]
+    pub(crate) fn share_locations(&self) -> Option<(PathBuf, ShareLocations)> {
+        let root = ShareSource::share_root(self)?;
+        let locations = match self.get() {
+            Some(runtime) => runtime.serving().share_locations(&root),
+            None => {
+                let paths = MeshPaths::from_env();
+                ShareLocations::new(&paths.config_dir, &root).with_cache_dir(&paths.cache_dir)
+            }
+        };
+        Some((root, locations))
     }
 }
 
@@ -6837,6 +6859,26 @@ mod tests {
         snapshot.cwd = root.clone();
         slot.publish(snapshot);
         assert_eq!(slot.share_root(), Some(root));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_slot_names_the_share_files_only_once_a_snapshot_names_a_root() {
+        let slot = MeshSlot::default();
+        assert!(slot.share_locations().is_none(), "nothing published");
+
+        let tmp = TempDir::new("slot-share-locations");
+        let mut snapshot = snapshot_fixture();
+        snapshot.cwd = tmp.path.clone();
+        slot.publish(snapshot);
+
+        let (root, locations) = slot.share_locations().unwrap();
+        assert_eq!(root, tmp.path);
+        assert!(
+            locations.global.ends_with("mesh/shares.yaml"),
+            "{locations:?}"
+        );
+        assert!(locations.workspace.starts_with(&tmp.path), "{locations:?}");
     }
 
     /// A fork serves from its own grants file: a path granted to the fork's instance is
