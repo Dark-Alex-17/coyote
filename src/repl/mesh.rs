@@ -271,7 +271,12 @@ async fn join(ctx: &mut RequestContext, options: JoinOptions) -> Result<()> {
         );
     };
     let cwd = env::current_dir()?;
-    out_text(&render_on_preview(&config, &session_name, fresh));
+    out_text(&render_on_preview(
+        &config,
+        &session_name,
+        fresh,
+        shared_count(ctx),
+    ));
     if let Some(warning) = cwd_warning(&cwd, dirs::home_dir().as_deref()) {
         err_text(&warning);
     }
@@ -2870,8 +2875,43 @@ fn audience(interface: &MeshInterface) -> &'static str {
     }
 }
 
+/// How many paths the share files already hand every trusted peer, for the `.mesh on`
+/// preview; `capped` says the count stopped at `LIST_PAGE_SIZE`.
+struct SharedCount {
+    paths: usize,
+    capped: bool,
+}
+
+/// Counts the peer-less entries only, what every trusted peer gets, after the built-in
+/// and user denies; a peer-scoped allow is not counted. Resolved without the case probe,
+/// since nothing may touch the tree before the user consents to serving it. `None` before
+/// a snapshot names the share root.
+fn shared_count(ctx: &RequestContext) -> Option<SharedCount> {
+    let (_, locations) = ctx.app.mesh.share_locations()?;
+    let (set, _warning) = ShareSet::load_quietly(locations);
+    let resolved = set.resolve(
+        &PeerRef::unscoped(),
+        false,
+        DEFAULT_LIST_WALK_BOUND,
+        LIST_PAGE_SIZE,
+    );
+    Some(SharedCount {
+        paths: resolved
+            .entries
+            .iter()
+            .filter(|entry| entry.verdict == ShareVerdict::Shared)
+            .count(),
+        capped: resolved.capped,
+    })
+}
+
 /// What `.mesh on` prints before anything leaves the machine.
-fn render_on_preview(config: &MeshConfig, session_name: &str, fresh: bool) -> String {
+fn render_on_preview(
+    config: &MeshConfig,
+    session_name: &str,
+    fresh: bool,
+    shared: Option<SharedCount>,
+) -> String {
     let mut lines = vec![
         format!(
             "Joining the mesh for session '{session_name}' (this session only; config.yaml is not changed)."
@@ -2905,6 +2945,16 @@ fn render_on_preview(config: &MeshConfig, session_name: &str, fresh: bool) -> St
     lines.push(
         "  status card and brief: this session's objective, state, repo and todo, served to trusted peers on request".to_string(),
     );
+    if let Some(shared) = shared.filter(|shared| shared.paths > 0) {
+        let n = if shared.capped {
+            format!("{LIST_PAGE_SIZE} or more")
+        } else {
+            shared.paths.to_string()
+        };
+        lines.push(format!(
+            "  files: {n} path(s) are shared with trusted peers (`.mesh shares`)"
+        ));
+    }
     if fresh {
         lines.push(
             "  fresh id: this session gets a new mesh id and destination; peers that trusted the old destination must trust the new one".to_string(),
@@ -3925,7 +3975,7 @@ mod tests {
             display_name: Some("Ann".into()),
             ..public_config()
         };
-        let text = render_on_preview(&config, "work", false);
+        let text = render_on_preview(&config, "work", false, None);
         assert!(text.contains("session 'work'"), "{text}");
         assert!(text.contains("config.yaml is not changed"), "{text}");
         assert!(text.contains("announce:"), "{text}");
@@ -3954,7 +4004,7 @@ mod tests {
             announce: false,
             ..MeshConfig::default()
         };
-        let text = render_on_preview(&quiet, "work", true);
+        let text = render_on_preview(&quiet, "work", true, None);
         assert!(text.contains("announce: nothing until"), "{text}");
         assert!(
             text.contains("\n  propagation sync: off (announce: false); .mesh sync runs one\n"),
@@ -3970,7 +4020,7 @@ mod tests {
             propagation_sync_interval_secs: 0,
             ..MeshConfig::default()
         };
-        let text = render_on_preview(&manual, "work", false);
+        let text = render_on_preview(&manual, "work", false, None);
         assert!(
             text.contains(
                 "\n  propagation sync: off (propagation_sync_interval_secs: 0); .mesh sync runs one\n"
@@ -3981,7 +4031,7 @@ mod tests {
             announce: false,
             ..manual
         };
-        let text = render_on_preview(&quiet_and_manual, "work", false);
+        let text = render_on_preview(&quiet_and_manual, "work", false, None);
         assert!(
             text.contains("propagation sync: off (announce: false)"),
             "announce: false is the reason given when both are off: {text}"
@@ -13254,6 +13304,77 @@ mod tests {
                         ShareSet::load_quietly(locations).0.entries(),
                         [allow_entry(Layer::Global, "docs/**", None)]
                     );
+                }
+
+                /// The preview names what the share files already hand every trusted
+                /// peer, so the user sees it before consenting; nothing is said when
+                /// nothing is shared or no snapshot names the root.
+                #[test]
+                #[serial]
+                fn mesh_on_preview_names_the_shared_path_count_only_when_the_effective_set_is_non_empty()
+                 {
+                    let config = MeshConfig {
+                        interfaces: vec![MeshInterface::Lan],
+                        ..MeshConfig::default()
+                    };
+                    let clause = |shared: Option<SharedCount>| {
+                        render_on_preview(&config, "work", false, shared)
+                            .lines()
+                            .find(|line| line.starts_with("  files:"))
+                            .map(str::to_string)
+                    };
+                    assert_eq!(
+                        clause(Some(SharedCount {
+                            paths: 3,
+                            capped: false
+                        }))
+                        .as_deref(),
+                        Some("  files: 3 path(s) are shared with trusted peers (`.mesh shares`)")
+                    );
+                    assert_eq!(
+                        clause(Some(SharedCount {
+                            paths: LIST_PAGE_SIZE,
+                            capped: true
+                        }))
+                        .as_deref(),
+                        Some(
+                            "  files: 1000 or more path(s) are shared with trusted peers (`.mesh shares`)"
+                        )
+                    );
+                    assert_eq!(
+                        clause(Some(SharedCount {
+                            paths: 0,
+                            capped: false
+                        })),
+                        None
+                    );
+                    assert_eq!(clause(None), None);
+
+                    let _guard = TestConfigDirGuard::new("repl-mesh-on-preview-shares");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[false]);
+                    let mut ctx = ctx_with(config, true);
+                    ctx.session = Some(Session::default());
+                    let root = TempDir::new("repl-mesh-on-preview-shares-root");
+                    seed_files(
+                        &root.path,
+                        &["docs/a.md", "docs/b.md", "docs/.env", "src/main.rs"],
+                    );
+                    publish_root(&ctx, &root.path);
+                    let (_, locations) = ctx.app.mesh.share_locations().unwrap();
+                    write_share_file(
+                        &locations.global,
+                        "version: 1\nallow:\n- pattern: docs/**\n",
+                    );
+
+                    run_async(run(&mut ctx, ".mesh on")).unwrap();
+                    assert!(ctx.app.mesh.get().is_none());
+                    let out = stdout_lines();
+                    let files = index_of(
+                        &out,
+                        "  files: 2 path(s) are shared with trusted peers (`.mesh shares`)",
+                    );
+                    assert!(files < index_of(&out, "Mesh stays off"), "{out:?}");
                 }
 
                 #[test]
