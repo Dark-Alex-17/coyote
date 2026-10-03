@@ -1427,9 +1427,10 @@ fn usage_probe_docs_say_messages_are_posted_and_held_messages_are_fetched_back_a
         root.contains("`.mesh sync`"),
         "root README must name `.mesh sync` as the manual fetch verb"
     );
+    // A later file verb named `fetch` may appear here; only the sync sentence is pinned.
     assert!(
-        !root.contains(".mesh fetch"),
-        "root README must not name the withdrawn `.mesh fetch` verb"
+        !root.contains("on demand with `.mesh fetch`"),
+        "root README must not name the withdrawn `.mesh fetch` verb as the manual fetch"
     );
     let readme = one_line(&read(deployment_dir().join("README.md")));
     assert!(
@@ -1469,10 +1470,17 @@ fn usage_probe_docs_say_messages_are_posted_and_held_messages_are_fetched_back_a
         !readme.contains("Fetching held messages back is not yet triggered"),
         "deployment README must not still say fetch-back is not yet triggered"
     );
+    // A later file verb named `fetch` may appear here; only the sync sentences are pinned.
     assert!(
-        !readme.contains(".mesh fetch"),
-        "deployment README must not name the withdrawn `.mesh fetch` verb"
+        readme.contains("`.mesh sync` runs a fetch now"),
+        "deployment README must name `.mesh sync` as the manual fetch verb"
     );
+    for withdrawn in ["`.mesh fetch` runs a fetch now", "`.mesh fetch` is refused"] {
+        assert!(
+            !readme.contains(withdrawn),
+            "deployment README must not name the withdrawn `.mesh fetch` verb as the manual fetch: {withdrawn}"
+        );
+    }
 }
 
 #[test]

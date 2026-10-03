@@ -22395,6 +22395,7 @@ mod tests {
             UntrustOutcome::Refused {
                 identity: refused_peer_identity.clone(),
                 already_refused: false,
+                record_missing: false,
             }
         );
 

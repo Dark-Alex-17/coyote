@@ -576,6 +576,9 @@ pub(crate) enum UntrustOutcome {
     Refused {
         identity: String,
         already_refused: bool,
+        /// No record and no session twin held the destination when the call was made,
+        /// so the write pass back-fills one bound to the resolved identity.
+        record_missing: bool,
     },
 }
 
@@ -1316,8 +1319,9 @@ impl TrustStore {
     /// the destination's record, its session twin, or a peer table row whose binding
     /// verifies, so a destination never trusted on its own can still be refused; it gets a
     /// record bound to the identity the peer table proves, written with the deny, so
-    /// forgetting the identity forgets the refusal too. `dry_run` reports the outcome and
-    /// writes nothing.
+    /// forgetting the identity forgets the refusal too. A knocker that never announced has
+    /// no row to resolve through and cannot be refused until it is heard. `dry_run` reports
+    /// the outcome and writes nothing.
     pub(crate) fn untrust_destination(
         &self,
         mesh: &dyn LiveMesh,
@@ -1342,14 +1346,7 @@ impl TrustStore {
                 })
             });
         let Some((identity, last_seen)) = resolved else {
-            if file.denied_destinations.contains_key(&destination) {
-                bail!(
-                    "Destination {destination} is refused and its identity is not trusted; `.mesh trust {destination}` lifts that once the peer is heard."
-                );
-            }
-            bail!(
-                "Destination {destination} is not in the trust list, so there is nothing to untrust."
-            );
+            return Err(nothing_to_untrust(&file, &destination));
         };
         let trusted_all = file
             .identities
@@ -1359,10 +1356,12 @@ impl TrustStore {
             let already_refused = file.denied_destinations.contains_key(&destination);
             let has_record = file.destinations.contains_key(&destination)
                 || state.session_destinations.contains_key(&destination);
-            if dry_run || (already_refused && has_record) {
+            let record_missing = !has_record;
+            if dry_run || (already_refused && !record_missing) {
                 return Ok(UntrustOutcome::Refused {
                     identity,
                     already_refused,
+                    record_missing,
                 });
             }
             file.destinations
@@ -1393,19 +1392,13 @@ impl TrustStore {
             return Ok(UntrustOutcome::Refused {
                 identity,
                 already_refused,
+                record_missing,
             });
         }
         let on_disk = file.destinations.remove(&destination);
         let in_session = state.session_destinations.contains_key(&destination);
         if on_disk.is_none() && !in_session {
-            if file.denied_destinations.contains_key(&destination) {
-                bail!(
-                    "Destination {destination} is refused and its identity is not trusted; `.mesh trust {destination}` lifts that once the peer is heard."
-                );
-            }
-            bail!(
-                "Destination {destination} is not in the trust list, so there is nothing to untrust."
-            );
+            return Err(nothing_to_untrust(&file, &destination));
         }
         if dry_run {
             return Ok(UntrustOutcome::Forgotten { identity });
@@ -1859,6 +1852,15 @@ fn refuse_if_blocked(file: &TrustFile, identity: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn nothing_to_untrust(file: &TrustFile, destination: &str) -> anyhow::Error {
+    if file.denied_destinations.contains_key(destination) {
+        return anyhow!(
+            "Destination {destination} is refused and its identity is not trusted; `.mesh trust {destination}` lifts that once the peer is heard."
+        );
+    }
+    anyhow!("Destination {destination} is not in the trust list, so there is nothing to untrust.")
 }
 
 fn identity_entry(now: SystemTime, last_seen: SystemTime, all_destinations: bool) -> IdentityEntry {
@@ -2406,6 +2408,9 @@ mod tests {
                 identity: identity.clone(),
                 was_granting: true,
                 removed: vec![destination.clone()],
+            },
+            TrustMutation::RefuseDestination {
+                destination: destination.clone(),
             },
             TrustMutation::BlockIdentity {
                 identity: identity.clone(),
@@ -4622,6 +4627,7 @@ mod tests {
         let refused = UntrustOutcome::Refused {
             identity: peer.identity_hash.clone(),
             already_refused: false,
+            record_missing: true,
         };
 
         let outcome = fx
@@ -4671,6 +4677,7 @@ mod tests {
             UntrustOutcome::Refused {
                 identity: peer.identity_hash.clone(),
                 already_refused: true,
+                record_missing: false,
             }
         );
     }
@@ -4705,6 +4712,7 @@ mod tests {
             UntrustOutcome::Refused {
                 identity: peer.identity_hash.clone(),
                 already_refused: false,
+                record_missing: false,
             }
         );
         let listed = record(&fx.store, &peer.destination_hash);
@@ -4779,6 +4787,7 @@ mod tests {
             UntrustOutcome::Refused {
                 identity: peer.identity_hash.clone(),
                 already_refused: false,
+                record_missing: true,
             }
         );
         let listed = record(&fx.store, &peer.destination_hash);
@@ -4923,6 +4932,7 @@ mod tests {
             UntrustOutcome::Refused {
                 identity: peer.identity_hash.clone(),
                 already_refused: true,
+                record_missing: false,
             }
         );
         assert_eq!(fx.file_bytes(), before);
@@ -4955,6 +4965,7 @@ mod tests {
             UntrustOutcome::Refused {
                 identity: peer.identity_hash.clone(),
                 already_refused: true,
+                record_missing: true,
             }
         );
         let backfilled = record(&fx.store, &peer.destination_hash);
@@ -5189,6 +5200,7 @@ mod tests {
             UntrustOutcome::Refused {
                 identity: peer.identity_hash.clone(),
                 already_refused: true,
+                record_missing: false,
             }
         );
         assert_eq!(
@@ -5264,6 +5276,7 @@ mod tests {
             UntrustOutcome::Refused {
                 identity: peer.identity_hash.clone(),
                 already_refused: false,
+                record_missing: false,
             }
         );
         assert_eq!(fx.file_bytes(), before, "a dry run writes nothing");

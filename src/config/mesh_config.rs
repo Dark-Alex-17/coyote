@@ -800,7 +800,7 @@ mod tests {
         }
     }
 
-    /// Usage probe: the documented ``0 = fetch only on `.mesh sync` `` is a VALID setting for an
+    /// Usage probe: the documented `0 = fetch only on .mesh sync` is a VALID setting for an
     /// enabled mesh, unlike the rate and retention keys where 0 is out of range; an absent
     /// key reads as the documented 300; a negative or fractional value is refused at parse
     /// time naming the key rather than silently clamped.

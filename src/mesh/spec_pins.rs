@@ -2121,6 +2121,7 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
     /// its withdrawn name.
     #[test]
     fn usage_probe_spec_names_the_sync_verb_not_the_fetch_verb() {
+        // A later file verb named `fetch` must narrow this needle to the sync sentences.
         let hits: Vec<String> = SPEC
             .lines()
             .enumerate()
