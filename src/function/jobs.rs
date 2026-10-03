@@ -1637,6 +1637,25 @@ mod tests {
         assert!(message.contains("interactive"));
     }
 
+    /// Spec-first usage probe: the three file tools are kept off `job__start` by the
+    /// same prefix refusal as the other six — `mesh__list`/`mesh__fetch` are already
+    /// synchronous-with-a-timeout and `mesh__request_access` is already async+collect.
+    #[test]
+    fn usage_probe_job_start_refuses_the_three_file_tools_as_already_asynchronous() {
+        for tool in ["mesh__list", "mesh__fetch", "mesh__request_access"] {
+            let rejection = whitelist_rejection(tool).expect(tool);
+            let message = rejection["message"].as_str().unwrap();
+            assert!(
+                message.starts_with(&format!("'{tool}' is already asynchronous")),
+                "unexpected message for {tool}: {message}"
+            );
+            assert!(
+                !is_backgroundable_tool(tool),
+                "{tool} must not be backgroundable"
+            );
+        }
+    }
+
     #[test]
     fn whitelist_rejects_fast_mcp_meta_tools() {
         for tool in [

@@ -1038,6 +1038,26 @@ mod tests {
         );
     }
 
+    /// `untrusted_content::wrap` keeps its own invisible-character list rather than
+    /// importing this module's; this pins the two together so a character
+    /// `display_text` drops can never lead a marker line past the fence's quote.
+    #[test]
+    fn every_invisible_character_display_text_drops_cannot_lead_a_marker_past_the_fence() {
+        let dropped = ('\0'..=char::MAX).filter(|c| {
+            !c.is_control()
+                && !matches!(c, '\u{2028}' | '\u{2029}')
+                && (announce::is_control_or_invisible(*c) || announce::is_variation_selector(*c))
+        });
+        for c in dropped {
+            let fenced = crate::utils::untrusted_content::wrap("peer ab12", &format!("{c}=== x"));
+            assert!(
+                fenced.contains(&format!("\n> {c}=== x\n")),
+                "U+{:04X} led an unquoted marker line: {fenced}",
+                c as u32
+            );
+        }
+    }
+
     #[test]
     fn rfc3339_round_trips_to_the_second() {
         let time = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_790_000_000);

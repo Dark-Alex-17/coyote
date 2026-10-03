@@ -52,8 +52,9 @@ pub(crate) const LAST_LIST_CACHE_PEERS: usize = 32;
 const LIST_PAGE_HEADROOM: usize = 2048;
 /// The longest cursor a peer may send or return; `shares::list_cursor` makes 32 bytes.
 const CURSOR_MAX_BYTES: usize = 64;
-/// How much of a peer's `invalid_path` rule is kept; the rule ids are a dozen characters.
+/// The longest `invalid_path` rule a peer may name; the rule ids are a dozen characters.
 const RULE_MAX_CHARS: usize = 32;
+const UNKNOWN_RULE: &str = "unknown";
 /// Largest file an `ok` reply may carry while its response frame still fits ONE Resource
 /// segment: `MAX_EFFICIENT_SIZE` less the frame and the reply's other keys. An itemized
 /// workaround, not a protocol limit. reticulum-rs-transport 0.12.0 sends the first
@@ -684,6 +685,22 @@ fn text_of(value: &Value) -> Option<&str> {
     value.as_str()
 }
 
+/// The rule a peer's `invalid_path` reply names, kept only when it is shaped like one of
+/// `wire_path::RULES`' ids; the model reads it, so a peer may not put words there.
+fn rule_of(value: &Value) -> Option<String> {
+    let rule = text_of(value)?;
+    let shaped = !rule.is_empty()
+        && rule.chars().count() <= RULE_MAX_CHARS
+        && rule
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+    Some(if shaped {
+        rule.to_string()
+    } else {
+        UNKNOWN_RULE.to_string()
+    })
+}
+
 fn bin32_of(value: &Value) -> Option<[u8; 32]> {
     bin_of(value).and_then(|bytes| bytes.try_into().ok())
 }
@@ -1079,11 +1096,9 @@ impl MeshRuntime {
             "not_shared" => Ok(Fetched::NotShared),
             "invalid_path" => {
                 let rule = field(entries, "rule")
-                    .and_then(text_of)
+                    .and_then(rule_of)
                     .ok_or(FetchError::Malformed("rule"))?;
-                Ok(Fetched::InvalidPath {
-                    rule: rule.chars().take(RULE_MAX_CHARS).collect(),
-                })
+                Ok(Fetched::InvalidPath { rule })
             }
             "too_large" => {
                 let limit = field(entries, "limit")
@@ -2320,6 +2335,40 @@ mod tests {
             memory.lists.get(&key(2)),
             Some(vec!["refreshed".to_string()])
         );
+    }
+
+    #[test]
+    fn a_peers_invalid_path_rule_is_kept_only_when_shaped_like_a_rule_id() {
+        let reply = |rule: Value| status_reply("invalid_path", vec![("rule", rule)]);
+        let rule_in = |reply: &Value| {
+            field(reply.as_map().unwrap(), "rule")
+                .and_then(rule_of)
+                .ok_or(FetchError::Malformed("rule"))
+        };
+
+        assert_eq!(rule_in(&reply(Value::from("segment"))).unwrap(), "segment");
+        assert_eq!(
+            rule_in(&reply(Value::from("trailing_dot"))).unwrap(),
+            "trailing_dot"
+        );
+        for rule in [
+            "x\n=== y",
+            "Segment",
+            "run rm -rf",
+            "",
+            "é",
+            &"a".repeat(33),
+        ] {
+            assert_eq!(
+                rule_in(&reply(Value::from(rule))).unwrap(),
+                "unknown",
+                "{rule:?}"
+            );
+        }
+        assert!(matches!(
+            rule_in(&reply(Value::from(7u8))),
+            Err(FetchError::Malformed("rule"))
+        ));
     }
 
     #[cfg(unix)]
