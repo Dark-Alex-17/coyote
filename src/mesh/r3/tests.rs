@@ -8235,4 +8235,292 @@ pub(crate) mod network {
         assert!(records.iter().all(|record| record.id != "acc-5"));
         pair.stop_node_a().await;
     }
+
+    /// Spec-first probe over a live pair, the refusal half of the cycle: B's
+    /// reason carries ANSI, a carriage return, a line feed and the path's own name, and
+    /// A's human line shows it stripped; both hooks name B's identity and destination,
+    /// the id and the count and nothing else — never the path, never a word of the
+    /// reason; A's refusal reaches B as a `/message` reply answered under the access id
+    /// with exactly one data part `{access:{status:"denied"}}`, no `expires`, no
+    /// `paths` anywhere in the body; nothing is granted, the share list is untouched,
+    /// the fetch is `not_shared`, and the same set may be asked again at once (F8).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_a_refusal_over_a_live_pair_is_denied_without_expires_and_no_hook_or_reply_carries_a_path_or_the_reason()
+     {
+        use crate::mesh::events::env_value;
+
+        let pair = NodePair::start_with("usage-probe-access-refuse", |_| {}, trusting_b).await;
+        pair.introduce_b_to_a().await;
+        let (slot, idle) = installed_slot(&pair);
+        let sink = hook_sink_for(&pair, &slot);
+        let workspace = share_docs_from_a(&pair, &slot, "usage-probe-access-refuse-root");
+        fs::write(
+            workspace.path.join("src").join("secret.rs"),
+            b"struct Secret;\n",
+        )
+        .unwrap();
+        let shares = mesh_config_dir(&pair.config_dir_a()).join("shares.yaml");
+        let shares_before = fs::read_to_string(&shares).unwrap();
+        let b_identity = pair.responder.desc.identity.address_hash.to_hex_string();
+        let b_destination = pair.responder.desc.address_hash.to_hex_string();
+        let reason = "\u{1b}[31mneed\r\n`src/secret.rs`\u{7} badly";
+
+        let asked = b_asks_a(
+            &pair,
+            ACCESS_PATH,
+            access_body("acc-7", &["src/secret.rs"], reason),
+            short_options(),
+        )
+        .await;
+        assert_eq!(wire_status(&asked.value), "pending");
+        {
+            let notes = idle.0.lock();
+            assert_eq!(notes.len(), 1, "{notes:?}");
+            // The reason clause: ANSI and the bell stripped, the carriage return and the
+            // line feed made spaces, so the reason stays on the verbs' line and the verbs
+            // are the last thing on it.
+            let (_, reason_clause) = notes[0]
+                .text
+                .rsplit_once("\n— \"")
+                .unwrap_or_else(|| panic!("{:?}", notes[0].text));
+            assert!(reason_clause.starts_with("need  "), "{reason_clause:?}");
+            assert!(
+                reason_clause.contains(
+                    " badly\" · grant: .mesh grant acc-7 [--standing] | refuse: .mesh refuse acc-7"
+                ),
+                "{reason_clause:?}"
+            );
+            assert!(!reason_clause.contains("[31m"), "{reason_clause:?}");
+            assert!(!reason_clause.contains('\r'), "{reason_clause:?}");
+            assert!(!notes[0].text.contains('\u{1b}'), "{:?}", notes[0].text);
+            assert!(!notes[0].text.contains('\u{7}'), "{:?}", notes[0].text);
+        }
+
+        pair.recorder_b.queue(Script::Acknowledge);
+        let report = slot.access().refuse("acc-7").await.unwrap();
+        assert_eq!(report.decision, crate::mesh::events::AccessDecision::Denied);
+        assert_eq!(report.expires, None);
+        assert!(!report.standing);
+        assert_eq!(report.path_count, 1);
+        assert_eq!(report.peer_destination, b_destination);
+        assert_eq!(report.via, PeerVia::Direct);
+
+        assert_eq!(pair.recorder_b.seen_count(), 1);
+        assert_eq!(pair.recorder_b.last().path_hash, PathHash::of(MESSAGE_PATH));
+        let raw = pair.recorder_b.last_body();
+        let has_key = |value: &Value, key: &str| -> bool {
+            fn walk(value: &Value, key: &str) -> bool {
+                match value {
+                    Value::Map(entries) => entries
+                        .iter()
+                        .any(|(name, inner)| name.as_str() == Some(key) || walk(inner, key)),
+                    Value::Array(items) => items.iter().any(|item| walk(item, key)),
+                    _ => false,
+                }
+            }
+            walk(value, key)
+        };
+        assert!(!has_key(&raw, "paths"), "{raw:?}");
+        assert!(!has_key(&raw, "expires"), "{raw:?}");
+        let reply = from_r3_body(&raw).unwrap();
+        assert_eq!(reply.kind, PeerKind::Reply);
+        assert_eq!(reply.in_reply_to.as_deref(), Some("acc-7"));
+        assert_eq!(reply.thread.as_deref(), Some("acc-7"));
+        assert_eq!(reply.disposition, Some(Disposition::Answered));
+        assert_eq!(reply.fields, None);
+        assert_eq!(reply.dropped_parts, 0);
+        assert_eq!(
+            reply.parts,
+            vec![RawPart::Data {
+                data: serde_json::json!({ "access": { "status": "denied" } })
+            }]
+        );
+        assert!(!reply.content.contains('\n'), "{:?}", reply.content);
+        assert!(!reply.content.contains("secret"), "{:?}", reply.content);
+
+        assert!(pair.node_a.serving().grants().list().unwrap().is_empty());
+        assert_eq!(fs::read_to_string(&shares).unwrap(), shares_before);
+        assert!(
+            slot.inbound_store()
+                .unwrap()
+                .list(SystemTime::now())
+                .unwrap()
+                .is_empty()
+        );
+        let fetched = b_asks_a(
+            &pair,
+            FETCH_PATH,
+            fetch_body("src/secret.rs", None),
+            short_options(),
+        )
+        .await;
+        assert_eq!(wire_status(&fetched.value), "not_shared");
+
+        wait_until("the refusal to fire mesh.access.decided", || {
+            sink.snapshot()
+                .iter()
+                .any(|(event, _)| *event == HookEvent::MeshAccessDecided)
+        })
+        .await;
+        let fired = sink.drain();
+        let requested = fires_of(&fired, HookEvent::MeshAccessRequested);
+        assert_eq!(requested.len(), 1, "{fired:?}");
+        let mut requested_keys: Vec<&str> = requested[0].iter().map(|(key, _)| *key).collect();
+        requested_keys.sort_unstable();
+        assert_eq!(
+            requested_keys,
+            vec![
+                "COYOTE_MESH_ACCESS_ID",
+                "COYOTE_MESH_PATH_COUNT",
+                "COYOTE_MESH_PEER_DESTINATION",
+                "COYOTE_MESH_PEER_IDENTITY",
+            ]
+        );
+        assert_eq!(
+            env_value(requested[0], "COYOTE_MESH_ACCESS_ID"),
+            Some("acc-7")
+        );
+        assert_eq!(env_value(requested[0], "COYOTE_MESH_PATH_COUNT"), Some("1"));
+        assert_eq!(
+            env_value(requested[0], "COYOTE_MESH_PEER_IDENTITY"),
+            Some(b_identity.as_str())
+        );
+        assert_eq!(
+            env_value(requested[0], "COYOTE_MESH_PEER_DESTINATION"),
+            Some(b_destination.as_str())
+        );
+        let decided = fires_of(&fired, HookEvent::MeshAccessDecided);
+        assert_eq!(decided.len(), 1, "{fired:?}");
+        assert_eq!(
+            env_value(decided[0], "COYOTE_MESH_ACCESS_ID"),
+            Some("acc-7")
+        );
+        assert_eq!(
+            env_value(decided[0], "COYOTE_MESH_DECISION"),
+            Some("denied")
+        );
+        assert_eq!(
+            env_value(decided[0], "COYOTE_MESH_PEER_IDENTITY"),
+            Some(b_identity.as_str())
+        );
+        for (event, envs) in &fired {
+            for (key, value) in envs {
+                assert!(!value.contains("secret"), "{event:?} {key}={value}");
+                assert!(!value.contains("badly"), "{event:?} {key}={value}");
+                assert!(!value.contains("need"), "{event:?} {key}={value}");
+            }
+        }
+
+        let again = b_asks_a(
+            &pair,
+            ACCESS_PATH,
+            access_body("acc-8", &["src/secret.rs"], "second try"),
+            short_options(),
+        )
+        .await;
+        assert_eq!(wire_status(&again.value), "pending");
+        assert_eq!(idle.0.lock().len(), 2);
+        pair.stop_node_a().await;
+    }
+
+    /// Spec-first probe: a one-off grant for a caller-chosen TTL reaches the
+    /// peer over the live link with `expires` about now + that TTL — the same instant
+    /// the report and the grant record carry — and the path is then served once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_a_custom_ttl_reaches_the_peer_as_the_decisions_expires_over_a_live_pair() {
+        let pair = NodePair::start_with("usage-probe-access-ttl", |_| {}, trusting_b).await;
+        pair.introduce_b_to_a().await;
+        let (slot, _idle) = installed_slot(&pair);
+        let workspace = share_docs_from_a(&pair, &slot, "usage-probe-access-ttl-root");
+        fs::write(workspace.path.join("src").join("ttl.rs"), b"struct Ttl;\n").unwrap();
+
+        let asked = b_asks_a(
+            &pair,
+            ACCESS_PATH,
+            access_body("acc-9", &["src/ttl.rs"], "briefly"),
+            short_options(),
+        )
+        .await;
+        assert_eq!(wire_status(&asked.value), "pending");
+        let before = SystemTime::now();
+        pair.recorder_b.queue(Script::Acknowledge);
+        let report = slot
+            .access()
+            .grant("acc-9", false, Some(Duration::from_secs(90)))
+            .await
+            .unwrap();
+
+        let expires = report.expires.unwrap();
+        let floor = (before + Duration::from_secs(90) - Duration::from_secs(1))
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        let wire_expires = expires.duration_since(UNIX_EPOCH).unwrap().as_secs_f64();
+        assert!(
+            wire_expires >= floor && wire_expires < floor + 61.0,
+            "{wire_expires} is not about 90 s after {before:?}"
+        );
+        let reply = from_r3_body(&pair.recorder_b.last_body()).unwrap();
+        assert_eq!(reply.in_reply_to.as_deref(), Some("acc-9"));
+        assert_eq!(
+            reply.parts,
+            vec![RawPart::Data {
+                data: serde_json::json!({ "access": { "status": "granted", "expires": wire_expires } })
+            }]
+        );
+        let grants = pair.node_a.serving().grants().list().unwrap();
+        assert_eq!(grants.len(), 1, "{grants:?}");
+        assert_eq!(grants[0].expires, crate::mesh::rfc3339_utc(expires));
+
+        let served = b_asks_a(
+            &pair,
+            FETCH_PATH,
+            fetch_body("src/ttl.rs", None),
+            short_options(),
+        )
+        .await;
+        assert_eq!(wire_status(&served.value), "ok");
+        let spent = b_asks_a(
+            &pair,
+            FETCH_PATH,
+            fetch_body("src/ttl.rs", None),
+            short_options(),
+        )
+        .await;
+        assert_eq!(wire_status(&spent.value), "not_shared");
+        pair.stop_node_a().await;
+    }
+
+    /// Spec-first probe of the fallback trigger set: a peer that answers
+    /// `/access` with `no_access` (the requester is known to it but not trusted) has
+    /// refused, not vanished — the requester gets the typed refusal and never posts the
+    /// request to the propagation node it knows; only Timeout/LinkFailed/LinkClosed do.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_a_no_access_refusal_of_an_access_request_never_falls_back_to_the_propagation_node()
+     {
+        let (pair, mut node) = pair_with_propagation_node("usage-probe-access-no-access").await;
+        pair.introduce_b_to_a().await;
+        pair.recorder_b
+            .queue(Script::Reply(Reply::Code(RefusalCode::NoAccess)));
+        let request = access_request("acc-1", &["src/x.rs"], "please");
+
+        let err = pair
+            .node_a
+            .request_access_wire(&pair.responder.desc, &request, fallback_access_options())
+            .await
+            .unwrap_err();
+
+        assert_eq!(err, AccessError::Refused(RefusalCode::NoAccess));
+        assert!(
+            err.to_string()
+                .starts_with("The peer refused the access request: "),
+            "{err}"
+        );
+        assert_eq!(pair.recorder_b.seen_count(), 1);
+        assert_eq!(pair.recorder_b.last().path_hash, PathHash::of(ACCESS_PATH));
+        sleep(Duration::from_millis(500)).await;
+        node.nothing_else_received();
+        pair.stop_node_a().await;
+        node.stop().await;
+    }
 }

@@ -5009,4 +5009,274 @@ mod tests {
         installed.stop().await;
         stub.stop().await;
     }
+
+    // ---- usage-probe spec-first tests: per-identity sets, deny-first admission, the
+    // debug log and a re-used id ----
+
+    /// Duplicate-set admission is judged per identity and on the collapsed set: a
+    /// second identity may ask for exactly the set a first one has pending, while the
+    /// first identity's re-ask that only repeats a path is still the same set.
+    #[test]
+    fn usage_probe_duplicate_sets_are_judged_per_identity_and_after_collapsing_repeats() {
+        let fixture = bare_slot("access-dup-identity");
+        let other = hex_lower(&[0xcd; 16]);
+        let first =
+            fixture
+                .slot
+                .admit_access(inbound(&identity(), "a-1", &["src/x.rs", "docs/y.md"], ""));
+        assert_eq!(first, AccessOutcome::Pending);
+
+        let elsewhere =
+            fixture
+                .slot
+                .admit_access(inbound(&other, "c-1", &["docs/y.md", "src/x.rs"], ""));
+        assert_eq!(elsewhere, AccessOutcome::Pending);
+
+        let repeated = fixture.slot.admit_access(inbound(
+            &identity(),
+            "a-2",
+            &["src/x.rs", "src/x.rs", "docs/y.md"],
+            "",
+        ));
+        assert_eq!(repeated, AccessOutcome::Refused(AccessRefusal::Duplicate));
+
+        let superset = fixture.slot.admit_access(inbound(
+            &identity(),
+            "a-3",
+            &["src/x.rs", "docs/y.md", "README.md"],
+            "",
+        ));
+        assert_eq!(superset, AccessOutcome::Pending);
+
+        let records = access_records(&fixture.slot);
+        let ids: Vec<&str> = records.iter().map(|record| record.id.as_str()).collect();
+        assert_eq!(ids.len(), 3, "{ids:?}");
+        assert!(ids.contains(&"a-1") && ids.contains(&"c-1") && ids.contains(&"a-3"));
+        assert_eq!(fixture.idle.texts().len(), 3);
+        assert_eq!(fixture.hooks.snapshot().len(), 3);
+    }
+
+    /// Admission is deny-first like a fetch: a path an allow reaches but a user deny
+    /// names is `pending`, not `granted`, while a sibling the same allow reaches is
+    /// granted at once; a set mixing the two is pending as a whole.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_a_user_deny_keeps_an_allowed_path_from_being_granted_at_once() {
+        let installed = Installed::start("access-deny-first").await;
+        fs::write(installed.root.join("src/open.rs"), b"pub struct Open;").unwrap();
+        fs::write(installed.root.join("src/secret.rs"), b"struct Secret;").unwrap();
+        let shares = mesh_config_dir(&installed.tmp.path.join("config")).join("shares.yaml");
+        fs::create_dir_all(shares.parent().unwrap()).unwrap();
+        fs::write(
+            &shares,
+            format!(
+                "version: 1\nallow:\n- pattern: 'src/**'\n  peer: '{}'\ndeny:\n- pattern: 'src/secret.rs'\n",
+                identity()
+            ),
+        )
+        .unwrap();
+
+        let (denied, open, mixed) = tokio::task::spawn_blocking({
+            let slot = Arc::clone(&installed.slot);
+            move || {
+                (
+                    slot.admit_access(inbound(&identity(), "a-1", &["src/secret.rs"], "")),
+                    slot.admit_access(inbound(&identity(), "a-2", &["src/open.rs"], "")),
+                    slot.admit_access(inbound(
+                        &identity(),
+                        "a-3",
+                        &["src/open.rs", "src/secret.rs"],
+                        "",
+                    )),
+                )
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(denied, AccessOutcome::Pending);
+        assert!(matches!(open, AccessOutcome::Granted { .. }), "{open:?}");
+        assert_eq!(mixed, AccessOutcome::Pending);
+        let records = access_records(&installed.slot);
+        let mut ids: Vec<&str> = records.iter().map(|record| record.id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["a-1", "a-3"], "{records:?}");
+        assert_eq!(installed.idle.texts().len(), 2);
+        let fired = installed.hooks.drain();
+        let events: Vec<HookEvent> = fired.iter().map(|(event, _)| *event).collect();
+        assert_eq!(
+            events,
+            vec![
+                HookEvent::MeshAccessRequested,
+                HookEvent::MeshAccessRequested,
+                HookEvent::MeshAccessDecided,
+                HookEvent::MeshAccessRequested,
+            ]
+        );
+        assert_eq!(env_value(&fired[2].1, "COYOTE_MESH_ACCESS_ID"), Some("a-2"));
+        installed.stop().await;
+    }
+
+    /// On the link path every refusal is logged at debug naming the rule the wire
+    /// carries (`duplicate`, `too_many_pending`) or the validation failure, and no
+    /// debug line from the handler ever carries a requested path or the reason.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_refusals_are_logged_at_debug_with_the_rule_and_never_a_path_or_reason() {
+        use crate::testing::{debug_snapshot, install_log_collector};
+
+        install_log_collector();
+        let fixture = bare_slot("access-debug-log");
+        let handler = AccessHandler::new(Arc::downgrade(&fixture.slot) as Weak<dyn AccessSurface>);
+        let peer = TransportIdentity::new_from_rand(OsRng);
+        let id8 = short(&peer.as_identity().address_hash.to_hex_string()).to_string();
+        let mine = |line: &String| line.contains(&id8) && line.contains("/access");
+        let path = "src/probe-leak-zq.rs";
+        let reason = "probe-leak-reason-zq";
+
+        let before = debug_snapshot().iter().filter(|line| mine(line)).count();
+        let first = handler
+            .handle(admitted(body("a-1", &[path], reason), &peer))
+            .await;
+        assert!(matches!(first, Reply::Value(_)));
+        let duplicate = handler
+            .handle(admitted(body("a-2", &[path], reason), &peer))
+            .await;
+        let Reply::Value(value) = &duplicate else {
+            panic!("not a wire reply");
+        };
+        assert_eq!(
+            value
+                .as_map()
+                .unwrap()
+                .iter()
+                .find(|(key, _)| key.as_str() == Some("reason"))
+                .and_then(|(_, value)| value.as_str()),
+            Some("duplicate")
+        );
+        for n in 2..=ACCESS_MAX_PENDING_PER_IDENTITY {
+            let reply = handler
+                .handle(admitted(
+                    body(
+                        &format!("a-{n}"),
+                        &[&format!("src/probe-leak-{n}.rs")],
+                        reason,
+                    ),
+                    &peer,
+                ))
+                .await;
+            assert!(matches!(reply, Reply::Value(_)), "{n}");
+        }
+        let sixth = handler
+            .handle(admitted(
+                body("a-9", &["src/probe-leak-9.rs"], reason),
+                &peer,
+            ))
+            .await;
+        let Reply::Value(value) = &sixth else {
+            panic!("not a wire reply");
+        };
+        assert_eq!(
+            value
+                .as_map()
+                .unwrap()
+                .iter()
+                .find(|(key, _)| key.as_str() == Some("reason"))
+                .and_then(|(_, value)| value.as_str()),
+            Some("too_many_pending")
+        );
+        let invalid = handler
+            .handle(admitted(
+                body("a-10", &["../probe-leak-zq.rs"], reason),
+                &peer,
+            ))
+            .await;
+        assert!(matches!(invalid, Reply::Code(RefusalCode::InvalidData)));
+
+        let lines: Vec<String> = debug_snapshot()
+            .into_iter()
+            .filter(mine)
+            .skip(before)
+            .collect();
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.ends_with("refused: duplicate")),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.ends_with("refused: too_many_pending")),
+            "{lines:?}"
+        );
+        // Admission and the handler each log a refusal, so count rules, not lines: the
+        // invalid body is refused once, by the handler, before admission.
+        assert!(
+            lines.iter().any(|line| line.contains("refused: ")
+                && !line.contains("duplicate")
+                && !line.contains("too_many_pending")),
+            "no refusal line for the invalid body: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("answered pending")),
+            "{lines:?}"
+        );
+        for line in &lines {
+            assert!(
+                !line.contains("probe-leak"),
+                "a path or the reason leaked: {line}"
+            );
+            assert!(!line.contains(reason), "the reason leaked: {line}");
+        }
+    }
+
+    /// An access request whose id is the one of the same peer's pending QUESTION is a
+    /// re-used id: the spec refuses a same-id re-request as `duplicate`, nothing is
+    /// filed over the question, and the question stands.
+    #[test]
+    fn usage_probe_an_access_id_colliding_with_the_peers_pending_question_is_refused_as_duplicate()
+    {
+        let fixture = bare_slot("access-id-vs-question");
+        store_of(&fixture.slot)
+            .upsert(question_record("q-1"), SystemTime::now())
+            .unwrap();
+
+        let outcome =
+            fixture
+                .slot
+                .admit_access(inbound(&identity(), "q-1", &["src/x.rs"], "same id"));
+
+        assert_eq!(outcome, AccessOutcome::Refused(AccessRefusal::Duplicate));
+        let records = access_records(&fixture.slot);
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(records[0].id, "q-1");
+        assert_eq!(records[0].kind, InboundKind::Question);
+        assert!(records[0].paths.is_empty());
+        assert!(fixture.idle.texts().is_empty());
+        assert!(fixture.hooks.snapshot().is_empty());
+        let fresh = fixture
+            .slot
+            .admit_access(inbound(&identity(), "a-1", &["src/x.rs"], ""));
+        assert_eq!(fresh, AccessOutcome::Pending);
+
+        // The same shape across peers: another identity re-using a pending access id is
+        // a re-used id too, and it has no pending request of its own to be "too many".
+        let other = hex_lower(&[0xcd; 16]);
+        let collided = fixture
+            .slot
+            .admit_access(inbound(&other, "a-1", &["docs/z.md"], ""));
+        assert_eq!(
+            collided,
+            AccessOutcome::Refused(AccessRefusal::Duplicate),
+            "{collided:?}"
+        );
+        let records = access_records(&fixture.slot);
+        assert_eq!(records.len(), 2, "{records:?}");
+        assert!(
+            records
+                .iter()
+                .all(|record| record.peer_identity == identity())
+        );
+        assert_eq!(fixture.idle.texts().len(), 1);
+    }
 }
