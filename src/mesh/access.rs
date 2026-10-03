@@ -1260,10 +1260,14 @@ fn take(store: &InboundStore, record: &InboundRecord) -> Result<()> {
     Ok(())
 }
 
-/// Puts a taken request back after `err` stopped its decision, so it stays pending to
-/// decide again; a put-back that fails too is reported beside `err`, since the human
-/// needs to know both that the peer heard nothing and that the request is gone.
-fn put_back(store: &InboundStore, record: &InboundRecord, err: anyhow::Error) -> anyhow::Error {
+/// Puts a taken record back after `err` stopped its decision or answer, so it stays
+/// pending to take again; a put-back that fails too is reported beside `err`, since the
+/// human needs to know both that the peer heard nothing and that the record is gone.
+pub(crate) fn put_back(
+    store: &InboundStore,
+    record: &InboundRecord,
+    err: anyhow::Error,
+) -> anyhow::Error {
     match store.upsert(record.clone(), SystemTime::now()) {
         Ok(()) => err,
         Err(put_back) => anyhow!(
@@ -2440,6 +2444,10 @@ mod tests {
         }
 
         fn answer(&self, _id: &str, _text: &str) -> bool {
+            false
+        }
+
+        fn holds(&self, _id: &str) -> bool {
             false
         }
 

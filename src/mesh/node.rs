@@ -1,6 +1,6 @@
 use crate::config::mesh_config::{MeshConfig, MeshInterface};
 use crate::config::{ForkRekey, Session, paths};
-use crate::mesh::access::{AccessHandler, AccessRouting, AccessSurface};
+use crate::mesh::access::{AccessHandler, AccessRouting, AccessSurface, put_back};
 use crate::mesh::announce::{
     AnnounceAppData, HEARTBEAT_SECS, REANNOUNCE_FLOOR_SECS, announce_app_data,
 };
@@ -578,8 +578,9 @@ impl MeshRuntime {
                 _ => None,
             })
             .collect();
+        let grants = self.serving().grants();
         if !references.is_empty() {
-            self.serving().grants().grant(
+            grants.grant(
                 &message.id,
                 destination_hex,
                 &references,
@@ -591,8 +592,7 @@ impl MeshRuntime {
             Ok(outcome) => Ok(outcome),
             Err(err) => {
                 if !references.is_empty()
-                    && let Err(revoke) =
-                        self.serving().grants().revoke(&message.id, destination_hex)
+                    && let Err(revoke) = grants.revoke(&message.id, destination_hex)
                 {
                     bail!(
                         "{err}; and the one-off grant lent to {} for it could not be taken back: {revoke:#}",
@@ -2528,7 +2528,7 @@ impl MeshSlot {
     /// `answer_inbound` carrying one file part, which goes to the peer from this node
     /// alone: no live run is offered the answer, so the file's bytes never reach a model.
     /// A run still holding the question is not bypassed either, since its own reply
-    /// would follow this one once the hold lapsed; the answer is refused until then.
+    /// would follow this one once the hold lapsed; `refuse_held_by_envoy` says so.
     pub(crate) async fn answer_inbound_with_file(
         &self,
         id: &str,
@@ -2536,11 +2536,7 @@ impl MeshSlot {
         part: RawPart,
     ) -> Result<SendOutcome> {
         let (store, record) = self.open_question(id)?;
-        if self.envoy.load_full().is_some_and(|sink| sink.holds(id)) {
-            bail!(
-                "`{id}` is being answered by the envoy right now; answer without `--attach`, or wait for its hold to lapse."
-            );
-        }
+        self.refuse_held_by_envoy(id)?;
         let runtime = self.runtime_to_answer(id, &record)?;
         let reply = OutboundPeer::with_parts(
             PeerKind::Reply,
@@ -2553,6 +2549,17 @@ impl MeshSlot {
         )?;
         self.send_human_answer(&runtime, &store, &record, reply, text)
             .await
+    }
+
+    /// Refuses an answer that cannot go through a live run while that run holds `id`,
+    /// so a verb can say so before it prints what it would have sent.
+    pub(crate) fn refuse_held_by_envoy(&self, id: &str) -> Result<()> {
+        if self.envoy.load_full().is_some_and(|sink| sink.holds(id)) {
+            bail!(
+                "`{id}` is being answered by the envoy right now; answer without `--attach`, or wait for its hold to lapse."
+            );
+        }
+        Ok(())
     }
 
     fn open_question(&self, id: &str) -> Result<(Arc<InboundStore>, InboundRecord)> {
@@ -2579,7 +2586,9 @@ impl MeshSlot {
     }
 
     /// The tail both human answers share: in the question's thread, worded as answered,
-    /// sent with any reference lent, then dropped from the store and filed for the leader.
+    /// taken out of the store first so two processes answering the same question cannot
+    /// both tell the peer, then sent with any reference lent and filed for the leader. A
+    /// send that fails puts the question back as pending.
     async fn send_human_answer(
         &self,
         runtime: &MeshRuntime,
@@ -2591,10 +2600,19 @@ impl MeshSlot {
         let reply = reply
             .with_thread(Some(record.thread.clone()))?
             .with_disposition(Disposition::Answered, None);
-        let outcome = runtime
+        if !store.remove(&record.id)? {
+            bail!(
+                "`{}` was already answered by another process; nothing was sent",
+                record.id
+            );
+        }
+        let outcome = match runtime
             .send_peer_lending_reference(&record.peer_destination, &reply)
-            .await?;
-        store.remove(&record.id)?;
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(err) => return Err(put_back(store, record, err)),
+        };
         self.record_human_answer(record, text);
         Ok(outcome)
     }
@@ -3168,13 +3186,13 @@ mod tests {
     use crate::mesh::trust::TrustOptions;
     use crate::supervisor::mailbox::EnvelopePayload;
     use crate::testing::{debug_snapshot, install_log_collector, warn_snapshot};
+    #[cfg(unix)]
+    use async_trait::async_trait;
     use rns_transport::destination::link::LinkId;
     #[cfg(unix)]
     use rns_transport::iface::tcp_server::TcpServer;
     #[cfg(unix)]
     use std::sync::atomic::AtomicBool;
-    #[cfg(unix)]
-    use std::sync::atomic::Ordering;
     #[cfg(unix)]
     use tokio::net::TcpListener;
 
@@ -5044,6 +5062,82 @@ mod tests {
         );
         assert!(store.get("a-1").unwrap().is_none());
         assert!(runtime.serving().grants().list().unwrap().is_empty());
+        assert!(slot.stop().await.unwrap());
+        stub.stop().await;
+    }
+
+    /// Serves `/message` on a stub in the recorder's place and refuses every message.
+    #[cfg(unix)]
+    struct Throttling;
+
+    #[cfg(unix)]
+    #[async_trait]
+    impl Handler for Throttling {
+        async fn handle(&self, _request: AdmittedRequest) -> Reply {
+            Reply::Code(RefusalCode::Throttled)
+        }
+    }
+
+    /// The answer takes the question out of the store before it sends, as a decision
+    /// does: a question another process already took is not sent again, and one whose
+    /// send the peer refuses goes back as pending, with nothing filed for the leader.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_human_answer_takes_the_question_before_it_sends_and_puts_it_back_when_the_send_fails()
+     {
+        use crate::mesh::trust::TrustOptions;
+
+        let stub = PeerStub::listen("node-answer-take-stub", TcpServer::DEFAULT_CLIENT_MTU).await;
+        stub.serve(MESSAGE_PATH, Arc::new(Throttling) as Arc<dyn Handler>);
+        let started = started_runtime_on("node-answer-take", stub.port()).await;
+        let runtime = started.runtime.clone();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime.clone()).unwrap();
+        stub.trust(&runtime.current_destination_hash(), runtime.fingerprint());
+        stub.announce(Some("Stub")).await;
+        let to = stub.destination_hex();
+        let peers = runtime.peers();
+        wait_until("the node to file the stub", || peers.get(&to).is_some()).await;
+        runtime
+            .trust()
+            .trust_destination(
+                slot.as_ref(),
+                &to,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        let store = slot.inbound_store().unwrap();
+        let record = InboundRecord {
+            peer_destination: to.clone(),
+            peer_identity: stub.identity_hex(),
+            ..inbound_record("a-1")
+        };
+        let reply = OutboundPeer::new(PeerKind::Reply, "yes", None, Some("a-1"), None).unwrap();
+
+        let err = slot
+            .send_human_answer(&runtime, &store, &record, reply, "yes")
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "`a-1` was already answered by another process; nothing was sent"
+        );
+        assert!(stub.seen().is_empty(), "{:?}", stub.seen());
+
+        store.upsert(record, SystemTime::now()).unwrap();
+        let err = slot.answer_inbound("a-1", "yes").await.unwrap_err();
+
+        let err = err.to_string();
+        assert!(err.contains("The peer refused the message"), "{err}");
+        assert!(!err.contains("another process"), "{err}");
+        assert!(
+            store.get("a-1").unwrap().is_some(),
+            "a send the peer refused leaves the question pending"
+        );
+        assert!(stub.seen().is_empty(), "{:?}", stub.seen());
+        assert!(slot.take_model_notes().is_empty(), "nothing was answered");
         assert!(slot.stop().await.unwrap());
         stub.stop().await;
     }

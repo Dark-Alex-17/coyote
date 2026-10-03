@@ -33,9 +33,7 @@ pub(crate) trait EnvoySink: Send + Sync {
     /// Whether a live run is holding on the human's answer to `id`. Consumes nothing:
     /// an answer that cannot go through the run (one carrying a file) is refused while
     /// the hold stands, so the run's own lapsed reply never follows it to the peer.
-    fn holds(&self, _id: &str) -> bool {
-        false
-    }
+    fn holds(&self, id: &str) -> bool;
     /// Cuts the run in flight short, hold included, without taking the sink down: the
     /// node it was answering for is going away and its reply would have nowhere to go.
     fn interrupt(&self);

@@ -6190,6 +6190,10 @@ pub(crate) mod network {
             false
         }
 
+        fn holds(&self, _id: &str) -> bool {
+            false
+        }
+
         fn interrupt(&self) {}
     }
 
@@ -6507,6 +6511,10 @@ pub(crate) mod network {
         }
 
         fn answer(&self, _id: &str, _text: &str) -> bool {
+            false
+        }
+
+        fn holds(&self, _id: &str) -> bool {
             false
         }
 

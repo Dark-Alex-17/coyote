@@ -5337,11 +5337,12 @@ impl RequestContext {
     }
 
     /// Completions for `.mesh grant` and `.mesh refuse`, `rest` being everything after
-    /// the verb: the pending access requests until the id is given, then for `grant` the
-    /// flags not yet used, `--standing` and `--for` each dropping once the other is
-    /// present, and `--global`/`--workspace`, which name the share file a standing grant
-    /// writes to, offered only after `--standing` and each dropping once its partner is
-    /// present. `refuse` takes no flags.
+    /// the verb: the pending access requests until the id is given, since the first
+    /// word is read as the id, then for `grant` the flags not yet used, `--standing` and
+    /// `--for` each dropping once the other is present, and `--global`/`--workspace`,
+    /// which name the share file a standing grant writes to, offered only after
+    /// `--standing` and each dropping once its partner is present. `refuse` takes no
+    /// flags.
     fn mesh_completion_decision_verb(
         &self,
         verb: &str,
@@ -5350,14 +5351,13 @@ impl RequestContext {
         let Some((_, prior)) = rest.split_last() else {
             return Vec::new();
         };
-        let mut values = if prior.is_empty() {
-            self.mesh_completion_access_requests()
-        } else {
-            Vec::new()
-        };
-        if verb != "grant" {
-            return values;
+        if prior.is_empty() {
+            return self.mesh_completion_access_requests();
         }
+        if verb != "grant" {
+            return Vec::new();
+        }
+        let mut values = Vec::new();
         let standing = prior.contains(&"--standing");
         let excluded = |flag: &str| match flag {
             "--standing" => prior.contains(&"--for"),
@@ -24218,8 +24218,8 @@ mod tests {
         let refuse = fixture.complete(&["refuse", ""]);
         assert_eq!(
             completion_values(&grant),
-            ["a-1", "--standing", "--for "],
-            "the access id, then the flags a fresh grant takes"
+            ["a-1"],
+            "the first word is the id, so no flag is offered in its place"
         );
         assert_eq!(completion_values(&refuse), ["a-1"], "refuse takes no flags");
         let expected_prefix = format!("{} · 2 paths · ", short(&hex_lower(&[0x12; 16])));

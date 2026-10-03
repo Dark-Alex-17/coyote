@@ -841,6 +841,9 @@ async fn answer(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             if record.kind == InboundKind::Access {
                 bail!(access_not_a_question(id));
             }
+            if attach.is_some() {
+                ctx.app.mesh.refuse_held_by_envoy(id)?;
+            }
             let attachment = prepared_attachment(ctx, attach, &runtime)?;
             out_text(&sending_notice(&record.peer_destination));
             match attachment {
@@ -1097,7 +1100,8 @@ fn parts_of(attachment: Option<Attachment>) -> Vec<RawPart> {
 /// the order `.mesh allow` judges a pattern: the text alone, then the protected
 /// directories, then the disk, then the built-in deny. By reference the peer's fetch is
 /// what delivers the file, so one the serving side would refuse, by size or by a rule
-/// the one-off grant never lifts, is refused here rather than sent as a dead reference.
+/// the one-off grant never lifts, or because the share list itself was refused at load,
+/// is refused here rather than sent as a dead reference.
 fn attachment(
     ctx: &RequestContext,
     path_text: &str,
@@ -1153,14 +1157,21 @@ fn attachment(
     if !metadata.is_file() {
         bail!("`{shown}` is not a regular file.");
     }
-    let in_root = dunce::canonicalize(&root)
-        .and_then(|canonical_root| Ok(dunce::canonicalize(&file_path)?.starts_with(canonical_root)))
-        .unwrap_or(false);
-    if !in_root {
+    let canonical = dunce::canonicalize(&root)
+        .and_then(|canonical_root| {
+            let canonical = dunce::canonicalize(&file_path)?;
+            Ok(canonical.starts_with(canonical_root).then_some(canonical))
+        })
+        .ok()
+        .flatten();
+    let Some(canonical) = canonical else {
         bail!(
             "`{shown}` lies outside {} once its links are followed; nothing was sent.",
             root.display()
         );
+    };
+    if !opened_the_judged_file(&metadata, &canonical) {
+        bail!("`{shown}` changed under this node while it was being read; nothing was sent.");
     }
     let case_insensitive = root_case(ctx, &root)?.unwrap_or(false);
     match (set.builtin_denies(path_text, case_insensitive)?, force) {
@@ -1217,9 +1228,12 @@ fn attachment(
             human_size(size)
         );
     }
+    if let Some(refusal) = set.refusal() {
+        bail!("{} Nothing was sent.", shown_refusal(refusal));
+    }
     if let Some(reason) = set
-        .verdict_for(&PeerRef::unscoped(), path_text, case_insensitive)
-        .and_then(unserved_reason)
+        .verdict_for(&PeerRef::unscoped(), path_text, case_insensitive)?
+        .and_then(|(verdict, _)| unserved_reason(verdict))
     {
         bail!(
             "`{shown}` would travel as a reference, which this node would not serve ({reason}); lift the rule first; nothing was sent."
@@ -1260,6 +1274,21 @@ fn open_attachment(path: &Path) -> Result<(fs::File, fs::Metadata)> {
         .metadata()
         .with_context(|| format!("Failed to read metadata of '{}'", path.display()))?;
     Ok((file, metadata))
+}
+
+/// Whether the handle `attachment` opened is the file at `canonical`, the one the root
+/// boundary was judged on, so a file swapped between the open and that judgement is not
+/// sent on the other's verdict.
+#[cfg(unix)]
+fn opened_the_judged_file(opened: &fs::Metadata, canonical: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    fs::metadata(canonical)
+        .is_ok_and(|judged| (judged.dev(), judged.ino()) == (opened.dev(), opened.ino()))
+}
+
+#[cfg(not(unix))]
+fn opened_the_judged_file(_opened: &fs::Metadata, _canonical: &Path) -> bool {
+    true
 }
 
 /// Why a fetch of a file would be refused, for a verdict no grant lifts; `None` for one a
@@ -1477,11 +1506,7 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
             "`{shown}` breaks the `{rule}` rule of the wire path grammar; pass a path exactly as `.mesh shares --peer` or mesh__list shows it."
         ),
         Ok(Fetched::TooLarge { limit }) => {
-            let ceiling = if limit == SINGLE_SEGMENT_FETCH_CEILING {
-                " That is the single-segment ceiling every node applies today."
-            } else {
-                ""
-            };
+            let ceiling = ceiling_note(limit);
             bail!("{peer} serves files of at most {limit} bytes and `{shown}` is larger.{ceiling}");
         }
         Err(FileFetchError::NotServed) => {
@@ -1490,6 +1515,16 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
         Err(err) => bail!(err.to_string()),
     }
     Ok(())
+}
+
+/// Appended to a size refusal when `limit` is the ceiling every node shares, not one
+/// this node chose.
+fn ceiling_note(limit: u64) -> &'static str {
+    if limit == SINGLE_SEGMENT_FETCH_CEILING {
+        " That is the single-segment ceiling every node applies today."
+    } else {
+        ""
+    }
 }
 
 struct FetchArgs {
@@ -2668,9 +2703,9 @@ async fn grant(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         );
     }
     let scope = scope_flag(&args, "grant")?;
-    live(ctx)?;
+    let runtime = live(ctx)?;
     let record = open_access_request(ctx, id)?;
-    refuse_unservable(ctx, id, &record)?;
+    refuse_unservable(ctx, &runtime, id, &record)?;
     let target = args
         .standing
         .then(|| loaded_for_writing(ctx).map(|(_, set)| ShareTarget::of(&set, scope)))
@@ -2754,25 +2789,48 @@ fn open_access_request(ctx: &RequestContext, id: &str) -> Result<InboundRecord> 
     Ok(record)
 }
 
-/// Refuses a grant that would deliver nothing: a path a deny, the built-in deny or a
-/// protected directory holds back would be granted and then answered `not_shared`, since
-/// no grant lifts those, so the human is told before anything is written or sent. A path
-/// that resolves to nothing has no rule to lift and is left to the grant.
-fn refuse_unservable(ctx: &RequestContext, id: &str, record: &InboundRecord) -> Result<()> {
+/// Refuses a grant that would deliver nothing, judging each requested path as a
+/// reference is judged: a path a deny, the built-in deny or a protected directory holds
+/// back would be granted and then answered `not_shared`, since no grant lifts those, and
+/// a file above the serving limit would be answered `too_large`; the human is told
+/// before anything is written or sent. A share list refused at load serves nothing, so
+/// it stops the grant first. A path that resolves to nothing has no rule to lift and is
+/// left to the grant.
+fn refuse_unservable(
+    ctx: &RequestContext,
+    runtime: &MeshRuntime,
+    id: &str,
+    record: &InboundRecord,
+) -> Result<()> {
     let (root, set) = share_set(ctx)?;
+    if let Some(refusal) = set.refusal() {
+        bail!("{} Nothing was sent.", shown_refusal(refusal));
+    }
     let case_insensitive = root_case(ctx, &root)?.unwrap_or(false);
     let peer = PeerRef {
         identity: &record.peer_identity,
         destination: &record.peer_destination,
     };
+    let limit = runtime.serving().serving_limit();
     for path in &record.paths {
-        if let Some(reason) = set
-            .verdict_for(&peer, path, case_insensitive)
-            .and_then(unserved_reason)
-        {
+        let Some((verdict, canonical)) = set.verdict_for(&peer, path, case_insensitive)? else {
+            continue;
+        };
+        let shown = listed_paths(std::slice::from_ref(path));
+        if let Some(reason) = unserved_reason(verdict) {
             bail!(
-                "{} would not be served even once granted ({reason}); refuse the request with `.mesh refuse {id}`, or lift the rule first.",
-                listed_paths(std::slice::from_ref(path))
+                "{shown} would not be served even once granted ({reason}); refuse the request with `.mesh refuse {id}`, or lift the rule first."
+            );
+        }
+        let Ok(metadata) = fs::metadata(&canonical) else {
+            continue;
+        };
+        let size = metadata.len();
+        if size > limit {
+            bail!(
+                "{shown} would not be served even once granted (it is {} and this node serves at most {limit} bytes); refuse the request with `.mesh refuse {id}`, or lift the rule first.{}",
+                human_size(size),
+                ceiling_note(limit)
             );
         }
     }
@@ -7546,6 +7604,10 @@ mod tests {
                     false
                 }
 
+                fn holds(&self, _id: &str) -> bool {
+                    false
+                }
+
                 fn interrupt(&self) {
                     self.interrupts.fetch_add(1, Ordering::SeqCst);
                 }
@@ -10613,16 +10675,16 @@ mod tests {
                 });
             }
 
-            /// Usage probe: `undeny` and `fetch` are no longer verbs, and `deny` takes a
-            /// file pattern. With the node ON and an identity trusted for all its
-            /// instances, the withdrawn words are refused as unknown `.mesh` commands and a
-            /// `deny` of a destination is sent to `untrust` (not the mesh-off teaching
-            /// text, not a macro-path error); each asks nothing and leaves the trust file,
-            /// the deny overlay and the verdict exactly as they were. The renamed and
-            /// folded verbs are the ones that work in their place.
+            /// Usage probe: `undeny` is no longer a verb, and `deny` takes a file pattern.
+            /// With the node ON and an identity trusted for all its instances, the
+            /// withdrawn word is refused as an unknown `.mesh` command and a `deny` of a
+            /// destination is sent to `untrust` (not the mesh-off teaching text, not a
+            /// macro-path error); each asks nothing and leaves the trust file, the deny
+            /// overlay and the verdict exactly as they were. The renamed and folded verbs
+            /// are the ones that work in their place.
             #[test]
             #[serial]
-            fn usage_probe_deny_undeny_and_fetch_are_withdrawn_verbs_that_touch_nothing() {
+            fn usage_probe_deny_of_a_peer_and_undeny_are_withdrawn_and_touch_nothing() {
                 let _guard = TestConfigDirGuard::new("repl-mesh-withdrawn-verbs");
                 let _capture = capture::install();
                 let _script = prompt_script::install(&[]);
@@ -20661,6 +20723,51 @@ mod tests {
                     });
                 }
 
+                /// A share list refused at load serves nothing, so a grant on it would be
+                /// answered `not_shared` for every path; the refusal the file earned stops
+                /// the grant, one-off and standing, before anything is written or sent, and
+                /// `refuse` still works.
+                #[test]
+                #[serial]
+                fn grant_is_refused_with_the_share_list_refusal_and_refuse_still_decides() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-grant-refused-list");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-grant-refused-list").await;
+                        fs::write(fx.root.path.join("x.rs"), "fn x() {}\n").unwrap();
+                        let (_, locations) = share_locations(&fx.ctx).unwrap();
+                        fs::create_dir_all(locations.global.parent().unwrap()).unwrap();
+                        fs::write(&locations.global, "version: 99\n").unwrap();
+                        let before = fs::read(&locations.global).unwrap();
+                        fx.file("a-1", InboundKind::Access, &["x.rs"]);
+
+                        for line in [".mesh grant a-1", ".mesh grant a-1 --standing"] {
+                            let printed = stdout_lines().len();
+                            let err = refusal(&mut fx.ctx, line).await;
+                            assert!(
+                                err.contains(&locations.global.display().to_string()),
+                                "{line}: {err}"
+                            );
+                            assert!(err.ends_with(" Nothing was sent."), "{line}: {err}");
+                            assert!(!err.contains("would not be served"), "{line}: {err}");
+                            assert_eq!(stdout_lines().len(), printed, "{line} prints nothing");
+                        }
+                        assert!(fx.stub.seen().is_empty(), "{:?}", fx.stub.seen());
+                        assert!(fx.grants().is_empty(), "{:?}", fx.grants());
+                        assert_eq!(fs::read(&locations.global).unwrap(), before);
+                        assert!(!locations.workspace.exists());
+                        assert_eq!(fx.pending_ids(), ["a-1"]);
+
+                        let out = out_of(&mut fx.ctx, ".mesh refuse a-1").await.unwrap();
+
+                        assert!(out.contains("Refused a-1: 1 path"), "{out}");
+                        assert_eq!(fx.heard(), "access denied: 1 path");
+                        assert!(fx.pending_ids().is_empty());
+                        fx.stop().await;
+                    });
+                }
+
                 #[test]
                 #[serial]
                 fn refuse_tells_the_peer_no_and_writes_nothing() {
@@ -21576,6 +21683,65 @@ mod tests {
                         }
                         assert!(fx.stub.seen().is_empty(), "{:?}", fx.stub.seen());
                         assert!(fx.grants().is_empty(), "{:?}", fx.grants());
+                        fx.stop().await;
+                    });
+                }
+
+                /// A share list refused at load shares nothing, so a reference would be
+                /// answered `not_shared` whatever the rules say; the refusal the file
+                /// earned stops the reference form, while the inline form, which never
+                /// consults the list, still travels.
+                #[test]
+                #[serial]
+                fn an_attached_reference_is_refused_with_the_share_list_refusal_while_inline_travels()
+                 {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-attach-refused-list");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::with_config(
+                            "repl-mesh-attach-refused-list",
+                            with_inline_max(1024),
+                        )
+                        .await;
+                        write(&fx.root.path, "big.bin", &vec![0x5A; 1025]);
+                        write(&fx.root.path, "docs/notes.md", NOTES);
+                        let (_, locations) = share_locations(&fx.ctx).unwrap();
+                        fs::create_dir_all(locations.global.parent().unwrap()).unwrap();
+                        fs::write(&locations.global, "version: 99\n").unwrap();
+                        let to = fx.stub.destination_hex();
+
+                        let line = format!(".mesh reply {to} --yes \"x\" --attach big.bin");
+                        let printed = stdout_lines().len();
+                        let err = refusal(&mut fx.ctx, &line).await;
+
+                        assert!(
+                            err.contains(&locations.global.display().to_string()),
+                            "{err}"
+                        );
+                        assert!(err.ends_with(" Nothing was sent."), "{err}");
+                        assert!(!err.contains("would travel as a reference"), "{err}");
+                        assert_eq!(stdout_lines().len(), printed, "{line} prints nothing");
+                        assert!(fx.stub.seen().is_empty(), "{:?}", fx.stub.seen());
+                        assert!(fx.grants().is_empty(), "{:?}", fx.grants());
+
+                        let out = out_of(
+                            &mut fx.ctx,
+                            &format!(".mesh reply {to} --yes \"x\" --attach docs/notes.md"),
+                        )
+                        .await
+                        .unwrap();
+
+                        assert!(
+                            out.lines()
+                                .any(|line| line == inline_line("docs/notes.md", 9)),
+                            "{out}"
+                        );
+                        assert_eq!(
+                            fx.stub.seen()[0].parts,
+                            [inline_part("docs/notes.md", NOTES)]
+                        );
+                        assert!(fx.grants().is_empty());
                         fx.stop().await;
                     });
                 }

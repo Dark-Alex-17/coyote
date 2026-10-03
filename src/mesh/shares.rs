@@ -711,23 +711,28 @@ impl ShareSet {
         rules.resolved(&canonical).is_some() && rules.judge(&wire, &canonical) == Judgement::Allowed
     }
 
-    /// Where a fetch of `wire_text` by `peer` would stand, with the reason: the resolve
-    /// and judge half of `is_served` with nothing stat'ed, opened or spent, so a verb can
-    /// tell the human whether a grant or a reference would ever be served before it
-    /// commits one. `None` is a name the grammar refuses, one that resolves to nothing,
-    /// or rules that cannot be built: no rule holds such a file back, there is simply
-    /// nothing to judge.
+    /// Where a fetch of `wire_text` by `peer` would stand, with the reason and the file
+    /// it was judged on: the resolve and judge half of `is_served` with nothing stat'ed,
+    /// opened or spent, so a verb can tell the human whether a grant or a reference
+    /// would ever be served before it commits one. `None` is a name the grammar refuses
+    /// or one that resolves to nothing: no rule holds such a file back, there is simply
+    /// nothing to judge. Rules that cannot be built are the error `rules` gives, since a
+    /// set that serves nothing must not read as one with nothing to lift.
     pub(crate) fn verdict_for(
         &self,
         peer: &PeerRef<'_>,
         wire_text: &str,
         case_insensitive: bool,
-    ) -> Option<Verdict> {
-        let wire = WirePath::parse(wire_text).ok()?;
+    ) -> Result<Option<(Verdict, PathBuf)>> {
+        let rules = self.rules(peer, case_insensitive)?;
+        let Ok(wire) = WirePath::parse(wire_text) else {
+            return Ok(None);
+        };
         let candidate = self.locations.workspace_root.join(wire.to_relative_path());
-        let canonical = dunce::canonicalize(candidate).ok()?;
-        let rules = self.rules(peer, case_insensitive).ok()?;
-        Some(rules.verdict(&wire, &canonical))
+        let Ok(canonical) = dunce::canonicalize(candidate) else {
+            return Ok(None);
+        };
+        Ok(Some((rules.verdict(&wire, &canonical), canonical)))
     }
 
     /// The files `peer` may fetch, one page at a time, sorted by wire path. The walk
@@ -3981,7 +3986,7 @@ mod tests {
     }
 
     #[test]
-    fn verdict_for_keeps_the_reason_and_has_none_for_a_file_that_resolves_to_nothing() {
+    fn verdict_for_keeps_the_reason_and_the_file_and_has_none_for_one_that_resolves_to_nothing() {
         let fx = Fixture::new("verdict-for");
         let (identity, destination) = anyone();
         let peer = PeerRef {
@@ -3992,12 +3997,16 @@ mod tests {
         set.apply(allow("docs/**"), WriteScope::Global).unwrap();
         set.apply(deny("docs/private.md"), WriteScope::Global)
             .unwrap();
-        fx.file("docs/a.md");
+        let a = fx.file("docs/a.md");
         fx.file("docs/private.md");
         fx.file("docs/.env");
         fx.file("src/main.rs");
         fx.file(".git/HEAD");
-        let verdict = |wire_text: &str| set.verdict_for(&peer, wire_text, false);
+        let verdict = |wire_text: &str| {
+            set.verdict_for(&peer, wire_text, false)
+                .unwrap()
+                .map(|(verdict, _)| verdict)
+        };
 
         assert_eq!(verdict("docs/a.md"), Some(Verdict::Shared));
         assert_eq!(verdict("docs/private.md"), Some(Verdict::Denied));
@@ -4006,6 +4015,32 @@ mod tests {
         assert_eq!(verdict(".git/HEAD"), Some(Verdict::Protected));
         assert_eq!(verdict("docs/missing.md"), None);
         assert_eq!(verdict("../outside.md"), None, "the grammar refuses it");
+        assert_eq!(
+            set.verdict_for(&peer, "docs/a.md", false).unwrap(),
+            Some((Verdict::Shared, a)),
+            "the file the verdict was judged on comes with it"
+        );
+    }
+
+    #[test]
+    fn verdict_for_is_an_error_while_poisoned_rather_than_nothing_to_judge() {
+        let fx = Fixture::new("verdict-for-poisoned");
+        fx.write(Layer::Global, "version: 0\nallow: []\n");
+        let (identity, destination) = anyone();
+        let peer = PeerRef {
+            identity: &identity,
+            destination: &destination,
+        };
+        fx.file("docs/a.md");
+        let set = fx.load();
+
+        let err = set.verdict_for(&peer, "docs/a.md", false).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("refused when it was loaded, so nothing is shared"),
+            "{err}"
+        );
     }
 
     #[cfg(unix)]
