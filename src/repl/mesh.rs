@@ -5,6 +5,9 @@ use crate::config::{MeshConfig, RequestContext, paths};
 use crate::function::mesh::trust_label;
 use crate::mesh::access::GrantKind;
 use crate::mesh::card::{CardSource, DISPLAY_NAME_MAX_CHARS, StatusHandler, render_for_human};
+use crate::mesh::fetch::{
+    FILE_FETCH_REQUEST_TIMEOUT, FetchError as FileFetchError, Fetched, SINGLE_SEGMENT_FETCH_CEILING,
+};
 use crate::mesh::identity::{self, Predecessor, fingerprint};
 use crate::mesh::idle::plural;
 use crate::mesh::knock::{KnockIntro, KnockOutcome, KnockVia};
@@ -31,8 +34,8 @@ use crate::mesh::wire_path::WIRE_PATH_MAX_BYTES;
 use crate::mesh::{
     FetchError, FetchReport, LoggingInboundSink, MAX_WANTS_PER_FETCH, MESH_ALREADY_ON, MeshPaths,
     MeshRuntime, NodeOptions, PeerRecord, PropagationNodeRecord, age_text, canonical_hash,
-    destination_address, display_text, parse_rfc3339, redact_hashes, refuse_symlink, rfc3339_utc,
-    short,
+    decode_hex, destination_address, display_text, hex_lower, parse_rfc3339, redact_hashes,
+    refuse_symlink, rfc3339_utc, short,
 };
 use crate::supervisor::mailbox::EnvelopePayload;
 use crate::utils::{AbortSignal, drain_stale_tty_input, wait_user_interrupt};
@@ -176,12 +179,18 @@ pub(super) const VERBS: &[(&str, &str, &str)] = &[
         "Refuse a peer's access request",
         ".mesh refuse <id>",
     ),
+    (
+        "fetch",
+        "Fetch one file a trusted peer shares into this node's staging inbox",
+        ".mesh fetch <destination> <path> [--if-sha256 <hex>]",
+    ),
 ];
 
 pub(crate) const MESH_OFF: &str = "Mesh is off. Run `.mesh on` first.";
 const ROTATE_NEEDS_OFF: &str = "Mesh is on. Run `.mesh off` first; the identity is rotated only while no session's node on this config dir is running, then `.mesh on` announces the new one.";
 const BROADCAST_NOTICE: &str = "This sends a bulletin to every peer this node trusts that has a known path right now. Peers you have not trusted receive nothing.";
 const REPLY_REFUSAL_TAIL: &str = "Nothing is sent to a destination this node does not trust.";
+const FETCH_REFUSAL_TAIL: &str = "Nothing is fetched from a destination this node does not trust.";
 const STATUS_REFUSAL_TAIL: &str = "Status is only requested from trusted destinations.";
 const KNOCK_REFUSAL_TAIL: &str = "A knock is not sent to a destination this node has denied or an identity it has blocked; `.mesh trust <destination>` / `.mesh unblock` lift that.";
 const INBOX_CONTENT_MAX_CHARS: usize = 200;
@@ -230,6 +239,7 @@ pub(crate) async fn run(
         "shares" => shares(ctx, rest),
         "grant" => grant(ctx, rest).await,
         "refuse" => refuse(ctx, rest).await,
+        "fetch" => fetch(ctx, &abort_signal, rest).await,
         other => bail!("Unknown .mesh command '{other}'. Type `.mesh` for the list."),
     }
 }
@@ -859,6 +869,122 @@ async fn knock(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
         Err(err) => bail!(err.to_string()),
     }
     Ok(())
+}
+
+/// `.mesh fetch <destination> <path> [--if-sha256 <hex>]`: pulls one file a trusted peer
+/// shares into the staging inbox and says where it landed. The bytes are never printed.
+async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&str>) -> Result<()> {
+    let Some(rest) = rest else {
+        out_text(&render_verb_help("fetch"));
+        return Ok(());
+    };
+    let Some(args) = parse_fetch_args(rest)? else {
+        out_text(&render_verb_help("fetch"));
+        return Ok(());
+    };
+    let Some(destination) = canonical_hash(&args.destination) else {
+        bail!(
+            "'{}' is not a destination hash: expected 32 hex characters, as `.mesh peers` lists them.",
+            args.destination
+        );
+    };
+    let runtime = live(ctx)?;
+    peer_for_contact(&runtime, &destination, FETCH_REFUSAL_TAIL)?;
+    let Some(desc) = runtime.resolve_destination(&destination).await else {
+        bail!(
+            "Destination {destination} cannot be reached yet: its announce has not been heard since this node started. Wait for it to announce, or check `.mesh peers`."
+        );
+    };
+    let shown = shown_pattern(&args.path);
+    let peer = short(&destination);
+    out_text(&format!(
+        "Fetching `{shown}` from {peer} over the mesh (up to {} s)...",
+        FILE_FETCH_REQUEST_TIMEOUT.as_secs()
+    ));
+    let outcome = tokio::select! {
+        outcome = runtime.fetch_file(&desc, &args.path, args.if_sha256) => outcome,
+        _ = wait_user_interrupt(Some(abort_signal)) => {
+            out_text(&format!("Fetch of `{shown}` interrupted; nothing was staged."));
+            return Ok(());
+        }
+    };
+    match outcome {
+        Ok(Fetched::Staged { path, size, sha256 }) => {
+            out_text(&format!(
+                "Staged `{shown}` from {peer}: {size} bytes, sha256 {}, at {}.",
+                hex_lower(&sha256),
+                path.display()
+            ));
+            out_text(
+                "The file is the peer's; move it into the tree yourself if you want it there.",
+            );
+        }
+        Ok(Fetched::NotModified { .. }) => out_text(&format!(
+            "The peer's copy of `{shown}` still has the sha256 you hold; nothing was fetched."
+        )),
+        Ok(Fetched::NotShared) => bail!(
+            "{peer} does not share `{shown}` with this node (or it does not exist; the two are not told apart). Ask the person at that node to `.mesh allow` it, or to `.mesh grant` a request the model makes with mesh__request_access."
+        ),
+        Ok(Fetched::InvalidPath { rule }) => bail!(
+            "`{shown}` breaks the `{rule}` rule of the wire path grammar; pass a path exactly as `.mesh shares --peer` or mesh__list shows it."
+        ),
+        Ok(Fetched::TooLarge { limit }) => {
+            let ceiling = if limit == SINGLE_SEGMENT_FETCH_CEILING {
+                " That is the single-segment ceiling every node applies today."
+            } else {
+                ""
+            };
+            bail!("{peer} serves files of at most {limit} bytes and `{shown}` is larger.{ceiling}");
+        }
+        Err(FileFetchError::NotServed) => {
+            bail!("{peer} does not share files; it may run an older Coyote or have sharing off.")
+        }
+        Err(err) => bail!(err.to_string()),
+    }
+    Ok(())
+}
+
+struct FetchArgs {
+    destination: String,
+    path: String,
+    if_sha256: Option<[u8; 32]>,
+}
+
+/// Two positionals, destination then path, and `--if-sha256 <hex>` anywhere; `None`
+/// when either positional is missing, which the caller answers with the usage line.
+fn parse_fetch_args(rest: &str) -> Result<Option<FetchArgs>> {
+    let mut positional = Vec::new();
+    let mut if_sha256 = None;
+    let mut tokens = split_tokens(rest).into_iter();
+    while let Some(token) = tokens.next() {
+        if token == "--if-sha256" {
+            let value = match tokens.next() {
+                Some(value) if !value.starts_with("--") => value,
+                _ => bail!("'{token}' needs a value. {}", render_verb_help("fetch")),
+            };
+            let hash = decode_hex(&value).and_then(|bytes| <[u8; 32]>::try_from(bytes).ok());
+            let Some(hash) = hash else {
+                bail!(
+                    "`--if-sha256` takes the 64-hex sha256 `.mesh fetch` printed last time; '{value}' is not one. {}",
+                    render_verb_help("fetch")
+                );
+            };
+            if_sha256 = Some(hash);
+        } else if token.starts_with("--") || positional.len() == 2 {
+            return Err(unexpected(&token, "fetch"));
+        } else {
+            positional.push(token);
+        }
+    }
+    let mut positional = positional.into_iter();
+    let (Some(destination), Some(path)) = (positional.next(), positional.next()) else {
+        return Ok(None);
+    };
+    Ok(Some(FetchArgs {
+        destination,
+        path,
+        if_sha256,
+    }))
 }
 
 fn render_sync(report: &FetchReport) -> String {
@@ -12403,14 +12529,14 @@ mod tests {
                 });
             }
 
-            /// Usage probe: bare `.mesh` lists exactly the 26 verbs, one row each in table
+            /// Usage probe: bare `.mesh` lists exactly the 27 verbs, one row each in table
             /// order, `sync` and `forget` among them and none of the withdrawn spellings;
             /// the old `.mesh help` is an unknown verb whose single-sentence error points
             /// at `.mesh` for the list (it does not name `sync`), and under the node it
             /// touches nothing.
             #[test]
             #[serial]
-            fn usage_probe_bare_mesh_lists_the_twenty_six_verbs_and_the_old_help_spelling_points_at_it()
+            fn usage_probe_bare_mesh_lists_the_twenty_seven_verbs_and_the_old_help_spelling_points_at_it()
              {
                 let _guard = TestConfigDirGuard::new("repl-mesh-usage-probe-verb-list");
                 let _capture = capture::install();
@@ -12434,7 +12560,7 @@ mod tests {
                         .collect();
                     let expected: Vec<&str> = VERBS.iter().map(|(name, _, _)| *name).collect();
                     assert_eq!(listed, expected, "{out}");
-                    assert_eq!(listed.len(), 26, "{out}");
+                    assert_eq!(listed.len(), 27, "{out}");
                     for present in [
                         "sync", "forget", "untrust", "trust", "block", "unblock", "allow", "deny",
                         "unshare", "shares", "grant", "refuse",
@@ -19920,6 +20046,409 @@ mod tests {
                         );
                         assert!(fx.heard().starts_with("access granted:"));
                         assert!(fx.pending_ids().is_empty());
+                        fx.stop().await;
+                    });
+                }
+            }
+
+            mod fetch_verb {
+                use super::*;
+                use crate::mesh::message::PEER_WIRE_VERSION;
+                use crate::mesh::test_support::{AdmittedRequest, FETCH_PATH, Handler, Reply};
+                use async_trait::async_trait;
+                use sha2::{Digest as _, Sha256};
+                use std::collections::VecDeque;
+
+                /// The `/fetch` provider of a scripted peer: answers each request with the
+                /// next queued reply and keeps the request bodies it heard.
+                #[derive(Default)]
+                struct ScriptedFetch {
+                    replies: Mutex<VecDeque<Value>>,
+                    heard: Mutex<Vec<Value>>,
+                }
+
+                #[async_trait]
+                impl Handler for ScriptedFetch {
+                    async fn handle(&self, request: AdmittedRequest) -> Reply {
+                        self.heard.lock().push(request.body);
+                        match self.replies.lock().pop_front() {
+                            Some(value) => Reply::Value(value),
+                            None => Reply::Silent,
+                        }
+                    }
+                }
+
+                /// A node trusting a stub peer that trusts it back, the stub serving
+                /// `/fetch` from a script unless `serves_files` is off.
+                struct FetchFixture {
+                    stub: PeerStub,
+                    script: Arc<ScriptedFetch>,
+                    started: StartedRuntime,
+                    ctx: RequestContext,
+                }
+
+                impl FetchFixture {
+                    async fn new(tag: &str, serves_files: bool) -> Self {
+                        let stub =
+                            PeerStub::listen(&format!("{tag}-stub"), TcpServer::DEFAULT_CLIENT_MTU)
+                                .await;
+                        let script = Arc::new(ScriptedFetch::default());
+                        if serves_files {
+                            stub.serve(FETCH_PATH, script.clone());
+                        }
+                        let started = started_runtime_on(tag, stub.port()).await;
+                        let runtime = started.runtime.clone();
+                        let ctx = ctx_with(MeshConfig::default(), true);
+                        ctx.app.mesh.install(runtime.clone()).unwrap();
+                        stub.trust(&runtime.current_destination_hash(), runtime.fingerprint());
+                        stub.announce(Some("Stub")).await;
+                        let to = stub.destination_hex();
+                        let peers = runtime.peers();
+                        wait_until("the node to file the stub", || peers.get(&to).is_some()).await;
+                        runtime
+                            .trust()
+                            .trust_destination(
+                                ctx.app.mesh.as_ref(),
+                                &to,
+                                TrustOptions::default(),
+                                SystemTime::now(),
+                            )
+                            .unwrap();
+                        Self {
+                            stub,
+                            script,
+                            started,
+                            ctx,
+                        }
+                    }
+
+                    /// Queues one `/fetch` reply: `status` with the wire version, plus `extra`.
+                    fn queue(&self, status: &str, extra: Vec<(&str, Value)>) {
+                        let mut entries = vec![
+                            (Value::from("v"), Value::from(PEER_WIRE_VERSION)),
+                            (Value::from("status"), Value::from(status)),
+                        ];
+                        entries.extend(
+                            extra
+                                .into_iter()
+                                .map(|(key, value)| (Value::from(key), value)),
+                        );
+                        self.script.replies.lock().push_back(Value::Map(entries));
+                    }
+
+                    fn heard(&self) -> Vec<Value> {
+                        self.script.heard.lock().clone()
+                    }
+
+                    fn dest(&self) -> String {
+                        short(&self.stub.destination_hex()).to_string()
+                    }
+
+                    fn fetching(&self, path: &str) -> String {
+                        format!(
+                            "Fetching `{path}` from {} over the mesh (up to {} s)...",
+                            self.dest(),
+                            FILE_FETCH_REQUEST_TIMEOUT.as_secs()
+                        )
+                    }
+
+                    fn inbox_root(&self) -> PathBuf {
+                        let runtime = &self.started.runtime;
+                        runtime
+                            .cache_dir()
+                            .join("mesh")
+                            .join("inbox")
+                            .join(runtime.current_instance_id())
+                    }
+
+                    async fn stop(self) {
+                        assert!(self.ctx.app.mesh.stop().await.unwrap());
+                        self.started.relay_handle.abort();
+                        self.stub.stop().await;
+                    }
+                }
+
+                fn ok_reply(bytes: &[u8]) -> Vec<(&'static str, Value)> {
+                    vec![
+                        ("size", Value::from(bytes.len() as u64)),
+                        ("sha256", Value::Binary(Sha256::digest(bytes).to_vec())),
+                        ("bytes", Value::Binary(bytes.to_vec())),
+                    ]
+                }
+
+                fn field<'a>(body: &'a Value, key: &str) -> Option<&'a Value> {
+                    body.as_map()?
+                        .iter()
+                        .find(|(k, _)| k.as_str() == Some(key))
+                        .map(|(_, v)| v)
+                }
+
+                #[test]
+                #[serial]
+                fn fetch_stages_the_peers_bytes_under_the_inbox_and_says_where_they_landed() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-fetch-staged");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = FetchFixture::new("repl-mesh-fetch-staged", true).await;
+                        let bytes = b"# a\n";
+                        fx.queue("ok", ok_reply(bytes));
+                        let line = format!(".mesh fetch {} docs/a.md", fx.stub.destination_hex());
+
+                        let out = out_of(&mut fx.ctx, &line).await.unwrap();
+
+                        let staged = dunce::canonicalize(fx.inbox_root())
+                            .unwrap()
+                            .join(fx.stub.destination_hex()[..8].to_lowercase())
+                            .join("docs")
+                            .join("a.md");
+                        let lines: Vec<&str> = out.lines().collect();
+                        assert_eq!(
+                            lines,
+                            [
+                                fx.fetching("docs/a.md"),
+                                format!(
+                                    "Staged `docs/a.md` from {}: 4 bytes, sha256 {}, at {}.",
+                                    fx.dest(),
+                                    hex_lower(&Sha256::digest(bytes)),
+                                    staged.display()
+                                ),
+                                "The file is the peer's; move it into the tree yourself if you want it there."
+                                    .to_string(),
+                            ],
+                            "{out}"
+                        );
+                        assert_eq!(fs::read(&staged).unwrap(), bytes);
+                        let heard = fx.heard();
+                        assert_eq!(heard.len(), 1, "{heard:?}");
+                        assert_eq!(field(&heard[0], "path"), Some(&Value::from("docs/a.md")));
+                        assert_eq!(field(&heard[0], "if_sha256"), Some(&Value::Nil));
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        fx.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn fetch_with_the_held_sha256_sends_it_and_reports_the_copy_unchanged() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-fetch-not-modified");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = FetchFixture::new("repl-mesh-fetch-not-modified", true).await;
+                        let digest = Sha256::digest(b"# a\n");
+                        fx.queue(
+                            "not_modified",
+                            vec![("sha256", Value::Binary(digest.to_vec()))],
+                        );
+                        let line = format!(
+                            ".mesh fetch {} docs/a.md --if-sha256 {}",
+                            fx.stub.destination_hex(),
+                            hex_lower(&digest).to_uppercase()
+                        );
+
+                        let out = out_of(&mut fx.ctx, &line).await.unwrap();
+
+                        let lines: Vec<&str> = out.lines().collect();
+                        assert_eq!(
+                            lines,
+                            [
+                                fx.fetching("docs/a.md"),
+                                "The peer's copy of `docs/a.md` still has the sha256 you hold; nothing was fetched."
+                                    .to_string(),
+                            ],
+                            "{out}"
+                        );
+                        let heard = fx.heard();
+                        assert_eq!(heard.len(), 1, "{heard:?}");
+                        assert_eq!(
+                            field(&heard[0], "if_sha256"),
+                            Some(&Value::Binary(digest.to_vec()))
+                        );
+                        assert!(!fx.inbox_root().exists());
+                        fx.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn fetch_reports_not_shared_too_large_and_a_peer_without_fetch_in_the_peers_words()
+                {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-fetch-refusals");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = FetchFixture::new("repl-mesh-fetch-refusals", true).await;
+                        let dest = fx.stub.destination_hex();
+                        let line = format!(".mesh fetch {dest} docs/a.md");
+                        let printed = stdout_lines().len();
+
+                        fx.queue("not_shared", vec![]);
+                        assert_eq!(
+                            refusal(&mut fx.ctx, &line).await,
+                            format!(
+                                "{} does not share `docs/a.md` with this node (or it does not exist; the two are not told apart). Ask the person at that node to `.mesh allow` it, or to `.mesh grant` a request the model makes with mesh__request_access.",
+                                fx.dest()
+                            )
+                        );
+
+                        fx.queue("too_large", vec![("limit", Value::from(4096u64))]);
+                        assert_eq!(
+                            refusal(&mut fx.ctx, &line).await,
+                            format!(
+                                "{} serves files of at most 4096 bytes and `docs/a.md` is larger.",
+                                fx.dest()
+                            )
+                        );
+
+                        fx.queue(
+                            "too_large",
+                            vec![("limit", Value::from(SINGLE_SEGMENT_FETCH_CEILING))],
+                        );
+                        assert_eq!(
+                            refusal(&mut fx.ctx, &line).await,
+                            format!(
+                                "{} serves files of at most {SINGLE_SEGMENT_FETCH_CEILING} bytes and `docs/a.md` is larger. That is the single-segment ceiling every node applies today.",
+                                fx.dest()
+                            )
+                        );
+
+                        assert_eq!(fx.heard().len(), 3);
+                        assert!(!fx.inbox_root().exists());
+                        assert_eq!(
+                            stdout_lines()[printed..],
+                            vec![fx.fetching("docs/a.md"); 3],
+                            "each attempt prints its one progress line"
+                        );
+                        fx.stop().await;
+
+                        let mut bare = FetchFixture::new("repl-mesh-fetch-unserved", false).await;
+                        let line = format!(".mesh fetch {} docs/a.md", bare.stub.destination_hex());
+                        assert_eq!(
+                            refusal(&mut bare.ctx, &line).await,
+                            format!(
+                                "{} does not share files; it may run an older Coyote or have sharing off.",
+                                bare.dest()
+                            )
+                        );
+                        bare.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn fetch_refuses_a_path_the_wire_grammar_rejects_without_asking_the_peer() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-fetch-invalid-path");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = FetchFixture::new("repl-mesh-fetch-invalid-path", true).await;
+                        let line = format!(".mesh fetch {} ../x", fx.stub.destination_hex());
+                        let printed = stdout_lines().len();
+
+                        assert_eq!(
+                            refusal(&mut fx.ctx, &line).await,
+                            "`../x` breaks the `segment` rule of the wire path grammar; pass a path exactly as `.mesh shares --peer` or mesh__list shows it."
+                        );
+
+                        assert!(fx.heard().is_empty(), "{:?}", fx.heard());
+                        assert_eq!(stdout_lines()[printed..], [fx.fetching("../x")]);
+                        fx.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn fetch_is_refused_in_one_line_before_any_request_leaves() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-fetch-teaching");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut off = ctx_with(MeshConfig::default(), true);
+                        assert_eq!(
+                            refusal(
+                                &mut off,
+                                ".mesh fetch 0123456789abcdef0123456789abcdef docs/a.md"
+                            )
+                            .await,
+                            MESH_OFF
+                        );
+
+                        let mut fx = FetchFixture::new("repl-mesh-fetch-teaching", true).await;
+                        let runtime = fx.started.runtime.clone();
+                        let (untrusted, identity) = heard_peer(&runtime, "Uma", SystemTime::now());
+                        let unheard = hex_lower(&[0x7e; 16]);
+                        let trusted = fx.stub.destination_hex();
+                        let usage = render_verb_help("fetch");
+                        let verdict = runtime.trust().authorize(&identity, &untrusted);
+                        let untrusted_refusal =
+                            trust_refusal(&untrusted, verdict, FETCH_REFUSAL_TAIL).unwrap();
+                        assert!(untrusted_refusal.ends_with(FETCH_REFUSAL_TAIL));
+                        for (line, expected) in [
+                            (
+                                format!(".mesh fetch {untrusted} docs/a.md"),
+                                untrusted_refusal,
+                            ),
+                            (
+                                format!(".mesh fetch {unheard} docs/a.md"),
+                                unheard_refusal(&runtime, &unheard, FETCH_REFUSAL_TAIL).to_string(),
+                            ),
+                            (
+                                ".mesh fetch stub docs/a.md".to_string(),
+                                "'stub' is not a destination hash: expected 32 hex characters, as `.mesh peers` lists them."
+                                    .to_string(),
+                            ),
+                            (
+                                format!(".mesh fetch {trusted} docs/a.md --if-sha256 abc"),
+                                format!(
+                                    "`--if-sha256` takes the 64-hex sha256 `.mesh fetch` printed last time; 'abc' is not one. {usage}"
+                                ),
+                            ),
+                            (
+                                format!(".mesh fetch {trusted} docs/a.md --if-sha256"),
+                                format!("'--if-sha256' needs a value. {usage}"),
+                            ),
+                            (
+                                format!(".mesh fetch {trusted} docs/a.md docs/b.md"),
+                                format!("Unexpected 'docs/b.md'. {usage}"),
+                            ),
+                            (
+                                format!(".mesh fetch {trusted} docs/a.md --yes"),
+                                format!("Unexpected '--yes'. {usage}"),
+                            ),
+                        ] {
+                            let printed = stdout_lines().len();
+                            assert_eq!(refusal(&mut fx.ctx, &line).await, expected, "{line}");
+                            assert_eq!(stdout_lines().len(), printed, "{line} prints nothing");
+                        }
+                        assert!(fx.heard().is_empty(), "{:?}", fx.heard());
+                        assert!(!fx.inbox_root().exists());
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        fx.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn fetch_prints_its_usage_without_a_destination_or_a_path() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-fetch-usage");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = FetchFixture::new("repl-mesh-fetch-usage", true).await;
+                        for line in [
+                            ".mesh fetch".to_string(),
+                            format!(".mesh fetch {}", fx.stub.destination_hex()),
+                            format!(
+                                ".mesh fetch {} --if-sha256 {}",
+                                fx.stub.destination_hex(),
+                                hex_lower(&[0x11; 32])
+                            ),
+                        ] {
+                            let out = out_of(&mut fx.ctx, &line).await.unwrap();
+                            assert_eq!(out, render_verb_help("fetch"), "{line}");
+                        }
+                        assert!(fx.heard().is_empty(), "{:?}", fx.heard());
                         fx.stop().await;
                     });
                 }
