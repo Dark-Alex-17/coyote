@@ -295,6 +295,18 @@ pub(crate) struct MatchCount {
     pub truncated: bool,
 }
 
+/// Why the built-in deny names a relative file: by its text, which an override of that
+/// text lifts, or only by what it resolves to on disk, which an override of the text
+/// never reaches since overrides are judged on the resolved name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BuiltinHit {
+    ByText,
+    ByResolution {
+        /// The `/`-separated path under the root the file resolved to.
+        resolved: String,
+    },
+}
+
 /// One entry as a share file holds it, with the layer it came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RawEntry {
@@ -948,20 +960,30 @@ impl ShareSet {
     /// Whether the built-in deny, with the workspace config directory, names this one
     /// relative file: judged on the text, and on what it resolves to under the root when
     /// it exists, so a link to a secret is caught as a fetch of it would be. This is what
-    /// a forced allow of such a file has to be told about.
-    pub(crate) fn builtin_denies(&self, path: &str, case_insensitive: bool) -> Result<bool> {
+    /// a forced allow of such a file has to be told about; a text match is reported over
+    /// a resolution match, since an override of the text lifts the former alone.
+    pub(crate) fn builtin_denies(
+        &self,
+        path: &str,
+        case_insensitive: bool,
+    ) -> Result<Option<BuiltinHit>> {
         let builtin = self.builtin(case_insensitive)?;
         if builtin.is_match(path) {
-            return Ok(true);
+            return Ok(Some(BuiltinHit::ByText));
         }
         let Ok(root) = self.canonical_root() else {
-            return Ok(false);
+            return Ok(None);
         };
         let Ok(canonical) = dunce::canonicalize(root.join(path)) else {
-            return Ok(false);
+            return Ok(None);
         };
-        Ok(segments_under(&root, &canonical)
-            .is_some_and(|segments| builtin.is_match(segments.join("/"))))
+        let Some(segments) = segments_under(&root, &canonical) else {
+            return Ok(None);
+        };
+        let resolved = segments.join("/");
+        Ok(builtin
+            .is_match(&resolved)
+            .then_some(BuiltinHit::ByResolution { resolved }))
     }
 }
 
@@ -2874,11 +2896,18 @@ mod tests {
             ".git/config",
             in_config_dir.as_str(),
         ] {
-            assert!(set.builtin_denies(path, false).unwrap(), "{path}");
+            assert_eq!(
+                set.builtin_denies(path, false).unwrap(),
+                Some(BuiltinHit::ByText),
+                "{path}"
+            );
         }
-        assert!(!set.builtin_denies("docs/a.md", false).unwrap());
-        assert!(set.builtin_denies("docs/.ENV", true).unwrap());
-        assert!(!set.builtin_denies("docs/.ENV", false).unwrap());
+        assert_eq!(set.builtin_denies("docs/a.md", false).unwrap(), None);
+        assert_eq!(
+            set.builtin_denies("docs/.ENV", true).unwrap(),
+            Some(BuiltinHit::ByText)
+        );
+        assert_eq!(set.builtin_denies("docs/.ENV", false).unwrap(), None);
     }
 
     #[cfg(unix)]
@@ -2888,9 +2917,20 @@ mod tests {
         let set = fx.load();
         fx.file(".env");
         fx.link("docs/settings", "../.env");
+        fx.link("docs/.env.local", "../.env");
 
-        assert!(set.builtin_denies("docs/settings", false).unwrap());
-        assert!(!set.builtin_denies("docs/missing", false).unwrap());
+        assert_eq!(
+            set.builtin_denies("docs/settings", false).unwrap(),
+            Some(BuiltinHit::ByResolution {
+                resolved: ".env".to_string()
+            })
+        );
+        assert_eq!(set.builtin_denies("docs/missing", false).unwrap(), None);
+        assert_eq!(
+            set.builtin_denies("docs/.env.local", false).unwrap(),
+            Some(BuiltinHit::ByText),
+            "the text match is reported over the resolution"
+        );
     }
 
     #[test]

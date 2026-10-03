@@ -16,8 +16,8 @@ use crate::mesh::pending::{
     Correlation, InboundKind, InboundRecord, PendingState, access_not_a_question,
 };
 use crate::mesh::shares::{
-    DEFAULT_LIST_WALK_BOUND, GLOB_METACHARACTERS, LIST_PAGE_SIZE, Layer, MatchCount, Mutation,
-    PeerRef, RawKind, ShareLocations, ShareSet, Verdict as ShareVerdict, WriteScope,
+    BuiltinHit, DEFAULT_LIST_WALK_BOUND, GLOB_METACHARACTERS, LIST_PAGE_SIZE, Layer, MatchCount,
+    Mutation, PeerRef, RawKind, ShareLocations, ShareSet, Verdict as ShareVerdict, WriteScope,
     is_broad_pattern, is_canonical_peer, validate_override, validate_pattern,
 };
 use crate::mesh::trust::{
@@ -1495,13 +1495,17 @@ fn allow(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
                 set.locations().workspace.display()
             );
         }
-        if !set.builtin_denies(&pattern, case_insensitive)? {
-            bail!(
+        match set.builtin_denies(&pattern, case_insensitive)? {
+            Some(BuiltinHit::ByText) => {}
+            Some(BuiltinHit::ByResolution { resolved }) => bail!(
+                "`{pattern}` resolves to `{resolved}`, which the built-in deny names; `.mesh allow {resolved} --force --global` lifts that file."
+            ),
+            None => bail!(
                 "`{pattern}` is not under the built-in deny, so there is nothing for `--force` to lift; drop `--force`."
-            );
+            ),
         }
     } else if !pattern.contains(GLOB_METACHARACTERS)
-        && set.builtin_denies(&pattern, case_insensitive)?
+        && set.builtin_denies(&pattern, case_insensitive)?.is_some()
     {
         bail!(
             "`{pattern}` is under the built-in deny, so an allow alone would share nothing; `.mesh allow {pattern} --force --global` lifts it for this one file."
@@ -12505,6 +12509,82 @@ mod tests {
                             ]
                         );
                         assert_eq!(prompt_script::prompts_asked(), 0);
+                        fx.stop().await;
+                    });
+                }
+
+                /// The lift is judged on the resolved name, so the written override must
+                /// carry it: the effective view shows the file without the built-in mark.
+                #[test]
+                #[serial]
+                fn allow_force_lifts_the_built_in_deny_in_the_effective_view() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-allow-force-effective");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = ShareFixture::new(
+                            "repl-mesh-allow-force-effective",
+                            &[".env", "docs/a.md"],
+                        )
+                        .await;
+
+                        out_of(&mut fx.ctx, ".mesh allow .env --force --global")
+                            .await
+                            .unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh shares --effective")
+                            .await
+                            .unwrap();
+
+                        let lines: Vec<&str> = out.lines().collect();
+                        assert_eq!(
+                            lines,
+                            [
+                                format!(
+                                    "Files every trusted peer can fetch from {}:",
+                                    fx.root.path.display()
+                                )
+                                .as_str(),
+                                "  .env",
+                            ],
+                            "{out}"
+                        );
+                        fx.stop().await;
+                    });
+                }
+
+                /// An override of the link's text would never match the resolved secret,
+                /// so writing it would only print a false lift; the verb names the file
+                /// the override has to carry instead and writes nothing.
+                #[test]
+                #[serial]
+                fn allow_force_on_a_link_to_a_secret_names_the_resolved_file_and_writes_nothing() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-allow-force-link");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx =
+                            ShareFixture::new("repl-mesh-allow-force-link", &[".env", "docs/a.md"])
+                                .await;
+                        std::os::unix::fs::symlink("../.env", fx.root.path.join("docs/settings"))
+                            .unwrap();
+
+                        let err =
+                            refusal(&mut fx.ctx, ".mesh allow docs/settings --force --global")
+                                .await;
+
+                        assert_eq!(
+                            err,
+                            "`docs/settings` resolves to `.env`, which the built-in deny names; `.mesh allow .env --force --global` lifts that file."
+                        );
+                        assert!(!fx.locations.global.exists());
+                        assert!(fx.entries().is_empty());
+
+                        let err = refusal(&mut fx.ctx, ".mesh allow docs/settings").await;
+                        assert!(
+                            err.starts_with("`docs/settings` is under the built-in deny"),
+                            "{err}"
+                        );
+                        assert!(!fx.locations.global.exists());
                         fx.stop().await;
                     });
                 }
