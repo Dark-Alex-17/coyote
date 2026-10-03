@@ -3009,7 +3009,7 @@ fn polyfill_cmd_name<T: AsRef<Path>>(cmd_name: &str, bin_dir: &[T]) -> String {
 // Polling tools are expected to repeat with identical arguments (status probes,
 // list views, inbox checks); recording them would also let them break up
 // detection of a real loop in the calls they interleave with.
-const LOOP_TRACKER_EXEMPT_TOOLS: [&str; 9] = [
+const LOOP_TRACKER_EXEMPT_TOOLS: [&str; 10] = [
     "job__check",
     "job__list",
     "agent__check",
@@ -3019,6 +3019,7 @@ const LOOP_TRACKER_EXEMPT_TOOLS: [&str; 9] = [
     "mesh__check_inbox",
     "mesh__collect",
     "mesh__peers",
+    "mesh__list",
 ];
 
 fn is_loop_tracker_exempt(name: &str) -> bool {
@@ -3914,10 +3915,11 @@ mod tests {
             "mesh__check_inbox",
             "mesh__collect",
             "mesh__peers",
+            "mesh__list",
         ]
         .into_iter()
         .collect();
-        assert_eq!(LOOP_TRACKER_EXEMPT_TOOLS.len(), 9);
+        assert_eq!(LOOP_TRACKER_EXEMPT_TOOLS.len(), 10);
         assert_eq!(actual, expected);
     }
 

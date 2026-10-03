@@ -5364,6 +5364,9 @@ mod tests {
                             "mesh__collect",
                             "mesh__check_inbox",
                             "mesh__broadcast",
+                            "mesh__list",
+                            "mesh__fetch",
+                            "mesh__request_access",
                         ]
                     );
                     let slot = Arc::clone(&ctx.app.mesh);

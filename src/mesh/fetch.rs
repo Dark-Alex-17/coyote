@@ -10,62 +10,42 @@
 //! reply as peer-controlled data, caps what it keeps, checks the bytes against the hash the
 //! peer sent, and stages them under this instance's inbox.
 
-#[cfg(all(test, unix))]
 use crate::config::mesh_config::MAX_FETCH_FILE_BYTES;
 use crate::mesh::card::StatusCard;
 use crate::mesh::events::{MeshEvent, MeshHooks};
 use crate::mesh::grants::GrantStore;
-#[cfg(all(test, unix))]
 use crate::mesh::inbox::StageError;
-use crate::mesh::message::PEER_WIRE_VERSION;
-#[cfg(all(test, unix))]
-use crate::mesh::message::{PEER_LINK_TIMEOUT, PEER_REQUEST_TIMEOUT};
-#[cfg(all(test, unix))]
+use crate::mesh::message::{PEER_LINK_TIMEOUT, PEER_REQUEST_TIMEOUT, PEER_WIRE_VERSION};
 use crate::mesh::node::MeshRuntime;
 use crate::mesh::r3::{
-    AdmittedRequest, Handler, MAX_R3_PAYLOAD_BYTES, RefusalCode, Reply, Settlement,
+    AdmittedRequest, DispatchError, FETCH_PATH, Handler, LIST_PATH, MAX_R3_PAYLOAD_BYTES, R3Error,
+    RefusalCode, Reply, RequestOptions, Settlement,
 };
-#[cfg(all(test, unix))]
-use crate::mesh::r3::{DispatchError, FETCH_PATH, LIST_PATH, R3Error, RequestOptions};
-#[cfg(all(test, unix))]
-use crate::mesh::shares::LIST_PAGE_SIZE;
 use crate::mesh::shares::{
-    self, DEFAULT_LIST_WALK_BOUND, Listed, PeerRef, Served, ServedFile, ShareLocations, ShareSet,
-    Via,
+    self, DEFAULT_LIST_WALK_BOUND, LIST_PAGE_SIZE, Listed, PeerRef, Served, ServedFile,
+    ShareLocations, ShareSet, Via,
 };
-#[cfg(all(test, unix))]
-use crate::mesh::wire_path::WIRE_PATH_MAX_BYTES;
-use crate::mesh::wire_path::WirePath;
+use crate::mesh::wire_path::{WIRE_PATH_MAX_BYTES, WirePath};
 use crate::mesh::{hex_lower, redact_hashes, short};
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use rmpv::Value;
-#[cfg(all(test, unix))]
 use rns_transport::destination::DestinationDesc;
 use rns_transport::resource::MAX_EFFICIENT_SIZE;
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
-#[cfg(all(test, unix))]
 use std::fmt;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
-#[cfg(all(test, unix))]
-use std::time::Duration;
-use std::time::{SystemTime, UNIX_EPOCH};
-
-// The requester half, `list_shares` and `fetch_file`, is compiled only where the live-pair
-// tests that drive it run, until the `mesh__*` tools call it; the items it alone uses are
-// gated with it.
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// How long a fetch waits for its answer: a `MAX_FETCH_FILE_BYTES` Resource on a slow
 /// interface takes minutes, where a status card takes a round trip.
-#[cfg(all(test, unix))]
 pub(crate) const FILE_FETCH_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// How many peers' last status card and last listing are kept, oldest out first.
 pub(crate) const LAST_CARD_CACHE_PEERS: usize = 32;
-#[cfg(test)]
 pub(crate) const LAST_LIST_CACHE_PEERS: usize = 32;
 /// Bytes left free under `MAX_R3_PAYLOAD_BYTES` by a listing page, for the frame, the
 /// envelope and the page's own keys around the entries.
@@ -73,7 +53,6 @@ const LIST_PAGE_HEADROOM: usize = 2048;
 /// The longest cursor a peer may send or return; `shares::list_cursor` makes 32 bytes.
 const CURSOR_MAX_BYTES: usize = 64;
 /// How much of a peer's `invalid_path` rule is kept; the rule ids are a dozen characters.
-#[cfg(all(test, unix))]
 const RULE_MAX_CHARS: usize = 32;
 /// Largest file an `ok` reply may carry while its response frame still fits ONE Resource
 /// segment: `MAX_EFFICIENT_SIZE` less the frame and the reply's other keys. An itemized
@@ -779,7 +758,6 @@ fn unix_secs_f64(time: SystemTime) -> f64 {
 }
 
 /// One file in a peer's listing, as `list_shares` read it.
-#[cfg(all(test, unix))]
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct SharedEntry {
     pub path: String,
@@ -789,14 +767,12 @@ pub(crate) struct SharedEntry {
 }
 
 /// One page of a peer's listing; `next` is the cursor for the page after it.
-#[cfg(all(test, unix))]
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct SharesPage {
     pub entries: Vec<SharedEntry>,
     pub next: Option<String>,
 }
 
-#[cfg(all(test, unix))]
 impl SharesPage {
     /// The page as the peer sent it, capped and with malformed entries skipped.
     fn from_value(value: &Value, dest8: &str) -> Result<Self, FetchError> {
@@ -854,7 +830,6 @@ impl SharesPage {
 
 /// What a fetch came back with. Everything but `Staged` is the peer's typed answer;
 /// a path this node's own grammar refuses is `InvalidPath` without a round trip.
-#[cfg(all(test, unix))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Fetched {
     Staged {
@@ -876,7 +851,6 @@ pub(crate) enum Fetched {
 
 /// Why a listing or a fetch did not yield its answer. The file's bytes never appear in
 /// one, and neither does a status word the peer made up.
-#[cfg(all(test, unix))]
 #[derive(Debug)]
 pub(crate) enum FetchError {
     Transport(R3Error),
@@ -894,7 +868,6 @@ pub(crate) enum FetchError {
     Stage(StageError),
 }
 
-#[cfg(all(test, unix))]
 impl fmt::Display for FetchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -912,7 +885,6 @@ impl fmt::Display for FetchError {
     }
 }
 
-#[cfg(all(test, unix))]
 impl std::error::Error for FetchError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
@@ -929,7 +901,6 @@ impl std::error::Error for FetchError {
 #[derive(Default)]
 pub(crate) struct PeerMemory {
     cards: Recent<StatusCard>,
-    #[cfg(test)]
     lists: Recent<Vec<String>>,
 }
 
@@ -939,7 +910,6 @@ impl PeerMemory {
             .remember(destination_hex, card, LAST_CARD_CACHE_PEERS);
     }
 
-    #[cfg(test)]
     fn remember_list(&self, destination_hex: &str, paths: Vec<String>) {
         self.lists
             .remember(destination_hex, paths, LAST_LIST_CACHE_PEERS);
@@ -978,7 +948,6 @@ impl<T: Clone> Recent<T> {
     }
 }
 
-#[cfg(all(test, unix))]
 impl MeshRuntime {
     /// One page of the files `destination` shares with this node, answered live or not at
     /// all. The paths of a page that was read are remembered for `last_list`.
@@ -1128,12 +1097,14 @@ impl MeshRuntime {
 
     /// The status card `destination` last answered with, if it is among the last
     /// `LAST_CARD_CACHE_PEERS` peers asked.
+    #[cfg(all(test, unix))]
     pub(crate) fn last_card(&self, destination_hex: &str) -> Option<StatusCard> {
         self.memory().cards.get(destination_hex)
     }
 
     /// The paths on the last listing page `destination` answered with, if it is among
     /// the last `LAST_LIST_CACHE_PEERS` peers listed.
+    #[cfg(all(test, unix))]
     pub(crate) fn last_list(&self, destination_hex: &str) -> Option<Vec<String>> {
         self.memory().lists.get(destination_hex)
     }

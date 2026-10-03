@@ -11979,13 +11979,16 @@ mod tests {
             .collect()
     }
 
-    const ALL_MESH_TOOLS: [&str; 6] = [
+    const ALL_MESH_TOOLS: [&str; 9] = [
         "mesh__peers",
         "mesh__send",
         "mesh__ask",
         "mesh__collect",
         "mesh__check_inbox",
         "mesh__broadcast",
+        "mesh__list",
+        "mesh__fetch",
+        "mesh__request_access",
     ];
 
     /// Puts the mesh declarations in the pool the way an installed node would, with no
@@ -12047,6 +12050,19 @@ mod tests {
             "{:?}",
             mesh_tool_names(&child)
         );
+        let child_tools: Vec<&str> = child
+            .tool_scope
+            .functions
+            .declarations()
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect();
+        for reader in ["mesh__list", "mesh__fetch", "mesh__request_access"] {
+            assert!(
+                !child_tools.contains(&reader),
+                "{reader} reached a child: {child_tools:?}"
+            );
+        }
         assert!(selected_mesh_tools(&child).is_empty());
 
         assert!(parent.app.mesh.stop().await.unwrap());

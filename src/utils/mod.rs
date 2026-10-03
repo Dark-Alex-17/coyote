@@ -11,6 +11,7 @@ mod path;
 mod render_prompt;
 mod request;
 mod spinner;
+pub mod untrusted_content;
 mod variables;
 #[cfg(windows)]
 pub(crate) mod windows_acl;

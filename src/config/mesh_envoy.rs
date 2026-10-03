@@ -959,7 +959,7 @@ mod tests {
     use crate::function::ToolCall;
     use crate::function::user_interaction::handle_user_tool;
     use crate::hooks::{HookDef, HooksMap, test_sink};
-    use crate::mesh::envoy::{PEER_FENCE_BEGIN, PEER_FENCE_END};
+    use crate::mesh::envoy::{peer_fence_begin, peer_fence_end};
     use crate::mesh::idle::IdleSink;
     use crate::mesh::limits::{PEER_RETRY_AFTER_CAPACITY, PeerLimitConfig};
     #[cfg(unix)]
@@ -1155,9 +1155,11 @@ mod tests {
             via: "direct link",
         };
         let inside = |user: &str| {
-            assert!(user.starts_with(PEER_FENCE_BEGIN), "{user}");
-            assert!(user.ends_with(PEER_FENCE_END), "{user}");
-            user[PEER_FENCE_BEGIN.len()..user.len() - PEER_FENCE_END.len()].to_string()
+            let begin = peer_fence_begin();
+            let end = peer_fence_end();
+            assert!(user.starts_with(&begin), "{user}");
+            assert!(user.ends_with(&end), "{user}");
+            user[begin.len()..user.len() - end.len()].to_string()
         };
         let (tail, user) = compose_envoy_input(None, &card, &message);
         assert_eq!(
@@ -1591,6 +1593,12 @@ mod tests {
             assert!(
                 !declared.iter().any(|name| name.starts_with(prefix)),
                 "{prefix} leaked into {declared:?}"
+            );
+        }
+        for reader in ["mesh__list", "mesh__fetch", "mesh__request_access"] {
+            assert!(
+                !declared.iter().any(|name| name == reader),
+                "{reader} reached the envoy: {declared:?}"
             );
         }
         for banned in ["execute_command", "fs_write", "fs_patch"] {
@@ -4237,8 +4245,12 @@ mod tests {
         let requests = client.requests.lock();
         assert_eq!(requests.len(), 2);
         let first_text = &requests[0].messages;
-        let begin = first_text.find(PEER_FENCE_BEGIN).expect("the fence opens");
-        let end = first_text.find(PEER_FENCE_END).expect("the fence closes");
+        let begin = first_text
+            .find(&peer_fence_begin())
+            .expect("the fence opens");
+        let end = first_text
+            .find(&peer_fence_end())
+            .expect("the fence closes");
         assert!(begin < end);
         assert!(first_text[begin..end].contains(payload), "{first_text}");
         assert!(

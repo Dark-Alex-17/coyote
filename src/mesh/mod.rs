@@ -193,6 +193,8 @@ pub(crate) mod test_support {
     pub(crate) use super::propagation_fetch::{InboundMessage, InboundSink};
     pub(crate) use super::protocol::Compatibility;
     #[cfg(unix)]
+    pub(crate) use super::r3::{ACCESS_PATH, FETCH_PATH, LIST_PATH};
+    #[cfg(unix)]
     use super::r3::{
         Admission, Dispatcher, InboundRequest, LoggingKnockSink, R3Client, R3Server, RequestHandler,
     };

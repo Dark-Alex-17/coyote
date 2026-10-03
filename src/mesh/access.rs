@@ -12,13 +12,11 @@
 //! to the inbound record and the human line and nowhere else, never to the envoy, a
 //! model note or a log line.
 
-#[cfg(all(test, unix))]
 use crate::mesh::canonical_hash;
 use crate::mesh::events::{AccessDecision, MeshEvent};
 use crate::mesh::fetch::{FetchServing, ShareSource, field, versioned_map};
 use crate::mesh::grants::DEFAULT_GRANT_TTL;
 use crate::mesh::idle::{IdleNotify, Origin};
-#[cfg(all(test, unix))]
 use crate::mesh::message::PEER_REQUEST_TIMEOUT;
 #[cfg(test)]
 use crate::mesh::message::SendOutcome;
@@ -26,29 +24,23 @@ use crate::mesh::message::{
     Disposition, OutboundPeer, PEER_WIRE_VERSION, PartLimits, PeerKind, PeerVia, RawPart,
     SendError, is_wire_id,
 };
-#[cfg(test)]
-use crate::mesh::node::MeshRuntime;
-use crate::mesh::node::MeshSlot;
+use crate::mesh::node::{MeshRuntime, MeshSlot};
 use crate::mesh::notify::Source;
 #[cfg(test)]
 use crate::mesh::parse_rfc3339;
-#[cfg(all(test, unix))]
-use crate::mesh::pending::{DEFAULT_COLLECT_TIMEOUT, PENDING_QUESTION_MAX_CHARS};
-use crate::mesh::pending::{INBOUND_RECORD_VERSION, InboundKind, InboundRecord};
 #[cfg(test)]
-use crate::mesh::pending::{InboundStore, PENDING_RECORD_VERSION, PendingRecord, PendingState};
-#[cfg(all(test, unix))]
-use crate::mesh::propagation::PropagationOptions;
-#[cfg(test)]
-use crate::mesh::propagation::{OutboundMessage, PropagationError};
+use crate::mesh::pending::InboundStore;
+use crate::mesh::pending::{
+    DEFAULT_COLLECT_TIMEOUT, INBOUND_RECORD_VERSION, InboundKind, InboundRecord,
+    PENDING_QUESTION_MAX_CHARS, PENDING_RECORD_VERSION, PendingRecord, PendingState,
+};
+use crate::mesh::propagation::{OutboundMessage, PropagationError, PropagationOptions};
 use crate::mesh::propagation_fetch::{InboundMessage, InboundSink};
-#[cfg(test)]
 use crate::mesh::protocol::describe_version;
-#[cfg(test)]
-use crate::mesh::r3::{ACCESS_PATH, DispatchError, OriginName, R3Error};
-use crate::mesh::r3::{AdmittedRequest, Handler, NAME_HASH_LEN, RefusalCode, Reply};
-#[cfg(all(test, unix))]
-use crate::mesh::r3::{DEFAULT_LINK_TIMEOUT, RequestOptions};
+use crate::mesh::r3::{
+    ACCESS_PATH, AdmittedRequest, DEFAULT_LINK_TIMEOUT, DispatchError, Handler, NAME_HASH_LEN,
+    OriginName, R3Error, RefusalCode, Reply, RequestOptions,
+};
 use crate::mesh::shares::PeerRef;
 #[cfg(test)]
 use crate::mesh::shares::{Mutation, ShareSet, WriteScope};
@@ -62,12 +54,10 @@ use anyhow::{Context, bail};
 use async_trait::async_trait;
 use lxmf_core::constants::{FIELD_CUSTOM_DATA, FIELD_CUSTOM_TYPE};
 use rmpv::Value;
-#[cfg(all(test, unix))]
 use rns_transport::destination::DestinationDesc;
 use rns_transport::hash::AddressHash;
 use serde_json::json;
 use std::collections::BTreeSet;
-#[cfg(test)]
 use std::fmt;
 use std::fs;
 use std::path::Path;
@@ -114,7 +104,7 @@ pub(crate) enum AccessOutcome {
 }
 
 impl AccessOutcome {
-    fn status(&self) -> &'static str {
+    pub(crate) fn status(&self) -> &'static str {
         match self {
             Self::Pending => "pending",
             Self::Granted { .. } => "granted",
@@ -308,17 +298,13 @@ pub(crate) fn validate_access(
     })
 }
 
-// The requester half is test-only until the tool that asks a peer for access lands.
-
 /// Timeouts for one access request: the direct attempt, then the fallback post.
-#[cfg(all(test, unix))]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct AccessOptions {
     pub request: RequestOptions,
     pub propagation: PropagationOptions,
 }
 
-#[cfg(all(test, unix))]
 impl Default for AccessOptions {
     fn default() -> Self {
         Self {
@@ -333,7 +319,6 @@ impl Default for AccessOptions {
 
 /// What a sent request came back as, and by which route. A stored request is pending by
 /// definition: the peer has not seen it yet.
-#[cfg(all(test, unix))]
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct AccessRequestOutcome {
     pub id: String,
@@ -341,7 +326,6 @@ pub(crate) struct AccessRequestOutcome {
     pub via: PeerVia,
 }
 
-#[cfg(test)]
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum AccessError {
     NotRunning,
@@ -377,7 +361,6 @@ pub(crate) enum AccessError {
     Propagation(PropagationError),
 }
 
-#[cfg(test)]
 impl fmt::Display for AccessError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -434,10 +417,8 @@ impl fmt::Display for AccessError {
     }
 }
 
-#[cfg(test)]
 impl std::error::Error for AccessError {}
 
-#[cfg(all(test, unix))]
 impl MeshSlot {
     /// Asks the trusted instance at `peer_destination` to let this node read `paths`.
     /// The correlation is opened before the send so a decision that beats the reply's
@@ -509,7 +490,6 @@ impl MeshSlot {
     }
 }
 
-#[cfg(all(test, unix))]
 impl MeshRuntime {
     /// Puts `request` to `destination` over a link and reads the answer. Only the
     /// peer-unreachable errors fall back to store-and-forward: a refusal of any code
@@ -604,7 +584,6 @@ impl MeshRuntime {
     }
 }
 
-#[cfg(all(test, unix))]
 fn access_body(request: &ValidAccess) -> Value {
     Value::Map(vec![
         (Value::from("v"), Value::from(PEER_WIRE_VERSION)),
@@ -614,7 +593,6 @@ fn access_body(request: &ValidAccess) -> Value {
     ])
 }
 
-#[cfg(test)]
 fn wire_paths(paths: &[String]) -> Value {
     Value::Array(
         paths
@@ -627,7 +605,6 @@ fn wire_paths(paths: &[String]) -> Value {
 /// Reads what came back for the request sent as `sent_id`: a peer with nothing behind
 /// `/access` answers with a dispatch error, which is told apart from a malformed access
 /// reply before the reply is decoded.
-#[cfg(test)]
 fn read_access_reply(value: &Value, sent_id: &str) -> Result<AccessOutcome, AccessError> {
     if let Some(error) = DispatchError::from_value(value) {
         return Err(AccessError::NotServed(error));
@@ -638,7 +615,6 @@ fn read_access_reply(value: &Value, sent_id: &str) -> Result<AccessOutcome, Acce
 /// Reads the peer's access reply to the request sent as `sent_id`. Keys the peer adds
 /// are ignored; a status or refusal reason this Coyote does not know is a typed error,
 /// so a newer peer's answer is reported rather than guessed at.
-#[cfg(test)]
 pub(crate) fn decode_access_response(
     value: &Value,
     sent_id: &str,
@@ -857,7 +833,6 @@ pub(crate) const ACCESS_TYPE: &str = "scope.access/1";
 /// recipient recomputes the asking destination from that name and the signer's
 /// identity, exactly as the dispatcher does for a link request, so a stored request can
 /// only ever name one of the requester's own instances.
-#[cfg(test)]
 pub(crate) fn access_message(request: &ValidAccess, origin: &OriginName) -> OutboundMessage {
     OutboundMessage {
         title: None,
