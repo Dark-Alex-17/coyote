@@ -1465,23 +1465,25 @@ pub(crate) fn is_broad_pattern(pattern: &str) -> bool {
 
 /// What a completion for `allow` or `deny` must not offer: `.git`, the workspace config
 /// directory under either name it goes by, or anything the built-in deny matches by
-/// name. Built once per completion, since the built-in set is compiled on construction
-/// and asked about every entry of the directory. No I/O. The built-in set is this
-/// module's own constants, so one that fails to compile is a bug and hides everything.
+/// name, judged across case when the root folds it so nothing is offered that the verb
+/// then refuses. Built once per completion, since the built-in set is compiled on
+/// construction and asked about every entry of the directory. No I/O. The built-in set
+/// is this module's own constants, so one that fails to compile is a bug and hides
+/// everything.
 pub(crate) struct CompletionFilter {
     config_dir_names: Vec<String>,
     builtin: Option<GlobSet>,
 }
 
 impl CompletionFilter {
-    pub(crate) fn new(workspace_config_dir_name: &str) -> Self {
+    pub(crate) fn new(workspace_config_dir_name: &str, case_insensitive: bool) -> Self {
         let patterns = builtin_deny_patterns(workspace_config_dir_name);
         Self {
             config_dir_names: workspace_config_dir_names(workspace_config_dir_name)
                 .into_iter()
                 .map(str::to_string)
                 .collect(),
-            builtin: compile(patterns.iter().map(String::as_str), false).ok(),
+            builtin: compile(patterns.iter().map(String::as_str), case_insensitive).ok(),
         }
     }
 
@@ -2986,7 +2988,7 @@ mod tests {
 
     #[test]
     fn the_completion_filter_hides_git_the_config_dir_and_built_in_denied_names() {
-        let filter = CompletionFilter::new(".coyote-custom");
+        let filter = CompletionFilter::new(".coyote-custom", false);
         for (name, hidden) in [
             (".git", true),
             (".coyote", true),
@@ -2999,6 +3001,20 @@ mod tests {
             ("README.md", false),
         ] {
             assert_eq!(filter.is_hidden(name), hidden, "{name}");
+        }
+    }
+
+    #[test]
+    fn the_completion_filter_hides_built_in_denied_names_across_case_only_on_a_folding_root() {
+        for name in [".ENV", "X.PEM", "ID_RSA", ".GIT"] {
+            assert!(
+                CompletionFilter::new(".coyote", true).is_hidden(name),
+                "{name} is hidden when the root folds case"
+            );
+            assert!(
+                !CompletionFilter::new(".coyote", false).is_hidden(name),
+                "{name} is offered when the root does not"
+            );
         }
     }
 

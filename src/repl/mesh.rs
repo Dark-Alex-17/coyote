@@ -1862,12 +1862,13 @@ fn shares(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         None => PeerRef::unscoped(),
     };
     let text = if args.effective {
+        let case = root_case(ctx, &root)?;
         render_effective_shares(
             &set,
             &peer_ref,
             &share_audience(peer.as_deref()),
             &root,
-            root_folds_case(ctx, &root),
+            case,
         )
     } else {
         render_share_rules(&set, &peer_ref, peer.as_deref())
@@ -1962,24 +1963,33 @@ fn render_effective_shares(
     peer: &PeerRef<'_>,
     audience: &str,
     root: &Path,
-    case_insensitive: bool,
+    case: Option<bool>,
 ) -> String {
+    let case_insensitive = case.unwrap_or(false);
     let resolved = set.resolve(
         peer,
         case_insensitive,
         DEFAULT_LIST_WALK_BOUND,
         LIST_PAGE_SIZE,
     );
-    if resolved.entries.is_empty() {
-        return format!(
-            "Nothing resolves: no allow rule names an existing file under {}.",
-            root.display()
+    let mut lines = Vec::new();
+    if case.is_none() {
+        lines.push(
+            "The share root's case folding could not be read; patterns were matched case-sensitively."
+                .to_string(),
         );
     }
-    let mut lines = vec![format!(
+    if resolved.entries.is_empty() {
+        lines.push(format!(
+            "Nothing resolves: no allow rule names an existing file under {}.",
+            root.display()
+        ));
+        return lines.join("\n");
+    }
+    lines.push(format!(
         "Files {audience} can fetch from {}:",
         root.display()
-    )];
+    ));
     for entry in &resolved.entries {
         let mark = match entry.verdict {
             ShareVerdict::Shared => "",
@@ -2078,7 +2088,7 @@ fn share_set(ctx: &RequestContext) -> Result<(PathBuf, ShareSet)> {
 fn writable_share_set(ctx: &RequestContext) -> Result<(PathBuf, ShareSet, bool)> {
     live(ctx)?;
     let (root, set) = loaded_for_writing(ctx)?;
-    let case_insensitive = root_folds_case(ctx, &root);
+    let case_insensitive = root_case(ctx, &root)?.unwrap_or(false);
     Ok((root, set, case_insensitive))
 }
 
@@ -2094,16 +2104,26 @@ fn loaded_for_writing(ctx: &RequestContext) -> Result<(PathBuf, ShareSet)> {
     Ok((root, set))
 }
 
-/// The node's memoised probe of the share root, or while the mesh is off the read-only
-/// hint, since the probe writes a temp file into the root and nothing may touch the tree
-/// before the user consents to serving it; `false` when neither can tell.
-fn root_folds_case(ctx: &RequestContext, root: &Path) -> bool {
-    ctx.app
-        .mesh
-        .get()
-        .and_then(|runtime| runtime.serving().case_insensitive_for(root))
-        .or_else(|| case_folding_hint(root))
-        .unwrap_or(false)
+/// Whether the share root folds case, as the rules must be judged: the node's memoised
+/// probe while the mesh is on, which is an error when the probe failed, since the node
+/// then serves nothing from the root and a verb that guessed would describe shares that
+/// do not exist. While the mesh is off, the read-only hint, since the probe writes a
+/// temp file into the root and nothing may touch the tree before the user consents to
+/// serving it; `Ok(None)` when the hint cannot tell, for the caller to say so.
+fn root_case(ctx: &RequestContext, root: &Path) -> Result<Option<bool>> {
+    match ctx.app.mesh.get() {
+        Some(runtime) => runtime
+            .serving()
+            .case_insensitive_for(root)
+            .map(Some)
+            .ok_or_else(|| {
+                anyhow!(
+                    "The share root {} could not be probed, so this node serves nothing from it; fix the directory's permissions and run `.mesh off` then `.mesh on`.",
+                    root.display()
+                )
+            }),
+        None => Ok(case_folding_hint(root)),
+    }
 }
 
 /// Where a mutation lands, taken before it is applied so `created` is truthful.
@@ -15278,6 +15298,78 @@ mod tests {
                     let (_, locations) = share_locations(&ctx).unwrap();
                     assert!(!locations.global.exists());
                     assert!(!locations.workspace.exists());
+                }
+
+                /// A root the node could not probe serves nothing, so the verbs say that
+                /// rather than guess how its rules fold and describe shares that do not
+                /// exist. Root writes anywhere, so under root there is nothing to show.
+                #[test]
+                #[serial]
+                fn allow_and_shares_effective_refuse_a_root_the_node_could_not_probe() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-unprobeable-root");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx =
+                            ShareFixture::new("repl-mesh-unprobeable-root", &["docs/a.md"]).await;
+                        let locked = ModeRestore::read_only(&fx.root.path);
+                        if fs::File::create(fx.root.path.join("probe-write-check")).is_ok() {
+                            locked.restore();
+                            fx.stop().await;
+                            return;
+                        }
+                        let sentence = format!(
+                            "The share root {} could not be probed, so this node serves nothing from it; fix the directory's permissions and run `.mesh off` then `.mesh on`.",
+                            fx.root.path.display()
+                        );
+
+                        let err = refusal(&mut fx.ctx, ".mesh allow docs/**").await;
+                        assert_eq!(err, sentence);
+                        assert!(!fx.locations.global.exists());
+                        assert!(!fx.locations.workspace.exists());
+
+                        fx.write_global("version: 1\nallow:\n- pattern: docs/**\n");
+                        let err = refusal(&mut fx.ctx, ".mesh shares --effective").await;
+                        assert_eq!(err, sentence);
+
+                        assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        locked.restore();
+                        fx.stop().await;
+                    });
+                }
+
+                /// While the mesh is off the hint is all there is, and a root with no
+                /// ASCII letter in any name gives none; the view says it judged the
+                /// patterns case-sensitively rather than passing the guess off as fact.
+                #[test]
+                #[serial]
+                fn shares_effective_while_off_says_when_the_case_hint_could_not_be_read() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-shares-off-no-hint");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    let mut ctx = off_ctx();
+                    let root = TempDir::new("repl-mesh-shares-off-no-hint-root");
+                    seed_files(&root.path, &["1/2.md"]);
+                    publish_root(&ctx, &root.path);
+                    let (_, locations) = share_locations(&ctx).unwrap();
+                    write_share_file(&locations.global, "version: 1\nallow:\n- pattern: '**'\n");
+
+                    run_async(run(&mut ctx, ".mesh shares --effective")).unwrap();
+
+                    let out = stdout_lines().join("\n");
+                    assert_eq!(
+                        out.lines().collect::<Vec<_>>(),
+                        [
+                            "The share root's case folding could not be read; patterns were matched case-sensitively.",
+                            format!(
+                                "Files every trusted peer can fetch from {}:",
+                                root.path.display()
+                            )
+                            .as_str(),
+                            "  1/2.md",
+                        ]
+                    );
                 }
             }
         }

@@ -5356,11 +5356,20 @@ impl RequestContext {
     /// symlink, since the walk judges files by their real path and a rule naming the link
     /// would serve none. Local filesystem and the published snapshot only; nothing reaches
     /// the wire or the trust store. Empty for a directory prefix the verbs would refuse as
-    /// a pattern; sorted and cut at 200.
+    /// a pattern, and for a root the node could not probe, since it serves nothing from
+    /// it; sorted and cut at 200.
     fn mesh_completion_share_paths(&self, typed: &str) -> Vec<(String, Option<String>)> {
         use crate::mesh::shares::{CompletionFilter, validate_pattern};
 
         let Some((root, _)) = self.share_locations() else {
+            return Vec::new();
+        };
+        let Some(case_insensitive) = self
+            .app
+            .mesh
+            .get()
+            .and_then(|runtime| runtime.serving().case_insensitive_for(&root))
+        else {
             return Vec::new();
         };
         if typed.starts_with('/')
@@ -5390,7 +5399,7 @@ impl RequestContext {
         let Ok(entries) = fs::read_dir(&dir) else {
             return Vec::new();
         };
-        let filter = CompletionFilter::new(&paths::workspace_config_dir_name());
+        let filter = CompletionFilter::new(&paths::workspace_config_dir_name(), case_insensitive);
         let mut values: Vec<(String, Option<String>)> = entries
             .flatten()
             .filter_map(|entry| {
@@ -23753,6 +23762,35 @@ mod tests {
             "a dotfile that is not protected stays on offer"
         );
 
+        fixture.stop().await;
+    }
+
+    /// The node serves nothing from a root it could not probe, so the completer offers
+    /// nothing from it either rather than paths the verb then refuses.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_allow_offers_nothing_from_a_root_that_cannot_be_probed() {
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-allow-unprobeable").await;
+        let root = publish_share_root(&fixture.ctx, "rc-mesh-complete-allow-unprobeable-root");
+        seed_share_files(&root.path, &["README.md", "docs/a.md"]);
+        let set_mode = |mode| {
+            fs::set_permissions(&root.path, fs::Permissions::from_mode(mode)).unwrap();
+        };
+        set_mode(0o555);
+        if fs::File::create(root.path.join("written-despite-the-mode")).is_ok() {
+            set_mode(0o755);
+            fixture.stop().await;
+            return;
+        }
+
+        let rows = fixture.complete(&["allow", ""]);
+        let values = completion_values(&rows);
+
+        set_mode(0o755);
+        assert_eq!(values, ALLOW_FLAGS, "only the flags: {values:?}");
         fixture.stop().await;
     }
 
