@@ -23568,6 +23568,131 @@ mod tests {
         );
     }
 
+    /// Usage probe: the path completer walks nested directories (a sub-directory is
+    /// offered slashed under its parent), hides a built-in-denied file wherever it sits,
+    /// and omits a symlinked FILE that leaves the root as it omits a symlinked directory.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn usage_probe_repl_complete_mesh_allow_walks_nested_dirs_and_hides_out_of_root_file_links()
+     {
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-probe-complete-allow-nested").await;
+        let root = publish_share_root(&fixture.ctx, "rc-probe-complete-allow-nested-root");
+        let outside = crate::mesh::test_support::TempDir::new("rc-probe-complete-allow-outside");
+        seed_share_files(&root.path, &["docs/a.md", "docs/sub/deep.md", "docs/.env"]);
+        seed_share_files(&outside.path, &["leak.txt"]);
+        std::os::unix::fs::symlink(outside.path.join("leak.txt"), root.path.join("leak.txt"))
+            .unwrap();
+
+        let rows = fixture.complete(&["allow", ""]);
+        let top = completion_values(&rows);
+        assert!(top.contains(&"docs/"), "{top:?}");
+        assert!(!top.iter().any(|value| value.contains("leak")), "{top:?}");
+
+        let rows = fixture.complete(&["allow", "docs/"]);
+        let docs = completion_values(&rows);
+        assert_eq!(docs, ["docs/a.md", "docs/sub/"], "{docs:?}");
+
+        let rows = fixture.complete(&["allow", "docs/sub/"]);
+        let deep = completion_values(&rows);
+        assert_eq!(deep, ["docs/sub/deep.md"], "{deep:?}");
+
+        fixture.stop().await;
+    }
+
+    /// Usage probe: `deny` and `unshare` apply the same used-flag/exclusive-partner rule
+    /// `allow` does (`--yes` hides `--dry-run`, `--workspace` hides `--global`), and a
+    /// pattern already typed under `unshare` with a layer flag leaves the remaining flags.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn usage_probe_repl_complete_deny_and_unshare_drop_used_flags_and_their_partners() {
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-probe-complete-deny-flags").await;
+        let root = publish_share_root(&fixture.ctx, "rc-probe-complete-deny-flags-root");
+        seed_share_files(&root.path, &["docs/a.md"]);
+        let (_, locations) = fixture.ctx.app.mesh.share_locations().unwrap();
+        fs::create_dir_all(locations.global.parent().unwrap()).unwrap();
+        fs::write(
+            &locations.global,
+            "version: 1\nallow:\n- pattern: docs/**\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            completion_values(&fixture.complete(&["deny", "docs/**", "--yes", ""])),
+            ["--global", "--workspace"],
+            "--yes is used and excludes --dry-run"
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["deny", "docs/**", "--workspace", ""])),
+            ["--yes", "--dry-run"],
+            "--workspace is used and excludes --global"
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["unshare", "--global", ""])),
+            ["docs/**", "--yes", "--dry-run"],
+            "a layer flag before the positional leaves the patterns on offer"
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["unshare", "docs/**", "--dry-run", ""])),
+            ["--global", "--workspace"],
+            "--dry-run is used and excludes --yes"
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["shares", "--effective", "--peer", ""]))
+                .iter()
+                .filter(|value| value.starts_with("--"))
+                .count(),
+            0,
+            "no flags while a peer value is being typed"
+        );
+
+        fixture.stop().await;
+    }
+
+    /// Usage probe: the completer offers paths the verb accepts but never the protected
+    /// directories themselves, even when the typed prefix names them.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn usage_probe_repl_complete_mesh_allow_never_offers_inside_protected_dirs() {
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-probe-complete-allow-protected").await;
+        let root = publish_share_root(&fixture.ctx, "rc-probe-complete-allow-protected-root");
+        seed_share_files(
+            &root.path,
+            &[
+                ".git/HEAD",
+                ".git/config",
+                ".coyote/config.yaml",
+                ".gitignore",
+                "README.md",
+            ],
+        );
+
+        for typed in [".", ".g", ".git/", ".git/H", ".coyote/", ".co"] {
+            let rows = fixture.complete(&["allow", typed]);
+            let values = completion_values(&rows);
+            assert!(
+                !values
+                    .iter()
+                    .any(|value| value.starts_with(".git/") || value.starts_with(".coyote/")),
+                "{typed}: {values:?}"
+            );
+        }
+        let rows = fixture.complete(&["allow", "."]);
+        let dot = completion_values(&rows);
+        assert_eq!(
+            dot,
+            [".gitignore"],
+            "a dotfile that is not protected stays on offer"
+        );
+
+        fixture.stop().await;
+    }
+
     #[test]
     fn repl_complete_info_mcp_server_offers_only_running_servers() {
         let mut ctx = RequestContext::new(mcp_app_state(&["gh"]), WorkingMode::Cmd);

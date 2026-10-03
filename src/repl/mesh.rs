@@ -13440,6 +13440,633 @@ mod tests {
                         fx.stop().await;
                     });
                 }
+
+                /// Usage probe: "more than one file/kind holds it" includes one file holding
+                /// the pattern as both an allow and a deny; `unshare` names each holder
+                /// with its kind, asks once, removes nothing on no and both on yes; a
+                /// dry run previews both removals and writes nothing.
+                #[test]
+                #[serial]
+                fn usage_probe_unshare_with_an_allow_and_a_deny_in_one_file_lists_both_kinds_and_confirms()
+                 {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-unshare-kinds");
+                    let _capture = capture::install();
+                    run_async(async {
+                        let mut fx =
+                            ShareFixture::new("repl-mesh-probe-unshare-kinds", &["docs/a.md"])
+                                .await;
+                        fx.write_global(
+                            "version: 1\nallow:\n- pattern: docs/**\ndeny:\n- pattern: docs/**\n",
+                        );
+                        let both = [
+                            allow_entry(Layer::Global, "docs/**", None),
+                            deny_entry(Layer::Global, "docs/**"),
+                        ];
+                        assert_eq!(fx.entries(), both);
+
+                        let quiet = prompt_script::install(&[]);
+                        let out = out_of(&mut fx.ctx, ".mesh unshare docs/** --dry-run")
+                            .await
+                            .unwrap();
+                        assert!(out.contains("allow"), "{out}");
+                        assert!(out.contains("deny"), "{out}");
+                        assert!(out.ends_with(DRY_RUN_NOTHING_CHANGED), "{out}");
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        assert_eq!(fx.entries(), both);
+                        drop(quiet);
+
+                        let declined = prompt_script::install(&[false]);
+                        let out = out_of(&mut fx.ctx, ".mesh unshare docs/**").await.unwrap();
+                        let lines: Vec<&str> = out.lines().collect();
+                        assert!(lines.contains(&"`docs/**` is held by:"), "{out}");
+                        assert!(
+                            lines.contains(&format!("  allow in {}", fx.global()).as_str()),
+                            "{out}"
+                        );
+                        assert!(
+                            lines.contains(&format!("  deny in {}", fx.global()).as_str()),
+                            "{out}"
+                        );
+                        assert!(out.ends_with(NOTHING_CHANGED), "{out}");
+                        assert_eq!(prompt_script::prompts_asked(), 1);
+                        assert_eq!(fx.entries(), both);
+                        drop(declined);
+
+                        let accepted = prompt_script::install(&[true]);
+                        let out = out_of(&mut fx.ctx, ".mesh unshare docs/**").await.unwrap();
+                        assert!(
+                            out.ends_with(&format!(
+                                "Removed the allow and deny for `docs/**` from {}.",
+                                fx.global()
+                            )),
+                            "{out}"
+                        );
+                        assert_eq!(prompt_script::prompts_asked(), 1);
+                        assert!(fx.entries().is_empty());
+                        drop(accepted);
+
+                        // The pattern is reusable once removed.
+                        let _quiet = prompt_script::install(&[]);
+                        let out = out_of(&mut fx.ctx, ".mesh allow docs/**").await.unwrap();
+                        assert!(out.contains("Allowed `docs/**`"), "{out}");
+                        assert_eq!(fx.entries(), [allow_entry(Layer::Global, "docs/**", None)]);
+                        fx.stop().await;
+                    });
+                }
+
+                /// Usage probe: when both files hold the pattern, the layer flag stands in for
+                /// the question — `--global` removes the global copy only, without a prompt,
+                /// and the workspace copy keeps serving.
+                #[test]
+                #[serial]
+                fn usage_probe_unshare_layer_flag_resolves_holders_in_both_files_without_a_prompt()
+                {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-unshare-layer");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx =
+                            ShareFixture::new("repl-mesh-probe-unshare-layer", &["docs/a.md"])
+                                .await;
+                        out_of(&mut fx.ctx, ".mesh allow docs/**").await.unwrap();
+                        out_of(&mut fx.ctx, ".mesh allow docs/** --workspace")
+                            .await
+                            .unwrap();
+                        assert_eq!(fx.entries().len(), 2);
+
+                        let out = out_of(&mut fx.ctx, ".mesh unshare docs/** --global")
+                            .await
+                            .unwrap();
+
+                        assert!(
+                            out.ends_with(&format!(
+                                "Removed the allow for `docs/**` from {}.",
+                                fx.global()
+                            )),
+                            "{out}"
+                        );
+                        assert!(!out.contains(&fx.workspace()), "{out}");
+                        assert_eq!(
+                            fx.entries(),
+                            [allow_entry(Layer::Workspace, "docs/**", None)]
+                        );
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+
+                        let out = out_of(&mut fx.ctx, ".mesh unshare docs/** --workspace")
+                            .await
+                            .unwrap();
+                        assert!(
+                            out.ends_with(&format!(
+                                "Removed the allow for `docs/**` from {}.",
+                                fx.workspace()
+                            )),
+                            "{out}"
+                        );
+                        assert!(fx.entries().is_empty());
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        fx.stop().await;
+                    });
+                }
+
+                /// Usage probe: the completer offers override paths under `unshare`, so the
+                /// verb takes one — an inert workspace override is removed like any other
+                /// entry, and `.mesh shares` stops flagging it.
+                #[test]
+                #[serial]
+                fn usage_probe_unshare_removes_a_lone_override_entry() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-unshare-override-only");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = ShareFixture::new(
+                            "repl-mesh-probe-unshare-override-only",
+                            &["docs/a.md"],
+                        )
+                        .await;
+                        fx.write_workspace("version: 1\noverride:\n- path: k.pem\n");
+                        let out = out_of(&mut fx.ctx, ".mesh shares").await.unwrap();
+                        assert!(out.contains("ignored: overrides are honoured"), "{out}");
+
+                        let out = out_of(&mut fx.ctx, ".mesh unshare k.pem").await.unwrap();
+
+                        assert!(out.contains("k.pem"), "{out}");
+                        assert!(out.contains(&fx.workspace()), "{out}");
+                        assert!(fx.entries().is_empty(), "{:?}", fx.entries());
+                        let out = out_of(&mut fx.ctx, ".mesh shares").await.unwrap();
+                        assert!(!out.contains("k.pem"), "{out}");
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        fx.stop().await;
+                    });
+                }
+
+                /// Usage probe: a `deny` dry run prints the match count and the target file
+                /// and writes nothing, like `allow`'s.
+                #[test]
+                #[serial]
+                fn usage_probe_deny_dry_run_prints_the_count_and_target_and_writes_nothing() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-deny-dry-run");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = ShareFixture::new(
+                            "repl-mesh-probe-deny-dry-run",
+                            &["docs/a.md", "docs/b.md"],
+                        )
+                        .await;
+
+                        let out = out_of(&mut fx.ctx, ".mesh deny docs/** --dry-run")
+                            .await
+                            .unwrap();
+
+                        assert!(
+                            out.contains(&format!(
+                                "`docs/**` matches 2 file(s) under {}.",
+                                fx.root.path.display()
+                            )),
+                            "{out}"
+                        );
+                        assert!(
+                            out.contains(&format!(
+                                "Would write to {}: deny `docs/**`",
+                                fx.global()
+                            )),
+                            "{out}"
+                        );
+                        assert!(out.ends_with(DRY_RUN_NOTHING_CHANGED), "{out}");
+                        assert!(!fx.locations.global.exists());
+                        assert!(!fx.locations.workspace.exists());
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        fx.stop().await;
+                    });
+                }
+
+                /// Usage probe: a peer-scoped allow resolves for that peer only — the
+                /// every-trusted-peer listing leaves it out, `--peer` brings it in — and the
+                /// listing never prints what the files contain.
+                #[test]
+                #[serial]
+                fn usage_probe_shares_effective_scopes_peer_allows_and_never_prints_contents() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-effective-peer");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = ShareFixture::new(
+                            "repl-mesh-probe-effective-peer",
+                            &["docs/a.md", "src/main.rs"],
+                        )
+                        .await;
+                        const SECRET: &str = "PROBE-FILE-CONTENT-7f3a";
+                        fs::write(fx.root.path.join("docs/a.md"), SECRET).unwrap();
+                        fs::write(fx.root.path.join("src/main.rs"), SECRET).unwrap();
+                        let peer = "ab".repeat(16);
+                        let other = "ef".repeat(16);
+                        out_of(&mut fx.ctx, ".mesh allow docs/**").await.unwrap();
+                        out_of(&mut fx.ctx, &format!(".mesh allow src/** --peer {peer}"))
+                            .await
+                            .unwrap();
+
+                        let everyone = out_of(&mut fx.ctx, ".mesh shares --effective")
+                            .await
+                            .unwrap();
+                        assert!(everyone.contains("  docs/a.md"), "{everyone}");
+                        assert!(!everyone.contains("src/main.rs"), "{everyone}");
+
+                        let scoped = out_of(
+                            &mut fx.ctx,
+                            &format!(".mesh shares --effective --peer {peer}"),
+                        )
+                        .await
+                        .unwrap();
+                        assert!(scoped.contains("  docs/a.md"), "{scoped}");
+                        assert!(scoped.contains("  src/main.rs"), "{scoped}");
+
+                        let unscoped = out_of(
+                            &mut fx.ctx,
+                            &format!(".mesh shares --effective --peer {other}"),
+                        )
+                        .await
+                        .unwrap();
+                        assert!(unscoped.contains("  docs/a.md"), "{unscoped}");
+                        assert!(!unscoped.contains("src/main.rs"), "{unscoped}");
+
+                        let rules = out_of(&mut fx.ctx, ".mesh shares").await.unwrap();
+                        for out in [&everyone, &scoped, &unscoped, &rules] {
+                            assert!(!out.contains(SECRET), "{out}");
+                            assert!(!out.contains(&peer), "{out}");
+                        }
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        fx.stop().await;
+                    });
+                }
+
+                /// Usage probe: `--effective` is bounded like `/list` — more files than one
+                /// page shows stop at the page size with a line saying the listing was
+                /// capped, rather than scrolling every file past the user.
+                #[test]
+                #[serial]
+                fn usage_probe_shares_effective_is_bounded_like_list() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-effective-bound");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let many: Vec<String> = (0..LIST_PAGE_SIZE + 1)
+                            .map(|i| format!("docs/f{i:04}.md"))
+                            .collect();
+                        let many: Vec<&str> = many.iter().map(String::as_str).collect();
+                        let mut fx =
+                            ShareFixture::new("repl-mesh-probe-effective-bound", &many).await;
+                        out_of(&mut fx.ctx, ".mesh allow docs/** --yes")
+                            .await
+                            .unwrap();
+
+                        let out = out_of(&mut fx.ctx, ".mesh shares --effective")
+                            .await
+                            .unwrap();
+
+                        let files = out
+                            .lines()
+                            .filter(|line| line.starts_with("  docs/"))
+                            .count();
+                        assert_eq!(files, LIST_PAGE_SIZE, "{}", out.lines().count());
+                        assert!(
+                            !out.contains(&format!("docs/f{:04}.md", LIST_PAGE_SIZE)),
+                            "{out}"
+                        );
+                        assert!(out.contains("capped"), "{out}");
+                        assert!(out.contains(&LIST_PAGE_SIZE.to_string()), "{out}");
+                        fx.stop().await;
+                    });
+                }
+
+                /// Usage probe (B-22): the preview counts the files the PEER-LESS allows reach
+                /// after the user denies — a peer-scoped allow and a denied file add nothing —
+                /// and says nothing at all when only peer-scoped allows exist.
+                #[test]
+                #[serial]
+                fn usage_probe_on_preview_count_skips_peer_scoped_allows_and_user_denied_files() {
+                    let config = MeshConfig {
+                        interfaces: vec![MeshInterface::Lan],
+                        ..MeshConfig::default()
+                    };
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-on-preview-count");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[false, false]);
+                    let mut ctx = ctx_with(config, true);
+                    ctx.session = Some(Session::default());
+                    let root = TempDir::new("repl-mesh-probe-on-preview-count-root");
+                    seed_files(
+                        &root.path,
+                        &["docs/a.md", "docs/b.md", "docs/c.md", "src/main.rs"],
+                    );
+                    publish_root(&ctx, &root.path);
+                    let (_, locations) = ctx.app.mesh.share_locations().unwrap();
+                    let peer = "ab".repeat(16);
+
+                    write_share_file(
+                        &locations.global,
+                        &format!(
+                            "version: 1\nallow:\n- pattern: docs/**\n- pattern: src/**\n  peer: {peer}\ndeny:\n- pattern: docs/b.md\n"
+                        ),
+                    );
+                    run_async(run(&mut ctx, ".mesh on")).unwrap();
+                    assert!(ctx.app.mesh.get().is_none());
+                    let out = stdout_lines();
+                    let files = index_of(
+                        &out,
+                        "  files: 2 path(s) are shared with trusted peers (`.mesh shares`)",
+                    );
+                    assert!(files < index_of(&out, "Mesh stays off"), "{out:?}");
+                    assert_eq!(
+                        out.iter()
+                            .filter(|line| line.contains("shared with trusted peers"))
+                            .count(),
+                        1,
+                        "{out:?}"
+                    );
+
+                    let before = stdout_lines().len();
+                    write_share_file(
+                        &locations.global,
+                        &format!("version: 1\nallow:\n- pattern: src/**\n  peer: {peer}\n"),
+                    );
+                    run_async(run(&mut ctx, ".mesh on")).unwrap();
+                    assert!(ctx.app.mesh.get().is_none());
+                    let out = stdout_lines()[before..].to_vec();
+                    assert!(
+                        !out.iter()
+                            .any(|line| line.contains("shared with trusted peers")),
+                        "{out:?}"
+                    );
+                    assert!(
+                        out.iter().any(|line| line.contains("Mesh stays off")),
+                        "{out:?}"
+                    );
+                    assert_eq!(prompt_script::prompts_asked(), 2);
+                }
+
+                /// Usage probe: bare `allow`/`deny`/`unshare` print usage and touch nothing
+                /// whatever the node's state — on without a snapshot, on with one.
+                #[test]
+                #[serial]
+                fn usage_probe_bare_share_verbs_print_usage_while_on_with_or_without_a_root() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-bare-on");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let started = started_runtime("repl-mesh-probe-bare-on").await;
+                        let mut ctx = ctx_with(MeshConfig::default(), true);
+                        ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                        for verb in ["allow", "deny", "unshare"] {
+                            let out = out_of(&mut ctx, &format!(".mesh {verb}")).await.unwrap();
+                            assert!(
+                                out.contains(&format!("Usage: .mesh {verb}")),
+                                "{verb}: {out}"
+                            );
+                        }
+                        let root = TempDir::new("repl-mesh-probe-bare-on-root");
+                        seed_files(&root.path, &["docs/a.md"]);
+                        publish_root(&ctx, &root.path);
+                        for verb in ["allow", "deny", "unshare"] {
+                            let out = out_of(&mut ctx, &format!(".mesh {verb}")).await.unwrap();
+                            assert!(
+                                out.contains(&format!("Usage: .mesh {verb}")),
+                                "{verb}: {out}"
+                            );
+                        }
+                        let (_, locations) = ctx.app.mesh.share_locations().unwrap();
+                        assert!(!locations.global.exists());
+                        assert!(!locations.workspace.exists());
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        assert!(ctx.app.mesh.stop().await.unwrap());
+                        started.relay_handle.abort();
+                    });
+                }
+
+                /// Usage probe: the withdrawn-spelling classification (`deny <32-hex>`) comes
+                /// before the mesh gate, so an off context hears the teaching, not `MESH_OFF`;
+                /// `shares --peer` refuses a non-hash rather than listing for "bob".
+                #[test]
+                #[serial]
+                fn usage_probe_classification_errors_precede_mesh_off_and_shares_refuses_a_non_hash_peer()
+                 {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-classify-off");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    let mut ctx = off_ctx();
+                    let dest = "3f9c2a7b1d4e6f80a1b2c3d4e5f60718";
+
+                    let err = err_of(&mut ctx, &format!(".mesh deny {dest}"));
+                    assert!(err.contains(&format!(".mesh untrust {dest}")), "{err}");
+                    assert_ne!(err, MESH_OFF);
+
+                    let root = TempDir::new("repl-mesh-probe-classify-off-root");
+                    seed_files(&root.path, &["docs/a.md"]);
+                    publish_root(&ctx, &root.path);
+                    let err = err_of(&mut ctx, ".mesh shares --peer bob");
+                    assert!(err.contains("`bob`"), "{err}");
+                    assert!(err.contains("peer hash"), "{err}");
+                    assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
+                }
+
+                /// Usage probe (B-22): the live preview count stops at the page size and says
+                /// "1000 or more" instead of walking every file past the user.
+                #[test]
+                #[serial]
+                fn usage_probe_on_preview_count_is_capped_at_the_page_size() {
+                    let config = MeshConfig {
+                        interfaces: vec![MeshInterface::Lan],
+                        ..MeshConfig::default()
+                    };
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-on-preview-cap");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[false]);
+                    let mut ctx = ctx_with(config, true);
+                    ctx.session = Some(Session::default());
+                    let root = TempDir::new("repl-mesh-probe-on-preview-cap-root");
+                    let many: Vec<String> = (0..LIST_PAGE_SIZE + 1)
+                        .map(|i| format!("docs/f{i:04}.md"))
+                        .collect();
+                    let many: Vec<&str> = many.iter().map(String::as_str).collect();
+                    seed_files(&root.path, &many);
+                    publish_root(&ctx, &root.path);
+                    let (_, locations) = ctx.app.mesh.share_locations().unwrap();
+                    write_share_file(
+                        &locations.global,
+                        "version: 1\nallow:\n- pattern: docs/**\n",
+                    );
+
+                    run_async(run(&mut ctx, ".mesh on")).unwrap();
+                    assert!(ctx.app.mesh.get().is_none());
+                    let out = stdout_lines();
+                    let files = index_of(
+                        &out,
+                        "  files: 1000 or more path(s) are shared with trusted peers (`.mesh shares`)",
+                    );
+                    assert!(files < index_of(&out, "Mesh stays off"), "{out:?}");
+                }
+
+                /// Usage probe: the match count a user confirms against counts regular files
+                /// the pattern reaches under the root — a symlinked directory is not followed
+                /// and `.git/` is never entered — so `**` over a tree of links stays small
+                /// and asks only because of its head.
+                #[cfg(unix)]
+                #[test]
+                #[serial]
+                fn usage_probe_match_count_skips_symlinked_dirs_and_git() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-count-links");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = ShareFixture::new(
+                            "repl-mesh-probe-count-links",
+                            &["docs/a.md", ".git/objects/aa", ".git/objects/bb"],
+                        )
+                        .await;
+                        let outside = TempDir::new("repl-mesh-probe-count-links-outside");
+                        let many: Vec<String> = (0..150).map(|i| format!("f{i:03}")).collect();
+                        let many: Vec<&str> = many.iter().map(String::as_str).collect();
+                        seed_files(&outside.path, &many);
+                        std::os::unix::fs::symlink(&outside.path, fx.root.path.join("linked"))
+                            .unwrap();
+
+                        let out = out_of(&mut fx.ctx, ".mesh allow ** --dry-run")
+                            .await
+                            .unwrap();
+                        assert!(
+                            out.contains(&format!(
+                                "`**` matches 1 file(s) under {}.",
+                                fx.root.path.display()
+                            )),
+                            "{out}"
+                        );
+                        let out = out_of(&mut fx.ctx, ".mesh allow linked/** --dry-run")
+                            .await
+                            .unwrap();
+                        assert!(out.contains("matches 0 file(s) under"), "{out}");
+                        assert!(out.ends_with(DRY_RUN_NOTHING_CHANGED), "{out}");
+
+                        // The linked tree is not served either.
+                        out_of(&mut fx.ctx, ".mesh allow linked/**").await.unwrap();
+                        let out = out_of(&mut fx.ctx, ".mesh shares --effective")
+                            .await
+                            .unwrap();
+                        assert!(!out.contains("linked/f"), "{out}");
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        fx.stop().await;
+                    });
+                }
+
+                /// Usage probe: a `**` head anywhere in the first segment is broad (`**/*.md`
+                /// asks even over one file); an `unshare` that needs the question fails
+                /// without a terminal naming `--yes`, and `--yes` stands in for it; a malformed
+                /// or parent-escaping pattern is refused and writes nothing.
+                #[test]
+                #[serial]
+                fn usage_probe_broad_head_variants_non_tty_unshare_and_malformed_patterns() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-broad-variants");
+                    let _capture = capture::install();
+                    run_async(async {
+                        let mut fx =
+                            ShareFixture::new("repl-mesh-probe-broad-variants", &["docs/a.md"])
+                                .await;
+
+                        let declined = prompt_script::install(&[false]);
+                        let out = out_of(&mut fx.ctx, ".mesh allow **/*.md").await.unwrap();
+                        assert!(out.contains("matches 1 file(s) under"), "{out}");
+                        assert!(out.ends_with(NOTHING_CHANGED), "{out}");
+                        assert_eq!(prompt_script::prompts_asked(), 1);
+                        assert!(!fx.locations.global.exists());
+                        drop(declined);
+
+                        let quiet = prompt_script::install(&[]);
+                        for line in [
+                            ".mesh allow docs/[",
+                            ".mesh allow docs/../x",
+                            ".mesh allow ./docs/**",
+                        ] {
+                            let err = refusal(&mut fx.ctx, line).await;
+                            assert_ne!(err, MESH_OFF, "{line}");
+                            assert!(!err.is_empty(), "{line}");
+                        }
+                        assert!(!fx.locations.global.exists());
+                        assert!(!fx.locations.workspace.exists());
+
+                        out_of(&mut fx.ctx, ".mesh allow docs/**").await.unwrap();
+                        out_of(&mut fx.ctx, ".mesh allow docs/** --workspace")
+                            .await
+                            .unwrap();
+                        assert_eq!(fx.entries().len(), 2);
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        drop(quiet);
+
+                        let non_tty = prompt_script::install_non_interactive();
+                        let err = refusal(&mut fx.ctx, ".mesh unshare docs/**").await;
+                        assert!(err.contains("--yes"), "{err}");
+                        assert_eq!(fx.entries().len(), 2);
+                        drop(non_tty);
+
+                        let _quiet = prompt_script::install(&[]);
+                        let out = out_of(&mut fx.ctx, ".mesh unshare docs/** --yes")
+                            .await
+                            .unwrap();
+                        assert!(out.contains(&fx.global()), "{out}");
+                        assert!(out.contains(&fx.workspace()), "{out}");
+                        assert!(fx.entries().is_empty());
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        fx.stop().await;
+                    });
+                }
+
+                /// Usage probe: a flag missing its value is a usage error ahead of the mesh gate.
+                #[test]
+                #[serial]
+                fn usage_probe_peer_flag_without_a_value_is_a_usage_error_before_the_gate() {
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    let mut ctx = off_ctx();
+                    for line in [".mesh allow docs/** --peer", ".mesh shares --peer"] {
+                        let err = err_of(&mut ctx, line);
+                        assert_ne!(err, MESH_OFF, "{line}");
+                        assert!(err.contains("--peer"), "{line}: {err}");
+                    }
+                    assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
+                }
+
+                /// Usage probe (B-22): a share file the node refuses leaves the effective set
+                /// empty, so the preview says nothing about shares and still reaches the
+                /// consent question.
+                #[test]
+                #[serial]
+                fn usage_probe_on_preview_says_nothing_when_the_share_file_is_refused() {
+                    let config = MeshConfig {
+                        interfaces: vec![MeshInterface::Lan],
+                        ..MeshConfig::default()
+                    };
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-on-preview-refused");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[false]);
+                    let mut ctx = ctx_with(config, true);
+                    ctx.session = Some(Session::default());
+                    let root = TempDir::new("repl-mesh-probe-on-preview-refused-root");
+                    seed_files(&root.path, &["docs/a.md"]);
+                    publish_root(&ctx, &root.path);
+                    let (_, locations) = ctx.app.mesh.share_locations().unwrap();
+                    write_share_file(&locations.global, "version: 99\n");
+
+                    run_async(run(&mut ctx, ".mesh on")).unwrap();
+                    assert!(ctx.app.mesh.get().is_none());
+                    let out = stdout_lines();
+                    assert!(
+                        !out.iter()
+                            .any(|line| line.contains("shared with trusted peers")),
+                        "{out:?}"
+                    );
+                    assert!(
+                        out.iter().any(|line| line.contains("Mesh stays off")),
+                        "{out:?}"
+                    );
+                    assert_eq!(prompt_script::prompts_asked(), 1);
+                }
             }
         }
     }
