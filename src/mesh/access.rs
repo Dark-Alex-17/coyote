@@ -45,7 +45,7 @@ use crate::mesh::{
     destination_address, display_text, human_size, redact_hashes, rfc3339_utc, short,
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use lxmf_core::constants::{FIELD_CUSTOM_DATA, FIELD_CUSTOM_TYPE};
 use rmpv::Value;
@@ -1021,15 +1021,16 @@ pub(crate) struct AccessDecisionReport {
 
 impl AccessStore<'_> {
     /// Lets the requesting peer read every path it asked for, as `kind` says. Either way
-    /// the request is taken out of the store before the reply goes, so two processes
-    /// deciding the same id send one reply between them, and put back when the send
-    /// fails, so it stays pending to decide again. A one-off grant is written before
-    /// the send: one the peer never heard of expires on its own. The standing entries
-    /// are written after it: they would outlive a reply that never arrived and a later
-    /// refusal alike, so the peer must have heard yes first. The share list is loaded
-    /// once before the send, so a list that cannot be written is found before the peer
-    /// is told anything, and again after it, so an edit made while the reply was in
-    /// flight is not written over.
+    /// the request is taken out of the store before anything is written or sent, so two
+    /// processes deciding the same id send one reply and write one grant between them,
+    /// and put back when the send fails, so it stays pending to decide again. A one-off
+    /// grant is written between the take and the send and taken back with the request
+    /// when the send fails: the peer never heard yes, and the human may refuse next. The
+    /// standing entries are written after the send: they would outlive a reply that
+    /// never arrived and a later refusal alike, so the peer must have heard yes first.
+    /// The share list is loaded once before the send, so a list that cannot be written
+    /// is found before the peer is told anything, and again after it, so an edit made
+    /// while the reply was in flight is not written over.
     pub(crate) async fn grant(&self, id: &str, kind: GrantKind) -> Result<AccessDecisionReport> {
         let (store, record, runtime) = self.pending(id)?;
         match kind {
@@ -1049,37 +1050,65 @@ impl AccessStore<'_> {
                     .standing_shares(&runtime, &record)
                     .and_then(|mut shares| share_standing(&mut shares, &record, scope))
                 {
-                    store.upsert(record.clone(), SystemTime::now())?;
-                    bail!(
+                    let err = anyhow!(
                         "{} was already told yes, but the share list could not be written: {err:#}. Run `.mesh grant {id} --standing` again once the share list is writable; the request stays pending until then.",
                         short(&record.peer_destination)
                     );
+                    return Err(put_back(&store, &record, err));
                 }
                 self.settle(record, AccessDecision::Granted, None, true, sent)
             }
-            GrantKind::OneOff { ttl } => {
-                let granted = runtime.serving().grants().grant(
-                    id,
-                    &record.peer_destination,
-                    &record.paths,
-                    ttl,
-                    SystemTime::now(),
-                )?;
-                let expires = Some(
-                    parse_rfc3339(&granted.expires)
-                        .context("The grant was written with an expiry that does not read back")?,
-                );
-                let sent = self
-                    .send_decision(
-                        &store,
-                        &record,
-                        &runtime,
-                        AccessDecision::Granted,
-                        expires,
-                        false,
-                    )
-                    .await?;
-                self.settle(record, AccessDecision::Granted, expires, false, sent)
+            GrantKind::OneOff { ttl } => self.grant_once(&store, record, &runtime, ttl).await,
+        }
+    }
+
+    /// The one-off arm of `grant`, from the take on: the grant is written, the reply
+    /// sent, and both undone when either fails, so a request back in the store has no
+    /// grant standing behind it.
+    async fn grant_once(
+        &self,
+        store: &InboundStore,
+        record: InboundRecord,
+        runtime: &MeshRuntime,
+        ttl: Option<Duration>,
+    ) -> Result<AccessDecisionReport> {
+        take(store, &record)?;
+        let grants = runtime.serving().grants();
+        let outcome = async {
+            let granted = grants.grant(
+                &record.id,
+                &record.peer_destination,
+                &record.paths,
+                ttl,
+                SystemTime::now(),
+            )?;
+            let expires = parse_rfc3339(&granted.expires)
+                .context("The grant was written with an expiry that does not read back")?;
+            let sent = self
+                .send(
+                    &record,
+                    runtime,
+                    AccessDecision::Granted,
+                    Some(expires),
+                    false,
+                )
+                .await?;
+            Ok((expires, sent))
+        }
+        .await;
+        match outcome {
+            Ok((expires, sent)) => {
+                self.settle(record, AccessDecision::Granted, Some(expires), false, sent)
+            }
+            Err(err) => {
+                let err = match grants.revoke(&record.id, &record.peer_destination) {
+                    Ok(_) => err,
+                    Err(revoke) => anyhow!(
+                        "{err:#}; the grant written for `{}` could not be taken back either: {revoke:#}",
+                        record.id
+                    ),
+                };
+                Err(put_back(store, &record, err))
             }
         }
     }
@@ -1137,12 +1166,26 @@ impl AccessStore<'_> {
         Ok(shares)
     }
 
-    /// Takes the request out of the store, then sends the reply; a send that fails puts
-    /// it back. The take is what keeps two processes deciding the same id from both
-    /// telling the peer: the one that finds the record already gone sends nothing.
+    /// `take`, then `send`; a send that fails puts the request back.
     async fn send_decision(
         &self,
         store: &InboundStore,
+        record: &InboundRecord,
+        runtime: &MeshRuntime,
+        decision: AccessDecision,
+        expires: Option<SystemTime>,
+        standing: bool,
+    ) -> Result<SendOutcome> {
+        take(store, record)?;
+        self.send(record, runtime, decision, expires, standing)
+            .await
+            .map_err(|err| put_back(store, record, err))
+    }
+
+    /// Sends the decision reply to the requesting peer; the caller has taken the
+    /// request and puts it back if this fails.
+    async fn send(
+        &self,
         record: &InboundRecord,
         runtime: &MeshRuntime,
         decision: AccessDecision,
@@ -1158,17 +1201,7 @@ impl AccessStore<'_> {
             standing,
             &runtime.part_limits(),
         )?;
-        if !store.remove(&record.id)? {
-            bail!(
-                "`{}` was already decided by another process; nothing was sent",
-                record.id
-            );
-        }
-        let sent = runtime.send_peer(&record.peer_destination, &reply).await;
-        if sent.is_err() {
-            store.upsert(record.clone(), SystemTime::now())?;
-        }
-        Ok(sent?)
+        Ok(runtime.send_peer(&record.peer_destination, &reply).await?)
     }
 
     /// Closes a request the peer has heard the decision on: the hook fires and the
@@ -1211,6 +1244,32 @@ impl AccessStore<'_> {
             standing,
             via: sent.via,
         })
+    }
+}
+
+/// Takes the request out of the store: what keeps two processes deciding the same id
+/// from both telling the peer, or both writing a grant. The one that finds the record
+/// already gone does neither.
+fn take(store: &InboundStore, record: &InboundRecord) -> Result<()> {
+    if !store.remove(&record.id)? {
+        bail!(
+            "`{}` was already decided by another process; nothing was sent",
+            record.id
+        );
+    }
+    Ok(())
+}
+
+/// Puts a taken request back after `err` stopped its decision, so it stays pending to
+/// decide again; a put-back that fails too is reported beside `err`, since the human
+/// needs to know both that the peer heard nothing and that the request is gone.
+fn put_back(store: &InboundStore, record: &InboundRecord, err: anyhow::Error) -> anyhow::Error {
+    match store.upsert(record.clone(), SystemTime::now()) {
+        Ok(()) => err,
+        Err(put_back) => anyhow!(
+            "{err:#}; and `{}` could not be put back as pending: {put_back:#}",
+            record.id
+        ),
     }
 }
 
@@ -2841,6 +2900,66 @@ mod tests {
         stub.stop().await;
     }
 
+    /// A one-off grant whose decision the peer refuses to take is undone whole: the
+    /// grant written between the take and the send is taken back, the request is
+    /// pending again, the peer heard nothing it could act on and the human reads one
+    /// line naming the send, not the race.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_one_off_grant_whose_send_fails_leaves_no_grant_and_the_request_pending() {
+        let stub =
+            PeerStub::listen("access-one-off-unsent-stub", TcpServer::DEFAULT_CLIENT_MTU).await;
+        stub.serve(MESSAGE_PATH, Arc::new(Throttling) as Arc<dyn Handler>);
+        let installed = Installed::beside("access-one-off-unsent", &stub).await;
+        installed
+            .ask(&stub, "a-1", &["src/x.rs", "docs/y.md"])
+            .await;
+
+        let err = installed
+            .slot
+            .access()
+            .grant("a-1", GrantKind::OneOff { ttl: None })
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("The peer refused the message"), "{err}");
+        assert!(!err.contains("already decided"), "{err}");
+        assert_eq!(err.lines().count(), 1, "{err}");
+        assert!(installed.grants().is_empty(), "{:?}", installed.grants());
+        let identity = stub.identity_hex();
+        let destination = stub.destination_hex();
+        let peer = PeerRef {
+            identity: &identity,
+            destination: &destination,
+        };
+        assert!(
+            !installed
+                .runtime
+                .serving()
+                .grants()
+                .is_granted(&peer, "src/x.rs", SystemTime::now())
+                .unwrap()
+        );
+        let records = access_records(&installed.slot);
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(records[0].id, "a-1");
+        assert_eq!(records[0].paths, ["src/x.rs", "docs/y.md"]);
+        assert!(stub.seen().is_empty());
+        let events: Vec<HookEvent> = installed
+            .hooks
+            .drain()
+            .iter()
+            .map(|(event, _)| *event)
+            .collect();
+        assert!(
+            !events.contains(&HookEvent::MeshAccessDecided),
+            "{events:?}"
+        );
+        installed.stop().await;
+        stub.stop().await;
+    }
+
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_grant_for_a_duration_overrides_the_ttl() {
@@ -4369,9 +4488,11 @@ mod tests {
 
     /// Two processes deciding the same request: both find it pending, one takes it out
     /// of the store and sends, and the other, reaching the take second, bails naming
-    /// the race and sends nothing, so the peer hears exactly one decision. The late
-    /// process is played by a `grant` whose lookup ran before the other's decision and
-    /// whose send runs after it.
+    /// the race, sends nothing and writes no grant, so the peer hears exactly one
+    /// decision and the grant on file is the one it heard of. The late process is
+    /// played by a one-off `grant` whose lookup ran before the other's decision and
+    /// whose take runs after it, asking a longer TTL than the winner's so its grant
+    /// would be told apart.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_request_another_process_decided_first_is_not_decided_again() {
@@ -4385,21 +4506,14 @@ mod tests {
         let late = installed.slot.access();
         let (store, record, runtime) = late.pending("a-1").unwrap();
 
-        installed
+        let report = installed
             .slot
             .access()
             .grant("a-1", GrantKind::OneOff { ttl: None })
             .await
             .unwrap();
         let err = late
-            .send_decision(
-                &store,
-                &record,
-                &runtime,
-                AccessDecision::Granted,
-                None,
-                false,
-            )
+            .grant_once(&store, record, &runtime, Some(Duration::from_secs(3_600)))
             .await
             .unwrap_err()
             .to_string();
@@ -4409,6 +4523,13 @@ mod tests {
             "`a-1` was already decided by another process; nothing was sent"
         );
         assert!(access_records(&installed.slot).is_empty());
+        let grants = installed.grants();
+        assert_eq!(grants.len(), 1, "{grants:?}");
+        assert_eq!(
+            parse_rfc3339(&grants[0].expires),
+            report.expires,
+            "the grant on file is the winner's, not the loser's hour-long one"
+        );
         decided_once(&installed.hooks, "a-1", "granted");
         decision_seen(&stub, "a-1");
         installed.stop().await;

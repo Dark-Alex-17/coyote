@@ -559,9 +559,9 @@ impl MeshRuntime {
 
     /// `send_peer` for a message the human attached a file to: a file carried by
     /// reference is first lent to the peer as a one-off grant under the message's id, so
-    /// the peer may fetch it once within the default TTL. Nothing takes a grant back, so
-    /// a send that then fails says the grant stands. A message with no reference part is
-    /// sent as it is.
+    /// the peer may fetch it once within the default TTL. A send that then fails takes
+    /// the grant back: the peer never heard of the file. A message with no reference
+    /// part is sent as it is.
     pub(crate) async fn send_peer_lending_reference(
         &self,
         destination_hex: &str,
@@ -578,32 +578,29 @@ impl MeshRuntime {
                 _ => None,
             })
             .collect();
-        let grant = if references.is_empty() {
-            None
-        } else {
-            Some(self.serving().grants().grant(
+        if !references.is_empty() {
+            self.serving().grants().grant(
                 &message.id,
                 destination_hex,
                 &references,
                 None,
                 SystemTime::now(),
-            )?)
-        };
+            )?;
+        }
         match self.send_peer(destination_hex, message).await {
             Ok(outcome) => Ok(outcome),
-            Err(err) => match grant {
-                Some(grant) => bail!(
-                    "{err}; the one-off grant for {} to {} stands until {}",
-                    references
-                        .iter()
-                        .map(|path| format!("`{path}`"))
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    short(destination_hex),
-                    grant.expires
-                ),
-                None => Err(err.into()),
-            },
+            Err(err) => {
+                if !references.is_empty()
+                    && let Err(revoke) =
+                        self.serving().grants().revoke(&message.id, destination_hex)
+                {
+                    bail!(
+                        "{err}; and the one-off grant lent to {} for it could not be taken back: {revoke:#}",
+                        short(destination_hex)
+                    );
+                }
+                Err(err.into())
+            }
         }
     }
 
@@ -6080,6 +6077,53 @@ mod tests {
             sink.drain().is_empty(),
             "a bulletin's fan-out reports through mesh.bulletin.sent alone"
         );
+        runtime.shutdown().await.unwrap();
+        started.relay_handle.abort();
+    }
+
+    /// A reference the send never carried is not left lent: the one-off grant written
+    /// before the send is taken back when the send fails, and the error is the send's.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lend_whose_send_fails_takes_the_grant_back() {
+        use crate::mesh::message::SendError;
+
+        let started = started_runtime("node-lend-unsent").await;
+        let runtime = &started.runtime;
+        let destination = "ab".repeat(16);
+        let message = OutboundPeer {
+            kind: PeerKind::Message,
+            id: "m-1".to_string(),
+            in_reply_to: None,
+            title: None,
+            content: "see the attached".to_string(),
+            fields: None,
+            parts: vec![RawPart::File {
+                name: "docs/big.md".to_string(),
+                size: 4_096,
+                sha256: [7u8; 32],
+                bytes: None,
+                reference: Some("docs/big.md".to_string()),
+            }],
+            thread: None,
+            disposition: None,
+            retry_after: None,
+        };
+
+        let err = runtime
+            .send_peer_lending_reference(&destination, &message)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(
+            err,
+            SendError::NotTrusted {
+                destination: destination.clone()
+            }
+            .to_string()
+        );
+        assert!(runtime.serving().grants().list().unwrap().is_empty());
         runtime.shutdown().await.unwrap();
         started.relay_handle.abort();
     }

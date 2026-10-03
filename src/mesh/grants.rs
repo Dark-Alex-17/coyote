@@ -205,6 +205,27 @@ impl GrantStore {
         Ok(record)
     }
 
+    /// Takes back the grant `id` gave the instance at `peer_destination`, when the
+    /// decision it was written for never reached the peer; `Ok(false)` when there was none.
+    pub(crate) fn revoke(&self, id: &str, peer_destination: &str) -> Result<bool> {
+        let Some(peer) = canonical_hash(peer_destination) else {
+            return Ok(false);
+        };
+        if !self.path.exists() {
+            return Ok(false);
+        }
+        let _guard = self.write_lock.lock();
+        let _file_lock = self.file_lock()?;
+        let mut records = self.read_all()?;
+        let before = records.len();
+        records.retain(|existing| !(existing.id == id && same_hash(&existing.peer, &peer)));
+        let revoked = records.len() < before;
+        if revoked {
+            self.write_all(&records)?;
+        }
+        Ok(revoked)
+    }
+
     /// A preview of whether `peer` could fetch `path` right now: an unexpired grant for
     /// its destination names exactly this text with a use left. Nothing is reserved, so
     /// another fetch may spend that use before this caller acts; a fetch that means to
@@ -470,6 +491,7 @@ mod tests {
         assert!(store.list().unwrap().is_empty());
         assert!(!store.is_granted(&peer, "docs/a.md", t(1_000)).unwrap());
         assert!(!store.consume(&peer, "docs/a.md", t(1_000)).unwrap());
+        assert!(!store.revoke("req", &destination).unwrap());
         assert_eq!(store.prune(t(1_000)).unwrap(), 0);
         assert!(!mesh_cache_dir(&tmp.path).exists());
     }
@@ -648,6 +670,50 @@ mod tests {
                 .is_granted(&second_peer, "docs/b.md", t(1_000))
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn revoke_takes_back_one_peers_grant_under_the_id_and_leaves_the_rest() {
+        let (store, _tmp) = store("grants-revoke");
+        let (identity, first, second) = (fake_hash(0x1a), fake_hash(0x2b), fake_hash(0x3c));
+        store
+            .grant("req", &first, &paths(&["docs/a.md"]), None, t(1_000))
+            .unwrap();
+        store
+            .grant("req", &second, &paths(&["docs/b.md"]), None, t(1_000))
+            .unwrap();
+        store
+            .grant("other", &first, &paths(&["docs/c.md"]), None, t(1_000))
+            .unwrap();
+        let first_peer = PeerRef {
+            identity: &identity,
+            destination: &first,
+        };
+        let second_peer = PeerRef {
+            identity: &identity,
+            destination: &second,
+        };
+
+        assert!(store.revoke("req", &first.to_uppercase()).unwrap());
+
+        assert!(
+            !store
+                .is_granted(&first_peer, "docs/a.md", t(1_000))
+                .unwrap()
+        );
+        assert!(
+            store
+                .is_granted(&first_peer, "docs/c.md", t(1_000))
+                .unwrap()
+        );
+        assert!(
+            store
+                .is_granted(&second_peer, "docs/b.md", t(1_000))
+                .unwrap()
+        );
+        assert_eq!(store.list().unwrap().len(), 2);
+        assert!(!store.revoke("req", &first).unwrap());
+        assert!(!store.revoke("never", &second).unwrap());
     }
 
     #[test]
