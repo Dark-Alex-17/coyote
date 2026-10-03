@@ -4487,6 +4487,11 @@ impl RequestContext {
                 );
             }
         } else if cmd == ".mesh"
+            && args.len() >= 2
+            && matches!(args[0], "allow" | "deny" | "unshare" | "shares")
+        {
+            values = self.mesh_completion_share_verb(args[0], &args[1..]);
+        } else if cmd == ".mesh"
             && args.len() == 2
             && matches!(args[0], "info" | "status" | "reply" | "knock")
         {
@@ -5261,6 +5266,155 @@ impl RequestContext {
                     )
                 }),
         );
+        values
+    }
+
+    /// Completions for the share verbs, `rest` being everything after the verb with the
+    /// token being typed last. After `--peer` the trusted destinations and identities;
+    /// otherwise the data rows the verb takes, once, before its positional is given, then
+    /// the flags not yet used, each of `--global`/`--workspace` and `--yes`/`--dry-run`
+    /// dropping once its partner is present.
+    fn mesh_completion_share_verb(
+        &self,
+        verb: &str,
+        rest: &[&str],
+    ) -> Vec<(String, Option<String>)> {
+        let Some((typed, prior)) = rest.split_last() else {
+            return Vec::new();
+        };
+        if prior.last() == Some(&"--peer") {
+            let mut values = self.mesh_completion_trusted(false);
+            push_missing(&mut values, self.mesh_completion_trusted(true));
+            return values;
+        }
+        let positional_taken = prior.iter().enumerate().any(|(index, token)| {
+            !token.starts_with("--") && (index == 0 || prior[index - 1] != "--peer")
+        });
+        let mut values = match verb {
+            "allow" | "deny" if !positional_taken && self.app.mesh.get().is_some() => {
+                self.mesh_completion_share_paths(typed)
+            }
+            "unshare" if !positional_taken => self.mesh_completion_share_patterns(),
+            _ => Vec::new(),
+        };
+        let flags: &[&str] = match verb {
+            "allow" => &[
+                "--peer ",
+                "--force",
+                "--global",
+                "--workspace",
+                "--yes",
+                "--dry-run",
+            ],
+            "deny" | "unshare" => &["--global", "--workspace", "--yes", "--dry-run"],
+            _ => &["--peer ", "--effective"],
+        };
+        let excluded = |flag: &str| match flag {
+            "--global" => prior.contains(&"--workspace"),
+            "--workspace" => prior.contains(&"--global"),
+            "--yes" => prior.contains(&"--dry-run"),
+            "--dry-run" => prior.contains(&"--yes"),
+            _ => false,
+        };
+        for flag in flags {
+            if prior.contains(&flag.trim_end()) || excluded(flag) {
+                continue;
+            }
+            values.push(((*flag).to_string(), None));
+        }
+        values
+    }
+
+    /// Root-relative paths for `.mesh allow <TAB>` and `.mesh deny <TAB>`: the entries of
+    /// the share-root directory `typed` names, directories with a trailing `/`, less
+    /// `.git`, the workspace config directory, anything the built-in deny names, and any
+    /// symlink that leaves the root. Local filesystem and the published snapshot only;
+    /// nothing reaches the wire or the trust store. Empty for an absolute, backslashed or
+    /// `..` prefix, since the verbs refuse those; sorted and cut at 200.
+    fn mesh_completion_share_paths(&self, typed: &str) -> Vec<(String, Option<String>)> {
+        let Some((root, _)) = self.app.mesh.share_locations() else {
+            return Vec::new();
+        };
+        if typed.starts_with('/')
+            || typed.contains('\\')
+            || typed.split('/').any(|segment| segment == "..")
+        {
+            return Vec::new();
+        }
+        let (dir_part, tail) = match typed.rfind('/') {
+            Some(slash) => typed.split_at(slash + 1),
+            None => ("", typed),
+        };
+        let Ok(canonical_root) = dunce::canonicalize(&root) else {
+            return Vec::new();
+        };
+        let Ok(dir) = dunce::canonicalize(root.join(dir_part)) else {
+            return Vec::new();
+        };
+        if !dir.starts_with(&canonical_root) {
+            return Vec::new();
+        }
+        let Ok(entries) = fs::read_dir(&dir) else {
+            return Vec::new();
+        };
+        let config_dir_name = paths::workspace_config_dir_name();
+        let mut values: Vec<(String, Option<String>)> = entries
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name().into_string().ok()?;
+                if !name.starts_with(tail) {
+                    return None;
+                }
+                let relative = format!("{dir_part}{name}");
+                if crate::mesh::shares::hidden_from_completion(&relative, &config_dir_name)
+                    || crate::mesh::shares::hidden_from_completion(&name, &config_dir_name)
+                {
+                    return None;
+                }
+                let path = entry.path();
+                let metadata = fs::metadata(&path).ok()?;
+                if entry.file_type().ok()?.is_symlink()
+                    && !dunce::canonicalize(&path)
+                        .ok()?
+                        .starts_with(&canonical_root)
+                {
+                    return None;
+                }
+                let value = if metadata.is_dir() {
+                    format!("{relative}/")
+                } else {
+                    relative
+                };
+                Some((value, None))
+            })
+            .collect();
+        values.sort();
+        values.truncate(200);
+        values
+    }
+
+    /// Patterns for `.mesh unshare <TAB>`: every entry of both share files as they are on
+    /// disk, described as `{allow|deny|override} · {global|workspace}`; a pattern both
+    /// files hold keeps its first description. Works while the mesh is off.
+    fn mesh_completion_share_patterns(&self) -> Vec<(String, Option<String>)> {
+        use crate::mesh::shares::{Layer, RawKind, ShareSet};
+
+        let Some((_, locations)) = self.app.mesh.share_locations() else {
+            return Vec::new();
+        };
+        let mut values = Vec::new();
+        for entry in ShareSet::load_quietly(locations).0.entries() {
+            let (kind, text) = match entry.kind {
+                RawKind::Allow { pattern, .. } => ("allow", pattern),
+                RawKind::Deny { pattern } => ("deny", pattern),
+                RawKind::Override { path } => ("override", path),
+            };
+            let layer = match entry.layer {
+                Layer::Global => "global",
+                Layer::Workspace => "workspace",
+            };
+            push_missing(&mut values, vec![(text, Some(format!("{kind} · {layer}")))]);
+        }
         values
     }
 
@@ -23084,6 +23238,334 @@ mod tests {
 
         assert!(ctx.app.mesh.stop().await.unwrap());
         started.relay_handle.abort();
+    }
+
+    /// A share-root workspace published as the fixture's snapshot, so the share verbs
+    /// complete against it.
+    #[cfg(unix)]
+    fn publish_share_root(ctx: &RequestContext, tag: &str) -> crate::mesh::test_support::TempDir {
+        let tmp = crate::mesh::test_support::TempDir::new(tag);
+        let mut snapshot = crate::mesh::test_support::snapshot_fixture();
+        snapshot.cwd = tmp.path.clone();
+        ctx.app.mesh.publish(snapshot);
+        tmp
+    }
+
+    #[cfg(unix)]
+    fn seed_share_files(root: &Path, files: &[&str]) {
+        for relative in files {
+            let path = root.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, relative).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    const ALLOW_FLAGS: [&str; 6] = [
+        "--peer ",
+        "--force",
+        "--global",
+        "--workspace",
+        "--yes",
+        "--dry-run",
+    ];
+
+    #[cfg(unix)]
+    const DENY_FLAGS: [&str; 4] = ["--global", "--workspace", "--yes", "--dry-run"];
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_allow_offers_share_root_paths_with_dirs_slashed_and_secrets_hidden()
+    {
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-allow").await;
+        let root = publish_share_root(&fixture.ctx, "rc-mesh-complete-allow-root");
+        let outside = crate::mesh::test_support::TempDir::new("rc-mesh-complete-allow-outside");
+        seed_share_files(
+            &root.path,
+            &[
+                "README.md",
+                "docs/a.md",
+                ".env",
+                "id_rsa",
+                "k.pem",
+                ".git/HEAD",
+                ".coyote/config.yaml",
+            ],
+        );
+        std::os::unix::fs::symlink(&outside.path, root.path.join("out")).unwrap();
+
+        let expected_top = ["README.md", "docs/"]
+            .into_iter()
+            .chain(ALLOW_FLAGS)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            completion_values(&fixture.complete(&["allow", ""])),
+            expected_top,
+            "plain files and directories, slashed, then the flags; secrets, `.git`, the \
+             config dir and the symlink out of the root are hidden"
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["allow", "docs/"])),
+            ["docs/a.md"],
+            "a typed directory prefix lists that directory; the flags fall to the filter"
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["allow", "RE"])),
+            ["README.md"],
+            "a typed name prefix narrows the rows"
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["deny", ""])),
+            ["README.md", "docs/"]
+                .into_iter()
+                .chain(DENY_FLAGS)
+                .collect::<Vec<_>>(),
+            "deny offers the same paths with its own flags"
+        );
+        for typed in ["/etc", "docs\\a", "../x", "docs/../x"] {
+            assert!(
+                fixture.ctx.mesh_completion_share_paths(typed).is_empty(),
+                "{typed}: a prefix the verb refuses offers no paths"
+            );
+        }
+
+        fixture.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_allow_is_bounded_to_two_hundred_entries() {
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-allow-bound").await;
+        let root = publish_share_root(&fixture.ctx, "rc-mesh-complete-allow-bound-root");
+        let names: Vec<String> = (0..250).map(|n| format!("f{n:03}.txt")).collect();
+        let files: Vec<&str> = names.iter().map(String::as_str).collect();
+        seed_share_files(&root.path, &files);
+
+        let rows = fixture.complete(&["allow", ""]);
+        let paths: Vec<&str> = completion_values(&rows)
+            .into_iter()
+            .filter(|value| !value.starts_with("--"))
+            .collect();
+        assert_eq!(paths.len(), 200, "{rows:?}");
+        assert_eq!(paths, files[..200], "the first two hundred by name");
+
+        fixture.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_allow_offers_nothing_but_flags_once_the_pattern_is_typed() {
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-allow-typed").await;
+        let root = publish_share_root(&fixture.ctx, "rc-mesh-complete-allow-typed-root");
+        seed_share_files(&root.path, &["docs/a.md"]);
+
+        assert_eq!(
+            completion_values(&fixture.complete(&["allow", "docs/**", ""])),
+            ALLOW_FLAGS,
+            "the positional is taken, so only flags remain"
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["allow", "x", "--global", ""])),
+            ["--peer ", "--force", "--yes", "--dry-run"],
+            "--global is used and excludes --workspace"
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["allow", "x", "--dry-run", ""])),
+            ["--peer ", "--force", "--global", "--workspace"],
+            "--dry-run is used and excludes --yes"
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["allow", "--force", ""])),
+            [
+                "docs/",
+                "--peer ",
+                "--global",
+                "--workspace",
+                "--yes",
+                "--dry-run"
+            ],
+            "a flag before the positional leaves the paths on offer"
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&[
+                "allow",
+                "--peer",
+                &fixture.trusted_destination,
+                ""
+            ])),
+            [
+                "docs/",
+                "--force",
+                "--global",
+                "--workspace",
+                "--yes",
+                "--dry-run"
+            ],
+            "the value after --peer is not the positional"
+        );
+
+        fixture.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_allow_peer_offers_trusted_destinations_and_identities() {
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-allow-peer").await;
+        let _root = publish_share_root(&fixture.ctx, "rc-mesh-complete-allow-peer-root");
+
+        let rows = fixture.complete(&["allow", "x", "--peer", ""]);
+        let values = completion_values(&rows);
+        assert_eq!(
+            values[0],
+            fixture.trusted_destination.as_str(),
+            "the trusted destination comes first: {rows:?}"
+        );
+        let mut identities = values[1..].to_vec();
+        identities.sort_unstable();
+        let mut expected = [
+            fixture.trusted_peer_identity.as_str(),
+            fixture.trusted_identity.as_str(),
+            fixture.refused_peer_identity.as_str(),
+        ];
+        expected.sort_unstable();
+        assert_eq!(
+            identities, expected,
+            "then every trusted identity: {rows:?}"
+        );
+        assert!(
+            !values.iter().any(|value| value.starts_with("--")),
+            "no flags while a peer is being typed: {rows:?}"
+        );
+        assert_eq!(
+            fixture.complete(&["shares", "--peer", ""]),
+            rows,
+            "shares --peer takes the same records"
+        );
+
+        fixture.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_unshare_offers_the_patterns_of_both_files_labelled_by_kind_and_layer()
+     {
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-unshare").await;
+        let _root = publish_share_root(&fixture.ctx, "rc-mesh-complete-unshare-root");
+        let (_, locations) = fixture.ctx.app.mesh.share_locations().unwrap();
+        for (path, yaml) in [
+            (
+                &locations.global,
+                "version: 1\nallow:\n- pattern: docs/**\ndeny:\n- pattern: docs/private/**\n",
+            ),
+            (
+                &locations.workspace,
+                "version: 1\nallow:\n- pattern: src/**\n- pattern: docs/**\noverride:\n- path: .env.example\n",
+            ),
+        ] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, yaml).unwrap();
+        }
+
+        let rows = fixture.complete(&["unshare", ""]);
+        let described = |value: &str| Some(value.to_string());
+        assert_eq!(
+            rows,
+            [
+                ("docs/**".to_string(), described("allow · global")),
+                ("docs/private/**".to_string(), described("deny · global")),
+                ("src/**".to_string(), described("allow · workspace")),
+                (
+                    ".env.example".to_string(),
+                    described("override · workspace")
+                ),
+                ("--global".to_string(), None),
+                ("--workspace".to_string(), None),
+                ("--yes".to_string(), None),
+                ("--dry-run".to_string(), None),
+            ],
+            "global entries first, a pattern both files hold once, then the flags"
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["unshare", "docs/**", ""])),
+            DENY_FLAGS,
+            "nothing but flags once the pattern is typed"
+        );
+
+        fixture.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_shares_offers_its_two_flags_and_a_used_flag_is_not_offered_again() {
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-shares").await;
+        let _root = publish_share_root(&fixture.ctx, "rc-mesh-complete-shares-root");
+
+        assert_eq!(
+            completion_values(&fixture.complete(&["shares", ""])),
+            ["--peer ", "--effective"]
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["shares", "--effective", ""])),
+            ["--peer "]
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&[
+                "shares",
+                "--peer",
+                &fixture.trusted_destination,
+                ""
+            ])),
+            ["--effective"]
+        );
+
+        fixture.stop().await;
+    }
+
+    /// `allow` and `deny` refuse while the mesh is off, so nothing probes the tree for them;
+    /// `unshare` reads the files the node would serve from and still completes.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn repl_complete_mesh_allow_offers_only_flags_while_the_mesh_is_off() {
+        let _guard = TestConfigDirGuard::new();
+        let ctx = create_test_ctx();
+        let root = publish_share_root(&ctx, "rc-mesh-complete-allow-off-root");
+        seed_share_files(&root.path, &["README.md"]);
+        let (_, locations) = ctx.app.mesh.share_locations().unwrap();
+        fs::create_dir_all(locations.global.parent().unwrap()).unwrap();
+        fs::write(
+            &locations.global,
+            "version: 1\nallow:\n- pattern: docs/**\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            completion_values(&ctx.repl_complete(".mesh", &["allow", ""], "")),
+            ALLOW_FLAGS
+        );
+        assert_eq!(
+            completion_values(&ctx.repl_complete(".mesh", &["deny", ""], "")),
+            DENY_FLAGS
+        );
+        assert_eq!(
+            completion_values(&ctx.repl_complete(".mesh", &["unshare", ""], "")),
+            ["docs/**"]
+                .into_iter()
+                .chain(DENY_FLAGS)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

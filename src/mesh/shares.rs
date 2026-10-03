@@ -1377,7 +1377,6 @@ pub(crate) fn is_broad_pattern(pattern: &str) -> bool {
 /// `deny`: `.git`, the workspace config directory under either name it goes by, or
 /// anything the built-in deny matches by name. No I/O. The built-in set is this module's
 /// own constants, so one that fails to compile is a bug and hides everything.
-#[cfg(test)]
 pub(crate) fn hidden_from_completion(relative: &str, workspace_config_dir_name: &str) -> bool {
     workspace_config_dir_names(workspace_config_dir_name).contains(&relative)
         || compile(
