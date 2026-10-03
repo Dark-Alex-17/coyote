@@ -52,10 +52,13 @@ pub(crate) const DEFAULT_LIST_WALK_BOUND: usize = 100_000;
 /// Entries per listing page, the wire's cap.
 pub(crate) const LIST_PAGE_SIZE: usize = 1_000;
 
-/// What no allow reaches, at any depth, unless an `override` names the exact file: secrets
-/// by their usual names, and `.git` as a directory or as the file a worktree or submodule
-/// has, so `**` never enters a repository's own store. The workspace config directory
-/// joins this list at runtime under whatever name it has.
+/// What no allow reaches, at any depth. The secret names are liftable: an `override`
+/// naming the exact file serves it. `.git` and `.git/**` are stronger than that and sit
+/// here only so the alias and resolved-text match, the `builtin_denies` teaching and the
+/// completion filter catch them by name: a file under any `.git` directory, at any
+/// depth, is `Protected` in `verdict` before an override is consulted, and nothing lifts
+/// it. The workspace config directory joins this list at runtime under whatever name it
+/// has.
 const BUILTIN_DENY: [&str; 7] = [
     ".env", ".env.*", "*.pem", "*.key", "id_*", ".git", ".git/**",
 ];

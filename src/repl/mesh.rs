@@ -14688,6 +14688,67 @@ mod tests {
                     });
                 }
 
+                /// A file under any `.git` directory, exactly allowed AND named by a global
+                /// override, is still `(protected)` in the human's view and never listed as
+                /// shared: `verdict` protects the `.git` segment before it consults the
+                /// override, so the view and the wire agree.
+                #[test]
+                #[serial]
+                fn shares_effective_marks_files_under_any_git_directory_protected_despite_an_override()
+                 {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-shares-effective-git");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = ShareFixture::new(
+                            "repl-mesh-shares-effective-git",
+                            &[".git/HEAD", "vendor/x/.git/HEAD", "docs/a.md"],
+                        )
+                        .await;
+                        fx.write_global(
+                            "version: 1\nallow:\n- pattern: .git/HEAD\n- pattern: vendor/x/.git/HEAD\n- pattern: docs/**\noverride:\n- path: .git/HEAD\n- path: vendor/x/.git/HEAD\n",
+                        );
+
+                        let out = out_of(&mut fx.ctx, ".mesh shares --effective")
+                            .await
+                            .unwrap();
+                        let lines: Vec<&str> = out.lines().collect();
+                        assert_eq!(
+                            lines,
+                            [
+                                format!(
+                                    "Files every trusted peer can fetch from {}:",
+                                    fx.root.path.display()
+                                )
+                                .as_str(),
+                                "  .git/HEAD  (protected)",
+                                "  docs/a.md",
+                                "  vendor/x/.git/HEAD  (protected)",
+                            ],
+                            "{out}"
+                        );
+                        for under_git in [".git/HEAD", "vendor/x/.git/HEAD"] {
+                            assert!(
+                                !out.lines().any(|line| line.trim() == under_git),
+                                "listed as shared despite sitting under `.git`: {out}"
+                            );
+                            let identity = "1a".repeat(16);
+                            let destination = "2b".repeat(16);
+                            let peer = PeerRef {
+                                identity: &identity,
+                                destination: &destination,
+                            };
+                            assert!(
+                                !ShareSet::load_quietly(fx.locations.clone())
+                                    .0
+                                    .is_allowed(&peer, under_git, false),
+                                "the wire serves what the view calls protected: {under_git}"
+                            );
+                        }
+                        fx.stop().await;
+                    });
+                }
+
                 /// `shares` is inspection and reads the files the node would serve from
                 /// even while it is off; the mutations refuse after their usage checks and
                 /// before any prompt, like every other node verb.
