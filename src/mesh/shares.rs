@@ -964,7 +964,7 @@ impl ShareSet {
     /// so `allow` and `deny` refuse it before anything is walked or written: `.git`, or
     /// the workspace config directory under either name it goes by, or a segment that
     /// resolves into any directory the walk skips, such as a configured inbox under the
-    /// root.
+    /// root or a `.git` anywhere on the resolved path.
     pub(crate) fn protected_head(&self, pattern: &str) -> Option<String> {
         let head = pattern.split('/').next()?;
         if head == ".git"
@@ -972,9 +972,12 @@ impl ShareSet {
         {
             return Some(head.to_string());
         }
-        let resolved = dunce::canonicalize(self.canonical_root().ok()?.join(head)).ok()?;
-        // The walk skips `.git` by name, so a link to one is not among `protected_dirs`.
-        (resolved.file_name().is_some_and(|name| name == ".git")
+        let root = self.canonical_root().ok()?;
+        let resolved = dunce::canonicalize(root.join(head)).ok()?;
+        // The walk skips `.git` by name, so a link into one is not among `protected_dirs`.
+        (resolved
+            .strip_prefix(&root)
+            .is_ok_and(|relative| relative.components().any(|part| part.as_os_str() == ".git"))
             || protected_dirs(&self.locations)
                 .iter()
                 .any(|dir| resolved.starts_with(dir)))
@@ -3004,11 +3007,21 @@ mod tests {
     fn protected_head_names_a_link_that_resolves_to_the_git_dir() {
         let fx = Fixture::new("protected-head-git-link");
         fx.file(".git/HEAD");
+        fx.file(".git/hooks/pre-commit");
         fx.link("git-link", ".git");
+        fx.link("lnk", ".git/hooks");
+        fx.link("cfg", ".git/HEAD");
         let set = fx.load();
 
         assert_eq!(set.protected_head("git-link/**"), Some("git-link".into()));
         assert_eq!(set.protected_head("git-link"), Some("git-link".into()));
+        assert_eq!(
+            set.protected_head("lnk/**"),
+            Some("lnk".into()),
+            "a link into a directory below `.git` is as protected as one to it"
+        );
+        assert_eq!(set.protected_head("cfg"), Some("cfg".into()));
+        assert_eq!(set.protected_head(".git"), Some(".git".into()));
     }
 
     #[test]

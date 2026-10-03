@@ -5356,8 +5356,9 @@ impl RequestContext {
     /// directory the walk skips and every symlink, since the walk judges files by their
     /// real path and a rule naming the link would serve none. Local filesystem and the
     /// published snapshot only; nothing reaches the wire or the trust store. Empty for a
-    /// directory prefix the verbs would refuse as a pattern, and for a root the node
-    /// could not probe, since it serves nothing from it; sorted and cut at 200.
+    /// directory prefix the verbs would refuse as a pattern or that passes through a
+    /// symlink, and for a root the node could not probe, since it serves nothing from
+    /// it; sorted and cut at 200.
     fn mesh_completion_share_paths(&self, typed: &str) -> Vec<(String, Option<String>)> {
         use crate::mesh::shares::{CompletionFilter, validate_pattern};
 
@@ -5386,6 +5387,13 @@ impl RequestContext {
             && validate_pattern(dir).is_err()
         {
             return Vec::new();
+        }
+        let mut walked = root.clone();
+        for segment in dir_part.split('/').filter(|segment| !segment.is_empty()) {
+            walked.push(segment);
+            if fs::symlink_metadata(&walked).is_ok_and(|meta| meta.file_type().is_symlink()) {
+                return Vec::new();
+            }
         }
         let Ok(canonical_root) = dunce::canonicalize(&root) else {
             return Vec::new();
@@ -23683,6 +23691,44 @@ mod tests {
         let rows = fixture.complete(&["allow", "docs/sub/"]);
         let deep = completion_values(&rows);
         assert_eq!(deep, ["docs/sub/deep.md"], "{deep:?}");
+
+        fixture.stop().await;
+    }
+
+    /// A symlinked directory is never offered, and neither is anything typed through
+    /// one: the verbs refuse a pattern spelled through a link, so a prefix that passes
+    /// through one at any depth lists nothing while the real directory still does.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_allow_lists_nothing_through_a_symlinked_directory_prefix() {
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-link-prefix").await;
+        let root = publish_share_root(&fixture.ctx, "rc-mesh-complete-link-prefix-root");
+        seed_share_files(&root.path, &["docs/a.md", "sub/notes.md", ".git/HEAD"]);
+        std::os::unix::fs::symlink("docs", root.path.join("dlink")).unwrap();
+        std::os::unix::fs::symlink("../docs", root.path.join("sub/dlink")).unwrap();
+        std::os::unix::fs::symlink(".git", root.path.join("glink")).unwrap();
+
+        for typed in ["dlink/", "dlink/a", "sub/dlink/", "glink/", "glink/HE"] {
+            assert!(
+                fixture.ctx.mesh_completion_share_paths(typed).is_empty(),
+                "{typed}: a prefix through a link offers no paths"
+            );
+        }
+        assert_eq!(
+            completion_values(&fixture.ctx.mesh_completion_share_paths("d")),
+            ["docs/"],
+            "the real directory is offered, the link beside it is not"
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["allow", "sub/"])),
+            ["sub/notes.md"]
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["allow", "docs/"])),
+            ["docs/a.md"]
+        );
 
         fixture.stop().await;
     }

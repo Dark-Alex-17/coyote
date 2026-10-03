@@ -1482,6 +1482,7 @@ fn allow(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             short(&destination)
         );
     }
+    refuse_git_directory_pattern(&pattern)?;
     refuse_directory_pattern(&pattern, "share what is under it with")?;
     validate_pattern(&pattern)?;
     let peer = peer.as_deref().map(canonical_peer).transpose()?;
@@ -1489,12 +1490,10 @@ fn allow(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         validate_override(&pattern)?;
     }
     let (root, mut set, case_insensitive) = writable_share_set(ctx)?;
-    refuse_existing_directory(&root, &pattern, "share what is under it with")?;
     if let Some(head) = set.protected_head(&pattern) {
-        bail!(
-            "`{pattern}` is under `{head}/`, which is never shared, not even with `--force`; nothing was written."
-        );
+        bail!(never_shared_sentence(&pattern, &head, "allow"));
     }
+    refuse_existing_directory(&root, &pattern, "share what is under it with")?;
     refuse_link_in_pattern(
         &root,
         &set,
@@ -1670,15 +1669,14 @@ fn deny(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             short(&destination)
         );
     }
+    refuse_git_directory_pattern(&pattern)?;
     refuse_directory_pattern(&pattern, "keep what is under it back with")?;
     validate_pattern(&pattern)?;
     let (root, mut set, case_insensitive) = writable_share_set(ctx)?;
-    refuse_existing_directory(&root, &pattern, "keep what is under it back with")?;
     if let Some(head) = set.protected_head(&pattern) {
-        bail!(
-            "`{pattern}` is under `{head}/`, which is never shared, so no deny is needed; nothing was written."
-        );
+        bail!(never_shared_sentence(&pattern, &head, "deny"));
     }
+    refuse_existing_directory(&root, &pattern, "keep what is under it back with")?;
     refuse_link_in_pattern(
         &root,
         &set,
@@ -2135,6 +2133,16 @@ fn refuse_directory_pattern(pattern: &str, does: &str) -> Result<()> {
     Ok(())
 }
 
+/// `.git/` spelled the directory way is refused outright: the glob it would be taught is
+/// refused the same way. `unshare` keeps the teaching, since a rule under `.git/**` an
+/// older file holds can still be removed.
+fn refuse_git_directory_pattern(pattern: &str) -> Result<()> {
+    if pattern.ends_with('/') && pattern.split('/').next() == Some(".git") {
+        bail!("`.git/` is never shared; nothing was written.");
+    }
+    Ok(())
+}
+
 /// A bare directory name passes every pattern check, matches no file and would write a
 /// rule that can never serve one; the root is known only once the share set is loaded.
 fn refuse_existing_directory(root: &Path, pattern: &str, does: &str) -> Result<()> {
@@ -2153,10 +2161,21 @@ fn directory_sentence(pattern: &str, does: &str) -> String {
     )
 }
 
+fn never_shared_sentence(pattern: &str, head: &str, verb: &str) -> String {
+    let reason = if verb == "deny" {
+        "so no deny is needed"
+    } else {
+        "not even with `--force`"
+    };
+    format!("`{pattern}` is under `{head}/`, which is never shared, {reason}; nothing was written.")
+}
+
 /// Allow and the walk judge a file by the path it resolves to and never enter a linked
 /// directory, so a pattern that spells a link — whole, or as a literal leading segment —
 /// can serve nothing; the human is told the resolved path to name instead. A link to a
-/// file the built-in deny has a say over is left to `builtin_denies`, whose arms teach it.
+/// file the built-in deny has a say over is left to `allow`'s `builtin_denies` arms, which
+/// teach it; `deny` has none, so it refuses here. Nothing resolving into a protected
+/// directory is ever taught, since the verb would refuse the remedy.
 fn refuse_link_in_pattern(
     root: &Path,
     set: &ShareSet,
@@ -2188,13 +2207,17 @@ fn refuse_link_in_pattern(
         };
         let relative = canonical.strip_prefix(&canonical_root)?;
         let rest = &pattern[prefix.len()..];
+        if relative.as_os_str().is_empty() {
+            bail!(
+                "`{prefix}` is a link to the share root; leave it off the pattern, or name everything with `**`."
+            );
+        }
+        let relative = relative_text(relative);
+        if let Some(head) = set.protected_head(&relative) {
+            bail!(never_shared_sentence(pattern, &head, verb));
+        }
+        let resolved = shown_pattern(&relative);
         if canonical.is_dir() {
-            if relative.as_os_str().is_empty() {
-                bail!(
-                    "`{prefix}` is a link to the share root; leave it off the pattern, or name everything with `**`."
-                );
-            }
-            let resolved = shown_pattern(&relative_text(relative));
             if rest.is_empty() {
                 bail!(
                     "`{prefix}` is a link to `{resolved}`; {does} `{resolved}/**`, or one file by its path."
@@ -2204,11 +2227,23 @@ fn refuse_link_in_pattern(
                 "`{prefix}` is a link to `{resolved}`; name the path through it as `{resolved}{rest}`."
             );
         }
-        if rest.is_empty() && set.builtin_denies(pattern, case_insensitive)?.is_none() {
-            let resolved = shown_pattern(&relative_text(relative));
+        if !rest.is_empty() {
             bail!(
-                "`{prefix}` is a link to `{resolved}`; `.mesh {verb} {resolved}` names that file."
+                "`{prefix}` is a link to the file `{resolved}`, so nothing is under it; nothing was written."
             );
+        }
+        match set.builtin_denies(pattern, case_insensitive)? {
+            None => bail!(
+                "`{prefix}` is a link to `{resolved}`; `.mesh {verb} {resolved}` names that file."
+            ),
+            Some(_) if verb != "deny" => {}
+            Some(BuiltinHit::ByText | BuiltinHit::ByResolution { .. }) => bail!(
+                "`{prefix}` is a link to `{resolved}`, which the built-in deny already holds back; nothing to deny."
+            ),
+            Some(BuiltinHit::LinkNamedLikeASecret { .. }) => bail!(
+                "`{prefix}` is a link to `{resolved}`; `.mesh deny {resolved}` keeps that file back."
+            ),
+            Some(BuiltinHit::UnresolvableLink) => bail!(dead_link_sentence(&link, prefix)),
         }
     }
     Ok(())
@@ -13294,6 +13329,186 @@ mod tests {
                         );
                         assert!(!fx.locations.global.exists());
                         assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
+                        fx.stop().await;
+                    });
+                }
+
+                /// A protected directory is an existing directory too, so the protected
+                /// refusal has to come first: teaching `.git/**` would hand over a pattern
+                /// the verb refuses. The trailing-slash spelling is refused before the gate.
+                #[test]
+                #[serial]
+                fn a_bare_protected_directory_is_refused_as_never_shared_not_taught_as_a_glob() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-bare-protected");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = ShareFixture::with_inbox(
+                            "repl-mesh-bare-protected",
+                            &[".git/HEAD", ".coyote/config.yaml", "inbox/fetched.md"],
+                            Some("inbox"),
+                        )
+                        .await;
+
+                        assert_eq!(
+                            refusal(&mut fx.ctx, ".mesh allow .git").await,
+                            "`.git` is under `.git/`, which is never shared, not even with `--force`; nothing was written."
+                        );
+                        assert_eq!(
+                            refusal(&mut fx.ctx, ".mesh deny .coyote").await,
+                            "`.coyote` is under `.coyote/`, which is never shared, so no deny is needed; nothing was written."
+                        );
+                        assert_eq!(
+                            refusal(&mut fx.ctx, ".mesh allow inbox").await,
+                            "`inbox` is under `inbox/`, which is never shared, not even with `--force`; nothing was written."
+                        );
+                        for line in [
+                            ".mesh allow .git/",
+                            ".mesh deny .git/",
+                            ".mesh allow .git/hooks/",
+                        ] {
+                            assert_eq!(
+                                refusal(&mut fx.ctx, line).await,
+                                "`.git/` is never shared; nothing was written.",
+                                "{line}"
+                            );
+                        }
+                        assert_eq!(
+                            refusal(&mut fx.ctx, ".mesh unshare .git/").await,
+                            "`.git/` names a directory; name what is under it with `.git/**`, or one file by its path.",
+                            "a legacy rule under `.git/**` is still removable, so unshare keeps the teaching"
+                        );
+                        assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
+                        assert!(!fx.locations.global.exists());
+                        assert!(!fx.locations.workspace.exists());
+                        fx.stop().await;
+                    });
+                }
+
+                /// A link resolving anywhere under `.git` is as unshareable as `.git`
+                /// itself, whether it lands on a directory below it or on one of its files,
+                /// so no remedy is taught: neither a re-rooted glob nor a forced allow.
+                #[test]
+                #[serial]
+                fn a_link_into_the_git_dir_is_refused_not_taught() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-link-into-git");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = ShareFixture::new(
+                            "repl-mesh-link-into-git",
+                            &[".git/config", ".git/hooks/pre-commit", "sub/.keep"],
+                        )
+                        .await;
+                        std::os::unix::fs::symlink(".git/hooks", fx.root.path.join("lnk")).unwrap();
+                        std::os::unix::fs::symlink(".git/config", fx.root.path.join("cfg"))
+                            .unwrap();
+                        std::os::unix::fs::symlink("../.git/config", fx.root.path.join("sub/cfg"))
+                            .unwrap();
+
+                        for line in [
+                            ".mesh allow lnk/**",
+                            ".mesh allow lnk",
+                            ".mesh allow cfg --force --global",
+                            ".mesh allow cfg",
+                        ] {
+                            let pattern = line.split_whitespace().nth(2).unwrap();
+                            let head = pattern.split('/').next().unwrap();
+                            assert_eq!(
+                                refusal(&mut fx.ctx, line).await,
+                                format!(
+                                    "`{pattern}` is under `{head}/`, which is never shared, not even with `--force`; nothing was written."
+                                ),
+                                "{line}"
+                            );
+                        }
+                        assert_eq!(
+                            refusal(&mut fx.ctx, ".mesh allow sub/cfg --force --global").await,
+                            "`sub/cfg` is under `.git/`, which is never shared, not even with `--force`; nothing was written."
+                        );
+                        assert_eq!(
+                            refusal(&mut fx.ctx, ".mesh deny sub/cfg").await,
+                            "`sub/cfg` is under `.git/`, which is never shared, so no deny is needed; nothing was written."
+                        );
+                        assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
+                        assert!(fx.entries().is_empty());
+                        assert!(!fx.locations.global.exists());
+                        fx.stop().await;
+                    });
+                }
+
+                /// A deny is judged on the text a peer sends and on the resolved path, so a
+                /// deny naming a link to a secret adds nothing the built-in deny lacks, and
+                /// a deny of a secret-named link to a plain file would hold back only the
+                /// link's name; the real file is what to deny.
+                #[test]
+                #[serial]
+                fn deny_of_a_link_to_a_secret_or_a_secret_named_link_is_refused_naming_the_real_file()
+                 {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-deny-link-secret");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = ShareFixture::new(
+                            "repl-mesh-deny-link-secret",
+                            &["secrets/id_rsa", "docs/a.txt", "certs/.keep"],
+                        )
+                        .await;
+                        std::os::unix::fs::symlink("secrets/id_rsa", fx.root.path.join("s"))
+                            .unwrap();
+                        std::os::unix::fs::symlink(
+                            "../docs/a.txt",
+                            fx.root.path.join("certs/server.pem"),
+                        )
+                        .unwrap();
+
+                        assert_eq!(
+                            refusal(&mut fx.ctx, ".mesh deny s").await,
+                            "`s` is a link to `secrets/id_rsa`, which the built-in deny already holds back; nothing to deny."
+                        );
+                        assert_eq!(
+                            refusal(&mut fx.ctx, ".mesh deny certs/server.pem").await,
+                            "`certs/server.pem` is a link to `docs/a.txt`; `.mesh deny docs/a.txt` keeps that file back."
+                        );
+                        assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
+                        assert!(fx.entries().is_empty());
+                        assert!(!fx.locations.global.exists());
+
+                        let out = out_of(&mut fx.ctx, ".mesh deny docs/a.txt").await.unwrap();
+                        assert!(out.contains("written to"), "{out}");
+                        assert_eq!(fx.entries(), [deny_entry(Layer::Global, "docs/a.txt")]);
+                        fx.stop().await;
+                    });
+                }
+
+                /// Nothing sits under a file, so a pattern that continues past a link to
+                /// one can match nothing; both verbs say so rather than teach a path.
+                #[test]
+                #[serial]
+                fn a_file_link_with_a_tail_is_refused_for_allow_and_deny() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-file-link-tail");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx =
+                            ShareFixture::new("repl-mesh-file-link-tail", &["docs/a.md"]).await;
+                        std::os::unix::fs::symlink("docs/a.md", fx.root.path.join("flink"))
+                            .unwrap();
+
+                        for line in [
+                            ".mesh allow flink/*",
+                            ".mesh deny flink/**",
+                            ".mesh allow flink/x.md --force --global",
+                        ] {
+                            assert_eq!(
+                                refusal(&mut fx.ctx, line).await,
+                                "`flink` is a link to the file `docs/a.md`, so nothing is under it; nothing was written.",
+                                "{line}"
+                            );
+                        }
+                        assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
+                        assert!(fx.entries().is_empty());
+                        assert!(!fx.locations.global.exists());
                         fx.stop().await;
                     });
                 }
