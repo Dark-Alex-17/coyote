@@ -5355,23 +5355,27 @@ impl RequestContext {
     /// `.git`, the workspace config directory, anything the built-in deny names, every
     /// directory the walk skips and every symlink, since the walk judges files by their
     /// real path and a rule naming the link would serve none. Local filesystem and the
-    /// published snapshot only; nothing reaches the wire or the trust store. Empty for a
-    /// directory prefix the verbs would refuse as a pattern or that passes through a
-    /// symlink, and for a root the node could not probe, since it serves nothing from
-    /// it; sorted and cut at 200.
+    /// published snapshot only; nothing reaches the wire or the trust store, and nothing
+    /// is written under the root: case is judged by the node's memoised probe when it
+    /// has one and by the read-only hint otherwise. Empty for a directory prefix the
+    /// verbs would refuse as a pattern or that passes through a symlink, and for a root
+    /// whose probe failed, since the node serves nothing from it; sorted and cut at 200.
     fn mesh_completion_share_paths(&self, typed: &str) -> Vec<(String, Option<String>)> {
-        use crate::mesh::shares::{CompletionFilter, validate_pattern};
+        use crate::mesh::shares::{CompletionFilter, case_folding_hint, validate_pattern};
 
         let Some((root, locations)) = self.share_locations() else {
             return Vec::new();
         };
-        let Some(case_insensitive) = self
+        let case_insensitive = match self
             .app
             .mesh
             .get()
-            .and_then(|runtime| runtime.serving().case_insensitive_for(&root))
-        else {
-            return Vec::new();
+            .and_then(|runtime| runtime.serving().probed_case_for(&root))
+        {
+            Some(Some(folds)) => folds,
+            Some(None) => return Vec::new(),
+            // When the hint cannot tell, judge across case: the direction that hides more.
+            None => case_folding_hint(&root).unwrap_or(true),
         };
         if typed.starts_with('/')
             || typed.contains('\\')
@@ -6680,6 +6684,8 @@ mod tests {
         AgentExitStatus, AgentHandle, AgentResult, JobHandle, JobResult, JobState, JobStatus,
     };
     use crate::testing::EnvVarGuard;
+    #[cfg(unix)]
+    use crate::testing::{install_log_collector, warn_snapshot};
     use crate::utils;
     use crate::utils::get_env_name;
     use crate::vault::Vault;
@@ -23405,6 +23411,75 @@ mod tests {
         fixture.stop().await;
     }
 
+    /// Completion is read-only: it never runs the case probe, which writes a marker file
+    /// under the root and memoises a failure that turns sharing off; the verbs still do.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_allow_never_probes_the_share_root() {
+        install_log_collector();
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-allow-no-probe").await;
+        let root = publish_share_root(&fixture.ctx, "rc-mesh-complete-allow-no-probe-root");
+        seed_share_files(&root.path, &["README.md", "docs/a.md"]);
+        let serving = fixture.started.runtime.serving();
+        let listing = || {
+            let mut names: Vec<String> = fs::read_dir(&root.path)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect();
+            names.sort_unstable();
+            names
+        };
+        let sharing_off_warns = || {
+            warn_snapshot()
+                .iter()
+                .filter(|line| line.starts_with("Mesh file sharing is off for this workspace"))
+                .count()
+        };
+        let listing_before = listing();
+        let warns_before = sharing_off_warns();
+        assert_eq!(serving.probed_case_for(&root.path), None, "a fresh root");
+
+        let rows = fixture.complete(&["allow", ""]);
+        let values = completion_values(&rows);
+
+        assert!(
+            values.starts_with(&["README.md", "docs/"]),
+            "the paths are offered without a probe: {values:?}"
+        );
+        assert_eq!(
+            serving.probed_case_for(&root.path),
+            None,
+            "completion left the root unprobed"
+        );
+        let listing_after = listing();
+        assert_eq!(
+            listing_after, listing_before,
+            "completion added nothing to the root"
+        );
+        assert!(
+            !listing_after
+                .iter()
+                .any(|name| name.starts_with(".coyote-case-probe-")),
+            "{listing_after:?}"
+        );
+        assert_eq!(
+            sharing_off_warns(),
+            warns_before,
+            "completion warned of nothing"
+        );
+
+        let probed = serving.case_insensitive_for(&root.path);
+        assert!(probed.is_some(), "the verbs' probe still runs: {probed:?}");
+        assert!(
+            matches!(serving.probed_case_for(&root.path), Some(Some(_))),
+            "and is memoised"
+        );
+
+        fixture.stop().await;
+    }
+
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
@@ -23825,8 +23900,9 @@ mod tests {
         fixture.stop().await;
     }
 
-    /// The node serves nothing from a root it could not probe, so the completer offers
-    /// nothing from it either rather than paths the verb then refuses.
+    /// The node serves nothing from a root whose probe failed, so once the verbs have
+    /// memoised that failure the completer offers nothing from it either rather than
+    /// paths the verb then refuses.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
@@ -23845,6 +23921,15 @@ mod tests {
             fixture.stop().await;
             return;
         }
+        assert_eq!(
+            fixture
+                .started
+                .runtime
+                .serving()
+                .case_insensitive_for(&root.path),
+            None,
+            "the probe fails against the read-only root"
+        );
 
         let rows = fixture.complete(&["allow", ""]);
         let values = completion_values(&rows);

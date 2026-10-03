@@ -169,6 +169,16 @@ impl FetchServing {
         answer
     }
 
+    /// The memoised probe answer for `root`, never probing: `None` when `root` has not
+    /// been probed, `Some(None)` when its probe failed, `Some(Some(folds))` otherwise.
+    pub(crate) fn probed_case_for(&self, root: &Path) -> Option<Option<bool>> {
+        let probe = self.probe.lock();
+        match probe.as_ref() {
+            Some((probed, answer)) if probed == root => Some(*answer),
+            _ => None,
+        }
+    }
+
     /// Where the share lists for `root` live, with the cache and any configured inbox
     /// protected from serving.
     pub(crate) fn share_locations(&self, root: &Path) -> ShareLocations {
