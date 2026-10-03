@@ -18270,6 +18270,424 @@ mod tests {
                         assert!(violations.is_empty(), "{}", violations.join("\n"));
                     });
                 }
+
+                /// Usage probe r9 (a)/(f): "a pattern any of whose literal segments is
+                /// `.git` (at ANY depth)" is refused by the verbs — including a literal
+                /// `.git` segment that sits BEHIND a glob segment (`vendor/*/.git/HEAD`,
+                /// `**/.git/**`). Such a rule can never serve anything (the walk never
+                /// enters `.git` and the built-in deny holds the exact file back), so the
+                /// alternative is a dead rule written after "matches 0 file(s)" — or, for
+                /// the broad spelling, a confirmation question about sharing nothing.
+                #[test]
+                #[serial]
+                fn usage_probe_a_literal_git_segment_behind_a_glob_is_refused_not_written_dead() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-git-behind-glob");
+                    let _capture = capture::install();
+                    // A question about sharing "0 files" under `.git` is itself a violation.
+                    let _script = prompt_script::install_answering(|_| false);
+                    run_async(async {
+                        let mut fx = ShareFixture::new(
+                            "repl-mesh-probe-git-behind-glob",
+                            &[
+                                "vendor/dep/.git/HEAD",
+                                "vendor/dep/.git/hooks/pre-commit",
+                                "vendor/dep/src/lib.rs",
+                                "docs/a.md",
+                            ],
+                        )
+                        .await;
+
+                        let mut violations = Vec::new();
+                        for line in [
+                            ".mesh allow vendor/*/.git/HEAD",
+                            ".mesh allow vendor/*/.git/**",
+                            ".mesh allow */.git/config",
+                            ".mesh allow **/.git/HEAD",
+                            ".mesh deny vendor/*/.git/hooks/*",
+                            ".mesh deny **/.git/**",
+                            ".mesh allow vendor/*/.git/HEAD --dry-run",
+                        ] {
+                            let before = stdout_lines().len();
+                            match out_of(&mut fx.ctx, line).await {
+                                Ok(out) => violations
+                                    .push(format!("{line}: accepted instead of refused: {out:?}")),
+                                Err(err) => {
+                                    let err = err.to_string();
+                                    if !err.contains("never shared") {
+                                        violations.push(format!(
+                                            "{line}: not refused as never shared: {err}"
+                                        ));
+                                    }
+                                }
+                            }
+                            let printed = &stdout_lines()[before..];
+                            if !printed.is_empty() {
+                                violations.push(format!("{line}: printed {printed:?}"));
+                            }
+                        }
+                        if prompt_script::prompts_asked() != 0 {
+                            violations.push(format!(
+                                "{} question(s) asked about a pattern under .git",
+                                prompt_script::prompts_asked()
+                            ));
+                        }
+                        if !fx.entries().is_empty() {
+                            violations.push(format!("a rule was written: {:?}", fx.entries()));
+                            // Severity oracle for the report: does the written glob allow
+                            // serve a `.git` file on the wire, or is it merely dead?
+                            let identity = "1a".repeat(16);
+                            let destination = "2b".repeat(16);
+                            let peer = PeerRef {
+                                identity: &identity,
+                                destination: &destination,
+                            };
+                            let set = ShareSet::load_quietly(fx.locations.clone()).0;
+                            for wire in ["vendor/dep/.git/HEAD", "vendor/dep/.git/hooks/pre-commit"]
+                            {
+                                violations.push(format!(
+                                    "wire oracle: is_allowed({wire}) = {}",
+                                    set.is_allowed(&peer, wire, false)
+                                ));
+                            }
+                        }
+                        // The ordinary glob beside it is untouched by the check, and the
+                        // walk it counts never enters the nested `.git`.
+                        let out = out_of(&mut fx.ctx, ".mesh allow vendor/*/** --dry-run")
+                            .await
+                            .unwrap();
+                        assert!(out.contains("matches 1 file(s)"), "{out}");
+                        fx.stop().await;
+                        assert!(violations.is_empty(), "{}", violations.join("\n"));
+                    });
+                }
+
+                /// Usage probe r9 (a): the `.git` rule is SEGMENT EQUALITY, not a prefix
+                /// or substring test — `.gitignore`, `.github/**`, `foo.git/HEAD`,
+                /// `src/git/x.rs` and a `.coyote`-lookalike directory are ordinary paths
+                /// that the verbs accept with the right count, the trailing-slash form
+                /// teaches `<dir>/**` as for any directory, and the same lookalikes
+                /// are offered by the completer. A configured inbox `inbox` protects
+                /// nothing named `inbox2`.
+                #[test]
+                #[serial]
+                fn usage_probe_git_and_config_dir_lookalikes_are_ordinary_paths() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-lookalikes");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = ShareFixture::with_inbox(
+                            "repl-mesh-probe-lookalikes",
+                            &[
+                                ".gitignore",
+                                ".github/workflows/ci.yml",
+                                ".github/CODEOWNERS",
+                                "foo.git/HEAD",
+                                "src/git/x.rs",
+                                ".coyote-notes/a.md",
+                                "inbox2/kept.md",
+                                "inbox/fetched.md",
+                                ".git/HEAD",
+                            ],
+                            Some("inbox"),
+                        )
+                        .await;
+
+                        let mut violations = Vec::new();
+                        for (line, count) in [
+                            (".mesh allow .gitignore --dry-run", "matches 1 file(s)"),
+                            (".mesh allow .github/** --dry-run", "matches 2 file(s)"),
+                            (".mesh allow foo.git/HEAD --dry-run", "matches 1 file(s)"),
+                            (".mesh allow foo.git/** --dry-run", "matches 1 file(s)"),
+                            (".mesh allow src/git/x.rs --dry-run", "matches 1 file(s)"),
+                            (
+                                ".mesh allow .coyote-notes/** --dry-run",
+                                "matches 1 file(s)",
+                            ),
+                            (".mesh allow inbox2/** --dry-run", "matches 1 file(s)"),
+                            (".mesh deny .github/** --dry-run", "matches 2 file(s)"),
+                            (".mesh deny .gitignore --dry-run", "matches 1 file(s)"),
+                        ] {
+                            match out_of(&mut fx.ctx, line).await {
+                                Ok(out) => {
+                                    if !out.contains(count) || !out.contains("Would write to") {
+                                        violations.push(format!("{line}: {out:?}"));
+                                    }
+                                }
+                                Err(err) => violations.push(format!("{line}: refused: {err}")),
+                            }
+                        }
+                        // Trailing slash on a lookalike directory keeps the ordinary teaching.
+                        for (line, taught) in [
+                            (".mesh allow .github/", ".github/**"),
+                            (".mesh allow foo.git/", "foo.git/**"),
+                            (".mesh allow .coyote-notes/", ".coyote-notes/**"),
+                            (".mesh allow inbox2/", "inbox2/**"),
+                        ] {
+                            let err = refusal(&mut fx.ctx, line).await;
+                            if err.contains("never shared") || taught_pattern(&err) != taught {
+                                violations.push(format!("{line}: {err}"));
+                            }
+                        }
+                        // Bare lookalike directories likewise.
+                        for (line, taught) in [
+                            (".mesh allow .github", ".github/**"),
+                            (".mesh allow foo.git", "foo.git/**"),
+                            (".mesh allow inbox2", "inbox2/**"),
+                        ] {
+                            let err = refusal(&mut fx.ctx, line).await;
+                            if err.contains("never shared") || taught_pattern(&err) != taught {
+                                violations.push(format!("{line}: {err}"));
+                            }
+                        }
+                        // The completer offers the lookalikes and hides the real ones.
+                        let offered = fx.ctx.repl_complete(".mesh", &["allow", ""], "");
+                        let labels: Vec<&str> = offered.iter().map(|(v, _)| v.as_str()).collect();
+                        for want in [
+                            ".gitignore",
+                            ".github/",
+                            "foo.git/",
+                            ".coyote-notes/",
+                            "inbox2/",
+                        ] {
+                            if !labels.contains(&want) {
+                                violations.push(format!("completion omits {want}: {labels:?}"));
+                            }
+                        }
+                        for hidden in [".git/", "inbox/"] {
+                            if labels.contains(&hidden) {
+                                violations.push(format!("completion offers {hidden}: {labels:?}"));
+                            }
+                        }
+                        // One real write, to prove the lookalike is a rule like any other.
+                        let out = out_of(&mut fx.ctx, ".mesh allow .github/**").await.unwrap();
+                        assert!(out.contains("written to"), "{out}");
+                        assert_eq!(
+                            fx.entries(),
+                            [allow_entry(Layer::Global, ".github/**", None)]
+                        );
+                        let out = out_of(&mut fx.ctx, ".mesh shares --effective")
+                            .await
+                            .unwrap();
+                        assert!(out.contains(".github/workflows/ci.yml"), "{out}");
+                        assert!(!out.contains(".git/HEAD"), "{out}");
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        fx.stop().await;
+                        assert!(violations.is_empty(), "{}", violations.join("\n"));
+                    });
+                }
+
+                /// Usage probe r9 (a)/(c)/(f): a hand-placed (or pre-fix) row naming a
+                /// nested `.git` file is listed by `.mesh shares` with its file, and
+                /// `unshare` removes it — removal is the remedy, so the protected-directory
+                /// refusal the write verbs apply does not stand in its way; `--effective`
+                /// agrees with the wire path about the file (the engine honouring a
+                /// GLOBAL exact-file override under `.git/` is the recorded open user
+                /// decision, not asserted either way here). While the mesh is OFF the
+                /// no-slash spelling waits behind the gate (the protected head needs the
+                /// root), unlike the slash form, which is static.
+                #[test]
+                #[serial]
+                fn usage_probe_unshare_removes_a_hand_placed_nested_git_row_that_shares_lists() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-unshare-git-row");
+                    let _capture = capture::install();
+                    // Two holders (allow + override) in one file: unshare asks once.
+                    let _script = prompt_script::install(&[true]);
+                    run_async(async {
+                        let mut fx = ShareFixture::new(
+                            "repl-mesh-probe-unshare-git-row",
+                            &["vendor/dep/.git/HEAD", "docs/a.md"],
+                        )
+                        .await;
+                        fx.write_global(
+                            "version: 1\nallow:\n- pattern: vendor/dep/.git/HEAD\n- pattern: docs/**\noverride:\n- path: vendor/dep/.git/HEAD\n",
+                        );
+
+                        let out = out_of(&mut fx.ctx, ".mesh shares").await.unwrap();
+                        assert!(out.contains("vendor/dep/.git/HEAD"), "{out}");
+                        assert!(out.contains(&fx.global()), "{out}");
+
+                        let out = out_of(&mut fx.ctx, ".mesh shares --effective")
+                            .await
+                            .unwrap();
+                        assert!(out.contains("docs/a.md"), "{out}");
+                        let listed_fetchable = out
+                            .lines()
+                            .any(|line| line.trim() == "vendor/dep/.git/HEAD");
+                        let identity = "1a".repeat(16);
+                        let destination = "2b".repeat(16);
+                        let peer = PeerRef {
+                            identity: &identity,
+                            destination: &destination,
+                        };
+                        let wire = ShareSet::load_quietly(fx.locations.clone()).0.is_allowed(
+                            &peer,
+                            "vendor/dep/.git/HEAD",
+                            false,
+                        );
+                        assert_eq!(
+                            listed_fetchable, wire,
+                            "--effective must agree with the wire path: {out}"
+                        );
+
+                        let out = out_of(&mut fx.ctx, ".mesh unshare vendor/dep/.git/HEAD")
+                            .await
+                            .unwrap();
+                        assert!(
+                            out.contains("Removed") && out.contains("vendor/dep/.git/HEAD"),
+                            "{out}"
+                        );
+                        assert!(
+                            !fx.entries().iter().any(|entry| {
+                                matches!(&entry.kind, RawKind::Allow { pattern, .. } if pattern == "vendor/dep/.git/HEAD")
+                            }),
+                            "{:?}",
+                            fx.entries()
+                        );
+                        assert!(
+                            fx.entries()
+                                .contains(&allow_entry(Layer::Global, "docs/**", None)),
+                            "{:?}",
+                            fx.entries()
+                        );
+                        assert_eq!(
+                            prompt_script::prompts_asked(),
+                            1,
+                            "two holders in one file are confirmed once"
+                        );
+
+                        // Gone: a second unshare finds no holder and writes nothing.
+                        let entries = fx.entries();
+                        let err = refusal(&mut fx.ctx, ".mesh unshare vendor/dep/.git/HEAD").await;
+                        assert!(!err.contains("never shared"), "{err}");
+                        assert_eq!(fx.entries(), entries);
+                        fx.stop().await;
+                    });
+
+                    // Mesh OFF: the no-slash nested-`.git` spellings wait behind the gate;
+                    // the slash form does not.
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    for line in [
+                        ".mesh allow vendor/dep/.git/HEAD",
+                        ".mesh allow vendor/*/.git/HEAD",
+                        ".mesh deny vendor/dep/.git/hooks/*",
+                    ] {
+                        assert_eq!(err_of(&mut ctx, line), MESH_OFF, "{line}");
+                    }
+                    assert_ne!(err_of(&mut ctx, ".mesh allow vendor/dep/.git/"), MESH_OFF);
+                }
+
+                /// Usage probe r9 (a): a link to a directory that CONTAINS a nested `.git`
+                /// is an ordinary directory link — `allow dlink` / `dlink/**` teach the
+                /// resolved `vendor/dep/**` (links judged before the bare-directory
+                /// rule), the taught remedy is accepted and counts only what the walk
+                /// enters (never the `.git` below it), while spelling `.git` through the
+                /// link (`dlink/.git/HEAD`, with or without `--force`) is refused with no
+                /// remedy naming a path under `.git`.
+                #[test]
+                #[serial]
+                fn usage_probe_a_link_to_a_dir_holding_a_nested_git_is_taught_its_real_path_only() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-link-dir-with-git");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = ShareFixture::new(
+                            "repl-mesh-probe-link-dir-with-git",
+                            &[
+                                "vendor/dep/.git/HEAD",
+                                "vendor/dep/.git/hooks/pre-commit",
+                                "vendor/dep/src/lib.rs",
+                                "vendor/dep/README.md",
+                            ],
+                        )
+                        .await;
+                        let root = &fx.root.path;
+                        std::os::unix::fs::symlink("vendor/dep", root.join("dlink")).unwrap();
+
+                        let mut violations = Vec::new();
+                        for (line, taught) in [
+                            (".mesh allow dlink", "vendor/dep/**"),
+                            (".mesh allow dlink/**", "vendor/dep/**"),
+                            (".mesh deny dlink", "vendor/dep/**"),
+                            (".mesh allow dlink/src/*.rs", "vendor/dep/src/*.rs"),
+                            (".mesh allow dlink/README.md", "vendor/dep/README.md"),
+                        ] {
+                            match out_of(&mut fx.ctx, line).await {
+                                Ok(out) => violations.push(format!("{line}: accepted: {out:?}")),
+                                Err(err) => {
+                                    let err = err.to_string();
+                                    if taught_pattern(&err) != taught {
+                                        violations.push(format!(
+                                            "{line}: taught `{}`, expected `{taught}`: {err}",
+                                            taught_pattern(&err)
+                                        ));
+                                    }
+                                    if err.contains("dlink/**") {
+                                        violations.push(format!("{line}: names the link: {err}"));
+                                    }
+                                }
+                            }
+                        }
+                        // Through the link into the nested `.git`: refused, no remedy under it.
+                        for line in [
+                            ".mesh allow dlink/.git/HEAD",
+                            ".mesh allow dlink/.git/HEAD --force --global",
+                            ".mesh allow dlink/.git/**",
+                            ".mesh deny dlink/.git/hooks/*",
+                        ] {
+                            match out_of(&mut fx.ctx, line).await {
+                                Ok(out) => violations.push(format!("{line}: accepted: {out:?}")),
+                                Err(err) => {
+                                    let err = err.to_string();
+                                    if !err.contains("never shared") {
+                                        violations.push(format!("{line}: {err}"));
+                                    }
+                                    let remedy_under_git = err
+                                        .split('`')
+                                        .enumerate()
+                                        .filter(|(index, _)| index % 2 == 1)
+                                        .any(|(_, token)| {
+                                            token.starts_with(".mesh ") && token.contains(".git/")
+                                        });
+                                    if remedy_under_git {
+                                        violations
+                                            .push(format!("{line}: remedy under .git: {err}"));
+                                    }
+                                }
+                            }
+                        }
+                        // The taught remedies are accepted and the walk skips the `.git`.
+                        for (line, count) in [
+                            (".mesh allow vendor/dep/** --dry-run", "matches 2 file(s)"),
+                            (
+                                ".mesh allow vendor/dep/src/*.rs --dry-run",
+                                "matches 1 file(s)",
+                            ),
+                            (
+                                ".mesh allow vendor/dep/README.md --dry-run",
+                                "matches 1 file(s)",
+                            ),
+                        ] {
+                            match out_of(&mut fx.ctx, line).await {
+                                Ok(out) => {
+                                    if !out.contains(count) {
+                                        violations.push(format!("{line}: {out:?}"));
+                                    }
+                                }
+                                Err(err) => violations.push(format!("{line}: refused: {err}")),
+                            }
+                        }
+                        assert!(fx.entries().is_empty(), "{:?}", fx.entries());
+                        assert!(!fx.locations.global.exists());
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        assert!(
+                            stdout_lines().iter().all(|l| !l.contains("written to")),
+                            "{:?}",
+                            stdout_lines()
+                        );
+                        fx.stop().await;
+                        assert!(violations.is_empty(), "{}", violations.join("\n"));
+                    });
+                }
             }
         }
     }
