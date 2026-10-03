@@ -1495,6 +1495,14 @@ fn allow(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             "`{pattern}` is under `{head}/`, which is never shared, not even with `--force`; nothing was written."
         );
     }
+    refuse_link_in_pattern(
+        &root,
+        &set,
+        &pattern,
+        case_insensitive,
+        "allow",
+        "share what is under it with",
+    )?;
     let target = ShareTarget::of(&set, scope);
     refuse_symlink(&target.path)?;
     if force {
@@ -1518,6 +1526,9 @@ fn allow(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
                     "`{pattern}` is a link to `{resolved}`, which the built-in deny does not name, so there is nothing to lift; `.mesh allow {resolved}` shares that file."
                 )
             }
+            Some(BuiltinHit::UnresolvableLink) => {
+                bail!(dead_link_sentence(&root.join(&pattern), &pattern))
+            }
             None => bail!(
                 "`{pattern}` is not under the built-in deny, so there is nothing for `--force` to lift; drop `--force`."
             ),
@@ -1538,6 +1549,9 @@ fn allow(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
                 bail!(
                     "`{pattern}` is a link to `{resolved}`, which the built-in deny does not name; `.mesh allow {resolved}` shares that file."
                 )
+            }
+            Some(BuiltinHit::UnresolvableLink) => {
+                bail!(dead_link_sentence(&root.join(&pattern), &pattern))
             }
             None => {}
         }
@@ -1665,6 +1679,14 @@ fn deny(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             "`{pattern}` is under `{head}/`, which is never shared, so no deny is needed; nothing was written."
         );
     }
+    refuse_link_in_pattern(
+        &root,
+        &set,
+        &pattern,
+        case_insensitive,
+        "deny",
+        "keep what is under it back with",
+    )?;
     let target = ShareTarget::of(&set, scope);
     refuse_symlink(&target.path)?;
     let matches = describe_matches(&set, &pattern, &root, case_insensitive)?;
@@ -2129,6 +2151,89 @@ fn directory_sentence(pattern: &str, does: &str) -> String {
         "`{pattern}` names a directory; {does} `{}/**`, or one file by its path.",
         pattern.trim_end_matches('/')
     )
+}
+
+/// Allow and the walk judge a file by the path it resolves to and never enter a linked
+/// directory, so a pattern that spells a link — whole, or as a literal leading segment —
+/// can serve nothing; the human is told the resolved path to name instead. A link to a
+/// file the built-in deny has a say over is left to `builtin_denies`, whose arms teach it.
+fn refuse_link_in_pattern(
+    root: &Path,
+    set: &ShareSet,
+    pattern: &str,
+    case_insensitive: bool,
+    verb: &str,
+    does: &str,
+) -> Result<()> {
+    let Ok(canonical_root) = dunce::canonicalize(root) else {
+        return Ok(());
+    };
+    let mut end = 0;
+    for segment in pattern.split('/') {
+        if segment.contains(GLOB_METACHARACTERS) {
+            break;
+        }
+        end += segment.len();
+        let prefix = &pattern[..end];
+        end += '/'.len_utf8();
+        let link = root.join(prefix);
+        if !fs::symlink_metadata(&link).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            continue;
+        }
+        let Some(canonical) = dunce::canonicalize(&link)
+            .ok()
+            .filter(|canonical| canonical.starts_with(&canonical_root))
+        else {
+            bail!(dead_link_sentence(&link, prefix));
+        };
+        let relative = canonical.strip_prefix(&canonical_root)?;
+        let rest = &pattern[prefix.len()..];
+        if canonical.is_dir() {
+            if relative.as_os_str().is_empty() {
+                bail!(
+                    "`{prefix}` is a link to the share root; leave it off the pattern, or name everything with `**`."
+                );
+            }
+            let resolved = shown_pattern(&relative_text(relative));
+            if rest.is_empty() {
+                bail!(
+                    "`{prefix}` is a link to `{resolved}`; {does} `{resolved}/**`, or one file by its path."
+                );
+            }
+            bail!(
+                "`{prefix}` is a link to `{resolved}`; name the path through it as `{resolved}{rest}`."
+            );
+        }
+        if rest.is_empty() && set.builtin_denies(pattern, case_insensitive)?.is_none() {
+            let resolved = shown_pattern(&relative_text(relative));
+            bail!(
+                "`{prefix}` is a link to `{resolved}`; `.mesh {verb} {resolved}` names that file."
+            );
+        }
+    }
+    Ok(())
+}
+
+/// A link that resolves to nothing under the root can serve no fetch, so no rule through
+/// it can either: it dangles, or it lands outside the root.
+fn dead_link_sentence(link: &Path, prefix: &str) -> String {
+    if link.exists() {
+        format!(
+            "`{prefix}` is a link that leaves the share root, so no rule through it can share a file; nothing was written."
+        )
+    } else {
+        format!(
+            "`{prefix}` is a link to nothing, so no rule through it can share a file; nothing was written."
+        )
+    }
+}
+
+fn relative_text(relative: &Path) -> String {
+    relative
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// The share root and where its two files live, with the configured inbox protected
@@ -12910,6 +13015,120 @@ mod tests {
                     });
                 }
 
+                /// The walk never enters a linked directory, so a rule spelled through
+                /// one serves nothing; the refusal names the directory the link resolves
+                /// to, whole or with the rest of the pattern carried over.
+                #[test]
+                #[serial]
+                fn a_link_to_a_directory_teaches_the_resolved_directory_and_writes_nothing() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-dir-link");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = ShareFixture::new("repl-mesh-dir-link", &["docs/a.md"]).await;
+                        std::os::unix::fs::symlink("docs", fx.root.path.join("dlink")).unwrap();
+
+                        assert_eq!(
+                            refusal(&mut fx.ctx, ".mesh allow dlink").await,
+                            "`dlink` is a link to `docs`; share what is under it with `docs/**`, or one file by its path."
+                        );
+                        assert_eq!(
+                            refusal(&mut fx.ctx, ".mesh allow dlink/**").await,
+                            "`dlink` is a link to `docs`; name the path through it as `docs/**`."
+                        );
+                        assert_eq!(
+                            refusal(&mut fx.ctx, ".mesh deny dlink/*.md").await,
+                            "`dlink` is a link to `docs`; name the path through it as `docs/*.md`."
+                        );
+                        assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
+                        assert!(fx.entries().is_empty());
+                        assert!(!fx.locations.global.exists());
+
+                        let out = out_of(&mut fx.ctx, ".mesh allow docs/**").await.unwrap();
+                        assert!(out.contains("written to"), "{out}");
+                        assert_eq!(fx.entries(), [allow_entry(Layer::Global, "docs/**", None)]);
+                        fx.stop().await;
+                    });
+                }
+
+                /// Nothing can be fetched through a link that resolves to nothing under
+                /// the root, so an allow of one would be inert and an override of its
+                /// secret-like name would lift nothing; both are refused before the
+                /// built-in deny has a say.
+                #[test]
+                #[serial]
+                fn a_dangling_or_escaping_link_is_refused_even_with_force() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-dead-link");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = ShareFixture::new("repl-mesh-dead-link", &["docs/a.md"]).await;
+                        let elsewhere = TempDir::new("repl-mesh-dead-link-elsewhere");
+                        let real = elsewhere.path.join("real");
+                        fs::write(&real, "outside").unwrap();
+                        let env = fx.root.path.join(".env");
+
+                        std::os::unix::fs::symlink("missing", &env).unwrap();
+                        for line in [".mesh allow .env --force --global", ".mesh allow .env"] {
+                            assert_eq!(
+                                refusal(&mut fx.ctx, line).await,
+                                "`.env` is a link to nothing, so no rule through it can share a file; nothing was written.",
+                                "{line}"
+                            );
+                        }
+
+                        fs::remove_file(&env).unwrap();
+                        std::os::unix::fs::symlink(&real, &env).unwrap();
+                        for line in [".mesh allow .env --force --global", ".mesh deny .env"] {
+                            assert_eq!(
+                                refusal(&mut fx.ctx, line).await,
+                                "`.env` is a link that leaves the share root, so no rule through it can share a file; nothing was written.",
+                                "{line}"
+                            );
+                        }
+
+                        assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
+                        assert!(fx.entries().is_empty());
+                        assert!(!fx.locations.global.exists());
+                        fx.stop().await;
+                    });
+                }
+
+                /// An allow is judged on the resolved path, so an allow of a link to a
+                /// plain file would match nothing; the refusal teaches the allow of the
+                /// file itself, which the verb accepts.
+                #[test]
+                #[serial]
+                fn a_link_to_a_plain_file_teaches_the_plain_allow_of_the_real_file() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-file-link");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = ShareFixture::new("repl-mesh-file-link", &["README.md"]).await;
+                        std::os::unix::fs::symlink("README.md", fx.root.path.join("readme-link"))
+                            .unwrap();
+
+                        assert_eq!(
+                            refusal(&mut fx.ctx, ".mesh allow readme-link").await,
+                            "`readme-link` is a link to `README.md`; `.mesh allow README.md` names that file."
+                        );
+                        assert_eq!(
+                            refusal(&mut fx.ctx, ".mesh deny readme-link").await,
+                            "`readme-link` is a link to `README.md`; `.mesh deny README.md` names that file."
+                        );
+                        assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
+                        assert!(fx.entries().is_empty());
+
+                        let out = out_of(&mut fx.ctx, ".mesh allow README.md").await.unwrap();
+                        assert!(out.contains("written to"), "{out}");
+                        assert_eq!(
+                            fx.entries(),
+                            [allow_entry(Layer::Global, "README.md", None)]
+                        );
+                        fx.stop().await;
+                    });
+                }
+
                 #[test]
                 #[serial]
                 fn allow_force_under_the_workspace_layer_teaches_global() {
@@ -14936,7 +15155,8 @@ mod tests {
                 /// Usage probe: the match count a user confirms against counts regular files
                 /// the pattern reaches under the root — a symlinked directory is not followed
                 /// and `.git/` is never entered — so `**` over a tree of links stays small
-                /// and asks only because of its head.
+                /// and asks only because of its head; a pattern through the link is refused
+                /// rather than counted at zero and written.
                 #[cfg(unix)]
                 #[test]
                 #[serial]
@@ -14967,18 +15187,12 @@ mod tests {
                             )),
                             "{out}"
                         );
-                        let out = out_of(&mut fx.ctx, ".mesh allow linked/** --dry-run")
-                            .await
-                            .unwrap();
-                        assert!(out.contains("matches 0 file(s) under"), "{out}");
-                        assert!(out.ends_with(DRY_RUN_NOTHING_CHANGED), "{out}");
-
-                        // The linked tree is not served either.
-                        out_of(&mut fx.ctx, ".mesh allow linked/**").await.unwrap();
-                        let out = out_of(&mut fx.ctx, ".mesh shares --effective")
-                            .await
-                            .unwrap();
-                        assert!(!out.contains("linked/f"), "{out}");
+                        for line in [".mesh allow linked/** --dry-run", ".mesh allow linked/**"] {
+                            let err = refusal(&mut fx.ctx, line).await;
+                            assert!(err.contains("leaves the share root"), "{line}: {err}");
+                            assert!(!err.contains("matches"), "{line}: {err}");
+                        }
+                        assert!(fx.entries().is_empty());
                         assert_eq!(prompt_script::prompts_asked(), 0);
                         fx.stop().await;
                     });

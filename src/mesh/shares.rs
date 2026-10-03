@@ -298,7 +298,9 @@ pub(crate) struct MatchCount {
 /// Why the built-in deny names a relative file: by its text, which an override of that
 /// text lifts; by what it resolves to on disk, which an override of the text never
 /// reaches since overrides are judged on the resolved name; or by its text alone while
-/// it is a link to a file the deny does not name, so there is nothing to lift at all.
+/// it is a link to a file the deny does not name, so there is nothing to lift at all. A
+/// link named like a secret that resolves to nothing under the root is told apart too:
+/// no fetch through it can succeed, so an override of its text would lift nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BuiltinHit {
     ByText,
@@ -310,6 +312,7 @@ pub(crate) enum BuiltinHit {
         /// The `/`-separated path under the root the link resolved to.
         resolved: String,
     },
+    UnresolvableLink,
 }
 
 /// One entry as a share file holds it, with the layer it came from.
@@ -993,6 +996,9 @@ impl ShareSet {
         let builtin = self.builtin(case_insensitive)?;
         let by_text = builtin.is_match(path);
         let Some(resolved) = self.resolved_name(path) else {
+            if by_text && self.is_link(path) {
+                return Ok(Some(BuiltinHit::UnresolvableLink));
+            }
             return Ok(by_text.then_some(BuiltinHit::ByText));
         };
         let same_name = if case_insensitive {
@@ -1015,6 +1021,11 @@ impl ShareSet {
         let root = self.canonical_root().ok()?;
         let canonical = dunce::canonicalize(root.join(path)).ok()?;
         Some(segments_under(&root, &canonical)?.join("/"))
+    }
+
+    fn is_link(&self, path: &str) -> bool {
+        fs::symlink_metadata(self.locations.workspace_root.join(path))
+            .is_ok_and(|meta| meta.file_type().is_symlink())
     }
 }
 
@@ -3074,6 +3085,39 @@ mod tests {
                 resolved: "notes.txt".to_string()
             }),
             "a secret-like link name pointing at a plain file is told apart"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_secret_named_link_to_nothing_is_not_lift_able() {
+        let fx = Fixture::new("builtin-denies-dangling-link");
+        let set = fx.load();
+        std::os::unix::fs::symlink("missing", fx.root.join(".env")).unwrap();
+        std::os::unix::fs::symlink("missing", fx.root.join("settings")).unwrap();
+
+        assert_eq!(
+            set.builtin_denies(".env", false).unwrap(),
+            Some(BuiltinHit::UnresolvableLink)
+        );
+        assert_eq!(
+            set.builtin_denies("settings", false).unwrap(),
+            None,
+            "a dangling link the deny does not name is no business of the built-in layer"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_secret_named_link_that_leaves_the_root_is_not_lift_able() {
+        let fx = Fixture::new("builtin-denies-escaping-link");
+        let set = fx.load();
+        fs::write(fx._tmp.path.join("real"), "outside").unwrap();
+        fx.link(".env", "../real");
+
+        assert_eq!(
+            set.builtin_denies(".env", false).unwrap(),
+            Some(BuiltinHit::UnresolvableLink)
         );
     }
 
