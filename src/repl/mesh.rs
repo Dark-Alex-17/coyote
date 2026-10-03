@@ -1471,6 +1471,7 @@ fn allow(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         force,
     } = args;
     let (root, mut set, case_insensitive) = writable_share_set(ctx)?;
+    refuse_directory_pattern(&pattern, "share what is under it with")?;
     validate_pattern(&pattern)?;
     if let Some(head) = set.protected_head(&pattern) {
         bail!(
@@ -1593,6 +1594,7 @@ fn deny(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         );
     }
     let (root, mut set, case_insensitive) = writable_share_set(ctx)?;
+    refuse_directory_pattern(&pattern, "keep what is under it back with")?;
     validate_pattern(&pattern)?;
     if let Some(head) = set.protected_head(&pattern) {
         bail!(
@@ -1666,6 +1668,7 @@ fn unshare(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         ..
     } = args;
     let (root, mut set, case_insensitive) = writable_share_set(ctx)?;
+    refuse_directory_pattern(&pattern, "name what is under it with")?;
     let locations = set.locations().clone();
     let path_of = |layer: Layer| match layer {
         Layer::Global => locations.global.display(),
@@ -1971,6 +1974,15 @@ fn classify_share(args: MutationArgs, verb: &str) -> Result<Option<ShareArgs>> {
         peer: args.peer,
         force: args.force,
     }))
+}
+
+/// The completer offers a directory as `docs/`, which no share rule can hold, so the
+/// human hears what to type rather than that the pattern has an empty segment.
+fn refuse_directory_pattern(pattern: &str, does: &str) -> Result<()> {
+    if pattern.ends_with('/') {
+        bail!("`{pattern}` names a directory; {does} `{pattern}**`, or one file by its path.");
+    }
+    Ok(())
 }
 
 /// The share root and where its two files live, with the configured inbox protected
@@ -12624,6 +12636,37 @@ mod tests {
                             "`.git/**` is under `.git/`, which is never shared, so no deny is needed; nothing was written."
                         );
                         assert!(!fx.locations.global.exists());
+                        fx.stop().await;
+                    });
+                }
+
+                /// The completer's directory value is what a human most likely types next,
+                /// so the slash gets its own sentence rather than the empty-segment refusal.
+                #[test]
+                #[serial]
+                fn a_pattern_ending_in_a_slash_teaches_the_double_star_and_writes_nothing() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-trailing-slash");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx =
+                            ShareFixture::new("repl-mesh-trailing-slash", &["docs/a.md"]).await;
+
+                        assert_eq!(
+                            refusal(&mut fx.ctx, ".mesh allow docs/").await,
+                            "`docs/` names a directory; share what is under it with `docs/**`, or one file by its path."
+                        );
+                        assert_eq!(
+                            refusal(&mut fx.ctx, ".mesh deny docs/").await,
+                            "`docs/` names a directory; keep what is under it back with `docs/**`, or one file by its path."
+                        );
+                        assert_eq!(
+                            refusal(&mut fx.ctx, ".mesh unshare docs/").await,
+                            "`docs/` names a directory; name what is under it with `docs/**`, or one file by its path."
+                        );
+                        assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
+                        assert!(!fx.locations.global.exists());
+                        assert!(!fx.locations.workspace.exists());
                         fx.stop().await;
                     });
                 }
