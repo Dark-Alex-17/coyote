@@ -6190,6 +6190,39 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn open_attachment_refuses_a_symlink_at_the_open_not_only_at_the_pre_check() {
+        let tmp = crate::mesh::test_support::TempDir::new("repl-attach-open-nofollow");
+        let target = tmp.path.join("notes.md");
+        fs::write(&target, b"# notes\n").unwrap();
+        let link = tmp.path.join("link.md");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let err = open_attachment(&link).unwrap_err();
+        let io = err
+            .downcast_ref::<std::io::Error>()
+            .expect("the open itself fails, before any read");
+        assert_eq!(io.raw_os_error(), Some(libc::ELOOP), "{err:#}");
+        assert!(
+            format!("{err:#}").contains(&format!("Failed to read '{}'", link.display())),
+            "{err:#}"
+        );
+
+        let (file, metadata) = open_attachment(&target).unwrap();
+        assert!(metadata.is_file());
+        assert_eq!(metadata.len(), 8);
+        assert!(
+            opened_the_judged_file(&metadata, &target),
+            "the handle is the judged file"
+        );
+        assert!(
+            !opened_the_judged_file(&metadata, &tmp.path.join("absent.md")),
+            "a judged path that is not the opened file is not vouched for"
+        );
+        drop(file);
+    }
+
+    #[test]
     fn attach_is_lifted_from_around_the_quoted_text_and_never_from_inside_it() {
         let (attach, rest) = take_attach("\"see this\" --attach docs/notes.md", "reply").unwrap();
         let attach = attach.unwrap();
@@ -21265,6 +21298,106 @@ mod tests {
                         fx.stop().await;
                     });
                 }
+
+                /// Usage probe (R8 is a `grant` pre-flight only): a request naming a
+                /// denied path can still be REFUSED, the peer hears `access denied`, the
+                /// record closes and no grant or share row appears.
+                #[test]
+                #[serial]
+                fn usage_probe_refuse_still_decides_a_request_grant_would_not_serve() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-refuse-unservable");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-refuse-unservable").await;
+                        let root = fx.root.path.clone();
+                        fs::create_dir_all(root.join("docs")).unwrap();
+                        fs::write(root.join("docs/private.md"), "private").unwrap();
+                        fs::create_dir_all(root.join(".git")).unwrap();
+                        fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+                        out_of(&mut fx.ctx, ".mesh deny docs/private.md --yes")
+                            .await
+                            .unwrap();
+                        let (_, locations) = share_locations(&fx.ctx).unwrap();
+                        let before = ShareSet::load_quietly(locations.clone()).0.entries();
+                        fx.file(
+                            "a-1",
+                            InboundKind::Access,
+                            &["docs/private.md", ".git/HEAD"],
+                        );
+                        assert!(
+                            refusal(&mut fx.ctx, ".mesh grant a-1")
+                                .await
+                                .contains("would not be served even once granted")
+                        );
+
+                        let out = out_of(&mut fx.ctx, ".mesh refuse a-1").await.unwrap();
+
+                        assert!(out.contains("Refused a-1: 2 paths"), "{out}");
+                        assert_eq!(fx.heard(), "access denied: 2 paths");
+                        assert!(fx.pending_ids().is_empty());
+                        assert!(fx.grants().is_empty());
+                        assert_eq!(ShareSet::load_quietly(locations).0.entries(), before);
+                        fx.stop().await;
+                    });
+                }
+
+                /// Usage probe (R8: `.mesh grant`/`--standing` "judge every requested path
+                /// the same way" as a reference, which is refused above
+                /// `FetchServing::serving_limit()`): a requested file this node would answer
+                /// `too_large` is not granted either, one-off or standing; the request stays
+                /// pending, the peer hears nothing and no grant or share row is written. A
+                /// sibling request for a file at the limit is granted.
+                ///
+                /// RED at 72f59c3: `.mesh grant a-1` grants both paths ("Granted a-1: 2 paths
+                /// … each fetchable once"); the peer's fetch of `big.bin` would answer `too_large`.
+                #[test]
+                #[serial]
+                fn usage_probe_grant_judges_a_requested_file_above_the_serving_limit_like_a_reference()
+                 {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-grant-too-large");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx =
+                            PeerFixture::with_config("repl-mesh-grant-too-large", |config| {
+                                config.fetch.inline_max_bytes = 1024;
+                                config.fetch.max_bytes = 2048;
+                            })
+                            .await;
+                        let root = fx.root.path.clone();
+                        fs::write(root.join("big.bin"), vec![0x5A; 2049]).unwrap();
+                        fs::write(root.join("fits.bin"), vec![0x5A; 2048]).unwrap();
+                        let (_, locations) = share_locations(&fx.ctx).unwrap();
+                        let before = ShareSet::load_quietly(locations.clone()).0.entries();
+                        fx.file("a-1", InboundKind::Access, &["fits.bin", "big.bin"]);
+                        fx.file("a-2", InboundKind::Access, &["fits.bin"]);
+
+                        for line in [".mesh grant a-1", ".mesh grant a-1 --standing"] {
+                            let printed = stdout_lines().len();
+                            let err = refusal(&mut fx.ctx, line).await;
+                            assert!(
+                                err.starts_with("`big.bin` would not be served even once granted (")
+                                    && err.ends_with("); refuse the request with `.mesh refuse a-1`, or lift the rule first."),
+                                "{line}: {err}"
+                            );
+                            assert_eq!(stdout_lines().len(), printed, "{line} prints nothing");
+                        }
+                        assert!(fx.stub.seen().is_empty(), "{:?}", fx.stub.seen());
+                        assert!(fx.grants().is_empty(), "{:?}", fx.grants());
+                        assert_eq!(ShareSet::load_quietly(locations).0.entries(), before);
+                        let mut ids = fx.pending_ids();
+                        ids.sort();
+                        assert_eq!(ids, ["a-1", "a-2"]);
+
+                        let out = out_of(&mut fx.ctx, ".mesh grant a-2").await.unwrap();
+
+                        assert!(out.contains("Granted a-2: 1 path"), "{out}");
+                        assert_eq!(fx.grants().len(), 1, "{:?}", fx.grants());
+                        assert_eq!(fx.pending_ids(), ["a-1"]);
+                        fx.stop().await;
+                    });
+                }
             }
 
             mod attach {
@@ -21989,6 +22122,418 @@ mod tests {
                             "{out}"
                         );
                         fx.stop().await;
+                    });
+                }
+
+                /// Usage probe (R2): while a live envoy run holds the question, `--attach`
+                /// is refused with the one sentence, for a reference-size file too, so no
+                /// one-off grant is lent for an answer that never went; the question stays
+                /// pending and nothing reaches the peer or the envoy. A plain answer on the
+                /// held question is not refused by that sentence, and once the hold lapses
+                /// the same `--attach` line answers.
+                #[test]
+                #[serial]
+                fn usage_probe_attach_is_refused_while_the_envoy_holds_the_question_and_lends_nothing()
+                 {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-attach-held");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::with_config(
+                            "repl-mesh-attach-held",
+                            with_inline_max(1024),
+                        )
+                        .await;
+                        let big = vec![0x5A; 1025];
+                        write(&fx.root.path, "big.bin", &big);
+                        write(&fx.root.path, "docs/notes.md", NOTES);
+                        fx.file("q-1", InboundKind::Question, &[]);
+                        fx.file("q-2", InboundKind::Question, &[]);
+                        let envoy = RecordingEnvoy::new(true, true);
+                        *envoy.held.lock() = Some("q-1".to_string());
+                        fx.ctx
+                            .app
+                            .mesh
+                            .set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
+                        let expected = "`q-1` is being answered by the envoy right now; answer without `--attach`, or wait for its hold to lapse.";
+
+                        for line in [
+                            ".mesh answer q-1 \"x\" --attach big.bin",
+                            ".mesh answer q-1 \"x\" --attach docs/notes.md",
+                        ] {
+                            let printed = stdout_lines().len();
+                            assert_eq!(refusal(&mut fx.ctx, line).await, expected, "{line}");
+                            // Observed at 72f59c3 (advisory, not pinned): the refusal is
+                            // preceded by "Sending your answer to … over the mesh..." and
+                            // the attaching notice, which for the reference form reads
+                            // "<peer> may fetch it once within 15m" although nothing is
+                            // lent or sent. Only the lend claim is pinned false here.
+                            let since: Vec<String> = stdout_lines()[printed..].to_vec();
+                            assert!(
+                                since.iter().all(|line| !line.starts_with("Answered")),
+                                "{line}: {since:?}"
+                            );
+                            assert!(
+                                fx.grants().is_empty(),
+                                "{line}: a grant was lent for an answer that was refused: {:?}",
+                                fx.grants()
+                            );
+                        }
+                        assert!(
+                            fx.grants().is_empty(),
+                            "no grant is lent for an answer that never went: {:?}",
+                            fx.grants()
+                        );
+                        assert!(fx.stub.seen().is_empty(), "{:?}", fx.stub.seen());
+                        assert!(envoy.answers.lock().is_empty());
+                        let mut ids = fx.pending_ids();
+                        ids.sort();
+                        assert_eq!(ids, ["q-1", "q-2"]);
+
+                        // Another question the run does not hold attaches as before.
+                        let out = out_of(&mut fx.ctx, ".mesh answer q-2 \"y\" --attach big.bin")
+                            .await
+                            .unwrap();
+                        assert!(
+                            out.lines().any(|line| line
+                                == reference_line("big.bin", 1025, &fx.stub.destination_hex())),
+                            "{out}"
+                        );
+                        assert_eq!(fx.grants().len(), 1, "{:?}", fx.grants());
+                        assert_eq!(fx.pending_ids(), ["q-1"]);
+
+                        // A plain answer on the held question is not refused by that
+                        // sentence: it goes the envoy's way.
+                        let out = out_of(&mut fx.ctx, ".mesh answer q-1 \"plain\"")
+                            .await
+                            .unwrap();
+                        assert!(!out.contains("being answered by the envoy"), "{out}");
+                        assert_eq!(
+                            envoy.answers.lock().as_slice(),
+                            [("q-1".to_string(), "plain".to_string())]
+                        );
+
+                        // Once the hold lapses the same `--attach` line answers.
+                        envoy.held.lock().take();
+                        let out =
+                            out_of(&mut fx.ctx, ".mesh answer q-1 \"x\" --attach docs/notes.md")
+                                .await
+                                .unwrap();
+                        assert!(out.ends_with("Answered q-1."), "{out}");
+                        assert!(fx.pending_ids().is_empty());
+                        let seen = fx.stub.seen();
+                        assert_eq!(seen.len(), 2, "{seen:?}");
+                        assert_eq!(seen[1].parts, [inline_part("docs/notes.md", NOTES)]);
+                        fx.stop().await;
+                    });
+                }
+
+                mod lend_gate {
+                    use crate::mesh::message::{from_r3_body, received_reply};
+                    use crate::mesh::test_support::{AdmittedRequest, Handler, RefusalCode, Reply};
+                    use async_trait::async_trait;
+                    use parking_lot::Mutex;
+                    use std::sync::atomic::{AtomicBool, Ordering};
+
+                    /// Refuses every `/message` while `armed`; afterwards acknowledges
+                    /// each body by id as a peer's slot would, keeping what it heard.
+                    #[derive(Default)]
+                    pub(super) struct Gate {
+                        pub(super) armed: AtomicBool,
+                        pub(super) heard: Mutex<Vec<String>>,
+                    }
+
+                    #[async_trait]
+                    impl Handler for Gate {
+                        async fn handle(&self, request: AdmittedRequest) -> Reply {
+                            if self.armed.load(Ordering::SeqCst) {
+                                return Reply::Code(RefusalCode::Throttled);
+                            }
+                            match from_r3_body(&request.body) {
+                                Ok(body) => {
+                                    self.heard.lock().push(body.content.clone());
+                                    Reply::Value(received_reply(&body.id))
+                                }
+                                Err(_) => Reply::Code(RefusalCode::InvalidData),
+                            }
+                        }
+                    }
+                }
+
+                /// Usage probe (R3, "a failed `--attach` reference lend also revokes its
+                /// grant"): the peer refuses the message that carried the reference, so the
+                /// one-off grant lent for it is taken back on both `answer` and `reply`, the
+                /// question stays pending, the human reads one line that is the send's and
+                /// not "the grant stands", and the retry once the peer takes it lends once.
+                #[test]
+                #[serial]
+                fn usage_probe_a_reference_lend_the_peer_refuses_takes_the_grant_back_and_keeps_the_question()
+                 {
+                    use crate::mesh::test_support::{Handler, MESSAGE_PATH};
+                    use lend_gate::Gate;
+                    use std::sync::atomic::Ordering;
+
+                    let _guard = TestConfigDirGuard::new("repl-mesh-attach-lend-unsent");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::with_config(
+                            "repl-mesh-attach-lend-unsent",
+                            with_inline_max(1024),
+                        )
+                        .await;
+                        let gate = Arc::new(Gate::default());
+                        gate.armed.store(true, Ordering::SeqCst);
+                        fx.stub
+                            .serve(MESSAGE_PATH, gate.clone() as Arc<dyn Handler>);
+                        let big = vec![0x5A; 1025];
+                        write(&fx.root.path, "big.bin", &big);
+                        fx.file("q-1", InboundKind::Question, &[]);
+                        let to = fx.stub.destination_hex();
+
+                        for line in [
+                            ".mesh answer q-1 \"x\" --attach big.bin".to_string(),
+                            format!(".mesh reply {to} --yes \"x\" --attach big.bin"),
+                        ] {
+                            let err = refusal(&mut fx.ctx, &line).await;
+                            assert_eq!(err.lines().count(), 1, "{line}: {err}");
+                            assert!(
+                                !err.contains("stands until")
+                                    && !err.contains("could not be taken back"),
+                                "the grant is taken back, silently: {err}"
+                            );
+                            assert!(
+                                !err.contains("Throttled") && !err.contains("R3Error"),
+                                "the human reads words, not a Debug dump: {err}"
+                            );
+                            assert!(
+                                fx.grants().is_empty(),
+                                "{line}: a grant stands for a reference the peer never heard of: {:?}",
+                                fx.grants()
+                            );
+                        }
+                        assert_eq!(fx.pending_ids(), ["q-1"], "the question is still open");
+                        assert!(gate.heard.lock().is_empty(), "{:?}", gate.heard.lock());
+
+                        gate.armed.store(false, Ordering::SeqCst);
+                        let out = out_of(&mut fx.ctx, ".mesh answer q-1 \"x\" --attach big.bin")
+                            .await
+                            .unwrap();
+
+                        assert!(out.ends_with("Answered q-1."), "{out}");
+                        assert_eq!(gate.heard.lock().as_slice(), ["x"]);
+                        let grants = fx.grants();
+                        assert_eq!(
+                            grants.len(),
+                            1,
+                            "exactly one grant for the one lend the peer heard: {grants:?}"
+                        );
+                        assert_eq!(grants[0].peer, to);
+                        assert_eq!(grants[0].paths[0].path, "big.bin");
+                        assert!(fx.pending_ids().is_empty());
+                        fx.stop().await;
+                    });
+                }
+
+                /// Usage probe ((b) "the share set is NOT consulted for the INLINE form" +
+                /// (c) with `--attach`): a small file a `deny` rule names still travels
+                /// inline since the human named it, while an access id answered with an
+                /// attachment is sent to its own verb by the cross-kind sentence, with
+                /// nothing read, sent or lent.
+                #[test]
+                #[serial]
+                fn usage_probe_a_denied_small_file_travels_inline_and_an_access_id_with_attach_is_redirected()
+                 {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-attach-inline-denied");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::with_config(
+                            "repl-mesh-attach-inline-denied",
+                            with_inline_max(1024),
+                        )
+                        .await;
+                        write(&fx.root.path, "docs/private.md", NOTES);
+                        write(&fx.root.path, "big.bin", &vec![0x5A; 1025]);
+                        out_of(&mut fx.ctx, ".mesh deny docs/private.md --yes")
+                            .await
+                            .unwrap();
+                        fx.file("a-1", InboundKind::Access, &["src/x.rs"]);
+                        let to = fx.stub.destination_hex();
+
+                        for args in ["--attach docs/private.md", "--attach big.bin"] {
+                            let line = format!(".mesh answer a-1 \"x\" {args}");
+                            let printed = stdout_lines().len();
+                            assert_eq!(
+                                refusal(&mut fx.ctx, &line).await,
+                                "`a-1` is an access request, not a question; decide it with `.mesh grant a-1` or `.mesh refuse a-1`",
+                                "{line}"
+                            );
+                            assert_eq!(stdout_lines().len(), printed, "{line} prints nothing");
+                        }
+                        assert!(fx.stub.seen().is_empty(), "{:?}", fx.stub.seen());
+                        assert!(fx.grants().is_empty(), "{:?}", fx.grants());
+                        assert_eq!(fx.pending_ids(), ["a-1"]);
+
+                        let out = out_of(
+                            &mut fx.ctx,
+                            &format!(".mesh reply {to} --yes \"x\" --attach docs/private.md"),
+                        )
+                        .await
+                        .unwrap();
+
+                        assert!(
+                            out.lines()
+                                .any(|line| line == inline_line("docs/private.md", 9)),
+                            "{out}"
+                        );
+                        let seen = fx.stub.seen();
+                        assert_eq!(seen.len(), 1, "{seen:?}");
+                        assert_eq!(seen[0].parts, [inline_part("docs/private.md", NOTES)]);
+                        assert!(fx.grants().is_empty(), "inline lends nothing");
+                        fx.stop().await;
+                    });
+                }
+
+                /// Usage probe (R1 "relative to the share root" + R9 one O_NOFOLLOW open):
+                /// a path whose directory is a link out of the share root names a file
+                /// that is not under the root, and is refused like any other such path;
+                /// nothing of it travels, and no byte of it is echoed. A path through a link
+                /// to a directory INSIDE the root names a file the human could name
+                /// directly, and travels inline under the name the human gave (the share
+                /// set is not consulted for the inline form; only the final component is
+                /// held to O_NOFOLLOW).
+                #[test]
+                #[serial]
+                fn usage_probe_attach_through_an_escaping_link_is_refused_and_through_an_inner_one_travels()
+                 {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-attach-linked-dir");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-attach-linked-dir").await;
+                        let root = fx.root.path.clone();
+                        let outside = TempDir::new("repl-mesh-attach-linked-dir-outside");
+                        fs::write(outside.path.join("secret.txt"), b"outside the root\n").unwrap();
+                        std::os::unix::fs::symlink(&outside.path, root.join("escape")).unwrap();
+                        write(&root, "docs/notes.md", NOTES);
+                        std::os::unix::fs::symlink("docs", root.join("alias")).unwrap();
+                        let to = fx.stub.destination_hex();
+                        let shown_root = root.display().to_string();
+
+                        let line =
+                            format!(".mesh reply {to} --yes \"x\" --attach escape/secret.txt");
+                        let printed = stdout_lines().len();
+                        let err = refusal(&mut fx.ctx, &line).await;
+                        assert_eq!(
+                            err,
+                            format!(
+                                "`escape/secret.txt` lies outside {shown_root} once its links are followed; nothing was sent."
+                            ),
+                            "{line}"
+                        );
+                        assert!(
+                            !err.contains(&outside.path.display().to_string()),
+                            "where the link leads is not echoed: {err}"
+                        );
+                        assert_eq!(stdout_lines().len(), printed, "{line} prints nothing");
+                        assert!(fx.stub.seen().is_empty(), "{:?}", fx.stub.seen());
+                        assert!(fx.grants().is_empty(), "{:?}", fx.grants());
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+
+                        let out = out_of(
+                            &mut fx.ctx,
+                            &format!(".mesh reply {to} --yes \"x\" --attach alias/notes.md"),
+                        )
+                        .await
+                        .unwrap();
+
+                        assert!(
+                            out.lines()
+                                .any(|line| line == inline_line("alias/notes.md", 9)),
+                            "{out}"
+                        );
+                        let seen = fx.stub.seen();
+                        assert_eq!(seen.len(), 1, "{seen:?}");
+                        assert_eq!(seen[0].parts, [inline_part("alias/notes.md", NOTES)]);
+                        assert!(fx.grants().is_empty());
+                        fx.stop().await;
+                    });
+                }
+
+                /// Usage probe (R8's purpose, "a reference is only as good as the fetch
+                /// behind it"): a reference named through a link to a directory inside the
+                /// root is one the peer can actually fetch, under the name it heard, on the
+                /// one-off grant; so the pre-flight's silence on inner links is sound.
+                #[test]
+                #[serial]
+                fn usage_probe_a_reference_through_an_inner_link_is_fetchable_under_the_name_heard()
+                {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-attach-link-fetch");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let pair = NodePair::start_with(
+                            "repl-mesh-attach-link-fetch",
+                            with_inline_max(1024),
+                            trusting_b,
+                        )
+                        .await;
+                        pair.introduce_b_to_a().await;
+                        let mut ctx = ctx_with(
+                            MeshConfig {
+                                fetch: MeshFetch {
+                                    inline_max_bytes: 1024,
+                                    ..Default::default()
+                                },
+                                ..MeshConfig::default()
+                            },
+                            true,
+                        );
+                        ctx.app.mesh.install(pair.node_a.clone()).unwrap();
+                        let workspace = TempDir::new("repl-mesh-attach-link-fetch-root");
+                        let big = vec![0x5A; 1025];
+                        write(&workspace.path, "docs/big.bin", &big);
+                        std::os::unix::fs::symlink("docs", workspace.path.join("alias")).unwrap();
+                        publish_root(&ctx, &workspace.path);
+                        let b_hex = pair.responder.desc.address_hash.to_hex_string();
+                        pair.recorder_b.queue(Script::Acknowledge);
+
+                        let out = out_of(
+                            &mut ctx,
+                            &format!(".mesh reply {b_hex} --yes \"x\" --attach alias/big.bin"),
+                        )
+                        .await
+                        .unwrap();
+
+                        assert!(
+                            out.lines()
+                                .any(|line| line == reference_line("alias/big.bin", 1025, &b_hex)),
+                            "{out}"
+                        );
+                        let heard = from_r3_body(&pair.recorder_b.last_body()).unwrap();
+                        assert_eq!(heard.parts, [reference_part("alias/big.bin", &big)]);
+                        let served = pair
+                            .b_asks_a(
+                                FETCH_PATH,
+                                fetch_body("alias/big.bin", None),
+                                short_options(),
+                            )
+                            .await;
+                        assert_eq!(wire_status(&served.value), "ok", "{:?}", served.value);
+                        assert_eq!(
+                            wire_field(&served.value, "bytes"),
+                            Some(&Value::Binary(big))
+                        );
+                        let spent = pair
+                            .b_asks_a(
+                                FETCH_PATH,
+                                fetch_body("alias/big.bin", None),
+                                short_options(),
+                            )
+                            .await;
+                        assert_eq!(wire_status(&spent.value), "not_shared");
+                        pair.stop_node_a().await;
                     });
                 }
             }
