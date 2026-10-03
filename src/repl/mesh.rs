@@ -2792,10 +2792,10 @@ fn open_access_request(ctx: &RequestContext, id: &str) -> Result<InboundRecord> 
 /// Refuses a grant that would deliver nothing, judging each requested path as a
 /// reference is judged: a path a deny, the built-in deny or a protected directory holds
 /// back would be granted and then answered `not_shared`, since no grant lifts those, and
-/// a file above the serving limit would be answered `too_large`; the human is told
-/// before anything is written or sent. A share list refused at load serves nothing, so
-/// it stops the grant first. A path that resolves to nothing has no rule to lift and is
-/// left to the grant.
+/// a directory or a file above the serving limit would be answered `not_shared` or
+/// `too_large`; the human is told before anything is written or sent. A share list
+/// refused at load serves nothing, so it stops the grant first. A path that resolves to
+/// nothing has no rule to lift and is left to the grant.
 fn refuse_unservable(
     ctx: &RequestContext,
     runtime: &MeshRuntime,
@@ -2825,6 +2825,11 @@ fn refuse_unservable(
         let Ok(metadata) = fs::metadata(&canonical) else {
             continue;
         };
+        if !metadata.is_file() {
+            bail!(
+                "{shown} would not be served even once granted (it is not a regular file); refuse the request with `.mesh refuse {id}`, or lift the rule first."
+            );
+        }
         let size = metadata.len();
         if size > limit {
             bail!(
@@ -6219,6 +6224,56 @@ mod tests {
             !opened_the_judged_file(&metadata, &tmp.path.join("absent.md")),
             "a judged path that is not the opened file is not vouched for"
         );
+        drop(file);
+    }
+
+    /// Usage probe (R9, "refuses when the handle's (dev, ino) differs from the judged
+    /// canonical path"): the shape of the race the rule exists for is a regular file
+    /// renamed over the judged path after the open. Byte-identical content and size do
+    /// not vouch for it: it is another inode, so the handle is not the judged file. A
+    /// hard link to the opened inode IS the same file, so it is vouched for, and after
+    /// the swap the handle still reads the bytes it opened.
+    #[test]
+    #[cfg(unix)]
+    fn usage_probe_opened_the_judged_file_sees_a_file_renamed_over_the_path_but_vouches_for_a_hard_link()
+     {
+        let tmp = crate::mesh::test_support::TempDir::new("repl-attach-open-swapped");
+        let judged = tmp.path.join("notes.md");
+        fs::write(&judged, b"# notes\n").unwrap();
+        let twin = tmp.path.join("twin.md");
+        fs::write(&twin, b"# notes\n").unwrap();
+        let alias = tmp.path.join("alias.md");
+        fs::hard_link(&judged, &alias).unwrap();
+
+        let (file, opened) = open_attachment(&judged).unwrap();
+        assert!(opened_the_judged_file(&opened, &judged));
+        assert!(
+            opened_the_judged_file(&opened, &alias),
+            "a hard link is the same inode, so it is the judged file"
+        );
+
+        fs::rename(&twin, &judged).unwrap();
+
+        assert!(
+            !opened_the_judged_file(&opened, &judged),
+            "the path now names another inode with the same bytes and size; the handle is not vouched for"
+        );
+        assert!(
+            opened_the_judged_file(&opened, &alias),
+            "the alias still names the inode that was opened"
+        );
+        let mut bytes = Vec::new();
+        (&file).read_to_end(&mut bytes).unwrap();
+        assert_eq!(
+            bytes, b"# notes\n",
+            "the handle reads what it opened, not the path"
+        );
+
+        // A directory or a dangling path at the judged location is not vouched for either.
+        fs::remove_file(&judged).unwrap();
+        assert!(!opened_the_judged_file(&opened, &judged));
+        fs::create_dir(&judged).unwrap();
+        assert!(!opened_the_judged_file(&opened, &judged));
         drop(file);
     }
 
@@ -20710,6 +20765,41 @@ mod tests {
                     });
                 }
 
+                /// A requested directory has an allow-able verdict but `/fetch` serves only
+                /// regular files, so a grant for it would be answered `not_shared`; the verb
+                /// refuses it the same way, one-off and standing, and the request stays open.
+                #[test]
+                #[serial]
+                fn grant_refuses_a_requested_directory_before_the_peer_hears_yes() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-grant-directory");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-grant-directory").await;
+                        let root = fx.root.path.clone();
+                        fs::create_dir_all(root.join("docs")).unwrap();
+                        fs::write(root.join("docs/a.md"), "a").unwrap();
+                        fx.file("a-1", InboundKind::Access, &["docs/a.md", "docs"]);
+
+                        let expected = "`docs` would not be served even once granted (it is not a regular file); refuse the request with `.mesh refuse a-1`, or lift the rule first.";
+                        for line in [".mesh grant a-1", ".mesh grant a-1 --standing"] {
+                            let printed = stdout_lines().len();
+                            assert_eq!(refusal(&mut fx.ctx, line).await, expected, "{line}");
+                            assert_eq!(stdout_lines().len(), printed, "{line} prints nothing");
+                        }
+                        assert!(fx.stub.seen().is_empty(), "{:?}", fx.stub.seen());
+                        assert!(fx.grants().is_empty(), "{:?}", fx.grants());
+                        let (_, locations) = share_locations(&fx.ctx).unwrap();
+                        assert!(
+                            ShareSet::load_quietly(locations).0.entries().is_empty(),
+                            "no standing row was written"
+                        );
+                        assert_eq!(fx.pending_ids(), ["a-1"]);
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        fx.stop().await;
+                    });
+                }
+
                 /// `--standing` is judged the same way before anything is written: an allow
                 /// row for a denied or protected file would be inert, so no row is added.
                 #[test]
@@ -22163,15 +22253,10 @@ mod tests {
                         ] {
                             let printed = stdout_lines().len();
                             assert_eq!(refusal(&mut fx.ctx, line).await, expected, "{line}");
-                            // Observed at 72f59c3 (advisory, not pinned): the refusal is
-                            // preceded by "Sending your answer to … over the mesh..." and
-                            // the attaching notice, which for the reference form reads
-                            // "<peer> may fetch it once within 15m" although nothing is
-                            // lent or sent. Only the lend claim is pinned false here.
                             let since: Vec<String> = stdout_lines()[printed..].to_vec();
                             assert!(
-                                since.iter().all(|line| !line.starts_with("Answered")),
-                                "{line}: {since:?}"
+                                since.is_empty(),
+                                "{line}: the refusal is the whole output: {since:?}"
                             );
                             assert!(
                                 fx.grants().is_empty(),
@@ -22534,6 +22619,216 @@ mod tests {
                             .await;
                         assert_eq!(wire_status(&spent.value), "not_shared");
                         pair.stop_node_a().await;
+                    });
+                }
+
+                /// Usage probe (R2, "`--attach` is refused BEFORE any notice is printed"):
+                /// while a live run holds the question, the hold sentence is the whole
+                /// output of the line, for the inline and the reference form alike: no
+                /// "Sending your answer…" and no attaching notice precedes it, so the
+                /// human never reads a lend that did not happen. A hold on an ACCESS id
+                /// changes nothing: the cross-kind sentence of (c) comes first, and
+                /// nothing is printed there either.
+                #[test]
+                #[serial]
+                fn usage_probe_the_hold_refusal_is_the_whole_output_and_no_notice_precedes_it() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-attach-held-silent");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::with_config(
+                            "repl-mesh-attach-held-silent",
+                            with_inline_max(1024),
+                        )
+                        .await;
+                        write(&fx.root.path, "big.bin", &vec![0x5A; 1025]);
+                        write(&fx.root.path, "docs/notes.md", NOTES);
+                        fx.file("q-1", InboundKind::Question, &[]);
+                        fx.file("a-1", InboundKind::Access, &["src/x.rs"]);
+                        let envoy = RecordingEnvoy::new(true, true);
+                        *envoy.held.lock() = Some("q-1".to_string());
+                        fx.ctx
+                            .app
+                            .mesh
+                            .set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
+                        let hold = "`q-1` is being answered by the envoy right now; answer without `--attach`, or wait for its hold to lapse.";
+
+                        for line in [
+                            ".mesh answer q-1 \"x\" --attach big.bin",
+                            ".mesh answer q-1 \"x\" --attach docs/notes.md",
+                            ".mesh answer q-1 \"x\" --attach big.bin --force",
+                        ] {
+                            let printed = stdout_lines().len();
+                            let err = refusal(&mut fx.ctx, line).await;
+                            assert_eq!(err, hold, "{line}");
+                            assert_eq!(
+                                &stdout_lines()[printed..],
+                                &[] as &[String],
+                                "{line}: the refusal is the whole output"
+                            );
+                        }
+
+                        // A hold on an access id is never consulted: the kind is judged
+                        // first, and that refusal prints nothing either.
+                        *envoy.held.lock() = Some("a-1".to_string());
+                        let printed = stdout_lines().len();
+                        let err =
+                            refusal(&mut fx.ctx, ".mesh answer a-1 \"x\" --attach big.bin").await;
+                        assert_eq!(
+                            err,
+                            "`a-1` is an access request, not a question; decide it with `.mesh grant a-1` or `.mesh refuse a-1`"
+                        );
+                        assert_eq!(&stdout_lines()[printed..], &[] as &[String], "{err}");
+
+                        assert!(fx.grants().is_empty(), "{:?}", fx.grants());
+                        assert!(fx.stub.seen().is_empty(), "{:?}", fx.stub.seen());
+                        assert!(envoy.answers.lock().is_empty());
+                        let mut ids = fx.pending_ids();
+                        ids.sort();
+                        assert_eq!(ids, ["a-1", "q-1"]);
+                        fx.stop().await;
+                    });
+                }
+
+                /// Usage probe (R3, "the plain answer path now mirrors this: take → send
+                /// → put back on failure", exercised through the INLINE `--attach` form,
+                /// which lends nothing): the peer refuses the message, so the question is
+                /// pending again, the human reads the send's one line (not "already
+                /// answered by another process"), no grant appears since nothing was
+                /// lent, and the retry once the peer takes it closes the question with the
+                /// bytes travelling inline exactly once. `reply --yes` inline on the same
+                /// refusing peer errs the same way and lends nothing.
+                #[test]
+                #[serial]
+                fn usage_probe_an_inline_attachment_the_peer_refuses_puts_the_question_back_and_the_retry_sends_once()
+                 {
+                    use crate::mesh::test_support::{Handler, MESSAGE_PATH};
+                    use lend_gate::Gate;
+                    use std::sync::atomic::Ordering;
+
+                    let _guard = TestConfigDirGuard::new("repl-mesh-attach-inline-unsent");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::with_config(
+                            "repl-mesh-attach-inline-unsent",
+                            with_inline_max(1024),
+                        )
+                        .await;
+                        let gate = Arc::new(Gate::default());
+                        gate.armed.store(true, Ordering::SeqCst);
+                        fx.stub
+                            .serve(MESSAGE_PATH, gate.clone() as Arc<dyn Handler>);
+                        write(&fx.root.path, "docs/notes.md", NOTES);
+                        fx.file("q-1", InboundKind::Question, &[]);
+                        let to = fx.stub.destination_hex();
+
+                        for line in [
+                            ".mesh answer q-1 \"x\" --attach docs/notes.md".to_string(),
+                            format!(".mesh reply {to} --yes \"x\" --attach docs/notes.md"),
+                        ] {
+                            let err = refusal(&mut fx.ctx, &line).await;
+                            assert_eq!(err.lines().count(), 1, "{line}: {err}");
+                            assert!(
+                                !err.contains("another process"),
+                                "{line}: a send the peer refused is not a race: {err}"
+                            );
+                            assert!(
+                                !err.contains("Throttled") && !err.contains("R3Error"),
+                                "{line}: words, not a Debug dump: {err}"
+                            );
+                            assert_eq!(
+                                fx.pending_ids(),
+                                ["q-1"],
+                                "{line}: the question is put back as pending"
+                            );
+                            assert!(fx.grants().is_empty(), "{line}: {:?}", fx.grants());
+                        }
+                        assert!(gate.heard.lock().is_empty(), "{:?}", gate.heard.lock());
+
+                        gate.armed.store(false, Ordering::SeqCst);
+                        let out =
+                            out_of(&mut fx.ctx, ".mesh answer q-1 \"x\" --attach docs/notes.md")
+                                .await
+                                .unwrap();
+
+                        assert!(out.ends_with("Answered q-1."), "{out}");
+                        assert!(
+                            out.contains(&inline_line("docs/notes.md", NOTES.len() as u64)),
+                            "{out}"
+                        );
+                        assert_eq!(gate.heard.lock().as_slice(), ["x"], "sent exactly once");
+                        assert!(
+                            fx.grants().is_empty(),
+                            "inline lends nothing: {:?}",
+                            fx.grants()
+                        );
+                        assert!(fx.pending_ids().is_empty());
+
+                        // The question is gone: the same line is now a teaching error, not
+                        // a second send.
+                        let err =
+                            refusal(&mut fx.ctx, ".mesh answer q-1 \"x\" --attach docs/notes.md")
+                                .await;
+                        assert!(err.contains("q-1"), "{err}");
+                        assert_eq!(
+                            gate.heard.lock().as_slice(),
+                            ["x"],
+                            "nothing was sent again"
+                        );
+                        fx.stop().await;
+                    });
+                }
+
+                /// Usage probe (R8 reference form, order of judgement): a reference the
+                /// serving side would refuse is refused with ONE sentence that names the
+                /// first reason in the documented order (size before the share list's
+                /// refusal before a rule), and the human reads no notice first; the same
+                /// file under `inline_max_bytes` still travels inline under a refused list.
+                #[test]
+                #[serial]
+                fn usage_probe_a_reference_refused_by_size_names_size_even_when_the_share_list_is_refused_too()
+                 {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-attach-size-before-list");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::with_config(
+                            "repl-mesh-attach-size-before-list",
+                            |config| {
+                                config.fetch.inline_max_bytes = 1024;
+                                config.fetch.max_bytes = 2048;
+                            },
+                        )
+                        .await;
+                        write(&fx.root.path, "big.bin", &vec![0x5A; 2049]);
+                        write(&fx.root.path, "mid.bin", &vec![0x5A; 1025]);
+                        let (_, locations) = share_locations(&fx.ctx).unwrap();
+                        fs::create_dir_all(locations.global.parent().unwrap()).unwrap();
+                        fs::write(&locations.global, "version: 99\n").unwrap();
+                        fx.file("q-1", InboundKind::Question, &[]);
+
+                        let printed = stdout_lines().len();
+                        let err =
+                            refusal(&mut fx.ctx, ".mesh answer q-1 \"x\" --attach big.bin").await;
+                        assert_eq!(
+                            err,
+                            "`big.bin` is 2 KB and this node serves at most 2048 bytes by reference; nothing was sent."
+                        );
+                        assert_eq!(&stdout_lines()[printed..], &[] as &[String]);
+
+                        let err =
+                            refusal(&mut fx.ctx, ".mesh answer q-1 \"x\" --attach mid.bin").await;
+                        assert!(
+                            err.contains(&locations.global.display().to_string())
+                                && err.ends_with(" Nothing was sent."),
+                            "{err}"
+                        );
+                        assert_eq!(&stdout_lines()[printed..], &[] as &[String]);
+                        assert!(fx.grants().is_empty(), "{:?}", fx.grants());
+                        assert!(fx.stub.seen().is_empty(), "{:?}", fx.stub.seen());
+                        assert_eq!(fx.pending_ids(), ["q-1"]);
+                        fx.stop().await;
                     });
                 }
             }

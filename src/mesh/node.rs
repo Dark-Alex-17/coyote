@@ -5142,6 +5142,105 @@ mod tests {
         stub.stop().await;
     }
 
+    /// Usage probe (R3, the answer path mirrors the decision path, exercised with a
+    /// REFERENCE part — the one form that writes a grant): a question another process
+    /// already took is refused with the one sentence and NO one-off grant is lent for the
+    /// reference, since the take comes before the lend; a reference answer whose send the
+    /// peer refuses lends and then takes the grant back, puts the question back, and
+    /// files nothing for the leader.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_a_reference_answer_on_a_taken_question_lends_nothing_and_a_refused_one_takes_it_back()
+     {
+        use crate::mesh::trust::TrustOptions;
+        use sha2::{Digest as _, Sha256};
+
+        let stub =
+            PeerStub::listen("node-answer-ref-take-stub", TcpServer::DEFAULT_CLIENT_MTU).await;
+        stub.serve(MESSAGE_PATH, Arc::new(Throttling) as Arc<dyn Handler>);
+        let started = started_runtime_on("node-answer-ref-take", stub.port()).await;
+        let runtime = started.runtime.clone();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime.clone()).unwrap();
+        stub.trust(&runtime.current_destination_hash(), runtime.fingerprint());
+        stub.announce(Some("Stub")).await;
+        let to = stub.destination_hex();
+        let peers = runtime.peers();
+        wait_until("the node to file the stub", || peers.get(&to).is_some()).await;
+        runtime
+            .trust()
+            .trust_destination(
+                slot.as_ref(),
+                &to,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        let store = slot.inbound_store().unwrap();
+        let record = InboundRecord {
+            peer_destination: to.clone(),
+            peer_identity: stub.identity_hex(),
+            ..inbound_record("q-1")
+        };
+        let bytes = vec![0x5A; 4096];
+        let part = RawPart::File {
+            name: "big.bin".to_string(),
+            size: bytes.len() as u64,
+            sha256: Sha256::digest(&bytes).into(),
+            bytes: None,
+            reference: Some("big.bin".to_string()),
+        };
+        let reply = OutboundPeer::with_parts(
+            PeerKind::Reply,
+            "see this",
+            None,
+            Some("q-1"),
+            None,
+            vec![part.clone()],
+            &runtime.part_limits(),
+        )
+        .unwrap();
+
+        // Taken by another process: nothing is lent, nothing is sent.
+        let err = slot
+            .send_human_answer(&runtime, &store, &record, reply, "see this")
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "`q-1` was already answered by another process; nothing was sent"
+        );
+        assert!(stub.seen().is_empty(), "{:?}", stub.seen());
+        assert!(
+            runtime.serving().grants().list().unwrap().is_empty(),
+            "no grant is lent for an answer that was never sent"
+        );
+
+        // Pending again, but the peer refuses the message: the lend is taken back and
+        // the question is put back.
+        store.upsert(record, SystemTime::now()).unwrap();
+        let err = slot
+            .answer_inbound_with_file("q-1", "see this", part)
+            .await
+            .unwrap_err();
+
+        let err = err.to_string();
+        assert!(err.contains("The peer refused the message"), "{err}");
+        assert!(!err.contains("another process"), "{err}");
+        assert!(!err.contains("could not be taken back"), "{err}");
+        assert!(store.get("q-1").unwrap().is_some(), "put back as pending");
+        assert!(
+            runtime.serving().grants().list().unwrap().is_empty(),
+            "the grant lent for the refused send is revoked: {:?}",
+            runtime.serving().grants().list().unwrap()
+        );
+        assert!(stub.seen().is_empty(), "{:?}", stub.seen());
+        assert!(slot.take_model_notes().is_empty(), "nothing was answered");
+        assert!(slot.stop().await.unwrap());
+        stub.stop().await;
+    }
+
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_store_and_forward_refusal_reply_inherits_the_refused_message_thread() {
