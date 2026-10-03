@@ -1872,7 +1872,7 @@ fn shares(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
 
 fn render_share_rules(set: &ShareSet, peer: &PeerRef<'_>, scoped_to: Option<&str>) -> String {
     let locations = set.locations();
-    let effective = set.effective(peer);
+    let effective = scoped_to.is_some().then(|| set.effective(peer));
     let rows: Vec<String> = set
         .entries()
         .into_iter()
@@ -1883,12 +1883,13 @@ fn render_share_rules(set: &ShareSet, peer: &PeerRef<'_>, scoped_to: Option<&str
             };
             let (kind, pattern, note) = match entry.kind {
                 RawKind::Allow { pattern, peer } => {
-                    let applies = effective.iter().any(|applied| {
-                        applied.pattern == pattern
-                            && applied.layer == entry.layer
-                            && applied.peer == peer
-                    });
-                    if scoped_to.is_some() && !applies {
+                    if let Some(effective) = &effective
+                        && !effective.iter().any(|applied| {
+                            applied.pattern == pattern
+                                && applied.layer == entry.layer
+                                && applied.peer == peer
+                        })
+                    {
                         return None;
                     }
                     let note = match &peer {
@@ -1923,6 +1924,12 @@ fn render_share_rules(set: &ShareSet, peer: &PeerRef<'_>, scoped_to: Option<&str
         })
         .collect();
     if rows.is_empty() {
+        if let Some(hash) = scoped_to {
+            return format!(
+                "No share rule applies to peer {}; `.mesh shares` lists every rule.",
+                short(hash)
+            );
+        }
         return format!(
             "No share rules in {} or {}. `.mesh allow docs/**` shares docs/ with every trusted peer.",
             locations.global.display(),
@@ -13741,6 +13748,38 @@ mod tests {
                         ShareSet::load_quietly(locations).0.entries(),
                         [allow_entry(Layer::Global, "docs/**", None)]
                     );
+                }
+
+                /// Rules exist but none reaches the named peer: the listing says so rather
+                /// than claiming the files are empty.
+                #[test]
+                #[serial]
+                fn shares_for_a_peer_no_rule_reaches_says_so_instead_of_no_rules_at_all() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-shares-peer-no-rows");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    let mut ctx = off_ctx();
+                    let root = TempDir::new("repl-mesh-shares-peer-no-rows-root");
+                    seed_files(&root.path, &["docs/a.md"]);
+                    publish_root(&ctx, &root.path);
+                    let (_, locations) = share_locations(&ctx).unwrap();
+                    let other = "ef".repeat(16);
+                    write_share_file(
+                        &locations.global,
+                        &format!("version: 1\nallow:\n- pattern: docs/**\n  peer: {other}\n"),
+                    );
+                    let peer = "ab".repeat(16);
+
+                    run_async(run(&mut ctx, &format!(".mesh shares --peer {peer}"))).unwrap();
+
+                    assert_eq!(
+                        stdout_lines().join("\n"),
+                        format!(
+                            "No share rule applies to peer {}; `.mesh shares` lists every rule.",
+                            short(&peer)
+                        )
+                    );
+                    assert_eq!(prompt_script::prompts_asked(), 0);
                 }
 
                 /// What the node will protect, the off-path views protect too: a configured
