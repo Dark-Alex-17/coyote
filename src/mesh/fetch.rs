@@ -140,7 +140,7 @@ impl FetchServing {
 
     /// The size a served file is held to: the configured limit, capped at what one
     /// Resource segment carries while `SINGLE_SEGMENT_FETCH_CEILING` stands.
-    fn serving_limit(&self) -> u64 {
+    pub(crate) fn serving_limit(&self) -> u64 {
         self.max_bytes.min(SINGLE_SEGMENT_FETCH_CEILING)
     }
 

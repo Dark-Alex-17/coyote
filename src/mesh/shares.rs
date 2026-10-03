@@ -711,6 +711,25 @@ impl ShareSet {
         rules.resolved(&canonical).is_some() && rules.judge(&wire, &canonical) == Judgement::Allowed
     }
 
+    /// Where a fetch of `wire_text` by `peer` would stand, with the reason: the resolve
+    /// and judge half of `is_served` with nothing stat'ed, opened or spent, so a verb can
+    /// tell the human whether a grant or a reference would ever be served before it
+    /// commits one. `None` is a name the grammar refuses, one that resolves to nothing,
+    /// or rules that cannot be built: no rule holds such a file back, there is simply
+    /// nothing to judge.
+    pub(crate) fn verdict_for(
+        &self,
+        peer: &PeerRef<'_>,
+        wire_text: &str,
+        case_insensitive: bool,
+    ) -> Option<Verdict> {
+        let wire = WirePath::parse(wire_text).ok()?;
+        let candidate = self.locations.workspace_root.join(wire.to_relative_path());
+        let canonical = dunce::canonicalize(candidate).ok()?;
+        let rules = self.rules(peer, case_insensitive).ok()?;
+        Some(rules.verdict(&wire, &canonical))
+    }
+
     /// The files `peer` may fetch, one page at a time, sorted by wire path. The walk
     /// starts at the literal head of each allow pattern rather than at the root, so a
     /// share of `docs/**` never reads the rest of the tree, and it visits at most
@@ -3959,6 +3978,34 @@ mod tests {
 
         assert!(!set.is_allowed(&requester, "docs/a.md", false));
         assert!(set.is_allowed(&scoped, "docs/a.md", false));
+    }
+
+    #[test]
+    fn verdict_for_keeps_the_reason_and_has_none_for_a_file_that_resolves_to_nothing() {
+        let fx = Fixture::new("verdict-for");
+        let (identity, destination) = anyone();
+        let peer = PeerRef {
+            identity: &identity,
+            destination: &destination,
+        };
+        let mut set = fx.load();
+        set.apply(allow("docs/**"), WriteScope::Global).unwrap();
+        set.apply(deny("docs/private.md"), WriteScope::Global)
+            .unwrap();
+        fx.file("docs/a.md");
+        fx.file("docs/private.md");
+        fx.file("docs/.env");
+        fx.file("src/main.rs");
+        fx.file(".git/HEAD");
+        let verdict = |wire_text: &str| set.verdict_for(&peer, wire_text, false);
+
+        assert_eq!(verdict("docs/a.md"), Some(Verdict::Shared));
+        assert_eq!(verdict("docs/private.md"), Some(Verdict::Denied));
+        assert_eq!(verdict("docs/.env"), Some(Verdict::BuiltinDenied));
+        assert_eq!(verdict("src/main.rs"), Some(Verdict::NotAllowed));
+        assert_eq!(verdict(".git/HEAD"), Some(Verdict::Protected));
+        assert_eq!(verdict("docs/missing.md"), None);
+        assert_eq!(verdict("../outside.md"), None, "the grammar refuses it");
     }
 
     #[cfg(unix)]
