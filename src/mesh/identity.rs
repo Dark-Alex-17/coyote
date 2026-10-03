@@ -1,7 +1,7 @@
 use crate::config::paths;
 use crate::mesh::lock::{read_holder_pid, write_holder_pid};
 use crate::mesh::schema::{Remedy, VersionProbe, unversioned_refusal, version_refusal};
-use crate::mesh::{mesh_config_dir, redact_hashes, rfc3339_utc, short};
+use crate::mesh::{mesh_config_dir, redact_hashes, refuse_symlink, rfc3339_utc, short};
 #[cfg(windows)]
 use crate::utils::windows_acl;
 
@@ -176,23 +176,6 @@ pub(crate) fn current_identity(path: &Path) -> Result<PrivateIdentity> {
         );
     }
     load_identity(path)
-}
-
-/// Rotation writes only regular files: renaming over a symlinked key would replace the link
-/// and leave the old private key at its target, and appending through a symlinked history
-/// would write wherever it points.
-fn refuse_symlink(path: &Path) -> Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => bail!(
-            "'{}' is a symlink; mesh identity rotation writes only regular files. Replace the link with the file it points to and try again.",
-            path.display()
-        ),
-        Ok(_) => Ok(()),
-        Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
-        Err(err) => {
-            Err(err).with_context(|| format!("Failed to read metadata of '{}'", path.display()))
-        }
-    }
 }
 
 /// Removes the key a rotation staged but never renamed into place, so the unused private

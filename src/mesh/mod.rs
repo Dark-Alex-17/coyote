@@ -51,10 +51,10 @@ pub(crate) use propagation_nodes::PropagationNodeRecord;
 pub(crate) use r3::{RequestOptions, redact_hashes, short};
 
 use crate::config::sanitize_display_text;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use rns_transport::hash::{AddressHash, Hash};
 use sha2::Digest;
-use std::fs::{self, File};
+use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -155,21 +155,54 @@ pub(crate) fn display_text(text: &str, max_chars: usize) -> Option<String> {
     Some(capped.trim_end().to_string())
 }
 
-/// Writes `bytes` to `<path>.tmp` beside `path`, syncs it, then renames it into place, so a
-/// crash mid-write cannot leave a half-written file for the next load to refuse.
+/// Writes `bytes` to a fresh temp file beside `path`, syncs it, then renames it into
+/// place, so a crash mid-write cannot leave a half-written file for the next load to
+/// refuse. The temp name is unique per write and opened `create_new`, so a planted link
+/// under a guessable name is never followed; a symlink at `path` itself is refused, since
+/// renaming over it would replace the link while a write through it would land wherever
+/// it points. The workspace share list lives in the repository, so a clone chooses what
+/// is at these names.
 pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create directory '{}'", parent.display()))?;
     }
-    let tmp = path.with_added_extension("tmp");
-    File::create(&tmp)
-        .and_then(|mut file| {
-            file.write_all(bytes)?;
-            file.sync_all()
-        })
-        .and_then(|()| fs::rename(&tmp, path))
-        .with_context(|| format!("Failed to write '{}'", path.display()))
+    refuse_symlink(path)?;
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let tmp = path.with_added_extension(format!("{}-{nanos}.tmp", std::process::id()));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .with_context(|| format!("Failed to write '{}'", path.display()))?;
+    let written = file
+        .write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .and_then(|()| fs::rename(&tmp, path));
+    drop(file);
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    written.with_context(|| format!("Failed to write '{}'", path.display()))
+}
+
+/// Mesh state is written only to regular files: a symlink at `path` is refused rather
+/// than replaced or written through. A missing file passes.
+pub(crate) fn refuse_symlink(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => bail!(
+            "'{}' is a symlink; mesh state is written only to regular files. Replace the link with the file it points to and try again.",
+            path.display()
+        ),
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => {
+            Err(err).with_context(|| format!("Failed to read metadata of '{}'", path.display()))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1092,7 +1125,6 @@ mod tests {
 
         write_atomically(&path, b"second").unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"second");
-        assert!(!path.with_extension("json.tmp").exists());
         assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
 
         let blocked = tmp.path.join("file-not-dir");
@@ -1100,6 +1132,57 @@ mod tests {
         let err = write_atomically(&blocked.join("x.yaml"), b"x").unwrap_err();
         let text = format!("{err:#}");
         assert!(text.contains(&blocked.display().to_string()), "{text}");
+    }
+
+    /// A clone can plant whatever it likes beside the workspace share list, so a link at
+    /// the old temp name must not be written through and a link at the destination must
+    /// not be replaced.
+    #[cfg(unix)]
+    #[test]
+    fn write_atomically_never_follows_a_planted_symlink_at_the_temp_or_the_destination() {
+        let tmp = TempDir::new("write-atomically-symlink");
+        let sentinel = tmp.path.join("sentinel");
+        fs::write(&sentinel, b"untouched").unwrap();
+        let dir = tmp.path.join("state");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("shares.yaml");
+        std::os::unix::fs::symlink(&sentinel, path.with_added_extension("tmp")).unwrap();
+
+        write_atomically(&path, b"written").unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"written");
+        assert_eq!(fs::read(&sentinel).unwrap(), b"untouched");
+        let mut left: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            ["shares.yaml", "shares.yaml.tmp"],
+            "the planted link stays as found and no temp of ours is left"
+        );
+
+        let linked = dir.join("linked.yaml");
+        std::os::unix::fs::symlink(&sentinel, &linked).unwrap();
+        let err = write_atomically(&linked, b"written")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            format!(
+                "'{}' is a symlink; mesh state is written only to regular files. Replace the link with the file it points to and try again.",
+                linked.display()
+            )
+        );
+        assert_eq!(fs::read(&sentinel).unwrap(), b"untouched");
+        assert!(
+            fs::symlink_metadata(&linked)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 3, "no temp is left");
     }
 
     #[test]
