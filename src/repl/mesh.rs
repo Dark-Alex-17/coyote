@@ -9705,6 +9705,274 @@ mod tests {
                 });
             }
 
+            /// Usage probe: the one legacy shape the withdrawn `.mesh deny` verb could leave —
+            /// a denied record under an identity that is NOT trusted for all — is forgotten
+            /// whole from the verb: `--dry-run` previews and writes nothing, the consented
+            /// write takes the record AND its deny in one commit (one `mesh.trust.revoked`,
+            /// no grant), so no orphan deny survives and the next `untrust` says the
+            /// destination is not in the list at all.
+            #[test]
+            #[serial]
+            fn usage_probe_untrust_of_a_denied_record_under_a_plain_identity_forgets_the_deny_through_the_repl()
+             {
+                use crate::hooks::HookEvent;
+                use crate::mesh::events::{
+                    MeshHooks, RecordingHookSink, TrustHookObserver, env_value, one_fire,
+                };
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-usage-probe-plain-denied-forget");
+                let _capture = capture::install();
+                run_async(async {
+                    let started =
+                        started_runtime("repl-mesh-usage-probe-plain-denied-forget").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let trust = started.runtime.trust();
+                    let now = SystemTime::now();
+                    let (dest, id) = heard_peer(&started.runtime, "Tia", now);
+                    out_of(&mut ctx, &format!(".mesh trust {dest} --yes"))
+                        .await
+                        .unwrap();
+                    assert!(
+                        trust
+                            .records()
+                            .iter()
+                            .all(|record| !(record.hash == id && record.all_destinations)),
+                        "the identity is not trusted for all: destination tier only"
+                    );
+                    // The legacy shape: a deny laid over a record under a plain identity.
+                    trust
+                        .deny_destination(ctx.app.mesh.as_ref(), &dest, None, now)
+                        .unwrap();
+                    let row = |trust: &TrustStore| {
+                        trust
+                            .records()
+                            .into_iter()
+                            .find(|record| record.hash == dest)
+                    };
+                    assert!(row(&trust).unwrap().denied);
+                    assert_eq!(row(&trust).unwrap().identity.as_deref(), Some(id.as_str()));
+                    assert_eq!(trust.authorize(&id, &dest).rule, Rule::DestinationDenied);
+                    let before = trust_file(&trust).expect("the record is on disk");
+                    let hooks = MeshHooks::default();
+                    let sink = RecordingHookSink::attach(&hooks);
+                    trust.set_observer(Arc::new(TrustHookObserver(hooks)));
+                    let offers = |ctx: &RequestContext, words: &[&str]| -> Vec<String> {
+                        ctx.repl_complete(".mesh", words, "")
+                            .into_iter()
+                            .map(|(candidate, _)| candidate)
+                            .collect()
+                    };
+                    // (Whether `untrust <TAB>` offers a denied record under a plain identity is
+                    // a deferred completion question; the verb's behaviour is what is pinned.)
+
+                    // Dry run under both spellings: the preview, then nothing written.
+                    let _script = prompt_script::install(&[]);
+                    for verb in ["untrust", "forget"] {
+                        let out = out_of(&mut ctx, &format!(".mesh {verb} {dest} --dry-run"))
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            out,
+                            format!(
+                                "This forgets trusted instance {}; the record for its identity stays.\n{DRY_RUN_NOTHING_CHANGED}",
+                                short(&dest)
+                            ),
+                            "{verb}"
+                        );
+                    }
+                    assert_eq!(trust_file(&trust).as_deref(), Some(before.as_slice()));
+                    assert!(row(&trust).unwrap().denied);
+                    assert_eq!(trust.denied().len(), 1);
+                    assert!(sink.drain().is_empty(), "a dry run fires nothing");
+                    assert_eq!(prompt_script::prompts_asked(), 0, "a dry run asks nothing");
+                    drop(_script);
+
+                    // Consented through the alias: record and deny go in the same write.
+                    let _script = prompt_script::install(&[true]);
+                    let out = out_of(&mut ctx, &format!(".mesh forget {dest}"))
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        out,
+                        format!(
+                            "This forgets trusted instance {short}; the record for its identity stays.\nUntrusted {short}.",
+                            short = short(&dest)
+                        )
+                    );
+                    assert_eq!(prompt_script::prompts_asked(), 1, "forgetting is consented");
+                    assert!(row(&trust).is_none(), "the record is gone");
+                    assert!(
+                        trust.denied().is_empty(),
+                        "no orphan deny survives the record: {:?}",
+                        trust.denied()
+                    );
+                    assert_eq!(trust.authorize(&id, &dest).rule, Rule::DefaultClosed);
+                    assert_eq!(trust.authorize(&id, &dest).decision, Decision::Refuse);
+                    let envs = one_fire(&sink, HookEvent::MeshTrustRevoked);
+                    assert_eq!(
+                        env_value(&envs, "COYOTE_MESH_TRUST_TIER"),
+                        Some("destination")
+                    );
+                    assert_eq!(
+                        env_value(&envs, "COYOTE_MESH_PEER_DESTINATION"),
+                        Some(dest.as_str())
+                    );
+                    assert_ne!(trust_file(&trust).as_deref(), Some(before.as_slice()));
+
+                    // Afterwards the destination is simply not in the list — not "refused".
+                    assert_eq!(
+                        refusal(&mut ctx, &format!(".mesh untrust {dest}")).await,
+                        format!(
+                            "Destination {dest} is not in the trust list, so there is nothing to untrust."
+                        )
+                    );
+                    assert!(!offers(&ctx, &["untrust", ""]).contains(&dest));
+                    assert!(!offers(&ctx, &["forget", ""]).contains(&dest));
+                    assert!(
+                        offers(&ctx, &["trust", ""]).contains(&dest),
+                        "still heard, so `trust` offers it"
+                    );
+                    assert!(sink.drain().is_empty());
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// Usage probe: forgetting a denied record drops only ITS deny — a sibling's deny
+            /// is left alone — and the rule holds for a record that lives in the session only:
+            /// its on-disk deny is still taken, which is a file write even though the record
+            /// itself was never on disk.
+            #[test]
+            #[serial]
+            fn usage_probe_forgetting_a_denied_record_takes_only_its_own_deny_even_for_a_session_record()
+             {
+                use crate::hooks::HookEvent;
+                use crate::mesh::events::{
+                    MeshHooks, RecordingHookSink, TrustHookObserver, one_fire,
+                };
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-usage-probe-sibling-deny");
+                let _capture = capture::install();
+                let _script = prompt_script::install(&[]);
+                run_async(async {
+                    let started = started_runtime("repl-mesh-usage-probe-sibling-deny").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let trust = started.runtime.trust();
+                    let now = SystemTime::now();
+                    let (disk_dest, disk_id) = heard_peer(&started.runtime, "Tia", now);
+                    let (session_dest, session_id) = heard_peer(&started.runtime, "Bea", now);
+                    out_of(&mut ctx, &format!(".mesh trust {disk_dest} --yes"))
+                        .await
+                        .unwrap();
+                    trust
+                        .trust_destination_for_session(ctx.app.mesh.as_ref(), &session_dest, now)
+                        .unwrap();
+                    trust
+                        .deny_destination(ctx.app.mesh.as_ref(), &disk_dest, None, now)
+                        .unwrap();
+                    trust
+                        .deny_destination(ctx.app.mesh.as_ref(), &session_dest, None, now)
+                        .unwrap();
+                    let row = |trust: &TrustStore, hash: &str| {
+                        trust
+                            .records()
+                            .into_iter()
+                            .find(|record| record.hash == hash)
+                    };
+                    assert!(row(&trust, &disk_dest).unwrap().denied);
+                    assert!(row(&trust, &session_dest).unwrap().denied);
+                    assert_eq!(trust.denied().len(), 2);
+                    assert_eq!(
+                        trust.authorize(&session_id, &session_dest).rule,
+                        Rule::DestinationDenied
+                    );
+                    let hooks = MeshHooks::default();
+                    let sink = RecordingHookSink::attach(&hooks);
+                    trust.set_observer(Arc::new(TrustHookObserver(hooks)));
+
+                    // Forgetting the disk record leaves the sibling's deny where it is.
+                    let out = out_of(&mut ctx, &format!(".mesh untrust {disk_dest} --yes"))
+                        .await
+                        .unwrap();
+                    assert!(
+                        out.ends_with(&format!("Untrusted {}.", short(&disk_dest))),
+                        "{out}"
+                    );
+                    assert!(row(&trust, &disk_dest).is_none());
+                    assert_eq!(
+                        trust.authorize(&disk_id, &disk_dest).rule,
+                        Rule::DefaultClosed
+                    );
+                    let denied: Vec<String> = trust
+                        .denied()
+                        .into_iter()
+                        .map(|overlay| overlay.hash)
+                        .collect();
+                    assert_eq!(denied, [session_dest.as_str()], "only its own deny went");
+                    assert!(row(&trust, &session_dest).unwrap().denied);
+                    assert_eq!(
+                        trust.authorize(&session_id, &session_dest).rule,
+                        Rule::DestinationDenied
+                    );
+                    one_fire(&sink, HookEvent::MeshTrustRevoked);
+                    let between = trust_file(&trust).expect("the file holds the sibling deny");
+
+                    // The session record never reached the file; its deny did, and goes too.
+                    let out = out_of(&mut ctx, &format!(".mesh untrust {session_dest} --dry-run"))
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        out,
+                        format!(
+                            "This forgets trusted instance {}; the record for its identity stays.\n{DRY_RUN_NOTHING_CHANGED}",
+                            short(&session_dest)
+                        )
+                    );
+                    assert_eq!(trust_file(&trust).as_deref(), Some(between.as_slice()));
+                    assert!(sink.drain().is_empty());
+                    let out = out_of(&mut ctx, &format!(".mesh forget {session_dest} --yes"))
+                        .await
+                        .unwrap();
+                    assert!(
+                        out.ends_with(&format!("Untrusted {}.", short(&session_dest))),
+                        "{out}"
+                    );
+                    assert!(row(&trust, &session_dest).is_none());
+                    assert!(
+                        trust.denied().is_empty(),
+                        "the session record's on-disk deny went with it: {:?}",
+                        trust.denied()
+                    );
+                    assert_eq!(
+                        trust.authorize(&session_id, &session_dest).rule,
+                        Rule::DefaultClosed
+                    );
+                    assert_ne!(
+                        trust_file(&trust).as_deref(),
+                        Some(between.as_slice()),
+                        "dropping the deny is a file write"
+                    );
+                    one_fire(&sink, HookEvent::MeshTrustRevoked);
+                    assert_eq!(
+                        prompt_script::prompts_asked(),
+                        0,
+                        "--yes stood in for every question"
+                    );
+                    assert_eq!(
+                        refusal(&mut ctx, &format!(".mesh untrust {session_dest}")).await,
+                        format!(
+                            "Destination {session_dest} is not in the trust list, so there is nothing to untrust."
+                        )
+                    );
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
             /// A knock is only proof when its hashes derive the destination: one cached
             /// before its name hash was kept and one whose identity does not derive the
             /// destination are both refused with a teaching text, and nothing is written.
