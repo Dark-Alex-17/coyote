@@ -17068,6 +17068,345 @@ mod tests {
                         fx.stop().await;
                     });
                 }
+
+                /// The last backticked token of a teaching sentence: the remedy it
+                /// hands the operator.
+                fn taught_pattern(sentence: &str) -> String {
+                    sentence
+                        .split('`')
+                        .enumerate()
+                        .filter(|(index, _)| index % 2 == 1)
+                        .map(|(_, token)| token.to_string())
+                        .last()
+                        .unwrap_or_else(|| panic!("no backticked remedy in {sentence:?}"))
+                }
+
+                /// (a) A link as a LEADING segment is judged by what it resolves to: a
+                /// file tail behind a linked directory teaches the plain allow of the real
+                /// file, a nested link head (`sub/dlink`) teaches the pattern re-rooted
+                /// through the real directory, and no flag (`--dry-run`, `--global`,
+                /// `--workspace`, `--force`) turns the refusal into a write or an
+                /// announcement.
+                #[test]
+                #[serial]
+                fn usage_probe_a_link_head_before_a_tail_or_nested_under_a_dir_is_judged_by_its_resolution()
+                 {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-link-head");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = ShareFixture::new(
+                            "repl-mesh-probe-link-head",
+                            &["docs/a.md", "docs/sub/x.md", "sub/.keep"],
+                        )
+                        .await;
+                        std::os::unix::fs::symlink("docs", fx.root.path.join("dlink")).unwrap();
+                        std::os::unix::fs::symlink("../docs", fx.root.path.join("sub/dlink"))
+                            .unwrap();
+                        std::os::unix::fs::symlink("docs/sub", fx.root.path.join("deep")).unwrap();
+
+                        // Link head, plain-file tail ⇒ the real file is taught.
+                        for line in [
+                            ".mesh allow dlink/a.md",
+                            ".mesh allow dlink/a.md --dry-run",
+                            ".mesh allow dlink/a.md --global",
+                            ".mesh allow dlink/a.md --workspace",
+                            ".mesh allow dlink/a.md --force",
+                            ".mesh deny dlink/a.md",
+                            ".mesh allow sub/dlink/a.md",
+                        ] {
+                            let err = refusal(&mut fx.ctx, line).await;
+                            assert_eq!(
+                                taught_pattern(&err),
+                                "docs/a.md",
+                                "{line}: teaches the real file: {err}"
+                            );
+                            assert!(!err.contains("dlink/a.md`"), "{line}: {err}");
+                        }
+
+                        // Nested link head ⇒ the pattern is re-rooted through the real dir.
+                        for (line, taught) in [
+                            (".mesh allow sub/dlink", "docs/**"),
+                            (".mesh allow sub/dlink/**", "docs/**"),
+                            (".mesh allow sub/dlink/*.md --dry-run", "docs/*.md"),
+                            (".mesh deny sub/dlink/**", "docs/**"),
+                            (".mesh allow deep", "docs/sub/**"),
+                            (".mesh allow deep/**", "docs/sub/**"),
+                            (".mesh allow deep/x.md", "docs/sub/x.md"),
+                            (".mesh allow dlink/sub/**", "docs/sub/**"),
+                            (".mesh allow dlink/sub/x.md", "docs/sub/x.md"),
+                        ] {
+                            let err = refusal(&mut fx.ctx, line).await;
+                            assert_eq!(taught_pattern(&err), taught, "{line}: {err}");
+                        }
+
+                        assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
+                        assert!(fx.entries().is_empty());
+                        assert!(!fx.locations.global.exists());
+                        assert!(!fx.locations.workspace.exists());
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+
+                        // Every taught remedy is accepted by the verb and serves the real file.
+                        for taught in ["docs/a.md", "docs/sub/**"] {
+                            let out = out_of(&mut fx.ctx, &format!(".mesh allow {taught}"))
+                                .await
+                                .unwrap();
+                            assert!(out.contains("written to"), "{taught}: {out}");
+                        }
+                        let out = out_of(&mut fx.ctx, ".mesh shares --effective")
+                            .await
+                            .unwrap();
+                        assert!(out.lines().any(|line| line == "  docs/a.md"), "{out}");
+                        assert!(out.lines().any(|line| line == "  docs/sub/x.md"), "{out}");
+                        assert!(!out.contains("dlink") && !out.contains("deep"), "{out}");
+                        fx.stop().await;
+                    });
+                }
+
+                /// (a) A link resolving to the share root itself, or a chain of links,
+                /// still teaches a pattern the verb accepts (never `./**` or `/**`, which
+                /// `validate_pattern` refuses); a link head resolving into `.git` is
+                /// refused as never shared even when the link sits in a subdirectory.
+                #[test]
+                #[serial]
+                fn usage_probe_a_link_to_the_root_a_link_chain_and_a_nested_link_into_git_are_judged_resolved()
+                 {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-link-root");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = ShareFixture::new(
+                            "repl-mesh-probe-link-root",
+                            &["docs/a.md", ".git/HEAD", "sub/.keep"],
+                        )
+                        .await;
+                        std::os::unix::fs::symlink(".", fx.root.path.join("here")).unwrap();
+                        std::os::unix::fs::symlink("docs", fx.root.path.join("dlink")).unwrap();
+                        std::os::unix::fs::symlink("dlink", fx.root.path.join("chain")).unwrap();
+                        std::os::unix::fs::symlink("../.git", fx.root.path.join("sub/glink"))
+                            .unwrap();
+
+                        // Root-resolving link: the remedy must be a pattern the verb takes.
+                        for line in [".mesh allow here/docs/**", ".mesh allow here/docs/a.md"] {
+                            let err = refusal(&mut fx.ctx, line).await;
+                            assert!(
+                                err.contains("`here`") && err.contains("share root"),
+                                "{line}: names the link and what it resolves to: {err}"
+                            );
+                            let taught = taught_pattern(&err);
+                            assert!(
+                                !taught.starts_with('/') && !taught.starts_with("./"),
+                                "{line}: teaches a pattern validate_pattern accepts: {err}"
+                            );
+                        }
+                        for line in [".mesh allow here", ".mesh allow here/**"] {
+                            let err = refusal(&mut fx.ctx, line).await;
+                            let taught = taught_pattern(&err);
+                            assert!(
+                                !taught.starts_with('/') && !taught.starts_with("./"),
+                                "{line}: teaches a pattern validate_pattern accepts: {err}"
+                            );
+                            // `--dry-run` never prompts, so a broad remedy is probed
+                            // for acceptance without `--yes`.
+                            let out =
+                                out_of(&mut fx.ctx, &format!(".mesh allow {taught} --dry-run"))
+                                    .await
+                                    .unwrap_or_else(|err| {
+                                        panic!("{line}: taught `{taught}` is refused: {err}")
+                                    });
+                            assert!(!out.contains("written to"), "{out}");
+                        }
+
+                        // A link to a link to a directory resolves to that directory.
+                        for (line, taught) in [
+                            (".mesh allow chain/**", "docs/**"),
+                            (".mesh allow chain", "docs/**"),
+                            (".mesh allow chain/a.md", "docs/a.md"),
+                        ] {
+                            let err = refusal(&mut fx.ctx, line).await;
+                            assert_eq!(taught_pattern(&err), taught, "{line}: {err}");
+                        }
+
+                        // A nested link head into `.git` is never shared.
+                        for line in [
+                            ".mesh allow sub/glink/**",
+                            ".mesh allow sub/glink/HEAD",
+                            ".mesh allow sub/glink/HEAD --force --global",
+                            ".mesh deny sub/glink/**",
+                        ] {
+                            let err = refusal(&mut fx.ctx, line).await;
+                            assert!(
+                                err.contains(".git") || err.contains("never"),
+                                "{line}: names the skipped directory: {err}"
+                            );
+                            assert!(!err.contains("written to"), "{line}: {err}");
+                        }
+
+                        let stdout = stdout_lines();
+                        assert!(
+                            stdout
+                                .iter()
+                                .all(|line| !line.contains("written to")
+                                    && !line.contains("Will write")),
+                            "{stdout:?}"
+                        );
+                        assert!(fx.entries().is_empty());
+                        assert!(!fx.locations.global.exists());
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        fx.stop().await;
+                    });
+                }
+
+                /// (c) Judging a link needs the root, so it waits behind the mesh gate;
+                /// (a) `unshare` removes an entry by its TEXT, so a rule an older build
+                /// wrote through a link can still be removed and still shows in `shares`
+                /// — the link judgement never strands a legacy rule.
+                #[test]
+                #[serial]
+                fn usage_probe_link_judgement_waits_behind_the_gate_and_never_strands_a_legacy_rule()
+                 {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-link-gate");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    {
+                        let mut ctx = off_ctx();
+                        let root = TempDir::new("repl-mesh-probe-link-gate-root");
+                        seed_files(&root.path, &["docs/a.md"]);
+                        std::os::unix::fs::symlink("docs", root.path.join("dlink")).unwrap();
+                        std::os::unix::fs::symlink("missing", root.path.join("gone")).unwrap();
+                        publish_root(&ctx, &root.path);
+                        let (_, locations) = share_locations(&ctx).unwrap();
+
+                        for line in [
+                            ".mesh allow dlink",
+                            ".mesh allow dlink/**",
+                            ".mesh allow dlink/a.md",
+                            ".mesh allow gone",
+                            ".mesh allow gone --force --global",
+                            ".mesh deny dlink/**",
+                            ".mesh unshare dlink/**",
+                        ] {
+                            assert_eq!(err_of(&mut ctx, line), MESH_OFF, "{line}");
+                        }
+                        // The trailing-slash teaching is pure and still fires first.
+                        let err = err_of(&mut ctx, ".mesh allow dlink/");
+                        assert_ne!(err, MESH_OFF);
+                        assert!(err.contains("/**`"), "{err}");
+                        assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
+                        assert!(!locations.global.exists());
+                    }
+
+                    run_async(async {
+                        let mut fx = ShareFixture::new(
+                            "repl-mesh-probe-link-gate",
+                            &["docs/a.md", "docs/b.md"],
+                        )
+                        .await;
+                        std::os::unix::fs::symlink("docs", fx.root.path.join("dlink")).unwrap();
+                        fx.write_global(
+                            "version: 1\nallow:\n- pattern: dlink/**\n- pattern: docs/a.md\ndeny:\n- pattern: dlink/b.md\n",
+                        );
+
+                        // The legacy rows are listed with their file and serve nothing.
+                        let out = out_of(&mut fx.ctx, ".mesh shares").await.unwrap();
+                        assert!(out.contains("dlink/**"), "{out}");
+                        assert!(out.contains("dlink/b.md"), "{out}");
+                        assert!(out.contains(&fx.global()), "{out}");
+                        let out = out_of(&mut fx.ctx, ".mesh shares --effective")
+                            .await
+                            .unwrap();
+                        assert!(out.lines().any(|line| line == "  docs/a.md"), "{out}");
+                        assert!(!out.contains("dlink"), "{out}");
+
+                        // Re-asking for the legacy allow is still refused (nothing doubled).
+                        let err = refusal(&mut fx.ctx, ".mesh allow dlink/**").await;
+                        assert_eq!(taught_pattern(&err), "docs/**", "{err}");
+                        assert_eq!(fx.entries().len(), 3);
+
+                        // unshare works by text and removes each legacy row.
+                        let out = out_of(&mut fx.ctx, ".mesh unshare dlink/**")
+                            .await
+                            .unwrap_or_else(|err| {
+                                panic!(
+                                    "a legacy rule spelled through a link cannot be removed: {err}"
+                                )
+                            });
+                        assert!(out.contains("dlink/**"), "{out}");
+                        let out = out_of(&mut fx.ctx, ".mesh unshare dlink/b.md")
+                            .await
+                            .unwrap_or_else(|err| {
+                                panic!(
+                                    "a legacy deny spelled through a link cannot be removed: {err}"
+                                )
+                            });
+                        assert!(out.contains("dlink/b.md"), "{out}");
+                        assert_eq!(
+                            fx.entries(),
+                            [allow_entry(Layer::Global, "docs/a.md", None)]
+                        );
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        fx.stop().await;
+                    });
+                }
+
+                /// (h) Nothing the verb would refuse is offered: a link head is never a
+                /// completion, and neither is a path spelled through one, while the real
+                /// directory behind it still is.
+                #[test]
+                #[serial]
+                fn usage_probe_completion_never_offers_a_path_through_a_link_head() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-link-complete");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = ShareFixture::new(
+                            "repl-mesh-probe-link-complete",
+                            &["docs/a.md", "sub/notes.md", ".git/HEAD"],
+                        )
+                        .await;
+                        std::os::unix::fs::symlink("docs", fx.root.path.join("dlink")).unwrap();
+                        std::os::unix::fs::symlink("../docs", fx.root.path.join("sub/dlink"))
+                            .unwrap();
+                        std::os::unix::fs::symlink(".git", fx.root.path.join("glink")).unwrap();
+
+                        let mut violations = Vec::new();
+                        for (prefix, forbidden, expected) in [
+                            ("d", "dlink", Some("docs/")),
+                            ("dlink/", "dlink/", None),
+                            ("sub/", "sub/dlink", Some("sub/notes.md")),
+                            ("sub/dlink/", "dlink", None),
+                            ("glink/", "glink", None),
+                        ] {
+                            let offered: Vec<String> = fx
+                                .ctx
+                                .repl_complete(".mesh", &["allow", prefix], "")
+                                .into_iter()
+                                .map(|(candidate, _)| candidate)
+                                .collect();
+                            if offered.iter().any(|value| value.contains(forbidden)) {
+                                violations.push(format!(
+                                    "prefix {prefix:?} offers a path through a link: {offered:?}"
+                                ));
+                            }
+                            if let Some(expected) = expected {
+                                assert!(
+                                    offered.iter().any(|value| value == expected),
+                                    "{prefix}: {offered:?}"
+                                );
+                            } else if !offered.is_empty() {
+                                violations.push(format!(
+                                    "prefix {prefix:?} should list nothing: {offered:?}"
+                                ));
+                            }
+                        }
+                        // Each offered value through a link is one the verb refuses.
+                        let err = refusal(&mut fx.ctx, ".mesh allow dlink/a.md").await;
+                        assert!(err.contains("`docs/a.md`"), "{err}");
+                        assert!(fx.entries().is_empty());
+                        fx.stop().await;
+                        assert!(violations.is_empty(), "{}", violations.join("\n"));
+                    });
+                }
             }
         }
     }
