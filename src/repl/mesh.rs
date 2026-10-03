@@ -2014,7 +2014,7 @@ fn render_effective_shares(
     }
     if resolved.capped {
         lines.push(format!(
-            "… listing capped at {LIST_PAGE_SIZE} entries; narrow the patterns or use mesh__list."
+            "… listing capped at {LIST_PAGE_SIZE} entries; narrow the patterns, or pass `--peer <hash>` to see one peer's view."
         ));
     }
     if resolved.truncated {
@@ -2072,7 +2072,10 @@ fn classify_share(args: MutationArgs, verb: &str) -> Result<Option<ShareArgs>> {
 /// alone name the filesystem root, which `validate_pattern` has the sentence for.
 fn refuse_directory_pattern(pattern: &str, does: &str) -> Result<()> {
     if pattern.ends_with('/') && !pattern.starts_with('/') {
-        bail!("`{pattern}` names a directory; {does} `{pattern}**`, or one file by its path.");
+        bail!(
+            "`{pattern}` names a directory; {does} `{}/**`, or one file by its path.",
+            pattern.trim_end_matches('/')
+        );
     }
     Ok(())
 }
@@ -2080,9 +2083,7 @@ fn refuse_directory_pattern(pattern: &str, does: &str) -> Result<()> {
 /// The share root and where its two files live, with the configured inbox protected
 /// whether or not a node is running; `None` before a snapshot names the root.
 fn share_locations(ctx: &RequestContext) -> Option<(PathBuf, ShareLocations)> {
-    ctx.app
-        .mesh
-        .share_locations(ctx.app.config.mesh.fetch.inbox_dir.as_deref())
+    ctx.share_locations()
 }
 
 /// The share root and the two share files, loaded; the verbs' one way in. Each verb
@@ -2846,14 +2847,14 @@ pub(crate) mod prompt_script {
     //! closure that runs while the question stands, counting every prompt asked. The
     //! script is process-global: tests using it must be `#[serial]`.
 
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     const INACTIVE: usize = 0;
     const TTY: usize = 1;
     const NON_TTY: usize = 2;
 
-    type Answerer = Box<dyn Fn(&str) -> bool + Send + Sync>;
+    type Answerer = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 
     static STATE: AtomicUsize = AtomicUsize::new(INACTIVE);
     static ASKED: AtomicUsize = AtomicUsize::new(0);
@@ -2874,10 +2875,11 @@ pub(crate) mod prompt_script {
     #[cfg(unix)]
     #[must_use]
     pub fn install_answering(answer: impl Fn(&str) -> bool + Send + Sync + 'static) -> ScriptGuard {
+        let guard = install_with_state(TTY, &[]);
         *ANSWERER
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Box::new(answer));
-        install_with_state(TTY, &[])
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(answer));
+        guard
     }
 
     /// Forces stdin to be no terminal, so the flag-naming refusal is pinned wherever the
@@ -2891,6 +2893,10 @@ pub(crate) mod prompt_script {
         *ANSWERS
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = answers.to_vec();
+        ANSWERER
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
         ASKED.store(0, Ordering::SeqCst);
         STATE.store(state, Ordering::SeqCst);
         ScriptGuard
@@ -2927,11 +2933,12 @@ pub(crate) mod prompt_script {
 
     pub(super) fn next_answer(question: &str) -> bool {
         ASKED.fetch_add(1, Ordering::SeqCst);
-        if let Some(answer) = ANSWERER
+        // Cloned out so arbitrary test code never runs under the lock.
+        let answerer = ANSWERER
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .as_ref()
-        {
+            .clone();
+        if let Some(answer) = answerer {
             return answer(question);
         }
         let mut answers = ANSWERS
@@ -12998,6 +13005,10 @@ mod tests {
                         assert_eq!(
                             refusal(&mut fx.ctx, ".mesh unshare docs/").await,
                             "`docs/` names a directory; name what is under it with `docs/**`, or one file by its path."
+                        );
+                        assert_eq!(
+                            refusal(&mut fx.ctx, ".mesh allow docs//").await,
+                            "`docs//` names a directory; share what is under it with `docs/**`, or one file by its path."
                         );
                         for line in [".mesh allow /", ".mesh deny //", ".mesh unshare /docs/"] {
                             let err = refusal(&mut fx.ctx, line).await;

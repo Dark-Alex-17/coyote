@@ -2070,7 +2070,7 @@ fn key_change_text(change: &MarkedKeyChange, new_destination: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::TempDir;
+    use super::super::test_support::{TempDir, siblings_of};
     use super::*;
     use crate::hooks::HookEvent;
     use crate::mesh::events::{
@@ -3098,7 +3098,11 @@ mod tests {
             ts = rfc3339_utc(t(1_790_000_000)),
         );
         assert_eq!(text, expected);
-        assert!(!fx.store.path().with_extension("yaml.tmp").exists());
+        assert_eq!(
+            siblings_of(fx.store.path()),
+            ["trust.yaml"],
+            "the atomic write leaves no temp file behind"
+        );
     }
 
     #[test]

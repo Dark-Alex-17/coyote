@@ -311,7 +311,7 @@ fn is_expired(record: &PeerRecord, now: SystemTime) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::TempDir;
+    use super::super::test_support::{TempDir, siblings_of};
     use super::*;
     use crate::mesh::protocol::MESH_PROTOCOL_VERSION;
     use crate::testing::{install_log_collector, warn_snapshot};
@@ -501,7 +501,11 @@ mod tests {
         );
         table.persist().unwrap();
         assert!(path.exists());
-        assert!(!path.with_extension("json.tmp").exists());
+        assert_eq!(
+            siblings_of(&path),
+            ["peers.json"],
+            "the atomic write leaves no temp file behind"
+        );
 
         let reloaded = PeerTable::load(path, t0 + PEER_TTL).unwrap();
 

@@ -178,11 +178,9 @@ pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
         .create_new(true)
         .open(&tmp)
         .with_context(|| format!("Failed to write '{}'", path.display()))?;
-    let written = file
-        .write_all(bytes)
-        .and_then(|()| file.sync_all())
-        .and_then(|()| fs::rename(&tmp, path));
+    let flushed = file.write_all(bytes).and_then(|()| file.sync_all());
     drop(file);
+    let written = flushed.and_then(|()| fs::rename(&tmp, path));
     if written.is_err() {
         let _ = fs::remove_file(&tmp);
     }
@@ -331,6 +329,17 @@ pub(crate) mod test_support {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
         }
+    }
+
+    /// The names in `path`'s directory, sorted, so a test can pin that an atomic write
+    /// left nothing beside the file it replaced.
+    pub(crate) fn siblings_of(path: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
     }
 
     /// A TCP listener that accepts every connection and holds it open until the peer hangs

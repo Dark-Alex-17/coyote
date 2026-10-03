@@ -1515,7 +1515,7 @@ mod tests {
     use crate::mesh::propagation::build_signed_message;
     use crate::mesh::r3::{OriginName, RequestFrame};
     use crate::mesh::session_destination_name;
-    use crate::mesh::test_support::{TempDir, TrustList, read_source, rust_sources};
+    use crate::mesh::test_support::{TempDir, TrustList, read_source, rust_sources, siblings_of};
     use crate::testing::{debug_snapshot, install_log_collector, warn_snapshot};
 
     use lxmf_core::message::Payload;
@@ -2528,7 +2528,11 @@ mod tests {
         );
         store.record_sync("cafe", t(5_001), 3);
         store.persist().unwrap();
-        assert!(!path.with_extension("json.tmp").exists());
+        assert_eq!(
+            siblings_of(&path),
+            ["propagation.json"],
+            "the atomic write leaves no temp file behind"
+        );
 
         let json: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(json["version"], 1);

@@ -332,7 +332,7 @@ impl KnockCache {
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::TempDir;
+    use super::super::test_support::{TempDir, siblings_of};
     use super::*;
     use crate::mesh::{hex_lower, rfc3339_utc};
     use crate::testing::{install_log_collector, warn_snapshot};
@@ -425,7 +425,11 @@ mod tests {
         let text = fs::read_to_string(cache.path()).unwrap();
         assert_eq!(text.lines().count(), 3);
         assert!(text.lines().next().unwrap().contains("\"third\""), "{text}");
-        assert!(!cache.path().with_extension("jsonl.tmp").exists());
+        assert_eq!(
+            siblings_of(cache.path()),
+            ["knocks.jsonl", "knocks.jsonl.lock"],
+            "the atomic write leaves no temp file behind"
+        );
     }
 
     #[test]
@@ -619,7 +623,11 @@ mod tests {
             .to_string();
         assert!(err.contains("refusing"), "{err}");
         assert_eq!(fs::read(cache.path()).unwrap(), bytes_before);
-        assert!(!cache.path().with_extension("jsonl.tmp").exists());
+        assert_eq!(
+            siblings_of(cache.path()),
+            ["knocks.jsonl", "knocks.jsonl.lock"],
+            "the atomic write leaves no temp file behind"
+        );
     }
 
     #[test]

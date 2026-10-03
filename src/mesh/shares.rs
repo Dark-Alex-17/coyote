@@ -912,10 +912,11 @@ impl ShareSet {
         let mut walk = Walk::new(&rules, walk_bound, cap).keeping_only(Verdict::Shared);
         let patterns = self.allow_patterns(peer);
         walk.run_from(patterns.iter().map(String::as_str));
+        let (capped, truncated) = (walk.capped, walk.truncated);
         MatchCount {
-            files: walk.candidates.len(),
-            capped: walk.capped,
-            truncated: walk.truncated,
+            files: walk.sorted().len(),
+            capped,
+            truncated,
         }
     }
 
