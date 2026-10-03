@@ -5286,6 +5286,14 @@ impl RequestContext {
             return Vec::new();
         };
         if prior.last() == Some(&"--peer") {
+            let takes_peer = match verb {
+                "allow" => !prior.contains(&"--force"),
+                "shares" => true,
+                _ => false,
+            };
+            if !takes_peer {
+                return Vec::new();
+            }
             let mut values = self.mesh_completion_trusted(false);
             push_missing(&mut values, self.mesh_completion_trusted(true));
             return values;
@@ -5344,12 +5352,11 @@ impl RequestContext {
 
     /// Root-relative paths for `.mesh allow <TAB>` and `.mesh deny <TAB>`: the entries of
     /// the share-root directory `typed` names, directories with a trailing `/`, less
-    /// `.git`, the workspace config directory, anything the built-in deny names, any
-    /// symlink that leaves the root and any symlinked directory, since the walk names
-    /// files by their real path and a rule under the link would reach none. Local
-    /// filesystem and the published snapshot only; nothing reaches the wire or the trust
-    /// store. Empty for a directory prefix the verbs would refuse as a pattern; sorted and
-    /// cut at 200.
+    /// `.git`, the workspace config directory, anything the built-in deny names and every
+    /// symlink, since the walk judges files by their real path and a rule naming the link
+    /// would serve none. Local filesystem and the published snapshot only; nothing reaches
+    /// the wire or the trust store. Empty for a directory prefix the verbs would refuse as
+    /// a pattern; sorted and cut at 200.
     fn mesh_completion_share_paths(&self, typed: &str) -> Vec<(String, Option<String>)> {
         use crate::mesh::shares::{CompletionFilter, validate_pattern};
 
@@ -5395,17 +5402,11 @@ impl RequestContext {
                 if filter.is_hidden(&relative) || filter.is_hidden(&name) {
                     return None;
                 }
-                let path = entry.path();
-                let metadata = fs::metadata(&path).ok()?;
-                if entry.file_type().ok()?.is_symlink()
-                    && (metadata.is_dir()
-                        || !dunce::canonicalize(&path)
-                            .ok()?
-                            .starts_with(&canonical_root))
-                {
+                let file_type = entry.file_type().ok()?;
+                if file_type.is_symlink() {
                     return None;
                 }
-                let value = if metadata.is_dir() {
+                let value = if file_type.is_dir() {
                     format!("{relative}/")
                 } else {
                     relative
@@ -23495,6 +23496,16 @@ mod tests {
             rows,
             "shares --peer takes the same records"
         );
+        for prior in [
+            ["deny", "--peer", ""].as_slice(),
+            &["unshare", "--peer", ""],
+            &["allow", "x", "--force", "--peer", ""],
+        ] {
+            assert!(
+                fixture.complete(prior).is_empty(),
+                "{prior:?}: `--peer` is not a flag this verb takes here"
+            );
+        }
 
         fixture.stop().await;
     }
@@ -23616,12 +23627,12 @@ mod tests {
 
     /// Usage probe: the path completer walks nested directories (a sub-directory is
     /// offered slashed under its parent), hides a built-in-denied file wherever it sits,
-    /// and omits a symlinked FILE that leaves the root as it omits a symlinked directory.
+    /// and omits every symlinked FILE, inside the root or out of it, as it omits a
+    /// symlinked directory: the walk serves the real path, never the link.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
-    async fn usage_probe_repl_complete_mesh_allow_walks_nested_dirs_and_hides_out_of_root_file_links()
-     {
+    async fn usage_probe_repl_complete_mesh_allow_walks_nested_dirs_and_hides_file_links() {
         let _guard = TestConfigDirGuard::new();
         let fixture = seed_mesh_completion_fixture("rc-probe-complete-allow-nested").await;
         let root = publish_share_root(&fixture.ctx, "rc-probe-complete-allow-nested-root");
@@ -23630,11 +23641,17 @@ mod tests {
         seed_share_files(&outside.path, &["leak.txt"]);
         std::os::unix::fs::symlink(outside.path.join("leak.txt"), root.path.join("leak.txt"))
             .unwrap();
+        std::os::unix::fs::symlink(root.path.join("docs/a.md"), root.path.join("alias.md"))
+            .unwrap();
 
         let rows = fixture.complete(&["allow", ""]);
         let top = completion_values(&rows);
         assert!(top.contains(&"docs/"), "{top:?}");
         assert!(!top.iter().any(|value| value.contains("leak")), "{top:?}");
+        assert!(
+            !top.iter().any(|value| value.contains("alias")),
+            "a link to a file inside the root is hidden too: {top:?}"
+        );
 
         let rows = fixture.complete(&["allow", "docs/"]);
         let docs = completion_values(&rows);
