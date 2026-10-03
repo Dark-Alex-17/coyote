@@ -14504,7 +14504,7 @@ mod tests {
                     });
                 }
 
-                /// Usage probe (B-22): the preview counts the files the PEER-LESS allows reach
+                /// Usage probe: the preview counts the files the PEER-LESS allows reach
                 /// after the user denies — a peer-scoped allow and a denied file add nothing —
                 /// and says nothing at all when only peer-scoped allows exist.
                 #[test]
@@ -14634,7 +14634,7 @@ mod tests {
                     assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
                 }
 
-                /// Usage probe (B-22): the live preview count stops at the page size and says
+                /// Usage probe: the live preview count stops at the page size and says
                 /// "1000 or more" instead of walking every file past the user.
                 #[test]
                 #[serial]
@@ -14836,7 +14836,7 @@ mod tests {
                     assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
                 }
 
-                /// Usage probe (B-22): a share file the node refuses leaves the effective set
+                /// Usage probe: a share file the node refuses leaves the effective set
                 /// empty, so the preview says nothing about shares and still reaches the
                 /// consent question.
                 #[test]
@@ -15543,6 +15543,412 @@ mod tests {
                     let err = stderr_lines().join("\n");
                     assert!(err.contains("Failed to resolve the share root"), "{err}");
                     assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
+                }
+
+                /// Usage probe: a failed probe closes EVERY mutation verb — `deny` and
+                /// `unshare` refuse by the same one sentence as `allow`, a broad `allow`
+                /// refuses before it asks, and the share files stay byte-identical —
+                /// while plain `shares` is inspection and still lists the rules. The probe
+                /// is memoised, so restoring the permissions alone does not reopen the
+                /// verbs: the sentence's own remedy (`.mesh off` then `.mesh on`) is the
+                /// only way back.
+                #[test]
+                #[serial]
+                fn usage_probe_deny_and_unshare_also_refuse_an_unprobeable_root_while_shares_lists()
+                {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-unprobeable-all");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = ShareFixture::new(
+                            "repl-mesh-probe-unprobeable-all",
+                            &["docs/a.md", "docs/b.md"],
+                        )
+                        .await;
+                        fx.write_global(
+                            "version: 1\nallow:\n- pattern: docs/**\ndeny:\n- pattern: secrets/**\n",
+                        );
+                        let before = fs::read_to_string(&fx.locations.global).unwrap();
+                        let locked = ModeRestore::read_only(&fx.root.path);
+                        if fs::File::create(fx.root.path.join("probe-write-check")).is_ok() {
+                            locked.restore();
+                            fx.stop().await;
+                            return;
+                        }
+                        let sentence = format!(
+                            "The share root {} could not be probed, so this node serves nothing from it; fix the directory's permissions and run `.mesh off` then `.mesh on`.",
+                            fx.root.path.display()
+                        );
+
+                        for line in [
+                            ".mesh deny docs/a.md",
+                            ".mesh deny **",
+                            ".mesh unshare docs/**",
+                            ".mesh unshare secrets/**",
+                            ".mesh allow **",
+                            ".mesh allow docs/b.md --dry-run",
+                        ] {
+                            assert_eq!(refusal(&mut fx.ctx, line).await, sentence, "{line}");
+                        }
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
+                        assert_eq!(fs::read_to_string(&fx.locations.global).unwrap(), before);
+                        assert!(!fx.locations.workspace.exists());
+
+                        let out = out_of(&mut fx.ctx, ".mesh shares").await.unwrap();
+                        assert!(out.starts_with("Share rules ("), "{out}");
+                        assert!(out.contains("docs/**"), "{out}");
+                        assert!(out.contains("secrets/**"), "{out}");
+                        assert!(!out.contains("could not be probed"), "{out}");
+
+                        locked.restore();
+                        assert_eq!(
+                            refusal(&mut fx.ctx, ".mesh deny docs/a.md").await,
+                            sentence,
+                            "the node's probe is memoised; the sentence's remedy is off/on"
+                        );
+                        assert_eq!(fs::read_to_string(&fx.locations.global).unwrap(), before);
+                        fx.stop().await;
+                    });
+                }
+
+                /// Usage probe: the preview counts FILES, not rule hits — five allow
+                /// patterns that all reach the same three files (one through a linked head
+                /// that resolves to the same directory) read as "3 path(s)", and the
+                /// effective view lists each file once.
+                #[test]
+                #[serial]
+                fn usage_probe_on_preview_and_effective_count_an_overlapping_file_once() {
+                    let config = MeshConfig {
+                        interfaces: vec![MeshInterface::Lan],
+                        ..MeshConfig::default()
+                    };
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-distinct-count");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[false]);
+                    let mut ctx = ctx_with(config, true);
+                    ctx.session = Some(Session::default());
+                    let root = TempDir::new("repl-mesh-probe-distinct-count-root");
+                    seed_files(
+                        &root.path,
+                        &["docs/a.md", "docs/b.md", "docs/sub/x.md", "src/main.rs"],
+                    );
+                    std::os::unix::fs::symlink("docs", root.path.join("dl")).unwrap();
+                    publish_root(&ctx, &root.path);
+                    let (_, locations) = share_locations(&ctx).unwrap();
+                    write_share_file(
+                        &locations.global,
+                        "version: 1\nallow:\n- pattern: docs/**\n- pattern: dl/**\n- pattern: docs/sub/**\n- pattern: docs/*.md\n- pattern: docs/a.md\n",
+                    );
+
+                    run_async(run(&mut ctx, ".mesh shares --effective")).unwrap();
+                    let out = stdout_lines().join("\n");
+                    assert_eq!(
+                        out.lines().collect::<Vec<_>>(),
+                        [
+                            format!(
+                                "Files every trusted peer can fetch from {}:",
+                                root.path.display()
+                            )
+                            .as_str(),
+                            "  docs/a.md",
+                            "  docs/b.md",
+                            "  docs/sub/x.md",
+                        ],
+                        "{out}"
+                    );
+
+                    let before = stdout_lines().len();
+                    run_async(run(&mut ctx, ".mesh on")).unwrap();
+                    assert!(ctx.app.mesh.get().is_none());
+                    let out = stdout_lines()[before..].to_vec();
+                    let files = index_of(
+                        &out,
+                        "  files: 3 path(s) are shared with trusted peers (`.mesh shares`)",
+                    );
+                    assert!(files < index_of(&out, "Mesh stays off"), "{out:?}");
+                    assert_eq!(prompt_script::prompts_asked(), 1);
+                }
+
+                /// Usage probe: every share-file write (create global, no-op, create
+                /// workspace, bare allow into the workspace, deny, unshare, dry-run) leaves
+                /// exactly the share file beside its neighbours — no temp file survives a
+                /// write, a no-op or a dry run — and the file written is a regular file.
+                #[test]
+                #[serial]
+                fn usage_probe_share_writes_leave_no_temp_file_beside_the_share_file() {
+                    use crate::mesh::test_support::siblings_of;
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-no-temp");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = ShareFixture::new(
+                            "repl-mesh-probe-no-temp",
+                            &["docs/a.md", "docs/b.md", "notes/n.md"],
+                        )
+                        .await;
+                        let global_name = fx
+                            .locations
+                            .global
+                            .file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .into_owned();
+                        let workspace_name = fx
+                            .locations
+                            .workspace
+                            .file_name()
+                            .unwrap()
+                            .to_string_lossy()
+                            .into_owned();
+                        fs::create_dir_all(fx.locations.global.parent().unwrap()).unwrap();
+                        let global_before = siblings_of(&fx.locations.global);
+                        assert!(!global_before.contains(&global_name));
+                        let mut expected_global = global_before.clone();
+                        expected_global.push(global_name.clone());
+                        expected_global.sort();
+
+                        out_of(&mut fx.ctx, ".mesh allow docs/a.md").await.unwrap();
+                        assert_eq!(siblings_of(&fx.locations.global), expected_global);
+                        assert!(
+                            fs::symlink_metadata(&fx.locations.global)
+                                .unwrap()
+                                .file_type()
+                                .is_file()
+                        );
+
+                        out_of(&mut fx.ctx, ".mesh allow docs/a.md").await.unwrap();
+                        assert_eq!(siblings_of(&fx.locations.global), expected_global, "no-op");
+                        out_of(&mut fx.ctx, ".mesh deny docs/b.md --dry-run")
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            siblings_of(&fx.locations.global),
+                            expected_global,
+                            "dry run"
+                        );
+                        out_of(&mut fx.ctx, ".mesh deny docs/b.md").await.unwrap();
+                        assert_eq!(siblings_of(&fx.locations.global), expected_global, "deny");
+                        out_of(&mut fx.ctx, ".mesh unshare docs/b.md")
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            siblings_of(&fx.locations.global),
+                            expected_global,
+                            "unshare"
+                        );
+
+                        out_of(&mut fx.ctx, ".mesh allow notes/n.md --workspace")
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            siblings_of(&fx.locations.workspace),
+                            std::slice::from_ref(&workspace_name),
+                            "workspace created"
+                        );
+                        out_of(&mut fx.ctx, ".mesh allow docs/b.md").await.unwrap();
+                        assert_eq!(
+                            siblings_of(&fx.locations.workspace),
+                            std::slice::from_ref(&workspace_name),
+                            "bare allow lands in the workspace file"
+                        );
+                        assert_eq!(siblings_of(&fx.locations.global), expected_global);
+                        assert_eq!(
+                            fx.entries(),
+                            [
+                                allow_entry(Layer::Global, "docs/a.md", None),
+                                allow_entry(Layer::Workspace, "notes/n.md", None),
+                                allow_entry(Layer::Workspace, "docs/b.md", None),
+                            ]
+                        );
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        fx.stop().await;
+                    });
+                }
+
+                /// Usage probe: a pattern held in BOTH files, peer-scoped in one, is listed
+                /// per holder with its file and scope; under Auto the verb asks, a layer
+                /// flag removes only that file's row, and the other file's row survives.
+                #[test]
+                #[serial]
+                fn usage_probe_unshare_lists_cross_file_holders_with_scope_and_a_flag_takes_one() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-unshare-cross");
+                    let _capture = capture::install();
+                    run_async(async {
+                        let mut fx =
+                            ShareFixture::new("repl-mesh-probe-unshare-cross", &["docs/a.md"])
+                                .await;
+                        let peer = "ab".repeat(16);
+                        fx.write_global("version: 1\nallow:\n- pattern: docs/**\n");
+                        fx.write_workspace(&format!(
+                            "version: 1\nallow:\n- pattern: docs/**\n  peer: {peer}\n"
+                        ));
+                        let both = [
+                            allow_entry(Layer::Global, "docs/**", None),
+                            allow_entry(Layer::Workspace, "docs/**", Some(&peer)),
+                        ];
+                        assert_eq!(fx.entries(), both);
+
+                        let _script = prompt_script::install(&[false]);
+                        let out = out_of(&mut fx.ctx, ".mesh unshare docs/**").await.unwrap();
+                        let lines: Vec<&str> = out.lines().collect();
+                        assert!(lines.contains(&"`docs/**` is held by:"), "{out}");
+                        assert!(
+                            lines.contains(
+                                &format!("  allow (every trusted peer) in {}", fx.global())
+                                    .as_str()
+                            ),
+                            "{out}"
+                        );
+                        assert!(
+                            lines.contains(
+                                &format!("  allow (peer {}) in {}", short(&peer), fx.workspace())
+                                    .as_str()
+                            ),
+                            "{out}"
+                        );
+                        assert!(!out.contains(&peer), "{out}");
+                        assert!(out.ends_with(NOTHING_CHANGED), "{out}");
+                        assert_eq!(prompt_script::prompts_asked(), 1);
+                        assert_eq!(fx.entries(), both);
+
+                        let out = out_of(&mut fx.ctx, ".mesh unshare docs/** --workspace")
+                            .await
+                            .unwrap();
+                        assert!(
+                            out.contains(&format!(
+                                "Removed the allow for `docs/**` from {}.",
+                                fx.workspace()
+                            )),
+                            "{out}"
+                        );
+                        assert_eq!(prompt_script::prompts_asked(), 1);
+                        assert_eq!(fx.entries(), [allow_entry(Layer::Global, "docs/**", None)]);
+                        assert_eq!(
+                            fs::read_to_string(&fx.locations.global).unwrap(),
+                            "version: 1\nallow:\n- pattern: docs/**\n"
+                        );
+                        fx.stop().await;
+                    });
+                }
+
+                /// Usage probe: when the rules cannot be built, `--effective --peer` says
+                /// why too — never "no rule reaches the peer" — and a share file the loader
+                /// refuses is named as the reason rather than read as an empty rule set.
+                #[test]
+                #[serial]
+                fn usage_probe_effective_says_why_for_a_peer_and_for_a_refused_share_file() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-effective-why");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    let peer = "ab".repeat(16);
+                    {
+                        let mut ctx = off_ctx();
+                        let root = TempDir::new("repl-mesh-probe-effective-why-root");
+                        publish_root(&ctx, &root.path.join("gone"));
+                        let (_, locations) = share_locations(&ctx).unwrap();
+                        write_share_file(
+                            &locations.global,
+                            "version: 1\nallow:\n- pattern: '**'\n",
+                        );
+
+                        run_async(run(
+                            &mut ctx,
+                            &format!(".mesh shares --effective --peer {peer}"),
+                        ))
+                        .unwrap();
+                        let err = stderr_lines().join("\n");
+                        assert!(err.contains("Failed to resolve the share root"), "{err}");
+                        assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
+                        assert!(!err.contains("no rule reaches"), "{err}");
+                    }
+                    let _capture = capture::install();
+                    {
+                        let mut ctx = off_ctx();
+                        let root = TempDir::new("repl-mesh-probe-effective-refused-root");
+                        seed_files(&root.path, &["docs/a.md"]);
+                        publish_root(&ctx, &root.path);
+                        let (_, locations) = share_locations(&ctx).unwrap();
+                        write_share_file(
+                            &locations.global,
+                            "version: 99\nallow:\n- pattern: '**'\n",
+                        );
+
+                        run_async(run(&mut ctx, ".mesh shares --effective")).unwrap();
+                        let out = stdout_lines().join("\n");
+                        let err = stderr_lines().join("\n");
+                        let all = format!("{out}\n{err}");
+                        assert!(
+                            !all.contains("Nothing resolves: no allow rule names an existing file"),
+                            "a refused file is not an empty rule set: {all}"
+                        );
+                        assert!(
+                            all.contains(&locations.global.display().to_string()),
+                            "the reason names the refused file: {all}"
+                        );
+                        assert!(all.contains("version 99"), "{all}");
+                        assert!(!all.contains("docs/a.md"), "{all}");
+                    }
+                }
+
+                /// Usage probe: the command the link teaching names is accepted end to end,
+                /// and afterwards the resolved file is served while the link itself still
+                /// is not (symlinks are never followed), so the lift reaches exactly what the
+                /// sentence said.
+                #[test]
+                #[serial]
+                fn usage_probe_following_the_link_teaching_lifts_the_resolved_file_not_the_link() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-link-teaching");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = ShareFixture::new(
+                            "repl-mesh-probe-link-teaching",
+                            &[".env", "docs/a.md"],
+                        )
+                        .await;
+                        std::os::unix::fs::symlink("../.env", fx.root.path.join("docs/settings"))
+                            .unwrap();
+
+                        let err = refusal(&mut fx.ctx, ".mesh allow docs/settings").await;
+                        let taught = "`.mesh allow .env --force --global`";
+                        assert!(err.contains(taught), "{err}");
+                        assert!(err.contains("resolves to `.env`"), "{err}");
+                        assert!(fx.entries().is_empty());
+
+                        let out = out_of(&mut fx.ctx, ".mesh allow .env --force --global")
+                            .await
+                            .unwrap();
+                        assert!(out.contains("written to"), "{out}");
+                        assert_eq!(
+                            fx.entries(),
+                            [
+                                allow_entry(Layer::Global, ".env", None),
+                                override_entry(Layer::Global, ".env"),
+                            ]
+                        );
+
+                        let out = out_of(&mut fx.ctx, ".mesh shares --effective")
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            out.lines().collect::<Vec<_>>(),
+                            [
+                                format!(
+                                    "Files every trusted peer can fetch from {}:",
+                                    fx.root.path.display()
+                                )
+                                .as_str(),
+                                "  .env",
+                            ],
+                            "{out}"
+                        );
+
+                        let err = refusal(&mut fx.ctx, ".mesh allow docs/settings").await;
+                        assert!(err.contains("resolves to `.env`"), "{err}");
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        fx.stop().await;
+                    });
                 }
             }
         }
