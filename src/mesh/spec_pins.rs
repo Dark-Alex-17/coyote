@@ -2118,15 +2118,27 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
     }
 
     /// The verb that pulls held messages is `.mesh sync`; the spec names it and never
-    /// its withdrawn name.
+    /// its withdrawn name. `.mesh fetch` is the file verb, so the needle is the sync
+    /// sentences the old spelling stood in, not the bare words.
     #[test]
     fn usage_probe_spec_names_the_sync_verb_not_the_fetch_verb() {
-        // A later file verb named `fetch` must narrow this needle to the sync sentences.
+        const WITHDRAWN: [&str; 5] = [
+            "`.mesh fetch` runs a fetch",
+            "on demand with `.mesh fetch`",
+            "from `.mesh fetch`;",
+            "only `.mesh fetch` runs",
+            "`.mesh fetch` is refused",
+        ];
         let hits: Vec<String> = SPEC
             .lines()
             .enumerate()
-            .filter(|(_, line)| line.contains(".mesh fetch"))
-            .map(|(index, _)| format!("docs/mesh/PROTOCOL.md:{}: names .mesh fetch", index + 1))
+            .filter(|(_, line)| WITHDRAWN.iter().any(|phrase| line.contains(phrase)))
+            .map(|(index, _)| {
+                format!(
+                    "docs/mesh/PROTOCOL.md:{}: names .mesh fetch as the sync verb",
+                    index + 1
+                )
+            })
             .collect();
         assert!(hits.is_empty(), "{}", hits.join("\n"));
         assert!(

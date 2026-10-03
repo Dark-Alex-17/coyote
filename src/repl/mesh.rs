@@ -20520,7 +20520,7 @@ mod tests {
             mod access_verbs {
                 use super::*;
                 use crate::mesh::mesh_config_dir;
-                use crate::mesh::shares::{RawEntry, RawKind};
+                use crate::mesh::shares::{RawEntry, RawKind, Served};
 
                 #[test]
                 #[serial]
@@ -20796,6 +20796,154 @@ mod tests {
                         );
                         assert_eq!(fx.pending_ids(), ["a-1"]);
                         assert_eq!(prompt_script::prompts_asked(), 0);
+                        fx.stop().await;
+                    });
+                }
+
+                /// Usage probe (R8, "a requested path that is not a regular file" is refused
+                /// before any grant): the clause is about what `/fetch` serves, not about
+                /// directories in particular. A FIFO is zero bytes, so the size clause never
+                /// sees it, and a link to a directory resolves to no file either; both are
+                /// refused with the not-a-regular-file sentence, one-off and standing, with
+                /// nothing printed, written or sent. A link to a regular file inside the root
+                /// IS what the serving engine serves, so the verb grants it and the engine
+                /// then serves that very grant: the verb and the engine judge alike.
+                #[test]
+                #[serial]
+                #[cfg(unix)]
+                fn usage_probe_grant_refuses_a_fifo_and_a_link_to_a_directory_but_grants_a_link_to_a_file()
+                 {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-grant-not-regular");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-grant-not-regular").await;
+                        let root = fx.root.path.clone();
+                        fs::create_dir_all(root.join("docs")).unwrap();
+                        fs::write(root.join("docs/a.md"), "a").unwrap();
+                        let status = std::process::Command::new("mkfifo")
+                            .arg(root.join("pipe"))
+                            .status()
+                            .unwrap();
+                        assert!(status.success(), "mkfifo");
+                        std::os::unix::fs::symlink("docs", root.join("dlink")).unwrap();
+                        std::os::unix::fs::symlink("docs/a.md", root.join("flink")).unwrap();
+                        fx.file("a-1", InboundKind::Access, &["docs/a.md", "pipe"]);
+                        fx.file("a-2", InboundKind::Access, &["dlink"]);
+                        fx.file("a-3", InboundKind::Access, &["flink"]);
+
+                        for (line, expected) in [
+                            (
+                                ".mesh grant a-1",
+                                "`pipe` would not be served even once granted (it is not a regular file); refuse the request with `.mesh refuse a-1`, or lift the rule first.",
+                            ),
+                            (
+                                ".mesh grant a-1 --standing",
+                                "`pipe` would not be served even once granted (it is not a regular file); refuse the request with `.mesh refuse a-1`, or lift the rule first.",
+                            ),
+                            (
+                                ".mesh grant a-2 --for 2h",
+                                "`dlink` would not be served even once granted (it is not a regular file); refuse the request with `.mesh refuse a-2`, or lift the rule first.",
+                            ),
+                            (
+                                ".mesh grant a-2 --standing --global",
+                                "`dlink` would not be served even once granted (it is not a regular file); refuse the request with `.mesh refuse a-2`, or lift the rule first.",
+                            ),
+                        ] {
+                            let printed = stdout_lines().len();
+                            assert_eq!(refusal(&mut fx.ctx, line).await, expected, "{line}");
+                            assert_eq!(stdout_lines().len(), printed, "{line} prints nothing");
+                        }
+                        assert!(fx.stub.seen().is_empty(), "{:?}", fx.stub.seen());
+                        assert!(fx.grants().is_empty(), "{:?}", fx.grants());
+                        let (_, locations) = share_locations(&fx.ctx).unwrap();
+                        assert!(
+                            ShareSet::load_quietly(locations).0.entries().is_empty(),
+                            "no standing row was written"
+                        );
+                        let mut ids = fx.pending_ids();
+                        ids.sort();
+                        assert_eq!(ids, ["a-1", "a-2", "a-3"]);
+
+                        // The link to a regular file is granted, and the engine serves the
+                        // grant the verb wrote: what the verb lets through, `/fetch` delivers.
+                        let out = out_of(&mut fx.ctx, ".mesh grant a-3").await.unwrap();
+                        assert!(out.starts_with("Paths asked for: `flink`."), "{out}");
+                        assert!(out.contains("Granted a-3: 1 path for"), "{out}");
+                        assert!(fx.heard().starts_with("access granted:"));
+                        let grants = fx.grants();
+                        assert_eq!(grants.len(), 1, "{grants:?}");
+                        assert_eq!(grants[0].id, "a-3");
+                        let (_, set) = share_set(&fx.ctx).unwrap();
+                        let peer_destination = fx.stub.destination_hex();
+                        let peer_identity = fx.stub.identity_hex();
+                        let peer = PeerRef {
+                            identity: &peer_identity,
+                            destination: &peer_destination,
+                        };
+                        let serving = fx.started.runtime.serving();
+                        let store = serving.grants();
+                        let served = set.is_served(
+                            &peer,
+                            "flink",
+                            false,
+                            serving.serving_limit(),
+                            Some((&store, SystemTime::now())),
+                        );
+                        assert!(
+                            matches!(served, Served::File(_)),
+                            "the engine serves the granted link: {served:?}"
+                        );
+                        let mut ids = fx.pending_ids();
+                        ids.sort();
+                        assert_eq!(ids, ["a-1", "a-2"]);
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        fx.stop().await;
+                    });
+                }
+
+                /// Usage probe (R8 sentence, "refuse the request with `.mesh refuse <id>`"):
+                /// the remedy the refusal teaches works on the very request it refused. The
+                /// refused grant left the request open and untouched, so `.mesh refuse` takes
+                /// it, the peer hears no, nothing was ever granted, and the id is gone.
+                #[test]
+                #[serial]
+                fn usage_probe_refuse_decides_a_request_whose_grant_was_refused_for_a_directory() {
+                    let guard = TestConfigDirGuard::new("repl-mesh-grant-dir-then-refuse");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-grant-dir-then-refuse").await;
+                        let root = fx.root.path.clone();
+                        fs::create_dir_all(root.join("docs")).unwrap();
+                        fs::write(root.join("docs/a.md"), "a").unwrap();
+                        fx.file("a-1", InboundKind::Access, &["docs"]);
+
+                        let err = refusal(&mut fx.ctx, ".mesh grant a-1").await;
+                        assert_eq!(
+                            err,
+                            "`docs` would not be served even once granted (it is not a regular file); refuse the request with `.mesh refuse a-1`, or lift the rule first."
+                        );
+                        assert_eq!(fx.pending_ids(), ["a-1"]);
+
+                        let out = out_of(&mut fx.ctx, ".mesh refuse a-1").await.unwrap();
+                        let lines: Vec<&str> = out.lines().collect();
+                        assert_eq!(
+                            lines,
+                            [
+                                sending(&fx),
+                                format!("Refused a-1: 1 path for {} (via direct).", fx.dest()),
+                            ],
+                            "{out}"
+                        );
+                        assert_eq!(fx.heard(), "access denied: 1 path");
+                        assert!(fx.grants().is_empty());
+                        assert!(!mesh_config_dir(&guard.path).join("shares.yaml").exists());
+                        assert!(fx.pending_ids().is_empty());
+                        assert_eq!(
+                            refusal(&mut fx.ctx, ".mesh grant a-1").await,
+                            "No open access request has id a-1. `.mesh pending` lists the ones this node knows about."
+                        );
                         fx.stop().await;
                     });
                 }
@@ -21813,6 +21961,54 @@ mod tests {
                             fx.stub.seen()[0].parts,
                             [inline_part(".env", b"SECRET=1\n")]
                         );
+                        fx.stop().await;
+                    });
+                }
+
+                /// Usage probe (R9 single O_NOFOLLOW open + R8 "not a regular file"): a FIFO
+                /// named by `--attach` is refused on its kind BEFORE the one open, since a
+                /// read-open of a FIFO waits for a writer that never comes and would wedge
+                /// the REPL. Inline and reference judge it the same; nothing is printed,
+                /// sent or granted, and the question stays open. Bounded so a regression
+                /// that opens the pipe fails instead of hanging the suite.
+                #[test]
+                #[serial]
+                #[cfg(unix)]
+                fn usage_probe_attaching_a_fifo_is_refused_without_opening_it() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-attach-fifo");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-attach-fifo").await;
+                        let root = fx.root.path.clone();
+                        fs::create_dir_all(root.join("docs")).unwrap();
+                        let status = std::process::Command::new("mkfifo")
+                            .arg(root.join("docs/pipe"))
+                            .status()
+                            .unwrap();
+                        assert!(status.success(), "mkfifo");
+                        fx.file("q-1", InboundKind::Question, &[]);
+                        let to = fx.stub.destination_hex();
+
+                        for line in [
+                            ".mesh answer q-1 \"x\" --attach docs/pipe".to_string(),
+                            format!(".mesh reply {to} \"x\" --attach docs/pipe"),
+                            ".mesh answer q-1 \"x\" --attach docs/pipe --force".to_string(),
+                        ] {
+                            let printed = stdout_lines().len();
+                            let err = tokio::time::timeout(
+                                Duration::from_secs(10),
+                                refusal(&mut fx.ctx, &line),
+                            )
+                            .await
+                            .unwrap_or_else(|_| panic!("{line}: hung on the FIFO"));
+                            assert_eq!(err, "`docs/pipe` is not a regular file.", "{line}");
+                            assert_eq!(stdout_lines().len(), printed, "{line} prints nothing");
+                        }
+                        assert!(fx.stub.seen().is_empty(), "{:?}", fx.stub.seen());
+                        assert!(fx.grants().is_empty());
+                        assert_eq!(fx.pending_ids(), ["q-1"]);
+                        assert_eq!(prompt_script::prompts_asked(), 0);
                         fx.stop().await;
                     });
                 }
