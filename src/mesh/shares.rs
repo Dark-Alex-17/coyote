@@ -26,15 +26,12 @@ use crate::mesh::grants::GrantStore;
 use crate::mesh::schema::{Remedy, VersionProbe, unversioned_refusal, version_refusal};
 use crate::mesh::trust::same_hash;
 use crate::mesh::wire_path::WirePath;
-#[cfg(test)]
 use crate::mesh::write_atomically;
 use crate::mesh::{
     canonical_hash, hex_lower, mesh_cache_dir, mesh_config_dir, redact_hashes, short,
 };
 
-#[cfg(test)]
-use anyhow::anyhow;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use globset::{Glob, GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -61,7 +58,7 @@ pub(crate) const LIST_PAGE_SIZE: usize = 1_000;
 const BUILTIN_DENY: [&str; 7] = [
     ".env", ".env.*", "*.pem", "*.key", "id_*", ".git", ".git/**",
 ];
-const GLOB_METACHARACTERS: [char; 6] = ['*', '?', '[', ']', '{', '}'];
+pub(crate) const GLOB_METACHARACTERS: [char; 6] = ['*', '?', '[', ']', '{', '}'];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -135,12 +132,6 @@ pub(crate) struct Entry {
     pub layer: Layer,
 }
 
-// The mutation half, `apply` and what it alone uses, and the verb-side helpers after
-// `list` are test-only until the `.mesh` share verbs call them: this is a binary crate,
-// so an item only a test reaches is dead code to the build, and each gate falls with
-// its first caller.
-
-#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WriteScope {
     Auto,
@@ -148,7 +139,6 @@ pub(crate) enum WriteScope {
     Workspace,
 }
 
-#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Mutation {
     Allow {
@@ -168,7 +158,6 @@ pub(crate) enum Mutation {
     },
 }
 
-#[cfg(test)]
 impl Mutation {
     fn kind(&self) -> &'static str {
         match self {
@@ -182,7 +171,6 @@ impl Mutation {
 
 /// What `apply` did: the file it targeted, and whether that file changed or already
 /// said so.
-#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Applied {
     pub path: PathBuf,
@@ -200,7 +188,6 @@ impl PeerRef<'static> {
     /// The reference no scoped allow applies to, so `effective` and the walks answer for
     /// every trusted peer at once: a scoped entry compares against a canonical 32-hex
     /// hash, which an empty string never equals, so only peer-less entries match it.
-    #[cfg(test)]
     pub(crate) const fn unscoped() -> Self {
         Self {
             identity: "",
@@ -286,7 +273,6 @@ pub(crate) struct Listing {
 /// file an allow names, each with its verdict, so a deny that swallows an allow is
 /// visible. `truncated` says the walk hit its bound; `capped` that more than `cap`
 /// entries were found and the rest cut.
-#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct Resolved {
     pub entries: Vec<ResolvedEntry>,
@@ -294,7 +280,6 @@ pub(crate) struct Resolved {
     pub capped: bool,
 }
 
-#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResolvedEntry {
     pub path: String,
@@ -303,7 +288,6 @@ pub(crate) struct ResolvedEntry {
 
 /// How many regular files one pattern alone reaches under the share root, counted up to
 /// `cap`: `capped` says the count stopped there, `truncated` that the walk hit its bound.
-#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MatchCount {
     pub files: usize,
@@ -312,14 +296,12 @@ pub(crate) struct MatchCount {
 }
 
 /// One entry as a share file holds it, with the layer it came from.
-#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RawEntry {
     pub layer: Layer,
     pub kind: RawKind,
 }
 
-#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RawKind {
     Allow {
@@ -398,7 +380,6 @@ pub(crate) struct ShareSet {
     locations: ShareLocations,
     global: SharesFile,
     workspace: SharesFile,
-    #[cfg(test)]
     workspace_exists: bool,
     poisoned: Option<String>,
 }
@@ -407,8 +388,8 @@ impl ShareSet {
     /// Never fails and never creates a file; a refused file is warned about once here and
     /// its refusal kept for `apply` to repeat. The warning is the outer context alone, the
     /// file and the remedy; the offending entry is the user's own text and stays in the
-    /// refusal. The REPL's share verbs are the callers; the wire path uses
-    /// `load_quietly` and owns the warning.
+    /// refusal. Nothing in production loads this way yet: the wire path and the REPL's
+    /// share verbs use `load_quietly` and own the warning.
     #[cfg(test)]
     pub(crate) fn load(locations: ShareLocations) -> Self {
         let (set, warning) = Self::load_quietly(locations);
@@ -442,7 +423,6 @@ impl ShareSet {
                 locations,
                 global,
                 workspace: workspace.0,
-                #[cfg(test)]
                 workspace_exists: workspace.1,
                 poisoned,
             },
@@ -770,7 +750,6 @@ impl ShareSet {
         walk
     }
 
-    #[cfg(test)]
     pub(crate) fn write_target(&self, scope: WriteScope) -> Layer {
         write_target(self.workspace_exists, scope)
     }
@@ -779,7 +758,6 @@ impl ShareSet {
     /// memory. A mutation the file already holds is `Ok` without a write, and `Applied`
     /// says which. Refused while poisoned, with the load's refusal, so a corrupt file is
     /// never replaced by a fresh one.
-    #[cfg(test)]
     pub(crate) fn apply(&mut self, mutation: Mutation, scope: WriteScope) -> Result<Applied> {
         if let Some(refusal) = &self.poisoned {
             bail!("{refusal} Nothing was written.");
@@ -812,7 +790,6 @@ impl ShareSet {
     }
 }
 
-#[cfg(test)]
 impl ShareSet {
     /// Every entry of both files as written, global first, in file order; empty while
     /// poisoned, like `effective`.
@@ -958,7 +935,6 @@ impl ShareSet {
 
 /// The layer a mutation lands in: under `Auto` the workspace file when it exists, else the
 /// global one; `Global` and `Workspace` pick outright, and `Workspace` creates the file.
-#[cfg(test)]
 pub(crate) fn write_target(workspace_exists: bool, scope: WriteScope) -> Layer {
     match scope {
         WriteScope::Auto if workspace_exists => Layer::Workspace,
@@ -1393,7 +1369,6 @@ pub(crate) fn is_canonical_peer(peer: &str) -> bool {
 
 /// Whether `pattern` reaches the whole tree: its first segment is `**`, so `**`,
 /// `**/*.md` and `**/x` are broad where `docs/**` is not.
-#[cfg(test)]
 pub(crate) fn is_broad_pattern(pattern: &str) -> bool {
     pattern.split('/').next() == Some("**")
 }
@@ -1416,7 +1391,6 @@ pub(crate) fn hidden_from_completion(relative: &str, workspace_config_dir_name: 
 
 /// Applies `mutation` to `file`, which lives at `path`; `Ok(false)` means the file already
 /// says so and nothing needs writing.
-#[cfg(test)]
 fn mutate(file: &mut SharesFile, path: &Path, mutation: &Mutation) -> Result<bool> {
     match mutation {
         Mutation::Allow { pattern, peer } => {
@@ -1458,7 +1432,6 @@ fn mutate(file: &mut SharesFile, path: &Path, mutation: &Mutation) -> Result<boo
     }
 }
 
-#[cfg(test)]
 fn push_unless_present<T: PartialEq>(entries: &mut Vec<T>, entry: T) -> bool {
     if entries.contains(&entry) {
         return false;
@@ -1467,7 +1440,6 @@ fn push_unless_present<T: PartialEq>(entries: &mut Vec<T>, entry: T) -> bool {
     true
 }
 
-#[cfg(test)]
 fn canonical_peer(peer: &str) -> Result<String> {
     canonical_hash(peer).ok_or_else(|| {
         anyhow!(

@@ -15,10 +15,16 @@ use crate::mesh::message::{
 use crate::mesh::pending::{
     Correlation, InboundKind, InboundRecord, PendingState, access_not_a_question,
 };
+use crate::mesh::shares::{
+    DEFAULT_LIST_WALK_BOUND, GLOB_METACHARACTERS, LIST_PAGE_SIZE, Layer, Mutation, PeerRef,
+    RawKind, ShareSet, Verdict as ShareVerdict, WriteScope, is_broad_pattern, is_canonical_peer,
+    validate_override, validate_pattern,
+};
 use crate::mesh::trust::{
     Decision, KeyChange, LiveMesh, Rule, Tier, TrustChange, TrustOptions, TrustRecord, TrustStore,
     UntrustOutcome, Verdict, decode_name_hash, parse_hash,
 };
+use crate::mesh::wire_path::WIRE_PATH_MAX_BYTES;
 use crate::mesh::{
     FetchError, FetchReport, LoggingInboundSink, MAX_WANTS_PER_FETCH, MESH_ALREADY_ON, MeshPaths,
     MeshRuntime, NodeOptions, PeerRecord, PropagationNodeRecord, age_text, canonical_hash,
@@ -34,7 +40,7 @@ use log::debug;
 use std::env;
 use std::fs;
 use std::io::IsTerminal;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -136,6 +142,26 @@ pub(super) const VERBS: &[(&str, &str, &str)] = &[
         "Ask an untrusted peer to trust this instance, with an optional intro",
         ".mesh knock <destination> [--yes] [--intro \"text\"]",
     ),
+    (
+        "allow",
+        "Share files matching a pattern with every trusted peer, or with one peer",
+        ".mesh allow docs/** [--peer <identity|destination>] [--force] [--global|--workspace] [--yes|--dry-run]",
+    ),
+    (
+        "deny",
+        "Never share files matching a pattern, whatever `allow` says; a share rule, not a peer refusal (that is `untrust`)",
+        ".mesh deny \"src/vault/*\" [--global|--workspace] [--yes|--dry-run]",
+    ),
+    (
+        "unshare",
+        "Remove the allow or deny share rule that holds a pattern",
+        ".mesh unshare docs/** [--global|--workspace] [--yes|--dry-run]",
+    ),
+    (
+        "shares",
+        "List the share rules and the file each came from, or the files a peer can fetch",
+        ".mesh shares [--peer <identity|destination>] [--effective]",
+    ),
 ];
 
 pub(crate) const MESH_OFF: &str = "Mesh is off. Run `.mesh on` first.";
@@ -147,6 +173,10 @@ const KNOCK_REFUSAL_TAIL: &str = "A knock is not sent to a destination this node
 const INBOX_CONTENT_MAX_CHARS: usize = 200;
 const NOTHING_CHANGED: &str = "Nothing was changed.";
 const DRY_RUN_NOTHING_CHANGED: &str = "This was a dry run; nothing changed.";
+const SHARE_ROOT_UNKNOWN: &str =
+    "The share root is unknown until a turn completes in this session; run one, then try again.";
+/// Above this many matching files a share pattern is confirmed before it is written.
+const BROAD_MATCH_LIMIT: usize = 100;
 /// How long a trusted instance goes unheard before `.mesh trust --prune` lists it, when
 /// `--older-than` is not given.
 const PRUNE_DEFAULT_OLDER_THAN: Duration = Duration::from_secs(30 * 24 * 60 * 60);
@@ -180,6 +210,10 @@ pub(crate) async fn run(
         "rotate" => rotate(ctx, rest),
         "sync" => sync(ctx, &abort_signal, rest).await,
         "knock" => knock(ctx, &abort_signal, rest).await,
+        "allow" => allow(ctx, rest),
+        "deny" => deny(ctx, rest),
+        "unshare" => unshare(ctx, rest),
+        "shares" => shares(ctx, rest),
         other => bail!("Unknown .mesh command '{other}'. Type `.mesh` for the list."),
     }
 }
@@ -1399,6 +1433,688 @@ fn rotate(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// `.mesh allow <pattern>`: an allow rule for every trusted peer or for one. `--force`
+/// adds the override that lifts the built-in deny for one exact file, which only the
+/// global file may carry.
+fn allow(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
+    let Some(rest) = rest else {
+        out_text(&render_verb_help("allow"));
+        return Ok(());
+    };
+    let args = parse_mutation_args(
+        rest,
+        "allow",
+        &[
+            "--peer",
+            "--force",
+            "--global",
+            "--workspace",
+            "--yes",
+            "--dry-run",
+        ],
+    )?;
+    let Some(args) = classify_share(args, "allow")? else {
+        out_text(&render_verb_help("allow"));
+        return Ok(());
+    };
+    let ShareArgs {
+        pattern,
+        scope,
+        yes,
+        dry_run,
+        peer,
+        force,
+    } = args;
+    let (root, mut set, case_insensitive) = writable_share_set(ctx)?;
+    validate_pattern(&pattern)?;
+    if let Some(head) = set.protected_head(&pattern) {
+        bail!(
+            "`{pattern}` is under `{head}/`, which is never shared, not even with `--force`; nothing was written."
+        );
+    }
+    let peer = peer.as_deref().map(peer_hash).transpose()?;
+    let target = ShareTarget::of(&set, scope);
+    if force {
+        validate_override(&pattern)?;
+        if target.layer == Layer::Workspace {
+            bail!(
+                "Overrides are honoured from the global share file only, so `--force` cannot be written to {}; pass `--global`.",
+                set.locations().workspace.display()
+            );
+        }
+        if !set.builtin_denies(&pattern, case_insensitive)? {
+            bail!(
+                "`{pattern}` is not under the built-in deny, so there is nothing for `--force` to lift; drop `--force`."
+            );
+        }
+    } else if !pattern.contains(GLOB_METACHARACTERS)
+        && set.builtin_denies(&pattern, case_insensitive)?
+    {
+        bail!(
+            "`{pattern}` is under the built-in deny, so an allow alone would share nothing; `.mesh allow {pattern} --force --global` lifts it for this one file."
+        );
+    }
+    let matches = describe_matches(&set, &pattern, &root, case_insensitive)?;
+    let audience = share_audience(peer.as_deref());
+    let lift = if force {
+        ", and an override lifting the built-in deny for it"
+    } else {
+        ""
+    };
+    out_text(&format!(
+        "{} write to {}: allow `{pattern}` for {audience}{lift}.",
+        intent_verb(dry_run),
+        target.written_to()
+    ));
+    if dry_run {
+        out_text(DRY_RUN_NOTHING_CHANGED);
+        return Ok(());
+    }
+    if matches.broad {
+        let question = format!(
+            "Share {} files matching `{pattern}` with {audience}?",
+            matches.words
+        );
+        if !confirm_or_flag(&question, "--yes", yes)? {
+            out_text(NOTHING_CHANGED);
+            return Ok(());
+        }
+    }
+    let mut changed = set
+        .apply(
+            Mutation::Allow {
+                pattern: pattern.clone(),
+                peer,
+            },
+            scope,
+        )?
+        .changed;
+    if force {
+        changed |= set
+            .apply(
+                Mutation::Override {
+                    path: pattern.clone(),
+                },
+                scope,
+            )?
+            .changed;
+    }
+    if !changed {
+        out_text(&format!(
+            "`{pattern}` is already allowed for {audience} in {}; nothing was changed.",
+            target.path.display()
+        ));
+        return Ok(());
+    }
+    out_text(&format!(
+        "Allowed `{pattern}` for {audience}; written to {}.",
+        target.written_to()
+    ));
+    if force {
+        out_text(&format!(
+            "The built-in deny for `{pattern}` is lifted by an override in the same file."
+        ));
+    }
+    Ok(())
+}
+
+/// `.mesh deny <pattern>`: a deny rule, which no allow in either file gets past. A hash
+/// in the pattern's place is the withdrawn peer verb's spelling and is sent to `untrust`.
+fn deny(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
+    let Some(rest) = rest else {
+        out_text(&render_verb_help("deny"));
+        return Ok(());
+    };
+    let args = parse_mutation_args(
+        rest,
+        "deny",
+        &["--global", "--workspace", "--yes", "--dry-run"],
+    )?;
+    let Some(args) = classify_share(args, "deny")? else {
+        out_text(&render_verb_help("deny"));
+        return Ok(());
+    };
+    let ShareArgs {
+        pattern,
+        scope,
+        yes,
+        dry_run,
+        ..
+    } = args;
+    if let Some(destination) = canonical_hash(&pattern) {
+        bail!(
+            "`.mesh deny` takes a file pattern, not a peer; to refuse the instance {} run `.mesh untrust {destination}`.",
+            short(&destination)
+        );
+    }
+    let (root, mut set, case_insensitive) = writable_share_set(ctx)?;
+    validate_pattern(&pattern)?;
+    if let Some(head) = set.protected_head(&pattern) {
+        bail!(
+            "`{pattern}` is under `{head}/`, which is never shared, so no deny is needed; nothing was written."
+        );
+    }
+    let target = ShareTarget::of(&set, scope);
+    let matches = describe_matches(&set, &pattern, &root, case_insensitive)?;
+    out_text(&format!(
+        "{} write to {}: deny `{pattern}` to every peer.",
+        intent_verb(dry_run),
+        target.written_to()
+    ));
+    if dry_run {
+        out_text(DRY_RUN_NOTHING_CHANGED);
+        return Ok(());
+    }
+    if matches.broad {
+        let question = format!(
+            "Deny {} files matching `{pattern}` to every peer?",
+            matches.words
+        );
+        if !confirm_or_flag(&question, "--yes", yes)? {
+            out_text(NOTHING_CHANGED);
+            return Ok(());
+        }
+    }
+    let applied = set.apply(
+        Mutation::Deny {
+            pattern: pattern.clone(),
+        },
+        scope,
+    )?;
+    if applied.changed {
+        out_text(&format!(
+            "Denied `{pattern}` to every peer; written to {}.",
+            target.written_to()
+        ));
+    } else {
+        out_text(&format!(
+            "`{pattern}` is already denied to every peer in {}; nothing was changed.",
+            target.path.display()
+        ));
+    }
+    Ok(())
+}
+
+/// `.mesh unshare <pattern>`: removes every rule whose text is `pattern`, allow, deny or
+/// override alike, from the file that holds it. Under the write rule a pattern held
+/// only by the other file is refused with the flag that reaches it, so a bare `unshare`
+/// never edits a file the matching `allow` would not have.
+fn unshare(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
+    let Some(rest) = rest else {
+        out_text(&render_verb_help("unshare"));
+        return Ok(());
+    };
+    let args = parse_mutation_args(
+        rest,
+        "unshare",
+        &["--global", "--workspace", "--yes", "--dry-run"],
+    )?;
+    let Some(args) = classify_share(args, "unshare")? else {
+        out_text(&render_verb_help("unshare"));
+        return Ok(());
+    };
+    let ShareArgs {
+        pattern,
+        scope,
+        yes,
+        dry_run,
+        ..
+    } = args;
+    let (root, mut set, case_insensitive) = writable_share_set(ctx)?;
+    let locations = set.locations().clone();
+    let path_of = |layer: Layer| match layer {
+        Layer::Global => locations.global.display(),
+        Layer::Workspace => locations.workspace.display(),
+    };
+    let flag_of = |layer: Layer| match layer {
+        Layer::Global => "--global",
+        Layer::Workspace => "--workspace",
+    };
+    let holders = share_holders(&set, &pattern);
+    let mut targets: Vec<(Layer, Vec<&'static str>)> = [Layer::Global, Layer::Workspace]
+        .into_iter()
+        .filter_map(|layer| {
+            let kinds: Vec<&'static str> = holders
+                .iter()
+                .filter(|(held, _)| *held == layer)
+                .map(|(_, kind)| *kind)
+                .collect();
+            (!kinds.is_empty()).then_some((layer, kinds))
+        })
+        .collect();
+    let Some((first_layer, first_kinds)) = targets.first().cloned() else {
+        bail!(
+            "No share rule has the pattern `{pattern}` in {} or {}; `.mesh shares` lists them.",
+            path_of(Layer::Global),
+            path_of(Layer::Workspace)
+        );
+    };
+    match scope {
+        WriteScope::Global | WriteScope::Workspace => {
+            let picked = match scope {
+                WriteScope::Workspace => Layer::Workspace,
+                _ => Layer::Global,
+            };
+            if !targets.iter().any(|(held, _)| *held == picked) {
+                bail!(
+                    "No share rule in {} has the pattern `{pattern}`; {} holds it — pass `{}` instead.",
+                    path_of(picked),
+                    path_of(first_layer),
+                    flag_of(first_layer)
+                );
+            }
+            targets.retain(|(held, _)| *held == picked);
+        }
+        WriteScope::Auto => {
+            let reach = set.write_target(WriteScope::Auto);
+            if !targets.iter().any(|(held, _)| *held == reach) {
+                bail!(
+                    "`{pattern}` is held by {} ({}); the write rule reaches {} — pass `{}` to remove it from {}.",
+                    path_of(first_layer),
+                    kind_list(&first_kinds),
+                    path_of(reach),
+                    flag_of(first_layer),
+                    path_of(first_layer)
+                );
+            }
+        }
+    }
+    let total: usize = targets.iter().map(|(_, kinds)| kinds.len()).sum();
+    let matches = describe_matches(&set, &pattern, &root, case_insensitive)?;
+    if total > 1 {
+        out_text(&format!("`{pattern}` is held by:"));
+        for (layer, kinds) in &targets {
+            for kind in kinds {
+                out_text(&format!("  {kind} in {}", path_of(*layer)));
+            }
+        }
+    }
+    for (layer, kinds) in &targets {
+        out_text(&format!(
+            "{} remove the {} for `{pattern}` from {}.",
+            intent_verb(dry_run),
+            kind_list(kinds),
+            path_of(*layer)
+        ));
+    }
+    if dry_run {
+        out_text(DRY_RUN_NOTHING_CHANGED);
+        return Ok(());
+    }
+    if total > 1 || matches.broad {
+        let question = match targets.as_slice() {
+            [(layer, kinds)] if total == 1 => format!(
+                "Remove the {} for `{pattern}` from {}?",
+                kind_list(kinds),
+                path_of(*layer)
+            ),
+            _ => format!("Remove all {total} rules for `{pattern}`?"),
+        };
+        if !confirm_or_flag(&question, "--yes", yes)? {
+            out_text(NOTHING_CHANGED);
+            return Ok(());
+        }
+    }
+    for (layer, kinds) in &targets {
+        let scope = match layer {
+            Layer::Global => WriteScope::Global,
+            Layer::Workspace => WriteScope::Workspace,
+        };
+        set.apply(
+            Mutation::Unshare {
+                pattern: pattern.clone(),
+            },
+            scope,
+        )?;
+        out_text(&format!(
+            "Removed the {} for `{pattern}` from {}.",
+            kind_list(kinds),
+            path_of(*layer)
+        ));
+    }
+    Ok(())
+}
+
+/// `.mesh shares`: the rules as the two files hold them, or with `--effective` the files
+/// they resolve to under the root with the verdict a fetch of each would get. Inspection
+/// only, so it works while the mesh is off and never prints a file's contents.
+fn shares(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
+    let args = parse_mutation_args(rest.unwrap_or(""), "shares", &["--peer", "--effective"])?;
+    if let Some(token) = args.positional.first() {
+        return Err(unexpected(token, "shares"));
+    }
+    let peer = args.peer.as_deref().map(peer_hash).transpose()?;
+    let (root, set) = share_set(ctx)?;
+    if let Some(refusal) = set.refusal() {
+        err_text(refusal);
+        out_text("Nothing is shared until it is fixed.");
+        return Ok(());
+    }
+    let peer_ref = match peer.as_deref() {
+        Some(hash) => PeerRef {
+            identity: hash,
+            destination: hash,
+        },
+        None => PeerRef::unscoped(),
+    };
+    let text = if args.effective {
+        render_effective_shares(
+            &set,
+            &peer_ref,
+            &share_audience(peer.as_deref()),
+            &root,
+            root_folds_case(ctx, &root),
+        )
+    } else {
+        render_share_rules(&set, &peer_ref, peer.as_deref())
+    };
+    out_text(&text);
+    Ok(())
+}
+
+fn render_share_rules(set: &ShareSet, peer: &PeerRef<'_>, scoped_to: Option<&str>) -> String {
+    let locations = set.locations();
+    let effective = set.effective(peer);
+    let rows: Vec<String> = set
+        .entries()
+        .into_iter()
+        .filter_map(|entry| {
+            let layer = match entry.layer {
+                Layer::Global => "global",
+                Layer::Workspace => "workspace",
+            };
+            let (kind, pattern, note) = match entry.kind {
+                RawKind::Allow { pattern, peer } => {
+                    let applies = effective.iter().any(|applied| {
+                        applied.pattern == pattern
+                            && applied.layer == entry.layer
+                            && applied.peer == peer
+                    });
+                    if scoped_to.is_some() && !applies {
+                        return None;
+                    }
+                    let note = match &peer {
+                        None => "every trusted peer".to_string(),
+                        Some(hash) if is_canonical_peer(hash) => format!("peer {}", short(hash)),
+                        Some(text) => format!(
+                            "scoped to no peer (`{}` is not a peer hash)",
+                            shown_pattern(text)
+                        ),
+                    };
+                    ("allow", pattern, note)
+                }
+                RawKind::Deny { pattern } => ("deny", pattern, String::new()),
+                RawKind::Override { path } => {
+                    let note = match entry.layer {
+                        Layer::Global => "lifts the built-in deny for this file",
+                        Layer::Workspace => {
+                            "ignored: overrides are honoured from the global file only"
+                        }
+                    };
+                    ("override", path, note.to_string())
+                }
+            };
+            Some(
+                format!(
+                    "  {kind:<9} {:<40} {layer:<10} {note}",
+                    shown_pattern(&pattern)
+                )
+                .trim_end()
+                .to_string(),
+            )
+        })
+        .collect();
+    if rows.is_empty() {
+        return format!(
+            "No share rules in {} or {}. `.mesh allow docs/**` shares docs/ with every trusted peer.",
+            locations.global.display(),
+            locations.workspace.display()
+        );
+    }
+    let presence = |path: &Path| if path.exists() { "" } else { " (absent)" };
+    let for_peer = scoped_to
+        .map(|hash| format!(" for peer {}", short(hash)))
+        .unwrap_or_default();
+    let mut lines = vec![format!(
+        "Share rules (global {}{}; workspace {}{}){for_peer}:",
+        locations.global.display(),
+        presence(&locations.global),
+        locations.workspace.display(),
+        presence(&locations.workspace)
+    )];
+    lines.extend(rows);
+    lines.join("\n")
+}
+
+fn render_effective_shares(
+    set: &ShareSet,
+    peer: &PeerRef<'_>,
+    audience: &str,
+    root: &Path,
+    case_insensitive: bool,
+) -> String {
+    let resolved = set.resolve(
+        peer,
+        case_insensitive,
+        DEFAULT_LIST_WALK_BOUND,
+        LIST_PAGE_SIZE,
+    );
+    if resolved.entries.is_empty() {
+        return format!(
+            "Nothing resolves: no allow rule names an existing file under {}.",
+            root.display()
+        );
+    }
+    let mut lines = vec![format!(
+        "Files {audience} can fetch from {}:",
+        root.display()
+    )];
+    for entry in &resolved.entries {
+        let mark = match entry.verdict {
+            ShareVerdict::Shared => "",
+            ShareVerdict::BuiltinDenied => "  (built-in deny)",
+            ShareVerdict::Denied => "  (denied)",
+            ShareVerdict::Protected => "  (protected)",
+            ShareVerdict::NotAllowed => "  (not allowed)",
+        };
+        lines.push(format!("  {}{mark}", entry.path));
+    }
+    if resolved.capped {
+        lines.push(format!(
+            "… listing capped at {LIST_PAGE_SIZE} entries; narrow the patterns or use mesh__list."
+        ));
+    }
+    if resolved.truncated {
+        lines.push("The walk stopped at its bound, so files may be missing.".to_string());
+    }
+    lines.join("\n")
+}
+
+/// A pattern as a share file holds it, shown the way peer text is: escapes stripped.
+fn shown_pattern(pattern: &str) -> String {
+    display_text(pattern, WIRE_PATH_MAX_BYTES).unwrap_or_default()
+}
+
+struct ShareArgs {
+    pattern: String,
+    scope: WriteScope,
+    yes: bool,
+    dry_run: bool,
+    peer: Option<String>,
+    force: bool,
+}
+
+/// `None` when the pattern is missing, which the verb answers with its usage.
+fn classify_share(args: MutationArgs, verb: &str) -> Result<Option<ShareArgs>> {
+    if args.dry_run && args.yes {
+        return Err(unexpected("--yes", verb));
+    }
+    let scope = match (args.global, args.workspace) {
+        (true, true) => bail!(
+            "`--global` and `--workspace` name different files; pass one. {}",
+            render_verb_help(verb)
+        ),
+        (true, false) => WriteScope::Global,
+        (false, true) => WriteScope::Workspace,
+        (false, false) => WriteScope::Auto,
+    };
+    Ok(args.positional.into_iter().next().map(|pattern| ShareArgs {
+        pattern,
+        scope,
+        yes: args.yes,
+        dry_run: args.dry_run,
+        peer: args.peer,
+        force: args.force,
+    }))
+}
+
+/// The share root and the two share files, loaded; the verbs' one way in. Each verb
+/// reads `refusal` itself, so the load's warning is not repeated here.
+fn share_set(ctx: &RequestContext) -> Result<(PathBuf, ShareSet)> {
+    let Some((root, locations)) = ctx.app.mesh.share_locations() else {
+        bail!(SHARE_ROOT_UNKNOWN);
+    };
+    let (set, _warning) = ShareSet::load_quietly(locations);
+    Ok((root, set))
+}
+
+/// `share_set` for a mutation: the mesh gate first, so an unattended verb never prompts
+/// about a node that is not there, then a refused file stops everything.
+fn writable_share_set(ctx: &RequestContext) -> Result<(PathBuf, ShareSet, bool)> {
+    live(ctx)?;
+    let (root, set) = share_set(ctx)?;
+    if let Some(refusal) = set.refusal() {
+        bail!("{refusal} Nothing was written.");
+    }
+    let case_insensitive = root_folds_case(ctx, &root);
+    Ok((root, set, case_insensitive))
+}
+
+/// The node's memoised probe of the share root; `false` while the mesh is off, since the
+/// probe writes a temp file into the root and nothing may touch the tree before the user
+/// consents to serving it.
+fn root_folds_case(ctx: &RequestContext, root: &Path) -> bool {
+    ctx.app
+        .mesh
+        .get()
+        .and_then(|runtime| runtime.serving().case_insensitive_for(root))
+        .unwrap_or(false)
+}
+
+/// Where a mutation lands, taken before it is applied so `created` is truthful.
+struct ShareTarget {
+    layer: Layer,
+    path: PathBuf,
+    created: bool,
+}
+
+impl ShareTarget {
+    fn of(set: &ShareSet, scope: WriteScope) -> Self {
+        let layer = set.write_target(scope);
+        let path = match layer {
+            Layer::Global => set.locations().global.clone(),
+            Layer::Workspace => set.locations().workspace.clone(),
+        };
+        Self {
+            layer,
+            path,
+            created: layer == Layer::Workspace && !set.workspace_exists(),
+        }
+    }
+
+    fn written_to(&self) -> String {
+        let created = if self.created { " (created)" } else { "" };
+        format!("{}{created}", self.path.display())
+    }
+}
+
+struct Breadth {
+    words: String,
+    broad: bool,
+}
+
+/// Prints how many files `pattern` reaches under the root and says whether that is broad
+/// enough to confirm: `**` at the head, more than `BROAD_MATCH_LIMIT` files, or a walk
+/// that stopped before it could tell.
+fn describe_matches(
+    set: &ShareSet,
+    pattern: &str,
+    root: &Path,
+    case_insensitive: bool,
+) -> Result<Breadth> {
+    let count = set.count_matches(
+        pattern,
+        case_insensitive,
+        DEFAULT_LIST_WALK_BOUND,
+        BROAD_MATCH_LIMIT + 1,
+    )?;
+    let words = if count.capped || count.truncated {
+        format!("more than {BROAD_MATCH_LIMIT}")
+    } else {
+        count.files.to_string()
+    };
+    out_text(&format!(
+        "`{pattern}` matches {words} file(s) under {}.",
+        root.display()
+    ));
+    Ok(Breadth {
+        broad: is_broad_pattern(pattern) || count.files > BROAD_MATCH_LIMIT || count.truncated,
+        words,
+    })
+}
+
+/// `(layer, kind)` for every entry whose text is exactly `pattern`, global first, in
+/// file order.
+fn share_holders(set: &ShareSet, pattern: &str) -> Vec<(Layer, &'static str)> {
+    set.entries()
+        .into_iter()
+        .filter_map(|entry| {
+            let kind = match &entry.kind {
+                RawKind::Allow { pattern: held, .. } if held == pattern => "allow",
+                RawKind::Deny { pattern: held } if held == pattern => "deny",
+                RawKind::Override { path } if path == pattern => "override",
+                _ => return None,
+            };
+            Some((entry.layer, kind))
+        })
+        .collect()
+}
+
+/// `allow`, `allow and override`, `allow, deny and override`; a kind held twice is
+/// named once.
+fn kind_list(kinds: &[&str]) -> String {
+    let mut names: Vec<&str> = Vec::new();
+    for kind in kinds {
+        if !names.contains(kind) {
+            names.push(kind);
+        }
+    }
+    match names.split_last() {
+        None => String::new(),
+        Some((last, [])) => (*last).to_string(),
+        Some((last, head)) => format!("{} and {last}", head.join(", ")),
+    }
+}
+
+fn intent_verb(dry_run: bool) -> &'static str {
+    if dry_run { "Would" } else { "Will" }
+}
+
+fn share_audience(peer: Option<&str>) -> String {
+    match peer {
+        None => "every trusted peer".to_string(),
+        Some(peer) => format!("peer {}", short(peer)),
+    }
+}
+
+fn peer_hash(token: &str) -> Result<String> {
+    canonical_hash(token).ok_or_else(|| {
+        anyhow!(
+            "`{token}` is not a peer hash; scope a share to a peer by the 32-hex identity or destination hash `.mesh peers` shows."
+        )
+    })
+}
+
 /// The store behind every trust mutation, refused with the store's own teaching text while
 /// the mesh is off; the store checks again through `LiveMesh` on the call itself.
 fn trust_store(ctx: &RequestContext) -> Result<Arc<TrustStore>> {
@@ -1577,6 +2293,11 @@ struct MutationArgs {
     intro: Option<String>,
     older_than: Option<Duration>,
     confirm: Option<String>,
+    peer: Option<String>,
+    force: bool,
+    global: bool,
+    workspace: bool,
+    effective: bool,
 }
 
 /// The trust verbs take one hash and valued flags, so every token is parsed and a flag may
@@ -1613,6 +2334,11 @@ fn parse_mutation_args(rest: &str, verb: &str, allowed: &[&str]) -> Result<Mutat
             "--intro" => args.intro = Some(value()?),
             "--older-than" => args.older_than = Some(parse_older_than(&value()?)?),
             "--confirm" => args.confirm = Some(value()?),
+            "--peer" => args.peer = Some(value()?),
+            "--force" => args.force = true,
+            "--global" => args.global = true,
+            "--workspace" => args.workspace = true,
+            "--effective" => args.effective = true,
             _ => return Err(unexpected(&token, verb)),
         }
     }
@@ -2083,7 +2809,7 @@ pub(crate) mod capture {
 
 fn render_help() -> String {
     let mut lines = vec![
-        "Mesh commands (nothing here writes config.yaml; trust and rotate persist under the mesh/ directory):".to_string(),
+        "Mesh commands (nothing here writes config.yaml; trust, rotate and share rules persist under the mesh/ directory, share rules also in the workspace file):".to_string(),
     ];
     for (verb, description, example) in VERBS {
         lines.push(format!("  .mesh {verb:<10} {description}"));
@@ -2942,15 +3668,20 @@ mod tests {
         ] {
             assert!(help.contains(present), "{present:?} missing from\n{help}");
         }
-        for withdrawn in [".mesh deny", ".mesh undeny"] {
-            assert!(!help.contains(withdrawn), "{withdrawn:?} still in\n{help}");
-            assert!(
-                !crate::repl::REPL_COMMANDS
-                    .iter()
-                    .any(|command| command.name == withdrawn),
-                "{withdrawn:?} still listed"
-            );
-        }
+        // `deny` is a file verb now; the peer refusal it once spelled is `untrust`.
+        assert!(
+            verb_description("deny").contains("share rule"),
+            "{}",
+            verb_description("deny")
+        );
+        let withdrawn = ".mesh undeny";
+        assert!(!help.contains(withdrawn), "{withdrawn:?} still in\n{help}");
+        assert!(
+            !crate::repl::REPL_COMMANDS
+                .iter()
+                .any(|command| command.name == withdrawn),
+            "{withdrawn:?} still listed"
+        );
         // A later file verb named `fetch` would get its own row; only the row is pinned absent.
         assert!(!VERBS.iter().any(|(name, _, _)| *name == "fetch"));
         assert!(
@@ -4436,6 +5167,9 @@ mod tests {
                 ".mesh block",
                 ".mesh unblock",
                 ".mesh knock",
+                ".mesh allow",
+                ".mesh deny",
+                ".mesh unshare",
             ] {
                 run_async(run(&mut ctx, line)).unwrap_or_else(|err| panic!("{line}: {err}"));
             }
@@ -4451,6 +5185,9 @@ mod tests {
                 ".mesh unblock <identity>",
                 ".mesh sync",
                 ".mesh knock <destination>",
+                ".mesh allow docs/**",
+                ".mesh deny \"src/vault/*\"",
+                ".mesh unshare docs/**",
             ] {
                 assert!(out.contains(example), "{example} missing from {out}");
             }
@@ -8491,12 +9228,13 @@ mod tests {
                 });
             }
 
-            /// Usage probe: `deny`, `undeny` and `fetch` are no longer verbs. With the node
-            /// ON and an identity trusted for all its instances, each of them is refused as
-            /// an unknown `.mesh` command (not the mesh-off teaching text, not a macro-path
-            /// error), asks nothing, and leaves the trust file, the deny overlay and the
-            /// verdict exactly as they were. The renamed and folded verbs are the ones that
-            /// work in their place.
+            /// Usage probe: `undeny` and `fetch` are no longer verbs, and `deny` takes a
+            /// file pattern. With the node ON and an identity trusted for all its
+            /// instances, the withdrawn words are refused as unknown `.mesh` commands and a
+            /// `deny` of a destination is sent to `untrust` (not the mesh-off teaching
+            /// text, not a macro-path error); each asks nothing and leaves the trust file,
+            /// the deny overlay and the verdict exactly as they were. The renamed and
+            /// folded verbs are the ones that work in their place.
             #[test]
             #[serial]
             fn usage_probe_deny_undeny_and_fetch_are_withdrawn_verbs_that_touch_nothing() {
@@ -8517,18 +9255,28 @@ mod tests {
                     assert!(before.is_some());
                     assert_eq!(trust.authorize(&id, &dest).rule, Rule::IdentityTrusted);
 
-                    for (verb, line) in [
-                        ("deny", format!(".mesh deny {dest}")),
-                        ("deny", format!(".mesh deny {dest} --yes")),
-                        ("undeny", format!(".mesh undeny {dest}")),
-                        ("undeny", format!(".mesh undeny {dest} --yes")),
-                        ("fetch", ".mesh fetch".to_string()),
+                    let deny_teaching = format!(
+                        "`.mesh deny` takes a file pattern, not a peer; to refuse the instance {} run `.mesh untrust {dest}`.",
+                        short(&dest)
+                    );
+                    for (expected, line) in [
+                        (deny_teaching.clone(), format!(".mesh deny {dest}")),
+                        (deny_teaching.clone(), format!(".mesh deny {dest} --yes")),
+                        (
+                            "Unknown .mesh command 'undeny'".to_string(),
+                            format!(".mesh undeny {dest}"),
+                        ),
+                        (
+                            "Unknown .mesh command 'undeny'".to_string(),
+                            format!(".mesh undeny {dest} --yes"),
+                        ),
+                        (
+                            "Unknown .mesh command 'fetch'".to_string(),
+                            ".mesh fetch".to_string(),
+                        ),
                     ] {
                         let err = refusal(&mut ctx, &line).await;
-                        assert!(
-                            err.starts_with(&format!("Unknown .mesh command '{verb}'")),
-                            "{line}: {err}"
-                        );
+                        assert!(err.starts_with(&expected), "{line}: {err}");
                         assert!(!err.contains(MESH_OFF), "{line}: {err}");
                         assert!(!err.contains("Unknown command. Type"), "{line}: {err}");
                         assert_eq!(trust_file(&trust), before, "{line}");
@@ -8543,14 +9291,14 @@ mod tests {
 
                     // Verb help for a withdrawn word falls back to the full list, which
                     // names the verbs that replaced them and none of the withdrawn ones.
-                    for verb in ["deny", "undeny", "fetch"] {
+                    for verb in ["undeny", "fetch"] {
                         assert_eq!(render_verb_help(verb), render_help(), "{verb}");
                     }
                     let help = render_help();
                     for present in [".mesh sync", ".mesh forget", ".mesh untrust", ".mesh block"] {
                         assert!(help.contains(present), "{present}: {help}");
                     }
-                    for absent in [".mesh deny", ".mesh undeny", "undeny"] {
+                    for absent in [".mesh undeny", "undeny"] {
                         assert!(!help.contains(absent), "{absent}: {help}");
                     }
                     // A later file verb named `fetch` would get its own row; only the row is pinned absent.
@@ -11040,14 +11788,14 @@ mod tests {
                 });
             }
 
-            /// Usage probe: bare `.mesh` lists exactly the 20 verbs, one row each in table
+            /// Usage probe: bare `.mesh` lists exactly the 24 verbs, one row each in table
             /// order, `sync` and `forget` among them and none of the withdrawn spellings;
             /// the old `.mesh fetch` and `.mesh help` are unknown verbs
             /// whose single-sentence error points at `.mesh` for the list (it does not
             /// name `sync`), and under the node they touch nothing.
             #[test]
             #[serial]
-            fn usage_probe_bare_mesh_lists_the_twenty_verbs_and_the_old_fetch_spelling_points_at_it()
+            fn usage_probe_bare_mesh_lists_the_twenty_four_verbs_and_the_old_fetch_spelling_points_at_it()
              {
                 let _guard = TestConfigDirGuard::new("repl-mesh-usage-probe-verb-list");
                 let _capture = capture::install();
@@ -11071,11 +11819,14 @@ mod tests {
                         .collect();
                     let expected: Vec<&str> = VERBS.iter().map(|(name, _, _)| *name).collect();
                     assert_eq!(listed, expected, "{out}");
-                    assert_eq!(listed.len(), 20, "{out}");
-                    for present in ["sync", "forget", "untrust", "trust", "block", "unblock"] {
+                    assert_eq!(listed.len(), 24, "{out}");
+                    for present in [
+                        "sync", "forget", "untrust", "trust", "block", "unblock", "allow", "deny",
+                        "unshare", "shares",
+                    ] {
                         assert!(listed.contains(&present), "{present}: {out}");
                     }
-                    for absent in ["fetch", "deny", "undeny", "help"] {
+                    for absent in ["fetch", "undeny", "help"] {
                         assert!(!listed.contains(&absent), "{absent}: {out}");
                     }
                     assert!(out.contains("  .mesh sync       Sync the messages a propagation node holds for this node now"), "{out}");
@@ -11317,6 +12068,1257 @@ mod tests {
                     assert!(ctx.app.mesh.stop().await.unwrap());
                     started.relay_handle.abort();
                 });
+            }
+
+            mod share_verbs {
+                use super::*;
+                use crate::mesh::shares::{RawEntry, ShareLocations};
+                use crate::mesh::test_support::{TempDir, snapshot_fixture};
+
+                /// A node whose published snapshot names `root`, a temp workspace seeded
+                /// with `files`, as the share root; `locations` are the two share files
+                /// as the node resolves them.
+                struct ShareFixture {
+                    started: StartedRuntime,
+                    ctx: RequestContext,
+                    root: TempDir,
+                    locations: ShareLocations,
+                }
+
+                impl ShareFixture {
+                    async fn new(tag: &str, files: &[&str]) -> Self {
+                        let started = started_runtime(tag).await;
+                        let ctx = ctx_with(MeshConfig::default(), true);
+                        ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                        let root = TempDir::new(&format!("{tag}-root"));
+                        seed_files(&root.path, files);
+                        publish_root(&ctx, &root.path);
+                        let (_, locations) = ctx.app.mesh.share_locations().unwrap();
+                        Self {
+                            started,
+                            ctx,
+                            root,
+                            locations,
+                        }
+                    }
+
+                    fn global(&self) -> String {
+                        self.locations.global.display().to_string()
+                    }
+
+                    fn workspace(&self) -> String {
+                        self.locations.workspace.display().to_string()
+                    }
+
+                    fn entries(&self) -> Vec<RawEntry> {
+                        ShareSet::load_quietly(self.locations.clone()).0.entries()
+                    }
+
+                    fn write_global(&self, yaml: &str) {
+                        write_share_file(&self.locations.global, yaml);
+                    }
+
+                    fn write_workspace(&self, yaml: &str) {
+                        write_share_file(&self.locations.workspace, yaml);
+                    }
+
+                    async fn stop(self) {
+                        assert!(self.ctx.app.mesh.stop().await.unwrap());
+                        self.started.relay_handle.abort();
+                    }
+                }
+
+                fn seed_files(root: &Path, files: &[&str]) {
+                    for relative in files {
+                        let path = root.join(relative);
+                        fs::create_dir_all(path.parent().unwrap()).unwrap();
+                        fs::write(&path, relative).unwrap();
+                    }
+                }
+
+                fn publish_root(ctx: &RequestContext, root: &Path) {
+                    let mut snapshot = snapshot_fixture();
+                    snapshot.cwd = root.to_path_buf();
+                    ctx.app.mesh.publish(snapshot);
+                }
+
+                fn write_share_file(path: &Path, yaml: &str) {
+                    fs::create_dir_all(path.parent().unwrap()).unwrap();
+                    fs::write(path, yaml).unwrap();
+                }
+
+                fn allow_entry(layer: Layer, pattern: &str, peer: Option<&str>) -> RawEntry {
+                    RawEntry {
+                        layer,
+                        kind: RawKind::Allow {
+                            pattern: pattern.to_string(),
+                            peer: peer.map(str::to_string),
+                        },
+                    }
+                }
+
+                fn deny_entry(layer: Layer, pattern: &str) -> RawEntry {
+                    RawEntry {
+                        layer,
+                        kind: RawKind::Deny {
+                            pattern: pattern.to_string(),
+                        },
+                    }
+                }
+
+                fn override_entry(layer: Layer, path: &str) -> RawEntry {
+                    RawEntry {
+                        layer,
+                        kind: RawKind::Override {
+                            path: path.to_string(),
+                        },
+                    }
+                }
+
+                #[test]
+                #[serial]
+                fn allow_writes_the_global_file_when_no_workspace_file_exists_and_says_so() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-allow-global-default");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = ShareFixture::new(
+                            "repl-mesh-allow-global-default",
+                            &["docs/a.md", "docs/b.md"],
+                        )
+                        .await;
+                        assert!(!fx.locations.workspace.exists());
+
+                        let out = out_of(&mut fx.ctx, ".mesh allow docs/**").await.unwrap();
+
+                        let lines: Vec<&str> = out.lines().collect();
+                        assert_eq!(
+                            lines,
+                            [
+                                format!(
+                                    "`docs/**` matches 2 file(s) under {}.",
+                                    fx.root.path.display()
+                                ),
+                                format!(
+                                    "Will write to {}: allow `docs/**` for every trusted peer.",
+                                    fx.global()
+                                ),
+                                format!(
+                                    "Allowed `docs/**` for every trusted peer; written to {}.",
+                                    fx.global()
+                                ),
+                            ],
+                            "{out}"
+                        );
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        assert!(fx.locations.global.exists());
+                        assert!(!fx.locations.workspace.exists());
+                        assert_eq!(fx.entries(), [allow_entry(Layer::Global, "docs/**", None)]);
+                        fx.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn allow_workspace_creates_the_workspace_file_and_later_bare_allows_land_there() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-allow-workspace-created");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = ShareFixture::new(
+                            "repl-mesh-allow-workspace-created",
+                            &["docs/a.md", "notes/n.md"],
+                        )
+                        .await;
+
+                        let out = out_of(&mut fx.ctx, ".mesh allow docs/** --workspace")
+                            .await
+                            .unwrap();
+                        assert!(
+                            out.contains(&format!(
+                                "Will write to {} (created): allow `docs/**` for every trusted peer.",
+                                fx.workspace()
+                            )),
+                            "{out}"
+                        );
+                        assert!(
+                            out.contains(&format!(
+                                "Allowed `docs/**` for every trusted peer; written to {} (created).",
+                                fx.workspace()
+                            )),
+                            "{out}"
+                        );
+                        assert!(fx.locations.workspace.exists());
+                        assert!(!fx.locations.global.exists());
+
+                        let out = out_of(&mut fx.ctx, ".mesh allow notes/**").await.unwrap();
+                        assert!(
+                            out.contains(&format!(
+                                "Allowed `notes/**` for every trusted peer; written to {}.",
+                                fx.workspace()
+                            )),
+                            "{out}"
+                        );
+                        assert!(!out.contains("(created)"), "{out}");
+                        assert!(!fx.locations.global.exists());
+                        assert_eq!(
+                            fx.entries(),
+                            [
+                                allow_entry(Layer::Workspace, "docs/**", None),
+                                allow_entry(Layer::Workspace, "notes/**", None),
+                            ]
+                        );
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        fx.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn allow_global_forces_the_global_file_while_a_workspace_file_exists() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-allow-global-flag");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = ShareFixture::new(
+                            "repl-mesh-allow-global-flag",
+                            &["docs/a.md", "notes/n.md"],
+                        )
+                        .await;
+                        out_of(&mut fx.ctx, ".mesh allow docs/** --workspace")
+                            .await
+                            .unwrap();
+
+                        let out = out_of(&mut fx.ctx, ".mesh allow notes/** --global")
+                            .await
+                            .unwrap();
+
+                        assert!(
+                            out.contains(&format!(
+                                "Allowed `notes/**` for every trusted peer; written to {}.",
+                                fx.global()
+                            )),
+                            "{out}"
+                        );
+                        assert_eq!(
+                            fx.entries(),
+                            [
+                                allow_entry(Layer::Global, "notes/**", None),
+                                allow_entry(Layer::Workspace, "docs/**", None),
+                            ]
+                        );
+                        fx.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn allow_of_a_broad_pattern_prints_the_count_and_confirms_before_writing() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-allow-broad");
+                    let _capture = capture::install();
+                    run_async(async {
+                        let mut fx = ShareFixture::new(
+                            "repl-mesh-allow-broad",
+                            &["docs/a.md", "docs/b.md", "docs/c.md"],
+                        )
+                        .await;
+
+                        // `**` is broad by its head alone, even over an empty match.
+                        let declined = prompt_script::install(&[false]);
+                        let out = out_of(&mut fx.ctx, ".mesh allow **").await.unwrap();
+                        assert!(
+                            out.contains(&format!(
+                                "`**` matches 3 file(s) under {}.",
+                                fx.root.path.display()
+                            )),
+                            "{out}"
+                        );
+                        assert!(out.contains(NOTHING_CHANGED), "{out}");
+                        assert_eq!(prompt_script::prompts_asked(), 1);
+                        assert!(!fx.locations.global.exists());
+                        drop(declined);
+
+                        let non_tty = prompt_script::install_non_interactive();
+                        let err = refusal(&mut fx.ctx, ".mesh allow **").await;
+                        assert!(
+                            err.contains("Share 3 files matching `**` with every trusted peer?"),
+                            "{err}"
+                        );
+                        assert!(err.contains("--yes"), "{err}");
+                        assert!(!fx.locations.global.exists());
+                        drop(non_tty);
+
+                        // Three files under a literal head: written without a question.
+                        let _script = prompt_script::install(&[]);
+                        let out = out_of(&mut fx.ctx, ".mesh allow docs/**").await.unwrap();
+                        assert!(out.contains("Allowed `docs/**`"), "{out}");
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        fx.stop().await;
+
+                        let many: Vec<String> =
+                            (0..101).map(|i| format!("docs/f{i:03}.md")).collect();
+                        let many: Vec<&str> = many.iter().map(String::as_str).collect();
+                        let mut fx = ShareFixture::new("repl-mesh-allow-broad-many", &many).await;
+                        let accepted = prompt_script::install(&[true]);
+                        let out = out_of(&mut fx.ctx, ".mesh allow docs/**").await.unwrap();
+                        assert!(
+                            out.contains(&format!(
+                                "`docs/**` matches more than 100 file(s) under {}.",
+                                fx.root.path.display()
+                            )),
+                            "{out}"
+                        );
+                        assert!(out.contains("Allowed `docs/**`"), "{out}");
+                        assert_eq!(prompt_script::prompts_asked(), 1);
+                        assert_eq!(fx.entries(), [allow_entry(Layer::Global, "docs/**", None)]);
+                        drop(accepted);
+                        fx.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn allow_dry_run_prints_the_count_and_the_target_and_writes_nothing() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-allow-dry-run");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx =
+                            ShareFixture::new("repl-mesh-allow-dry-run", &["docs/a.md"]).await;
+
+                        for line in [".mesh allow docs/** --dry-run", ".mesh allow ** --dry-run"] {
+                            let out = out_of(&mut fx.ctx, line).await.unwrap();
+                            assert!(out.contains("matches 1 file(s) under"), "{line}: {out}");
+                            assert!(
+                                out.contains(&format!("Would write to {}: allow `", fx.global())),
+                                "{line}: {out}"
+                            );
+                            assert!(out.ends_with(DRY_RUN_NOTHING_CHANGED), "{line}: {out}");
+                        }
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        assert!(!fx.locations.global.exists());
+                        assert!(!fx.locations.workspace.exists());
+                        fx.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn allow_force_on_a_built_in_denied_file_writes_allow_and_override_to_the_global_file()
+                 {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-allow-force");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = ShareFixture::new("repl-mesh-allow-force", &[".env"]).await;
+
+                        let out = out_of(&mut fx.ctx, ".mesh allow .env --force --global")
+                            .await
+                            .unwrap();
+
+                        assert!(
+                            out.contains(&format!(
+                                "Will write to {}: allow `.env` for every trusted peer, and an override lifting the built-in deny for it.",
+                                fx.global()
+                            )),
+                            "{out}"
+                        );
+                        assert!(
+                            out.contains("The built-in deny for `.env` is lifted by an override in the same file."),
+                            "{out}"
+                        );
+                        let yaml = fs::read_to_string(&fx.locations.global).unwrap();
+                        assert!(yaml.contains("pattern: .env"), "{yaml}");
+                        assert!(yaml.contains("path: .env"), "{yaml}");
+                        assert_eq!(
+                            fx.entries(),
+                            [
+                                allow_entry(Layer::Global, ".env", None),
+                                override_entry(Layer::Global, ".env"),
+                            ]
+                        );
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        fx.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn allow_force_under_the_workspace_layer_teaches_global() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-allow-force-workspace");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = ShareFixture::new(
+                            "repl-mesh-allow-force-workspace",
+                            &[".env", "docs/a.md"],
+                        )
+                        .await;
+                        let teaching = format!(
+                            "Overrides are honoured from the global share file only, so `--force` cannot be written to {}; pass `--global`.",
+                            fx.workspace()
+                        );
+
+                        assert_eq!(
+                            refusal(&mut fx.ctx, ".mesh allow .env --force --workspace").await,
+                            teaching
+                        );
+                        out_of(&mut fx.ctx, ".mesh allow docs/** --workspace")
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            refusal(&mut fx.ctx, ".mesh allow .env --force").await,
+                            teaching
+                        );
+
+                        assert_eq!(
+                            fx.entries(),
+                            [allow_entry(Layer::Workspace, "docs/**", None)]
+                        );
+                        assert!(!fx.locations.global.exists());
+                        fx.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn allow_force_with_a_glob_is_refused_naming_one_exact_file() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-allow-force-glob");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx =
+                            ShareFixture::new("repl-mesh-allow-force-glob", &["k.pem"]).await;
+
+                        let err = refusal(&mut fx.ctx, ".mesh allow *.pem --force --global").await;
+
+                        assert_eq!(
+                            err,
+                            "An override lifts the built-in deny for one exact file; `*.pem` is a pattern. Name the file."
+                        );
+                        assert!(!fx.locations.global.exists());
+                        fx.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn allow_force_on_a_file_the_built_in_deny_does_not_name_is_refused() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-allow-force-plain");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx =
+                            ShareFixture::new("repl-mesh-allow-force-plain", &["README.md"]).await;
+
+                        let err =
+                            refusal(&mut fx.ctx, ".mesh allow README.md --force --global").await;
+
+                        assert_eq!(
+                            err,
+                            "`README.md` is not under the built-in deny, so there is nothing for `--force` to lift; drop `--force`."
+                        );
+                        assert!(!fx.locations.global.exists());
+                        fx.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn allow_of_a_built_in_denied_file_without_force_teaches_force_global() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-allow-builtin-plain");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx =
+                            ShareFixture::new("repl-mesh-allow-builtin-plain", &[".env"]).await;
+
+                        let err = refusal(&mut fx.ctx, ".mesh allow .env").await;
+
+                        assert_eq!(
+                            err,
+                            "`.env` is under the built-in deny, so an allow alone would share nothing; `.mesh allow .env --force --global` lifts it for this one file."
+                        );
+                        assert!(!fx.locations.global.exists());
+                        fx.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn allow_inside_git_or_the_workspace_config_dir_is_refused_even_with_force() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-allow-protected");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = ShareFixture::new(
+                            "repl-mesh-allow-protected",
+                            &[".git/config", ".coyote/sessions/x.yaml"],
+                        )
+                        .await;
+
+                        for (line, head) in [
+                            (".mesh allow .git/**", ".git"),
+                            (".mesh allow .git/config --force --global", ".git"),
+                            (".mesh allow .coyote/**", ".coyote"),
+                        ] {
+                            let pattern = line.split_whitespace().nth(2).unwrap();
+                            assert_eq!(
+                                refusal(&mut fx.ctx, line).await,
+                                format!(
+                                    "`{pattern}` is under `{head}/`, which is never shared, not even with `--force`; nothing was written."
+                                ),
+                                "{line}"
+                            );
+                        }
+                        assert_eq!(
+                            refusal(&mut fx.ctx, ".mesh deny .git/**").await,
+                            "`.git/**` is under `.git/`, which is never shared, so no deny is needed; nothing was written."
+                        );
+                        assert!(!fx.locations.global.exists());
+                        fx.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn allow_of_an_absolute_pattern_is_refused_with_the_relative_teaching() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-allow-absolute");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx =
+                            ShareFixture::new("repl-mesh-allow-absolute", &["docs/a.md"]).await;
+
+                        let err = refusal(&mut fx.ctx, ".mesh allow /etc/passwd").await;
+
+                        assert!(
+                            err.contains("Share patterns are relative to the workspace root"),
+                            "{err}"
+                        );
+                        assert!(err.ends_with("drop that prefix."), "{err}");
+                        assert!(!fx.locations.global.exists());
+                        fx.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn allow_scoped_to_a_non_hash_peer_is_refused_naming_mesh_peers() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-allow-peer");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx =
+                            ShareFixture::new("repl-mesh-allow-peer", &["docs/a.md"]).await;
+
+                        assert_eq!(
+                            refusal(&mut fx.ctx, ".mesh allow docs/** --peer bob").await,
+                            "`bob` is not a peer hash; scope a share to a peer by the 32-hex identity or destination hash `.mesh peers` shows."
+                        );
+                        assert!(!fx.locations.global.exists());
+
+                        let peer = "ab".repeat(16);
+                        let out = out_of(
+                            &mut fx.ctx,
+                            &format!(".mesh allow docs/** --peer {}", peer.to_uppercase()),
+                        )
+                        .await
+                        .unwrap();
+                        assert!(
+                            out.contains(&format!(
+                                "Allowed `docs/**` for peer {}; written to",
+                                short(&peer)
+                            )),
+                            "{out}"
+                        );
+                        assert_eq!(
+                            fx.entries(),
+                            [allow_entry(Layer::Global, "docs/**", Some(&peer))]
+                        );
+                        fx.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn allow_already_present_changes_nothing_and_says_so() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-allow-again");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx =
+                            ShareFixture::new("repl-mesh-allow-again", &["docs/a.md"]).await;
+                        out_of(&mut fx.ctx, ".mesh allow docs/**").await.unwrap();
+                        let before = fs::read(&fx.locations.global).unwrap();
+
+                        let out = out_of(&mut fx.ctx, ".mesh allow docs/**").await.unwrap();
+
+                        assert!(
+                            out.ends_with(&format!(
+                                "`docs/**` is already allowed for every trusted peer in {}; nothing was changed.",
+                                fx.global()
+                            )),
+                            "{out}"
+                        );
+                        assert_eq!(fs::read(&fx.locations.global).unwrap(), before);
+                        fx.stop().await;
+                    });
+                }
+
+                /// Both usage errors come before the mesh gate, so an off context pins them.
+                #[test]
+                #[serial]
+                fn allow_yes_with_dry_run_is_a_usage_error() {
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    let mut ctx = off_ctx();
+                    for verb in ["allow", "deny", "unshare"] {
+                        let err =
+                            err_of(&mut ctx, &format!(".mesh {verb} docs/** --yes --dry-run"));
+                        assert!(err.starts_with("Unexpected '--yes'"), "{verb}: {err}");
+                        assert!(err.contains(&format!(".mesh {verb}")), "{verb}: {err}");
+                        assert_ne!(err, MESH_OFF, "{verb}: the usage check comes first");
+                    }
+                    assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
+                }
+
+                #[test]
+                #[serial]
+                fn allow_global_with_workspace_is_a_usage_error() {
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    let mut ctx = off_ctx();
+                    for verb in ["allow", "deny", "unshare"] {
+                        let err = err_of(
+                            &mut ctx,
+                            &format!(".mesh {verb} docs/** --global --workspace"),
+                        );
+                        assert!(
+                            err.starts_with(
+                                "`--global` and `--workspace` name different files; pass one."
+                            ),
+                            "{verb}: {err}"
+                        );
+                        assert!(
+                            err.contains(&format!("Usage: .mesh {verb}")),
+                            "{verb}: {err}"
+                        );
+                    }
+                    assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
+                }
+
+                #[test]
+                #[serial]
+                fn deny_of_a_destination_hash_teaches_untrust() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-deny-hash");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = ShareFixture::new("repl-mesh-deny-hash", &["docs/a.md"]).await;
+                        let dest = "3f9c2a7b1d4e6f80a1b2c3d4e5f60718";
+
+                        let err =
+                            refusal(&mut fx.ctx, &format!(".mesh deny {}", dest.to_uppercase()))
+                                .await;
+
+                        assert_eq!(
+                            err,
+                            format!(
+                                "`.mesh deny` takes a file pattern, not a peer; to refuse the instance {} run `.mesh untrust {dest}`.",
+                                short(dest)
+                            )
+                        );
+                        assert!(!fx.locations.global.exists());
+                        fx.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn deny_writes_the_rule_and_confirms_when_broad() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-deny-writes");
+                    let _capture = capture::install();
+                    run_async(async {
+                        let mut fx = ShareFixture::new(
+                            "repl-mesh-deny-writes",
+                            &["src/vault/k.txt", "docs/a.md"],
+                        )
+                        .await;
+
+                        let quiet = prompt_script::install(&[]);
+                        let out = out_of(&mut fx.ctx, ".mesh deny \"src/vault/*\"")
+                            .await
+                            .unwrap();
+                        assert!(
+                            out.contains(&format!(
+                                "Will write to {}: deny `src/vault/*` to every peer.",
+                                fx.global()
+                            )),
+                            "{out}"
+                        );
+                        assert!(
+                            out.ends_with(&format!(
+                                "Denied `src/vault/*` to every peer; written to {}.",
+                                fx.global()
+                            )),
+                            "{out}"
+                        );
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        drop(quiet);
+
+                        let declined = prompt_script::install(&[false]);
+                        let out = out_of(&mut fx.ctx, ".mesh deny **").await.unwrap();
+                        assert!(out.ends_with(NOTHING_CHANGED), "{out}");
+                        assert_eq!(prompt_script::prompts_asked(), 1);
+                        drop(declined);
+
+                        let accepted = prompt_script::install(&[true]);
+                        let out = out_of(&mut fx.ctx, ".mesh deny **").await.unwrap();
+                        assert!(out.contains("Denied `**` to every peer"), "{out}");
+                        assert_eq!(prompt_script::prompts_asked(), 1);
+                        let out = out_of(&mut fx.ctx, ".mesh deny ** --yes").await.unwrap();
+                        assert!(
+                            out.ends_with(&format!(
+                                "`**` is already denied to every peer in {}; nothing was changed.",
+                                fx.global()
+                            )),
+                            "{out}"
+                        );
+                        assert_eq!(prompt_script::prompts_asked(), 1);
+                        drop(accepted);
+
+                        assert_eq!(
+                            fx.entries(),
+                            [
+                                deny_entry(Layer::Global, "src/vault/*"),
+                                deny_entry(Layer::Global, "**"),
+                            ]
+                        );
+                        fx.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn unshare_removes_the_allow_or_deny_that_holds_the_pattern() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-unshare");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx =
+                            ShareFixture::new("repl-mesh-unshare", &["docs/a.md", "secrets/s"])
+                                .await;
+                        out_of(&mut fx.ctx, ".mesh allow docs/**").await.unwrap();
+                        out_of(&mut fx.ctx, ".mesh deny secrets/**").await.unwrap();
+
+                        let out = out_of(&mut fx.ctx, ".mesh unshare docs/** --dry-run")
+                            .await
+                            .unwrap();
+                        assert!(
+                            out.contains(&format!(
+                                "Would remove the allow for `docs/**` from {}.",
+                                fx.global()
+                            )),
+                            "{out}"
+                        );
+                        assert!(out.ends_with(DRY_RUN_NOTHING_CHANGED), "{out}");
+                        assert_eq!(fx.entries().len(), 2);
+
+                        let out = out_of(&mut fx.ctx, ".mesh unshare docs/**").await.unwrap();
+                        assert!(
+                            out.ends_with(&format!(
+                                "Removed the allow for `docs/**` from {}.",
+                                fx.global()
+                            )),
+                            "{out}"
+                        );
+                        assert_eq!(fx.entries(), [deny_entry(Layer::Global, "secrets/**")]);
+
+                        let out = out_of(&mut fx.ctx, ".mesh unshare secrets/**")
+                            .await
+                            .unwrap();
+                        assert!(
+                            out.ends_with(&format!(
+                                "Removed the deny for `secrets/**` from {}.",
+                                fx.global()
+                            )),
+                            "{out}"
+                        );
+                        assert!(fx.entries().is_empty());
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        fx.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn unshare_with_holders_in_both_files_lists_them_and_confirms() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-unshare-both");
+                    let _capture = capture::install();
+                    run_async(async {
+                        let mut fx =
+                            ShareFixture::new("repl-mesh-unshare-both", &["docs/a.md"]).await;
+                        let quiet = prompt_script::install(&[]);
+                        out_of(&mut fx.ctx, ".mesh allow docs/**").await.unwrap();
+                        out_of(&mut fx.ctx, ".mesh allow docs/** --workspace")
+                            .await
+                            .unwrap();
+                        drop(quiet);
+                        let both = [
+                            allow_entry(Layer::Global, "docs/**", None),
+                            allow_entry(Layer::Workspace, "docs/**", None),
+                        ];
+                        assert_eq!(fx.entries(), both);
+
+                        let declined = prompt_script::install(&[false]);
+                        let out = out_of(&mut fx.ctx, ".mesh unshare docs/**").await.unwrap();
+                        let lines: Vec<&str> = out.lines().collect();
+                        assert!(lines.contains(&"`docs/**` is held by:"), "{out}");
+                        assert!(
+                            lines.contains(&format!("  allow in {}", fx.global()).as_str()),
+                            "{out}"
+                        );
+                        assert!(
+                            lines.contains(&format!("  allow in {}", fx.workspace()).as_str()),
+                            "{out}"
+                        );
+                        assert!(out.ends_with(NOTHING_CHANGED), "{out}");
+                        assert_eq!(prompt_script::prompts_asked(), 1);
+                        assert_eq!(fx.entries(), both);
+                        drop(declined);
+
+                        let accepted = prompt_script::install(&[true]);
+                        let out = out_of(&mut fx.ctx, ".mesh unshare docs/**").await.unwrap();
+                        assert!(
+                            out.contains(&format!(
+                                "Removed the allow for `docs/**` from {}.",
+                                fx.global()
+                            )),
+                            "{out}"
+                        );
+                        assert!(
+                            out.contains(&format!(
+                                "Removed the allow for `docs/**` from {}.",
+                                fx.workspace()
+                            )),
+                            "{out}"
+                        );
+                        assert_eq!(prompt_script::prompts_asked(), 1);
+                        assert!(fx.entries().is_empty());
+                        drop(accepted);
+                        fx.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn unshare_under_auto_when_only_the_other_layer_holds_it_teaches_the_flag() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-unshare-other-layer");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = ShareFixture::new(
+                            "repl-mesh-unshare-other-layer",
+                            &["docs/a.md", "notes/n.md"],
+                        )
+                        .await;
+                        out_of(&mut fx.ctx, ".mesh allow docs/**").await.unwrap();
+                        out_of(&mut fx.ctx, ".mesh allow notes/** --workspace")
+                            .await
+                            .unwrap();
+
+                        assert_eq!(
+                            refusal(&mut fx.ctx, ".mesh unshare docs/**").await,
+                            format!(
+                                "`docs/**` is held by {g} (allow); the write rule reaches {w} — pass `--global` to remove it from {g}.",
+                                g = fx.global(),
+                                w = fx.workspace()
+                            )
+                        );
+                        assert_eq!(
+                            refusal(&mut fx.ctx, ".mesh unshare docs/** --workspace").await,
+                            format!(
+                                "No share rule in {} has the pattern `docs/**`; {} holds it — pass `--global` instead.",
+                                fx.workspace(),
+                                fx.global()
+                            )
+                        );
+                        assert_eq!(fx.entries().len(), 2);
+
+                        let out = out_of(&mut fx.ctx, ".mesh unshare docs/** --global")
+                            .await
+                            .unwrap();
+                        assert!(
+                            out.ends_with(&format!(
+                                "Removed the allow for `docs/**` from {}.",
+                                fx.global()
+                            )),
+                            "{out}"
+                        );
+                        assert_eq!(
+                            fx.entries(),
+                            [allow_entry(Layer::Workspace, "notes/**", None)]
+                        );
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        fx.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn unshare_of_an_unknown_pattern_is_a_teaching_error_naming_shares() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-unshare-unknown");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx =
+                            ShareFixture::new("repl-mesh-unshare-unknown", &["docs/a.md"]).await;
+
+                        assert_eq!(
+                            refusal(&mut fx.ctx, ".mesh unshare nope/**").await,
+                            format!(
+                                "No share rule has the pattern `nope/**` in {} or {}; `.mesh shares` lists them.",
+                                fx.global(),
+                                fx.workspace()
+                            )
+                        );
+                        assert!(!fx.locations.global.exists());
+                        fx.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn unshare_also_drops_the_override_written_by_force() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-unshare-override");
+                    let _capture = capture::install();
+                    run_async(async {
+                        let mut fx =
+                            ShareFixture::new("repl-mesh-unshare-override", &[".env"]).await;
+                        let quiet = prompt_script::install(&[]);
+                        out_of(&mut fx.ctx, ".mesh allow .env --force --global")
+                            .await
+                            .unwrap();
+                        assert_eq!(fx.entries().len(), 2);
+                        drop(quiet);
+
+                        let accepted = prompt_script::install(&[true]);
+                        let out = out_of(&mut fx.ctx, ".mesh unshare .env").await.unwrap();
+                        assert!(
+                            out.ends_with(&format!(
+                                "Removed the allow and override for `.env` from {}.",
+                                fx.global()
+                            )),
+                            "{out}"
+                        );
+                        assert_eq!(prompt_script::prompts_asked(), 1);
+                        assert!(fx.entries().is_empty());
+                        let yaml = fs::read_to_string(&fx.locations.global).unwrap();
+                        assert!(!yaml.contains(".env"), "{yaml}");
+                        drop(accepted);
+                        fx.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn shares_lists_every_rule_with_its_file_and_peer_scope_and_flags_inert_workspace_overrides()
+                 {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-shares-list");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx =
+                            ShareFixture::new("repl-mesh-shares-list", &["docs/a.md"]).await;
+                        let peer = "cd".repeat(16);
+                        fx.write_global(&format!(
+                            "version: 1\nallow:\n- pattern: docs/**\n- pattern: src/**\n  peer: {peer}\n- pattern: etc/**\n  peer: nobody\ndeny:\n- pattern: secrets/**\noverride:\n- path: .env\n"
+                        ));
+                        fx.write_workspace(
+                            "version: 1\nallow:\n- pattern: notes/**\noverride:\n- path: k.pem\n",
+                        );
+
+                        let out = out_of(&mut fx.ctx, ".mesh shares").await.unwrap();
+
+                        let lines: Vec<&str> = out.lines().collect();
+                        assert_eq!(
+                            lines[0],
+                            format!(
+                                "Share rules (global {}; workspace {}):",
+                                fx.global(),
+                                fx.workspace()
+                            ),
+                            "{out}"
+                        );
+                        let rows: Vec<Vec<&str>> = lines[1..]
+                            .iter()
+                            .map(|line| line.split_whitespace().collect())
+                            .collect();
+                        assert_eq!(
+                            rows,
+                            [
+                                vec!["allow", "docs/**", "global", "every", "trusted", "peer"],
+                                vec!["allow", "src/**", "global", "peer", short(&peer)],
+                                vec![
+                                    "allow",
+                                    "etc/**",
+                                    "global",
+                                    "scoped",
+                                    "to",
+                                    "no",
+                                    "peer",
+                                    "(`nobody`",
+                                    "is",
+                                    "not",
+                                    "a",
+                                    "peer",
+                                    "hash)"
+                                ],
+                                vec!["deny", "secrets/**", "global"],
+                                vec![
+                                    "override", ".env", "global", "lifts", "the", "built-in",
+                                    "deny", "for", "this", "file"
+                                ],
+                                vec!["allow", "notes/**", "workspace", "every", "trusted", "peer"],
+                                vec![
+                                    "override",
+                                    "k.pem",
+                                    "workspace",
+                                    "ignored:",
+                                    "overrides",
+                                    "are",
+                                    "honoured",
+                                    "from",
+                                    "the",
+                                    "global",
+                                    "file",
+                                    "only"
+                                ],
+                            ],
+                            "{out}"
+                        );
+                        assert!(!out.contains(&peer), "no full hash in the listing: {out}");
+
+                        let other = "ef".repeat(16);
+                        let out = out_of(&mut fx.ctx, &format!(".mesh shares --peer {other}"))
+                            .await
+                            .unwrap();
+                        assert!(out.starts_with("Share rules ("), "{out}");
+                        assert!(
+                            out.lines()
+                                .next()
+                                .unwrap()
+                                .ends_with(&format!(" for peer {}:", short(&other))),
+                            "{out}"
+                        );
+                        assert!(out.contains("docs/**"), "{out}");
+                        assert!(
+                            !out.contains("src/**"),
+                            "a share scoped to another peer: {out}"
+                        );
+                        assert!(!out.contains("etc/**"), "a share scoped to nobody: {out}");
+                        assert!(
+                            out.contains("secrets/**"),
+                            "denies apply to every peer: {out}"
+                        );
+
+                        let out = out_of(&mut fx.ctx, &format!(".mesh shares --peer {peer}"))
+                            .await
+                            .unwrap();
+                        assert!(out.contains("src/**"), "{out}");
+
+                        assert_eq!(
+                            refusal(&mut fx.ctx, ".mesh shares docs/**").await,
+                            format!("Unexpected 'docs/**'. {}", render_verb_help("shares"))
+                        );
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        fx.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn shares_effective_lists_resolved_files_marking_built_in_and_user_denies() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-shares-effective");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = ShareFixture::new(
+                            "repl-mesh-shares-effective",
+                            &["docs/a.md", "docs/b.md", "docs/.env"],
+                        )
+                        .await;
+
+                        let out = out_of(&mut fx.ctx, ".mesh shares --effective")
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            out,
+                            format!(
+                                "Nothing resolves: no allow rule names an existing file under {}.",
+                                fx.root.path.display()
+                            )
+                        );
+
+                        fx.write_global(
+                            "version: 1\nallow:\n- pattern: docs/**\ndeny:\n- pattern: docs/b.md\n",
+                        );
+                        let out = out_of(&mut fx.ctx, ".mesh shares --effective")
+                            .await
+                            .unwrap();
+                        let lines: Vec<&str> = out.lines().collect();
+                        assert_eq!(
+                            lines,
+                            [
+                                format!(
+                                    "Files every trusted peer can fetch from {}:",
+                                    fx.root.path.display()
+                                )
+                                .as_str(),
+                                "  docs/.env  (built-in deny)",
+                                "  docs/a.md",
+                                "  docs/b.md  (denied)",
+                            ],
+                            "{out}"
+                        );
+
+                        let peer = "ab".repeat(16);
+                        let out = out_of(
+                            &mut fx.ctx,
+                            &format!(".mesh shares --effective --peer {peer}"),
+                        )
+                        .await
+                        .unwrap();
+                        assert!(
+                            out.starts_with(&format!("Files peer {} can fetch from", short(&peer))),
+                            "{out}"
+                        );
+                        assert!(!out.contains(&peer), "{out}");
+                        fx.stop().await;
+                    });
+                }
+
+                /// `shares` is inspection and reads the files the node would serve from
+                /// even while it is off; the mutations refuse after their usage checks and
+                /// before any prompt, like every other node verb.
+                #[test]
+                #[serial]
+                fn shares_works_while_the_mesh_is_off_and_the_mutations_do_not() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-shares-off");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[true; 4]);
+                    let mut ctx = off_ctx();
+                    let root = TempDir::new("repl-mesh-shares-off-root");
+                    seed_files(&root.path, &["docs/a.md"]);
+                    publish_root(&ctx, &root.path);
+                    let (_, locations) = ctx.app.mesh.share_locations().unwrap();
+
+                    run_async(run(&mut ctx, ".mesh shares")).unwrap();
+                    let out = stdout_lines().join("\n");
+                    assert!(
+                        out.starts_with(&format!(
+                            "No share rules in {} or {}.",
+                            locations.global.display(),
+                            locations.workspace.display()
+                        )),
+                        "{out}"
+                    );
+                    write_share_file(
+                        &locations.global,
+                        "version: 1\nallow:\n- pattern: docs/**\n",
+                    );
+                    run_async(run(&mut ctx, ".mesh shares --effective")).unwrap();
+                    let out = stdout_lines().join("\n");
+                    assert!(out.contains("  docs/a.md"), "{out}");
+
+                    for line in [
+                        ".mesh allow docs/**",
+                        ".mesh allow ** --yes",
+                        ".mesh deny docs/**",
+                        ".mesh unshare docs/**",
+                    ] {
+                        assert_eq!(err_of(&mut ctx, line), MESH_OFF, "{line}");
+                    }
+                    for line in [
+                        ".mesh allow docs/** --bogus",
+                        ".mesh deny docs/** --peer x",
+                        ".mesh unshare docs/** --force",
+                    ] {
+                        let err = err_of(&mut ctx, line);
+                        assert!(err.starts_with("Unexpected '"), "{line}: {err}");
+                        assert_ne!(err, MESH_OFF, "{line}: the usage check comes first");
+                    }
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+                    assert_eq!(
+                        ShareSet::load_quietly(locations).0.entries(),
+                        [allow_entry(Layer::Global, "docs/**", None)]
+                    );
+                }
+
+                #[test]
+                #[serial]
+                fn share_verbs_without_a_share_root_teach_that_it_is_unknown_until_a_turn_completes()
+                 {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-shares-no-root");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    let mut off = off_ctx();
+                    for line in [".mesh shares", ".mesh shares --effective"] {
+                        assert_eq!(err_of(&mut off, line), SHARE_ROOT_UNKNOWN, "{line}");
+                    }
+                    run_async(async {
+                        let started = started_runtime("repl-mesh-shares-no-root").await;
+                        let mut ctx = ctx_with(MeshConfig::default(), true);
+                        ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                        for line in [
+                            ".mesh allow docs/**",
+                            ".mesh deny docs/**",
+                            ".mesh unshare docs/**",
+                        ] {
+                            assert_eq!(refusal(&mut ctx, line).await, SHARE_ROOT_UNKNOWN, "{line}");
+                        }
+                        assert!(ctx.app.mesh.stop().await.unwrap());
+                        started.relay_handle.abort();
+                    });
+                    assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+                }
+
+                #[test]
+                #[serial]
+                fn a_refused_share_file_blocks_the_mutations_and_shares_says_so() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-shares-refused");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[true; 4]);
+                    run_async(async {
+                        let mut fx =
+                            ShareFixture::new("repl-mesh-shares-refused", &["docs/a.md"]).await;
+                        fx.write_global("version: 99\n");
+                        let before = fs::read(&fx.locations.global).unwrap();
+
+                        for line in [
+                            ".mesh allow docs/**",
+                            ".mesh deny docs/**",
+                            ".mesh unshare docs/**",
+                        ] {
+                            let err = refusal(&mut fx.ctx, line).await;
+                            assert!(err.contains(&fx.global()), "{line}: {err}");
+                            assert!(err.ends_with("Nothing was written."), "{line}: {err}");
+                        }
+                        assert_eq!(fs::read(&fx.locations.global).unwrap(), before);
+                        assert!(!fx.locations.workspace.exists());
+
+                        let out = out_of(&mut fx.ctx, ".mesh shares").await.unwrap();
+                        assert_eq!(out, "Nothing is shared until it is fixed.");
+                        let warned = stderr_lines();
+                        assert_eq!(warned.len(), 1, "{warned:?}");
+                        assert!(warned[0].contains(&fx.global()), "{warned:?}");
+                        assert!(warned[0].contains("version"), "{warned:?}");
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        fx.stop().await;
+                    });
+                }
             }
         }
     }

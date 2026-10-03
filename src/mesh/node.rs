@@ -47,7 +47,6 @@ use crate::mesh::r3::{
     R3Client, R3Error, R3Server, RefusalCode, RequestOptions, RequestOutcome, STATUS_PATH,
     redact_hashes, short,
 };
-#[cfg(test)]
 use crate::mesh::shares::ShareLocations;
 use crate::mesh::snapshot::MeshSnapshot;
 use crate::mesh::trust::TrustStore;
@@ -2936,7 +2935,6 @@ impl MeshSlot {
     /// `FetchServing::share_locations`, cache dir and configured inbox protected; while
     /// the mesh is off it is built from `MeshPaths::from_env()`, so `.mesh shares` and
     /// the `.mesh on` preview read the files the node will serve from.
-    #[cfg(test)]
     pub(crate) fn share_locations(&self) -> Option<(PathBuf, ShareLocations)> {
         let root = ShareSource::share_root(self)?;
         let locations = match self.get() {
