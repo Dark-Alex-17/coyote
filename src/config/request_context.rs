@@ -22259,6 +22259,7 @@ mod tests {
         legacy_identity: String,
         provable_knock: KnockRecord,
         legacy_knock: KnockRecord,
+        blocked_knock: KnockRecord,
         trusted_identity: String,
     }
 
@@ -22327,7 +22328,7 @@ mod tests {
         };
         let legacy_knock = KnockRecord {
             version: KNOCK_RECORD_VERSION,
-            received_at,
+            received_at: received_at.clone(),
             identity_hash: hex_lower(&[0xc6; 16]),
             destination_hash: hex_lower(&[0xc5; 16]),
             name_hash: String::new(),
@@ -22335,7 +22336,17 @@ mod tests {
             intro: None,
             hops: 1,
         };
-        for knock in [&provable_knock, &legacy_knock] {
+        let blocked_knock = KnockRecord {
+            version: KNOCK_RECORD_VERSION,
+            received_at,
+            identity_hash: blocked_identity.clone(),
+            destination_hash: hex_lower(&[0xc9; 16]),
+            name_hash: hex_lower(&[0xca; 10]),
+            display_name: Some("Dov".to_string()),
+            intro: None,
+            hops: 1,
+        };
+        for knock in [&provable_knock, &legacy_knock, &blocked_knock] {
             started
                 .runtime
                 .knock_gate()
@@ -22395,6 +22406,7 @@ mod tests {
             legacy_identity,
             provable_knock,
             legacy_knock,
+            blocked_knock,
             trusted_identity,
         }
     }
@@ -22465,6 +22477,20 @@ mod tests {
                 .iter()
                 .any(|(value, _)| *value == fixture.blocked_destination),
             "a blocked identity's destination is refused until `.mesh unblock`"
+        );
+        assert!(
+            !trust
+                .iter()
+                .any(|(value, _)| *value == fixture.blocked_knock.destination_hash),
+            "a knock from a blocked identity is refused the same way"
+        );
+        assert!(
+            fixture
+                .ctx
+                .mesh_completion_knocks()
+                .iter()
+                .any(|(value, _)| *value == fixture.blocked_knock.destination_hash),
+            "the knock is still cached; the `trust` filter keeps it out"
         );
 
         fixture.stop().await;
@@ -22658,6 +22684,14 @@ mod tests {
                 .iter()
                 .any(|(value, _)| *value == fixture.blocked_identity),
             "an identity already blocked leaves `block` nothing to do"
+        );
+        assert!(
+            fixture
+                .ctx
+                .mesh_completion_knocks()
+                .iter()
+                .any(|(value, _)| *value == fixture.blocked_knock.destination_hash),
+            "the blocked identity's knock is still cached; the `block` filter keeps it out"
         );
 
         fixture.stop().await;

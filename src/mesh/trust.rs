@@ -359,8 +359,8 @@ impl fmt::Display for TrustMutation {
             Self::UntrustDestination { destination, .. } => {
                 write!(f, "untrust destination {}", short(destination))
             }
-            Self::RefuseDestination { destination, .. } => {
-                write!(f, "refuse {}", short(destination))
+            Self::RefuseDestination { destination } => {
+                write!(f, "refuse destination {}", short(destination))
             }
             Self::UntrustIdentity {
                 identity, removed, ..
@@ -870,7 +870,7 @@ impl TrustStore {
 
     /// Every identity and destination record, disk first then session, each section in key
     /// order. A denied destination is still listed, flagged, so the user can see what a
-    /// `deny` is holding back; a deny with no record of its own is listed too, so the
+    /// refusal is holding back; a deny with no record of its own is listed too, so the
     /// enumeration is the whole picture.
     pub(crate) fn records(&self) -> Vec<TrustRecord> {
         let state = self.inner.lock();
@@ -1314,8 +1314,10 @@ impl TrustStore {
     /// its standing, the destination record (if any) keeps its label and binding, and
     /// `trust_destination` lifts the deny on the intact record. The identity is read from
     /// the destination's record, its session twin, or a peer table row whose binding
-    /// verifies, so a destination never trusted on its own can still be refused. `dry_run`
-    /// reports the outcome and writes nothing.
+    /// verifies, so a destination never trusted on its own can still be refused; it gets a
+    /// record bound to the identity the peer table proves, written with the deny, so
+    /// forgetting the identity forgets the refusal too. `dry_run` reports the outcome and
+    /// writes nothing.
     pub(crate) fn untrust_destination(
         &self,
         mesh: &dyn LiveMesh,
@@ -1327,23 +1329,19 @@ impl TrustStore {
         let destination = normalize_hash(destination_hash);
         let mut state = self.inner.lock();
         let mut file = state.file.clone();
-        let identity = file
+        let resolved = file
             .destinations
             .get(&destination)
-            .map(|entry| entry.identity.clone())
+            .or_else(|| state.session_destinations.get(&destination))
+            .map(|entry| (entry.identity.clone(), entry.last_seen_at.0))
             .or_else(|| {
-                state
-                    .session_destinations
-                    .get(&destination)
-                    .map(|entry| entry.identity.clone())
-            })
-            .or_else(|| {
-                peers
-                    .get(&destination)
-                    .and_then(|peer| verified_identity(&peer).ok())
-                    .map(|identity| identity.to_hex_string())
+                peers.get(&destination).and_then(|peer| {
+                    verified_identity(&peer)
+                        .ok()
+                        .map(|identity| (identity.to_hex_string(), peer.last_seen))
+                })
             });
-        let Some(identity) = identity else {
+        let Some((identity, last_seen)) = resolved else {
             bail!(
                 "Destination {destination} is not in the trust list, so there is nothing to untrust."
             );
@@ -1360,6 +1358,16 @@ impl TrustStore {
                     already_refused,
                 });
             }
+            file.destinations
+                .entry(destination.clone())
+                .or_insert_with(|| DestinationEntry {
+                    identity: identity.clone(),
+                    added_at: Stamp::new(now),
+                    last_seen_at: Stamp::new(last_seen),
+                    label: None,
+                    note: None,
+                    key_changed: None,
+                });
             upsert_overlay(
                 &mut file.denied_destinations,
                 destination.clone(),
@@ -1373,6 +1381,8 @@ impl TrustStore {
                     destination: destination.clone(),
                 },
             )?;
+            // The record now lives on disk, so a session twin would list the same hash twice.
+            state.session_destinations.remove(&destination);
             return Ok(UntrustOutcome::Refused {
                 identity,
                 already_refused,
@@ -4737,6 +4747,51 @@ mod tests {
     }
 
     #[test]
+    fn untrust_destination_of_a_peer_table_only_instance_writes_a_bound_record_with_the_deny() {
+        let fx = Fixture::new("trust-untrust-refuse-peer-table-only");
+        let peer = announced("alpha");
+        fx.announce(&peer, t(2_000));
+        fx.trust_identity(&peer.identity_hash, t(3_000));
+        let sink = fx.observed();
+
+        let outcome = fx
+            .store
+            .untrust_destination(&fx.mesh, &peer.destination_hash, t(4_000), false)
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            UntrustOutcome::Refused {
+                identity: peer.identity_hash.clone(),
+                already_refused: false,
+            }
+        );
+        let listed = record(&fx.store, &peer.destination_hash);
+        assert_eq!(listed.tier, Tier::Destination);
+        assert_eq!(
+            listed.identity.as_deref(),
+            Some(peer.identity_hash.as_str())
+        );
+        assert_eq!(listed.label, None);
+        assert!(listed.denied);
+        assert!(!listed.session);
+        assert_eq!(listed.added_at, t(4_000));
+        assert_eq!(listed.last_seen_at, t(2_000));
+        assert_eq!(fx.store.denied().len(), 1);
+        assert_eq!(fx.store.denied()[0].hash, peer.destination_hash);
+        assert_eq!(
+            fx.store
+                .authorize(&peer.identity_hash, &peer.destination_hash),
+            verdict(Decision::Refuse, Rule::DestinationDenied)
+        );
+        assert!(
+            sink.drain().is_empty(),
+            "a refusal grants nothing, so it fires nothing"
+        );
+        assert_eq!(fx.reopen().records(), fx.store.records());
+    }
+
+    #[test]
     fn untrust_identity_drops_the_denies_of_the_instances_it_forgets() {
         let fx = Fixture::new("trust-untrust-identity-sweeps-denies");
         let peer = announced("alpha");
@@ -4756,6 +4811,46 @@ mod tests {
         assert_eq!(removed, vec![peer.destination_hash.clone()]);
         assert!(fx.store.denied().is_empty());
         assert!(fx.store.records().is_empty());
+        assert_eq!(fx.reopen().denied(), fx.store.denied());
+    }
+
+    #[test]
+    fn untrust_identity_drops_the_deny_of_a_peer_table_only_instance_it_forgets() {
+        let fx = Fixture::new("trust-untrust-identity-sweeps-peer-table-deny");
+        let identity = PrivateIdentity::new_from_rand(OsRng);
+        let bound = announced_as(identity.clone(), "alpha");
+        let heard = announced_as(identity, "beta");
+        fx.announce(&bound, t(2_000));
+        fx.announce(&heard, t(2_000));
+        fx.trust_identity(&bound.identity_hash, t(2_000));
+        fx.trust_destination(&bound, t(2_000));
+        fx.store
+            .untrust_destination(&fx.mesh, &bound.destination_hash, t(3_000), false)
+            .unwrap();
+        fx.store
+            .untrust_destination(&fx.mesh, &heard.destination_hash, t(3_000), false)
+            .unwrap();
+        assert_eq!(fx.store.denied().len(), 2);
+
+        let mut removed = fx
+            .store
+            .untrust_identity(&fx.mesh, &bound.identity_hash)
+            .unwrap();
+        removed.sort();
+
+        let mut expected = vec![
+            bound.destination_hash.clone(),
+            heard.destination_hash.clone(),
+        ];
+        expected.sort();
+        assert_eq!(removed, expected);
+        assert!(fx.store.denied().is_empty());
+        assert!(fx.store.records().is_empty());
+        assert_eq!(
+            fx.store
+                .authorize(&bound.identity_hash, &heard.destination_hash),
+            verdict(Decision::Refuse, Rule::DefaultClosed)
+        );
         assert_eq!(fx.reopen().denied(), fx.store.denied());
     }
 
@@ -4817,6 +4912,121 @@ mod tests {
         );
         assert_eq!(fx.file_bytes(), before);
         assert_eq!(fx.store.denied().len(), 1);
+    }
+
+    /// Usage probe: the whole refuse-then-lift cycle on a trusted-all identity's
+    /// instance is silent to hooks. The refusal removes nothing (no `revoked`), the
+    /// second refusal changes nothing, and the lift is an `Updated` on the intact
+    /// record (no `granted`, like every other update). Only forgetting the identity
+    /// afterwards speaks, and then once per record. A hook author therefore learns of
+    /// a refusal only from `.mesh` output, never from `mesh.trust.*`.
+    #[test]
+    fn usage_probe_refuse_lift_and_refuse_again_fire_no_trust_hooks() {
+        let fx = Fixture::new("trust-usage-probe-refuse-lift-silent");
+        let peer = announced("alpha");
+        fx.announce(&peer, t(2_000));
+        fx.trust_identity(&peer.identity_hash, t(2_000));
+        fx.store
+            .trust_destination(
+                &fx.mesh,
+                &peer.destination_hash,
+                TrustOptions {
+                    label: Some("Bob".to_string()),
+                    note: None,
+                },
+                t(2_000),
+            )
+            .unwrap();
+        let sink = fx.observed();
+
+        fx.store
+            .untrust_destination(&fx.mesh, &peer.destination_hash, t(3_000), false)
+            .unwrap();
+        assert!(sink.drain().is_empty(), "a refusal removes nothing");
+
+        fx.store
+            .untrust_destination(&fx.mesh, &peer.destination_hash, t(3_500), false)
+            .unwrap();
+        assert!(sink.drain().is_empty(), "a second refusal is a no-op");
+
+        let lifted = fx
+            .store
+            .trust_destination(
+                &fx.mesh,
+                &peer.destination_hash,
+                TrustOptions::default(),
+                t(4_000),
+            )
+            .unwrap();
+        assert_eq!(lifted.change, TrustChange::Updated);
+        assert!(lifted.deny_lifted);
+        assert_eq!(
+            record(&fx.store, &peer.destination_hash).label.as_deref(),
+            Some("Bob"),
+            "the lift keeps the label the record had before the refusal"
+        );
+        assert!(
+            sink.drain().is_empty(),
+            "lifting a refusal on an intact record is an update, not a grant"
+        );
+
+        let removed = fx
+            .store
+            .untrust_identity(&fx.mesh, &peer.identity_hash)
+            .unwrap();
+        assert_eq!(removed, vec![peer.destination_hash.clone()]);
+        let fired = sink.drain();
+        assert_eq!(fired.len(), 2, "{fired:?}");
+        assert!(
+            fired
+                .iter()
+                .all(|(event, _)| *event == HookEvent::MeshTrustRevoked),
+            "{fired:?}"
+        );
+    }
+
+    /// Usage probe: lifting a deny that has no record under it (a seeded overlay; a
+    /// refusal always writes a record) is a fresh grant and fires `granted` with both
+    /// hashes, so the two shapes of lift differ only in whether a hook speaks.
+    #[test]
+    fn usage_probe_lifting_a_record_less_deny_is_a_grant_that_fires_granted() {
+        let fx = Fixture::new("trust-usage-probe-lift-orphan-grants");
+        let peer = announced("alpha");
+        fx.announce(&peer, t(2_000));
+        fx.trust_identity(&peer.identity_hash, t(2_000));
+        fx.store
+            .deny_destination(&fx.mesh, &peer.destination_hash, None, t(3_000))
+            .unwrap();
+        assert!(
+            !fx.store
+                .records()
+                .iter()
+                .any(|record| record.hash == peer.destination_hash && !record.denied),
+            "no trusted record sits under the deny"
+        );
+        let sink = fx.observed();
+
+        let lifted = fx
+            .store
+            .trust_destination(
+                &fx.mesh,
+                &peer.destination_hash,
+                TrustOptions::default(),
+                t(4_000),
+            )
+            .unwrap();
+
+        assert_eq!(lifted.change, TrustChange::Added);
+        assert!(lifted.deny_lifted);
+        let envs = one_fire(&sink, HookEvent::MeshTrustGranted);
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_PEER_DESTINATION"),
+            Some(peer.destination_hash.as_str())
+        );
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_PEER_IDENTITY"),
+            Some(peer.identity_hash.as_str())
+        );
     }
 
     #[test]

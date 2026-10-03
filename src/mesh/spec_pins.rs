@@ -2124,8 +2124,8 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
         let hits: Vec<String> = SPEC
             .lines()
             .enumerate()
-            .filter(|(_, line)| line.contains("`.mesh fetch`"))
-            .map(|(index, _)| format!("docs/mesh/PROTOCOL.md:{}: names `.mesh fetch`", index + 1))
+            .filter(|(_, line)| line.contains(".mesh fetch"))
+            .map(|(index, _)| format!("docs/mesh/PROTOCOL.md:{}: names .mesh fetch", index + 1))
             .collect();
         assert!(hits.is_empty(), "{}", hits.join("\n"));
         assert!(SPEC.contains("`.mesh sync`"));
