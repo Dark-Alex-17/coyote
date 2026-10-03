@@ -1470,18 +1470,25 @@ fn allow(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         peer,
         force,
     } = args;
-    let (root, mut set, case_insensitive) = writable_share_set(ctx)?;
+    if force && peer.is_some() {
+        bail!(
+            "`--force` lifts the built-in deny for every peer whose allow names `{pattern}`, so it cannot be scoped with `--peer`; drop `--peer` (every trusted peer with a matching allow will see the file)."
+        );
+    }
     refuse_directory_pattern(&pattern, "share what is under it with")?;
     validate_pattern(&pattern)?;
+    let peer = peer.as_deref().map(peer_hash).transpose()?;
+    if force {
+        validate_override(&pattern)?;
+    }
+    let (root, mut set, case_insensitive) = writable_share_set(ctx)?;
     if let Some(head) = set.protected_head(&pattern) {
         bail!(
             "`{pattern}` is under `{head}/`, which is never shared, not even with `--force`; nothing was written."
         );
     }
-    let peer = peer.as_deref().map(peer_hash).transpose()?;
     let target = ShareTarget::of(&set, scope);
     if force {
-        validate_override(&pattern)?;
         if target.layer == Layer::Workspace {
             bail!(
                 "Overrides are honoured from the global share file only, so `--force` cannot be written to {}; pass `--global`.",
@@ -1593,9 +1600,9 @@ fn deny(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             short(&destination)
         );
     }
-    let (root, mut set, case_insensitive) = writable_share_set(ctx)?;
     refuse_directory_pattern(&pattern, "keep what is under it back with")?;
     validate_pattern(&pattern)?;
+    let (root, mut set, case_insensitive) = writable_share_set(ctx)?;
     if let Some(head) = set.protected_head(&pattern) {
         bail!(
             "`{pattern}` is under `{head}/`, which is never shared, so no deny is needed; nothing was written."
@@ -1667,8 +1674,8 @@ fn unshare(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         dry_run,
         ..
     } = args;
-    let (root, mut set, case_insensitive) = writable_share_set(ctx)?;
     refuse_directory_pattern(&pattern, "name what is under it with")?;
+    let (root, mut set, case_insensitive) = writable_share_set(ctx)?;
     let locations = set.locations().clone();
     let path_of = |layer: Layer| match layer {
         Layer::Global => locations.global.display(),
@@ -12757,6 +12764,32 @@ mod tests {
                     });
                 }
 
+                /// The refusal is pure, so it fires before the mesh gate: an off context
+                /// hears it, not `MESH_OFF`, and no share file comes into being.
+                #[test]
+                #[serial]
+                fn allow_force_with_peer_is_refused_before_the_mesh_gate_and_writes_nothing() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-allow-force-peer");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    let mut ctx = off_ctx();
+                    let root = TempDir::new("repl-mesh-allow-force-peer-root");
+                    seed_files(&root.path, &[".env"]);
+                    publish_root(&ctx, &root.path);
+                    let (_, locations) = share_locations(&ctx).unwrap();
+                    let peer = "ab".repeat(16);
+
+                    let err = err_of(&mut ctx, &format!(".mesh allow .env --force --peer {peer}"));
+
+                    assert_eq!(
+                        err,
+                        "`--force` lifts the built-in deny for every peer whose allow names `.env`, so it cannot be scoped with `--peer`; drop `--peer` (every trusted peer with a matching allow will see the file)."
+                    );
+                    assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
+                    assert!(!locations.global.exists());
+                    assert!(!locations.workspace.exists());
+                }
+
                 /// Both usage errors come before the mesh gate, so an off context pins them.
                 #[test]
                 #[serial]
@@ -13339,6 +13372,20 @@ mod tests {
                         let err = err_of(&mut ctx, line);
                         assert!(err.starts_with("Unexpected '"), "{line}: {err}");
                         assert_ne!(err, MESH_OFF, "{line}: the usage check comes first");
+                    }
+                    for (line, teaching) in [
+                        (
+                            ".mesh allow /etc/passwd",
+                            "Share patterns are relative to the workspace root",
+                        ),
+                        (".mesh allow x --peer bob", "`bob` is not a peer hash"),
+                        (".mesh deny docs/", "`docs/` names a directory"),
+                        (".mesh unshare docs/", "`docs/` names a directory"),
+                        (".mesh allow *.pem --force", "`*.pem` is a pattern"),
+                    ] {
+                        let err = err_of(&mut ctx, line);
+                        assert!(err.contains(teaching), "{line}: {err}");
+                        assert_ne!(err, MESH_OFF, "{line}: the pattern checks come first");
                     }
                     assert_eq!(prompt_script::prompts_asked(), 0);
                     assert_eq!(

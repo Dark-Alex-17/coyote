@@ -5272,8 +5272,8 @@ impl RequestContext {
     /// Completions for the share verbs, `rest` being everything after the verb with the
     /// token being typed last. After `--peer` the trusted destinations and identities;
     /// otherwise the data rows the verb takes, once, before its positional is given, then
-    /// the flags not yet used, each of `--global`/`--workspace` and `--yes`/`--dry-run`
-    /// dropping once its partner is present.
+    /// the flags not yet used, each of `--global`/`--workspace`, `--yes`/`--dry-run` and
+    /// `--peer`/`--force` dropping once its partner is present.
     fn mesh_completion_share_verb(
         &self,
         verb: &str,
@@ -5314,6 +5314,8 @@ impl RequestContext {
             "--workspace" => prior.contains(&"--global"),
             "--yes" => prior.contains(&"--dry-run"),
             "--dry-run" => prior.contains(&"--yes"),
+            "--peer " => prior.contains(&"--force"),
+            "--force" => prior.contains(&"--peer"),
             _ => false,
         };
         for flag in flags {
@@ -23390,15 +23392,8 @@ mod tests {
         );
         assert_eq!(
             completion_values(&fixture.complete(&["allow", "--force", ""])),
-            [
-                "docs/",
-                "--peer ",
-                "--global",
-                "--workspace",
-                "--yes",
-                "--dry-run"
-            ],
-            "a flag before the positional leaves the paths on offer"
+            ["docs/", "--global", "--workspace", "--yes", "--dry-run"],
+            "a flag before the positional leaves the paths on offer; --force excludes --peer"
         );
         assert_eq!(
             completion_values(&fixture.complete(&[
@@ -23407,15 +23402,24 @@ mod tests {
                 &fixture.trusted_destination,
                 ""
             ])),
-            [
-                "docs/",
-                "--force",
-                "--global",
-                "--workspace",
-                "--yes",
-                "--dry-run"
-            ],
-            "the value after --peer is not the positional"
+            ["docs/", "--global", "--workspace", "--yes", "--dry-run"],
+            "the value after --peer is not the positional; --peer excludes --force"
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["allow", "x", "--force", ""])),
+            ["--global", "--workspace", "--yes", "--dry-run"],
+            "--force is used and excludes --peer"
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&[
+                "allow",
+                "x",
+                "--peer",
+                &fixture.trusted_destination,
+                ""
+            ])),
+            ["--global", "--workspace", "--yes", "--dry-run"],
+            "--peer is used and excludes --force"
         );
 
         fixture.stop().await;
