@@ -1511,12 +1511,16 @@ fn allow(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
                 "`{pattern}` is not under the built-in deny, so there is nothing for `--force` to lift; drop `--force`."
             ),
         }
-    } else if !pattern.contains(GLOB_METACHARACTERS)
-        && set.builtin_denies(&pattern, case_insensitive)?.is_some()
-    {
-        bail!(
-            "`{pattern}` is under the built-in deny, so an allow alone would share nothing; `.mesh allow {pattern} --force --global` lifts it for this one file."
-        );
+    } else if !pattern.contains(GLOB_METACHARACTERS) {
+        match set.builtin_denies(&pattern, case_insensitive)? {
+            Some(BuiltinHit::ByText) => bail!(
+                "`{pattern}` is under the built-in deny, so an allow alone would share nothing; `.mesh allow {pattern} --force --global` lifts it for this one file."
+            ),
+            Some(BuiltinHit::ByResolution { resolved }) => bail!(
+                "`{pattern}` resolves to `{resolved}`, which the built-in deny names, so an allow alone would share nothing; `.mesh allow {resolved} --force --global` lifts that file."
+            ),
+            None => {}
+        }
     }
     let matches = describe_matches(&set, &pattern, &root, case_insensitive)?;
     let audience = share_audience(peer.as_deref());
@@ -12724,7 +12728,9 @@ mod tests {
 
                 /// An override of the link's text would never match the resolved secret,
                 /// so writing it would only print a false lift; the verb names the file
-                /// the override has to carry instead and writes nothing.
+                /// the override has to carry instead and writes nothing. Without `--force`
+                /// the teaching names that same file, since the command it suggests has to
+                /// be one the forced branch accepts.
                 #[test]
                 #[serial]
                 fn allow_force_on_a_link_to_a_secret_names_the_resolved_file_and_writes_nothing() {
@@ -12750,11 +12756,12 @@ mod tests {
                         assert!(fx.entries().is_empty());
 
                         let err = refusal(&mut fx.ctx, ".mesh allow docs/settings").await;
-                        assert!(
-                            err.starts_with("`docs/settings` is under the built-in deny"),
-                            "{err}"
+                        assert_eq!(
+                            err,
+                            "`docs/settings` resolves to `.env`, which the built-in deny names, so an allow alone would share nothing; `.mesh allow .env --force --global` lifts that file."
                         );
                         assert!(!fx.locations.global.exists());
+                        assert!(fx.entries().is_empty());
                         fx.stop().await;
                     });
                 }
