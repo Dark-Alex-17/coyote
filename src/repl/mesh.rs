@@ -2790,7 +2790,9 @@ pub(crate) mod prompt_script {
 
     /// Forces a terminal on stdin and puts every question to `answer`, which runs
     /// between the verb's prompt and its write, so a test can change the files it is
-    /// about to write while the question stands.
+    /// about to write while the question stands. Its callers start a node, which the
+    /// tests only do on unix.
+    #[cfg(unix)]
     #[must_use]
     pub fn install_answering(answer: impl Fn(&str) -> bool + Send + Sync + 'static) -> ScriptGuard {
         *ANSWERER
