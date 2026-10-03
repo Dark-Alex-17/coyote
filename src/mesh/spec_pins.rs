@@ -2117,6 +2117,20 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
         }
     }
 
+    /// The verb that pulls held messages is `.mesh sync`; the spec names it and never
+    /// its withdrawn name.
+    #[test]
+    fn usage_probe_spec_names_the_sync_verb_not_the_fetch_verb() {
+        let hits: Vec<String> = SPEC
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| line.contains("`.mesh fetch`"))
+            .map(|(index, _)| format!("docs/mesh/PROTOCOL.md:{}: names `.mesh fetch`", index + 1))
+            .collect();
+        assert!(hits.is_empty(), "{}", hits.join("\n"));
+        assert!(SPEC.contains("`.mesh sync`"));
+    }
+
     /// Usage probe for T33 (a)/B2: section 5.1's layout line, every offset the field
     /// table spells, and both worked hex examples are derived from the live five-byte
     /// magic, not left at the old four-byte arithmetic. The examples must round-trip

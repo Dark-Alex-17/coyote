@@ -800,10 +800,10 @@ mod tests {
         }
     }
 
-    /// Usage probe (TASK-100 (b)/(f)): the documented `0 = fetch only on .mesh sync` is a
-    /// VALID setting for an enabled mesh, unlike the rate and retention keys where 0 is out
-    /// of range; an absent key reads as the documented 300; a negative or fractional value
-    /// is refused at parse time naming the key rather than silently clamped.
+    /// Usage probe: the documented `0 = fetch only on .mesh sync` is a VALID setting for an
+    /// enabled mesh, unlike the rate and retention keys where 0 is out of range; an absent
+    /// key reads as the documented 300; a negative or fractional value is refused at parse
+    /// time naming the key rather than silently clamped.
     #[test]
     fn propagation_sync_interval_zero_is_manual_and_valid_while_negatives_fail_to_parse() {
         let enabled = "mesh:\n  enabled: true\n  interfaces:\n    - {type: private, host: relay, port: 4242}\n";

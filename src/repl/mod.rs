@@ -225,7 +225,7 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 83]> = LazyLock::new(|| {
         ),
         ReplCommand::new(
             ".mesh untrust",
-            "Forget a trusted instance, or an identity with every instance bound to it; `untrust` forgets, `block` remembers and refuses",
+            "Forget a trusted instance, or an identity with every instance bound to it; `untrust` forgets (an instance of an identity trusted for all is refused instead), `block` remembers and refuses",
             AssertState::pass(),
         ),
         ReplCommand::new(
