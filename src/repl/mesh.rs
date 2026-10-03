@@ -6286,7 +6286,7 @@ mod tests {
             };
             use crate::mesh::test_support::{
                 FakeNode, PeerSighting, PeerStub, StartedRuntime, loopback_relay, private_config,
-                started_runtime, started_runtime_on, wait_until,
+                started_runtime, started_runtime_on, started_runtime_with, wait_until,
             };
             use crate::mesh::trust::{LiveMesh, TrustOptions};
             use crate::testing::EnvVarGuard;
@@ -12303,11 +12303,28 @@ mod tests {
 
                 impl ShareFixture {
                     async fn new(tag: &str, files: &[&str]) -> Self {
-                        let started = started_runtime(tag).await;
-                        let ctx = ctx_with(MeshConfig::default(), true);
-                        ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                        Self::with_inbox(tag, files, None).await
+                    }
+
+                    /// `inbox` is a path under the root for the node's `mesh.fetch.inbox_dir`,
+                    /// configured on the node and the REPL alike as a real start would.
+                    async fn with_inbox(tag: &str, files: &[&str], inbox: Option<&str>) -> Self {
                         let root = TempDir::new(&format!("{tag}-root"));
                         seed_files(&root.path, files);
+                        let inbox_dir = inbox.map(|relative| root.path.join(relative));
+                        let started = started_runtime_with(tag, |config| {
+                            config.fetch.inbox_dir = inbox_dir.clone();
+                        })
+                        .await;
+                        let config = MeshConfig {
+                            fetch: crate::config::mesh_config::MeshFetch {
+                                inbox_dir,
+                                ..Default::default()
+                            },
+                            ..MeshConfig::default()
+                        };
+                        let ctx = ctx_with(config, true);
+                        ctx.app.mesh.install(started.runtime.clone()).unwrap();
                         publish_root(&ctx, &root.path);
                         let (_, locations) = share_locations(&ctx).unwrap();
                         Self {
@@ -12900,6 +12917,37 @@ mod tests {
                             "`.git/**` is under `.git/`, which is never shared, so no deny is needed; nothing was written."
                         );
                         assert!(!fx.locations.global.exists());
+                        fx.stop().await;
+                    });
+                }
+
+                /// The walk skips the configured inbox as it skips `.git`, so a rule under
+                /// it would match nothing; the verbs refuse it by the same sentence instead
+                /// of writing a dead rule.
+                #[test]
+                #[serial]
+                fn allow_and_deny_under_the_configured_inbox_are_refused_as_never_shared() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-allow-inbox");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = ShareFixture::with_inbox(
+                            "repl-mesh-allow-inbox",
+                            &["docs/a.md", "inbox/fetched.md"],
+                            Some("inbox"),
+                        )
+                        .await;
+
+                        assert_eq!(
+                            refusal(&mut fx.ctx, ".mesh allow inbox/**").await,
+                            "`inbox/**` is under `inbox/`, which is never shared, not even with `--force`; nothing was written."
+                        );
+                        assert_eq!(
+                            refusal(&mut fx.ctx, ".mesh deny inbox/fetched.md").await,
+                            "`inbox/fetched.md` is under `inbox/`, which is never shared, so no deny is needed; nothing was written."
+                        );
+                        assert!(!fx.locations.global.exists());
+                        assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
                         fx.stop().await;
                     });
                 }

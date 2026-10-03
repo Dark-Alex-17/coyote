@@ -5352,16 +5352,16 @@ impl RequestContext {
 
     /// Root-relative paths for `.mesh allow <TAB>` and `.mesh deny <TAB>`: the entries of
     /// the share-root directory `typed` names, directories with a trailing `/`, less
-    /// `.git`, the workspace config directory, anything the built-in deny names and every
-    /// symlink, since the walk judges files by their real path and a rule naming the link
-    /// would serve none. Local filesystem and the published snapshot only; nothing reaches
-    /// the wire or the trust store. Empty for a directory prefix the verbs would refuse as
-    /// a pattern, and for a root the node could not probe, since it serves nothing from
-    /// it; sorted and cut at 200.
+    /// `.git`, the workspace config directory, anything the built-in deny names, every
+    /// directory the walk skips and every symlink, since the walk judges files by their
+    /// real path and a rule naming the link would serve none. Local filesystem and the
+    /// published snapshot only; nothing reaches the wire or the trust store. Empty for a
+    /// directory prefix the verbs would refuse as a pattern, and for a root the node
+    /// could not probe, since it serves nothing from it; sorted and cut at 200.
     fn mesh_completion_share_paths(&self, typed: &str) -> Vec<(String, Option<String>)> {
         use crate::mesh::shares::{CompletionFilter, validate_pattern};
 
-        let Some((root, _)) = self.share_locations() else {
+        let Some((root, locations)) = self.share_locations() else {
             return Vec::new();
         };
         let Some(case_insensitive) = self
@@ -5400,6 +5400,7 @@ impl RequestContext {
             return Vec::new();
         };
         let filter = CompletionFilter::new(&paths::workspace_config_dir_name(), case_insensitive);
+        let protected = locations.protected_dirs();
         let mut values: Vec<(String, Option<String>)> = entries
             .flatten()
             .filter_map(|entry| {
@@ -5413,6 +5414,10 @@ impl RequestContext {
                 }
                 let file_type = entry.file_type().ok()?;
                 if file_type.is_symlink() {
+                    return None;
+                }
+                let path = dir.join(&name);
+                if protected.iter().any(|skipped| path.starts_with(skipped)) {
                     return None;
                 }
                 let value = if file_type.is_dir() {
@@ -22477,13 +22482,22 @@ mod tests {
 
     #[cfg(unix)]
     async fn seed_mesh_completion_fixture(tag: &str) -> MeshCompletionFixture {
+        seed_mesh_completion_fixture_with(tag, |_| {}).await
+    }
+
+    /// `seed_mesh_completion_fixture` with the node's config adjusted before it starts.
+    #[cfg(unix)]
+    async fn seed_mesh_completion_fixture_with(
+        tag: &str,
+        adjust: impl FnOnce(&mut MeshConfig),
+    ) -> MeshCompletionFixture {
         use crate::mesh::hex_lower;
         use crate::mesh::knocks::KNOCK_RECORD_VERSION;
         use crate::mesh::rfc3339_utc;
-        use crate::mesh::test_support::{PeerSighting, derived_sighting, started_runtime};
+        use crate::mesh::test_support::{PeerSighting, derived_sighting, started_runtime_with};
         use crate::mesh::trust::{TrustOptions, UntrustOutcome};
 
-        let started = started_runtime(tag).await;
+        let started = started_runtime_with(tag, adjust).await;
         let mut ctx = create_test_ctx();
         ctx.update_app_config(|app| app.mesh.enabled = true);
         ctx.app.mesh.install(started.runtime.clone()).unwrap();
@@ -23791,6 +23805,40 @@ mod tests {
 
         set_mode(0o755);
         assert_eq!(values, ALLOW_FLAGS, "only the flags: {values:?}");
+        fixture.stop().await;
+    }
+
+    /// The walk never enters the configured inbox, so a rule under it would match
+    /// nothing and the verbs refuse it; the completer leaves it off the list too.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_allow_never_offers_the_configured_inbox() {
+        let _guard = TestConfigDirGuard::new();
+        let root = crate::mesh::test_support::TempDir::new("rc-mesh-complete-allow-inbox-root");
+        seed_share_files(
+            &root.path,
+            &["README.md", "inbox/fetched.md", "inbound/x.md"],
+        );
+        let inbox = root.path.join("inbox");
+        let fixture = seed_mesh_completion_fixture_with("rc-mesh-complete-allow-inbox", |config| {
+            config.fetch.inbox_dir = Some(inbox);
+        })
+        .await;
+        let mut snapshot = crate::mesh::test_support::snapshot_fixture();
+        snapshot.cwd = root.path.clone();
+        fixture.ctx.app.mesh.publish(snapshot);
+
+        let rows = fixture.complete(&["allow", ""]);
+        assert_eq!(
+            completion_values(&rows),
+            ["README.md", "inbound/"]
+                .into_iter()
+                .chain(ALLOW_FLAGS)
+                .collect::<Vec<_>>()
+        );
+        assert!(fixture.ctx.mesh_completion_share_paths("inbox/").is_empty());
+
         fixture.stop().await;
     }
 

@@ -381,6 +381,12 @@ impl ShareLocations {
         self.protected.push(dir.to_path_buf());
         self
     }
+
+    /// The directories the walk never enters, as they resolve on disk, so a view of the
+    /// root can leave out what no rule could ever share.
+    pub(crate) fn protected_dirs(&self) -> Vec<PathBuf> {
+        protected_dirs(self)
+    }
 }
 
 /// Both files as loaded. A missing file is an empty layer; a file that cannot be read as
@@ -947,14 +953,21 @@ impl ShareSet {
 
     /// The first segment of `pattern` when it names a directory nothing may serve out of,
     /// so `allow` and `deny` refuse it before anything is walked or written: `.git`, or
-    /// the workspace config directory under either name it goes by. The global config
-    /// directory is not addressable by a relative pattern, so it is not checked here.
+    /// the workspace config directory under either name it goes by, or a segment that
+    /// resolves into any directory the walk skips, such as a configured inbox under the
+    /// root.
     pub(crate) fn protected_head(&self, pattern: &str) -> Option<String> {
         let head = pattern.split('/').next()?;
-        let protected = head == ".git"
-            || workspace_config_dir_names(&self.locations.workspace_config_dir_name)
-                .contains(&head);
-        protected.then(|| head.to_string())
+        if head == ".git"
+            || workspace_config_dir_names(&self.locations.workspace_config_dir_name).contains(&head)
+        {
+            return Some(head.to_string());
+        }
+        let resolved = dunce::canonicalize(self.canonical_root().ok()?.join(head)).ok()?;
+        protected_dirs(&self.locations)
+            .iter()
+            .any(|dir| resolved.starts_with(dir))
+            .then(|| head.to_string())
     }
 
     /// Whether the built-in deny, with the workspace config directory, names this one
@@ -2932,6 +2945,28 @@ mod tests {
             set.protected_head("docs/.git/**"),
             None,
             "the built-in deny, not this check, covers a nested `.git`"
+        );
+    }
+
+    /// Every directory the walk skips is refused at the head, not just the two names:
+    /// a configured inbox under the root, and the global config directory when the root
+    /// encloses it.
+    #[test]
+    fn protected_head_names_a_configured_inbox_and_an_enclosed_config_dir() {
+        let fx = Fixture::enclosing("protected-head-dirs");
+        fx.file("inbox/fetched.md");
+        fx.file("docs/a.md");
+        fs::create_dir_all(&fx.config_dir).unwrap();
+        let set = ShareSet::load(fx.locations().with_protected(&fx.root.join("inbox")));
+
+        assert_eq!(set.protected_head("inbox/**"), Some("inbox".into()));
+        assert_eq!(set.protected_head("inbox/fetched.md"), Some("inbox".into()));
+        assert_eq!(set.protected_head("config/**"), Some("config".into()));
+        assert_eq!(set.protected_head("docs/**"), None);
+        assert_eq!(
+            set.protected_head("missing/**"),
+            None,
+            "a head that does not resolve is left to the walk, which finds nothing"
         );
     }
 

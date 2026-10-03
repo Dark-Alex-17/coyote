@@ -1004,8 +1004,20 @@ pub(crate) mod test_support {
     /// A runtime joined to a loopback relay, with its identity and cache under a temp dir.
     #[cfg(unix)]
     pub(crate) async fn started_runtime(tag: &str) -> StartedRuntime {
+        started_runtime_with(tag, |_| {}).await
+    }
+
+    /// `started_runtime` with the node's config adjusted first, for a test whose node
+    /// must stage or protect a directory of the test's choosing.
+    #[cfg(unix)]
+    pub(crate) async fn started_runtime_with(
+        tag: &str,
+        adjust: impl FnOnce(&mut MeshConfig),
+    ) -> StartedRuntime {
         let (addr, relay_handle, _) = loopback_relay().await;
-        started_runtime_at(tag, addr.port(), relay_handle).await
+        let mut config = private_config(addr.port());
+        adjust(&mut config);
+        started_runtime_at(tag, config, relay_handle).await
     }
 
     /// A runtime joined to whatever listens on `port`, such as a `PeerStub`. There is no
@@ -1013,19 +1025,24 @@ pub(crate) mod test_support {
     /// nothing.
     #[cfg(unix)]
     pub(crate) async fn started_runtime_on(tag: &str, port: u16) -> StartedRuntime {
-        started_runtime_at(tag, port, tokio::spawn(std::future::ready(()))).await
+        started_runtime_at(
+            tag,
+            private_config(port),
+            tokio::spawn(std::future::ready(())),
+        )
+        .await
     }
 
     #[cfg(unix)]
     async fn started_runtime_at(
         tag: &str,
-        port: u16,
+        config: MeshConfig,
         relay_handle: JoinHandle<()>,
     ) -> StartedRuntime {
         let tmp = TempDir::new(tag);
         let mut session = Session::default();
         let runtime = MeshRuntime::start(
-            &private_config(port),
+            &config,
             true,
             &mut session,
             mesh_paths(&tmp),
