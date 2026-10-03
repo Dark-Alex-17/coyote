@@ -1423,6 +1423,14 @@ fn usage_probe_docs_say_messages_are_posted_and_held_messages_are_fetched_back_a
         !root.contains("fetching held messages back is not yet"),
         "root README must not still say fetch-back is not yet wired up"
     );
+    assert!(
+        root.contains("`.mesh sync`"),
+        "root README must name `.mesh sync` as the manual fetch verb"
+    );
+    assert!(
+        !root.contains(".mesh fetch"),
+        "root README must not name the withdrawn `.mesh fetch` verb"
+    );
     let readme = one_line(&read(deployment_dir().join("README.md")));
     assert!(
         readme.contains("it posts the message to a propagation node"),
@@ -1460,6 +1468,10 @@ fn usage_probe_docs_say_messages_are_posted_and_held_messages_are_fetched_back_a
     assert!(
         !readme.contains("Fetching held messages back is not yet triggered"),
         "deployment README must not still say fetch-back is not yet triggered"
+    );
+    assert!(
+        !readme.contains(".mesh fetch"),
+        "deployment README must not name the withdrawn `.mesh fetch` verb"
     );
 }
 

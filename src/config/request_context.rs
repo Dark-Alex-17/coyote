@@ -4523,6 +4523,12 @@ impl RequestContext {
             && args[1] == "--identity"
         {
             values = self.mesh_completion_trusted(true);
+        } else if cmd == ".mesh"
+            && args.len() == 3
+            && matches!(args[0], "untrust" | "forget")
+            && args[1] == "--dry-run"
+        {
+            values = self.mesh_completion_trusted(false);
         } else if cmd == ".mesh" && args.len() == 2 && args[0] == "block" {
             values = self.mesh_completion_identities(true);
         } else if cmd == ".mesh" && args.len() == 2 && args[0] == "unblock" {
@@ -22315,10 +22321,11 @@ mod tests {
                 .observe(peer, now - Duration::from_secs(minutes * 60));
         }
 
-        let received_at = rfc3339_utc(now - Duration::from_secs(5 * 60));
+        // Knocked minutes apart, oldest appended first, so "newest first" is a real order.
+        let knocked_at = |minutes: u64| rfc3339_utc(now - Duration::from_secs(minutes * 60));
         let provable_knock = KnockRecord {
             version: KNOCK_RECORD_VERSION,
-            received_at: received_at.clone(),
+            received_at: knocked_at(5),
             identity_hash: hex_lower(&[0xc2; 16]),
             destination_hash: hex_lower(&[0xc1; 16]),
             name_hash: hex_lower(&[0xc4; 10]),
@@ -22328,7 +22335,7 @@ mod tests {
         };
         let legacy_knock = KnockRecord {
             version: KNOCK_RECORD_VERSION,
-            received_at: received_at.clone(),
+            received_at: knocked_at(4),
             identity_hash: hex_lower(&[0xc6; 16]),
             destination_hash: hex_lower(&[0xc5; 16]),
             name_hash: String::new(),
@@ -22338,7 +22345,7 @@ mod tests {
         };
         let blocked_knock = KnockRecord {
             version: KNOCK_RECORD_VERSION,
-            received_at,
+            received_at: knocked_at(3),
             identity_hash: blocked_identity.clone(),
             destination_hash: hex_lower(&[0xc9; 16]),
             name_hash: hex_lower(&[0xca; 10]),
@@ -22558,6 +22565,17 @@ mod tests {
                 "--dry-run"
             ],
             "the destination-tier records, then the flags"
+        );
+        let dry_run = fixture.complete(&["untrust", "--dry-run", ""]);
+        assert_eq!(
+            dry_run,
+            fixture.complete(&["forget", "--dry-run", ""]),
+            "both verbs take the same records after --dry-run"
+        );
+        assert_eq!(
+            completion_values(&dry_run),
+            [fixture.trusted_destination.as_str()],
+            "--dry-run first still completes the destination, flags aside"
         );
         let description = completion_description(&untrust, &fixture.trusted_destination);
         assert!(
