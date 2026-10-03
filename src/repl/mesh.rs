@@ -1,7 +1,7 @@
 use crate::config::mesh_config::{
     MESH_INFO_LABEL_WIDTH, MeshBrief, MeshInterface, render_mesh_info,
 };
-use crate::config::{MeshConfig, RequestContext};
+use crate::config::{MeshConfig, RequestContext, paths};
 use crate::function::mesh::trust_label;
 use crate::mesh::card::{CardSource, DISPLAY_NAME_MAX_CHARS, StatusHandler, render_for_human};
 use crate::mesh::identity::{self, Predecessor, fingerprint};
@@ -18,8 +18,8 @@ use crate::mesh::pending::{
 use crate::mesh::shares::{
     BuiltinHit, DEFAULT_LIST_WALK_BOUND, GLOB_METACHARACTERS, LIST_PAGE_SIZE, Layer, MatchCount,
     Mutation, PeerRef, RawKind, ShareLocations, ShareSet, Verdict as ShareVerdict, WriteScope,
-    canonical_peer, case_folding_hint, is_broad_pattern, is_canonical_peer, validate_override,
-    validate_pattern,
+    canonical_peer, case_folding_hint, is_broad_pattern, is_canonical_peer, protected_segment,
+    validate_override, validate_pattern,
 };
 use crate::mesh::trust::{
     Decision, KeyChange, LiveMesh, Rule, Tier, TrustChange, TrustOptions, TrustRecord, TrustStore,
@@ -1482,7 +1482,7 @@ fn allow(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             short(&destination)
         );
     }
-    refuse_git_directory_pattern(&pattern)?;
+    refuse_protected_directory_pattern(ctx, &pattern, "allow")?;
     refuse_directory_pattern(&pattern, "share what is under it with")?;
     validate_pattern(&pattern)?;
     let peer = peer.as_deref().map(canonical_peer).transpose()?;
@@ -1493,7 +1493,6 @@ fn allow(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     if let Some(head) = set.protected_head(&pattern) {
         bail!(never_shared_sentence(&pattern, &head, "allow"));
     }
-    refuse_existing_directory(&root, &pattern, "share what is under it with")?;
     refuse_link_in_pattern(
         &root,
         &set,
@@ -1502,6 +1501,7 @@ fn allow(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         "allow",
         "share what is under it with",
     )?;
+    refuse_existing_directory(&root, &pattern, "share what is under it with")?;
     let target = ShareTarget::of(&set, scope);
     refuse_symlink(&target.path)?;
     if force {
@@ -1669,14 +1669,13 @@ fn deny(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             short(&destination)
         );
     }
-    refuse_git_directory_pattern(&pattern)?;
+    refuse_protected_directory_pattern(ctx, &pattern, "deny")?;
     refuse_directory_pattern(&pattern, "keep what is under it back with")?;
     validate_pattern(&pattern)?;
     let (root, mut set, case_insensitive) = writable_share_set(ctx)?;
     if let Some(head) = set.protected_head(&pattern) {
         bail!(never_shared_sentence(&pattern, &head, "deny"));
     }
-    refuse_existing_directory(&root, &pattern, "keep what is under it back with")?;
     refuse_link_in_pattern(
         &root,
         &set,
@@ -1685,6 +1684,7 @@ fn deny(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         "deny",
         "keep what is under it back with",
     )?;
+    refuse_existing_directory(&root, &pattern, "keep what is under it back with")?;
     let target = ShareTarget::of(&set, scope);
     refuse_symlink(&target.path)?;
     let matches = describe_matches(&set, &pattern, &root, case_insensitive)?;
@@ -2133,12 +2133,27 @@ fn refuse_directory_pattern(pattern: &str, does: &str) -> Result<()> {
     Ok(())
 }
 
-/// `.git/` spelled the directory way is refused outright: the glob it would be taught is
-/// refused the same way. `unshare` keeps the teaching, since a rule under `.git/**` an
-/// older file holds can still be removed.
-fn refuse_git_directory_pattern(pattern: &str) -> Result<()> {
-    if pattern.ends_with('/') && pattern.split('/').next() == Some(".git") {
-        bail!("`.git/` is never shared; nothing was written.");
+/// A directory the walk never enters, spelled the directory way, is refused outright
+/// rather than taught `<dir>/**`: the verb would refuse that glob the same way. Judged
+/// against the root when a snapshot has named one, so a configured inbox counts, and by
+/// `.git` and the workspace config directory's names otherwise, so it fires before the
+/// mesh gate like the teaching it replaces. `unshare` keeps the teaching, since a rule
+/// under such a directory an older file holds can still be removed.
+fn refuse_protected_directory_pattern(
+    ctx: &RequestContext,
+    pattern: &str,
+    verb: &str,
+) -> Result<()> {
+    if !pattern.ends_with('/') {
+        return Ok(());
+    }
+    let dir = pattern.trim_end_matches('/');
+    let protected = match share_locations(ctx) {
+        Some((_, locations)) => ShareSet::load_quietly(locations).0.protected_head(dir),
+        None => protected_segment(dir, &paths::workspace_config_dir_name()).map(str::to_string),
+    };
+    if let Some(head) = protected {
+        bail!(never_shared_sentence(pattern, &head, verb));
     }
     Ok(())
 }
@@ -2161,13 +2176,43 @@ fn directory_sentence(pattern: &str, does: &str) -> String {
     )
 }
 
+/// Refuses `pattern` for landing in `head`, a directory nothing serves out of. A pattern
+/// that spells that directory itself by name — bare or with a trailing slash — or a glob
+/// under it is answered with the directory alone, so no glob under it is ever echoed
+/// where a remedy would stand; anything else under it, or a path that lands there only
+/// by resolution, is echoed so the human sees what was judged.
 fn never_shared_sentence(pattern: &str, head: &str, verb: &str) -> String {
     let reason = if verb == "deny" {
         "so no deny is needed"
     } else {
         "not even with `--force`"
     };
+    if let Some(dir) = typed_protected_dir(pattern, head) {
+        let rest = &pattern[dir.len()..];
+        if rest.trim_start_matches('/').is_empty() || rest.contains(GLOB_METACHARACTERS) {
+            return format!("`{dir}/` is never shared, {reason}; nothing was written.");
+        }
+    }
     format!("`{pattern}` is under `{head}/`, which is never shared, {reason}; nothing was written.")
+}
+
+/// The typed path up to and including `head` where `pattern` spells it by name:
+/// `vendor/dep/.git` for `vendor/dep/.git/**` under `.git`. `None` when the pattern
+/// reaches `head` only by resolution, as through a link.
+fn typed_protected_dir(pattern: &str, head: &str) -> Option<String> {
+    let mut end = 0;
+    for segment in pattern.split('/') {
+        if segment.contains(GLOB_METACHARACTERS) {
+            return None;
+        }
+        end += segment.len();
+        let typed = &pattern[..end];
+        if typed == head || typed.ends_with(&format!("/{head}")) {
+            return Some(typed.to_string());
+        }
+        end += '/'.len_utf8();
+    }
+    None
 }
 
 /// Allow and the walk judge a file by the path it resolves to and never enter a linked
@@ -13266,6 +13311,8 @@ mod tests {
                     });
                 }
 
+                /// A glob under a protected directory is answered with the directory, a
+                /// file under it is echoed; neither teaches a remedy.
                 #[test]
                 #[serial]
                 fn allow_inside_git_or_the_workspace_config_dir_is_refused_even_with_force() {
@@ -13279,23 +13326,25 @@ mod tests {
                         )
                         .await;
 
-                        for (line, head) in [
-                            (".mesh allow .git/**", ".git"),
-                            (".mesh allow .git/config --force --global", ".git"),
-                            (".mesh allow .coyote/**", ".coyote"),
+                        for (line, sentence) in [
+                            (
+                                ".mesh allow .git/**",
+                                "`.git/` is never shared, not even with `--force`; nothing was written.",
+                            ),
+                            (
+                                ".mesh allow .git/config --force --global",
+                                "`.git/config` is under `.git/`, which is never shared, not even with `--force`; nothing was written.",
+                            ),
+                            (
+                                ".mesh allow .coyote/**",
+                                "`.coyote/` is never shared, not even with `--force`; nothing was written.",
+                            ),
                         ] {
-                            let pattern = line.split_whitespace().nth(2).unwrap();
-                            assert_eq!(
-                                refusal(&mut fx.ctx, line).await,
-                                format!(
-                                    "`{pattern}` is under `{head}/`, which is never shared, not even with `--force`; nothing was written."
-                                ),
-                                "{line}"
-                            );
+                            assert_eq!(refusal(&mut fx.ctx, line).await, sentence, "{line}");
                         }
                         assert_eq!(
                             refusal(&mut fx.ctx, ".mesh deny .git/**").await,
-                            "`.git/**` is under `.git/`, which is never shared, so no deny is needed; nothing was written."
+                            "`.git/` is never shared, so no deny is needed; nothing was written."
                         );
                         assert!(!fx.locations.global.exists());
                         fx.stop().await;
@@ -13321,7 +13370,7 @@ mod tests {
 
                         assert_eq!(
                             refusal(&mut fx.ctx, ".mesh allow inbox/**").await,
-                            "`inbox/**` is under `inbox/`, which is never shared, not even with `--force`; nothing was written."
+                            "`inbox/` is never shared, not even with `--force`; nothing was written."
                         );
                         assert_eq!(
                             refusal(&mut fx.ctx, ".mesh deny inbox/fetched.md").await,
@@ -13352,26 +13401,31 @@ mod tests {
 
                         assert_eq!(
                             refusal(&mut fx.ctx, ".mesh allow .git").await,
-                            "`.git` is under `.git/`, which is never shared, not even with `--force`; nothing was written."
+                            "`.git/` is never shared, not even with `--force`; nothing was written."
                         );
                         assert_eq!(
                             refusal(&mut fx.ctx, ".mesh deny .coyote").await,
-                            "`.coyote` is under `.coyote/`, which is never shared, so no deny is needed; nothing was written."
+                            "`.coyote/` is never shared, so no deny is needed; nothing was written."
                         );
                         assert_eq!(
                             refusal(&mut fx.ctx, ".mesh allow inbox").await,
-                            "`inbox` is under `inbox/`, which is never shared, not even with `--force`; nothing was written."
+                            "`inbox/` is never shared, not even with `--force`; nothing was written."
                         );
-                        for line in [
-                            ".mesh allow .git/",
-                            ".mesh deny .git/",
-                            ".mesh allow .git/hooks/",
+                        for (line, sentence) in [
+                            (
+                                ".mesh allow .git/",
+                                "`.git/` is never shared, not even with `--force`; nothing was written.",
+                            ),
+                            (
+                                ".mesh deny .git/",
+                                "`.git/` is never shared, so no deny is needed; nothing was written.",
+                            ),
+                            (
+                                ".mesh allow .git/hooks/",
+                                "`.git/hooks/` is under `.git/`, which is never shared, not even with `--force`; nothing was written.",
+                            ),
                         ] {
-                            assert_eq!(
-                                refusal(&mut fx.ctx, line).await,
-                                "`.git/` is never shared; nothing was written.",
-                                "{line}"
-                            );
+                            assert_eq!(refusal(&mut fx.ctx, line).await, sentence, "{line}");
                         }
                         assert_eq!(
                             refusal(&mut fx.ctx, ".mesh unshare .git/").await,
@@ -13385,9 +13439,133 @@ mod tests {
                     });
                 }
 
+                /// A nested repository's `.git` is as unenterable as the top-level one, so
+                /// a pattern spelling it at any depth is refused by both verbs, with or
+                /// without `--force`, and nothing beside it is touched.
+                #[test]
+                #[serial]
+                fn a_nested_git_directory_is_refused_by_name_like_the_top_level_one() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-nested-git");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = ShareFixture::new(
+                            "repl-mesh-nested-git",
+                            &["vendor/dep/.git/HEAD", "vendor/dep/src/lib.rs"],
+                        )
+                        .await;
+
+                        for (line, sentence) in [
+                            (
+                                ".mesh allow vendor/dep/.git/**",
+                                "`vendor/dep/.git/` is never shared, not even with `--force`; nothing was written.",
+                            ),
+                            (
+                                ".mesh allow vendor/dep/.git",
+                                "`vendor/dep/.git/` is never shared, not even with `--force`; nothing was written.",
+                            ),
+                            (
+                                ".mesh allow vendor/dep/.git/HEAD --force --global",
+                                "`vendor/dep/.git/HEAD` is under `.git/`, which is never shared, not even with `--force`; nothing was written.",
+                            ),
+                            (
+                                ".mesh deny vendor/dep/.git/hooks/*",
+                                "`vendor/dep/.git/` is never shared, so no deny is needed; nothing was written.",
+                            ),
+                            (
+                                ".mesh deny vendor/dep/.git/HEAD",
+                                "`vendor/dep/.git/HEAD` is under `.git/`, which is never shared, so no deny is needed; nothing was written.",
+                            ),
+                        ] {
+                            assert_eq!(refusal(&mut fx.ctx, line).await, sentence, "{line}");
+                        }
+                        assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
+                        assert!(fx.entries().is_empty());
+                        assert!(!fx.locations.global.exists());
+                        fx.stop().await;
+                    });
+                }
+
+                /// A directory the walk never enters, spelled with a trailing slash — the
+                /// workspace config dir, the configured inbox, a nested repository's `.git`
+                /// — is refused as never shared before the mesh gate, by the sentence
+                /// `.git/` gets, rather than taught the `<dir>/**` the verb would then
+                /// refuse; an ordinary directory keeps the teaching, and the bare name
+                /// waits for the root behind the gate.
+                #[test]
+                #[serial]
+                fn a_trailing_slash_on_the_config_dir_the_inbox_or_a_nested_git_is_never_shared_before_the_gate()
+                 {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-slash-protected");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    let root = TempDir::new("repl-mesh-slash-protected-root");
+                    seed_files(
+                        &root.path,
+                        &[
+                            ".coyote/config.yaml",
+                            "inbox/fetched.md",
+                            "vendor/dep/.git/HEAD",
+                            "docs/a.md",
+                        ],
+                    );
+                    let config = MeshConfig {
+                        fetch: crate::config::mesh_config::MeshFetch {
+                            inbox_dir: Some(root.path.join("inbox")),
+                            ..Default::default()
+                        },
+                        ..MeshConfig::default()
+                    };
+                    let mut ctx = ctx_with(config, true);
+                    publish_root(&ctx, &root.path);
+                    let (_, locations) = share_locations(&ctx).unwrap();
+
+                    for (line, sentence) in [
+                        (
+                            ".mesh allow .coyote/",
+                            "`.coyote/` is never shared, not even with `--force`; nothing was written.",
+                        ),
+                        (
+                            ".mesh deny .coyote/",
+                            "`.coyote/` is never shared, so no deny is needed; nothing was written.",
+                        ),
+                        (
+                            ".mesh allow inbox/",
+                            "`inbox/` is never shared, not even with `--force`; nothing was written.",
+                        ),
+                        (
+                            ".mesh deny inbox/",
+                            "`inbox/` is never shared, so no deny is needed; nothing was written.",
+                        ),
+                        (
+                            ".mesh allow vendor/dep/.git/",
+                            "`vendor/dep/.git/` is never shared, not even with `--force`; nothing was written.",
+                        ),
+                        (
+                            ".mesh deny vendor/dep/.git/hooks/",
+                            "`vendor/dep/.git/hooks/` is under `.git/`, which is never shared, so no deny is needed; nothing was written.",
+                        ),
+                    ] {
+                        assert_eq!(err_of(&mut ctx, line), sentence, "{line}");
+                    }
+                    assert_eq!(
+                        err_of(&mut ctx, ".mesh allow docs/"),
+                        "`docs/` names a directory; share what is under it with `docs/**`, or one file by its path."
+                    );
+                    assert_eq!(
+                        err_of(&mut ctx, ".mesh allow inbox"),
+                        MESH_OFF,
+                        "the bare directory is judged against the root, which the gate guards"
+                    );
+                    assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
+                    assert!(!locations.global.exists());
+                    assert!(!locations.workspace.exists());
+                }
+
                 /// A link resolving anywhere under `.git` is as unshareable as `.git`
                 /// itself, whether it lands on a directory below it or on one of its files,
-                /// so no remedy is taught: neither a re-rooted glob nor a forced allow.
+                /// so no remedy is taught: neither a re-rooted glob nor a forced allow. The
+                /// sentence names `.git`, where the link lands, not the link.
                 #[test]
                 #[serial]
                 fn a_link_into_the_git_dir_is_refused_not_taught() {
@@ -13413,11 +13591,10 @@ mod tests {
                             ".mesh allow cfg",
                         ] {
                             let pattern = line.split_whitespace().nth(2).unwrap();
-                            let head = pattern.split('/').next().unwrap();
                             assert_eq!(
                                 refusal(&mut fx.ctx, line).await,
                                 format!(
-                                    "`{pattern}` is under `{head}/`, which is never shared, not even with `--force`; nothing was written."
+                                    "`{pattern}` is under `.git/`, which is never shared, not even with `--force`; nothing was written."
                                 ),
                                 "{line}"
                             );
@@ -17299,9 +17476,10 @@ mod tests {
                 /// (a) A link as a LEADING segment is judged by what it resolves to: a
                 /// file tail behind a linked directory teaches the plain allow of the real
                 /// file, a nested link head (`sub/dlink`) teaches the pattern re-rooted
-                /// through the real directory, and no flag (`--dry-run`, `--global`,
-                /// `--workspace`, `--force`) turns the refusal into a write or an
-                /// announcement.
+                /// through the real directory, a directory behind a link head is taught
+                /// its real path before it is taught `/**`, and no flag (`--dry-run`,
+                /// `--global`, `--workspace`, `--force`) turns the refusal into a write or
+                /// an announcement.
                 #[test]
                 #[serial]
                 fn usage_probe_a_link_head_before_a_tail_or_nested_under_a_dir_is_judged_by_its_resolution()
@@ -17350,9 +17528,16 @@ mod tests {
                             (".mesh allow deep/x.md", "docs/sub/x.md"),
                             (".mesh allow dlink/sub/**", "docs/sub/**"),
                             (".mesh allow dlink/sub/x.md", "docs/sub/x.md"),
+                            (".mesh allow dlink/sub", "docs/sub"),
+                            (".mesh deny dlink/sub", "docs/sub"),
                         ] {
                             let err = refusal(&mut fx.ctx, line).await;
                             assert_eq!(taught_pattern(&err), taught, "{line}: {err}");
+                        }
+                        // The taught path is a directory, which is then taught its glob.
+                        for verb in ["allow", "deny"] {
+                            let err = refusal(&mut fx.ctx, &format!(".mesh {verb} docs/sub")).await;
+                            assert_eq!(taught_pattern(&err), "docs/sub/**", "{verb}: {err}");
                         }
 
                         assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());

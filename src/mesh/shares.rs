@@ -960,28 +960,37 @@ impl ShareSet {
         })
     }
 
-    /// The first segment of `pattern` when it names a directory nothing may serve out of,
-    /// so `allow` and `deny` refuse it before anything is walked or written: `.git`, or
-    /// the workspace config directory under either name it goes by, or a segment that
-    /// resolves into any directory the walk skips, such as a configured inbox under the
-    /// root or a `.git` anywhere on the resolved path.
+    /// The directory nothing may serve out of that `pattern` names or lands in, so
+    /// `allow` and `deny` refuse it before anything is walked or written: `.git` or the
+    /// workspace config directory, under either name it goes by, as any literal segment;
+    /// or a literal prefix that resolves into a `.git` anywhere on its path, or into any
+    /// directory the walk skips, such as a configured inbox under the root. Names the
+    /// protected directory, not the pattern's first segment.
     pub(crate) fn protected_head(&self, pattern: &str) -> Option<String> {
-        let head = pattern.split('/').next()?;
-        if head == ".git"
-            || workspace_config_dir_names(&self.locations.workspace_config_dir_name).contains(&head)
+        if let Some(segment) = protected_segment(pattern, &self.locations.workspace_config_dir_name)
         {
-            return Some(head.to_string());
+            return Some(segment.to_string());
         }
         let root = self.canonical_root().ok()?;
-        let resolved = dunce::canonicalize(root.join(head)).ok()?;
+        let literal = literal_segments(pattern);
+        // The deepest literal prefix that resolves: a tail that does not exist still sits
+        // under whatever the prefix lands in.
+        let resolved = (1..=literal.len())
+            .rev()
+            .find_map(|depth| dunce::canonicalize(root.join(literal[..depth].join("/"))).ok())?;
         // The walk skips `.git` by name, so a link into one is not among `protected_dirs`.
-        (resolved
+        if resolved
             .strip_prefix(&root)
             .is_ok_and(|relative| relative.components().any(|part| part.as_os_str() == ".git"))
-            || protected_dirs(&self.locations)
-                .iter()
-                .any(|dir| resolved.starts_with(dir)))
-        .then(|| head.to_string())
+        {
+            return Some(".git".to_string());
+        }
+        let dir = protected_dirs(&self.locations)
+            .into_iter()
+            .find(|dir| resolved.starts_with(dir))?;
+        segments_under(&root, &dir)
+            .map(|segments| segments.join("/"))
+            .or_else(|| Some(dir.file_name()?.to_string_lossy().into_owned()))
     }
 
     /// Whether the built-in deny, with the workspace config directory, names this one
@@ -990,7 +999,9 @@ impl ShareSet {
     /// a forced allow of such a file has to be told about; a link is reported by its
     /// resolution even when its own name matches, since an override of the text would
     /// lift nothing: overrides are judged on the resolved name. A link named like a
-    /// secret that resolves to a plain file is told apart, since the plain file is shareable.
+    /// secret that resolves to a plain file is told apart, since the plain file is
+    /// shareable. A link anywhere on the path that resolves to nothing under the root is
+    /// reported as such, since no fetch through it can succeed.
     pub(crate) fn builtin_denies(
         &self,
         path: &str,
@@ -999,7 +1010,7 @@ impl ShareSet {
         let builtin = self.builtin(case_insensitive)?;
         let by_text = builtin.is_match(path);
         let Some(resolved) = self.resolved_name(path) else {
-            if by_text && self.is_link(path) {
+            if by_text && self.has_link(path) {
                 return Ok(Some(BuiltinHit::UnresolvableLink));
             }
             return Ok(by_text.then_some(BuiltinHit::ByText));
@@ -1026,9 +1037,13 @@ impl ShareSet {
         Some(segments_under(&root, &canonical)?.join("/"))
     }
 
-    fn is_link(&self, path: &str) -> bool {
-        fs::symlink_metadata(self.locations.workspace_root.join(path))
-            .is_ok_and(|meta| meta.file_type().is_symlink())
+    /// Whether any leading run of `path`'s segments is itself a symlink.
+    fn has_link(&self, path: &str) -> bool {
+        let mut prefix = self.locations.workspace_root.clone();
+        path.split('/').any(|segment| {
+            prefix.push(segment);
+            fs::symlink_metadata(&prefix).is_ok_and(|meta| meta.file_type().is_symlink())
+        })
     }
 }
 
@@ -1446,6 +1461,26 @@ fn builtin_deny_patterns(workspace_config_dir_name: &str) -> Vec<String> {
                 .map(|name| format!("{}/**", globset::escape(name))),
         )
         .flat_map(|pattern| [format!("**/{pattern}"), pattern])
+        .collect()
+}
+
+/// The first literal segment of `pattern`, ahead of any glob, that names a directory
+/// nothing may serve out of by name alone: `.git`, or the workspace config directory
+/// under either name it goes by. Needs no root, so a verb can say so before the gate.
+pub(crate) fn protected_segment<'a>(
+    pattern: &'a str,
+    workspace_config_dir_name: &str,
+) -> Option<&'a str> {
+    let names = workspace_config_dir_names(workspace_config_dir_name);
+    literal_segments(pattern)
+        .into_iter()
+        .find(|segment| *segment == ".git" || names.contains(segment))
+}
+
+fn literal_segments(pattern: &str) -> Vec<&str> {
+    pattern
+        .split('/')
+        .take_while(|segment| !segment.contains(GLOB_METACHARACTERS))
         .collect()
 }
 
@@ -2959,7 +2994,7 @@ mod tests {
     }
 
     #[test]
-    fn protected_head_names_git_and_the_workspace_config_dir_at_the_first_segment_only() {
+    fn protected_head_names_git_and_the_workspace_config_dir_at_any_literal_segment() {
         let fx = Fixture::new("protected-head");
         let set = fx.load();
         let dir = WORKSPACE_COYOTE_DIR_NAME;
@@ -2975,21 +3010,40 @@ mod tests {
         assert_eq!(set.protected_head("**"), None);
         assert_eq!(
             set.protected_head("docs/.git/**"),
+            Some(".git".into()),
+            "a nested repository's `.git` is as unenterable as the top-level one"
+        );
+        assert_eq!(
+            set.protected_head("vendor/dep/.git/HEAD"),
+            Some(".git".into())
+        );
+        assert_eq!(
+            set.protected_head(&format!("vendor/{dir}/x")),
+            Some(dir.into())
+        );
+        assert_eq!(
+            set.protected_head("docs/*/.git/**"),
             None,
-            "the built-in deny, not this check, covers a nested `.git`"
+            "a segment behind a glob is left to the walk, which never enters it"
         );
     }
 
     /// Every directory the walk skips is refused at the head, not just the two names:
     /// a configured inbox under the root, and the global config directory when the root
-    /// encloses it.
+    /// encloses it; a configured inbox below the first segment is found by resolving the
+    /// literal prefix, and a tail that does not exist under it changes nothing.
     #[test]
     fn protected_head_names_a_configured_inbox_and_an_enclosed_config_dir() {
         let fx = Fixture::enclosing("protected-head-dirs");
         fx.file("inbox/fetched.md");
         fx.file("docs/a.md");
+        fx.file("vendor/inbox/fetched.md");
         fs::create_dir_all(&fx.config_dir).unwrap();
-        let set = ShareSet::load(fx.locations().with_protected(&fx.root.join("inbox")));
+        let set = ShareSet::load(
+            fx.locations()
+                .with_protected(&fx.root.join("inbox"))
+                .with_protected(&fx.root.join("vendor/inbox")),
+        );
 
         assert_eq!(set.protected_head("inbox/**"), Some("inbox".into()));
         assert_eq!(set.protected_head("inbox/fetched.md"), Some("inbox".into()));
@@ -3000,6 +3054,15 @@ mod tests {
             None,
             "a head that does not resolve is left to the walk, which finds nothing"
         );
+        assert_eq!(
+            set.protected_head("vendor/inbox/fetched.md"),
+            Some("vendor/inbox".into())
+        );
+        assert_eq!(
+            set.protected_head("vendor/inbox/missing/*.md"),
+            Some("vendor/inbox".into())
+        );
+        assert_eq!(set.protected_head("vendor/**"), None);
     }
 
     #[cfg(unix)]
@@ -3013,14 +3076,14 @@ mod tests {
         fx.link("cfg", ".git/HEAD");
         let set = fx.load();
 
-        assert_eq!(set.protected_head("git-link/**"), Some("git-link".into()));
-        assert_eq!(set.protected_head("git-link"), Some("git-link".into()));
+        assert_eq!(set.protected_head("git-link/**"), Some(".git".into()));
+        assert_eq!(set.protected_head("git-link"), Some(".git".into()));
         assert_eq!(
             set.protected_head("lnk/**"),
-            Some("lnk".into()),
+            Some(".git".into()),
             "a link into a directory below `.git` is as protected as one to it"
         );
-        assert_eq!(set.protected_head("cfg"), Some("cfg".into()));
+        assert_eq!(set.protected_head("cfg"), Some(".git".into()));
         assert_eq!(set.protected_head(".git"), Some(".git".into()));
     }
 
@@ -3118,6 +3181,32 @@ mod tests {
             None,
             "a dangling link the deny does not name is no business of the built-in layer"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn builtin_denies_reports_an_unresolvable_link_in_any_leading_segment() {
+        let fx = Fixture::new("builtin-denies-dangling-dir-link");
+        let set = fx.load();
+        std::os::unix::fs::symlink("missing", fx.root.join("dead")).unwrap();
+        fx.file("real/.keep");
+        std::os::unix::fs::symlink("missing", fx.root.join("real/dead")).unwrap();
+
+        assert_eq!(
+            set.builtin_denies("dead/.env", false).unwrap(),
+            Some(BuiltinHit::UnresolvableLink),
+            "a dangling directory link ahead of a secret-like name resolves to nothing"
+        );
+        assert_eq!(
+            set.builtin_denies("real/dead/.env", false).unwrap(),
+            Some(BuiltinHit::UnresolvableLink)
+        );
+        assert_eq!(
+            set.builtin_denies("real/.env", false).unwrap(),
+            Some(BuiltinHit::ByText),
+            "a missing file under a real directory keeps the text judgement"
+        );
+        assert_eq!(set.builtin_denies("dead/notes.md", false).unwrap(), None);
     }
 
     #[cfg(unix)]
