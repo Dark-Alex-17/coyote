@@ -3,6 +3,7 @@ use crate::config::mesh_config::{
 };
 use crate::config::{MeshConfig, RequestContext, paths};
 use crate::function::mesh::trust_label;
+use crate::mesh::access::GrantKind;
 use crate::mesh::card::{CardSource, DISPLAY_NAME_MAX_CHARS, StatusHandler, render_for_human};
 use crate::mesh::identity::{self, Predecessor, fingerprint};
 use crate::mesh::idle::plural;
@@ -14,6 +15,7 @@ use crate::mesh::message::{
 };
 use crate::mesh::pending::{
     Correlation, InboundKind, InboundRecord, PendingState, access_not_a_question,
+    question_not_an_access_request,
 };
 use crate::mesh::shares::{
     BuiltinHit, DEFAULT_LIST_WALK_BOUND, GLOB_METACHARACTERS, LIST_PAGE_SIZE, Layer, MatchCount,
@@ -29,7 +31,8 @@ use crate::mesh::wire_path::WIRE_PATH_MAX_BYTES;
 use crate::mesh::{
     FetchError, FetchReport, LoggingInboundSink, MAX_WANTS_PER_FETCH, MESH_ALREADY_ON, MeshPaths,
     MeshRuntime, NodeOptions, PeerRecord, PropagationNodeRecord, age_text, canonical_hash,
-    destination_address, display_text, parse_rfc3339, redact_hashes, refuse_symlink, short,
+    destination_address, display_text, parse_rfc3339, redact_hashes, refuse_symlink, rfc3339_utc,
+    short,
 };
 use crate::supervisor::mailbox::EnvelopePayload;
 use crate::utils::{AbortSignal, drain_stale_tty_input, wait_user_interrupt};
@@ -163,6 +166,16 @@ pub(super) const VERBS: &[(&str, &str, &str)] = &[
         "List the share rules and the file each came from, or the files a peer can fetch",
         ".mesh shares [--peer <identity|destination>] [--effective]",
     ),
+    (
+        "grant",
+        "Grant a peer's access request: once for a while, or standing in the share list",
+        ".mesh grant <id> [--standing [--global|--workspace]] [--for 30m|2h|1d]",
+    ),
+    (
+        "refuse",
+        "Refuse a peer's access request",
+        ".mesh refuse <id>",
+    ),
 ];
 
 pub(crate) const MESH_OFF: &str = "Mesh is off. Run `.mesh on` first.";
@@ -215,6 +228,8 @@ pub(crate) async fn run(
         "deny" => deny(ctx, rest),
         "unshare" => unshare(ctx, rest),
         "shares" => shares(ctx, rest),
+        "grant" => grant(ctx, rest).await,
+        "refuse" => refuse(ctx, rest).await,
         other => bail!("Unknown .mesh command '{other}'. Type `.mesh` for the list."),
     }
 }
@@ -1945,6 +1960,126 @@ fn shares(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// `.mesh grant <id>`: lets the peer behind an access request read what it asked for,
+/// once through a short grant or with `--standing` through an allow rule per path in the
+/// share list. The id is the first token whatever it starts with, since a wire id may
+/// begin with `-`.
+async fn grant(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
+    let Some(rest) = rest else {
+        out_text(&render_verb_help("grant"));
+        return Ok(());
+    };
+    let (id, flags) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+    let args = parse_mutation_args(
+        flags,
+        "grant",
+        &["--standing", "--for", "--global", "--workspace"],
+    )?;
+    if let Some(token) = args.positional.first() {
+        return Err(unexpected(token, "grant"));
+    }
+    if args.standing && args.for_.is_some() {
+        bail!(
+            "`--standing` has no end, so `--for` does not apply; drop one of them. {}",
+            render_verb_help("grant")
+        );
+    }
+    if !args.standing && (args.global || args.workspace) {
+        bail!(
+            "`--global` and `--workspace` name the share file a standing grant writes to; pass `--standing` or drop them. {}",
+            render_verb_help("grant")
+        );
+    }
+    let scope = scope_flag(&args, "grant")?;
+    live(ctx)?;
+    let record = open_access_request(ctx, id)?;
+    let target = args
+        .standing
+        .then(|| loaded_for_writing(ctx).map(|(_, set)| ShareTarget::of(&set, scope)))
+        .transpose()?;
+    let kind = match &target {
+        Some(target) => {
+            out_text(&format!(
+                "Will write to {}: allow {} for identity {}.",
+                target.written_to(),
+                listed_paths(&record.paths),
+                short(&record.peer_identity)
+            ));
+            GrantKind::Standing {
+                scope: target.write_scope(),
+            }
+        }
+        None => GrantKind::OneOff { ttl: args.for_ },
+    };
+    out_text(&sending_notice(&record.peer_destination));
+    let report = ctx.app.mesh.access().grant(id, kind).await?;
+    let tail = match (&target, report.expires) {
+        (Some(target), _) => format!(", standing; written to {}", target.written_to()),
+        (None, Some(expires)) => format!(" until {}, each fetchable once", rfc3339_utc(expires)),
+        (None, None) => String::new(),
+    };
+    out_text(&format!(
+        "Granted {}: {} for {}{tail} (via {}).",
+        short(&report.id),
+        plural(report.path_count, "path", "paths"),
+        short(&report.peer_destination),
+        via_text(report.via)
+    ));
+    Ok(())
+}
+
+/// `.mesh refuse <id>`: tells the peer no; nothing is written.
+async fn refuse(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
+    let Some(rest) = rest else {
+        out_text(&render_verb_help("refuse"));
+        return Ok(());
+    };
+    let (id, flags) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+    if let Some(token) = split_tokens(flags).first() {
+        return Err(unexpected(token, "refuse"));
+    }
+    live(ctx)?;
+    let record = open_access_request(ctx, id)?;
+    out_text(&sending_notice(&record.peer_destination));
+    let report = ctx.app.mesh.access().refuse(id).await?;
+    out_text(&format!(
+        "Refused {}: {} for {} (via {}).",
+        short(&report.id),
+        plural(report.path_count, "path", "paths"),
+        short(&report.peer_destination),
+        via_text(report.via)
+    ));
+    Ok(())
+}
+
+/// The access request `id` names, or the sentence for a missing one or for a question,
+/// which `.mesh answer` takes.
+fn open_access_request(ctx: &RequestContext, id: &str) -> Result<InboundRecord> {
+    let record = match ctx.app.mesh.inbound_store() {
+        Some(store) => store.get(id)?,
+        None => None,
+    };
+    let Some(record) = record else {
+        bail!(
+            "No open access request has id {id}. `.mesh pending` lists the ones this node knows about."
+        );
+    };
+    if record.kind == InboundKind::Question {
+        bail!(question_not_an_access_request(id));
+    }
+    Ok(record)
+}
+
+/// The requested paths in backticks, a backtick inside one made an apostrophe as the
+/// notification line does, so peer text cannot pose as the frame.
+fn listed_paths(paths: &[String]) -> String {
+    paths
+        .iter()
+        .map(|path| format!("`{}`", path.replace('`', "'")))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn render_share_rules(set: &ShareSet, peer: &PeerRef<'_>, scoped_to: Option<&str>) -> String {
     let locations = set.locations();
     let effective = scoped_to.is_some().then(|| set.effective(peer));
@@ -2104,15 +2239,7 @@ fn classify_share(args: MutationArgs, verb: &str) -> Result<Option<ShareArgs>> {
     if args.dry_run && args.yes {
         return Err(unexpected("--yes", verb));
     }
-    let scope = match (args.global, args.workspace) {
-        (true, true) => bail!(
-            "`--global` and `--workspace` name different files; pass one. {}",
-            render_verb_help(verb)
-        ),
-        (true, false) => WriteScope::Global,
-        (false, true) => WriteScope::Workspace,
-        (false, false) => WriteScope::Auto,
-    };
+    let scope = scope_flag(&args, verb)?;
     Ok(args.positional.into_iter().next().map(|pattern| ShareArgs {
         pattern,
         scope,
@@ -2121,6 +2248,18 @@ fn classify_share(args: MutationArgs, verb: &str) -> Result<Option<ShareArgs>> {
         peer: args.peer,
         force: args.force,
     }))
+}
+
+fn scope_flag(args: &MutationArgs, verb: &str) -> Result<WriteScope> {
+    Ok(match (args.global, args.workspace) {
+        (true, true) => bail!(
+            "`--global` and `--workspace` name different files; pass one. {}",
+            render_verb_help(verb)
+        ),
+        (true, false) => WriteScope::Global,
+        (false, true) => WriteScope::Workspace,
+        (false, false) => WriteScope::Auto,
+    })
 }
 
 /// The completer offers a directory as `docs/`, which no share rule can hold, so the
@@ -2704,6 +2843,8 @@ struct MutationArgs {
     global: bool,
     workspace: bool,
     effective: bool,
+    standing: bool,
+    for_: Option<Duration>,
 }
 
 /// The trust verbs take one hash and valued flags, so every token is parsed and a flag may
@@ -2738,13 +2879,15 @@ fn parse_mutation_args(rest: &str, verb: &str, allowed: &[&str]) -> Result<Mutat
             "--label" => args.label = Some(value()?),
             "--note" => args.note = Some(value()?),
             "--intro" => args.intro = Some(value()?),
-            "--older-than" => args.older_than = Some(parse_older_than(&value()?)?),
+            "--older-than" => args.older_than = Some(parse_duration_text(&value()?)?),
             "--confirm" => args.confirm = Some(value()?),
             "--peer" => args.peer = Some(value()?),
             "--force" => args.force = true,
             "--global" => args.global = true,
             "--workspace" => args.workspace = true,
             "--effective" => args.effective = true,
+            "--standing" => args.standing = true,
+            "--for" => args.for_ = Some(parse_duration_text(&value()?)?),
             _ => return Err(unexpected(&token, verb)),
         }
     }
@@ -2779,7 +2922,7 @@ fn split_tokens(rest: &str) -> Vec<String> {
 }
 
 /// `<N>d`, `<N>h` or `<N>m` (minutes), N a whole number above zero.
-fn parse_older_than(text: &str) -> Result<Duration> {
+fn parse_duration_text(text: &str) -> Result<Duration> {
     let teaching = || {
         anyhow!(
             "'{text}' is not a duration: use a whole number of days, hours or minutes, such as 30d, 12h or 90m."
@@ -2803,7 +2946,7 @@ fn parse_older_than(text: &str) -> Result<Duration> {
         .ok_or_else(teaching)
 }
 
-/// `parse_older_than` in reverse, in the coarsest unit that divides it.
+/// `parse_duration_text` in reverse, in the coarsest unit that divides it.
 fn older_than_text(duration: Duration) -> String {
     let secs = duration.as_secs();
     if secs.is_multiple_of(86_400) {
@@ -4169,13 +4312,6 @@ mod tests {
                 .any(|command| command.name == withdrawn),
             "{withdrawn:?} still listed"
         );
-        // A later file verb named `fetch` would get its own row; only the row is pinned absent.
-        assert!(!VERBS.iter().any(|(name, _, _)| *name == "fetch"));
-        assert!(
-            !crate::repl::REPL_COMMANDS
-                .iter()
-                .any(|command| command.name == ".mesh fetch")
-        );
     }
 
     #[test]
@@ -4233,12 +4369,12 @@ mod tests {
     #[test]
     fn older_than_accepts_days_hours_minutes_only() {
         for (text, secs) in [("30d", 30 * 86_400), ("12h", 12 * 3_600), ("90m", 90 * 60)] {
-            let duration = parse_older_than(text).unwrap();
+            let duration = parse_duration_text(text).unwrap();
             assert_eq!(duration, Duration::from_secs(secs), "{text}");
             assert_eq!(older_than_text(duration), text);
         }
         for text in ["abc", "0d", "5w", ""] {
-            let err = parse_older_than(text).unwrap_err().to_string();
+            let err = parse_duration_text(text).unwrap_err().to_string();
             assert!(err.contains("30d, 12h or 90m"), "{text:?}: {err}");
         }
     }
@@ -9757,10 +9893,6 @@ mod tests {
                             "Unknown .mesh command 'undeny'".to_string(),
                             format!(".mesh undeny {dest} --yes"),
                         ),
-                        (
-                            "Unknown .mesh command 'fetch'".to_string(),
-                            ".mesh fetch".to_string(),
-                        ),
                     ] {
                         let err = refusal(&mut ctx, &line).await;
                         assert!(err.starts_with(&expected), "{line}: {err}");
@@ -9778,9 +9910,7 @@ mod tests {
 
                     // Verb help for a withdrawn word falls back to the full list, which
                     // names the verbs that replaced them and none of the withdrawn ones.
-                    for verb in ["undeny", "fetch"] {
-                        assert_eq!(render_verb_help(verb), render_help(), "{verb}");
-                    }
+                    assert_eq!(render_verb_help("undeny"), render_help());
                     let help = render_help();
                     for present in [".mesh sync", ".mesh forget", ".mesh untrust", ".mesh block"] {
                         assert!(help.contains(present), "{present}: {help}");
@@ -9788,13 +9918,6 @@ mod tests {
                     for absent in [".mesh undeny", "undeny"] {
                         assert!(!help.contains(absent), "{absent}: {help}");
                     }
-                    // A later file verb named `fetch` would get its own row; only the row is pinned absent.
-                    assert!(!VERBS.iter().any(|(name, _, _)| *name == "fetch"));
-                    assert!(
-                        !crate::repl::REPL_COMMANDS
-                            .iter()
-                            .any(|command| command.name == ".mesh fetch")
-                    );
                     assert!(
                         !KNOCK_REFUSAL_TAIL.contains("undeny"),
                         "{KNOCK_REFUSAL_TAIL}"
@@ -12280,14 +12403,14 @@ mod tests {
                 });
             }
 
-            /// Usage probe: bare `.mesh` lists exactly the 24 verbs, one row each in table
+            /// Usage probe: bare `.mesh` lists exactly the 26 verbs, one row each in table
             /// order, `sync` and `forget` among them and none of the withdrawn spellings;
-            /// the old `.mesh fetch` and `.mesh help` are unknown verbs
-            /// whose single-sentence error points at `.mesh` for the list (it does not
-            /// name `sync`), and under the node they touch nothing.
+            /// the old `.mesh help` is an unknown verb whose single-sentence error points
+            /// at `.mesh` for the list (it does not name `sync`), and under the node it
+            /// touches nothing.
             #[test]
             #[serial]
-            fn usage_probe_bare_mesh_lists_the_twenty_four_verbs_and_the_old_fetch_spelling_points_at_it()
+            fn usage_probe_bare_mesh_lists_the_twenty_six_verbs_and_the_old_help_spelling_points_at_it()
              {
                 let _guard = TestConfigDirGuard::new("repl-mesh-usage-probe-verb-list");
                 let _capture = capture::install();
@@ -12311,14 +12434,14 @@ mod tests {
                         .collect();
                     let expected: Vec<&str> = VERBS.iter().map(|(name, _, _)| *name).collect();
                     assert_eq!(listed, expected, "{out}");
-                    assert_eq!(listed.len(), 24, "{out}");
+                    assert_eq!(listed.len(), 26, "{out}");
                     for present in [
                         "sync", "forget", "untrust", "trust", "block", "unblock", "allow", "deny",
-                        "unshare", "shares",
+                        "unshare", "shares", "grant", "refuse",
                     ] {
                         assert!(listed.contains(&present), "{present}: {out}");
                     }
-                    for absent in ["fetch", "undeny", "help"] {
+                    for absent in ["undeny", "help"] {
                         assert!(!listed.contains(&absent), "{absent}: {out}");
                     }
                     assert!(out.contains("  .mesh sync       Sync the messages a propagation node holds for this node now"), "{out}");
@@ -12327,7 +12450,7 @@ mod tests {
                         "{out}"
                     );
 
-                    for old in [".mesh fetch", ".mesh help", ".mesh fetch --yes"] {
+                    for old in [".mesh help", ".mesh help --yes"] {
                         let printed = stdout_lines().len();
                         let err = refusal(&mut ctx, old).await;
                         let word = old.split_whitespace().nth(1).unwrap();
@@ -19358,6 +19481,447 @@ mod tests {
                         "{:?}",
                         &out[before..]
                     );
+                }
+            }
+
+            mod access_verbs {
+                use super::*;
+                use crate::mesh::grants::GrantRecord;
+                use crate::mesh::pending::INBOUND_RECORD_VERSION;
+                use crate::mesh::shares::{RawEntry, RawKind};
+                use crate::mesh::test_support::{TempDir, snapshot_fixture};
+                use crate::mesh::{mesh_config_dir, rfc3339_utc};
+
+                /// A node and a stub peer each trusting the other, the node's published
+                /// snapshot naming an empty temp workspace as the share root. `file`
+                /// puts a request from the stub in the inbound store as the dispatcher
+                /// would have.
+                struct AccessFixture {
+                    stub: PeerStub,
+                    started: StartedRuntime,
+                    ctx: RequestContext,
+                    _root: TempDir,
+                }
+
+                impl AccessFixture {
+                    async fn new(tag: &str) -> Self {
+                        let stub =
+                            PeerStub::listen(&format!("{tag}-stub"), TcpServer::DEFAULT_CLIENT_MTU)
+                                .await;
+                        let started = started_runtime_on(tag, stub.port()).await;
+                        let runtime = started.runtime.clone();
+                        let ctx = ctx_with(MeshConfig::default(), true);
+                        ctx.app.mesh.install(runtime.clone()).unwrap();
+                        stub.trust(&runtime.current_destination_hash(), runtime.fingerprint());
+                        stub.announce(Some("Stub")).await;
+                        let to = stub.destination_hex();
+                        let peers = runtime.peers();
+                        wait_until("the node to file the stub", || peers.get(&to).is_some()).await;
+                        runtime
+                            .trust()
+                            .trust_destination(
+                                ctx.app.mesh.as_ref(),
+                                &to,
+                                TrustOptions::default(),
+                                SystemTime::now(),
+                            )
+                            .unwrap();
+                        let root = TempDir::new(&format!("{tag}-root"));
+                        let mut snapshot = snapshot_fixture();
+                        snapshot.cwd = root.path.clone();
+                        ctx.app.mesh.publish(snapshot);
+                        Self {
+                            stub,
+                            started,
+                            ctx,
+                            _root: root,
+                        }
+                    }
+
+                    fn file(&self, id: &str, kind: InboundKind, paths: &[&str]) {
+                        let now = SystemTime::now();
+                        let (question, reason) = match kind {
+                            InboundKind::Question => ("which one?", ""),
+                            InboundKind::Access => ("", "need it"),
+                        };
+                        self.ctx
+                            .app
+                            .mesh
+                            .inbound_store()
+                            .unwrap()
+                            .upsert(
+                                InboundRecord {
+                                    version: INBOUND_RECORD_VERSION,
+                                    id: id.to_string(),
+                                    peer_destination: self.stub.destination_hex(),
+                                    peer_identity: self.stub.identity_hex(),
+                                    thread: id.to_string(),
+                                    question: question.to_string(),
+                                    envoy_question: String::new(),
+                                    received_at: rfc3339_utc(now),
+                                    kind,
+                                    paths: paths.iter().map(|path| path.to_string()).collect(),
+                                    reason: reason.to_string(),
+                                },
+                                now,
+                            )
+                            .unwrap();
+                    }
+
+                    fn dest(&self) -> String {
+                        short(&self.stub.destination_hex()).to_string()
+                    }
+
+                    fn pending_ids(&self) -> Vec<String> {
+                        self.ctx
+                            .app
+                            .mesh
+                            .inbound_store()
+                            .unwrap()
+                            .list(SystemTime::now())
+                            .unwrap()
+                            .into_iter()
+                            .map(|record| record.id)
+                            .collect()
+                    }
+
+                    fn grants(&self) -> Vec<GrantRecord> {
+                        self.started.runtime.serving().grants().list().unwrap()
+                    }
+
+                    /// The one reply the stub heard, as its content.
+                    fn heard(&self) -> String {
+                        let seen = self.stub.seen();
+                        assert_eq!(seen.len(), 1, "{seen:?}");
+                        assert_eq!(seen[0].kind, PeerKind::Reply);
+                        seen[0].content.clone()
+                    }
+
+                    async fn stop(self) {
+                        assert!(self.ctx.app.mesh.stop().await.unwrap());
+                        self.started.relay_handle.abort();
+                        self.stub.stop().await;
+                    }
+                }
+
+                fn sending(fx: &AccessFixture) -> String {
+                    format!("Sending your answer to {} over the mesh...", fx.dest())
+                }
+
+                #[test]
+                #[serial]
+                fn grant_writes_a_one_use_grant_until_the_default_ttl_and_the_peer_hears_yes() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-grant-once");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = AccessFixture::new("repl-mesh-grant-once").await;
+                        fx.file("a-1", InboundKind::Access, &["src/x.rs", "docs/y.md"]);
+
+                        let out = out_of(&mut fx.ctx, ".mesh grant a-1").await.unwrap();
+
+                        let grants = fx.grants();
+                        assert_eq!(grants.len(), 1, "{grants:?}");
+                        assert_eq!(grants[0].id, "a-1");
+                        assert_eq!(grants[0].peer, fx.stub.destination_hex());
+                        let uses: Vec<(&str, u32)> = grants[0]
+                            .paths
+                            .iter()
+                            .map(|path| (path.path.as_str(), path.uses))
+                            .collect();
+                        assert_eq!(uses, [("src/x.rs", 1), ("docs/y.md", 1)]);
+                        let lines: Vec<&str> = out.lines().collect();
+                        assert_eq!(
+                            lines,
+                            [
+                                sending(&fx),
+                                format!(
+                                    "Granted a-1: 2 paths for {} until {}, each fetchable once (via direct).",
+                                    fx.dest(),
+                                    grants[0].expires
+                                ),
+                            ],
+                            "{out}"
+                        );
+                        assert!(
+                            fx.heard().starts_with("access granted:"),
+                            "{:?}",
+                            fx.stub.seen()
+                        );
+                        assert!(fx.pending_ids().is_empty());
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        fx.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn grant_for_a_duration_expires_then_instead_of_at_the_default() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-grant-for");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = AccessFixture::new("repl-mesh-grant-for").await;
+                        fx.file("a-1", InboundKind::Access, &["src/x.rs"]);
+                        let before = SystemTime::now();
+
+                        let out = out_of(&mut fx.ctx, ".mesh grant a-1 --for 2h")
+                            .await
+                            .unwrap();
+
+                        let grants = fx.grants();
+                        assert_eq!(grants.len(), 1, "{grants:?}");
+                        let expires = parse_rfc3339(&grants[0].expires).unwrap();
+                        let two_hours = Duration::from_secs(2 * 3_600);
+                        let slack = Duration::from_secs(5);
+                        assert!(
+                            expires >= before + two_hours - slack
+                                && expires <= before + two_hours + slack,
+                            "{expires:?} is not about 2h after {before:?}"
+                        );
+                        assert!(
+                            out.ends_with(&format!(
+                                "Granted a-1: 1 path for {} until {}, each fetchable once (via direct).",
+                                fx.dest(),
+                                grants[0].expires
+                            )),
+                            "{out}"
+                        );
+                        assert!(fx.heard().starts_with("access granted:"));
+                        fx.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn grant_standing_previews_then_writes_an_allow_per_path_to_the_global_file() {
+                    let guard = TestConfigDirGuard::new("repl-mesh-grant-standing");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = AccessFixture::new("repl-mesh-grant-standing").await;
+                        fx.file("a-1", InboundKind::Access, &["src/x.rs", "docs/y.md"]);
+                        let global = mesh_config_dir(&fx.started.tmp.path.join("config"))
+                            .join("shares.yaml");
+                        let (_, locations) = share_locations(&fx.ctx).unwrap();
+                        assert_eq!(locations.global, global);
+                        assert!(!global.starts_with(&guard.path));
+                        assert!(!global.exists());
+
+                        let out = out_of(&mut fx.ctx, ".mesh grant a-1 --standing")
+                            .await
+                            .unwrap();
+
+                        let identity = fx.stub.identity_hex();
+                        let lines: Vec<&str> = out.lines().collect();
+                        assert_eq!(
+                            lines,
+                            [
+                                format!(
+                                    "Will write to {}: allow `src/x.rs`, `docs/y.md` for identity {}.",
+                                    global.display(),
+                                    short(&identity)
+                                ),
+                                sending(&fx),
+                                format!(
+                                    "Granted a-1: 2 paths for {}, standing; written to {} (via direct).",
+                                    fx.dest(),
+                                    global.display()
+                                ),
+                            ],
+                            "{out}"
+                        );
+                        assert!(global.exists());
+                        assert!(!locations.workspace.exists());
+                        let entries = ShareSet::load_quietly(locations).0.entries();
+                        let allow = |pattern: &str| RawEntry {
+                            layer: Layer::Global,
+                            kind: RawKind::Allow {
+                                pattern: pattern.to_string(),
+                                peer: Some(identity.clone()),
+                            },
+                        };
+                        assert_eq!(entries, [allow("src/x.rs"), allow("docs/y.md")]);
+                        assert!(fx.grants().is_empty());
+                        assert_eq!(fx.heard(), "access granted: 2 paths, standing");
+                        assert!(fx.pending_ids().is_empty());
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        fx.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn refuse_tells_the_peer_no_and_writes_nothing() {
+                    let guard = TestConfigDirGuard::new("repl-mesh-refuse");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = AccessFixture::new("repl-mesh-refuse").await;
+                        fx.file("a-1", InboundKind::Access, &["src/x.rs"]);
+
+                        let out = out_of(&mut fx.ctx, ".mesh refuse a-1").await.unwrap();
+
+                        let lines: Vec<&str> = out.lines().collect();
+                        assert_eq!(
+                            lines,
+                            [
+                                sending(&fx),
+                                format!("Refused a-1: 1 path for {} (via direct).", fx.dest()),
+                            ],
+                            "{out}"
+                        );
+                        assert_eq!(fx.heard(), "access denied: 1 path");
+                        assert!(fx.grants().is_empty());
+                        assert!(!mesh_config_dir(&guard.path).join("shares.yaml").exists());
+                        assert!(fx.pending_ids().is_empty());
+                        fx.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn grant_and_refuse_teach_in_one_line_and_send_nothing() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-grant-teaching");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut off = ctx_with(MeshConfig::default(), true);
+                        assert_eq!(refusal(&mut off, ".mesh grant a-1").await, MESH_OFF);
+                        assert_eq!(refusal(&mut off, ".mesh refuse a-1").await, MESH_OFF);
+
+                        let mut fx = AccessFixture::new("repl-mesh-grant-teaching").await;
+                        fx.file("a-1", InboundKind::Access, &["src/x.rs"]);
+                        let usage = render_verb_help("grant");
+                        for (line, expected) in [
+                            (
+                                ".mesh grant a-1 --standing --for 1h",
+                                format!(
+                                    "`--standing` has no end, so `--for` does not apply; drop one of them. {usage}"
+                                ),
+                            ),
+                            (
+                                ".mesh grant a-1 --global",
+                                format!(
+                                    "`--global` and `--workspace` name the share file a standing grant writes to; pass `--standing` or drop them. {usage}"
+                                ),
+                            ),
+                            (
+                                ".mesh grant a-1 --standing --global --workspace",
+                                format!(
+                                    "`--global` and `--workspace` name different files; pass one. {usage}"
+                                ),
+                            ),
+                            (
+                                ".mesh grant a-1 --for",
+                                format!("'--for' needs a value. {usage}"),
+                            ),
+                            (
+                                ".mesh grant a-1 --for 5w",
+                                "'5w' is not a duration: use a whole number of days, hours or minutes, such as 30d, 12h or 90m.".to_string(),
+                            ),
+                            (
+                                ".mesh grant a-9",
+                                "No open access request has id a-9. `.mesh pending` lists the ones this node knows about.".to_string(),
+                            ),
+                            (
+                                ".mesh refuse a-9",
+                                "No open access request has id a-9. `.mesh pending` lists the ones this node knows about.".to_string(),
+                            ),
+                            (
+                                ".mesh refuse a-1 --yes",
+                                format!("Unexpected '--yes'. {}", render_verb_help("refuse")),
+                            ),
+                        ] {
+                            let printed = stdout_lines().len();
+                            assert_eq!(refusal(&mut fx.ctx, line).await, expected, "{line}");
+                            assert_eq!(stdout_lines().len(), printed, "{line} prints nothing");
+                        }
+                        for verb in ["grant", "refuse"] {
+                            let out = out_of(&mut fx.ctx, &format!(".mesh {verb}")).await.unwrap();
+                            assert_eq!(out, render_verb_help(verb));
+                        }
+                        assert!(fx.stub.seen().is_empty(), "{:?}", fx.stub.seen());
+                        assert!(fx.grants().is_empty());
+                        assert_eq!(fx.pending_ids(), ["a-1"]);
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        fx.stop().await;
+                    });
+                }
+
+                /// `.mesh answer` on an access request and `.mesh grant`/`.mesh refuse` on
+                /// a question each point at the verb that takes that kind, and nothing is
+                /// sent or decided.
+                #[test]
+                #[serial]
+                fn answer_grant_and_refuse_each_send_the_other_kind_to_its_own_verb() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-access-cross-kind");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = AccessFixture::new("repl-mesh-access-cross-kind").await;
+                        fx.file("a-1", InboundKind::Access, &["src/x.rs"]);
+                        fx.file("q-1", InboundKind::Question, &[]);
+                        let printed = stdout_lines().len();
+
+                        assert_eq!(
+                            refusal(&mut fx.ctx, ".mesh answer a-1 here you go").await,
+                            access_not_a_question("a-1")
+                        );
+                        assert_eq!(
+                            refusal(&mut fx.ctx, ".mesh answer a-1 here you go").await,
+                            "`a-1` is an access request, not a question; decide it with `.mesh grant a-1` or `.mesh refuse a-1`"
+                        );
+                        for line in [
+                            ".mesh grant q-1",
+                            ".mesh grant q-1 --standing",
+                            ".mesh refuse q-1",
+                        ] {
+                            assert_eq!(
+                                refusal(&mut fx.ctx, line).await,
+                                "`q-1` is a question, not an access request; answer it with `.mesh answer q-1`",
+                                "{line}"
+                            );
+                        }
+
+                        assert!(fx.stub.seen().is_empty(), "{:?}", fx.stub.seen());
+                        let mut ids = fx.pending_ids();
+                        ids.sort();
+                        assert_eq!(ids, ["a-1", "q-1"]);
+                        assert_eq!(stdout_lines().len(), printed, "{:?}", stdout_lines());
+                        fx.stop().await;
+                    });
+                }
+
+                /// A wire id may begin with `-`; the first token is the id whatever it
+                /// starts with, so such a request can be decided.
+                #[test]
+                #[serial]
+                fn grant_takes_an_id_that_starts_with_a_dash() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-grant-dash-id");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = AccessFixture::new("repl-mesh-grant-dash-id").await;
+                        fx.file("-x1", InboundKind::Access, &["src/x.rs"]);
+
+                        let out = out_of(&mut fx.ctx, ".mesh grant -x1").await.unwrap();
+
+                        let grants = fx.grants();
+                        assert_eq!(grants.len(), 1, "{grants:?}");
+                        assert_eq!(grants[0].id, "-x1");
+                        assert!(
+                            out.ends_with(&format!(
+                                "Granted -x1: 1 path for {} until {}, each fetchable once (via direct).",
+                                fx.dest(),
+                                grants[0].expires
+                            )),
+                            "{out}"
+                        );
+                        assert!(fx.heard().starts_with("access granted:"));
+                        assert!(fx.pending_ids().is_empty());
+                        fx.stop().await;
+                    });
                 }
             }
         }

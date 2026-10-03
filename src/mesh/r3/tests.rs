@@ -490,7 +490,7 @@ pub(crate) mod network {
     use crate::function::mesh::{inherit_reply_thread, outbound_from_args};
     use crate::hooks::HookEvent;
     use crate::mesh::access::{
-        AccessError, AccessMessage, AccessOptions, AccessOutcome, AccessRequestOutcome,
+        AccessError, AccessMessage, AccessOptions, AccessOutcome, AccessRequestOutcome, GrantKind,
         ValidAccess, decode_access_message, validate_access,
     };
     use crate::mesh::announce::AnnounceAppData;
@@ -529,6 +529,7 @@ pub(crate) mod network {
     use crate::mesh::propagation_fetch::InboundMessage;
     use crate::mesh::protocol::{MESH_PROTOCOL_MIN_SUPPORTED, MESH_PROTOCOL_VERSION};
     use crate::mesh::session_destination_name;
+    use crate::mesh::shares::WriteScope;
     use crate::mesh::snapshot::{MeshSnapshot, PlanRef, RepoInfo, TurnState};
     use crate::mesh::test_support::{
         Connector, INTEROP_TIMEOUT, LEGACY_LINK_MTU, Listener, TempDir, TrustList, contains_bytes,
@@ -6726,7 +6727,11 @@ pub(crate) mod network {
         }
 
         pair.recorder_b.queue(Script::Acknowledge);
-        let report = slot.access().grant("acc-1", false, None).await.unwrap();
+        let report = slot
+            .access()
+            .grant("acc-1", GrantKind::OneOff { ttl: None })
+            .await
+            .unwrap();
         assert_eq!(report.via, PeerVia::Direct);
         assert_eq!(pair.recorder_b.seen_count(), 1);
         assert_eq!(pair.recorder_b.last().path_hash, PathHash::of(MESSAGE_PATH));
@@ -7028,7 +7033,10 @@ pub(crate) mod network {
         assert_eq!(idle.0.lock().len(), 1);
 
         pair.recorder_b.queue(Script::Acknowledge);
-        let granted = slot.access().grant("acc-env", false, None).await;
+        let granted = slot
+            .access()
+            .grant("acc-env", GrantKind::OneOff { ttl: None })
+            .await;
         assert!(granted.is_ok(), "{granted:?}");
 
         let fetched = b_asks_a(&pair, FETCH_PATH, fetch_body(".env", None), short_options()).await;
@@ -7083,7 +7091,11 @@ pub(crate) mod network {
         let before = SystemTime::now();
 
         pair.recorder_b.queue(Script::Hang);
-        let report = slot.access().grant("acc-sf", false, None).await.unwrap();
+        let report = slot
+            .access()
+            .grant("acc-sf", GrantKind::OneOff { ttl: None })
+            .await
+            .unwrap();
 
         assert_eq!(report.via, PeerVia::StoreAndForward);
         let expires = report.expires.unwrap();
@@ -8012,7 +8024,11 @@ pub(crate) mod network {
         assert_eq!(records[0].paths, vec!["src/secret.rs".to_string()]);
 
         pair.recorder_b.queue(Script::Acknowledge);
-        let report = slot.access().grant("acc-1", false, None).await.unwrap();
+        let report = slot
+            .access()
+            .grant("acc-1", GrantKind::OneOff { ttl: None })
+            .await
+            .unwrap();
         assert_eq!(report.path_count, 1);
 
         let served = b_asks_a(
@@ -8075,7 +8091,10 @@ pub(crate) mod network {
         .await;
         assert_eq!(wire_status(&asked.value), "pending");
         pair.recorder_b.queue(Script::Acknowledge);
-        slot.access().grant("acc-2", false, None).await.unwrap();
+        slot.access()
+            .grant("acc-2", GrantKind::OneOff { ttl: None })
+            .await
+            .unwrap();
 
         let fetch = |path: &'static str| {
             b_asks_a(&pair, FETCH_PATH, fetch_body(path, None), short_options())
@@ -8128,7 +8147,16 @@ pub(crate) mod network {
         .await;
         assert_eq!(wire_status(&asked.value), "pending");
         pair.recorder_b.queue(Script::Acknowledge);
-        let report = slot.access().grant("acc-3", true, None).await.unwrap();
+        let report = slot
+            .access()
+            .grant(
+                "acc-3",
+                GrantKind::Standing {
+                    scope: WriteScope::Auto,
+                },
+            )
+            .await
+            .unwrap();
         assert!(report.standing);
         assert_eq!(report.expires, None);
 
@@ -8446,7 +8474,12 @@ pub(crate) mod network {
         pair.recorder_b.queue(Script::Acknowledge);
         let report = slot
             .access()
-            .grant("acc-9", false, Some(Duration::from_secs(90)))
+            .grant(
+                "acc-9",
+                GrantKind::OneOff {
+                    ttl: Some(Duration::from_secs(90)),
+                },
+            )
             .await
             .unwrap();
 

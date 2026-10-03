@@ -86,18 +86,15 @@ pub(crate) enum BriefUpdateSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AccessDecision {
     Granted,
-    // Test-only until the human's refuse verb lands; until then the `COYOTE_MESH_DECISION`
-    // a production hook reads (via `wire_name()`) is only ever `granted`.
-    #[cfg(test)]
     Denied,
 }
 
 impl AccessDecision {
-    /// The status word the decision reply and the hook environment both carry.
+    /// The status word the decision reply and the hook's `COYOTE_MESH_DECISION` both
+    /// carry: `granted` or `denied`.
     pub(crate) fn wire_name(self) -> &'static str {
         match self {
             Self::Granted => "granted",
-            #[cfg(test)]
             Self::Denied => "denied",
         }
     }

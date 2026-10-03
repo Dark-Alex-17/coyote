@@ -18,21 +18,17 @@ use crate::mesh::fetch::{FetchServing, ShareSource, field, versioned_map};
 use crate::mesh::grants::DEFAULT_GRANT_TTL;
 use crate::mesh::idle::{IdleNotify, Origin};
 use crate::mesh::message::PEER_REQUEST_TIMEOUT;
-#[cfg(test)]
-use crate::mesh::message::SendOutcome;
 use crate::mesh::message::{
     Disposition, OutboundPeer, PEER_WIRE_VERSION, PartLimits, PeerKind, PeerVia, RawPart,
-    SendError, is_wire_id,
+    SendError, SendOutcome, is_wire_id,
 };
 use crate::mesh::node::{MeshRuntime, MeshSlot};
 use crate::mesh::notify::Source;
-#[cfg(test)]
 use crate::mesh::parse_rfc3339;
-#[cfg(test)]
-use crate::mesh::pending::InboundStore;
 use crate::mesh::pending::{
-    DEFAULT_COLLECT_TIMEOUT, INBOUND_RECORD_VERSION, InboundKind, InboundRecord,
+    DEFAULT_COLLECT_TIMEOUT, INBOUND_RECORD_VERSION, InboundKind, InboundRecord, InboundStore,
     PENDING_QUESTION_MAX_CHARS, PENDING_RECORD_VERSION, PendingRecord, PendingState,
+    question_not_an_access_request,
 };
 use crate::mesh::propagation::{OutboundMessage, PropagationError, PropagationOptions};
 use crate::mesh::propagation_fetch::{InboundMessage, InboundSink};
@@ -42,15 +38,12 @@ use crate::mesh::r3::{
     OriginName, R3Error, RefusalCode, Reply, RequestOptions,
 };
 use crate::mesh::shares::PeerRef;
-#[cfg(test)]
 use crate::mesh::shares::{Mutation, ShareSet, WriteScope};
 use crate::mesh::trust::{Decision, TrustStore, same_hash};
 use crate::mesh::wire_path::WirePath;
 use crate::mesh::{destination_address, display_text, redact_hashes, rfc3339_utc, short};
 
-use anyhow::Result;
-#[cfg(test)]
-use anyhow::{Context, bail};
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use lxmf_core::constants::{FIELD_CUSTOM_DATA, FIELD_CUSTOM_TYPE};
 use rmpv::Value;
@@ -992,21 +985,26 @@ impl InboundSink for AccessRouting<'_> {
 
 /// The human's side of a pending access request: grant it once or for good, or refuse
 /// it. Either way the peer hears a reply and the request leaves the inbound store.
-// The decision half is test-only until the human's grant and refuse verbs land.
-#[cfg(test)]
 pub(crate) struct AccessStore<'a> {
     slot: &'a MeshSlot,
 }
 
-#[cfg(test)]
 impl MeshSlot {
     pub(crate) fn access(&self) -> AccessStore<'_> {
         AccessStore { slot: self }
     }
 }
 
+/// How a grant lets the peer in: once, through a grant record that lends each path one
+/// use until `ttl` (the default when `None`) runs out, or standing, through an allow
+/// entry per path written to the share list `scope` picks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GrantKind {
+    OneOff { ttl: Option<Duration> },
+    Standing { scope: WriteScope },
+}
+
 /// What a decision did, for the line the human reads back.
-#[cfg(test)]
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct AccessDecisionReport {
     pub id: String,
@@ -1019,73 +1017,85 @@ pub(crate) struct AccessDecisionReport {
     pub via: PeerVia,
 }
 
-#[cfg(test)]
 impl AccessStore<'_> {
-    /// Lets the requesting peer read every path it asked for: once, through a grant that
-    /// lends each path one use until `ttl` (the default when `None`) runs out, or
-    /// standing, through an allow entry per path in the share list scoped to the
-    /// requesting identity. Either way the request is removed only once the peer has
-    /// the reply, so a send that fails leaves it pending to decide again. A one-off
-    /// grant is written before the send: one the peer never heard of expires on its
-    /// own. The standing entries are written after it: they would outlive a reply that
-    /// never arrived and a later refusal alike, so the peer must have heard yes first.
-    /// The share list is loaded once before the send, so a list that cannot be written
-    /// is found before the peer is told anything, and again after it, so an edit made
-    /// while the reply was in flight is not written over.
-    pub(crate) async fn grant(
-        &self,
-        id: &str,
-        standing: bool,
-        ttl: Option<Duration>,
-    ) -> Result<AccessDecisionReport> {
+    /// Lets the requesting peer read every path it asked for, as `kind` says. Either way
+    /// the request is taken out of the store before the reply goes, so two processes
+    /// deciding the same id send one reply between them, and put back when the send
+    /// fails, so it stays pending to decide again. A one-off grant is written before
+    /// the send: one the peer never heard of expires on its own. The standing entries
+    /// are written after it: they would outlive a reply that never arrived and a later
+    /// refusal alike, so the peer must have heard yes first. The share list is loaded
+    /// once before the send, so a list that cannot be written is found before the peer
+    /// is told anything, and again after it, so an edit made while the reply was in
+    /// flight is not written over.
+    pub(crate) async fn grant(&self, id: &str, kind: GrantKind) -> Result<AccessDecisionReport> {
         let (store, record, runtime) = self.pending(id)?;
-        if standing {
-            self.standing_shares(&runtime, &record)?;
-            let sent = self
-                .send_decision(&record, &runtime, AccessDecision::Granted, None, true)
-                .await?;
-            if let Err(err) = self
-                .standing_shares(&runtime, &record)
-                .and_then(|mut shares| share_standing(&mut shares, &record))
-            {
-                bail!(
-                    "{} was already told yes, but the share list could not be written: {err:#}. Run `.mesh grant {id} --standing` again once the share list is writable; the request stays pending until then.",
-                    short(&record.peer_destination)
-                );
+        match kind {
+            GrantKind::Standing { scope } => {
+                self.standing_shares(&runtime, &record)?;
+                let sent = self
+                    .send_decision(
+                        &store,
+                        &record,
+                        &runtime,
+                        AccessDecision::Granted,
+                        None,
+                        true,
+                    )
+                    .await?;
+                if let Err(err) = self
+                    .standing_shares(&runtime, &record)
+                    .and_then(|mut shares| share_standing(&mut shares, &record, scope))
+                {
+                    store.upsert(record.clone(), SystemTime::now())?;
+                    bail!(
+                        "{} was already told yes, but the share list could not be written: {err:#}. Run `.mesh grant {id} --standing` again once the share list is writable; the request stays pending until then.",
+                        short(&record.peer_destination)
+                    );
+                }
+                self.settle(record, AccessDecision::Granted, None, true, sent)
             }
-            return self.settle(&store, record, AccessDecision::Granted, None, true, sent);
+            GrantKind::OneOff { ttl } => {
+                let granted = runtime.serving().grants().grant(
+                    id,
+                    &record.peer_destination,
+                    &record.paths,
+                    ttl,
+                    SystemTime::now(),
+                )?;
+                let expires = Some(
+                    parse_rfc3339(&granted.expires)
+                        .context("The grant was written with an expiry that does not read back")?,
+                );
+                let sent = self
+                    .send_decision(
+                        &store,
+                        &record,
+                        &runtime,
+                        AccessDecision::Granted,
+                        expires,
+                        false,
+                    )
+                    .await?;
+                self.settle(record, AccessDecision::Granted, expires, false, sent)
+            }
         }
-        let granted = runtime.serving().grants().grant(
-            id,
-            &record.peer_destination,
-            &record.paths,
-            ttl,
-            SystemTime::now(),
-        )?;
-        let expires = Some(
-            parse_rfc3339(&granted.expires)
-                .context("The grant was written with an expiry that does not read back")?,
-        );
-        let sent = self
-            .send_decision(&record, &runtime, AccessDecision::Granted, expires, false)
-            .await?;
-        self.settle(
-            &store,
-            record,
-            AccessDecision::Granted,
-            expires,
-            false,
-            sent,
-        )
     }
 
     /// Tells the requesting peer no. Nothing is written to the grants or the share list.
     pub(crate) async fn refuse(&self, id: &str) -> Result<AccessDecisionReport> {
         let (store, record, runtime) = self.pending(id)?;
         let sent = self
-            .send_decision(&record, &runtime, AccessDecision::Denied, None, false)
+            .send_decision(
+                &store,
+                &record,
+                &runtime,
+                AccessDecision::Denied,
+                None,
+                false,
+            )
             .await?;
-        self.settle(&store, record, AccessDecision::Denied, None, false, sent)
+        self.settle(record, AccessDecision::Denied, None, false, sent)
     }
 
     fn pending(&self, id: &str) -> Result<(Arc<InboundStore>, InboundRecord, Arc<MeshRuntime>)> {
@@ -1096,9 +1106,7 @@ impl AccessStore<'_> {
             bail!("no open access request {id}");
         };
         if record.kind == InboundKind::Question {
-            bail!(
-                "`{id}` is a question, not an access request; answer it with `.mesh answer {id}`"
-            );
+            bail!(question_not_an_access_request(id));
         }
         let Some(runtime) = self.slot.get() else {
             bail!(
@@ -1127,8 +1135,12 @@ impl AccessStore<'_> {
         Ok(shares)
     }
 
+    /// Takes the request out of the store, then sends the reply; a send that fails puts
+    /// it back. The take is what keeps two processes deciding the same id from both
+    /// telling the peer: the one that finds the record already gone sends nothing.
     async fn send_decision(
         &self,
+        store: &InboundStore,
         record: &InboundRecord,
         runtime: &MeshRuntime,
         decision: AccessDecision,
@@ -1144,21 +1156,29 @@ impl AccessStore<'_> {
             standing,
             &runtime.part_limits(),
         )?;
-        Ok(runtime.send_peer(&record.peer_destination, &reply).await?)
+        if !store.remove(&record.id)? {
+            bail!(
+                "`{}` was already decided by another process; nothing was sent",
+                record.id
+            );
+        }
+        let sent = runtime.send_peer(&record.peer_destination, &reply).await;
+        if sent.is_err() {
+            store.upsert(record.clone(), SystemTime::now())?;
+        }
+        Ok(sent?)
     }
 
-    /// Closes a request the peer has heard the decision on: it leaves the store and the
-    /// hook fires.
+    /// Closes a request the peer has heard the decision on: the hook fires and the
+    /// human's line is built.
     fn settle(
         &self,
-        store: &InboundStore,
         record: InboundRecord,
         decision: AccessDecision,
         expires: Option<SystemTime>,
         standing: bool,
         sent: SendOutcome,
     ) -> Result<AccessDecisionReport> {
-        store.remove(&record.id)?;
         let InboundRecord {
             id,
             peer_destination,
@@ -1193,16 +1213,15 @@ impl AccessStore<'_> {
 }
 
 /// An allow entry per requested path, each matching that path literally and only for
-/// the requesting identity, in whichever share list the write rule picks.
-#[cfg(test)]
-fn share_standing(shares: &mut ShareSet, record: &InboundRecord) -> Result<()> {
+/// the requesting identity, in the share list `scope` picks.
+fn share_standing(shares: &mut ShareSet, record: &InboundRecord, scope: WriteScope) -> Result<()> {
     for path in &record.paths {
         shares.apply(
             Mutation::Allow {
                 pattern: globset::escape(path),
                 peer: Some(record.peer_identity.clone()),
             },
-            WriteScope::Auto,
+            scope,
         )?;
     }
     Ok(())
@@ -1225,7 +1244,6 @@ pub(crate) fn decision_reply(
     let plural = if path_count == 1 { "" } else { "s" };
     let counted = format!("{path_count} path{plural}");
     let content = match (decision, expires) {
-        #[cfg(test)]
         (AccessDecision::Denied, _) => format!("access denied: {counted}"),
         (AccessDecision::Granted, Some(expires)) => {
             format!("access granted: {counted} until {}", rfc3339_utc(expires))
@@ -2353,7 +2371,7 @@ mod tests {
         let grant = fixture
             .slot
             .access()
-            .grant("q-1", false, None)
+            .grant("q-1", GrantKind::OneOff { ttl: None })
             .await
             .unwrap_err()
             .to_string();
@@ -2802,7 +2820,7 @@ mod tests {
         let report = installed
             .slot
             .access()
-            .grant("a-1", false, None)
+            .grant("a-1", GrantKind::OneOff { ttl: None })
             .await
             .unwrap();
 
@@ -2865,7 +2883,12 @@ mod tests {
         let report = installed
             .slot
             .access()
-            .grant("a-1", false, Some(Duration::from_secs(60)))
+            .grant(
+                "a-1",
+                GrantKind::OneOff {
+                    ttl: Some(Duration::from_secs(60)),
+                },
+            )
             .await
             .unwrap();
 
@@ -2898,7 +2921,12 @@ mod tests {
         let report = installed
             .slot
             .access()
-            .grant("a-1", true, None)
+            .grant(
+                "a-1",
+                GrantKind::Standing {
+                    scope: WriteScope::Auto,
+                },
+            )
             .await
             .unwrap();
 
@@ -2983,7 +3011,12 @@ mod tests {
         let err = installed
             .slot
             .access()
-            .grant("a-1", true, None)
+            .grant(
+                "a-1",
+                GrantKind::Standing {
+                    scope: WriteScope::Auto,
+                },
+            )
             .await
             .unwrap_err()
             .to_string();
@@ -3051,7 +3084,12 @@ mod tests {
         let err = installed
             .slot
             .access()
-            .grant("a-1", true, None)
+            .grant(
+                "a-1",
+                GrantKind::Standing {
+                    scope: WriteScope::Auto,
+                },
+            )
             .await
             .unwrap_err()
             .to_string();
@@ -3107,7 +3145,12 @@ mod tests {
         let report = installed
             .slot
             .access()
-            .grant("a-1", true, None)
+            .grant(
+                "a-1",
+                GrantKind::Standing {
+                    scope: WriteScope::Auto,
+                },
+            )
             .await
             .unwrap();
 
@@ -3186,7 +3229,12 @@ mod tests {
         let report = installed
             .slot
             .access()
-            .grant("a-1", true, None)
+            .grant(
+                "a-1",
+                GrantKind::Standing {
+                    scope: WriteScope::Auto,
+                },
+            )
             .await
             .unwrap();
 
@@ -3242,7 +3290,12 @@ mod tests {
         let err = installed
             .slot
             .access()
-            .grant("a-1", true, None)
+            .grant(
+                "a-1",
+                GrantKind::Standing {
+                    scope: WriteScope::Auto,
+                },
+            )
             .await
             .unwrap_err()
             .to_string();
@@ -3371,7 +3424,7 @@ mod tests {
         let report = installed
             .slot
             .access()
-            .grant("a-1", false, None)
+            .grant("a-1", GrantKind::OneOff { ttl: None })
             .await
             .unwrap();
         assert_eq!(report.via, PeerVia::Direct);
@@ -4317,13 +4370,13 @@ mod tests {
         installed
             .slot
             .access()
-            .grant("a-1", false, None)
+            .grant("a-1", GrantKind::OneOff { ttl: None })
             .await
             .unwrap();
         let again = installed
             .slot
             .access()
-            .grant("a-1", false, None)
+            .grant("a-1", GrantKind::OneOff { ttl: None })
             .await
             .unwrap_err()
             .to_string();
@@ -4341,6 +4394,54 @@ mod tests {
         decided_once(&installed.hooks, "a-1", "granted");
         decision_seen(&stub, "a-1");
         assert_eq!(stub.seen().len(), 1, "the peer heard one decision");
+        installed.stop().await;
+        stub.stop().await;
+    }
+
+    /// Two processes deciding the same request: both find it pending, one takes it out
+    /// of the store and sends, and the other, reaching the take second, bails naming
+    /// the race and sends nothing, so the peer hears exactly one decision. The late
+    /// process is played by a `grant` whose lookup ran before the other's decision and
+    /// whose send runs after it.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_request_another_process_decided_first_is_not_decided_again() {
+        let stub = PeerStub::listen(
+            "access-decided-elsewhere-stub",
+            TcpServer::DEFAULT_CLIENT_MTU,
+        )
+        .await;
+        let installed = Installed::beside("access-decided-elsewhere", &stub).await;
+        installed.ask(&stub, "a-1", &["src/x.rs"]).await;
+        let late = installed.slot.access();
+        let (store, record, runtime) = late.pending("a-1").unwrap();
+
+        installed
+            .slot
+            .access()
+            .grant("a-1", GrantKind::OneOff { ttl: None })
+            .await
+            .unwrap();
+        let err = late
+            .send_decision(
+                &store,
+                &record,
+                &runtime,
+                AccessDecision::Granted,
+                None,
+                false,
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(
+            err,
+            "`a-1` was already decided by another process; nothing was sent"
+        );
+        assert!(access_records(&installed.slot).is_empty());
+        decided_once(&installed.hooks, "a-1", "granted");
+        decision_seen(&stub, "a-1");
         installed.stop().await;
         stub.stop().await;
     }
@@ -4417,7 +4518,7 @@ mod tests {
         installed
             .slot
             .access()
-            .grant("a-1", false, None)
+            .grant("a-1", GrantKind::OneOff { ttl: None })
             .await
             .unwrap();
         installed.hooks.drain();
@@ -4535,7 +4636,12 @@ mod tests {
         let err = installed
             .slot
             .access()
-            .grant("a-1", true, None)
+            .grant(
+                "a-1",
+                GrantKind::Standing {
+                    scope: WriteScope::Auto,
+                },
+            )
             .await
             .unwrap_err()
             .to_string();
@@ -4570,7 +4676,12 @@ mod tests {
         let report = installed
             .slot
             .access()
-            .grant("a-1", true, None)
+            .grant(
+                "a-1",
+                GrantKind::Standing {
+                    scope: WriteScope::Auto,
+                },
+            )
             .await
             .unwrap();
         assert!(report.standing);
@@ -4843,7 +4954,12 @@ mod tests {
         let err = installed
             .slot
             .access()
-            .grant("a-1", true, None)
+            .grant(
+                "a-1",
+                GrantKind::Standing {
+                    scope: WriteScope::Auto,
+                },
+            )
             .await
             .unwrap_err()
             .to_string();
@@ -4882,7 +4998,12 @@ mod tests {
         let report = installed
             .slot
             .access()
-            .grant("a-1", true, None)
+            .grant(
+                "a-1",
+                GrantKind::Standing {
+                    scope: WriteScope::Auto,
+                },
+            )
             .await
             .unwrap();
         assert!(report.standing);
@@ -4948,7 +5069,12 @@ mod tests {
         let report = installed
             .slot
             .access()
-            .grant("a-1", true, None)
+            .grant(
+                "a-1",
+                GrantKind::Standing {
+                    scope: WriteScope::Auto,
+                },
+            )
             .await
             .unwrap();
 

@@ -1007,7 +1007,7 @@ pub(crate) mod test_support {
         pub(crate) runtime: Arc<MeshRuntime>,
         pub(crate) session: Session,
         pub(crate) relay_handle: JoinHandle<()>,
-        _tmp: TempDir,
+        pub(crate) tmp: TempDir,
     }
 
     /// A runtime joined to a loopback relay, with its identity and cache under a temp dir.
@@ -1063,7 +1063,7 @@ pub(crate) mod test_support {
             runtime,
             session,
             relay_handle,
-            _tmp: tmp,
+            tmp,
         }
     }
 }

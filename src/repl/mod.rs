@@ -124,7 +124,7 @@ pub const DEFAULT_CONTINUATION_PROMPT: &str = indoc! {"
     5. Otherwise, continue with the next pending item now. Call tools immediately."
 };
 
-static REPL_COMMANDS: LazyLock<[ReplCommand; 87]> = LazyLock::new(|| {
+static REPL_COMMANDS: LazyLock<[ReplCommand; 89]> = LazyLock::new(|| {
     [
         ReplCommand::new(".help", "Show this help guide", AssertState::pass()),
         ReplCommand::new(".info", "Show system info", AssertState::pass()),
@@ -276,6 +276,16 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 87]> = LazyLock::new(|| {
         ReplCommand::new(
             ".mesh shares",
             "List the share rules and the file each came from, or the files a peer can fetch",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh grant",
+            "Grant a peer's access request: once for a while, or standing in the share list",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh refuse",
+            "Refuse a peer's access request",
             AssertState::pass(),
         ),
         ReplCommand::new(
@@ -3398,8 +3408,8 @@ mod tests {
     }
 
     #[test]
-    fn repl_commands_has_87_entries() {
-        assert_eq!(REPL_COMMANDS.len(), 87);
+    fn repl_commands_has_89_entries() {
+        assert_eq!(REPL_COMMANDS.len(), 89);
     }
 
     #[test]
@@ -3416,7 +3426,7 @@ mod tests {
             .iter()
             .map(|(verb, description, _)| (*verb, *description))
             .collect();
-        assert_eq!(commands.len(), 24);
+        assert_eq!(commands.len(), 26);
         assert_eq!(commands, verbs);
     }
 
