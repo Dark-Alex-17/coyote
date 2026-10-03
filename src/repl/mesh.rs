@@ -89,7 +89,7 @@ pub(super) const VERBS: &[(&str, &str, &str)] = &[
     (
         "inbox",
         "Drain the peer messages waiting for this node",
-        ".mesh inbox",
+        ".mesh inbox [--purge-files [--yes|--dry-run]]",
     ),
     (
         "pending",
@@ -223,7 +223,7 @@ pub(crate) async fn run(
         "info" => info(ctx, rest),
         "status" => status(ctx, &abort_signal, rest).await,
         "brief" => brief(ctx, rest),
-        "inbox" => inbox(ctx),
+        "inbox" => inbox(ctx, rest),
         "pending" => pending(ctx),
         "answer" => answer(ctx, rest).await,
         "reply" => reply(ctx, rest).await,
@@ -591,7 +591,27 @@ fn brief(ctx: &mut RequestContext, rest: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn inbox(ctx: &RequestContext) -> Result<()> {
+fn inbox(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
+    let Some(rest) = rest else {
+        return drain_inbox(ctx);
+    };
+    let args = parse_mutation_args(rest, "inbox", &["--purge-files", "--yes", "--dry-run"])?;
+    if let Some(token) = args.positional.first() {
+        return Err(unexpected(token, "inbox"));
+    }
+    if !args.purge_files {
+        bail!(
+            "`--yes` and `--dry-run` go with `--purge-files`; pass it or drop them. {}",
+            render_verb_help("inbox")
+        );
+    }
+    if args.dry_run && args.yes {
+        return Err(unexpected("--yes", "inbox"));
+    }
+    purge_inbox_files(ctx, args.yes, args.dry_run)
+}
+
+fn drain_inbox(ctx: &RequestContext) -> Result<()> {
     let (envelopes, dropped) = ctx.app.mesh.peer_inbox().drain();
     let rows: Vec<InboxRow> = envelopes
         .into_iter()
@@ -618,6 +638,171 @@ fn inbox(ctx: &RequestContext) -> Result<()> {
         err_text(&dropped_warning(dropped));
     }
     Ok(())
+}
+
+/// How many staged paths a `--purge-files --dry-run` lists before counting the rest.
+const PURGE_PREVIEW_LINES: usize = 20;
+
+/// The staged files are the peers' copies, so the one removal this file makes of them is
+/// the human's, confirmed with the count and size, and it takes exactly
+/// `<inbox root>/<instance_id>`: a symlinked root or instance directory is refused rather
+/// than followed, the directory must resolve under its parent, and the walk that counts
+/// what goes never follows a link inside the tree.
+fn purge_inbox_files(ctx: &RequestContext, yes: bool, dry_run: bool) -> Result<()> {
+    let runtime = live(ctx)?;
+    let staging = runtime.inbox_staging();
+    let inbox_root = staging.root();
+    let Some(parent) = inbox_root.parent() else {
+        bail!(
+            "'{}' has no parent directory; nothing was removed.",
+            inbox_root.display()
+        );
+    };
+    let nothing_staged = || format!("Nothing is staged under {}.", inbox_root.display());
+    if fs::symlink_metadata(parent).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        bail!(
+            "'{}' is a symlink; the inbox is only purged under a real directory.",
+            parent.display()
+        );
+    }
+    match fs::symlink_metadata(inbox_root) {
+        Ok(meta) if meta.file_type().is_symlink() => bail!(
+            "'{}' is a symlink; the inbox is only purged under a real directory.",
+            inbox_root.display()
+        ),
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            out_text(&nothing_staged());
+            return Ok(());
+        }
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("Failed to read metadata of '{}'", inbox_root.display()));
+        }
+    }
+    let resolved_root = dunce::canonicalize(inbox_root)
+        .with_context(|| format!("Failed to resolve '{}'", inbox_root.display()))?;
+    let resolved_parent = dunce::canonicalize(parent)
+        .with_context(|| format!("Failed to resolve '{}'", parent.display()))?;
+    if !resolved_root.starts_with(&resolved_parent) {
+        bail!(
+            "'{}' does not resolve under {}; nothing was removed.",
+            inbox_root.display(),
+            parent.display()
+        );
+    }
+    let instance_id = runtime.current_instance_id();
+    if inbox_root.file_name() != Some(std::ffi::OsStr::new(instance_id.as_str())) {
+        bail!(
+            "'{}' is not this instance's inbox directory; nothing was removed.",
+            inbox_root.display()
+        );
+    }
+    let staged = walk_staged(inbox_root, DEFAULT_LIST_WALK_BOUND)
+        .with_context(|| format!("Failed to read '{}'", inbox_root.display()))?;
+    if staged.paths.is_empty() {
+        out_text(&nothing_staged());
+        return Ok(());
+    }
+    let count = staged.count_text();
+    let size = human_size(staged.bytes);
+    if dry_run {
+        let mut lines = vec![format!(
+            "Would remove {count} ({size}) staged under {}:",
+            inbox_root.display()
+        )];
+        lines.extend(
+            staged
+                .paths
+                .iter()
+                .take(PURGE_PREVIEW_LINES)
+                .map(|path| format!("  {path}")),
+        );
+        if staged.paths.len() > PURGE_PREVIEW_LINES {
+            lines.push(format!(
+                "  … and {} more",
+                staged.paths.len() - PURGE_PREVIEW_LINES
+            ));
+        }
+        lines.push(DRY_RUN_NOTHING_CHANGED.to_string());
+        out_text(&lines.join("\n"));
+        return Ok(());
+    }
+    let question = format!(
+        "Remove {count} ({size}) staged under {}? They are the peers' copies; this cannot be undone.",
+        inbox_root.display()
+    );
+    if !confirm_or_flag(&question, "--yes", yes)? {
+        out_text(NOTHING_CHANGED);
+        return Ok(());
+    }
+    fs::remove_dir_all(inbox_root)
+        .with_context(|| format!("Failed to remove '{}'", inbox_root.display()))?;
+    out_text(&format!(
+        "Removed {count} ({size}) from {}.",
+        inbox_root.display()
+    ));
+    Ok(())
+}
+
+/// What a purge would take: every non-directory entry under the root as a `/`-separated
+/// path relative to it, sorted, and the bytes of the regular files among them. A symlink
+/// is one entry of no bytes marked ` (link)`; its target is never read.
+#[derive(Default)]
+struct StagedWalk {
+    paths: Vec<String>,
+    bytes: u64,
+    truncated: bool,
+}
+
+impl StagedWalk {
+    fn count_text(&self) -> String {
+        let files = plural(self.paths.len(), "file", "files");
+        if self.truncated {
+            format!("at least {files}")
+        } else {
+            files
+        }
+    }
+}
+
+fn walk_staged(root: &Path, bound: usize) -> std::io::Result<StagedWalk> {
+    let mut walk = StagedWalk::default();
+    let mut pending = vec![root.to_path_buf()];
+    let mut visited = 0;
+    while let Some(dir) = pending.pop() {
+        for entry in fs::read_dir(&dir)? {
+            if visited == bound {
+                walk.truncated = true;
+                walk.paths.sort();
+                return Ok(walk);
+            }
+            visited += 1;
+            let path = entry?.path();
+            let meta = fs::symlink_metadata(&path)?;
+            if meta.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            let relative: Vec<String> = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .components()
+                .map(|part| part.as_os_str().to_string_lossy().into_owned())
+                .collect();
+            let shown = display_text(&relative.join("/"), WIRE_PATH_MAX_BYTES).unwrap_or_default();
+            if meta.file_type().is_symlink() {
+                walk.paths.push(format!("{shown} (link)"));
+            } else {
+                if meta.is_file() {
+                    walk.bytes += meta.len();
+                }
+                walk.paths.push(shown);
+            }
+        }
+    }
+    walk.paths.sort();
+    Ok(walk)
 }
 
 fn pending(ctx: &RequestContext) -> Result<()> {
@@ -3286,6 +3471,7 @@ struct MutationArgs {
     effective: bool,
     standing: bool,
     for_: Option<Duration>,
+    purge_files: bool,
 }
 
 /// The trust verbs take one hash and valued flags, so every token is parsed and a flag may
@@ -3329,6 +3515,7 @@ fn parse_mutation_args(rest: &str, verb: &str, allowed: &[&str]) -> Result<Mutat
             "--effective" => args.effective = true,
             "--standing" => args.standing = true,
             "--for" => args.for_ = Some(parse_duration_text(&value()?)?),
+            "--purge-files" => args.purge_files = true,
             _ => return Err(unexpected(&token, verb)),
         }
     }
@@ -21194,6 +21381,345 @@ mod tests {
                         assert!(fx.heard().is_empty(), "{:?}", fx.heard());
                         fx.stop().await;
                     });
+                }
+            }
+
+            mod purge {
+                use super::*;
+
+                const ROOT_TAG: &str = "repl-mesh-inbox-purge";
+
+                /// A node whose staging inbox holds two files and a link out of the tree,
+                /// beside another instance's directory under the same inbox root.
+                struct PurgeFixture {
+                    started: StartedRuntime,
+                    ctx: RequestContext,
+                    outside: TempDir,
+                }
+
+                impl PurgeFixture {
+                    async fn new(tag: &str) -> Self {
+                        let started = started_runtime(tag).await;
+                        let ctx = ctx_with(MeshConfig::default(), true);
+                        ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                        let outside = TempDir::new(&format!("{tag}-outside"));
+                        fs::write(outside.path.join("target.txt"), b"keep me").unwrap();
+                        let fx = Self {
+                            started,
+                            ctx,
+                            outside,
+                        };
+                        let peer_dir = fx.root().join("aabbccdd");
+                        fs::create_dir_all(peer_dir.join("docs")).unwrap();
+                        fs::write(peer_dir.join("docs").join("a.md"), b"hello").unwrap();
+                        fs::write(peer_dir.join("b.bin"), b"1234567").unwrap();
+                        std::os::unix::fs::symlink(fx.outside_target(), peer_dir.join("link.txt"))
+                            .unwrap();
+                        fs::create_dir_all(fx.sibling_file().parent().unwrap()).unwrap();
+                        fs::write(fx.sibling_file(), b"theirs").unwrap();
+                        fx
+                    }
+
+                    fn root(&self) -> PathBuf {
+                        self.started.runtime.inbox_staging().root().to_path_buf()
+                    }
+
+                    fn sibling_file(&self) -> PathBuf {
+                        self.root()
+                            .parent()
+                            .unwrap()
+                            .join("other-instance")
+                            .join("x.txt")
+                    }
+
+                    fn outside_target(&self) -> PathBuf {
+                        self.outside.path.join("target.txt")
+                    }
+
+                    fn assert_tree_intact(&self) {
+                        let root = self.root();
+                        assert_eq!(
+                            fs::read(root.join("aabbccdd").join("docs").join("a.md")).unwrap(),
+                            b"hello"
+                        );
+                        assert_eq!(
+                            fs::read(root.join("aabbccdd").join("b.bin")).unwrap(),
+                            b"1234567"
+                        );
+                        assert!(
+                            fs::symlink_metadata(root.join("aabbccdd").join("link.txt"))
+                                .unwrap()
+                                .file_type()
+                                .is_symlink()
+                        );
+                        self.assert_neighbours_intact();
+                    }
+
+                    fn assert_neighbours_intact(&self) {
+                        assert_eq!(fs::read(self.sibling_file()).unwrap(), b"theirs");
+                        assert_eq!(fs::read(self.outside_target()).unwrap(), b"keep me");
+                    }
+
+                    async fn stop(self) {
+                        assert!(self.ctx.app.mesh.stop().await.unwrap());
+                        self.started.relay_handle.abort();
+                    }
+                }
+
+                fn confirm_question(root: &Path) -> String {
+                    format!(
+                        "Remove 3 files (12 bytes) staged under {}? They are the peers' copies; this cannot be undone.",
+                        root.display()
+                    )
+                }
+
+                #[test]
+                #[serial]
+                fn inbox_purge_files_confirms_with_the_counts_then_removes_only_this_instances_tree()
+                 {
+                    let _guard = TestConfigDirGuard::new(ROOT_TAG);
+                    let _capture = capture::install();
+                    let asked: Arc<Mutex<Vec<String>>> = Arc::default();
+                    let recorder = asked.clone();
+                    let _script = prompt_script::install_answering(move |question| {
+                        recorder.lock().push(question.to_string());
+                        true
+                    });
+                    run_async(async {
+                        let mut fx = PurgeFixture::new(ROOT_TAG).await;
+                        let root = fx.root();
+
+                        let out = out_of(&mut fx.ctx, ".mesh inbox --purge-files")
+                            .await
+                            .unwrap();
+
+                        assert_eq!(prompt_script::prompts_asked(), 1);
+                        assert_eq!(*asked.lock(), [confirm_question(&root)]);
+                        assert_eq!(
+                            out,
+                            format!("Removed 3 files (12 bytes) from {}.", root.display())
+                        );
+                        assert!(!root.exists(), "{}", root.display());
+                        assert!(fs::symlink_metadata(&root).is_err());
+                        fx.assert_neighbours_intact();
+                        fx.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn inbox_purge_files_with_yes_removes_without_asking() {
+                    let _guard = TestConfigDirGuard::new(ROOT_TAG);
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PurgeFixture::new(ROOT_TAG).await;
+                        let root = fx.root();
+
+                        let out = out_of(&mut fx.ctx, ".mesh inbox --purge-files --yes")
+                            .await
+                            .unwrap();
+
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        assert_eq!(
+                            out,
+                            format!("Removed 3 files (12 bytes) from {}.", root.display())
+                        );
+                        assert!(!root.exists(), "{}", root.display());
+                        fx.assert_neighbours_intact();
+                        fx.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn inbox_purge_files_dry_run_lists_the_relative_paths_and_removes_nothing() {
+                    let _guard = TestConfigDirGuard::new(ROOT_TAG);
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PurgeFixture::new(ROOT_TAG).await;
+                        let root = fx.root();
+
+                        let out = out_of(&mut fx.ctx, ".mesh inbox --purge-files --dry-run")
+                            .await
+                            .unwrap();
+
+                        let lines: Vec<&str> = out.lines().collect();
+                        assert_eq!(
+                            lines,
+                            [
+                                format!(
+                                    "Would remove 3 files (12 bytes) staged under {}:",
+                                    root.display()
+                                ),
+                                "  aabbccdd/b.bin".to_string(),
+                                "  aabbccdd/docs/a.md".to_string(),
+                                "  aabbccdd/link.txt (link)".to_string(),
+                                DRY_RUN_NOTHING_CHANGED.to_string(),
+                            ],
+                            "{out}"
+                        );
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        fx.assert_tree_intact();
+                        fx.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn inbox_purge_files_declined_changes_nothing() {
+                    let _guard = TestConfigDirGuard::new(ROOT_TAG);
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[false]);
+                    run_async(async {
+                        let mut fx = PurgeFixture::new(ROOT_TAG).await;
+
+                        let out = out_of(&mut fx.ctx, ".mesh inbox --purge-files")
+                            .await
+                            .unwrap();
+
+                        assert_eq!(out, NOTHING_CHANGED);
+                        assert_eq!(prompt_script::prompts_asked(), 1);
+                        fx.assert_tree_intact();
+                        fx.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn inbox_purge_files_without_a_terminal_refuses_naming_the_flag() {
+                    let _guard = TestConfigDirGuard::new(ROOT_TAG);
+                    let _capture = capture::install();
+                    let _script = prompt_script::install_non_interactive();
+                    run_async(async {
+                        let mut fx = PurgeFixture::new(ROOT_TAG).await;
+                        let root = fx.root();
+
+                        let err = refusal(&mut fx.ctx, ".mesh inbox --purge-files").await;
+
+                        assert_eq!(
+                            err,
+                            format!(
+                                "{} Standard input is not a terminal, so there is no prompt to answer; pass --yes to confirm.",
+                                confirm_question(&root)
+                            )
+                        );
+                        fx.assert_tree_intact();
+                        fx.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn inbox_purge_files_with_nothing_staged_says_so_whether_the_root_is_absent_or_empty()
+                 {
+                    let _guard = TestConfigDirGuard::new(ROOT_TAG);
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let started = started_runtime(ROOT_TAG).await;
+                        let mut ctx = ctx_with(MeshConfig::default(), true);
+                        ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                        let root = started.runtime.inbox_staging().root().to_path_buf();
+                        let nothing = format!("Nothing is staged under {}.", root.display());
+                        assert!(!root.exists());
+
+                        let out = out_of(&mut ctx, ".mesh inbox --purge-files").await.unwrap();
+                        assert_eq!(out, nothing);
+
+                        fs::create_dir_all(&root).unwrap();
+                        let out = out_of(&mut ctx, ".mesh inbox --purge-files --yes")
+                            .await
+                            .unwrap();
+                        assert_eq!(out, nothing);
+                        assert!(root.is_dir(), "the empty directory stays");
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+
+                        assert!(ctx.app.mesh.stop().await.unwrap());
+                        started.relay_handle.abort();
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn inbox_purge_files_refuses_a_symlinked_instance_directory_and_follows_nothing() {
+                    let _guard = TestConfigDirGuard::new(ROOT_TAG);
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[true]);
+                    run_async(async {
+                        let started = started_runtime(ROOT_TAG).await;
+                        let mut ctx = ctx_with(MeshConfig::default(), true);
+                        ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                        let root = started.runtime.inbox_staging().root().to_path_buf();
+                        let sibling = root.parent().unwrap().join("other-instance");
+                        fs::create_dir_all(&sibling).unwrap();
+                        fs::write(sibling.join("x.txt"), b"theirs").unwrap();
+                        std::os::unix::fs::symlink("other-instance", &root).unwrap();
+
+                        let err = refusal(&mut ctx, ".mesh inbox --purge-files").await;
+
+                        assert_eq!(
+                            err,
+                            format!(
+                                "'{}' is a symlink; the inbox is only purged under a real directory.",
+                                root.display()
+                            )
+                        );
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        assert_eq!(fs::read(sibling.join("x.txt")).unwrap(), b"theirs");
+                        assert!(
+                            fs::symlink_metadata(&root)
+                                .unwrap()
+                                .file_type()
+                                .is_symlink()
+                        );
+
+                        assert!(ctx.app.mesh.stop().await.unwrap());
+                        started.relay_handle.abort();
+                    });
+                }
+
+                /// The pure checks come before the node: the flags that go with
+                /// `--purge-files` teach when it is missing, `--yes` and `--dry-run` do not
+                /// combine, a stray word is unexpected, and only a well-formed purge reaches
+                /// the mesh gate.
+                #[test]
+                #[serial]
+                fn inbox_purge_files_argument_errors_come_before_the_mesh_gate() {
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    let mut ctx = off_ctx();
+
+                    assert_eq!(err_of(&mut ctx, ".mesh inbox --purge-files"), MESH_OFF);
+                    assert_eq!(
+                        err_of(&mut ctx, ".mesh inbox --purge-files --yes"),
+                        MESH_OFF
+                    );
+                    for line in [".mesh inbox --yes", ".mesh inbox --dry-run"] {
+                        assert_eq!(
+                            err_of(&mut ctx, line),
+                            format!(
+                                "`--yes` and `--dry-run` go with `--purge-files`; pass it or drop them. {}",
+                                render_verb_help("inbox")
+                            ),
+                            "{line}"
+                        );
+                    }
+                    assert_eq!(
+                        err_of(&mut ctx, ".mesh inbox --purge-files --dry-run --yes"),
+                        format!("Unexpected '--yes'. {}", render_verb_help("inbox"))
+                    );
+                    assert_eq!(
+                        err_of(&mut ctx, ".mesh inbox now"),
+                        format!("Unexpected 'now'. {}", render_verb_help("inbox"))
+                    );
+                    assert_eq!(
+                        err_of(&mut ctx, ".mesh inbox --purge"),
+                        format!("Unexpected '--purge'. {}", render_verb_help("inbox"))
+                    );
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+                    assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
                 }
             }
         }

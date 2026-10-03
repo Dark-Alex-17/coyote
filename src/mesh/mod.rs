@@ -1352,7 +1352,9 @@ mod tests {
 
     /// A staged file is the peer's and stays until a person removes it: no production line
     /// under `src/mesh`, nor in the mesh-facing tool and REPL files, removes a file or
-    /// directory it names through the inbox. The inbox's own removal is of its temp file.
+    /// directory it names through the inbox. The inbox's own removal is of its temp file,
+    /// and the REPL's one removal is the human's `.mesh inbox --purge-files`, of exactly
+    /// this instance's directory after a confirm.
     #[test]
     fn no_mesh_source_removes_an_inbox_path() {
         let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -1369,6 +1371,7 @@ mod tests {
         let inbox_tokens = ["inbox", "Inbox", ".staged", "Part::File"];
         let mut hits = Vec::new();
         let mut inbox_removals = Vec::new();
+        let mut repl_removals = Vec::new();
         for path in &sources {
             for (index, line) in production_code(&read_source(path)).iter().enumerate() {
                 if !removals.iter().any(|call| line.contains(call)) {
@@ -1376,6 +1379,8 @@ mod tests {
                 }
                 if path.ends_with("inbox.rs") {
                     inbox_removals.push(line.trim().to_string());
+                } else if path.ends_with("repl/mesh.rs") {
+                    repl_removals.push(line.trim().to_string());
                 } else if inbox_tokens.iter().any(|token| line.contains(token)) {
                     hits.push(format!("{}:{}: {}", path.display(), index + 1, line.trim()));
                 }
@@ -1386,6 +1391,11 @@ mod tests {
             inbox_removals,
             ["let _ = fs::remove_file(&tmp);"],
             "inbox.rs removes only its own temp file"
+        );
+        assert_eq!(
+            repl_removals,
+            ["fs::remove_dir_all(inbox_root)"],
+            "the REPL removes only the purge's inbox root"
         );
     }
 

@@ -83,6 +83,10 @@ impl InboxStaging {
         ))
     }
 
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
     /// Writes `bytes` under `<root>/<peer-dest8>/<rel>` and returns the absolute staged
     /// path. `peer_destination` is the peer's destination hash; its first eight characters,
     /// lower-cased, name the peer's directory. A file already at the target with the same
@@ -247,6 +251,20 @@ mod tests {
         assert_eq!(
             InboxStaging::for_instance_under(None, cache_dir, "inst").root,
             inbox_root(cache_dir, "inst")
+        );
+    }
+
+    #[test]
+    fn root_is_the_path_for_instance_under_computed_in_both_forms() {
+        let cache_dir = Path::new("cache");
+        assert_eq!(
+            InboxStaging::for_instance_under(None, cache_dir, "inst").root(),
+            inbox_root(cache_dir, "inst")
+        );
+        let configured = Path::new("/srv/coyote-inbox");
+        assert_eq!(
+            InboxStaging::for_instance_under(Some(configured), cache_dir, "inst").root(),
+            configured.join("inst")
         );
     }
 
