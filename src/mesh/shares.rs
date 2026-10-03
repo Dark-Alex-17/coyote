@@ -962,10 +962,10 @@ impl ShareSet {
 
     /// The directory nothing may serve out of that `pattern` names or lands in, so
     /// `allow` and `deny` refuse it before anything is walked or written: `.git` or the
-    /// workspace config directory, under either name it goes by, as any literal segment;
-    /// or a literal prefix that resolves into a `.git` anywhere on its path, or into any
-    /// directory the walk skips, such as a configured inbox under the root. Names the
-    /// protected directory, not the pattern's first segment.
+    /// workspace config directory, under either name it goes by, as any segment, even
+    /// one behind a glob; or a literal prefix that resolves into a `.git` anywhere on its
+    /// path, or into any directory the walk skips, such as a configured inbox under the
+    /// root. Names the protected directory, not the pattern's first segment.
     pub(crate) fn protected_head(&self, pattern: &str) -> Option<String> {
         if let Some(segment) = protected_segment(pattern, &self.locations.workspace_config_dir_name)
         {
@@ -1464,16 +1464,19 @@ fn builtin_deny_patterns(workspace_config_dir_name: &str) -> Vec<String> {
         .collect()
 }
 
-/// The first literal segment of `pattern`, ahead of any glob, that names a directory
-/// nothing may serve out of by name alone: `.git`, or the workspace config directory
-/// under either name it goes by. Needs no root, so a verb can say so before the gate.
+/// The first segment of `pattern`, at any depth and behind any glob, that names a
+/// directory nothing may serve out of by name alone: `.git`, or the workspace config
+/// directory under either name it goes by. Whole-segment equality, so `.github` and
+/// `foo.git` are ordinary, and a glob segment never matches. The walk never enters such a
+/// directory, so a rule under one is dead at any depth. Needs no root, so a verb can say
+/// so before the gate.
 pub(crate) fn protected_segment<'a>(
     pattern: &'a str,
     workspace_config_dir_name: &str,
 ) -> Option<&'a str> {
     let names = workspace_config_dir_names(workspace_config_dir_name);
-    literal_segments(pattern)
-        .into_iter()
+    pattern
+        .split('/')
         .find(|segment| *segment == ".git" || names.contains(segment))
 }
 
@@ -3023,9 +3026,39 @@ mod tests {
         );
         assert_eq!(
             set.protected_head("docs/*/.git/**"),
-            None,
-            "a segment behind a glob is left to the walk, which never enters it"
+            Some(".git".into()),
+            "a segment behind a glob is still one the walk never enters"
         );
+    }
+
+    /// A `.git` the walk would never enter is refused wherever it sits in the pattern,
+    /// glob segments before it or not; the test is whole-segment equality, so a name that
+    /// merely contains `.git` is an ordinary path.
+    #[test]
+    fn protected_head_names_git_behind_a_glob_segment() {
+        let fx = Fixture::new("protected-head-glob");
+        let set = fx.load();
+        let dir = WORKSPACE_COYOTE_DIR_NAME;
+
+        for pattern in [
+            "vendor/*/.git/HEAD",
+            "*/.git/config",
+            "**/.git/**",
+            "vendor/*/.git/hooks/*",
+        ] {
+            assert_eq!(
+                set.protected_head(pattern),
+                Some(".git".into()),
+                "{pattern}"
+            );
+        }
+        assert_eq!(
+            set.protected_head(&format!("**/{dir}/**")),
+            Some(dir.into())
+        );
+        for pattern in ["**/.github/**", "*/foo.git/x", "**/.gitignore", "*/.g*/x"] {
+            assert_eq!(set.protected_head(pattern), None, "{pattern}");
+        }
     }
 
     /// Every directory the walk skips is refused at the head, not just the two names:

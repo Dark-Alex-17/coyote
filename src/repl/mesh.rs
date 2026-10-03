@@ -17810,9 +17810,10 @@ mod tests {
 
                 /// (a)/(c) `.git/` with a trailing slash is a pure refusal ("never
                 /// shared") that fires BEFORE the mesh gate for `allow` and `deny`, at any
-                /// depth of a by-name `.git` component; `unshare` keeps the `<dir>/**`
-                /// teaching (a legacy rule under it is still removable); the bare `.git`
-                /// directory (no slash) needs the root and so waits behind the gate.
+                /// depth of a by-name `.git` component, glob segments ahead of it or not;
+                /// `unshare` keeps the `<dir>/**` teaching (a legacy rule under it is
+                /// still removable); the bare `.git` directory (no slash) needs the root
+                /// and so waits behind the gate.
                 #[test]
                 #[serial]
                 fn usage_probe_git_slash_is_never_shared_before_the_gate_and_unshare_keeps_teaching()
@@ -17832,6 +17833,8 @@ mod tests {
                         ".mesh allow .git/hooks/",
                         ".mesh allow vendor/dep/.git/",
                         ".mesh deny vendor/dep/.git/hooks/",
+                        ".mesh allow **/.git/",
+                        ".mesh deny vendor/*/.git/",
                         ".mesh allow .git/ --force --global",
                     ] {
                         let err = err_of(&mut ctx, line);
