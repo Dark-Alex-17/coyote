@@ -1735,18 +1735,17 @@ fn unshare(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         Layer::Workspace => "--workspace",
     };
     let holders = share_holders(&set, &pattern);
-    let mut targets: Vec<(Layer, Vec<&'static str>)> = [Layer::Global, Layer::Workspace]
+    let mut targets: Vec<(Layer, Vec<&ShareHolder>)> = [Layer::Global, Layer::Workspace]
         .into_iter()
         .filter_map(|layer| {
-            let kinds: Vec<&'static str> = holders
+            let held: Vec<&ShareHolder> = holders
                 .iter()
-                .filter(|(held, _)| *held == layer)
-                .map(|(_, kind)| *kind)
+                .filter(|holder| holder.layer == layer)
                 .collect();
-            (!kinds.is_empty()).then_some((layer, kinds))
+            (!held.is_empty()).then_some((layer, held))
         })
         .collect();
-    let Some((first_layer, first_kinds)) = targets.first().cloned() else {
+    let Some((first_layer, first_held)) = targets.first().cloned() else {
         bail!(
             "No share rule has the pattern `{pattern}` in {} or {}; `.mesh shares` lists them.",
             path_of(Layer::Global),
@@ -1775,7 +1774,7 @@ fn unshare(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
                 bail!(
                     "`{pattern}` is held by {} ({}); the write rule reaches {} — pass `{}` to remove it from {}.",
                     path_of(first_layer),
-                    kind_list(&first_kinds),
+                    kind_list(&first_held),
                     path_of(reach),
                     flag_of(first_layer),
                     path_of(first_layer)
@@ -1783,21 +1782,26 @@ fn unshare(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             }
         }
     }
-    let total: usize = targets.iter().map(|(_, kinds)| kinds.len()).sum();
+    let total: usize = targets.iter().map(|(_, held)| held.len()).sum();
     let matches = describe_matches(&set, &pattern, &root, case_insensitive)?;
     if total > 1 {
         out_text(&format!("`{pattern}` is held by:"));
-        for (layer, kinds) in &targets {
-            for kind in kinds {
-                out_text(&format!("  {kind} in {}", path_of(*layer)));
+        for (layer, held) in &targets {
+            for holder in held {
+                let scope = match &holder.peer {
+                    None if holder.kind == "allow" => " (every trusted peer)".to_string(),
+                    None => String::new(),
+                    Some(hash) => format!(" (peer {})", short(hash)),
+                };
+                out_text(&format!("  {}{scope} in {}", holder.kind, path_of(*layer)));
             }
         }
     }
-    for (layer, kinds) in &targets {
+    for (layer, held) in &targets {
         out_text(&format!(
             "{} remove the {} for `{pattern}` from {}.",
             intent_verb(dry_run),
-            kind_list(kinds),
+            kind_list(held),
             path_of(*layer)
         ));
     }
@@ -1807,9 +1811,9 @@ fn unshare(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     }
     if total > 1 || matches.broad {
         let question = match targets.as_slice() {
-            [(layer, kinds)] if total == 1 => format!(
+            [(layer, held)] if total == 1 => format!(
                 "Remove the {} for `{pattern}` from {}?",
-                kind_list(kinds),
+                kind_list(held),
                 path_of(*layer)
             ),
             _ => format!("Remove all {total} rules for `{pattern}`?"),
@@ -1823,7 +1827,7 @@ fn unshare(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             bail!("The share list changed while the prompt was open; run `.mesh unshare` again.");
         }
     }
-    for (layer, kinds) in &targets {
+    for (layer, held) in &targets {
         let scope = match layer {
             Layer::Global => WriteScope::Global,
             Layer::Workspace => WriteScope::Workspace,
@@ -1836,7 +1840,7 @@ fn unshare(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         )?;
         out_text(&format!(
             "Removed the {} for `{pattern}` from {}.",
-            kind_list(kinds),
+            kind_list(held),
             path_of(*layer)
         ));
     }
@@ -2209,19 +2213,34 @@ fn breadth_words(count: &MatchCount) -> String {
     }
 }
 
-/// `(layer, kind)` for every entry whose text is exactly `pattern`, global first, in
-/// file order.
-fn share_holders(set: &ShareSet, pattern: &str) -> Vec<(Layer, &'static str)> {
+/// One entry whose text is exactly the pattern `unshare` was given; `peer` is the allow
+/// row's scope, so two allows for the same pattern read as distinct rows.
+#[derive(Debug, PartialEq, Eq)]
+struct ShareHolder {
+    layer: Layer,
+    kind: &'static str,
+    peer: Option<String>,
+}
+
+/// Every entry whose text is exactly `pattern`, global first, in file order.
+fn share_holders(set: &ShareSet, pattern: &str) -> Vec<ShareHolder> {
     set.entries()
         .into_iter()
         .filter_map(|entry| {
-            let kind = match &entry.kind {
-                RawKind::Allow { pattern: held, .. } if held == pattern => "allow",
-                RawKind::Deny { pattern: held } if held == pattern => "deny",
-                RawKind::Override { path } if path == pattern => "override",
+            let (kind, peer) = match entry.kind {
+                RawKind::Allow {
+                    pattern: held,
+                    peer,
+                } if held == pattern => ("allow", peer),
+                RawKind::Deny { pattern: held } if held == pattern => ("deny", None),
+                RawKind::Override { path } if path == pattern => ("override", None),
                 _ => return None,
             };
-            Some((entry.layer, kind))
+            Some(ShareHolder {
+                layer: entry.layer,
+                kind,
+                peer,
+            })
         })
         .collect()
 }
@@ -2236,11 +2255,11 @@ fn layer_holds(set: &ShareSet, layer: Layer, kind: &RawKind) -> bool {
 
 /// `allow`, `allow and override`, `allow, deny and override`; a kind held twice is
 /// named once.
-fn kind_list(kinds: &[&str]) -> String {
+fn kind_list(holders: &[&ShareHolder]) -> String {
     let mut names: Vec<&str> = Vec::new();
-    for kind in kinds {
-        if !names.contains(kind) {
-            names.push(kind);
+    for holder in holders {
+        if !names.contains(&holder.kind) {
+            names.push(holder.kind);
         }
     }
     match names.split_last() {
@@ -13343,11 +13362,17 @@ mod tests {
                         let lines: Vec<&str> = out.lines().collect();
                         assert!(lines.contains(&"`docs/**` is held by:"), "{out}");
                         assert!(
-                            lines.contains(&format!("  allow in {}", fx.global()).as_str()),
+                            lines.contains(
+                                &format!("  allow (every trusted peer) in {}", fx.global())
+                                    .as_str()
+                            ),
                             "{out}"
                         );
                         assert!(
-                            lines.contains(&format!("  allow in {}", fx.workspace()).as_str()),
+                            lines.contains(
+                                &format!("  allow (every trusted peer) in {}", fx.workspace())
+                                    .as_str()
+                            ),
                             "{out}"
                         );
                         assert!(out.ends_with(NOTHING_CHANGED), "{out}");
@@ -13374,6 +13399,60 @@ mod tests {
                         assert_eq!(prompt_script::prompts_asked(), 1);
                         assert!(fx.entries().is_empty());
                         drop(accepted);
+                        fx.stop().await;
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn unshare_names_the_peer_scope_of_each_allow_it_will_remove() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-unshare-scopes");
+                    let _capture = capture::install();
+                    run_async(async {
+                        let mut fx =
+                            ShareFixture::new("repl-mesh-unshare-scopes", &["docs/a.md"]).await;
+                        let peer = "ab".repeat(16);
+                        fx.write_global(&format!(
+                            "version: 1\nallow:\n- pattern: docs/**\n- pattern: docs/**\n  peer: {peer}\n"
+                        ));
+                        let both = [
+                            allow_entry(Layer::Global, "docs/**", None),
+                            allow_entry(Layer::Global, "docs/**", Some(&peer)),
+                        ];
+                        assert_eq!(fx.entries(), both);
+
+                        let _script = prompt_script::install(&[false]);
+                        let out = out_of(&mut fx.ctx, ".mesh unshare docs/**").await.unwrap();
+
+                        let lines: Vec<&str> = out.lines().collect();
+                        assert!(lines.contains(&"`docs/**` is held by:"), "{out}");
+                        assert!(
+                            lines.contains(
+                                &format!("  allow (every trusted peer) in {}", fx.global())
+                                    .as_str()
+                            ),
+                            "{out}"
+                        );
+                        assert!(
+                            lines.contains(
+                                &format!("  allow (peer {}) in {}", short(&peer), fx.global())
+                                    .as_str()
+                            ),
+                            "{out}"
+                        );
+                        assert!(
+                            lines.contains(
+                                &format!(
+                                    "Will remove the allow for `docs/**` from {}.",
+                                    fx.global()
+                                )
+                                .as_str()
+                            ),
+                            "{out}"
+                        );
+                        assert!(out.ends_with(NOTHING_CHANGED), "{out}");
+                        assert_eq!(prompt_script::prompts_asked(), 1);
+                        assert_eq!(fx.entries(), both);
                         fx.stop().await;
                     });
                 }
@@ -14149,7 +14228,10 @@ mod tests {
                         let lines: Vec<&str> = out.lines().collect();
                         assert!(lines.contains(&"`docs/**` is held by:"), "{out}");
                         assert!(
-                            lines.contains(&format!("  allow in {}", fx.global()).as_str()),
+                            lines.contains(
+                                &format!("  allow (every trusted peer) in {}", fx.global())
+                                    .as_str()
+                            ),
                             "{out}"
                         );
                         assert!(
