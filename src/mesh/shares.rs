@@ -296,13 +296,18 @@ pub(crate) struct MatchCount {
 }
 
 /// Why the built-in deny names a relative file: by its text, which an override of that
-/// text lifts, or only by what it resolves to on disk, which an override of the text
-/// never reaches since overrides are judged on the resolved name.
+/// text lifts; by what it resolves to on disk, which an override of the text never
+/// reaches since overrides are judged on the resolved name; or by its text alone while
+/// it is a link to a file the deny does not name, so there is nothing to lift at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BuiltinHit {
     ByText,
     ByResolution {
         /// The `/`-separated path under the root the file resolved to.
+        resolved: String,
+    },
+    LinkNamedLikeASecret {
+        /// The `/`-separated path under the root the link resolved to.
         resolved: String,
     },
 }
@@ -978,7 +983,8 @@ impl ShareSet {
     /// it exists, so a link to a secret is caught as a fetch of it would be. This is what
     /// a forced allow of such a file has to be told about; a link is reported by its
     /// resolution even when its own name matches, since an override of the text would
-    /// lift nothing: overrides are judged on the resolved name.
+    /// lift nothing: overrides are judged on the resolved name. A link named like a
+    /// secret that resolves to a plain file is told apart, since the plain file is shareable.
     pub(crate) fn builtin_denies(
         &self,
         path: &str,
@@ -997,8 +1003,10 @@ impl ShareSet {
         if same_name {
             return Ok(by_text.then_some(BuiltinHit::ByText));
         }
-        Ok((by_text || builtin.is_match(&resolved))
-            .then_some(BuiltinHit::ByResolution { resolved }))
+        if builtin.is_match(&resolved) {
+            return Ok(Some(BuiltinHit::ByResolution { resolved }));
+        }
+        Ok(by_text.then_some(BuiltinHit::LinkNamedLikeASecret { resolved }))
     }
 
     /// The `/`-separated path under the root that `root/path` resolves to on disk; `None`
@@ -3051,12 +3059,21 @@ mod tests {
             Some(BuiltinHit::ByResolution {
                 resolved: "real.key".to_string()
             }),
-            "a secret-like link name pointing at a plain name is still reported by resolution"
+            "a secret-like link name pointing at another secret is reported by resolution"
         );
         assert_eq!(
             set.builtin_denies("docs/.env.staging", false).unwrap(),
             Some(BuiltinHit::ByText),
             "an existing non-link keeps the text judgement"
+        );
+        fx.file("notes.txt");
+        fx.link("docs/.env.notes", "../notes.txt");
+        assert_eq!(
+            set.builtin_denies("docs/.env.notes", false).unwrap(),
+            Some(BuiltinHit::LinkNamedLikeASecret {
+                resolved: "notes.txt".to_string()
+            }),
+            "a secret-like link name pointing at a plain file is told apart"
         );
     }
 

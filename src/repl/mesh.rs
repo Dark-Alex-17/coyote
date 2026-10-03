@@ -1510,6 +1510,12 @@ fn allow(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
                     "`{pattern}` resolves to `{resolved}`, which the built-in deny names; `.mesh allow {resolved} --force --global` lifts that file."
                 )
             }
+            Some(BuiltinHit::LinkNamedLikeASecret { resolved }) => {
+                let resolved = shown_pattern(&resolved);
+                bail!(
+                    "`{pattern}` is a link to `{resolved}`, which the built-in deny does not name, so there is nothing to lift; `.mesh allow {resolved}` shares that file."
+                )
+            }
             None => bail!(
                 "`{pattern}` is not under the built-in deny, so there is nothing for `--force` to lift; drop `--force`."
             ),
@@ -1523,6 +1529,12 @@ fn allow(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
                 let resolved = shown_pattern(&resolved);
                 bail!(
                     "`{pattern}` resolves to `{resolved}`, which the built-in deny names, so an allow alone would share nothing; `.mesh allow {resolved} --force --global` lifts that file."
+                )
+            }
+            Some(BuiltinHit::LinkNamedLikeASecret { resolved }) => {
+                let resolved = shown_pattern(&resolved);
+                bail!(
+                    "`{pattern}` is a link to `{resolved}`, which the built-in deny does not name; `.mesh allow {resolved}` shares that file."
                 )
             }
             None => {}
@@ -16096,6 +16108,323 @@ mod tests {
                         let err = refusal(&mut fx.ctx, ".mesh allow docs/settings").await;
                         assert!(err.contains("resolves to `.env`"), "{err}");
                         assert_eq!(prompt_script::prompts_asked(), 0);
+                        fx.stop().await;
+                    });
+                }
+
+                /// (a) A link is judged by the resolved name whether or not its own name
+                /// is secret-like: `.env -> notes.txt` is refused naming the real file,
+                /// with and without `--force`, and nothing is written. A teaching error
+                /// teaches a command that works, so the command it quotes is accepted
+                /// and shares the real file.
+                #[test]
+                #[serial]
+                fn usage_probe_secret_named_link_to_a_plain_file_is_refused_naming_the_real_file_and_the_taught_command_works()
+                 {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-secret-link-plain");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = ShareFixture::new(
+                            "repl-mesh-probe-secret-link-plain",
+                            &["notes.txt", "docs/a.md"],
+                        )
+                        .await;
+                        std::os::unix::fs::symlink("notes.txt", fx.root.path.join(".env")).unwrap();
+
+                        let plain = refusal(&mut fx.ctx, ".mesh allow .env").await;
+                        assert!(
+                            plain.contains("`notes.txt`"),
+                            "names the real file: {plain}"
+                        );
+                        assert!(!fx.locations.global.exists(), "{plain}");
+                        let forced =
+                            refusal(&mut fx.ctx, ".mesh allow .env --force --global").await;
+                        assert!(
+                            forced.contains("`notes.txt`"),
+                            "names the real file: {forced}"
+                        );
+                        assert!(!fx.locations.global.exists(), "{forced}");
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+
+                        // The command the teaching error quotes must itself be accepted.
+                        for err in [&plain, &forced] {
+                            let taught = err
+                                .split('`')
+                                .find(|part| part.starts_with(".mesh allow "))
+                                .unwrap_or_else(|| panic!("no taught command in: {err}"));
+                            let out = out_of(&mut fx.ctx, taught)
+                                .await
+                                .unwrap_or_else(|e| {
+                                    panic!("teaching error {err:?} quotes `{taught}`, which the verb refuses: {e}")
+                                });
+                            assert!(
+                                out.contains("written to") || out.contains("already"),
+                                "{out}"
+                            );
+                        }
+                        let out = out_of(&mut fx.ctx, ".mesh shares --effective")
+                            .await
+                            .unwrap();
+                        assert!(out.lines().any(|line| line == "  notes.txt"), "{out}");
+                        assert!(!out.lines().any(|line| line.trim() == ".env"), "{out}");
+                        fx.stop().await;
+                    });
+                }
+
+                /// (a) The resolved link target in the refusal is a repo-derived name and
+                /// goes through `display_text`: a directory whose name carries an escape
+                /// never reaches the terminal raw, while the sentence still names the file.
+                #[test]
+                #[serial]
+                fn usage_probe_link_resolving_through_an_escaped_directory_is_refused_with_a_clean_sentence()
+                 {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-escaped-link");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx =
+                            ShareFixture::new("repl-mesh-probe-escaped-link", &["docs/a.md"]).await;
+                        let dir = "sub\u{1b}[31mdir";
+                        seed_files(&fx.root.path, &[&format!("{dir}/.env")]);
+                        std::os::unix::fs::symlink(
+                            format!("../{dir}/.env"),
+                            fx.root.path.join("docs/settings"),
+                        )
+                        .unwrap();
+
+                        for line in [
+                            ".mesh allow docs/settings",
+                            ".mesh allow docs/settings --force --global",
+                        ] {
+                            let err = refusal(&mut fx.ctx, line).await;
+                            assert!(!err.contains('\u{1b}'), "{line}: raw escape in: {err:?}");
+                            assert!(err.contains("resolves to `subdir/.env`"), "{line}: {err}");
+                            assert!(!fx.locations.global.exists(), "{line}: {err}");
+                        }
+                        assert!(fx.entries().is_empty());
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        fx.stop().await;
+                    });
+                }
+
+                /// (a) A `peer:` field is repo-derived text: a non-hash peer carrying an
+                /// escape is shown as "scoped to no peer" with the escape stripped, both in
+                /// the `shares` row and in the holder row `unshare` prints before asking.
+                #[test]
+                #[serial]
+                fn usage_probe_shares_and_unshare_strip_escapes_from_a_non_hash_peer_field() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-escaped-peer");
+                    let _capture = capture::install();
+                    run_async(async {
+                        let mut fx =
+                            ShareFixture::new("repl-mesh-probe-escaped-peer", &["docs/a.md"]).await;
+                        fx.write_global(
+                            "version: 1\nallow:\n- pattern: docs/**\n- pattern: docs/**\n  peer: \"\\x1b[31mnobody\"\n",
+                        );
+                        let both = [
+                            allow_entry(Layer::Global, "docs/**", None),
+                            allow_entry(Layer::Global, "docs/**", Some("\u{1b}[31mnobody")),
+                        ];
+                        assert_eq!(fx.entries(), both, "the file loads with the odd peer");
+
+                        let out = out_of(&mut fx.ctx, ".mesh shares").await.unwrap();
+                        assert!(!out.contains('\u{1b}'), "shares: raw escape in: {out:?}");
+                        assert!(out.contains("scoped to no peer"), "{out}");
+                        assert!(
+                            out.contains("(`nobody` is not a peer hash)"),
+                            "the text survives, cleaned: {out}"
+                        );
+
+                        let _non_tty = prompt_script::install_non_interactive();
+                        let err = refusal(&mut fx.ctx, ".mesh unshare docs/**").await;
+                        let out = stdout_lines().join("\n");
+                        let printed = format!("{out}\n{err}");
+                        assert!(
+                            !printed.contains('\u{1b}'),
+                            "unshare: raw escape in: {printed:?}"
+                        );
+                        assert!(
+                            printed.contains(&format!(
+                                "  allow (scoped to no peer: `nobody`) in {}",
+                                fx.global()
+                            )),
+                            "{printed}"
+                        );
+                        assert!(err.contains("--yes"), "{err}");
+                        assert_eq!(fx.entries(), both);
+                        fx.stop().await;
+                    });
+                }
+
+                /// (a) A pattern whose head is a link resolving to `.git/` is a directory
+                /// the walk never enters: `allow`, `allow --force` and `deny` refuse it with
+                /// the protected reason and write nothing.
+                #[test]
+                #[serial]
+                fn usage_probe_a_link_head_resolving_to_the_git_dir_is_refused_as_never_shared() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-git-link-head");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = ShareFixture::new(
+                            "repl-mesh-probe-git-link-head",
+                            &[".git/config", "docs/a.md"],
+                        )
+                        .await;
+                        std::os::unix::fs::symlink(".git", fx.root.path.join("git-link")).unwrap();
+
+                        for line in [
+                            ".mesh allow git-link/**",
+                            ".mesh allow git-link/config --force --global",
+                            ".mesh allow git-link",
+                            ".mesh deny git-link/**",
+                        ] {
+                            let err = refusal(&mut fx.ctx, line).await;
+                            assert!(err.contains("never shared"), "{line}: {err}");
+                            assert!(err.contains("`git-link"), "{line}: {err}");
+                            assert!(err.contains("nothing was written"), "{line}: {err}");
+                        }
+                        assert!(!fx.locations.global.exists());
+                        assert!(!fx.locations.workspace.exists());
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+
+                        // A link elsewhere in the tree is not a protected head; the walk
+                        // simply never follows it, so the plain file next to it still shares.
+                        let out = out_of(&mut fx.ctx, ".mesh allow docs/**").await.unwrap();
+                        assert!(out.contains("written to"), "{out}");
+                        fx.stop().await;
+                    });
+                }
+
+                /// (d) + (a) `unshare` of a broad pattern that is held in both files asks
+                /// one question carrying the breadth words, and a `yes` removes every holder
+                /// while the files are re-read first; no temp file is left beside either.
+                #[test]
+                #[serial]
+                fn usage_probe_unshare_breadth_question_then_yes_removes_every_holder_temp_free() {
+                    use crate::mesh::test_support::siblings_of;
+
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-unshare-breadth-yes");
+                    let _capture = capture::install();
+                    run_async(async {
+                        let mut fx = ShareFixture::new(
+                            "repl-mesh-probe-unshare-breadth-yes",
+                            &["docs/a.md", "docs/b.md", "src/main.rs"],
+                        )
+                        .await;
+                        let quiet = prompt_script::install(&[]);
+                        out_of(&mut fx.ctx, ".mesh allow ** --yes").await.unwrap();
+                        out_of(&mut fx.ctx, ".mesh allow ** --yes --workspace")
+                            .await
+                            .unwrap();
+                        drop(quiet);
+                        assert_eq!(fx.entries().len(), 2);
+                        let global_siblings = siblings_of(&fx.locations.global);
+                        let workspace_siblings = siblings_of(&fx.locations.workspace);
+
+                        let _non_tty = prompt_script::install_non_interactive();
+                        let err = refusal(&mut fx.ctx, ".mesh unshare **").await;
+                        assert!(
+                            err.starts_with("Remove all 2 rules for `**` (3 files)?"),
+                            "{err}"
+                        );
+                        assert_eq!(fx.entries().len(), 2);
+                        drop(_non_tty);
+
+                        let _yes = prompt_script::install(&[true]);
+                        let out = out_of(&mut fx.ctx, ".mesh unshare **").await.unwrap();
+                        assert!(out.contains("`**` matches 3 file(s)"), "{out}");
+                        assert!(out.contains("Removed"), "{out}");
+                        assert_eq!(prompt_script::prompts_asked(), 1);
+                        assert!(fx.entries().is_empty(), "{out}");
+                        assert_eq!(siblings_of(&fx.locations.global), global_siblings);
+                        assert_eq!(siblings_of(&fx.locations.workspace), workspace_siblings);
+                        fx.stop().await;
+                    });
+                }
+
+                /// (b) + (c) The three new mutators and `shares` each have a usage line,
+                /// an unknown flag is a usage error that acts on nothing, and `--dry-run`
+                /// with `--yes` is refused as a usage error before the mesh gate on every
+                /// mutator (not just `allow`).
+                #[test]
+                #[serial]
+                fn usage_probe_every_share_mutator_rejects_yes_with_dry_run_before_the_gate() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-flags-off");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut ctx = ctx_with(MeshConfig::default(), true);
+                        for verb in ["allow", "deny", "unshare"] {
+                            let err =
+                                refusal(&mut ctx, &format!(".mesh {verb} docs/** --yes --dry-run"))
+                                    .await;
+                            assert!(
+                                err.contains("--yes") && err.contains("--dry-run"),
+                                "{verb}: {err}"
+                            );
+                            assert!(
+                                !err.contains(MESH_OFF),
+                                "{verb}: usage before the gate: {err}"
+                            );
+                            let err =
+                                refusal(&mut ctx, &format!(".mesh {verb} docs/** --bogus")).await;
+                            assert!(
+                                !err.contains(MESH_OFF),
+                                "{verb}: usage before the gate: {err}"
+                            );
+                            assert!(
+                                err.contains("Usage") || err.contains("--bogus"),
+                                "{verb}: {err}"
+                            );
+                        }
+                        let err = refusal(&mut ctx, ".mesh shares --bogus").await;
+                        assert!(err.contains("Usage") || err.contains("--bogus"), "{err}");
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                    });
+                }
+
+                /// (i) The `.mesh on` preview clause counts a file once even when a user
+                /// deny removes one of two allows that reach it, and the count is exact
+                /// (no floor words) when the walk finished.
+                #[test]
+                #[serial]
+                fn usage_probe_on_preview_count_is_exact_after_a_deny_narrows_overlapping_allows() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-preview-exact");
+                    let _capture = capture::install();
+                    run_async(async {
+                        let fx = ShareFixture::new(
+                            "repl-mesh-probe-preview-exact",
+                            &["docs/a.md", "docs/b.md", "docs/sub/c.md", "src/main.rs"],
+                        )
+                        .await;
+                        fx.write_global(
+                            "version: 1\nallow:\n- pattern: docs/**\n- pattern: docs/*.md\n- pattern: src/main.rs\ndeny:\n- pattern: docs/sub/**\n",
+                        );
+                        let count = shared_count(&fx.ctx).expect("a snapshot names the root");
+                        assert_eq!(
+                            count,
+                            MatchCount {
+                                files: 3,
+                                capped: false,
+                                truncated: false
+                            },
+                            "a.md, b.md, main.rs once each; sub/c.md denied"
+                        );
+                        let config = MeshConfig {
+                            interfaces: vec![MeshInterface::Lan],
+                            ..MeshConfig::default()
+                        };
+                        let preview = render_on_preview(&config, "work", false, Some(count));
+                        let clause = preview
+                            .lines()
+                            .find(|line| line.starts_with("  files:"))
+                            .unwrap_or_else(|| panic!("no files clause in: {preview}"));
+                        assert_eq!(
+                            clause,
+                            "  files: 3 path(s) are shared with trusted peers (`.mesh shares`)"
+                        );
                         fx.stop().await;
                     });
                 }
