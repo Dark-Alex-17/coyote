@@ -1568,7 +1568,7 @@ fn allow(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
                 pattern: pattern.clone(),
                 peer,
             },
-            scope,
+            target.write_scope(),
         )?
         .changed;
     if force {
@@ -1577,7 +1577,7 @@ fn allow(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
                 Mutation::Override {
                     path: pattern.clone(),
                 },
-                scope,
+                target.write_scope(),
             )?
             .changed;
     }
@@ -1674,7 +1674,7 @@ fn deny(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         Mutation::Deny {
             pattern: pattern.clone(),
         },
-        scope,
+        target.write_scope(),
     )?;
     if applied.changed {
         out_text(&format!(
@@ -2110,6 +2110,15 @@ impl ShareTarget {
             layer,
             path,
             created: layer == Layer::Workspace && !set.workspace_exists(),
+        }
+    }
+
+    /// The announced layer as a scope `apply` cannot re-resolve, so a workspace file
+    /// that appears while the prompt stands does not move the write.
+    fn write_scope(&self) -> WriteScope {
+        match self.layer {
+            Layer::Global => WriteScope::Global,
+            Layer::Workspace => WriteScope::Workspace,
         }
     }
 
@@ -13390,6 +13399,52 @@ mod tests {
                             [
                                 allow_entry(Layer::Global, "notes/**", None),
                                 allow_entry(Layer::Global, "**", None),
+                            ]
+                        );
+                        fx.stop().await;
+                    });
+                }
+
+                /// "Will write to" and "written to" must name the same file: a workspace
+                /// file created while the question stands does not pull the write into it.
+                #[test]
+                #[serial]
+                fn allow_writes_the_layer_it_announced_even_if_the_workspace_file_appears_during_the_prompt()
+                 {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-allow-announced-layer");
+                    let _capture = capture::install();
+                    run_async(async {
+                        let mut fx =
+                            ShareFixture::new("repl-mesh-allow-announced-layer", &["docs/a.md"])
+                                .await;
+                        let workspace = fx.locations.workspace.clone();
+                        let _script = prompt_script::install_answering(move |_question| {
+                            write_share_file(
+                                &workspace,
+                                "version: 1\nallow:\n- pattern: docs/**\n",
+                            );
+                            true
+                        });
+
+                        let out = out_of(&mut fx.ctx, ".mesh allow **").await.unwrap();
+
+                        assert!(
+                            out.contains(&format!("Will write to {}:", fx.global())),
+                            "{out}"
+                        );
+                        assert!(
+                            out.ends_with(&format!(
+                                "Allowed `**` for every trusted peer; written to {}.",
+                                fx.global()
+                            )),
+                            "{out}"
+                        );
+                        assert_eq!(prompt_script::prompts_asked(), 1);
+                        assert_eq!(
+                            fx.entries(),
+                            [
+                                allow_entry(Layer::Global, "**", None),
+                                allow_entry(Layer::Workspace, "docs/**", None),
                             ]
                         );
                         fx.stop().await;
