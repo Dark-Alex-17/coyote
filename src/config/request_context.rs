@@ -42,8 +42,9 @@ use crate::mcp::{
     is_mcp_meta_function, mcp_meta_function_names,
 };
 use crate::mesh::card::DISPLAY_NAME_MAX_CHARS;
+use crate::mesh::idle::plural;
 use crate::mesh::knocks::KnockRecord;
-use crate::mesh::pending::{InboundKind, PENDING_QUESTION_MAX_CHARS};
+use crate::mesh::pending::{InboundKind, InboundRecord, PENDING_QUESTION_MAX_CHARS};
 use crate::mesh::shares::GLOB_METACHARACTERS;
 use crate::mesh::trust::{Tier, TrustRecord};
 use crate::mesh::wire_path::WIRE_PATH_MAX_BYTES;
@@ -194,6 +195,33 @@ fn push_missing(values: &mut Vec<(String, Option<String>)>, extra: Vec<(String, 
         }
         values.push((value, description));
     }
+}
+
+/// Flags for `.mesh inbox`, `rest` being everything after the verb: `--purge-files`
+/// until it is given, then `--yes` and `--dry-run`, each dropping once its partner is
+/// present.
+fn mesh_completion_inbox(rest: &[&str]) -> Vec<(String, Option<String>)> {
+    let Some((_, prior)) = rest.split_last() else {
+        return Vec::new();
+    };
+    let flags: &[&str] = if prior.contains(&"--purge-files") {
+        &["--yes", "--dry-run"]
+    } else {
+        &["--purge-files"]
+    };
+    let excluded = |flag: &str| match flag {
+        "--yes" => prior.contains(&"--dry-run"),
+        "--dry-run" => prior.contains(&"--yes"),
+        _ => false,
+    };
+    let mut values = Vec::new();
+    for flag in flags {
+        if prior.contains(flag) || excluded(flag) {
+            continue;
+        }
+        values.push(((*flag).to_string(), None));
+    }
+    values
 }
 
 /// The peer table, newest sighting first.
@@ -4509,6 +4537,14 @@ impl RequestContext {
             }
         } else if cmd == ".mesh" && args.len() == 3 && args[0] == "reply" && args[1] == "--yes" {
             values = self.mesh_completion_peers(false);
+        } else if cmd == ".mesh" && args.len() >= 3 && matches!(args[0], "answer" | "reply") {
+            values = self.mesh_completion_message_verb(args[0], &args[1..]);
+        } else if cmd == ".mesh" && args.len() >= 2 && matches!(args[0], "grant" | "refuse") {
+            values = self.mesh_completion_decision_verb(args[0], &args[1..]);
+        } else if cmd == ".mesh" && args.len() >= 2 && args[0] == "fetch" {
+            values = self.mesh_completion_fetch(&args[1..]);
+        } else if cmd == ".mesh" && args.len() >= 2 && args[0] == "inbox" {
+            values = mesh_completion_inbox(&args[1..]);
         } else if cmd == ".mesh" && args.len() == 2 && args[0] == "trust" {
             values = self.mesh_completion_trustable_destinations();
             values.push(("--identity ".to_string(), None));
@@ -5229,23 +5265,29 @@ impl RequestContext {
             .collect()
     }
 
-    /// Ids for `.mesh answer <TAB>`: the questions peers escalated, then the ones this
-    /// node asked, each described by its question as `display_text` renders it.
-    fn mesh_completion_questions(&self) -> Vec<(String, Option<String>)> {
-        let inbound = match self.app.mesh.inbound_store() {
+    /// What peers escalated and this node has not yet decided; empty, with a debug line,
+    /// when the store cannot be read, since completion never fails the prompt.
+    fn mesh_completion_inbound(&self, verb: &str) -> Vec<InboundRecord> {
+        match self.app.mesh.inbound_store() {
             Some(store) => match store.list(SystemTime::now()) {
                 Ok(records) => records,
                 Err(err) => {
                     debug!(
-                        "inbound store unreadable while completing `.mesh answer`: {}",
+                        "inbound store unreadable while completing `.mesh {verb}`: {}",
                         redact_hashes(&format!("{err:#}"))
                     );
                     Vec::new()
                 }
             },
             None => Vec::new(),
-        };
-        let mut values: Vec<(String, Option<String>)> = inbound
+        }
+    }
+
+    /// Ids for `.mesh answer <TAB>`: the questions peers escalated, then the ones this
+    /// node asked, each described by its question as `display_text` renders it.
+    fn mesh_completion_questions(&self) -> Vec<(String, Option<String>)> {
+        let mut values: Vec<(String, Option<String>)> = self
+            .mesh_completion_inbound("answer")
             .into_iter()
             .filter(|record| record.kind != InboundKind::Access)
             .map(|record| {
@@ -5269,6 +5311,148 @@ impl RequestContext {
                 }),
         );
         values
+    }
+
+    /// Ids for `.mesh grant <TAB>` and `.mesh refuse <TAB>`: the access requests peers
+    /// escalated, each described as `{short peer} · {n paths} · {age}`. Never the paths
+    /// or the reason, which a completion popup would show to whoever is at the screen.
+    fn mesh_completion_access_requests(&self) -> Vec<(String, Option<String>)> {
+        let now = SystemTime::now();
+        self.mesh_completion_inbound("grant")
+            .into_iter()
+            .filter(|record| record.kind == InboundKind::Access)
+            .map(|record| {
+                let age = parse_rfc3339(&record.received_at)
+                    .map(|then| age_text(now, then))
+                    .unwrap_or_default();
+                let description = format!(
+                    "{} · {} · {}",
+                    short(&record.peer_destination),
+                    plural(record.paths.len(), "path", "paths"),
+                    age
+                );
+                (record.id, Some(description))
+            })
+            .collect()
+    }
+
+    /// Completions for `.mesh grant` and `.mesh refuse`, `rest` being everything after
+    /// the verb: the pending access requests until the id is given, then for `grant` the
+    /// flags not yet used, `--standing` and `--for` each dropping once the other is
+    /// present, and `--global`/`--workspace`, which name the share file a standing grant
+    /// writes to, offered only after `--standing` and each dropping once its partner is
+    /// present. `refuse` takes no flags.
+    fn mesh_completion_decision_verb(
+        &self,
+        verb: &str,
+        rest: &[&str],
+    ) -> Vec<(String, Option<String>)> {
+        let Some((_, prior)) = rest.split_last() else {
+            return Vec::new();
+        };
+        let mut values = if prior.is_empty() {
+            self.mesh_completion_access_requests()
+        } else {
+            Vec::new()
+        };
+        if verb != "grant" {
+            return values;
+        }
+        let standing = prior.contains(&"--standing");
+        let excluded = |flag: &str| match flag {
+            "--standing" => prior.contains(&"--for"),
+            "--for " => standing,
+            "--global" => !standing || prior.contains(&"--workspace"),
+            "--workspace" => !standing || prior.contains(&"--global"),
+            _ => false,
+        };
+        for flag in ["--standing", "--for ", "--global", "--workspace"] {
+            if prior.contains(&flag.trim_end()) || excluded(flag) {
+                continue;
+            }
+            values.push((flag.to_string(), None));
+        }
+        values
+    }
+
+    /// Completions for `.mesh fetch`, `rest` being everything after the verb, from the
+    /// node's caches alone. Until the peer is given, the trusted destinations whose last
+    /// card advertises `fetch`, or every trusted destination while no card has been
+    /// heard, so a fresh node still completes its peers; after it, the paths on that
+    /// peer's last listing page; then `--if-sha256 `, offered once.
+    fn mesh_completion_fetch(&self, rest: &[&str]) -> Vec<(String, Option<String>)> {
+        let Some((_, prior)) = rest.split_last() else {
+            return Vec::new();
+        };
+        let Some(runtime) = self.app.mesh.get() else {
+            return Vec::new();
+        };
+        if prior.last() == Some(&"--if-sha256") {
+            return Vec::new();
+        }
+        match prior {
+            [] => {
+                let trusted = self.mesh_completion_trusted(false);
+                let mut cards_heard = 0;
+                let capable: Vec<(String, Option<String>)> = trusted
+                    .iter()
+                    .filter_map(|(hash, description)| {
+                        let card = runtime.last_card(hash)?;
+                        cards_heard += 1;
+                        card.caps.iter().any(|cap| cap == "fetch").then(|| {
+                            let description = description.as_deref().unwrap_or_default();
+                            (hash.clone(), Some(format!("{description} · fetch")))
+                        })
+                    })
+                    .collect();
+                if cards_heard == 0 { trusted } else { capable }
+            }
+            [peer] => {
+                let mut values: Vec<(String, Option<String>)> = runtime
+                    .last_list(peer)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|path| Some((display_text(&path, WIRE_PATH_MAX_BYTES)?, None)))
+                    .collect();
+                values.push(("--if-sha256 ".to_string(), None));
+                values
+            }
+            _ if prior.contains(&"--if-sha256") => Vec::new(),
+            _ => vec![("--if-sha256 ".to_string(), None)],
+        }
+    }
+
+    /// Completions for `.mesh answer` and `.mesh reply` once the id or destination is
+    /// given, `rest` being everything after the verb: the share-root paths after
+    /// `--attach`; otherwise `--attach ` until a file is attached and `--force` once one
+    /// is, plus `--yes` for `reply`, each offered once. Empty while the mesh is off.
+    fn mesh_completion_message_verb(
+        &self,
+        verb: &str,
+        rest: &[&str],
+    ) -> Vec<(String, Option<String>)> {
+        let Some((typed, prior)) = rest.split_last() else {
+            return Vec::new();
+        };
+        if self.app.mesh.get().is_none() {
+            return Vec::new();
+        }
+        if prior.last() == Some(&"--attach") {
+            return self.mesh_completion_share_paths(typed);
+        }
+        let mut flags = vec![if prior.contains(&"--attach") {
+            "--force"
+        } else {
+            "--attach "
+        }];
+        if verb == "reply" {
+            flags.push("--yes");
+        }
+        flags
+            .into_iter()
+            .filter(|flag| !prior.contains(&flag.trim_end()))
+            .map(|flag| (flag.to_string(), None))
+            .collect()
     }
 
     /// Completions for the share verbs, `rest` being everything after the verb with the
@@ -23972,6 +24156,271 @@ mod tests {
         assert!(fixture.ctx.mesh_completion_share_paths("inbox/").is_empty());
 
         fixture.stop().await;
+    }
+
+    #[cfg(unix)]
+    fn seed_inbound(
+        ctx: &RequestContext,
+        id: &str,
+        kind: InboundKind,
+        paths: &[&str],
+        reason: &str,
+        now: SystemTime,
+    ) {
+        use crate::mesh::hex_lower;
+        use crate::mesh::pending::INBOUND_RECORD_VERSION;
+        use crate::mesh::rfc3339_utc;
+
+        ctx.app
+            .mesh
+            .inbound_store()
+            .expect("install attaches an inbound store")
+            .upsert(
+                InboundRecord {
+                    version: INBOUND_RECORD_VERSION,
+                    id: id.to_string(),
+                    peer_destination: hex_lower(&[0x12; 16]),
+                    peer_identity: hex_lower(&[0xef; 16]),
+                    thread: id.to_string(),
+                    question: String::new(),
+                    envoy_question: String::new(),
+                    received_at: rfc3339_utc(now),
+                    kind,
+                    paths: paths.iter().map(|path| (*path).to_string()).collect(),
+                    reason: reason.to_string(),
+                },
+                now,
+            )
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_grant_and_refuse_offer_pending_access_ids_with_peer_count_and_age_never_paths()
+     {
+        use crate::mesh::hex_lower;
+
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-grant").await;
+        let now = SystemTime::now();
+        seed_inbound(
+            &fixture.ctx,
+            "a-1",
+            InboundKind::Access,
+            &["src/secret.rs", "docs/plan.md"],
+            "secret reason",
+            now,
+        );
+        seed_inbound(&fixture.ctx, "q-1", InboundKind::Question, &[], "", now);
+
+        let grant = fixture.complete(&["grant", ""]);
+        let refuse = fixture.complete(&["refuse", ""]);
+        assert_eq!(
+            completion_values(&grant),
+            ["a-1", "--standing", "--for "],
+            "the access id, then the flags a fresh grant takes"
+        );
+        assert_eq!(completion_values(&refuse), ["a-1"], "refuse takes no flags");
+        let expected_prefix = format!("{} · 2 paths · ", short(&hex_lower(&[0x12; 16])));
+        for rows in [&grant, &refuse] {
+            let description = completion_description(rows, "a-1");
+            assert!(
+                description.starts_with(&expected_prefix) && description.ends_with("s ago"),
+                "{description:?}"
+            );
+            for (_, description) in rows.iter() {
+                let description = description.as_deref().unwrap_or_default();
+                assert!(
+                    !description.contains("secret") && !description.contains('/'),
+                    "neither a path nor the reason leaks: {description:?}"
+                );
+            }
+        }
+        assert_eq!(
+            completion_values(&fixture.complete(&["answer", ""])),
+            ["q-1"],
+            "an access request is decided, not answered"
+        );
+
+        fixture.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_grant_flags_follow_standing_and_for_exclusions() {
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-grant-flags").await;
+
+        assert_eq!(
+            completion_values(&fixture.complete(&["grant", "a-1", ""])),
+            ["--standing", "--for "]
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["grant", "a-1", "--standing", ""])),
+            ["--global", "--workspace"],
+            "the share-file flags follow `--standing`; `--for` does not apply"
+        );
+        assert!(
+            fixture
+                .complete(&["grant", "a-1", "--for", "2h", ""])
+                .is_empty(),
+            "a timed grant is neither standing nor written to a share file"
+        );
+        assert!(
+            fixture
+                .complete(&["grant", "a-1", "--standing", "--global", ""])
+                .is_empty()
+        );
+        assert!(fixture.complete(&["refuse", "a-1", ""]).is_empty());
+
+        fixture.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_fetch_offers_fetch_capable_peers_then_the_last_listing() {
+        use crate::mesh::card::build_card;
+
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-fetch").await;
+        let trusted = fixture.trusted_destination.clone();
+        let runtime = fixture.ctx.app.mesh.get().unwrap();
+
+        let fresh = fixture.complete(&["fetch", ""]);
+        assert_eq!(
+            completion_values(&fresh),
+            [trusted.as_str()],
+            "with no card heard, every trusted destination; never a heard-only peer"
+        );
+        let trusted_description = completion_description(&fresh, &trusted);
+
+        runtime.memory().remember_card(
+            &trusted,
+            build_card(None, None, None, None, None, &[], SystemTime::now()),
+        );
+        assert!(
+            fixture.complete(&["fetch", ""]).is_empty(),
+            "a card without the `fetch` cap rules its peer out"
+        );
+        runtime.memory().remember_card(
+            &trusted,
+            build_card(
+                None,
+                None,
+                None,
+                None,
+                None,
+                &["fetch".to_string()],
+                SystemTime::now(),
+            ),
+        );
+        let capable = fixture.complete(&["fetch", ""]);
+        assert_eq!(completion_values(&capable), [trusted.as_str()]);
+        assert_eq!(
+            completion_description(&capable, &trusted),
+            format!("{trusted_description} · fetch")
+        );
+
+        assert_eq!(
+            completion_values(&fixture.complete(&["fetch", &trusted, ""])),
+            ["--if-sha256 "],
+            "no listing heard yet"
+        );
+        runtime.memory().remember_list(
+            &trusted,
+            vec!["docs/a.md".to_string(), "README.md".to_string()],
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["fetch", &trusted, ""])),
+            ["docs/a.md", "README.md", "--if-sha256 "],
+            "the last listing in its own order, then the flag"
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["fetch", &trusted, "docs/a.md", ""])),
+            ["--if-sha256 "]
+        );
+        assert!(
+            fixture
+                .complete(&["fetch", &trusted, "docs/a.md", "--if-sha256", ""])
+                .is_empty()
+        );
+
+        fixture.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_answer_and_reply_offer_attach_then_share_root_paths_then_force() {
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture("rc-mesh-complete-attach").await;
+        let root = publish_share_root(&fixture.ctx, "rc-mesh-complete-attach-root");
+        seed_share_files(
+            &root.path,
+            &[
+                "README.md",
+                "docs/a.md",
+                ".env",
+                ".git/HEAD",
+                ".coyote/config.yaml",
+            ],
+        );
+        let heard = fixture.heard_destination.clone();
+
+        assert_eq!(
+            completion_values(&fixture.complete(&["answer", "p1", ""])),
+            ["--attach "]
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["answer", "p1", "--attach", ""])),
+            ["README.md", "docs/"],
+            "the share-root completer, secrets and the config dir hidden"
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["answer", "p1", "--attach", "docs/a.md", ""])),
+            ["--force"]
+        );
+        assert!(
+            fixture
+                .complete(&["answer", "p1", "--attach", "docs/a.md", "--force", ""])
+                .is_empty()
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["reply", &heard, ""])),
+            ["--attach ", "--yes"]
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["reply", &heard, "--yes", ""])),
+            ["--attach "]
+        );
+        let after_flag = fixture.complete(&["reply", "--yes", ""]);
+        assert!(
+            after_flag.iter().any(|(value, _)| *value == heard)
+                && !after_flag.iter().any(|(value, _)| value.starts_with("--")),
+            "`reply --yes <TAB>` still offers peers alone: {after_flag:?}"
+        );
+
+        fixture.stop().await;
+    }
+
+    #[test]
+    fn repl_complete_mesh_inbox_offers_the_purge_flags_with_their_exclusions() {
+        let ctx = create_test_ctx();
+        let complete = |args: &[&str]| ctx.repl_complete(".mesh", args, "");
+
+        assert_eq!(
+            complete(&["inbox", ""]),
+            [("--purge-files".to_string(), None)]
+        );
+        assert_eq!(
+            complete(&["inbox", "--purge-files", ""]),
+            [("--yes".to_string(), None), ("--dry-run".to_string(), None)]
+        );
+        assert!(complete(&["inbox", "--purge-files", "--dry-run", ""]).is_empty());
+        assert!(complete(&["inbox", "--purge-files", "--yes", ""]).is_empty());
     }
 
     #[test]

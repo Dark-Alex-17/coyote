@@ -929,7 +929,7 @@ impl PeerMemory {
             .remember(destination_hex, card, LAST_CARD_CACHE_PEERS);
     }
 
-    fn remember_list(&self, destination_hex: &str, paths: Vec<String>) {
+    pub(crate) fn remember_list(&self, destination_hex: &str, paths: Vec<String>) {
         self.lists
             .remember(destination_hex, paths, LAST_LIST_CACHE_PEERS);
     }
@@ -957,7 +957,6 @@ impl<T: Clone> Recent<T> {
         }
     }
 
-    #[cfg(test)]
     fn get(&self, key: &str) -> Option<T> {
         self.entries
             .lock()
@@ -1114,14 +1113,12 @@ impl MeshRuntime {
 
     /// The status card `destination` last answered with, if it is among the last
     /// `LAST_CARD_CACHE_PEERS` peers asked.
-    #[cfg(all(test, unix))]
     pub(crate) fn last_card(&self, destination_hex: &str) -> Option<StatusCard> {
         self.memory().cards.get(destination_hex)
     }
 
     /// The paths on the last listing page `destination` answered with, if it is among
     /// the last `LAST_LIST_CACHE_PEERS` peers listed.
-    #[cfg(all(test, unix))]
     pub(crate) fn last_list(&self, destination_hex: &str) -> Option<Vec<String>> {
         self.memory().lists.get(destination_hex)
     }
