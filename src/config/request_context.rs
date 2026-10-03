@@ -44,7 +44,9 @@ use crate::mcp::{
 use crate::mesh::card::DISPLAY_NAME_MAX_CHARS;
 use crate::mesh::knocks::KnockRecord;
 use crate::mesh::pending::{InboundKind, PENDING_QUESTION_MAX_CHARS};
+use crate::mesh::shares::GLOB_METACHARACTERS;
 use crate::mesh::trust::{Tier, TrustRecord};
+use crate::mesh::wire_path::WIRE_PATH_MAX_BYTES;
 use crate::mesh::{
     MeshRuntime, MeshSlot, PeerRecord, age_text, display_text, parse_rfc3339, redact_hashes, short,
 };
@@ -5273,7 +5275,8 @@ impl RequestContext {
     /// token being typed last. After `--peer` the trusted destinations and identities;
     /// otherwise the data rows the verb takes, once, before its positional is given, then
     /// the flags not yet used, each of `--global`/`--workspace`, `--yes`/`--dry-run` and
-    /// `--peer`/`--force` dropping once its partner is present.
+    /// `--peer`/`--force` dropping once its partner is present, and `--force` once the
+    /// positional is a glob, since an override names one exact file.
     fn mesh_completion_share_verb(
         &self,
         verb: &str,
@@ -5287,14 +5290,15 @@ impl RequestContext {
             push_missing(&mut values, self.mesh_completion_trusted(true));
             return values;
         }
-        let positional_taken = prior.iter().enumerate().any(|(index, token)| {
-            !token.starts_with("--") && (index == 0 || prior[index - 1] != "--peer")
+        let positional = prior.iter().enumerate().find_map(|(index, token)| {
+            (!token.starts_with("--") && (index == 0 || prior[index - 1] != "--peer"))
+                .then_some(*token)
         });
         let mut values = match verb {
-            "allow" | "deny" if !positional_taken && self.app.mesh.get().is_some() => {
+            "allow" | "deny" if positional.is_none() && self.app.mesh.get().is_some() => {
                 self.mesh_completion_share_paths(typed)
             }
-            "unshare" if !positional_taken => self.mesh_completion_share_patterns(),
+            "unshare" if positional.is_none() => self.mesh_completion_share_patterns(),
             _ => Vec::new(),
         };
         let flags: &[&str] = match verb {
@@ -5315,7 +5319,10 @@ impl RequestContext {
             "--yes" => prior.contains(&"--dry-run"),
             "--dry-run" => prior.contains(&"--yes"),
             "--peer " => prior.contains(&"--force"),
-            "--force" => prior.contains(&"--peer"),
+            "--force" => {
+                prior.contains(&"--peer")
+                    || positional.is_some_and(|token| token.contains(GLOB_METACHARACTERS))
+            }
             _ => false,
         };
         for flag in flags {
@@ -5337,11 +5344,15 @@ impl RequestContext {
 
     /// Root-relative paths for `.mesh allow <TAB>` and `.mesh deny <TAB>`: the entries of
     /// the share-root directory `typed` names, directories with a trailing `/`, less
-    /// `.git`, the workspace config directory, anything the built-in deny names, and any
-    /// symlink that leaves the root. Local filesystem and the published snapshot only;
-    /// nothing reaches the wire or the trust store. Empty for an absolute, backslashed or
-    /// `..` prefix, since the verbs refuse those; sorted and cut at 200.
+    /// `.git`, the workspace config directory, anything the built-in deny names, any
+    /// symlink that leaves the root and any symlinked directory, since the walk names
+    /// files by their real path and a rule under the link would reach none. Local
+    /// filesystem and the published snapshot only; nothing reaches the wire or the trust
+    /// store. Empty for a directory prefix the verbs would refuse as a pattern; sorted and
+    /// cut at 200.
     fn mesh_completion_share_paths(&self, typed: &str) -> Vec<(String, Option<String>)> {
+        use crate::mesh::shares::{CompletionFilter, validate_pattern};
+
         let Some((root, _)) = self.share_locations() else {
             return Vec::new();
         };
@@ -5355,6 +5366,11 @@ impl RequestContext {
             Some(slash) => typed.split_at(slash + 1),
             None => ("", typed),
         };
+        if let Some(dir) = dir_part.strip_suffix('/')
+            && validate_pattern(dir).is_err()
+        {
+            return Vec::new();
+        }
         let Ok(canonical_root) = dunce::canonicalize(&root) else {
             return Vec::new();
         };
@@ -5367,7 +5383,7 @@ impl RequestContext {
         let Ok(entries) = fs::read_dir(&dir) else {
             return Vec::new();
         };
-        let config_dir_name = paths::workspace_config_dir_name();
+        let filter = CompletionFilter::new(&paths::workspace_config_dir_name());
         let mut values: Vec<(String, Option<String>)> = entries
             .flatten()
             .filter_map(|entry| {
@@ -5376,17 +5392,16 @@ impl RequestContext {
                     return None;
                 }
                 let relative = format!("{dir_part}{name}");
-                if crate::mesh::shares::hidden_from_completion(&relative, &config_dir_name)
-                    || crate::mesh::shares::hidden_from_completion(&name, &config_dir_name)
-                {
+                if filter.is_hidden(&relative) || filter.is_hidden(&name) {
                     return None;
                 }
                 let path = entry.path();
                 let metadata = fs::metadata(&path).ok()?;
                 if entry.file_type().ok()?.is_symlink()
-                    && !dunce::canonicalize(&path)
-                        .ok()?
-                        .starts_with(&canonical_root)
+                    && (metadata.is_dir()
+                        || !dunce::canonicalize(&path)
+                            .ok()?
+                            .starts_with(&canonical_root))
                 {
                     return None;
                 }
@@ -5395,7 +5410,7 @@ impl RequestContext {
                 } else {
                     relative
                 };
-                Some((value, None))
+                Some((display_text(&value, WIRE_PATH_MAX_BYTES)?, None))
             })
             .collect();
         values.sort();
@@ -5405,7 +5420,8 @@ impl RequestContext {
 
     /// Patterns for `.mesh unshare <TAB>`: every entry of both share files as they are on
     /// disk, described as `{allow|deny|override} · {global|workspace}`; a pattern both
-    /// files hold keeps its first description. Works while the mesh is off.
+    /// files hold keeps its first description, and one that is nothing but escapes is not
+    /// offered. Works while the mesh is off.
     fn mesh_completion_share_patterns(&self) -> Vec<(String, Option<String>)> {
         use crate::mesh::shares::{Layer, RawKind, ShareSet};
 
@@ -5418,6 +5434,9 @@ impl RequestContext {
                 RawKind::Allow { pattern, .. } => ("allow", pattern),
                 RawKind::Deny { pattern } => ("deny", pattern),
                 RawKind::Override { path } => ("override", path),
+            };
+            let Some(text) = display_text(&text, WIRE_PATH_MAX_BYTES) else {
+                continue;
             };
             let layer = match entry.layer {
                 Layer::Global => "global",
@@ -23305,6 +23324,7 @@ mod tests {
             ],
         );
         std::os::unix::fs::symlink(&outside.path, root.path.join("out")).unwrap();
+        std::os::unix::fs::symlink(root.path.join("docs"), root.path.join("docs-link")).unwrap();
 
         let expected_top = ["README.md", "docs/"]
             .into_iter()
@@ -23314,7 +23334,8 @@ mod tests {
             completion_values(&fixture.complete(&["allow", ""])),
             expected_top,
             "plain files and directories, slashed, then the flags; secrets, `.git`, the \
-             config dir and the symlink out of the root are hidden"
+             config dir, the symlink out of the root and the symlinked directory inside it \
+             are hidden"
         );
         assert_eq!(
             completion_values(&fixture.complete(&["allow", "docs/"])),
@@ -23334,7 +23355,15 @@ mod tests {
                 .collect::<Vec<_>>(),
             "deny offers the same paths with its own flags"
         );
-        for typed in ["/etc", "docs\\a", "../x", "docs/../x"] {
+        for typed in [
+            "/etc",
+            "docs\\a",
+            "../x",
+            "docs/../x",
+            "./",
+            "docs//",
+            "./docs/",
+        ] {
             assert!(
                 fixture.ctx.mesh_completion_share_paths(typed).is_empty(),
                 "{typed}: a prefix the verb refuses offers no paths"
@@ -23377,8 +23406,13 @@ mod tests {
 
         assert_eq!(
             completion_values(&fixture.complete(&["allow", "docs/**", ""])),
+            ["--peer ", "--global", "--workspace", "--yes", "--dry-run"],
+            "the positional is taken, so only flags remain; a glob cannot be forced"
+        );
+        assert_eq!(
+            completion_values(&fixture.complete(&["allow", "docs/a.md", ""])),
             ALLOW_FLAGS,
-            "the positional is taken, so only flags remain"
+            "one exact file keeps --force on offer"
         );
         assert_eq!(
             completion_values(&fixture.complete(&["allow", "x", "--global", ""])),

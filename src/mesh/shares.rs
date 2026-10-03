@@ -1463,19 +1463,35 @@ pub(crate) fn is_broad_pattern(pattern: &str) -> bool {
     pattern.split('/').next() == Some("**")
 }
 
-/// Whether a root-relative name must not be offered as a completion for `allow` or
-/// `deny`: `.git`, the workspace config directory under either name it goes by, or
-/// anything the built-in deny matches by name. No I/O. The built-in set is this module's
-/// own constants, so one that fails to compile is a bug and hides everything.
-pub(crate) fn hidden_from_completion(relative: &str, workspace_config_dir_name: &str) -> bool {
-    workspace_config_dir_names(workspace_config_dir_name).contains(&relative)
-        || compile(
-            builtin_deny_patterns(workspace_config_dir_name)
-                .iter()
-                .map(String::as_str),
-            false,
-        )
-        .map_or(true, |builtin| builtin.is_match(relative))
+/// What a completion for `allow` or `deny` must not offer: `.git`, the workspace config
+/// directory under either name it goes by, or anything the built-in deny matches by
+/// name. Built once per completion, since the built-in set is compiled on construction
+/// and asked about every entry of the directory. No I/O. The built-in set is this
+/// module's own constants, so one that fails to compile is a bug and hides everything.
+pub(crate) struct CompletionFilter {
+    config_dir_names: Vec<String>,
+    builtin: Option<GlobSet>,
+}
+
+impl CompletionFilter {
+    pub(crate) fn new(workspace_config_dir_name: &str) -> Self {
+        let patterns = builtin_deny_patterns(workspace_config_dir_name);
+        Self {
+            config_dir_names: workspace_config_dir_names(workspace_config_dir_name)
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            builtin: compile(patterns.iter().map(String::as_str), false).ok(),
+        }
+    }
+
+    pub(crate) fn is_hidden(&self, relative: &str) -> bool {
+        self.config_dir_names.iter().any(|name| name == relative)
+            || self
+                .builtin
+                .as_ref()
+                .is_none_or(|builtin| builtin.is_match(relative))
+    }
 }
 
 /// Applies `mutation` to `file`, which lives at `path`; `Ok(false)` means the file already
@@ -1529,7 +1545,9 @@ fn push_unless_present<T: PartialEq>(entries: &mut Vec<T>, entry: T) -> bool {
     true
 }
 
-fn canonical_peer(peer: &str) -> Result<String> {
+/// The canonical hash an allow entry's `peer` holds, or the one teaching refusal for a
+/// token that is not one; the verbs use it so the sentence is said in one place.
+pub(crate) fn canonical_peer(peer: &str) -> Result<String> {
     canonical_hash(peer).ok_or_else(|| {
         anyhow!(
             "`{peer}` is not a peer hash; scope a share to a peer by the 32-hex identity or destination hash `.mesh peers` shows."
@@ -2959,7 +2977,8 @@ mod tests {
     }
 
     #[test]
-    fn hidden_from_completion_hides_git_the_config_dir_and_built_in_denied_names() {
+    fn the_completion_filter_hides_git_the_config_dir_and_built_in_denied_names() {
+        let filter = CompletionFilter::new(".coyote-custom");
         for (name, hidden) in [
             (".git", true),
             (".coyote", true),
@@ -2971,11 +2990,7 @@ mod tests {
             ("docs", false),
             ("README.md", false),
         ] {
-            assert_eq!(
-                hidden_from_completion(name, ".coyote-custom"),
-                hidden,
-                "{name}"
-            );
+            assert_eq!(filter.is_hidden(name), hidden, "{name}");
         }
     }
 

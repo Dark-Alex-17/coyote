@@ -18,7 +18,8 @@ use crate::mesh::pending::{
 use crate::mesh::shares::{
     BuiltinHit, DEFAULT_LIST_WALK_BOUND, GLOB_METACHARACTERS, LIST_PAGE_SIZE, Layer, MatchCount,
     Mutation, PeerRef, RawKind, ShareLocations, ShareSet, Verdict as ShareVerdict, WriteScope,
-    case_folding_hint, is_broad_pattern, is_canonical_peer, validate_override, validate_pattern,
+    canonical_peer, case_folding_hint, is_broad_pattern, is_canonical_peer, validate_override,
+    validate_pattern,
 };
 use crate::mesh::trust::{
     Decision, KeyChange, LiveMesh, Rule, Tier, TrustChange, TrustOptions, TrustRecord, TrustStore,
@@ -1477,7 +1478,7 @@ fn allow(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     }
     refuse_directory_pattern(&pattern, "share what is under it with")?;
     validate_pattern(&pattern)?;
-    let peer = peer.as_deref().map(peer_hash).transpose()?;
+    let peer = peer.as_deref().map(canonical_peer).transpose()?;
     if force {
         validate_override(&pattern)?;
     }
@@ -1513,6 +1514,29 @@ fn allow(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     }
     let matches = describe_matches(&set, &pattern, &root, case_insensitive)?;
     let audience = share_audience(peer.as_deref());
+    let already = format!(
+        "`{pattern}` is already allowed for {audience} in {}; nothing was changed.",
+        target.path.display()
+    );
+    let held = layer_holds(
+        &set,
+        target.layer,
+        &RawKind::Allow {
+            pattern: pattern.clone(),
+            peer: peer.clone(),
+        },
+    ) && (!force
+        || layer_holds(
+            &set,
+            target.layer,
+            &RawKind::Override {
+                path: pattern.clone(),
+            },
+        ));
+    if held {
+        out_text(&already);
+        return Ok(());
+    }
     let lift = if force {
         ", and an override lifting the built-in deny for it"
     } else {
@@ -1558,10 +1582,7 @@ fn allow(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             .changed;
     }
     if !changed {
-        out_text(&format!(
-            "`{pattern}` is already allowed for {audience} in {}; nothing was changed.",
-            target.path.display()
-        ));
+        out_text(&already);
         return Ok(());
     }
     out_text(&format!(
@@ -1615,6 +1636,20 @@ fn deny(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     }
     let target = ShareTarget::of(&set, scope);
     let matches = describe_matches(&set, &pattern, &root, case_insensitive)?;
+    let already = format!(
+        "`{pattern}` is already denied to every peer in {}; nothing was changed.",
+        target.path.display()
+    );
+    if layer_holds(
+        &set,
+        target.layer,
+        &RawKind::Deny {
+            pattern: pattern.clone(),
+        },
+    ) {
+        out_text(&already);
+        return Ok(());
+    }
     out_text(&format!(
         "{} write to {}: deny `{pattern}` to every peer.",
         intent_verb(dry_run),
@@ -1647,18 +1682,15 @@ fn deny(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             target.written_to()
         ));
     } else {
-        out_text(&format!(
-            "`{pattern}` is already denied to every peer in {}; nothing was changed.",
-            target.path.display()
-        ));
+        out_text(&already);
     }
     Ok(())
 }
 
 /// `.mesh unshare <pattern>`: removes every rule whose text is `pattern`, allow, deny or
 /// override alike, from the file that holds it. Under the write rule a pattern held
-/// only by the other file is refused with the flag that reaches it, so a bare `unshare`
-/// never edits a file the matching `allow` would not have.
+/// only by the other file is refused with the flag that reaches it; when both files hold
+/// it, both are named and the removal confirmed before either is edited.
 fn unshare(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     let Some(rest) = rest else {
         out_text(&render_verb_help("unshare"));
@@ -1808,10 +1840,10 @@ fn shares(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     if let Some(token) = args.positional.first() {
         return Err(unexpected(token, "shares"));
     }
-    let peer = args.peer.as_deref().map(peer_hash).transpose()?;
+    let peer = args.peer.as_deref().map(canonical_peer).transpose()?;
     let (root, set) = share_set(ctx)?;
     if let Some(refusal) = set.refusal() {
-        err_text(refusal);
+        err_text(&shown_refusal(refusal));
         out_text("Nothing is shared until it is fixed.");
         return Ok(());
     }
@@ -1960,6 +1992,12 @@ fn shown_pattern(pattern: &str) -> String {
     display_text(pattern, WIRE_PATH_MAX_BYTES).unwrap_or_default()
 }
 
+/// A load refusal as the human sees it: it quotes the file's own text, so escapes are
+/// stripped the way a pattern's are.
+fn shown_refusal(refusal: &str) -> String {
+    display_text(refusal, 4096).unwrap_or_default()
+}
+
 struct ShareArgs {
     pattern: String,
     scope: WriteScope,
@@ -2036,7 +2074,7 @@ fn writable_share_set(ctx: &RequestContext) -> Result<(PathBuf, ShareSet, bool)>
 fn loaded_for_writing(ctx: &RequestContext) -> Result<(PathBuf, ShareSet)> {
     let (root, set) = share_set(ctx)?;
     if let Some(refusal) = set.refusal() {
-        bail!("{refusal} Nothing was written.");
+        bail!("{} Nothing was written.", shown_refusal(refusal));
     }
     Ok((root, set))
 }
@@ -2132,6 +2170,14 @@ fn share_holders(set: &ShareSet, pattern: &str) -> Vec<(Layer, &'static str)> {
         .collect()
 }
 
+/// Whether `layer` already holds exactly `kind`, so a verb can say nothing needs writing
+/// before it announces a write.
+fn layer_holds(set: &ShareSet, layer: Layer, kind: &RawKind) -> bool {
+    set.entries()
+        .iter()
+        .any(|entry| entry.layer == layer && entry.kind == *kind)
+}
+
 /// `allow`, `allow and override`, `allow, deny and override`; a kind held twice is
 /// named once.
 fn kind_list(kinds: &[&str]) -> String {
@@ -2157,14 +2203,6 @@ fn share_audience(peer: Option<&str>) -> String {
         None => "every trusted peer".to_string(),
         Some(peer) => format!("peer {}", short(peer)),
     }
-}
-
-fn peer_hash(token: &str) -> Result<String> {
-    canonical_hash(token).ok_or_else(|| {
-        anyhow!(
-            "`{token}` is not a peer hash; scope a share to a peer by the 32-hex identity or destination hash `.mesh peers` shows."
-        )
-    })
 }
 
 /// The store behind every trust mutation, refused with the store's own teaching text while
@@ -12881,6 +12919,10 @@ mod tests {
                                 fx.global()
                             )),
                             "{out}"
+                        );
+                        assert!(
+                            !out.contains("write to"),
+                            "no write is announced when nothing needs writing: {out}"
                         );
                         assert_eq!(fs::read(&fx.locations.global).unwrap(), before);
                         fx.stop().await;
