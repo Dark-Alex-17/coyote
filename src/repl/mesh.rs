@@ -14512,6 +14512,360 @@ mod tests {
                     );
                     assert_eq!(prompt_script::prompts_asked(), 1);
                 }
+
+                /// The checks that need the loaded share set (protected head, built-in
+                /// deny, the walk behind a broad pattern, the holders behind an unshare)
+                /// wait for the mesh gate, and no prompt stands while the mesh is off; the
+                /// off context creates no share file either.
+                #[test]
+                #[serial]
+                fn usage_probe_share_set_checks_and_prompts_wait_behind_the_mesh_gate() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-gate-order");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    let mut ctx = off_ctx();
+                    let root = TempDir::new("repl-mesh-probe-gate-order-root");
+                    seed_files(
+                        &root.path,
+                        &[".env", ".git/HEAD", "docs/a.md", "src/main.rs"],
+                    );
+                    publish_root(&ctx, &root.path);
+                    let (_, locations) = share_locations(&ctx).unwrap();
+                    write_share_file(&locations.global, "version: 1\nallow:\n- pattern: '**'\n");
+                    write_share_file(
+                        &locations.workspace,
+                        "version: 1\nallow:\n- pattern: '**'\n",
+                    );
+                    let workspace_before = fs::read(&locations.workspace).unwrap();
+
+                    for line in [
+                        ".mesh allow .git/HEAD",
+                        ".mesh deny .git/HEAD",
+                        ".mesh allow .env",
+                        ".mesh allow .env --force --global",
+                        ".mesh allow docs/a.md --force --global",
+                        ".mesh allow **",
+                        ".mesh allow **/*.rs",
+                        ".mesh deny **",
+                        ".mesh unshare **",
+                        ".mesh allow docs/** --workspace",
+                        ".mesh allow docs/** --dry-run",
+                    ] {
+                        assert_eq!(err_of(&mut ctx, line), MESH_OFF, "{line}");
+                    }
+
+                    assert_eq!(
+                        prompt_script::prompts_asked(),
+                        0,
+                        "no prompt stands while off"
+                    );
+                    assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
+                    assert_eq!(fs::read(&locations.workspace).unwrap(), workspace_before);
+                    assert_eq!(
+                        ShareSet::load_quietly(locations).0.entries(),
+                        [
+                            allow_entry(Layer::Global, "**", None),
+                            allow_entry(Layer::Workspace, "**", None),
+                        ]
+                    );
+                }
+
+                /// The workspace share list lives in the repository, so a clone chooses
+                /// what sits at its name: a link there is refused rather than written
+                /// through, and a planted link under the old temp name is never followed
+                /// because every write opens a fresh temp name with `create_new`.
+                #[test]
+                #[serial]
+                fn usage_probe_workspace_share_file_link_is_refused_and_a_planted_temp_link_is_never_followed()
+                 {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-ws-link");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = ShareFixture::new(
+                            "repl-mesh-probe-ws-link",
+                            &["docs/a.md", "src/main.rs"],
+                        )
+                        .await;
+                        let elsewhere = TempDir::new("repl-mesh-probe-ws-link-elsewhere");
+                        let victim = elsewhere.path.join("victim.yaml");
+                        let victim_yaml = "version: 1\nallow:\n- pattern: zzz/**\n";
+                        fs::write(&victim, victim_yaml).unwrap();
+                        fs::create_dir_all(fx.locations.workspace.parent().unwrap()).unwrap();
+                        std::os::unix::fs::symlink(&victim, &fx.locations.workspace).unwrap();
+
+                        let err = refusal(&mut fx.ctx, ".mesh allow docs/** --workspace").await;
+
+                        assert!(err.contains("is a symlink"), "{err}");
+                        assert!(
+                            !err.contains("written to"),
+                            "no write is announced on a refusal: {err}"
+                        );
+                        assert_eq!(fs::read_to_string(&victim).unwrap(), victim_yaml);
+                        assert!(
+                            fs::symlink_metadata(&fx.locations.workspace)
+                                .unwrap()
+                                .file_type()
+                                .is_symlink(),
+                            "the link is neither replaced nor removed"
+                        );
+                        assert!(
+                            !fx.locations.global.exists(),
+                            "nothing fell through to global"
+                        );
+
+                        fs::remove_file(&fx.locations.workspace).unwrap();
+                        let planted_target = elsewhere.path.join("planted.txt");
+                        fs::write(&planted_target, "untouched").unwrap();
+                        let planted = fx.locations.workspace.with_added_extension("tmp");
+                        std::os::unix::fs::symlink(&planted_target, &planted).unwrap();
+
+                        let out = out_of(&mut fx.ctx, ".mesh allow docs/** --workspace")
+                            .await
+                            .unwrap();
+
+                        assert!(
+                            out.ends_with(&format!(
+                                "Allowed `docs/**` for every trusted peer; written to {} (created).",
+                                fx.workspace()
+                            )),
+                            "{out}"
+                        );
+                        assert_eq!(fs::read_to_string(&planted_target).unwrap(), "untouched");
+                        assert!(
+                            fs::symlink_metadata(&planted)
+                                .unwrap()
+                                .file_type()
+                                .is_symlink(),
+                            "the planted link is left where it was"
+                        );
+                        assert!(
+                            fs::symlink_metadata(&fx.locations.workspace)
+                                .unwrap()
+                                .file_type()
+                                .is_file(),
+                            "the workspace file is a regular file"
+                        );
+                        let leftovers: Vec<String> =
+                            fs::read_dir(fx.locations.workspace.parent().unwrap())
+                                .unwrap()
+                                .map(|entry| {
+                                    entry.unwrap().file_name().to_string_lossy().into_owned()
+                                })
+                                .filter(|name| {
+                                    name.ends_with(".tmp") && *name != "mesh-shares.yaml.tmp"
+                                })
+                                .collect();
+                        assert!(
+                            leftovers.is_empty(),
+                            "no temp file survives the write: {leftovers:?}"
+                        );
+
+                        let out = out_of(&mut fx.ctx, ".mesh deny src/**").await.unwrap();
+                        assert!(
+                            out.ends_with(&format!(
+                                "Denied `src/**` to every peer; written to {}.",
+                                fx.workspace()
+                            )),
+                            "a bare deny lands in the workspace file once it exists: {out}"
+                        );
+                        assert_eq!(
+                            fx.entries(),
+                            [
+                                allow_entry(Layer::Workspace, "docs/**", None),
+                                deny_entry(Layer::Workspace, "src/**"),
+                            ]
+                        );
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        fx.stop().await;
+                    });
+                }
+
+                /// Nothing leaves this machine and nothing lands on it before consent: the
+                /// off-path `shares`, `shares --effective` and the `.mesh on` preview read
+                /// the share root's case folding without writing a probe file, and create
+                /// no share file of their own. The root directory's mtime is the oracle: a
+                /// probe that creates and removes a file bumps it, a read-only hint does not.
+                #[test]
+                #[serial]
+                fn usage_probe_pre_consent_views_leave_the_share_root_and_share_files_untouched() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-no-probe-file");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[false]);
+                    let root = TempDir::new("repl-mesh-probe-no-probe-file-root");
+                    seed_files(&root.path, &["docs/a.md", "README.md", "src/lib.rs"]);
+                    let config = MeshConfig {
+                        interfaces: vec![MeshInterface::Lan],
+                        ..MeshConfig::default()
+                    };
+                    let mut ctx = ctx_with(config, true);
+                    ctx.session = Some(Session::default());
+                    publish_root(&ctx, &root.path);
+                    let (_, locations) = share_locations(&ctx).unwrap();
+                    write_share_file(&locations.global, "version: 1\nallow:\n- pattern: '**'\n");
+                    let global_before = fs::read(&locations.global).unwrap();
+                    let listing = |dir: &Path| -> Vec<String> {
+                        fn walk(dir: &Path, prefix: &str, into: &mut Vec<String>) {
+                            for entry in fs::read_dir(dir).unwrap() {
+                                let entry = entry.unwrap();
+                                let name =
+                                    format!("{prefix}{}", entry.file_name().to_string_lossy());
+                                if entry.file_type().unwrap().is_dir() {
+                                    walk(&entry.path(), &format!("{name}/"), into);
+                                } else {
+                                    into.push(name);
+                                }
+                            }
+                        }
+                        let mut names = Vec::new();
+                        walk(dir, "", &mut names);
+                        names.sort();
+                        names
+                    };
+                    let before = listing(&root.path);
+                    assert_eq!(before, ["README.md", "docs/a.md", "src/lib.rs"]);
+                    let pinned = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+                    let dir = fs::File::open(&root.path).unwrap();
+                    dir.set_modified(pinned).unwrap();
+                    drop(dir);
+                    assert_eq!(
+                        fs::metadata(&root.path).unwrap().modified().unwrap(),
+                        pinned
+                    );
+
+                    run_async(run(&mut ctx, ".mesh shares")).unwrap();
+                    run_async(run(&mut ctx, ".mesh shares --effective")).unwrap();
+                    let out = stdout_lines().join("\n");
+                    assert!(out.contains("  src/lib.rs"), "{out}");
+                    run_async(run(&mut ctx, ".mesh on")).unwrap();
+                    assert!(ctx.app.mesh.get().is_none());
+                    let out = stdout_lines().join("\n");
+                    assert!(
+                        out.lines().any(|line| line
+                            == "  files: 3 path(s) are shared with trusted peers (`.mesh shares`)"),
+                        "{out}"
+                    );
+                    assert_eq!(prompt_script::prompts_asked(), 1);
+
+                    assert_eq!(
+                        fs::metadata(&root.path).unwrap().modified().unwrap(),
+                        pinned,
+                        "nothing was created or removed under the share root before consent"
+                    );
+                    assert_eq!(
+                        listing(&root.path),
+                        before,
+                        "no probe file under the share root"
+                    );
+                    assert!(
+                        !locations.workspace.exists(),
+                        "inspection creates no workspace file"
+                    );
+                    assert_eq!(fs::read(&locations.global).unwrap(), global_before);
+                }
+
+                /// A rule already held prints its sentence and asks nothing even when the
+                /// pattern is broad; `--force` on a file whose allow is held but whose
+                /// override is not completes the pair once, and the built-in deny names
+                /// the file by text, so the file need not exist on disk.
+                #[test]
+                #[serial]
+                fn usage_probe_an_already_held_broad_rule_asks_nothing_and_force_completes_a_half_held_pair()
+                 {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-already-broad");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = ShareFixture::new(
+                            "repl-mesh-probe-already-broad",
+                            &["docs/a.md", "docs/b.md", "src/main.rs"],
+                        )
+                        .await;
+                        fx.write_global(
+                            "version: 1\nallow:\n- pattern: '**'\n- pattern: .env\ndeny:\n- pattern: '**/*.rs'\n",
+                        );
+                        let before = fs::read(&fx.locations.global).unwrap();
+
+                        let out = out_of(&mut fx.ctx, ".mesh allow **").await.unwrap();
+                        // The match-count line precedes the sentence (the in-tree test
+                        // accepts it with `ends_with`); what the criterion forbids is an
+                        // announced write and a prompt.
+                        assert_eq!(
+                            out.lines().last().unwrap(),
+                            &format!(
+                                "`**` is already allowed for every trusted peer in {}; nothing was changed.",
+                                fx.global()
+                            ),
+                            "{out}"
+                        );
+                        assert!(
+                            !out.contains("rite to") && !out.contains("Allowed `"),
+                            "no write is announced for a held rule: {out}"
+                        );
+                        let out = out_of(&mut fx.ctx, ".mesh deny **/*.rs").await.unwrap();
+                        assert_eq!(
+                            out.lines().last().unwrap(),
+                            &format!(
+                                "`**/*.rs` is already denied to every peer in {}; nothing was changed.",
+                                fx.global()
+                            )
+                        );
+                        assert!(
+                            !out.contains("rite to") && !out.contains("Denied `"),
+                            "no write is announced for a held rule: {out}"
+                        );
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        assert_eq!(fs::read(&fx.locations.global).unwrap(), before);
+
+                        let out = out_of(&mut fx.ctx, ".mesh allow .env --force --global")
+                            .await
+                            .unwrap();
+                        assert!(
+                            out.contains(&format!("written to {}", fx.global())),
+                            "the missing override is written: {out}"
+                        );
+                        assert_eq!(
+                            fx.entries(),
+                            [
+                                allow_entry(Layer::Global, "**", None),
+                                allow_entry(Layer::Global, ".env", None),
+                                deny_entry(Layer::Global, "**/*.rs"),
+                                override_entry(Layer::Global, ".env"),
+                            ],
+                            "the allow is not duplicated; the override joins it"
+                        );
+
+                        let out = out_of(&mut fx.ctx, ".mesh allow .env --force --global")
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            out.lines().last().unwrap(),
+                            &format!(
+                                "`.env` is already allowed for every trusted peer in {}; nothing was changed.",
+                                fx.global()
+                            ),
+                            "a held allow+override pair is a no-op"
+                        );
+                        assert!(
+                            !out.contains("rite to") && !out.contains("Allowed `"),
+                            "no write is announced for a held pair: {out}"
+                        );
+
+                        let out = out_of(&mut fx.ctx, ".mesh allow id_rsa --force --global")
+                            .await
+                            .unwrap();
+                        assert!(
+                            out.contains(&format!("written to {}", fx.global())),
+                            "the built-in deny names `id_rsa` by text; it need not exist: {out}"
+                        );
+                        assert!(
+                            fx.entries()
+                                .contains(&override_entry(Layer::Global, "id_rsa"))
+                        );
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        fx.stop().await;
+                    });
+                }
             }
         }
     }
