@@ -5357,9 +5357,10 @@ impl RequestContext {
     /// real path and a rule naming the link would serve none. Local filesystem and the
     /// published snapshot only; nothing reaches the wire or the trust store, and nothing
     /// is written under the root: case is judged by the node's memoised probe when it
-    /// has one and by the read-only hint otherwise. Empty for a directory prefix the
-    /// verbs would refuse as a pattern or that passes through a symlink, and for a root
-    /// whose probe failed, since the node serves nothing from it; sorted and cut at 200.
+    /// has one, by the read-only hint otherwise, and case-insensitively when neither can
+    /// tell, the direction that hides more. Empty for a directory prefix the verbs would
+    /// refuse as a pattern or that passes through a symlink, and for a root whose probe
+    /// failed, since the node serves nothing from it; sorted and cut at 200.
     fn mesh_completion_share_paths(&self, typed: &str) -> Vec<(String, Option<String>)> {
         use crate::mesh::shares::{CompletionFilter, case_folding_hint, validate_pattern};
 

@@ -19052,6 +19052,252 @@ mod tests {
                         fx.stop().await;
                     });
                 }
+
+                /// Usage probe (write rule: "no workspace file ⇒ global and says so"):
+                /// a workspace file `--workspace` created and bare `allow` then wrote to is
+                /// removed by hand; the next bare `allow` lands in the GLOBAL file and both
+                /// the announcement and the result sentence name the global path, `shares`
+                /// lists only the global rows, and `--workspace` creates the file afresh
+                /// saying "(created)" again.
+                #[test]
+                #[serial]
+                fn usage_probe_bare_allow_falls_back_to_global_after_the_workspace_file_is_removed_by_hand()
+                 {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-ws-removed");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = ShareFixture::new(
+                            "repl-mesh-probe-ws-removed",
+                            &["docs/a.md", "notes/n.md", "src/x.rs", "etc/e.cfg"],
+                        )
+                        .await;
+
+                        out_of(&mut fx.ctx, ".mesh allow docs/** --workspace")
+                            .await
+                            .unwrap();
+                        out_of(&mut fx.ctx, ".mesh allow notes/**").await.unwrap();
+                        assert_eq!(
+                            fx.entries(),
+                            [
+                                allow_entry(Layer::Workspace, "docs/**", None),
+                                allow_entry(Layer::Workspace, "notes/**", None),
+                            ]
+                        );
+                        assert!(!fx.locations.global.exists());
+
+                        fs::remove_file(&fx.locations.workspace).unwrap();
+
+                        let out = out_of(&mut fx.ctx, ".mesh allow src/x.rs").await.unwrap();
+                        let lines: Vec<&str> = out.lines().collect();
+                        assert_eq!(
+                            lines,
+                            [
+                                format!(
+                                    "`src/x.rs` matches 1 file(s) under {}.",
+                                    fx.root.path.display()
+                                ),
+                                format!(
+                                    "Will write to {}: allow `src/x.rs` for every trusted peer.",
+                                    fx.global()
+                                ),
+                                format!(
+                                    "Allowed `src/x.rs` for every trusted peer; written to {}.",
+                                    fx.global()
+                                ),
+                            ],
+                            "{out}"
+                        );
+                        assert!(fx.locations.global.exists());
+                        assert!(
+                            !fx.locations.workspace.exists(),
+                            "a bare allow never re-creates the workspace file"
+                        );
+                        assert_eq!(fx.entries(), [allow_entry(Layer::Global, "src/x.rs", None)]);
+
+                        let out = out_of(&mut fx.ctx, ".mesh shares").await.unwrap();
+                        // The header names both files, the removed one as absent; the rows
+                        // are the global file's alone.
+                        assert!(out.contains(&fx.global()), "{out}");
+                        assert!(
+                            out.contains(&format!("{} (absent)", fx.workspace())),
+                            "{out}"
+                        );
+                        let rows: Vec<&str> =
+                            out.lines().filter(|line| line.starts_with("  ")).collect();
+                        assert_eq!(rows.len(), 1, "{out}");
+                        assert!(
+                            rows[0].contains("src/x.rs") && rows[0].contains("global"),
+                            "{out}"
+                        );
+                        assert!(
+                            !out.lines().skip(1).any(|line| line.contains("workspace")),
+                            "{out}"
+                        );
+                        assert!(
+                            !out.contains("docs/**") && !out.contains("notes/**"),
+                            "{out}"
+                        );
+
+                        let out = out_of(&mut fx.ctx, ".mesh allow etc/e.cfg --workspace")
+                            .await
+                            .unwrap();
+                        assert!(
+                            out.contains(&format!(
+                                "Allowed `etc/e.cfg` for every trusted peer; written to {} (created).",
+                                fx.workspace()
+                            )),
+                            "{out}"
+                        );
+                        assert_eq!(
+                            fx.entries(),
+                            [
+                                allow_entry(Layer::Global, "src/x.rs", None),
+                                allow_entry(Layer::Workspace, "etc/e.cfg", None),
+                            ]
+                        );
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        fx.stop().await;
+                    });
+                }
+
+                /// Usage probe (broad confirm / dry-run write nothing): with a share
+                /// file ALREADY on disk, a declined broad `allow`, `deny` and `unshare`, a
+                /// `--dry-run` of each and a non-TTY refusal all leave the file
+                /// byte-identical — a hand-written comment the serializer would drop is the
+                /// oracle that no rewrite happened — and print `Nothing was changed.` only
+                /// on the declined prompts.
+                #[test]
+                #[serial]
+                fn usage_probe_declined_or_dry_run_mutations_leave_an_existing_share_file_byte_identical()
+                 {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-byte-identical");
+                    let _capture = capture::install();
+                    run_async(async {
+                        let many: Vec<String> =
+                            (0..101).map(|i| format!("docs/f{i:03}.md")).collect();
+                        let mut files: Vec<&str> = many.iter().map(String::as_str).collect();
+                        files.push("notes/n.md");
+                        let mut fx =
+                            ShareFixture::new("repl-mesh-probe-byte-identical", &files).await;
+                        let original = "# hand-written comment the serializer would drop\nversion: 1\nallow:\n- pattern: '**'\n- pattern: notes/**\n";
+                        fx.write_global(original);
+                        let bytes_before = fs::read(&fx.locations.global).unwrap();
+                        assert_eq!(bytes_before, original.as_bytes());
+
+                        let declined = prompt_script::install(&[false, false, false]);
+                        for line in [
+                            ".mesh deny docs/**",
+                            ".mesh allow **/*.md",
+                            ".mesh unshare **",
+                        ] {
+                            let out = out_of(&mut fx.ctx, line).await.unwrap();
+                            assert!(out.contains(NOTHING_CHANGED), "{line}: {out}");
+                        }
+                        assert_eq!(prompt_script::prompts_asked(), 3);
+                        drop(declined);
+
+                        let _script = prompt_script::install(&[]);
+                        for line in [
+                            ".mesh deny docs/** --dry-run",
+                            ".mesh allow **/*.md --dry-run",
+                            ".mesh unshare ** --dry-run",
+                            ".mesh allow notes/** --dry-run",
+                        ] {
+                            let out = out_of(&mut fx.ctx, line).await.unwrap();
+                            assert!(!out.contains("written to"), "{line}: {out}");
+                        }
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        drop(_script);
+
+                        let _non_tty = prompt_script::install_non_interactive();
+                        let err = refusal(&mut fx.ctx, ".mesh deny docs/**").await;
+                        assert!(err.contains("--yes"), "{err}");
+
+                        assert_eq!(
+                            fs::read(&fx.locations.global).unwrap(),
+                            bytes_before,
+                            "declined, dry-run and refused mutations must not rewrite the file"
+                        );
+                        assert!(
+                            !fx.locations.workspace.exists(),
+                            "nothing created a workspace file either"
+                        );
+                        let siblings: Vec<_> = fs::read_dir(fx.locations.global.parent().unwrap())
+                            .unwrap()
+                            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+                            .filter(|name| name.contains(".tmp"))
+                            .collect();
+                        assert!(siblings.is_empty(), "{siblings:?}");
+                        fx.stop().await;
+                    });
+                }
+
+                /// Usage probe (`.mesh on` preview clause boundary): exactly
+                /// `LIST_PAGE_SIZE` distinct shared files is an exact count — "files: 1000
+                /// path(s)" — not the "1000 or more" the page-size cap says one file later,
+                /// and a user deny that takes one away reads "999".
+                #[test]
+                #[serial]
+                fn usage_probe_on_preview_says_exactly_one_thousand_at_the_page_size() {
+                    let config = MeshConfig {
+                        interfaces: vec![MeshInterface::Lan],
+                        ..MeshConfig::default()
+                    };
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-on-preview-exact");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[false, false]);
+                    let mut ctx = ctx_with(config, true);
+                    ctx.session = Some(Session::default());
+                    let root = TempDir::new("repl-mesh-probe-on-preview-exact-root");
+                    let many: Vec<String> = (0..LIST_PAGE_SIZE)
+                        .map(|i| format!("docs/f{i:04}.md"))
+                        .collect();
+                    let many: Vec<&str> = many.iter().map(String::as_str).collect();
+                    seed_files(&root.path, &many);
+                    publish_root(&ctx, &root.path);
+                    let (_, locations) = share_locations(&ctx).unwrap();
+                    write_share_file(
+                        &locations.global,
+                        "version: 1\nallow:\n- pattern: docs/**\n",
+                    );
+
+                    run_async(run(&mut ctx, ".mesh on")).unwrap();
+                    assert!(ctx.app.mesh.get().is_none());
+                    let out = stdout_lines();
+                    let files = index_of(
+                        &out,
+                        &format!(
+                            "  files: {LIST_PAGE_SIZE} path(s) are shared with trusted peers (`.mesh shares`)"
+                        ),
+                    );
+                    assert!(files < index_of(&out, "Mesh stays off"), "{out:?}");
+                    assert!(
+                        !out.iter().any(|line| line.contains("or more")),
+                        "exactly the page size is not past the cap: {out:?}"
+                    );
+
+                    write_share_file(
+                        &locations.global,
+                        "version: 1\nallow:\n- pattern: docs/**\ndeny:\n- pattern: docs/f0000.md\n",
+                    );
+                    let before = out.len();
+                    run_async(run(&mut ctx, ".mesh on")).unwrap();
+                    assert!(ctx.app.mesh.get().is_none());
+                    let out = stdout_lines();
+                    let files = index_of(
+                        &out[before..],
+                        &format!(
+                            "  files: {} path(s) are shared with trusted peers (`.mesh shares`)",
+                            LIST_PAGE_SIZE - 1
+                        ),
+                    );
+                    assert!(
+                        files < index_of(&out[before..], "Mesh stays off"),
+                        "{:?}",
+                        &out[before..]
+                    );
+                }
             }
         }
     }
