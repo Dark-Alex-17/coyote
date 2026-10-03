@@ -6868,9 +6868,14 @@ mod tests {
         assert_eq!(slot.share_root(), Some(root));
     }
 
+    /// The workspace share file is named relative to the root under the default config
+    /// directory name, so the test holds the override unset for its whole body.
     #[cfg(unix)]
     #[test]
+    #[serial_test::serial]
     fn the_slot_names_the_share_files_only_once_a_snapshot_names_a_root() {
+        let _default_name =
+            crate::testing::EnvVarGuard::unset(crate::utils::get_env_name("workspace_config_dir"));
         let slot = MeshSlot::default();
         assert!(slot.share_locations(None).is_none(), "nothing published");
 
