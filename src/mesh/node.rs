@@ -2101,7 +2101,7 @@ impl MeshSlot {
     }
 
     /// Asks the idle-time driver for a propagation fetch; without a driver nothing is
-    /// fetched until `.mesh fetch`.
+    /// fetched until `.mesh sync`.
     pub(crate) fn request_sync(&self) {
         if let Some(sink) = self.idle.load_full() {
             sink.request_sync();

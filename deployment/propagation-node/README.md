@@ -10,12 +10,12 @@ Status in this build: Coyote discovers propagation nodes from their announces (`
 `propagation_nodes`) and posts to the nearest one when a direct link fails (`mesh__send` reports
 `via: store_and_forward`). Held messages are fetched back automatically every `mesh.propagation_sync_interval_secs`
 seconds (default 300; `0` turns the automatic path off, including the join-time fetch) and once a propagation node is
-heard after the node joins; `.mesh fetch` runs a fetch now. A `.mesh knock` to an unreachable peer is parked on the
+heard after the node joins; `.mesh sync` runs a fetch now. A `.mesh knock` to an unreachable peer is parked on the
 node the same way. Coyote's table of propagation nodes is not kept across a Coyote restart, so after a restart the
 first fetch waits for the node's next announce (up to `announce_interval`, 30 minutes with the shipped `lxmd.config`;
-`.mesh fetch` is refused until then too); a held message whose sender has not announced since the restart is kept on
+`.mesh sync` is refused until then too); a held message whose sender has not announced since the restart is kept on
 the node until it has been seen on three fetches and at least 15 minutes (one peer heartbeat) have passed; then it is
-dropped. A Coyote node with `announce: false` never fetches on its own; `.mesh fetch` does.
+dropped. A Coyote node with `announce: false` never fetches on its own; `.mesh sync` does.
 
 ## Build and run
 

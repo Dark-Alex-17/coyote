@@ -4149,7 +4149,7 @@ mod tests {
         installed
             .runtime
             .trust()
-            .untrust_destination(slot.as_ref(), &to)
+            .untrust_destination(slot.as_ref(), &to, SystemTime::now(), false)
             .unwrap();
         let withdrawn = slot.request_access(&to, &paths, "").await.unwrap_err();
         assert_eq!(withdrawn, AccessError::Untrusted);

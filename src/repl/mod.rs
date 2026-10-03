@@ -124,7 +124,7 @@ pub const DEFAULT_CONTINUATION_PROMPT: &str = indoc! {"
     5. Otherwise, continue with the next pending item now. Call tools immediately."
 };
 
-static REPL_COMMANDS: LazyLock<[ReplCommand; 84]> = LazyLock::new(|| {
+static REPL_COMMANDS: LazyLock<[ReplCommand; 83]> = LazyLock::new(|| {
     [
         ReplCommand::new(".help", "Show this help guide", AssertState::pass()),
         ReplCommand::new(".info", "Show system info", AssertState::pass()),
@@ -225,12 +225,17 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 84]> = LazyLock::new(|| {
         ),
         ReplCommand::new(
             ".mesh untrust",
-            "Forget a trusted instance, or an identity together with every instance bound to it",
+            "Forget a trusted instance, or an identity with every instance bound to it; `untrust` forgets, `block` remembers and refuses",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh forget",
+            "alias of `untrust`: forget this peer",
             AssertState::pass(),
         ),
         ReplCommand::new(
             ".mesh block",
-            "Silence a whole identity: its knocks are dropped and its trust removed",
+            "Refuse every instance of an identity, including ones you trusted, and drop its knocks; `block` remembers where `untrust` only forgets",
             AssertState::pass(),
         ),
         ReplCommand::new(
@@ -239,23 +244,13 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 84]> = LazyLock::new(|| {
             AssertState::pass(),
         ),
         ReplCommand::new(
-            ".mesh deny",
-            "Refuse one instance: deny stops one destination being contacted, where block silences a whole identity",
-            AssertState::pass(),
-        ),
-        ReplCommand::new(
-            ".mesh undeny",
-            "Lift a deny on one instance (the identity-level counterpart is unblock)",
-            AssertState::pass(),
-        ),
-        ReplCommand::new(
             ".mesh rotate",
             "Mint a new mesh identity while the node is off; peers must re-trust the new one",
             AssertState::pass(),
         ),
         ReplCommand::new(
-            ".mesh fetch",
-            "Fetch the messages a propagation node holds for this node now",
+            ".mesh sync",
+            "Sync the messages a propagation node holds for this node now",
             AssertState::pass(),
         ),
         ReplCommand::new(
@@ -3383,8 +3378,8 @@ mod tests {
     }
 
     #[test]
-    fn repl_commands_has_84_entries() {
-        assert_eq!(REPL_COMMANDS.len(), 84);
+    fn repl_commands_has_83_entries() {
+        assert_eq!(REPL_COMMANDS.len(), 83);
     }
 
     #[test]
@@ -3401,7 +3396,7 @@ mod tests {
             .iter()
             .map(|(verb, description, _)| (*verb, *description))
             .collect();
-        assert_eq!(commands.len(), 21);
+        assert_eq!(commands.len(), 20);
         assert_eq!(commands, verbs);
     }
 

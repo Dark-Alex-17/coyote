@@ -233,7 +233,7 @@ pub(crate) struct SyncSchedule {
 
 impl SyncSchedule {
     /// `interval_secs` of 0, or a node that does not announce, means fetch only on
-    /// `.mesh fetch`: no request is accepted and no timer is armed. A fetch identifies
+    /// `.mesh sync`: no request is accepted and no timer is armed. A fetch identifies
     /// this node to the propagation node, which an `announce: false` operator chose not
     /// to have happen on its own.
     pub(crate) fn new(interval_secs: u64, announce: bool) -> Self {

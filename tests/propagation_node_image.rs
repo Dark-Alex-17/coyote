@@ -1442,7 +1442,7 @@ fn usage_probe_docs_say_messages_are_posted_and_held_messages_are_fetched_back_a
     );
     assert!(
         readme.contains(
-            "Coyote's table of propagation nodes is not kept across a Coyote restart, so after a restart the first fetch waits for the node's next announce (up to `announce_interval`, 30 minutes with the shipped `lxmd.config`; `.mesh fetch` is refused until then too)"
+            "Coyote's table of propagation nodes is not kept across a Coyote restart, so after a restart the first fetch waits for the node's next announce (up to `announce_interval`, 30 minutes with the shipped `lxmd.config`; `.mesh sync` is refused until then too)"
         ),
         "deployment README must say whose table is lost on restart and how long the first fetch can wait"
     );

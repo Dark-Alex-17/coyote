@@ -3542,7 +3542,7 @@ mod tests {
         }
 
         /// A fetch identifies the node to the propagation node, so a node whose operator
-        /// chose not to announce is never identified on its own; `.mesh fetch` still is.
+        /// chose not to announce is never identified on its own; `.mesh sync` still is.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn a_node_that_does_not_announce_never_fetches_automatically() {
             let ctx = ctx_for(MeshConfig {
@@ -3731,7 +3731,7 @@ mod tests {
 
         /// Usage probe (TASK-100 (b)): the `.mesh off` / `.mesh on` cycle. Leaving the mesh
         /// disarms the schedule with nothing owed; the NEXT install asks again on its own,
-        /// so a rejoined node gets its join-time fetch without `.mesh fetch`, and a fetch
+        /// so a rejoined node gets its join-time fetch without `.mesh sync`, and a fetch
         /// that receives nothing stays silent across both joins.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn rejoining_after_mesh_off_starts_the_join_time_sync_again() {

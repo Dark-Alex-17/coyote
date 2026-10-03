@@ -4191,7 +4191,7 @@ pub(crate) mod network {
             )
             .unwrap();
         trust
-            .untrust_destination(slot.as_ref(), &b_instance_hex)
+            .untrust_destination(slot.as_ref(), &b_instance_hex, SystemTime::now(), false)
             .unwrap();
         assert_eq!(
             trust.identity_standing(&b_identity_hex),

@@ -78,7 +78,7 @@ pub struct MeshConfig {
     pub peer_max_cost_usd_per_hour: f64,
     /// Seconds between automatic fetches of the messages a propagation node holds for
     /// this node, the first running once a propagation node is heard after the node
-    /// joins; 0 = fetch only on `.mesh fetch`; off while `announce` is false, since a
+    /// joins; 0 = fetch only on `.mesh sync`; off while `announce` is false, since a
     /// fetch identifies this node to the propagation node.
     /// Sideband's `lxmf_sync_interval` defaults to 43200 s with periodic sync off and
     /// NomadNet's to 21600 s; neither fits an interactive REPL, so 300 s is used.
@@ -800,7 +800,7 @@ mod tests {
         }
     }
 
-    /// Usage probe (TASK-100 (b)/(f)): the documented `0 = fetch only on .mesh fetch` is a
+    /// Usage probe (TASK-100 (b)/(f)): the documented `0 = fetch only on .mesh sync` is a
     /// VALID setting for an enabled mesh, unlike the rate and retention keys where 0 is out
     /// of range; an absent key reads as the documented 300; a negative or fractional value
     /// is refused at parse time naming the key rather than silently clamped.
