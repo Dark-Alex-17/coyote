@@ -2046,9 +2046,10 @@ fn classify_share(args: MutationArgs, verb: &str) -> Result<Option<ShareArgs>> {
 }
 
 /// The completer offers a directory as `docs/`, which no share rule can hold, so the
-/// human hears what to type rather than that the pattern has an empty segment.
+/// human hears what to type rather than that the pattern has an empty segment. Slashes
+/// alone name the filesystem root, which `validate_pattern` has the sentence for.
 fn refuse_directory_pattern(pattern: &str, does: &str) -> Result<()> {
-    if pattern.ends_with('/') {
+    if pattern.ends_with('/') && !pattern.starts_with('/') {
         bail!("`{pattern}` names a directory; {does} `{pattern}**`, or one file by its path.");
     }
     Ok(())
@@ -3028,12 +3029,18 @@ fn audience(interface: &MeshInterface) -> &'static str {
 fn shared_count(ctx: &RequestContext) -> Option<MatchCount> {
     let (root, locations) = share_locations(ctx)?;
     let (set, _warning) = ShareSet::load_quietly(locations);
-    Some(set.count_shared(
+    let count = set.count_shared(
         &PeerRef::unscoped(),
         case_folding_hint(&root).unwrap_or(false),
         DEFAULT_LIST_WALK_BOUND,
-        LIST_PAGE_SIZE,
-    ))
+        LIST_PAGE_SIZE + 1,
+    );
+    // The walk caps at `cap` files seen, so one past the page tells a full page from more.
+    Some(MatchCount {
+        files: count.files.min(LIST_PAGE_SIZE),
+        capped: count.files > LIST_PAGE_SIZE,
+        truncated: count.truncated,
+    })
 }
 
 /// What `.mesh on` prints before anything leaves the machine.
@@ -12894,6 +12901,13 @@ mod tests {
                             refusal(&mut fx.ctx, ".mesh unshare docs/").await,
                             "`docs/` names a directory; name what is under it with `docs/**`, or one file by its path."
                         );
+                        for line in [".mesh allow /", ".mesh deny //", ".mesh unshare /docs/"] {
+                            let err = refusal(&mut fx.ctx, line).await;
+                            assert!(
+                                err.contains("Share patterns are relative to the workspace root"),
+                                "{line}: a root-anchored slash is not a directory to glob under: {err}"
+                            );
+                        }
                         assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
                         assert!(!fx.locations.global.exists());
                         assert!(!fx.locations.workspace.exists());

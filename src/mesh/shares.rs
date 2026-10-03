@@ -354,7 +354,7 @@ impl ShareLocations {
         )
     }
 
-    pub(crate) fn with_dir_name(
+    fn with_dir_name(
         config_dir: &Path,
         workspace_root: &Path,
         workspace_config_dir_name: String,
@@ -2040,7 +2040,15 @@ mod tests {
         assert_eq!(written, locations.global);
         assert!(locations.global.exists());
         assert!(!locations.workspace.exists());
-        assert!(!locations.global.with_added_extension("tmp").exists());
+        let siblings: Vec<String> = fs::read_dir(locations.global.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(
+            siblings,
+            ["shares.yaml"],
+            "the atomic write leaves no temp file behind"
+        );
 
         let fx = Fixture::new("shares-apply-auto-workspace");
         let locations = fx.locations();
