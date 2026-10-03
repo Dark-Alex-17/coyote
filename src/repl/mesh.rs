@@ -18691,6 +18691,367 @@ mod tests {
                         assert!(violations.is_empty(), "{}", violations.join("\n"));
                     });
                 }
+
+                /// Usage probe r10 (a): the "ANY segment — literal or behind a glob" rule
+                /// covers the workspace config directory's name as well as `.git`: with a
+                /// glob segment ahead of it (`*/.coyote/mesh-shares.yaml`, `**/.coyote/**`)
+                /// both `allow` and `deny` refuse as never shared, write nothing, print
+                /// nothing and ask nothing — `--dry-run` included. The trailing-slash
+                /// spelling behind a glob is the pure pre-gate refusal (fires while the
+                /// mesh is off); the no-slash spelling waits behind the gate like every
+                /// other check that needs the root.
+                #[test]
+                #[serial]
+                fn usage_probe_r10_config_dir_name_behind_a_glob_is_refused_by_the_verbs() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-cfg-behind-glob");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install_answering(|_| false);
+                    let dir = crate::config::WORKSPACE_COYOTE_DIR_NAME;
+                    run_async(async {
+                        let mut fx = ShareFixture::new(
+                            "repl-mesh-probe-cfg-behind-glob",
+                            &[
+                                "vendor/dep/.coyote/mesh-shares.yaml",
+                                "vendor/dep/src/lib.rs",
+                                "docs/a.md",
+                            ],
+                        )
+                        .await;
+
+                        let mut violations = Vec::new();
+                        for line in [
+                            format!(".mesh allow */{dir}/mesh-shares.yaml"),
+                            format!(".mesh allow vendor/*/{dir}/**"),
+                            format!(".mesh allow **/{dir}/**"),
+                            format!(".mesh deny vendor/*/{dir}/*.yaml"),
+                            format!(".mesh deny **/{dir}/**"),
+                            format!(".mesh allow */{dir}/mesh-shares.yaml --dry-run"),
+                            format!(".mesh allow vendor/*/{dir}/ --dry-run"),
+                            format!(".mesh deny **/{dir}/"),
+                        ] {
+                            let before = stdout_lines().len();
+                            match out_of(&mut fx.ctx, &line).await {
+                                Ok(out) => violations
+                                    .push(format!("{line}: accepted instead of refused: {out:?}")),
+                                Err(err) => {
+                                    let err = err.to_string();
+                                    if !err.contains("never shared")
+                                        || !err.contains(&format!("`{dir}/`"))
+                                        || !err.contains("nothing was written")
+                                    {
+                                        violations.push(format!("{line}: {err}"));
+                                    }
+                                    // No remedy under the protected directory is taught.
+                                    if err.contains(".mesh allow") || err.contains(".mesh deny") {
+                                        violations.push(format!("{line}: teaches a remedy: {err}"));
+                                    }
+                                }
+                            }
+                            let printed = &stdout_lines()[before..];
+                            if !printed.is_empty() {
+                                violations.push(format!("{line}: printed {printed:?}"));
+                            }
+                        }
+                        if prompt_script::prompts_asked() != 0 {
+                            violations.push(format!(
+                                "{} question(s) asked about a pattern under {dir}",
+                                prompt_script::prompts_asked()
+                            ));
+                        }
+                        if !fx.entries().is_empty() {
+                            violations.push(format!("a rule was written: {:?}", fx.entries()));
+                        }
+                        // The refusal's claim is true on the serving side: the ordinary
+                        // glob beside it is accepted, but the nested config-dir file is
+                        // held back by the built-in deny at any depth, so `--effective`
+                        // never lists it (the match count is the pattern alone, per the
+                        // plan, and may include it).
+                        let out = out_of(&mut fx.ctx, ".mesh allow vendor/*/**")
+                            .await
+                            .unwrap();
+                        assert!(out.contains("written to"), "{out}");
+                        assert_eq!(
+                            fx.entries(),
+                            [allow_entry(Layer::Global, "vendor/*/**", None)]
+                        );
+                        let out = out_of(&mut fx.ctx, ".mesh shares --effective")
+                            .await
+                            .unwrap();
+                        assert!(
+                            out.lines().any(|l| l.trim() == "vendor/dep/src/lib.rs"),
+                            "{out}"
+                        );
+                        let nested = format!("vendor/dep/{dir}/mesh-shares.yaml");
+                        let nested_rows: Vec<&str> =
+                            out.lines().filter(|l| l.contains(&nested)).collect();
+                        assert!(
+                            nested_rows
+                                .iter()
+                                .all(|row| row.contains("(built-in deny)")),
+                            "a nested `{dir}` file is never fetchable, so any row for it carries the built-in-deny mark: {out}"
+                        );
+                        let identity = "1a".repeat(16);
+                        let destination = "2b".repeat(16);
+                        let peer = PeerRef {
+                            identity: &identity,
+                            destination: &destination,
+                        };
+                        assert!(
+                            !ShareSet::load_quietly(fx.locations.clone())
+                                .0
+                                .is_allowed(&peer, &nested, false),
+                            "wire path must agree: {nested} is held back"
+                        );
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        fx.stop().await;
+                        assert!(violations.is_empty(), "{}", violations.join("\n"));
+                    });
+
+                    // Mesh OFF: the slash form behind a glob is pure and fires before the
+                    // gate; the no-slash form needs the root and waits behind it.
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    for line in [
+                        format!(".mesh allow */{dir}/"),
+                        format!(".mesh deny **/{dir}/"),
+                        format!(".mesh allow vendor/*/{dir}/"),
+                    ] {
+                        let err = err_of(&mut ctx, &line);
+                        assert_ne!(err, MESH_OFF, "{line}");
+                        assert!(err.contains("never shared"), "{line}: {err}");
+                    }
+                    for line in [
+                        format!(".mesh allow */{dir}/mesh-shares.yaml"),
+                        format!(".mesh deny **/{dir}/**"),
+                    ] {
+                        assert_eq!(err_of(&mut ctx, &line), MESH_OFF, "{line}");
+                    }
+                }
+
+                /// Usage probe r10 (a): the segment test stays WHOLE-SEGMENT EQUALITY when
+                /// it runs behind a glob — `*/.gitignore`, `*/.github/**`, `*/foo.git/HEAD`,
+                /// `src/*/x.rs` and `*/.coyote-notes/*` are ordinary patterns with the
+                /// right counts — and a GLOB segment never matches by name even when it
+                /// would match `.git` as a glob (`.git*`, `*.git/HEAD`, `vendor/*/.g*/**`):
+                /// such a pattern is counted by the walk, which never enters `.git`, so
+                /// `.git*` reaches `.gitignore` alone. A lookalike behind a glob is a rule
+                /// like any other: written, listed by `--effective`, never a `.git` file.
+                #[test]
+                #[serial]
+                fn usage_probe_r10_lookalikes_and_glob_segments_behind_a_glob_are_ordinary() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-lookalikes-glob");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install_answering(|_| true);
+                    run_async(async {
+                        let mut fx = ShareFixture::new(
+                            "repl-mesh-probe-lookalikes-glob",
+                            &[
+                                ".gitignore",
+                                ".gitattributes",
+                                "sub/.gitignore",
+                                ".github/ci.yml",
+                                "sub/.github/ci.yml",
+                                "sub/.github/CODEOWNERS",
+                                "foo.git/HEAD",
+                                "vendor/foo.git/HEAD",
+                                "src/git/x.rs",
+                                "sub/.coyote-notes/a.md",
+                                ".git/HEAD",
+                                ".git/config",
+                                "vendor/dep/.git/HEAD",
+                                "vendor/dep/src/lib.rs",
+                            ],
+                        )
+                        .await;
+
+                        let mut violations = Vec::new();
+                        for (line, count) in [
+                            (".mesh allow */.gitignore --dry-run", "matches 1 file(s)"),
+                            (".mesh allow */.github/** --dry-run", "matches 2 file(s)"),
+                            (".mesh allow */foo.git/HEAD --dry-run", "matches 1 file(s)"),
+                            (".mesh allow src/*/x.rs --dry-run", "matches 1 file(s)"),
+                            (
+                                ".mesh allow */.coyote-notes/* --dry-run",
+                                "matches 1 file(s)",
+                            ),
+                            (".mesh deny */.github/** --dry-run", "matches 2 file(s)"),
+                            // Glob segments that would match `.git` as a glob are not
+                            // the name `.git`; the walk decides, and never enters it.
+                            (".mesh allow .git* --dry-run", "matches 2 file(s)"),
+                            (".mesh allow *.git/HEAD --dry-run", "matches 1 file(s)"),
+                            (".mesh allow vendor/*/.g*/** --dry-run", "matches 0 file(s)"),
+                            (".mesh deny .git* --dry-run", "matches 2 file(s)"),
+                        ] {
+                            match out_of(&mut fx.ctx, line).await {
+                                Ok(out) => {
+                                    if !out.contains(count) || !out.contains("Would write to") {
+                                        violations.push(format!("{line}: {out:?}"));
+                                    }
+                                }
+                                Err(err) => violations.push(format!("{line}: refused: {err}")),
+                            }
+                        }
+                        // Trailing slash on a lookalike behind a glob keeps the ordinary
+                        // `<dir>/**` teaching, never the protected-directory refusal.
+                        for (line, taught) in [
+                            (".mesh allow */.github/", "*/.github/**"),
+                            (".mesh allow */foo.git/", "*/foo.git/**"),
+                            (".mesh deny sub/.coyote-notes/", "sub/.coyote-notes/**"),
+                        ] {
+                            let err = refusal(&mut fx.ctx, line).await;
+                            if err.contains("never shared") || taught_pattern(&err) != taught {
+                                violations.push(format!("{line}: {err}"));
+                            }
+                        }
+                        assert_eq!(prompt_script::prompts_asked(), 0, "{violations:?}");
+
+                        // One real write behind a glob, and one broad one (confirmed).
+                        let out = out_of(&mut fx.ctx, ".mesh allow */.github/**")
+                            .await
+                            .unwrap();
+                        assert!(out.contains("written to"), "{out}");
+                        let out = out_of(&mut fx.ctx, ".mesh allow **/.gitignore")
+                            .await
+                            .unwrap();
+                        assert!(out.contains("written to"), "{out}");
+                        assert_eq!(
+                            prompt_script::prompts_asked(),
+                            1,
+                            "only the `**`-rooted pattern is broad"
+                        );
+                        assert_eq!(
+                            fx.entries(),
+                            [
+                                allow_entry(Layer::Global, "*/.github/**", None),
+                                allow_entry(Layer::Global, "**/.gitignore", None),
+                            ]
+                        );
+                        let out = out_of(&mut fx.ctx, ".mesh shares --effective")
+                            .await
+                            .unwrap();
+                        for want in [
+                            "sub/.github/ci.yml",
+                            "sub/.github/CODEOWNERS",
+                            "sub/.gitignore",
+                        ] {
+                            assert!(out.lines().any(|l| l.trim() == want), "{want}: {out}");
+                        }
+                        assert!(out.lines().any(|l| l.trim() == ".gitignore"), "{out}");
+                        assert!(
+                            !out.contains(".git/HEAD") && !out.contains(".git/config"),
+                            "{out}"
+                        );
+                        fx.stop().await;
+                        assert!(violations.is_empty(), "{}", violations.join("\n"));
+                    });
+                }
+
+                /// Usage probe r10 (a)/(h): rows under `.git` BEHIND A GLOB that an older
+                /// file (or a hand) placed are still inspectable and removable — `.mesh
+                /// shares` lists them with their file, the `unshare` completer offers them,
+                /// `--effective` never lists a `.git` file for them, and `unshare` removes
+                /// each (a single holder without a question; the `**`-rooted one after
+                /// the broad confirmation) — removal is the remedy, so the write verbs'
+                /// never-shared refusal does not stand in its way.
+                #[test]
+                #[serial]
+                fn usage_probe_r10_unshare_removes_hand_placed_behind_glob_git_rows() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-probe-unshare-glob-git");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install_answering(|_| true);
+                    run_async(async {
+                        let mut fx = ShareFixture::new(
+                            "repl-mesh-probe-unshare-glob-git",
+                            &[
+                                "vendor/dep/.git/HEAD",
+                                "vendor/dep/.git/hooks/pre-commit",
+                                "vendor/dep/src/lib.rs",
+                                "docs/a.md",
+                            ],
+                        )
+                        .await;
+                        fx.write_global(
+                            "version: 1\nallow:\n- pattern: vendor/*/.git/HEAD\n- pattern: '**/.git/**'\n- pattern: docs/**\ndeny:\n- pattern: '*/.git/hooks/*'\n",
+                        );
+
+                        let out = out_of(&mut fx.ctx, ".mesh shares").await.unwrap();
+                        for want in [
+                            "vendor/*/.git/HEAD",
+                            "**/.git/**",
+                            "*/.git/hooks/*",
+                            "docs/**",
+                        ] {
+                            assert!(out.contains(want), "{want}: {out}");
+                        }
+                        assert!(out.contains(&fx.global()), "{out}");
+
+                        let out = out_of(&mut fx.ctx, ".mesh shares --effective")
+                            .await
+                            .unwrap();
+                        assert!(out.lines().any(|l| l.trim() == "docs/a.md"), "{out}");
+                        assert!(!out.contains(".git/"), "{out}");
+
+                        let offered = fx.ctx.repl_complete(".mesh", &["unshare", ""], "");
+                        let labels: Vec<&str> = offered.iter().map(|(v, _)| v.as_str()).collect();
+                        for want in ["vendor/*/.git/HEAD", "**/.git/**", "*/.git/hooks/*"] {
+                            assert!(
+                                labels.contains(&want),
+                                "unshare completion omits {want}: {labels:?}"
+                            );
+                        }
+
+                        // The write verbs still refuse the same spellings (no re-add).
+                        for line in [
+                            ".mesh allow vendor/*/.git/HEAD",
+                            ".mesh deny */.git/hooks/*",
+                        ] {
+                            let err = refusal(&mut fx.ctx, line).await;
+                            assert!(err.contains("never shared"), "{line}: {err}");
+                        }
+
+                        let out = out_of(&mut fx.ctx, ".mesh unshare vendor/*/.git/HEAD")
+                            .await
+                            .unwrap();
+                        assert!(
+                            out.contains("Removed") && out.contains("vendor/*/.git/HEAD"),
+                            "{out}"
+                        );
+                        assert_eq!(
+                            prompt_script::prompts_asked(),
+                            0,
+                            "a single holder asks nothing"
+                        );
+
+                        let out = out_of(&mut fx.ctx, ".mesh unshare */.git/hooks/*")
+                            .await
+                            .unwrap();
+                        assert!(
+                            out.contains("Removed") && out.contains("*/.git/hooks/*"),
+                            "{out}"
+                        );
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+
+                        let out = out_of(&mut fx.ctx, ".mesh unshare **/.git/**")
+                            .await
+                            .unwrap();
+                        assert!(
+                            out.contains("Removed") && out.contains("**/.git/**"),
+                            "{out}"
+                        );
+                        assert_eq!(
+                            prompt_script::prompts_asked(),
+                            1,
+                            "the `**`-rooted pattern is broad"
+                        );
+
+                        assert_eq!(fx.entries(), [allow_entry(Layer::Global, "docs/**", None)]);
+
+                        // Gone: a second unshare finds no holder, and is not a never-shared refusal.
+                        let err = refusal(&mut fx.ctx, ".mesh unshare vendor/*/.git/HEAD").await;
+                        assert!(!err.contains("never shared"), "{err}");
+                        assert_eq!(fx.entries(), [allow_entry(Layer::Global, "docs/**", None)]);
+                        fx.stop().await;
+                    });
+                }
             }
         }
     }
