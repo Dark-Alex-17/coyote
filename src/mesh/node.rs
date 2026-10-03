@@ -3162,6 +3162,7 @@ mod tests {
     use rns_transport::iface::tcp_server::TcpServer;
     #[cfg(unix)]
     use std::sync::atomic::AtomicBool;
+    #[cfg(unix)]
     use std::sync::atomic::Ordering;
     #[cfg(unix)]
     use tokio::net::TcpListener;
