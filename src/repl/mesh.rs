@@ -16,9 +16,9 @@ use crate::mesh::pending::{
     Correlation, InboundKind, InboundRecord, PendingState, access_not_a_question,
 };
 use crate::mesh::shares::{
-    DEFAULT_LIST_WALK_BOUND, GLOB_METACHARACTERS, LIST_PAGE_SIZE, Layer, Mutation, PeerRef,
-    RawKind, ShareSet, Verdict as ShareVerdict, WriteScope, is_broad_pattern, is_canonical_peer,
-    validate_override, validate_pattern,
+    DEFAULT_LIST_WALK_BOUND, GLOB_METACHARACTERS, LIST_PAGE_SIZE, Layer, MatchCount, Mutation,
+    PeerRef, RawKind, ShareSet, Verdict as ShareVerdict, WriteScope, is_broad_pattern,
+    is_canonical_peer, validate_override, validate_pattern,
 };
 use crate::mesh::trust::{
     Decision, KeyChange, LiveMesh, Rule, Tier, TrustChange, TrustOptions, TrustRecord, TrustStore,
@@ -2876,33 +2876,19 @@ fn audience(interface: &MeshInterface) -> &'static str {
 }
 
 /// How many paths the share files already hand every trusted peer, for the `.mesh on`
-/// preview; `capped` says the count stopped at `LIST_PAGE_SIZE`.
-struct SharedCount {
-    paths: usize,
-    capped: bool,
-}
-
-/// Counts the peer-less entries only, what every trusted peer gets, after the built-in
-/// and user denies; a peer-scoped allow is not counted. Resolved without the case probe,
-/// since nothing may touch the tree before the user consents to serving it. `None` before
-/// a snapshot names the share root.
-fn shared_count(ctx: &RequestContext) -> Option<SharedCount> {
+/// preview: the peer-less entries only, after the built-in and user denies, so a
+/// peer-scoped allow is not counted and neither is a file a deny holds back. Counted up
+/// to `LIST_PAGE_SIZE`, without the case probe, since nothing may touch the tree before
+/// the user consents to serving it. `None` before a snapshot names the share root.
+fn shared_count(ctx: &RequestContext) -> Option<MatchCount> {
     let (_, locations) = ctx.app.mesh.share_locations()?;
     let (set, _warning) = ShareSet::load_quietly(locations);
-    let resolved = set.resolve(
+    Some(set.count_shared(
         &PeerRef::unscoped(),
         false,
         DEFAULT_LIST_WALK_BOUND,
         LIST_PAGE_SIZE,
-    );
-    Some(SharedCount {
-        paths: resolved
-            .entries
-            .iter()
-            .filter(|entry| entry.verdict == ShareVerdict::Shared)
-            .count(),
-        capped: resolved.capped,
-    })
+    ))
 }
 
 /// What `.mesh on` prints before anything leaves the machine.
@@ -2910,7 +2896,7 @@ fn render_on_preview(
     config: &MeshConfig,
     session_name: &str,
     fresh: bool,
-    shared: Option<SharedCount>,
+    shared: Option<MatchCount>,
 ) -> String {
     let mut lines = vec![
         format!(
@@ -2945,11 +2931,15 @@ fn render_on_preview(
     lines.push(
         "  status card and brief: this session's objective, state, repo and todo, served to trusted peers on request".to_string(),
     );
-    if let Some(shared) = shared.filter(|shared| shared.paths > 0) {
-        let n = if shared.capped {
-            format!("{LIST_PAGE_SIZE} or more")
-        } else {
-            shared.paths.to_string()
+    if let Some(shared) = shared.filter(|shared| shared.files > 0) {
+        let n = match shared {
+            MatchCount { capped: true, .. } => format!("{LIST_PAGE_SIZE} or more"),
+            MatchCount {
+                truncated: true,
+                files,
+                ..
+            } => format!("at least {files}"),
+            MatchCount { files, .. } => files.to_string(),
         };
         lines.push(format!(
             "  files: {n} path(s) are shared with trusted peers (`.mesh shares`)"
@@ -13317,24 +13307,26 @@ mod tests {
                         interfaces: vec![MeshInterface::Lan],
                         ..MeshConfig::default()
                     };
-                    let clause = |shared: Option<SharedCount>| {
+                    let clause = |shared: Option<MatchCount>| {
                         render_on_preview(&config, "work", false, shared)
                             .lines()
                             .find(|line| line.starts_with("  files:"))
                             .map(str::to_string)
                     };
                     assert_eq!(
-                        clause(Some(SharedCount {
-                            paths: 3,
-                            capped: false
+                        clause(Some(MatchCount {
+                            files: 3,
+                            capped: false,
+                            truncated: false,
                         }))
                         .as_deref(),
                         Some("  files: 3 path(s) are shared with trusted peers (`.mesh shares`)")
                     );
                     assert_eq!(
-                        clause(Some(SharedCount {
-                            paths: LIST_PAGE_SIZE,
-                            capped: true
+                        clause(Some(MatchCount {
+                            files: LIST_PAGE_SIZE,
+                            capped: true,
+                            truncated: false,
                         }))
                         .as_deref(),
                         Some(
@@ -13342,9 +13334,34 @@ mod tests {
                         )
                     );
                     assert_eq!(
-                        clause(Some(SharedCount {
-                            paths: 0,
-                            capped: false
+                        clause(Some(MatchCount {
+                            files: 7,
+                            capped: false,
+                            truncated: true,
+                        }))
+                        .as_deref(),
+                        Some(
+                            "  files: at least 7 path(s) are shared with trusted peers (`.mesh shares`)"
+                        ),
+                        "a walk cut short names a floor, not a count"
+                    );
+                    assert_eq!(
+                        clause(Some(MatchCount {
+                            files: LIST_PAGE_SIZE,
+                            capped: true,
+                            truncated: true,
+                        }))
+                        .as_deref(),
+                        Some(
+                            "  files: 1000 or more path(s) are shared with trusted peers (`.mesh shares`)"
+                        ),
+                        "the cap wins when both hold"
+                    );
+                    assert_eq!(
+                        clause(Some(MatchCount {
+                            files: 0,
+                            capped: false,
+                            truncated: false,
                         })),
                         None
                     );
@@ -13901,6 +13918,44 @@ mod tests {
                     let files = index_of(
                         &out,
                         "  files: 1000 or more path(s) are shared with trusted peers (`.mesh shares`)",
+                    );
+                    assert!(files < index_of(&out, "Mesh stays off"), "{out:?}");
+                }
+
+                /// The cap is on what peers get, not on what the allows reach: a page of
+                /// denied files sorting ahead of the one shared file leaves the count at 1.
+                #[test]
+                #[serial]
+                fn mesh_on_preview_counts_shared_files_only_when_denied_ones_fill_the_page_first() {
+                    let config = MeshConfig {
+                        interfaces: vec![MeshInterface::Lan],
+                        ..MeshConfig::default()
+                    };
+                    let _guard = TestConfigDirGuard::new("repl-mesh-on-preview-denied-first");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[false]);
+                    let mut ctx = ctx_with(config, true);
+                    ctx.session = Some(Session::default());
+                    let root = TempDir::new("repl-mesh-on-preview-denied-first-root");
+                    let mut many: Vec<String> = (0..LIST_PAGE_SIZE + 1)
+                        .map(|i| format!("a-denied/f{i:04}.md"))
+                        .collect();
+                    many.push("z-shared/one.md".to_string());
+                    let many: Vec<&str> = many.iter().map(String::as_str).collect();
+                    seed_files(&root.path, &many);
+                    publish_root(&ctx, &root.path);
+                    let (_, locations) = ctx.app.mesh.share_locations().unwrap();
+                    write_share_file(
+                        &locations.global,
+                        "version: 1\nallow:\n- pattern: '**'\ndeny:\n- pattern: a-denied/**\n",
+                    );
+
+                    run_async(run(&mut ctx, ".mesh on")).unwrap();
+                    assert!(ctx.app.mesh.get().is_none());
+                    let out = stdout_lines();
+                    let files = index_of(
+                        &out,
+                        "  files: 1 path(s) are shared with trusted peers (`.mesh shares`)",
                     );
                     assert!(files < index_of(&out, "Mesh stays off"), "{out:?}");
                 }

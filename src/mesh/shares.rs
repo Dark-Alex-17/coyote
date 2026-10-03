@@ -286,8 +286,8 @@ pub(crate) struct ResolvedEntry {
     pub verdict: Verdict,
 }
 
-/// How many regular files one pattern alone reaches under the share root, counted up to
-/// `cap`: `capped` says the count stopped there, `truncated` that the walk hit its bound.
+/// How many regular files a walk kept, counted up to `cap`: `capped` says the count
+/// stopped there, `truncated` that the walk hit its bound.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MatchCount {
     pub files: usize,
@@ -742,12 +742,16 @@ impl ShareSet {
         walk_bound: usize,
     ) -> Walk<'r> {
         let mut walk = Walk::new(rules, walk_bound, usize::MAX);
-        walk.run_from(
-            self.effective(peer)
-                .iter()
-                .map(|entry| entry.pattern.as_str()),
-        );
+        let patterns = self.allow_patterns(peer);
+        walk.run_from(patterns.iter().map(String::as_str));
         walk
+    }
+
+    fn allow_patterns(&self, peer: &PeerRef<'_>) -> Vec<String> {
+        self.effective(peer)
+            .into_iter()
+            .map(|entry| entry.pattern)
+            .collect()
     }
 
     pub(crate) fn write_target(&self, scope: WriteScope) -> Layer {
@@ -866,6 +870,34 @@ impl ShareSet {
             entries,
             truncated,
             capped,
+        }
+    }
+
+    /// How many files `peer` would actually be served, counted up to `cap` and no
+    /// further: the walk behind `resolve` keeping only the `Shared` verdicts, so a
+    /// thousand denied files sorting ahead of one shared file still count as one. A set
+    /// whose rules cannot be built counts nothing.
+    pub(crate) fn count_shared(
+        &self,
+        peer: &PeerRef<'_>,
+        case_insensitive: bool,
+        walk_bound: usize,
+        cap: usize,
+    ) -> MatchCount {
+        let Ok(rules) = self.rules(peer, case_insensitive) else {
+            return MatchCount {
+                files: 0,
+                capped: false,
+                truncated: false,
+            };
+        };
+        let mut walk = Walk::new(&rules, walk_bound, cap).keeping_only(Verdict::Shared);
+        let patterns = self.allow_patterns(peer);
+        walk.run_from(patterns.iter().map(String::as_str));
+        MatchCount {
+            files: walk.candidates.len(),
+            capped: walk.capped,
+            truncated: walk.truncated,
         }
     }
 
@@ -1070,6 +1102,8 @@ struct Walk<'a> {
     /// Files kept before the walk stops; `usize::MAX` keeps them all.
     cap: usize,
     capped: bool,
+    /// When set, only files with this verdict are kept and counted against `cap`.
+    only: Option<Verdict>,
     candidates: Vec<Candidate>,
 }
 
@@ -1089,8 +1123,14 @@ impl<'a> Walk<'a> {
             truncated: false,
             cap,
             capped: false,
+            only: None,
             candidates: Vec::new(),
         }
+    }
+
+    fn keeping_only(mut self, verdict: Verdict) -> Self {
+        self.only = Some(verdict);
+        self
     }
 
     /// Walks from the literal head of each pattern rather than from the root, so a share
@@ -1166,6 +1206,9 @@ impl<'a> Walk<'a> {
             return;
         }
         let verdict = self.rules.verdict(&wire, &canonical);
+        if self.only.is_some_and(|only| only != verdict) {
+            return;
+        }
         self.candidates.push(Candidate {
             path: wire_text,
             canonical,
@@ -2654,6 +2697,44 @@ mod tests {
             [".env", "docs/a.md"]
         );
         assert!(resolved.capped);
+    }
+
+    #[test]
+    fn count_shared_counts_only_the_shared_verdicts_and_caps_on_them_alone() {
+        let (fx, set) = resolve_fixture("count-shared");
+        fx.file("docs/b.md");
+
+        let count = set.count_shared(&PeerRef::unscoped(), false, DEFAULT_LIST_WALK_BOUND, 2);
+        assert_eq!(
+            count,
+            MatchCount {
+                files: 2,
+                capped: true,
+                truncated: false,
+            },
+            "`.env` and `src/vault/k` are denied, so the cap of 2 is reached by the two docs"
+        );
+
+        let uncapped = set.count_shared(&PeerRef::unscoped(), false, DEFAULT_LIST_WALK_BOUND, 3);
+        assert_eq!(
+            uncapped,
+            MatchCount {
+                files: 2,
+                capped: false,
+                truncated: false,
+            }
+        );
+        assert!(
+            set.count_shared(&PeerRef::unscoped(), false, 2, LIST_PAGE_SIZE)
+                .truncated
+        );
+        fx.write(Layer::Global, "version: 1\nallow: [\n");
+        assert_eq!(
+            fx.load()
+                .count_shared(&PeerRef::unscoped(), false, DEFAULT_LIST_WALK_BOUND, 2)
+                .files,
+            0
+        );
     }
 
     #[test]
