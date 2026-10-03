@@ -1110,6 +1110,31 @@ pub(crate) fn probe_case_insensitive(root: &Path) -> Result<bool> {
     Ok(folds)
 }
 
+/// A read-only stand-in for `probe_case_insensitive` where nothing may be created under
+/// the root yet, as in the views shown before the human consents to serving the tree:
+/// the first entry of `root` with an ASCII letter in its name is looked up under the
+/// other case. `None` when the directory cannot be read or holds no such entry. A root
+/// holding both spellings of a name reads as folding, which over-states at consent;
+/// that is the safe direction, since the denies are then judged across case too.
+pub(crate) fn case_folding_hint(root: &Path) -> Option<bool> {
+    let name = fs::read_dir(root)
+        .ok()?
+        .flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .find(|name| name.chars().any(|c| c.is_ascii_alphabetic()))?;
+    let swapped: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_lowercase() {
+                c.to_ascii_uppercase()
+            } else {
+                c.to_ascii_lowercase()
+            }
+        })
+        .collect();
+    Some(fs::symlink_metadata(root.join(swapped)).is_ok())
+}
+
 /// The directory walk behind `list`, `resolve` and `count_matches`: an explicit stack, a
 /// budget of entries to visit, a cap on the files kept, and every regular file an allow
 /// names, unopened and with its verdict, so one traversal serves a peer's listing and
@@ -4142,6 +4167,61 @@ mod tests {
 
         assert!(err.contains("case probe"), "{err}");
         assert!(!fx.root.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_case_hint_reads_a_case_sensitive_root_from_an_existing_name() {
+        let fx = Fixture::new("hint-sensitive");
+        fx.file("README.md");
+
+        assert_eq!(case_folding_hint(&fx.root), Some(false));
+    }
+
+    #[test]
+    fn the_case_hint_agrees_with_the_probe_and_creates_nothing() {
+        let fx = Fixture::new("hint-agrees");
+        fx.file("README.md");
+
+        let hint = case_folding_hint(&fx.root);
+
+        assert_eq!(hint, Some(probe_case_insensitive(&fx.root).unwrap()));
+        let names: Vec<String> = fs::read_dir(&fx.root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["README.md"]);
+    }
+
+    #[test]
+    fn the_case_hint_has_no_answer_for_an_empty_or_missing_root() {
+        let fx = Fixture::new("hint-empty");
+        assert_eq!(case_folding_hint(&fx.root), None);
+
+        fx.file("1234");
+        assert_eq!(case_folding_hint(&fx.root), None, "no letter to swap");
+
+        fs::remove_dir_all(&fx.root).unwrap();
+        assert_eq!(case_folding_hint(&fx.root), None);
+    }
+
+    /// Both spellings on disk read as folding whatever the disk does; on a folding disk
+    /// the second spelling cannot be created, and the hint is then the probe's case above.
+    #[test]
+    fn the_case_hint_reads_both_spellings_as_folding() {
+        let fx = Fixture::new("hint-both");
+        fx.file("Readme.txt");
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(fx.root.join("rEADME.TXT"))
+        {
+            Ok(_) => {}
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => return,
+            Err(err) => panic!("{err}"),
+        }
+
+        assert_eq!(case_folding_hint(&fx.root), Some(true));
     }
 
     /// Ten files sit outside the allow and the bound admits four visits; a walk that

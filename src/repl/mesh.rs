@@ -18,7 +18,7 @@ use crate::mesh::pending::{
 use crate::mesh::shares::{
     BuiltinHit, DEFAULT_LIST_WALK_BOUND, GLOB_METACHARACTERS, LIST_PAGE_SIZE, Layer, MatchCount,
     Mutation, PeerRef, RawKind, ShareLocations, ShareSet, Verdict as ShareVerdict, WriteScope,
-    is_broad_pattern, is_canonical_peer, validate_override, validate_pattern,
+    case_folding_hint, is_broad_pattern, is_canonical_peer, validate_override, validate_pattern,
 };
 use crate::mesh::trust::{
     Decision, KeyChange, LiveMesh, Rule, Tier, TrustChange, TrustOptions, TrustRecord, TrustStore,
@@ -2041,14 +2041,15 @@ fn loaded_for_writing(ctx: &RequestContext) -> Result<(PathBuf, ShareSet)> {
     Ok((root, set))
 }
 
-/// The node's memoised probe of the share root; `false` while the mesh is off, since the
-/// probe writes a temp file into the root and nothing may touch the tree before the user
-/// consents to serving it.
+/// The node's memoised probe of the share root, or while the mesh is off the read-only
+/// hint, since the probe writes a temp file into the root and nothing may touch the tree
+/// before the user consents to serving it; `false` when neither can tell.
 fn root_folds_case(ctx: &RequestContext, root: &Path) -> bool {
     ctx.app
         .mesh
         .get()
         .and_then(|runtime| runtime.serving().case_insensitive_for(root))
+        .or_else(|| case_folding_hint(root))
         .unwrap_or(false)
 }
 
@@ -2950,14 +2951,15 @@ fn audience(interface: &MeshInterface) -> &'static str {
 /// How many paths the share files already hand every trusted peer, for the `.mesh on`
 /// preview: the peer-less entries only, after the built-in and user denies, so a
 /// peer-scoped allow is not counted and neither is a file a deny holds back. Counted up
-/// to `LIST_PAGE_SIZE`, without the case probe, since nothing may touch the tree before
-/// the user consents to serving it. `None` before a snapshot names the share root.
+/// to `LIST_PAGE_SIZE`, with the read-only case hint in place of the probe, since nothing
+/// may touch the tree before the user consents to serving it. `None` before a snapshot
+/// names the share root.
 fn shared_count(ctx: &RequestContext) -> Option<MatchCount> {
-    let (_, locations) = share_locations(ctx)?;
+    let (root, locations) = share_locations(ctx)?;
     let (set, _warning) = ShareSet::load_quietly(locations);
     Some(set.count_shared(
         &PeerRef::unscoped(),
-        false,
+        case_folding_hint(&root).unwrap_or(false),
         DEFAULT_LIST_WALK_BOUND,
         LIST_PAGE_SIZE,
     ))
