@@ -1871,6 +1871,10 @@ fn shares(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     };
     let text = if args.effective {
         let case = root_case(ctx, &root)?;
+        if let Err(err) = set.rules(&peer_ref, case.unwrap_or(false)) {
+            err_text(&shown_refusal(&format!("{err:#}")));
+            return Ok(());
+        }
         render_effective_shares(
             &set,
             &peer_ref,
@@ -15507,6 +15511,27 @@ mod tests {
                             "  1/2.md",
                         ]
                     );
+                }
+
+                /// A root the rules cannot be judged under resolves nothing, and the view
+                /// says why rather than claiming no allow names a file.
+                #[test]
+                #[serial]
+                fn shares_effective_says_why_when_the_rules_cannot_be_built() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-shares-no-rules");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    let mut ctx = off_ctx();
+                    let root = TempDir::new("repl-mesh-shares-no-rules-root");
+                    publish_root(&ctx, &root.path.join("gone"));
+                    let (_, locations) = share_locations(&ctx).unwrap();
+                    write_share_file(&locations.global, "version: 1\nallow:\n- pattern: '**'\n");
+
+                    run_async(run(&mut ctx, ".mesh shares --effective")).unwrap();
+
+                    let err = stderr_lines().join("\n");
+                    assert!(err.contains("Failed to resolve the share root"), "{err}");
+                    assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
                 }
             }
         }
