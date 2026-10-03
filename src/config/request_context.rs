@@ -5325,6 +5325,14 @@ impl RequestContext {
         values
     }
 
+    /// The share root and its two share files, the configured inbox protected whether or
+    /// not a node is running; `None` before a snapshot names the root.
+    fn share_locations(&self) -> Option<(PathBuf, crate::mesh::shares::ShareLocations)> {
+        self.app
+            .mesh
+            .share_locations(self.app.config.mesh.fetch.inbox_dir.as_deref())
+    }
+
     /// Root-relative paths for `.mesh allow <TAB>` and `.mesh deny <TAB>`: the entries of
     /// the share-root directory `typed` names, directories with a trailing `/`, less
     /// `.git`, the workspace config directory, anything the built-in deny names, and any
@@ -5332,7 +5340,7 @@ impl RequestContext {
     /// nothing reaches the wire or the trust store. Empty for an absolute, backslashed or
     /// `..` prefix, since the verbs refuse those; sorted and cut at 200.
     fn mesh_completion_share_paths(&self, typed: &str) -> Vec<(String, Option<String>)> {
-        let Some((root, _)) = self.app.mesh.share_locations() else {
+        let Some((root, _)) = self.share_locations() else {
             return Vec::new();
         };
         if typed.starts_with('/')
@@ -5399,7 +5407,7 @@ impl RequestContext {
     fn mesh_completion_share_patterns(&self) -> Vec<(String, Option<String>)> {
         use crate::mesh::shares::{Layer, RawKind, ShareSet};
 
-        let Some((_, locations)) = self.app.mesh.share_locations() else {
+        let Some((_, locations)) = self.share_locations() else {
             return Vec::new();
         };
         let mut values = Vec::new();
@@ -23461,7 +23469,7 @@ mod tests {
         let _guard = TestConfigDirGuard::new();
         let fixture = seed_mesh_completion_fixture("rc-mesh-complete-unshare").await;
         let _root = publish_share_root(&fixture.ctx, "rc-mesh-complete-unshare-root");
-        let (_, locations) = fixture.ctx.app.mesh.share_locations().unwrap();
+        let (_, locations) = fixture.ctx.share_locations().unwrap();
         for (path, yaml) in [
             (
                 &locations.global,
@@ -23543,7 +23551,7 @@ mod tests {
         let ctx = create_test_ctx();
         let root = publish_share_root(&ctx, "rc-mesh-complete-allow-off-root");
         seed_share_files(&root.path, &["README.md"]);
-        let (_, locations) = ctx.app.mesh.share_locations().unwrap();
+        let (_, locations) = ctx.share_locations().unwrap();
         fs::create_dir_all(locations.global.parent().unwrap()).unwrap();
         fs::write(
             &locations.global,
@@ -23612,7 +23620,7 @@ mod tests {
         let fixture = seed_mesh_completion_fixture("rc-probe-complete-deny-flags").await;
         let root = publish_share_root(&fixture.ctx, "rc-probe-complete-deny-flags-root");
         seed_share_files(&root.path, &["docs/a.md"]);
-        let (_, locations) = fixture.ctx.app.mesh.share_locations().unwrap();
+        let (_, locations) = fixture.ctx.share_locations().unwrap();
         fs::create_dir_all(locations.global.parent().unwrap()).unwrap();
         fs::write(
             &locations.global,

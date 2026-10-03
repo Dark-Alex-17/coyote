@@ -17,8 +17,8 @@ use crate::mesh::pending::{
 };
 use crate::mesh::shares::{
     DEFAULT_LIST_WALK_BOUND, GLOB_METACHARACTERS, LIST_PAGE_SIZE, Layer, MatchCount, Mutation,
-    PeerRef, RawKind, ShareSet, Verdict as ShareVerdict, WriteScope, is_broad_pattern,
-    is_canonical_peer, validate_override, validate_pattern,
+    PeerRef, RawKind, ShareLocations, ShareSet, Verdict as ShareVerdict, WriteScope,
+    is_broad_pattern, is_canonical_peer, validate_override, validate_pattern,
 };
 use crate::mesh::trust::{
     Decision, KeyChange, LiveMesh, Rule, Tier, TrustChange, TrustOptions, TrustRecord, TrustStore,
@@ -1973,10 +1973,18 @@ fn classify_share(args: MutationArgs, verb: &str) -> Result<Option<ShareArgs>> {
     }))
 }
 
+/// The share root and where its two files live, with the configured inbox protected
+/// whether or not a node is running; `None` before a snapshot names the root.
+fn share_locations(ctx: &RequestContext) -> Option<(PathBuf, ShareLocations)> {
+    ctx.app
+        .mesh
+        .share_locations(ctx.app.config.mesh.fetch.inbox_dir.as_deref())
+}
+
 /// The share root and the two share files, loaded; the verbs' one way in. Each verb
 /// reads `refusal` itself, so the load's warning is not repeated here.
 fn share_set(ctx: &RequestContext) -> Result<(PathBuf, ShareSet)> {
-    let Some((root, locations)) = ctx.app.mesh.share_locations() else {
+    let Some((root, locations)) = share_locations(ctx) else {
         bail!(SHARE_ROOT_UNKNOWN);
     };
     let (set, _warning) = ShareSet::load_quietly(locations);
@@ -2881,7 +2889,7 @@ fn audience(interface: &MeshInterface) -> &'static str {
 /// to `LIST_PAGE_SIZE`, without the case probe, since nothing may touch the tree before
 /// the user consents to serving it. `None` before a snapshot names the share root.
 fn shared_count(ctx: &RequestContext) -> Option<MatchCount> {
-    let (_, locations) = ctx.app.mesh.share_locations()?;
+    let (_, locations) = share_locations(ctx)?;
     let (set, _warning) = ShareSet::load_quietly(locations);
     Some(set.count_shared(
         &PeerRef::unscoped(),
@@ -12133,7 +12141,7 @@ mod tests {
                         let root = TempDir::new(&format!("{tag}-root"));
                         seed_files(&root.path, files);
                         publish_root(&ctx, &root.path);
-                        let (_, locations) = ctx.app.mesh.share_locations().unwrap();
+                        let (_, locations) = share_locations(&ctx).unwrap();
                         Self {
                             started,
                             ctx,
@@ -13252,7 +13260,7 @@ mod tests {
                     let root = TempDir::new("repl-mesh-shares-off-root");
                     seed_files(&root.path, &["docs/a.md"]);
                     publish_root(&ctx, &root.path);
-                    let (_, locations) = ctx.app.mesh.share_locations().unwrap();
+                    let (_, locations) = share_locations(&ctx).unwrap();
 
                     run_async(run(&mut ctx, ".mesh shares")).unwrap();
                     let out = stdout_lines().join("\n");
@@ -13294,6 +13302,46 @@ mod tests {
                         ShareSet::load_quietly(locations).0.entries(),
                         [allow_entry(Layer::Global, "docs/**", None)]
                     );
+                }
+
+                /// What the node will protect, the off-path views protect too: a configured
+                /// inbox inside the share root is never entered under `**`, as the walk a
+                /// running node does never enters it, so it is neither listed nor counted.
+                #[test]
+                #[serial]
+                fn shares_and_the_on_preview_protect_the_configured_inbox_while_the_mesh_is_off() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-shares-off-inbox");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[false]);
+                    let root = TempDir::new("repl-mesh-shares-off-inbox-root");
+                    seed_files(&root.path, &["docs/a.md", "inbox/fetched.md"]);
+                    let config = MeshConfig {
+                        interfaces: vec![MeshInterface::Lan],
+                        fetch: crate::config::mesh_config::MeshFetch {
+                            inbox_dir: Some(root.path.join("inbox")),
+                            ..Default::default()
+                        },
+                        ..MeshConfig::default()
+                    };
+                    let mut ctx = ctx_with(config, true);
+                    ctx.session = Some(Session::default());
+                    publish_root(&ctx, &root.path);
+                    let (_, locations) = share_locations(&ctx).unwrap();
+                    write_share_file(&locations.global, "version: 1\nallow:\n- pattern: '**'\n");
+
+                    run_async(run(&mut ctx, ".mesh shares --effective")).unwrap();
+                    let out = stdout_lines().join("\n");
+                    assert!(out.ends_with("\n  docs/a.md"), "{out}");
+                    assert!(!out.contains("inbox/"), "{out}");
+
+                    run_async(run(&mut ctx, ".mesh on")).unwrap();
+                    assert!(ctx.app.mesh.get().is_none());
+                    let out = stdout_lines();
+                    let files = index_of(
+                        &out,
+                        "  files: 1 path(s) are shared with trusted peers (`.mesh shares`)",
+                    );
+                    assert!(files < index_of(&out, "Mesh stays off"), "{out:?}");
                 }
 
                 /// The preview names what the share files already hand every trusted
@@ -13378,7 +13426,7 @@ mod tests {
                         &["docs/a.md", "docs/b.md", "docs/.env", "src/main.rs"],
                     );
                     publish_root(&ctx, &root.path);
-                    let (_, locations) = ctx.app.mesh.share_locations().unwrap();
+                    let (_, locations) = share_locations(&ctx).unwrap();
                     write_share_file(
                         &locations.global,
                         "version: 1\nallow:\n- pattern: docs/**\n",
@@ -13776,7 +13824,7 @@ mod tests {
                         &["docs/a.md", "docs/b.md", "docs/c.md", "src/main.rs"],
                     );
                     publish_root(&ctx, &root.path);
-                    let (_, locations) = ctx.app.mesh.share_locations().unwrap();
+                    let (_, locations) = share_locations(&ctx).unwrap();
                     let peer = "ab".repeat(16);
 
                     write_share_file(
@@ -13850,7 +13898,7 @@ mod tests {
                                 "{verb}: {out}"
                             );
                         }
-                        let (_, locations) = ctx.app.mesh.share_locations().unwrap();
+                        let (_, locations) = share_locations(&ctx).unwrap();
                         assert!(!locations.global.exists());
                         assert!(!locations.workspace.exists());
                         assert_eq!(prompt_script::prompts_asked(), 0);
@@ -13906,7 +13954,7 @@ mod tests {
                     let many: Vec<&str> = many.iter().map(String::as_str).collect();
                     seed_files(&root.path, &many);
                     publish_root(&ctx, &root.path);
-                    let (_, locations) = ctx.app.mesh.share_locations().unwrap();
+                    let (_, locations) = share_locations(&ctx).unwrap();
                     write_share_file(
                         &locations.global,
                         "version: 1\nallow:\n- pattern: docs/**\n",
@@ -13944,7 +13992,7 @@ mod tests {
                     let many: Vec<&str> = many.iter().map(String::as_str).collect();
                     seed_files(&root.path, &many);
                     publish_root(&ctx, &root.path);
-                    let (_, locations) = ctx.app.mesh.share_locations().unwrap();
+                    let (_, locations) = share_locations(&ctx).unwrap();
                     write_share_file(
                         &locations.global,
                         "version: 1\nallow:\n- pattern: '**'\ndeny:\n- pattern: a-denied/**\n",
@@ -14105,7 +14153,7 @@ mod tests {
                     let root = TempDir::new("repl-mesh-probe-on-preview-refused-root");
                     seed_files(&root.path, &["docs/a.md"]);
                     publish_root(&ctx, &root.path);
-                    let (_, locations) = ctx.app.mesh.share_locations().unwrap();
+                    let (_, locations) = share_locations(&ctx).unwrap();
                     write_share_file(&locations.global, "version: 99\n");
 
                     run_async(run(&mut ctx, ".mesh on")).unwrap();

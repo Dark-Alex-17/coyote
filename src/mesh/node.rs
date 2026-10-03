@@ -2933,15 +2933,24 @@ impl MeshSlot {
     /// The share root, the published snapshot's `cwd`, and where its two share files
     /// live; `None` before a snapshot exists. With a running node this is the node's own
     /// `FetchServing::share_locations`, cache dir and configured inbox protected; while
-    /// the mesh is off it is built from `MeshPaths::from_env()`, so `.mesh shares` and
-    /// the `.mesh on` preview read the files the node will serve from.
-    pub(crate) fn share_locations(&self) -> Option<(PathBuf, ShareLocations)> {
+    /// the mesh is off it is built from `MeshPaths::from_env()` with `inbox_dir`, the
+    /// configured `mesh.fetch.inbox_dir`, protected the same way, so `.mesh shares` and
+    /// the `.mesh on` preview see exactly what the node will serve.
+    pub(crate) fn share_locations(
+        &self,
+        inbox_dir: Option<&Path>,
+    ) -> Option<(PathBuf, ShareLocations)> {
         let root = ShareSource::share_root(self)?;
         let locations = match self.get() {
             Some(runtime) => runtime.serving().share_locations(&root),
             None => {
                 let paths = MeshPaths::from_env();
-                ShareLocations::new(&paths.config_dir, &root).with_cache_dir(&paths.cache_dir)
+                let locations =
+                    ShareLocations::new(&paths.config_dir, &root).with_cache_dir(&paths.cache_dir);
+                match inbox_dir {
+                    Some(inbox_dir) => locations.with_protected(inbox_dir),
+                    None => locations,
+                }
             }
         };
         Some((root, locations))
@@ -6863,14 +6872,14 @@ mod tests {
     #[test]
     fn the_slot_names_the_share_files_only_once_a_snapshot_names_a_root() {
         let slot = MeshSlot::default();
-        assert!(slot.share_locations().is_none(), "nothing published");
+        assert!(slot.share_locations(None).is_none(), "nothing published");
 
         let tmp = TempDir::new("slot-share-locations");
         let mut snapshot = snapshot_fixture();
         snapshot.cwd = tmp.path.clone();
         slot.publish(snapshot);
 
-        let (root, locations) = slot.share_locations().unwrap();
+        let (root, locations) = slot.share_locations(None).unwrap();
         assert_eq!(root, tmp.path);
         assert!(
             locations.global.ends_with("mesh/shares.yaml"),
