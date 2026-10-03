@@ -29,7 +29,7 @@ use crate::mesh::wire_path::WIRE_PATH_MAX_BYTES;
 use crate::mesh::{
     FetchError, FetchReport, LoggingInboundSink, MAX_WANTS_PER_FETCH, MESH_ALREADY_ON, MeshPaths,
     MeshRuntime, NodeOptions, PeerRecord, PropagationNodeRecord, age_text, canonical_hash,
-    destination_address, display_text, parse_rfc3339, redact_hashes, short,
+    destination_address, display_text, parse_rfc3339, redact_hashes, refuse_symlink, short,
 };
 use crate::supervisor::mailbox::EnvelopePayload;
 use crate::utils::{AbortSignal, drain_stale_tty_input, wait_user_interrupt};
@@ -1489,12 +1489,14 @@ fn allow(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         validate_override(&pattern)?;
     }
     let (root, mut set, case_insensitive) = writable_share_set(ctx)?;
+    refuse_existing_directory(&root, &pattern, "share what is under it with")?;
     if let Some(head) = set.protected_head(&pattern) {
         bail!(
             "`{pattern}` is under `{head}/`, which is never shared, not even with `--force`; nothing was written."
         );
     }
     let target = ShareTarget::of(&set, scope);
+    refuse_symlink(&target.path)?;
     if force {
         if target.layer == Layer::Workspace {
             bail!(
@@ -1657,12 +1659,14 @@ fn deny(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     refuse_directory_pattern(&pattern, "keep what is under it back with")?;
     validate_pattern(&pattern)?;
     let (root, mut set, case_insensitive) = writable_share_set(ctx)?;
+    refuse_existing_directory(&root, &pattern, "keep what is under it back with")?;
     if let Some(head) = set.protected_head(&pattern) {
         bail!(
             "`{pattern}` is under `{head}/`, which is never shared, so no deny is needed; nothing was written."
         );
     }
     let target = ShareTarget::of(&set, scope);
+    refuse_symlink(&target.path)?;
     let matches = describe_matches(&set, &pattern, &root, case_insensitive)?;
     let already = format!(
         "`{pattern}` is already denied to every peer in {}; nothing was changed.",
@@ -1799,6 +1803,12 @@ fn unshare(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
                 );
             }
         }
+    }
+    for (layer, _) in &targets {
+        refuse_symlink(match layer {
+            Layer::Global => &locations.global,
+            Layer::Workspace => &locations.workspace,
+        })?;
     }
     let total: usize = targets.iter().map(|(_, held)| held.len()).sum();
     let matches = describe_matches(&set, &pattern, &root, case_insensitive)?;
@@ -2098,12 +2108,27 @@ fn classify_share(args: MutationArgs, verb: &str) -> Result<Option<ShareArgs>> {
 /// alone name the filesystem root, which `validate_pattern` has the sentence for.
 fn refuse_directory_pattern(pattern: &str, does: &str) -> Result<()> {
     if pattern.ends_with('/') && !pattern.starts_with('/') {
-        bail!(
-            "`{pattern}` names a directory; {does} `{}/**`, or one file by its path.",
-            pattern.trim_end_matches('/')
-        );
+        bail!(directory_sentence(pattern, does));
     }
     Ok(())
+}
+
+/// A bare directory name passes every pattern check, matches no file and would write a
+/// rule that can never serve one; the root is known only once the share set is loaded.
+fn refuse_existing_directory(root: &Path, pattern: &str, does: &str) -> Result<()> {
+    if !pattern.contains(GLOB_METACHARACTERS)
+        && fs::symlink_metadata(root.join(pattern)).is_ok_and(|meta| meta.is_dir())
+    {
+        bail!(directory_sentence(pattern, does));
+    }
+    Ok(())
+}
+
+fn directory_sentence(pattern: &str, does: &str) -> String {
+    format!(
+        "`{pattern}` names a directory; {does} `{}/**`, or one file by its path.",
+        pattern.trim_end_matches('/')
+    )
 }
 
 /// The share root and where its two files live, with the configured inbox protected
@@ -13096,6 +13121,44 @@ mod tests {
                     });
                 }
 
+                /// `docs` without the slash passes every pattern check and would write an
+                /// allow matching no file, so an existing directory gets the same teaching.
+                #[test]
+                #[serial]
+                fn allow_of_a_bare_directory_teaches_the_double_star_and_writes_nothing() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-bare-directory");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx =
+                            ShareFixture::new("repl-mesh-bare-directory", &["docs/a.md"]).await;
+
+                        assert_eq!(
+                            refusal(&mut fx.ctx, ".mesh allow docs").await,
+                            "`docs` names a directory; share what is under it with `docs/**`, or one file by its path."
+                        );
+                        assert_eq!(
+                            refusal(&mut fx.ctx, ".mesh deny docs").await,
+                            "`docs` names a directory; keep what is under it back with `docs/**`, or one file by its path."
+                        );
+                        assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
+                        assert!(!fx.locations.global.exists());
+                        assert!(!fx.locations.workspace.exists());
+
+                        let out = out_of(&mut fx.ctx, ".mesh allow docs/**").await.unwrap();
+                        assert!(
+                            out.ends_with(&format!(
+                                "Allowed `docs/**` for every trusted peer; written to {}.",
+                                fx.global()
+                            )),
+                            "{out}"
+                        );
+                        assert_eq!(fx.entries(), [allow_entry(Layer::Global, "docs/**", None)]);
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        fx.stop().await;
+                    });
+                }
+
                 #[test]
                 #[serial]
                 fn allow_of_an_absolute_pattern_is_refused_with_the_relative_teaching() {
@@ -15121,6 +15184,24 @@ mod tests {
                             !err.contains("written to"),
                             "no write is announced on a refusal: {err}"
                         );
+                        assert!(
+                            stdout_lines().iter().all(|line| !line.contains("write to")),
+                            "the link is refused before the write is announced: {:?}",
+                            stdout_lines()
+                        );
+                        let broad = refusal(&mut fx.ctx, ".mesh allow **/*.md --workspace").await;
+                        assert!(broad.contains("is a symlink"), "{broad}");
+                        assert_eq!(
+                            prompt_script::prompts_asked(),
+                            0,
+                            "a broad pattern on a linked share file asks nothing"
+                        );
+                        let denied = refusal(&mut fx.ctx, ".mesh deny **/*.md --workspace").await;
+                        assert!(denied.contains("is a symlink"), "{denied}");
+                        let unshared =
+                            refusal(&mut fx.ctx, ".mesh unshare zzz/** --workspace").await;
+                        assert!(unshared.contains("is a symlink"), "{unshared}");
+                        assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
                         assert_eq!(fs::read_to_string(&victim).unwrap(), victim_yaml);
                         assert!(
                             fs::symlink_metadata(&fx.locations.workspace)
