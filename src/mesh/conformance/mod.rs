@@ -895,6 +895,122 @@ mod tests {
         "MESH-MSG-048",
         "MESH-MSG-055",
         "MESH-PROP-009",
+        "MESH-LIST-001",
+        "MESH-LIST-002",
+        "MESH-LIST-003",
+        "MESH-LIST-004",
+        "MESH-LIST-005",
+        "MESH-LIST-006",
+        "MESH-LIST-007",
+        "MESH-LIST-008",
+        "MESH-LIST-009",
+        "MESH-LIST-010",
+        "MESH-LIST-011",
+        "MESH-LIST-012",
+        "MESH-LIST-013",
+        "MESH-LIST-014",
+        "MESH-LIST-015",
+        "MESH-LIST-016",
+        "MESH-LIST-017",
+        "MESH-LIST-018",
+        "MESH-LIST-019",
+        "MESH-LIST-020",
+        "MESH-LIST-021",
+        "MESH-LIST-022",
+        "MESH-LIST-023",
+        "MESH-LIST-024",
+        "MESH-LIST-025",
+        "MESH-FETCH-001",
+        "MESH-FETCH-002",
+        "MESH-FETCH-003",
+        "MESH-FETCH-004",
+        "MESH-FETCH-005",
+        "MESH-FETCH-006",
+        "MESH-FETCH-007",
+        "MESH-FETCH-008",
+        "MESH-FETCH-009",
+        "MESH-FETCH-010",
+        "MESH-FETCH-011",
+        "MESH-FETCH-012",
+        "MESH-FETCH-013",
+        "MESH-FETCH-014",
+        "MESH-FETCH-015",
+        "MESH-FETCH-016",
+        "MESH-FETCH-017",
+        "MESH-FETCH-018",
+        "MESH-FETCH-019",
+        "MESH-FETCH-020",
+        "MESH-FETCH-021",
+        "MESH-FETCH-022",
+        "MESH-FETCH-023",
+        "MESH-FETCH-024",
+        "MESH-FETCH-025",
+        "MESH-FETCH-026",
+        "MESH-FETCH-027",
+        "MESH-FETCH-028",
+        "MESH-FETCH-029",
+        "MESH-FETCH-030",
+        "MESH-FETCH-031",
+        "MESH-FETCH-032",
+        "MESH-FETCH-033",
+        "MESH-FETCH-034",
+        "MESH-ACCESS-001",
+        "MESH-ACCESS-002",
+        "MESH-ACCESS-003",
+        "MESH-ACCESS-004",
+        "MESH-ACCESS-005",
+        "MESH-ACCESS-006",
+        "MESH-ACCESS-007",
+        "MESH-ACCESS-008",
+        "MESH-ACCESS-009",
+        "MESH-ACCESS-010",
+        "MESH-ACCESS-011",
+        "MESH-ACCESS-012",
+        "MESH-ACCESS-013",
+        "MESH-ACCESS-014",
+        "MESH-ACCESS-015",
+        "MESH-ACCESS-016",
+        "MESH-ACCESS-017",
+        "MESH-ACCESS-018",
+        "MESH-ACCESS-019",
+        "MESH-ACCESS-020",
+        "MESH-ACCESS-021",
+        "MESH-ACCESS-022",
+        "MESH-ACCESS-023",
+        "MESH-ACCESS-024",
+        "MESH-ACCESS-025",
+        "MESH-ACCESS-026",
+        "MESH-ACCESS-027",
+        "MESH-ACCESS-028",
+        "MESH-ACCESS-029",
+        "MESH-SHARE-001",
+        "MESH-SHARE-002",
+        "MESH-SHARE-003",
+        "MESH-SHARE-004",
+        "MESH-SHARE-005",
+        "MESH-SHARE-006",
+        "MESH-SHARE-007",
+        "MESH-SHARE-008",
+        "MESH-SHARE-009",
+        "MESH-SHARE-010",
+        "MESH-SHARE-011",
+        "MESH-SHARE-012",
+        "MESH-SHARE-013",
+        "MESH-SHARE-014",
+        "MESH-SHARE-015",
+        "MESH-SHARE-016",
+        "MESH-SHARE-017",
+        "MESH-SHARE-018",
+        "MESH-SHARE-019",
+        "MESH-SHARE-020",
+        "MESH-SCHEMA-001",
+        "MESH-SCHEMA-002",
+        "MESH-SCHEMA-003",
+        "MESH-SCHEMA-004",
+        "MESH-PART-008",
+        "MESH-PART-011",
+        "MESH-PART-014",
+        "MESH-PART-026",
     ];
 
     fn area(id: &str) -> &str {
@@ -990,15 +1106,18 @@ mod tests {
         );
     }
 
-    // The minimum-coverage rule reads: "every id in areas DEST, ANN, ENV, VER, EXT, CODE and
-    // every catch-all/`any other value` row in KNOCK/STATUS/MSG/PROP". These derive that set
-    // from `docs/mesh/PROTOCOL.md` itself so the hand-maintained `REQUIRED_IDS` above cannot
-    // silently drift from it.
+    // The minimum-coverage rule reads: "every id in areas DEST, ANN, ENV, VER, EXT, CODE,
+    // LIST, FETCH, ACCESS, SHARE, SCHEMA and every catch-all/`any other value` row in
+    // KNOCK/STATUS/MSG/PROP/PART/DISP". These derive that set from `docs/mesh/PROTOCOL.md`
+    // itself so the hand-maintained `REQUIRED_IDS` above cannot silently drift from it, in
+    // either direction.
 
     /// Areas whose every id must have a vector.
-    const FULLY_COVERED_AREAS: &[&str] = &["DEST", "ANN", "ENV", "VER", "EXT", "CODE"];
+    const FULLY_COVERED_AREAS: &[&str] = &[
+        "DEST", "ANN", "ENV", "VER", "EXT", "CODE", "LIST", "FETCH", "ACCESS", "SHARE", "SCHEMA",
+    ];
     /// Areas where only the catch-all table rows must have a vector.
-    const CATCH_ALL_AREAS: &[&str] = &["KNOCK", "STATUS", "MSG", "PROP"];
+    const CATCH_ALL_AREAS: &[&str] = &["KNOCK", "STATUS", "MSG", "PROP", "PART", "DISP"];
 
     /// The `**[MESH-AREA-NNN]**` ids on one spec line, in order.
     fn ids_on(line: &str) -> Vec<&str> {
@@ -1104,6 +1223,16 @@ mod tests {
             omitted,
             Vec::<&str>::new(),
             "catch-all / fully-covered-area ids the ruling requires but REQUIRED_IDS omits"
+        );
+        let surplus: Vec<&str> = listed
+            .iter()
+            .copied()
+            .filter(|id| !derived.contains(*id))
+            .collect();
+        assert_eq!(
+            surplus,
+            Vec::<&str>::new(),
+            "REQUIRED_IDS names ids the ruling does not require; the areas or the catch-all rows changed"
         );
     }
 
