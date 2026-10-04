@@ -4052,6 +4052,69 @@ mod tests {
         assert!(decoded.parts.is_empty());
     }
 
+    #[test]
+    fn a_reply_with_every_optional_key_is_emitted_in_the_specified_order() {
+        fn keys(message: &OutboundPeer) -> Vec<String> {
+            let Value::Map(entries) = to_r3_body(message, 1.0) else {
+                unreachable!()
+            };
+            entries
+                .iter()
+                .map(|(k, _)| k.as_str().unwrap().to_string())
+                .collect()
+        }
+
+        let reply = OutboundPeer::with_parts(
+            PeerKind::Reply,
+            "the answer",
+            Some("Re: question"),
+            Some("q-1"),
+            Some(serde_json::json!({ "n": 1 })),
+            vec![text_part("aside")],
+            &PartLimits::default(),
+        )
+        .unwrap()
+        .with_thread(Some("t-1".into()))
+        .unwrap()
+        .with_disposition(Disposition::Refused, Some(60));
+        assert_eq!(
+            keys(&reply),
+            [
+                "v",
+                "kind",
+                "id",
+                "in_reply_to",
+                "thread",
+                "title",
+                "content",
+                "fields",
+                "disposition",
+                "retry_after",
+                "parts",
+                "ts",
+            ]
+        );
+
+        let ask = OutboundPeer::with_parts(
+            PeerKind::Ask,
+            "a question",
+            Some("Question"),
+            None,
+            Some(serde_json::json!({ "n": 1 })),
+            vec![text_part("aside")],
+            &PartLimits::default(),
+        )
+        .unwrap()
+        .with_thread(Some("t-1".into()))
+        .unwrap();
+        assert_eq!(
+            keys(&ask),
+            [
+                "v", "kind", "id", "thread", "title", "content", "fields", "parts", "ts",
+            ]
+        );
+    }
+
     /// Every cap at once: with content, title, both ids, fields and parts of all four
     /// shapes (text, data, inline file, reference file) at their caps together, the message
     /// still fits under both receivers' bounds and every field survives encode→decode

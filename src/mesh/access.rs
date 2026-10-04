@@ -5018,7 +5018,7 @@ mod tests {
         }
     }
 
-    /// The 3a3d1d1 fix re-loads the share list AFTER the send, which adds a failure
+    /// A standing grant re-loads the share list AFTER the send, which adds a failure
     /// point the pre-flight cannot see: a list that was fine before the send and is
     /// poisoned by the time of the write. The peer must have heard yes
     /// before standing entries are written, so the peer holds exactly one `granted`

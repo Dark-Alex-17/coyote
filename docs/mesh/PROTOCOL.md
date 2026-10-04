@@ -27,7 +27,7 @@ This document does not specify:
 
 - Cryptography. Identity keys, Link encryption, signatures and cryptographic agility are Reticulum's and LXMF's; section 15 states what this document relies on them for and specifies no cipher, key size or negotiation of its own.
 - The human-facing `.mesh` REPL surface and its output text, except where a stored or shown value fixes a wire form.
-- On-disk formats, except where a stored form fixes a canonical form (section 3) or a wire value (the knock record, section 8.4), or where section 14.1 fixes the versioning discipline every on-disk store follows.
+- On-disk formats, except where a stored form fixes a canonical form (section 3) or a wire value (the knock record, section 8.4), where section 10.17 fixes the key set of the share files and the grant store, or where section 14.1 fixes the versioning discipline every on-disk store follows.
 
 Section 19 is the single authoritative listing of constants; every constant named in prose is written as `NAME` with its value and is listed there.
 
@@ -642,7 +642,7 @@ A wire id is 1 to `PEER_ID_MAX_CHARS` = `64` bytes, each in `[0-9A-Za-z_.:-]` (`
 | `ts` | f64 | Unix seconds of sending, as an `f64` | **[MESH-MSG-009]** Missing, not a number (`uint`, `int`, `f32` or `f64`), or not finite once read as f64: the receiver MUST refuse with `InvalidData` (`r3_body_round_trips_and_rejects_malformed` accepts a `uint` `ts`). |
 | any other key | any | nothing | **[MESH-MSG-010]** The receiver MUST ignore it (`r3_body_round_trips_and_rejects_malformed`). |
 
-**[MESH-MSG-011]** A sender MUST emit the keys it sets in the order given above, `thread` between `in_reply_to` and `title`, `disposition`, `retry_after` and `parts` between `fields` and `ts`.
+**[MESH-MSG-011]** A sender MUST emit the keys it sets in the order given above, `thread` between `in_reply_to` and `title`, `disposition`, `retry_after` and `parts` between `fields` and `ts` (`a_reply_with_every_optional_key_is_emitted_in_the_specified_order`, src/mesh/message.rs).
 
 **[MESH-MSG-012]** A receiver MUST validate in the order of the rows above, after first refusing a body that is not a `map` with `InvalidData`; the first failure decides.
 
@@ -953,8 +953,8 @@ source_hash       bin(16)                  # the asker's delivery destination
 signature         bin(64)
 payload = msgpack [timestamp, title, content, fields]
   timestamp  1790000000.0
-  title      "Peer struct"
-  content    "Is the Peer struct in src/mesh/peer.rs still the one on main?"
+  title      bin "Peer struct"                                                     # UTF-8 bytes
+  content    bin "Is the Peer struct in src/mesh/peer.rs still the one on main?"  # UTF-8 bytes
   fields = {
     0xfb: "scope.peer/1",                  # FIELD_CUSTOM_TYPE: PEER_MESSAGE_TYPE
     0xfc: {                                # FIELD_CUSTOM_DATA
@@ -1113,7 +1113,7 @@ Reply: a map carrying `status` and the keys of that status beside it, never a ne
 
 **[MESH-FETCH-032]** A requester MUST wait `FILE_FETCH_REQUEST_TIMEOUT` = `120` seconds for a fetch reply, a file of `MAX_FETCH_FILE_BYTES` on a slow interface taking minutes where a listing takes a round trip (`a_file_fetch_waits_two_minutes_where_a_listing_waits_a_round_trip`, src/mesh/fetch.rs).
 
-**[MESH-FETCH-033]** A responder MUST NOT disclose a served file's path through any side channel a served fetch raises (a log line, a notification or a hook) and MUST raise such a side channel only for a reply that was sent; the reference's hook event `mesh.fetch.served` fires once the `ok` reply is on the wire, with the peer's identity and destination hashes, the size and the first 8 lowercase hex digits of the digest (`FetchSettlement`; `a_served_fetch_fires_mesh_fetch_served_with_peer_size_and_hash_prefix_and_no_path`, src/mesh/fetch.rs).
+**[MESH-FETCH-033]** A responder MUST NOT disclose a served file's path through any side channel that leaves the node (a hook environment or a log line) raised by a served fetch and MUST raise such a side channel only for a reply that was sent; the operator's own screen is not a side channel; the reference's hook event `mesh.fetch.served` fires once the `ok` reply is on the wire, with the peer's identity and destination hashes, the size and the first 8 lowercase hex digits of the digest (`FetchSettlement`; `a_served_fetch_fires_mesh_fetch_served_with_peer_size_and_hash_prefix_and_no_path`, src/mesh/fetch.rs).
 
 **[MESH-FETCH-034]** A grant use spent by an `ok` that was never sent MUST be refunded (section 10.17; `GrantRefund`, src/mesh/fetch.rs).
 
@@ -1145,10 +1145,10 @@ Reply, emission order `v`, `id`, `status`, then `expires` or `reason` (`access_r
 | any other key | any | nothing | **[MESH-ACCESS-013]** The requester MUST ignore it, a key of another status included. |
 
 ```text
-/access req  { "v": 1, "id": "7c1e…", "paths": ["src/x.rs"], "reason": "need the struct" }
-        resp { "v": 1, "id": "7c1e…", "status": "pending" }
-        resp { "v": 1, "id": "7c1e…", "status": "granted", "expires": 1790000900.0 }
-        resp { "v": 1, "id": "7c1e…", "status": "refused", "reason": "duplicate" }
+/access req  { "v": 1, "id": "7c1e4b2a9d3f4e6c8b1a0d5e2f7c9a41", "paths": ["src/x.rs"], "reason": "need the struct" }
+        resp { "v": 1, "id": "7c1e4b2a9d3f4e6c8b1a0d5e2f7c9a41", "status": "pending" }
+        resp { "v": 1, "id": "7c1e4b2a9d3f4e6c8b1a0d5e2f7c9a41", "status": "granted", "expires": 1790000900.0 }
+        resp { "v": 1, "id": "7c1e4b2a9d3f4e6c8b1a0d5e2f7c9a41", "status": "refused", "reason": "duplicate" }
 ```
 
 **[MESH-ACCESS-014]** A requester that section 6.6 does not admit MUST hear what that section gives its standing, silence for an unknown or blocked identity, before any body is read (`usage_probe_an_untrusted_instances_access_request_is_silent_like_status_and_leaves_nothing_behind`, `usage_probe_a_known_but_untrusted_instances_access_request_earns_no_access_and_is_never_filed`, src/mesh/r3/tests.rs).
@@ -1186,7 +1186,7 @@ Custom data map (emission order `name_hash`, `id`, `paths`):
 
 **[MESH-ACCESS-028]** The receiver MUST compute the requesting instance from `name_hash` and the signer as MESH-MSG-058 does, MUST drop an untrusted one, and MUST admit a trusted one as on the link (MESH-ACCESS-015 to MESH-ACCESS-017), where a refusal is not answered, there being no link to say so over, and a grant at once is settled with the decision reply of MESH-ACCESS-018 (`AccessRouting`, `settle_granted_at_once`, src/mesh/access.rs; `a_propagated_access_request_from_an_untrusted_instance_is_dropped_before_admission`, `a_propagated_request_that_is_already_shared_sends_the_decision_reply`, `the_grant_a_stored_request_earns_at_once_reaches_the_peer_as_a_decision_reply`).
 
-**[MESH-ACCESS-029]** A responder MUST NOT disclose a requested path or the `reason` through any side channel (a hook, a log line or a notification) raised by an access request or by a decision on one; the reference's hook event `mesh.access.requested` fires when a request is filed as pending and when it is granted at once, not for a refusal, with the peer's identity and destination hashes (`COYOTE_MESH_PEER_IDENTITY`, `COYOTE_MESH_PEER_DESTINATION`), the access id (`COYOTE_MESH_ACCESS_ID`) and the path count (`COYOTE_MESH_PATH_COUNT`), and its `mesh.access.decided` fires when a decision is made, the grant at once included, with the peer, the access id and `COYOTE_MESH_DECISION` = `granted` or `denied` (`access_events_carry_peer_count_and_decision_but_never_a_path`, src/mesh/access.rs; src/mesh/events.rs).
+**[MESH-ACCESS-029]** A responder MUST NOT disclose a requested path or the `reason` through any side channel that leaves the node (a hook environment or a log line) raised by an access request or by a decision on one; the operator's own screen is not a side channel, and the reference's decision notification shows its operator the paths and the `reason` (`access_text`, src/mesh/access.rs); the reference's hook event `mesh.access.requested` fires when a request is filed as pending and when it is granted at once, not for a refusal, with the peer's identity and destination hashes (`COYOTE_MESH_PEER_IDENTITY`, `COYOTE_MESH_PEER_DESTINATION`), the access id (`COYOTE_MESH_ACCESS_ID`) and the path count (`COYOTE_MESH_PATH_COUNT`), and its `mesh.access.decided` fires when a decision is made, the grant at once included, with the peer, the access id and `COYOTE_MESH_DECISION` = `granted` or `denied` (`access_events_carry_peer_count_and_decision_but_never_a_path`, src/mesh/access.rs; src/mesh/events.rs).
 
 What the human sees is application surface, not wire format. The reference shows who asks, each path with whether it exists under the share root and its size, and the reason, cleaned and cut to a display cap; the reason is screen text only and never model input (section 15).
 
@@ -1424,10 +1424,10 @@ This document is the registry. A code point is allocated by a row in the table b
 | `v`, `prefix`, `cursor`, `entries`, `next` | map key, list body | | 10.14 |
 | `path`, `size`, `sha256`, `mtime` | map key, list entry | | 10.14 |
 | `v`, `path`, `if_sha256` | map key, fetch request | | 10.15 |
-| `status`, `size`, `sha256`, `bytes`, `rule`, `limit` | map key, fetch reply | | 10.15 |
+| `v`, `status`, `size`, `sha256`, `bytes`, `rule`, `limit` | map key, fetch reply | | 10.15 |
 | `ok`, `not_modified`, `not_shared`, `invalid_path`, `too_large` | fetch `status` value | | 10.15 |
 | `v`, `id`, `paths`, `reason` | map key, access request | | 10.16 |
-| `id`, `status`, `expires`, `reason` | map key, access reply | | 10.16 |
+| `v`, `id`, `status`, `expires`, `reason` | map key, access reply | | 10.16 |
 | `pending`, `granted`, `refused` | access `status` value | | 10.16 |
 | `duplicate`, `too_many_pending` | access `reason` value | | 10.16 |
 | `access`, `status`, `expires` | map key, decision part | | 10.16 |

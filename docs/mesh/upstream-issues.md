@@ -173,7 +173,8 @@ segment arrives, `handle_resource_proof` (`transport/resource_wire.rs`) lets the
 manager build the next segment's advertisement and hands it to `handler.send_packet`; the
 `resource-retry` worker in `transport/jobs.rs` re-sends pending advertisements
 (`poll_outgoing`) the same way. `send_packet` routes through the path table
-(`route_outbound_packet`, `transport/handler.rs`), and a link id is never a path-table key, so
+(`route_outbound_packet` in `transport/path.rs`, called from `send_packet` in
+`transport/handler.rs`), and a link id is never a path-table key, so
 the lookup finds no next interface; only an announce is broadcast without a route, and a node
 with `broadcast: false` records `DroppedNoRoute` and sends nothing. The requester, which
 received segment one, waits for an advertisement that never leaves the responder.

@@ -6227,8 +6227,8 @@ mod tests {
         drop(file);
     }
 
-    /// Usage probe (R9, "refuses when the handle's (dev, ino) differs from the judged
-    /// canonical path"): the shape of the race the rule exists for is a regular file
+    /// A handle whose (dev, ino) differs from the judged canonical path is refused:
+    /// the shape of the race the rule exists for is a regular file
     /// renamed over the judged path after the open. Byte-identical content and size do
     /// not vouch for it: it is another inode, so the handle is not the judged file. A
     /// hard link to the opened inode IS the same file, so it is vouched for, and after
@@ -19909,7 +19909,7 @@ mod tests {
                     });
                 }
 
-                /// Usage probe r10 (a): the "ANY segment — literal or behind a glob" rule
+                /// The "ANY segment — literal or behind a glob" rule
                 /// covers the workspace config directory's name as well as `.git`: with a
                 /// glob segment ahead of it (`*/.coyote/mesh-shares.yaml`, `**/.coyote/**`)
                 /// both `allow` and `deny` refuse as never shared, write nothing, print
@@ -20044,7 +20044,7 @@ mod tests {
                     }
                 }
 
-                /// Usage probe r10 (a): the segment test stays WHOLE-SEGMENT EQUALITY when
+                /// The segment test stays WHOLE-SEGMENT EQUALITY when
                 /// it runs behind a glob — `*/.gitignore`, `*/.github/**`, `*/foo.git/HEAD`,
                 /// `src/*/x.rs` and `*/.coyote-notes/*` are ordinary patterns with the
                 /// right counts — and a GLOB segment never matches by name even when it
@@ -20162,7 +20162,7 @@ mod tests {
                     });
                 }
 
-                /// Usage probe r10 (a)/(h): rows under `.git` BEHIND A GLOB that an older
+                /// Rows under `.git` BEHIND A GLOB that an older
                 /// file (or a hand) placed are still inspectable and removable — `.mesh
                 /// shares` lists them with their file, the `unshare` completer offers them,
                 /// `--effective` never lists a `.git` file for them, and `unshare` removes
@@ -20800,8 +20800,8 @@ mod tests {
                     });
                 }
 
-                /// Usage probe (R8, "a requested path that is not a regular file" is refused
-                /// before any grant): the clause is about what `/fetch` serves, not about
+                /// A requested path that is not a regular file is refused before any
+                /// grant: the clause is about what `/fetch` serves, not about
                 /// directories in particular. A FIFO is zero bytes, so the size clause never
                 /// sees it, and a link to a directory resolves to no file either; both are
                 /// refused with the not-a-regular-file sentence, one-off and standing, with
@@ -20902,8 +20902,8 @@ mod tests {
                     });
                 }
 
-                /// Usage probe (R8 sentence, "refuse the request with `.mesh refuse <id>`"):
-                /// the remedy the refusal teaches works on the very request it refused. The
+                /// The remedy the refusal teaches, "refuse the request with `.mesh refuse
+                /// <id>`", works on the very request it refused. The
                 /// refused grant left the request open and untouched, so `.mesh refuse` takes
                 /// it, the peer hears no, nothing was ever granted, and the id is gone.
                 #[test]
@@ -21345,7 +21345,7 @@ mod tests {
                     });
                 }
 
-                /// Usage probe (R3): once a request is decided its record is gone, so a
+                /// Once a request is decided its record is gone, so a
                 /// second `grant` or `refuse` from the REPL teaches the unknown-id sentence,
                 /// sends nothing more and writes no second grant.
                 #[test]
@@ -21382,7 +21382,7 @@ mod tests {
                     });
                 }
 
-                /// Usage probe (R3 take-before-send): when the peer will not take the
+                /// Take before send: when the peer will not take the
                 /// decision, the request stays in `.mesh pending`, no grant is written, no
                 /// share entry lands, and the human reads one teaching error.
                 mod decision_gate {
@@ -21494,7 +21494,7 @@ mod tests {
                     });
                 }
 
-                /// Usage probe (R3 re-upsert): the request a failed send put back is whole,
+                /// The request a failed send put back is whole,
                 /// so the same one-off decision succeeds on the next try and writes exactly
                 /// one grant.
                 #[test]
@@ -21537,7 +21537,7 @@ mod tests {
                     });
                 }
 
-                /// Usage probe (R8 is a `grant` pre-flight only): a request naming a
+                /// The path judgement is a `grant` pre-flight only: a request naming a
                 /// denied path can still be REFUSED, the peer hears `access denied`, the
                 /// record closes and no grant or share row appears.
                 #[test]
@@ -21580,9 +21580,9 @@ mod tests {
                     });
                 }
 
-                /// Usage probe (R8: `.mesh grant`/`--standing` "judge every requested path
-                /// the same way" as a reference, which is refused above
-                /// `FetchServing::serving_limit()`): a requested file this node would answer
+                /// `.mesh grant`/`--standing` judge every requested path the same way as a
+                /// reference, which is refused above
+                /// `FetchServing::serving_limit()`: a requested file this node would answer
                 /// `too_large` is not granted either, one-off or standing; the request stays
                 /// pending, the peer hears nothing and no grant or share row is written. A
                 /// sibling request for a file at the limit is granted.
@@ -22158,11 +22158,11 @@ mod tests {
                     });
                 }
 
-                /// Usage probe (R2 outbound-correlation route, the other three arms):
+                /// The outbound-correlation route, the other three arms:
                 /// answering a question THIS node asked judges `--attach` like every other
                 /// route — (b) a file at or under `inline_max_bytes` travels INLINE with no
-                /// grant, (R8) protected and built-in-deny paths are refused in one line
-                /// before anything is printed, sent or lent, and (R3) a reference lend the
+                /// grant, protected and built-in-deny paths are refused in one line
+                /// before anything is printed, sent or lent, and a reference lend the
                 /// peer refuses takes its grant back — while the correlation stays open
                 /// throughout and an envoy hold on the id never refuses or sees anything.
                 #[test]
@@ -22446,7 +22446,7 @@ mod tests {
                     });
                 }
 
-                /// Usage probe (R9 single O_NOFOLLOW open + R8 "not a regular file"): a FIFO
+                /// One O_NOFOLLOW open, after the not-a-regular-file judgement: a FIFO
                 /// named by `--attach` is refused on its kind BEFORE the one open, since a
                 /// read-open of a FIFO waits for a writer that never comes and would wedge
                 /// the REPL. Inline and reference judge it the same; nothing is printed,
@@ -22892,7 +22892,7 @@ mod tests {
                     });
                 }
 
-                /// Usage probe (R2): while a live envoy run holds the question, `--attach`
+                /// While a live envoy run holds the question, `--attach`
                 /// is refused with the one sentence, for a reference-size file too, so no
                 /// one-off grant is lent for an answer that never went; the question stays
                 /// pending and nothing reaches the peer or the envoy. A plain answer on the
@@ -23022,8 +23022,8 @@ mod tests {
                     }
                 }
 
-                /// Usage probe (R3, "a failed `--attach` reference lend also revokes its
-                /// grant"): the peer refuses the message that carried the reference, so the
+                /// A failed `--attach` reference lend also revokes its
+                /// grant: the peer refuses the message that carried the reference, so the
                 /// one-off grant lent for it is taken back on both `answer` and `reply`, the
                 /// question stays pending, the human reads one line that is the send's and
                 /// not "the grant stands", and the retry once the peer takes it lends once.
@@ -23157,7 +23157,7 @@ mod tests {
                     });
                 }
 
-                /// Usage probe (R1 "relative to the share root" + R9 one O_NOFOLLOW open):
+                /// Relative to the share root, through one O_NOFOLLOW open:
                 /// a path whose directory is a link out of the share root names a file
                 /// that is not under the root, and is refused like any other such path;
                 /// nothing of it travels, and no byte of it is echoed. A path through a link
@@ -23223,8 +23223,8 @@ mod tests {
                     });
                 }
 
-                /// Usage probe (R8's purpose, "a reference is only as good as the fetch
-                /// behind it"): a reference named through a link to a directory inside the
+                /// A reference is only as good as the fetch
+                /// behind it: a reference named through a link to a directory inside the
                 /// root is one the peer can actually fetch, under the name it heard, on the
                 /// one-off grant; so the pre-flight's silence on inner links is sound.
                 #[test]
@@ -23299,7 +23299,7 @@ mod tests {
                     });
                 }
 
-                /// Usage probe (R2, "`--attach` is refused BEFORE any notice is printed"):
+                /// `--attach` is refused BEFORE any notice is printed:
                 /// while a live run holds the question, the hold sentence is the whole
                 /// output of the line, for the inline and the reference form alike: no
                 /// "Sending your answer…" and no attaching notice precedes it, so the
@@ -23367,9 +23367,9 @@ mod tests {
                     });
                 }
 
-                /// Usage probe (R3, "the plain answer path now mirrors this: take → send
-                /// → put back on failure", exercised through the INLINE `--attach` form,
-                /// which lends nothing): the peer refuses the message, so the question is
+                /// The plain answer path mirrors the decision path, take → send
+                /// → put back on failure, exercised through the INLINE `--attach` form,
+                /// which lends nothing: the peer refuses the message, so the question is
                 /// pending again, the human reads the send's one line (not "already
                 /// answered by another process"), no grant appears since nothing was
                 /// lent, and the retry once the peer takes it closes the question with the
@@ -23457,7 +23457,7 @@ mod tests {
                     });
                 }
 
-                /// Usage probe (R8 reference form, order of judgement): a reference the
+                /// Reference form, order of judgement: a reference the
                 /// serving side would refuse is refused with ONE sentence that names the
                 /// first reason in the documented order (size before the share list's
                 /// refusal before a rule), and the human reads no notice first; the same

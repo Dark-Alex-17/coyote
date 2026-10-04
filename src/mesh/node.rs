@@ -5142,8 +5142,8 @@ mod tests {
         stub.stop().await;
     }
 
-    /// Usage probe (R3, the answer path mirrors the decision path, exercised with a
-    /// REFERENCE part — the one form that writes a grant): a question another process
+    /// The answer path mirrors the decision path, exercised with a
+    /// REFERENCE part (the one form that writes a grant): a question another process
     /// already took is refused with the one sentence and NO one-off grant is lent for the
     /// reference, since the take comes before the lend; a reference answer whose send the
     /// peer refuses lends and then takes the grant back, puts the question back, and

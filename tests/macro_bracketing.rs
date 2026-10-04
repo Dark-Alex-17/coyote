@@ -368,7 +368,7 @@ fn literal_mesh_step_is_refused_at_load_and_closes_the_bracket() {
     assert_started_and_single_terminal(&dir, "FAILED");
 }
 
-/// Usage probe (spec (b)): the bare `coyote --macro` route consults no
+/// The bare `coyote --macro` route consults no
 /// policy, so the load-time refusal is the only gate on it — and it must
 /// land BEFORE the first step runs. The first step here is a shell
 /// passthrough that appends a `STEP_RAN` marker, so "did not execute" is a

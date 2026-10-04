@@ -2446,7 +2446,7 @@ mod tests {
         source.remove_dir();
     }
 
-    // ---- usage-probe spec-first additions ----------------------------------------------
+    // ---- held escalations: lapses, ceilings, hand-offs, over a live link -----------------
 
     /// A job whose sender is `source_destination`/`source_identity`, for tests that watch
     /// the reply arrive at a live peer instead of in the mesh-off inbox.
@@ -5085,7 +5085,7 @@ mod tests {
         source.remove_dir();
     }
 
-    // ---- usage probe: dispositions on the wire -------------------------------------------
+    // ---- dispositions on the wire --------------------------------------------------------
 
     /// A drive that asks the human twice in one run and answers with both replies.
     #[cfg(unix)]
@@ -6289,7 +6289,7 @@ mod tests {
         }
     }
 
-    // ---- usage probe: the asking peer's own tools over two real nodes ------------------
+    // ---- the asking peer's own tools over two real nodes ---------------------------------
 
     /// A Reticulum transport node in-process: a `TcpServer` on a transport with transport
     /// mode on. Two `MeshRuntime`s that both join it hear each other's announces through

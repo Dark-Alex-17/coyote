@@ -1347,7 +1347,7 @@ variables:
         assert!(!ctx.macro_non_isolated);
     }
 
-    // ---- usage probe: spec-first tests for the .mesh-in-macros exclusion ----
+    // ---- the .mesh-in-macros exclusion ----
 
     /// The reason wording is fixed verbatim; pin the whole sentence so
     /// the `.list macros` row and the load error cannot drift apart from it.

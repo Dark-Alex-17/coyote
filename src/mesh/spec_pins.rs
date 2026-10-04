@@ -628,7 +628,13 @@ pub(crate) fn rust_sources(dir: &Path) -> std::io::Result<String> {
 /// Each `.rs` file under `root/src` as its `/`-joined path relative to `root` and its
 /// contents, as `rust_files` walks it.
 fn rust_source_files(root: &Path) -> std::io::Result<Vec<(String, String)>> {
-    rust_files(&root.join("src"))?
+    rust_files_under(root, "src")
+}
+
+/// Each `.rs` file under `root/<dir>` as its `/`-joined path relative to `root` and its
+/// contents, as `rust_files` walks it.
+fn rust_files_under(root: &Path, dir: &str) -> std::io::Result<Vec<(String, String)>> {
+    rust_files(&root.join(dir))?
         .into_iter()
         .map(|path| {
             let relative = path
@@ -2922,11 +2928,11 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
     }
 
     /// A line that cites a planning artefact (a task id, a lettered review criterion, a
-    /// review round, a ruling) instead of the behaviour it tests, in any letter case. The
-    /// needles are assembled at runtime so this file does not spell them. A task id quoted
-    /// inside a code span or a string literal is fixture input, not a citation, and a line
-    /// that names the `ILLUSTRATIVE_IDS` list is the fixture that keeps one such id on
-    /// purpose.
+    /// review round, a ruling, a commit) instead of the behaviour it tests, in any letter
+    /// case. The needles are assembled at runtime so this file does not spell them. A task
+    /// id quoted inside a code span or a string literal is fixture input, not a citation,
+    /// and a line that names the `ILLUSTRATIVE_IDS` list is the fixture that keeps one such
+    /// id on purpose.
     fn cites_a_plan_label(line: &str) -> bool {
         if line.contains("ILLUSTRATIVE_IDS") {
             return false;
@@ -2943,13 +2949,16 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
         let rounds = [
             ["probe,", " round "].concat(),
             ["review", " round "].concat(),
+            ["criteria", " "].concat(),
         ];
         let ruling = ["ruling", " "].concat();
+        let shorthand = "(r";
         let plain = [
             ["plan", " criterion"].concat(),
             ["plan", " ruling"].concat(),
             ["user", " ruling"].concat(),
         ];
+        let commit = [" fix", " commit"];
         let letter_in_parens = |rest: &[u8]| {
             rest.first() == Some(&b'(')
                 && rest.get(1).is_some_and(u8::is_ascii_lowercase)
@@ -2957,10 +2966,30 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
         };
         let after_optional_round = |rest: &[u8]| {
             let rest = match rest {
-                [b' ', b'r', digit, rest @ ..] if digit.is_ascii_digit() => rest,
+                [b' ', b'r', digits @ ..] if digits.first().is_some_and(u8::is_ascii_digit) => {
+                    &digits[digits.iter().take_while(|b| b.is_ascii_digit()).count()..]
+                }
                 rest => rest,
             };
             letter_in_parens(rest.strip_prefix(b" ").unwrap_or(rest))
+        };
+        let after_a_short_hash = |before: &[u8]| {
+            let hex = before
+                .iter()
+                .rev()
+                .take_while(|b| b.is_ascii_hexdigit())
+                .count();
+            (7..=40).contains(&hex)
+                && before[..before.len() - hex]
+                    .last()
+                    .is_none_or(|b| !b.is_ascii_alphanumeric() && *b != b'_')
+        };
+        let round_number_alone = |rest: &[u8]| {
+            let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+            digits > 0
+                && rest[digits..]
+                    .first()
+                    .is_none_or(|b| !b.is_ascii_alphanumeric() && *b != b'_')
         };
         let comment_text = line
             .trim_start()
@@ -2978,6 +3007,11 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
                 })
             })
             || plain.iter().any(|needle| line.contains(needle.as_str()))
+            || comment_text.is_some_and(|text| follows(text, shorthand, round_number_alone))
+            || commit.iter().any(|needle| {
+                line.match_indices(needle)
+                    .any(|(at, _)| after_a_short_hash(&line.as_bytes()[..at]))
+            })
     }
 
     fn without_quoted(line: &str) -> String {
@@ -3014,6 +3048,16 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
             ["// ---- usage probe,", " round 2 ----"].concat(),
             ["/// Plan", " criterion (f): at every cap"].concat(),
             ["// the plan", " ruling was"].concat(),
+            ["/// usage", " probe r10 (b): the tenth"].concat(),
+            ["// settled (R", "3): the reply"].concat(),
+            ["// ---- usage probe (r", "4) ----"].concat(),
+            ["// criteria", " 3+4 hold"].concat(),
+            ["// the 3a3d1d1", " fix narrowed it"].concat(),
+            [
+                "// after 0123456789abcdef0123456789abcdef01234567",
+                " commit",
+            ]
+            .concat(),
         ] {
             assert!(cites_a_plan_label(&hit), "{hit:?}");
         }
@@ -3026,6 +3070,12 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
             "// the ruling stands".to_string(),
             "// a planned criterion is unmet".to_string(),
             "// B6 and G8 are hex here".to_string(),
+            "// the R3 transport frames it".to_string(),
+            "// Err(R3Error::Shutdown) ends it".to_string(),
+            "assert_eq!(r1.len(), 2);".to_string(),
+            "// 9f1c3b0e6d8a4f2b9c7e1a5d3b8f6c04 is a wire id".to_string(),
+            "// a fix for the relay".to_string(),
+            "// the criteria differ".to_string(),
             ["// the rule quotes `// TASK", "-002` as its example"].concat(),
             ["let id = \"TASK", "-002\";"].concat(),
             ["const ILLUSTRATIVE_IDS: [&str; 1] = [\"TASK", "-002\"];"].concat(),
@@ -3038,6 +3088,7 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
     fn source_comments_cite_behaviour_not_plan_labels() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut files: Vec<(String, String)> = rust_source_files(root).unwrap();
+        files.extend(rust_files_under(root, "tests").unwrap());
         files.push(("docs/mesh/PROTOCOL.md".to_string(), SPEC.to_string()));
         let hits: Vec<String> = files
             .iter()
@@ -3049,7 +3100,12 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
                     .map(move |(index, line)| format!("{path}:{}: {}", index + 1, line.trim()))
             })
             .collect();
-        assert!(hits.is_empty(), "{}", hits.join("\n"));
+        assert!(
+            hits.is_empty(),
+            "code comments describe behaviour; cite a MESH- id or the behaviour instead of a \
+             plan label:\n{}",
+            hits.join("\n")
+        );
     }
 
     #[test]

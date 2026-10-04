@@ -1402,9 +1402,9 @@ fn usage_probe_copying_only_the_lxmd_identity_moves_destinations_but_not_the_tra
 }
 
 // ---------------------------------------------------------------------------
-// Usage probe, round 3 (spec-first from the README as of 0097462): the
-// bind-mount recipe, the `lxmd --status` operating note against a LIVE daemon,
-// seeding on the non-daemon paths, and the store-and-forward wording.
+// README operating notes: the bind-mount recipe, the `lxmd --status` operating
+// note against a LIVE daemon, seeding on the non-daemon paths, and the
+// store-and-forward wording.
 // ---------------------------------------------------------------------------
 
 /// Collapse every whitespace run to one space so a re-wrapped sentence still matches.
@@ -1779,9 +1779,10 @@ fn usage_probe_bind_mount_recipe_runs_the_daemon_and_keeps_identities_private() 
 }
 
 // ---------------------------------------------------------------------------
-// Usage probe, round 4 (6bd1512): the corrected multi-node advice, the BuildKit
-// note, the .gitattributes widening, the load-bearing /opt/coyote-pn mkdir and the
-// exact exit codes / rewritten-file list the status note now promises.
+// README multi-node and status notes: the corrected multi-node advice, the
+// BuildKit note, the .gitattributes widening, the load-bearing /opt/coyote-pn
+// mkdir and the exact exit codes / rewritten-file list the status note now
+// promises.
 // ---------------------------------------------------------------------------
 
 #[test]

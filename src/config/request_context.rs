@@ -11276,7 +11276,7 @@ mod tests {
         assert!(ctx.session.as_ref().unwrap().todo_list().goal.is_empty());
     }
 
-    // Usage probe (spec-first, criteria 3+4): the reserved `temp` name can
+    // The reserved `temp` name can
     // never land in Workspace scope — not via the bare flag, and not by
     // spelling the name out either. The rejection is a no-op: no workspace
     // `temp.yaml`, and the live session keeps its Global scope/path so a
