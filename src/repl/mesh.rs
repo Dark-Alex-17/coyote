@@ -24639,8 +24639,9 @@ mod tests {
                             .unwrap();
                         assert!(
                             !dry.contains("big.txt")
-                                && !dry.contains("1000")
-                                && !dry.contains("1007"),
+                                && dry.contains("(7 bytes)")
+                                && !dry.contains("(1000 bytes)")
+                                && !dry.contains("(1007 bytes)"),
                             "the link's target is not walked: {dry}"
                         );
                         assert_eq!(fs::read(outside.path.join("big.txt")).unwrap().len(), 1000);
@@ -24651,8 +24652,8 @@ mod tests {
                         let question = asked.lock()[0].clone();
                         assert!(
                             question.contains("(7 bytes)")
-                                && !question.contains("1000")
-                                && !question.contains("1007"),
+                                && !question.contains("(1000 bytes)")
+                                && !question.contains("(1007 bytes)"),
                             "the byte total is this tree's own: {question}"
                         );
                         assert!(out.starts_with("Removed "), "{out}");
