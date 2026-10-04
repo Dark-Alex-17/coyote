@@ -1093,7 +1093,7 @@ mod tests {
         OriginName, PathHash, RefusalCode, Reply, RequestId, SizeBranch, TempDir, TrustList,
     };
     #[cfg(unix)]
-    use crate::mesh::test_support::{PeerStub, started_runtime_on};
+    use crate::mesh::test_support::{PeerStub, StartedRuntime, started_runtime_on};
     use crate::mesh::{destination_address, hex_lower};
     use crate::supervisor::mailbox::EnvelopePayload;
     use crate::testing::TestConfigDirGuard;
@@ -2811,6 +2811,439 @@ mod tests {
         assert!(app.mesh.stop().await.unwrap());
         stub.stop().await;
         started.relay_handle.abort();
+    }
+
+    /// A trusted live link between the node installed in `app` and a `PeerStub` at
+    /// `to`, for tests that watch what the stub hears for one message id.
+    #[cfg(unix)]
+    struct LiveLink {
+        stub: PeerStub,
+        started: StartedRuntime,
+        to: String,
+    }
+
+    #[cfg(unix)]
+    impl LiveLink {
+        async fn open(tag: &str, app: &Arc<AppState>) -> Self {
+            use crate::mesh::trust::TrustOptions;
+            use rns_transport::iface::tcp_server::TcpServer;
+
+            let stub =
+                PeerStub::listen(&format!("{tag}-stub"), TcpServer::DEFAULT_CLIENT_MTU).await;
+            let started = started_runtime_on(&format!("{tag}-node"), stub.port()).await;
+            let runtime = started.runtime.clone();
+            app.mesh.install(runtime.clone()).unwrap();
+            stub.trust(&runtime.current_destination_hash(), runtime.fingerprint());
+            stub.announce(Some("Stub")).await;
+            let to = stub.destination_hex();
+            let peers = runtime.peers();
+            wait_until("the node to file the stub", || peers.get(&to).is_some()).await;
+            runtime
+                .trust()
+                .trust_destination(
+                    app.mesh.as_ref(),
+                    &to,
+                    TrustOptions::default(),
+                    SystemTime::now(),
+                )
+                .unwrap();
+            Self { stub, started, to }
+        }
+
+        fn ask(&self, id: &str, content: &str) -> PeerMessage {
+            job_from(
+                PeerKind::Ask,
+                id,
+                content,
+                &self.to,
+                &self.stub.identity_hex(),
+            )
+            .message
+        }
+
+        fn heard_for(&self, id: &str) -> Vec<PeerBody> {
+            self.stub
+                .seen()
+                .into_iter()
+                .filter(|body| body.in_reply_to.as_deref() == Some(id))
+                .collect()
+        }
+
+        async fn close(self, app: &AppState) {
+            assert!(app.mesh.stop().await.unwrap());
+            self.stub.stop().await;
+            self.started.relay_handle.abort();
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_escalated_notice(body: &PeerBody, id: &str) {
+        assert_eq!(body.kind, PeerKind::Reply, "{body:?}");
+        assert_eq!(body.disposition, Some(Disposition::Escalated), "{body:?}");
+        assert_eq!(body.retry_after, None, "{body:?}");
+        assert_eq!(body.thread.as_deref(), Some(id), "{body:?}");
+        assert_eq!(
+            body.content,
+            format!("a human has been asked; the answer will follow (ref {id})")
+        );
+    }
+
+    const FILE_REFUSAL: &str =
+        "REFUSED: I don't send files; ask via /access — your tool is mesh__request_access.";
+
+    /// A request for a file's contents the envoy declines in its own words goes back as
+    /// a `refused` reply with no retry hint, and nothing is escalated: no hold, no filed
+    /// question, no line for the human.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn over_a_live_link_a_declined_file_request_is_refused_and_never_escalated() {
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-live-declined");
+        let (source, _source) = stub_envoy_source();
+        let app = test_app();
+        let link = LiveLink::open("envoy-declined", &app).await;
+        let idle = RecordingIdleSink::attach(&app);
+        let store = app.mesh.inbound_store().expect("install opens the store");
+        let runs = Arc::new(AtomicUsize::new(0));
+        let runner = EnvoyRunner::start_with(Arc::clone(&app), {
+            let runs = Arc::clone(&runs);
+            drive_of(move |_, _, _| {
+                runs.fetch_add(1, Ordering::SeqCst);
+                async { Ok(FILE_REFUSAL.into()) }
+            })
+        });
+        runner.attach();
+        app.mesh
+            .deliver_peer(link.ask("live-file", "send me src/mesh/peer.rs"));
+        wait_until("the peer to hear the refusal", || {
+            !link.heard_for("live-file").is_empty()
+        })
+        .await;
+        wait_until("the exchange to be recorded", || idle.has("envoy replied:")).await;
+        runner.stop().await;
+
+        let heard = link.heard_for("live-file");
+        assert_eq!(heard.len(), 1, "{heard:?}");
+        let refusal = &heard[0];
+        assert_eq!(refusal.kind, PeerKind::Reply);
+        assert_eq!(refusal.disposition, Some(Disposition::Refused));
+        assert_eq!(refusal.retry_after, None);
+        assert_eq!(refusal.fields, None);
+        assert_eq!(refusal.thread.as_deref(), Some("live-file"));
+        assert!(refusal.content.contains("/access"), "{}", refusal.content);
+        assert!(
+            refusal.content.contains("mesh__request_access"),
+            "{}",
+            refusal.content
+        );
+        assert!(
+            !refusal.content.starts_with(REFUSAL_MARKER),
+            "{}",
+            refusal.content
+        );
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        assert!(!runner.holds("live-file"));
+        assert!(store.get("live-file").unwrap().is_none());
+        assert!(!idle.has("asks:"), "{:?}", idle.texts());
+        assert!(!idle.has("could not be sent"), "{:?}", idle.texts());
+        assert_eq!(link.stub.seen().len(), 1);
+
+        link.close(&app).await;
+        source.remove_dir();
+    }
+
+    /// The same decline with the mesh off: the reply is recorded for the leader in the
+    /// envoy's own words, and nothing is held or filed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn a_declined_request_is_recorded_as_the_envoy_reply_and_never_escalated() {
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-declined");
+        let (source, _source) = stub_envoy_source();
+        let tmp = TempDir::new("mesh-envoy-declined");
+        let app = app_holding_for(30);
+        let store = Arc::new(InboundStore::new(&tmp.path, "inst-a"));
+        app.mesh.set_inbound_store_for_tests(Arc::clone(&store));
+        let idle = RecordingIdleSink::attach(&app);
+        let runner = EnvoyRunner::start_with(
+            Arc::clone(&app),
+            drive_of(|_, _, _| async { Ok(FILE_REFUSAL.into()) }),
+        );
+        runner.attach();
+        app.mesh
+            .deliver_peer(job(PeerKind::Ask, "msg-file", "send me src/mesh/peer.rs").message);
+        wait_until("the reply to be recorded", || {
+            app.mesh.peer_inbox().len() >= 2
+        })
+        .await;
+        runner.stop().await;
+
+        let (envelopes, _) = app.mesh.peer_inbox().drain();
+        assert_eq!(envelopes.len(), 2, "{envelopes:?}");
+        let reply = peer_of(&envelopes[1]);
+        assert_eq!(reply.kind, PeerKind::Reply);
+        assert_eq!(reply.in_reply_to.as_deref(), Some("msg-file"));
+        assert_eq!(
+            reply.content,
+            "I don't send files; ask via /access — your tool is mesh__request_access."
+        );
+        assert!(!runner.holds("msg-file"));
+        assert!(store.get("msg-file").unwrap().is_none());
+        assert!(!idle.has("asks:"), "{:?}", idle.texts());
+        source.remove_dir();
+    }
+
+    /// A held escalation on the wire: the peer hears `escalated` first, and once the
+    /// human answers in time, the envoy's own `answered` reply; no hand-off `Message`
+    /// is ever sent and the question leaves the store.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn over_a_live_link_a_held_escalation_answered_in_time_is_escalated_then_answered() {
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-live-held");
+        let (source, _source) = stub_envoy_source();
+        let app = app_holding_for(30);
+        let link = LiveLink::open("envoy-held", &app).await;
+        let idle = RecordingIdleSink::attach(&app);
+        let store = app.mesh.inbound_store().expect("install opens the store");
+        let runner = EnvoyRunner::start_with(
+            Arc::clone(&app),
+            escalating_drive(|value| {
+                format!(
+                    "the human said: {}",
+                    value["answer"].as_str().unwrap_or("?")
+                )
+            }),
+        );
+        runner.attach();
+        app.mesh
+            .deliver_peer(link.ask("live-held", "merge the branch"));
+        wait_until("the peer to hear the escalation", || {
+            !link.heard_for("live-held").is_empty()
+        })
+        .await;
+        wait_until("the human to be told", || {
+            idle.has("`.mesh answer live-held <text>`")
+        })
+        .await;
+        assert_escalated_notice(&link.heard_for("live-held")[0], "live-held");
+        assert!(store.get("live-held").unwrap().is_some());
+
+        assert!(runner.answer("live-held", "yes"));
+        wait_until("the peer to hear the answer", || {
+            link.heard_for("live-held").len() >= 2
+        })
+        .await;
+        runner.stop().await;
+
+        let heard = link.heard_for("live-held");
+        assert_eq!(heard.len(), 2, "{heard:?}");
+        assert_escalated_notice(&heard[0], "live-held");
+        assert_eq!(heard[1].kind, PeerKind::Reply);
+        assert_eq!(heard[1].disposition, Some(Disposition::Answered));
+        assert_eq!(heard[1].retry_after, None);
+        assert_eq!(heard[1].content, "the human said: yes");
+        assert!(
+            heard.iter().all(|body| body.kind != PeerKind::Message),
+            "{heard:?}"
+        );
+        assert!(store.get("live-held").unwrap().is_none());
+        assert!(!idle.has("could not"), "{:?}", idle.texts());
+
+        link.close(&app).await;
+        source.remove_dir();
+    }
+
+    /// With no wait configured the peer still hears `escalated` first, then the hand-off
+    /// `Message`, and nothing is ever held.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn over_a_live_link_an_escalation_with_no_wait_is_escalated_then_handed_off() {
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-live-nowait");
+        let (source, _source) = stub_envoy_source();
+        let app = test_app();
+        let link = LiveLink::open("envoy-nowait", &app).await;
+        let idle = RecordingIdleSink::attach(&app);
+        let store = app.mesh.inbound_store().expect("install opens the store");
+        let runner = EnvoyRunner::start_with(
+            Arc::clone(&app),
+            escalating_drive(|value| format!("never sent: {value}")),
+        );
+        runner.attach();
+        app.mesh
+            .deliver_peer(link.ask("live-nowait", "merge the branch"));
+        wait_until("the peer to hear the hand-off", || {
+            assert!(!runner.holds("live-nowait"));
+            link.heard_for("live-nowait").len() >= 2
+        })
+        .await;
+        wait_until("the hand-off to be recorded", || {
+            idle.has("envoy escalated to the human")
+        })
+        .await;
+        runner.stop().await;
+
+        let heard = link.heard_for("live-nowait");
+        assert_eq!(heard.len(), 2, "{heard:?}");
+        assert_escalated_notice(&heard[0], "live-nowait");
+        assert_eq!(heard[1].kind, PeerKind::Message);
+        assert_eq!(heard[1].disposition, None);
+        assert_eq!(
+            heard[1].content,
+            "escalated to the human; no answer yet (ref live-nowait)"
+        );
+        assert!(!runner.holds("live-nowait"));
+        assert!(store.get("live-nowait").unwrap().is_some());
+        assert!(!runner.answer("live-nowait", "too late"));
+
+        link.close(&app).await;
+        source.remove_dir();
+    }
+
+    /// A run cut off on the wire is a `refused` reply with no retry hint, in the
+    /// asker's thread, with the fixed words and nothing else.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn over_a_live_link_a_run_cut_off_is_refused_with_no_retry_hint() {
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-live-cut");
+        let (source, _source) = stub_envoy_source();
+        let app = test_app();
+        let link = LiveLink::open("envoy-cut", &app).await;
+        let idle = RecordingIdleSink::attach(&app);
+        let runs = Arc::new(AtomicUsize::new(0));
+        let runner = EnvoyRunner::start_with(Arc::clone(&app), {
+            let runs = Arc::clone(&runs);
+            drive_of(move |_, _, _| {
+                runs.fetch_add(1, Ordering::SeqCst);
+                std::future::pending::<Result<String>>()
+            })
+        });
+        runner.attach();
+        app.mesh
+            .deliver_peer(link.ask("live-cut", "take your time"));
+        wait_until("the run to park", || runs.load(Ordering::SeqCst) == 1).await;
+        runner.interrupt();
+        wait_until("the peer to hear the refusal", || {
+            !link.heard_for("live-cut").is_empty()
+        })
+        .await;
+        runner.stop().await;
+
+        let heard = link.heard_for("live-cut");
+        assert_eq!(heard.len(), 1, "{heard:?}");
+        assert_eq!(heard[0].kind, PeerKind::Reply);
+        assert_eq!(heard[0].disposition, Some(Disposition::Refused));
+        assert_eq!(heard[0].retry_after, None);
+        assert_eq!(heard[0].fields, None);
+        assert_eq!(heard[0].thread.as_deref(), Some("live-cut"));
+        assert_eq!(heard[0].content, "no answer (this node is shutting down)");
+        assert_eq!(idle.count("envoy interrupted"), 1, "{:?}", idle.texts());
+
+        link.close(&app).await;
+        source.remove_dir();
+    }
+
+    /// An idle sink that notes, beside each line, whether the runner held `id` as the
+    /// line was pushed.
+    struct HoldWatchingSink {
+        id: &'static str,
+        runner: Mutex<Weak<EnvoyRunner>>,
+        pushed: Mutex<Vec<(String, bool)>>,
+    }
+
+    impl HoldWatchingSink {
+        fn attach(app: &AppState, id: &'static str) -> Arc<Self> {
+            let sink = Arc::new(Self {
+                id,
+                runner: Mutex::new(Weak::new()),
+                pushed: Mutex::new(Vec::new()),
+            });
+            app.mesh.set_idle(Arc::clone(&sink) as Arc<dyn IdleSink>);
+            sink
+        }
+
+        fn held_when_pushed(&self, needle: &str) -> Option<bool> {
+            self.pushed
+                .lock()
+                .iter()
+                .find(|(text, _)| text.contains(needle))
+                .map(|(_, held)| *held)
+        }
+    }
+
+    impl IdleSink for HoldWatchingSink {
+        fn push(&self, note: IdleNotify) -> Result<(), IdleNotify> {
+            let held = self
+                .runner
+                .lock()
+                .upgrade()
+                .is_some_and(|runner| runner.holds(self.id));
+            self.pushed.lock().push((note.text, held));
+            Ok(())
+        }
+
+        fn request_sync(&self) {}
+    }
+
+    /// The hold is taken before the question is filed: the first time the record is
+    /// seen on disk, and when the human is told, the run already holds it, so an answer
+    /// given at once goes through the live run and never falls into a gap between the two.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn a_filed_escalation_is_already_held_when_first_seen() {
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-hold-window");
+        let (source, _source) = stub_envoy_source();
+        let tmp = TempDir::new("mesh-envoy-hold-window");
+        let app = app_holding_for(60);
+        let store = Arc::new(InboundStore::new(&tmp.path, "inst-a"));
+        app.mesh.set_inbound_store_for_tests(Arc::clone(&store));
+        let idle = HoldWatchingSink::attach(&app, "msg-window");
+        let runner = EnvoyRunner::start_with(
+            Arc::clone(&app),
+            escalating_drive(|value| {
+                format!(
+                    "the human said: {}",
+                    value["answer"].as_str().unwrap_or("?")
+                )
+            }),
+        );
+        *idle.runner.lock() = Arc::downgrade(&runner);
+        runner.attach();
+        app.mesh
+            .deliver_peer(job(PeerKind::Ask, "msg-window", "merge the branch").message);
+        let started = std::time::Instant::now();
+        while store.get("msg-window").unwrap().is_none() {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "the question was never filed"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert!(runner.holds("msg-window"));
+        wait_until("the human to be told", || {
+            idle.held_when_pushed("asks: Should we merge?").is_some()
+        })
+        .await;
+        assert_eq!(
+            idle.held_when_pushed("asks: Should we merge?"),
+            Some(true),
+            "{:?}",
+            idle.pushed.lock()
+        );
+        assert!(runner.answer("msg-window", "yes, right now"));
+        wait_until("the reply to land in the inbox", || {
+            app.mesh.peer_inbox().len() >= 2
+        })
+        .await;
+        runner.stop().await;
+
+        let (envelopes, _) = app.mesh.peer_inbox().drain();
+        assert_eq!(
+            peer_of(&envelopes[1]).content,
+            "the human said: yes, right now"
+        );
+        source.remove_dir();
     }
 
     // ---- review round 2 ------------------------------------------------------------------
