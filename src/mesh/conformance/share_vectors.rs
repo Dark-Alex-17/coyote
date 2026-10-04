@@ -3,8 +3,8 @@
 //! of section 10.17, the `/list` and `/fetch` handlers and requesters of sections 10.14
 //! and 10.15, and the on-disk versioning of section 14.1 for the stores they read. Every
 //! row runs in-process against this crate's own `WirePath`, `ShareSet`, `GrantStore`,
-//! `ListHandler`, `FetchHandler`, `SharesPage`, `R3Client` and record types, on a share
-//! root the row builds in a temporary directory.
+//! `ListHandler`, `FetchHandler`, `SharesPage`, `R3Client`, record types and the REPL's
+//! `attachment` predicate, on a share root the row builds in a temporary directory.
 //!
 //! Every row names the id it exercises and the receiver action the spec mandates for it. A
 //! row written faithfully from the spec that the code does not honour is kept as written
@@ -14,14 +14,15 @@
 use super::{Kind, Listed};
 use crate::config::WORKSPACE_COYOTE_DIR_NAME;
 use crate::config::mesh_config::MAX_FETCH_FILE_BYTES;
+use crate::config::{AppState, RequestContext, WorkingMode};
 use crate::hooks::HookEvent;
 use crate::mesh::access::validate_access;
 use crate::mesh::card::{STATE_IDLE, STATUS_CARD_VERSION, StatusCard};
 use crate::mesh::events::{MeshHooks, RecordingHookSink, env_value};
 use crate::mesh::fetch::{
-    CURSOR_MAX_BYTES, FILE_FETCH_REQUEST_TIMEOUT, FetchError, FetchHandler, FetchServing, Fetched,
-    FileReader, LIST_PAGE_HEADROOM, ListHandler, SINGLE_SEGMENT_FETCH_CEILING, ShareSource,
-    SharesPage, field, rule_of,
+    CURSOR_MAX_BYTES, FILE_FETCH_REQUEST_TIMEOUT, FetchError, FetchHandler, FetchReply,
+    FetchServing, Fetched, FileReader, LIST_PAGE_HEADROOM, ListHandler,
+    SINGLE_SEGMENT_FETCH_CEILING, ShareSource, SharesPage, field, read_fetch_reply, rule_of,
 };
 use crate::mesh::grants::{
     DEFAULT_GRANT_TTL, DEFAULT_GRANT_USES, GRANT_MAX_PATHS, GRANT_RECORD_VERSION, GrantStore,
@@ -32,10 +33,10 @@ use crate::mesh::message::{
 };
 use crate::mesh::pending::{INBOUND_RECORD_VERSION, InboundKind, InboundRecord};
 use crate::mesh::r3::{
-    AdmittedRequest, Dispatcher, Envelope, FETCH_PATH, Handler, InboundRequest, KnockEvent,
-    KnockSink, LIST_PATH, MAX_FETCH_RESPONSE_BYTES, MAX_R3_PAYLOAD_BYTES, NAME_HASH_LEN,
-    OriginName, PathHash, R3Client, R3Error, RESPONSE_FRAME_PREFIX, RefusalCode, Reply,
-    RequestHandler, RequestId, ResponseFrame, STATUS_PATH, SizeBranch,
+    AdmittedRequest, DispatchError, Dispatcher, Envelope, FETCH_PATH, Handler, InboundRequest,
+    KnockEvent, KnockSink, LIST_PATH, MAX_FETCH_RESPONSE_BYTES, MAX_R3_PAYLOAD_BYTES,
+    NAME_HASH_LEN, OriginName, PathHash, R3Client, R3Error, RESPONSE_FRAME_PREFIX, RefusalCode,
+    Reply, RequestHandler, RequestId, ResponseFrame, STATUS_PATH, SizeBranch,
 };
 use crate::mesh::schema::{Remedy, version_refusal};
 use crate::mesh::shares::{
@@ -43,11 +44,12 @@ use crate::mesh::shares::{
     ServedFile, ShareLocations, ShareSet, Verdict, Via, WriteScope, list_cursor,
     probe_case_insensitive, validate_override, validate_pattern, write_target,
 };
-use crate::mesh::test_support::{TempDir, TrustList, siblings_of};
+use crate::mesh::test_support::{TempDir, TrustList, siblings_of, snapshot_fixture};
 use crate::mesh::wire_path::{
     RULES, WIRE_PATH_MAX_BYTES, WIRE_PATH_MAX_SEGMENTS, WirePath, is_rule_id,
 };
 use crate::mesh::{hex_lower, mesh_config_dir, rfc3339_utc};
+use crate::repl::mesh::{AttachForm, Attachment, attachment};
 use crate::testing::{debug_snapshot, install_log_collector, warn_snapshot};
 
 use rand_core::OsRng;
@@ -98,6 +100,10 @@ enum Case {
     /// The requester's side of both paths: `SharesPage`, the inbox staging, the response
     /// bound of `R3Client` and the card keys of section 9 that announce the paths.
     FetchClient(ClientProbe),
+    /// The REPL's `attachment` predicate over a share root built for the row, the file
+    /// the human names held to section 10.17 as MESH-SHARE-020 has it. Reads the config
+    /// dir from the process env, so its executor serialises and holds a config-dir guard.
+    Attachment(Check),
 }
 
 enum WireProbe {
@@ -258,7 +264,36 @@ enum ClientProbe {
         value: Value,
         kept: bool,
     },
+    /// What `read_fetch_reply` makes of a peer's `/fetch` reply.
+    Reply {
+        value: Value,
+        expect: Result<FetchReply, ReplyError>,
+    },
     Check(Check),
+}
+
+/// The `FetchError` a reply reader can end in, comparable; `Transport` and `Stage` never
+/// come out of a pure read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplyError {
+    NotServed,
+    Malformed(&'static str),
+    Oversize(usize),
+    Corrupt,
+    UnknownStatus,
+}
+
+fn reply_error(err: &FetchError) -> Result<ReplyError, String> {
+    Ok(match err {
+        FetchError::NotServed => ReplyError::NotServed,
+        FetchError::Malformed(key) => ReplyError::Malformed(key),
+        FetchError::Oversize { len } => ReplyError::Oversize(*len),
+        FetchError::Corrupt => ReplyError::Corrupt,
+        FetchError::UnknownStatus => ReplyError::UnknownStatus,
+        FetchError::Transport(_) | FetchError::Stage(_) => {
+            return Err(format!("a pure read ended in {err:?}"));
+        }
+    })
 }
 
 impl Case {
@@ -271,6 +306,7 @@ impl Case {
             Self::ListServe(_) => "ListServe",
             Self::FetchServe(_) => "FetchServe",
             Self::FetchClient(_) => "FetchClient",
+            Self::Attachment(_) => "Attachment",
         }
     }
 }
@@ -313,6 +349,7 @@ fn run(case: &Case) -> Result<(), String> {
         Case::ListServe(probe) => run_list(probe),
         Case::FetchServe(probe) => run_fetch(probe),
         Case::FetchClient(probe) => run_client(probe),
+        Case::Attachment(check) => check(),
     }
 }
 
@@ -583,6 +620,13 @@ fn run_client(probe: &ClientProbe) -> Result<(), String> {
         }
         ClientProbe::Entry { value, kept } => {
             same("kept", SharesPage::entry(value).is_some(), *kept)
+        }
+        ClientProbe::Reply { value, expect } => {
+            let observed = match read_fetch_reply(value) {
+                Ok(reply) => Ok(reply),
+                Err(err) => Err(reply_error(&err)?),
+            };
+            same("fetch reply", &observed, expect)
         }
         ClientProbe::Check(check) => check(),
     }
@@ -2096,6 +2140,10 @@ fn client_check(id: &'static str, kind: Kind, check: Check) -> Vector {
     row(id, kind, Case::FetchClient(ClientProbe::Check(check)))
 }
 
+fn attach_check(id: &'static str, kind: Kind, check: Check) -> Vector {
+    row(id, kind, Case::Attachment(check))
+}
+
 fn list_request(
     id: &'static str,
     kind: Kind,
@@ -2169,6 +2217,50 @@ fn entry_row(id: &'static str, kind: Kind, value: Value, kept: bool) -> Vector {
         kind,
         Case::FetchClient(ClientProbe::Entry { value, kept }),
     )
+}
+
+fn reply_row(
+    id: &'static str,
+    kind: Kind,
+    value: Value,
+    expect: Result<FetchReply, ReplyError>,
+) -> Vector {
+    row(
+        id,
+        kind,
+        Case::FetchClient(ClientProbe::Reply { value, expect }),
+    )
+}
+
+/// A `/fetch` reply of this build's version carrying `status` and nothing else.
+fn fetch_reply(status: &str) -> Value {
+    map(vec![
+        ("v", Value::from(PEER_WIRE_VERSION)),
+        ("status", Value::from(status)),
+    ])
+}
+
+/// An `ok` reply for `bytes`, its `size` and `sha256` as an honest peer sends them.
+fn ok_reply(bytes: &[u8]) -> Value {
+    let reply = with(fetch_reply("ok"), "bytes", bin(bytes));
+    let reply = with(reply, "size", Value::from(bytes.len() as u64));
+    with(reply, "sha256", bin(&Sha256::digest(bytes)))
+}
+
+fn ok_read(bytes: &[u8]) -> Result<FetchReply, ReplyError> {
+    Ok(FetchReply::Ok {
+        bytes: bytes.to_vec(),
+        size: bytes.len() as u64,
+        sha256: Sha256::digest(bytes).into(),
+    })
+}
+
+fn not_modified_reply(sha256: &[u8]) -> Value {
+    with(fetch_reply("not_modified"), "sha256", bin(sha256))
+}
+
+fn malformed(key: &'static str) -> Result<FetchReply, ReplyError> {
+    Err(ReplyError::Malformed(key))
 }
 
 // ---------------------------------------------------------------------------------------
@@ -2990,6 +3082,172 @@ fn a_fetch_waits_two_minutes() -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------------------
+// Checks: the attachment predicate
+// ---------------------------------------------------------------------------------------
+
+/// A share root named by a published snapshot, as the REPL has it with the mesh off,
+/// its global share file carrying `deny`.
+struct AttachRoot {
+    _tmp: TempDir,
+    ctx: RequestContext,
+}
+
+impl AttachRoot {
+    fn build(tag: &str, files: &[(&str, &[u8])], deny: &[&str]) -> Result<Self, String> {
+        let tmp = TempDir::new(tag);
+        for (relative, bytes) in files {
+            let path = tmp.path.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, bytes).unwrap();
+        }
+        let ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Repl);
+        let mut snapshot = snapshot_fixture();
+        snapshot.cwd = tmp.path.clone();
+        ctx.app.mesh.publish(snapshot);
+        let (root, locations) = ctx
+            .share_locations()
+            .ok_or("the published snapshot names no share root")?;
+        same("share root", root, tmp.path.clone())?;
+        fs::create_dir_all(locations.global.parent().unwrap()).unwrap();
+        fs::write(&locations.global, shares_yaml(&[], deny, &[])).unwrap();
+        Ok(Self { _tmp: tmp, ctx })
+    }
+
+    fn attach(&self, path: &str, force: bool, inline_max: u64) -> Result<Attachment, String> {
+        let limits = PartLimits {
+            inline_max_bytes: inline_max,
+        };
+        attachment(
+            &self.ctx,
+            path,
+            force,
+            &limits,
+            SINGLE_SEGMENT_FETCH_CEILING,
+        )
+        .map_err(|err| err.to_string())
+    }
+}
+
+fn inline_of(attached: &Attachment, name: &str, bytes: &[u8]) -> Result<(), String> {
+    same("form", attached.form, AttachForm::Inline)?;
+    same("name", attached.name.as_str(), name)?;
+    same("size", attached.size, bytes.len() as u64)?;
+    same(
+        "part",
+        &attached.part,
+        &RawPart::File {
+            name: name.to_string(),
+            size: bytes.len() as u64,
+            sha256: sha256_of(bytes),
+            bytes: Some(bytes.to_vec()),
+            reference: None,
+        },
+    )
+}
+
+fn refused_with(observed: Result<Attachment, String>, phrases: &[&str]) -> Result<(), String> {
+    match observed {
+        Ok(attached) => Err(format!(
+            "expected a refusal naming {phrases:?}, observed {:?} `{}`",
+            attached.form, attached.name
+        )),
+        Err(text) => missing_phrases(&text, phrases),
+    }
+}
+
+fn an_inline_attachment_travels_whatever_the_allow_and_deny_lists_say() -> Result<(), String> {
+    let fx = AttachRoot::build(
+        "attach-inline-bypass",
+        &[
+            ("docs/notes.md", b"notes\n".as_slice()),
+            ("docs/private.md", b"mine\n".as_slice()),
+        ],
+        &["docs/private.md"],
+    )?;
+    let unlisted = fx.attach("docs/notes.md", false, 1024)?;
+    inline_of(&unlisted, "docs/notes.md", b"notes\n")?;
+    let denied = fx.attach("docs/private.md", false, 1024)?;
+    inline_of(&denied, "docs/private.md", b"mine\n")
+}
+
+fn an_attachment_under_the_protected_set_is_refused_with_or_without_force() -> Result<(), String> {
+    let fx = AttachRoot::build(
+        "attach-protected",
+        &[
+            (".coyote/settings.yaml", b"x\n".as_slice()),
+            (".git/HEAD", b"ref: refs/heads/main\n".as_slice()),
+        ],
+        &[],
+    )?;
+    for path in [".coyote/settings.yaml", ".git/HEAD"] {
+        for force in [false, true] {
+            refused_with(
+                fx.attach(path, force, 1024),
+                &["never shared", "`--force`", "nothing was sent."],
+            )
+            .map_err(|err| format!("{path} force={force}: {err}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn the_built_in_deny_refuses_an_attachment_until_force_lifts_it() -> Result<(), String> {
+    let fx = AttachRoot::build(
+        "attach-builtin-deny",
+        &[(".env", b"SECRET=1\n".as_slice())],
+        &[],
+    )?;
+    refused_with(
+        fx.attach(".env", false, 1024),
+        &["built-in deny", "`--force` attaches it anyway"],
+    )?;
+    let forced = fx.attach(".env", true, 1024)?;
+    inline_of(&forced, ".env", b"SECRET=1\n")
+}
+
+fn a_file_above_the_inline_limit_travels_by_reference() -> Result<(), String> {
+    let big = vec![0x5a; 1025];
+    let fx = AttachRoot::build("attach-reference", &[("docs/big.bin", &big)], &[])?;
+    let at_limit = fx.attach("docs/big.bin", false, 1025)?;
+    inline_of(&at_limit, "docs/big.bin", &big)?;
+    let referenced = fx.attach("docs/big.bin", false, 1024)?;
+    same("form", referenced.form, AttachForm::Reference)?;
+    same("size", referenced.size, 1025)?;
+    same(
+        "part",
+        &referenced.part,
+        &RawPart::File {
+            name: "docs/big.bin".to_string(),
+            size: 1025,
+            sha256: sha256_of(&big),
+            bytes: None,
+            reference: Some("docs/big.bin".to_string()),
+        },
+    )
+}
+
+fn a_reference_the_serving_side_would_not_serve_is_refused() -> Result<(), String> {
+    let big = vec![0x5a; 1025];
+    let fx = AttachRoot::build(
+        "attach-unservable-reference",
+        &[("docs/private.md", &big), (".env", &big)],
+        &["docs/private.md"],
+    )?;
+    refused_with(
+        fx.attach("docs/private.md", false, 1024),
+        &[
+            "`docs/private.md` would travel as a reference, which this node would not serve (a deny rule names it); lift the rule first; nothing was sent.",
+        ],
+    )?;
+    refused_with(
+        fx.attach(".env", true, 1024),
+        &[
+            "`.env` would travel as a reference, which this node would not serve (the built-in deny names it); lift the rule first; nothing was sent.",
+        ],
+    )
+}
+
+// ---------------------------------------------------------------------------------------
 // The table
 // ---------------------------------------------------------------------------------------
 
@@ -3002,6 +3260,7 @@ fn vectors() -> Vec<Vector> {
     rows.extend(list_serve_rows());
     rows.extend(fetch_serve_rows());
     rows.extend(fetch_client_rows());
+    rows.extend(attachment_rows());
     rows
 }
 
@@ -4713,6 +4972,10 @@ fn fetch_client_rows() -> Vec<Vector> {
     use Kind::{Boundary, Invalid, Valid};
     let good = || entry_of("docs/a.md");
     let one = || page_value(vec![good()], Value::Nil);
+    let hello = b"hello";
+    let hash = [0x11; 32];
+    let at_bound = vec![0x5a; MAX_FETCH_FILE_BYTES as usize];
+    let over_bound = vec![0x5a; MAX_FETCH_FILE_BYTES as usize + 1];
     let sixty_four = "a".repeat(CURSOR_MAX_BYTES);
     let sixty_five = "a".repeat(CURSOR_MAX_BYTES + 1);
     let thousand_and_one: Vec<Value> = (0..=LIST_PAGE_SIZE)
@@ -4950,6 +5213,245 @@ fn fetch_client_rows() -> Vec<Vector> {
             Invalid,
             a_rule_is_kept_when_known_read_as_unknown_otherwise_and_malformed_when_not_text,
         ),
+        reply_row("MESH-FETCH-013", Invalid, Value::from(7), malformed("map")),
+        reply_row(
+            "MESH-FETCH-013",
+            Invalid,
+            without(fetch_reply("not_shared"), "v"),
+            malformed("v"),
+        ),
+        reply_row(
+            "MESH-FETCH-013",
+            Invalid,
+            with(fetch_reply("not_shared"), "v", Value::from(2)),
+            malformed("v"),
+        ),
+        reply_row(
+            "MESH-FETCH-013",
+            Invalid,
+            DispatchError::NoProvider {
+                path: FETCH_PATH.to_string(),
+            }
+            .to_value(),
+            Err(ReplyError::NotServed),
+        ),
+        reply_row(
+            "MESH-FETCH-014",
+            Invalid,
+            without(ok_reply(hello), "status"),
+            malformed("status"),
+        ),
+        reply_row(
+            "MESH-FETCH-014",
+            Invalid,
+            with(ok_reply(hello), "status", Value::from(1)),
+            malformed("status"),
+        ),
+        reply_row(
+            "MESH-FETCH-015",
+            Invalid,
+            fetch_reply("maybe"),
+            Err(ReplyError::UnknownStatus),
+        ),
+        reply_row(
+            "MESH-FETCH-015",
+            Invalid,
+            with(ok_reply(hello), "status", Value::from("OK")),
+            Err(ReplyError::UnknownStatus),
+        ),
+        reply_row(
+            "MESH-FETCH-016",
+            Invalid,
+            without(ok_reply(hello), "size"),
+            malformed("size"),
+        ),
+        reply_row(
+            "MESH-FETCH-016",
+            Invalid,
+            with(ok_reply(hello), "size", Value::from(-5)),
+            malformed("size"),
+        ),
+        reply_row(
+            "MESH-FETCH-016",
+            Invalid,
+            with(ok_reply(hello), "size", Value::from(hello.len() - 1)),
+            malformed("size"),
+        ),
+        reply_row("MESH-FETCH-016", Valid, ok_reply(hello), ok_read(hello)),
+        reply_row(
+            "MESH-FETCH-017",
+            Invalid,
+            without(ok_reply(hello), "sha256"),
+            malformed("sha256"),
+        ),
+        reply_row(
+            "MESH-FETCH-017",
+            Invalid,
+            with(
+                ok_reply(hello),
+                "sha256",
+                Value::from(hex_lower(&Sha256::digest(hello))),
+            ),
+            malformed("sha256"),
+        ),
+        reply_row(
+            "MESH-FETCH-017",
+            Invalid,
+            with(ok_reply(hello), "sha256", bin(&hash[..31])),
+            malformed("sha256"),
+        ),
+        reply_row(
+            "MESH-FETCH-017",
+            Invalid,
+            fetch_reply("not_modified"),
+            malformed("sha256"),
+        ),
+        reply_row(
+            "MESH-FETCH-017",
+            Invalid,
+            with(fetch_reply("not_modified"), "sha256", Value::from("abc")),
+            malformed("sha256"),
+        ),
+        reply_row(
+            "MESH-FETCH-017",
+            Invalid,
+            not_modified_reply(&hash[..31]),
+            malformed("sha256"),
+        ),
+        reply_row(
+            "MESH-FETCH-017",
+            Valid,
+            not_modified_reply(&hash),
+            Ok(FetchReply::NotModified { sha256: hash }),
+        ),
+        reply_row(
+            "MESH-FETCH-018",
+            Invalid,
+            with(ok_reply(hello), "sha256", bin(&hash)),
+            Err(ReplyError::Corrupt),
+        ),
+        reply_row(
+            "MESH-FETCH-019",
+            Invalid,
+            without(ok_reply(hello), "bytes"),
+            malformed("bytes"),
+        ),
+        reply_row(
+            "MESH-FETCH-019",
+            Invalid,
+            with(ok_reply(hello), "bytes", Value::from("hello")),
+            malformed("bytes"),
+        ),
+        reply_row(
+            "MESH-FETCH-020",
+            Invalid,
+            with(
+                with(fetch_reply("ok"), "bytes", bin(&over_bound)),
+                "size",
+                Value::from(1),
+            ),
+            Err(ReplyError::Oversize(over_bound.len())),
+        ),
+        reply_row(
+            "MESH-FETCH-020",
+            Boundary,
+            ok_reply(&at_bound),
+            ok_read(&at_bound),
+        ),
+        reply_row(
+            "MESH-FETCH-021",
+            Invalid,
+            fetch_reply("invalid_path"),
+            malformed("rule"),
+        ),
+        reply_row(
+            "MESH-FETCH-021",
+            Invalid,
+            with(fetch_reply("invalid_path"), "rule", Value::from(3)),
+            malformed("rule"),
+        ),
+        reply_row(
+            "MESH-FETCH-021",
+            Boundary,
+            with(
+                fetch_reply("invalid_path"),
+                "rule",
+                Value::from("the path was bad"),
+            ),
+            Ok(FetchReply::InvalidPath {
+                rule: "unknown".to_string(),
+            }),
+        ),
+        reply_row(
+            "MESH-FETCH-021",
+            Valid,
+            with(fetch_reply("invalid_path"), "rule", Value::from("segment")),
+            Ok(FetchReply::InvalidPath {
+                rule: "segment".to_string(),
+            }),
+        ),
+        reply_row(
+            "MESH-FETCH-022",
+            Invalid,
+            fetch_reply("too_large"),
+            malformed("limit"),
+        ),
+        reply_row(
+            "MESH-FETCH-022",
+            Invalid,
+            with(fetch_reply("too_large"), "limit", Value::from("4096")),
+            malformed("limit"),
+        ),
+        reply_row(
+            "MESH-FETCH-022",
+            Valid,
+            with(fetch_reply("too_large"), "limit", Value::from(4096)),
+            Ok(FetchReply::TooLarge { limit: 4096 }),
+        ),
+        reply_row(
+            "MESH-FETCH-023",
+            Valid,
+            with(
+                with(fetch_reply("not_shared"), "bytes", bin(hello)),
+                "limit",
+                Value::from(1),
+            ),
+            Ok(FetchReply::NotShared),
+        ),
+        reply_row(
+            "MESH-FETCH-023",
+            Valid,
+            with(ok_reply(hello), "rule", Value::from("segment")),
+            ok_read(hello),
+        ),
+        reply_row(
+            "MESH-FETCH-023",
+            Valid,
+            with(not_modified_reply(&hash), "extra", Value::from(7)),
+            Ok(FetchReply::NotModified { sha256: hash }),
+        ),
+        reply_row(
+            "MESH-FETCH-023",
+            Valid,
+            with(
+                with(fetch_reply("invalid_path"), "rule", Value::from("segment")),
+                "size",
+                Value::from(9),
+            ),
+            Ok(FetchReply::InvalidPath {
+                rule: "segment".to_string(),
+            }),
+        ),
+        reply_row(
+            "MESH-FETCH-023",
+            Valid,
+            with(
+                with(fetch_reply("too_large"), "limit", Value::from(4096)),
+                "sha256",
+                bin(&hash),
+            ),
+            Ok(FetchReply::TooLarge { limit: 4096 }),
+        ),
         client_check(
             "MESH-FETCH-028",
             Boundary,
@@ -4971,6 +5473,37 @@ fn fetch_client_rows() -> Vec<Vector> {
             a_fetched_file_yields_its_path_size_and_digest_and_never_its_bytes,
         ),
         client_check("MESH-FETCH-032", Valid, a_fetch_waits_two_minutes),
+    ]
+}
+
+fn attachment_rows() -> Vec<Vector> {
+    use Kind::{Boundary, Invalid, Valid};
+    vec![
+        attach_check(
+            "MESH-SHARE-020",
+            Valid,
+            an_inline_attachment_travels_whatever_the_allow_and_deny_lists_say,
+        ),
+        attach_check(
+            "MESH-SHARE-020",
+            Invalid,
+            an_attachment_under_the_protected_set_is_refused_with_or_without_force,
+        ),
+        attach_check(
+            "MESH-SHARE-020",
+            Invalid,
+            the_built_in_deny_refuses_an_attachment_until_force_lifts_it,
+        ),
+        attach_check(
+            "MESH-SHARE-020",
+            Boundary,
+            a_file_above_the_inline_limit_travels_by_reference,
+        ),
+        attach_check(
+            "MESH-SHARE-020",
+            Invalid,
+            a_reference_the_serving_side_would_not_serve_is_refused,
+        ),
     ]
 }
 
@@ -5008,7 +5541,7 @@ mod tests {
         );
     }
 
-    const TESTED: [&str; 7] = [
+    const TESTED: [&str; 8] = [
         "WirePath",
         "ShareSet",
         "GrantStore",
@@ -5016,6 +5549,7 @@ mod tests {
         "ListServe",
         "FetchServe",
         "FetchClient",
+        "Attachment",
     ];
 
     #[test]
@@ -5051,6 +5585,13 @@ mod tests {
     #[test]
     fn requesters_read_pages_and_replies_as_sections_10_14_and_10_15_mandate() {
         run_family("FetchClient");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn attachments_are_held_to_section_10_17_as_the_human_named_them() {
+        let _guard = crate::testing::TestConfigDirGuard::new("conformance-attachment");
+        run_family("Attachment");
     }
 
     #[test]

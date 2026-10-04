@@ -1828,6 +1828,7 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 | Announce | `announce_vectors_decode_as_section_5_1_mandates` |
 | AnnounceEncode | `announce_encode_vectors_refuse_what_a_sender_must_not_emit` |
 | AnnouncePolicy | `announce_policy_vectors_withhold_the_display_name_as_section_5_2_mandates` |
+| Attachment | `attachments_are_held_to_section_10_17_as_the_human_named_them` |
 | Card | `card_vectors_decode_as_section_9_mandates` |
 | CardEncode | `card_encode_vectors_pin_the_emission_order` |
 | Correlation | `size_branches_and_correlation_hold_on_a_live_link` |
@@ -2232,17 +2233,17 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 | MESH-FETCH-010 | FetchServe (Invalid) |
 | MESH-FETCH-011 | FetchServe (Boundary), FetchServe (Invalid), FetchServe (Valid) |
 | MESH-FETCH-012 | FetchServe (Valid) |
-| MESH-FETCH-013 | Requester (Invalid) |
-| MESH-FETCH-014 | Requester (Invalid) |
+| MESH-FETCH-013 | FetchClient (Invalid), Requester (Invalid) |
+| MESH-FETCH-014 | FetchClient (Invalid), Requester (Invalid) |
 | MESH-FETCH-015 | FetchClient (Invalid), Requester (Invalid) |
-| MESH-FETCH-016 | Requester (Invalid) |
-| MESH-FETCH-017 | Requester (Invalid) |
-| MESH-FETCH-018 | Requester (Invalid) |
-| MESH-FETCH-019 | Requester (Invalid) |
-| MESH-FETCH-020 | no vector yet |
-| MESH-FETCH-021 | FetchClient (Invalid) |
-| MESH-FETCH-022 | Requester (Invalid) |
-| MESH-FETCH-023 | Requester (Valid) |
+| MESH-FETCH-016 | FetchClient (Invalid), FetchClient (Valid), Requester (Invalid) |
+| MESH-FETCH-017 | FetchClient (Invalid), FetchClient (Valid), Requester (Invalid) |
+| MESH-FETCH-018 | FetchClient (Invalid), Requester (Invalid) |
+| MESH-FETCH-019 | FetchClient (Invalid), Requester (Invalid) |
+| MESH-FETCH-020 | FetchClient (Boundary), FetchClient (Invalid) |
+| MESH-FETCH-021 | FetchClient (Boundary), FetchClient (Invalid), FetchClient (Valid) |
+| MESH-FETCH-022 | FetchClient (Invalid), FetchClient (Valid), Requester (Invalid) |
+| MESH-FETCH-023 | FetchClient (Valid), Requester (Valid) |
 | MESH-FETCH-024 | Cycle (Valid), FetchServe (Invalid), FetchServe (Valid) |
 | MESH-FETCH-025 | FetchServe (Invalid) |
 | MESH-FETCH-026 | FetchServe (Valid) |
@@ -2302,7 +2303,7 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 | MESH-SHARE-017 | GrantStore (Valid) |
 | MESH-SHARE-018 | GrantStore (Boundary), GrantStore (Invalid) |
 | MESH-SHARE-019 | Lending (Invalid), Lending (Valid) |
-| MESH-SHARE-020 | no vector yet |
+| MESH-SHARE-020 | Attachment (Boundary), Attachment (Invalid), Attachment (Valid) |
 | MESH-PROP-001 | Custom (Valid) |
 | MESH-PROP-002 | Custom (Valid) |
 | MESH-PROP-003 | Custom (Invalid), Custom (Valid) |

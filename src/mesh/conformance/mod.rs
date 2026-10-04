@@ -14,9 +14,9 @@
 //!   the executor is `#[cfg(unix)]` with the fixtures it drives.
 //! - `share_vectors`: the wire-path grammar and the decoders that reuse it, the share set and
 //!   the grant store on a share root built per row, the `/list` and `/fetch` handlers driven
-//!   in-process over such a root, the requester's page and reply readers, and the versioning
-//!   of the stores they read (`ListServe`, `FetchServe`, `FetchClient`). Rust only, every
-//!   platform.
+//!   in-process over such a root, the requester's page and reply readers, the versioning
+//!   of the stores they read, and the REPL's attachment predicate over such a root
+//!   (`ListServe`, `FetchServe`, `FetchClient`, `Attachment`). Rust only, every platform.
 //! - `access_vectors`: the `/access` request and reply tables, the rate rule over a bare
 //!   `MeshSlot`, the LXMF carriage and its routing, the human's decision reply and the
 //!   requester's correlation of it, and the envoy's outcome wording (`AccessRequest`,
@@ -418,6 +418,10 @@ const EXECUTED_BY: &[(&str, &[&str])] = &[
     (
         "AccessRequest",
         &["access_requests_are_answered_as_section_10_16_mandates"],
+    ),
+    (
+        "Attachment",
+        &["attachments_are_held_to_section_10_17_as_the_human_named_them"],
     ),
     (
         "Ack",
