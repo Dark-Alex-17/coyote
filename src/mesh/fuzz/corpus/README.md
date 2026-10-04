@@ -51,6 +51,11 @@ within the frame decoder's nesting budget is a violation, not a skip.
 | `0x09` | `DispatchError::from_value` (section 6.7) | msgpack map |
 | `0x0a` | `PendingStore::load_pending` (section 10.5) | jsonl text |
 | `0x0b` | `WirePath::parse`, the file part name grammar (`wire_path.rs`) | UTF-8 text |
+| `0x0c` | `SharesPage::from_value`, the `/list` reply (section 10.14) | msgpack page map |
+| `0x0d` | `read_fetch_reply`, the `/fetch` reply (section 10.15) | msgpack reply map |
+| `0x0e` | `read_access_reply`, the `/access` reply (section 10.16) | msgpack reply map |
+| `0x0f` | `decode_access_message`, LXMF access custom fields (section 10.16) | msgpack fields map keyed `0xFB`, `0xFC` |
+| `0x10` | `decode_access`, the `/access` request body (section 10.16) | msgpack body map |
 
 ## Replay
 
@@ -82,6 +87,10 @@ The `codecs/MESH-FETCH-004-<rule>.bin` files, one per wire-path rule, are pinned
 path limits by `fuzz_codec_corpus_wire_path_seeds_break_exactly_the_rule_their_name_claims`;
 after a limit or rule change, `COYOTE_MESH_FUZZ_WRITE_CORPUS=1 cargo test --all fuzz_codec_corpus_wire_path`
 rewrites them.
+The `codecs/MESH-LIST-*`, `MESH-FETCH-015`, `MESH-FETCH-018`, `MESH-FETCH-021` and `MESH-ACCESS-*`
+files are pinned to the live page, cursor, path and reply constants by
+`fuzz_codec_corpus_share_and_access_seeds_reach_the_outcome_their_name_claims`;
+`COYOTE_MESH_FUZZ_WRITE_CORPUS=1 cargo test --all fuzz_codec_corpus_share_and_access` rewrites them.
 
 `.gitattributes` marks `src/mesh/fuzz/corpus/**/*.bin` as `binary`. Without it Git's text
 heuristic can take a small msgpack file for text and rewrite a `0x0a` byte (`c4 0a`, the

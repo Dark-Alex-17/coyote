@@ -229,7 +229,7 @@ pub(crate) fn access_reply(id: &str, outcome: &AccessOutcome) -> Value {
     Value::Map(entries)
 }
 
-fn decode_access(body: &Value) -> Result<ValidAccess, &'static str> {
+pub(crate) fn decode_access(body: &Value) -> Result<ValidAccess, &'static str> {
     let entries = versioned_map(body)?;
     let id = field(entries, "id")
         .and_then(Value::as_str)
@@ -579,7 +579,7 @@ impl MeshRuntime {
     }
 }
 
-fn access_body(request: &ValidAccess) -> Value {
+pub(crate) fn access_body(request: &ValidAccess) -> Value {
     Value::Map(vec![
         (Value::from("v"), Value::from(PEER_WIRE_VERSION)),
         (Value::from("id"), Value::from(request.id.as_str())),
@@ -600,7 +600,10 @@ fn wire_paths(paths: &[String]) -> Value {
 /// Reads what came back for the request sent as `sent_id`: a peer with nothing behind
 /// `/access` answers with a dispatch error, which is told apart from a malformed access
 /// reply before the reply is decoded.
-fn read_access_reply(value: &Value, sent_id: &str) -> Result<AccessOutcome, AccessError> {
+pub(crate) fn read_access_reply(
+    value: &Value,
+    sent_id: &str,
+) -> Result<AccessOutcome, AccessError> {
     if let Some(error) = DispatchError::from_value(value) {
         return Err(AccessError::NotServed(error));
     }

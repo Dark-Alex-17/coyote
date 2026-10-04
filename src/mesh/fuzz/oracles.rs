@@ -5,11 +5,17 @@
 //! text; a check that could only fail on a panic is not an oracle and is not here.
 
 use super::SplitMix;
-use crate::config::mesh_config::MAX_INLINE_FILE_TOTAL;
+use crate::config::mesh_config::{MAX_FETCH_FILE_BYTES, MAX_INLINE_FILE_TOTAL};
+use crate::mesh::access::{
+    ACCESS_MAX_PATHS, ACCESS_REASON_MAX_CHARS, ACCESS_TYPE, AccessError, AccessMessage,
+    AccessOutcome, AccessRefusal, ValidAccess, access_body, access_message, access_reply,
+    decode_access, decode_access_message, read_access_reply,
+};
 use crate::mesh::announce::{
     ANNOUNCE_MAGIC, AnnounceAppData, MAX_DISPLAY_NAME_BYTES, is_control_or_invisible,
 };
 use crate::mesh::card::{STATUS_CARD_VERSION, StatusCard, StatusError};
+use crate::mesh::fetch::{CURSOR_MAX_BYTES, FetchError, FetchReply, SharesPage, read_fetch_reply};
 use crate::mesh::knock::{KNOCK_TYPE, KnockMessage, decode_knock_message, intro_from_r3_body};
 use crate::mesh::knocks::KNOCK_INTRO_MAX_CHARS;
 use crate::mesh::message::{
@@ -31,9 +37,10 @@ use crate::mesh::protocol::{MESH_PROTOCOL_MIN_SUPPORTED, MESH_PROTOCOL_VERSION, 
 use crate::mesh::r3::{
     ACCESS_PATH, AdmittedRequest, DispatchError, Dispatcher, Envelope, EnvelopeError, FETCH_PATH,
     Handler, InboundRequest, KNOCK_PATH, KNOWN_PATHS, KnockEvent, KnockSink, LIST_PATH,
-    MAX_R3_NESTING_DEPTH, MESSAGE_PATH, NAME_HASH_LEN, PathHash, R3Error, RefusalCode, Reply,
-    RequestFrame, RequestHandler, RequestId, STATUS_PATH, SizeBranch,
+    MAX_R3_NESTING_DEPTH, MESSAGE_PATH, NAME_HASH_LEN, OriginName, PathHash, R3Error, RefusalCode,
+    Reply, RequestFrame, RequestHandler, RequestId, STATUS_PATH, SizeBranch,
 };
+use crate::mesh::shares::LIST_PAGE_SIZE;
 use crate::mesh::test_support::{TempDir, TrustList};
 use crate::mesh::trust::TrustStore;
 use crate::mesh::wire_path::{WIRE_PATH_MAX_BYTES, WIRE_PATH_MAX_SEGMENTS, WirePath};
@@ -265,8 +272,13 @@ type UintField = Field<u64>;
 type U32Field = Field<u32>;
 type U16Field = Field<u16>;
 type ByteField = Field<u8>;
+type F64Field = Field<f64>;
+type Bin32Field = Field<[u8; 32]>;
 /// The schema version `1` most of the time.
 type Version1 = Field<()>;
+/// The one value the reader expects, fixed by its context (the id sent, the honest
+/// length or digest), most of the time.
+type Expected = Field<()>;
 
 fn text(field: TextField) -> Value {
     field.into_value(Value::from)
@@ -1898,8 +1910,13 @@ const TAG_VERSION_REFUSAL: u8 = 0x08;
 const TAG_DISPATCH_ERROR: u8 = 0x09;
 pub(super) const TAG_PENDING: u8 = 0x0a;
 pub(super) const TAG_WIRE_PATH: u8 = 0x0b;
+pub(super) const TAG_LIST_PAGE: u8 = 0x0c;
+pub(super) const TAG_FETCH_REPLY: u8 = 0x0d;
+pub(super) const TAG_ACCESS_REPLY: u8 = 0x0e;
+pub(super) const TAG_ACCESS_FIELDS: u8 = 0x0f;
+pub(super) const TAG_ACCESS_REQUEST: u8 = 0x10;
 /// Every tag, for the README table check.
-pub(super) const CODEC_TAGS: [u8; 11] = [
+pub(super) const CODEC_TAGS: [u8; 16] = [
     TAG_CARD,
     TAG_BODY,
     TAG_INTRO,
@@ -1911,6 +1928,11 @@ pub(super) const CODEC_TAGS: [u8; 11] = [
     TAG_DISPATCH_ERROR,
     TAG_PENDING,
     TAG_WIRE_PATH,
+    TAG_LIST_PAGE,
+    TAG_FETCH_REPLY,
+    TAG_ACCESS_REPLY,
+    TAG_ACCESS_FIELDS,
+    TAG_ACCESS_REQUEST,
 ];
 
 pub(super) struct CodecFixture {
@@ -1948,6 +1970,11 @@ pub(super) struct CodecBundle {
     dispatch_error: DispatchErrorGen,
     pending: Unlikely<JsonlGen>,
     wire_path: WirePathGen,
+    list_page: ListPageGen,
+    fetch_reply: FetchReplyGen,
+    access_reply: AccessReplyGen,
+    access_fields: AccessFieldsGen,
+    access_request: AccessRequestGen,
 }
 
 impl CodecBundle {
@@ -1969,6 +1996,14 @@ impl CodecBundle {
                 packed(&self.dispatch_error.into_value()),
             ),
             tagged(TAG_WIRE_PATH, self.wire_path.into_text().into_bytes()),
+            tagged(TAG_LIST_PAGE, packed(&self.list_page.into_value())),
+            tagged(TAG_FETCH_REPLY, packed(&self.fetch_reply.into_value())),
+            tagged(TAG_ACCESS_REPLY, packed(&self.access_reply.into_value())),
+            tagged(TAG_ACCESS_FIELDS, packed(&self.access_fields.into_value())),
+            tagged(
+                TAG_ACCESS_REQUEST,
+                packed(&self.access_request.into_value()),
+            ),
         ];
         if let Some(pending) = self.pending.0 {
             inputs.push(tagged(TAG_PENDING, pending.into_text().into_bytes()));
@@ -2006,6 +2041,11 @@ pub(super) fn check_codec_bytes(fx: &CodecFixture, bytes: &[u8]) -> Result<(), S
         TAG_DISPATCH_ERROR => with_value(payload, check_dispatch_error),
         TAG_PENDING => check_pending(fx, payload),
         TAG_WIRE_PATH => check_wire_path(payload),
+        TAG_LIST_PAGE => with_value(payload, check_list_page),
+        TAG_FETCH_REPLY => with_value(payload, check_fetch_reply),
+        TAG_ACCESS_REPLY => with_value(payload, check_access_reply),
+        TAG_ACCESS_FIELDS => with_value(payload, check_access_fields),
+        TAG_ACCESS_REQUEST => with_value(payload, check_access_request),
         other => Err(format!("unknown codec tag {other:#04x}")),
     }
 }
@@ -2319,6 +2359,856 @@ fn check_wire_path(payload: &[u8]) -> Result<(), String> {
                 },
             )
         }
+    }
+}
+
+// --- /list page and /fetch reply (sections 10.14 and 10.15) ----------------------------
+
+const FETCH_STATUSES: [&str; 5] = [
+    "ok",
+    "not_modified",
+    "not_shared",
+    "invalid_path",
+    "too_large",
+];
+
+/// A word from a closed vocabulary, a word outside it, or no `str` at all.
+#[derive(Debug, Arbitrary)]
+enum WordGen {
+    Known(u8),
+    Unknown(String),
+    Odd(Scalar),
+}
+
+impl WordGen {
+    fn into_value(self, words: &[&str]) -> Value {
+        match self {
+            Self::Known(i) => Value::from(words[usize::from(i) % words.len()]),
+            Self::Unknown(word) => Value::from(word),
+            Self::Odd(odd) => odd.into_value(),
+        }
+    }
+}
+
+/// Text under a cap: any text, a run built to straddle the cap, or no `str` at all.
+#[derive(Debug, Arbitrary)]
+enum CappedTextGen {
+    Text(String),
+    Edge(u8),
+    Odd(Scalar),
+}
+
+impl CappedTextGen {
+    fn into_value(self, cap: usize) -> Value {
+        match self {
+            Self::Text(text) => Value::from(text),
+            Self::Edge(n) => Value::from("a".repeat(cap - 2 + usize::from(n) % 4)),
+            Self::Odd(odd) => odd.into_value(),
+        }
+    }
+}
+
+fn bin32(field: Bin32Field) -> Value {
+    field.into_value(|bytes| Value::Binary(bytes.to_vec()))
+}
+
+fn wire_path(path: WirePathGen) -> Value {
+    Value::from(path.into_text())
+}
+
+#[derive(Debug, Arbitrary)]
+struct EntryGen {
+    path: Likely<Field<WirePathGen>>,
+    size: Likely<UintField>,
+    sha256: Likely<Bin32Field>,
+    mtime: Likely<F64Field>,
+    shape: Shape,
+    replace: Unlikely<Scalar>,
+}
+
+impl EntryGen {
+    fn into_value(self) -> Value {
+        let map = self.shape.map(vec![
+            (
+                key("path"),
+                present(self.path, |path| path.into_value(wire_path)),
+            ),
+            (key("size"), present(self.size, uint)),
+            (key("sha256"), present(self.sha256, bin32)),
+            (
+                key("mtime"),
+                present(self.mtime, |mtime| mtime.into_value(Value::F64)),
+            ),
+        ]);
+        sub_map(map, self.replace)
+    }
+}
+
+/// The `entries` list: a few entries, one repeated to straddle `LIST_PAGE_SIZE`, or no
+/// list at all.
+#[derive(Debug, Arbitrary)]
+enum EntriesGen {
+    List(Vec<EntryGen>),
+    Repeated(u8, Box<EntryGen>),
+    NotAList(Scalar),
+}
+
+impl EntriesGen {
+    fn into_value(self) -> Value {
+        match self {
+            Self::List(entries) => Value::Array(
+                entries
+                    .into_iter()
+                    .take(MAX_CHILDREN)
+                    .map(EntryGen::into_value)
+                    .collect(),
+            ),
+            Self::Repeated(n, entry) => Value::Array(vec![
+                entry.into_value();
+                LIST_PAGE_SIZE - 2 + usize::from(n) % 4
+            ]),
+            Self::NotAList(odd) => odd.into_value(),
+        }
+    }
+}
+
+#[derive(Debug, Arbitrary)]
+struct ListPageGen {
+    v: Likely<Version1>,
+    entries: Likely<EntriesGen>,
+    next: Unlikely<CappedTextGen>,
+    shape: Shape,
+    replace: Unlikely<ArbValue>,
+}
+
+impl ListPageGen {
+    fn into_value(self) -> Value {
+        let map = self.shape.map(vec![
+            (key("v"), present(self.v, version1)),
+            (
+                key("entries"),
+                present(self.entries, EntriesGen::into_value),
+            ),
+            (
+                key("next"),
+                rare(self.next, |next| next.into_value(CURSOR_MAX_BYTES)),
+            ),
+        ]);
+        or_replaced(map, self.replace)
+    }
+}
+
+#[derive(Debug)]
+enum ListClass<'a> {
+    Malformed(&'static str),
+    /// A page: `kept` of the first `LIST_PAGE_SIZE` elements pass the entry table.
+    Readable {
+        kept: usize,
+        next: Option<&'a str>,
+    },
+}
+
+/// Section 10.14's reply table as a predicate: a map carrying `v` = 1 (MESH-LIST-006),
+/// `entries` an array (MESH-LIST-007), `next` absent, nil or a `str` within
+/// `CURSOR_MAX_BYTES` (MESH-LIST-009); then the first `LIST_PAGE_SIZE` elements held to
+/// the entry table, the rest of the page kept whatever they are (MESH-LIST-008).
+fn expect_list_page(value: &Value) -> ListClass<'_> {
+    let Some(entries) = value.as_map() else {
+        return ListClass::Malformed("map");
+    };
+    if first(entries, "v").and_then(Value::as_u64) != Some(PEER_WIRE_VERSION) {
+        return ListClass::Malformed("v");
+    }
+    let Some(listed) = first(entries, "entries").and_then(Value::as_array) else {
+        return ListClass::Malformed("entries");
+    };
+    let next = match first(entries, "next") {
+        None => None,
+        Some(cursor) => match cursor.as_str() {
+            Some(cursor) if cursor.len() <= CURSOR_MAX_BYTES => Some(cursor),
+            _ => return ListClass::Malformed("next"),
+        },
+    };
+    let kept = listed
+        .iter()
+        .take(LIST_PAGE_SIZE)
+        .filter(|entry| expect_entry(entry))
+        .count();
+    ListClass::Readable { kept, next }
+}
+
+/// MESH-LIST-011 to MESH-LIST-014: a map whose `path` is a `str` the wire path grammar
+/// accepts, `size` a `uint`, `sha256` a 32-byte `bin` and `mtime` a finite number.
+fn expect_entry(value: &Value) -> bool {
+    let Some(entries) = value.as_map() else {
+        return false;
+    };
+    first(entries, "path")
+        .and_then(Value::as_str)
+        .is_some_and(|path| WirePath::parse(path).is_ok())
+        && first(entries, "size").and_then(Value::as_u64).is_some()
+        && bin32_of(first(entries, "sha256")).is_some()
+        && first(entries, "mtime")
+            .and_then(Value::as_f64)
+            .is_some_and(f64::is_finite)
+}
+
+/// A 32-byte `bin` and nothing else; `Value::as_slice` would take a `str` as well.
+fn bin32_of(value: Option<&Value>) -> Option<[u8; 32]> {
+    match value? {
+        Value::Binary(bytes) => bytes.as_slice().try_into().ok(),
+        _ => None,
+    }
+}
+
+fn check_list_page(value: &Value) -> Result<(), String> {
+    let observed = SharesPage::from_value(value, "fuzz");
+    match (expect_list_page(value), &observed) {
+        (ListClass::Malformed(key), Err(FetchError::Malformed(got))) => ensure(*got == key, || {
+            format!("MESH-LIST-006..009: the refusal names `{key}`, the decoder said `{got}`")
+        }),
+        (ListClass::Readable { kept, next }, Ok(page)) => {
+            ensure(page.entries.len() == kept, || {
+                format!(
+                    "MESH-LIST-008: {kept} of the first {LIST_PAGE_SIZE} elements pass the entry table, the page kept {}",
+                    page.entries.len()
+                )
+            })?;
+            ensure(page.next.as_deref() == next, || {
+                format!(
+                    "MESH-LIST-009: next is the cursor sent, {next:?}, got {:?}",
+                    page.next
+                )
+            })?;
+            ensure(
+                page.entries
+                    .iter()
+                    .all(|entry| WirePath::parse(&entry.path).is_ok() && entry.mtime.is_finite()),
+                || {
+                    "MESH-LIST-011/014: every kept entry names a wire path and a finite mtime"
+                        .to_string()
+                },
+            )
+        }
+        (class, observed) => Err(format!(
+            "MESH-LIST-006..009: the predicate says {class:?}, the decoder says {observed:?}"
+        )),
+    }
+}
+
+#[derive(Debug, Arbitrary)]
+struct FetchReplyGen {
+    v: Likely<Version1>,
+    status: Likely<WordGen>,
+    payload: Vec<u8>,
+    bytes: Likely<Expected>,
+    size: Likely<Expected>,
+    sha256: Likely<Expected>,
+    rule: Likely<WordGen>,
+    limit: Likely<UintField>,
+    shape: Shape,
+    replace: Unlikely<ArbValue>,
+    dispatch: Unlikely<DispatchErrorGen>,
+}
+
+impl FetchReplyGen {
+    /// `bytes`, `size` and `sha256` are honest about `payload` unless a field goes odd,
+    /// so an `ok` reply is read to the end about as often as it is refused part-way.
+    fn into_value(self) -> Value {
+        if let Some(dispatch) = self.dispatch.0 {
+            return dispatch.into_value();
+        }
+        let digest = Sha256::digest(&self.payload).to_vec();
+        let len = self.payload.len() as u64;
+        let map = self.shape.map(vec![
+            (key("v"), present(self.v, version1)),
+            (
+                key("status"),
+                present(self.status, |status| status.into_value(&FETCH_STATUSES)),
+            ),
+            (
+                key("bytes"),
+                present(self.bytes, |bytes| {
+                    bytes.into_value(|()| Value::Binary(self.payload))
+                }),
+            ),
+            (
+                key("size"),
+                present(self.size, |size| size.into_value(|()| Value::from(len))),
+            ),
+            (
+                key("sha256"),
+                present(self.sha256, |sha256| {
+                    sha256.into_value(|()| Value::Binary(digest))
+                }),
+            ),
+            (
+                key("rule"),
+                present(self.rule, |rule| rule.into_value(&WIRE_PATH_RULES)),
+            ),
+            (key("limit"), present(self.limit, uint)),
+        ]);
+        or_replaced(map, self.replace)
+    }
+}
+
+#[derive(Debug)]
+enum FetchClass {
+    NotServed,
+    Malformed(&'static str),
+    Oversize(usize),
+    Corrupt,
+    UnknownStatus,
+    Readable(FetchReply),
+}
+
+/// Section 10.15's reply table as a predicate, in the requester's gate order: a dispatch
+/// error is `NotServed` (MESH-FETCH-013); then the map and `v` (MESH-FETCH-013), `status`
+/// a `str` (MESH-FETCH-014) naming one of the five (MESH-FETCH-015). An `ok` reply is
+/// judged `bytes` (MESH-FETCH-019), their count against `MAX_FETCH_FILE_BYTES`
+/// (MESH-FETCH-020), `size` (MESH-FETCH-016), `sha256` (MESH-FETCH-017), then the digest
+/// (MESH-FETCH-018); `invalid_path` keeps a rule the grammar names and reads any other
+/// `str` as `unknown` (MESH-FETCH-021); `too_large` carries a `uint` (MESH-FETCH-022).
+fn expect_fetch_reply(value: &Value) -> FetchClass {
+    if expect_dispatch_error(value).is_some() {
+        return FetchClass::NotServed;
+    }
+    let Some(entries) = value.as_map() else {
+        return FetchClass::Malformed("map");
+    };
+    if first(entries, "v").and_then(Value::as_u64) != Some(PEER_WIRE_VERSION) {
+        return FetchClass::Malformed("v");
+    }
+    let Some(status) = first(entries, "status").and_then(Value::as_str) else {
+        return FetchClass::Malformed("status");
+    };
+    match status {
+        "ok" => {
+            let Some(Value::Binary(bytes)) = first(entries, "bytes") else {
+                return FetchClass::Malformed("bytes");
+            };
+            if bytes.len() as u64 > MAX_FETCH_FILE_BYTES {
+                return FetchClass::Oversize(bytes.len());
+            }
+            if first(entries, "size").and_then(Value::as_u64) != Some(bytes.len() as u64) {
+                return FetchClass::Malformed("size");
+            }
+            let Some(sha256) = bin32_of(first(entries, "sha256")) else {
+                return FetchClass::Malformed("sha256");
+            };
+            if <[u8; 32]>::from(Sha256::digest(bytes)) != sha256 {
+                return FetchClass::Corrupt;
+            }
+            FetchClass::Readable(FetchReply::Ok {
+                bytes: bytes.clone(),
+                size: bytes.len() as u64,
+                sha256,
+            })
+        }
+        "not_modified" => match bin32_of(first(entries, "sha256")) {
+            Some(sha256) => FetchClass::Readable(FetchReply::NotModified { sha256 }),
+            None => FetchClass::Malformed("sha256"),
+        },
+        "not_shared" => FetchClass::Readable(FetchReply::NotShared),
+        "invalid_path" => match first(entries, "rule").and_then(Value::as_str) {
+            Some(rule) if WIRE_PATH_RULES.contains(&rule) => {
+                FetchClass::Readable(FetchReply::InvalidPath {
+                    rule: rule.to_string(),
+                })
+            }
+            Some(_) => FetchClass::Readable(FetchReply::InvalidPath {
+                rule: "unknown".to_string(),
+            }),
+            None => FetchClass::Malformed("rule"),
+        },
+        "too_large" => match first(entries, "limit").and_then(Value::as_u64) {
+            Some(limit) => FetchClass::Readable(FetchReply::TooLarge { limit }),
+            None => FetchClass::Malformed("limit"),
+        },
+        _ => FetchClass::UnknownStatus,
+    }
+}
+
+fn check_fetch_reply(value: &Value) -> Result<(), String> {
+    let observed = read_fetch_reply(value);
+    match (expect_fetch_reply(value), &observed) {
+        (FetchClass::NotServed, Err(FetchError::NotServed)) => Ok(()),
+        (FetchClass::Malformed(key), Err(FetchError::Malformed(got))) => {
+            ensure(*got == key, || {
+                format!("MESH-FETCH-013..022: the refusal names `{key}`, the decoder said `{got}`")
+            })
+        }
+        (FetchClass::Oversize(len), Err(FetchError::Oversize { len: got })) => {
+            ensure(*got == len, || {
+                format!("MESH-FETCH-020: the oversize refusal names {len} bytes, got {got}")
+            })
+        }
+        (FetchClass::Corrupt, Err(FetchError::Corrupt)) => Ok(()),
+        (FetchClass::UnknownStatus, Err(FetchError::UnknownStatus)) => Ok(()),
+        (FetchClass::Readable(expected), Ok(reply)) => ensure(*reply == expected, || {
+            format!(
+                "MESH-FETCH-016..022: the reply reads as {expected:?}, the decoder gave {reply:?}"
+            )
+        }),
+        (class, observed) => Err(format!(
+            "MESH-FETCH-013..022: the predicate says {class:?}, the decoder says {observed:?}"
+        )),
+    }
+}
+
+// --- /access reply, request body and LXMF fields (section 10.16) -----------------------
+
+/// The id every generated access reply is read against: a reply naming it is this
+/// request's, any other id is MESH-ACCESS-008's malformed reply.
+pub(super) const SENT_ID: &str = "acc-1";
+const ACCESS_STATUSES: [&str; 3] = ["pending", "granted", "refused"];
+const ACCESS_REFUSALS: [&str; 2] = ["duplicate", "too_many_pending"];
+
+/// The refusals `decode_access` can emit: the map and version gates, the key shapes, then
+/// `validate_access`'s rules (MESH-ACCESS-001 to MESH-ACCESS-004).
+const ACCESS_REQUEST_REASONS: [&str; 11] = [
+    "the body is not a map",
+    "v is missing or not the supported version",
+    "id is missing or not text",
+    "paths is missing or not a list",
+    "a path is not text",
+    "reason is not text",
+    "id is not a wire id",
+    "paths names more than the cap allows",
+    "a path is not a wire path",
+    "paths is empty",
+    "reason is longer than the cap allows",
+];
+
+/// The refusals `decode_access_message` can emit: the custom data and `name_hash` gates
+/// (MESH-ACCESS-021, MESH-ACCESS-023), the key shapes (MESH-ACCESS-024, MESH-ACCESS-025),
+/// then `validate_access`'s rules with the reason read from the content (MESH-ACCESS-027).
+const ACCESS_FIELDS_REASONS: [&str; 11] = [
+    "custom data is missing or not a map",
+    "name_hash is missing or not binary",
+    "name_hash is not 10 bytes",
+    "id is missing or not text",
+    "paths is missing or not a list",
+    "a path is not text",
+    "id is not a wire id",
+    "paths names more than the cap allows",
+    "a path is not a wire path",
+    "paths is empty",
+    "reason is longer than the cap allows",
+];
+
+#[derive(Debug, Arbitrary)]
+struct AccessReplyGen {
+    v: Likely<Version1>,
+    id: Likely<Expected>,
+    status: Likely<WordGen>,
+    expires: Likely<F64Field>,
+    reason: Likely<WordGen>,
+    shape: Shape,
+    replace: Unlikely<ArbValue>,
+    dispatch: Unlikely<DispatchErrorGen>,
+}
+
+impl AccessReplyGen {
+    fn into_value(self) -> Value {
+        if let Some(dispatch) = self.dispatch.0 {
+            return dispatch.into_value();
+        }
+        let map = self.shape.map(vec![
+            (key("v"), present(self.v, version1)),
+            (
+                key("id"),
+                present(self.id, |id| id.into_value(|()| Value::from(SENT_ID))),
+            ),
+            (
+                key("status"),
+                present(self.status, |status| status.into_value(&ACCESS_STATUSES)),
+            ),
+            (
+                key("expires"),
+                present(self.expires, |expires| expires.into_value(Value::F64)),
+            ),
+            (
+                key("reason"),
+                present(self.reason, |reason| reason.into_value(&ACCESS_REFUSALS)),
+            ),
+        ]);
+        or_replaced(map, self.replace)
+    }
+}
+
+#[derive(Debug)]
+enum AccessReplyClass {
+    NotServed,
+    Malformed(&'static str),
+    UnknownStatus,
+    Readable(AccessOutcome),
+}
+
+/// Section 10.16's reply table as a predicate, in the requester's gate order: a dispatch
+/// error is `NotServed`, then the map and `v` (MESH-ACCESS-007), the `id` sent
+/// (MESH-ACCESS-008), `status` a `str` (MESH-ACCESS-009) naming one of the three
+/// (MESH-ACCESS-010); `granted` carries a number (MESH-ACCESS-011), `refused` one of the
+/// two reasons or it is the unknown status (MESH-ACCESS-012).
+fn expect_access_reply(value: &Value) -> AccessReplyClass {
+    if expect_dispatch_error(value).is_some() {
+        return AccessReplyClass::NotServed;
+    }
+    let Some(entries) = value.as_map() else {
+        return AccessReplyClass::Malformed("the body is not a map");
+    };
+    if first(entries, "v").and_then(Value::as_u64) != Some(PEER_WIRE_VERSION) {
+        return AccessReplyClass::Malformed("v is missing or not the supported version");
+    }
+    if first(entries, "id").and_then(Value::as_str) != Some(SENT_ID) {
+        return AccessReplyClass::Malformed("id is missing or not the one sent");
+    }
+    let Some(status) = first(entries, "status").and_then(Value::as_str) else {
+        return AccessReplyClass::Malformed("status is missing or not text");
+    };
+    match status {
+        "pending" => AccessReplyClass::Readable(AccessOutcome::Pending),
+        "granted" => match first(entries, "expires").and_then(Value::as_f64) {
+            Some(expires) => AccessReplyClass::Readable(AccessOutcome::Granted { expires }),
+            None => AccessReplyClass::Malformed("expires is missing or not a number"),
+        },
+        "refused" => match first(entries, "reason").and_then(Value::as_str) {
+            Some("duplicate") => {
+                AccessReplyClass::Readable(AccessOutcome::Refused(AccessRefusal::Duplicate))
+            }
+            Some("too_many_pending") => {
+                AccessReplyClass::Readable(AccessOutcome::Refused(AccessRefusal::TooManyPending))
+            }
+            _ => AccessReplyClass::UnknownStatus,
+        },
+        _ => AccessReplyClass::UnknownStatus,
+    }
+}
+
+/// Equality on the wire, so a NaN `expires` compares equal to itself.
+fn same_outcome(a: &AccessOutcome, b: &AccessOutcome) -> bool {
+    match (a, b) {
+        (AccessOutcome::Granted { expires: x }, AccessOutcome::Granted { expires: y }) => {
+            x.to_bits() == y.to_bits()
+        }
+        _ => a == b,
+    }
+}
+
+fn check_access_reply(value: &Value) -> Result<(), String> {
+    let observed = read_access_reply(value, SENT_ID);
+    match (expect_access_reply(value), &observed) {
+        (AccessReplyClass::NotServed, Err(AccessError::NotServed(_))) => Ok(()),
+        (AccessReplyClass::Malformed(reason), Err(AccessError::Malformed(got))) => {
+            ensure(*got == reason, || {
+                format!("MESH-ACCESS-007..011: the refusal is `{reason}`, the decoder said `{got}`")
+            })
+        }
+        (AccessReplyClass::UnknownStatus, Err(AccessError::UnknownStatus)) => Ok(()),
+        (AccessReplyClass::Readable(expected), Ok(outcome)) => {
+            ensure(same_outcome(outcome, &expected), || {
+                format!(
+                    "MESH-ACCESS-010..012: the reply reads as {expected:?}, the decoder gave {outcome:?}"
+                )
+            })?;
+            let reencoded = access_reply(SENT_ID, outcome);
+            let back = read_access_reply(&reencoded, SENT_ID);
+            ensure(
+                back.as_ref().is_ok_and(|back| same_outcome(back, outcome)),
+                || {
+                    format!(
+                        "section 10.16 round trip: read(access_reply(o)) must equal o for {outcome:?}, re-read {back:?}"
+                    )
+                },
+            )?;
+            ensure(
+                packed(&reencoded) == packed(&access_reply(SENT_ID, outcome)),
+                || {
+                    "MESH-CANON: encoding an access reply twice must give the same bytes"
+                        .to_string()
+                },
+            )?;
+            no_duplicate_keys(&reencoded)
+        }
+        (class, observed) => Err(format!(
+            "MESH-ACCESS-007..012: the predicate says {class:?}, the decoder says {observed:?}"
+        )),
+    }
+}
+
+/// The `paths` list: wire paths, one repeated to straddle `ACCESS_MAX_PATHS`, or no list
+/// at all.
+#[derive(Debug, Arbitrary)]
+enum PathsGen {
+    List(Vec<Field<WirePathGen>>),
+    Repeated(u8, WirePathGen),
+    NotAList(Scalar),
+}
+
+impl PathsGen {
+    fn into_value(self) -> Value {
+        match self {
+            Self::List(paths) => Value::Array(
+                paths
+                    .into_iter()
+                    .take(MAX_CHILDREN)
+                    .map(|path| path.into_value(wire_path))
+                    .collect(),
+            ),
+            Self::Repeated(n, path) => Value::Array(vec![
+                wire_path(path);
+                ACCESS_MAX_PATHS - 2 + usize::from(n) % 4
+            ]),
+            Self::NotAList(odd) => odd.into_value(),
+        }
+    }
+}
+
+#[derive(Debug, Arbitrary)]
+struct AccessRequestGen {
+    v: Likely<Version1>,
+    id: Likely<IdGen>,
+    paths: Likely<PathsGen>,
+    reason: Unlikely<CappedTextGen>,
+    shape: Shape,
+    replace: Unlikely<ArbValue>,
+}
+
+impl AccessRequestGen {
+    fn into_value(self) -> Value {
+        let map = self.shape.map(vec![
+            (key("v"), present(self.v, version1)),
+            (key("id"), present(self.id, IdGen::into_value)),
+            (key("paths"), present(self.paths, PathsGen::into_value)),
+            (
+                key("reason"),
+                rare(self.reason, |reason| {
+                    reason.into_value(ACCESS_REASON_MAX_CHARS)
+                }),
+            ),
+        ]);
+        or_replaced(map, self.replace)
+    }
+}
+
+/// `ACCESS_TYPE` two times in three, as `str` or `bin`; otherwise any tag.
+#[derive(Debug, Arbitrary)]
+enum AccessTag {
+    Str,
+    Bin,
+    Any(TypeTag),
+}
+
+impl AccessTag {
+    fn into_value(self) -> Value {
+        match self {
+            Self::Str => TypeTag::AccessStr.into_value(),
+            Self::Bin => TypeTag::AccessBin.into_value(),
+            Self::Any(tag) => tag.into_value(),
+        }
+    }
+}
+
+#[derive(Debug, Arbitrary)]
+struct AccessDataGen {
+    name_hash: Likely<NameHashGen>,
+    id: Likely<IdGen>,
+    paths: Likely<PathsGen>,
+    shape: Shape,
+    replace: Unlikely<Scalar>,
+}
+
+/// An LXMF `fields` map: the custom type under `0xFB`, the access data under `0xFC`.
+#[derive(Debug, Arbitrary)]
+struct AccessFieldsGen {
+    tag: Likely<AccessTag>,
+    data: Likely<AccessDataGen>,
+    shape: Shape,
+    replace: Unlikely<ArbValue>,
+}
+
+impl AccessFieldsGen {
+    fn into_value(self) -> Value {
+        let data = |data: AccessDataGen| {
+            let map = data.shape.map(vec![
+                (
+                    key("name_hash"),
+                    present(data.name_hash, NameHashGen::into_value),
+                ),
+                (key("id"), present(data.id, IdGen::into_value)),
+                (key("paths"), present(data.paths, PathsGen::into_value)),
+            ]);
+            sub_map(map, data.replace)
+        };
+        let map = self.shape.map(vec![
+            (
+                Value::from(FIELD_CUSTOM_TYPE),
+                present(self.tag, AccessTag::into_value),
+            ),
+            (Value::from(FIELD_CUSTOM_DATA), present(self.data, data)),
+        ]);
+        or_replaced(map, self.replace)
+    }
+}
+
+/// The request table's `id`, `paths` and `reason` rows (MESH-ACCESS-002 to
+/// MESH-ACCESS-004) as both routes hold them: the wire id when every row passes. The
+/// path cap is judged on the list as sent, and a non-empty list of wire paths cannot
+/// lose every entry to repeat-dropping, so the floor is non-emptiness; the reason is
+/// cleaned as peer text before it is counted.
+fn expect_access_rows<'a>(entries: &'a [(Value, Value)], reason: &str) -> Option<&'a str> {
+    let id = first(entries, "id")
+        .and_then(Value::as_str)
+        .filter(|id| is_wire_id(id))?;
+    let paths = first(entries, "paths").and_then(Value::as_array)?;
+    let listed = !paths.is_empty()
+        && paths.len() <= ACCESS_MAX_PATHS
+        && paths.iter().all(|path| {
+            path.as_str()
+                .is_some_and(|path| WirePath::parse(path).is_ok())
+        });
+    let reasoned = display_text(reason, usize::MAX)
+        .is_none_or(|cleaned| cleaned.chars().count() <= ACCESS_REASON_MAX_CHARS);
+    (listed && reasoned).then_some(id)
+}
+
+/// Section 10.16's request table as a predicate: a map carrying `v` = 1 (MESH-ACCESS-001),
+/// `reason` absent, nil or a `str` (MESH-ACCESS-004), then the rows both routes share.
+fn expect_access_request(value: &Value) -> Option<&str> {
+    let entries = value.as_map()?;
+    if first(entries, "v").and_then(Value::as_u64) != Some(PEER_WIRE_VERSION) {
+        return None;
+    }
+    let reason = match first(entries, "reason") {
+        None => "",
+        Some(reason) => reason.as_str()?,
+    };
+    expect_access_rows(entries, reason)
+}
+
+/// What both routes promise of an admitted request (MESH-ACCESS-002 to MESH-ACCESS-004):
+/// a wire id, one to `ACCESS_MAX_PATHS` wire paths with no exact repeat, and a reason
+/// that is cleaned peer text within the cap.
+fn check_valid_access(request: &ValidAccess) -> Result<(), String> {
+    ensure(is_wire_id(&request.id), || {
+        format!("MESH-ACCESS-002: the id is a wire id, got {:?}", request.id)
+    })?;
+    ensure(
+        !request.paths.is_empty() && request.paths.len() <= ACCESS_MAX_PATHS,
+        || {
+            format!(
+                "MESH-ACCESS-003: one to {ACCESS_MAX_PATHS} paths, got {}",
+                request.paths.len()
+            )
+        },
+    )?;
+    ensure(
+        request
+            .paths
+            .iter()
+            .all(|path| WirePath::parse(path).is_ok()),
+        || {
+            format!(
+                "MESH-ACCESS-003: every path is a wire path, got {:?}",
+                request.paths
+            )
+        },
+    )?;
+    ensure(
+        request
+            .paths
+            .iter()
+            .enumerate()
+            .all(|(index, path)| !request.paths[..index].contains(path)),
+        || {
+            format!(
+                "MESH-ACCESS-003: exact repeats are dropped, got {:?}",
+                request.paths
+            )
+        },
+    )?;
+    ensure(
+        request.reason.chars().count() <= ACCESS_REASON_MAX_CHARS
+            && display_text(&request.reason, usize::MAX).unwrap_or_default() == request.reason,
+        || {
+            format!(
+                "MESH-ACCESS-004: the reason is cleaned peer text within {ACCESS_REASON_MAX_CHARS} characters, got {:?}",
+                request.reason
+            )
+        },
+    )
+}
+
+fn check_access_request(value: &Value) -> Result<(), String> {
+    let observed = decode_access(value);
+    match (expect_access_request(value), &observed) {
+        (None, Err(reason)) => ensure(ACCESS_REQUEST_REASONS.contains(reason), || {
+            format!("MESH-ACCESS-001..004: `{reason}` is not a refusal the request table names")
+        }),
+        (Some(id), Ok(request)) => {
+            ensure(request.id == id, || {
+                format!(
+                    "MESH-ACCESS-002: the id is the one sent, {id:?}, got {:?}",
+                    request.id
+                )
+            })?;
+            check_valid_access(request)?;
+            let reencoded = access_body(request);
+            let back = decode_access(&reencoded);
+            ensure(back.as_ref() == Ok(request), || {
+                format!(
+                    "section 10.16 round trip: decode(access_body(r)) must equal r for {request:?}, re-read {back:?}"
+                )
+            })?;
+            no_duplicate_keys(&reencoded)
+        }
+        (expected, observed) => Err(format!(
+            "MESH-ACCESS-001..004: the predicate reads {expected:?}, the decoder {observed:?}"
+        )),
+    }
+}
+
+fn check_access_fields(fields: &Value) -> Result<(), String> {
+    let observed = decode_access_message(&inbound_with(fields.clone()));
+    let rows = || custom_data(fields).and_then(|data| expect_access_rows(data, INBOUND_CONTENT));
+    match (expect_typed(fields, ACCESS_TYPE), &observed) {
+        (None, AccessMessage::NotAnAccess) => Ok(()),
+        (Some(name_hash), AccessMessage::Malformed(reason)) => {
+            ensure(ACCESS_FIELDS_REASONS.contains(reason), || {
+                format!("MESH-ACCESS-021..027: `{reason}` is not a refusal section 10.16 names")
+            })?;
+            ensure(name_hash.is_none() || rows().is_none(), || {
+                format!(
+                    "MESH-ACCESS-023..027: a typed message with a 10-byte name_hash whose rows pass is an access request, refused as `{reason}`"
+                )
+            })
+        }
+        (Some(Some(expected)), AccessMessage::Access { name_hash, request }) => {
+            ensure(*name_hash == expected, || {
+                "MESH-ACCESS-023: the request's name_hash is the 10-byte bin under the custom data"
+                    .to_string()
+            })?;
+            ensure(rows() == Some(request.id.as_str()), || {
+                format!(
+                    "MESH-ACCESS-024/025: an admitted request passes the rows under its own id, got {request:?}"
+                )
+            })?;
+            check_valid_access(request)?;
+            let message = access_message(request, &OriginName(expected));
+            let fields = message
+                .fields
+                .ok_or_else(|| "MESH-ACCESS-020: access_message types its fields".to_string())?;
+            let back = decode_access_message(&inbound_message(message.content, fields.clone()));
+            ensure(back == observed, || {
+                format!(
+                    "section 10.16 round trip: decode(access_message(r)) must equal r for {request:?}, re-read {back:?}"
+                )
+            })?;
+            no_duplicate_keys(&fields)
+        }
+        (expected, observed) => Err(format!(
+            "MESH-ACCESS-020..027: typed={expected:?} by the predicate, decoded as {observed:?}"
+        )),
     }
 }
 
@@ -3023,6 +3913,8 @@ enum TypeTag {
     PeerBin,
     KnockStr,
     KnockBin,
+    AccessStr,
+    AccessBin,
     Other(Scalar),
 }
 
@@ -3033,6 +3925,8 @@ impl TypeTag {
             Self::PeerBin => Value::Binary(PEER_MESSAGE_TYPE.as_bytes().to_vec()),
             Self::KnockStr => Value::from(KNOCK_TYPE),
             Self::KnockBin => Value::Binary(KNOCK_TYPE.as_bytes().to_vec()),
+            Self::AccessStr => Value::from(ACCESS_TYPE),
+            Self::AccessBin => Value::Binary(ACCESS_TYPE.as_bytes().to_vec()),
             Self::Other(odd) => odd.into_value(),
         }
     }
@@ -3141,7 +4035,14 @@ fn custom_data(fields: &Value) -> Option<&[(Value, Value)]> {
         .map(Vec::as_slice)
 }
 
+/// The content every generated LXMF message carries, the reason of an access request.
+const INBOUND_CONTENT: &str = "hello";
+
 pub(super) fn inbound_with(fields: Value) -> InboundMessage {
+    inbound_message(INBOUND_CONTENT.as_bytes().to_vec(), fields)
+}
+
+fn inbound_message(content: Vec<u8>, fields: Value) -> InboundMessage {
     InboundMessage {
         transient_id: [1u8; 32],
         message_id: [2u8; 32],
@@ -3149,7 +4050,7 @@ pub(super) fn inbound_with(fields: Value) -> InboundMessage {
         source_delivery_hash: "0b".repeat(ADDRESS_HASH_SIZE),
         timestamp: 1_700_000_000.0,
         title: None,
-        content: Some(b"hello".to_vec()),
+        content: Some(content),
         fields: Some(fields),
         stamp_value: None,
     }

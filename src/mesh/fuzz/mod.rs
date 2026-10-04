@@ -720,6 +720,233 @@ fn fuzz_codec_corpus_wire_path_seeds_break_exactly_the_rule_their_name_claims() 
     }
 }
 
+/// Codec seeds for the `/list` page, `/fetch` reply and `/access` decoders, each built
+/// from the live page, cursor, path and reply constants and each reaching the outcome its
+/// name claims; `WRITE_CORPUS_ENV=1` rewrites the files, as for the wire-identifier seeds.
+#[test]
+fn fuzz_codec_corpus_share_and_access_seeds_reach_the_outcome_their_name_claims() {
+    use super::access::{
+        ACCESS_MAX_PATHS, ACCESS_TYPE, AccessError, AccessMessage, decode_access,
+        decode_access_message, read_access_reply,
+    };
+    use super::fetch::{CURSOR_MAX_BYTES, FetchError, FetchReply, SharesPage, read_fetch_reply};
+    use super::message::PEER_WIRE_VERSION;
+    use super::r3::NAME_HASH_LEN;
+    use lxmf_core::constants::{FIELD_CUSTOM_DATA, FIELD_CUSTOM_TYPE};
+    use oracles::{
+        SENT_ID, TAG_ACCESS_FIELDS, TAG_ACCESS_REPLY, TAG_ACCESS_REQUEST, TAG_FETCH_REPLY,
+        TAG_LIST_PAGE, inbound_with, unpack_whole,
+    };
+    use rmpv::Value;
+
+    fn tagged(tag: u8, value: &Value) -> Vec<u8> {
+        let mut bytes = vec![tag];
+        rmpv::encode::write_value(&mut bytes, value).unwrap();
+        bytes
+    }
+    fn versioned(tag: u8, rest: Vec<(&str, Value)>) -> Vec<u8> {
+        let mut entries = vec![("v", Value::from(PEER_WIRE_VERSION))];
+        entries.extend(rest);
+        let map = Value::Map(
+            entries
+                .into_iter()
+                .map(|(key, value)| (Value::from(key), value))
+                .collect(),
+        );
+        tagged(tag, &map)
+    }
+    fn paths(count: usize) -> Value {
+        Value::Array((0..count).map(|i| Value::from(format!("p{i}"))).collect())
+    }
+    let entry = Value::Map(vec![
+        (Value::from("path"), Value::from("docs/a.md")),
+        (Value::from("size"), Value::from(3u64)),
+        (Value::from("sha256"), Value::Binary(vec![0; 32])),
+        (Value::from("mtime"), Value::F64(0.0)),
+    ]);
+
+    enum Outcome {
+        ListMalformedNext,
+        ListOneEntryKept,
+        FetchUnknownStatus,
+        FetchCorrupt,
+        FetchUnknownRule,
+        AccessUnknownStatus,
+        AccessPathsOverCap,
+        AccessNameHashLength,
+    }
+
+    let expected = [
+        (
+            "MESH-LIST-009-next-65-bytes.bin",
+            versioned(
+                TAG_LIST_PAGE,
+                vec![
+                    ("entries", Value::Array(Vec::new())),
+                    ("next", Value::from("c".repeat(CURSOR_MAX_BYTES + 1))),
+                ],
+            ),
+            Outcome::ListMalformedNext,
+        ),
+        (
+            "MESH-LIST-008-entry-not-a-map-dropped.bin",
+            versioned(
+                TAG_LIST_PAGE,
+                vec![
+                    ("entries", Value::Array(vec![entry, Value::from(7u64)])),
+                    ("next", Value::Nil),
+                ],
+            ),
+            Outcome::ListOneEntryKept,
+        ),
+        (
+            "MESH-FETCH-015-unknown-status.bin",
+            versioned(TAG_FETCH_REPLY, vec![("status", Value::from("paused"))]),
+            Outcome::FetchUnknownStatus,
+        ),
+        (
+            "MESH-FETCH-018-corrupt-digest.bin",
+            versioned(
+                TAG_FETCH_REPLY,
+                vec![
+                    ("status", Value::from("ok")),
+                    ("bytes", Value::Binary(b"abc".to_vec())),
+                    ("size", Value::from(3u64)),
+                    ("sha256", Value::Binary(vec![0; 32])),
+                ],
+            ),
+            Outcome::FetchCorrupt,
+        ),
+        (
+            "MESH-FETCH-021-unknown-rule.bin",
+            versioned(
+                TAG_FETCH_REPLY,
+                vec![
+                    ("status", Value::from("invalid_path")),
+                    ("rule", Value::from("made_up")),
+                ],
+            ),
+            Outcome::FetchUnknownRule,
+        ),
+        (
+            "MESH-ACCESS-010-unknown-status.bin",
+            versioned(
+                TAG_ACCESS_REPLY,
+                vec![
+                    ("id", Value::from(SENT_ID)),
+                    ("status", Value::from("paused")),
+                ],
+            ),
+            Outcome::AccessUnknownStatus,
+        ),
+        (
+            "MESH-ACCESS-003-paths-over-cap.bin",
+            versioned(
+                TAG_ACCESS_REQUEST,
+                vec![
+                    ("id", Value::from("a-1")),
+                    ("paths", paths(ACCESS_MAX_PATHS + 1)),
+                ],
+            ),
+            Outcome::AccessPathsOverCap,
+        ),
+        (
+            "MESH-ACCESS-023-name-hash-nine-bytes.bin",
+            tagged(
+                TAG_ACCESS_FIELDS,
+                &Value::Map(vec![
+                    (Value::from(FIELD_CUSTOM_TYPE), Value::from(ACCESS_TYPE)),
+                    (
+                        Value::from(FIELD_CUSTOM_DATA),
+                        Value::Map(vec![
+                            (
+                                Value::from("name_hash"),
+                                Value::Binary(vec![0x07; NAME_HASH_LEN - 1]),
+                            ),
+                            (Value::from("id"), Value::from("a-1")),
+                            (Value::from("paths"), paths(1)),
+                        ]),
+                    ),
+                ]),
+            ),
+            Outcome::AccessNameHashLength,
+        ),
+    ];
+    let fixture = oracles::CodecFixture::new();
+    let write = std::env::var_os(WRITE_CORPUS_ENV).is_some_and(|v| v == "1");
+    for (name, bytes, outcome) in expected {
+        let path = corpus_dir("codecs").join(name);
+        if write {
+            fs::write(&path, &bytes).unwrap();
+        }
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            bytes,
+            "codecs/{name} must be the bytes built from the live constants; regenerate with {WRITE_CORPUS_ENV}=1"
+        );
+        let value = unpack_whole(&bytes[1..]).unwrap();
+        match outcome {
+            Outcome::ListMalformedNext => {
+                let observed = SharesPage::from_value(&value, "seed");
+                assert!(
+                    matches!(observed, Err(FetchError::Malformed("next"))),
+                    "codecs/{name}: read as {observed:?}"
+                );
+            }
+            Outcome::ListOneEntryKept => {
+                let page = SharesPage::from_value(&value, "seed")
+                    .unwrap_or_else(|err| panic!("codecs/{name} must read as a page: {err}"));
+                assert_eq!(page.entries.len(), 1, "codecs/{name}: {page:?}");
+            }
+            Outcome::FetchUnknownStatus => {
+                let observed = read_fetch_reply(&value);
+                assert!(
+                    matches!(observed, Err(FetchError::UnknownStatus)),
+                    "codecs/{name}: read as {observed:?}"
+                );
+            }
+            Outcome::FetchCorrupt => {
+                let observed = read_fetch_reply(&value);
+                assert!(
+                    matches!(observed, Err(FetchError::Corrupt)),
+                    "codecs/{name}: read as {observed:?}"
+                );
+            }
+            Outcome::FetchUnknownRule => {
+                let observed = read_fetch_reply(&value);
+                assert!(
+                    matches!(&observed, Ok(FetchReply::InvalidPath { rule }) if rule == "unknown"),
+                    "codecs/{name}: read as {observed:?}"
+                );
+            }
+            Outcome::AccessUnknownStatus => {
+                assert_eq!(
+                    read_access_reply(&value, SENT_ID),
+                    Err(AccessError::UnknownStatus),
+                    "codecs/{name}"
+                );
+            }
+            Outcome::AccessPathsOverCap => {
+                assert_eq!(
+                    decode_access(&value),
+                    Err("paths names more than the cap allows"),
+                    "codecs/{name}"
+                );
+            }
+            Outcome::AccessNameHashLength => {
+                assert_eq!(
+                    decode_access_message(&inbound_with(value)),
+                    AccessMessage::Malformed("name_hash is not 10 bytes"),
+                    "codecs/{name}"
+                );
+            }
+        }
+        oracles::check_codec_bytes(&fixture, &bytes).unwrap_or_else(|what| {
+            panic!("codecs/{name} must satisfy its decoder's oracle: {what}")
+        });
+    }
+}
+
 #[test]
 fn fuzz_wire_path_oracle_names_the_grammar_rules_in_the_order_they_are_checked() {
     assert_eq!(
