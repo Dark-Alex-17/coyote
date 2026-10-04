@@ -4,8 +4,8 @@
 //! requester's `decode_access_response` reads it, the LXMF carriage read by
 //! `decode_access_message` and routed by `AccessRouting`, the human's decision as
 //! `decision_reply` shapes it and the requester correlates it, and the outcome wording of
-//! `classify_answer` and `escalated_notice`. Every row runs in-process; an id that needs a
-//! share set, a grant store or a live envoy run has no row here.
+//! `classify_answer`, `escalated_notice` and `envoy_reply`. Every row runs in-process; an
+//! id that needs a share set, a grant store or a live envoy run has no row here.
 //!
 //! Every row names the id it exercises and the receiver action the spec mandates for it. A
 //! row written faithfully from the spec that the code does not honour is kept as written
@@ -13,8 +13,9 @@
 //! it, and fails when the flag goes stale.
 
 use super::{Kind, Listed};
+use crate::config::UnavailableReason;
 use crate::config::mesh_envoy::{
-    DECLINED_FALLBACK_TEXT, EnvoyOutcome, classify_answer, escalated_notice,
+    DECLINED_FALLBACK_TEXT, EnvoyOutcome, classify_answer, envoy_reply, escalated_notice,
 };
 use crate::hooks::HookEvent;
 use crate::mesh::access::{
@@ -82,8 +83,8 @@ enum Case {
     AccessLxmf(LxmfProbe),
     /// `decision_reply` and the requester's correlation of it, MESH-ACCESS-018.
     Decision(Check),
-    /// The envoy's outcome wording: `classify_answer` and `escalated_notice`, section
-    /// 10.10.
+    /// The envoy's outcome wording: `classify_answer`, `escalated_notice` and
+    /// `envoy_reply`, section 10.10.
     Disposition(Check),
 }
 
@@ -1487,6 +1488,70 @@ fn a_bare_marker_declines_with_the_fallback_text() -> Result<(), String> {
     )
 }
 
+fn a_decline_and_every_answerless_run_go_out_refused_with_no_retry_hint() -> Result<(), String> {
+    let message = question("q-1", Some("t-1"));
+    let sent = |outcome: &EnvoyOutcome, human: Option<&str>| {
+        envoy_reply(outcome, human, "the words".to_string(), &message)
+            .map_err(|err| err.to_string())
+    };
+    for (label, outcome) in [
+        ("declined", EnvoyOutcome::Declined("no".to_string())),
+        ("timed out", EnvoyOutcome::TimedOut),
+        ("interrupted", EnvoyOutcome::Interrupted),
+        (
+            "unavailable",
+            EnvoyOutcome::Unavailable(UnavailableReason::NoSource),
+        ),
+        ("failed", EnvoyOutcome::Failed("boom".to_string())),
+    ] {
+        let out = sent(&outcome, None)?;
+        same(&format!("{label}: kind"), out.kind, PeerKind::Reply)?;
+        same(
+            &format!("{label}: disposition"),
+            out.disposition,
+            Some(Disposition::Refused),
+        )?;
+        same(&format!("{label}: retry_after"), out.retry_after, None)?;
+        same(
+            &format!("{label}: in_reply_to"),
+            out.in_reply_to.as_deref(),
+            Some(message.message_id.as_str()),
+        )?;
+        same(
+            &format!("{label}: thread"),
+            out.thread.as_deref(),
+            Some(message.thread()),
+        )?;
+        ensure(out.parts.is_empty(), format!("{label} carried a part"))?;
+        same(
+            &format!("{label}: content"),
+            out.content.as_str(),
+            "the words",
+        )?;
+    }
+    let answered = sent(&EnvoyOutcome::Answered("x".to_string()), None)?;
+    same(
+        "an answer is answered",
+        answered.disposition,
+        Some(Disposition::Answered),
+    )?;
+    same("with no retry hint", answered.retry_after, None)?;
+    let human = sent(
+        &EnvoyOutcome::Declined("no".to_string()),
+        Some("human words"),
+    )?;
+    same(
+        "the human's answer is answered",
+        human.disposition,
+        Some(Disposition::Answered),
+    )?;
+    same(
+        "in the human's words",
+        human.content.as_str(),
+        "human words",
+    )
+}
+
 // ---------------------------------------------------------------------------------------
 // The table
 // ---------------------------------------------------------------------------------------
@@ -2233,6 +2298,11 @@ fn disposition_rows() -> Vec<Vector> {
             "MESH-DISP-018",
             Boundary,
             Case::Disposition(a_bare_marker_declines_with_the_fallback_text),
+        ),
+        row(
+            "MESH-DISP-018",
+            Valid,
+            Case::Disposition(a_decline_and_every_answerless_run_go_out_refused_with_no_retry_hint),
         ),
     ]
 }

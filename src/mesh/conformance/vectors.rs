@@ -8663,6 +8663,7 @@ fn part_vectors() -> Vec<Vector> {
             "MESH-PART-017",
             Kind::Invalid,
             Case::Custom(|| {
+                let long = "n".repeat(WIRE_PATH_MAX_BYTES + 1);
                 for name in [
                     "../../.bashrc",
                     "/etc/passwd",
@@ -8673,6 +8674,7 @@ fn part_vectors() -> Vec<Vector> {
                     "docs//notes.md",
                     "docs/./notes.md",
                     "e\u{301}.txt",
+                    long.as_str(),
                 ] {
                     let tmp = TempDir::new("conformance-part-name");
                     let kept = staged(
@@ -10447,6 +10449,38 @@ fn disp_vectors() -> Vec<Vector> {
                     "so is the filed answer",
                     filed_answer(&slot, "q-1").and_then(|answer| answer.thread),
                     Some("t-1".to_string()),
+                )
+            }),
+        ),
+        row(
+            "MESH-DISP-025",
+            Kind::Valid,
+            Case::Custom(|| {
+                let slot = asked()?;
+                let escalated = delivered(&slot, reply("r-1", Disposition::Escalated, None))?;
+                same(
+                    "the escalated copy is in the question's thread",
+                    escalated.thread.as_deref(),
+                    Some("t-1"),
+                )?;
+                ensure(
+                    slot.correlations().is_open("q-1"),
+                    "an escalated reply closed the question",
+                )?;
+                let answered = delivered(&slot, reply("r-2", Disposition::Answered, None))?;
+                same(
+                    "the answer that follows shares that thread",
+                    answered.thread.as_deref(),
+                    Some("t-1"),
+                )?;
+                same(
+                    "so does the filed answer",
+                    filed_answer(&slot, "q-1").and_then(|answer| answer.thread),
+                    Some("t-1".to_string()),
+                )?;
+                ensure(
+                    !slot.correlations().is_open("q-1"),
+                    "the answer did not close the question",
                 )
             }),
         ),

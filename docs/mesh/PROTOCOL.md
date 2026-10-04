@@ -2189,7 +2189,7 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 | MESH-DISP-015 | Disposition (Valid) |
 | MESH-DISP-016 | Disposition (Valid) |
 | MESH-DISP-017 | no vector yet |
-| MESH-DISP-018 | Disposition (Boundary), Disposition (Invalid) |
+| MESH-DISP-018 | Disposition (Boundary), Disposition (Invalid), Disposition (Valid) |
 | MESH-DISP-019 | Custom (Valid) |
 | MESH-DISP-020 | Custom (Valid) |
 | MESH-DISP-021 | Custom (Valid) |

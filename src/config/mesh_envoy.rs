@@ -1128,7 +1128,7 @@ pub(crate) fn escalated_notice(message: &PeerMessage) -> Result<OutboundPeer, Se
 /// retry hint; a run-time refusal is not the envoy's answer, so that one goes out as the
 /// typed refusal reply with its fields and retry hint. Words only: the envoy never
 /// attaches a part.
-fn envoy_reply(
+pub(crate) fn envoy_reply(
     outcome: &EnvoyOutcome,
     human_answer: Option<&str>,
     reply_text: String,
