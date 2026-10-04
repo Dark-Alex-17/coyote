@@ -1897,7 +1897,7 @@ pub(super) const TAG_REFUSAL_CODE: u8 = 0x07;
 const TAG_VERSION_REFUSAL: u8 = 0x08;
 const TAG_DISPATCH_ERROR: u8 = 0x09;
 pub(super) const TAG_PENDING: u8 = 0x0a;
-const TAG_WIRE_PATH: u8 = 0x0b;
+pub(super) const TAG_WIRE_PATH: u8 = 0x0b;
 /// Every tag, for the README table check.
 pub(super) const CODEC_TAGS: [u8; 11] = [
     TAG_CARD,

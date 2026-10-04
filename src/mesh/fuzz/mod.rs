@@ -663,6 +663,63 @@ fn fuzz_codec_corpus_files_carrying_wire_identifiers_are_built_from_the_live_con
     }
 }
 
+/// One codec seed per wire-path rule, each a path that breaks exactly the rule its name
+/// carries and none of the rules checked before it, so the replay exercises every
+/// `invalid_path` id the grammar can answer with. The texts are built from the live
+/// limits and `WRITE_CORPUS_ENV=1` rewrites the files, as for the wire-identifier seeds.
+#[test]
+fn fuzz_codec_corpus_wire_path_seeds_break_exactly_the_rule_their_name_claims() {
+    use super::wire_path::{RULES, WIRE_PATH_MAX_BYTES, WIRE_PATH_MAX_SEGMENTS, WirePath};
+    use oracles::TAG_WIRE_PATH;
+
+    fn text_for(rule: &str) -> String {
+        match rule {
+            "empty" => String::new(),
+            "length" => "a".repeat(WIRE_PATH_MAX_BYTES + 1),
+            "control" => "a\tb".to_string(),
+            "invisible" => "a\u{200b}b".to_string(),
+            "backslash" => "docs\\a.md".to_string(),
+            "leading_slash" => "/a".to_string(),
+            "drive_letter" => "C:x".to_string(),
+            "colon" => "ab:c".to_string(),
+            "nfc" => "e\u{301}".to_string(),
+            "segments" => "a/".repeat(WIRE_PATH_MAX_SEGMENTS) + "a",
+            "segment" => "docs//a.md".to_string(),
+            "trailing_dot" => "a.".to_string(),
+            "trailing_space" => "a ".to_string(),
+            "reserved_name" => "CON".to_string(),
+            other => panic!("no seed text for wire-path rule `{other}`"),
+        }
+    }
+
+    let fixture = oracles::CodecFixture::new();
+    let write = std::env::var_os(WRITE_CORPUS_ENV).is_some_and(|v| v == "1");
+    for (rule, _) in RULES {
+        let name = format!("MESH-FETCH-004-{rule}.bin");
+        let text = text_for(rule);
+        let bytes = [&[TAG_WIRE_PATH][..], text.as_bytes()].concat();
+        let path = corpus_dir("codecs").join(&name);
+        if write {
+            fs::write(&path, &bytes).unwrap();
+        }
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            bytes,
+            "codecs/{name} must be the bytes built from the live wire-path limits; regenerate with {WRITE_CORPUS_ENV}=1"
+        );
+        let Err(invalid) = WirePath::parse(&text) else {
+            panic!("codecs/{name}: {text:?} must be refused");
+        };
+        assert_eq!(
+            invalid.rule, rule,
+            "codecs/{name}: {text:?} must break `{rule}` first"
+        );
+        oracles::check_codec_bytes(&fixture, &bytes).unwrap_or_else(|what| {
+            panic!("codecs/{name} must satisfy the wire-path oracle: {what}")
+        });
+    }
+}
+
 /// Usage probe: the decoder and the fuzz oracle both read the version at a
 /// magic-length-relative offset. Every prefix of a valid announce, the exact one-short
 /// header (magic + 1 byte) and the exact header (magic + 2 bytes) must agree between the

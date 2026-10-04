@@ -1673,6 +1673,16 @@ mod tests {
     }
 
     #[test]
+    fn the_readme_counts_the_hook_events_the_registry_declares() {
+        const README: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"));
+        let n = HookEvent::ALL.len();
+        assert!(
+            README.contains(&format!("({n} events)")),
+            "README.md must say ({n} events) where n = HookEvent::ALL.len()"
+        );
+    }
+
+    #[test]
     fn rag_and_mcp_wildcard_whitelist_entries_are_valid() {
         for event in [
             "rag.sync.started",
