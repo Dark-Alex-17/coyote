@@ -16,15 +16,15 @@ next to it in `vectors.rs`.
 
 ### Verification record
 
-Last verified 2026-09-30, on Linux, with the Rust side at the crates.io `0.12.0` release of
+Last verified 2026-10-04, on Linux, with the Rust side at the crates.io `0.12.0` release of
 `lxmf-wire`, `reticulum-rs-transport` and `reticulum-rs-core`, and the Python side at RNS
 `1.5.2` / LXMF `0.9.6` (the two commits pinned above):
 
 | Invocation | Result |
 |---|---|
-| `COYOTE_MESH_INTEROP=1 cargo test --all mesh::conformance -- --include-ignored` (interop + netns) | 73 passed, 0 ignored |
-| `cargo test --all mesh::fuzz` | 17 passed |
-| `cargo test --all` | 4751 passed, 0 failed in the unit binary; 86 passed across the integration binaries |
+| `COYOTE_MESH_INTEROP=1 cargo test --all mesh::conformance -- --include-ignored` (vectors + interop + netns) | 94 passed, 0 ignored |
+| `cargo test --all mesh::fuzz` | 18 passed |
+| `cargo test --all` | 5570 passed, 0 failed in the unit binary; 86 passed across the integration binaries |
 
 The macOS and Windows legs are proven by the PR's CI matrix rather than by this record.
 Re-run the three commands and refresh this table whenever either side's pin moves.
