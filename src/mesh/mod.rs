@@ -247,8 +247,8 @@ pub(crate) mod test_support {
     pub(crate) use super::protocol::Compatibility;
     #[cfg(all(test, unix))]
     pub(crate) use super::r3::network::{
-        NodePair, Script as ResponderScript, fetch_body, short_options, trusting_b, wire_field,
-        wire_status,
+        NodePair, Script as ResponderScript, access_body, fetch_body, hook_sink_for,
+        installed_slot, share_docs_from_a, short_options, trusting_b, wire_field, wire_status,
     };
     #[cfg(unix)]
     pub(crate) use super::r3::{ACCESS_PATH, FETCH_PATH, LIST_PATH};

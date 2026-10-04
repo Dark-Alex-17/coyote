@@ -862,7 +862,7 @@ pub(crate) mod network {
         }
 
         /// `body` as this node sends it when it is the one requesting.
-        fn envelope(&self, body: Value) -> Envelope {
+        pub(crate) fn envelope(&self, body: Value) -> Envelope {
             Envelope::new(self.origin(), body)
         }
 

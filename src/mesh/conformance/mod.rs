@@ -22,6 +22,11 @@
 //!   requester's correlation of it, and the envoy's outcome wording (`AccessRequest`,
 //!   `AccessReply`, `AccessLxmf`, `Decision`, `Disposition`). Rust only, every
 //!   platform.
+//! - `live_vectors`: the file-sharing surface as two nodes see it: the list, access, decision
+//!   and fetch cycle, access admission, the requester's reading of fetch replies, symlinks
+//!   under the share root and the grant a reference attachment lends, run over the loopback
+//!   node pair of `r3::tests::network`. The table is declared everywhere so coverage counts
+//!   it; the executor is `#[cfg(unix)]` with the fixtures it drives.
 //! - `interop`: the protocol exercised against the pinned Python Reticulum/LXMF reference,
 //!   spawned as a subprocess. Those tests are `#[ignore]`d and gated on `COYOTE_MESH_INTEROP=1`;
 //!   `scripts/mesh-interop/setup.sh` prepares the reference and prints the environment they need.
@@ -34,12 +39,12 @@
 //! on its vectors, and the tests at the bottom of this file check the ids against the spec and
 //! report coverage.
 //!
-//! Platform note: `interop` and `link_vectors::loopback` are `#[cfg(unix)]` because the Python
-//! reference harness and the loopback fixtures they drive are unix-only, not because the mesh
-//! is; `netns` is `#[cfg(target_os = "linux")]` because network namespaces are a Linux kernel
-//! feature. Product code under `src/mesh/` is never cfg-gated; those three are the only
-//! exemption. Windows mesh behaviour is covered by the unit tests, the platform-independent
-//! vectors and manual verification, not by the Python interop matrix.
+//! Platform note: `interop`, `link_vectors::loopback` and `live_vectors::loopback` are
+//! `#[cfg(unix)]` because the Python reference harness and the loopback fixtures they drive are
+//! unix-only, not because the mesh is; `netns` is `#[cfg(target_os = "linux")]` because network
+//! namespaces are a Linux kernel feature. Product code under `src/mesh/` is never cfg-gated;
+//! those four are the only exemption. Windows mesh behaviour is covered by the unit tests, the
+//! platform-independent vectors and manual verification, not by the Python interop matrix.
 //!
 //! `coverage_table` renders the same data as the section 20 table of the spec, which
 //! `tests::the_coverage_table_in_the_spec_is_the_generated_one` holds to it.
@@ -48,6 +53,7 @@ mod access_vectors;
 mod env_vectors;
 mod interop_ids;
 mod link_vectors;
+mod live_vectors;
 mod share_vectors;
 mod vectors;
 
@@ -398,6 +404,10 @@ const ENFORCED_BY: &[(&str, &[&str])] = &[
 /// table is rendered from this.
 const EXECUTED_BY: &[(&str, &[&str])] = &[
     (
+        "Access",
+        &["access_admission_and_decisions_hold_over_a_live_pair"],
+    ),
+    (
         "AccessLxmf",
         &["stored_access_requests_are_read_and_routed_as_section_10_16_mandates"],
     ),
@@ -433,6 +443,10 @@ const EXECUTED_BY: &[(&str, &[&str])] = &[
     (
         "Correlation",
         &["size_branches_and_correlation_hold_on_a_live_link"],
+    ),
+    (
+        "Cycle",
+        &["a_list_access_grant_and_fetch_cycle_holds_over_a_live_pair"],
     ),
     ("Custom", &["custom_vectors_hold"]),
     (
@@ -515,6 +529,10 @@ const EXECUTED_BY: &[(&str, &[&str])] = &[
         &["the_timeouts_and_the_outbound_cap_end_requests_as_specified"],
     ),
     (
+        "Lending",
+        &["a_reference_attachment_lends_a_grant_only_for_a_message_the_peer_heard"],
+    ),
+    (
         "ListServe",
         &["list_handlers_answer_as_section_10_14_mandates"],
     ),
@@ -567,6 +585,10 @@ const EXECUTED_BY: &[(&str, &[&str])] = &[
         &["request_frame_vectors_decode_as_section_6_1_mandates"],
     ),
     (
+        "Requester",
+        &["the_requester_reads_fetch_replies_as_section_10_15_mandates"],
+    ),
+    (
         "RequestTimeout",
         &["the_timeouts_and_the_outbound_cap_end_requests_as_specified"],
     ),
@@ -578,6 +600,10 @@ const EXECUTED_BY: &[(&str, &[&str])] = &[
     (
         "SizeBranch",
         &["size_branches_and_correlation_hold_on_a_live_link"],
+    ),
+    (
+        "Symlinks",
+        &["symlinks_never_widen_what_is_served_or_written"],
     ),
     ("Text", &["text_vectors_clean_as_section_3_2_mandates"]),
     (
@@ -629,6 +655,7 @@ fn all_listed() -> Vec<Listed> {
     listed.extend(link_vectors::listed());
     listed.extend(share_vectors::listed());
     listed.extend(access_vectors::listed());
+    listed.extend(live_vectors::listed());
     listed.extend(interop_ids::listed());
     listed
 }

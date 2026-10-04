@@ -1820,6 +1820,7 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 
 | Family | Executed by |
 |---|---|
+| Access | `access_admission_and_decisions_hold_over_a_live_pair` |
 | AccessLxmf | `stored_access_requests_are_read_and_routed_as_section_10_16_mandates` |
 | AccessReply | `access_replies_are_read_as_section_10_16_mandates` |
 | AccessRequest | `access_requests_are_answered_as_section_10_16_mandates` |
@@ -1831,6 +1832,7 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 | CardEncode | `card_encode_vectors_pin_the_emission_order` |
 | Correlation | `size_branches_and_correlation_hold_on_a_live_link` |
 | Custom | `custom_vectors_hold` |
+| Cycle | `a_list_access_grant_and_fetch_cycle_holds_over_a_live_pair` |
 | Decision | `access_decisions_travel_as_section_10_16_mandates` |
 | Derivation | `derivation_vectors_reproduce_section_4` |
 | Dispatch | `dispatch_vectors_answer_as_section_6_6_mandates` |
@@ -1850,6 +1852,7 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 | Interop | `the_reference_announce_is_filed_and_it_derives_our_destination_from_our_announce`, `reference_requests_hear_the_specified_replies`, `our_requests_are_decoded_by_the_reference`, `a_propagation_node_demanding_a_raised_stamp_cost_still_takes_our_message` |
 | KnockBody | `knock_body_vectors_read_the_intro_as_section_8_1_mandates` |
 | KnockIntro | `knock_intro_vectors_clean_and_refuse_as_section_8_1_mandates` |
+| Lending | `a_reference_attachment_lends_a_grant_only_for_a_message_the_peer_heard` |
 | LinkTimeout | `the_timeouts_and_the_outbound_cap_end_requests_as_specified` |
 | ListServe | `list_handlers_answer_as_section_10_14_mandates` |
 | LxmfKnock | `lxmf_knock_vectors_decode_as_section_8_6_mandates` |
@@ -1865,10 +1868,12 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 | Registry | `registry_vectors_pin_the_code_points_of_section_13` |
 | RequestFrameDecode | `request_frame_vectors_decode_as_section_6_1_mandates` |
 | RequestTimeout | `the_timeouts_and_the_outbound_cap_end_requests_as_specified` |
+| Requester | `the_requester_reads_fetch_replies_as_section_10_15_mandates` |
 | ResponseFrameDecode | `response_frame_vectors_decode_as_section_6_2_mandates` |
 | ShareSet | `share_sets_judge_as_section_10_17_mandates` |
 | SizeBranch | `size_branches_and_correlation_hold_on_a_live_link` |
 | StoreSchema | `store_schemas_refuse_and_default_as_section_14_1_mandates` |
+| Symlinks | `symlinks_never_widen_what_is_served_or_written` |
 | Text | `text_vectors_clean_as_section_3_2_mandates` |
 | Trust | `trust_vectors_authorize_as_the_precedence_mandates` |
 | UnacknowledgedReply | `the_sender_outcomes_end_as_sections_8_5_and_10_4_mandate` |
@@ -2195,8 +2200,8 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 | MESH-FETCH-003 | WirePath (Boundary), WirePath (Invalid), WirePath (Valid) |
 | MESH-FETCH-004 | FetchServe (Invalid) |
 | MESH-FETCH-005 | WirePath (Invalid), WirePath (Valid) |
-| MESH-FETCH-006 | FetchServe (Invalid), FetchServe (Valid) |
-| MESH-FETCH-007 | WirePath (Invalid), WirePath (Valid) |
+| MESH-FETCH-006 | FetchServe (Invalid), FetchServe (Valid), Symlinks (Invalid) |
+| MESH-FETCH-007 | Requester (Boundary), Requester (Invalid), WirePath (Invalid), WirePath (Valid) |
 | MESH-LIST-001 | ListServe (Invalid), ListServe (Valid) |
 | MESH-LIST-002 | ListServe (Invalid), ListServe (Valid) |
 | MESH-LIST-003 | ListServe (Boundary), ListServe (Invalid) |
@@ -2212,7 +2217,7 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 | MESH-LIST-013 | FetchClient (Boundary), FetchClient (Invalid) |
 | MESH-LIST-014 | FetchClient (Boundary), FetchClient (Invalid), FetchClient (Valid) |
 | MESH-LIST-015 | FetchClient (Valid) |
-| MESH-LIST-016 | ListServe (Valid) |
+| MESH-LIST-016 | Cycle (Boundary), Cycle (Valid), ListServe (Valid) |
 | MESH-LIST-017 | ListServe (Valid) |
 | MESH-LIST-018 | ListServe (Boundary) |
 | MESH-LIST-019 | ListServe (Valid) |
@@ -2227,18 +2232,18 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 | MESH-FETCH-010 | FetchServe (Invalid) |
 | MESH-FETCH-011 | FetchServe (Boundary), FetchServe (Invalid), FetchServe (Valid) |
 | MESH-FETCH-012 | FetchServe (Valid) |
-| MESH-FETCH-013 | no vector yet |
-| MESH-FETCH-014 | no vector yet |
-| MESH-FETCH-015 | FetchClient (Invalid) |
-| MESH-FETCH-016 | no vector yet |
-| MESH-FETCH-017 | no vector yet |
-| MESH-FETCH-018 | no vector yet |
-| MESH-FETCH-019 | no vector yet |
+| MESH-FETCH-013 | Requester (Invalid) |
+| MESH-FETCH-014 | Requester (Invalid) |
+| MESH-FETCH-015 | FetchClient (Invalid), Requester (Invalid) |
+| MESH-FETCH-016 | Requester (Invalid) |
+| MESH-FETCH-017 | Requester (Invalid) |
+| MESH-FETCH-018 | Requester (Invalid) |
+| MESH-FETCH-019 | Requester (Invalid) |
 | MESH-FETCH-020 | no vector yet |
 | MESH-FETCH-021 | FetchClient (Invalid) |
-| MESH-FETCH-022 | no vector yet |
-| MESH-FETCH-023 | no vector yet |
-| MESH-FETCH-024 | FetchServe (Invalid), FetchServe (Valid) |
+| MESH-FETCH-022 | Requester (Invalid) |
+| MESH-FETCH-023 | Requester (Valid) |
+| MESH-FETCH-024 | Cycle (Valid), FetchServe (Invalid), FetchServe (Valid) |
 | MESH-FETCH-025 | FetchServe (Invalid) |
 | MESH-FETCH-026 | FetchServe (Valid) |
 | MESH-FETCH-027 | FetchServe (Boundary) |
@@ -2262,12 +2267,12 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 | MESH-ACCESS-011 | AccessReply (Invalid), AccessReply (Valid) |
 | MESH-ACCESS-012 | AccessReply (Invalid), AccessReply (Valid) |
 | MESH-ACCESS-013 | AccessReply (Boundary), AccessReply (Valid) |
-| MESH-ACCESS-014 | no vector yet |
-| MESH-ACCESS-015 | no vector yet |
-| MESH-ACCESS-016 | AccessRequest (Boundary), AccessRequest (Valid) |
+| MESH-ACCESS-014 | Access (Invalid) |
+| MESH-ACCESS-015 | Access (Valid) |
+| MESH-ACCESS-016 | AccessRequest (Boundary), AccessRequest (Valid), Cycle (Valid) |
 | MESH-ACCESS-017 | AccessRequest (Invalid) |
-| MESH-ACCESS-018 | Decision (Boundary), Decision (Valid) |
-| MESH-ACCESS-019 | no vector yet |
+| MESH-ACCESS-018 | Cycle (Valid), Decision (Boundary), Decision (Valid) |
+| MESH-ACCESS-019 | Access (Invalid), Cycle (Valid) |
 | MESH-ACCESS-020 | AccessLxmf (Boundary), AccessLxmf (Invalid), AccessLxmf (Valid) |
 | MESH-ACCESS-021 | AccessLxmf (Invalid) |
 | MESH-ACCESS-022 | AccessLxmf (Valid) |
@@ -2277,26 +2282,26 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 | MESH-ACCESS-026 | AccessLxmf (Valid) |
 | MESH-ACCESS-027 | AccessLxmf (Boundary), AccessLxmf (Valid) |
 | MESH-ACCESS-028 | AccessLxmf (Invalid) |
-| MESH-ACCESS-029 | AccessRequest (Valid) |
+| MESH-ACCESS-029 | AccessRequest (Valid), Cycle (Valid) |
 | MESH-SHARE-001 | ShareSet (Boundary), ShareSet (Invalid), ShareSet (Valid) |
 | MESH-SHARE-002 | ShareSet (Boundary), ShareSet (Invalid), ShareSet (Valid) |
 | MESH-SHARE-003 | ShareSet (Invalid) |
 | MESH-SHARE-004 | ShareSet (Boundary), ShareSet (Invalid), ShareSet (Valid) |
 | MESH-SHARE-005 | ShareSet (Invalid), ShareSet (Valid) |
-| MESH-SHARE-006 | ShareSet (Invalid), ShareSet (Valid) |
+| MESH-SHARE-006 | ShareSet (Invalid), ShareSet (Valid), Symlinks (Valid) |
 | MESH-SHARE-007 | ShareSet (Boundary), ShareSet (Invalid), ShareSet (Valid) |
 | MESH-SHARE-008 | ShareSet (Invalid), ShareSet (Valid) |
 | MESH-SHARE-009 | ShareSet (Invalid), ShareSet (Valid) |
 | MESH-SHARE-010 | ShareSet (Boundary), ShareSet (Invalid), ShareSet (Valid) |
 | MESH-SHARE-011 | ShareSet (Valid) |
-| MESH-SHARE-012 | ShareSet (Valid) |
+| MESH-SHARE-012 | ShareSet (Valid), Symlinks (Invalid) |
 | MESH-SHARE-013 | ShareSet (Valid) |
-| MESH-SHARE-014 | ShareSet (Invalid), ShareSet (Valid) |
+| MESH-SHARE-014 | Cycle (Boundary), Cycle (Valid), ShareSet (Invalid), ShareSet (Valid) |
 | MESH-SHARE-015 | GrantStore (Boundary), GrantStore (Invalid), GrantStore (Valid) |
 | MESH-SHARE-016 | GrantStore (Boundary), GrantStore (Valid) |
 | MESH-SHARE-017 | GrantStore (Valid) |
 | MESH-SHARE-018 | GrantStore (Boundary), GrantStore (Invalid) |
-| MESH-SHARE-019 | no vector yet |
+| MESH-SHARE-019 | Lending (Invalid), Lending (Valid) |
 | MESH-SHARE-020 | no vector yet |
 | MESH-PROP-001 | Custom (Valid) |
 | MESH-PROP-002 | Custom (Valid) |
