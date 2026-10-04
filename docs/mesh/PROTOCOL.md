@@ -259,7 +259,7 @@ A response is the msgpack array `[request_id, value]`; its encoding begins `92 c
 |---|---|---|---|
 | `[0]` request_id | bin(16) | the request id of the request being answered (section 6.3) | **[MESH-ENV-005]** A responder MUST put the request id computed by section 6.3 for the request it answers; a response naming no outstanding request answers nothing. |
 | `[1]` value | any | a reply value, a refusal code, a version refusal map or a dispatch error map | **[MESH-ENV-006]** The requester MUST decode this element in the order given in section 6.7. |
-| any other element or trailing bytes | none | nothing | **[MESH-ENV-007]** The requester MUST drop a response that is longer than `MAX_R3_PAYLOAD_BYTES`, that is not an `array` of exactly two elements, whose `[0]` is not a `bin` of exactly 16 bytes, that is followed by any further byte, that names no outstanding request, or that arrives on a link other than the one its request went out on; the request then ends in `Timeout` (`ResponseFrame::decode`, src/mesh/r3/frame.rs; `R3Client::deliver`, src/mesh/r3/client.rs; `response_on_the_wrong_link_is_ignored`, src/mesh/r3/tests.rs). |
+| any other element or trailing bytes | none | nothing | **[MESH-ENV-007]** The requester MUST drop a response that is longer than its path's bound (section 10.15: `MAX_FETCH_RESPONSE_BYTES` for `/fetch`, `MAX_R3_PAYLOAD_BYTES` otherwise), that is not an `array` of exactly two elements, whose `[0]` is not a `bin` of exactly 16 bytes, that is followed by any further byte, that names no outstanding request, or that arrives on a link other than the one its request went out on; the request then ends in `Timeout` (`ResponseFrame::decode`, src/mesh/r3/frame.rs; `R3Client::deliver`, src/mesh/r3/client.rs; `response_on_the_wrong_link_is_ignored`, src/mesh/r3/tests.rs). |
 
 **[MESH-ENV-049]** The requester MUST drop a response frame whose msgpack nesting spends more than `MAX_R3_NESTING_DEPTH` = `128` units of the depth budget accounted in MESH-ENV-048 (`ResponseFrame::decode`, `R3Error::Decode`); the request then ends in `Timeout` (`frames_refuse_nesting_past_the_depth_budget_and_accept_the_deepest_legal_frame`).
 
@@ -271,7 +271,7 @@ A response is the msgpack array `[request_id, value]`; its encoding begins `92 c
 
 **[MESH-ENV-010]** The size branch MUST be chosen the same way for requests and responses (`boundary_sizes_pick_packet_or_resource_on_both_halves`; the reference link MDU is 431 bytes at MTU 500).
 
-**[MESH-ENV-011]** A sender MUST refuse locally, without sending, any frame longer than `MAX_R3_PAYLOAD_BYTES` = `262144` bytes (`R3Error::Oversize`); the inbound bound is stage 1 of section 6.6.
+**[MESH-ENV-011]** A sender MUST refuse locally, without sending, any frame longer than its route's bound, `MAX_R3_PAYLOAD_BYTES` = `262144` bytes for every request and every response but a `/fetch` response, which is bound by `MAX_FETCH_RESPONSE_BYTES` = `4198400` bytes (section 10.15; `R3Error::Oversize`); the inbound bound is stage 1 of section 6.6.
 
 ### 6.4 Identity
 
@@ -333,7 +333,7 @@ Dispatch error maps (`DispatchError`, src/mesh/r3/dispatch.rs; `dispatch_errors_
 |---|---|---|---|
 | `error` | str | `"unknown_path"` or `"no_provider"` | **[MESH-ENV-040]** A requester MUST read a map without a `str` `error` equal to one of these as the path's reply value, never as a refusal code. |
 | `path_hash` | str, 32 hex | with `unknown_path`: the hex of the request's path hash | **[MESH-ENV-041]** When `error` is `"unknown_path"`, the requester MUST read the map as a dispatch error only when this key is a `str` of exactly 32 ASCII hexadecimal digits, and otherwise as the path's reply value (`unknown_path_with_a_malformed_hash_is_not_a_dispatch_error`, src/mesh/r3/dispatch.rs). |
-| `path` | str | with `no_provider`: the known path, for example `"/status"` | **[MESH-ENV-042]** When `error` is `"no_provider"`, the requester MUST read the map as a dispatch error only when this key is a `str` equal to one of `/knock`, `/status` and `/message`, and otherwise as the path's reply value (`no_provider_with_an_unknown_path_is_not_a_dispatch_error`, src/mesh/r3/dispatch.rs). |
+| `path` | str | with `no_provider`: the known path, for example `"/status"` | **[MESH-ENV-042]** When `error` is `"no_provider"`, the requester MUST read the map as a dispatch error only when this key is a `str` equal to one of `/knock`, `/status`, `/message`, `/list`, `/fetch` and `/access` (`KNOWN_PATHS`), and otherwise as the path's reply value (`no_provider_with_an_unknown_path_is_not_a_dispatch_error`, src/mesh/r3/dispatch.rs). |
 | any other key | any | nothing | **[MESH-ENV-043]** The receiver MUST ignore it. |
 
 ### 6.7 Refusal codes and client decoding
@@ -539,7 +539,7 @@ A card at every cap exceeds the link MDU and travels as a resource per section 6
 
 ### 9.2 Card
 
-Emission order: `v`, `display_name`, `objective`, `state`, `repo`, `plan`, `todo`, `"snapshot_age_secs"`, `"served_at_secs"`.
+Emission order: `v`, `display_name`, `objective`, `state`, `repo`, `plan`, `todo`, `about`, `caps`, `"snapshot_age_secs"`, `"served_at_secs"`.
 
 | Field | Type | Sender puts | Receiver action on any other value |
 |---|---|---|---|
@@ -550,6 +550,8 @@ Emission order: `v`, `display_name`, `objective`, `state`, `repo`, `plan`, `todo
 | `repo` | map | the repo map (section 9.4); omitted when none | **[MESH-STATUS-008]** Not a `map`: the receiver MUST reject the card as `Malformed`; absent or `nil`: none. |
 | `plan` | map | the plan map (section 9.5); omitted when none | **[MESH-STATUS-009]** Not a `map`: the receiver MUST reject the card as `Malformed`; absent or `nil`: none. |
 | `todo` | map | the todo map (section 9.6); omitted when none | **[MESH-STATUS-010]** Not a `map`: the receiver MUST reject the card as `Malformed`; absent or `nil`: none. |
+| `about` | str | what the node says of itself, cleaned, at most `ABOUT_MAX_CHARS` = `200` characters; omitted when none | **[MESH-FETCH-001]** Not a `str`: the receiver MUST read it as absent and keep the card, the key having been added after `v: 1` shipped (`text_or_absent`, src/mesh/card.rs; `a_card_with_a_malformed_about_and_caps_still_reads_the_rest_intact`); absent or `nil`: none; longer than 200 characters: truncated (`about_is_sanitised_and_cut_on_a_character_boundary`). |
+| `caps` | array of str | the capabilities the node advertises, at most `CAPS_MAX_ENTRIES` = `16` entries of at most `CAP_MAX_CHARS` = `32` characters each, cleaned; this version defines `fetch`, the paths of sections 10.14 and 10.15; omitted when empty | **[MESH-FETCH-002]** Not an `array`: the receiver MUST read no capabilities and keep the card (`text_list_or_empty`, src/mesh/card.rs; `caps_that_are_not_a_list_read_as_no_caps`); absent or `nil`: none; an entry that is not a `str`, or blank once cleaned: skipped; an entry longer than 32 characters: truncated; the seventeenth and later entries, counted as sent: dropped (`caps_skips_entries_that_are_not_text_and_drops_those_past_the_cap`); an entry this document does not name: kept (`unknown_caps_are_kept_and_the_maximal_card_round_trips_about_and_caps`). |
 | `"snapshot_age_secs"` | uint | seconds since the snapshot was taken; omitted when unknown | **[MESH-STATUS-011]** Not a non-negative integer: the receiver MUST reject the card as `Malformed`; absent or `nil`: none. |
 | `"served_at_secs"` | uint | Unix seconds when the card was served | **[MESH-STATUS-012]** Missing, `nil` or not a non-negative integer: the receiver MUST reject the card as `Malformed`. |
 | any other key | any | nothing | **[MESH-STATUS-013]** The receiver MUST ignore it (`unknown_keys_are_ignored_and_unknown_state_codes_are_kept`). |
@@ -559,6 +561,8 @@ Emission order: `v`, `display_name`, `objective`, `state`, `repo`, `plan`, `todo
 **[MESH-STATUS-015]** A responder MUST omit an absent field rather than send `nil`.
 
 **[MESH-STATUS-016]** A receiver MUST treat a `nil` value as a missing key (`Fields::get`).
+
+The reference always advertises `caps: ["fetch"]` (`CardSource::caps`, src/mesh/card.rs). `caps` informs the requester's display and is not a gate: whether a peer serves a path is learned from the dispatch error of section 6.6, not from the card.
 
 ### 9.3 State map
 
@@ -963,6 +967,154 @@ payload = msgpack [timestamp, title, content, fields]
 
 `v` is not repeated here, since the type tag carries the version; `title` and `content` ride the LXMF slots and `ts` is the LXMF timestamp. Both routes end in the pipeline of section 11.4.
 
+### 10.13 Wire paths
+
+A wire path names a file relative to a share root: `segment *( "/" segment )`, UTF-8, in NFC, never absolute (`WirePath::parse`, src/mesh/wire_path.rs). A string is held to the rules below in the order given, and the first rule it breaks names the refusal (`RULES`).
+
+| Rule | Condition | Receiver action |
+|---|---|---|
+| `empty` | the string is empty | refused as `empty` |
+| `length` | longer than `WIRE_PATH_MAX_BYTES` = `1024` bytes | refused as `length` |
+| `control` | a character for which `char::is_control()` is true | refused as `control` |
+| `invisible` | a code point of the section 3.3 set (`is_control_or_invisible`) | refused as `invisible` |
+| `backslash` | a `\` | refused as `backslash` |
+| `leading_slash` | the first character is `/` | refused as `leading_slash` |
+| `drive_letter` | the first two bytes are an ASCII letter and `:` (`[A-Za-z]:`) | refused as `drive_letter` |
+| `colon` | a `:` anywhere | refused as `colon` |
+| `nfc` | not in NFC (`is_nfc`) | refused as `nfc` |
+| `segments` | more than `WIRE_PATH_MAX_SEGMENTS` = `64` segments once split on `/` | refused as `segments` |
+| `segment` | a segment that is empty, `.` or `..` | refused as `segment` |
+| `trailing_dot` | a segment ending in `.` | refused as `trailing_dot` |
+| `trailing_space` | a segment ending in a space | refused as `trailing_space` |
+| `reserved_name` | a segment whose stem, the text before the first `.` with trailing spaces trimmed and ASCII-lowercased, is `con`, `prn`, `aux`, `nul`, or `com` or `lpt` followed by exactly one of `0` to `9`, `¹`, `²` and `³` (`is_windows_reserved_name`, src/utils/path.rs) | refused as `reserved_name` |
+
+What refused means depends on where the path travels: a `/fetch` `path` draws the `invalid_path` reply of section 10.15 carrying the rule, a `file` part is dropped and counted (section 10.9), and a `/list` entry is dropped by the requester (section 10.14). A requester holds its own `/fetch` `path` to the grammar before the round trip and reports the rule locally (`fetch_file`, src/mesh/fetch.rs).
+
+**[MESH-FETCH-003]** A `rule` key MUST carry one of the fourteen names above and nothing else (`is_rule_id`, src/mesh/wire_path.rs).
+
+**[MESH-FETCH-004]** A responder MUST hold a path to the grammar before it touches the filesystem and MUST answer `invalid_path` with the first rule broken (`an_invalid_wire_path_is_refused_before_the_filesystem_is_touched`, src/mesh/shares.rs).
+
+**[MESH-FETCH-005]** The grammar MUST apply to every path on the wire, a `/fetch` `path` (section 10.15), each of an `/access` `paths[]`, a `file` part's `name` and `ref.path` (section 10.9) and a `/list` entry's `path` (section 10.14), and to the relative path a receiver stages a file under in its inbox (`InboxStaging::stage`, src/mesh/inbox.rs).
+
+**[MESH-FETCH-006]** A responder MUST resolve a wire path under its share root, symlinks followed and case as the probed filesystem folds it, and MUST judge the resolved path: one that resolves outside the root, through a symlink or otherwise, or to anything but a regular file, is `not_shared` (`a_symlink_that_leaves_the_root_is_not_shared`, `a_candidate_outside_the_canonical_root_is_never_served`, `a_case_flipped_name_cannot_dodge_a_deny_under_either_fold_flag`, src/mesh/shares.rs).
+
+**[MESH-FETCH-007]** A requester MUST keep a `rule` that is one of the fourteen names and MUST read any other text there as `unknown`, so a peer's words never reach a model through it (`rule_of`, src/mesh/fetch.rs); a `rule` that is missing or not text makes the reply malformed (section 10.15).
+
+### 10.14 /list
+
+A listing is a request on `LIST_PATH` = `"/list"` (src/mesh/r3/dispatch.rs), answered from the share set and nothing else (`ListHandler`, src/mesh/fetch.rs); the requester side is `list_shares` in the same file.
+
+Request body, emission order `v`, `prefix`, `cursor` (`list_shares`); the reference sends `nil` for an absent `prefix` or `cursor`:
+
+| Field | Type | Sender puts | Receiver action on any other value |
+|---|---|---|---|
+| `v` | uint | `PEER_WIRE_VERSION` = `1` | **[MESH-LIST-001]** Missing or not equal to 1, as a body that is not a `map`: the receiver MUST refuse with `InvalidData` (`versioned_map`, `decode_list`, src/mesh/fetch.rs). |
+| `prefix` | str | a byte-wise prefix the paths of the entries are to start with; omitted or `nil` for every entry | **[MESH-LIST-002]** Present and not a `str`: the receiver MUST refuse with `InvalidData`. |
+| `cursor` | str | the `next` of the page before, at most `CURSOR_MAX_BYTES` = `64` bytes; omitted or `nil` for the first page | **[MESH-LIST-003]** Present and not a `str`, or longer than 64 bytes: the receiver MUST refuse with `InvalidData`. **[MESH-LIST-004]** A `str` that is the cursor of no entry in the current set: the receiver MUST answer the first page, a cursor from a listing that has changed starting over rather than skipping an unknown amount (`paging_resumes_after_the_cursor_and_an_unknown_cursor_starts_over`, src/mesh/shares.rs; `usage_probe_an_unknown_or_stale_cursor_starts_the_listing_over`, src/mesh/fetch.rs). |
+| any other key | any | nothing | **[MESH-LIST-005]** The receiver MUST ignore it. |
+
+Reply, emission order `v`, `entries`, `next` (`list_page`, src/mesh/fetch.rs), `next` sent as `nil` when no page follows:
+
+| Field | Type | Sender puts | Receiver action on any other value |
+|---|---|---|---|
+| `v` | uint | `PEER_WIRE_VERSION` = `1` | **[MESH-LIST-006]** Missing or not equal to 1, as a reply that is not a `map`: the requester MUST read the reply as malformed (`SharesPage::from_value`, src/mesh/fetch.rs), after the dispatch-error test of section 6.6, under which a `no_provider` map is `NotServed`. |
+| `entries` | array of entry maps | the page | **[MESH-LIST-007]** Missing or not an `array`: the requester MUST read the reply as malformed. **[MESH-LIST-008]** The requester MUST read at most the first `LIST_PAGE_SIZE` = `1000` elements and MUST drop, keeping the page, an element that is not a `map` or that breaks a row of the entry table below. |
+| `next` | str | the cursor of the last entry returned when entries follow it; `nil` otherwise | **[MESH-LIST-009]** Present and not a `str`, or longer than `CURSOR_MAX_BYTES` = `64` bytes: the requester MUST read the reply as malformed. |
+| any other key | any | nothing | **[MESH-LIST-010]** The requester MUST ignore it. |
+
+Entry, emission order `path`, `size`, `sha256`, `mtime` (`entry_value`, src/mesh/fetch.rs):
+
+| Field | Type | Sender puts | Receiver action on any other value |
+|---|---|---|---|
+| `path` | str, a wire path | the file's wire path under the share root | **[MESH-LIST-011]** Missing, not a `str` or not a wire path (section 10.13): the requester MUST drop the entry and keep the page (`SharesPage::entry`, src/mesh/fetch.rs). |
+| `size` | uint | the file's length in bytes | **[MESH-LIST-012]** Missing or not a non-negative integer: the requester MUST drop the entry. |
+| `sha256` | bin(32) | the SHA-256 of the file's bytes | **[MESH-LIST-013]** Missing, not a `bin` or not 32 bytes: the requester MUST drop the entry. |
+| `mtime` | f64 | the file's modification time as Unix seconds; `0.0` when the filesystem gives none | **[MESH-LIST-014]** Missing, not a number (`uint`, `int`, `f32` or `f64`), or not finite once read as f64: the requester MUST drop the entry. |
+| any other key | any | nothing | **[MESH-LIST-015]** The requester MUST ignore it. |
+
+**[MESH-LIST-016]** A listing MUST be the share set as it stands for the requester, the allows less the denies and the built-in and protected names (section 10.17), never the tree, and a grant MUST NOT appear in it (`ShareSet::list`, src/mesh/shares.rs).
+
+**[MESH-LIST-017]** A responder MUST sort the entries by wire path in byte order, a path reached twice listed once (`sorted`, src/mesh/shares.rs).
+
+**[MESH-LIST-018]** A page MUST hold at most `LIST_PAGE_SIZE` = `1000` entries and MUST end earlier, after the last entry that fits, when the next entry would take the encoded entries plus `LIST_PAGE_HEADROOM` = `2048` bytes past `MAX_R3_PAYLOAD_BYTES` (`bound_page`; `a_list_page_is_cut_by_encoded_bytes_before_the_entry_count`, `usage_probe_a_list_page_holds_at_most_one_thousand_entries`, src/mesh/fetch.rs).
+
+**[MESH-LIST-019]** `next` MUST be `cursor(path)` of the last entry returned when entries follow it and `nil` otherwise, where `cursor(path)` is the first 32 lowercase hex digits of `H(path)` (`list_cursor`; `a_list_cursor_is_the_first_half_of_the_sha256_of_the_path`, src/mesh/shares.rs: `docs/a.md` gives `5231f8a11b65145a1b0727cb8d209819`).
+
+**[MESH-LIST-020]** A requester MUST treat a cursor as opaque and hand it back as received.
+
+**[MESH-LIST-021]** A responder SHOULD bound the walk behind a listing; the reference visits at most `DEFAULT_LIST_WALK_BOUND` = `100000` entries, directories counted, and leaves what lies past the bound off the listing, with no flag on the wire (`a_tiny_walk_bound_truncates_the_listing`, src/mesh/shares.rs).
+
+**[MESH-LIST-022]** A responder MUST open and hash only the entries of the page it returns (`a_listing_hashes_only_the_page_it_returns`, src/mesh/shares.rs).
+
+**[MESH-LIST-023]** A node with no share root, one whose root cannot be probed for case folding, or one whose share rules cannot be built MUST answer the empty page `{ v, entries: [], next: nil }` (`ListHandler`, src/mesh/fetch.rs).
+
+**[MESH-LIST-024]** A requester that section 6.6 does not admit MUST hear what that section gives its standing, silence for an unknown or blocked identity, on `/list` and `/fetch` as on `/status` and whatever file it asked for (`usage_probe_list_and_fetch_from_an_untrusted_peer_are_silent_like_status_whatever_the_path`, src/mesh/r3/tests.rs).
+
+**[MESH-LIST-025]** A requester MUST wait `PEER_REQUEST_TIMEOUT` = `15` seconds for a listing (`a_file_fetch_waits_two_minutes_where_a_listing_waits_a_round_trip`, src/mesh/fetch.rs).
+
+```text
+/list   req  { "v": 1, "prefix": "docs/", "cursor": null }
+        resp { "v": 1, "entries": [ { "path": "docs/a.md", "size": 1204, "sha256": bin32, "mtime": 1790000000.0 } ], "next": null }
+        resp (empty effective set) { "v": 1, "entries": [], "next": null }
+```
+
+### 10.15 /fetch
+
+A fetch is a request on `FETCH_PATH` = `"/fetch"` (src/mesh/r3/dispatch.rs) for one file by wire path, answered with the file's bytes or a status word (`FetchHandler`, `serve_fetch`, src/mesh/fetch.rs); the requester side is `fetch_file` in the same file.
+
+Request body, emission order `v`, `path`, `if_sha256` (`fetch_file`); the reference sends `nil` for an absent `if_sha256`:
+
+| Field | Type | Sender puts | Receiver action on any other value |
+|---|---|---|---|
+| `v` | uint | `PEER_WIRE_VERSION` = `1` | **[MESH-FETCH-008]** Missing or not equal to 1, as a body that is not a `map`: the receiver MUST refuse with `InvalidData` (`decode_fetch`, src/mesh/fetch.rs). |
+| `path` | str, a wire path | the file's wire path | **[MESH-FETCH-009]** Missing or not a `str`: the receiver MUST refuse with `InvalidData`. **[MESH-FETCH-010]** A `str` that breaks the grammar of section 10.13: the receiver MUST answer `invalid_path` with the first rule broken. |
+| `if_sha256` | bin(32) | the SHA-256 the requester already holds for the file; omitted or `nil` otherwise | **[MESH-FETCH-011]** Present and not a `bin` of 32 bytes: the receiver MUST refuse with `InvalidData`. |
+| any other key | any | nothing | **[MESH-FETCH-012]** The receiver MUST ignore it. |
+
+Reply: a map carrying `status` and the keys of that status beside it, never a nested map (`status_reply`, src/mesh/fetch.rs); emission order `v`, `status`, then the status's keys in the order of the rows:
+
+| Field | Type | Sender puts | Receiver action on any other value |
+|---|---|---|---|
+| `v` | uint | `PEER_WIRE_VERSION` = `1` | **[MESH-FETCH-013]** Missing or not equal to 1, as a reply that is not a `map`: the requester MUST read the reply as malformed (`fetch_file`, src/mesh/fetch.rs), after the dispatch-error test of section 6.6, under which a `no_provider` map is `NotServed`. |
+| `status` | str | `ok`, `not_modified`, `not_shared`, `invalid_path` or `too_large` | **[MESH-FETCH-014]** Missing or not a `str`: the requester MUST read the reply as malformed. **[MESH-FETCH-015]** Any other `str`: the requester MUST fail the fetch as a client error, `peer sent an unknown status`, without reading the other keys and never by panicking. |
+| `size` | uint | with `ok`: the length of `bytes` | **[MESH-FETCH-016]** With `ok`, missing, not a non-negative integer or not equal to the length of `bytes`: the requester MUST read the reply as malformed. |
+| `sha256` | bin(32) | with `ok` and `not_modified`: the SHA-256 of the file's bytes | **[MESH-FETCH-017]** With `ok` or `not_modified`, missing, not a `bin` or not 32 bytes: the requester MUST read the reply as malformed. **[MESH-FETCH-018]** With `ok`, not equal to `H(bytes)`: the requester MUST discard the bytes as corrupt. |
+| `bytes` | bin | with `ok`: the file's bytes | **[MESH-FETCH-019]** With `ok`, missing or not a `bin`: the requester MUST read the reply as malformed. **[MESH-FETCH-020]** With `ok`, longer than `MAX_FETCH_FILE_BYTES` = `4194304` bytes: the requester MUST discard the bytes as oversize, before `size` or `sha256` is read. |
+| `rule` | str | with `invalid_path`: the first rule broken (section 10.13) | **[MESH-FETCH-021]** With `invalid_path`, missing or not a `str`: the requester MUST read the reply as malformed; any other `str` reads as `unknown` (MESH-FETCH-007). |
+| `limit` | uint | with `too_large`: the limit the responder applies, in bytes | **[MESH-FETCH-022]** With `too_large`, missing or not a non-negative integer: the requester MUST read the reply as malformed. |
+| any other key | any | nothing | **[MESH-FETCH-023]** The requester MUST ignore it, a key of another status included. |
+
+```text
+/fetch  req  { "v": 1, "path": "docs/a.md", "if_sha256": null }
+        resp { "v": 1, "status": "ok", "size": 1204, "sha256": bin32, "bytes": bin }
+        resp { "v": 1, "status": "not_modified", "sha256": bin32 }
+        resp { "v": 1, "status": "not_shared" }
+        resp { "v": 1, "status": "invalid_path", "rule": "segment" }
+        resp { "v": 1, "status": "too_large", "limit": 4194304 }
+```
+
+**[MESH-FETCH-024]** A responder MUST decide in this order, the first step that fires answering: the grammar (`invalid_path`); the canonical path of MESH-FETCH-006 and the share-set judgement of section 10.17 (`not_shared`); a stat of the resolved file, anything but a regular file `not_shared` and a length over the serving limit `too_large` with that limit, both before any grant use is spent; a read of the limit plus one bytes, a file that grew past the limit `too_large` and a failed read `not_shared`; `if_sha256` equal to the digest of the bytes read, `not_modified` with the digest and no body, a granted use staying spent; then `ok` (`serve_fetch`, src/mesh/fetch.rs; `is_served`, src/mesh/shares.rs; `too_large_carries_the_local_limit_and_not_modified_carries_no_body`, `a_file_that_grew_past_the_limit_after_the_stat_is_too_large`, `usage_probe_an_unreadable_granted_file_is_not_shared_byte_for_byte_and_keeps_its_use`, src/mesh/fetch.rs).
+
+**[MESH-FETCH-025]** `not_shared` MUST be byte-identical for a path that does not exist, one the share set does not serve the requester and one that could not be read, so no reply tells a peer whether a file exists (`not_shared`, src/mesh/fetch.rs; `not_shared_is_byte_identical_for_a_nonexistent_and_an_unshared_path`).
+
+**[MESH-FETCH-026]** The serving limit MUST be the node's `mesh.fetch.max_bytes`, default `DEFAULT_FETCH_MAX_BYTES` = `4194304` bytes and at most `MAX_FETCH_FILE_BYTES` = `4194304` bytes, and a responder MUST answer `too_large` with the limit it applies (`validate_keeps_fetch_max_bytes_between_one_and_the_file_ceiling`, src/config/mesh_config.rs).
+
+**[MESH-FETCH-027]** A requester MUST take the `limit` a `too_large` reply names as the responder's serving limit, which the reference caps at `SINGLE_SEGMENT_FETCH_CEILING` = `1048447` bytes (`MAX_EFFICIENT_SIZE` of the pinned transport, 1048575, less `OK_REPLY_FRAMING_BYTES` = `128`) so that an `ok` reply fits one Resource segment, a leniency of the reference (section 18) and not a limit of this protocol (`serving_limit`; `a_file_above_the_single_segment_ceiling_is_too_large_with_that_limit`, `an_ok_reply_at_the_ceiling_fits_one_resource_segment`, src/mesh/fetch.rs).
+
+**[MESH-FETCH-028]** A `/fetch` response MUST be bound by `MAX_FETCH_RESPONSE_BYTES` = `4198400` bytes, `MAX_FETCH_FILE_BYTES` plus 4096 bytes of framing, on both sides, the responder refusing locally a longer frame (`respond`, src/mesh/r3/server.rs) and the requester discarding a longer one after assembly (`deliver`, src/mesh/r3/client.rs), and every other response and every request MUST keep `MAX_R3_PAYLOAD_BYTES` = `262144` bytes (MESH-ENV-007, MESH-ENV-011; `a_fetch_response_between_the_two_bounds_is_delivered_and_a_status_response_of_that_size_is_dropped`, `a_fetch_response_at_its_bound_is_delivered_and_one_byte_over_is_dropped`, src/mesh/r3/tests.rs). Neither bound is set at advertisement time, where a rejection deadlocks the pinned transport (MESH-LEN-001).
+
+**[MESH-FETCH-029]** A requester MUST find the bound before it decodes: when the response begins `RESPONSE_FRAME_PREFIX` = `92 c4 10`, the 16 bytes after it are the request id and the bound is that of the pending request's path, and when it does not, or no request is pending under that id, the bound is `MAX_FETCH_RESPONSE_BYTES` until the frame is decoded and the pending request's path is known, when the path's bound applies (`pending_path`, src/mesh/r3/client.rs; `a_response_whose_prefix_is_not_a_frame_falls_back_to_the_coarse_bound`, src/mesh/r3/tests.rs).
+
+**[MESH-FETCH-030]** A requester MUST verify `size` against the length of `bytes` and `sha256` against `H(bytes)` (MESH-FETCH-016, MESH-FETCH-018) and MUST write the bytes to the staging inbox and never to the working tree, `<cache_dir>/mesh/inbox/<instance_id>/<peer>/<path>`, or `<mesh.fetch.inbox_dir>/<instance_id>/<peer>/<path>` when configured, with `<peer>` the first eight characters of the peer's destination hash lowercased and `<path>` the wire path, under the reuse, sibling and collision rules of MESH-PART-031 to MESH-PART-033, a collision failing the fetch (`InboxStaging::stage`, src/mesh/inbox.rs; `fetch_file`, src/mesh/fetch.rs).
+
+**[MESH-FETCH-031]** A fetched file's bytes MUST exist only on the wire and in the staging inbox: the requester yields the staged path, the size and the digest, never the bytes, and a model is handed the path as data (MESH-SEC-009, MESH-PART-034).
+
+**[MESH-FETCH-032]** A requester MUST wait `FILE_FETCH_REQUEST_TIMEOUT` = `120` seconds for a fetch reply, a file of `MAX_FETCH_FILE_BYTES` on a slow interface taking minutes where a listing takes a round trip (`a_file_fetch_waits_two_minutes_where_a_listing_waits_a_round_trip`, src/mesh/fetch.rs).
+
+**[MESH-FETCH-033]** A responder MUST fire the hook event `mesh.fetch.served` once an `ok` reply has been sent, with the peer's identity and destination hashes, the size and the first 8 lowercase hex digits of the digest, never the path, and MUST NOT fire it for a reply that was never sent (`FetchSettlement`; `a_served_fetch_fires_mesh_fetch_served_with_peer_size_and_hash_prefix_and_no_path`, src/mesh/fetch.rs).
+
+**[MESH-FETCH-034]** A grant use spent by an `ok` that was never sent MUST be refunded (section 10.17; `GrantRefund`, src/mesh/fetch.rs).
+
 ## 11. Store-and-forward via LXMF propagation
 
 When a direct request times out or the link fails (MESH-KNOCK-017, MESH-MSG-024), the message is posted to an LXMF propagation node and fetched by the recipient later.
@@ -1092,6 +1244,8 @@ This document is the registry. A code point is allocated by a row in the table b
 | `"/knock"` | request path | `KNOCK_PATH` | 8 |
 | `"/status"` | request path | `STATUS_PATH` | 9 |
 | `"/message"` | request path | `MESSAGE_PATH` | 10 |
+| `"/list"` | request path | `LIST_PATH` | 10.14 |
+| `"/fetch"` | request path | `FETCH_PATH` | 10.15 |
 | `"/get"` | request path, propagation node | | 11.3 |
 | `NoIdentity` | refusal code | `0xf0` | 6.7 |
 | `NoAccess` | refusal code | `0xf1` | 6.7 |
@@ -1109,6 +1263,8 @@ This document is the registry. A code point is allocated by a row in the table b
 | `intro` | map key, knock body | | 8.1 |
 | `name_hash` | map key, LXMF custom data | | 8.6, 10.8 |
 | `v`, `display_name`, `objective`, `state`, `repo`, `plan`, `todo`, `"snapshot_age_secs"`, `"served_at_secs"` | map key, card | | 9.2 |
+| `about`, `caps` | map key, card | | 9.2 |
+| `"fetch"` | capability, `caps` entry | | 9.2 |
 | `code`, `since_secs` | map key, state | | 9.3 |
 | `name`, `branch` | map key, repo | | 9.4 |
 | `title` | map key, plan | | 9.5 |
@@ -1123,6 +1279,12 @@ This document is the registry. A code point is allocated by a row in the table b
 | `received`, `id` | map key, acknowledgement | | 10.3 |
 | `refusal`, `"retry_after_secs"` | map key, typed refusal | | 10.7 |
 | `rate_limited`, `envoy_busy`, `envoy_stopping`, `peer_concurrency`, `token_ceiling`, `cost_ceiling`, `loop_guard` | `refusal` reason | | 10.7 |
+| `empty`, `length`, `control`, `invisible`, `backslash`, `leading_slash`, `drive_letter`, `colon`, `nfc`, `segments`, `segment`, `trailing_dot`, `trailing_space`, `reserved_name` | `rule` value | | 10.13 |
+| `prefix`, `cursor`, `entries`, `next` | map key, list body | | 10.14 |
+| `path`, `size`, `sha256`, `mtime` | map key, list entry | | 10.14 |
+| `path`, `if_sha256` | map key, fetch request | | 10.15 |
+| `status`, `size`, `sha256`, `bytes`, `rule`, `limit` | map key, fetch reply | | 10.15 |
+| `ok`, `not_modified`, `not_shared`, `invalid_path`, `too_large` | fetch `status` value | | 10.15 |
 | `"scope.knock/1"` | LXMF type tag | `KNOCK_TYPE` | 8.6 |
 | `"scope.peer/1"` | LXMF type tag | `PEER_MESSAGE_TYPE` | 10.8 |
 | `0xfb`, `0xfc` | LXMF field key | `FIELD_CUSTOM_TYPE`, `FIELD_CUSTOM_DATA` | 8.6, 10.8 |
@@ -1297,7 +1459,7 @@ Outside this section's reach, and outside the guarantee it gives, is the model c
 
 A leniency is a place where the reference deliberately does something other than the strict reading of an upstream contract, to interoperate with the pinned Reticulum, LXMF and rns-transport revisions as they are. Each entry states what is accepted, why, where the upstream side is recorded and what would remove it. Upstream issue drafts are kept in docs/mesh/upstream-issues.md; Part A holds the drafts this register cites, each cited by at least one entry, their status is "Drafted, not yet filed", and filing them is tracked as a follow-up. The drafts inherited from the earlier Reticulum audit (Part B of that file) correspond to no entry here.
 
-**[MESH-LEN-001]** Inbound size cap after assembly: an implementation MUST NOT set an advertisement-time request size cap or a response size limit on the pinned rns-transport, and MUST bound inbound frames after assembly on its own side instead (MESH-ENV-024; `oversized_request_resource_is_dropped_before_the_handler_runs`, `oversized_response_resource_is_dropped_after_assembly`). Why: rns-transport (rev `3ed5932`, unchanged at release 0.12.0) awaits the reject handler while holding the link lock, so any advertisement-time reject deadlocks the transport. Upstream: docs/mesh/upstream-issues.md, draft A1. Removal: when the pinned transport releases the lock before it sends the reject, re-arm the caps and keep the post-assembly bound as the second line.
+**[MESH-LEN-001]** Inbound size cap after assembly: an implementation MUST NOT set an advertisement-time request size cap or a response size limit on the pinned rns-transport, and MUST bound inbound frames after assembly on its own side instead, per path (`MAX_FETCH_RESPONSE_BYTES` for a `/fetch` response, `MAX_R3_PAYLOAD_BYTES` otherwise), the requester reading the bound off the response prefix before it decodes, as section 10.15 states (MESH-ENV-024; `oversized_request_resource_is_dropped_before_the_handler_runs`, `oversized_response_resource_is_dropped_after_assembly`). Why: rns-transport (rev `3ed5932`, unchanged at release 0.12.0) awaits the reject handler while holding the link lock, so any advertisement-time reject deadlocks the transport. Upstream: docs/mesh/upstream-issues.md, draft A1. Removal: when the pinned transport releases the lock before it sends the reject, re-arm the caps and keep the post-assembly bound as the second line.
 
 **[MESH-LEN-002]** Acceptance by silence: a sender MUST read silence for `PROPAGATION_REJECT_WINDOW` = `2` seconds after a completed transfer as the propagation node having accepted the message (MESH-PROP-016; `a_completed_transfer_is_accepted_one_window_later_not_at_the_deadline`). Why: the reference node answers an accepted packet with a packet proof only, which rns-transport turns into no event on an active link, so acceptance is inferred from the absence of the rejection signal of MESH-PROP-017. Upstream: docs/mesh/upstream-issues.md, draft A2. Removal: when the transport surfaces the proof as a link event, read acceptance from it and stop inferring it from silence.
 
@@ -1415,6 +1577,24 @@ A leniency is a place where the reference deliberately does something other than
 | `MAX_PARTS_BYTES` | `106496` | src/mesh/message.rs | a_parts_list_over_the_encoded_cap_sheds_trailing_parts_and_the_sender_refuses_it |
 | `MAX_INLINE_FILE_TOTAL` | `98304` | src/config/mesh_config.rs | inline_files_past_the_per_message_total_are_dropped_from_the_second |
 | `DEFAULT_INLINE_MAX_BYTES` | `65536` | src/config/mesh_config.rs | an_inline_file_over_inline_max_bytes_is_dropped |
+| `LIST_PATH` | `"/list"` | src/mesh/r3/dispatch.rs | spec_pins (this table) |
+| `FETCH_PATH` | `"/fetch"` | src/mesh/r3/dispatch.rs | spec_pins (this table) |
+| `WIRE_PATH_MAX_BYTES` | `1024` | src/mesh/wire_path.rs | a_path_over_the_byte_limit_is_refused_with_rule_length |
+| `WIRE_PATH_MAX_SEGMENTS` | `64` | src/mesh/wire_path.rs | a_path_over_the_segment_limit_is_refused_with_rule_segments |
+| `LIST_PAGE_SIZE` | `1000` | src/mesh/shares.rs | usage_probe_a_list_page_holds_at_most_one_thousand_entries |
+| `DEFAULT_LIST_WALK_BOUND` | `100000` | src/mesh/shares.rs | a_tiny_walk_bound_truncates_the_listing |
+| `CURSOR_MAX_BYTES` | `64` | src/mesh/fetch.rs | spec_pins (this table) |
+| `LIST_PAGE_HEADROOM` | `2048` | src/mesh/fetch.rs | a_list_page_is_cut_by_encoded_bytes_before_the_entry_count |
+| `FILE_FETCH_REQUEST_TIMEOUT` | `120` | src/mesh/fetch.rs | a_file_fetch_waits_two_minutes_where_a_listing_waits_a_round_trip |
+| `OK_REPLY_FRAMING_BYTES` | `128` | src/mesh/fetch.rs | an_ok_reply_at_the_ceiling_fits_one_resource_segment |
+| `SINGLE_SEGMENT_FETCH_CEILING` | `1048447` | src/mesh/fetch.rs | a_file_above_the_single_segment_ceiling_is_too_large_with_that_limit |
+| `DEFAULT_FETCH_MAX_BYTES` | `4194304` | src/config/mesh_config.rs | mesh_defaults_match_documented_values |
+| `MAX_FETCH_FILE_BYTES` | `4194304` | src/config/mesh_config.rs | validate_keeps_fetch_max_bytes_between_one_and_the_file_ceiling |
+| `MAX_FETCH_RESPONSE_BYTES` | `4198400` | src/mesh/r3/frame.rs | a_fetch_response_at_its_bound_is_delivered_and_one_byte_over_is_dropped |
+| `RESPONSE_FRAME_PREFIX` | `92 c4 10` | src/mesh/r3/frame.rs | a_response_frame_starts_with_the_pinned_prefix_and_its_request_id |
+| `ABOUT_MAX_CHARS` | `200` | src/mesh/card.rs | about_is_sanitised_and_cut_on_a_character_boundary |
+| `CAPS_MAX_ENTRIES` | `16` | src/mesh/card.rs | caps_skips_entries_that_are_not_text_and_drops_those_past_the_cap |
+| `CAP_MAX_CHARS` | `32` | src/mesh/card.rs | caps_skips_entries_that_are_not_text_and_drops_those_past_the_cap |
 
 ## 20. Conformance coverage
 
@@ -1641,6 +1821,8 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 | MESH-STATUS-008 | Card (Invalid), Card (Valid) |
 | MESH-STATUS-009 | Card (Invalid), Card (Valid) |
 | MESH-STATUS-010 | Card (Invalid), Card (Valid) |
+| MESH-FETCH-001 | no vector yet |
+| MESH-FETCH-002 | no vector yet |
 | MESH-STATUS-011 | Card (Boundary), Card (Invalid), Card (Valid) |
 | MESH-STATUS-012 | Card (Boundary), Card (Invalid), Interop (Valid) |
 | MESH-STATUS-013 | Card (Valid) |
@@ -1780,6 +1962,63 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 | MESH-DISP-024 | no vector yet |
 | MESH-DISP-025 | no vector yet |
 | MESH-DISP-026 | no vector yet |
+| MESH-FETCH-003 | no vector yet |
+| MESH-FETCH-004 | no vector yet |
+| MESH-FETCH-005 | no vector yet |
+| MESH-FETCH-006 | no vector yet |
+| MESH-FETCH-007 | no vector yet |
+| MESH-LIST-001 | no vector yet |
+| MESH-LIST-002 | no vector yet |
+| MESH-LIST-003 | no vector yet |
+| MESH-LIST-004 | no vector yet |
+| MESH-LIST-005 | no vector yet |
+| MESH-LIST-006 | no vector yet |
+| MESH-LIST-007 | no vector yet |
+| MESH-LIST-008 | no vector yet |
+| MESH-LIST-009 | no vector yet |
+| MESH-LIST-010 | no vector yet |
+| MESH-LIST-011 | no vector yet |
+| MESH-LIST-012 | no vector yet |
+| MESH-LIST-013 | no vector yet |
+| MESH-LIST-014 | no vector yet |
+| MESH-LIST-015 | no vector yet |
+| MESH-LIST-016 | no vector yet |
+| MESH-LIST-017 | no vector yet |
+| MESH-LIST-018 | no vector yet |
+| MESH-LIST-019 | no vector yet |
+| MESH-LIST-020 | no vector yet |
+| MESH-LIST-021 | no vector yet |
+| MESH-LIST-022 | no vector yet |
+| MESH-LIST-023 | no vector yet |
+| MESH-LIST-024 | no vector yet |
+| MESH-LIST-025 | no vector yet |
+| MESH-FETCH-008 | no vector yet |
+| MESH-FETCH-009 | no vector yet |
+| MESH-FETCH-010 | no vector yet |
+| MESH-FETCH-011 | no vector yet |
+| MESH-FETCH-012 | no vector yet |
+| MESH-FETCH-013 | no vector yet |
+| MESH-FETCH-014 | no vector yet |
+| MESH-FETCH-015 | no vector yet |
+| MESH-FETCH-016 | no vector yet |
+| MESH-FETCH-017 | no vector yet |
+| MESH-FETCH-018 | no vector yet |
+| MESH-FETCH-019 | no vector yet |
+| MESH-FETCH-020 | no vector yet |
+| MESH-FETCH-021 | no vector yet |
+| MESH-FETCH-022 | no vector yet |
+| MESH-FETCH-023 | no vector yet |
+| MESH-FETCH-024 | no vector yet |
+| MESH-FETCH-025 | no vector yet |
+| MESH-FETCH-026 | no vector yet |
+| MESH-FETCH-027 | no vector yet |
+| MESH-FETCH-028 | no vector yet |
+| MESH-FETCH-029 | no vector yet |
+| MESH-FETCH-030 | no vector yet |
+| MESH-FETCH-031 | no vector yet |
+| MESH-FETCH-032 | no vector yet |
+| MESH-FETCH-033 | no vector yet |
+| MESH-FETCH-034 | no vector yet |
 | MESH-PROP-001 | Custom (Valid) |
 | MESH-PROP-002 | Custom (Valid) |
 | MESH-PROP-003 | Custom (Invalid), Custom (Valid) |
@@ -2039,6 +2278,8 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 - [MESH-STATUS-008](#92-card) -- card repo
 - [MESH-STATUS-009](#92-card) -- card plan
 - [MESH-STATUS-010](#92-card) -- card todo
+- [MESH-FETCH-001](#92-card) -- card about, lenient on a non-string
+- [MESH-FETCH-002](#92-card) -- card caps, lenient on a non-list and on bad entries
 - [MESH-STATUS-011](#92-card) -- card snapshot age
 - [MESH-STATUS-012](#92-card) -- card served-at time
 - [MESH-STATUS-013](#92-card) -- card unknown keys
@@ -2178,6 +2419,63 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 - [MESH-DISP-024](#1011-thread) -- a reply carries the answered message's thread when known
 - [MESH-DISP-025](#1011-thread) -- a matching reply without thread inherits the question's
 - [MESH-DISP-026](#1011-thread) -- thread inheritance identity-gated; others downgraded
+- [MESH-FETCH-003](#1013-wire-paths) -- rule carries one of the fourteen names
+- [MESH-FETCH-004](#1013-wire-paths) -- grammar checked before the filesystem, first rule broken
+- [MESH-FETCH-005](#1013-wire-paths) -- the grammar applies to every path on the wire and in the inbox
+- [MESH-FETCH-006](#1013-wire-paths) -- canonical path judged; outside the root or not a regular file is not_shared
+- [MESH-FETCH-007](#1013-wire-paths) -- requester reads an unknown rule as unknown
+- [MESH-LIST-001](#1014-list) -- list v
+- [MESH-LIST-002](#1014-list) -- list prefix
+- [MESH-LIST-003](#1014-list) -- list cursor type and length
+- [MESH-LIST-004](#1014-list) -- unknown cursor restarts from the first page
+- [MESH-LIST-005](#1014-list) -- unknown list request keys ignored
+- [MESH-LIST-006](#1014-list) -- list reply v
+- [MESH-LIST-007](#1014-list) -- list reply entries
+- [MESH-LIST-008](#1014-list) -- requester reads at most a page and drops bad entries
+- [MESH-LIST-009](#1014-list) -- list reply next
+- [MESH-LIST-010](#1014-list) -- unknown list reply keys ignored
+- [MESH-LIST-011](#1014-list) -- entry path
+- [MESH-LIST-012](#1014-list) -- entry size
+- [MESH-LIST-013](#1014-list) -- entry sha256
+- [MESH-LIST-014](#1014-list) -- entry mtime
+- [MESH-LIST-015](#1014-list) -- unknown entry keys ignored
+- [MESH-LIST-016](#1014-list) -- a listing is the share set, never the tree, grants excluded
+- [MESH-LIST-017](#1014-list) -- entries sorted by wire path, byte order
+- [MESH-LIST-018](#1014-list) -- page size and encoded-bytes cut
+- [MESH-LIST-019](#1014-list) -- next is the cursor of the last entry, half a SHA-256
+- [MESH-LIST-020](#1014-list) -- cursor opaque to the requester
+- [MESH-LIST-021](#1014-list) -- walk bound
+- [MESH-LIST-022](#1014-list) -- only the page returned is hashed
+- [MESH-LIST-023](#1014-list) -- no share root or rules answers the empty page
+- [MESH-LIST-024](#1014-list) -- an unadmitted requester hears silence whatever it asks
+- [MESH-LIST-025](#1014-list) -- listing timeout
+- [MESH-FETCH-008](#1015-fetch) -- fetch v
+- [MESH-FETCH-009](#1015-fetch) -- fetch path type
+- [MESH-FETCH-010](#1015-fetch) -- fetch path grammar
+- [MESH-FETCH-011](#1015-fetch) -- fetch if_sha256
+- [MESH-FETCH-012](#1015-fetch) -- unknown fetch request keys ignored
+- [MESH-FETCH-013](#1015-fetch) -- fetch reply v
+- [MESH-FETCH-014](#1015-fetch) -- fetch status type
+- [MESH-FETCH-015](#1015-fetch) -- unknown status is a client error, never a panic
+- [MESH-FETCH-016](#1015-fetch) -- ok size equals the length of bytes
+- [MESH-FETCH-017](#1015-fetch) -- sha256 shape on ok and not_modified
+- [MESH-FETCH-018](#1015-fetch) -- ok bytes hash to sha256 or are corrupt
+- [MESH-FETCH-019](#1015-fetch) -- ok bytes shape
+- [MESH-FETCH-020](#1015-fetch) -- ok bytes over the file bound discarded
+- [MESH-FETCH-021](#1015-fetch) -- invalid_path rule shape
+- [MESH-FETCH-022](#1015-fetch) -- too_large limit shape
+- [MESH-FETCH-023](#1015-fetch) -- unknown fetch reply keys ignored
+- [MESH-FETCH-024](#1015-fetch) -- responder decision order
+- [MESH-FETCH-025](#1015-fetch) -- not_shared is byte-identical, no existence oracle
+- [MESH-FETCH-026](#1015-fetch) -- serving limit is mesh.fetch.max_bytes, too_large names it
+- [MESH-FETCH-027](#1015-fetch) -- the single-segment ceiling is a reference leniency
+- [MESH-FETCH-028](#1015-fetch) -- the two-bound response rule
+- [MESH-FETCH-029](#1015-fetch) -- bound found by the response prefix peek
+- [MESH-FETCH-030](#1015-fetch) -- verified bytes staged under the inbox, never the working tree
+- [MESH-FETCH-031](#1015-fetch) -- fetched bytes exist on the wire and in the inbox only
+- [MESH-FETCH-032](#1015-fetch) -- fetch timeout
+- [MESH-FETCH-033](#1015-fetch) -- mesh.fetch.served fires once the ok is sent, without the path
+- [MESH-FETCH-034](#1015-fetch) -- a grant use spent by an unsent ok is refunded
 - [MESH-PROP-001](#111-outbound) -- LXMF addressing
 - [MESH-PROP-002](#111-outbound) -- LXMF payload
 - [MESH-PROP-003](#111-outbound) -- non-map fields refused

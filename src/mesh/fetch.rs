@@ -49,9 +49,9 @@ pub(crate) const LAST_CARD_CACHE_PEERS: usize = 32;
 pub(crate) const LAST_LIST_CACHE_PEERS: usize = 32;
 /// Bytes left free under `MAX_R3_PAYLOAD_BYTES` by a listing page, for the frame, the
 /// envelope and the page's own keys around the entries.
-const LIST_PAGE_HEADROOM: usize = 2048;
+pub(crate) const LIST_PAGE_HEADROOM: usize = 2048;
 /// The longest cursor a peer may send or return; `shares::list_cursor` makes 32 bytes.
-const CURSOR_MAX_BYTES: usize = 64;
+pub(crate) const CURSOR_MAX_BYTES: usize = 64;
 const UNKNOWN_RULE: &str = "unknown";
 /// Largest file an `ok` reply may carry while its response frame still fits ONE Resource
 /// segment: `MAX_EFFICIENT_SIZE` less the frame and the reply's other keys. An itemized
@@ -70,7 +70,7 @@ pub(crate) const SINGLE_SEGMENT_FETCH_CEILING: u64 =
 /// Room for the response frame (19 bytes), the map header and the `v`, `status`, `size`,
 /// `sha256` and `bytes` keys with their headers around the file bytes: 99 bytes today,
 /// rounded up.
-const OK_REPLY_FRAMING_BYTES: usize = 128;
+pub(crate) const OK_REPLY_FRAMING_BYTES: usize = 128;
 // The ceiling only ever lowers the configured limit; the day it does not, it is dead.
 const _: () =
     assert!(SINGLE_SEGMENT_FETCH_CEILING < crate::config::mesh_config::MAX_FETCH_FILE_BYTES);

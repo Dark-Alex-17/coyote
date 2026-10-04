@@ -25,9 +25,9 @@ const BCP14: &str = "The key words \"MUST\", \"MUST NOT\", \"REQUIRED\", \"SHALL
     \"SHOULD\", \"SHOULD NOT\", \"RECOMMENDED\", \"NOT RECOMMENDED\", \"MAY\", and \"OPTIONAL\" in \
     this document are to be interpreted as described in BCP 14 [RFC2119] [RFC8174] when, and \
     only when, they appear in all capitals, as shown here.";
-const AREAS: [&str; 18] = [
+const AREAS: [&str; 20] = [
     "DEST", "ANN", "ENV", "KNOCK", "STATUS", "MSG", "PROP", "VER", "TIME", "CANON", "EXT", "CODE",
-    "SEC", "INV", "LOG", "LEN", "PART", "DISP",
+    "SEC", "INV", "LOG", "LEN", "PART", "DISP", "LIST", "FETCH",
 ];
 /// Every compound keyword (`MUST NOT`, `NOT RECOMMENDED`, ...) contains one of these.
 const KEYWORDS: [&str; 7] = [
@@ -1010,28 +1010,38 @@ fn check_index_anchors(definitions: &[Definition], entries: &[IndexEntry]) -> Re
 mod tests {
     use super::*;
     use crate::config::mesh_config::{
-        DEFAULT_INLINE_MAX_BYTES, DEFAULT_PEER_MAX_CONCURRENT, DEFAULT_PEER_MAX_MESSAGES_PER_HOUR,
-        DEFAULT_PEER_MAX_TOKENS_PER_HOUR, MAX_FETCH_FILE_BYTES, MAX_INLINE_FILE_TOTAL,
+        DEFAULT_FETCH_MAX_BYTES, DEFAULT_INLINE_MAX_BYTES, DEFAULT_PEER_MAX_CONCURRENT,
+        DEFAULT_PEER_MAX_MESSAGES_PER_HOUR, DEFAULT_PEER_MAX_TOKENS_PER_HOUR, MAX_FETCH_FILE_BYTES,
+        MAX_INLINE_FILE_TOTAL,
     };
     use crate::config::mesh_envoy::ENVOY_RUN_TIMEOUT_SECS;
     use crate::mesh::message::{MAX_PARTS, MAX_PARTS_BYTES};
-    use crate::mesh::r3::{MAX_FETCH_RESPONSE_BYTES, RefusalCode, RequestId, ResponseFrame};
+    use crate::mesh::r3::{
+        MAX_FETCH_RESPONSE_BYTES, RESPONSE_FRAME_PREFIX, RefusalCode, RequestId, ResponseFrame,
+    };
     use crate::mesh::{
-        announce, card, identity, knock, knocks, limits, message, peers, pending, propagation,
-        propagation_fetch, propagation_nodes, protocol, r3, trust,
+        announce, card, fetch, identity, knock, knocks, limits, message, peers, pending,
+        propagation, propagation_fetch, propagation_nodes, protocol, r3, shares, trust, wire_path,
     };
     use lxmf_core::constants::{FIELD_CUSTOM_DATA, FIELD_CUSTOM_TYPE};
     use rmpv::Value;
     use rns_transport::hash::ADDRESS_HASH_SIZE;
     use std::time::Duration;
 
-    const EXPECTED_LITERALS: &str = r#"1,1,10,16,262144,128,"/knock","/status","/message",30,10,10,2,20,16,0xf0,0xf1,0xf3,0xf4,0xf5,0xf6,0xfd,0xfe,"SCOPE",64,300,900,3,2700,1800,1024,"scope.knock/1",200,15,10,256,3,600,256,16,1,0,1,2,64,280,64,64,120,280,"scope.peer/1",1,120,4000,64,4096,8,15,10,604800,256,3600,120,256,1,60,100000,120,26,60,2,60,1024,64,240,131072,112,4096,15552000,3,900,256,0,32,0xfb,0xfc,8,64,256,64,8,2,2,2,2,1,2,1,8,106496,98304,65536"#;
+    const EXPECTED_LITERALS: &str = r#"1,1,10,16,262144,128,"/knock","/status","/message",30,10,10,2,20,16,0xf0,0xf1,0xf3,0xf4,0xf5,0xf6,0xfd,0xfe,"SCOPE",64,300,900,3,2700,1800,1024,"scope.knock/1",200,15,10,256,3,600,256,16,1,0,1,2,64,280,64,64,120,280,"scope.peer/1",1,120,4000,64,4096,8,15,10,604800,256,3600,120,256,1,60,100000,120,26,60,2,60,1024,64,240,131072,112,4096,15552000,3,900,256,0,32,0xfb,0xfc,8,64,256,64,8,2,2,2,2,1,2,1,8,106496,98304,65536,"/list","/fetch",1024,64,1000,100000,64,2048,120,128,1048447,4194304,4194304,4198400,92 c4 10,200,16,32"#;
 
     fn expected_constants() -> Vec<(&'static str, String)> {
         let secs = |d: Duration| d.as_secs().to_string();
         let quoted = |s: &str| format!("{s:?}");
         let byte = |v: u8| format!("0x{v:02x}");
         let code = |c: RefusalCode| byte(c as u8);
+        let hex_bytes = |bytes: &[u8]| {
+            bytes
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
         vec![
             (
                 "MESH_PROTOCOL_VERSION",
@@ -1288,6 +1298,48 @@ mod tests {
                 "DEFAULT_INLINE_MAX_BYTES",
                 DEFAULT_INLINE_MAX_BYTES.to_string(),
             ),
+            ("LIST_PATH", quoted(r3::LIST_PATH)),
+            ("FETCH_PATH", quoted(r3::FETCH_PATH)),
+            (
+                "WIRE_PATH_MAX_BYTES",
+                wire_path::WIRE_PATH_MAX_BYTES.to_string(),
+            ),
+            (
+                "WIRE_PATH_MAX_SEGMENTS",
+                wire_path::WIRE_PATH_MAX_SEGMENTS.to_string(),
+            ),
+            ("LIST_PAGE_SIZE", shares::LIST_PAGE_SIZE.to_string()),
+            (
+                "DEFAULT_LIST_WALK_BOUND",
+                shares::DEFAULT_LIST_WALK_BOUND.to_string(),
+            ),
+            ("CURSOR_MAX_BYTES", fetch::CURSOR_MAX_BYTES.to_string()),
+            ("LIST_PAGE_HEADROOM", fetch::LIST_PAGE_HEADROOM.to_string()),
+            (
+                "FILE_FETCH_REQUEST_TIMEOUT",
+                secs(fetch::FILE_FETCH_REQUEST_TIMEOUT),
+            ),
+            (
+                "OK_REPLY_FRAMING_BYTES",
+                fetch::OK_REPLY_FRAMING_BYTES.to_string(),
+            ),
+            (
+                "SINGLE_SEGMENT_FETCH_CEILING",
+                fetch::SINGLE_SEGMENT_FETCH_CEILING.to_string(),
+            ),
+            (
+                "DEFAULT_FETCH_MAX_BYTES",
+                DEFAULT_FETCH_MAX_BYTES.to_string(),
+            ),
+            ("MAX_FETCH_FILE_BYTES", MAX_FETCH_FILE_BYTES.to_string()),
+            (
+                "MAX_FETCH_RESPONSE_BYTES",
+                MAX_FETCH_RESPONSE_BYTES.to_string(),
+            ),
+            ("RESPONSE_FRAME_PREFIX", hex_bytes(&RESPONSE_FRAME_PREFIX)),
+            ("ABOUT_MAX_CHARS", card::ABOUT_MAX_CHARS.to_string()),
+            ("CAPS_MAX_ENTRIES", card::CAPS_MAX_ENTRIES.to_string()),
+            ("CAP_MAX_CHARS", card::CAP_MAX_CHARS.to_string()),
         ]
     }
 
