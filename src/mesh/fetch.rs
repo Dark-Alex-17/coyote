@@ -700,7 +700,7 @@ fn text_of(value: &Value) -> Option<&str> {
 
 /// The rule a peer's `invalid_path` reply names, kept only when it is one of
 /// `wire_path::RULES`' ids; the model reads it, so a peer may not put words there.
-fn rule_of(value: &Value) -> Option<String> {
+pub(crate) fn rule_of(value: &Value) -> Option<String> {
     let rule = text_of(value)?;
     Some(if is_rule_id(rule) {
         rule.to_string()
@@ -800,7 +800,7 @@ pub(crate) struct SharesPage {
 
 impl SharesPage {
     /// The page as the peer sent it, capped and with malformed entries skipped.
-    fn from_value(value: &Value, dest8: &str) -> Result<Self, FetchError> {
+    pub(crate) fn from_value(value: &Value, dest8: &str) -> Result<Self, FetchError> {
         let entries = value.as_map().ok_or(FetchError::Malformed("map"))?;
         if field(entries, "v").and_then(Value::as_u64) != Some(PEER_WIRE_VERSION) {
             return Err(FetchError::Malformed("v"));
@@ -834,7 +834,7 @@ impl SharesPage {
         })
     }
 
-    fn entry(value: &Value) -> Option<SharedEntry> {
+    pub(crate) fn entry(value: &Value) -> Option<SharedEntry> {
         let entries = value.as_map()?;
         let path = field(entries, "path")
             .and_then(text_of)

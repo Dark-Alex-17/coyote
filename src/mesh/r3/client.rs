@@ -457,7 +457,7 @@ impl R3Client {
 
     /// `Shutdown` once `run` has exited: a link may outlive the client loop, and a request
     /// filed after the drain would otherwise wait out its full timeout.
-    pub(super) fn insert_pending(
+    pub(crate) fn insert_pending(
         &self,
         request_id: RequestId,
         link_id: LinkId,
@@ -588,7 +588,7 @@ impl R3Client {
     /// coarse bound and then the per-path one once decoded. The only bound before assembly
     /// is the upstream 64 MiB advertisement cap (`advertisement_limits.rs`), because the
     /// upstream reject path deadlocks the transport (rev 3ed5932 and release 0.12.0).
-    pub(super) fn deliver(&self, link_id: LinkId, bytes: &[u8], branch: SizeBranch) {
+    pub(crate) fn deliver(&self, link_id: LinkId, bytes: &[u8], branch: SizeBranch) {
         let path_bound = |path: &str| {
             if path == FETCH_PATH {
                 MAX_FETCH_RESPONSE_BYTES

@@ -367,7 +367,7 @@ impl ShareLocations {
         )
     }
 
-    fn with_dir_name(
+    pub(crate) fn with_dir_name(
         config_dir: &Path,
         workspace_root: &Path,
         workspace_config_dir_name: String,
