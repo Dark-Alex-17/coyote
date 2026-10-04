@@ -2824,9 +2824,12 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
             .iter()
             .filter(|(first, kind, value)| {
                 !rows.iter().any(|cells| {
-                    cells[0] == *first
-                        && cells[1].contains(kind)
-                        && value.as_ref().is_none_or(|value| cells[2] == *value)
+                    let [first_cell, kind_cell, value_cell, _] = cells.as_slice() else {
+                        panic!("registry row {cells:?} does not have four cells");
+                    };
+                    first_cell == first
+                        && kind_cell.contains(kind)
+                        && value.as_ref().is_none_or(|value| value_cell == value)
                 })
             })
             .map(|(first, kind, value)| {
@@ -2841,26 +2844,46 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
     }
 
     /// Every field a store file reads under a `#[serde(default)]` is named on the
-    /// MESH-CODE-005 line, by its on-disk key where the attribute renames it. The files are
-    /// the stores plus `message.rs`, whose `PeerMessage` and `Part` ride inside a pending
-    /// record; none of them holds a wire-only struct with a default.
+    /// MESH-CODE-005 line, by its on-disk key where the attribute renames it. The files
+    /// twin `ON_DISK_STRUCTS` in `schema.rs`: the stores plus `message.rs`, whose
+    /// `PeerMessage` and `Part` ride inside a pending record; none of them holds a
+    /// wire-only struct with a default.
     #[test]
     fn code_005_names_every_on_disk_serde_default_field() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut fields = BTreeSet::new();
         for file in [
-            "trust", "pending", "peers", "knocks", "shares", "grants", "message",
+            "trust",
+            "knocks",
+            "pending",
+            "message",
+            "identity",
+            "peers",
+            "protocol",
+            "propagation_fetch",
+            "shares",
+            "grants",
         ] {
             let path = format!("src/mesh/{file}.rs");
             let source = std::fs::read_to_string(root.join(&path)).unwrap();
             let lines: Vec<&str> = source.lines().map(str::trim).collect();
-            for (index, line) in lines.iter().enumerate() {
-                let Some(attribute) = line
-                    .strip_prefix("#[serde(")
-                    .and_then(|rest| rest.strip_suffix(")]"))
-                else {
+            let mut index = 0;
+            while index < lines.len() {
+                let start = index;
+                index += 1;
+                let Some(opened) = lines[start].strip_prefix("#[serde(") else {
                     continue;
                 };
+                let mut attribute = opened.to_string();
+                while !attribute.ends_with(")]") {
+                    let Some(next) = lines.get(index) else {
+                        panic!("unterminated serde attribute at {path}:{}", start + 1);
+                    };
+                    attribute.push(' ');
+                    attribute.push_str(next);
+                    index += 1;
+                }
+                let attribute = attribute.strip_suffix(")]").unwrap();
                 let arguments: Vec<&str> = attribute.split(',').map(str::trim).collect();
                 if !arguments
                     .iter()
@@ -2868,17 +2891,17 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
                 {
                     continue;
                 }
-                let field = lines[index + 1..]
+                let field = lines[index..]
                     .iter()
                     .find(|next| !next.starts_with("#[") && !next.starts_with("///"))
-                    .unwrap_or_else(|| panic!("{path}:{}: no field below", index + 1));
+                    .unwrap_or_else(|| panic!("{path}:{}: no field below", start + 1));
                 let declaration = field
                     .trim_start_matches("pub(crate) ")
                     .trim_start_matches("pub ");
                 assert!(
                     !declaration.starts_with("struct ") && !declaration.starts_with("enum "),
                     "{path}:{}: struct-level #[serde(default)]; its fields cannot be enumerated here",
-                    index + 1
+                    start + 1
                 );
                 let declared = declaration.split(':').next().unwrap().trim();
                 let renamed = arguments
@@ -2938,6 +2961,15 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
     fn follows(line: &str, needle: &str, accept: impl Fn(&[u8]) -> bool) -> bool {
         line.match_indices(needle)
             .any(|(at, _)| accept(&line.as_bytes()[at + needle.len()..]))
+    }
+
+    /// `follows`, with the needle starting a word, so a `render_spec(s)` call is no citation.
+    fn follows_word(line: &str, needle: &str, accept: impl Fn(&[u8]) -> bool) -> bool {
+        let bytes = line.as_bytes();
+        line.match_indices(needle).any(|(at, _)| {
+            is_word_boundary(at.checked_sub(1).and_then(|before| bytes.get(before)))
+                && accept(&bytes[at + needle.len()..])
+        })
     }
 
     /// A line that cites a planning artefact (a task id, a lettered review criterion, a
@@ -3014,7 +3046,7 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
             rest.first().is_some_and(u8::is_ascii_digit)
         }) || lettered
             .iter()
-            .any(|needle| follows(&line, needle, after_optional_round))
+            .any(|needle| follows_word(&line, needle, after_optional_round))
             || comment_text.is_some_and(|text| letter_in_parens(text.as_bytes()))
             || rounds.iter().chain(std::iter::once(&ruling)).any(|needle| {
                 follows(&line, needle, |rest| {
@@ -3096,6 +3128,7 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
             "// the cache fix narrowed it".to_string(),
             "// a defaced fix is reverted".to_string(),
             "// the criteria differ".to_string(),
+            "// render_spec(s) builds the table".to_string(),
             ["// the rule quotes `// TASK", "-002` as its example"].concat(),
             ["let id = \"TASK", "-002\";"].concat(),
             ["const ILLUSTRATIVE_IDS: [&str; 1] = [\"TASK", "-002\"];"].concat(),

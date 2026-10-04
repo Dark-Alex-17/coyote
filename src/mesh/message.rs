@@ -4052,6 +4052,57 @@ mod tests {
         assert!(decoded.parts.is_empty());
     }
 
+    /// A reply with every optional key set, for the key-order checks on both routes.
+    fn every_optional_key_reply() -> OutboundPeer {
+        OutboundPeer::with_parts(
+            PeerKind::Reply,
+            "the answer",
+            Some("Re: question"),
+            Some("q-1"),
+            Some(serde_json::json!({ "n": 1 })),
+            vec![text_part("aside")],
+            &PartLimits::default(),
+        )
+        .unwrap()
+        .with_thread(Some("t-1".into()))
+        .unwrap()
+        .with_disposition(Disposition::Refused, Some(60))
+    }
+
+    /// An ask with every optional key set, including the disposition and retry_after the
+    /// sender's kind guard keeps off a non-reply.
+    fn every_optional_key_ask() -> OutboundPeer {
+        OutboundPeer::with_parts(
+            PeerKind::Ask,
+            "a question",
+            Some("Question"),
+            None,
+            Some(serde_json::json!({ "n": 1 })),
+            vec![text_part("aside")],
+            &PartLimits::default(),
+        )
+        .unwrap()
+        .with_thread(Some("t-1".into()))
+        .unwrap()
+        .with_disposition(Disposition::Refused, Some(60))
+    }
+
+    fn lxmf_custom_data_keys(message: &OutboundPeer) -> Vec<String> {
+        let stored = peer_lxmf_message(message, &OriginName([7u8; NAME_HASH_LEN]));
+        let Some(Value::Map(fields)) = stored.fields else {
+            unreachable!()
+        };
+        let Some((_, Value::Map(data))) = fields
+            .iter()
+            .find(|(key, _)| key.as_u64() == Some(u64::from(FIELD_CUSTOM_DATA)))
+        else {
+            unreachable!()
+        };
+        data.iter()
+            .map(|(k, _)| k.as_str().unwrap().to_string())
+            .collect()
+    }
+
     #[test]
     fn a_reply_with_every_optional_key_is_emitted_in_the_specified_order() {
         fn keys(message: &OutboundPeer) -> Vec<String> {
@@ -4064,21 +4115,8 @@ mod tests {
                 .collect()
         }
 
-        let reply = OutboundPeer::with_parts(
-            PeerKind::Reply,
-            "the answer",
-            Some("Re: question"),
-            Some("q-1"),
-            Some(serde_json::json!({ "n": 1 })),
-            vec![text_part("aside")],
-            &PartLimits::default(),
-        )
-        .unwrap()
-        .with_thread(Some("t-1".into()))
-        .unwrap()
-        .with_disposition(Disposition::Refused, Some(60));
         assert_eq!(
-            keys(&reply),
+            keys(&every_optional_key_reply()),
             [
                 "v",
                 "kind",
@@ -4094,21 +4132,8 @@ mod tests {
                 "ts",
             ]
         );
-
-        let ask = OutboundPeer::with_parts(
-            PeerKind::Ask,
-            "a question",
-            Some("Question"),
-            None,
-            Some(serde_json::json!({ "n": 1 })),
-            vec![text_part("aside")],
-            &PartLimits::default(),
-        )
-        .unwrap()
-        .with_thread(Some("t-1".into()))
-        .unwrap();
         assert_eq!(
-            keys(&ask),
+            keys(&every_optional_key_ask()),
             [
                 "v", "kind", "id", "thread", "title", "content", "fields", "parts", "ts",
             ]
@@ -4117,32 +4142,8 @@ mod tests {
 
     #[test]
     fn a_reply_with_every_optional_key_rides_lxmf_custom_data_in_the_specified_order() {
-        let reply = OutboundPeer::with_parts(
-            PeerKind::Reply,
-            "the answer",
-            Some("Re: question"),
-            Some("q-1"),
-            Some(serde_json::json!({ "n": 1 })),
-            vec![text_part("aside")],
-            &PartLimits::default(),
-        )
-        .unwrap()
-        .with_thread(Some("t-1".into()))
-        .unwrap()
-        .with_disposition(Disposition::Refused, Some(60));
-        let stored = peer_lxmf_message(&reply, &OriginName([7u8; NAME_HASH_LEN]));
-        let Some(Value::Map(fields)) = stored.fields else {
-            unreachable!()
-        };
-        let Some((_, Value::Map(data))) = fields
-            .iter()
-            .find(|(key, _)| key.as_u64() == Some(u64::from(FIELD_CUSTOM_DATA)))
-        else {
-            unreachable!()
-        };
-        let keys: Vec<&str> = data.iter().map(|(k, _)| k.as_str().unwrap()).collect();
         assert_eq!(
-            keys,
+            lxmf_custom_data_keys(&every_optional_key_reply()),
             [
                 "kind",
                 "id",
@@ -4154,6 +4155,10 @@ mod tests {
                 "retry_after",
                 "parts",
             ]
+        );
+        assert_eq!(
+            lxmf_custom_data_keys(&every_optional_key_ask()),
+            ["kind", "id", "thread", "name_hash", "fields", "parts"]
         );
     }
 

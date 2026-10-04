@@ -3156,6 +3156,7 @@ mod tests {
     use super::*;
     use crate::config::mesh_config::MeshBrief;
     use crate::hooks::HookEvent;
+    use crate::mesh::access::{access_message, validate_access};
     use crate::mesh::destination_address;
     use crate::mesh::events::{RecordingHookSink, env_value, one_fire};
     use crate::mesh::message::{
@@ -4375,6 +4376,123 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    /// The fetch path's chain, as `fetch_propagated` builds it: knocks peel off first,
+    /// then access requests, then peer messages, and whatever is none of those reaches
+    /// the plain inbox sink.
+    #[test]
+    fn the_lxmf_routing_chain_hands_each_type_to_its_own_stage_and_the_rest_to_the_inbox() {
+        let tmp = TempDir::new("node-routing-chain");
+        let slot = Arc::new(slot_with_inbound(&tmp));
+        let origin = OriginName([7u8; NAME_HASH_LEN]);
+        let knock_origin = OriginName([8u8; NAME_HASH_LEN]);
+        let peer = TransportIdentity::new_from_rand(OsRng);
+        let peer_hex = peer.address_hash().to_hex_string();
+        let peer_destination = destination_address(&origin.0, peer.address_hash()).to_hex_string();
+        let knocker = TransportIdentity::new_from_rand(OsRng);
+        let knocker_hex = knocker.address_hash().to_hex_string();
+        let (trust, _trust_dir) = TrustList::default()
+            .destination(&peer_destination, &peer_hex)
+            .identity(&knocker_hex, false)
+            .open("node-routing-chain-trust");
+        let peers =
+            Arc::new(PeerTable::load(tmp.path.join("peers.json"), SystemTime::now()).unwrap());
+        let gate = KnockGate::new(
+            trust.clone(),
+            peers,
+            KnockCache::new(&tmp.path, 24),
+            MeshHooks::default(),
+        );
+        let inbox = CountingSink::default();
+        let peer_stage = PeerRouting {
+            trust: &trust,
+            surface: Some(slot.clone() as Arc<dyn PeerSurface>),
+            inner: &inbox,
+        };
+        let access_stage = AccessRouting {
+            trust: &trust,
+            surface: Some(slot.clone() as Arc<dyn AccessSurface>),
+            inner: &peer_stage,
+        };
+        let chain = KnockRouting {
+            gate: &gate,
+            inner: &access_stage,
+        };
+        let fetched = |message: &OutboundMessage, from: &str| InboundMessage {
+            transient_id: [1u8; 32],
+            message_id: [2u8; 32],
+            source_identity_hash: from.to_string(),
+            source_delivery_hash: hex_lower(&[0x03; 16]),
+            timestamp: 1_700_000_000.0,
+            title: message.title.clone(),
+            content: Some(message.content.clone()),
+            fields: message.fields.clone(),
+            stamp_value: None,
+        };
+
+        let knock = knock_message(&KnockIntro::new("let me in").unwrap(), &knock_origin);
+        chain.deliver(fetched(&knock, &knocker_hex));
+        let request = validate_access("a-1", vec!["src/x.rs".to_string()], "please").unwrap();
+        chain.deliver(fetched(&access_message(&request, &origin), &peer_hex));
+        let stored =
+            OutboundPeer::new(PeerKind::Message, "from the node", None, None, None).unwrap();
+        chain.deliver(fetched(&peer_lxmf_message(&stored, &origin), &peer_hex));
+        let plain = OutboundMessage {
+            title: None,
+            content: b"plain lxmf".to_vec(),
+            fields: None,
+        };
+        chain.deliver(fetched(&plain, &peer_hex));
+
+        let knocks = gate.cache().list(SystemTime::now()).unwrap();
+        assert_eq!(knocks.len(), 1, "the gate saw the knock and nothing else");
+        assert_eq!(knocks[0].identity_hash, knocker_hex);
+        assert_eq!(knocks[0].intro.as_deref(), Some("let me in"));
+
+        let filed = slot
+            .inbound_store()
+            .unwrap()
+            .list(SystemTime::now())
+            .unwrap();
+        assert_eq!(
+            filed.len(),
+            1,
+            "the access surface saw the request and nothing else"
+        );
+        assert_eq!(filed[0].id, "a-1");
+        assert_eq!(filed[0].kind, InboundKind::Access);
+        assert_eq!(filed[0].peer_identity, peer_hex);
+        assert_eq!(filed[0].peer_destination, peer_destination);
+
+        let (delivered, dropped) = slot.peer_inbox().drain();
+        assert_eq!(
+            peer_ids(&delivered),
+            [stored.id.as_str()],
+            "the peer surface saw the message and nothing else"
+        );
+        assert_eq!(dropped, 0);
+
+        let plain_messages = inbox.0.lock();
+        assert_eq!(
+            plain_messages.len(),
+            1,
+            "only the plain message reaches the inbox sink"
+        );
+        assert_eq!(
+            plain_messages[0].content.as_deref(),
+            Some(b"plain lxmf".as_slice())
+        );
+        assert_eq!(plain_messages[0].source_identity_hash, peer_hex);
+    }
+
+    #[derive(Default)]
+    struct CountingSink(parking_lot::Mutex<Vec<InboundMessage>>);
+
+    impl InboundSink for CountingSink {
+        fn deliver(&self, message: InboundMessage) {
+            self.0.lock().push(message);
+        }
     }
 
     /// The store-and-forward path owes a refused sender one typed reply per identity,

@@ -12739,11 +12739,11 @@ mod tests {
                 });
             }
 
-            /// Usage probe (knock ruling): only denied/blocked stand in a knock's
-            /// way. An instance heard under a NEW key (marked `key changed` in the peer
-            /// table; `authorize` judges it default-closed, which refuses `.mesh reply`) is
-            /// still knockable: the notice shows `trust: untrusted` and the question is
-            /// asked; nothing is sent when it is declined.
+            /// Only denied/blocked stand in a knock's way. An instance heard under a NEW
+            /// key (marked `key changed` in the peer table; `authorize` judges it
+            /// default-closed, which refuses `.mesh reply`) is still knockable: the notice
+            /// shows `trust: untrusted` and the question is asked; nothing is sent when it
+            /// is declined.
             #[test]
             #[serial]
             fn usage_probe_knock_passes_the_gate_for_an_instance_whose_key_changed() {
@@ -23097,11 +23097,11 @@ mod tests {
                     });
                 }
 
-                /// "The share set is NOT consulted for the INLINE form", with `--attach`
-                /// included: a small file a `deny` rule names still travels
-                /// inline since the human named it, while an access id answered with an
-                /// attachment is sent to its own verb by the cross-kind sentence, with
-                /// nothing read, sent or lent.
+                /// The share set is not consulted for the INLINE form, and an access id
+                /// answered with `--attach` is sent to its own verb: a small file a `deny`
+                /// rule names still travels inline since the human named it, while the
+                /// access id meets the cross-kind sentence with nothing read, sent or
+                /// lent.
                 #[test]
                 #[serial]
                 fn usage_probe_a_denied_small_file_travels_inline_and_an_access_id_with_attach_is_redirected()
@@ -24637,6 +24637,14 @@ mod tests {
                         let dry = out_of(&mut ctx, ".mesh inbox --purge-files --dry-run")
                             .await
                             .unwrap();
+                        assert_eq!(
+                            dry.lines().next().unwrap(),
+                            format!(
+                                "Would remove 2 files (7 bytes) staged under {}:",
+                                root.display()
+                            ),
+                            "the link is one entry of no bytes: {dry}"
+                        );
                         assert!(
                             !dry.contains("big.txt")
                                 && dry.contains("(7 bytes)")

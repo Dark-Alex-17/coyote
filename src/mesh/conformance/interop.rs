@@ -625,6 +625,12 @@ fn the_reference_peer_serves_exactly_the_paths_the_readme_says_it_does() {
         [STATUS_PATH, MESSAGE_PATH],
         "scripts/mesh-interop/reference_peer.py registers a different set of request paths"
     );
+    for path in registered {
+        assert!(
+            unwrapped.contains(&format!("`{path}`")),
+            "scripts/mesh-interop/README.md does not name the served path `{path}`"
+        );
+    }
 }
 
 #[test]

@@ -63,12 +63,14 @@ const UNKNOWN_RULE: &str = "unknown";
 /// waits out its deadline. Removal condition: the upstream release that sends follow-up
 /// advertisements the way it sends the first. Then `mesh.fetch.max_bytes` applies alone,
 /// this constant, `OK_REPLY_FRAMING_BYTES` and
-/// `an_ok_reply_at_the_ceiling_fits_one_resource_segment` go, and the multi-segment
-/// reassembly test returns; the ceiling clauses on the `mesh.fetch.max_bytes` row of
-/// README.md and in the config template and example go with it, as do the leniency
-/// MESH-LEN-007 in docs/mesh/PROTOCOL.md, both constants' `expected_constants` entries in
-/// src/mesh/spec_pins.rs and their section 19 rows. Recorded as draft A4 in
-/// docs/mesh/upstream-issues.md.
+/// `an_ok_reply_at_the_ceiling_fits_one_resource_segment` and
+/// `a_file_above_the_single_segment_ceiling_is_too_large_with_that_limit` go, and the
+/// multi-segment reassembly test returns; the ceiling clauses on the `mesh.fetch.max_bytes`
+/// row of README.md and in the config template and example go with it, as do the ceiling
+/// clauses in MESH-FETCH-026, MESH-FETCH-027 and MESH-SEC-018 and the section 15.5 bounds
+/// table, the leniency MESH-LEN-007 in docs/mesh/PROTOCOL.md, both constants'
+/// `expected_constants` entries in src/mesh/spec_pins.rs and their section 19 rows.
+/// Recorded as draft A4 in docs/mesh/upstream-issues.md.
 pub(crate) const SINGLE_SEGMENT_FETCH_CEILING: u64 =
     (MAX_EFFICIENT_SIZE - OK_REPLY_FRAMING_BYTES) as u64;
 /// Room for the response frame (19 bytes), the map header and the `v`, `status`, `size`,

@@ -1147,8 +1147,8 @@ async fn lan_collision() {
     assert!(first_slot.stop().await.unwrap());
 }
 
-// Usage-probe additions (spec-first, always-on): the acceptance criteria as written, not
-// the implementation as read.
+// Usage-probe additions (spec-first, always-on): the spec as written, not the
+// implementation as read.
 
 /// The relay is "a transport-enabled `rnsd` relay with a
 /// `TCPServerInterface`" that the two `private` nodes dial on the bridge address. It must
