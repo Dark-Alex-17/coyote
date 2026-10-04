@@ -1,6 +1,9 @@
 //! The `docs/mesh/PROTOCOL.md` ids the interop tests in `interop` exercise, kept apart from
 //! that `#[cfg(unix)]` module so the coverage report and the section 20 table count them on
-//! every platform.
+//! every platform. The Python reference serves only `/status` and `/message`, so the ids
+//! here cover the announce, status and message exchanges alone; the `/list`, `/fetch` and
+//! `/access` paths have no reference and are covered by the Rust-only vectors of
+//! `share_vectors`, `access_vectors` and `live_vectors`.
 
 use super::{Kind, Listed};
 

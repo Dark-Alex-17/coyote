@@ -69,9 +69,11 @@ One Python process, driven over stdin/stdout with one JSON object per line. Comm
 creates a Coyote-shaped destination `scope.session.<instance_id>` serving `/status` and
 `/message` to anyone, and prints `READY {json}` with `relay_port`, `identity_hash`,
 `destination_hash`, `name_hash` and `instance_id`. The reference peer does not implement
-`/knock`, `/list`, `/fetch` or `/access`; the file-sharing paths are exercised by the Rust
-in-process node pair in `src/mesh/r3/tests.rs` (conformance vectors for those areas are
-not yet written).
+`/knock`, `/list`, `/fetch` or `/access`; the file-sharing paths are covered by Rust-only
+in-process conformance vectors in `src/mesh/conformance/share_vectors.rs`,
+`access_vectors.rs` and `live_vectors.rs` (the last over the loopback node pair of
+`src/mesh/r3/tests.rs`), so the Python reference still serves only `/status` and
+`/message`, and the interop matrix exercises only those two paths.
 
 | Command | Arguments | Reply / effect |
 |---|---|---|

@@ -1717,6 +1717,27 @@ mod tests {
             unwrapped.contains(&gap),
             "scripts/mesh-interop/README.md no longer says {gap:?}"
         );
+        // The README must also say what does cover those paths: the Rust-only vector
+        // modules, each of which must exist and list rows.
+        let covered_by = "the file-sharing paths are covered by Rust-only in-process conformance vectors in `src/mesh/conformance/share_vectors.rs`, `access_vectors.rs` and `live_vectors.rs`";
+        assert!(
+            unwrapped.contains(covered_by),
+            "scripts/mesh-interop/README.md no longer says {covered_by:?}"
+        );
+        for (module, listed) in [
+            ("share_vectors.rs", super::share_vectors::listed().len()),
+            ("access_vectors.rs", super::access_vectors::listed().len()),
+            ("live_vectors.rs", super::live_vectors::listed().len()),
+        ] {
+            assert!(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("src/mesh/conformance")
+                    .join(module)
+                    .is_file()
+                    && listed > 0,
+                "the README names {module} as a vector module, which must exist and list rows"
+            );
+        }
 
         let mut lines = REFERENCE_PEER.lines();
         let mut registered = Vec::new();
