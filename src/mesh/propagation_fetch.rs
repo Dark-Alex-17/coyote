@@ -1505,17 +1505,24 @@ async fn process_bodies(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mesh::access::{AccessRouting, AccessSurface, access_message, validate_access};
     use crate::mesh::destination_address;
     use crate::mesh::events::MeshHooks;
     use crate::mesh::knock::{
         KnockGate, KnockIntro, KnockRouting, KnockSurface, RecordingSurface, knock_message,
     };
     use crate::mesh::knocks::KnockCache;
+    use crate::mesh::message::{
+        OutboundPeer, PeerKind, PeerRouting, PeerSurface, peer_lxmf_message,
+    };
+    use crate::mesh::node::MeshSlot;
     use crate::mesh::peers::PeerSighting;
-    use crate::mesh::propagation::build_signed_message;
+    use crate::mesh::pending::{InboundKind, InboundStore};
+    use crate::mesh::propagation::{OutboundMessage, build_signed_message};
     use crate::mesh::r3::{OriginName, RequestFrame};
     use crate::mesh::session_destination_name;
     use crate::mesh::test_support::{TempDir, TrustList, read_source, rust_sources, siblings_of};
+    use crate::supervisor::mailbox::EnvelopePayload;
     use crate::testing::{debug_snapshot, install_log_collector, warn_snapshot};
 
     use lxmf_core::message::Payload;
@@ -2346,9 +2353,11 @@ mod tests {
         assert_eq!(delivered[0].stamp_value, None);
     }
 
-    /// The runtime's sink as `fetch_propagated` builds it: a knock from a known identity
-    /// stops at the gate, which surfaces and files it under the instance recomputed from
-    /// the origin and the signer; a message from the same identity passes through.
+    /// The knock stage alone of the chain `fetch_propagated` builds: a knock from a known
+    /// identity stops at the gate, which surfaces and files it under the instance
+    /// recomputed from the origin and the signer; a message from the same identity
+    /// passes through. The whole chain is driven in
+    /// `sealed_bodies_reach_the_stage_of_the_full_chain_the_runtime_builds`.
     #[tokio::test]
     async fn a_fetched_knock_stops_at_the_gate_and_a_message_passes_through() {
         let knocker = CorePrivateIdentity::new_from_rand(OsRng);
@@ -2405,6 +2414,132 @@ mod tests {
         );
         assert_eq!(surface.texts().len(), 1);
         assert_eq!(gate.cache().list(SystemTime::now()).unwrap().len(), 1);
+    }
+
+    /// The full chain `fetch_propagated` builds, fed sealed bodies through the pipeline:
+    /// a knock is filed by the gate, an access request by the access surface, a peer
+    /// message by the peer surface, and only a plain message reaches the inbox sink.
+    /// The same knock body fetched again is a duplicate before any stage sees it.
+    #[tokio::test]
+    async fn sealed_bodies_reach_the_stage_of_the_full_chain_the_runtime_builds() {
+        let knocker = CorePrivateIdentity::new_from_rand(OsRng);
+        let knocker_id = transport_identity_of(&knocker);
+        let peer = CorePrivateIdentity::new_from_rand(OsRng);
+        let peer_id = transport_identity_of(&peer);
+        let origin = OriginName::of(&session_destination_name("peer"));
+        let knock_origin = OriginName::of(&session_destination_name("knocker"));
+        let peer_destination =
+            destination_address(&origin.0, &peer_id.address_hash).to_hex_string();
+        let mut bench = Bench::new(
+            "fetch-full-chain",
+            TrustList::default()
+                .destination(&peer_destination, &identity_hex(&peer_id))
+                .identity(&identity_hex(&knocker_id), false),
+        );
+        bench.keys.know(&knocker_id);
+        bench.keys.know(&peer_id);
+        let me = bench.me();
+        let trust = bench.trust.clone();
+        let slot = Arc::new(MeshSlot::default());
+        slot.set_inbound_store_for_tests(Arc::new(InboundStore::new(&bench._tmp.path, "inst")));
+        let peers = Arc::new(
+            PeerTable::load(bench._tmp.path.join("peers.json"), SystemTime::now()).unwrap(),
+        );
+        let gate = KnockGate::new(
+            trust.clone(),
+            peers,
+            KnockCache::new(&bench._tmp.path, 24),
+            MeshHooks::default(),
+        );
+        let inbox = CountingSink::default();
+        let peer_stage = PeerRouting {
+            trust: &trust,
+            surface: Some(slot.clone() as Arc<dyn PeerSurface>),
+            inner: &inbox,
+        };
+        let access_stage = AccessRouting {
+            trust: &trust,
+            surface: Some(slot.clone() as Arc<dyn AccessSurface>),
+            inner: &peer_stage,
+        };
+        let chain = KnockRouting {
+            gate: &gate,
+            inner: &access_stage,
+        };
+        let sealed = |signer: &CorePrivateIdentity, message: &OutboundMessage| {
+            build_signed_message(signer, &lxmf_delivery_hash(&me), message, 1_700_000_000.5)
+                .unwrap()
+                .pack_propagation_transient_with_rng(&to_core_identity(&me), OsRng)
+                .unwrap()
+                .0
+        };
+
+        let knock = knock_body(&knocker, &me, "let me in", &knock_origin);
+        assert_eq!(
+            bench.process_into(&knock, &chain).await,
+            BodyOutcome::Delivered
+        );
+        let request = validate_access("acc-1", vec!["docs/a.md".to_string()], "why").unwrap();
+        let access = sealed(&peer, &access_message(&request, &origin));
+        assert_eq!(
+            bench.process_into(&access, &chain).await,
+            BodyOutcome::Delivered
+        );
+        let stored =
+            OutboundPeer::new(PeerKind::Message, "from the node", None, None, None).unwrap();
+        let peer_message = sealed(&peer, &peer_lxmf_message(&stored, &origin));
+        assert_eq!(
+            bench.process_into(&peer_message, &chain).await,
+            BodyOutcome::Delivered
+        );
+        let plain = honest_body(&peer, &me, b"hello");
+        assert_eq!(
+            bench.process_into(&plain, &chain).await,
+            BodyOutcome::Delivered
+        );
+
+        let knocks = gate.cache().list(SystemTime::now()).unwrap();
+        assert_eq!(knocks.len(), 1, "the gate saw the knock and nothing else");
+        assert_eq!(knocks[0].identity_hash, identity_hex(&knocker_id));
+        assert_eq!(knocks[0].intro.as_deref(), Some("let me in"));
+
+        let filed = slot
+            .inbound_store()
+            .unwrap()
+            .list(SystemTime::now())
+            .unwrap();
+        assert_eq!(
+            filed.len(),
+            1,
+            "the access surface saw the request and nothing else"
+        );
+        assert_eq!(filed[0].id, "acc-1");
+        assert_eq!(filed[0].kind, InboundKind::Access);
+        assert_eq!(filed[0].peer_identity, identity_hex(&peer_id));
+        assert_eq!(filed[0].peer_destination, peer_destination);
+
+        let (delivered, dropped) = slot.peer_inbox().drain();
+        assert_eq!(
+            delivered.len(),
+            1,
+            "the peer surface saw the message and nothing else"
+        );
+        match &delivered[0].payload {
+            EnvelopePayload::Peer(message) => assert_eq!(message.message_id, stored.id),
+            other => panic!("not a peer envelope: {other:?}"),
+        }
+        assert_eq!(dropped, 0);
+
+        let message = inbox.only();
+        assert_eq!(message.content.as_deref(), Some(&b"hello"[..]));
+        assert_eq!(message.source_identity_hash, identity_hex(&peer_id));
+
+        assert_eq!(
+            discarded(bench.process_into(&knock, &chain).await),
+            Discard::Duplicate
+        );
+        assert_eq!(gate.cache().list(SystemTime::now()).unwrap().len(), 1);
+        assert_eq!(inbox.count(), 1);
     }
 
     fn store_at(tmp: &TempDir, now: SystemTime) -> FetchStore {
