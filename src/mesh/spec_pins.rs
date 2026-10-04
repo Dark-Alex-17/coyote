@@ -2855,23 +2855,36 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
             let source = std::fs::read_to_string(root.join(&path)).unwrap();
             let lines: Vec<&str> = source.lines().map(str::trim).collect();
             for (index, line) in lines.iter().enumerate() {
-                let Some(attribute) = line.strip_prefix("#[serde(default") else {
+                let Some(attribute) = line
+                    .strip_prefix("#[serde(")
+                    .and_then(|rest| rest.strip_suffix(")]"))
+                else {
                     continue;
                 };
+                let arguments: Vec<&str> = attribute.split(',').map(str::trim).collect();
+                if !arguments
+                    .iter()
+                    .any(|argument| *argument == "default" || argument.starts_with("default ="))
+                {
+                    continue;
+                }
                 let field = lines[index + 1..]
                     .iter()
                     .find(|next| !next.starts_with("#[") && !next.starts_with("///"))
                     .unwrap_or_else(|| panic!("{path}:{}: no field below", index + 1));
-                let declared = field
+                let declaration = field
                     .trim_start_matches("pub(crate) ")
-                    .trim_start_matches("pub ")
-                    .split(':')
-                    .next()
-                    .unwrap()
-                    .trim();
-                let renamed = attribute
-                    .split_once("rename = \"")
-                    .and_then(|(_, rest)| rest.split('"').next());
+                    .trim_start_matches("pub ");
+                assert!(
+                    !declaration.starts_with("struct ") && !declaration.starts_with("enum "),
+                    "{path}:{}: struct-level #[serde(default)]; its fields cannot be enumerated here",
+                    index + 1
+                );
+                let declared = declaration.split(':').next().unwrap().trim();
+                let renamed = arguments
+                    .iter()
+                    .find_map(|argument| argument.strip_prefix("rename = \""))
+                    .and_then(|rest| rest.split('"').next());
                 fields.insert(renamed.unwrap_or(declared).to_string());
             }
         }
@@ -2979,17 +2992,19 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
                 .rev()
                 .take_while(|b| b.is_ascii_hexdigit())
                 .count();
+            let token = &before[before.len() - hex..];
             (7..=40).contains(&hex)
+                && token.iter().any(u8::is_ascii_digit)
                 && before[..before.len() - hex]
                     .last()
                     .is_none_or(|b| !b.is_ascii_alphanumeric() && *b != b'_')
         };
-        let round_number_alone = |rest: &[u8]| {
+        let round_shorthand = |rest: &[u8]| {
             let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+            let rest = &rest[digits..];
             digits > 0
-                && rest[digits..]
-                    .first()
-                    .is_none_or(|b| !b.is_ascii_alphanumeric() && *b != b'_')
+                && (rest.first() == Some(&b')')
+                    || rest.strip_prefix(b" ").is_some_and(letter_in_parens))
         };
         let comment_text = line
             .trim_start()
@@ -3007,7 +3022,7 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
                 })
             })
             || plain.iter().any(|needle| line.contains(needle.as_str()))
-            || comment_text.is_some_and(|text| follows(text, shorthand, round_number_alone))
+            || comment_text.is_some_and(|text| follows(text, shorthand, round_shorthand))
             || commit.iter().any(|needle| {
                 line.match_indices(needle)
                     .any(|(at, _)| after_a_short_hash(&line.as_bytes()[..at]))
@@ -3051,6 +3066,7 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
             ["/// usage", " probe r10 (b): the tenth"].concat(),
             ["// settled (R", "3): the reply"].concat(),
             ["// ---- usage probe (r", "4) ----"].concat(),
+            ["// settled (r", "2 (b)): the reply"].concat(),
             ["// criteria", " 3+4 hold"].concat(),
             ["// the 3a3d1d1", " fix narrowed it"].concat(),
             [
@@ -3071,10 +3087,14 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
             "// a planned criterion is unmet".to_string(),
             "// B6 and G8 are hex here".to_string(),
             "// the R3 transport frames it".to_string(),
+            "// the R3 transport (r3 for short) frames it".to_string(),
+            "// the transport (r3, lowercase on the wire) frames it".to_string(),
             "// Err(R3Error::Shutdown) ends it".to_string(),
             "assert_eq!(r1.len(), 2);".to_string(),
             "// 9f1c3b0e6d8a4f2b9c7e1a5d3b8f6c04 is a wire id".to_string(),
             "// a fix for the relay".to_string(),
+            "// the cache fix narrowed it".to_string(),
+            "// a defaced fix is reverted".to_string(),
             "// the criteria differ".to_string(),
             ["// the rule quotes `// TASK", "-002` as its example"].concat(),
             ["let id = \"TASK", "-002\";"].concat(),
@@ -3128,6 +3148,43 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
         assert!(
             ids.iter()
                 .all(|id| parse_id(id).is_some_and(|(_, rest)| rest.is_empty()))
+        );
+    }
+
+    #[test]
+    fn frozen_areas_define_no_id_past_their_published_maximum() {
+        let definitions = definitions(&body(SPEC).unwrap()).unwrap();
+        let frozen = [
+            ("DEST", 10),
+            ("ANN", 33),
+            ("ENV", 50),
+            ("VER", 14),
+            ("EXT", 8),
+            ("CODE", 5),
+            ("KNOCK", 29),
+            ("STATUS", 30),
+            ("MSG", 59),
+            ("PROP", 42),
+            ("TIME", 11),
+            ("CANON", 13),
+        ];
+        let highest: Vec<(&str, usize)> = frozen
+            .iter()
+            .map(|(area, _)| {
+                let prefix = format!("MESH-{area}-");
+                let max = definitions
+                    .iter()
+                    .filter_map(|d| d.id.strip_prefix(&prefix))
+                    .map(|digits| digits.parse::<usize>().expect("three digits"))
+                    .max()
+                    .unwrap_or_else(|| panic!("{area} defines no ids"));
+                (*area, max)
+            })
+            .collect();
+        assert_eq!(
+            highest,
+            frozen.to_vec(),
+            "a new requirement in a frozen area moves this pin deliberately"
         );
     }
 

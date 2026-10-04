@@ -1349,8 +1349,8 @@ variables:
 
     // ---- the .mesh-in-macros exclusion ----
 
-    /// The reason wording is fixed verbatim; pin the whole sentence so
-    /// the `.list macros` row and the load error cannot drift apart from it.
+    /// `forbidden_mesh_step` fixes the reason wording verbatim; pin the whole sentence
+    /// so the `.list macros` row and the load error cannot drift apart from it.
     #[test]
     fn usage_probe_reason_is_the_exact_spec_sentence() {
         let m = macro_with_steps(&[".model x", "  .mesh trust {{peer}}"]);

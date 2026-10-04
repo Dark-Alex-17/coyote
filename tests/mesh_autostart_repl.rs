@@ -1,9 +1,9 @@
 //! Black-box coverage of the mesh autostart through the interactive REPL:
-//! `mesh.enabled: true` joins the mesh
-//! when the REPL starts, before the first prompt, without asking; a failed
-//! `.mesh on` precondition prints that refusal and leaves the mesh off with a
-//! usable prompt; `mesh.enabled: false` never mentions joining. The one-shot
-//! side (`--macro` never autostarts) lives in `macro_bracketing.rs`.
+//! `mesh.enabled: true` joins the mesh when the REPL starts, before the first
+//! prompt, without asking; a failed `.mesh on` precondition prints that refusal
+//! and leaves the mesh off with a usable prompt; `mesh.enabled: false` never
+//! mentions joining. The one-shot side (`--macro` never autostarts) lives in
+//! `macro_bracketing.rs`.
 //!
 //! Drives the real `coyote` binary through a pty like `envoy_repl.rs`, against
 //! a private-relay interface pointing at a loopback listener this test owns

@@ -27,7 +27,7 @@ This document does not specify:
 
 - Cryptography. Identity keys, Link encryption, signatures and cryptographic agility are Reticulum's and LXMF's; section 15 states what this document relies on them for and specifies no cipher, key size or negotiation of its own.
 - The human-facing `.mesh` REPL surface and its output text, except where a stored or shown value fixes a wire form.
-- On-disk formats, except where a stored form fixes a canonical form (section 3) or a wire value (the knock record, section 8.4), where section 10.17 fixes the key set of the share files and the grant store, or where section 14.1 fixes the versioning discipline every on-disk store follows.
+- On-disk formats, except where a stored form fixes a canonical form (section 3) or a wire value (the knock record, section 8.4), where section 10.17 fixes the key set of the share files and the content of the grant store, or where section 14.1 fixes the versioning discipline every on-disk store follows.
 
 Section 19 is the single authoritative listing of constants; every constant named in prose is written as `NAME` with its value and is listed there.
 
@@ -769,7 +769,7 @@ LXMF fields map:
 | `0xfc` (`FIELD_CUSTOM_DATA`) | map | the custom data map below | **[MESH-MSG-047]** When missing or not a `map`, the receiver MUST drop the message as malformed. |
 | any other key | any | nothing | **[MESH-MSG-048]** The receiver MUST ignore it. |
 
-Custom data map (emission order `kind`, `id`, `in_reply_to`, `thread`, `name_hash`, `fields`, `disposition`, `retry_after`, `parts`; the last three as section 10.1: `disposition` and `retry_after` on a `reply` only, `parts` only when non-empty):
+Custom data map, emitted in the order `kind`, `id`, `in_reply_to`, `thread`, `name_hash`, `fields`, `disposition`, `retry_after`, `parts` (src/mesh/message.rs; `a_reply_with_every_optional_key_rides_lxmf_custom_data_in_the_specified_order`); the last three as section 10.1: `disposition` and `retry_after` on a `reply` only, `parts` only when non-empty:
 
 | Field | Type | Sender puts | Receiver action on any other value |
 |---|---|---|---|

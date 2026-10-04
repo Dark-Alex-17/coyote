@@ -942,9 +942,8 @@ fn crlf_terminated_allowed_lines_are_accepted_by_lxmd() {
 }
 
 // ---------------------------------------------------------------------------
-// Usage probe (spec-first, written from the README's promises before the
-// entrypoint was read): the `lxmd` passthrough, the argument fallthrough, the
-// shutdown path and the identity-portability fine print.
+// README entrypoint promises: the `lxmd` passthrough, the argument fallthrough,
+// the shutdown path and the identity-portability fine print.
 // ---------------------------------------------------------------------------
 
 /// The interop harness checkout of `clone` (`lxmf` or `reticulum`, as

@@ -22160,7 +22160,7 @@ mod tests {
 
                 /// The outbound-correlation route, the other three arms:
                 /// answering a question THIS node asked judges `--attach` like every other
-                /// route — (b) a file at or under `inline_max_bytes` travels INLINE with no
+                /// route — a file at or under `inline_max_bytes` travels INLINE with no
                 /// grant, protected and built-in-deny paths are refused in one line
                 /// before anything is printed, sent or lent, and a reference lend the
                 /// peer refuses takes its grant back — while the correlation stays open
@@ -23304,7 +23304,7 @@ mod tests {
                 /// output of the line, for the inline and the reference form alike: no
                 /// "Sending your answer…" and no attaching notice precedes it, so the
                 /// human never reads a lend that did not happen. A hold on an ACCESS id
-                /// changes nothing: the cross-kind sentence of (c) comes first, and
+                /// changes nothing: the cross-kind sentence comes first, and
                 /// nothing is printed there either.
                 #[test]
                 #[serial]
@@ -24640,8 +24640,7 @@ mod tests {
                         assert!(
                             !dry.contains("big.txt")
                                 && dry.contains("(7 bytes)")
-                                && !dry.contains("(1000 bytes)")
-                                && !dry.contains("(1007 bytes)"),
+                                && !dry.contains("KB"),
                             "the link's target is not walked: {dry}"
                         );
                         assert_eq!(fs::read(outside.path.join("big.txt")).unwrap().len(), 1000);
@@ -24651,9 +24650,7 @@ mod tests {
                         assert_eq!(prompt_script::prompts_asked(), 1);
                         let question = asked.lock()[0].clone();
                         assert!(
-                            question.contains("(7 bytes)")
-                                && !question.contains("(1000 bytes)")
-                                && !question.contains("(1007 bytes)"),
+                            question.contains("(7 bytes)") && !question.contains("KB"),
                             "the byte total is this tree's own: {question}"
                         );
                         assert!(out.starts_with("Removed "), "{out}");

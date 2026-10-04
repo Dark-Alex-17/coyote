@@ -10994,7 +10994,7 @@ mod tests {
         assert!(info.contains("workspace_sessions_dir"));
     }
 
-    // --- usage-probe (spec-first) coverage for the workspace-sessions surface ---
+    // ---- workspace-sessions surface ----
 
     #[test]
     #[serial]
@@ -23916,7 +23916,7 @@ mod tests {
         );
     }
 
-    /// Usage probe: the path completer walks nested directories (a sub-directory is
+    /// The path completer walks nested directories (a sub-directory is
     /// offered slashed under its parent), hides a built-in-denied file wherever it sits,
     /// and omits every symlinked FILE, inside the root or out of it, as it omits a
     /// symlinked directory: the walk serves the real path, never the link.
@@ -23993,7 +23993,7 @@ mod tests {
         fixture.stop().await;
     }
 
-    /// Usage probe: `deny` and `unshare` apply the same used-flag/exclusive-partner rule
+    /// `deny` and `unshare` apply the same used-flag/exclusive-partner rule
     /// `allow` does (`--yes` hides `--dry-run`, `--workspace` hides `--global`), and a
     /// pattern already typed under `unshare` with a layer flag leaves the remaining flags.
     #[cfg(unix)]
@@ -24044,7 +24044,7 @@ mod tests {
         fixture.stop().await;
     }
 
-    /// Usage probe: the completer offers paths the verb accepts but never the protected
+    /// The completer offers paths the verb accepts but never the protected
     /// directories themselves, even when the typed prefix names them.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

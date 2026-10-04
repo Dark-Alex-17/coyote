@@ -4115,6 +4115,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_reply_with_every_optional_key_rides_lxmf_custom_data_in_the_specified_order() {
+        let reply = OutboundPeer::with_parts(
+            PeerKind::Reply,
+            "the answer",
+            Some("Re: question"),
+            Some("q-1"),
+            Some(serde_json::json!({ "n": 1 })),
+            vec![text_part("aside")],
+            &PartLimits::default(),
+        )
+        .unwrap()
+        .with_thread(Some("t-1".into()))
+        .unwrap()
+        .with_disposition(Disposition::Refused, Some(60));
+        let stored = peer_lxmf_message(&reply, &OriginName([7u8; NAME_HASH_LEN]));
+        let Some(Value::Map(fields)) = stored.fields else {
+            unreachable!()
+        };
+        let Some((_, Value::Map(data))) = fields
+            .iter()
+            .find(|(key, _)| key.as_u64() == Some(u64::from(FIELD_CUSTOM_DATA)))
+        else {
+            unreachable!()
+        };
+        let keys: Vec<&str> = data.iter().map(|(k, _)| k.as_str().unwrap()).collect();
+        assert_eq!(
+            keys,
+            [
+                "kind",
+                "id",
+                "in_reply_to",
+                "thread",
+                "name_hash",
+                "fields",
+                "disposition",
+                "retry_after",
+                "parts",
+            ]
+        );
+    }
+
     /// Every cap at once: with content, title, both ids, fields and parts of all four
     /// shapes (text, data, inline file, reference file) at their caps together, the message
     /// still fits under both receivers' bounds and every field survives encode→decode
