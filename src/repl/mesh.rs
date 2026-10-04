@@ -1517,11 +1517,12 @@ async fn fetch(ctx: &RequestContext, abort_signal: &AbortSignal, rest: Option<&s
     Ok(())
 }
 
-/// Appended to a size refusal when `limit` is the ceiling every node shares, not one
-/// this node chose.
+/// Appended to a size refusal when `limit` is the single-segment ceiling this build
+/// applies on the pinned transport, a reference leniency rather than a protocol limit
+/// or one this node chose.
 fn ceiling_note(limit: u64) -> &'static str {
     if limit == SINGLE_SEGMENT_FETCH_CEILING {
-        " That is the single-segment ceiling every node applies today."
+        " That is the single-segment ceiling this build applies on the pinned transport while its multi-segment defect stands; it is not a limit of the protocol."
     } else {
         ""
     }
@@ -23941,7 +23942,7 @@ mod tests {
                         assert_eq!(
                             refusal(&mut fx.ctx, &line).await,
                             format!(
-                                "{} serves files of at most {SINGLE_SEGMENT_FETCH_CEILING} bytes and `docs/a.md` is larger. That is the single-segment ceiling every node applies today.",
+                                "{} serves files of at most {SINGLE_SEGMENT_FETCH_CEILING} bytes and `docs/a.md` is larger. That is the single-segment ceiling this build applies on the pinned transport while its multi-segment defect stands; it is not a limit of the protocol.",
                                 fx.dest()
                             )
                         );

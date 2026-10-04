@@ -2913,6 +2913,29 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
         );
     }
 
+    /// MESH-LEN-007 binds the reference on the pinned transport, not every responder:
+    /// the single-segment ceiling is a leniency the reference applies while that
+    /// transport's multi-segment defect stands, and the protocol's own serving limit
+    /// stays MESH-FETCH-026. Widening the subject back to "a responder MUST" would turn
+    /// the workaround into a protocol limit, so both the subject and the disclaimer are
+    /// pinned.
+    #[test]
+    fn len_007_binds_the_reference_on_the_pinned_transport_not_the_protocol() {
+        let definition = SPEC
+            .lines()
+            .find(|line| line.starts_with("**[MESH-LEN-007]**"))
+            .expect("MESH-LEN-007 is defined");
+        for clause in [
+            "a responder on the pinned rns-transport MUST cap its serving limit at `SINGLE_SEGMENT_FETCH_CEILING`",
+            "not a limit of this protocol, whose serving limit is MESH-FETCH-026 (MESH-FETCH-027",
+        ] {
+            assert!(
+                definition.contains(clause),
+                "{definition:?} lacks {clause:?}"
+            );
+        }
+    }
+
     /// Every field a store file reads under a `#[serde(default)]` is named on the
     /// MESH-CODE-005 line, by its on-disk key where the attribute renames it. The files
     /// are those of `ON_DISK_STRUCTS` in `schema.rs`: the stores plus `message.rs`, whose
