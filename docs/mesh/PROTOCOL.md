@@ -2065,17 +2065,17 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 | MESH-MSG-002 | Interop (Invalid), MessageBody (Invalid), MessageBody (Valid) |
 | MESH-MSG-003 | MessageBody (Boundary), MessageBody (Invalid), MessageBody (Valid) |
 | MESH-MSG-004 | MessageBody (Boundary), MessageBody (Invalid), MessageBody (Valid) |
-| MESH-DISP-001 | no vector yet |
+| MESH-DISP-001 | MessageBody (Boundary), MessageBody (Invalid), MessageBody (Valid) |
 | MESH-MSG-005 | MessageBody (Boundary), MessageBody (Invalid), MessageBody (Valid) |
 | MESH-MSG-006 | MessageBody (Boundary), MessageBody (Invalid), MessageBody (Valid) |
 | MESH-MSG-007 | MessageBody (Invalid), MessageBody (Valid) |
 | MESH-MSG-008 | Custom (Boundary), Custom (Invalid), MessageBody (Invalid) |
-| MESH-DISP-002 | no vector yet |
-| MESH-DISP-003 | no vector yet |
-| MESH-DISP-004 | no vector yet |
-| MESH-PART-001 | no vector yet |
-| MESH-PART-002 | no vector yet |
-| MESH-PART-003 | no vector yet |
+| MESH-DISP-002 | MessageBody (Invalid), MessageBody (Valid) |
+| MESH-DISP-003 | MessageBody (Invalid) |
+| MESH-DISP-004 | MessageBody (Boundary), MessageBody (Invalid), MessageBody (Valid) |
+| MESH-PART-001 | MessageBody (Boundary), MessageBody (Invalid), MessageBody (Valid) |
+| MESH-PART-002 | Custom (Boundary), Custom (Invalid) |
+| MESH-PART-003 | Custom (Boundary), Custom (Invalid) |
 | MESH-MSG-009 | MessageBody (Boundary), MessageBody (Invalid), MessageBody (Valid) |
 | MESH-MSG-010 | MessageBody (Valid) |
 | MESH-MSG-011 | Custom (Valid), Interop (Valid), MessageBodyEncode (Valid) |
@@ -2120,66 +2120,66 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 | MESH-MSG-049 | LxmfPeer (Invalid), LxmfPeer (Valid) |
 | MESH-MSG-050 | LxmfPeer (Boundary), LxmfPeer (Invalid), LxmfPeer (Valid) |
 | MESH-MSG-051 | LxmfPeer (Boundary), LxmfPeer (Invalid), LxmfPeer (Valid) |
-| MESH-DISP-006 | no vector yet |
+| MESH-DISP-006 | LxmfPeer (Invalid), LxmfPeer (Valid) |
 | MESH-MSG-052 | LxmfPeer (Boundary), LxmfPeer (Invalid) |
 | MESH-MSG-053 | LxmfPeer (Valid) |
 | MESH-MSG-054 | Custom (Invalid), LxmfPeer (Boundary), LxmfPeer (Invalid) |
-| MESH-DISP-007 | no vector yet |
-| MESH-DISP-008 | no vector yet |
-| MESH-PART-004 | no vector yet |
+| MESH-DISP-007 | LxmfPeer (Invalid), LxmfPeer (Valid) |
+| MESH-DISP-008 | LxmfPeer (Invalid), LxmfPeer (Valid) |
+| MESH-PART-004 | Custom (Valid), LxmfPeer (Invalid), LxmfPeer (Valid) |
 | MESH-MSG-055 | LxmfPeer (Valid) |
 | MESH-MSG-056 | Custom (Valid) |
 | MESH-MSG-057 | Custom (Boundary), LxmfPeer (Valid) |
 | MESH-MSG-058 | no vector yet |
 | MESH-MSG-059 | no vector yet |
-| MESH-PART-005 | no vector yet |
-| MESH-PART-006 | no vector yet |
-| MESH-PART-007 | no vector yet |
-| MESH-PART-008 | no vector yet |
-| MESH-PART-009 | no vector yet |
-| MESH-PART-010 | no vector yet |
-| MESH-PART-011 | no vector yet |
-| MESH-PART-012 | no vector yet |
-| MESH-PART-013 | no vector yet |
-| MESH-PART-014 | no vector yet |
-| MESH-PART-015 | no vector yet |
-| MESH-PART-016 | no vector yet |
-| MESH-PART-017 | no vector yet |
-| MESH-PART-018 | no vector yet |
-| MESH-PART-019 | no vector yet |
-| MESH-PART-020 | no vector yet |
-| MESH-PART-021 | no vector yet |
-| MESH-PART-022 | no vector yet |
-| MESH-PART-023 | no vector yet |
-| MESH-PART-024 | no vector yet |
-| MESH-PART-025 | no vector yet |
-| MESH-PART-026 | no vector yet |
-| MESH-PART-027 | no vector yet |
-| MESH-PART-028 | no vector yet |
-| MESH-PART-029 | no vector yet |
-| MESH-PART-030 | no vector yet |
-| MESH-PART-031 | no vector yet |
-| MESH-PART-032 | no vector yet |
-| MESH-PART-033 | no vector yet |
-| MESH-PART-034 | no vector yet |
-| MESH-DISP-009 | no vector yet |
-| MESH-DISP-010 | no vector yet |
-| MESH-DISP-011 | no vector yet |
-| MESH-DISP-012 | no vector yet |
-| MESH-DISP-013 | no vector yet |
-| MESH-DISP-014 | no vector yet |
+| MESH-PART-005 | MessageBody (Invalid) |
+| MESH-PART-006 | MessageBody (Invalid), MessageBody (Valid) |
+| MESH-PART-007 | MessageBody (Invalid) |
+| MESH-PART-008 | MessageBody (Valid) |
+| MESH-PART-009 | MessageBody (Invalid), MessageBody (Valid) |
+| MESH-PART-010 | Custom (Boundary), Custom (Invalid) |
+| MESH-PART-011 | MessageBody (Valid) |
+| MESH-PART-012 | MessageBody (Invalid), MessageBody (Valid) |
+| MESH-PART-013 | Custom (Boundary), Custom (Invalid), MessageBody (Boundary), MessageBody (Invalid) |
+| MESH-PART-014 | MessageBody (Valid) |
+| MESH-PART-015 | Custom (Valid), MessageBody (Valid) |
+| MESH-PART-016 | MessageBody (Invalid) |
+| MESH-PART-017 | Custom (Invalid) |
+| MESH-PART-018 | MessageBody (Invalid) |
+| MESH-PART-019 | Custom (Invalid) |
+| MESH-PART-020 | MessageBody (Invalid), MessageBody (Valid) |
+| MESH-PART-021 | Custom (Invalid) |
+| MESH-PART-022 | MessageBody (Invalid) |
+| MESH-PART-023 | Custom (Boundary), Custom (Invalid) |
+| MESH-PART-024 | MessageBody (Invalid), MessageBody (Valid) |
+| MESH-PART-025 | Custom (Invalid), Custom (Valid), MessageBody (Valid) |
+| MESH-PART-026 | MessageBody (Valid) |
+| MESH-PART-027 | MessageBody (Invalid), MessageBody (Valid) |
+| MESH-PART-028 | Custom (Valid) |
+| MESH-PART-029 | Custom (Boundary), Custom (Invalid) |
+| MESH-PART-030 | Custom (Boundary) |
+| MESH-PART-031 | Custom (Invalid), Custom (Valid) |
+| MESH-PART-032 | Custom (Valid) |
+| MESH-PART-033 | Custom (Invalid), Custom (Valid) |
+| MESH-PART-034 | Custom (Valid) |
+| MESH-DISP-009 | Custom (Valid) |
+| MESH-DISP-010 | Custom (Valid) |
+| MESH-DISP-011 | Custom (Invalid) |
+| MESH-DISP-012 | Custom (Valid) |
+| MESH-DISP-013 | Custom (Valid) |
+| MESH-DISP-014 | Custom (Valid), MessageBodyEncode (Valid) |
 | MESH-DISP-015 | no vector yet |
 | MESH-DISP-016 | no vector yet |
 | MESH-DISP-017 | no vector yet |
 | MESH-DISP-018 | no vector yet |
-| MESH-DISP-019 | no vector yet |
-| MESH-DISP-020 | no vector yet |
-| MESH-DISP-021 | no vector yet |
-| MESH-DISP-022 | no vector yet |
-| MESH-DISP-023 | no vector yet |
-| MESH-DISP-024 | no vector yet |
-| MESH-DISP-025 | no vector yet |
-| MESH-DISP-026 | no vector yet |
+| MESH-DISP-019 | Custom (Valid) |
+| MESH-DISP-020 | Custom (Valid) |
+| MESH-DISP-021 | Custom (Valid) |
+| MESH-DISP-022 | Custom (Valid) |
+| MESH-DISP-023 | Custom (Boundary), MessageBodyEncode (Valid) |
+| MESH-DISP-024 | Custom (Valid) |
+| MESH-DISP-025 | Custom (Boundary), Custom (Valid) |
+| MESH-DISP-026 | Custom (Invalid) |
 | MESH-FETCH-003 | no vector yet |
 | MESH-FETCH-004 | no vector yet |
 | MESH-FETCH-005 | no vector yet |
@@ -2323,7 +2323,7 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 | MESH-PROP-035 | no vector yet |
 | MESH-PROP-036 | no vector yet |
 | MESH-PROP-037 | no vector yet |
-| MESH-PROP-038 | LxmfKnock (Valid), LxmfPeer (Valid) |
+| MESH-PROP-038 | Custom (Valid), LxmfKnock (Valid), LxmfPeer (Valid) |
 | MESH-PROP-039 | no vector yet |
 | MESH-PROP-040 | no vector yet |
 | MESH-PROP-041 | no vector yet |

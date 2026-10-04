@@ -12,10 +12,11 @@ use crate::mesh::protocol::{
     MESH_PROTOCOL_MIN_SUPPORTED, MESH_PROTOCOL_VERSION, VersionRefusal, protocol_supported,
 };
 use crate::mesh::r3::{
-    Admission, DispatchError, Dispatcher, Envelope, EnvelopeError, HANDLER_TIMEOUT, Handler,
-    InboundRequest, KNOCK_PATH, KnockEvent, KnockSink, MAX_CONCURRENT_INBOUND_REQUESTS,
-    MAX_R3_PAYLOAD_BYTES, MESSAGE_PATH, NAME_HASH_LEN, OriginName, PathHash, R3Error, RefusalCode,
-    Reply, RequestFrame, RequestHandler, RequestId, ResponseFrame, STATUS_PATH, SizeBranch,
+    ACCESS_PATH, Admission, DispatchError, Dispatcher, Envelope, EnvelopeError, FETCH_PATH,
+    HANDLER_TIMEOUT, Handler, InboundRequest, KNOCK_PATH, KnockEvent, KnockSink, LIST_PATH,
+    MAX_CONCURRENT_INBOUND_REQUESTS, MAX_R3_PAYLOAD_BYTES, MESSAGE_PATH, NAME_HASH_LEN, OriginName,
+    PathHash, R3Error, RefusalCode, Reply, RequestFrame, RequestHandler, RequestId, ResponseFrame,
+    STATUS_PATH, SizeBranch,
 };
 use crate::mesh::test_support::TrustList;
 use crate::mesh::trust::{Decision, Rule, Verdict};
@@ -2069,6 +2070,51 @@ fn dispatch_vectors() -> Vec<Vector> {
                 knocked(),
             ),
         ),
+        served(
+            Provider::Echo(LIST_PATH),
+            dispatch(
+                "MESH-ENV-036",
+                Kind::Valid,
+                LIST_PATH,
+                trusted,
+                envelope_value(),
+                Answer::Value(body.clone()),
+                Knock::None,
+            ),
+        ),
+        served(
+            Provider::Echo(FETCH_PATH),
+            dispatch(
+                "MESH-ENV-036",
+                Kind::Valid,
+                FETCH_PATH,
+                trusted,
+                envelope_value(),
+                Answer::Value(body.clone()),
+                Knock::None,
+            ),
+        ),
+        served(
+            Provider::Echo(ACCESS_PATH),
+            dispatch(
+                "MESH-ENV-036",
+                Kind::Valid,
+                ACCESS_PATH,
+                trusted,
+                envelope_value(),
+                Answer::Value(body.clone()),
+                Knock::None,
+            ),
+        ),
+        dispatch(
+            "MESH-ENV-036",
+            Kind::Valid,
+            FETCH_PATH,
+            trusted,
+            envelope_value(),
+            no_provider_answer(FETCH_PATH),
+            Knock::None,
+        ),
         dispatch(
             "MESH-VER-012",
             Kind::Invalid,
@@ -3028,6 +3074,24 @@ fn dispatch_error_vectors() -> Vec<Vector> {
             Kind::Valid,
             no_provider_value(Value::from(MESSAGE_PATH)),
             no_provider(MESSAGE_PATH),
+        ),
+        dispatch_error(
+            "MESH-ENV-042",
+            Kind::Valid,
+            no_provider_value(Value::from(LIST_PATH)),
+            no_provider(LIST_PATH),
+        ),
+        dispatch_error(
+            "MESH-ENV-042",
+            Kind::Valid,
+            no_provider_value(Value::from(FETCH_PATH)),
+            no_provider(FETCH_PATH),
+        ),
+        dispatch_error(
+            "MESH-ENV-042",
+            Kind::Valid,
+            no_provider_value(Value::from(ACCESS_PATH)),
+            no_provider(ACCESS_PATH),
         ),
         dispatch_error(
             "MESH-ENV-042",
