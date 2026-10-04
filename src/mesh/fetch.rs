@@ -874,6 +874,90 @@ pub(crate) enum Fetched {
     },
 }
 
+/// A `/fetch` reply as the requester reads it, section 10.15: the peer's typed answer
+/// before this node has staged anything. An `ok` reply is judged in the order bytes,
+/// their count against `MAX_FETCH_FILE_BYTES`, `size`, `sha256`, then the digest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FetchReply {
+    Ok {
+        bytes: Vec<u8>,
+        size: u64,
+        sha256: [u8; 32],
+    },
+    NotModified {
+        sha256: [u8; 32],
+    },
+    NotShared,
+    InvalidPath {
+        rule: String,
+    },
+    TooLarge {
+        limit: u64,
+    },
+}
+
+/// Reads a `/fetch` reply body; a dispatch error there means the peer serves no files.
+pub(crate) fn read_fetch_reply(value: &Value) -> Result<FetchReply, FetchError> {
+    if DispatchError::from_value(value).is_some() {
+        return Err(FetchError::NotServed);
+    }
+    let entries = value.as_map().ok_or(FetchError::Malformed("map"))?;
+    if field(entries, "v").and_then(Value::as_u64) != Some(PEER_WIRE_VERSION) {
+        return Err(FetchError::Malformed("v"));
+    }
+    let status = field(entries, "status")
+        .and_then(text_of)
+        .ok_or(FetchError::Malformed("status"))?;
+    match status {
+        "ok" => {
+            let bytes = field(entries, "bytes")
+                .and_then(bin_of)
+                .ok_or(FetchError::Malformed("bytes"))?;
+            if bytes.len() as u64 > MAX_FETCH_FILE_BYTES {
+                return Err(FetchError::Oversize { len: bytes.len() });
+            }
+            let size = field(entries, "size")
+                .and_then(Value::as_u64)
+                .ok_or(FetchError::Malformed("size"))?;
+            if size != bytes.len() as u64 {
+                return Err(FetchError::Malformed("size"));
+            }
+            let sha256 = field(entries, "sha256")
+                .and_then(bin32_of)
+                .ok_or(FetchError::Malformed("sha256"))?;
+            let digest: [u8; 32] = Sha256::digest(bytes).into();
+            if digest != sha256 {
+                return Err(FetchError::Corrupt);
+            }
+            Ok(FetchReply::Ok {
+                bytes: bytes.to_vec(),
+                size,
+                sha256: digest,
+            })
+        }
+        "not_modified" => {
+            let sha256 = field(entries, "sha256")
+                .and_then(bin32_of)
+                .ok_or(FetchError::Malformed("sha256"))?;
+            Ok(FetchReply::NotModified { sha256 })
+        }
+        "not_shared" => Ok(FetchReply::NotShared),
+        "invalid_path" => {
+            let rule = field(entries, "rule")
+                .and_then(rule_of)
+                .ok_or(FetchError::Malformed("rule"))?;
+            Ok(FetchReply::InvalidPath { rule })
+        }
+        "too_large" => {
+            let limit = field(entries, "limit")
+                .and_then(Value::as_u64)
+                .ok_or(FetchError::Malformed("limit"))?;
+            Ok(FetchReply::TooLarge { limit })
+        }
+        _ => Err(FetchError::UnknownStatus),
+    }
+}
+
 /// Why a listing or a fetch did not yield its answer. The file's bytes never appear in
 /// one, and neither does a status word the peer made up.
 #[derive(Debug)]
@@ -1055,40 +1139,14 @@ impl MeshRuntime {
             .request(destination, FETCH_PATH, body, options)
             .await
             .map_err(FetchError::Transport)?;
-        if DispatchError::from_value(&outcome.value).is_some() {
-            return Err(FetchError::NotServed);
-        }
-        let entries = outcome.value.as_map().ok_or(FetchError::Malformed("map"))?;
-        if field(entries, "v").and_then(Value::as_u64) != Some(PEER_WIRE_VERSION) {
-            return Err(FetchError::Malformed("v"));
-        }
-        let status = field(entries, "status")
-            .and_then(text_of)
-            .ok_or(FetchError::Malformed("status"))?;
-        match status {
-            "ok" => {
-                let bytes = field(entries, "bytes")
-                    .and_then(bin_of)
-                    .ok_or(FetchError::Malformed("bytes"))?;
-                if bytes.len() as u64 > MAX_FETCH_FILE_BYTES {
-                    return Err(FetchError::Oversize { len: bytes.len() });
-                }
-                let size = field(entries, "size")
-                    .and_then(Value::as_u64)
-                    .ok_or(FetchError::Malformed("size"))?;
-                if size != bytes.len() as u64 {
-                    return Err(FetchError::Malformed("size"));
-                }
-                let sha256 = field(entries, "sha256")
-                    .and_then(bin32_of)
-                    .ok_or(FetchError::Malformed("sha256"))?;
-                let digest: [u8; 32] = Sha256::digest(bytes).into();
-                if digest != sha256 {
-                    return Err(FetchError::Corrupt);
-                }
+        match read_fetch_reply(&outcome.value)? {
+            FetchReply::Ok {
+                bytes,
+                size,
+                sha256: digest,
+            } => {
                 let staging = self.inbox_staging();
                 let peer_destination = destination.address_hash.to_hex_string();
-                let bytes = bytes.to_vec();
                 let staged = tokio::task::spawn_blocking(move || {
                     staging.stage(&peer_destination, &wire_path, &digest, &bytes)
                 })
@@ -1101,26 +1159,10 @@ impl MeshRuntime {
                     sha256: digest,
                 })
             }
-            "not_modified" => {
-                let sha256 = field(entries, "sha256")
-                    .and_then(bin32_of)
-                    .ok_or(FetchError::Malformed("sha256"))?;
-                Ok(Fetched::NotModified { sha256 })
-            }
-            "not_shared" => Ok(Fetched::NotShared),
-            "invalid_path" => {
-                let rule = field(entries, "rule")
-                    .and_then(rule_of)
-                    .ok_or(FetchError::Malformed("rule"))?;
-                Ok(Fetched::InvalidPath { rule })
-            }
-            "too_large" => {
-                let limit = field(entries, "limit")
-                    .and_then(Value::as_u64)
-                    .ok_or(FetchError::Malformed("limit"))?;
-                Ok(Fetched::TooLarge { limit })
-            }
-            _ => Err(FetchError::UnknownStatus),
+            FetchReply::NotModified { sha256 } => Ok(Fetched::NotModified { sha256 }),
+            FetchReply::NotShared => Ok(Fetched::NotShared),
+            FetchReply::InvalidPath { rule } => Ok(Fetched::InvalidPath { rule }),
+            FetchReply::TooLarge { limit } => Ok(Fetched::TooLarge { limit }),
         }
     }
 
