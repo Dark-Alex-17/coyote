@@ -2886,6 +2886,33 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
         );
     }
 
+    /// MESH-SEC-019 states why `/list` entries travel unfenced where fetched text does
+    /// not: the wire-path grammar of section 10.13 admits no character that could forge
+    /// a fence marker. Dropping the clause would leave the asymmetry unexplained, and
+    /// widening the grammar would make the clause false, so the paragraph is pinned to
+    /// both the clause and the section it leans on.
+    #[test]
+    fn sec_019_states_why_list_entries_are_returned_unfenced() {
+        let definition = SPEC
+            .lines()
+            .find(|line| line.starts_with("**[MESH-SEC-019]**"))
+            .expect("MESH-SEC-019 is defined");
+        for clause in [
+            "`/list` entries are returned unfenced",
+            "the wire-path grammar admitting no line terminator, control or invisible character",
+            "(section 10.13;",
+        ] {
+            assert!(
+                definition.contains(clause),
+                "{definition:?} lacks {clause:?}"
+            );
+        }
+        assert!(
+            SPEC.contains("### 10.13 Wire paths"),
+            "the clause names a section this document no longer has"
+        );
+    }
+
     /// Every field a store file reads under a `#[serde(default)]` is named on the
     /// MESH-CODE-005 line, by its on-disk key where the attribute renames it. The files
     /// are those of `ON_DISK_STRUCTS` in `schema.rs`: the stores plus `message.rs`, whose
