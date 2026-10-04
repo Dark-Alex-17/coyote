@@ -1369,6 +1369,28 @@ pub(crate) mod network {
                 .unwrap()
         }
 
+        /// Node B's transport asks node A's `path` proving `identity` instead of B's own,
+        /// the way `status_of_a` does: a second peer behind the same link endpoint.
+        pub(crate) async fn asks_a_as(
+            &self,
+            identity: &TransportIdentity,
+            path: &str,
+            body: Value,
+            options: RequestOptions,
+        ) -> RequestOutcome {
+            self.client_b
+                .request(
+                    &self.responder.transport,
+                    identity,
+                    &self.a_desc,
+                    path,
+                    self.responder.envelope(body),
+                    options,
+                )
+                .await
+                .unwrap()
+        }
+
         /// Arms node A's advertisement-time request cap, which production code leaves off,
         /// and trips it with an oversize request from B. The reject deadlocks A's transport
         /// (upstream rev 3ed5932 and release 0.12.0), which is what the bounded-wait tests need.

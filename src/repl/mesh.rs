@@ -21636,6 +21636,282 @@ mod tests {
                         fx.stop().await;
                     });
                 }
+
+                /// Usage probe (spec: "standing grants show up in `/list` for that identity
+                /// only"; `--workspace` lands in the workspace share file with `peer:` =
+                /// the requester's IDENTITY): the whole human→peer round trip over a real
+                /// link. The peer hears the decision as a reply with one `data` part
+                /// `{access:{status:"granted"}}` and no `expires`; its `/list` then shows
+                /// exactly the granted path and its `/fetch` is served every time (a rule,
+                /// not a one-off: no grant record is written); a second trusted identity
+                /// sees nothing in `/list` and its `/fetch` of the granted path is refused
+                /// byte for byte like a path that does not exist.
+                #[test]
+                #[serial]
+                fn usage_probe_a_standing_workspace_grant_is_listed_and_served_to_the_requesting_identity_only()
+                 {
+                    use crate::mesh::message::{PEER_WIRE_VERSION, from_r3_body};
+                    use crate::mesh::test_support::{
+                        FETCH_PATH, LIST_PATH, NodePair, ResponderScript as Script, fetch_body,
+                        short_options, trusting_b, wire_field, wire_status,
+                    };
+                    use rand_core::OsRng;
+                    use rns_transport::identity::PrivateIdentity as TransportIdentity;
+
+                    let _guard = TestConfigDirGuard::new("repl-mesh-grant-standing-live");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let stranger = TransportIdentity::new_from_rand(OsRng);
+                        let stranger_hex = stranger.as_identity().address_hash.to_hex_string();
+                        let pair = NodePair::start_with(
+                            "repl-mesh-grant-standing-live",
+                            |_| {},
+                            |responder| trusting_b(responder).identity(&stranger_hex, true),
+                        )
+                        .await;
+                        pair.introduce_b_to_a().await;
+                        let mut ctx = ctx_with(MeshConfig::default(), true);
+                        ctx.app.mesh.install(pair.node_a.clone()).unwrap();
+                        let workspace = TempDir::new("repl-mesh-grant-standing-live-root");
+                        fs::create_dir_all(workspace.path.join("docs")).unwrap();
+                        fs::write(workspace.path.join("docs/a.md"), b"# a\n").unwrap();
+                        fs::write(workspace.path.join("docs/b.md"), b"# b\n").unwrap();
+                        publish_root(&ctx, &workspace.path);
+                        let b_hex = pair.responder.desc.address_hash.to_hex_string();
+                        let b_identity = pair.responder.desc.identity.address_hash.to_hex_string();
+                        let now = SystemTime::now();
+                        ctx.app
+                            .mesh
+                            .inbound_store()
+                            .unwrap()
+                            .upsert(
+                                InboundRecord {
+                                    version: INBOUND_RECORD_VERSION,
+                                    id: "a-1".to_string(),
+                                    peer_destination: b_hex.clone(),
+                                    peer_identity: b_identity.clone(),
+                                    thread: "a-1".to_string(),
+                                    question: String::new(),
+                                    envoy_question: String::new(),
+                                    received_at: rfc3339_utc(now),
+                                    kind: InboundKind::Access,
+                                    paths: vec!["docs/a.md".to_string()],
+                                    reason: "need it".to_string(),
+                                },
+                                now,
+                            )
+                            .unwrap();
+                        let (_, locations) = share_locations(&ctx).unwrap();
+                        assert!(!locations.workspace.exists());
+                        assert!(!locations.global.exists());
+                        pair.recorder_b.queue(Script::Acknowledge);
+
+                        let out = out_of(&mut ctx, ".mesh grant a-1 --standing --workspace")
+                            .await
+                            .unwrap();
+
+                        // The human's side: the file named, the identity (never the destination).
+                        let last = out.lines().last().unwrap();
+                        assert!(
+                            last.starts_with(&format!(
+                                "Granted a-1: 1 path for {}, standing; written to {}",
+                                short(&b_hex),
+                                locations.workspace.display()
+                            )) && last.ends_with("(via direct)."),
+                            "{out}"
+                        );
+                        assert!(
+                            out.lines()
+                                .next()
+                                .unwrap()
+                                .contains(&format!("for identity {}.", short(&b_identity))),
+                            "{out}"
+                        );
+                        assert!(locations.workspace.exists());
+                        assert!(!locations.global.exists());
+                        let entries = ShareSet::load_quietly(locations.clone()).0.entries();
+                        assert_eq!(
+                            entries,
+                            [RawEntry {
+                                layer: Layer::Workspace,
+                                kind: RawKind::Allow {
+                                    pattern: "docs/a.md".to_string(),
+                                    peer: Some(b_identity.clone()),
+                                },
+                            }]
+                        );
+                        assert_ne!(
+                            b_identity, b_hex,
+                            "the fixture tells identity and destination apart"
+                        );
+                        assert!(pair.node_a.serving().grants().list().unwrap().is_empty());
+
+                        // The peer's side: the decision on the wire.
+                        let heard = from_r3_body(&pair.recorder_b.last_body()).unwrap();
+                        assert_eq!(heard.kind, PeerKind::Reply);
+                        assert_eq!(heard.in_reply_to.as_deref(), Some("a-1"));
+                        assert_eq!(
+                            heard.parts,
+                            [RawPart::Data {
+                                data: serde_json::json!({ "access": { "status": "granted" } })
+                            }]
+                        );
+                        assert_eq!(heard.content, "access granted: 1 path, standing");
+
+                        let list_body =
+                            || Value::Map(vec![(Value::from("v"), Value::from(PEER_WIRE_VERSION))]);
+                        let paths_of = |value: &Value| -> Vec<String> {
+                            wire_field(value, "entries")
+                                .and_then(Value::as_array)
+                                .unwrap_or_else(|| panic!("{value:?}"))
+                                .iter()
+                                .map(|entry| {
+                                    wire_field(entry, "path")
+                                        .and_then(Value::as_str)
+                                        .unwrap()
+                                        .to_string()
+                                })
+                                .collect()
+                        };
+                        let listed = pair.b_asks_a(LIST_PATH, list_body(), short_options()).await;
+                        assert_eq!(paths_of(&listed.value), ["docs/a.md"], "{:?}", listed.value);
+                        for round in 1..=2 {
+                            let served = pair
+                                .b_asks_a(
+                                    FETCH_PATH,
+                                    fetch_body("docs/a.md", None),
+                                    short_options(),
+                                )
+                                .await;
+                            assert_eq!(
+                                wire_status(&served.value),
+                                "ok",
+                                "round {round}: {:?}",
+                                served.value
+                            );
+                            assert_eq!(
+                                wire_field(&served.value, "bytes"),
+                                Some(&Value::Binary(b"# a\n".to_vec())),
+                                "a standing grant is a rule, served every time"
+                            );
+                        }
+                        let other = pair
+                            .b_asks_a(FETCH_PATH, fetch_body("docs/b.md", None), short_options())
+                            .await;
+                        assert_eq!(wire_status(&other.value), "not_shared");
+
+                        // Another trusted identity: nothing listed, the granted path refused
+                        // exactly like one that does not exist.
+                        let strangers_list = pair
+                            .asks_a_as(&stranger, LIST_PATH, list_body(), short_options())
+                            .await;
+                        assert_eq!(
+                            paths_of(&strangers_list.value),
+                            Vec::<String>::new(),
+                            "{:?}",
+                            strangers_list.value
+                        );
+                        let strangers_fetch = pair
+                            .asks_a_as(
+                                &stranger,
+                                FETCH_PATH,
+                                fetch_body("docs/a.md", None),
+                                short_options(),
+                            )
+                            .await;
+                        let strangers_missing = pair
+                            .asks_a_as(
+                                &stranger,
+                                FETCH_PATH,
+                                fetch_body("docs/missing.md", None),
+                                short_options(),
+                            )
+                            .await;
+                        assert_eq!(wire_status(&strangers_fetch.value), "not_shared");
+                        assert_eq!(strangers_fetch.value, strangers_missing.value);
+
+                        assert!(
+                            ctx.app
+                                .mesh
+                                .inbound_store()
+                                .unwrap()
+                                .list(SystemTime::now())
+                                .unwrap()
+                                .is_empty()
+                        );
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        pair.stop_node_a().await;
+                    });
+                }
+
+                /// Usage probe (`--for <dur>`, help: `[--for 30m|2h|1d]`): a compound such
+                /// as `29d23h` or `30d1m` is not in the grammar, so it is the duration
+                /// teaching, not the cap sentence, and nothing moves; the 30d cap is
+                /// inclusive in every unit, so `720h` and `43200m` are each granted until
+                /// exactly thirty days out.
+                #[test]
+                #[serial]
+                fn usage_probe_for_takes_one_unit_and_the_cap_is_inclusive_in_hours_and_minutes() {
+                    let _guard = TestConfigDirGuard::new("repl-mesh-grant-for-units");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let mut fx = PeerFixture::new("repl-mesh-grant-for-units").await;
+                        fx.file("a-1", InboundKind::Access, &["src/x.rs"]);
+                        fx.file("a-2", InboundKind::Access, &["src/x.rs"]);
+
+                        for text in ["29d23h", "30d1m", "1d12h", "0d", "1.5d"] {
+                            let line = format!(".mesh grant a-1 --for {text}");
+                            let printed = stdout_lines().len();
+                            assert_eq!(
+                                refusal(&mut fx.ctx, &line).await,
+                                format!(
+                                    "'{text}' is not a duration: use a whole number of days, hours or minutes, such as 30d, 12h or 90m."
+                                ),
+                                "{line}"
+                            );
+                            assert_eq!(stdout_lines().len(), printed, "{line} prints nothing");
+                        }
+                        assert!(fx.stub.seen().is_empty(), "{:?}", fx.stub.seen());
+                        assert!(fx.grants().is_empty());
+                        let mut ids = fx.pending_ids();
+                        ids.sort();
+                        assert_eq!(ids, ["a-1", "a-2"]);
+
+                        let thirty_days = Duration::from_secs(30 * 86_400);
+                        let slack = Duration::from_secs(5);
+                        for (id, text) in [("a-1", "720h"), ("a-2", "43200m")] {
+                            let before = SystemTime::now();
+                            let out =
+                                out_of(&mut fx.ctx, &format!(".mesh grant {id} --for {text}"))
+                                    .await
+                                    .unwrap();
+                            let grant = fx
+                                .grants()
+                                .into_iter()
+                                .find(|grant| grant.id == id)
+                                .unwrap_or_else(|| panic!("{text}: {:?}", fx.grants()));
+                            let expires = parse_rfc3339(&grant.expires).unwrap();
+                            assert!(
+                                expires >= before + thirty_days - slack
+                                    && expires <= before + thirty_days + slack,
+                                "{text}: {expires:?} is not about 30d after {before:?}"
+                            );
+                            assert!(
+                                out.ends_with(&format!(
+                                    "Granted {id}: 1 path for {} until {}, each fetchable once (via direct).",
+                                    fx.dest(),
+                                    grant.expires
+                                )),
+                                "{text}: {out}"
+                            );
+                        }
+                        assert!(fx.pending_ids().is_empty());
+                        assert_eq!(fx.stub.seen().len(), 2);
+                        fx.stop().await;
+                    });
+                }
             }
 
             mod attach {
@@ -23230,6 +23506,180 @@ mod tests {
                         assert!(fx.stub.seen().is_empty(), "{:?}", fx.stub.seen());
                         assert_eq!(fx.pending_ids(), ["q-1"]);
                         fx.stop().await;
+                    });
+                }
+
+                /// Usage probe (peer side of `--attach`): over a real link, a reference the
+                /// peer has already fetched once is refused with the `not_shared` reply a
+                /// path that never existed gets, byte for byte (no "it was here a moment
+                /// ago" oracle), and the lend leaves no rule behind for `/list`. An inline
+                /// attachment arrives as a `file` part with the bytes that, admitted through
+                /// the receiver's own `PeerMessage::new_with`, lands at
+                /// `<cache_dir>/mesh/inbox/<instance_id>/<dest8>/<name>` with the bytes the
+                /// human attached and no grant written on either side.
+                #[test]
+                #[serial]
+                fn usage_probe_a_spent_reference_refuses_like_a_missing_file_and_an_inline_file_stages_at_the_peer()
+                 {
+                    use crate::mesh::inbox::{InboxStaging, inbox_root};
+                    use crate::mesh::message::{
+                        PEER_WIRE_VERSION, Part, PartLimits, RawPeerMessage,
+                    };
+                    use crate::mesh::test_support::LIST_PATH;
+
+                    let _guard = TestConfigDirGuard::new("repl-mesh-attach-peer-side");
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let pair = NodePair::start_with(
+                            "repl-mesh-attach-peer-side",
+                            with_inline_max(1024),
+                            trusting_b,
+                        )
+                        .await;
+                        pair.introduce_b_to_a().await;
+                        let mut ctx = ctx_with(
+                            MeshConfig {
+                                fetch: MeshFetch {
+                                    inline_max_bytes: 1024,
+                                    ..Default::default()
+                                },
+                                ..MeshConfig::default()
+                            },
+                            true,
+                        );
+                        ctx.app.mesh.install(pair.node_a.clone()).unwrap();
+                        let workspace = TempDir::new("repl-mesh-attach-peer-side-root");
+                        let big = vec![0x5A; 1025];
+                        write(&workspace.path, "big.bin", &big);
+                        write(&workspace.path, "docs/notes.md", NOTES);
+                        publish_root(&ctx, &workspace.path);
+                        let b_hex = pair.responder.desc.address_hash.to_hex_string();
+                        let a_hex = pair.node_a.current_destination_hash();
+
+                        // Reference form: fetchable once, then refused like a missing path.
+                        pair.recorder_b.queue(Script::Acknowledge);
+                        let out = out_of(
+                            &mut ctx,
+                            &format!(".mesh reply {b_hex} --yes \"x\" --attach big.bin"),
+                        )
+                        .await
+                        .unwrap();
+                        assert!(
+                            out.lines()
+                                .any(|line| line == reference_line("big.bin", 1025, &b_hex)),
+                            "{out}"
+                        );
+                        let heard = from_r3_body(&pair.recorder_b.last_body()).unwrap();
+                        assert_eq!(heard.parts, [reference_part("big.bin", &big)]);
+                        assert_eq!(pair.node_a.serving().grants().list().unwrap().len(), 1);
+
+                        let served = pair
+                            .b_asks_a(FETCH_PATH, fetch_body("big.bin", None), short_options())
+                            .await;
+                        assert_eq!(wire_status(&served.value), "ok", "{:?}", served.value);
+                        assert_eq!(
+                            wire_field(&served.value, "bytes"),
+                            Some(&Value::Binary(big.clone()))
+                        );
+                        let spent = pair
+                            .b_asks_a(FETCH_PATH, fetch_body("big.bin", None), short_options())
+                            .await;
+                        let missing = pair
+                            .b_asks_a(FETCH_PATH, fetch_body("never.bin", None), short_options())
+                            .await;
+                        assert_eq!(wire_status(&spent.value), "not_shared");
+                        assert_eq!(
+                            spent.value, missing.value,
+                            "a spent lend and a missing path are not told apart"
+                        );
+                        let listed = pair
+                            .b_asks_a(
+                                LIST_PATH,
+                                Value::Map(vec![(
+                                    Value::from("v"),
+                                    Value::from(PEER_WIRE_VERSION),
+                                )]),
+                                short_options(),
+                            )
+                            .await;
+                        let listed_paths: Vec<&str> = wire_field(&listed.value, "entries")
+                            .and_then(Value::as_array)
+                            .unwrap_or_else(|| panic!("{:?}", listed.value))
+                            .iter()
+                            .map(|entry| wire_field(entry, "path").and_then(Value::as_str).unwrap())
+                            .collect();
+                        assert_eq!(listed_paths, Vec::<&str>::new(), "a lend is not a share");
+
+                        // Inline form: the bytes travel, and the receiver stages them.
+                        pair.recorder_b.queue(Script::Acknowledge);
+                        let out = out_of(
+                            &mut ctx,
+                            &format!(".mesh reply {b_hex} --yes \"y\" --attach docs/notes.md"),
+                        )
+                        .await
+                        .unwrap();
+                        assert!(
+                            out.lines().any(
+                                |line| line == inline_line("docs/notes.md", NOTES.len() as u64)
+                            ),
+                            "{out}"
+                        );
+                        let heard = from_r3_body(&pair.recorder_b.last_body()).unwrap();
+                        assert_eq!(heard.kind, PeerKind::Message);
+                        assert_eq!(heard.parts, [inline_part("docs/notes.md", NOTES)]);
+                        assert_eq!(
+                            pair.node_a.serving().grants().list().unwrap().len(),
+                            1,
+                            "inline earns no grant; only the earlier lend stands"
+                        );
+
+                        let peer_cache = TempDir::new("repl-mesh-attach-peer-side-cache");
+                        let staging =
+                            InboxStaging::for_instance_under(None, &peer_cache.path, "peer-inst");
+                        let raw = RawPeerMessage {
+                            source_identity: pair.node_a.fingerprint().to_string(),
+                            source_destination: a_hex.clone(),
+                            destination: b_hex.clone(),
+                            title: heard.title.clone(),
+                            content: heard.content.clone(),
+                            fields: heard.fields.clone(),
+                            timestamp: heard.timestamp,
+                            message_id: heard.id.clone(),
+                            in_reply_to: heard.in_reply_to.clone(),
+                            kind: heard.kind,
+                            via: PeerVia::Direct,
+                            thread: heard.thread.clone(),
+                            disposition: heard.disposition,
+                            retry_after: heard.retry_after,
+                            parts: heard.parts.clone(),
+                            dropped_parts: heard.dropped_parts,
+                        };
+                        let landed = tokio::task::spawn_blocking(move || {
+                            PeerMessage::new_with(raw, &PartLimits::default(), Some(&staging))
+                        })
+                        .await
+                        .unwrap();
+                        let expected =
+                            dunce::canonicalize(inbox_root(&peer_cache.path, "peer-inst"))
+                                .unwrap()
+                                .join(a_hex[..8].to_ascii_lowercase())
+                                .join("docs")
+                                .join("notes.md");
+                        assert_eq!(
+                            landed.parts,
+                            [Part::File {
+                                name: "docs/notes.md".to_string(),
+                                size: NOTES.len() as u64,
+                                sha256: hex_lower(&Sha256::digest(NOTES)),
+                                staged: Some(expected.clone()),
+                                reference: None,
+                            }]
+                        );
+                        assert_eq!(landed.dropped_parts, 0);
+                        assert_eq!(fs::read(&expected).unwrap(), NOTES);
+                        assert_eq!(landed.content, "y");
+                        pair.stop_node_a().await;
                     });
                 }
             }
