@@ -1057,17 +1057,17 @@ fn without(text: &str, from: usize, to: usize) -> String {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AttachForm {
+pub(crate) enum AttachForm {
     Inline,
     Reference,
 }
 
 /// The one file `--attach` names, shaped as the part that carries it.
-struct Attachment {
-    part: RawPart,
-    name: String,
-    size: u64,
-    form: AttachForm,
+pub(crate) struct Attachment {
+    pub(crate) part: RawPart,
+    pub(crate) name: String,
+    pub(crate) size: u64,
+    pub(crate) form: AttachForm,
 }
 
 fn prepared_attachment(
@@ -1102,7 +1102,7 @@ fn parts_of(attachment: Option<Attachment>) -> Vec<RawPart> {
 /// what delivers the file, so one the serving side would refuse, by size or by a rule
 /// the one-off grant never lifts, or because the share list itself was refused at load,
 /// is refused here rather than sent as a dead reference.
-fn attachment(
+pub(crate) fn attachment(
     ctx: &RequestContext,
     path_text: &str,
     force: bool,
