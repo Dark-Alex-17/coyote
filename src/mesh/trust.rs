@@ -3145,12 +3145,15 @@ mod tests {
         assert!(!err.contains("upgrade Coyote"), "{err}");
     }
 
-    /// Usage probe for T33 (e): a `trust.yaml` the pre-SCOPE build wrote (a well-formed
+    /// Usage probe: a `trust.yaml` the pre-SCOPE build wrote (a well-formed
     /// version-1 file whose destination hashes derive from the old application name) is
     /// refused with a clear message, never opened as an empty trust list.
     #[test]
     fn usage_probe_open_refuses_a_well_formed_version_1_trust_file_written_before_scope() {
-        assert_eq!(TRUST_FILE_VERSION, 2, "T33 bumps the trust file 1 -> 2");
+        assert_eq!(
+            TRUST_FILE_VERSION, 2,
+            "the SCOPE wire rename bumps the trust file 1 -> 2"
+        );
         let tmp = TempDir::new("trust-pre-scope-v1");
         let path = mesh_config_dir(&tmp.path).join("trust.yaml");
         fs::create_dir_all(path.parent().unwrap()).unwrap();

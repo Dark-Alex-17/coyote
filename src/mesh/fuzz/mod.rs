@@ -663,7 +663,7 @@ fn fuzz_codec_corpus_files_carrying_wire_identifiers_are_built_from_the_live_con
     }
 }
 
-/// Usage probe for T33 (a)/B2: the decoder and the fuzz oracle both read the version at a
+/// Usage probe: the decoder and the fuzz oracle both read the version at a
 /// magic-length-relative offset. Every prefix of a valid announce, the exact one-short
 /// header (magic + 1 byte) and the exact header (magic + 2 bytes) must agree between the
 /// two, and the header-only announce must decode as its big-endian version with no name;

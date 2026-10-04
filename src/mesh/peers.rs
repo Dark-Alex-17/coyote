@@ -839,12 +839,15 @@ mod tests {
         assert_version_is_refused("peers-older", 0, "no migration");
     }
 
-    /// Usage probe for T33 (e): the `peers.json` a pre-SCOPE build wrote is a well-formed
+    /// Usage probe: the `peers.json` a pre-SCOPE build wrote is a well-formed
     /// version-1 table whose destination hashes derive from the old application name. It
     /// must be refused with a clear message, not loaded as an empty table.
     #[test]
     fn usage_probe_load_refuses_a_well_formed_version_1_table_written_before_scope() {
-        assert_eq!(PEER_TABLE_VERSION, 2, "T33 bumps the peer table 1 -> 2");
+        assert_eq!(
+            PEER_TABLE_VERSION, 2,
+            "the SCOPE wire rename bumps the peer table 1 -> 2"
+        );
         assert_version_is_refused("peers-pre-scope-v1", 1, "no migration");
     }
 }

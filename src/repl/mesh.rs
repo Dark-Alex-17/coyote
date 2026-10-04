@@ -6809,7 +6809,7 @@ mod tests {
             assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
         }
 
-        /// Usage probe (TASK-100 (c)): "reports counts" means every counter of the report
+        /// Usage probe: "reports counts" means every counter of the report
         /// is on the line, with the node named by its short hash, so a human can tell
         /// listed-but-unwanted from received-but-deferred without reading logs.
         #[test]
@@ -12578,7 +12578,7 @@ mod tests {
                 });
             }
 
-            /// Usage probe (TASK-100 (d)): like every consenting verb, a knock without a
+            /// Usage probe: like every consenting verb, a knock without a
             /// terminal and without `--yes` is refused naming the flag, after the notice
             /// but before anything is sent; the intro bound is enforced BEFORE consent is
             /// even considered (an over-long intro is refused with no notice and no prompt).
@@ -12635,7 +12635,7 @@ mod tests {
                 });
             }
 
-            /// Usage probe (TASK-100 (d)): a knock is NOT gated on this node's trust of the
+            /// Usage probe: a knock is NOT gated on this node's trust of the
             /// peer. The same heard-but-untrusted destination that `.mesh reply` refuses
             /// with the trust tail reaches the knock's consent notice, and an intro of
             /// exactly the bound is accepted.
@@ -12739,7 +12739,7 @@ mod tests {
                 });
             }
 
-            /// Usage probe (TASK-100 knock ruling): only denied/blocked stand in a knock's
+            /// Usage probe (knock ruling): only denied/blocked stand in a knock's
             /// way. An instance heard under a NEW key (marked `key changed` in the peer
             /// table; `authorize` judges it default-closed, which refuses `.mesh reply`) is
             /// still knockable: the notice shows `trust: untrusted` and the question is
@@ -12876,7 +12876,7 @@ mod tests {
                 .unwrap()
             }
 
-            /// Usage probe (T33 (e), at the consumer surface): a trust file written before
+            /// Usage probe (at the consumer surface): a trust file written before
             /// the rename is not "silently empty" — `.mesh on` itself refuses, the message
             /// names the file, both versions and the remedy, the mesh stays off with no
             /// tools exposed, and the file is left exactly as it was. The relay port is
@@ -12928,7 +12928,7 @@ mod tests {
                 });
             }
 
-            /// Usage probe (T33 (e), at the consumer surface): the peer table lives in the
+            /// Usage probe (at the consumer surface): the peer table lives in the
             /// cache and is loaded by the start too; one written before the rename
             /// (`"version":1`, the table is at `2` now) refuses `.mesh on` by name, with the
             /// mesh staying off and the table untouched.
@@ -12970,7 +12970,7 @@ mod tests {
                 });
             }
 
-            /// Usage probe (T33 (e), at the consumer surface): the knock cache is read
+            /// Usage probe (at the consumer surface): the knock cache is read
             /// lazily, so a pre-rename line (`"version":1`; records are at `2` now) surfaces
             /// at `.mesh knocks` — by file and line, naming both versions and the remedy —
             /// instead of listing nothing. The node itself keeps running (the cache is not
@@ -21213,11 +21213,11 @@ mod tests {
                     });
                 }
 
-                /// Usage probe (T32b (a), TASK-115 write rule): a standing grant lands in
-                /// the workspace share file when one exists, `--global` forces the global
-                /// file beside it, and `--workspace` creates the workspace file when it is
-                /// missing. Each entry is scoped to the requesting identity and the layer
-                /// is announced the way `.mesh allow` announces it.
+                /// Usage probe: a standing grant lands in the share file the write rule
+                /// names — the workspace share file when one exists, the global file beside
+                /// it under `--global`, and a freshly created workspace file under
+                /// `--workspace` when it is missing. Each entry is scoped to the requesting
+                /// identity and the layer is announced the way `.mesh allow` announces it.
                 #[test]
                 #[serial]
                 fn usage_probe_grant_standing_follows_the_share_write_rule_and_its_forcing_flags() {
@@ -22437,7 +22437,7 @@ mod tests {
                     });
                 }
 
-                /// Usage probe (T32b (b): "size ≤ inline_max_bytes ⇒ inline"): a file of
+                /// Usage probe ("size ≤ inline_max_bytes ⇒ inline"): a file of
                 /// exactly `inline_max_bytes` travels inline and earns no grant; one byte
                 /// more is a reference with a one-off grant.
                 #[test]
@@ -22491,7 +22491,7 @@ mod tests {
                     });
                 }
 
-                /// Usage probe (T32b (b) on `answer`): a large attachment on an answer is a
+                /// Usage probe (attachment on `answer`): a large attachment on an answer is a
                 /// reference part plus a one-off grant to the asking instance, the reply is
                 /// threaded to the question, the question is closed, and the envoy never
                 /// sees it.
@@ -22559,7 +22559,7 @@ mod tests {
                     });
                 }
 
-                /// Usage probe (T32b (b): "the protected set (… inbox) refuses even with
+                /// Usage probe ("the protected set (… inbox) refuses even with
                 /// `--force`"): with `mesh.fetch.inbox_dir` placed under the share root, a
                 /// staged peer file cannot be attached, forced or not, and nothing is sent.
                 #[test]
@@ -23636,7 +23636,7 @@ mod tests {
                     });
                 }
 
-                /// Usage probe (T32b (a): "maps every `Fetched`/`FetchError` outcome to a
+                /// Usage probe ("maps every `Fetched`/`FetchError` outcome to a
                 /// human teaching sentence carrying the same facts as `mesh__fetch`'s"):
                 /// bytes that do not hash as the peer said, a status word this Coyote does
                 /// not know, and a reply missing its bytes each end in one sentence that
@@ -23699,7 +23699,7 @@ mod tests {
                     });
                 }
 
-                /// Usage probe (T32b (a): "into the SAME staging inbox the tool uses" +
+                /// Usage probe ("into the SAME staging inbox the tool uses" +
                 /// "prints the staged absolute path"): a second fetch of a path whose bytes
                 /// changed lands beside the first copy under the inbox's hash-suffixed
                 /// name, the printed path is that real path, and an unchanged re-fetch
@@ -24100,7 +24100,7 @@ mod tests {
                     assert!(stdout_lines().is_empty(), "{:?}", stdout_lines());
                 }
 
-                /// Usage probe (T32b (j): "a symlinked root or instance dir is never
+                /// Usage probe ("a symlinked root or instance dir is never
                 /// followed"): when the inbox ROOT itself (`<cache>/mesh/inbox`) is a
                 /// symlink to a directory holding this instance's files, nothing behind
                 /// the link is counted, confirmed or removed.
@@ -24157,7 +24157,7 @@ mod tests {
                     });
                 }
 
-                /// Usage probe (T32b (j): "nothing else under the inbox root is touched"
+                /// Usage probe ("nothing else under the inbox root is touched"
                 /// + "never followed"): a directory symlink inside this instance's tree is
                 /// removed as a link; the directory it points to, and its files, survive
                 /// and are not part of the count or the byte total.

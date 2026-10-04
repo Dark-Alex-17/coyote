@@ -2113,7 +2113,7 @@ mod tests {
         source.remove_dir();
     }
 
-    // ---- usage-probe (TASK-083) spec-first additions -----------------------------------
+    // ---- usage-probe spec-first additions ----------------------------------------------
 
     /// A job whose sender is `source_destination`/`source_identity`, for tests that watch
     /// the reply arrive at a live peer instead of in the mesh-off inbox.

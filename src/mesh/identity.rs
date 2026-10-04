@@ -1494,7 +1494,7 @@ mod tests {
 
     #[test]
     fn usage_probe_a_version_1_predecessors_line_written_before_scope_still_loads() {
-        // T33 (SCOPE wire rename) bumps trust/peers/knocks 1 -> 2 and MUST NOT bump
+        // The SCOPE wire rename bumps trust/peers/knocks 1 -> 2 and MUST NOT bump
         // `PREDECESSOR_RECORD_VERSION`: a history file written on the build before the
         // rename, spelled with a literal `"version":1` (not the constant, which a wrongful
         // bump would follow silently), still loads with its line intact.

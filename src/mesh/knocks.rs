@@ -924,13 +924,16 @@ mod tests {
         assert!(!err.contains("upgrade Coyote"), "{err}");
     }
 
-    /// Usage probe for T33 (e): a `knocks.jsonl` line the pre-SCOPE build wrote (a
+    /// Usage probe: a `knocks.jsonl` line the pre-SCOPE build wrote (a
     /// well-formed version-1 record whose hashes derive from the old application name)
     /// refuses the cache with a clear message, on listing and on the next append, rather
     /// than reading as an empty cache or being silently skipped.
     #[test]
     fn usage_probe_a_well_formed_version_1_record_written_before_scope_refuses_the_cache() {
-        assert_eq!(KNOCK_RECORD_VERSION, 2, "T33 bumps the knock record 1 -> 2");
+        assert_eq!(
+            KNOCK_RECORD_VERSION, 2,
+            "the SCOPE wire rename bumps the knock record 1 -> 2"
+        );
         let tmp = TempDir::new("knocks-pre-scope-v1");
         let cache = KnockCache::new(&tmp.path, 24);
         let mut old = serde_json::to_value(knock("pre-scope", t(1_000))).unwrap();

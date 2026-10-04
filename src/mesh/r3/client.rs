@@ -573,7 +573,7 @@ impl R3Client {
             }
             // Deliberately not fast-failed yet: a peer that rejects the advertisement waits
             // out the request deadline. Changing that alters the wedge-test expectations and
-            // is tracked as a TASK-063 follow-up; the arm is named so it cannot hide in `_`.
+            // is tracked as a follow-up; the arm is named so it cannot hide in `_`.
             ResourceEventKind::OutboundRejected => {}
             _ => {}
         }

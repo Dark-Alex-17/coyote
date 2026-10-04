@@ -2067,7 +2067,7 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
         );
     }
 
-    /// Usage probe for T33 (b)/B2: the protocol spec's definition and table rows spell
+    /// Usage probe: the protocol spec's definition and table rows spell
     /// the SCOPE wire identifiers everywhere. Nothing is released, so there is no
     /// "formerly" form to allow: the pre-SCOPE announce magic (as text or as its hex
     /// bytes), the old `<app>.mesh` destination name in any spelling of application and
@@ -2158,9 +2158,9 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
         );
     }
 
-    /// Usage probe (TASK-116 90e48e1): the narrowed needle is still red-capable for every
-    /// withdrawn SYNC sentence, is a strict narrowing of the old bare `.mesh fetch` pin, and
-    /// spares the sentences TASK-118 will write for the FILE verb.
+    /// Usage probe: the narrowed needle is still red-capable for every withdrawn SYNC
+    /// sentence, is a strict narrowing of the old bare `.mesh fetch` pin, and spares the
+    /// sentences the FILE verb will carry in the spec.
     #[test]
     fn usage_probe_sync_needle_trips_the_withdrawn_sentences_and_spares_the_file_verb() {
         for phrase in WITHDRAWN_SYNC_PHRASINGS {
@@ -2202,7 +2202,7 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
         ));
     }
 
-    /// Usage probe for T33 (a)/B2: section 5.1's layout line, every offset the field
+    /// Usage probe: section 5.1's layout line, every offset the field
     /// table spells, and both worked hex examples are derived from the live five-byte
     /// magic, not left at the old four-byte arithmetic. The examples must round-trip
     /// through the live codec to exactly the version and name the prose gives them.
