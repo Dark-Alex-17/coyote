@@ -2851,11 +2851,48 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
         );
     }
 
+    /// The `/fetch` worked example spells the protocol's file bound in its `too_large`
+    /// line, and the sentence under it names the limit the reference answers while the
+    /// single-segment ceiling stands, so dropping the ceiling or moving it moves the note.
+    #[test]
+    fn fetch_example_notes_the_live_ceiling_under_the_protocol_bound() {
+        let lines: Vec<&str> = SPEC.lines().collect();
+        let example = lines
+            .iter()
+            .position(|line| line.contains(r#""status": "too_large", "limit": "#))
+            .expect("the /fetch example has a too_large line");
+        assert!(
+            lines[example].ends_with(&format!(r#""limit": {MAX_FETCH_FILE_BYTES} }}"#)),
+            "{:?}",
+            lines[example]
+        );
+        assert_eq!(
+            lines[example + 1],
+            "```",
+            "the too_large line closes the example"
+        );
+        let note = lines[example + 3];
+        assert_eq!(lines[example + 2], "", "{note:?}");
+        for needle in [
+            "`SINGLE_SEGMENT_FETCH_CEILING`",
+            "MESH-LEN-007",
+            &format!("`limit: {}`", fetch::SINGLE_SEGMENT_FETCH_CEILING),
+        ] {
+            assert!(note.contains(needle), "{note:?} lacks {needle:?}");
+        }
+        assert!(
+            !note.contains(&MAX_FETCH_FILE_BYTES.to_string()),
+            "the note names the ceiling, not the bound the example already spells: {note:?}"
+        );
+    }
+
     /// Every field a store file reads under a `#[serde(default)]` is named on the
     /// MESH-CODE-005 line, by its on-disk key where the attribute renames it. The files
     /// are those of `ON_DISK_STRUCTS` in `schema.rs`: the stores plus `message.rs`, whose
     /// `PeerMessage` and `Part` ride inside a pending record; none of them holds a
-    /// wire-only struct with a default.
+    /// wire-only struct with a default. The line also states the one exception to the
+    /// bump rule, an additive default that reads an older record as what it was, and
+    /// names MESH-SCHEMA-003 as its instance, so the two paragraphs cannot drift apart.
     #[test]
     fn code_005_names_every_on_disk_serde_default_field() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -2918,6 +2955,42 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
             .filter(|field| !definition.contains(&format!("`{field}`")))
             .collect();
         assert_eq!(missing, Vec::<&String>::new());
+
+        for clause in [
+            "a field removed, renamed or retyped, or a field added without a default, MUST bump the store's constant",
+            "a field added with a `#[serde(default)]` whose default is the only value an older record could have held MAY land inside the version (MESH-SCHEMA-003 is the instance)",
+        ] {
+            assert!(
+                definition.contains(clause),
+                "{definition:?} lacks {clause:?}"
+            );
+        }
+        assert!(
+            !definition.contains("a field added included"),
+            "the unconditional bump rule is back: {definition:?}"
+        );
+        let instance = SPEC
+            .lines()
+            .find(|line| line.starts_with("**[MESH-SCHEMA-003]**"))
+            .expect("MESH-SCHEMA-003 is defined");
+        let additive = ["kind", "paths", "reason"];
+        for field in additive {
+            assert!(
+                fields.contains(field),
+                "pending.rs no longer defaults `{field}`"
+            );
+            assert!(instance.contains(&format!("`{field}`")), "{instance:?}");
+        }
+        assert!(
+            instance.contains("`INBOUND_RECORD_VERSION` = `2`")
+                && instance.contains("without `kind`, `paths` or `reason`"),
+            "{instance:?}"
+        );
+        assert!(
+            definition
+                .contains("on an inbound record `kind`, `paths` and `reason` (MESH-SCHEMA-003)"),
+            "{definition:?}"
+        );
     }
 
     #[test]
