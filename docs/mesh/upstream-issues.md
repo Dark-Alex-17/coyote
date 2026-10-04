@@ -55,9 +55,12 @@ well-formed request on the same link and assert it is served.
 #### What this crate does meanwhile
 
 Production code sets no advertisement-time cap and no response size limit. Inbound requests and
-responses are bounded on this side after assembly instead, at `MAX_R3_PAYLOAD_BYTES`
-(`R3Server::dispatch`, `R3Client::deliver`), with the upstream 64 MiB advertisement cap as the
-only bound before that. The cap setter is reachable from tests only (`arm_request_cap_for_test`).
+responses are bounded on this side after assembly instead, per path: a request at
+`MAX_R3_PAYLOAD_BYTES` (`R3Server::dispatch`), a response at `MAX_FETCH_RESPONSE_BYTES` when it
+answers a `/fetch` and `MAX_R3_PAYLOAD_BYTES` otherwise, the path read off the pending request
+the frame's fixed prefix names before the frame is decoded (`R3Client::deliver`), with the
+upstream 64 MiB advertisement cap as the only bound before that. The cap setter is reachable
+from tests only (`arm_request_cap_for_test`).
 Removal condition: when the pinned transport sends the reject outside the lock, re-arm the cap
 and keep the post-assembly bound as the second line.
 

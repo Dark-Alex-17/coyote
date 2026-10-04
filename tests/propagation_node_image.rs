@@ -55,6 +55,10 @@ const LXMF_VERSION: &str = "0.9.6";
 /// The warning lxmd 0.9.6 logs when `auth_required = yes` and the allowed list
 /// is empty (the typo is upstream's). The README quotes it verbatim.
 const EMPTY_ALLOWED_WARNING: &str = "Clint authentication was enabled, but no identity hashes could be loaded from /data/lxmd/allowed. Nobody will be able to sync messages from this propagation node.";
+/// The paths `scripts/mesh-interop/README.md` says the reference peer leaves to the
+/// in-process conformance pair; compared with the README's line wrapping collapsed.
+const REFERENCE_PEER_GAP: &str =
+    "The reference peer does not implement `/knock`, `/list`, `/fetch` or `/access`;";
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -109,6 +113,14 @@ fn dockerfile_pins_the_versions_the_interop_harness_is_verified_against() {
         interop_readme.contains(&format!("`{RNS_VERSION}`"))
             && interop_readme.contains(&format!("`{LXMF_VERSION}`")),
         "scripts/mesh-interop/README.md no longer names RNS {RNS_VERSION} / LXMF {LXMF_VERSION}; the image pins must move with it"
+    );
+    let unwrapped = interop_readme
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        unwrapped.contains(REFERENCE_PEER_GAP),
+        "scripts/mesh-interop/README.md no longer says {REFERENCE_PEER_GAP:?}"
     );
 }
 

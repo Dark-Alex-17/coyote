@@ -6913,7 +6913,7 @@ pub(crate) mod network {
 
     // ---- spec-first tests written from the wire contract, not from the handler ----
 
-    /// G8 + I4 (MESH-ENV-027): `/access` is always registered, so an instance whose
+    /// MESH-ENV-027: `/access` is always registered, so an instance whose
     /// identity this node has no standing for meets the trust gate, not an unknown-path
     /// refusal: silence before a byte of the body is decoded, exactly as on `/status`,
     /// `/list` and `/fetch`; nothing filed, no human line, no access hook. A shared path
@@ -8110,7 +8110,7 @@ pub(crate) mod network {
         pair.stop_node_a().await;
     }
 
-    /// B6: a one-off grant is per PATH — one use each, spent independently. Fetching
+    /// A one-off grant is per PATH — one use each, spent independently. Fetching
     /// the first path twice spends only that path; the second path is still served
     /// once, then not.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

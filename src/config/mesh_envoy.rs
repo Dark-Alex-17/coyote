@@ -1535,7 +1535,7 @@ mod tests {
         );
     }
 
-    /// I7: file bytes never traverse a model. Whatever the run came to, and whether or
+    /// File bytes never traverse a model. Whatever the run came to, and whether or
     /// not the human took the question, what goes back is words in the asker's thread
     /// with no part. Every reply names its disposition; only a refusal the human did not
     /// override carries a retry hint and fields, since it is not the envoy's answer.

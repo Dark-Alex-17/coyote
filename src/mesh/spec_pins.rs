@@ -16,6 +16,9 @@ const UPSTREAM_ISSUES: &str = include_str!(concat!(
 ));
 
 const EXPECTED_H1: &str = "# SCOPE — Session Coordination & Presence Exchange";
+const EXPECTED_TAGLINE: &str = "\"SCOPE is a peer protocol by which running LLM sessions announce presence, share status, and exchange messages on their owners' behalf, over Reticulum, without a broker.\"";
+const INTRODUCTION_HEADING: &str = "## 1. Introduction and scope";
+const AREAS_SENTENCE_OPEN: &str = "Requirement ids have the form";
 const SECTION_COUNT: usize = 21;
 const CODE_POINT_HEADING: &str = "## 13. Code-point immutability";
 const ON_DISK_SCHEMA_KIND: &str = "on-disk schema version";
@@ -1015,6 +1018,7 @@ mod tests {
         MAX_INLINE_FILE_TOTAL,
     };
     use crate::config::mesh_envoy::ENVOY_RUN_TIMEOUT_SECS;
+    use crate::function::mesh::FETCH_INLINE_TEXT_MAX_BYTES;
     use crate::mesh::message::{MAX_PARTS, MAX_PARTS_BYTES};
     use crate::mesh::r3::{
         MAX_FETCH_RESPONSE_BYTES, RESPONSE_FRAME_PREFIX, RefusalCode, RequestId, ResponseFrame,
@@ -1029,7 +1033,7 @@ mod tests {
     use rns_transport::hash::ADDRESS_HASH_SIZE;
     use std::time::Duration;
 
-    const EXPECTED_LITERALS: &str = r#"1,1,10,16,262144,128,"/knock","/status","/message",30,10,10,2,20,16,0xf0,0xf1,0xf3,0xf4,0xf5,0xf6,0xfd,0xfe,"SCOPE",64,300,900,3,2700,1800,1024,"scope.knock/1",200,15,10,256,3,600,256,16,1,0,1,2,64,280,64,64,120,280,"scope.peer/1",1,120,4000,64,4096,8,15,10,604800,256,3600,120,256,1,60,100000,120,26,60,2,60,1024,64,240,131072,112,4096,15552000,3,900,256,0,32,0xfb,0xfc,8,64,256,64,8,2,2,2,2,1,2,1,8,106496,98304,65536,"/list","/fetch",1024,64,1000,100000,64,2048,120,128,1048447,4194304,4194304,4198400,92 c4 10,200,16,32,"/access","scope.access/1",16,500,5,900,1,1,1,16"#;
+    const EXPECTED_LITERALS: &str = r#"1,1,10,16,262144,128,"/knock","/status","/message",30,10,10,2,20,16,0xf0,0xf1,0xf3,0xf4,0xf5,0xf6,0xfd,0xfe,"SCOPE",64,300,900,3,2700,1800,1024,"scope.knock/1",200,15,10,256,3,600,256,16,1,0,1,2,64,280,64,64,120,280,"scope.peer/1",1,120,4000,64,4096,8,15,10,604800,256,3600,120,256,1,60,100000,120,26,60,2,60,1024,64,240,131072,112,4096,15552000,3,900,256,0,32,0xfb,0xfc,8,64,256,64,8,2,2,2,2,1,2,1,8,106496,98304,65536,"/list","/fetch",1024,64,1000,100000,64,2048,120,128,1048447,4194304,4194304,4198400,92 c4 10,200,16,32,"/access","scope.access/1",16,500,5,900,1,1,1,16,32768"#;
 
     fn expected_constants() -> Vec<(&'static str, String)> {
         let secs = |d: Duration| d.as_secs().to_string();
@@ -1363,6 +1367,10 @@ mod tests {
             ),
             ("DEFAULT_GRANT_USES", grants::DEFAULT_GRANT_USES.to_string()),
             ("GRANT_MAX_PATHS", grants::GRANT_MAX_PATHS.to_string()),
+            (
+                "FETCH_INLINE_TEXT_MAX_BYTES",
+                FETCH_INLINE_TEXT_MAX_BYTES.to_string(),
+            ),
         ]
     }
 
@@ -2090,6 +2098,56 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
     }
 
     #[test]
+    fn spec_opens_with_the_tagline_and_defines_a_session() {
+        let mut lines = SPEC.lines();
+        assert_eq!(lines.next(), Some(EXPECTED_H1));
+        let opening = lines
+            .find(|line| !line.trim().is_empty())
+            .expect("a line after the H1");
+        assert!(
+            opening.starts_with(EXPECTED_TAGLINE),
+            "the spec no longer opens with the tagline: {opening:?}"
+        );
+        assert!(
+            opening.contains("A session is"),
+            "the opening line no longer defines a session: {opening:?}"
+        );
+    }
+
+    /// The reference implementation is named once, where section 1 says what it is;
+    /// everywhere else the text speaks of sessions, nodes, requesters and responders.
+    #[test]
+    fn coyote_is_named_once_in_the_introduction() {
+        // Assembled at runtime so the mesh source guard does not match this test's text.
+        let name = ["Coy", "ote"].concat();
+        let prose = strip_code(SPEC);
+        let everywhere = prose.matches(name.as_str()).count();
+        assert_eq!(
+            everywhere, 1,
+            "{name} is named {everywhere} times outside code"
+        );
+        let introduction = section(&prose, INTRODUCTION_HEADING).unwrap();
+        assert_eq!(
+            introduction.content.matches(name.as_str()).count(),
+            1,
+            "{name} is not named under {INTRODUCTION_HEADING:?}"
+        );
+    }
+
+    #[test]
+    fn the_areas_sentence_names_every_area_token() {
+        let sentence = SPEC
+            .lines()
+            .find(|line| line.starts_with(AREAS_SENTENCE_OPEN))
+            .unwrap_or_else(|| panic!("no line starts with {AREAS_SENTENCE_OPEN:?}"));
+        let missing: Vec<&str> = AREAS
+            .into_iter()
+            .filter(|area| !sentence.contains(&format!("`{area}`")))
+            .collect();
+        assert!(missing.is_empty(), "the areas sentence omits {missing:?}");
+    }
+
+    #[test]
     fn spec_has_the_bcp14_boilerplate() {
         check_boilerplate(SPEC).unwrap();
     }
@@ -2154,7 +2212,8 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
     /// the SCOPE wire identifiers everywhere. Nothing is released, so there is no
     /// "formerly" form to allow: the pre-SCOPE announce magic (as text or as its hex
     /// bytes), the old `<app>.mesh` destination name in any spelling of application and
-    /// aspect, and the old `<app>.<kind>/1` LXMF type tags may not appear on any line.
+    /// aspect, the old `<app>.<kind>/1` LXMF type tags and the bare `<app>.` prefix may
+    /// not appear on any line.
     #[test]
     fn usage_probe_spec_spells_no_pre_scope_wire_identifier() {
         // Assembled at runtime so the mesh source guard does not match this test's text.
@@ -2162,6 +2221,7 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
         let needles = [
             ["COY", "M"].concat(),
             "43 4f 59 4d".to_string(),
+            format!("{old_app}."),
             format!("{old_app}.mesh"),
             format!("{old_app}.peer/"),
             format!("{old_app}.knock/"),

@@ -70,7 +70,9 @@ impl PendingState {
 /// One line of `pending-<instance_id>.jsonl`. The shape is a stable on-disk record other
 /// code reads back. It rejects fields it does not know, so any change to the layout, a
 /// field added included, bumps `PENDING_RECORD_VERSION` and a reader refuses the whole
-/// file on a version it does not write.
+/// file on a version it does not write. `reply` is the exception, carried with a
+/// `#[serde(default)]` and skipped when `None`: a line without one loads as a question
+/// not yet answered, which is what it is.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PendingRecord {
@@ -319,7 +321,7 @@ pub(crate) fn question_not_an_access_request(id: &str) -> String {
 /// One line of `inbound-<instance_id>.jsonl`: a question a peer asked that the envoy
 /// could not answer on its own, waiting on the person at the keyboard. The same on-disk
 /// discipline as `PendingRecord`: unknown fields are rejected and any layout change bumps
-/// `INBOUND_RECORD_VERSION`. `kind`, `paths` and `reason` are the one exception, added
+/// `INBOUND_RECORD_VERSION`. `kind`, `paths` and `reason` are the exception, added
 /// within version 2 with a `#[serde(default)]`: a record written before they existed
 /// loads as a question with no paths and no reason, which is what it was.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
