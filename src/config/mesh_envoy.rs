@@ -61,7 +61,7 @@ pub(crate) const ENVOY_ESCALATION_POLL: Duration = Duration::from_millis(100);
 const ENVOY_STOP_GRACE: Duration = Duration::from_secs(5);
 /// The envoy's final text leads with this when it will not handle the request; the
 /// words after it are what the peer hears.
-const REFUSAL_MARKER: &str = "REFUSED:";
+pub(crate) const REFUSAL_MARKER: &str = "REFUSED:";
 /// What the peer hears for a marker with no words after it.
 const DECLINED_FALLBACK_TEXT: &str = "this node will not handle that request";
 
@@ -686,7 +686,9 @@ impl EnvoyRunner {
         bound: NoticeBound<'_>,
     ) -> Result<(), String> {
         let question = strip_tool_tag(&request.question);
-        let app = self.app.load();
+        // A full load: the notice send below can wait out the run's whole ceiling, too
+        // long to hold a swap guard.
+        let app = self.app.load_full();
         let Some(store) = app.mesh.inbound_store() else {
             warn!(
                 "Mesh is off, so the escalated question {} from {} cannot be filed",
@@ -5856,5 +5858,434 @@ mod tests {
             classify_answer("\u{200B}\x1b[0m \n"),
             EnvoyOutcome::Failed(_)
         ));
+    }
+
+    // ---- usage probe, round 3 ----------------------------------------------------------
+
+    /// A drive that escalates, then takes `after_answer` to finish once the human has
+    /// answered — a model call that still has work to do after the hold is over.
+    #[cfg(unix)]
+    fn slow_escalating_drive(after_answer: Duration) -> EnvoyDrive {
+        drive_of(move |ctx, _, _| async move {
+            let mut ctx = ctx;
+            let value = handle_user_tool(
+                &mut ctx,
+                "user__ask",
+                &json!({"question": "Should we merge?"}),
+            )
+            .await?;
+            tokio::time::sleep(after_answer).await;
+            Ok(format!(
+                "the human said: {}",
+                value["answer"].as_str().unwrap_or("?")
+            ))
+        })
+    }
+
+    #[cfg(unix)]
+    fn message_hooks(
+        hooks: &crate::mesh::events::RecordingHookSink,
+        event: HookEvent,
+    ) -> Vec<Vec<(&'static str, String)>> {
+        hooks
+            .snapshot()
+            .into_iter()
+            .filter(|(fired, _)| *fired == event)
+            .map(|(_, envs)| envs)
+            .collect()
+    }
+
+    /// The hold is re-checked once the notice settles: the human answers while the
+    /// notice is still in flight and the hold lapses before the peer comes round, yet
+    /// the answer wins — the run goes on to the human's `answered` reply and no
+    /// "no answer yet" hand-off is sent. The notice and the answer each fire
+    /// `mesh.message.sent`; nothing fires `mesh.message.failed`.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn usage_probe_an_answer_given_during_a_stalled_notice_beats_a_hold_that_lapsed_meanwhile()
+     {
+        use crate::mesh::events::{RecordingHookSink, env_value};
+
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-probe-stall-lapse-answer");
+        let (source, _source) = stub_envoy_source();
+        let hold = Duration::from_secs(2);
+        let app = app_holding_for(hold.as_secs());
+        let link = LiveLink::open("envoy-probe-stall-lapse", &app).await;
+        let peer = StallingPeer::serve_on(&link.stub);
+        let hooks = RecordingHookSink::attach(link.started.runtime.hooks());
+        let idle = RecordingIdleSink::attach(&app);
+        let store = app.mesh.inbound_store().expect("install opens the store");
+        let runner = EnvoyRunner::start_with(
+            Arc::clone(&app),
+            slow_escalating_drive(Duration::from_secs(5)),
+        );
+        runner.attach();
+        app.mesh
+            .deliver_peer(link.ask("stall-lapse", "merge the branch"));
+        wait_until("the notice to reach the stalled peer", || {
+            peer.arrived_for("stall-lapse").len() == 1
+        })
+        .await;
+        assert!(runner.holds("stall-lapse"));
+
+        // Answered inside the hold, while the notice is still in flight …
+        assert!(runner.answer("stall-lapse", "yes"));
+        assert!(!runner.holds("stall-lapse"));
+        // … then the hold lapses with the peer still stalled.
+        tokio::time::sleep(hold + Duration::from_secs(1)).await;
+        assert_eq!(peer.arrived_for("stall-lapse").len(), 1);
+        assert!(
+            !idle.has("envoy escalated to the human"),
+            "{:?}",
+            idle.texts()
+        );
+
+        peer.release();
+        wait_until("the peer to hear the answer", || {
+            peer.arrived_for("stall-lapse").len() >= 2
+        })
+        .await;
+        runner.stop().await;
+
+        let heard = peer.arrived_for("stall-lapse");
+        assert_eq!(heard.len(), 2, "{heard:?}");
+        assert_escalated_notice(&heard[0], "stall-lapse");
+        assert_eq!(heard[1].kind, PeerKind::Reply, "{heard:?}");
+        assert_eq!(heard[1].disposition, Some(Disposition::Answered));
+        assert_eq!(heard[1].thread.as_deref(), Some("stall-lapse"));
+        assert_eq!(heard[1].content, "the human said: yes");
+        assert_eq!(
+            idle.count("envoy replied: the human said: yes"),
+            1,
+            "{:?}",
+            idle.texts()
+        );
+        assert_eq!(
+            idle.count("envoy escalated to the human"),
+            0,
+            "{:?}",
+            idle.texts()
+        );
+        assert!(!idle.has("could not tell"), "{:?}", idle.texts());
+        assert!(store.get("stall-lapse").unwrap().is_none());
+        assert!(!runner.holds("stall-lapse"));
+
+        let sent = message_hooks(&hooks, HookEvent::MeshMessageSent);
+        let mut sent_ids: Vec<&str> = sent
+            .iter()
+            .filter_map(|envs| env_value(envs, "COYOTE_MESH_MESSAGE_ID"))
+            .collect();
+        sent_ids.sort_unstable();
+        let mut heard_ids: Vec<&str> = heard.iter().map(|body| body.id.as_str()).collect();
+        heard_ids.sort_unstable();
+        assert_eq!(sent_ids, heard_ids, "{sent:?}");
+        assert!(
+            message_hooks(&hooks, HookEvent::MeshMessageFailed).is_empty(),
+            "{:?}",
+            hooks.snapshot()
+        );
+
+        link.close(&app).await;
+        source.remove_dir();
+    }
+
+    /// A hold that lapsed while the notice was in flight, with no answer given, is over
+    /// the moment the notice settles: the hand-off `Message` goes out well inside one
+    /// more hold's time, the question stays on file and the human hears the hand-off
+    /// once. Both the notice and the hand-off fire `mesh.message.sent`; nothing fails.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn usage_probe_a_hold_that_lapsed_during_a_stalled_notice_hands_off_as_soon_as_it_settles()
+     {
+        use crate::mesh::events::{RecordingHookSink, env_value};
+
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-probe-stall-lapse-handoff");
+        let (source, _source) = stub_envoy_source();
+        let hold = Duration::from_secs(2);
+        let app = app_holding_for(hold.as_secs());
+        let link = LiveLink::open("envoy-probe-stall-handoff", &app).await;
+        let peer = StallingPeer::serve_on(&link.stub);
+        let hooks = RecordingHookSink::attach(link.started.runtime.hooks());
+        let idle = RecordingIdleSink::attach(&app);
+        let store = app.mesh.inbound_store().expect("install opens the store");
+        let runner = EnvoyRunner::start_with(Arc::clone(&app), stuck_escalating_drive());
+        runner.attach();
+        app.mesh
+            .deliver_peer(link.ask("stall-handoff", "merge the branch"));
+        wait_until("the notice to reach the stalled peer", || {
+            peer.arrived_for("stall-handoff").len() == 1
+        })
+        .await;
+        assert!(runner.holds("stall-handoff"));
+
+        // The hold lapses with the notice still in flight and nobody answering.
+        tokio::time::sleep(hold + Duration::from_secs(1)).await;
+        assert!(runner.holds("stall-handoff"));
+        assert_eq!(peer.arrived_for("stall-handoff").len(), 1);
+        assert!(
+            !idle.has("envoy escalated to the human"),
+            "{:?}",
+            idle.texts()
+        );
+
+        let released_at = std::time::Instant::now();
+        peer.release();
+        wait_until("the peer to hear the hand-off", || {
+            peer.arrived_for("stall-handoff").len() >= 2
+        })
+        .await;
+        assert!(
+            released_at.elapsed() < hold,
+            "the lapsed hold was waited out again: {:?}",
+            released_at.elapsed()
+        );
+        wait_until("the human to hear the hand-off", || {
+            idle.has("envoy escalated to the human")
+        })
+        .await;
+        runner.stop().await;
+
+        let heard = peer.arrived_for("stall-handoff");
+        assert_eq!(heard.len(), 2, "{heard:?}");
+        assert_escalated_notice(&heard[0], "stall-handoff");
+        assert_eq!(heard[1].kind, PeerKind::Message, "{heard:?}");
+        assert_eq!(heard[1].disposition, None);
+        assert_eq!(heard[1].thread.as_deref(), Some("stall-handoff"));
+        assert_eq!(
+            heard[1].content,
+            "escalated to the human; no answer yet (ref stall-handoff)"
+        );
+        assert_eq!(
+            idle.count("envoy escalated to the human"),
+            1,
+            "{:?}",
+            idle.texts()
+        );
+        assert!(!idle.has("could not tell"), "{:?}", idle.texts());
+        assert!(!idle.has("envoy timed out"), "{:?}", idle.texts());
+        assert!(!runner.holds("stall-handoff"));
+        assert!(store.get("stall-handoff").unwrap().is_some());
+
+        let sent = message_hooks(&hooks, HookEvent::MeshMessageSent);
+        let mut sent_ids: Vec<&str> = sent
+            .iter()
+            .filter_map(|envs| env_value(envs, "COYOTE_MESH_MESSAGE_ID"))
+            .collect();
+        sent_ids.sort_unstable();
+        let mut heard_ids: Vec<&str> = heard.iter().map(|body| body.id.as_str()).collect();
+        heard_ids.sort_unstable();
+        assert_eq!(sent_ids, heard_ids, "{sent:?}");
+        assert!(
+            message_hooks(&hooks, HookEvent::MeshMessageFailed).is_empty(),
+            "{:?}",
+            hooks.snapshot()
+        );
+
+        link.close(&app).await;
+        source.remove_dir();
+    }
+
+    /// A notice whose send fails outright is reported by the send itself, once: one
+    /// `mesh.message.failed` in the send's own class, never a second one as a cut-off.
+    /// The human's answer then fails to go out the same way, and that is one more fire
+    /// of the send's class for the reply's id — still nothing `cancelled` or `timed_out`,
+    /// and nothing `sent`.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn usage_probe_a_failed_notice_fires_message_failed_once_and_never_as_a_cut_off() {
+        use crate::mesh::events::{RecordingHookSink, env_value};
+
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-probe-failed-notice-hook");
+        let (source, _source) = stub_envoy_source();
+        let app = app_holding_for(30);
+        let link = LiveLink::open("envoy-probe-failed-hook", &app).await;
+        let hooks = RecordingHookSink::attach(link.started.runtime.hooks());
+        let idle = RecordingIdleSink::attach(&app);
+        let runner = EnvoyRunner::start_with(
+            Arc::clone(&app),
+            escalating_drive(|value| {
+                format!(
+                    "the human said: {}",
+                    value["answer"].as_str().unwrap_or("?")
+                )
+            }),
+        );
+        runner.attach();
+        // `job` carries a source destination the node has never heard of.
+        app.mesh
+            .deliver_peer(job(PeerKind::Ask, "failed-hook", "merge the branch").message);
+        wait_until("the human to hear the notice failed", || {
+            idle.has("could not tell")
+        })
+        .await;
+        assert!(runner.holds("failed-hook"));
+
+        let failed = message_hooks(&hooks, HookEvent::MeshMessageFailed);
+        assert_eq!(failed.len(), 1, "{failed:?}");
+        assert_eq!(
+            env_value(&failed[0], "COYOTE_MESH_ERROR_CLASS"),
+            Some("not_trusted")
+        );
+        assert_eq!(
+            env_value(&failed[0], "COYOTE_MESH_MESSAGE_KIND"),
+            Some("reply")
+        );
+        assert_eq!(
+            env_value(&failed[0], "COYOTE_MESH_PEER_DESTINATION"),
+            Some(hex_lower(&[0xab; 16]).as_str())
+        );
+        let notice_id = env_value(&failed[0], "COYOTE_MESH_MESSAGE_ID")
+            .expect("the failed notice names its id")
+            .to_string();
+        assert_ne!(notice_id, "failed-hook");
+
+        assert!(runner.answer("failed-hook", "yes"));
+        wait_until("the run to end with the human's answer", || {
+            idle.has("envoy replied: the human said: yes")
+        })
+        .await;
+        runner.stop().await;
+
+        let failed = message_hooks(&hooks, HookEvent::MeshMessageFailed);
+        assert_eq!(failed.len(), 2, "{failed:?}");
+        for envs in &failed {
+            assert_eq!(
+                env_value(envs, "COYOTE_MESH_ERROR_CLASS"),
+                Some("not_trusted"),
+                "{envs:?}"
+            );
+            assert_eq!(env_value(envs, "COYOTE_MESH_MESSAGE_KIND"), Some("reply"));
+        }
+        let reply_id = env_value(&failed[1], "COYOTE_MESH_MESSAGE_ID").unwrap();
+        assert_ne!(reply_id, notice_id, "{failed:?}");
+        assert!(
+            message_hooks(&hooks, HookEvent::MeshMessageSent).is_empty(),
+            "{:?}",
+            hooks.snapshot()
+        );
+        assert!(
+            idle.texts().iter().any(|text| {
+                text.contains("could not be sent")
+                    && text.contains("stays open for `.mesh answer failed-hook`")
+            }),
+            "{:?}",
+            idle.texts()
+        );
+
+        link.close(&app).await;
+        source.remove_dir();
+    }
+
+    /// A cut-off notice is a `failed` fire and never a `sent` one: once the peer comes
+    /// round, only the hand-off `Message` fires `mesh.message.sent`, and the notice's id
+    /// appears in exactly one hook, `mesh.message.failed`, class `cancelled`.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn usage_probe_a_cut_off_notice_is_never_reported_sent_and_the_hand_off_is() {
+        use crate::mesh::events::{RecordingHookSink, env_value};
+
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-probe-cut-off-sent");
+        let (source, _source) = stub_envoy_source();
+        let app = app_holding_for(300);
+        let link = LiveLink::open("envoy-probe-cut-off-sent", &app).await;
+        let peer = StallingPeer::serve_on(&link.stub);
+        let hooks = RecordingHookSink::attach(link.started.runtime.hooks());
+        let idle = RecordingIdleSink::attach(&app);
+        let runner = EnvoyRunner::start_with(Arc::clone(&app), stuck_escalating_drive());
+        runner.attach();
+        app.mesh
+            .deliver_peer(link.ask("cut-off-sent", "merge the branch"));
+        wait_until("the notice to reach the stalled peer", || {
+            peer.arrived_for("cut-off-sent").len() == 1
+        })
+        .await;
+        runner.interrupt();
+        wait_until("the human to hear the notice was cut off", || {
+            idle.has("could not tell")
+        })
+        .await;
+        let failed = message_hooks(&hooks, HookEvent::MeshMessageFailed);
+        assert_eq!(failed.len(), 1, "{failed:?}");
+        assert!(
+            message_hooks(&hooks, HookEvent::MeshMessageSent).is_empty(),
+            "{:?}",
+            hooks.snapshot()
+        );
+
+        peer.release();
+        wait_until("the peer to hear the hand-off", || {
+            peer.arrived_for("cut-off-sent").len() >= 2
+        })
+        .await;
+        wait_until("the hand-off to be reported sent", || {
+            !message_hooks(&hooks, HookEvent::MeshMessageSent).is_empty()
+        })
+        .await;
+        runner.stop().await;
+
+        let heard = peer.arrived_for("cut-off-sent");
+        assert_eq!(heard.len(), 2, "{heard:?}");
+        let notice_id = heard[0].id.as_str();
+        let hand_off_id = heard[1].id.as_str();
+        let sent = message_hooks(&hooks, HookEvent::MeshMessageSent);
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(
+            env_value(&sent[0], "COYOTE_MESH_MESSAGE_ID"),
+            Some(hand_off_id)
+        );
+        assert_eq!(
+            env_value(&sent[0], "COYOTE_MESH_MESSAGE_KIND"),
+            Some("message")
+        );
+        let failed = message_hooks(&hooks, HookEvent::MeshMessageFailed);
+        assert_eq!(failed.len(), 1, "{failed:?}");
+        assert_eq!(
+            env_value(&failed[0], "COYOTE_MESH_MESSAGE_ID"),
+            Some(notice_id)
+        );
+        assert_eq!(
+            env_value(&failed[0], "COYOTE_MESH_ERROR_CLASS"),
+            Some("cancelled")
+        );
+        let naming_the_notice = hooks
+            .snapshot()
+            .iter()
+            .filter(|(_, envs)| env_value(envs, "COYOTE_MESH_MESSAGE_ID") == Some(notice_id))
+            .count();
+        assert_eq!(naming_the_notice, 1, "{:?}", hooks.snapshot());
+
+        link.close(&app).await;
+        source.remove_dir();
+    }
+
+    /// The runner sends the "answer will follow" reply itself, so the prompt no longer
+    /// asks the envoy to tell the peer so — an envoy that did would have shipped that
+    /// sentence as its `answered` reply. The escalation rule itself stays.
+    #[test]
+    fn usage_probe_the_composed_prompt_leaves_telling_the_peer_to_the_runner() {
+        let message = job(PeerKind::Ask, "msg-prompt", "merge the branch").message;
+        let card = PeerCard {
+            who: "alice".into(),
+            instance: "abcd1234".into(),
+            verb: "asked",
+            message_id: "msg-prompt".into(),
+            via: "direct link",
+        };
+        let (tail, _) = compose_envoy_input(Some("a brief"), &card, &message);
+        assert!(
+            tail.contains("the peer is told automatically that an answer will follow"),
+            "{tail}"
+        );
+        assert!(
+            tail.contains("call one of the user__ tools quoting the peer's request as data"),
+            "{tail}"
+        );
+        for stale in ["then tell the peer", "tell the peer an answer will follow"] {
+            assert!(!tail.contains(stale), "{stale:?} in {tail}");
+        }
     }
 }
