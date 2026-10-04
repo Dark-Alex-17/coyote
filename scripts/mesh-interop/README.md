@@ -68,7 +68,9 @@ One Python process, driven over stdin/stdout with one JSON object per line. Comm
 (transport enabled, one `TCPServerInterface` on a free loopback port, no shared instance),
 creates a Coyote-shaped destination `scope.session.<instance_id>` serving `/status` and
 `/message` to anyone, and prints `READY {json}` with `relay_port`, `identity_hash`,
-`destination_hash`, `name_hash` and `instance_id`.
+`destination_hash`, `name_hash` and `instance_id`. The reference peer does not implement
+`/knock`, `/list`, `/fetch` or `/access`; the file-sharing paths are exercised by the Rust
+in-process conformance pair only.
 
 | Command | Arguments | Reply / effect |
 |---|---|---|

@@ -1,12 +1,14 @@
-# Coyote Mesh Protocol, version 1: wire format
+# SCOPE — Session Coordination & Presence Exchange
 
-Status: normative. This document specifies the bytes that Coyote instances exchange over Reticulum. The reference implementation is `src/mesh/` in this repository; every value below is the code's value, named by its constant and by the test that pins it. Security considerations are section 15, invariants section 16, log redaction section 17 and the leniency register section 18; the conformance vector suite is the `cfg(test)` module `src/mesh/conformance/`, and section 20 maps every requirement id to what exercises it.
+"SCOPE is a peer protocol by which running LLM sessions announce presence, share status, and exchange messages on their owners' behalf, over Reticulum, without a broker." A session is one running LLM REPL or agent process with its own identity key and one announced destination. A session is not an agent: a plain REPL with no agent is a full participant. A session is not a model: the protocol never talks to one.
+
+Status: normative. This document specifies version 1 of the wire format: the bytes that sessions exchange over Reticulum. Every value below is the reference implementation's value, named by its constant and by the test that pins it. Security considerations are section 15, invariants section 16, log redaction section 17 and the leniency register section 18; the conformance vector suite is the `cfg(test)` module `src/mesh/conformance/`, and section 20 maps every requirement id to what exercises it.
 
 Operator documentation (deployment, configuration, the `.mesh` commands) lives in [the wiki](https://github.com/Dark-Alex-17/coyote/wiki/Mesh); this document is the wire format only.
 
 ## 1. Introduction and scope
 
-Coyote Mesh lets Coyote instances discover and message each other over Reticulum. A node joins through the `.mesh` REPL family and the `mesh__*` tools, announces one destination per instance, answers peers through the envoy (a bounded model run that replies on the human's behalf), and serves its brief as a status card to trusted peers.
+SCOPE lets sessions discover and message each other over Reticulum. A session announces one destination, answers peers through the envoy (a bounded model run that replies on the owner's behalf), and serves its brief as a status card to trusted peers. Coyote is the reference implementation of this document; its source is `src/mesh/` in this repository, and "mesh" is that implementation's own name for its SCOPE feature (the `.mesh` REPL family, the `mesh__*` tools and the `mesh.*` hook events are application surface, not protocol).
 
 This document specifies:
 
@@ -14,7 +16,7 @@ This document specifies:
 (b) the announce application data and its timing (section 5);
 (c) the R3 request/response transport over Reticulum Links: frames, the Envelope, dispatch order, refusal codes (section 6);
 (d) version negotiation (section 7);
-(e) the request paths `/knock`, `/status` and `/message` (sections 8 to 10);
+(e) the request paths `/knock`, `/status`, `/message` and the file-sharing paths `/list`, `/fetch` and `/access` (sections 8 to 10);
 (f) store-and-forward through LXMF propagation nodes, outbound and inbound (section 11);
 (g) extensibility and code-point rules (sections 12 and 13);
 (h) the canonical forms applied before any peer datum is compared or displayed (section 3);
@@ -137,7 +139,7 @@ An instance whose identity key is replaced keeps its instance id, and with it it
 
 **[MESH-DEST-002]** A node's instance id MUST be 32 lowercase hex digits, minted once per session lineage and reused by every session of that lineage (`mesh_instance_id`, `is_valid_mesh_instance_id`, src/config/session.rs).
 
-**[MESH-DEST-003]** A Coyote instance's destination name MUST be application `scope`, aspect `session.<instance_id>` (`DestinationName::new("scope", "session.<instance_id>")`, src/mesh/node.rs).
+**[MESH-DEST-003]** A session's destination name MUST be application `scope`, aspect `session.<instance_id>` (`DestinationName::new("scope", "session.<instance_id>")`, src/mesh/node.rs).
 
 **[MESH-DEST-004]** The name hash MUST be the first 10 bytes of the SHA-256 of the ASCII string `scope.session.<instance_id>` (upstream `DestinationName::new`, which hashes `app || "." || aspects`).
 
@@ -155,7 +157,7 @@ An instance whose identity key is replaced keeps its instance id, and with it it
 
 ## 5. Announce
 
-A Coyote instance announces its destination (section 4) over Reticulum. The announce's application data is the only Coyote-defined content; everything else in the announce is Reticulum's.
+A session announces its destination (section 4) over Reticulum. The announce's application data is the only SCOPE-defined content; everything else in the announce is Reticulum's.
 
 ### 5.1 Application data
 
@@ -163,7 +165,7 @@ Layout: `magic(5) || version(2) || display_name(0..=64)`; total length 7 to 71 b
 
 | Bytes | Type | Sender puts | Receiver action on any other value |
 |---|---|---|---|
-| magic, bytes 0..5 | 5 bytes | `ANNOUNCE_MAGIC` = `"SCOPE"` | **[MESH-ANN-001]** The receiver MUST treat application data shorter than 7 bytes, or whose first 5 bytes are not `"SCOPE"`, as not a Coyote announce and MUST NOT record it. |
+| magic, bytes 0..5 | 5 bytes | `ANNOUNCE_MAGIC` = `"SCOPE"` | **[MESH-ANN-001]** The receiver MUST treat application data shorter than 7 bytes, or whose first 5 bytes are not `"SCOPE"`, as not a SCOPE announce and MUST NOT record it. |
 | version, bytes 5..7 | u16 big-endian | its own `MESH_PROTOCOL_VERSION` = `1` | **[MESH-ANN-002]** The receiver MUST record the announce for every value and MUST mark the peer `Incompatible` with the found version when it lies outside the receiver's window (section 7; `Compatibility::of`, src/mesh/protocol.rs; `observe_marks_an_unsupported_announce_version_incompatible`, src/mesh/peers.rs). |
 | display_name, bytes 7..end | UTF-8, 0 to `MAX_DISPLAY_NAME_BYTES` = `64` bytes | the configured display name, or nothing (section 5.2) | **[MESH-ANN-003]** The receiver MUST ignore the whole announce when the name is longer than 64 bytes, is not valid UTF-8, or contains any character of the section 3.3 table. **[MESH-ANN-004]** The receiver MUST read an empty name as no display name. |
 | any other byte | none | nothing | **[MESH-ANN-005]** There is no other field: the receiver MUST read every byte from offset 7 to the end as the display name (`app_data_carries_only_version_and_display_name`). |
@@ -180,11 +182,11 @@ Examples (`encode_layout_is_magic_version_name`, `decode_reads_version_big_endia
 
 **[MESH-ANN-009]** A sender MUST withhold the display name on every interface when any configured interface is `type: public`, unless `mesh.display_name_on_public` is `true` (`announce_app_data`, src/mesh/announce.rs; `public_interface_withholds_display_name_unless_opted_in`).
 
-**[MESH-ANN-010]** For each Coyote announce a receiver MUST record the destination hash, the identity hash, the name hash, the display name (or its absence), the announced version and the hop count.
+**[MESH-ANN-010]** For each SCOPE announce a receiver MUST record the destination hash, the identity hash, the name hash, the display name (or its absence), the announced version and the hop count.
 
 **[MESH-ANN-011]** Every announce MUST re-judge the peer's compatibility from the announced version, overriding a mark learned from a version refusal on the wire (`observe`, src/mesh/peers.rs; `an_announce_refresh_rejudges_a_wire_learned_mark`).
 
-Filing a Coyote announce whose name hash re-derives a trusted destination under another identity marks that record as MESH-SEC-014 describes (`AnnounceFiler::file`, src/mesh/node.rs). This announce path is the one that detects a genuinely rotated peer: on the link and knock paths an unknown identity is silenced before any verdict, so its name hash is never seen there.
+Filing a SCOPE announce whose name hash re-derives a trusted destination under another identity marks that record as MESH-SEC-014 describes (`AnnounceFiler::file`, src/mesh/node.rs). This announce path is the one that detects a genuinely rotated peer: on the link and knock paths an unknown identity is silenced before any verdict, so its name hash is never seen there.
 
 ### 5.3 Timing
 
@@ -204,7 +206,7 @@ Filing a Coyote announce whose name hash re-derives a trusted destination under 
 
 ### 5.4 Propagation node announces
 
-LXMF propagation nodes announce a destination of application `lxmf`, aspect `propagation`, whose application data is a msgpack array. Coyote reads it and never emits it. Reference layout: `[false, timebase, enabled, per_transfer_kb, per_sync_kb, [cost, flex, peering], {}]`. The layout check is upstream's `lxmf_core::announce::validate_pn_announce_data` (lxmf-rs rev 3ed5932, unchanged at release 0.12.0), which `PropagationNode::from_announce` (src/mesh/propagation.rs) runs before reading any slot; each refusal it produces is mapped to `InvalidAnnounce` and the node is not filed. In this section `int` is a msgpack integer of either family whose value fits `i64`, which is how upstream reads every integer slot.
+LXMF propagation nodes announce a destination of application `lxmf`, aspect `propagation`, whose application data is a msgpack array. A session reads it and never emits it. Reference layout: `[false, timebase, enabled, per_transfer_kb, per_sync_kb, [cost, flex, peering], {}]`. The layout check is upstream's `lxmf_core::announce::validate_pn_announce_data` (lxmf-rs rev 3ed5932, unchanged at release 0.12.0), which `PropagationNode::from_announce` (src/mesh/propagation.rs) runs before reading any slot; each refusal it produces is mapped to `InvalidAnnounce` and the node is not filed. In this section `int` is a msgpack integer of either family whose value fits `i64`, which is how upstream reads every integer slot.
 
 **[MESH-ANN-012]** A receiver MUST file into its propagation node table only an announce whose name hash equals `trunc_10(H("lxmf.propagation"))` (`PropagationNode::from_announce`, src/mesh/propagation.rs).
 
@@ -216,14 +218,14 @@ LXMF propagation nodes announce a destination of application `lxmf`, aspect `pro
 
 | Slot | Type | Sender puts | Receiver action on any other value |
 |---|---|---|---|
-| slot `[0]` | any | not emitted by Coyote | **[MESH-ANN-015]** The receiver MUST ignore it. |
-| slot `[1]` | int | not emitted by Coyote | **[MESH-ANN-016]** Not an `int` (the node's timebase, which Coyote does not read): the receiver MUST refuse the announce as `InvalidAnnounce` and MUST NOT file the node. |
-| slot `[2]` | bool | not emitted by Coyote | **[MESH-ANN-017]** The receiver MUST read this slot as whether the node accepts propagation (`PropagationNode::propagation_enabled`). **[MESH-ANN-018]** Not a `bool`: the receiver MUST refuse the announce as `InvalidAnnounce` and MUST NOT file the node. |
-| slot `[3]` | int, non-negative | not emitted by Coyote | **[MESH-ANN-019]** The receiver MUST read this slot as the node's per-transfer limit in kilobytes (`PropagationNode::per_transfer_limit_kb`). **[MESH-ANN-020]** Not an `int`: the receiver MUST refuse the announce as `InvalidAnnounce` and MUST NOT file the node. **[MESH-ANN-021]** A negative `int`: the receiver MUST refuse the announce as `InvalidAnnounce` (`per-transfer limit is not a non-negative integer`, `from_announce_refuses_malformed_app_data`) and MUST NOT file the node. |
-| slot `[4]` | int | not emitted by Coyote | **[MESH-ANN-022]** Not an `int` (the node's per-sync limit, which Coyote does not read): the receiver MUST refuse the announce as `InvalidAnnounce` and MUST NOT file the node. |
-| slot `[5]` | array of at least 3 `int` | not emitted by Coyote | **[MESH-ANN-023]** Not an `array`, shorter than 3 elements, or with any of `[5][0]`, `[5][1]`, `[5][2]` not an `int`: the receiver MUST refuse the announce as `InvalidAnnounce` and MUST NOT file the node (`from_announce_refuses_malformed_app_data`). |
-| slot `[5][0]` | int | not emitted by Coyote | **[MESH-ANN-024]** The receiver MUST read this element as the node's stamp cost (upstream `lxmf_core::announce::pn_stamp_cost_from_app_data`). **[MESH-ANN-025]** Negative: the receiver MUST refuse the announce as `NegativeStampCost` and MUST NOT file the node. **[MESH-ANN-026]** Greater than `u32::MAX`: the receiver MUST refuse the announce as `InvalidAnnounce` (`stamp cost does not fit a u32`) and MUST NOT file the node. **[MESH-ANN-027]** The receiver MUST file any other value, including one above `MAX_ACCEPTED_STAMP_COST` (section 11.1, `from_announce_refuses_negative_costs_and_files_any_other`). |
-| slot `[6]` | map | not emitted by Coyote | **[MESH-ANN-028]** Not a `map` (the node's metadata, which Coyote does not read): the receiver MUST refuse the announce as `InvalidAnnounce` and MUST NOT file the node. |
+| slot `[0]` | any | not emitted by a session | **[MESH-ANN-015]** The receiver MUST ignore it. |
+| slot `[1]` | int | not emitted by a session | **[MESH-ANN-016]** Not an `int` (the node's timebase, which a session does not read): the receiver MUST refuse the announce as `InvalidAnnounce` and MUST NOT file the node. |
+| slot `[2]` | bool | not emitted by a session | **[MESH-ANN-017]** The receiver MUST read this slot as whether the node accepts propagation (`PropagationNode::propagation_enabled`). **[MESH-ANN-018]** Not a `bool`: the receiver MUST refuse the announce as `InvalidAnnounce` and MUST NOT file the node. |
+| slot `[3]` | int, non-negative | not emitted by a session | **[MESH-ANN-019]** The receiver MUST read this slot as the node's per-transfer limit in kilobytes (`PropagationNode::per_transfer_limit_kb`). **[MESH-ANN-020]** Not an `int`: the receiver MUST refuse the announce as `InvalidAnnounce` and MUST NOT file the node. **[MESH-ANN-021]** A negative `int`: the receiver MUST refuse the announce as `InvalidAnnounce` (`per-transfer limit is not a non-negative integer`, `from_announce_refuses_malformed_app_data`) and MUST NOT file the node. |
+| slot `[4]` | int | not emitted by a session | **[MESH-ANN-022]** Not an `int` (the node's per-sync limit, which a session does not read): the receiver MUST refuse the announce as `InvalidAnnounce` and MUST NOT file the node. |
+| slot `[5]` | array of at least 3 `int` | not emitted by a session | **[MESH-ANN-023]** Not an `array`, shorter than 3 elements, or with any of `[5][0]`, `[5][1]`, `[5][2]` not an `int`: the receiver MUST refuse the announce as `InvalidAnnounce` and MUST NOT file the node (`from_announce_refuses_malformed_app_data`). |
+| slot `[5][0]` | int | not emitted by a session | **[MESH-ANN-024]** The receiver MUST read this element as the node's stamp cost (upstream `lxmf_core::announce::pn_stamp_cost_from_app_data`). **[MESH-ANN-025]** Negative: the receiver MUST refuse the announce as `NegativeStampCost` and MUST NOT file the node. **[MESH-ANN-026]** Greater than `u32::MAX`: the receiver MUST refuse the announce as `InvalidAnnounce` (`stamp cost does not fit a u32`) and MUST NOT file the node. **[MESH-ANN-027]** The receiver MUST file any other value, including one above `MAX_ACCEPTED_STAMP_COST` (section 11.1, `from_announce_refuses_negative_costs_and_files_any_other`). |
+| slot `[6]` | map | not emitted by a session | **[MESH-ANN-028]** Not a `map` (the node's metadata, which a session does not read): the receiver MUST refuse the announce as `InvalidAnnounce` and MUST NOT file the node. |
 | any other slot | any | nothing | **[MESH-ANN-029]** Elements beyond `[6]`: the receiver MUST ignore them. |
 
 **[MESH-ANN-030]** The propagation node table MUST hold at most `PROPAGATION_NODE_TABLE_MAX_ENTRIES` = `32` nodes; at the cap the least recently heard node is evicted (`cap_evicts_the_least_recently_heard_and_logs_it`, src/mesh/propagation_nodes.rs).
@@ -234,7 +236,7 @@ LXMF propagation nodes announce a destination of application `lxmf`, aspect `pro
 
 ## 6. R3 transport
 
-R3 is Coyote's request/response layer over a Reticulum Link. Its frames are byte-identical to Reticulum's Link request and response, so a Coyote request is a Reticulum request whose `data` is the Envelope of section 6.5.
+R3 is this document's request/response layer over a Reticulum Link. Its frames are byte-identical to Reticulum's Link request and response, so a SCOPE request is a Reticulum request whose `data` is the Envelope of section 6.5.
 
 ### 6.1 Request frame
 
@@ -338,7 +340,7 @@ Dispatch error maps (`DispatchError`, src/mesh/r3/dispatch.rs; `dispatch_errors_
 
 A refusal is a bare msgpack `uint` as the response value (`RefusalCode`, src/mesh/r3/error.rs; `refusal_codes_round_trip_the_wire_and_reject_other_values`, src/mesh/r3/tests.rs).
 
-| Code | Value | Wire bytes | Built by Coyote | Read by Coyote |
+| Code | Value | Wire bytes | Built by a session | Read by a session |
 |---|---|---|---|---|
 | `NoIdentity` | `0xf0` | `cc f0` | never | propagation node sentinel (section 11.3) |
 | `NoAccess` | `0xf1` | `cc f1` | dispatcher (section 6.6) | request refused; propagation node sentinel |
@@ -351,7 +353,7 @@ A refusal is a bare msgpack `uint` as the response value (`RefusalCode`, src/mes
 
 **[MESH-ENV-044]** A refusal MUST be sent as the bare `uint` of its value as the response value (`cc XX`).
 
-**[MESH-ENV-045]** Coyote MUST build only `NoAccess` (the dispatcher), `InvalidData` and `Throttled` (the `/message` handler); the other five codes are read, never built.
+**[MESH-ENV-045]** A session MUST build only `NoAccess` (the dispatcher), `InvalidData` and `Throttled` (the `/message` handler); the other five codes are read, never built.
 
 **[MESH-ENV-046]** A requester MUST decode a response value in this order: a `uint` equal to one of the eight values is that refusal; otherwise a map matching section 7 is a version refusal; otherwise the value is the path's reply value.
 
@@ -523,7 +525,7 @@ Custom data map:
 
 ## 9. /status
 
-The status card is Coyote's brief as served to a trusted peer: a request on `STATUS_PATH` = `"/status"` whose reply value is the card map (`StatusCard::to_value`, `StatusCard::from_value`, src/mesh/card.rs).
+The status card is a session's brief as served to a trusted peer: a request on `STATUS_PATH` = `"/status"` whose reply value is the card map (`StatusCard::to_value`, `StatusCard::from_value`, src/mesh/card.rs).
 
 ### 9.1 Request and reply
 
@@ -610,9 +612,9 @@ Emission order: `goal`, `done`, `total`.
 
 The requester's typed errors are `NotServed` (a dispatch error map, `no_provider` or `unknown_path`, section 6.6), `Malformed`, `UnsupportedVersion` and `Transport`; the requester tries `DispatchError::from_value` before `StatusCard::from_value`.
 
-## 10. /message
+## 10. /message, /list, /fetch and /access
 
-A peer message is a request on `MESSAGE_PATH` = `"/message"` (src/mesh/message.rs). The same body travels by store-and-forward as `"scope.peer/1"` (section 10.8).
+A peer message is a request on `MESSAGE_PATH` = `"/message"` (src/mesh/message.rs), specified in sections 10.1 to 10.8. The same body travels by store-and-forward as `"scope.peer/1"` (section 10.8). The file-sharing paths `/list`, `/fetch` and `/access` follow in the later subsections of this section.
 
 ### 10.1 Body
 
@@ -624,7 +626,7 @@ A wire id is 1 to `PEER_ID_MAX_CHARS` = `64` bytes, each in `[0-9A-Za-z_.:-]` (`
 |---|---|---|---|
 | `v` | uint | `PEER_WIRE_VERSION` = `1` | **[MESH-MSG-001]** Missing or not equal to 1: the receiver MUST refuse with `InvalidData`. |
 | `kind` | text | one of `message`, `ask`, `reply`, `bulletin` | **[MESH-MSG-002]** Missing or any other value: the receiver MUST refuse with `InvalidData`. |
-| `id` | text, a wire id | a fresh id; Coyote mints 32 lowercase hex (UUIDv4 simple form) | **[MESH-MSG-003]** Missing or not a wire id: the receiver MUST refuse with `InvalidData`. |
+| `id` | text, a wire id | a fresh id; the reference implementation mints 32 lowercase hex (UUIDv4 simple form) | **[MESH-MSG-003]** Missing or not a wire id: the receiver MUST refuse with `InvalidData`. |
 | `in_reply_to` | text, a wire id | the `id` of the message answered; omitted otherwise | **[MESH-MSG-004]** Present and not a wire id: the receiver MUST refuse with `InvalidData`. |
 | `title` | text | at most `PEER_TITLE_MAX_CHARS` = `120` characters; omitted when none | **[MESH-MSG-005]** Present and not text, or longer than 120 characters: the receiver MUST refuse with `InvalidData`. |
 | `content` | text | at most `PEER_CONTENT_MAX_CHARS` = `4000` characters | **[MESH-MSG-006]** Missing, not text, or longer than 4000 characters: the receiver MUST refuse with `InvalidData`. |
@@ -733,7 +735,7 @@ Typed refusal `fields` (`PeerRefusal::fields`; `refusal_fields_carry_the_reason_
 
 **[MESH-MSG-040]** A typed refusal MUST be carried in a `reply` whose `in_reply_to` is the refused message's `id`, whose content is the reason's text, and whose `fields` is the map above.
 
-The reference emits the typed refusal but does not yet read one: a receiving Coyote files it as an ordinary `reply`.
+The reference emits the typed refusal but does not yet read one: a receiving session files it as an ordinary `reply`.
 
 **[MESH-MSG-041]** A receiver MUST count messages against `mesh.peer_max_messages_per_hour` in fixed windows of `PEER_WINDOW` per sending identity; the `"retry_after_secs"` of `rate_limited` is the remainder of the window (`admit_message_refuses_the_sixty_first_in_an_hour_and_resets_after_rollover`).
 
@@ -965,7 +967,7 @@ The layouts of the stores below are not wire format and stay a section 1 non-goa
 
 **[MESH-CODE-003]** Every store in the table MUST carry its schema version, per file or per line as the table says, in a `version` field read before any other, and a writer MUST write the version this build reads: `TRUST_FILE_VERSION`, `KNOCK_RECORD_VERSION`, `PEER_TABLE_VERSION`, `PENDING_RECORD_VERSION` and `INBOUND_RECORD_VERSION` at `2`; `PREDECESSOR_RECORD_VERSION` and `PROPAGATION_STORE_VERSION` at `1` (section 19; `every_on_disk_store_version_is_pinned`).
 
-**[MESH-CODE-004]** A reader MUST read the version before any other field and MUST refuse the whole store, never one record and never a shorter list, when the version is not the one this build writes, and the refusal MUST name the file path, the version found, the version this build writes and the remedy: a newer version asks the person to upgrade Coyote, an older one states that no migration exists for versions before the baseline and asks them to move the file aside, and a version that cannot be read at all is an unknown shape, refused with the same remedy and naming the version this build writes. A disposable cache whose whole file is one document (`peers.json`, `propagation.json`) can set an unknown shape aside itself and start empty, but a readable version it does not write is refused under MESH-CODE-004 all the same. The per-store fixtures (`open_refuses_a_newer_file_version_naming_the_path`, `open_refuses_a_pre_baseline_file_version_as_having_no_migration`, `open_refuses_a_file_without_a_version`; src/mesh/trust.rs), (`newer_record_version_refuses_naming_the_file`, `pre_baseline_record_version_refuses_as_having_no_migration`, `a_line_without_a_version_refuses_the_whole_cache`; src/mesh/knocks.rs), (`a_newer_pending_line_refuses_the_whole_store_and_surfaces_no_record`, `a_pre_baseline_pending_line_refuses_as_having_no_migration`, `a_pending_line_without_a_version_refuses_the_whole_store`, `a_newer_inbound_line_refuses_the_whole_store_and_surfaces_no_record`, `a_pre_baseline_inbound_line_refuses_as_having_no_migration`, `an_inbound_line_without_a_version_refuses_the_whole_store`; src/mesh/pending.rs), (`predecessors_refuses_a_newer_line_and_shows_none_of_the_history`, `predecessors_refuses_a_pre_baseline_line_as_having_no_migration`, `predecessors_refuses_a_line_without_a_version`; src/mesh/identity.rs), (`load_refuses_a_newer_table_version_naming_the_path`, `load_refuses_a_pre_baseline_table_version_as_having_no_migration`, `load_sets_aside_an_unversioned_table_and_starts_empty`; src/mesh/peers.rs) and (`store_from_a_newer_coyote_is_refused_by_name`, `store_from_before_the_baseline_is_refused_as_having_no_migration`, `garbage_and_malformed_stores_are_set_aside`; src/mesh/propagation_fetch.rs) pin each store's wording.
+**[MESH-CODE-004]** A reader MUST read the version before any other field and MUST refuse the whole store, never one record and never a shorter list, when the version is not the one this build writes, and the refusal MUST name the file path, the version found, the version this build writes and the remedy: a newer version asks the person to upgrade the implementation, an older one states that no migration exists for versions before the baseline and asks them to move the file aside, and a version that cannot be read at all is an unknown shape, refused with the same remedy and naming the version this build writes. A disposable cache whose whole file is one document (`peers.json`, `propagation.json`) can set an unknown shape aside itself and start empty, but a readable version it does not write is refused under MESH-CODE-004 all the same. The per-store fixtures (`open_refuses_a_newer_file_version_naming_the_path`, `open_refuses_a_pre_baseline_file_version_as_having_no_migration`, `open_refuses_a_file_without_a_version`; src/mesh/trust.rs), (`newer_record_version_refuses_naming_the_file`, `pre_baseline_record_version_refuses_as_having_no_migration`, `a_line_without_a_version_refuses_the_whole_cache`; src/mesh/knocks.rs), (`a_newer_pending_line_refuses_the_whole_store_and_surfaces_no_record`, `a_pre_baseline_pending_line_refuses_as_having_no_migration`, `a_pending_line_without_a_version_refuses_the_whole_store`, `a_newer_inbound_line_refuses_the_whole_store_and_surfaces_no_record`, `a_pre_baseline_inbound_line_refuses_as_having_no_migration`, `an_inbound_line_without_a_version_refuses_the_whole_store`; src/mesh/pending.rs), (`predecessors_refuses_a_newer_line_and_shows_none_of_the_history`, `predecessors_refuses_a_pre_baseline_line_as_having_no_migration`, `predecessors_refuses_a_line_without_a_version`; src/mesh/identity.rs), (`load_refuses_a_newer_table_version_naming_the_path`, `load_refuses_a_pre_baseline_table_version_as_having_no_migration`, `load_sets_aside_an_unversioned_table_and_starts_empty`; src/mesh/peers.rs) and (`store_from_a_newer_coyote_is_refused_by_name`, `store_from_before_the_baseline_is_refused_as_having_no_migration`, `garbage_and_malformed_stores_are_set_aside`; src/mesh/propagation_fetch.rs) pin each store's wording.
 
 **[MESH-CODE-005]** The baseline is version `2` for `TRUST_FILE_VERSION`, `KNOCK_RECORD_VERSION`, `PEER_TABLE_VERSION`, `PENDING_RECORD_VERSION` and `INBOUND_RECORD_VERSION` and version `1` for `PREDECESSOR_RECORD_VERSION` and `PROPAGATION_STORE_VERSION`, and every on-disk struct and enum rejects a field it does not know, so a current-version record carrying such a field is refused, never read, and any change to a layout, a field added included, MUST bump the store's constant and MUST ship either a migration or an explicit refusal of the older version, and a version number MUST NOT be reused (MESH-CODE-001). The scan (`every_on_disk_struct_rejects_unknown_fields`, `every_deserializable_mesh_type_is_classified`; src/mesh/schema.rs) covers every type, and the per-store fixtures (`a_record_with_a_field_this_coyote_does_not_know_is_refused`, `a_reply_with_a_field_this_coyote_does_not_know_refuses_the_store`, `an_inbound_record_with_an_unknown_field_is_refused`; src/mesh/pending.rs), (`predecessors_refuses_an_unknown_field`; src/mesh/identity.rs) and (`load_sets_aside_a_current_table_with_an_unknown_field`; src/mesh/peers.rs) pin the refusal. One field, `key_changed` on the `trust.yaml` destination entry, was added before this rule existed and keeps a `#[serde(default)]`: a version-`2` trust file written without it loads with the field absent, a tolerance inside one version that is not a precedent for the next field (`open_still_refuses_unknown_fields_but_loads_a_record_without_key_changed`; src/mesh/trust.rs).
 
@@ -1635,7 +1637,7 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 - [MESH-DEST-008](#4-destination-naming) -- a peer names only its own instances
 - [MESH-DEST-009](#4-destination-naming) -- LXMF delivery hashes as source and destination
 - [MESH-DEST-010](#4-destination-naming) -- propagation node recognised by name hash
-- [MESH-ANN-001](#51-application-data) -- short or wrong-magic app data is not a Coyote announce
+- [MESH-ANN-001](#51-application-data) -- short or wrong-magic app data is not a SCOPE announce
 - [MESH-ANN-002](#51-application-data) -- every version recorded, out-of-window marked
 - [MESH-ANN-003](#51-application-data) -- invalid display name ignores the announce
 - [MESH-ANN-004](#51-application-data) -- empty name is no name
@@ -1722,7 +1724,7 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 - [MESH-ENV-042](#66-dispatch-order) -- no_provider needs a known path
 - [MESH-ENV-043](#66-dispatch-order) -- dispatch error unknown keys
 - [MESH-ENV-044](#67-refusal-codes-and-client-decoding) -- refusal is a bare uint
-- [MESH-ENV-045](#67-refusal-codes-and-client-decoding) -- codes Coyote builds
+- [MESH-ENV-045](#67-refusal-codes-and-client-decoding) -- codes a session builds
 - [MESH-ENV-046](#67-refusal-codes-and-client-decoding) -- client decode order
 - [MESH-ENV-047](#67-refusal-codes-and-client-decoding) -- unknown uint is a reply value
 - [MESH-TIME-008](#68-timeouts) -- request timeout outcome

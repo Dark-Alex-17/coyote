@@ -15,7 +15,7 @@ const UPSTREAM_ISSUES: &str = include_str!(concat!(
     "/docs/mesh/upstream-issues.md"
 ));
 
-const EXPECTED_H1: &str = "# Coyote Mesh Protocol, version 1: wire format";
+const EXPECTED_H1: &str = "# SCOPE — Session Coordination & Presence Exchange";
 const SECTION_COUNT: usize = 21;
 const CODE_POINT_HEADING: &str = "## 13. Code-point immutability";
 const ON_DISK_SCHEMA_KIND: &str = "on-disk schema version";
@@ -1284,7 +1284,7 @@ mod tests {
     }
 
     const VALID_SPEC: &str = "\
-# Coyote Mesh Protocol, version 1: wire format
+# SCOPE — Session Coordination & Presence Exchange
 
 ## 1. Introduction and scope
 
@@ -1477,7 +1477,7 @@ Fenced lines may say must and MUST without an id.
                 .unwrap_err()
                 .contains("exactly one H1")
         );
-        let wrong_h1 = sections(&(1..=21).collect::<Vec<_>>()).replace("version 1", "version 2");
+        let wrong_h1 = sections(&(1..=21).collect::<Vec<_>>()).replace("Presence", "Absence");
         assert!(check_headings(&wrong_h1).is_err());
         assert!(check_headings(&sections(&(1..=21).collect::<Vec<_>>())).is_ok());
         assert!(
