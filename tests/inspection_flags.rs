@@ -1323,6 +1323,10 @@ fn agent_envoy_one_shot_text_and_piped_stdin_run_and_clean_up() {
             stdout.contains(marker),
             "{label}: the user's text `{marker}` is not in the dry-run readout\nstdout: {stdout}"
         );
+        // The instructions name the peer's own tool once, so the peer knows where to
+        // ask for files; that is not a tool offered to the envoy, so it is the one
+        // `mesh__` mention the readout may carry.
+        let advertised = stdout.replacen("their tool is mesh__request_access", "", 1);
         for forbidden in [
             "execute_command",
             "agent__spawn",
@@ -1332,7 +1336,7 @@ fn agent_envoy_one_shot_text_and_piped_stdin_run_and_clean_up() {
             "skill__load",
         ] {
             assert!(
-                !stdout.contains(forbidden),
+                !advertised.contains(forbidden),
                 "{label}: `{forbidden}` is advertised in the envoy prompt\nstdout: {stdout}"
             );
         }

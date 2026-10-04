@@ -690,6 +690,26 @@ mod tests {
     }
 
     #[test]
+    fn embedded_instructions_tell_the_envoy_how_to_refuse_a_file_request() {
+        let instructions = &embedded_config()
+            .expect("embedded config parses")
+            .instructions;
+        for expected in [
+            "REFUSED:",
+            "/access",
+            "mesh__request_access",
+            "never attempted and never escalated",
+        ] {
+            assert!(instructions.contains(expected), "{instructions}");
+        }
+        let marker_lines = instructions
+            .lines()
+            .filter(|line| line.contains("REFUSED:"))
+            .count();
+        assert_eq!(marker_lines, 1, "{instructions}");
+    }
+
+    #[test]
     fn embedded_assets_ship_no_hooks_or_graph() {
         let mut files: Vec<String> = EnvoyAssets::iter()
             .map(|f| f.as_ref().to_string())

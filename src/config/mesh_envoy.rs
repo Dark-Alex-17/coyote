@@ -23,8 +23,8 @@ use crate::mesh::envoy::{EnvoyJob, EnvoySink, fence_peer_text};
 use crate::mesh::idle::{IdleNotify, Origin};
 use crate::mesh::limits::{PeerRefusal, RefusalReason};
 use crate::mesh::message::{
-    OutboundPeer, PEER_CONTENT_MAX_CHARS, PEER_LINE_MAX_CHARS, PEER_TITLE_MAX_CHARS, PeerKind,
-    PeerMessage, PeerVia, SendError,
+    Disposition, OutboundPeer, PEER_CONTENT_MAX_CHARS, PEER_LINE_MAX_CHARS, PEER_TITLE_MAX_CHARS,
+    PeerKind, PeerMessage, PeerVia, SendError,
 };
 use crate::mesh::notify::Source;
 use crate::mesh::pending::{
@@ -57,6 +57,11 @@ pub(crate) const ENVOY_RUN_TIMEOUT_SECS: u64 = 120;
 pub(crate) const ENVOY_ESCALATION_POLL: Duration = Duration::from_millis(100);
 /// How long `stop` waits for the worker before aborting it.
 const ENVOY_STOP_GRACE: Duration = Duration::from_secs(5);
+/// The envoy's final text leads with this when it will not handle the request; the
+/// words after it are what the peer hears.
+const REFUSAL_MARKER: &str = "REFUSED:";
+/// What the peer hears for a marker with no words after it.
+const DECLINED_FALLBACK_TEXT: &str = "this node will not handle that request";
 
 /// How one job is driven to text. Production is `run_child_agent`; tests inject closures.
 pub(crate) type EnvoyDrive = Arc<
@@ -111,6 +116,9 @@ pub(crate) fn compose_envoy_input(
 
 pub(crate) enum EnvoyOutcome {
     Answered(String),
+    /// The envoy declined the request in its own words; a refusal that is not a
+    /// run-time limit.
+    Declined(String),
     /// The question was handed to the human; `cut_short` when the run ceiling or a
     /// shutdown ended the hold rather than the configured wait.
     Escalated {
@@ -549,10 +557,7 @@ impl EnvoyRunner {
                     };
                 }
                 res = &mut run => break match res {
-                    Ok(text) => match display_text(&text, PEER_CONTENT_MAX_CHARS) {
-                        Some(text) => EnvoyOutcome::Answered(text),
-                        None => EnvoyOutcome::Failed("empty answer".into()),
-                    },
+                    Ok(text) => classify_answer(&text),
                     Err(err) => EnvoyOutcome::Failed(format!("{err:#}")),
                 },
                 _ = &mut deadline => {
@@ -583,7 +588,9 @@ impl EnvoyRunner {
                             Duration::from_secs(timeout_secs)
                                 .min(ceiling.saturating_sub(started.elapsed()))
                         });
-                        if let Err(err) = self.escalate(message, card, request, hold, &mut hold_until)
+                        if let Err(err) = self
+                            .escalate(message, card, request, hold, &mut hold_until)
+                            .await
                         {
                             break EnvoyOutcome::Failed(err);
                         }
@@ -622,7 +629,9 @@ impl EnvoyRunner {
         );
         let tokens = if snapshot.calls == 0 || snapshot.total_tokens() == 0 {
             let answer = match outcome {
-                EnvoyOutcome::Answered(text) => text.len() as u64 / 4,
+                EnvoyOutcome::Answered(text) | EnvoyOutcome::Declined(text) => {
+                    text.len() as u64 / 4
+                }
                 _ => 0,
             };
             prompt_estimate.saturating_add(answer)
@@ -638,12 +647,15 @@ impl EnvoyRunner {
             .debit(identity, tokens, snapshot.cost_usd, Instant::now());
     }
 
-    /// Files the question, tells the human, and holds the run open for the answer for
-    /// `hold` when the config allows a wait. With no wait the request is dropped along
-    /// with the run.
+    /// Files the question, tells the peer it has gone to the human, tells the human, and
+    /// holds the run open for the answer for `hold` when the config allows a wait. With
+    /// no wait the request is dropped along with the run.
+    /// The hold is taken before the question is filed, under the one lock `holds` and
+    /// `answer` read, so a human who sees the question on file can always answer it
+    /// through the live run.
     /// A question that cannot be filed (the mesh is off, or the id is held open by
     /// another peer) is never advertised: `.mesh answer` would reach the wrong record.
-    fn escalate(
+    async fn escalate(
         &self,
         message: &PeerMessage,
         card: &PeerCard,
@@ -652,7 +664,8 @@ impl EnvoyRunner {
         hold_until: &mut Option<Pin<Box<Sleep>>>,
     ) -> Result<(), String> {
         let question = strip_tool_tag(&request.question);
-        let Some(store) = self.app.load().mesh.inbound_store() else {
+        let app = self.app.load();
+        let Some(store) = app.mesh.inbound_store() else {
             warn!(
                 "Mesh is off, so the escalated question {} from {} cannot be filed",
                 message.message_id,
@@ -676,17 +689,28 @@ impl EnvoyRunner {
             paths: Vec::new(),
             reason: String::new(),
         };
-        if let Err(err) = store.upsert(record, now) {
-            warn!(
-                "Mesh envoy could not file the escalated question {} from {}: {}",
-                message.message_id,
-                short(&message.source_identity),
-                redact_hashes(&format!("{err:#}"))
-            );
-            return Err(format!("could not file the escalated question: {err:#}"));
+        {
+            let mut held = self.held.lock();
+            if hold.is_some() {
+                *held = Some(HeldEscalation {
+                    id: message.message_id.clone(),
+                    reply_tx: request.reply_tx,
+                });
+            }
+            if let Err(err) = store.upsert(record, now) {
+                held.take();
+                warn!(
+                    "Mesh envoy could not file the escalated question {} from {}: {}",
+                    message.message_id,
+                    short(&message.source_identity),
+                    redact_hashes(&format!("{err:#}"))
+                );
+                return Err(format!("could not file the escalated question: {err:#}"));
+            }
         }
+        self.tell_peer_escalated(&app, message, card).await;
         let line = display_text(question, PEER_LINE_MAX_CHARS).unwrap_or_default();
-        self.app.load().mesh.push_idle(IdleNotify {
+        app.mesh.push_idle(IdleNotify {
             source: Source::Message,
             origin: Origin::Peer(short(&message.source_identity).to_string()),
             text: format!(
@@ -696,13 +720,42 @@ impl EnvoyRunner {
             model_note: None,
         });
         if let Some(hold) = hold {
-            *self.held.lock() = Some(HeldEscalation {
-                id: message.message_id.clone(),
-                reply_tx: request.reply_tx,
-            });
             *hold_until = Some(Box::pin(tokio::time::sleep(hold)));
         }
         Ok(())
+    }
+
+    /// The immediate `escalated` reply: the peer hears at once that its question went
+    /// to the human, whether or not the run then waits for the answer. A send that
+    /// fails is told to the human and does not stop the escalation.
+    async fn tell_peer_escalated(&self, app: &AppState, message: &PeerMessage, card: &PeerCard) {
+        let unsent = match (app.mesh.get(), escalated_notice(message)) {
+            (Some(runtime), Ok(out)) => runtime
+                .send_peer(&message.source_destination, &out)
+                .await
+                .err()
+                .map(|err| err.to_string()),
+            (None, _) => Some("mesh is off".to_string()),
+            (_, Err(err)) => Some(err.to_string()),
+        };
+        let Some(why) = unsent else {
+            return;
+        };
+        warn!(
+            "Mesh envoy could not tell {} its question {} was escalated: {}",
+            short(&message.source_identity),
+            message.message_id,
+            redact_hashes(&why)
+        );
+        app.mesh.push_idle(IdleNotify {
+            source: Source::Message,
+            origin: Origin::Peer(short(&message.source_identity).to_string()),
+            text: format!(
+                "the envoy could not tell {} its question was escalated: {why}",
+                card.who
+            ),
+            model_note: None,
+        });
     }
 
     /// Replies to the peer, records the exchange for the session and fires the result
@@ -726,15 +779,19 @@ impl EnvoyRunner {
         // next job's peer.
         let consumed = self.consumed_answer.lock().take();
         let human_answer = match &outcome {
-            EnvoyOutcome::Answered(_) => None,
+            EnvoyOutcome::Answered(_) | EnvoyOutcome::Declined(_) => None,
             _ => consumed.and_then(|text| display_text(&text, PEER_CONTENT_MAX_CHARS)),
         };
-        // The filed question is settled only by the envoy's own answer to an escalated
-        // run or by the human's; a hand-off or a failure leaves it open.
-        let settles_question =
-            human_answer.is_some() || (escalated && matches!(outcome, EnvoyOutcome::Answered(_)));
+        // The filed question is settled only by the envoy's own last word on an
+        // escalated run or by the human's; a hand-off or a failure leaves it open.
+        let settles_question = human_answer.is_some()
+            || (escalated
+                && matches!(
+                    outcome,
+                    EnvoyOutcome::Answered(_) | EnvoyOutcome::Declined(_)
+                ));
         let (reply_text, error) = match &outcome {
-            EnvoyOutcome::Answered(text) => (text.clone(), None),
+            EnvoyOutcome::Answered(text) | EnvoyOutcome::Declined(text) => (text.clone(), None),
             EnvoyOutcome::Escalated { .. } => (
                 format!("escalated to the human; no answer yet (ref {id})"),
                 None,
@@ -798,7 +855,9 @@ impl EnvoyRunner {
             self.forget_question(&id);
         }
         match (&outcome, &human_answer) {
-            (EnvoyOutcome::Answered(text), _) => app.mesh.record_envoy_exchange(&message, text),
+            (EnvoyOutcome::Answered(text) | EnvoyOutcome::Declined(text), _) => {
+                app.mesh.record_envoy_exchange(&message, text)
+            }
             (_, Some(text)) => app.mesh.record_envoy_exchange(&message, text),
             (EnvoyOutcome::Escalated { .. }, None) => app.mesh.record_envoy_escalated(message, &id),
             (EnvoyOutcome::TimedOut, None) => {
@@ -925,29 +984,85 @@ fn strip_tool_tag(question: &str) -> &str {
     .trim()
 }
 
+/// Reads the envoy's final text as its outcome: words after a leading `REFUSED:` are a
+/// decline, anything else is its answer, and blank text is a failure. The marker must
+/// lead, so a mention of it mid-sentence stays an answer.
+fn classify_answer(text: &str) -> EnvoyOutcome {
+    let text = text.trim_start();
+    match text.strip_prefix(REFUSAL_MARKER) {
+        Some(rest) => EnvoyOutcome::Declined(
+            display_text(rest, PEER_CONTENT_MAX_CHARS)
+                .unwrap_or_else(|| DECLINED_FALLBACK_TEXT.to_string()),
+        ),
+        None => match display_text(text, PEER_CONTENT_MAX_CHARS) {
+            Some(text) => EnvoyOutcome::Answered(text),
+            None => EnvoyOutcome::Failed("empty answer".into()),
+        },
+    }
+}
+
+/// The reply sent the moment a question goes to the human, in the asker's thread and
+/// worded as escalated so its correlation stays open. Fixed words: nothing the peer
+/// wrote is echoed.
+fn escalated_notice(message: &PeerMessage) -> Result<OutboundPeer, SendError> {
+    let text = format!(
+        "a human has been asked; the answer will follow (ref {})",
+        message.message_id
+    );
+    OutboundPeer::new(
+        PeerKind::Reply,
+        &text,
+        None,
+        Some(&message.message_id),
+        None,
+    )?
+    .with_thread(Some(message.thread().to_string()))
+    .map(|out| out.with_disposition(Disposition::Escalated, None))
+}
+
 /// What the peer hears for `outcome`, in the thread of the message it answers: the
 /// human's words when they took the question, else `reply_text`. Only a final outcome
 /// goes out as a `Reply`; the escalation hand-off is a `Message` naming the question, so
-/// the asker's correlation stays open for the human's answer. The envoy's own answers
-/// carry no disposition; a refusal is not its answer, so that one goes out as the typed
-/// refusal reply with its fields and retry hint. Words only: the envoy never attaches a
-/// part.
+/// the asker's correlation stays open for the human's answer, and a `Message` carries no
+/// disposition. Every reply says what it is: the envoy's and the human's answers are
+/// `answered`; a decline, and a run that ended without an answer, are `refused` with no
+/// retry hint; a run-time refusal is not the envoy's answer, so that one goes out as the
+/// typed refusal reply with its fields and retry hint. Words only: the envoy never
+/// attaches a part.
 fn envoy_reply(
     outcome: &EnvoyOutcome,
     human_answer: Option<&str>,
     reply_text: String,
     message: &PeerMessage,
 ) -> Result<OutboundPeer, SendError> {
-    let (kind, reply_text) = match (outcome, human_answer) {
-        (_, Some(text)) => (PeerKind::Reply, text.to_string()),
-        (EnvoyOutcome::Escalated { .. }, None) => (PeerKind::Message, reply_text),
+    let (kind, disposition, reply_text) = match (outcome, human_answer) {
+        (_, Some(text)) => (
+            PeerKind::Reply,
+            Some(Disposition::Answered),
+            text.to_string(),
+        ),
+        (EnvoyOutcome::Answered(_), None) => {
+            (PeerKind::Reply, Some(Disposition::Answered), reply_text)
+        }
+        (EnvoyOutcome::Escalated { .. }, None) => (PeerKind::Message, None, reply_text),
         (EnvoyOutcome::Refused(refusal), None) => {
             return refusal_reply(&message.message_id, Some(message.thread()), refusal);
         }
-        _ => (PeerKind::Reply, reply_text),
+        (
+            EnvoyOutcome::Declined(_)
+            | EnvoyOutcome::TimedOut
+            | EnvoyOutcome::Interrupted
+            | EnvoyOutcome::Unavailable(_)
+            | EnvoyOutcome::Failed(_),
+            None,
+        ) => (PeerKind::Reply, Some(Disposition::Refused), reply_text),
     };
-    OutboundPeer::new(kind, &reply_text, None, Some(&message.message_id), None)?
-        .with_thread(Some(message.thread().to_string()))
+    let out = OutboundPeer::new(kind, &reply_text, None, Some(&message.message_id), None)?
+        .with_thread(Some(message.thread().to_string()))?;
+    Ok(match disposition {
+        Some(disposition) => out.with_disposition(disposition, None),
+        None => out,
+    })
 }
 
 #[cfg(test)]
@@ -969,14 +1084,16 @@ mod tests {
     #[cfg(unix)]
     use crate::mesh::message::PeerBody;
     use crate::mesh::message::{
-        Disposition, PeerMessageHandler, PeerRouting, PeerSurface, RawPeerMessage,
-        is_received_reply, peer_lxmf_message, to_r3_body,
+        PeerMessageHandler, PeerRouting, PeerSurface, RawPeerMessage, is_received_reply,
+        peer_lxmf_message, to_r3_body,
     };
     use crate::mesh::pending::InboundStore;
     use crate::mesh::test_support::{
         AdmittedRequest, Handler, InboundMessage, InboundSink, MESSAGE_PATH, NAME_HASH_LEN,
         OriginName, PathHash, RefusalCode, Reply, RequestId, SizeBranch, TempDir, TrustList,
     };
+    #[cfg(unix)]
+    use crate::mesh::test_support::{PeerStub, started_runtime_on};
     use crate::mesh::{destination_address, hex_lower};
     use crate::supervisor::mailbox::EnvelopePayload;
     use crate::testing::TestConfigDirGuard;
@@ -1216,14 +1333,42 @@ mod tests {
         assert_eq!(strip_tool_tag("no tag"), "no tag");
     }
 
+    #[test]
+    fn a_leading_refused_marker_makes_the_answer_a_decline() {
+        let declined = |text: &str| match classify_answer(text) {
+            EnvoyOutcome::Declined(words) => words,
+            _ => panic!("{text:?} was not a decline"),
+        };
+        let answered = |text: &str| match classify_answer(text) {
+            EnvoyOutcome::Answered(words) => words,
+            _ => panic!("{text:?} was not an answer"),
+        };
+        assert_eq!(declined("REFUSED: ask via /access"), "ask via /access");
+        assert_eq!(declined("  \n REFUSED: ask via /access"), "ask via /access");
+        assert_eq!(declined("REFUSED:"), DECLINED_FALLBACK_TEXT);
+        assert_eq!(declined("REFUSED:   "), DECLINED_FALLBACK_TEXT);
+        assert_eq!(answered("refused: x"), "refused: x");
+        assert_eq!(answered("I REFUSED: x"), "I REFUSED: x");
+        assert_eq!(answered("four"), "four");
+        assert!(matches!(
+            classify_answer(""),
+            EnvoyOutcome::Failed(why) if why == "empty answer"
+        ));
+        assert!(matches!(
+            classify_answer("  \n"),
+            EnvoyOutcome::Failed(why) if why == "empty answer"
+        ));
+    }
+
     /// I7: file bytes never traverse a model. Whatever the run came to, and whether or
     /// not the human took the question, what goes back is words in the asker's thread
-    /// with no part. Only a refusal the human did not override carries a disposition and
-    /// a retry hint, since it is not the envoy's answer.
+    /// with no part. Every reply names its disposition; only a refusal the human did not
+    /// override carries a retry hint and fields, since it is not the envoy's answer.
     #[test]
     fn the_envoy_never_attaches_a_part_whatever_the_outcome() {
         let outcomes = [
             ("answered", EnvoyOutcome::Answered("x".into())),
+            ("declined", EnvoyOutcome::Declined("ask via /access".into())),
             ("escalated", EnvoyOutcome::Escalated { cut_short: false }),
             (
                 "escalated cut short",
@@ -1286,39 +1431,52 @@ mod tests {
                         .unwrap_or_else(|err| panic!("{label} / {human_answer:?}: {err}"));
                     let case = format!("{label} / {human_answer:?} -> {out:?}");
                     assert!(out.parts.is_empty(), "{case}");
-                    match (outcome, human_answer) {
-                        (EnvoyOutcome::Refused(refusal), None) => {
-                            let expected = match refusal.reason {
-                                RefusalReason::TokenCeiling | RefusalReason::CostCeiling => {
-                                    Disposition::BudgetExhausted
-                                }
-                                _ => Disposition::Refused,
-                            };
-                            assert_eq!(out.disposition, Some(expected), "{case}");
-                            assert_eq!(
-                                out.retry_after,
-                                Some(u32::try_from(refusal.retry_after_secs()).unwrap()),
-                                "{case}"
-                            );
-                            assert_eq!(out.fields, Some(refusal.fields()), "{case}");
-                        }
-                        _ => {
-                            assert!(out.disposition.is_none(), "{case}");
-                            assert!(out.retry_after.is_none(), "{case}");
-                            assert!(out.fields.is_none(), "{case}");
-                        }
+                    let (expected_kind, expected_disposition, expected_content) =
+                        match (outcome, human_answer) {
+                            (_, Some(text)) => (PeerKind::Reply, Some(Disposition::Answered), text),
+                            (EnvoyOutcome::Answered(_), None) => {
+                                (PeerKind::Reply, Some(Disposition::Answered), "text")
+                            }
+                            (
+                                EnvoyOutcome::Declined(_)
+                                | EnvoyOutcome::TimedOut
+                                | EnvoyOutcome::Interrupted
+                                | EnvoyOutcome::Unavailable(_)
+                                | EnvoyOutcome::Failed(_),
+                                None,
+                            ) => (PeerKind::Reply, Some(Disposition::Refused), "text"),
+                            (EnvoyOutcome::Escalated { .. }, None) => {
+                                (PeerKind::Message, None, "text")
+                            }
+                            (EnvoyOutcome::Refused(refusal), None) => {
+                                let expected = match refusal.reason {
+                                    RefusalReason::TokenCeiling | RefusalReason::CostCeiling => {
+                                        Disposition::BudgetExhausted
+                                    }
+                                    _ => Disposition::Refused,
+                                };
+                                assert_eq!(
+                                    out.retry_after,
+                                    Some(u32::try_from(refusal.retry_after_secs()).unwrap()),
+                                    "{case}"
+                                );
+                                assert_eq!(out.fields, Some(refusal.fields()), "{case}");
+                                (PeerKind::Reply, Some(expected), refusal.reason.peer_text())
+                            }
+                        };
+                    if !matches!((outcome, human_answer), (EnvoyOutcome::Refused(_), None)) {
+                        assert!(out.retry_after.is_none(), "{case}");
+                        assert!(out.fields.is_none(), "{case}");
                     }
+                    assert_eq!(out.kind, expected_kind, "{case}");
+                    assert_eq!(out.disposition, expected_disposition, "{case}");
+                    assert_eq!(out.content, expected_content, "{case}");
                     assert_eq!(out.thread.as_deref(), Some(message.thread()), "{case}");
                     assert_eq!(
                         out.in_reply_to.as_deref(),
                         Some(message.message_id.as_str()),
                         "{case}"
                     );
-                    let expected_kind = match (outcome, human_answer) {
-                        (EnvoyOutcome::Escalated { .. }, None) => PeerKind::Message,
-                        _ => PeerKind::Reply,
-                    };
-                    assert_eq!(out.kind, expected_kind, "{case}");
                 }
             }
         }
@@ -2432,16 +2590,17 @@ mod tests {
         source.remove_dir();
     }
 
-    /// (a)/(d)/(e) over a live link: the peer that asked hears a `Reply` correlated by
-    /// `in_reply_to` at ITS destination; an escalated question is handed off as a
-    /// `Message` naming the question, so the asker's correlation stays open; and the
-    /// human's late `.mesh answer` (via `answer_inbound`, the routing seam) reaches the
-    /// same peer as the correlated `Reply` without any live run.
+    /// Over a live link: the peer that asked hears an `answered` `Reply` correlated by
+    /// `in_reply_to` at ITS destination; an escalated question gets an `escalated`
+    /// `Reply` the moment it goes to the human, while the run is still held, and is
+    /// then handed off as a `Message` naming the question once the hold lapses, so the
+    /// asker's correlation stays open; and the human's late `.mesh answer` (via
+    /// `answer_inbound`, the routing seam) reaches the same peer as the correlated
+    /// `answered` `Reply` without any live run.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
     async fn over_a_live_link_the_peer_hears_the_answer_the_handoff_and_the_late_reply() {
-        use crate::mesh::test_support::{PeerStub, started_runtime_on};
         use crate::mesh::trust::TrustOptions;
         use rns_transport::iface::tcp_server::TcpServer;
 
@@ -2450,7 +2609,7 @@ mod tests {
         let stub = PeerStub::listen("envoy-live-stub", TcpServer::DEFAULT_CLIENT_MTU).await;
         let started = started_runtime_on("envoy-live-node", stub.port()).await;
         let runtime = started.runtime.clone();
-        let app = test_app();
+        let app = app_holding_for(1);
         app.mesh.install(runtime.clone()).unwrap();
         stub.trust(&runtime.current_destination_hash(), runtime.fingerprint());
         stub.announce(Some("Stub")).await;
@@ -2492,10 +2651,13 @@ mod tests {
         assert_eq!(seen[0].kind, PeerKind::Reply);
         assert_eq!(seen[0].content, "four");
         assert_eq!(seen[0].in_reply_to.as_deref(), Some("live-1"));
+        assert_eq!(seen[0].disposition, Some(Disposition::Answered));
+        assert_eq!(seen[0].retry_after, None);
         assert_eq!(idle.count("envoy replied: four"), 1, "{:?}", idle.texts());
         assert!(!idle.has("could not be sent"), "{:?}", idle.texts());
 
-        // Proposal with no wait: the peer is told it was escalated, with the ref id.
+        // Proposal with a 1 s hold: the peer is told at once that the human was asked,
+        // then handed off when the hold lapses.
         let runner = EnvoyRunner::start_with(
             Arc::clone(&app),
             escalating_drive(|value| format!("never sent: {value}")),
@@ -2511,21 +2673,39 @@ mod tests {
             )
             .message,
         );
-        wait_until("the peer to hear the hand-off", || stub.seen().len() >= 2).await;
-        runner.stop().await;
+        wait_until("the peer to hear the escalation", || stub.seen().len() >= 2).await;
         let seen = stub.seen();
         assert_eq!(seen.len(), 2, "{seen:?}");
-        assert_eq!(seen[1].kind, PeerKind::Message);
+        assert_eq!(seen[1].kind, PeerKind::Reply);
         assert_eq!(seen[1].in_reply_to.as_deref(), Some("live-2"));
+        assert_eq!(seen[1].thread.as_deref(), Some("live-2"));
+        assert_eq!(seen[1].disposition, Some(Disposition::Escalated));
+        assert_eq!(seen[1].retry_after, None);
         assert_eq!(
             seen[1].content,
+            "a human has been asked; the answer will follow (ref live-2)"
+        );
+        // The run is still held for the human while the peer hears this.
+        assert!(runner.holds("live-2"));
+        assert!(store.get("live-2").unwrap().is_some());
+        wait_until("the human to be told", || {
+            idle.has("`.mesh answer live-2 <text>`")
+        })
+        .await;
+        assert!(!idle.has("could not tell"), "{:?}", idle.texts());
+
+        wait_until("the peer to hear the hand-off", || stub.seen().len() >= 3).await;
+        runner.stop().await;
+        let seen = stub.seen();
+        assert_eq!(seen.len(), 3, "{seen:?}");
+        assert_eq!(seen[2].kind, PeerKind::Message);
+        assert_eq!(seen[2].in_reply_to.as_deref(), Some("live-2"));
+        assert_eq!(seen[2].disposition, None);
+        assert_eq!(
+            seen[2].content,
             "escalated to the human; no answer yet (ref live-2)"
         );
-        assert!(
-            idle.has("`.mesh answer live-2 <text>`"),
-            "{:?}",
-            idle.texts()
-        );
+        assert!(!runner.holds("live-2"));
         let record = store.get("live-2").unwrap().expect("the question is filed");
         assert_eq!(record.peer_destination, to);
         assert_eq!(record.peer_identity, stub.identity_hex());
@@ -2536,12 +2716,13 @@ mod tests {
             .answer_inbound("live-2", "yes, merge it")
             .await
             .unwrap();
-        wait_until("the peer to hear the late reply", || stub.seen().len() >= 3).await;
+        wait_until("the peer to hear the late reply", || stub.seen().len() >= 4).await;
         let seen = stub.seen();
-        assert_eq!(seen.len(), 3, "{seen:?}");
-        assert_eq!(seen[2].kind, PeerKind::Reply);
-        assert_eq!(seen[2].in_reply_to.as_deref(), Some("live-2"));
-        assert_eq!(seen[2].content, "yes, merge it");
+        assert_eq!(seen.len(), 4, "{seen:?}");
+        assert_eq!(seen[3].kind, PeerKind::Reply);
+        assert_eq!(seen[3].in_reply_to.as_deref(), Some("live-2"));
+        assert_eq!(seen[3].content, "yes, merge it");
+        assert_eq!(seen[3].disposition, Some(Disposition::Answered));
         assert!(store.get("live-2").unwrap().is_none());
         // Answering twice is refused: the question is gone.
         let err = app
@@ -2563,7 +2744,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
     async fn over_a_live_link_an_unavailable_envoy_gives_the_peer_no_reason() {
-        use crate::mesh::test_support::{PeerStub, started_runtime_on};
         use crate::mesh::trust::TrustOptions;
         use rns_transport::iface::tcp_server::TcpServer;
 
@@ -2612,6 +2792,8 @@ mod tests {
         assert_eq!(seen[0].kind, PeerKind::Reply);
         assert_eq!(seen[0].in_reply_to.as_deref(), Some("live-u"));
         assert_eq!(seen[0].content, "this node cannot answer right now");
+        assert_eq!(seen[0].disposition, Some(Disposition::Refused));
+        assert_eq!(seen[0].retry_after, None);
         let leader_line = idle
             .texts()
             .into_iter()
@@ -3117,7 +3299,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
     async fn a_queued_job_is_refused_at_run_time_once_the_window_is_spent() {
-        use crate::mesh::test_support::{PeerStub, started_runtime_on};
         use crate::mesh::trust::TrustOptions;
         use rns_transport::iface::tcp_server::TcpServer;
 
@@ -3405,7 +3586,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
     async fn a_refused_job_carries_typed_fields_on_the_wire() {
-        use crate::mesh::test_support::{PeerStub, started_runtime_on};
         use crate::mesh::trust::TrustOptions;
         use rns_transport::iface::tcp_server::TcpServer;
 
@@ -3473,8 +3653,8 @@ mod tests {
                 .any(|body| body.in_reply_to.as_deref() == Some("live-r1"))
         })
         .await;
-        // Usage probe (c): the envoy's own answer sets no disposition (a receiver reads a
-        // reply that names none as `answered`) and no retry hint, in the asker's thread.
+        // Usage probe (c): the envoy's own answer is `answered` with no retry hint, in
+        // the asker's thread.
         let seen = stub.seen();
         let answer = seen
             .iter()
@@ -4006,7 +4186,6 @@ mod tests {
     #[serial]
     async fn a_store_and_forward_refusal_reaches_the_peer_once_an_hour() {
         use crate::mesh::message::PeerAdmission;
-        use crate::mesh::test_support::{PeerStub, started_runtime_on};
         use crate::mesh::trust::TrustOptions;
         use rns_transport::iface::tcp_server::TcpServer;
 
