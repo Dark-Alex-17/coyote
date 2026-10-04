@@ -17,6 +17,11 @@
 //!   in-process over such a root, the requester's page and reply readers, and the versioning
 //!   of the stores they read (`ListServe`, `FetchServe`, `FetchClient`). Rust only, every
 //!   platform.
+//! - `access_vectors`: the `/access` request and reply tables, the rate rule over a bare
+//!   `MeshSlot`, the LXMF carriage and its routing, the human's decision reply and the
+//!   requester's correlation of it, and the envoy's outcome wording (`AccessRequest`,
+//!   `AccessReply`, `AccessLxmf`, `Decision`, `Disposition`). Rust only, every
+//!   platform.
 //! - `interop`: the protocol exercised against the pinned Python Reticulum/LXMF reference,
 //!   spawned as a subprocess. Those tests are `#[ignore]`d and gated on `COYOTE_MESH_INTEROP=1`;
 //!   `scripts/mesh-interop/setup.sh` prepares the reference and prints the environment they need.
@@ -39,6 +44,7 @@
 //! `coverage_table` renders the same data as the section 20 table of the spec, which
 //! `tests::the_coverage_table_in_the_spec_is_the_generated_one` holds to it.
 
+mod access_vectors;
 mod env_vectors;
 mod interop_ids;
 mod link_vectors;
@@ -392,6 +398,18 @@ const ENFORCED_BY: &[(&str, &[&str])] = &[
 /// table is rendered from this.
 const EXECUTED_BY: &[(&str, &[&str])] = &[
     (
+        "AccessLxmf",
+        &["stored_access_requests_are_read_and_routed_as_section_10_16_mandates"],
+    ),
+    (
+        "AccessReply",
+        &["access_replies_are_read_as_section_10_16_mandates"],
+    ),
+    (
+        "AccessRequest",
+        &["access_requests_are_answered_as_section_10_16_mandates"],
+    ),
+    (
         "Ack",
         &["acknowledgement_vectors_are_read_only_for_their_id"],
     ),
@@ -417,7 +435,15 @@ const EXECUTED_BY: &[(&str, &[&str])] = &[
         &["size_branches_and_correlation_hold_on_a_live_link"],
     ),
     ("Custom", &["custom_vectors_hold"]),
+    (
+        "Decision",
+        &["access_decisions_travel_as_section_10_16_mandates"],
+    ),
     ("Derivation", &["derivation_vectors_reproduce_section_4"]),
+    (
+        "Disposition",
+        &["envoy_outcomes_are_worded_as_section_10_10_mandates"],
+    ),
     (
         "Dispatch",
         &["dispatch_vectors_answer_as_section_6_6_mandates"],
@@ -602,6 +628,7 @@ fn all_listed() -> Vec<Listed> {
     listed.extend(env_vectors::listed());
     listed.extend(link_vectors::listed());
     listed.extend(share_vectors::listed());
+    listed.extend(access_vectors::listed());
     listed.extend(interop_ids::listed());
     listed
 }

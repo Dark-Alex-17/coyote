@@ -1820,6 +1820,9 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 
 | Family | Executed by |
 |---|---|
+| AccessLxmf | `stored_access_requests_are_read_and_routed_as_section_10_16_mandates` |
+| AccessReply | `access_replies_are_read_as_section_10_16_mandates` |
+| AccessRequest | `access_requests_are_answered_as_section_10_16_mandates` |
 | Ack | `acknowledgement_vectors_are_read_only_for_their_id` |
 | Announce | `announce_vectors_decode_as_section_5_1_mandates` |
 | AnnounceEncode | `announce_encode_vectors_refuse_what_a_sender_must_not_emit` |
@@ -1828,9 +1831,11 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 | CardEncode | `card_encode_vectors_pin_the_emission_order` |
 | Correlation | `size_branches_and_correlation_hold_on_a_live_link` |
 | Custom | `custom_vectors_hold` |
+| Decision | `access_decisions_travel_as_section_10_16_mandates` |
 | Derivation | `derivation_vectors_reproduce_section_4` |
 | Dispatch | `dispatch_vectors_answer_as_section_6_6_mandates` |
 | DispatchErrorDecode | `dispatch_error_vectors_read_as_section_6_7_mandates` |
+| Disposition | `envoy_outcomes_are_worded_as_section_10_10_mandates` |
 | EnvelopeDecode | `envelope_vectors_decode_as_section_6_5_mandates` |
 | EnvelopeEncode | `envelope_vectors_encode_in_the_key_order_of_section_6_5` |
 | FetchClient | `requesters_read_pages_and_replies_as_sections_10_14_and_10_15_mandate` |
@@ -2175,10 +2180,10 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 | MESH-DISP-012 | Custom (Valid) |
 | MESH-DISP-013 | Custom (Valid) |
 | MESH-DISP-014 | Custom (Valid), MessageBodyEncode (Valid) |
-| MESH-DISP-015 | no vector yet |
-| MESH-DISP-016 | no vector yet |
+| MESH-DISP-015 | Disposition (Valid) |
+| MESH-DISP-016 | Disposition (Valid) |
 | MESH-DISP-017 | no vector yet |
-| MESH-DISP-018 | no vector yet |
+| MESH-DISP-018 | Disposition (Boundary), Disposition (Invalid) |
 | MESH-DISP-019 | Custom (Valid) |
 | MESH-DISP-020 | Custom (Valid) |
 | MESH-DISP-021 | Custom (Valid) |
@@ -2244,35 +2249,35 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 | MESH-FETCH-032 | FetchClient (Valid) |
 | MESH-FETCH-033 | FetchServe (Valid) |
 | MESH-FETCH-034 | FetchServe (Valid) |
-| MESH-ACCESS-001 | no vector yet |
-| MESH-ACCESS-002 | no vector yet |
-| MESH-ACCESS-003 | no vector yet |
-| MESH-ACCESS-004 | no vector yet |
-| MESH-ACCESS-005 | no vector yet |
-| MESH-ACCESS-006 | no vector yet |
-| MESH-ACCESS-007 | no vector yet |
-| MESH-ACCESS-008 | no vector yet |
-| MESH-ACCESS-009 | no vector yet |
-| MESH-ACCESS-010 | no vector yet |
-| MESH-ACCESS-011 | no vector yet |
-| MESH-ACCESS-012 | no vector yet |
-| MESH-ACCESS-013 | no vector yet |
+| MESH-ACCESS-001 | AccessRequest (Invalid), AccessRequest (Valid) |
+| MESH-ACCESS-002 | AccessRequest (Invalid) |
+| MESH-ACCESS-003 | AccessRequest (Boundary), AccessRequest (Invalid) |
+| MESH-ACCESS-004 | AccessRequest (Boundary), AccessRequest (Invalid) |
+| MESH-ACCESS-005 | AccessRequest (Valid) |
+| MESH-ACCESS-006 | AccessRequest (Invalid) |
+| MESH-ACCESS-007 | AccessReply (Invalid), AccessReply (Valid) |
+| MESH-ACCESS-008 | AccessReply (Invalid) |
+| MESH-ACCESS-009 | AccessReply (Invalid) |
+| MESH-ACCESS-010 | AccessReply (Invalid) |
+| MESH-ACCESS-011 | AccessReply (Invalid), AccessReply (Valid) |
+| MESH-ACCESS-012 | AccessReply (Invalid), AccessReply (Valid) |
+| MESH-ACCESS-013 | AccessReply (Boundary), AccessReply (Valid) |
 | MESH-ACCESS-014 | no vector yet |
 | MESH-ACCESS-015 | no vector yet |
-| MESH-ACCESS-016 | no vector yet |
-| MESH-ACCESS-017 | no vector yet |
-| MESH-ACCESS-018 | no vector yet |
+| MESH-ACCESS-016 | AccessRequest (Boundary), AccessRequest (Valid) |
+| MESH-ACCESS-017 | AccessRequest (Invalid) |
+| MESH-ACCESS-018 | Decision (Boundary), Decision (Valid) |
 | MESH-ACCESS-019 | no vector yet |
-| MESH-ACCESS-020 | no vector yet |
-| MESH-ACCESS-021 | no vector yet |
-| MESH-ACCESS-022 | no vector yet |
-| MESH-ACCESS-023 | no vector yet |
-| MESH-ACCESS-024 | no vector yet |
-| MESH-ACCESS-025 | no vector yet |
-| MESH-ACCESS-026 | no vector yet |
-| MESH-ACCESS-027 | no vector yet |
-| MESH-ACCESS-028 | no vector yet |
-| MESH-ACCESS-029 | no vector yet |
+| MESH-ACCESS-020 | AccessLxmf (Boundary), AccessLxmf (Invalid), AccessLxmf (Valid) |
+| MESH-ACCESS-021 | AccessLxmf (Invalid) |
+| MESH-ACCESS-022 | AccessLxmf (Valid) |
+| MESH-ACCESS-023 | AccessLxmf (Boundary), AccessLxmf (Invalid) |
+| MESH-ACCESS-024 | AccessLxmf (Invalid) |
+| MESH-ACCESS-025 | AccessLxmf (Boundary), AccessLxmf (Invalid) |
+| MESH-ACCESS-026 | AccessLxmf (Valid) |
+| MESH-ACCESS-027 | AccessLxmf (Boundary), AccessLxmf (Valid) |
+| MESH-ACCESS-028 | AccessLxmf (Invalid) |
+| MESH-ACCESS-029 | AccessRequest (Valid) |
 | MESH-SHARE-001 | ShareSet (Boundary), ShareSet (Invalid), ShareSet (Valid) |
 | MESH-SHARE-002 | ShareSet (Boundary), ShareSet (Invalid), ShareSet (Valid) |
 | MESH-SHARE-003 | ShareSet (Invalid) |
