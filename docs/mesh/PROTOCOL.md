@@ -1833,6 +1833,8 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 | DispatchErrorDecode | `dispatch_error_vectors_read_as_section_6_7_mandates` |
 | EnvelopeDecode | `envelope_vectors_decode_as_section_6_5_mandates` |
 | EnvelopeEncode | `envelope_vectors_encode_in_the_key_order_of_section_6_5` |
+| FetchClient | `requesters_read_pages_and_replies_as_sections_10_14_and_10_15_mandate` |
+| FetchServe | `fetch_handlers_answer_as_section_10_15_mandates` |
 | GrantStore | `grant_stores_lend_spend_and_sweep_as_section_10_17_mandates` |
 | HandlerSlots | `the_responder_drops_what_section_6_6_says_it_drops` |
 | HandlerTimeout | `the_timeouts_and_the_outbound_cap_end_requests_as_specified` |
@@ -1844,6 +1846,7 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 | KnockBody | `knock_body_vectors_read_the_intro_as_section_8_1_mandates` |
 | KnockIntro | `knock_intro_vectors_clean_and_refuse_as_section_8_1_mandates` |
 | LinkTimeout | `the_timeouts_and_the_outbound_cap_end_requests_as_specified` |
+| ListServe | `list_handlers_answer_as_section_10_14_mandates` |
 | LxmfKnock | `lxmf_knock_vectors_decode_as_section_8_6_mandates` |
 | LxmfPeer | `lxmf_peer_vectors_decode_as_section_10_8_mandates` |
 | MessageBody | `message_body_vectors_decode_as_section_10_1_mandates` |
@@ -2043,8 +2046,8 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 | MESH-STATUS-008 | Card (Invalid), Card (Valid) |
 | MESH-STATUS-009 | Card (Invalid), Card (Valid) |
 | MESH-STATUS-010 | Card (Invalid), Card (Valid) |
-| MESH-FETCH-001 | no vector yet |
-| MESH-FETCH-002 | no vector yet |
+| MESH-FETCH-001 | FetchClient (Invalid) |
+| MESH-FETCH-002 | FetchClient (Invalid) |
 | MESH-STATUS-011 | Card (Boundary), Card (Invalid), Card (Valid) |
 | MESH-STATUS-012 | Card (Boundary), Card (Invalid), Interop (Valid) |
 | MESH-STATUS-013 | Card (Valid) |
@@ -2185,62 +2188,62 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 | MESH-DISP-025 | Custom (Boundary), Custom (Valid) |
 | MESH-DISP-026 | Custom (Invalid) |
 | MESH-FETCH-003 | WirePath (Boundary), WirePath (Invalid), WirePath (Valid) |
-| MESH-FETCH-004 | no vector yet |
+| MESH-FETCH-004 | FetchServe (Invalid) |
 | MESH-FETCH-005 | WirePath (Invalid), WirePath (Valid) |
-| MESH-FETCH-006 | no vector yet |
+| MESH-FETCH-006 | FetchServe (Invalid), FetchServe (Valid) |
 | MESH-FETCH-007 | WirePath (Invalid), WirePath (Valid) |
-| MESH-LIST-001 | no vector yet |
-| MESH-LIST-002 | no vector yet |
-| MESH-LIST-003 | no vector yet |
-| MESH-LIST-004 | no vector yet |
-| MESH-LIST-005 | no vector yet |
-| MESH-LIST-006 | no vector yet |
-| MESH-LIST-007 | no vector yet |
-| MESH-LIST-008 | no vector yet |
-| MESH-LIST-009 | no vector yet |
-| MESH-LIST-010 | no vector yet |
-| MESH-LIST-011 | no vector yet |
-| MESH-LIST-012 | no vector yet |
-| MESH-LIST-013 | no vector yet |
-| MESH-LIST-014 | no vector yet |
-| MESH-LIST-015 | no vector yet |
-| MESH-LIST-016 | no vector yet |
-| MESH-LIST-017 | no vector yet |
-| MESH-LIST-018 | no vector yet |
-| MESH-LIST-019 | no vector yet |
-| MESH-LIST-020 | no vector yet |
-| MESH-LIST-021 | no vector yet |
-| MESH-LIST-022 | no vector yet |
-| MESH-LIST-023 | no vector yet |
-| MESH-LIST-024 | no vector yet |
-| MESH-LIST-025 | no vector yet |
-| MESH-FETCH-008 | no vector yet |
-| MESH-FETCH-009 | no vector yet |
-| MESH-FETCH-010 | no vector yet |
-| MESH-FETCH-011 | no vector yet |
-| MESH-FETCH-012 | no vector yet |
+| MESH-LIST-001 | ListServe (Invalid), ListServe (Valid) |
+| MESH-LIST-002 | ListServe (Invalid), ListServe (Valid) |
+| MESH-LIST-003 | ListServe (Boundary), ListServe (Invalid) |
+| MESH-LIST-004 | ListServe (Valid) |
+| MESH-LIST-005 | ListServe (Valid) |
+| MESH-LIST-006 | FetchClient (Invalid), FetchClient (Valid) |
+| MESH-LIST-007 | FetchClient (Invalid) |
+| MESH-LIST-008 | FetchClient (Boundary), FetchClient (Invalid) |
+| MESH-LIST-009 | FetchClient (Boundary), FetchClient (Invalid) |
+| MESH-LIST-010 | FetchClient (Valid) |
+| MESH-LIST-011 | FetchClient (Invalid), FetchClient (Valid) |
+| MESH-LIST-012 | FetchClient (Boundary), FetchClient (Invalid) |
+| MESH-LIST-013 | FetchClient (Boundary), FetchClient (Invalid) |
+| MESH-LIST-014 | FetchClient (Boundary), FetchClient (Invalid), FetchClient (Valid) |
+| MESH-LIST-015 | FetchClient (Valid) |
+| MESH-LIST-016 | ListServe (Valid) |
+| MESH-LIST-017 | ListServe (Valid) |
+| MESH-LIST-018 | ListServe (Boundary) |
+| MESH-LIST-019 | ListServe (Valid) |
+| MESH-LIST-020 | FetchClient (Valid) |
+| MESH-LIST-021 | ListServe (Valid) |
+| MESH-LIST-022 | ListServe (Valid) |
+| MESH-LIST-023 | ListServe (Valid) |
+| MESH-LIST-024 | ListServe (Invalid) |
+| MESH-LIST-025 | ListServe (Valid) |
+| MESH-FETCH-008 | FetchServe (Invalid), FetchServe (Valid) |
+| MESH-FETCH-009 | FetchServe (Invalid) |
+| MESH-FETCH-010 | FetchServe (Invalid) |
+| MESH-FETCH-011 | FetchServe (Boundary), FetchServe (Invalid), FetchServe (Valid) |
+| MESH-FETCH-012 | FetchServe (Valid) |
 | MESH-FETCH-013 | no vector yet |
 | MESH-FETCH-014 | no vector yet |
-| MESH-FETCH-015 | no vector yet |
+| MESH-FETCH-015 | FetchClient (Invalid) |
 | MESH-FETCH-016 | no vector yet |
 | MESH-FETCH-017 | no vector yet |
 | MESH-FETCH-018 | no vector yet |
 | MESH-FETCH-019 | no vector yet |
 | MESH-FETCH-020 | no vector yet |
-| MESH-FETCH-021 | no vector yet |
+| MESH-FETCH-021 | FetchClient (Invalid) |
 | MESH-FETCH-022 | no vector yet |
 | MESH-FETCH-023 | no vector yet |
-| MESH-FETCH-024 | no vector yet |
-| MESH-FETCH-025 | no vector yet |
-| MESH-FETCH-026 | no vector yet |
-| MESH-FETCH-027 | no vector yet |
-| MESH-FETCH-028 | no vector yet |
-| MESH-FETCH-029 | no vector yet |
-| MESH-FETCH-030 | no vector yet |
-| MESH-FETCH-031 | no vector yet |
-| MESH-FETCH-032 | no vector yet |
-| MESH-FETCH-033 | no vector yet |
-| MESH-FETCH-034 | no vector yet |
+| MESH-FETCH-024 | FetchServe (Invalid), FetchServe (Valid) |
+| MESH-FETCH-025 | FetchServe (Invalid) |
+| MESH-FETCH-026 | FetchServe (Valid) |
+| MESH-FETCH-027 | FetchServe (Boundary) |
+| MESH-FETCH-028 | FetchClient (Boundary) |
+| MESH-FETCH-029 | FetchClient (Valid) |
+| MESH-FETCH-030 | FetchClient (Valid) |
+| MESH-FETCH-031 | FetchClient (Valid) |
+| MESH-FETCH-032 | FetchClient (Valid) |
+| MESH-FETCH-033 | FetchServe (Valid) |
+| MESH-FETCH-034 | FetchServe (Valid) |
 | MESH-ACCESS-001 | no vector yet |
 | MESH-ACCESS-002 | no vector yet |
 | MESH-ACCESS-003 | no vector yet |

@@ -1,8 +1,10 @@
 //! Requirement-id keyed vectors for the share side of the protocol: the wire-path grammar
 //! of section 10.13 and the three places that reuse it, the share set and the grant store
-//! of section 10.17, and the on-disk versioning of section 14.1 for the stores they read.
-//! Every row runs in-process against this crate's own `WirePath`, `ShareSet`, `GrantStore`
-//! and record types, on a share root the row builds in a temporary directory.
+//! of section 10.17, the `/list` and `/fetch` handlers and requesters of sections 10.14
+//! and 10.15, and the on-disk versioning of section 14.1 for the stores they read. Every
+//! row runs in-process against this crate's own `WirePath`, `ShareSet`, `GrantStore`,
+//! `ListHandler`, `FetchHandler`, `SharesPage`, `R3Client` and record types, on a share
+//! root the row builds in a temporary directory.
 //!
 //! Every row names the id it exercises and the receiver action the spec mandates for it. A
 //! row written faithfully from the spec that the code does not honour is kept as written
@@ -12,32 +14,55 @@
 use super::{Kind, Listed};
 use crate::config::WORKSPACE_COYOTE_DIR_NAME;
 use crate::config::mesh_config::MAX_FETCH_FILE_BYTES;
+use crate::hooks::HookEvent;
 use crate::mesh::access::validate_access;
-use crate::mesh::fetch::{SharesPage, rule_of};
+use crate::mesh::card::{STATE_IDLE, STATUS_CARD_VERSION, StatusCard};
+use crate::mesh::events::{MeshHooks, RecordingHookSink, env_value};
+use crate::mesh::fetch::{
+    CURSOR_MAX_BYTES, FILE_FETCH_REQUEST_TIMEOUT, FetchError, FetchHandler, FetchServing, Fetched,
+    FileReader, LIST_PAGE_HEADROOM, ListHandler, SINGLE_SEGMENT_FETCH_CEILING, ShareSource,
+    SharesPage, field, rule_of,
+};
 use crate::mesh::grants::{
     DEFAULT_GRANT_TTL, DEFAULT_GRANT_USES, GRANT_MAX_PATHS, GRANT_RECORD_VERSION, GrantStore,
 };
-use crate::mesh::message::{PartLimits, RawPart, admit_parts};
+use crate::mesh::inbox::{InboxStaging, StageError, inbox_root};
+use crate::mesh::message::{
+    PEER_REQUEST_TIMEOUT, PEER_WIRE_VERSION, PartLimits, RawPart, admit_parts,
+};
 use crate::mesh::pending::{INBOUND_RECORD_VERSION, InboundKind, InboundRecord};
+use crate::mesh::r3::{
+    AdmittedRequest, Dispatcher, Envelope, FETCH_PATH, Handler, InboundRequest, KnockEvent,
+    KnockSink, LIST_PATH, MAX_FETCH_RESPONSE_BYTES, MAX_R3_PAYLOAD_BYTES, NAME_HASH_LEN,
+    OriginName, PathHash, R3Client, R3Error, RESPONSE_FRAME_PREFIX, RefusalCode, Reply,
+    RequestHandler, RequestId, ResponseFrame, STATUS_PATH, SizeBranch,
+};
 use crate::mesh::schema::{Remedy, version_refusal};
 use crate::mesh::shares::{
-    Layer, Mutation, PeerRef, SHARES_FILE_VERSION, Served, ServedFile, ShareLocations, ShareSet,
-    Verdict, Via, WriteScope, probe_case_insensitive, validate_override, validate_pattern,
-    write_target,
+    DEFAULT_LIST_WALK_BOUND, LIST_PAGE_SIZE, Layer, Mutation, PeerRef, SHARES_FILE_VERSION, Served,
+    ServedFile, ShareLocations, ShareSet, Verdict, Via, WriteScope, list_cursor,
+    probe_case_insensitive, validate_override, validate_pattern, write_target,
 };
-use crate::mesh::test_support::{TempDir, siblings_of};
+use crate::mesh::test_support::{TempDir, TrustList, siblings_of};
 use crate::mesh::wire_path::{
     RULES, WIRE_PATH_MAX_BYTES, WIRE_PATH_MAX_SEGMENTS, WirePath, is_rule_id,
 };
-use crate::mesh::{hex_lower, rfc3339_utc};
+use crate::mesh::{hex_lower, mesh_config_dir, rfc3339_utc};
 use crate::testing::{debug_snapshot, install_log_collector, warn_snapshot};
 
+use rand_core::OsRng;
 use rmpv::Value;
+use rns_transport::destination::link::LinkId;
+use rns_transport::hash::AddressHash;
+use rns_transport::identity::PrivateIdentity;
 use sha2::{Digest, Sha256};
 use std::fmt::Debug;
 use std::fs;
-use std::path::PathBuf;
+use std::future::Future;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime};
+use tokio::sync::oneshot::error::TryRecvError;
 
 /// One requirement id, one input, one mandated receiver action.
 struct Vector {
@@ -66,6 +91,13 @@ enum Case {
     /// The version discipline of the share files, the grant store and the inbound
     /// record, section 14.1.
     StoreSchema(SchemaProbe),
+    /// `ListHandler` over a share root built for the row, section 10.14.
+    ListServe(ListProbe),
+    /// `FetchHandler` over a share root built for the row, section 10.15.
+    FetchServe(FetchProbe),
+    /// The requester's side of both paths: `SharesPage`, the inbox staging, the response
+    /// bound of `R3Client` and the card keys of section 9 that announce the paths.
+    FetchClient(ClientProbe),
 }
 
 enum WireProbe {
@@ -173,6 +205,62 @@ enum SchemaProbe {
     Check(Check),
 }
 
+enum ListProbe {
+    /// The handler's answer to `body` on a root holding `files`, every one allowed.
+    Request {
+        files: &'static [&'static str],
+        body: Value,
+        expect: ListAnswer,
+    },
+    Check(Check),
+}
+
+#[derive(Debug, PartialEq)]
+enum ListAnswer {
+    /// `Reply::Code(InvalidData)`.
+    Refused,
+    Page {
+        paths: Vec<&'static str>,
+        next: Option<String>,
+    },
+}
+
+enum FetchProbe {
+    /// The handler's answer to `body` on a root holding `files`, every one allowed.
+    Request {
+        files: &'static [&'static str],
+        body: Value,
+        expect: FetchAnswer,
+    },
+    Check(Check),
+}
+
+#[derive(Debug, PartialEq)]
+enum FetchAnswer {
+    /// `Reply::Code(InvalidData)`.
+    Refused,
+    /// A typed status reply; `invalid_path` names the rule.
+    Status {
+        status: &'static str,
+        rule: Option<&'static str>,
+    },
+}
+
+enum ClientProbe {
+    /// `SharesPage::from_value` on a peer's reply: how many entries are kept and the
+    /// cursor, or the key that made the reply malformed.
+    Page {
+        value: Value,
+        expect: Result<(usize, Option<String>), &'static str>,
+    },
+    /// Whether `SharesPage::entry` keeps the entry.
+    Entry {
+        value: Value,
+        kept: bool,
+    },
+    Check(Check),
+}
+
 impl Case {
     fn family(&self) -> &'static str {
         match self {
@@ -180,6 +268,9 @@ impl Case {
             Self::ShareSet(_) => "ShareSet",
             Self::GrantStore(_) => "GrantStore",
             Self::StoreSchema(_) => "StoreSchema",
+            Self::ListServe(_) => "ListServe",
+            Self::FetchServe(_) => "FetchServe",
+            Self::FetchClient(_) => "FetchClient",
         }
     }
 }
@@ -219,6 +310,9 @@ fn run(case: &Case) -> Result<(), String> {
         Case::ShareSet(probe) => run_share(probe),
         Case::GrantStore(check) => check(),
         Case::StoreSchema(probe) => run_schema(probe),
+        Case::ListServe(probe) => run_list(probe),
+        Case::FetchServe(probe) => run_fetch(probe),
+        Case::FetchClient(probe) => run_client(probe),
     }
 }
 
@@ -413,6 +507,84 @@ fn run_schema(probe: &SchemaProbe) -> Result<(), String> {
             same("inbound record", observed, expected)
         }
         SchemaProbe::Check(check) => check(),
+    }
+}
+
+fn run_list(probe: &ListProbe) -> Result<(), String> {
+    match probe {
+        ListProbe::Request {
+            files,
+            body,
+            expect,
+        } => {
+            let serve = Serve::new("list-row", MAX_FETCH_FILE_BYTES, &["**"]);
+            for file in *files {
+                serve.file(file, file.as_bytes());
+            }
+            let reply = serve.list(body.clone());
+            match expect {
+                ListAnswer::Refused => refused(&reply),
+                ListAnswer::Page { paths, next } => {
+                    let page = answered(reply)?;
+                    same("paths", entry_paths(&page), strings(paths))?;
+                    same("next", next_of(&page), next.clone())
+                }
+            }
+        }
+        ListProbe::Check(check) => check(),
+    }
+}
+
+fn run_fetch(probe: &FetchProbe) -> Result<(), String> {
+    match probe {
+        FetchProbe::Request {
+            files,
+            body,
+            expect,
+        } => {
+            let serve = Serve::new("fetch-row", MAX_FETCH_FILE_BYTES, &["**"]);
+            for file in *files {
+                serve.file(file, file.as_bytes());
+            }
+            let reply = serve.fetch(body.clone());
+            match expect {
+                FetchAnswer::Refused => refused(&reply),
+                FetchAnswer::Status { status, rule } => {
+                    let value = answered(reply)?;
+                    same("status", status_of(&value), Some(*status))?;
+                    same(
+                        "rule",
+                        key_of(&value, "rule").and_then(Value::as_str),
+                        *rule,
+                    )
+                }
+            }
+        }
+        FetchProbe::Check(check) => check(),
+    }
+}
+
+fn run_client(probe: &ClientProbe) -> Result<(), String> {
+    match probe {
+        ClientProbe::Page { value, expect } => {
+            match (SharesPage::from_value(value, "peer"), expect) {
+                (Ok(page), Ok((kept, next))) => {
+                    same("entries kept", page.entries.len(), *kept)?;
+                    same("next", page.next.as_deref(), next.as_deref())
+                }
+                (Err(FetchError::Malformed(key)), Err(expected)) => {
+                    same("malformed key", key, *expected)
+                }
+                (Ok(page), Err(expected)) => Err(format!(
+                    "expected malformed `{expected}`, observed {page:?}"
+                )),
+                (Err(err), _) => Err(format!("expected {expect:?}, observed {err:?}")),
+            }
+        }
+        ClientProbe::Entry { value, kept } => {
+            same("kept", SharesPage::entry(value).is_some(), *kept)
+        }
+        ClientProbe::Check(check) => check(),
     }
 }
 
@@ -1534,6 +1706,1290 @@ fn the_version_pin_names_the_share_and_grant_constants() -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------------------
+// Fixtures: the handlers
+// ---------------------------------------------------------------------------------------
+
+const GRANT_ID: &str = "0123456789abcdef";
+const ORIGIN: [u8; NAME_HASH_LEN] = [7; NAME_HASH_LEN];
+/// A response frame around a `bin32` body: the array and request-id headers plus the
+/// body's own header.
+const RESPONSE_FRAME_OVERHEAD: usize = 24;
+
+struct TestSource {
+    root: Option<PathBuf>,
+    serving: Option<Arc<FetchServing>>,
+}
+
+impl ShareSource for TestSource {
+    fn share_root(&self) -> Option<PathBuf> {
+        self.root.clone()
+    }
+
+    fn serving(&self) -> Option<Arc<FetchServing>> {
+        self.serving.clone()
+    }
+}
+
+struct FailingReader;
+
+impl FileReader for FailingReader {
+    fn read_bounded(&self, _file: fs::File, _limit: u64) -> std::io::Result<Vec<u8>> {
+        Err(std::io::Error::other("the disk went away"))
+    }
+}
+
+/// Hands back `limit` bytes whatever the file holds, as a file that grew past the limit
+/// between the stat and the read would.
+struct GrowingReader;
+
+impl FileReader for GrowingReader {
+    fn read_bounded(&self, _file: fs::File, limit: u64) -> std::io::Result<Vec<u8>> {
+        Ok(vec![b'x'; limit as usize])
+    }
+}
+
+struct NoKnocks;
+
+impl KnockSink for NoKnocks {
+    fn knock(&self, _: KnockEvent) {}
+}
+
+/// A share root with the global share list beside it, served to one peer through the
+/// `/list` and `/fetch` handlers.
+struct Serve {
+    tmp: TempDir,
+    root: PathBuf,
+    serving: Arc<FetchServing>,
+    source: Arc<TestSource>,
+    identity: PrivateIdentity,
+    identity_hex: String,
+    destination: String,
+    hooks: MeshHooks,
+}
+
+impl Serve {
+    fn new(tag: &str, max_bytes: u64, allow: &[&str]) -> Self {
+        Self::build(tag, max_bytes, allow, &[], None)
+    }
+
+    /// `inbox_dir` is relative to the share root, as a `mesh.fetch.inbox_dir` pointed
+    /// inside a shared workspace is.
+    fn build(
+        tag: &str,
+        max_bytes: u64,
+        allow: &[&str],
+        deny: &[&str],
+        inbox_dir: Option<&str>,
+    ) -> Self {
+        let tmp = TempDir::new(tag);
+        let root = tmp.path.join("workspace");
+        fs::create_dir_all(&root).unwrap();
+        let allow: Vec<(&str, Option<&str>)> =
+            allow.iter().map(|pattern| (*pattern, None)).collect();
+        let shares = mesh_config_dir(&tmp.path.join("config")).join("shares.yaml");
+        fs::create_dir_all(shares.parent().unwrap()).unwrap();
+        fs::write(&shares, shares_yaml(&allow, deny, &[])).unwrap();
+        let cache_dir = tmp.path.join("cache");
+        let hooks = MeshHooks::default();
+        let serving = Arc::new(FetchServing::new(
+            tmp.path.join("config"),
+            cache_dir.clone(),
+            inbox_dir.map(|dir| root.join(dir)),
+            max_bytes,
+            GrantStore::new(&cache_dir, "inst"),
+            hooks.clone(),
+        ));
+        let source = Arc::new(TestSource {
+            root: Some(root.clone()),
+            serving: Some(Arc::clone(&serving)),
+        });
+        let identity = PrivateIdentity::new_from_rand(OsRng);
+        let identity_hex = identity.as_identity().address_hash.to_hex_string();
+        Self {
+            tmp,
+            root,
+            serving,
+            source,
+            identity,
+            identity_hex,
+            destination: fake_hash(0x2b),
+            hooks,
+        }
+    }
+
+    fn shares_file(&self) -> PathBuf {
+        mesh_config_dir(&self.tmp.path.join("config")).join("shares.yaml")
+    }
+
+    fn file(&self, relative: &str, bytes: &[u8]) {
+        let path = self.root.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, bytes).unwrap();
+    }
+
+    fn admitted(&self, path: &str, body: Value) -> AdmittedRequest {
+        AdmittedRequest {
+            link_id: LinkId::new_from_rand(OsRng),
+            identity: *self.identity.as_identity(),
+            destination_hash: AddressHash::new_from_hex_string(&self.destination).unwrap(),
+            request_id: RequestId::from([1u8; 16]),
+            path_hash: PathHash::of(path),
+            requested_at: 1_700_000_000.0,
+            body,
+            branch: SizeBranch::Packet,
+        }
+    }
+
+    fn list(&self, body: Value) -> Reply {
+        list_via(&self.source, self.admitted(LIST_PATH, body))
+    }
+
+    fn fetch(&self, body: Value) -> Reply {
+        self.fetch_with(FetchHandler::new(weak(&self.source)), body)
+    }
+
+    fn fetch_with(&self, handler: FetchHandler, body: Value) -> Reply {
+        block_on(handler.handle(self.admitted(FETCH_PATH, body)))
+    }
+
+    fn grant(&self, paths: &[&str]) {
+        self.serving
+            .grants()
+            .grant(
+                GRANT_ID,
+                &self.destination,
+                &strings(paths),
+                None,
+                SystemTime::now(),
+            )
+            .unwrap();
+    }
+
+    /// The uses left on the one granted path of the one grant on file.
+    fn uses_left(&self) -> u32 {
+        let records = self.serving.grants().list().unwrap();
+        let [record] = records.as_slice() else {
+            panic!("one grant record, got {}", records.len());
+        };
+        let [granted] = record.paths.as_slice() else {
+            panic!("one granted path, got {}", record.paths.len());
+        };
+        granted.uses_left
+    }
+
+    /// The handler's reply for `identity` once the dispatcher has judged it under `trust`.
+    fn dispatch(
+        &self,
+        trust: &TrustList,
+        identity: &PrivateIdentity,
+        path: &str,
+        body: Value,
+    ) -> Reply {
+        let (store, _tmp) = trust.open("dispatch-trust");
+        let dispatcher = Dispatcher::new(store, Arc::new(NoKnocks));
+        let registered = dispatcher
+            .register(LIST_PATH, Arc::new(ListHandler::new(weak(&self.source))))
+            .and_then(|_| {
+                dispatcher.register(FETCH_PATH, Arc::new(FetchHandler::new(weak(&self.source))))
+            });
+        assert!(registered.is_ok(), "the list and fetch paths register");
+        let request = InboundRequest {
+            link_id: LinkId::new_from_rand(OsRng),
+            identity: Some(*identity.as_identity()),
+            request_id: RequestId::from([1u8; 16]),
+            path_hash: PathHash::of(path),
+            requested_at: 0.0,
+            data: Envelope::new(OriginName(ORIGIN), body).into_value(),
+            branch: SizeBranch::Packet,
+        };
+        block_on(RequestHandler::handle(&dispatcher, request))
+    }
+}
+
+fn weak(source: &Arc<TestSource>) -> Weak<dyn ShareSource> {
+    Arc::downgrade(source) as Weak<dyn ShareSource>
+}
+
+fn list_via(source: &Arc<TestSource>, request: AdmittedRequest) -> Reply {
+    block_on(ListHandler::new(weak(source)).handle(request))
+}
+
+fn block_on<F: Future>(future: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(future)
+}
+
+fn describe(reply: &Reply) -> String {
+    match reply {
+        Reply::Value(value) => format!("Value({value})"),
+        Reply::Settled { value, .. } => format!("Settled({value})"),
+        Reply::Code(code) => format!("Code({code:?})"),
+        Reply::Silent => "Silent".to_string(),
+    }
+}
+
+/// The value of an answered reply; a settled one is dropped unsent.
+fn answered(reply: Reply) -> Result<Value, String> {
+    match reply {
+        Reply::Value(value) | Reply::Settled { value, .. } => Ok(value),
+        other => Err(format!("expected a value, observed {}", describe(&other))),
+    }
+}
+
+fn refused(reply: &Reply) -> Result<(), String> {
+    ensure(
+        matches!(reply, Reply::Code(RefusalCode::InvalidData)),
+        format!("expected InvalidData, observed {}", describe(reply)),
+    )
+}
+
+fn key_of<'a>(value: &'a Value, key: &str) -> Option<&'a Value> {
+    field(value.as_map()?, key)
+}
+
+fn keys_of(value: &Value) -> Vec<&str> {
+    value
+        .as_map()
+        .into_iter()
+        .flatten()
+        .filter_map(|(key, _)| key.as_str())
+        .collect()
+}
+
+fn status_of(value: &Value) -> Option<&str> {
+    key_of(value, "status")?.as_str()
+}
+
+fn entry_paths(page: &Value) -> Vec<String> {
+    key_of(page, "entries")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| key_of(entry, "path")?.as_str().map(str::to_string))
+        .collect()
+}
+
+fn next_of(page: &Value) -> Option<String> {
+    key_of(page, "next")?.as_str().map(str::to_string)
+}
+
+fn map(entries: Vec<(&str, Value)>) -> Value {
+    Value::Map(
+        entries
+            .into_iter()
+            .map(|(key, value)| (Value::from(key), value))
+            .collect(),
+    )
+}
+
+fn bin(bytes: &[u8]) -> Value {
+    Value::Binary(bytes.to_vec())
+}
+
+fn list_body(prefix: Option<&str>, cursor: Option<&str>) -> Value {
+    map(vec![
+        ("v", Value::from(PEER_WIRE_VERSION)),
+        ("prefix", prefix.map_or(Value::Nil, Value::from)),
+        ("cursor", cursor.map_or(Value::Nil, Value::from)),
+    ])
+}
+
+fn fetch_body(path: &str, if_sha256: Option<[u8; 32]>) -> Value {
+    map(vec![
+        ("v", Value::from(PEER_WIRE_VERSION)),
+        ("path", Value::from(path)),
+        ("if_sha256", if_sha256.map_or(Value::Nil, |hash| bin(&hash))),
+    ])
+}
+
+/// `body` with `key` set, replacing an earlier value under it.
+fn with(body: Value, key: &str, value: Value) -> Value {
+    let Value::Map(mut entries) = body else {
+        unreachable!("bodies are maps")
+    };
+    entries.retain(|(name, _)| name.as_str() != Some(key));
+    entries.push((Value::from(key), value));
+    Value::Map(entries)
+}
+
+fn without(body: Value, key: &str) -> Value {
+    let Value::Map(mut entries) = body else {
+        unreachable!("bodies are maps")
+    };
+    entries.retain(|(name, _)| name.as_str() != Some(key));
+    Value::Map(entries)
+}
+
+/// A page as a peer sends it.
+fn page_value(entries: Vec<Value>, next: Value) -> Value {
+    map(vec![
+        ("v", Value::from(PEER_WIRE_VERSION)),
+        ("entries", Value::Array(entries)),
+        ("next", next),
+    ])
+}
+
+fn entry_of(path: &str) -> Value {
+    map(vec![
+        ("path", Value::from(path)),
+        ("size", Value::from(1u64)),
+        ("sha256", bin(&[0x5a; 32])),
+        ("mtime", Value::F64(1_700_000_000.0)),
+    ])
+}
+
+fn sha256_of(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
+}
+
+/// The bytes a reply with this value puts on the wire.
+fn framed(value: Value) -> Vec<u8> {
+    ResponseFrame {
+        request_id: RequestId::from([1u8; 16]),
+        data: value,
+    }
+    .encode()
+}
+
+fn encoded_len(value: &Value) -> usize {
+    let mut bytes = Vec::new();
+    rmpv::encode::write_value(&mut bytes, value).unwrap();
+    bytes.len()
+}
+
+fn frame_of(request_id: RequestId, total: usize) -> Result<Vec<u8>, String> {
+    let bytes = ResponseFrame {
+        request_id,
+        data: Value::Binary(vec![0x5a; total - RESPONSE_FRAME_OVERHEAD]),
+    }
+    .encode();
+    same("frame length", bytes.len(), total)?;
+    Ok(bytes)
+}
+
+/// The requester's end of one pending request, as `R3Client::request` holds it.
+type Pending = tokio::sync::oneshot::Receiver<Result<(Value, SizeBranch), R3Error>>;
+
+fn pending_on(
+    client: &R3Client,
+    request_id: RequestId,
+    link_id: LinkId,
+    path: &str,
+) -> Result<Pending, String> {
+    client
+        .insert_pending(request_id, link_id, path, None)
+        .map_err(|err| format!("insert_pending: {err:?}"))
+}
+
+fn list_check(id: &'static str, kind: Kind, check: Check) -> Vector {
+    row(id, kind, Case::ListServe(ListProbe::Check(check)))
+}
+
+fn fetch_check(id: &'static str, kind: Kind, check: Check) -> Vector {
+    row(id, kind, Case::FetchServe(FetchProbe::Check(check)))
+}
+
+fn client_check(id: &'static str, kind: Kind, check: Check) -> Vector {
+    row(id, kind, Case::FetchClient(ClientProbe::Check(check)))
+}
+
+fn list_request(
+    id: &'static str,
+    kind: Kind,
+    files: &'static [&'static str],
+    body: Value,
+    expect: ListAnswer,
+) -> Vector {
+    row(
+        id,
+        kind,
+        Case::ListServe(ListProbe::Request {
+            files,
+            body,
+            expect,
+        }),
+    )
+}
+
+fn page_of(paths: &[&'static str], next: Option<String>) -> ListAnswer {
+    ListAnswer::Page {
+        paths: paths.to_vec(),
+        next,
+    }
+}
+
+fn fetch_request(
+    id: &'static str,
+    kind: Kind,
+    files: &'static [&'static str],
+    body: Value,
+    expect: FetchAnswer,
+) -> Vector {
+    row(
+        id,
+        kind,
+        Case::FetchServe(FetchProbe::Request {
+            files,
+            body,
+            expect,
+        }),
+    )
+}
+
+fn status(status: &'static str) -> FetchAnswer {
+    FetchAnswer::Status { status, rule: None }
+}
+
+fn invalid_path(rule: &'static str) -> FetchAnswer {
+    FetchAnswer::Status {
+        status: "invalid_path",
+        rule: Some(rule),
+    }
+}
+
+fn page_row(
+    id: &'static str,
+    kind: Kind,
+    value: Value,
+    expect: Result<(usize, Option<String>), &'static str>,
+) -> Vector {
+    row(
+        id,
+        kind,
+        Case::FetchClient(ClientProbe::Page { value, expect }),
+    )
+}
+
+fn entry_row(id: &'static str, kind: Kind, value: Value, kept: bool) -> Vector {
+    row(
+        id,
+        kind,
+        Case::FetchClient(ClientProbe::Entry { value, kept }),
+    )
+}
+
+// ---------------------------------------------------------------------------------------
+// Checks: the list handler
+// ---------------------------------------------------------------------------------------
+
+fn a_listing_is_the_share_set_for_the_requester_and_never_the_tree() -> Result<(), String> {
+    let serve = Serve::build(
+        "list-set",
+        MAX_FETCH_FILE_BYTES,
+        &["docs/**", "top.*"],
+        &["docs/secret.md"],
+        None,
+    );
+    for path in [
+        "docs/a.md",
+        "docs/secret.md",
+        "top.md",
+        "top.pem",
+        "src/g.rs",
+        "other.md",
+    ] {
+        serve.file(path, b"x");
+    }
+    serve.grant(&["src/g.rs"]);
+
+    let page = answered(serve.list(list_body(None, None)))?;
+    same(
+        "paths",
+        entry_paths(&page),
+        strings(&["docs/a.md", "top.md"]),
+    )?;
+    let granted = answered(serve.fetch(fetch_body("src/g.rs", None)))?;
+    same(
+        "the granted file still fetches",
+        status_of(&granted),
+        Some("ok"),
+    )
+}
+
+fn a_protected_inbox_inside_the_root_is_left_off_the_listing() -> Result<(), String> {
+    let serve = Serve::build(
+        "list-protected",
+        MAX_FETCH_FILE_BYTES,
+        &["**"],
+        &[],
+        Some("inbox"),
+    );
+    serve.file("inbox/inst/peer/a.md", b"x");
+    serve.file("top.md", b"x");
+
+    let page = answered(serve.list(list_body(None, None)))?;
+    same("paths", entry_paths(&page), strings(&["top.md"]))
+}
+
+fn a_page_holds_a_thousand_entries_and_the_cursor_resumes_after_the_last() -> Result<(), String> {
+    let serve = Serve::new("list-thousand", MAX_FETCH_FILE_BYTES, &["**"]);
+    let all: Vec<String> = (0..=LIST_PAGE_SIZE)
+        .map(|n| format!("f{n:04}.md"))
+        .collect();
+    for path in &all {
+        serve.file(path, b"x");
+    }
+
+    let first = answered(serve.list(list_body(None, None)))?;
+    same(
+        "first page",
+        entry_paths(&first),
+        all[..LIST_PAGE_SIZE].to_vec(),
+    )?;
+    same(
+        "next",
+        next_of(&first),
+        Some(list_cursor(&all[LIST_PAGE_SIZE - 1])),
+    )?;
+    let second = answered(serve.list(list_body(None, next_of(&first).as_deref())))?;
+    same(
+        "second page",
+        entry_paths(&second),
+        all[LIST_PAGE_SIZE..].to_vec(),
+    )?;
+    same("the last page carries no cursor", next_of(&second), None)?;
+    same("page size", LIST_PAGE_SIZE, 1_000)
+}
+
+/// Four hundred entries fit the share set's page but not the wire: the page is cut where
+/// the next entry would overflow the frame, and the cursor resumes after it.
+fn a_page_is_cut_by_encoded_bytes_before_the_entry_count() -> Result<(), String> {
+    let serve = Serve::new("list-cut", MAX_FETCH_FILE_BYTES, &["docs/**"]);
+    let deep = ["a", "b", "c", "d"].map(|c| c.repeat(200)).join("/");
+    let all: Vec<String> = (0..400).map(|n| format!("docs/{deep}/{n:03}.md")).collect();
+    for path in &all {
+        ensure(
+            path.len() <= WIRE_PATH_MAX_BYTES,
+            "a fixture path is over the wire cap",
+        )?;
+        serve.file(path, b"x");
+    }
+
+    let first = answered(serve.list(list_body(None, None)))?;
+    let frame = framed(first.clone());
+    ensure(
+        frame.len() <= MAX_R3_PAYLOAD_BYTES,
+        format!("the page frame is {} bytes", frame.len()),
+    )?;
+    let kept = entry_paths(&first);
+    ensure(
+        !kept.is_empty() && kept.len() < all.len(),
+        format!("{} entries kept", kept.len()),
+    )?;
+    same("kept in order", kept.as_slice(), &all[..kept.len()])?;
+    let cursor = next_of(&first).ok_or("a cut page carries a cursor")?;
+    same("cursor", cursor.clone(), list_cursor(kept.last().unwrap()))?;
+    let second = answered(serve.list(list_body(None, Some(&cursor))))?;
+    same(
+        "second page",
+        entry_paths(&second),
+        all[kept.len()..].to_vec(),
+    )?;
+    let entries = key_of(&first, "entries").ok_or("no entries")?;
+    let next_entry = key_of(&second, "entries")
+        .and_then(Value::as_array)
+        .and_then(|entries| entries.first())
+        .ok_or("the second page is empty")?;
+    ensure(
+        encoded_len(entries) + encoded_len(next_entry) + LIST_PAGE_HEADROOM > MAX_R3_PAYLOAD_BYTES,
+        "the page was cut before the headroom was reached",
+    )?;
+    same("headroom", LIST_PAGE_HEADROOM, 2048)
+}
+
+fn the_cursor_is_the_first_half_of_the_sha256_of_the_path() -> Result<(), String> {
+    same(
+        "docs/a.md",
+        list_cursor("docs/a.md"),
+        "5231f8a11b65145a1b0727cb8d209819".to_string(),
+    )?;
+    same(
+        "half the digest",
+        list_cursor("docs/a.md"),
+        hex_lower(&sha256_of(b"docs/a.md")[..16]),
+    )
+}
+
+fn a_bounded_walk_truncates_the_listing_and_the_wire_page_carries_no_flag() -> Result<(), String> {
+    let fx = Fixture::new("list-bound");
+    fx.write(Layer::Global, &allow_all());
+    for path in ["a.md", "b.md", "c.md", "d.md", "e.md", "f.md"] {
+        fx.file(path);
+    }
+    let (identity, destination) = named_peer();
+    let peer = PeerRef {
+        identity: &identity,
+        destination: &destination,
+    };
+    let set = fx.load();
+
+    let bounded = set.list(&peer, None, None, false, 3);
+    let whole = set.list(&peer, None, None, false, DEFAULT_LIST_WALK_BOUND);
+    ensure(bounded.truncated, "a walk of 3 over 6 entries is truncated")?;
+    ensure(
+        bounded.entries.len() < whole.entries.len(),
+        format!(
+            "{} bounded entries of {}",
+            bounded.entries.len(),
+            whole.entries.len()
+        ),
+    )?;
+    ensure(!whole.truncated, "the default bound truncates 6 entries")?;
+    same("whole", whole.entries.len(), 6)?;
+    same("default bound", DEFAULT_LIST_WALK_BOUND, 100_000)?;
+
+    let serve = Serve::new("list-flag", MAX_FETCH_FILE_BYTES, &["**"]);
+    serve.file("a.md", b"x");
+    let page = answered(serve.list(list_body(None, None)))?;
+    same("page keys", keys_of(&page), vec!["v", "entries", "next"])
+}
+
+/// A cursor on an entry that is never hashed still resumes after it: the walk names the
+/// candidates and only the page returned is opened.
+fn a_listing_hashes_only_the_page_it_returns() -> Result<(), String> {
+    let serve = Serve::new("list-page-hash", MAX_FETCH_FILE_BYTES, &["**"]);
+    for name in ["a.md", "b.md", "c.md"] {
+        serve.file(name, name.as_bytes());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(serve.root.join("b.md"), fs::Permissions::from_mode(0o000)).unwrap();
+    }
+
+    let after_b = answered(serve.list(list_body(None, Some(&list_cursor("b.md")))))?;
+    let first = answered(serve.list(list_body(None, None)))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(serve.root.join("b.md"), fs::Permissions::from_mode(0o644)).unwrap();
+        same(
+            "the unreadable file is dropped from its page",
+            entry_paths(&first),
+            strings(&["a.md", "c.md"]),
+        )?;
+    }
+    #[cfg(not(unix))]
+    same(
+        "first page",
+        entry_paths(&first),
+        strings(&["a.md", "b.md", "c.md"]),
+    )?;
+    same(
+        "the cursor on b.md resumes after it",
+        entry_paths(&after_b),
+        strings(&["c.md"]),
+    )
+}
+
+fn no_root_no_serving_or_a_broken_share_list_answers_the_empty_page() -> Result<(), String> {
+    let serve = Serve::new("list-empty", MAX_FETCH_FILE_BYTES, &["**"]);
+    serve.file("a.md", b"x");
+    let empty = page_value(Vec::new(), Value::Nil);
+    let request = || serve.admitted(LIST_PATH, list_body(None, None));
+
+    let no_root = Arc::new(TestSource {
+        root: None,
+        serving: Some(Arc::clone(&serve.serving)),
+    });
+    same(
+        "no share root",
+        answered(list_via(&no_root, request()))?,
+        empty.clone(),
+    )?;
+    let no_serving = Arc::new(TestSource {
+        root: Some(serve.root.clone()),
+        serving: None,
+    });
+    same(
+        "no serving state",
+        answered(list_via(&no_serving, request()))?,
+        empty.clone(),
+    )?;
+    let unprobable = Arc::new(TestSource {
+        root: Some(serve.root.join("missing")),
+        serving: Some(Arc::clone(&serve.serving)),
+    });
+    same(
+        "a root that cannot be probed",
+        answered(list_via(&unprobable, request()))?,
+        empty.clone(),
+    )?;
+    fs::write(serve.shares_file(), "version: 1\nallow: 7\n").unwrap();
+    same(
+        "a refused share list",
+        answered(serve.list(list_body(None, None)))?,
+        empty,
+    )
+}
+
+fn an_unknown_or_blocked_identity_hears_silence_on_list_and_fetch() -> Result<(), String> {
+    let serve = Serve::new("dispatch-silence", MAX_FETCH_FILE_BYTES, &["**"]);
+    serve.file("a.md", b"x");
+    let identity = PrivateIdentity::new_from_rand(OsRng);
+    let identity_hex = identity.as_identity().address_hash.to_hex_string();
+    let silenced = [
+        ("unknown", TrustList::default()),
+        ("blocked", TrustList::default().block(&identity_hex)),
+    ];
+    let trusted = TrustList::default().identity(&identity_hex, true);
+
+    for (path, body) in [
+        (LIST_PATH, list_body(None, None)),
+        (FETCH_PATH, fetch_body("a.md", None)),
+    ] {
+        for (shape, trust) in &silenced {
+            let reply = serve.dispatch(trust, &identity, path, body.clone());
+            ensure(
+                matches!(reply, Reply::Silent),
+                format!(
+                    "{shape} identity on {path}: expected silence, observed {}",
+                    describe(&reply)
+                ),
+            )?;
+        }
+        let reply = serve.dispatch(&trusted, &identity, path, body);
+        ensure(
+            matches!(reply, Reply::Value(_) | Reply::Settled { .. }),
+            format!(
+                "trusted identity on {path}: expected an answer, observed {}",
+                describe(&reply)
+            ),
+        )?;
+    }
+    Ok(())
+}
+
+fn a_listing_waits_a_round_trip() -> Result<(), String> {
+    same(
+        "PEER_REQUEST_TIMEOUT",
+        PEER_REQUEST_TIMEOUT,
+        Duration::from_secs(15),
+    )
+}
+
+// ---------------------------------------------------------------------------------------
+// Checks: the fetch handler
+// ---------------------------------------------------------------------------------------
+
+fn an_invalid_path_is_refused_before_the_root_is_probed() -> Result<(), String> {
+    let serve = Serve::new("fetch-grammar-first", MAX_FETCH_FILE_BYTES, &["**"]);
+    for (text, rule) in [
+        ("../../.bashrc", "segment"),
+        ("docs\\a.md", "backslash"),
+        ("/etc/passwd", "leading_slash"),
+        ("", "empty"),
+    ] {
+        let value = answered(serve.fetch(fetch_body(text, None)))?;
+        same(
+            &format!("{text:?} status"),
+            status_of(&value),
+            Some("invalid_path"),
+        )?;
+        same(
+            &format!("{text:?} rule"),
+            key_of(&value, "rule").and_then(Value::as_str),
+            Some(rule),
+        )?;
+    }
+    ensure(
+        serve.serving.probed_case_for(&serve.root).is_none(),
+        "the root was probed for a path the grammar refuses",
+    )?;
+    same(
+        "entries under the root",
+        fs::read_dir(&serve.root).unwrap().count(),
+        0,
+    )
+}
+
+fn too_large_is_decided_at_the_stat_before_a_grant_use_is_spent() -> Result<(), String> {
+    let serve = Serve::new("fetch-too-large-grant", 8, &[]);
+    serve.file("big.bin", &[b'x'; 9]);
+    serve.grant(&["big.bin"]);
+    let lent = serve.uses_left();
+
+    let value = answered(serve.fetch(fetch_body("big.bin", None)))?;
+    same("status", status_of(&value), Some("too_large"))?;
+    same(
+        "limit",
+        key_of(&value, "limit").and_then(Value::as_u64),
+        Some(8),
+    )?;
+    same("uses left", serve.uses_left(), lent)
+}
+
+fn a_failed_read_is_not_shared_and_a_file_that_grew_is_too_large() -> Result<(), String> {
+    let serve = Serve::new("fetch-read", 8, &["**"]);
+    serve.file("a.md", b"x");
+    let missing = answered(serve.fetch(fetch_body("missing.md", None)))?;
+
+    let failed = answered(serve.fetch_with(
+        FetchHandler::with_reader(weak(&serve.source), Arc::new(FailingReader)),
+        fetch_body("a.md", None),
+    ))?;
+    same(
+        "a failed read is not_shared, byte for byte",
+        framed(failed),
+        framed(missing),
+    )?;
+    let grown = answered(serve.fetch_with(
+        FetchHandler::with_reader(weak(&serve.source), Arc::new(GrowingReader)),
+        fetch_body("a.md", None),
+    ))?;
+    same("grown status", status_of(&grown), Some("too_large"))?;
+    same(
+        "grown limit",
+        key_of(&grown, "limit").and_then(Value::as_u64),
+        Some(8),
+    )
+}
+
+fn a_matching_if_sha256_is_not_modified_without_a_body_and_spends_the_use() -> Result<(), String> {
+    let serve = Serve::new("fetch-not-modified", MAX_FETCH_FILE_BYTES, &[]);
+    let bytes = b"# docs\n";
+    serve.file("docs/a.md", bytes);
+    serve.grant(&["docs/a.md"]);
+    let lent = serve.uses_left();
+
+    let value = answered(serve.fetch(fetch_body("docs/a.md", Some(sha256_of(bytes)))))?;
+    same("status", status_of(&value), Some("not_modified"))?;
+    same("keys", keys_of(&value), vec!["v", "status", "sha256"])?;
+    same(
+        "sha256",
+        key_of(&value, "sha256").cloned(),
+        Some(bin(&sha256_of(bytes))),
+    )?;
+    same("uses left", serve.uses_left(), lent - 1)
+}
+
+fn an_ok_reply_carries_the_size_the_digest_and_the_bytes() -> Result<(), String> {
+    let serve = Serve::new("fetch-ok", MAX_FETCH_FILE_BYTES, &["**"]);
+    let bytes = b"# docs\n";
+    serve.file("docs/a.md", bytes);
+
+    let value = answered(serve.fetch(fetch_body("docs/a.md", None)))?;
+    same("status", status_of(&value), Some("ok"))?;
+    same(
+        "keys",
+        keys_of(&value),
+        vec!["v", "status", "size", "sha256", "bytes"],
+    )?;
+    same(
+        "size",
+        key_of(&value, "size").and_then(Value::as_u64),
+        Some(bytes.len() as u64),
+    )?;
+    same(
+        "sha256",
+        key_of(&value, "sha256").cloned(),
+        Some(bin(&sha256_of(bytes))),
+    )?;
+    same("bytes", key_of(&value, "bytes").cloned(), Some(bin(bytes)))?;
+    let stale = answered(serve.fetch(fetch_body("docs/a.md", Some([0u8; 32]))))?;
+    same(
+        "a stale if_sha256 is answered ok",
+        status_of(&stale),
+        Some("ok"),
+    )
+}
+
+fn not_shared_is_byte_identical_for_a_missing_an_unshared_and_a_denied_file() -> Result<(), String>
+{
+    let serve = Serve::new("fetch-not-shared", MAX_FETCH_FILE_BYTES, &["docs/**"]);
+    serve.file("src/x.rs", b"x");
+    serve.file("docs/.env", b"x");
+
+    let missing = answered(serve.fetch(fetch_body("docs/missing.md", None)))?;
+    same("status", status_of(&missing), Some("not_shared"))?;
+    same("keys", keys_of(&missing), vec!["v", "status"])?;
+    let missing = framed(missing);
+    let unshared = framed(answered(serve.fetch(fetch_body("src/x.rs", None)))?);
+    let denied = framed(answered(serve.fetch(fetch_body("docs/.env", None)))?);
+    same("unshared", unshared, missing.clone())?;
+    same("builtin-denied", denied, missing)
+}
+
+fn the_serving_limit_is_the_configured_bytes_under_the_ceiling() -> Result<(), String> {
+    let small = Serve::new("fetch-limit-small", 8, &["**"]);
+    same("small limit", small.serving.serving_limit(), 8)?;
+    let full = Serve::new("fetch-limit-full", MAX_FETCH_FILE_BYTES, &["**"]);
+    same(
+        "capped limit",
+        full.serving.serving_limit(),
+        MAX_FETCH_FILE_BYTES.min(SINGLE_SEGMENT_FETCH_CEILING),
+    )?;
+    same("file ceiling", MAX_FETCH_FILE_BYTES, 4_194_304)?;
+    small.file("big.bin", &[b'x'; 9]);
+    let value = answered(small.fetch(fetch_body("big.bin", None)))?;
+    same("status", status_of(&value), Some("too_large"))?;
+    same(
+        "limit",
+        key_of(&value, "limit").and_then(Value::as_u64),
+        Some(8),
+    )
+}
+
+fn a_file_one_past_the_ceiling_is_too_large_and_one_at_it_is_ok() -> Result<(), String> {
+    let serve = Serve::new("fetch-ceiling", MAX_FETCH_FILE_BYTES, &["**"]);
+    let ceiling = SINGLE_SEGMENT_FETCH_CEILING as usize;
+    serve.file("over.bin", &vec![b'x'; ceiling + 1]);
+    serve.file("at.bin", &vec![b'x'; ceiling]);
+
+    let over = answered(serve.fetch(fetch_body("over.bin", None)))?;
+    same("over status", status_of(&over), Some("too_large"))?;
+    same(
+        "over limit",
+        key_of(&over, "limit").and_then(Value::as_u64),
+        Some(1_048_447),
+    )?;
+    let at = answered(serve.fetch(fetch_body("at.bin", None)))?;
+    same("at status", status_of(&at), Some("ok"))?;
+    same(
+        "at size",
+        key_of(&at, "size").and_then(Value::as_u64),
+        Some(SINGLE_SEGMENT_FETCH_CEILING),
+    )
+}
+
+fn a_served_fetch_fires_once_sent_with_peer_size_and_hash_prefix_and_no_path() -> Result<(), String>
+{
+    let serve = Serve::new("fetch-hook", MAX_FETCH_FILE_BYTES, &["docs/**"]);
+    let bytes = b"# docs\n";
+    serve.file("docs/a.md", bytes);
+    let sink = RecordingHookSink::attach(&serve.hooks);
+
+    let refused = answered(serve.fetch(fetch_body("docs/missing.md", None)))?;
+    same("refused", status_of(&refused), Some("not_shared"))?;
+    ensure(sink.drain().is_empty(), "a not_shared reply fired a hook")?;
+    let unsent = serve.fetch(fetch_body("docs/a.md", None));
+    ensure(
+        matches!(unsent, Reply::Settled { .. }),
+        format!("expected a settled ok, observed {}", describe(&unsent)),
+    )?;
+    drop(unsent);
+    ensure(sink.drain().is_empty(), "an unsent reply fired a hook")?;
+
+    let Reply::Settled { settlement, .. } = serve.fetch(fetch_body("docs/a.md", None)) else {
+        return Err("an ok reply settles on send".to_string());
+    };
+    settlement.sent();
+    let fired = sink.drain();
+    let [(event, envs)] = fired.as_slice() else {
+        return Err(format!("expected one fire, observed {fired:?}"));
+    };
+    same("event", event, &HookEvent::MeshFetchServed)?;
+    same(
+        "identity",
+        env_value(envs, "COYOTE_MESH_PEER_IDENTITY"),
+        Some(serve.identity_hex.as_str()),
+    )?;
+    same(
+        "destination",
+        env_value(envs, "COYOTE_MESH_PEER_DESTINATION"),
+        Some(serve.destination.as_str()),
+    )?;
+    same(
+        "size",
+        env_value(envs, "COYOTE_MESH_SIZE"),
+        Some(bytes.len().to_string().as_str()),
+    )?;
+    same(
+        "hash prefix",
+        env_value(envs, "COYOTE_MESH_HASH_PREFIX"),
+        Some(&hex_lower(&sha256_of(bytes))[..8]),
+    )?;
+    ensure(
+        envs.iter()
+            .all(|(_, value)| !value.contains("docs") && !value.contains("a.md")),
+        format!("a path leaked into the hook environment: {envs:?}"),
+    )
+}
+
+fn an_ok_dropped_unsent_refunds_the_grant_use_and_one_sent_keeps_it_spent() -> Result<(), String> {
+    let serve = Serve::new("fetch-refund", MAX_FETCH_FILE_BYTES, &[]);
+    serve.file("docs/a.md", b"x");
+    serve.grant(&["docs/a.md"]);
+    let lent = serve.uses_left();
+
+    let unsent = serve.fetch(fetch_body("docs/a.md", None));
+    ensure(
+        matches!(unsent, Reply::Settled { .. }),
+        format!("expected a settled ok, observed {}", describe(&unsent)),
+    )?;
+    same("spent while in flight", serve.uses_left(), lent - 1)?;
+    drop(unsent);
+    same("refunded when dropped unsent", serve.uses_left(), lent)?;
+
+    let Reply::Settled { settlement, .. } = serve.fetch(fetch_body("docs/a.md", None)) else {
+        return Err("an ok reply settles on send".to_string());
+    };
+    settlement.sent();
+    same("spent once sent", serve.uses_left(), lent - 1)
+}
+
+// ---------------------------------------------------------------------------------------
+// Checks: the requester
+// ---------------------------------------------------------------------------------------
+
+fn a_card_with_a_malformed_about_or_caps_keeps_the_rest() -> Result<(), String> {
+    let card = |about: Value, caps: Value| {
+        StatusCard::from_value(&map(vec![
+            ("v", Value::from(STATUS_CARD_VERSION)),
+            ("state", map(vec![("code", Value::from(STATE_IDLE))])),
+            ("served_at_secs", Value::from(1_700_000_000u64)),
+            ("about", about),
+            ("caps", caps),
+        ]))
+        .map_err(|err| format!("{err:?}"))
+    };
+
+    let malformed = card(Value::from(7), Value::from(7))?;
+    same("about", malformed.about, None)?;
+    same("caps", malformed.caps, Vec::<String>::new())?;
+    same("state", malformed.state.code, STATE_IDLE)?;
+    let well = card(
+        Value::from("a node"),
+        Value::Array(vec![
+            Value::from(7),
+            Value::from("fetch"),
+            Value::from("   "),
+            Value::from("x".repeat(40)),
+        ]),
+    )?;
+    same("about kept", well.about, Some("a node".to_string()))?;
+    same("caps", well.caps, vec!["fetch".to_string(), "x".repeat(32)])
+}
+
+fn an_unknown_status_is_a_client_error_with_the_pinned_wording() -> Result<(), String> {
+    same(
+        "wording",
+        FetchError::UnknownStatus.to_string(),
+        "peer sent an unknown status".to_string(),
+    )
+}
+
+fn a_rule_is_kept_when_known_read_as_unknown_otherwise_and_malformed_when_not_text()
+-> Result<(), String> {
+    same(
+        "known",
+        rule_of(&Value::from("segment")),
+        Some("segment".to_string()),
+    )?;
+    same(
+        "other text",
+        rule_of(&Value::from("the path was bad")),
+        Some("unknown".to_string()),
+    )?;
+    same("not text", rule_of(&Value::from(7)), None)?;
+    same("nil", rule_of(&Value::Nil), None)
+}
+
+fn a_fetch_response_at_its_bound_is_delivered_and_one_byte_over_is_dropped() -> Result<(), String> {
+    block_on(async {
+        let client = R3Client::new();
+        let link_id = LinkId::new_from_rand(OsRng);
+
+        let over_id = RequestId::from([0xa1u8; 16]);
+        let mut over = pending_on(&client, over_id, link_id, FETCH_PATH)?;
+        client.deliver(
+            link_id,
+            &frame_of(over_id, MAX_FETCH_RESPONSE_BYTES + 1)?,
+            SizeBranch::Resource,
+        );
+        ensure(
+            matches!(over.try_recv(), Err(TryRecvError::Empty)),
+            "one byte over the fetch bound was delivered or failed the request",
+        )?;
+
+        let at_id = RequestId::from([0xa2u8; 16]);
+        let at = pending_on(&client, at_id, link_id, FETCH_PATH)?;
+        client.deliver(
+            link_id,
+            &frame_of(at_id, MAX_FETCH_RESPONSE_BYTES)?,
+            SizeBranch::Resource,
+        );
+        let (value, branch) = at
+            .await
+            .map_err(|err| format!("the pending request was dropped: {err}"))?
+            .map_err(|err| format!("the response failed: {err:?}"))?;
+        same("branch", branch, SizeBranch::Resource)?;
+        same(
+            "payload",
+            value.as_slice().map(<[u8]>::len),
+            Some(MAX_FETCH_RESPONSE_BYTES - RESPONSE_FRAME_OVERHEAD),
+        )?;
+        same(
+            "bound",
+            MAX_FETCH_RESPONSE_BYTES,
+            MAX_FETCH_FILE_BYTES as usize + 4096,
+        )
+    })
+}
+
+fn the_bound_is_found_from_the_frame_prefix_before_the_frame_is_decoded() -> Result<(), String> {
+    install_log_collector();
+    block_on(async {
+        let client = R3Client::new();
+        let link_id = LinkId::new_from_rand(OsRng);
+        let oversize_line = |len: usize, max: usize| {
+            format!(
+                "Dropped an oversize mesh response on link {} ({len} bytes, max {max})",
+                link_id.to_hex_string()
+            )
+        };
+
+        // One frame, one byte over the common bound: dropped for a pending `/status`,
+        // delivered for a pending `/fetch`.
+        let status_id = RequestId::from([0xb1u8; 16]);
+        let mut status = pending_on(&client, status_id, link_id, STATUS_PATH)?;
+        client.deliver(
+            link_id,
+            &frame_of(status_id, MAX_R3_PAYLOAD_BYTES + 1)?,
+            SizeBranch::Resource,
+        );
+        ensure(
+            matches!(status.try_recv(), Err(TryRecvError::Empty)),
+            "a status response over the common bound was delivered or failed the request",
+        )?;
+        ensure(
+            debug_snapshot().contains(&oversize_line(
+                MAX_R3_PAYLOAD_BYTES + 1,
+                MAX_R3_PAYLOAD_BYTES,
+            )),
+            "the status drop was not logged against the common bound",
+        )?;
+        let fetch_id = RequestId::from([0xb2u8; 16]);
+        let fetch = pending_on(&client, fetch_id, link_id, FETCH_PATH)?;
+        client.deliver(
+            link_id,
+            &frame_of(fetch_id, MAX_R3_PAYLOAD_BYTES + 1)?,
+            SizeBranch::Resource,
+        );
+        let (value, _) = fetch
+            .await
+            .map_err(|err| format!("the pending request was dropped: {err}"))?
+            .map_err(|err| format!("the response failed: {err:?}"))?;
+        same(
+            "fetch payload",
+            value.as_slice().map(<[u8]>::len),
+            Some(MAX_R3_PAYLOAD_BYTES + 1 - RESPONSE_FRAME_OVERHEAD),
+        )?;
+
+        // No frame prefix: the coarse bound.
+        client.deliver(
+            link_id,
+            &vec![0xc0; MAX_FETCH_RESPONSE_BYTES + 1],
+            SizeBranch::Resource,
+        );
+        ensure(
+            debug_snapshot().contains(&oversize_line(
+                MAX_FETCH_RESPONSE_BYTES + 1,
+                MAX_FETCH_RESPONSE_BYTES,
+            )),
+            "bytes without a frame prefix were not judged under the coarse bound",
+        )?;
+
+        // A frame for an id nothing is pending on: the coarse bound, so one byte over the
+        // common bound reaches the decoder and fails to match.
+        let stray_id = RequestId::from([0xb3u8; 16]);
+        client.deliver(
+            link_id,
+            &frame_of(stray_id, MAX_R3_PAYLOAD_BYTES + 1)?,
+            SizeBranch::Resource,
+        );
+        let unmatched = format!("Unmatched mesh response {}", stray_id.to_hex_string());
+        ensure(
+            debug_snapshot()
+                .iter()
+                .any(|line| line.contains(&unmatched)),
+            "a frame for no pending request was not judged under the coarse bound",
+        )?;
+        same("prefix", RESPONSE_FRAME_PREFIX, [0x92, 0xc4, 0x10])
+    })
+}
+
+fn the_inbox_stages_under_the_instance_and_peer_and_refuses_a_collision() -> Result<(), String> {
+    let tmp = TempDir::new("inbox-stage");
+    let cache_dir = tmp.path.join("cache");
+    let staging = InboxStaging::for_instance_under(None, &cache_dir, "inst");
+    same(
+        "inbox under the cache dir",
+        staging.root().to_path_buf(),
+        inbox_root(&cache_dir, "inst"),
+    )?;
+    let configured =
+        InboxStaging::for_instance_under(Some(&tmp.path.join("drop")), &cache_dir, "inst");
+    same(
+        "configured inbox",
+        configured.root().to_path_buf(),
+        tmp.path.join("drop").join("inst"),
+    )?;
+
+    let destination = "ABCDEF0123456789abcdef0123456789";
+    let path = WirePath::parse("docs/a.md").map_err(|invalid| invalid.rule.to_string())?;
+    let stage = |bytes: &[u8]| staging.stage(destination, &path, &sha256_of(bytes), bytes);
+    let first = b"one";
+    let staged = stage(first).map_err(|err| err.to_string())?;
+    let expected = dunce::canonicalize(staging.root())
+        .unwrap()
+        .join("abcdef01")
+        .join("docs")
+        .join("a.md");
+    same("staged path", staged.clone(), expected.clone())?;
+    same("staged bytes", fs::read(&staged).unwrap(), first.to_vec())?;
+    same(
+        "the same bytes reuse the file",
+        stage(first).map_err(|err| err.to_string())?,
+        expected.clone(),
+    )?;
+    let second = b"two";
+    let sibling = stage(second).map_err(|err| err.to_string())?;
+    same(
+        "other bytes land beside it",
+        sibling.clone(),
+        expected.with_file_name(format!("a-{}.md", &hex_lower(&sha256_of(second))[..8])),
+    )?;
+    fs::write(&sibling, b"three").unwrap();
+    ensure(
+        matches!(stage(second), Err(StageError::Collision)),
+        "a target and a sibling both holding other bytes did not collide",
+    )?;
+    same(
+        "the target is untouched",
+        fs::read(&staged).unwrap(),
+        first.to_vec(),
+    )
+}
+
+fn a_fetched_file_yields_its_path_size_and_digest_and_never_its_bytes() -> Result<(), String> {
+    let fetched = Fetched::Staged {
+        path: PathBuf::from("inbox/a.md"),
+        size: 3,
+        sha256: sha256_of(b"one"),
+    };
+    // Destructured without a rest pattern, so a bytes field would fail to compile here.
+    let Fetched::Staged { path, size, sha256 } = &fetched else {
+        return Err("a staged fetch".to_string());
+    };
+    same("path", path.as_path(), Path::new("inbox/a.md"))?;
+    same("size", *size, 3)?;
+    same("digest", *sha256, sha256_of(b"one"))
+}
+
+fn a_fetch_waits_two_minutes() -> Result<(), String> {
+    same(
+        "FILE_FETCH_REQUEST_TIMEOUT",
+        FILE_FETCH_REQUEST_TIMEOUT,
+        Duration::from_secs(120),
+    )
+}
+
+// ---------------------------------------------------------------------------------------
 // The table
 // ---------------------------------------------------------------------------------------
 
@@ -1543,6 +2999,9 @@ fn vectors() -> Vec<Vector> {
     rows.extend(share_set_rows());
     rows.extend(grant_store_rows());
     rows.extend(store_schema_rows());
+    rows.extend(list_serve_rows());
+    rows.extend(fetch_serve_rows());
+    rows.extend(fetch_client_rows());
     rows
 }
 
@@ -2804,6 +4263,717 @@ fn store_schema_rows() -> Vec<Vector> {
     ]
 }
 
+fn list_serve_rows() -> Vec<Vector> {
+    use Kind::{Boundary, Invalid, Valid};
+    const TWO: &[&str] = &["docs/a.md", "src/b.rs"];
+    let sixty_four = "a".repeat(CURSOR_MAX_BYTES);
+    let sixty_five = "a".repeat(CURSOR_MAX_BYTES + 1);
+    vec![
+        list_request(
+            "MESH-LIST-001",
+            Invalid,
+            TWO,
+            without(list_body(None, None), "v"),
+            ListAnswer::Refused,
+        ),
+        list_request(
+            "MESH-LIST-001",
+            Invalid,
+            TWO,
+            with(list_body(None, None), "v", Value::from(2u64)),
+            ListAnswer::Refused,
+        ),
+        list_request(
+            "MESH-LIST-001",
+            Invalid,
+            TWO,
+            with(list_body(None, None), "v", Value::from("1")),
+            ListAnswer::Refused,
+        ),
+        list_request(
+            "MESH-LIST-001",
+            Invalid,
+            TWO,
+            Value::from("list"),
+            ListAnswer::Refused,
+        ),
+        list_request(
+            "MESH-LIST-001",
+            Valid,
+            TWO,
+            list_body(None, None),
+            page_of(TWO, None),
+        ),
+        list_request(
+            "MESH-LIST-002",
+            Invalid,
+            TWO,
+            with(list_body(None, None), "prefix", Value::from(7)),
+            ListAnswer::Refused,
+        ),
+        list_request(
+            "MESH-LIST-002",
+            Invalid,
+            TWO,
+            with(list_body(None, None), "prefix", bin(b"docs")),
+            ListAnswer::Refused,
+        ),
+        list_request(
+            "MESH-LIST-002",
+            Valid,
+            TWO,
+            list_body(Some("docs/"), None),
+            page_of(&["docs/a.md"], None),
+        ),
+        list_request(
+            "MESH-LIST-002",
+            Valid,
+            TWO,
+            without(list_body(None, None), "prefix"),
+            page_of(TWO, None),
+        ),
+        list_request(
+            "MESH-LIST-003",
+            Invalid,
+            TWO,
+            with(list_body(None, None), "cursor", Value::from(7)),
+            ListAnswer::Refused,
+        ),
+        list_request(
+            "MESH-LIST-003",
+            Invalid,
+            TWO,
+            list_body(None, Some(&sixty_five)),
+            ListAnswer::Refused,
+        ),
+        list_request(
+            "MESH-LIST-003",
+            Boundary,
+            TWO,
+            list_body(None, Some(&sixty_four)),
+            page_of(TWO, None),
+        ),
+        list_request(
+            "MESH-LIST-004",
+            Valid,
+            TWO,
+            list_body(None, Some("00000000000000000000000000000000")),
+            page_of(TWO, None),
+        ),
+        list_request(
+            "MESH-LIST-004",
+            Valid,
+            TWO,
+            list_body(None, Some(&list_cursor("docs/a.md"))),
+            page_of(&["src/b.rs"], None),
+        ),
+        list_request(
+            "MESH-LIST-005",
+            Valid,
+            TWO,
+            with(list_body(None, None), "extra", Value::from(7)),
+            page_of(TWO, None),
+        ),
+        list_request(
+            "MESH-LIST-005",
+            Valid,
+            TWO,
+            with(
+                list_body(None, None),
+                "paths",
+                Value::Array(vec![Value::from("x")]),
+            ),
+            page_of(TWO, None),
+        ),
+        list_check(
+            "MESH-LIST-016",
+            Valid,
+            a_listing_is_the_share_set_for_the_requester_and_never_the_tree,
+        ),
+        list_check(
+            "MESH-LIST-016",
+            Valid,
+            a_protected_inbox_inside_the_root_is_left_off_the_listing,
+        ),
+        list_request(
+            "MESH-LIST-017",
+            Valid,
+            &["a.md", "Z.md", "B.md", "docs/x.md", "docs-x.md"],
+            list_body(None, None),
+            page_of(&["B.md", "Z.md", "a.md", "docs-x.md", "docs/x.md"], None),
+        ),
+        list_request(
+            "MESH-LIST-017",
+            Valid,
+            &["a.md", "Z.md", "B.md", "docs/x.md", "docs-x.md"],
+            list_body(Some("docs"), None),
+            page_of(&["docs-x.md", "docs/x.md"], None),
+        ),
+        list_check(
+            "MESH-LIST-018",
+            Boundary,
+            a_page_holds_a_thousand_entries_and_the_cursor_resumes_after_the_last,
+        ),
+        list_check(
+            "MESH-LIST-018",
+            Boundary,
+            a_page_is_cut_by_encoded_bytes_before_the_entry_count,
+        ),
+        list_check(
+            "MESH-LIST-019",
+            Valid,
+            the_cursor_is_the_first_half_of_the_sha256_of_the_path,
+        ),
+        list_check(
+            "MESH-LIST-019",
+            Valid,
+            a_page_holds_a_thousand_entries_and_the_cursor_resumes_after_the_last,
+        ),
+        list_check(
+            "MESH-LIST-021",
+            Valid,
+            a_bounded_walk_truncates_the_listing_and_the_wire_page_carries_no_flag,
+        ),
+        list_check(
+            "MESH-LIST-022",
+            Valid,
+            a_listing_hashes_only_the_page_it_returns,
+        ),
+        list_check(
+            "MESH-LIST-023",
+            Valid,
+            no_root_no_serving_or_a_broken_share_list_answers_the_empty_page,
+        ),
+        list_check(
+            "MESH-LIST-024",
+            Invalid,
+            an_unknown_or_blocked_identity_hears_silence_on_list_and_fetch,
+        ),
+        list_check("MESH-LIST-025", Valid, a_listing_waits_a_round_trip),
+    ]
+}
+
+fn fetch_serve_rows() -> Vec<Vector> {
+    use Kind::{Boundary, Invalid, Valid};
+    const ONE: &[&str] = &["docs/a.md"];
+    let body = || fetch_body("docs/a.md", None);
+    vec![
+        fetch_request(
+            "MESH-FETCH-004",
+            Invalid,
+            ONE,
+            fetch_body("docs/../a.md", None),
+            invalid_path("segment"),
+        ),
+        fetch_check(
+            "MESH-FETCH-004",
+            Invalid,
+            an_invalid_path_is_refused_before_the_root_is_probed,
+        ),
+        fetch_request(
+            "MESH-FETCH-006",
+            Invalid,
+            ONE,
+            fetch_body("docs", None),
+            status("not_shared"),
+        ),
+        fetch_request("MESH-FETCH-006", Valid, ONE, body(), status("ok")),
+        fetch_request(
+            "MESH-FETCH-008",
+            Invalid,
+            ONE,
+            without(body(), "v"),
+            FetchAnswer::Refused,
+        ),
+        fetch_request(
+            "MESH-FETCH-008",
+            Invalid,
+            ONE,
+            with(body(), "v", Value::from(2u64)),
+            FetchAnswer::Refused,
+        ),
+        fetch_request(
+            "MESH-FETCH-008",
+            Invalid,
+            ONE,
+            Value::from("fetch"),
+            FetchAnswer::Refused,
+        ),
+        fetch_request("MESH-FETCH-008", Valid, ONE, body(), status("ok")),
+        fetch_request(
+            "MESH-FETCH-009",
+            Invalid,
+            ONE,
+            without(body(), "path"),
+            FetchAnswer::Refused,
+        ),
+        fetch_request(
+            "MESH-FETCH-009",
+            Invalid,
+            ONE,
+            with(body(), "path", Value::Nil),
+            FetchAnswer::Refused,
+        ),
+        fetch_request(
+            "MESH-FETCH-009",
+            Invalid,
+            ONE,
+            with(body(), "path", Value::from(7)),
+            FetchAnswer::Refused,
+        ),
+        fetch_request(
+            "MESH-FETCH-009",
+            Invalid,
+            ONE,
+            with(body(), "path", bin(b"docs/a.md")),
+            FetchAnswer::Refused,
+        ),
+        fetch_request(
+            "MESH-FETCH-010",
+            Invalid,
+            ONE,
+            fetch_body("", None),
+            invalid_path("empty"),
+        ),
+        fetch_request(
+            "MESH-FETCH-010",
+            Invalid,
+            ONE,
+            fetch_body("docs//a.md", None),
+            invalid_path("segment"),
+        ),
+        fetch_request(
+            "MESH-FETCH-010",
+            Invalid,
+            ONE,
+            fetch_body("docs\\a.md", None),
+            invalid_path("backslash"),
+        ),
+        fetch_request(
+            "MESH-FETCH-010",
+            Invalid,
+            ONE,
+            fetch_body("/docs/a.md", None),
+            invalid_path("leading_slash"),
+        ),
+        fetch_request(
+            "MESH-FETCH-010",
+            Invalid,
+            ONE,
+            fetch_body("c:/a.md", None),
+            invalid_path("drive_letter"),
+        ),
+        fetch_request(
+            "MESH-FETCH-010",
+            Invalid,
+            ONE,
+            fetch_body("cafe\u{301}.md", None),
+            invalid_path("nfc"),
+        ),
+        fetch_request(
+            "MESH-FETCH-010",
+            Invalid,
+            ONE,
+            fetch_body("docs/a\tb.md", None),
+            invalid_path("control"),
+        ),
+        fetch_request(
+            "MESH-FETCH-010",
+            Invalid,
+            ONE,
+            fetch_body("docs./a.md", None),
+            invalid_path("trailing_dot"),
+        ),
+        fetch_request(
+            "MESH-FETCH-010",
+            Invalid,
+            ONE,
+            fetch_body("con.md", None),
+            invalid_path("reserved_name"),
+        ),
+        fetch_request(
+            "MESH-FETCH-011",
+            Invalid,
+            ONE,
+            with(body(), "if_sha256", Value::from("abc")),
+            FetchAnswer::Refused,
+        ),
+        fetch_request(
+            "MESH-FETCH-011",
+            Invalid,
+            ONE,
+            with(body(), "if_sha256", bin(&[0u8; 31])),
+            FetchAnswer::Refused,
+        ),
+        fetch_request(
+            "MESH-FETCH-011",
+            Invalid,
+            ONE,
+            with(body(), "if_sha256", bin(&[0u8; 33])),
+            FetchAnswer::Refused,
+        ),
+        fetch_request(
+            "MESH-FETCH-011",
+            Boundary,
+            ONE,
+            fetch_body("docs/a.md", Some([0u8; 32])),
+            status("ok"),
+        ),
+        fetch_request(
+            "MESH-FETCH-011",
+            Valid,
+            ONE,
+            without(body(), "if_sha256"),
+            status("ok"),
+        ),
+        fetch_request(
+            "MESH-FETCH-012",
+            Valid,
+            ONE,
+            with(body(), "extra", Value::from(7)),
+            status("ok"),
+        ),
+        fetch_request(
+            "MESH-FETCH-012",
+            Valid,
+            ONE,
+            with(body(), "prefix", Value::from("docs/")),
+            status("ok"),
+        ),
+        fetch_request(
+            "MESH-FETCH-024",
+            Invalid,
+            &[],
+            fetch_body("../a.md", None),
+            invalid_path("segment"),
+        ),
+        fetch_request(
+            "MESH-FETCH-024",
+            Invalid,
+            ONE,
+            fetch_body("docs/missing.md", None),
+            status("not_shared"),
+        ),
+        fetch_request(
+            "MESH-FETCH-024",
+            Invalid,
+            ONE,
+            fetch_body("docs", None),
+            status("not_shared"),
+        ),
+        fetch_check(
+            "MESH-FETCH-024",
+            Invalid,
+            too_large_is_decided_at_the_stat_before_a_grant_use_is_spent,
+        ),
+        fetch_check(
+            "MESH-FETCH-024",
+            Invalid,
+            a_failed_read_is_not_shared_and_a_file_that_grew_is_too_large,
+        ),
+        fetch_check(
+            "MESH-FETCH-024",
+            Valid,
+            a_matching_if_sha256_is_not_modified_without_a_body_and_spends_the_use,
+        ),
+        fetch_check(
+            "MESH-FETCH-024",
+            Valid,
+            an_ok_reply_carries_the_size_the_digest_and_the_bytes,
+        ),
+        fetch_check(
+            "MESH-FETCH-025",
+            Invalid,
+            not_shared_is_byte_identical_for_a_missing_an_unshared_and_a_denied_file,
+        ),
+        fetch_check(
+            "MESH-FETCH-026",
+            Valid,
+            the_serving_limit_is_the_configured_bytes_under_the_ceiling,
+        ),
+        fetch_check(
+            "MESH-FETCH-027",
+            Boundary,
+            a_file_one_past_the_ceiling_is_too_large_and_one_at_it_is_ok,
+        ),
+        fetch_check(
+            "MESH-FETCH-033",
+            Valid,
+            a_served_fetch_fires_once_sent_with_peer_size_and_hash_prefix_and_no_path,
+        ),
+        fetch_check(
+            "MESH-FETCH-034",
+            Valid,
+            an_ok_dropped_unsent_refunds_the_grant_use_and_one_sent_keeps_it_spent,
+        ),
+    ]
+}
+
+fn fetch_client_rows() -> Vec<Vector> {
+    use Kind::{Boundary, Invalid, Valid};
+    let good = || entry_of("docs/a.md");
+    let one = || page_value(vec![good()], Value::Nil);
+    let sixty_four = "a".repeat(CURSOR_MAX_BYTES);
+    let sixty_five = "a".repeat(CURSOR_MAX_BYTES + 1);
+    let thousand_and_one: Vec<Value> = (0..=LIST_PAGE_SIZE)
+        .map(|n| entry_of(&format!("f{n:04}.md")))
+        .collect();
+    vec![
+        client_check(
+            "MESH-FETCH-001",
+            Invalid,
+            a_card_with_a_malformed_about_or_caps_keeps_the_rest,
+        ),
+        client_check(
+            "MESH-FETCH-002",
+            Invalid,
+            a_card_with_a_malformed_about_or_caps_keeps_the_rest,
+        ),
+        page_row("MESH-LIST-006", Invalid, without(one(), "v"), Err("v")),
+        page_row(
+            "MESH-LIST-006",
+            Invalid,
+            with(one(), "v", Value::from(2u64)),
+            Err("v"),
+        ),
+        page_row("MESH-LIST-006", Invalid, Value::from("page"), Err("map")),
+        page_row("MESH-LIST-006", Valid, one(), Ok((1, None))),
+        page_row(
+            "MESH-LIST-007",
+            Invalid,
+            without(one(), "entries"),
+            Err("entries"),
+        ),
+        page_row(
+            "MESH-LIST-007",
+            Invalid,
+            with(one(), "entries", Value::from(7)),
+            Err("entries"),
+        ),
+        page_row(
+            "MESH-LIST-007",
+            Invalid,
+            with(one(), "entries", Value::Nil),
+            Err("entries"),
+        ),
+        page_row(
+            "MESH-LIST-008",
+            Boundary,
+            page_value(thousand_and_one, Value::Nil),
+            Ok((LIST_PAGE_SIZE, None)),
+        ),
+        page_row(
+            "MESH-LIST-008",
+            Invalid,
+            page_value(vec![Value::from(7), good()], Value::Nil),
+            Ok((1, None)),
+        ),
+        page_row(
+            "MESH-LIST-008",
+            Invalid,
+            page_value(vec![entry_of("docs//a.md"), good()], Value::Nil),
+            Ok((1, None)),
+        ),
+        page_row(
+            "MESH-LIST-009",
+            Invalid,
+            with(one(), "next", Value::from(7)),
+            Err("next"),
+        ),
+        page_row(
+            "MESH-LIST-009",
+            Invalid,
+            with(one(), "next", Value::from(sixty_five.as_str())),
+            Err("next"),
+        ),
+        page_row(
+            "MESH-LIST-009",
+            Boundary,
+            with(one(), "next", Value::from(sixty_four.as_str())),
+            Ok((1, Some(sixty_four.clone()))),
+        ),
+        page_row(
+            "MESH-LIST-010",
+            Valid,
+            with(one(), "extra", Value::from(7)),
+            Ok((1, None)),
+        ),
+        page_row(
+            "MESH-LIST-010",
+            Valid,
+            with(one(), "truncated", Value::Boolean(true)),
+            Ok((1, None)),
+        ),
+        // The requester keeps the cursor verbatim; `list_shares` is the only builder of
+        // the request that hands it back and needs a runtime, so the pin stops here.
+        page_row(
+            "MESH-LIST-020",
+            Valid,
+            with(one(), "next", Value::from("AbC-opaque!?")),
+            Ok((1, Some("AbC-opaque!?".to_string()))),
+        ),
+        entry_row("MESH-LIST-011", Invalid, without(good(), "path"), false),
+        entry_row(
+            "MESH-LIST-011",
+            Invalid,
+            with(good(), "path", Value::from(7)),
+            false,
+        ),
+        entry_row("MESH-LIST-011", Invalid, entry_of("docs//a.md"), false),
+        entry_row("MESH-LIST-011", Invalid, entry_of("../a.md"), false),
+        entry_row("MESH-LIST-011", Invalid, entry_of(""), false),
+        entry_row("MESH-LIST-011", Valid, good(), true),
+        entry_row("MESH-LIST-012", Invalid, without(good(), "size"), false),
+        entry_row(
+            "MESH-LIST-012",
+            Invalid,
+            with(good(), "size", Value::from(-1i64)),
+            false,
+        ),
+        entry_row(
+            "MESH-LIST-012",
+            Invalid,
+            with(good(), "size", Value::from("1")),
+            false,
+        ),
+        entry_row(
+            "MESH-LIST-012",
+            Invalid,
+            with(good(), "size", Value::F64(1.0)),
+            false,
+        ),
+        entry_row(
+            "MESH-LIST-012",
+            Boundary,
+            with(good(), "size", Value::from(0u64)),
+            true,
+        ),
+        entry_row(
+            "MESH-LIST-012",
+            Boundary,
+            with(good(), "size", Value::from(u64::MAX)),
+            true,
+        ),
+        entry_row("MESH-LIST-013", Invalid, without(good(), "sha256"), false),
+        entry_row(
+            "MESH-LIST-013",
+            Invalid,
+            with(good(), "sha256", Value::from("a".repeat(32).as_str())),
+            false,
+        ),
+        entry_row(
+            "MESH-LIST-013",
+            Invalid,
+            with(good(), "sha256", bin(&[0u8; 31])),
+            false,
+        ),
+        entry_row(
+            "MESH-LIST-013",
+            Invalid,
+            with(good(), "sha256", bin(&[0u8; 33])),
+            false,
+        ),
+        entry_row(
+            "MESH-LIST-013",
+            Boundary,
+            with(good(), "sha256", bin(&[0u8; 32])),
+            true,
+        ),
+        entry_row("MESH-LIST-014", Invalid, without(good(), "mtime"), false),
+        entry_row(
+            "MESH-LIST-014",
+            Invalid,
+            with(good(), "mtime", Value::from("1")),
+            false,
+        ),
+        entry_row(
+            "MESH-LIST-014",
+            Invalid,
+            with(good(), "mtime", Value::F64(f64::NAN)),
+            false,
+        ),
+        entry_row(
+            "MESH-LIST-014",
+            Invalid,
+            with(good(), "mtime", Value::F64(f64::INFINITY)),
+            false,
+        ),
+        entry_row(
+            "MESH-LIST-014",
+            Invalid,
+            with(good(), "mtime", Value::F32(f32::NAN)),
+            false,
+        ),
+        entry_row(
+            "MESH-LIST-014",
+            Valid,
+            with(good(), "mtime", Value::from(1u64)),
+            true,
+        ),
+        entry_row(
+            "MESH-LIST-014",
+            Valid,
+            with(good(), "mtime", Value::from(-1i64)),
+            true,
+        ),
+        entry_row(
+            "MESH-LIST-014",
+            Valid,
+            with(good(), "mtime", Value::F32(1.5)),
+            true,
+        ),
+        entry_row(
+            "MESH-LIST-014",
+            Boundary,
+            with(good(), "mtime", Value::F64(0.0)),
+            true,
+        ),
+        entry_row(
+            "MESH-LIST-015",
+            Valid,
+            with(good(), "extra", Value::from(7)),
+            true,
+        ),
+        entry_row(
+            "MESH-LIST-015",
+            Valid,
+            with(good(), "mode", Value::from("0644")),
+            true,
+        ),
+        client_check(
+            "MESH-FETCH-015",
+            Invalid,
+            an_unknown_status_is_a_client_error_with_the_pinned_wording,
+        ),
+        client_check(
+            "MESH-FETCH-021",
+            Invalid,
+            a_rule_is_kept_when_known_read_as_unknown_otherwise_and_malformed_when_not_text,
+        ),
+        client_check(
+            "MESH-FETCH-028",
+            Boundary,
+            a_fetch_response_at_its_bound_is_delivered_and_one_byte_over_is_dropped,
+        ),
+        client_check(
+            "MESH-FETCH-029",
+            Valid,
+            the_bound_is_found_from_the_frame_prefix_before_the_frame_is_decoded,
+        ),
+        client_check(
+            "MESH-FETCH-030",
+            Valid,
+            the_inbox_stages_under_the_instance_and_peer_and_refuses_a_collision,
+        ),
+        client_check(
+            "MESH-FETCH-031",
+            Valid,
+            a_fetched_file_yields_its_path_size_and_digest_and_never_its_bytes,
+        ),
+        client_check("MESH-FETCH-032", Valid, a_fetch_waits_two_minutes),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2838,7 +5008,15 @@ mod tests {
         );
     }
 
-    const TESTED: [&str; 4] = ["WirePath", "ShareSet", "GrantStore", "StoreSchema"];
+    const TESTED: [&str; 7] = [
+        "WirePath",
+        "ShareSet",
+        "GrantStore",
+        "StoreSchema",
+        "ListServe",
+        "FetchServe",
+        "FetchClient",
+    ];
 
     #[test]
     fn wire_paths_are_held_to_the_fourteen_rules_of_section_10_13() {
@@ -2858,6 +5036,21 @@ mod tests {
     #[test]
     fn store_schemas_refuse_and_default_as_section_14_1_mandates() {
         run_family("StoreSchema");
+    }
+
+    #[test]
+    fn list_handlers_answer_as_section_10_14_mandates() {
+        run_family("ListServe");
+    }
+
+    #[test]
+    fn fetch_handlers_answer_as_section_10_15_mandates() {
+        run_family("FetchServe");
+    }
+
+    #[test]
+    fn requesters_read_pages_and_replies_as_sections_10_14_and_10_15_mandate() {
+        run_family("FetchClient");
     }
 
     #[test]

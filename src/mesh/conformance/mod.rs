@@ -13,8 +13,10 @@
 //!   fixtures of `r3::tests::network`. The table is declared everywhere so coverage counts it;
 //!   the executor is `#[cfg(unix)]` with the fixtures it drives.
 //! - `share_vectors`: the wire-path grammar and the decoders that reuse it, the share set and
-//!   the grant store on a share root built per row, and the versioning of the stores they
-//!   read. Rust only, every platform.
+//!   the grant store on a share root built per row, the `/list` and `/fetch` handlers driven
+//!   in-process over such a root, the requester's page and reply readers, and the versioning
+//!   of the stores they read (`ListServe`, `FetchServe`, `FetchClient`). Rust only, every
+//!   platform.
 //! - `interop`: the protocol exercised against the pinned Python Reticulum/LXMF reference,
 //!   spawned as a subprocess. Those tests are `#[ignore]`d and gated on `COYOTE_MESH_INTEROP=1`;
 //!   `scripts/mesh-interop/setup.sh` prepares the reference and prints the environment they need.
@@ -433,6 +435,14 @@ const EXECUTED_BY: &[(&str, &[&str])] = &[
         &["envelope_vectors_encode_in_the_key_order_of_section_6_5"],
     ),
     (
+        "FetchClient",
+        &["requesters_read_pages_and_replies_as_sections_10_14_and_10_15_mandate"],
+    ),
+    (
+        "FetchServe",
+        &["fetch_handlers_answer_as_section_10_15_mandates"],
+    ),
+    (
         "GrantStore",
         &["grant_stores_lend_spend_and_sweep_as_section_10_17_mandates"],
     ),
@@ -477,6 +487,10 @@ const EXECUTED_BY: &[(&str, &[&str])] = &[
     (
         "LinkTimeout",
         &["the_timeouts_and_the_outbound_cap_end_requests_as_specified"],
+    ),
+    (
+        "ListServe",
+        &["list_handlers_answer_as_section_10_14_mandates"],
     ),
     (
         "LxmfKnock",
