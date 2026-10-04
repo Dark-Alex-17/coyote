@@ -319,7 +319,9 @@ pub(crate) fn question_not_an_access_request(id: &str) -> String {
 /// One line of `inbound-<instance_id>.jsonl`: a question a peer asked that the envoy
 /// could not answer on its own, waiting on the person at the keyboard. The same on-disk
 /// discipline as `PendingRecord`: unknown fields are rejected and any layout change bumps
-/// `INBOUND_RECORD_VERSION`.
+/// `INBOUND_RECORD_VERSION`. `kind`, `paths` and `reason` are the one exception, added
+/// within version 2 with a `#[serde(default)]`: a record written before they existed
+/// loads as a question with no paths and no reason, which is what it was.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct InboundRecord {

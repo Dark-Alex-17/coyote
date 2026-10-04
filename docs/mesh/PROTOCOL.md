@@ -1188,6 +1188,71 @@ Custom data map (emission order `name_hash`, `id`, `paths`):
 
 What the human sees is application surface, not wire format. The reference shows who asks, each path with whether it exists under the share root and its size, and the reason, cleaned and cut to a display cap; the reason is screen text only and never model input (section 15).
 
+### 10.17 Share set and grants
+
+The share set is the policy by which a responder decides which files under its share root, the workspace root, a trusted peer is served through `/list` (section 10.14) and `/fetch` (section 10.15); the grant store is the per-peer exception to it that an access decision (section 10.16) or an attachment by reference (section 10.9) writes. Neither is wire format, and the layouts stay a section 1 non-goal; what this section fixes is what they decide, since a peer's view of the tree is exactly what they serve (`ShareSet`, `is_served`, src/mesh/shares.rs; `GrantStore`, src/mesh/grants.rs).
+
+The share set is two YAML files, the global `<config_dir>/mesh/shares.yaml` and the workspace `<workspace_root>/<workspace config dir>/mesh-shares.yaml` (`ShareLocations`, src/mesh/shares.rs), of one shape (`SharesFile`):
+
+| Member | Content |
+|---|---|
+| `version` | `SHARES_FILE_VERSION` = `1` (section 14.1) |
+| `allow` | list of `{pattern, peer}`, `peer` optional |
+| `deny` | list of `{pattern}` |
+| `override` | list of `{path}` |
+
+**[MESH-SHARE-001]** A share file MUST be a map of `version`, `allow`, `deny` and `override`, each list absent reading as empty and any other key refusing the file (MESH-CODE-005), and a `peer` MUST be a canonical 32-hex identity or destination hash (section 3.1), absent meaning every trusted peer, which a writer refuses in any other form and a reader, finding one on disk, matches to nobody rather than everybody (`a_peer_that_is_not_a_canonical_hash_is_refused_at_write_and_ignored_on_disk`, src/mesh/shares.rs).
+
+**[MESH-SHARE-002]** A `pattern` MUST be a glob relative to the share root, `/`-separated on every platform, without a leading `/` or drive prefix and without an empty, `.` or `..` segment, where `*` and `?` stay inside one segment and `**` alone crosses a `/`, and an `override` `path` MUST be one exact wire path (section 10.13) carrying no glob metacharacter (`validate_pattern`, `validate_override`, src/mesh/shares.rs).
+
+**[MESH-SHARE-003]** A share file this build cannot read, a version it does not write (section 14.1), an unknown key or an entry MESH-SHARE-002 refuses included, MUST fail the whole set closed: nothing is served from either layer, a grant included, no mutation is written over the file, and the refusal names the file (`a_corrupt_file_poisons_the_whole_set_and_is_warned_about_once`, `a_hand_edited_absolute_or_dotted_pattern_poisons_the_set_at_load`, `a_poisoned_set_serves_nothing_even_on_a_grant`, src/mesh/shares.rs).
+
+**[MESH-SHARE-004]** A responder MUST judge a candidate, resolved on disk under the share root, in this order, the first step that fires answering (`verdict`, src/mesh/shares.rs): protected (MESH-SHARE-005), never served; a user `deny` from either layer (MESH-SHARE-006), never served; the built-in deny (MESH-SHARE-007) unless an `override` lifts it (MESH-SHARE-008), never served; an `allow` (MESH-SHARE-009), served; otherwise not allowed, served under a grant alone (MESH-SHARE-014). Deny wins whatever the order of the lists because ordered rules were rejected: an order-dependent list is mis-edited, and the first-match rule is the mistake every firewall language made.
+
+**[MESH-SHARE-005]** A resolved path under the workspace config directory, under its runtime name and its default name alike, under the global config directory, under the mesh cache directory, under a configured inbox directory, or with a `.git` segment at any depth MUST be protected: never served, never listed, and lifted by nothing, an `override` included (`protected_dirs`, src/mesh/shares.rs; `protected_head_names_git_and_the_workspace_config_dir_at_any_literal_segment`, `the_workspace_config_dir_is_never_served_under_allow_everything`, `the_global_config_dir_is_never_served_when_the_share_root_encloses_it`, `a_file_under_the_mesh_cache_dir_is_never_served_or_listed`, `usage_probe_an_override_never_lifts_a_file_under_any_git_directory`).
+
+**[MESH-SHARE-006]** A user `deny`, from the global or the workspace file, MUST be judged on the name the peer sent and on the path it resolved to under the share root, so that no alias dodges one (`a_user_deny_on_the_resolved_file_holds_through_an_alias`, `deny_wins_across_layers_and_an_override_lifts_only_the_builtin_deny`, src/mesh/shares.rs).
+
+**[MESH-SHARE-007]** The built-in deny MUST name `.env`, `.env.*`, `*.pem`, `*.key`, `id_*`, `.git` and `.git/**` at any depth, with the workspace config directory under each name it goes by, and MUST be judged on the name the peer sent and on the resolved path as a user `deny` is (`BUILTIN_DENY`, src/mesh/shares.rs; `builtin_denies_the_usual_secrets_git_and_the_workspace_config_dir_but_not_a_doc`).
+
+**[MESH-SHARE-008]** An `override` MUST lift the built-in deny for the one resolved file whose path it names exactly, and nothing else: it lifts no user `deny` and no protected path, it serves nothing on its own, an `allow` still having to match, and only the global file's overrides count, a workspace `override` being read, shown to the human and never applied, since the workspace file arrives with a cloned repository that could ship `allow **` beside `override .env` (`a_workspace_override_is_inert_and_only_a_global_one_lifts_the_builtin_deny`, `deny_wins_across_layers_and_an_override_lifts_only_the_builtin_deny`, src/mesh/shares.rs).
+
+**[MESH-SHARE-009]** An `allow` MUST be judged on the resolved path alone, so that a symlink serves only what an allow names on disk, and MUST apply only to the peer it names or, naming none, to every trusted peer (`an_allow_is_judged_on_the_resolved_file_not_the_alias`, `a_peer_scoped_allow_matches_the_identity_or_the_destination_and_nobody_else`, src/mesh/shares.rs).
+
+**[MESH-SHARE-010]** On a share root whose filesystem folds case, every rule, the user `deny`, the built-in deny and the `override` included, MUST match across case, the fold learned by probing the root and never assumed (`probe_case_insensitive`, src/mesh/shares.rs; `case_insensitive_rules_match_across_case_and_so_does_the_override`, `a_case_flipped_name_cannot_dodge_a_deny_under_either_fold_flag`, `the_case_probe_leaves_no_file_behind`).
+
+**[MESH-SHARE-011]** The share root MUST be the caller's, and the module MUST NOT read the current directory (`the_module_never_reads_the_current_directory`, src/mesh/shares.rs).
+
+**[MESH-SHARE-012]** A mutation MUST land in the workspace file when it exists and in the global file otherwise, unless the caller names a layer, MUST be validated as MESH-SHARE-001 and MESH-SHARE-002 say before anything is written, and MUST be written as every mesh store is, to a fresh temporary file beside the destination that is then renamed into place, a symlink at the destination refused (`write_target`, `apply`, src/mesh/shares.rs; `write_atomically`, src/mesh/mod.rs; `write_target_prefers_an_existing_workspace_file_unless_a_layer_is_named`, `apply_writes_the_file_write_target_names_and_leaves_the_other_alone`, `write_atomically_never_follows_a_planted_symlink_at_the_temp_or_the_destination`).
+
+**[MESH-SHARE-013]** An operator log line about a share mutation MUST name the share file and MUST NOT carry a pattern or an override path (`mutation_logs_name_the_share_file_but_never_a_pattern_or_override_path`, src/mesh/shares.rs).
+
+The grant store is `<cache_dir>/mesh/grants-<instance_id>.jsonl`, one record per line (`GrantRecord`, src/mesh/grants.rs):
+
+| Member | Content |
+|---|---|
+| `version` | `GRANT_RECORD_VERSION` = `1` (section 14.1) |
+| `id` | the access request or message id the grant answers, a wire id |
+| `peer` | 32 hex, the destination hash of the instance granted |
+| `paths` | list of `{path, uses, uses_left}`, `path` a wire path |
+| `expires` | RFC 3339 UTC |
+
+**[MESH-SHARE-014]** A grant MUST match the path a peer fetches byte for byte against the text it sent, no glob and no case fold, MUST be consulted only for a path the share set finds not allowed, never for one it denies or protects, and MUST reserve one use before the file is opened, so that two fetches racing for one use are not both served (`is_served`, src/mesh/shares.rs; `a_granted_path_outside_every_allow_is_served`; `usage_probe_a_grant_on_a_built_in_denied_path_never_serves_it`, src/mesh/r3/tests.rs; `a_one_off_grant_is_consumed_by_the_fetch_and_the_second_fetch_is_not_shared`, src/mesh/fetch.rs).
+
+**[MESH-SHARE-015]** A writer MUST refuse a grant whose `id` is not a wire id (section 10.1), whose `peer` is not a canonical 32-hex destination hash, or whose paths are none, more than `GRANT_MAX_PATHS` = `16` or not every one a wire path, MUST drop exact repeats among the paths, MUST lend each path `DEFAULT_GRANT_USES` = `1` use, MUST set `expires` to the write time plus the TTL, `DEFAULT_GRANT_TTL` = `900` seconds unless the caller names one, and MUST replace an earlier grant under the same `id` for the same peer rather than add to it (`grant`, src/mesh/grants.rs; `grant_defaults_are_pinned`, `a_grant_refuses_a_peer_that_is_not_a_hash_or_paths_outside_the_grammar_or_count`, `a_grant_refuses_an_id_outside_the_wire_alphabet`, `a_grant_stores_the_peer_canonically_dedupes_its_paths_and_replaces_its_own_id`).
+
+**[MESH-SHARE-016]** A reserved use MUST be refunded when the open fails, when the opened file is larger than its stat said or when the `ok` it was spent on is never sent (MESH-FETCH-034), never above the `uses` the grant lent, a stat that finds no regular file or a size over the serving limit MUST spend nothing, a `not_modified` reply keeps the use spent, and a grant whose every use is spent MUST stay on file until it expires so that a refund has a record to land on (`consume`, `refund`, src/mesh/grants.rs; `an_exhausted_grant_survives_until_it_expires_so_a_refund_has_somewhere_to_land`; `a_grant_use_is_refunded_when_the_read_fails_after_is_served`, src/mesh/fetch.rs; `a_file_over_the_limit_is_too_large_and_a_granted_one_keeps_its_use`, src/mesh/shares.rs).
+
+**[MESH-SHARE-017]** `revoke` MUST remove the grant one peer holds under an `id` and leave every other grant, that peer's under other ids and other peers' under the same id included (`revoke_takes_back_one_peers_grant_under_the_id_and_leaves_the_rest`, src/mesh/grants.rs).
+
+**[MESH-SHARE-018]** A reader MUST drop expired grants when the store is opened and on every check, and MUST refuse the whole store, as section 14.1 says, on a line whose `expires` does not parse or whose `uses_left` exceeds its `uses` (`expired_grants_are_swept_on_open_and_on_every_check`, `a_grant_line_with_more_uses_left_than_granted_is_refused`, src/mesh/grants.rs). A grant never appears in a listing (MESH-LIST-016).
+
+Three grant shapes exist, each the human's doing. A one-off grant answers an access request with one use per path under the TTL, and a standing grant answers it with an `allow` for the requesting identity written to the share list, both under MESH-ACCESS-019. The third is automatic:
+
+**[MESH-SHARE-019]** A sender attaching a file by reference (section 10.9) MUST write a one-off grant for the recipient under the message `id`, naming every referenced path with the default uses and TTL, before the send, and MUST take it back when the send fails, so that the peer never holds a grant for a message it did not receive (`send_peer_lending_reference`, src/mesh/node.rs; `reply_with_a_large_attachment_sends_a_reference_and_a_one_off_grant`, `an_attached_reference_is_fetchable_exactly_once`, src/repl/mesh.rs).
+
+**[MESH-SHARE-020]** A file the human attaches by name MUST NOT be held to the `allow` and `deny` lists when it travels inline, the human having chosen it, but MUST be refused under the protected set with or without force, MUST be refused under the built-in deny unless the operator forces it, and when it travels by reference MUST be refused whenever the share set would not serve it to the recipient, there being no force for a reference (`attachment`, src/repl/mesh.rs; `usage_probe_a_denied_small_file_travels_inline_and_an_access_id_with_attach_is_redirected`, `usage_probe_attach_refuses_the_configured_inbox_even_with_force`, `an_attached_reference_the_serving_side_would_refuse_is_refused_without_a_grant`).
+
 ## 11. Store-and-forward via LXMF propagation
 
 When a direct request times out or the link fails (MESH-KNOCK-017, MESH-MSG-024), the message is posted to an LXMF propagation node and fetched by the recipient later.
@@ -1365,6 +1430,7 @@ This document is the registry. A code point is allocated by a row in the table b
 | `duplicate`, `too_many_pending` | access `reason` value | | 10.16 |
 | `access`, `status`, `expires` | map key, decision part | | 10.16 |
 | `granted`, `denied` | decision `status` value | | 10.16 |
+| `question`, `access` | inbound record `kind` value | | 14.1 |
 | `"scope.knock/1"` | LXMF type tag | `KNOCK_TYPE` | 8.6 |
 | `"scope.peer/1"` | LXMF type tag | `PEER_MESSAGE_TYPE` | 10.8 |
 | `"scope.access/1"` | LXMF type tag | `ACCESS_TYPE` | 10.16 |
@@ -1380,6 +1446,8 @@ This document is the registry. A code point is allocated by a row in the table b
 | `1` | on-disk schema version | `PREDECESSOR_RECORD_VERSION` | 14.1 |
 | `2` | on-disk schema version | `PEER_TABLE_VERSION` | 14.1 |
 | `1` | on-disk schema version | `PROPAGATION_STORE_VERSION` | 14.1 |
+| `1` | on-disk schema version | `SHARES_FILE_VERSION` | 14.1 |
+| `1` | on-disk schema version | `GRANT_RECORD_VERSION` | 14.1 |
 
 ## 14. Requirement-id stability
 
@@ -1398,12 +1466,23 @@ The layouts of the stores below are not wire format and stay a section 1 non-goa
 | `identity.predecessors.jsonl` | config `mesh/` | line | `PREDECESSOR_RECORD_VERSION` | user file: fix it or move it aside |
 | `peers.json` | cache `mesh/` | file | `PEER_TABLE_VERSION` | cache: move it aside |
 | `propagation.json` | cache `mesh/` | file | `PROPAGATION_STORE_VERSION` | cache: move it aside |
+| `shares.yaml` | config `mesh/` | file | `SHARES_FILE_VERSION` | user file: fix it or move it aside |
+| `mesh-shares.yaml` | workspace config dir | file | `SHARES_FILE_VERSION` | user file: fix it or move it aside |
+| `grants-<instance_id>.jsonl` | cache `mesh/` | line | `GRANT_RECORD_VERSION` | cache: move it aside |
 
-**[MESH-CODE-003]** Every store in the table MUST carry its schema version, per file or per line as the table says, in a `version` field read before any other, and a writer MUST write the version this build reads: `TRUST_FILE_VERSION`, `KNOCK_RECORD_VERSION`, `PEER_TABLE_VERSION`, `PENDING_RECORD_VERSION` and `INBOUND_RECORD_VERSION` at `2`; `PREDECESSOR_RECORD_VERSION` and `PROPAGATION_STORE_VERSION` at `1` (section 19; `every_on_disk_store_version_is_pinned`).
+**[MESH-SCHEMA-001]** `shares.yaml` and `mesh-shares.yaml` MUST each carry `SHARES_FILE_VERSION` = `1` per file, and a reader MUST refuse a file of any other version, or without one, under MESH-CODE-004 with the user-file remedy, the whole share set failing closed (MESH-SHARE-003) rather than the other layer loading alone (`a_newer_file_version_is_refused_asking_for_an_upgrade`, `a_pre_baseline_file_version_is_refused_as_having_no_migration`, `a_file_without_a_version_is_refused_as_an_unknown_shape`; src/mesh/shares.rs).
+
+**[MESH-SCHEMA-002]** `grants-<instance_id>.jsonl` MUST carry `GRANT_RECORD_VERSION` = `1` per line, a reader MUST refuse the whole store under MESH-CODE-004 with the cache remedy on a line of any other version or without one, and the writer MUST refuse a record of another version rather than write it (`a_newer_grant_line_refuses_the_whole_store`, `a_grant_line_without_a_version_refuses_the_whole_store`, `the_writer_refuses_a_record_of_another_version`; src/mesh/grants.rs).
+
+**[MESH-SCHEMA-003]** An inbound record (`inbound-<instance_id>.jsonl`) MUST carry `kind`, `question` or `access`, with the request's `paths` and `reason` when it is `access`, under `INBOUND_RECORD_VERSION` = `2`, and a reader MUST read a version-`2` record without `kind`, `paths` or `reason` as a `question` with no paths and an empty reason, the only values a record written before the fields existed can hold (`InboundKind`, `InboundRecord`, src/mesh/pending.rs; `an_inbound_line_without_the_access_placeholders_loads_as_a_question`, `inbound_upsert_holds_the_access_fields_to_the_record_kind`).
+
+**[MESH-SCHEMA-004]** A version this build does not write MUST refuse the share list and the grant store in the `version_refusal` wording of every older store (src/mesh/schema.rs), and `every_on_disk_store_version_is_pinned` MUST pin every constant of the table, `SHARES_FILE_VERSION` and `GRANT_RECORD_VERSION` included, so that a bump moves the section 19 row and this table with it.
+
+**[MESH-CODE-003]** Every store in the table MUST carry its schema version, per file or per line as the table says, in a `version` field read before any other, and a writer MUST write the version this build reads: `TRUST_FILE_VERSION`, `KNOCK_RECORD_VERSION`, `PEER_TABLE_VERSION`, `PENDING_RECORD_VERSION` and `INBOUND_RECORD_VERSION` at `2`; `PREDECESSOR_RECORD_VERSION`, `PROPAGATION_STORE_VERSION`, `SHARES_FILE_VERSION` and `GRANT_RECORD_VERSION` at `1` (section 19; `every_on_disk_store_version_is_pinned`).
 
 **[MESH-CODE-004]** A reader MUST read the version before any other field and MUST refuse the whole store, never one record and never a shorter list, when the version is not the one this build writes, and the refusal MUST name the file path, the version found, the version this build writes and the remedy: a newer version asks the person to upgrade the implementation, an older one states that no migration exists for versions before the baseline and asks them to move the file aside, and a version that cannot be read at all is an unknown shape, refused with the same remedy and naming the version this build writes. A disposable cache whose whole file is one document (`peers.json`, `propagation.json`) can set an unknown shape aside itself and start empty, but a readable version it does not write is refused under MESH-CODE-004 all the same. The per-store fixtures (`open_refuses_a_newer_file_version_naming_the_path`, `open_refuses_a_pre_baseline_file_version_as_having_no_migration`, `open_refuses_a_file_without_a_version`; src/mesh/trust.rs), (`newer_record_version_refuses_naming_the_file`, `pre_baseline_record_version_refuses_as_having_no_migration`, `a_line_without_a_version_refuses_the_whole_cache`; src/mesh/knocks.rs), (`a_newer_pending_line_refuses_the_whole_store_and_surfaces_no_record`, `a_pre_baseline_pending_line_refuses_as_having_no_migration`, `a_pending_line_without_a_version_refuses_the_whole_store`, `a_newer_inbound_line_refuses_the_whole_store_and_surfaces_no_record`, `a_pre_baseline_inbound_line_refuses_as_having_no_migration`, `an_inbound_line_without_a_version_refuses_the_whole_store`; src/mesh/pending.rs), (`predecessors_refuses_a_newer_line_and_shows_none_of_the_history`, `predecessors_refuses_a_pre_baseline_line_as_having_no_migration`, `predecessors_refuses_a_line_without_a_version`; src/mesh/identity.rs), (`load_refuses_a_newer_table_version_naming_the_path`, `load_refuses_a_pre_baseline_table_version_as_having_no_migration`, `load_sets_aside_an_unversioned_table_and_starts_empty`; src/mesh/peers.rs) and (`store_from_a_newer_coyote_is_refused_by_name`, `store_from_before_the_baseline_is_refused_as_having_no_migration`, `garbage_and_malformed_stores_are_set_aside`; src/mesh/propagation_fetch.rs) pin each store's wording.
 
-**[MESH-CODE-005]** The baseline is version `2` for `TRUST_FILE_VERSION`, `KNOCK_RECORD_VERSION`, `PEER_TABLE_VERSION`, `PENDING_RECORD_VERSION` and `INBOUND_RECORD_VERSION` and version `1` for `PREDECESSOR_RECORD_VERSION` and `PROPAGATION_STORE_VERSION`, and every on-disk struct and enum rejects a field it does not know, so a current-version record carrying such a field is refused, never read, and any change to a layout, a field added included, MUST bump the store's constant and MUST ship either a migration or an explicit refusal of the older version, and a version number MUST NOT be reused (MESH-CODE-001). The scan (`every_on_disk_struct_rejects_unknown_fields`, `every_deserializable_mesh_type_is_classified`; src/mesh/schema.rs) covers every type, and the per-store fixtures (`a_record_with_a_field_this_coyote_does_not_know_is_refused`, `a_reply_with_a_field_this_coyote_does_not_know_refuses_the_store`, `an_inbound_record_with_an_unknown_field_is_refused`; src/mesh/pending.rs), (`predecessors_refuses_an_unknown_field`; src/mesh/identity.rs) and (`load_sets_aside_a_current_table_with_an_unknown_field`; src/mesh/peers.rs) pin the refusal. One field, `key_changed` on the `trust.yaml` destination entry, was added before this rule existed and keeps a `#[serde(default)]`: a version-`2` trust file written without it loads with the field absent, a tolerance inside one version that is not a precedent for the next field (`open_still_refuses_unknown_fields_but_loads_a_record_without_key_changed`; src/mesh/trust.rs).
+**[MESH-CODE-005]** The baseline is version `2` for `TRUST_FILE_VERSION`, `KNOCK_RECORD_VERSION`, `PEER_TABLE_VERSION`, `PENDING_RECORD_VERSION` and `INBOUND_RECORD_VERSION` and version `1` for `PREDECESSOR_RECORD_VERSION`, `PROPAGATION_STORE_VERSION`, `SHARES_FILE_VERSION` and `GRANT_RECORD_VERSION`, and every on-disk struct and enum rejects a field it does not know, so a current-version record carrying such a field is refused, never read, and any change to a layout, a field added included, MUST bump the store's constant and MUST ship either a migration or an explicit refusal of the older version, and a version number MUST NOT be reused (MESH-CODE-001). The scan (`every_on_disk_struct_rejects_unknown_fields`, `every_deserializable_mesh_type_is_classified`; src/mesh/schema.rs) covers every type, and the per-store fixtures (`a_record_with_a_field_this_coyote_does_not_know_is_refused`, `a_reply_with_a_field_this_coyote_does_not_know_refuses_the_store`, `an_inbound_record_with_an_unknown_field_is_refused`; src/mesh/pending.rs), (`predecessors_refuses_an_unknown_field`; src/mesh/identity.rs) and (`load_sets_aside_a_current_table_with_an_unknown_field`; src/mesh/peers.rs) pin the refusal. Some fields keep a `#[serde(default)]` inside the current version: on `trust.yaml` the four top-level maps and `key_changed` on a destination entry, on a `peers.json` row `name_hash` and `compatibility`, on a `knocks.jsonl` record `name_hash`, on a pending record `reply`, on an inbound record `kind`, `paths` and `reason` (MESH-SCHEMA-003), and on a share file its three lists and an entry's `peer` (MESH-SHARE-001). Each is a tolerance for an absent field inside one version, never for an unknown one, and none is a precedent for the next field (`open_still_refuses_unknown_fields_but_loads_a_record_without_key_changed`; src/mesh/trust.rs).
 
 ## 15. Security considerations
 
@@ -1682,6 +1761,10 @@ A leniency is a place where the reference deliberately does something other than
 | `ACCESS_REASON_MAX_CHARS` | `500` | src/mesh/access.rs | a_reason_of_exactly_the_cap_is_accepted |
 | `ACCESS_MAX_PENDING_PER_IDENTITY` | `5` | src/mesh/access.rs | a_sixth_pending_request_from_one_identity_is_refused_as_too_many_pending |
 | `DEFAULT_GRANT_TTL` | `900` | src/mesh/grants.rs | grant_defaults_are_pinned |
+| `SHARES_FILE_VERSION` | `1` | src/mesh/shares.rs | every_on_disk_store_version_is_pinned |
+| `GRANT_RECORD_VERSION` | `1` | src/mesh/grants.rs | every_on_disk_store_version_is_pinned |
+| `DEFAULT_GRANT_USES` | `1` | src/mesh/grants.rs | grant_defaults_are_pinned |
+| `GRANT_MAX_PATHS` | `16` | src/mesh/grants.rs | spec_pins (this table) |
 
 ## 20. Conformance coverage
 
@@ -2135,6 +2218,26 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 | MESH-ACCESS-027 | no vector yet |
 | MESH-ACCESS-028 | no vector yet |
 | MESH-ACCESS-029 | no vector yet |
+| MESH-SHARE-001 | no vector yet |
+| MESH-SHARE-002 | no vector yet |
+| MESH-SHARE-003 | no vector yet |
+| MESH-SHARE-004 | no vector yet |
+| MESH-SHARE-005 | no vector yet |
+| MESH-SHARE-006 | no vector yet |
+| MESH-SHARE-007 | no vector yet |
+| MESH-SHARE-008 | no vector yet |
+| MESH-SHARE-009 | no vector yet |
+| MESH-SHARE-010 | no vector yet |
+| MESH-SHARE-011 | no vector yet |
+| MESH-SHARE-012 | no vector yet |
+| MESH-SHARE-013 | no vector yet |
+| MESH-SHARE-014 | no vector yet |
+| MESH-SHARE-015 | no vector yet |
+| MESH-SHARE-016 | no vector yet |
+| MESH-SHARE-017 | no vector yet |
+| MESH-SHARE-018 | no vector yet |
+| MESH-SHARE-019 | no vector yet |
+| MESH-SHARE-020 | no vector yet |
 | MESH-PROP-001 | Custom (Valid) |
 | MESH-PROP-002 | Custom (Valid) |
 | MESH-PROP-003 | Custom (Invalid), Custom (Valid) |
@@ -2187,6 +2290,10 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 | MESH-EXT-008 | Registry (Valid) |
 | MESH-CODE-001 | Registry (Valid) |
 | MESH-CODE-002 | Registry (Valid) |
+| MESH-SCHEMA-001 | no vector yet |
+| MESH-SCHEMA-002 | no vector yet |
+| MESH-SCHEMA-003 | no vector yet |
+| MESH-SCHEMA-004 | no vector yet |
 | MESH-CODE-003 | Registry (Valid) |
 | MESH-CODE-004 | Registry (Valid) |
 | MESH-CODE-005 | Registry (Valid) |
@@ -2621,6 +2728,26 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 - [MESH-ACCESS-027](#1016-access) -- LXMF title absent, reason as content
 - [MESH-ACCESS-028](#1016-access) -- stored request recomputes the instance and is admitted as on the link
 - [MESH-ACCESS-029](#1016-access) -- mesh.access.requested and mesh.access.decided carry no path or reason
+- [MESH-SHARE-001](#1017-share-set-and-grants) -- share file shape, a peer canonical or matching nobody
+- [MESH-SHARE-002](#1017-share-set-and-grants) -- patterns are root-relative globs, an override one exact wire path
+- [MESH-SHARE-003](#1017-share-set-and-grants) -- an unreadable share file fails the whole set closed
+- [MESH-SHARE-004](#1017-share-set-and-grants) -- judgement order: protected, deny, built-in deny, allow, grant
+- [MESH-SHARE-005](#1017-share-set-and-grants) -- protected directories and .git are never served and nothing lifts them
+- [MESH-SHARE-006](#1017-share-set-and-grants) -- a user deny is judged on the sent name and the resolved path
+- [MESH-SHARE-007](#1017-share-set-and-grants) -- the built-in deny names secrets, .git and the workspace config dir
+- [MESH-SHARE-008](#1017-share-set-and-grants) -- an override lifts the built-in deny for one exact file, from the global file only
+- [MESH-SHARE-009](#1017-share-set-and-grants) -- an allow is judged on the resolved path and scoped to its peer
+- [MESH-SHARE-010](#1017-share-set-and-grants) -- on a case-folding root every rule matches across case
+- [MESH-SHARE-011](#1017-share-set-and-grants) -- the share root is the caller's, never the current directory
+- [MESH-SHARE-012](#1017-share-set-and-grants) -- a mutation lands in the workspace file else the global one, written atomically
+- [MESH-SHARE-013](#1017-share-set-and-grants) -- mutation logs name the file, never a pattern
+- [MESH-SHARE-014](#1017-share-set-and-grants) -- a grant matches byte-exact, after the share set, and reserves a use before the open
+- [MESH-SHARE-015](#1017-share-set-and-grants) -- grant write rules: wire id, canonical peer, 1 to 16 paths, one use, TTL, replace
+- [MESH-SHARE-016](#1017-share-set-and-grants) -- a use is refunded on a failed read or unsent ok, bounded, and an exhausted grant stays until expiry
+- [MESH-SHARE-017](#1017-share-set-and-grants) -- revoke removes one peer's grant under an id
+- [MESH-SHARE-018](#1017-share-set-and-grants) -- expired grants swept on open and every check, a surplus of uses refused
+- [MESH-SHARE-019](#1017-share-set-and-grants) -- a reference attachment writes a one-off grant under the message id, revoked on a failed send
+- [MESH-SHARE-020](#1017-share-set-and-grants) -- an inline attachment bypasses allow and deny but never the protected set
 - [MESH-PROP-001](#111-outbound) -- LXMF addressing
 - [MESH-PROP-002](#111-outbound) -- LXMF payload
 - [MESH-PROP-003](#111-outbound) -- non-map fields refused
@@ -2673,6 +2800,10 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 - [MESH-EXT-008](#12-extensibility) -- schema versions bump for incompatible changes
 - [MESH-CODE-001](#13-code-point-immutability) -- code point semantics never change
 - [MESH-CODE-002](#13-code-point-immutability) -- new semantics take a new code point
+- [MESH-SCHEMA-001](#141-on-disk-schema-versioning) -- the share files carry SHARES_FILE_VERSION per file
+- [MESH-SCHEMA-002](#141-on-disk-schema-versioning) -- the grant store carries GRANT_RECORD_VERSION per line
+- [MESH-SCHEMA-003](#141-on-disk-schema-versioning) -- the inbound record carries kind, paths and reason under version 2
+- [MESH-SCHEMA-004](#141-on-disk-schema-versioning) -- the new stores refuse in the common wording and their versions are pinned
 - [MESH-CODE-003](#141-on-disk-schema-versioning) -- every on-disk store carries its schema version
 - [MESH-CODE-004](#141-on-disk-schema-versioning) -- a version this build does not write refuses the whole store, naming file, versions and remedy
 - [MESH-CODE-005](#141-on-disk-schema-versioning) -- a layout change bumps the version and ships a migration or a refusal
