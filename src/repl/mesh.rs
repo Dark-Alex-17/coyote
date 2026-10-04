@@ -8393,7 +8393,7 @@ mod tests {
                 });
             }
 
-            /// Spec-first usage probe, criterion (f) at the command level: `--yes` is consent
+            /// Spec-first usage probe at the command level: `--yes` is consent
             /// only as the LEADING token. Inside the message text it is just words, so
             /// without a terminal the send is refused naming the flag, no prompt is asked,
             /// and nothing leaves the node; a leading `--yes` on the same node proceeds to
@@ -9034,7 +9034,7 @@ mod tests {
                 });
             }
 
-            /// Spec-first usage probe, criterion (f) + B-28 at the command level: `.mesh reply`
+            /// Spec-first usage probe at the command level: `.mesh reply`
             /// announces a trusted destination WITH its trust standing before asking, and an
             /// untrusted, denied or blocked destination is refused naming that standing before
             /// any prompt is asked (a leading `--yes` does not bypass that refusal: it is not a

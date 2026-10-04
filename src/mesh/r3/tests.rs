@@ -5762,7 +5762,7 @@ pub(crate) mod network {
         pair.responder.stop().await;
     }
 
-    /// Usage probe, criterion (e), on the production path: node A started from a config
+    /// Usage probe on the production path: node A started from a config
     /// with `mesh.about` serves a card whose `about` is that text through the one
     /// `display_text` sanitiser (trimmed, control sequences stripped) and advertises
     /// `fetch` in `caps`.

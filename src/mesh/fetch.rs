@@ -64,7 +64,9 @@ const UNKNOWN_RULE: &str = "unknown";
 /// advertisements the way it sends the first. Then `mesh.fetch.max_bytes` applies alone,
 /// this constant and `an_ok_reply_at_the_ceiling_fits_one_resource_segment` go, and the
 /// multi-segment reassembly test returns; the ceiling clauses on the `mesh.fetch.max_bytes`
-/// row of README.md and in the config template and example go with it.
+/// row of README.md and in the config template and example go with it, as do the
+/// MESH-LEN-007 row of docs/mesh/PROTOCOL.md and this constant's `expected_constants`
+/// entry in src/mesh/spec_pins.rs.
 /// Recorded as draft A4 in docs/mesh/upstream-issues.md and leniency MESH-LEN-007 in
 /// docs/mesh/PROTOCOL.md.
 pub(crate) const SINGLE_SEGMENT_FETCH_CEILING: u64 =

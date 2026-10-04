@@ -3421,7 +3421,7 @@ mod tests {
         source.remove_dir();
     }
 
-    // ---- review round 2 ------------------------------------------------------------------
+    // ---- escalation refusals, runner lifecycle, flood and budget bounds, interrupts ------
 
     fn other_peer_record(id: &str) -> InboundRecord {
         InboundRecord {

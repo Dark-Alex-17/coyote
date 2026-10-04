@@ -1031,9 +1031,10 @@ mod tests {
     use lxmf_core::constants::{FIELD_CUSTOM_DATA, FIELD_CUSTOM_TYPE};
     use rmpv::Value;
     use rns_transport::hash::ADDRESS_HASH_SIZE;
+    use rns_transport::resource::MAX_EFFICIENT_SIZE;
     use std::time::Duration;
 
-    const EXPECTED_LITERALS: &str = r#"1,1,10,16,262144,128,"/knock","/status","/message",30,10,10,2,20,16,0xf0,0xf1,0xf3,0xf4,0xf5,0xf6,0xfd,0xfe,"SCOPE",64,300,900,3,2700,1800,1024,"scope.knock/1",200,15,10,256,3,600,256,16,1,0,1,2,64,280,64,64,120,280,"scope.peer/1",1,120,4000,64,4096,8,15,10,604800,256,3600,120,256,1,60,100000,120,26,60,2,60,1024,64,240,131072,112,4096,15552000,3,900,256,0,32,0xfb,0xfc,8,64,256,64,8,2,2,2,2,1,2,1,8,106496,98304,65536,"/list","/fetch",1024,64,1000,100000,64,2048,120,128,1048447,4194304,4194304,4198400,92 c4 10,200,16,32,"/access","scope.access/1",16,500,5,900,1,1,1,16,32768"#;
+    const EXPECTED_LITERALS: &str = r#"1,1,10,16,262144,128,"/knock","/status","/message",30,10,10,2,20,16,0xf0,0xf1,0xf3,0xf4,0xf5,0xf6,0xfd,0xfe,"SCOPE",64,300,900,3,2700,1800,1024,"scope.knock/1",200,15,10,256,3,600,256,16,1,0,1,2,64,280,64,64,120,280,"scope.peer/1",1,120,4000,64,4096,8,15,10,604800,256,3600,120,256,1,60,100000,120,26,60,2,60,1024,64,240,131072,112,4096,15552000,3,900,256,0,32,0xfb,0xfc,8,64,256,64,8,2,2,2,2,1,2,1,8,106496,98304,65536,"/list","/fetch",1024,64,1000,100000,64,2048,120,128,1048447,4194304,4194304,4198400,92 c4 10,200,16,32,"/access","scope.access/1",16,500,5,900,1,1,1,16,32768,1048575"#;
 
     fn expected_constants() -> Vec<(&'static str, String)> {
         let secs = |d: Duration| d.as_secs().to_string();
@@ -1371,6 +1372,7 @@ mod tests {
                 "FETCH_INLINE_TEXT_MAX_BYTES",
                 FETCH_INLINE_TEXT_MAX_BYTES.to_string(),
             ),
+            ("MAX_EFFICIENT_SIZE", MAX_EFFICIENT_SIZE.to_string()),
         ]
     }
 
@@ -2145,6 +2147,19 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
             .filter(|area| !sentence.contains(&format!("`{area}`")))
             .collect();
         assert!(missing.is_empty(), "the areas sentence omits {missing:?}");
+        let unknown: Vec<&str> = split_spans(sentence)
+            .into_iter()
+            .map(|(_, span)| span)
+            .filter(|span| {
+                !span.is_empty()
+                    && span.bytes().all(|b| b.is_ascii_uppercase())
+                    && !AREAS.contains(span)
+            })
+            .collect();
+        assert!(
+            unknown.is_empty(),
+            "the areas sentence names {unknown:?}, which are not areas"
+        );
     }
 
     #[test]
@@ -2250,6 +2265,7 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
             "53 43 4f 50 45",
             "scope.session.<instance_id>",
             "DestinationName::new(\"scope\", \"session.<instance_id>\")",
+            "| `scope.session.<instance_id>` | destination name: application `scope`, aspect `session.<instance_id>` | `DestinationName::new(\"scope\", \"session.<instance_id>\")` | 4 |",
             "\"scope.knock/1\"",
             "\"scope.peer/1\"",
         ] {
@@ -2646,6 +2662,24 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
         check_constants(&actual, &expected_constants()).unwrap();
     }
 
+    /// The cells of every body row of the one table under `CODE_POINT_HEADING`.
+    fn registry_rows() -> Vec<Vec<String>> {
+        let section = section(SPEC, CODE_POINT_HEADING).unwrap();
+        let tables = tables(&section.content);
+        let [table] = tables.as_slice() else {
+            panic!(
+                "{CODE_POINT_HEADING:?} holds {} tables, expected exactly one",
+                tables.len()
+            );
+        };
+        table
+            .rows
+            .iter()
+            .skip(2)
+            .map(|row| cells(row).into_iter().map(str::to_string).collect())
+            .collect()
+    }
+
     #[test]
     fn registry_on_disk_schema_version_rows_match_the_live_constants() {
         let live = [
@@ -2665,19 +2699,10 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
             ("SHARES_FILE_VERSION", shares::SHARES_FILE_VERSION),
             ("GRANT_RECORD_VERSION", grants::GRANT_RECORD_VERSION),
         ];
-        let section = section(SPEC, CODE_POINT_HEADING).unwrap();
-        let tables = tables(&section.content);
-        let [table] = tables.as_slice() else {
-            panic!(
-                "{CODE_POINT_HEADING:?} holds {} tables, expected exactly one",
-                tables.len()
-            );
-        };
-        let rows: Vec<(u64, Vec<&str>)> = table
-            .rows
+        let registry = registry_rows();
+        let rows: Vec<(u64, Vec<&str>)> = registry
             .iter()
-            .map(|row| cells(row))
-            .filter(|cells| cells.get(1) == Some(&ON_DISK_SCHEMA_KIND))
+            .filter(|cells| cells.get(1).map(String::as_str) == Some(ON_DISK_SCHEMA_KIND))
             .map(|cells| {
                 let [value, _, names, _] = cells.as_slice() else {
                     panic!("registry row {cells:?} does not have four cells");
@@ -2708,6 +2733,240 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
             let (_, want) = live.iter().find(|(live, _)| live == name).unwrap();
             assert_eq!(value, want, "`{name}`");
         }
+    }
+
+    /// The registry rows for the code points the code spells as constants or wire names
+    /// list exactly those values, so a value renamed or added in code shows up here.
+    #[test]
+    fn registry_rows_name_the_live_code_points() {
+        let paths = [
+            ("KNOCK_PATH", r3::KNOCK_PATH),
+            ("STATUS_PATH", r3::STATUS_PATH),
+            ("MESSAGE_PATH", r3::MESSAGE_PATH),
+            ("LIST_PATH", r3::LIST_PATH),
+            ("FETCH_PATH", r3::FETCH_PATH),
+            ("ACCESS_PATH", r3::ACCESS_PATH),
+        ];
+        assert_eq!(paths.map(|(_, path)| path), r3::KNOWN_PATHS);
+        let spans = |words: &[&str]| {
+            words
+                .iter()
+                .map(|word| format!("`{word}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let dispositions = [
+            message::Disposition::Answered,
+            message::Disposition::Escalated,
+            message::Disposition::Refused,
+            message::Disposition::BudgetExhausted,
+        ]
+        .map(message::Disposition::wire_name);
+        // String literals at the `status_reply` call sites of src/mesh/fetch.rs.
+        let fetch_statuses = [
+            "ok",
+            "not_modified",
+            "not_shared",
+            "invalid_path",
+            "too_large",
+        ];
+        let access_statuses = [
+            access::AccessOutcome::Pending.status(),
+            access::AccessOutcome::Granted { expires: 0.0 }.status(),
+            access::AccessOutcome::Refused(access::AccessRefusal::Duplicate).status(),
+        ];
+        let access_reasons = [
+            access::AccessRefusal::Duplicate,
+            access::AccessRefusal::TooManyPending,
+        ]
+        .map(access::AccessRefusal::wire_name);
+        let mut expected: Vec<(String, &str, Option<String>)> = paths
+            .iter()
+            .map(|(name, path)| {
+                (
+                    format!("`{path:?}`"),
+                    "request path",
+                    Some(format!("`{name}`")),
+                )
+            })
+            .collect();
+        expected.extend([
+            (spans(&["text", "data", "file"]), "`type` value", None),
+            (spans(&dispositions), "`disposition` value", None),
+            (spans(&fetch_statuses), "fetch `status` value", None),
+            (spans(&access_statuses), "access `status` value", None),
+            (spans(&access_reasons), "access `reason` value", None),
+            ("`\"fetch\"`".to_string(), "capability", None),
+            (
+                format!("`{:?}`", knock::KNOCK_TYPE),
+                "LXMF type tag",
+                Some("`KNOCK_TYPE`".to_string()),
+            ),
+            (
+                format!("`{:?}`", message::PEER_MESSAGE_TYPE),
+                "LXMF type tag",
+                Some("`PEER_MESSAGE_TYPE`".to_string()),
+            ),
+            (
+                format!("`{:?}`", access::ACCESS_TYPE),
+                "LXMF type tag",
+                Some("`ACCESS_TYPE`".to_string()),
+            ),
+        ]);
+        let rows = registry_rows();
+        let missing: Vec<String> = expected
+            .iter()
+            .filter(|(first, kind, value)| {
+                !rows.iter().any(|cells| {
+                    cells[0] == *first
+                        && cells[1].contains(kind)
+                        && value.as_ref().is_none_or(|value| cells[2] == *value)
+                })
+            })
+            .map(|(first, kind, value)| {
+                format!("| {first} | {kind} | {} |", value.as_deref().unwrap_or(""))
+            })
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "the registry lacks rows for:\n{}",
+            missing.join("\n")
+        );
+    }
+
+    /// Every field a store file reads under a `#[serde(default)]` is named on the
+    /// MESH-CODE-005 line, by its on-disk key where the attribute renames it. The files are
+    /// the stores plus `message.rs`, whose `PeerMessage` and `Part` ride inside a pending
+    /// record; none of them holds a wire-only struct with a default.
+    #[test]
+    fn code_005_names_every_on_disk_serde_default_field() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut fields = BTreeSet::new();
+        for file in [
+            "trust", "pending", "peers", "knocks", "shares", "grants", "message",
+        ] {
+            let path = format!("src/mesh/{file}.rs");
+            let source = std::fs::read_to_string(root.join(&path)).unwrap();
+            let lines: Vec<&str> = source.lines().map(str::trim).collect();
+            for (index, line) in lines.iter().enumerate() {
+                let Some(attribute) = line.strip_prefix("#[serde(default") else {
+                    continue;
+                };
+                let field = lines[index + 1..]
+                    .iter()
+                    .find(|next| !next.starts_with("#[") && !next.starts_with("///"))
+                    .unwrap_or_else(|| panic!("{path}:{}: no field below", index + 1));
+                let declared = field
+                    .trim_start_matches("pub(crate) ")
+                    .trim_start_matches("pub ")
+                    .split(':')
+                    .next()
+                    .unwrap()
+                    .trim();
+                let renamed = attribute
+                    .split_once("rename = \"")
+                    .and_then(|(_, rest)| rest.split('"').next());
+                fields.insert(renamed.unwrap_or(declared).to_string());
+            }
+        }
+        assert!(fields.len() > 10, "{fields:?}");
+        let definition = SPEC
+            .lines()
+            .find(|line| line.starts_with("**[MESH-CODE-005]**"))
+            .expect("MESH-CODE-005 is defined");
+        let missing: Vec<&String> = fields
+            .iter()
+            .filter(|field| !definition.contains(&format!("`{field}`")))
+            .collect();
+        assert_eq!(missing, Vec::<&String>::new());
+    }
+
+    fn follows(line: &str, needle: &str, accept: impl Fn(&[u8]) -> bool) -> bool {
+        line.match_indices(needle)
+            .any(|(at, _)| accept(&line.as_bytes()[at + needle.len()..]))
+    }
+
+    /// A line that cites a planning artefact (a task id, a lettered review criterion, a
+    /// review round) instead of the behaviour it tests. The needles are assembled at
+    /// runtime so this file does not spell them. A task id quoted inside a code span or
+    /// a string literal is fixture input, not a citation, and a line that names the
+    /// `ILLUSTRATIVE_IDS` list is the fixture that keeps one such id on purpose.
+    fn cites_a_plan_label(line: &str) -> bool {
+        if line.contains("ILLUSTRATIVE_IDS") {
+            return false;
+        }
+        let task = ["TASK", "-"].concat();
+        let criterion = ["criterion", " ("].concat();
+        let round = ["review", " round "].concat();
+        let plain = [
+            ["Plan", " criterion"].concat(),
+            ["plan", " ruling"].concat(),
+        ];
+        follows(&without_quoted(line), &task, |rest| {
+            rest.first().is_some_and(u8::is_ascii_digit)
+        }) || follows(line, &criterion, |rest| {
+            rest.first().is_some_and(u8::is_ascii_lowercase) && rest.get(1) == Some(&b')')
+        }) || follows(line, &round, |rest| {
+            rest.first().is_some_and(u8::is_ascii_digit)
+        }) || plain.iter().any(|needle| line.contains(needle.as_str()))
+    }
+
+    fn without_quoted(line: &str) -> String {
+        let mut out = String::with_capacity(line.len());
+        let mut rest = strip_spans(line);
+        while let Some(open) = rest.find('"') {
+            let Some(close) = rest[open + 1..].find('"') else {
+                break;
+            };
+            out.push_str(&rest[..open]);
+            out.push(' ');
+            rest = rest[open + close + 2..].to_string();
+        }
+        out.push_str(&rest);
+        out
+    }
+
+    #[test]
+    fn plan_label_scanner_trips_each_shape_and_spares_prose() {
+        for hit in [
+            ["// see TASK", "-118 for why"].concat(),
+            ["/// Usage probe, criterion", " (b): the root"].concat(),
+            ["// ---- review", " round 2 ----"].concat(),
+            ["/// Plan", " criterion (f): at every cap"].concat(),
+            ["// the plan", " ruling was"].concat(),
+        ] {
+            assert!(cites_a_plan_label(&hit), "{hit:?}");
+        }
+        for miss in [
+            "// the TASK list is drained".to_string(),
+            "// a criterion (the first) applies".to_string(),
+            "// reviewed in round 2 of the audit".to_string(),
+            "// the plan criterion is unmet".to_string(),
+            "// B6 and G8 are hex here".to_string(),
+            ["// the rule quotes `// TASK", "-002` as its example"].concat(),
+            ["let id = \"TASK", "-002\";"].concat(),
+            ["const ILLUSTRATIVE_IDS: [&str; 1] = [\"TASK", "-002\"];"].concat(),
+        ] {
+            assert!(!cites_a_plan_label(&miss), "{miss:?}");
+        }
+    }
+
+    #[test]
+    fn source_comments_cite_behaviour_not_plan_labels() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files: Vec<(String, String)> = rust_source_files(root).unwrap();
+        files.push(("docs/mesh/PROTOCOL.md".to_string(), SPEC.to_string()));
+        let hits: Vec<String> = files
+            .iter()
+            .flat_map(|(path, source)| {
+                source
+                    .lines()
+                    .enumerate()
+                    .filter(|(_, line)| cites_a_plan_label(line))
+                    .map(move |(index, line)| format!("{path}:{}: {}", index + 1, line.trim()))
+            })
+            .collect();
+        assert!(hits.is_empty(), "{}", hits.join("\n"));
     }
 
     #[test]

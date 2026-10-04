@@ -584,7 +584,7 @@ mod tests {
         assert_eq!(files_under(&inbox.root), Vec::<PathBuf>::new());
     }
 
-    /// Usage probe, criterion (b) "canonicalise the inbox root": an operator whose cache
+    /// Usage probe, canonicalised inbox root: an operator whose cache
     /// directory is itself a symlink (a relocated `~/.cache`) stages normally. The staged
     /// path is absolute, resolved through the link and under the real root, the file holds
     /// the bytes, and the same file reached through the link and through the real path is
@@ -657,7 +657,7 @@ mod tests {
         );
     }
 
-    /// Usage probe, criterion (b): a peer's two names may clash as a file and a directory
+    /// Usage probe: a peer's two names may clash as a file and a directory
     /// (`docs` after `docs/a.md`, or `a.md/b.md` after `a.md`). Neither direction may
     /// replace or remove what is already staged; the later stage is refused with an error
     /// that names no path, and the inbox holds exactly the files it held before.
@@ -773,8 +773,8 @@ mod tests {
         assert_eq!(names, ["inbox", "plain"]);
     }
 
-    /// Usage probe, criterion (b) "lexically join the validated `rel`, `create_dir_all`
-    /// the parent": a name several directories deep lands into an empty peer directory
+    /// Usage probe, lexical join of the validated `rel` with `create_dir_all` on
+    /// the parent: a name several directories deep lands into an empty peer directory
     /// with every intermediate directory created, and a second name whose parents only
     /// partly exist is written beside it. Both paths are absolute and under the resolved
     /// root; the inbox holds exactly those two files.
@@ -820,7 +820,7 @@ mod tests {
         assert_eq!(found, [deep, beside]);
     }
 
-    /// Usage probe, criterion (b) layout `<peer-dest8>/<rel>`: two peers staging the same
+    /// Usage probe, layout `<peer-dest8>/<rel>`: two peers staging the same
     /// name with different bytes do not collide — each lands under its own directory with
     /// no hash suffix and its own bytes, and a peer's directory is named by *its*
     /// destination, not the other's.
@@ -857,7 +857,7 @@ mod tests {
         assert_eq!(found, expected);
     }
 
-    /// Usage probe, criterion (b) "prefix-check the parent's canonical path": the guard
+    /// Usage probe, prefix check on the parent's canonical path: the guard
     /// holds at the shallowest level a peer-named path can reach. When the peer's own
     /// `<dest8>` directory is a symlink leading outside the root, a stage of any name
     /// (one level or deep) is `Escaped` before anything is created or written at the
@@ -901,7 +901,7 @@ mod tests {
         assert_eq!(files_under(&inbox.root), Vec::<PathBuf>::new());
     }
 
-    /// Usage probe, criterion (b) "same sha256 ⇒ reuse" at the degenerate size: an empty
+    /// Usage probe, same sha256 ⇒ reuse at the degenerate size: an empty
     /// inline file stages to an empty file at its name, a second stage of the same empty
     /// content reuses that path, and other bytes under the same name take the hash-suffixed
     /// sibling rather than filling the empty file in.

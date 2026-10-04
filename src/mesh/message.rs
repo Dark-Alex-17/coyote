@@ -4052,8 +4052,8 @@ mod tests {
         assert!(decoded.parts.is_empty());
     }
 
-    /// Plan criterion (f): with content, title, both ids, fields and parts of all four
-    /// shapes (text, data, inline file, reference file) at their caps at once, the message
+    /// Every cap at once: with content, title, both ids, fields and parts of all four
+    /// shapes (text, data, inline file, reference file) at their caps together, the message
     /// still fits under both receivers' bounds and every field survives encode→decode
     /// byte-for-byte on both routes.
     #[test]
@@ -4676,7 +4676,7 @@ mod tests {
         );
     }
 
-    /// Usage probe, criterion (a) as amended: the sender normalises `text` and `data`
+    /// Usage probe, normalisation before the caps: the sender normalises `text` and `data`
     /// parts BEFORE the caps, so a message whose parts are over the char, fields and
     /// encoded-size caps only by invisibles the receiver strips anyway is accepted — and
     /// what the sender puts on the wire is a fixed point for the receiver on both routes:
@@ -4763,7 +4763,7 @@ mod tests {
         assert_eq!(landed.parts, message.parts);
     }
 
-    /// Usage probe, criterion (b): the staging path is keyed by the sending peer, so two
+    /// Usage probe: the staging path is keyed by the sending peer, so two
     /// peers sending a file under the same name each get their own copy under their own
     /// `<peer-dest8>` directory, neither suffixed and neither overwriting the other.
     #[test]
@@ -4805,7 +4805,7 @@ mod tests {
         assert_eq!(std::fs::read(&path_b).unwrap(), b"from b");
     }
 
-    /// Usage probe, criterion (b) collision rule as amended (hard-link publish, never
+    /// Usage probe, staging collision rule (hard-link publish, never
     /// overwrite): a second message from the same peer under a taken name lands beside
     /// the first as `<stem>-<sha8><ext>`; when that sibling name is also taken by other
     /// bytes the part is dropped and counted, the message still lands with its content
