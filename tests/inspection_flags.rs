@@ -1326,7 +1326,17 @@ fn agent_envoy_one_shot_text_and_piped_stdin_run_and_clean_up() {
         // The instructions name the peer's own tool once, so the peer knows where to
         // ask for files; that is not a tool offered to the envoy, so it is the one
         // `mesh__` mention the readout may carry.
-        let advertised = stdout.replacen("their tool is mesh__request_access", "", 1);
+        let exempt = "their tool is mesh__request_access";
+        assert!(
+            stdout.contains(exempt),
+            "{label}: the peer's own tool is no longer named as `{exempt}`\nstdout: {stdout}"
+        );
+        assert_eq!(
+            stdout.matches("mesh__").count(),
+            1,
+            "{label}: a `mesh__` tool beyond the peer's own is advertised\nstdout: {stdout}"
+        );
+        let advertised = stdout.replacen(exempt, "", 1);
         for forbidden in [
             "execute_command",
             "agent__spawn",

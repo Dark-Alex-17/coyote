@@ -162,6 +162,14 @@ struct Prepared {
     prompt_estimate: u64,
 }
 
+/// The run around an escalation, as the escalated notice needs it: whether this is
+/// the run's first escalation, the run's cancellation, and what is left of its ceiling.
+struct NoticeBound<'a> {
+    first: bool,
+    cancel: &'a CancellationToken,
+    remaining: Duration,
+}
+
 pub(crate) struct EnvoyRunner {
     app: ArcSwap<AppState>,
     jobs: mpsc::Sender<EnvoyJob>,
@@ -583,13 +591,17 @@ impl EnvoyRunner {
                         && queue.has_pending()
                         && let Some(request) = first_pending(&queue)
                     {
+                        let bound = NoticeBound {
+                            first: !escalated,
+                            cancel: &cancel,
+                            remaining: ceiling.saturating_sub(started.elapsed()),
+                        };
                         escalated = true;
                         let hold = (timeout_secs > 0).then(|| {
-                            Duration::from_secs(timeout_secs)
-                                .min(ceiling.saturating_sub(started.elapsed()))
+                            Duration::from_secs(timeout_secs).min(bound.remaining)
                         });
                         if let Err(err) = self
-                            .escalate(message, card, request, hold, &mut hold_until)
+                            .escalate(message, card, request, hold, &mut hold_until, bound)
                             .await
                         {
                             break EnvoyOutcome::Failed(err);
@@ -647,14 +659,17 @@ impl EnvoyRunner {
             .debit(identity, tokens, snapshot.cost_usd, Instant::now());
     }
 
-    /// Files the question, tells the peer it has gone to the human, tells the human, and
-    /// holds the run open for the answer for `hold` when the config allows a wait. With
-    /// no wait the request is dropped along with the run.
+    /// Files the question, tells the human, holds the run open for the answer for `hold`
+    /// when the config allows a wait, and then tells the peer its question has gone to
+    /// the human. With no wait the request is dropped along with the run.
     /// The hold is taken before the question is filed, under the one lock `holds` and
     /// `answer` read, so a human who sees the question on file can always answer it
     /// through the live run.
     /// A question that cannot be filed (the mesh is off, or the id is held open by
     /// another peer) is never advertised: `.mesh answer` would reach the wrong record.
+    /// The peer is told last and only on the run's first escalation, with the send
+    /// bounded by the run's cancellation and remaining ceiling, so the human's line and
+    /// the hold are never delayed by a slow peer.
     async fn escalate(
         &self,
         message: &PeerMessage,
@@ -662,6 +677,7 @@ impl EnvoyRunner {
         request: EscalationRequest,
         hold: Option<Duration>,
         hold_until: &mut Option<Pin<Box<Sleep>>>,
+        bound: NoticeBound<'_>,
     ) -> Result<(), String> {
         let question = strip_tool_tag(&request.question);
         let app = self.app.load();
@@ -708,7 +724,6 @@ impl EnvoyRunner {
                 return Err(format!("could not file the escalated question: {err:#}"));
             }
         }
-        self.tell_peer_escalated(&app, message, card).await;
         let line = display_text(question, PEER_LINE_MAX_CHARS).unwrap_or_default();
         app.mesh.push_idle(IdleNotify {
             source: Source::Message,
@@ -722,19 +737,33 @@ impl EnvoyRunner {
         if let Some(hold) = hold {
             *hold_until = Some(Box::pin(tokio::time::sleep(hold)));
         }
+        // The asker's correlation is one-shot: a second `escalated` reply to the same
+        // question would be refused on the far side, so only the first is sent.
+        if bound.first {
+            self.tell_peer_escalated(&app, message, card, bound).await;
+        }
         Ok(())
     }
 
     /// The immediate `escalated` reply: the peer hears at once that its question went
-    /// to the human, whether or not the run then waits for the answer. A send that
-    /// fails is told to the human and does not stop the escalation.
-    async fn tell_peer_escalated(&self, app: &AppState, message: &PeerMessage, card: &PeerCard) {
+    /// to the human, whether or not the run then waits for the answer. A send that fails,
+    /// or is cut off by the run's cancellation or ceiling, is told to the human and does
+    /// not stop the escalation.
+    async fn tell_peer_escalated(
+        &self,
+        app: &AppState,
+        message: &PeerMessage,
+        card: &PeerCard,
+        bound: NoticeBound<'_>,
+    ) {
         let unsent = match (app.mesh.get(), escalated_notice(message)) {
-            (Some(runtime), Ok(out)) => runtime
-                .send_peer(&message.source_destination, &out)
-                .await
-                .err()
-                .map(|err| err.to_string()),
+            (Some(runtime), Ok(out)) => bounded_send(
+                runtime.send_peer(&message.source_destination, &out),
+                bound.cancel,
+                bound.remaining,
+            )
+            .await
+            .err(),
             (None, _) => Some("mesh is off".to_string()),
             (_, Err(err)) => Some(err.to_string()),
         };
@@ -986,18 +1015,34 @@ fn strip_tool_tag(question: &str) -> &str {
 
 /// Reads the envoy's final text as its outcome: words after a leading `REFUSED:` are a
 /// decline, anything else is its answer, and blank text is a failure. The marker must
-/// lead, so a mention of it mid-sentence stays an answer.
+/// lead, so a mention of it mid-sentence stays an answer. The text is cleaned the way
+/// peer-facing text is before the marker is looked for, so an invisible character
+/// ahead of it cannot turn a decline into an answer.
 fn classify_answer(text: &str) -> EnvoyOutcome {
-    let text = text.trim_start();
-    match text.strip_prefix(REFUSAL_MARKER) {
-        Some(rest) => EnvoyOutcome::Declined(
-            display_text(rest, PEER_CONTENT_MAX_CHARS)
-                .unwrap_or_else(|| DECLINED_FALLBACK_TEXT.to_string()),
-        ),
-        None => match display_text(text, PEER_CONTENT_MAX_CHARS) {
-            Some(text) => EnvoyOutcome::Answered(text),
-            None => EnvoyOutcome::Failed("empty answer".into()),
-        },
+    let Some(clean) = display_text(text, PEER_CONTENT_MAX_CHARS) else {
+        return EnvoyOutcome::Failed("empty answer".into());
+    };
+    match clean.strip_prefix(REFUSAL_MARKER) {
+        Some(rest) if rest.trim().is_empty() => {
+            EnvoyOutcome::Declined(DECLINED_FALLBACK_TEXT.to_string())
+        }
+        Some(rest) => EnvoyOutcome::Declined(rest.trim_start().to_string()),
+        None => EnvoyOutcome::Answered(clean),
+    }
+}
+
+/// Waits for `send` unless the run is cancelled or its `remaining` ceiling lapses first,
+/// so a slow peer cannot hold the run open past either.
+async fn bounded_send<T>(
+    send: impl Future<Output = Result<T, SendError>>,
+    cancel: &CancellationToken,
+    remaining: Duration,
+) -> Result<T, String> {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err("cancelled".to_string()),
+        _ = tokio::time::sleep(remaining) => Err("timed out".to_string()),
+        res = send => res.map_err(|err| err.to_string()),
     }
 }
 
@@ -1358,6 +1403,67 @@ mod tests {
             classify_answer("  \n"),
             EnvoyOutcome::Failed(why) if why == "empty answer"
         ));
+    }
+
+    #[test]
+    fn an_invisible_character_ahead_of_the_refused_marker_still_makes_a_decline() {
+        let declined = |text: &str| match classify_answer(text) {
+            EnvoyOutcome::Declined(words) => words,
+            _ => panic!("{text:?} was not a decline"),
+        };
+        assert_eq!(
+            declined("\u{200B}REFUSED: ask via /access"),
+            "ask via /access"
+        );
+        assert_eq!(declined("\u{200B}REFUSED:"), DECLINED_FALLBACK_TEXT);
+        assert_eq!(
+            declined("\u{200B} REFUSED: \u{200B}ask via /access"),
+            "ask via /access"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bounded_send_that_finishes_in_time_returns_its_result() {
+        let cancel = CancellationToken::new();
+        let sent = bounded_send(
+            std::future::ready(Ok::<(), SendError>(())),
+            &cancel,
+            Duration::from_secs(60),
+        )
+        .await;
+        assert_eq!(sent, Ok(()));
+        let failed = bounded_send(
+            std::future::ready(Err::<(), SendError>(SendError::NotRunning)),
+            &cancel,
+            Duration::from_secs(60),
+        )
+        .await;
+        assert_eq!(failed, Err(SendError::NotRunning.to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_bounded_send_is_cut_off_by_the_run_being_cancelled() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let sent = bounded_send(
+            std::future::pending::<Result<(), SendError>>(),
+            &cancel,
+            Duration::from_secs(60),
+        )
+        .await;
+        assert_eq!(sent, Err("cancelled".to_string()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_bounded_send_is_cut_off_when_the_run_s_ceiling_lapses() {
+        let cancel = CancellationToken::new();
+        let sent = bounded_send(
+            std::future::pending::<Result<(), SendError>>(),
+            &cancel,
+            Duration::from_secs(60),
+        )
+        .await;
+        assert_eq!(sent, Err("timed out".to_string()));
     }
 
     /// I7: file bytes never traverse a model. Whatever the run came to, and whether or
