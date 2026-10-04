@@ -877,6 +877,92 @@ A thread is the conversation a message belongs to, named by a wire id; `in_reply
 
 **[MESH-DISP-026]** Inheritance is identity-gated: the receiver MUST take the thread from the correlation only when the `reply` matches an open question from the asked identity, and MUST deliver a `reply` from any other identity, or one matching no open question, as a `message` with `thread`, `disposition` and `retry_after` cleared (`a_reply_from_another_identity_is_a_message_with_neither_thread_nor_disposition`, `usage_probe_a_forged_reply_carrying_its_own_thread_never_inherits_ours`, src/mesh/node.rs; `usage_probe_escalated_and_answered_replies_inherit_a_thread_that_is_not_the_id`, src/config/mesh_envoy.rs).
 
+### 10.12 Worked examples
+
+One `ask` from end to end, with the values illustrative and the structure that of the code. The asking node sends the request frame of section 6.1; `data` is the Envelope of section 6.5 and `body` is what `to_r3_body` emits, keys in the sender order of section 10.1:
+
+```text
+93 cb <8> c4 10 <16>                       # [time, path_hash, data]; path_hash = trunc_16(H("/message"))
+{                                          # data: the Envelope
+  "v": 1,                                  #   protocol version
+  "name_hash": bin(10),                    #   the asker's name hash
+  "body": {
+    "v": 1,                                #   PEER_WIRE_VERSION
+    "kind": "ask",
+    "id": "9f1c3b0e6d8a4f2b9c7e1a5d3b8f6c04",
+    "thread": "9f1c3b0e6d8a4f2b9c7e1a5d3b8f6c04",  # a root names itself
+    "title": "Peer struct",
+    "content": "Is the Peer struct in src/mesh/peer.rs still the one on main?",
+    "fields": { "task": "T16" },
+    "parts": [ { "type": "data", "data": { "want": ["src/mesh/peer.rs"] } } ],
+    "ts": 1790000000.0
+  }
+}
+```
+
+The answering node acknowledges on the same link with the response frame of section 6.2, before any envoy run (section 10.3):
+
+```text
+92 c4 10 <16>                              # [request_id, body]
+{ "received": true, "id": "9f1c3b0e6d8a4f2b9c7e1a5d3b8f6c04" }
+```
+
+The answer travels the other way as separate `/message` requests, each a `reply` in the question's thread. The envoy escalates, so the first is the notice of MESH-DISP-016, `disposition` where section 10.1 puts it, after `fields` and before `parts` and `ts`:
+
+```text
+{
+  "v": 1,
+  "kind": "reply",
+  "id": "c2e7a9d14b6f4e0c8a3d5f7b9e1c2a60",
+  "in_reply_to": "9f1c3b0e6d8a4f2b9c7e1a5d3b8f6c04",
+  "thread": "9f1c3b0e6d8a4f2b9c7e1a5d3b8f6c04",
+  "content": "a human has been asked; the answer will follow (ref 9f1c3b0e6d8a4f2b9c7e1a5d3b8f6c04)",
+  "disposition": "escalated",
+  "ts": 1790000012.0
+}
+```
+
+When the hold lapses without an answer the hand-off `message` of MESH-MSG-033 follows it. When the human answers, the answer goes as a second `reply`, here with the file attached inline (section 10.9):
+
+```text
+{
+  "v": 1,
+  "kind": "reply",
+  "id": "4b8d2f6a1c3e4d7f9a0b5c8e2d1f7a93",
+  "in_reply_to": "9f1c3b0e6d8a4f2b9c7e1a5d3b8f6c04",
+  "thread": "9f1c3b0e6d8a4f2b9c7e1a5d3b8f6c04",
+  "content": "yes, until Friday (attached: peer.rs)",
+  "disposition": "answered",
+  "parts": [ { "type": "file", "name": "peer.rs", "size": 61234, "sha256": bin(32), "bytes": bin } ],
+  "ts": 1790003600.0
+}
+```
+
+Had the first request timed out, the same `ask` would have gone by store-and-forward (section 10.8) as `peer_lxmf_message` builds it:
+
+```text
+destination_hash  bin(16)                  # the recipient's delivery destination
+source_hash       bin(16)                  # the asker's delivery destination
+signature         bin(64)
+payload = msgpack [timestamp, title, content, fields]
+  timestamp  1790000000.0
+  title      "Peer struct"
+  content    "Is the Peer struct in src/mesh/peer.rs still the one on main?"
+  fields = {
+    0xfb: "scope.peer/1",                  # FIELD_CUSTOM_TYPE: PEER_MESSAGE_TYPE
+    0xfc: {                                # FIELD_CUSTOM_DATA
+      "kind": "ask",
+      "id": "9f1c3b0e6d8a4f2b9c7e1a5d3b8f6c04",
+      "thread": "9f1c3b0e6d8a4f2b9c7e1a5d3b8f6c04",
+      "name_hash": bin(10),
+      "fields": { "task": "T16" },
+      "parts": [ { "type": "data", "data": { "want": ["src/mesh/peer.rs"] } } ]
+    }
+  }
+```
+
+`v` is not repeated here, since the type tag carries the version; `title` and `content` ride the LXMF slots and `ts` is the LXMF timestamp. Both routes end in the pipeline of section 11.4.
+
 ## 11. Store-and-forward via LXMF propagation
 
 When a direct request times out or the link fails (MESH-KNOCK-017, MESH-MSG-024), the message is posted to an LXMF propagation node and fetched by the recipient later.
@@ -998,6 +1084,8 @@ The rules below summarise behaviour the per-field tables carry; the tables gover
 **[MESH-CODE-002]** New semantics MUST use a new code point.
 
 Registry of code points allocated by this document:
+
+This document is the registry. A code point is allocated by a row in the table below together with a requirement in the section the row names; a value that appears in neither is unallocated. An allocation is permanent (MESH-CODE-001), and new semantics take a new code point rather than a changed row (MESH-CODE-002). What a receiver does with a value that is not in this table is fixed by the catch-all row of the table that carries the key: an unknown map key is ignored, an unknown part `type` is skipped, an unknown `disposition` on a `reply` reads as `answered`, an unknown `kind` is refused with `InvalidData`, and an unknown `state.code` is kept and rendered as unknown. There is no registration authority beyond this document, which has one implementer; a second implementer allocates by amending this table.
 
 | Code point | Kind | Value | Section |
 |---|---|---|---|
