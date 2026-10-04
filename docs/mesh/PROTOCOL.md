@@ -844,6 +844,8 @@ A file already at the target with the same SHA-256 is reused without a write; on
 
 **[MESH-PART-034]** An inline file's bytes MUST exist only on the wire and in the staging inbox: the part the pending store, the inbox envelope and a model see carries the staged path, never the bytes (`a_staged_part_serialises_its_path_and_never_bytes`), and the envoy attaches no part, so a file never traverses a model.
 
+The inbox is never swept on its own: staged files stay until the human removes them. The reference's `.mesh inbox --purge-files` removes this instance's tree, `<inbox root>/<instance_id>`, and nothing else, refuses to run when that directory or its parent is a symlink, walks at most `DEFAULT_LIST_WALK_BOUND` = `100000` entries and reports a byte total it could not finish counting as a lower bound.
+
 ### 10.10 Disposition
 
 What a `reply` says about the question it answers (`Disposition`, src/mesh/message.rs). A `disposition` this document does not name reads as `answered` (MESH-DISP-002); a `message`, `ask` or `bulletin` carries none (MESH-DISP-003).
@@ -862,6 +864,8 @@ The envoy's contract (`envoy_reply`, `escalated_notice`, src/config/mesh_envoy.r
 **[MESH-DISP-015]** An answer, the envoy's or the human's, MUST go out as `answered`.
 
 **[MESH-DISP-016]** An escalation MUST be told to the peer at once by a `reply` whose `disposition` is `escalated`, whose `in_reply_to` is the question's `id`, whose `thread` is the question's and whose content is exactly `a human has been asked; the answer will follow (ref <id>)` with `<id>` the question's `id`. **[MESH-DISP-017]** That reply MUST be sent once per run (`a_cut_off_escalated_notice_fires_message_failed_as_cancelled`), ahead of the hand-off `message` of MESH-MSG-033 and of any later `answered` reply (MESH-DISP-005; `over_a_live_link_the_peer_hears_the_answer_the_handoff_and_the_late_reply`).
+
+The send of that reply is bounded by the run's cancellation and by the ceiling of MESH-MSG-036; a notice cut off by either is not retried, and the reference reports it through its hook event `mesh.message.failed` with the error class `cancelled` or `timed_out` (`BoundedSendError`, src/config/mesh_envoy.rs).
 
 **[MESH-DISP-018]** A decline, and a run that timed out, was interrupted, found the envoy unavailable or failed, MUST go out as `refused` with no `retry_after`: a decline is an answer whose cleaned text leads with `REFUSED:`, the marker stripped and the words after it the content, `this node will not handle that request` when none follow (`a_leading_refused_marker_makes_the_answer_a_decline`, `a_declined_request_is_recorded_as_the_envoy_reply_and_never_escalated`), and the others carry the content of MESH-MSG-035.
 
