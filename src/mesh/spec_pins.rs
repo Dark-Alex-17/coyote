@@ -1030,9 +1030,9 @@ mod tests {
         MAX_FETCH_RESPONSE_BYTES, RESPONSE_FRAME_PREFIX, RefusalCode, RequestId, ResponseFrame,
     };
     use crate::mesh::{
-        access, announce, card, fetch, grants, identity, knock, knocks, limits, message, peers,
-        pending, propagation, propagation_fetch, propagation_nodes, protocol, r3, shares, trust,
-        wire_path,
+        access, announce, card, events, fetch, grants, identity, knock, knocks, limits, message,
+        peers, pending, propagation, propagation_fetch, propagation_nodes, protocol, r3, schema,
+        shares, trust, wire_path,
     };
     use lxmf_core::constants::{FIELD_CUSTOM_DATA, FIELD_CUSTOM_TYPE};
     use rmpv::Value;
@@ -2786,6 +2786,12 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
             access::AccessRefusal::TooManyPending,
         ]
         .map(access::AccessRefusal::wire_name);
+        let decisions = [
+            events::AccessDecision::Granted,
+            events::AccessDecision::Denied,
+        ]
+        .map(events::AccessDecision::wire_name);
+        let rules: Vec<&str> = wire_path::RULES.iter().map(|(name, _)| *name).collect();
         let mut expected: Vec<(String, &str, Option<String>)> = paths
             .iter()
             .map(|(name, path)| {
@@ -2802,6 +2808,8 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
             (spans(&fetch_statuses), "fetch `status` value", None),
             (spans(&access_statuses), "access `status` value", None),
             (spans(&access_reasons), "access `reason` value", None),
+            (spans(&decisions), "decision `status` value", None),
+            (spans(&rules), "`rule` value", None),
             ("`\"fetch\"`".to_string(), "capability", None),
             (
                 format!("`{:?}`", knock::KNOCK_TYPE),
@@ -2845,26 +2853,15 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
 
     /// Every field a store file reads under a `#[serde(default)]` is named on the
     /// MESH-CODE-005 line, by its on-disk key where the attribute renames it. The files
-    /// twin `ON_DISK_STRUCTS` in `schema.rs`: the stores plus `message.rs`, whose
+    /// are those of `ON_DISK_STRUCTS` in `schema.rs`: the stores plus `message.rs`, whose
     /// `PeerMessage` and `Part` ride inside a pending record; none of them holds a
     /// wire-only struct with a default.
     #[test]
     fn code_005_names_every_on_disk_serde_default_field() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut fields = BTreeSet::new();
-        for file in [
-            "trust",
-            "knocks",
-            "pending",
-            "message",
-            "identity",
-            "peers",
-            "protocol",
-            "propagation_fetch",
-            "shares",
-            "grants",
-        ] {
-            let path = format!("src/mesh/{file}.rs");
+        for (file, _) in schema::ON_DISK_STRUCTS {
+            let path = format!("src/mesh/{file}");
             let source = std::fs::read_to_string(root.join(&path)).unwrap();
             let lines: Vec<&str> = source.lines().map(str::trim).collect();
             let mut index = 0;
@@ -2973,11 +2970,11 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
     }
 
     /// A line that cites a planning artefact (a task id, a lettered review criterion, a
-    /// review round, a ruling, a commit) instead of the behaviour it tests, in any letter
-    /// case. The needles are assembled at runtime so this file does not spell them. A task
-    /// id quoted inside a code span or a string literal is fixture input, not a citation,
-    /// and a line that names the `ILLUSTRATIVE_IDS` list is the fixture that keeps one such
-    /// id on purpose.
+    /// review round, a ruling, a commit, a letter-dash-number plan label in a comment)
+    /// instead of the behaviour it tests, in any letter case. The needles are assembled at
+    /// runtime so this file does not spell them. A task id quoted inside a code span or a
+    /// string literal is fixture input, not a citation, and a line that names the
+    /// `ILLUSTRATIVE_IDS` list is the fixture that keeps one such id on purpose.
     fn cites_a_plan_label(line: &str) -> bool {
         if line.contains("ILLUSTRATIVE_IDS") {
             return false;
@@ -2990,6 +2987,11 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
             "spec".to_string(),
             ["usage", " probe"].concat(),
             "amendment".to_string(),
+        ];
+        let lettered_numbered = [
+            ["b", "-"].concat(),
+            ["g", "-"].concat(),
+            ["t", "-"].concat(),
         ];
         let rounds = [
             ["probe,", " round "].concat(),
@@ -3042,17 +3044,21 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
             .trim_start()
             .strip_prefix("//")
             .map(|text| text.trim_start_matches('/').trim_start());
-        follows(&without_quoted(&line), &task, |rest| {
-            rest.first().is_some_and(u8::is_ascii_digit)
-        }) || lettered
-            .iter()
-            .any(|needle| follows_word(&line, needle, after_optional_round))
-            || comment_text.is_some_and(|text| letter_in_parens(text.as_bytes()))
-            || rounds.iter().chain(std::iter::once(&ruling)).any(|needle| {
-                follows(&line, needle, |rest| {
-                    rest.first().is_some_and(u8::is_ascii_digit)
-                })
+        let starts_with_digit = |rest: &[u8]| rest.first().is_some_and(u8::is_ascii_digit);
+        follows(&without_quoted(&line), &task, starts_with_digit)
+            || lettered
+                .iter()
+                .any(|needle| follows_word(&line, needle, after_optional_round))
+            || comment_text.is_some_and(|text| {
+                lettered_numbered
+                    .iter()
+                    .any(|needle| follows_word(&without_quoted(text), needle, starts_with_digit))
             })
+            || comment_text.is_some_and(|text| letter_in_parens(text.as_bytes()))
+            || rounds
+                .iter()
+                .chain(std::iter::once(&ruling))
+                .any(|needle| follows(&line, needle, starts_with_digit))
             || plain.iter().any(|needle| line.contains(needle.as_str()))
             || comment_text.is_some_and(|text| follows(text, shorthand, round_shorthand))
             || commit.iter().any(|needle| {
@@ -3106,6 +3112,10 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
                 " commit",
             ]
             .concat(),
+            ["// the preview prints first (B", "-40)"].concat(),
+            ["/// g", "-12 covers the relay"].concat(),
+            ["// per t", "-3 the cap holds"].concat(),
+            ["// see B", "-7"].concat(),
         ] {
             assert!(cites_a_plan_label(&hit), "{hit:?}");
         }
@@ -3132,6 +3142,13 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
             ["// the rule quotes `// TASK", "-002` as its example"].concat(),
             ["let id = \"TASK", "-002\";"].concat(),
             ["const ILLUSTRATIVE_IDS: [&str; 1] = [\"TASK", "-002\"];"].concat(),
+            "// the a1b2c3 hash names it".to_string(),
+            "// sub-1 is the first child".to_string(),
+            "// the b-tree is balanced".to_string(),
+            "// t-shirt sizing".to_string(),
+            ["let label = \"B", "-40\";"].concat(),
+            ["  models: [{name: g", "-1}]"].concat(),
+            ["/// Node A asks in thread `t", "-1`; node B answers"].concat(),
         ] {
             assert!(!cites_a_plan_label(&miss), "{miss:?}");
         }

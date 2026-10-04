@@ -8715,8 +8715,8 @@ mod tests {
             /// private relay nobody listens on makes `MeshRuntime::start` fail after the
             /// trial id was minted. The session keeps its old id and stays clean, no node is
             /// installed, the catalog and the session config are untouched, and the preview
-            /// (with the fresh-id consequence) was already on stdout before the start ran
-            /// (B-40) while no "on" summary ever appeared.
+            /// (with the fresh-id consequence) is printed before the start is attempted,
+            /// while no "on" summary ever appears.
             #[test]
             #[serial]
             fn fresh_id_is_not_committed_when_the_real_start_is_refused() {

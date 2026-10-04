@@ -1305,8 +1305,9 @@ mod tests {
 
     #[test]
     fn a_version_1_inbound_line_from_before_the_parts_bump_is_refused() {
-        // Same as the pending store: the inbound record moved 1 -> 2 (thread,
-        // kind, paths, reason) and a pre-bump line is refused, not migrated.
+        // Same as the pending store: the inbound record moved 1 -> 2 when `thread` was
+        // added, and a pre-bump line is refused, not migrated. `kind`, `paths` and
+        // `reason` arrived later within version 2, under a `#[serde(default)]`.
         let tmp = TempDir::new("inbound-v1-before-bump");
         let store = InboundStore::new(&tmp.path, "inst");
         let line = concat!(

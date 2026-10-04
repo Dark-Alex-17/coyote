@@ -651,6 +651,9 @@ mod tests {
         COVERAGE_HEADING, ENFORCED_BY, EXECUTED_BY, Kind, NO_VECTOR, all_listed, coverage_table,
         spec_ids, uncovered_ids,
     };
+    use crate::mesh::r3::{
+        ACCESS_PATH, FETCH_PATH, KNOCK_PATH, LIST_PATH, MESSAGE_PATH, STATUS_PATH,
+    };
     use crate::mesh::spec_pins::{
         CATCH_ALL_ROW_PREFIXES, SPEC, is_catch_all_row, rust_sources, split_spans, test_functions,
     };
@@ -1457,5 +1460,61 @@ mod tests {
             summary.1["run"].as_str().unwrap().contains("date +%s"),
             "the summary step reads the clock"
         );
+    }
+
+    // The reference peer's served paths and the harness README's account of them, pinned
+    // on the files alone so the check runs on every platform, not only where the Python
+    // reference can be spawned.
+    const HARNESS_README: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/scripts/mesh-interop/README.md"
+    ));
+    const REFERENCE_PEER: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/scripts/mesh-interop/reference_peer.py"
+    ));
+
+    #[test]
+    fn the_reference_peer_serves_exactly_the_paths_the_readme_says_it_does() {
+        let gap = format!(
+            "The reference peer does not implement `{KNOCK_PATH}`, `{LIST_PATH}`, `{FETCH_PATH}` or `{ACCESS_PATH}`;"
+        );
+        let unwrapped = HARNESS_README
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            unwrapped.contains(&gap),
+            "scripts/mesh-interop/README.md no longer says {gap:?}"
+        );
+
+        let mut lines = REFERENCE_PEER.lines();
+        let mut registered = Vec::new();
+        while let Some(line) = lines.next() {
+            if !line.contains(".register_request_handler(") {
+                continue;
+            }
+            let args = lines
+                .next()
+                .unwrap_or_else(|| panic!("{line:?} has no argument line"));
+            let (_, after_quote) = args
+                .split_once('"')
+                .unwrap_or_else(|| panic!("{args:?} does not open a path literal"));
+            let (path, _) = after_quote
+                .split_once('"')
+                .unwrap_or_else(|| panic!("{args:?} does not close its path literal"));
+            registered.push(path);
+        }
+        assert_eq!(
+            registered,
+            [STATUS_PATH, MESSAGE_PATH],
+            "scripts/mesh-interop/reference_peer.py registers a different set of request paths"
+        );
+        for path in registered {
+            assert!(
+                unwrapped.contains(&format!("`{path}`")),
+                "scripts/mesh-interop/README.md does not name the served path `{path}`"
+            );
+        }
     }
 }

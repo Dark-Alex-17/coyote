@@ -11276,11 +11276,10 @@ mod tests {
         assert!(ctx.session.as_ref().unwrap().todo_list().goal.is_empty());
     }
 
-    // The reserved `temp` name can
-    // never land in Workspace scope — not via the bare flag, and not by
-    // spelling the name out either. The rejection is a no-op: no workspace
-    // `temp.yaml`, and the live session keeps its Global scope/path so a
-    // later re-home under a real name still works.
+    // The reserved `temp` name can never land in Workspace scope — not via the bare flag,
+    // and not by spelling the name out either. The rejection is a no-op: no workspace
+    // `temp.yaml`, and the live session keeps its Global scope/path so a later re-home
+    // under a real name still works.
     #[test]
     #[serial]
     fn usage_probe_explicit_temp_name_into_workspace_is_rejected_without_side_effects() {
@@ -21512,9 +21511,8 @@ mod tests {
         }
     }
 
-    /// A macro discovered ON DISK with a literal
-    /// `.mesh` step reaches the `.list macros` row renderer as
-    /// `invalid ({reason})`, with the reason naming the offending step —
+    /// A macro discovered on disk with a literal `.mesh` step reaches the `.list macros`
+    /// row renderer as `invalid ({reason})`, with the reason naming the offending step —
     /// the same policy object `list_assets("macros")` iterates.
     #[test]
     #[serial]
@@ -23916,10 +23914,10 @@ mod tests {
         );
     }
 
-    /// The path completer walks nested directories (a sub-directory is
-    /// offered slashed under its parent), hides a built-in-denied file wherever it sits,
-    /// and omits every symlinked FILE, inside the root or out of it, as it omits a
-    /// symlinked directory: the walk serves the real path, never the link.
+    /// The path completer walks nested directories (a sub-directory is offered slashed
+    /// under its parent), hides a built-in-denied file wherever it sits, and omits every
+    /// symlinked file, inside the root or out of it, as it omits a symlinked directory:
+    /// the walk serves the real path, never the link.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]

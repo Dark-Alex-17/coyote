@@ -4873,9 +4873,9 @@ mod tests {
         assert_eq!(landed.parts, message.parts);
     }
 
-    /// Usage probe: the staging path is keyed by the sending peer, so two
-    /// peers sending a file under the same name each get their own copy under their own
-    /// `<peer-dest8>` directory, neither suffixed and neither overwriting the other.
+    /// The staging path is keyed by the sending peer, so two peers sending a file under
+    /// the same name each get their own copy under their own `<peer-dest8>` directory,
+    /// neither suffixed and neither overwriting the other.
     #[test]
     fn two_peers_sending_the_same_file_name_land_in_separate_directories() {
         let tmp = TempDir::new("message-two-peers");

@@ -1778,10 +1778,11 @@ fn usage_probe_bind_mount_recipe_runs_the_daemon_and_keeps_identities_private() 
 }
 
 // ---------------------------------------------------------------------------
-// README multi-node and status notes: the corrected multi-node advice, the
-// BuildKit note, the .gitattributes widening, the load-bearing /opt/coyote-pn
-// mkdir and the exact exit codes / rewritten-file list the status note now
-// promises.
+// README multi-node and status notes: the multi-node advice names `static_peers`
+// as the knob and warns off `from_static_only`, the BuildKit note and the
+// .gitattributes line-ending pins match the Dockerfile, the /opt/coyote-pn mkdir
+// is load-bearing, and the status note's exit codes and rewritten-file list are
+// exact.
 // ---------------------------------------------------------------------------
 
 #[test]

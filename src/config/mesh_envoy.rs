@@ -1535,10 +1535,11 @@ mod tests {
         );
     }
 
-    /// File bytes never traverse a model. Whatever the run came to, and whether or
-    /// not the human took the question, what goes back is words in the asker's thread
-    /// with no part. Every reply names its disposition; only a refusal the human did not
-    /// override carries a retry hint and fields, since it is not the envoy's answer.
+    /// MESH-SEC-022 and MESH-INV-008: file bytes never traverse a model. Whatever the run
+    /// came to, and whether or not the human took the question, what goes back is words in
+    /// the asker's thread with no part. Every reply names its disposition; only a refusal
+    /// the human did not override carries a retry hint and fields, since it is not the
+    /// envoy's answer.
     #[test]
     fn the_envoy_never_attaches_a_part_whatever_the_outcome() {
         let outcomes = [
@@ -2464,10 +2465,10 @@ mod tests {
         job
     }
 
-    /// A held escalation whose wait lapses hands the question off (the peer
-    /// is told there is no answer yet), the run ends, and the QUESTION stays open in the
-    /// inbound store so a late `.mesh answer` can still route it. The dead run must not be
-    /// able to take that late answer.
+    /// A held escalation whose wait lapses hands the question off (the peer is told there
+    /// is no answer yet), the run ends, and the question stays open in the inbound store
+    /// so a late `.mesh answer` can still route it. The dead run must not be able to take
+    /// that late answer.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
     async fn a_held_escalation_that_lapses_hands_off_and_keeps_the_question_open() {
@@ -4000,9 +4001,9 @@ mod tests {
                 .is_some_and(|secs| secs >= 1),
             "{fields}"
         );
-        // A run-time refusal is not the envoy's answer, so on the wire it
-        // carries the typed disposition, the retry hint and the refused message's thread
-        // (a root message's thread is its own id).
+        // A run-time refusal is not the envoy's answer, so on the wire it carries the
+        // typed disposition, the retry hint and the refused message's thread (a root
+        // message's thread is its own id).
         assert_eq!(refusal.disposition, Some(Disposition::BudgetExhausted));
         assert_eq!(
             refusal.retry_after.map(u64::from),
@@ -4261,8 +4262,7 @@ mod tests {
                 .any(|body| body.in_reply_to.as_deref() == Some("live-r1"))
         })
         .await;
-        // The envoy's own answer is `answered` with no retry hint, in
-        // the asker's thread.
+        // The envoy's own answer is `answered` with no retry hint, in the asker's thread.
         let seen = stub.seen();
         let answer = seen
             .iter()

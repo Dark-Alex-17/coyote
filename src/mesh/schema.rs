@@ -93,47 +93,48 @@ pub(crate) fn unversioned_refusal(
     )
 }
 
+/// Every type serde reads from a mesh store, by file. A type missing here is one the
+/// version discipline does not cover, so the list is the contract, not a mirror.
+#[cfg(test)]
+pub(crate) const ON_DISK_STRUCTS: &[(&str, &[&str])] = &[
+    (
+        "trust.rs",
+        &[
+            "TrustFile",
+            "IdentityEntry",
+            "DestinationEntry",
+            "KeyChanged",
+            "OverlayEntry",
+        ],
+    ),
+    ("knocks.rs", &["KnockRecord"]),
+    ("pending.rs", &["PendingRecord", "InboundRecord"]),
+    ("message.rs", &["PeerMessage", "Part"]),
+    ("identity.rs", &["Predecessor"]),
+    ("peers.rs", &["PeerTableFile", "PeerRecord"]),
+    ("protocol.rs", &["Compatibility"]),
+    (
+        "propagation_fetch.rs",
+        &[
+            "StoreFile",
+            "SeenRecord",
+            "DeliveredRecord",
+            "DeferredRecord",
+            "CursorRecord",
+        ],
+    ),
+    (
+        "shares.rs",
+        &["SharesFile", "AllowEntry", "DenyEntry", "OverrideEntry"],
+    ),
+    ("grants.rs", &["GrantRecord", "GrantedPath"]),
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
     use std::path::PathBuf;
-
-    /// Every type serde reads from a mesh store, by file. A type missing here is one the
-    /// version discipline does not cover, so the list is the contract, not a mirror.
-    const ON_DISK_STRUCTS: &[(&str, &[&str])] = &[
-        (
-            "trust.rs",
-            &[
-                "TrustFile",
-                "IdentityEntry",
-                "DestinationEntry",
-                "KeyChanged",
-                "OverlayEntry",
-            ],
-        ),
-        ("knocks.rs", &["KnockRecord"]),
-        ("pending.rs", &["PendingRecord", "InboundRecord"]),
-        ("message.rs", &["PeerMessage", "Part"]),
-        ("identity.rs", &["Predecessor"]),
-        ("peers.rs", &["PeerTableFile", "PeerRecord"]),
-        ("protocol.rs", &["Compatibility"]),
-        (
-            "propagation_fetch.rs",
-            &[
-                "StoreFile",
-                "SeenRecord",
-                "DeliveredRecord",
-                "DeferredRecord",
-                "CursorRecord",
-            ],
-        ),
-        (
-            "shares.rs",
-            &["SharesFile", "AllowEntry", "DenyEntry", "OverrideEntry"],
-        ),
-        ("grants.rs", &["GrantRecord", "GrantedPath"]),
-    ];
 
     /// Types that derive `Deserialize` but need no `deny_unknown_fields`: a fieldless enum
     /// has no field map for an unknown key to hide in, and the probe is lenient by design.

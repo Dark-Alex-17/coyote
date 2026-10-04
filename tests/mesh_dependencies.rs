@@ -615,9 +615,9 @@ fn the_release_gate_names_every_obligation_notice_records() {
 }
 
 // ---------------------------------------------------------------------------
-// Tests for the crates.io pin. Each pins one promise the pin makes about the
-// tree as a consumer meets it: `cargo build --locked` pulls nothing from git,
-// the release is the one the stamp API needs, the guide no longer describes a
+// Tests for the crates.io pin. Each holds one promise it makes about the tree
+// as a consumer meets it: `cargo build --locked` pulls nothing from git, the
+// release is the one the stamp API needs, the guide no longer describes a git
 // pin that is gone, and the merge gate's mechanism check can actually go red.
 // ---------------------------------------------------------------------------
 

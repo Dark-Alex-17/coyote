@@ -1398,9 +1398,9 @@ variables:
         }
     }
 
-    /// Enforcement lives in `Macro::load`, so it fires before
-    /// variable resolution — a mesh macro invoked WITHOUT its required
-    /// variable reports the refusal, not the usage error.
+    /// Enforcement lives in `Macro::load`, so it fires before variable resolution — a mesh
+    /// macro invoked without its required variable reports the refusal, not the usage
+    /// error.
     #[test]
     #[serial]
     fn usage_probe_load_refusal_precedes_variable_resolution() {

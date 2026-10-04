@@ -4378,9 +4378,9 @@ mod tests {
         );
     }
 
-    /// The fetch path's chain, as `fetch_propagated` builds it: knocks peel off first,
-    /// then access requests, then peer messages, and whatever is none of those reaches
-    /// the plain inbox sink.
+    /// The fetch path's chain, mirroring the chain `fetch_propagated` builds: knocks peel
+    /// off first, then access requests, then peer messages, and whatever is none of those
+    /// reaches the plain inbox sink.
     #[test]
     fn the_lxmf_routing_chain_hands_each_type_to_its_own_stage_and_the_rest_to_the_inbox() {
         let tmp = TempDir::new("node-routing-chain");
@@ -5260,12 +5260,12 @@ mod tests {
         stub.stop().await;
     }
 
-    /// The answer path mirrors the decision path, exercised with a
-    /// REFERENCE part (the one form that writes a grant): a question another process
-    /// already took is refused with the one sentence and NO one-off grant is lent for the
-    /// reference, since the take comes before the lend; a reference answer whose send the
-    /// peer refuses lends and then takes the grant back, puts the question back, and
-    /// files nothing for the leader.
+    /// The answer path mirrors the decision path, exercised with a reference part (the
+    /// one form that writes a grant): a question another process already took is refused
+    /// with the one sentence and no one-off grant is lent for the reference, since the
+    /// take comes before the lend; a reference answer whose send the peer refuses lends
+    /// and then takes the grant back, puts the question back, and files nothing for the
+    /// leader.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn usage_probe_a_reference_answer_on_a_taken_question_lends_nothing_and_a_refused_one_takes_it_back()

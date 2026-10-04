@@ -718,11 +718,11 @@ mod tests {
         assert_eq!(peer_dest8("AbC"), "abc");
     }
 
-    /// A root that is "gone again" is reported as an I/O
-    /// failure of the inbox, never as a path leading outside it. The deterministic shapes
-    /// of a gone root are a symlink whose target does not exist and a symlink to a file:
-    /// both are refused as `Io`, nothing appears at the link's target, and the file a
-    /// link points at keeps its bytes.
+    /// A root that is "gone again" is reported as an I/O failure of the inbox, never as a
+    /// path leading outside it. The deterministic shapes of a gone root are a symlink
+    /// whose target does not exist and a symlink to a file: both are refused as `Io`,
+    /// nothing appears at the link's target, and the file a link points at keeps its
+    /// bytes.
     #[cfg(unix)]
     #[test]
     fn usage_probe_a_root_that_is_a_dangling_symlink_or_links_to_a_file_is_an_io_error_not_an_escape()
@@ -820,10 +820,9 @@ mod tests {
         assert_eq!(found, [deep, beside]);
     }
 
-    /// Usage probe, layout `<peer-dest8>/<rel>`: two peers staging the same
-    /// name with different bytes do not collide — each lands under its own directory with
-    /// no hash suffix and its own bytes, and a peer's directory is named by *its*
-    /// destination, not the other's.
+    /// Layout `<peer-dest8>/<rel>`: two peers staging the same name with different bytes
+    /// do not collide — each lands under its own directory with no hash suffix and its
+    /// own bytes, and a peer's directory is named by *its* destination, not the other's.
     #[test]
     fn usage_probe_two_peers_staging_the_same_name_land_in_their_own_directories_without_a_suffix()
     {
@@ -857,11 +856,11 @@ mod tests {
         assert_eq!(found, expected);
     }
 
-    /// Usage probe, prefix check on the parent's canonical path: the guard
-    /// holds at the shallowest level a peer-named path can reach. When the peer's own
-    /// `<dest8>` directory is a symlink leading outside the root, a stage of any name
-    /// (one level or deep) is `Escaped` before anything is created or written at the
-    /// link's target, and the error names no path.
+    /// Prefix check on the parent's canonical path: the guard holds at the shallowest
+    /// level a peer-named path can reach. When the peer's own `<dest8>` directory is a
+    /// symlink leading outside the root, a stage of any name (one level or deep) is
+    /// `Escaped` before anything is created or written at the link's target, and the
+    /// error names no path.
     #[cfg(unix)]
     #[test]
     fn usage_probe_a_peer_directory_that_is_itself_a_link_outside_the_root_is_refused_before_any_write()
@@ -901,10 +900,10 @@ mod tests {
         assert_eq!(files_under(&inbox.root), Vec::<PathBuf>::new());
     }
 
-    /// Usage probe, same sha256 ⇒ reuse at the degenerate size: an empty
-    /// inline file stages to an empty file at its name, a second stage of the same empty
-    /// content reuses that path, and other bytes under the same name take the hash-suffixed
-    /// sibling rather than filling the empty file in.
+    /// Same sha256 ⇒ reuse, at the degenerate size: an empty inline file stages to an
+    /// empty file at its name, a second stage of the same empty content reuses that path,
+    /// and other bytes under the same name take the hash-suffixed sibling rather than
+    /// filling the empty file in.
     #[test]
     fn usage_probe_an_empty_inline_file_stages_and_is_reused_like_any_other() {
         let tmp = TempDir::new("inbox-empty");

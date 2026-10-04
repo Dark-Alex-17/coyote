@@ -70,7 +70,8 @@ creates a Coyote-shaped destination `scope.session.<instance_id>` serving `/stat
 `/message` to anyone, and prints `READY {json}` with `relay_port`, `identity_hash`,
 `destination_hash`, `name_hash` and `instance_id`. The reference peer does not implement
 `/knock`, `/list`, `/fetch` or `/access`; the file-sharing paths are exercised by the Rust
-in-process conformance pair only.
+in-process node pair in `src/mesh/r3/tests.rs` (conformance vectors for those areas are
+not yet written).
 
 | Command | Arguments | Reply / effect |
 |---|---|---|
