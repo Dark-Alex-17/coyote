@@ -5019,6 +5019,7 @@ mod tests {
     // ---- usage probe: dispositions on the wire -------------------------------------------
 
     /// A drive that asks the human twice in one run and answers with both replies.
+    #[cfg(unix)]
     fn twice_escalating_drive() -> EnvoyDrive {
         drive_of(move |ctx, _, _| async move {
             let mut ctx = ctx;
