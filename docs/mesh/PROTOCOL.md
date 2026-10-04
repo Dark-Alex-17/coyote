@@ -412,7 +412,7 @@ The version refusal value (`VersionRefusal::to_value`, `VersionRefusal::from_val
 
 The announce is authoritative: every announce re-judges the mark from its version (MESH-ANN-011), and an announce outside the window records the peer and marks it (MESH-ANN-002).
 
-Schema versions are distinct from the protocol version and travel inside bodies: `STATUS_CARD_VERSION` = `1` (card `v`, section 9.2), `PEER_WIRE_VERSION` = `1` (message body `v`, section 10.1), and the LXMF type tags `"scope.knock/1"` and `"scope.peer/1"` (sections 8.6 and 10.8).
+Schema versions are distinct from the protocol version and travel inside bodies: `STATUS_CARD_VERSION` = `1` (card `v`, section 9.2), `PEER_WIRE_VERSION` = `1` (message body `v`, section 10.1), and the LXMF type tags `"scope.knock/1"`, `"scope.peer/1"` and `"scope.access/1"` (sections 8.6, 10.8 and 10.16).
 
 Two nodes interoperate exactly when their windows intersect. Failure is visible as the refusal map above over R3, and as a local `Incompatible` mark with outbound refused after an announce.
 
@@ -1115,6 +1115,79 @@ Reply: a map carrying `status` and the keys of that status beside it, never a ne
 
 **[MESH-FETCH-034]** A grant use spent by an `ok` that was never sent MUST be refunded (section 10.17; `GrantRefund`, src/mesh/fetch.rs).
 
+### 10.16 /access
+
+An access request is a request on `ACCESS_PATH` = `"/access"` (src/mesh/r3/dispatch.rs) by which a requester asks the human at the responding session for paths its share set does not serve it (`AccessHandler`, `admit_access`, src/mesh/access.rs); the requester side is `request_access_wire` in the same file. The same body travels by store-and-forward as `"scope.access/1"` when the link fails (`ACCESS_TYPE`, below). An access request is for the human: it never reaches the envoy or any model (`an_access_request_never_reaches_the_envoy_sink`, src/mesh/access.rs; `a_full_access_grant_and_fetch_cycle_over_a_live_pair_never_calls_the_envoy`, src/mesh/r3/tests.rs).
+
+Request body, emission order `v`, `id`, `paths`, `reason` (`access_body`, src/mesh/access.rs):
+
+| Field | Type | Sender puts | Receiver action on any other value |
+|---|---|---|---|
+| `v` | uint | `PEER_WIRE_VERSION` = `1` | **[MESH-ACCESS-001]** Missing or not equal to 1, as a body that is not a `map`: the receiver MUST refuse with `InvalidData` (`decode_access`, `validate_access`, src/mesh/access.rs). |
+| `id` | str, a wire id | an id the requester mints for this request (section 10.1) | **[MESH-ACCESS-002]** Missing, not a `str` or not a wire id: the receiver MUST refuse with `InvalidData`. |
+| `paths` | array of str, each a wire path | the paths asked for, at most `ACCESS_MAX_PATHS` = `16` | **[MESH-ACCESS-003]** Missing, not an `array`, an element that is not a `str` or not a wire path (section 10.13), more than 16 elements as sent, or none left once exact repeats are dropped: the receiver MUST refuse with `InvalidData`. |
+| `reason` | str | why, cleaned as peer text (section 3.2), at most `ACCESS_REASON_MAX_CHARS` = `500` characters; absent or blank reads as empty | **[MESH-ACCESS-004]** Present and not a `str`, or longer than 500 characters once cleaned: the receiver MUST refuse with `InvalidData` (`a_reason_of_exactly_the_cap_is_accepted`, src/mesh/access.rs). |
+| any other key | any | nothing | **[MESH-ACCESS-005]** The receiver MUST ignore it. |
+
+**[MESH-ACCESS-006]** Every rule of the request table MUST draw the same `InvalidData`, so the refusal says nothing about which rule was broken (`an_access_body_that_fails_any_rule_earns_the_same_invalid_data_refusal`, src/mesh/access.rs).
+
+Reply, emission order `v`, `id`, `status`, then `expires` or `reason` (`access_reply`, src/mesh/access.rs):
+
+| Field | Type | Sender puts | Receiver action on any other value |
+|---|---|---|---|
+| `v` | uint | `PEER_WIRE_VERSION` = `1` | **[MESH-ACCESS-007]** Missing or not equal to 1, as a reply that is not a `map`: the requester MUST read the reply as malformed (`read_access_reply`, `decode_access_response`, src/mesh/access.rs), after the dispatch-error test of section 6.6, under which a `no_provider` map is `NotServed` (`a_peer_without_an_access_provider_is_reported_as_not_serving_access_not_as_malformed`). |
+| `id` | str | the request's `id` | **[MESH-ACCESS-008]** Missing or not the id sent: the requester MUST read the reply as malformed. |
+| `status` | str | `pending`, `granted` or `refused` | **[MESH-ACCESS-009]** Missing or not a `str`: the requester MUST read the reply as malformed. **[MESH-ACCESS-010]** Any other `str`: the requester MUST fail the request as a client error, `UnknownStatus`, without reading the other keys and never by panicking (`a_reply_with_an_unknown_status_is_a_typed_error_never_a_panic`, src/mesh/access.rs). |
+| `expires` | f64 | with `granted`: the grant's end as Unix seconds | **[MESH-ACCESS-011]** With `granted`, missing or not a number: the requester MUST read the reply as malformed. |
+| `reason` | str | with `refused`: `duplicate` or `too_many_pending` | **[MESH-ACCESS-012]** With `refused`, missing or any other value: the requester MUST fail the request as a client error, `UnknownStatus`. |
+| any other key | any | nothing | **[MESH-ACCESS-013]** The requester MUST ignore it, a key of another status included. |
+
+```text
+/access req  { "v": 1, "id": "7c1e…", "paths": ["src/x.rs"], "reason": "need the struct" }
+        resp { "v": 1, "id": "7c1e…", "status": "pending" }
+        resp { "v": 1, "id": "7c1e…", "status": "granted", "expires": 1790000900.0 }
+        resp { "v": 1, "id": "7c1e…", "status": "refused", "reason": "duplicate" }
+```
+
+**[MESH-ACCESS-014]** A requester that section 6.6 does not admit MUST hear what that section gives its standing, silence for an unknown or blocked identity, before any body is read (`usage_probe_an_untrusted_instances_access_request_is_silent_like_status_and_leaves_nothing_behind`, `usage_probe_a_known_but_untrusted_instances_access_request_earns_no_access_and_is_never_filed`, src/mesh/r3/tests.rs).
+
+**[MESH-ACCESS-015]** When every path asked for is already served to the requester by the share set (section 10.17), a responder MUST answer `granted` at once with `expires` = now + `DEFAULT_GRANT_TTL` = `900` seconds, filing nothing and writing no grant (`already_shared`, src/mesh/access.rs; `an_access_request_for_paths_already_shared_with_the_peer_is_granted_at_once_without_a_human`, `a_path_shared_with_another_identity_is_not_granted_at_once`).
+
+**[MESH-ACCESS-016]** Otherwise a responder MUST judge the request against its open inbound records in this order, the first step that fires answering: an `id` equal to any open record's id, of either kind and from any peer, `refused` with `duplicate`; the same set of paths, in any order, as one of this identity's open access requests, `refused` with `duplicate`; `ACCESS_MAX_PENDING_PER_IDENTITY` = `5` open access requests from this identity already, `refused` with `too_many_pending`; then the request is filed as an inbound record of kind `access` carrying the paths and the reason (section 14.1) and answered `pending`, the rule judged and the record filed under one lock (`rate_rule`, src/mesh/access.rs; `a_sixth_pending_request_from_one_identity_is_refused_as_too_many_pending`, `a_burst_of_concurrent_requests_from_one_identity_never_files_more_than_the_cap`, `usage_probe_a_colliding_id_on_the_handler_path_is_duplicate_at_debug_and_never_a_warn`). Only open requests count: a set that was refused, or one the human has decided, can be asked for again.
+
+**[MESH-ACCESS-017]** A responder whose inbound store is missing or cannot be written MUST answer `refused` with `too_many_pending`, the one refusal that means ask again later, and MUST leave no trace of the request (`an_access_that_cannot_be_filed_is_refused_too_many_pending_at_debug_and_leaves_no_trace`, src/mesh/access.rs).
+
+**[MESH-ACCESS-018]** The human's decision MUST travel as a `reply` on `/message` (section 10.1) whose `in_reply_to` and `thread` are the access `id`, with `disposition` `answered`, exactly one `data` part `{ "access": { "status": "granted" | "denied", "expires"?: f64 } }` and a `content` line of `access granted: N path(s)` or `access denied: N path(s)`, where `expires` is Unix seconds and present with a one-off grant only, never with a standing grant or a denial, and the paths MUST NOT be repeated: the requester holds them under the id, a grant is for every path asked or none, and the reply can travel through a propagation node (`decision_reply`, src/mesh/access.rs; `a_grant_sends_an_answered_reply_with_one_data_part_and_no_paths`; `usage_probe_a_refusal_over_a_live_pair_is_denied_without_expires_and_no_hook_or_reply_carries_a_path_or_the_reason`, src/mesh/r3/tests.rs). The requester correlates the reply under the access id (section 10.5; `request_access_opens_a_correlation_only_while_the_answer_is_pending`) and reads the decision from `parts[0].data.access`.
+
+**[MESH-ACCESS-019]** A one-off grant MUST write one use per path with the TTL (section 10.17) before the decision reply is sent and MUST take that grant back when the send fails, the request staying pending, a standing grant MUST write its share entries only after the peer has heard yes, and a refusal MUST write nothing, so a peer never holds a grant it was not told of and never hears yes without one (`a_one_off_grant_whose_send_fails_leaves_no_grant_and_the_request_pending`, `a_standing_grant_writes_the_share_list_only_after_the_peer_heard_yes`, `a_refusal_removes_the_request_and_writes_no_grant`, src/mesh/access.rs). A late decision is bounded by the one-off TTL and by one use per path (section 15).
+
+Over LXMF, an access request is a message (`access_message`, `decode_access_message`, src/mesh/access.rs; `scope_access_lxmf_round_trips_and_a_knock_is_not_an_access`) posted per section 11.1 when the direct request times out or the link fails (`an_unreachable_access_request_falls_back_to_the_propagation_node`, src/mesh/r3/tests.rs). Title absent, content = the reason's UTF-8 bytes, fields as below.
+
+LXMF fields map:
+
+| Field | Type | Sender puts | Receiver action on any other value |
+|---|---|---|---|
+| `0xfb` (`FIELD_CUSTOM_TYPE`) | text | `ACCESS_TYPE` = `"scope.access/1"` | **[MESH-ACCESS-020]** When absent or not this tag, the receiver MUST NOT treat the message as an access request; it proceeds to the next route of MESH-PROP-038. |
+| `0xfc` (`FIELD_CUSTOM_DATA`) | map | the custom data map below | **[MESH-ACCESS-021]** When missing or not a `map`, the receiver MUST drop the message as malformed. |
+| any other key | any | nothing | **[MESH-ACCESS-022]** The receiver MUST ignore it. |
+
+Custom data map (emission order `name_hash`, `id`, `paths`):
+
+| Field | Type | Sender puts | Receiver action on any other value |
+|---|---|---|---|
+| `name_hash` | bin(10) | the requester's own name hash | **[MESH-ACCESS-023]** Missing, not a `bin` or not 10 bytes: the receiver MUST drop the message as malformed. |
+| `id` | text, a wire id | the request `id` | **[MESH-ACCESS-024]** Missing, not text or not a wire id: the receiver MUST drop the message as malformed. |
+| `paths` | array of text, each a wire path | the request `paths` | **[MESH-ACCESS-025]** Anything the `paths` row of the request table refuses: the receiver MUST drop the message as malformed. |
+| any other key | any | nothing | **[MESH-ACCESS-026]** The receiver MUST ignore it. |
+
+**[MESH-ACCESS-027]** A sender MUST leave the LXMF title absent and MUST put the reason's UTF-8 bytes as the LXMF content, empty when there is none, and the receiver MUST decode the content as lossy UTF-8 and hold it to the `reason` row of the request table, dropping the message as malformed when it fails (`a_stored_access_request_is_held_to_the_link_rules`, src/mesh/access.rs).
+
+**[MESH-ACCESS-028]** The receiver MUST compute the requesting instance from `name_hash` and the signer as MESH-MSG-058 does, MUST drop an untrusted one, and MUST admit a trusted one as on the link (MESH-ACCESS-015 to MESH-ACCESS-017), where a refusal is not answered, there being no link to say so over, and a grant at once is settled with the decision reply of MESH-ACCESS-018 (`AccessRouting`, `settle_granted_at_once`, src/mesh/access.rs; `a_propagated_access_request_from_an_untrusted_instance_is_dropped_before_admission`, `a_propagated_request_that_is_already_shared_sends_the_decision_reply`, `the_grant_a_stored_request_earns_at_once_reaches_the_peer_as_a_decision_reply`).
+
+**[MESH-ACCESS-029]** A responder MUST fire the hook event `mesh.access.requested` when a request is filed as pending and when it is granted at once, not for a refusal, with the peer's identity and destination hashes (`COYOTE_MESH_PEER_IDENTITY`, `COYOTE_MESH_PEER_DESTINATION`), the access id (`COYOTE_MESH_ACCESS_ID`) and the path count (`COYOTE_MESH_PATH_COUNT`), MUST fire `mesh.access.decided` when a decision is made, the grant at once included, with the peer, the access id and `COYOTE_MESH_DECISION` = `granted` or `denied`, and MUST NOT put a path or the reason in either (`access_events_carry_peer_count_and_decision_but_never_a_path`, src/mesh/access.rs; src/mesh/events.rs).
+
+What the human sees is application surface, not wire format. The reference shows who asks, each path with whether it exists under the share root and its size, and the reason, cleaned and cut to a display cap; the reason is screen text only and never model input (section 15).
+
 ## 11. Store-and-forward via LXMF propagation
 
 When a direct request times out or the link fails (MESH-KNOCK-017, MESH-MSG-024), the message is posted to an LXMF propagation node and fetched by the recipient later.
@@ -1199,7 +1272,7 @@ Each body of round 2 runs the stages below in order; the first that fails decide
 | 6 | the source's public key resolves (transport announce cache, then the peer table by delivery hash) | **[MESH-PROP-033]** The receiver MUST defer it as `UnknownSource`: not acknowledged, not recorded. **[MESH-PROP-034]** The receiver MUST keep deferring it until both `MAX_UNKNOWN_SOURCE_DEFERRALS` = `3` deferrals have passed and `UNKNOWN_SOURCE_DEFERRAL_HORIZON` = `900` seconds (one `HEARTBEAT_SECS`) have elapsed since the first sighting, and on the next sighting MUST record, acknowledge and drop it (`UnknownSourceBudgetSpent`; `an_unknown_source_is_deferred_for_three_sightings_and_a_heartbeat_then_given_up_on`). | no, then yes |
 | 7 | the signature verifies | **[MESH-PROP-035]** The receiver MUST discard it as `BadSignature`. | yes |
 | 8 | the signer's standing is `Trusted` | **[MESH-PROP-036]** `Unknown` MUST be discarded as `UntrustedSource`. **[MESH-PROP-037]** `Blocked` MUST be discarded as `BlockedSource` (`a_blocked_signer_is_discarded_and_the_stamp_line_is_logged_for_a_trusted_one`). | yes |
-| 9 | routing | **[MESH-PROP-038]** The receiver MUST route in this order: knock (`"scope.knock/1"`, section 8.6), then peer message (`"scope.peer/1"`, section 10.8), then the ordinary inbox. | yes |
+| 9 | routing | **[MESH-PROP-038]** The receiver MUST route in this order: knock (`"scope.knock/1"`, section 8.6), then access request (`"scope.access/1"`, section 10.16), then peer message (`"scope.peer/1"`, section 10.8), then the ordinary inbox. | yes |
 
 **[MESH-PROP-039]** The deferral table MUST hold at most `MAX_DEFERRED_IDS` = `256` ids, the longest deferred evicted past the cap (`deferrals_evict_the_longest_deferred_past_capacity_and_log_it`).
 
@@ -1246,6 +1319,7 @@ This document is the registry. A code point is allocated by a row in the table b
 | `"/message"` | request path | `MESSAGE_PATH` | 10 |
 | `"/list"` | request path | `LIST_PATH` | 10.14 |
 | `"/fetch"` | request path | `FETCH_PATH` | 10.15 |
+| `"/access"` | request path | `ACCESS_PATH` | 10.16 |
 | `"/get"` | request path, propagation node | | 11.3 |
 | `NoIdentity` | refusal code | `0xf0` | 6.7 |
 | `NoAccess` | refusal code | `0xf1` | 6.7 |
@@ -1261,7 +1335,7 @@ This document is the registry. A code point is allocated by a row in the table b
 | `error`, `path_hash`, `path` | map key, dispatch error | | 6.6 |
 | `"unknown_path"`, `"no_provider"` | `error` string | | 6.6 |
 | `intro` | map key, knock body | | 8.1 |
-| `name_hash` | map key, LXMF custom data | | 8.6, 10.8 |
+| `name_hash` | map key, LXMF custom data | | 8.6, 10.8, 10.16 |
 | `v`, `display_name`, `objective`, `state`, `repo`, `plan`, `todo`, `"snapshot_age_secs"`, `"served_at_secs"` | map key, card | | 9.2 |
 | `about`, `caps` | map key, card | | 9.2 |
 | `"fetch"` | capability, `caps` entry | | 9.2 |
@@ -1285,9 +1359,16 @@ This document is the registry. A code point is allocated by a row in the table b
 | `path`, `if_sha256` | map key, fetch request | | 10.15 |
 | `status`, `size`, `sha256`, `bytes`, `rule`, `limit` | map key, fetch reply | | 10.15 |
 | `ok`, `not_modified`, `not_shared`, `invalid_path`, `too_large` | fetch `status` value | | 10.15 |
+| `id`, `paths`, `reason` | map key, access request | | 10.16 |
+| `id`, `status`, `expires`, `reason` | map key, access reply | | 10.16 |
+| `pending`, `granted`, `refused` | access `status` value | | 10.16 |
+| `duplicate`, `too_many_pending` | access `reason` value | | 10.16 |
+| `access`, `status`, `expires` | map key, decision part | | 10.16 |
+| `granted`, `denied` | decision `status` value | | 10.16 |
 | `"scope.knock/1"` | LXMF type tag | `KNOCK_TYPE` | 8.6 |
 | `"scope.peer/1"` | LXMF type tag | `PEER_MESSAGE_TYPE` | 10.8 |
-| `0xfb`, `0xfc` | LXMF field key | `FIELD_CUSTOM_TYPE`, `FIELD_CUSTOM_DATA` | 8.6, 10.8 |
+| `"scope.access/1"` | LXMF type tag | `ACCESS_TYPE` | 10.16 |
+| `0xfb`, `0xfc` | LXMF field key | `FIELD_CUSTOM_TYPE`, `FIELD_CUSTOM_DATA` | 8.6, 10.8, 10.16 |
 | `"SCOPE"` | announce magic | `ANNOUNCE_MAGIC` | 5.1 |
 | `1` | protocol version | `MESH_PROTOCOL_VERSION` | 7 |
 | `1` | card schema version | `STATUS_CARD_VERSION` | 9.2 |
@@ -1595,6 +1676,12 @@ A leniency is a place where the reference deliberately does something other than
 | `ABOUT_MAX_CHARS` | `200` | src/mesh/card.rs | about_is_sanitised_and_cut_on_a_character_boundary |
 | `CAPS_MAX_ENTRIES` | `16` | src/mesh/card.rs | caps_skips_entries_that_are_not_text_and_drops_those_past_the_cap |
 | `CAP_MAX_CHARS` | `32` | src/mesh/card.rs | caps_skips_entries_that_are_not_text_and_drops_those_past_the_cap |
+| `ACCESS_PATH` | `"/access"` | src/mesh/r3/dispatch.rs | spec_pins (this table) |
+| `ACCESS_TYPE` | `"scope.access/1"` | src/mesh/access.rs | scope_access_lxmf_round_trips_and_a_knock_is_not_an_access |
+| `ACCESS_MAX_PATHS` | `16` | src/mesh/access.rs | access_limits_match_the_grant_store |
+| `ACCESS_REASON_MAX_CHARS` | `500` | src/mesh/access.rs | a_reason_of_exactly_the_cap_is_accepted |
+| `ACCESS_MAX_PENDING_PER_IDENTITY` | `5` | src/mesh/access.rs | a_sixth_pending_request_from_one_identity_is_refused_as_too_many_pending |
+| `DEFAULT_GRANT_TTL` | `900` | src/mesh/grants.rs | grant_defaults_are_pinned |
 
 ## 20. Conformance coverage
 
@@ -2019,6 +2106,35 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 | MESH-FETCH-032 | no vector yet |
 | MESH-FETCH-033 | no vector yet |
 | MESH-FETCH-034 | no vector yet |
+| MESH-ACCESS-001 | no vector yet |
+| MESH-ACCESS-002 | no vector yet |
+| MESH-ACCESS-003 | no vector yet |
+| MESH-ACCESS-004 | no vector yet |
+| MESH-ACCESS-005 | no vector yet |
+| MESH-ACCESS-006 | no vector yet |
+| MESH-ACCESS-007 | no vector yet |
+| MESH-ACCESS-008 | no vector yet |
+| MESH-ACCESS-009 | no vector yet |
+| MESH-ACCESS-010 | no vector yet |
+| MESH-ACCESS-011 | no vector yet |
+| MESH-ACCESS-012 | no vector yet |
+| MESH-ACCESS-013 | no vector yet |
+| MESH-ACCESS-014 | no vector yet |
+| MESH-ACCESS-015 | no vector yet |
+| MESH-ACCESS-016 | no vector yet |
+| MESH-ACCESS-017 | no vector yet |
+| MESH-ACCESS-018 | no vector yet |
+| MESH-ACCESS-019 | no vector yet |
+| MESH-ACCESS-020 | no vector yet |
+| MESH-ACCESS-021 | no vector yet |
+| MESH-ACCESS-022 | no vector yet |
+| MESH-ACCESS-023 | no vector yet |
+| MESH-ACCESS-024 | no vector yet |
+| MESH-ACCESS-025 | no vector yet |
+| MESH-ACCESS-026 | no vector yet |
+| MESH-ACCESS-027 | no vector yet |
+| MESH-ACCESS-028 | no vector yet |
+| MESH-ACCESS-029 | no vector yet |
 | MESH-PROP-001 | Custom (Valid) |
 | MESH-PROP-002 | Custom (Valid) |
 | MESH-PROP-003 | Custom (Invalid), Custom (Valid) |
@@ -2476,6 +2592,35 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 - [MESH-FETCH-032](#1015-fetch) -- fetch timeout
 - [MESH-FETCH-033](#1015-fetch) -- mesh.fetch.served fires once the ok is sent, without the path
 - [MESH-FETCH-034](#1015-fetch) -- a grant use spent by an unsent ok is refunded
+- [MESH-ACCESS-001](#1016-access) -- access v
+- [MESH-ACCESS-002](#1016-access) -- access id
+- [MESH-ACCESS-003](#1016-access) -- access paths
+- [MESH-ACCESS-004](#1016-access) -- access reason
+- [MESH-ACCESS-005](#1016-access) -- access request unknown key
+- [MESH-ACCESS-006](#1016-access) -- every request rule draws the same InvalidData
+- [MESH-ACCESS-007](#1016-access) -- access reply v
+- [MESH-ACCESS-008](#1016-access) -- access reply id echoes the request
+- [MESH-ACCESS-009](#1016-access) -- access reply status
+- [MESH-ACCESS-010](#1016-access) -- unknown access status is a client error
+- [MESH-ACCESS-011](#1016-access) -- expires with granted
+- [MESH-ACCESS-012](#1016-access) -- reason with refused
+- [MESH-ACCESS-013](#1016-access) -- access reply unknown key
+- [MESH-ACCESS-014](#1016-access) -- trust gate before the body
+- [MESH-ACCESS-015](#1016-access) -- paths already shared are granted at once
+- [MESH-ACCESS-016](#1016-access) -- rate rule over open inbound records, then filed as pending
+- [MESH-ACCESS-017](#1016-access) -- a store that cannot file is too_many_pending
+- [MESH-ACCESS-018](#1016-access) -- the decision is an answered reply with one data part and no paths
+- [MESH-ACCESS-019](#1016-access) -- grant written before the reply and taken back when the send fails
+- [MESH-ACCESS-020](#1016-access) -- LXMF access type tag
+- [MESH-ACCESS-021](#1016-access) -- LXMF access custom data map
+- [MESH-ACCESS-022](#1016-access) -- LXMF access fields unknown key
+- [MESH-ACCESS-023](#1016-access) -- LXMF access name_hash
+- [MESH-ACCESS-024](#1016-access) -- LXMF access id
+- [MESH-ACCESS-025](#1016-access) -- LXMF access paths
+- [MESH-ACCESS-026](#1016-access) -- LXMF access custom data unknown key
+- [MESH-ACCESS-027](#1016-access) -- LXMF title absent, reason as content
+- [MESH-ACCESS-028](#1016-access) -- stored request recomputes the instance and is admitted as on the link
+- [MESH-ACCESS-029](#1016-access) -- mesh.access.requested and mesh.access.decided carry no path or reason
 - [MESH-PROP-001](#111-outbound) -- LXMF addressing
 - [MESH-PROP-002](#111-outbound) -- LXMF payload
 - [MESH-PROP-003](#111-outbound) -- non-map fields refused

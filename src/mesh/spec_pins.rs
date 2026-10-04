@@ -25,9 +25,9 @@ const BCP14: &str = "The key words \"MUST\", \"MUST NOT\", \"REQUIRED\", \"SHALL
     \"SHOULD\", \"SHOULD NOT\", \"RECOMMENDED\", \"NOT RECOMMENDED\", \"MAY\", and \"OPTIONAL\" in \
     this document are to be interpreted as described in BCP 14 [RFC2119] [RFC8174] when, and \
     only when, they appear in all capitals, as shown here.";
-const AREAS: [&str; 20] = [
+const AREAS: [&str; 21] = [
     "DEST", "ANN", "ENV", "KNOCK", "STATUS", "MSG", "PROP", "VER", "TIME", "CANON", "EXT", "CODE",
-    "SEC", "INV", "LOG", "LEN", "PART", "DISP", "LIST", "FETCH",
+    "SEC", "INV", "LOG", "LEN", "PART", "DISP", "LIST", "FETCH", "ACCESS",
 ];
 /// Every compound keyword (`MUST NOT`, `NOT RECOMMENDED`, ...) contains one of these.
 const KEYWORDS: [&str; 7] = [
@@ -1020,15 +1020,16 @@ mod tests {
         MAX_FETCH_RESPONSE_BYTES, RESPONSE_FRAME_PREFIX, RefusalCode, RequestId, ResponseFrame,
     };
     use crate::mesh::{
-        announce, card, fetch, identity, knock, knocks, limits, message, peers, pending,
-        propagation, propagation_fetch, propagation_nodes, protocol, r3, shares, trust, wire_path,
+        access, announce, card, fetch, grants, identity, knock, knocks, limits, message, peers,
+        pending, propagation, propagation_fetch, propagation_nodes, protocol, r3, shares, trust,
+        wire_path,
     };
     use lxmf_core::constants::{FIELD_CUSTOM_DATA, FIELD_CUSTOM_TYPE};
     use rmpv::Value;
     use rns_transport::hash::ADDRESS_HASH_SIZE;
     use std::time::Duration;
 
-    const EXPECTED_LITERALS: &str = r#"1,1,10,16,262144,128,"/knock","/status","/message",30,10,10,2,20,16,0xf0,0xf1,0xf3,0xf4,0xf5,0xf6,0xfd,0xfe,"SCOPE",64,300,900,3,2700,1800,1024,"scope.knock/1",200,15,10,256,3,600,256,16,1,0,1,2,64,280,64,64,120,280,"scope.peer/1",1,120,4000,64,4096,8,15,10,604800,256,3600,120,256,1,60,100000,120,26,60,2,60,1024,64,240,131072,112,4096,15552000,3,900,256,0,32,0xfb,0xfc,8,64,256,64,8,2,2,2,2,1,2,1,8,106496,98304,65536,"/list","/fetch",1024,64,1000,100000,64,2048,120,128,1048447,4194304,4194304,4198400,92 c4 10,200,16,32"#;
+    const EXPECTED_LITERALS: &str = r#"1,1,10,16,262144,128,"/knock","/status","/message",30,10,10,2,20,16,0xf0,0xf1,0xf3,0xf4,0xf5,0xf6,0xfd,0xfe,"SCOPE",64,300,900,3,2700,1800,1024,"scope.knock/1",200,15,10,256,3,600,256,16,1,0,1,2,64,280,64,64,120,280,"scope.peer/1",1,120,4000,64,4096,8,15,10,604800,256,3600,120,256,1,60,100000,120,26,60,2,60,1024,64,240,131072,112,4096,15552000,3,900,256,0,32,0xfb,0xfc,8,64,256,64,8,2,2,2,2,1,2,1,8,106496,98304,65536,"/list","/fetch",1024,64,1000,100000,64,2048,120,128,1048447,4194304,4194304,4198400,92 c4 10,200,16,32,"/access","scope.access/1",16,500,5,900"#;
 
     fn expected_constants() -> Vec<(&'static str, String)> {
         let secs = |d: Duration| d.as_secs().to_string();
@@ -1340,6 +1341,18 @@ mod tests {
             ("ABOUT_MAX_CHARS", card::ABOUT_MAX_CHARS.to_string()),
             ("CAPS_MAX_ENTRIES", card::CAPS_MAX_ENTRIES.to_string()),
             ("CAP_MAX_CHARS", card::CAP_MAX_CHARS.to_string()),
+            ("ACCESS_PATH", quoted(r3::ACCESS_PATH)),
+            ("ACCESS_TYPE", quoted(access::ACCESS_TYPE)),
+            ("ACCESS_MAX_PATHS", access::ACCESS_MAX_PATHS.to_string()),
+            (
+                "ACCESS_REASON_MAX_CHARS",
+                access::ACCESS_REASON_MAX_CHARS.to_string(),
+            ),
+            (
+                "ACCESS_MAX_PENDING_PER_IDENTITY",
+                access::ACCESS_MAX_PENDING_PER_IDENTITY.to_string(),
+            ),
+            ("DEFAULT_GRANT_TTL", secs(grants::DEFAULT_GRANT_TTL)),
         ]
     }
 
