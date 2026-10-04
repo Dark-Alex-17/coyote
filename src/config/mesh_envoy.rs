@@ -6288,4 +6288,551 @@ mod tests {
             assert!(!tail.contains(stale), "{stale:?} in {tail}");
         }
     }
+
+    // ---- usage probe: the asking peer's own tools over two real nodes ------------------
+
+    /// A Reticulum transport node in-process: a `TcpServer` on a transport with transport
+    /// mode on. Two `MeshRuntime`s that both join it hear each other's announces through
+    /// its rebroadcasts and link to each other through it, so neither side is a stub.
+    #[cfg(unix)]
+    struct TransportRelay {
+        transport: Arc<rns_transport::transport::Transport>,
+        iface: AddressHash,
+        port: u16,
+    }
+
+    #[cfg(unix)]
+    impl TransportRelay {
+        async fn start() -> Self {
+            use rns_transport::iface::tcp_server::TcpServer;
+            use rns_transport::transport::{Transport, TransportConfig};
+
+            let port = crate::mesh::test_support::closed_port().await;
+            let mut config =
+                TransportConfig::new("relay", &PrivateIdentity::new_from_rand(OsRng), false);
+            config.set_transport_enabled(true);
+            // Rebroadcast every announce a few times, ~5 s apart, so a node that joins
+            // after the other one announced still hears it.
+            config.set_announce_retry_limit(4);
+            let transport = Arc::new(Transport::new(config));
+            let tcp = TcpServer::new(format!("127.0.0.1:{port}"), transport.iface_manager())
+                .with_client_mtu(TcpServer::DEFAULT_CLIENT_MTU);
+            let status = tcp.runtime_status_handle();
+            let iface = transport
+                .iface_manager()
+                .lock()
+                .await
+                .spawn(tcp, TcpServer::spawn);
+            wait_until("the relay to listen", || {
+                status.to_json()["listener_state"].as_str() == Some("listening")
+            })
+            .await;
+            Self {
+                transport,
+                iface,
+                port,
+            }
+        }
+
+        async fn stop(self) {
+            let _ = tokio::time::timeout(
+                Duration::from_secs(5),
+                self.transport.stop_interface(self.iface),
+            )
+            .await;
+        }
+    }
+
+    #[cfg(unix)]
+    async fn wait_up_to(what: &str, bound: Duration, f: impl Fn() -> bool) {
+        let started = std::time::Instant::now();
+        while !f() {
+            assert!(started.elapsed() < bound, "timed out waiting for {what}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Two real nodes through a relay. Node A is the asking peer and drives `mesh__ask`,
+    /// `mesh__collect` and `mesh__check_inbox` through `handle_mesh_tool`, exactly as a
+    /// model does; node B is the answering node, whose envoy runs on `app_b`. Each trusts
+    /// the other's destination the way `.mesh trust` does.
+    #[cfg(unix)]
+    struct AskingPeer {
+        relay: TransportRelay,
+        a: StartedRuntime,
+        b: StartedRuntime,
+        ctx: RequestContext,
+        app_b: Arc<AppState>,
+        to_b: String,
+    }
+
+    #[cfg(unix)]
+    impl AskingPeer {
+        async fn start(tag: &str, app_b: Arc<AppState>) -> Self {
+            use crate::config::WorkingMode;
+            use crate::function::mesh::mesh_function_declarations;
+            use crate::mesh::trust::TrustOptions;
+
+            let relay = TransportRelay::start().await;
+            let a = started_runtime_on(&format!("{tag}-a"), relay.port).await;
+            let b = started_runtime_on(&format!("{tag}-b"), relay.port).await;
+            let app_a = test_app();
+            app_a.mesh.install(a.runtime.clone()).unwrap();
+            app_b.mesh.install(b.runtime.clone()).unwrap();
+            let to_a = a.runtime.current_destination_hash();
+            let to_b = b.runtime.current_destination_hash();
+            let peers_a = a.runtime.peers();
+            let peers_b = b.runtime.peers();
+            wait_up_to(
+                "each node to file the other from the relayed announces",
+                Duration::from_secs(30),
+                || peers_a.get(&to_b).is_some() && peers_b.get(&to_a).is_some(),
+            )
+            .await;
+            a.runtime
+                .trust()
+                .trust_destination(
+                    app_a.mesh.as_ref(),
+                    &to_b,
+                    TrustOptions::default(),
+                    SystemTime::now(),
+                )
+                .unwrap();
+            b.runtime
+                .trust()
+                .trust_destination(
+                    app_b.mesh.as_ref(),
+                    &to_a,
+                    TrustOptions::default(),
+                    SystemTime::now(),
+                )
+                .unwrap();
+            let mut ctx = RequestContext::new(app_a, WorkingMode::Cmd);
+            ctx.declared_function_names.extend(
+                mesh_function_declarations()
+                    .into_iter()
+                    .map(|declaration| declaration.name),
+            );
+            Self {
+                relay,
+                a,
+                b,
+                ctx,
+                app_b,
+                to_b,
+            }
+        }
+
+        async fn tool(&mut self, action: &str, args: serde_json::Value) -> serde_json::Value {
+            crate::function::mesh::handle_mesh_tool(
+                &mut self.ctx,
+                &format!("mesh__{action}"),
+                &args,
+            )
+            .await
+            .unwrap()
+        }
+
+        /// `mesh__ask` without waiting; the id the asker will collect.
+        async fn ask(&mut self, message: &str) -> String {
+            let asked = self
+                .tool("ask", json!({"to": self.to_b, "message": message}))
+                .await;
+            assert_eq!(asked["status"], "asked", "{asked}");
+            assert_eq!(asked["to"], self.to_b, "{asked}");
+            let id = asked["id"].as_str().unwrap().to_string();
+            assert_eq!(asked["thread"], id, "{asked}");
+            assert_eq!(asked["next_action"], format!("mesh__collect --id {id}"));
+            id
+        }
+
+        async fn collect(&mut self, id: &str, timeout_secs: u64) -> serde_json::Value {
+            self.tool("collect", json!({"id": id, "timeout_secs": timeout_secs}))
+                .await
+        }
+
+        async fn stop(self) {
+            assert!(self.ctx.app.mesh.stop().await.unwrap());
+            assert!(self.app_b.mesh.stop().await.unwrap());
+            self.relay.stop().await;
+            self.a.relay_handle.abort();
+            self.b.relay_handle.abort();
+        }
+    }
+
+    /// The asserted shape of a `mesh__collect` that came back `replied`.
+    #[cfg(unix)]
+    fn assert_collected(
+        replied: &serde_json::Value,
+        id: &str,
+        from: &str,
+        disposition: &str,
+        content: &str,
+    ) {
+        use crate::utils::untrusted_content::wrap;
+        assert_eq!(replied["status"], "replied", "{replied}");
+        assert_eq!(replied["id"], id, "{replied}");
+        assert_eq!(replied["from"], from, "{replied}");
+        assert_eq!(replied["disposition"], disposition, "{replied}");
+        assert_eq!(replied["thread"], id, "{replied}");
+        assert!(
+            replied.get("retry_after").is_none(),
+            "no retry hint on a {disposition} reply: {replied}"
+        );
+        assert_eq!(replied["reply"]["kind"], "reply", "{replied}");
+        assert_eq!(replied["reply"]["in_reply_to"], id, "{replied}");
+        assert_eq!(
+            replied["reply"]["content"],
+            wrap(&format!("peer {from}"), content),
+            "{replied}"
+        );
+    }
+
+    /// The asking peer's full sequence over two real nodes for a request the envoy
+    /// escalates: `mesh__ask` returns `asked`; the first `mesh__collect` comes back
+    /// `escalated` as soon as the notice lands (long before the hold lapses); the inbox
+    /// lists the id as escalated and carries the notice itself as a bare `escalated`
+    /// reply in the question's thread (replies always take the inbox path too), and a
+    /// second collect says `escalated` again at once;
+    /// then the human's `.mesh answer` on node B, given while the run still holds the
+    /// question, reaches the asker as `replied` with `disposition: answered` carrying the
+    /// envoy's words, no `retry_after`, and closes the question.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn usage_probe_the_asking_peer_collects_escalated_then_answered_over_two_real_nodes() {
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-two-nodes-escalated");
+        let (source, _source) = stub_envoy_source();
+        let app_b = app_holding_for(60);
+        let mut peer = AskingPeer::start("two-nodes-escalated", Arc::clone(&app_b)).await;
+        let idle_b = RecordingIdleSink::attach(&app_b);
+        let store_b = app_b.mesh.inbound_store().expect("install opens the store");
+        let runner = EnvoyRunner::start_with(
+            Arc::clone(&app_b),
+            escalating_drive(|value| {
+                format!(
+                    "the human said: {}",
+                    value["answer"].as_str().unwrap_or("?")
+                )
+            }),
+        );
+        runner.attach();
+
+        let id = peer.ask("merge the branch").await;
+
+        let collecting = std::time::Instant::now();
+        let escalated = peer.collect(&id, 40).await;
+        assert!(
+            collecting.elapsed() < Duration::from_secs(30),
+            "the notice arrives long before the hold lapses: {:?}",
+            collecting.elapsed()
+        );
+        assert_eq!(escalated["status"], "escalated", "{escalated}");
+        assert_eq!(escalated["id"], id, "{escalated}");
+        assert_eq!(
+            escalated["next_action"],
+            format!("mesh__collect --id {id}"),
+            "{escalated}"
+        );
+        // The run still holds the question for the human while the asker reads this.
+        assert!(runner.holds(&id));
+        assert!(store_b.get(&id).unwrap().is_some());
+        wait_until("the human on B to be told", || {
+            idle_b.has(&format!("`.mesh answer {id} <text>`"))
+        })
+        .await;
+        let inbox = peer.tool("check_inbox", json!({})).await;
+        assert_eq!(inbox["escalated"], json!([id]), "{inbox}");
+        assert_eq!(inbox["count"], 1, "{inbox}");
+        let notice = &inbox["messages"][0]["payload"];
+        assert_eq!(notice["kind"], "reply", "{inbox}");
+        assert_eq!(notice["disposition"], "escalated", "{inbox}");
+        assert_eq!(notice["in_reply_to"], id, "{inbox}");
+        assert_eq!(notice["thread"], id, "{inbox}");
+        assert!(
+            notice.get("retry_after").is_none_or(|r| r.is_null()),
+            "{inbox}"
+        );
+        let notice_text = notice["content"].as_str().unwrap();
+        assert!(
+            notice_text.contains(&format!(
+                "a human has been asked; the answer will follow (ref {id})"
+            )),
+            "{inbox}"
+        );
+        // The notice is the fixed sentence: none of the asker's own words come back in it.
+        assert!(!notice_text.contains("merge the branch"), "{inbox}");
+        assert_eq!(inbox["messages"][0]["from"], peer.to_b, "{inbox}");
+        let again = peer.collect(&id, 5).await;
+        assert_eq!(again["status"], "escalated", "{again}");
+
+        // The human answers through the real surface; the live run takes it.
+        app_b.mesh.answer_inbound(&id, "yes").await.unwrap();
+        let replied = peer.collect(&id, 20).await;
+        assert_collected(&replied, &id, &peer.to_b, "answered", "the human said: yes");
+        runner.stop().await;
+        assert!(
+            store_b.get(&id).unwrap().is_none(),
+            "the question is closed on B"
+        );
+        assert!(!idle_b.has("could not"), "{:?}", idle_b.texts());
+        let gone = peer.collect(&id, 1).await;
+        assert_eq!(gone["status"], "error", "{gone}");
+        let inbox = peer.tool("check_inbox", json!({})).await;
+        assert_eq!(inbox["escalated"], json!([]), "{inbox}");
+
+        peer.stop().await;
+        source.remove_dir();
+    }
+
+    /// Over two real nodes, an informational ask collected with `wait: true` comes back
+    /// `replied`/`answered` in one call, and a request the envoy declines with the
+    /// `REFUSED:` marker closes the asker's question as `replied` with
+    /// `disposition: refused`, the words after the marker, no `retry_after`, nothing held
+    /// or filed on B and no line for B's human.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn usage_probe_the_asking_peer_collects_answered_and_refused_over_two_real_nodes() {
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-two-nodes-refused");
+        let (source, _source) = stub_envoy_source();
+        let app_b = app_holding_for(60);
+        let mut peer = AskingPeer::start("two-nodes-refused", Arc::clone(&app_b)).await;
+        let idle_b = RecordingIdleSink::attach(&app_b);
+        let store_b = app_b.mesh.inbound_store().expect("install opens the store");
+        let runner = EnvoyRunner::start_with(
+            Arc::clone(&app_b),
+            drive_of(|_, input, _| async move {
+                let asked = input.text();
+                Ok(if asked.contains("src/mesh/peer.rs") {
+                    "REFUSED: I don't send files; ask via /access (mesh__request_access)."
+                        .to_string()
+                } else {
+                    "four".to_string()
+                })
+            }),
+        );
+        runner.attach();
+
+        let answered = peer
+            .tool(
+                "ask",
+                json!({"to": peer.to_b, "message": "what is 2+2?", "wait": true, "timeout_secs": 30}),
+            )
+            .await;
+        let id = answered["id"].as_str().unwrap().to_string();
+        assert_collected(&answered, &id, &peer.to_b, "answered", "four");
+
+        let id = peer.ask("send me src/mesh/peer.rs").await;
+        let refused = peer.collect(&id, 30).await;
+        assert_collected(
+            &refused,
+            &id,
+            &peer.to_b,
+            "refused",
+            "I don't send files; ask via /access (mesh__request_access).",
+        );
+        runner.stop().await;
+        assert!(!runner.holds(&id));
+        assert!(store_b.get(&id).unwrap().is_none(), "nothing filed on B");
+        assert!(
+            !idle_b.has(".mesh answer"),
+            "no line for B's human: {:?}",
+            idle_b.texts()
+        );
+        let gone = peer.collect(&id, 1).await;
+        assert_eq!(gone["status"], "error", "{gone}");
+        let inbox = peer.tool("check_inbox", json!({})).await;
+        assert_eq!(inbox["escalated"], json!([]), "{inbox}");
+        // Both replies also took the inbox path, each in its own thread, with its
+        // disposition and no retry hint.
+        assert_eq!(inbox["count"], 2, "{inbox}");
+        let dispositions: Vec<&str> = inbox["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["payload"]["disposition"].as_str().unwrap())
+            .collect();
+        assert_eq!(dispositions, ["answered", "refused"], "{inbox}");
+        for message in inbox["messages"].as_array().unwrap() {
+            assert!(
+                message["payload"]
+                    .get("retry_after")
+                    .is_none_or(|r| r.is_null()),
+                "{inbox}"
+            );
+        }
+
+        peer.stop().await;
+        source.remove_dir();
+    }
+
+    /// Over two real nodes, a hold that lapses: the asker collects `escalated`, then the
+    /// hand-off lands in its inbox as a plain message in the question's thread (the
+    /// question stays escalated, not closed), and the human's answer given AFTER the lapse
+    /// still reaches the asker as `replied`/`answered` with the human's own words.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn usage_probe_the_asking_peer_hears_the_hand_off_then_collects_a_late_answer_over_two_real_nodes()
+     {
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-two-nodes-handoff");
+        let (source, _source) = stub_envoy_source();
+        let app_b = app_holding_for(2);
+        let mut peer = AskingPeer::start("two-nodes-handoff", Arc::clone(&app_b)).await;
+        let idle_b = RecordingIdleSink::attach(&app_b);
+        let store_b = app_b.mesh.inbound_store().expect("install opens the store");
+        let runner = EnvoyRunner::start_with(
+            Arc::clone(&app_b),
+            escalating_drive(|value| format!("never sent: {value}")),
+        );
+        runner.attach();
+
+        let id = peer.ask("merge the branch").await;
+        let escalated = peer.collect(&id, 30).await;
+        assert_eq!(escalated["status"], "escalated", "{escalated}");
+
+        // The hold lapses; the hand-off reaches the asker's inbox as a message.
+        wait_until("the hand-off to be recorded on B", || {
+            idle_b.has("envoy escalated to the human")
+        })
+        .await;
+        // The inbox carries the escalated notice first, then the hand-off.
+        let waited = std::time::Instant::now();
+        let mut inbox = loop {
+            let inbox = peer.tool("check_inbox", json!({})).await;
+            if inbox["count"] == 2 {
+                break inbox;
+            }
+            assert!(
+                waited.elapsed() < Duration::from_secs(10),
+                "the hand-off never reached the asker: {inbox}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        let notice = &inbox["messages"][0]["payload"];
+        assert_eq!(notice["kind"], "reply", "{inbox}");
+        assert_eq!(notice["disposition"], "escalated", "{inbox}");
+        let payload = &inbox["messages"][1]["payload"];
+        assert_eq!(payload["kind"], "message", "{inbox}");
+        assert_eq!(payload["in_reply_to"], id, "{inbox}");
+        assert_eq!(payload["thread"], id, "{inbox}");
+        assert!(
+            payload.get("disposition").is_none_or(|d| d.is_null()),
+            "{inbox}"
+        );
+        assert!(
+            payload["content"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("escalated to the human; no answer yet (ref {id})")),
+            "{inbox}"
+        );
+        assert_eq!(
+            inbox["threads"].as_array().unwrap().len(),
+            1,
+            "one thread: {inbox}"
+        );
+        assert_eq!(
+            inbox["escalated"],
+            json!([id]),
+            "the question stays escalated after the hand-off: {inbox}"
+        );
+        assert!(!runner.holds(&id));
+        assert!(store_b.get(&id).unwrap().is_some(), "still filed on B");
+        let still = peer.collect(&id, 2).await;
+        assert_eq!(still["status"], "escalated", "{still}");
+
+        // The human answers after the lapse: no run holds it, so B sends it directly.
+        app_b
+            .mesh
+            .answer_inbound(&id, "yes, merge it")
+            .await
+            .unwrap();
+        let replied = peer.collect(&id, 20).await;
+        assert_collected(&replied, &id, &peer.to_b, "answered", "yes, merge it");
+        runner.stop().await;
+        assert!(store_b.get(&id).unwrap().is_none());
+        inbox = peer.tool("check_inbox", json!({})).await;
+        assert_eq!(inbox["escalated"], json!([]), "{inbox}");
+        assert_eq!(inbox["count"], 1, "{inbox}");
+        assert_eq!(
+            inbox["messages"][0]["payload"]["disposition"], "answered",
+            "{inbox}"
+        );
+
+        peer.stop().await;
+        source.remove_dir();
+    }
+
+    /// Over two real nodes, a run cut off (interrupt) is collected by the asker as
+    /// `replied` with `disposition: refused`, no `retry_after`, the fixed words, and the
+    /// correlation closes.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn usage_probe_the_asking_peer_collects_a_cut_off_run_as_refused_over_two_real_nodes() {
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-two-nodes-cut");
+        let (source, _source) = stub_envoy_source();
+        let app_b = test_app();
+        let mut peer = AskingPeer::start("two-nodes-cut", Arc::clone(&app_b)).await;
+        let runs = Arc::new(AtomicUsize::new(0));
+        let runner = EnvoyRunner::start_with(Arc::clone(&app_b), {
+            let runs = Arc::clone(&runs);
+            drive_of(move |_, _, _| {
+                runs.fetch_add(1, Ordering::SeqCst);
+                std::future::pending::<Result<String>>()
+            })
+        });
+        runner.attach();
+
+        let id = peer.ask("take your time").await;
+        wait_until("the run to park", || runs.load(Ordering::SeqCst) == 1).await;
+        runner.interrupt();
+        let refused = peer.collect(&id, 20).await;
+        assert_collected(
+            &refused,
+            &id,
+            &peer.to_b,
+            "refused",
+            "no answer (this node is shutting down)",
+        );
+        runner.stop().await;
+        let gone = peer.collect(&id, 1).await;
+        assert_eq!(gone["status"], "error", "{gone}");
+
+        peer.stop().await;
+        source.remove_dir();
+    }
+
+    /// The marker only counts when it leads the cleaned text byte-for-byte: behind a
+    /// markdown quote, emphasis, heading or bullet it is part of an answer; a marker with
+    /// nothing or only blanks after it declines with the fixed sentence.
+    #[test]
+    fn usage_probe_a_marker_behind_markdown_is_an_answer_and_a_bare_marker_declines_with_the_fallback()
+     {
+        let declined = |text: &str| match classify_answer(text) {
+            EnvoyOutcome::Declined(words) => words,
+            _ => panic!("{text:?} was not a decline"),
+        };
+        let answered = |text: &str| match classify_answer(text) {
+            EnvoyOutcome::Answered(words) => words,
+            _ => panic!("{text:?} was not an answer"),
+        };
+        for text in [
+            "> REFUSED: quoted",
+            "**REFUSED:** emphasised",
+            "# REFUSED: heading",
+            "- REFUSED: bullet",
+            "`REFUSED:` code",
+            "Refused: title case",
+            "REFUSED - no colon",
+        ] {
+            assert_eq!(answered(text), text, "{text:?}");
+        }
+        assert_eq!(declined("REFUSED:"), DECLINED_FALLBACK_TEXT);
+        assert_eq!(declined("REFUSED:   "), DECLINED_FALLBACK_TEXT);
+        assert_eq!(declined("REFUSED: \n\n\t\n"), DECLINED_FALLBACK_TEXT);
+        assert_eq!(declined("REFUSED: no.\n"), "no.");
+    }
 }
