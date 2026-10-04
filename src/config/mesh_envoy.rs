@@ -63,7 +63,7 @@ const ENVOY_STOP_GRACE: Duration = Duration::from_secs(5);
 /// words after it are what the peer hears.
 pub(crate) const REFUSAL_MARKER: &str = "REFUSED:";
 /// What the peer hears for a marker with no words after it.
-const DECLINED_FALLBACK_TEXT: &str = "this node will not handle that request";
+pub(crate) const DECLINED_FALLBACK_TEXT: &str = "this node will not handle that request";
 
 /// How one job is driven to text. Production is `run_child_agent`; tests inject closures.
 pub(crate) type EnvoyDrive = Arc<
@@ -1042,7 +1042,7 @@ fn strip_tool_tag(question: &str) -> &str {
 /// lead, so a mention of it mid-sentence stays an answer. The text is cleaned the way
 /// peer-facing text is before the marker is looked for, so an invisible character
 /// ahead of it cannot turn a decline into an answer.
-fn classify_answer(text: &str) -> EnvoyOutcome {
+pub(crate) fn classify_answer(text: &str) -> EnvoyOutcome {
     let Some(clean) = display_text(text, PEER_CONTENT_MAX_CHARS) else {
         return EnvoyOutcome::Failed("empty answer".into());
     };
@@ -1103,7 +1103,7 @@ impl fmt::Display for BoundedSendError {
 /// The reply sent the moment a question goes to the human, in the asker's thread and
 /// worded as escalated so its correlation stays open. Fixed words plus the asker's id,
 /// which the wire-id grammar keeps out of free text.
-fn escalated_notice(message: &PeerMessage) -> Result<OutboundPeer, SendError> {
+pub(crate) fn escalated_notice(message: &PeerMessage) -> Result<OutboundPeer, SendError> {
     let text = format!(
         "a human has been asked; the answer will follow (ref {})",
         message.message_id
