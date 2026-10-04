@@ -1237,11 +1237,11 @@ pub(crate) mod network {
     pub(crate) struct NodePair {
         pub(crate) responder: Responder,
         pub(crate) recorder_b: Arc<Recorder>,
-        client_b: Arc<R3Client>,
+        pub(crate) client_b: Arc<R3Client>,
         cancel_b: CancellationToken,
         pub(crate) node_a: Arc<MeshRuntime>,
         recorder_a: Arc<Recorder>,
-        a_desc: DestinationDesc,
+        pub(crate) a_desc: DestinationDesc,
         _tmp: TempDir,
     }
 
@@ -5821,7 +5821,7 @@ pub(crate) mod network {
 
     /// An idle sink that keeps every line it is given.
     #[derive(Default)]
-    struct RecordingIdle(Mutex<Vec<IdleNotify>>);
+    pub(crate) struct RecordingIdle(Mutex<Vec<IdleNotify>>);
 
     impl IdleSink for RecordingIdle {
         fn push(&self, note: IdleNotify) -> Result<(), IdleNotify> {
@@ -5833,7 +5833,7 @@ pub(crate) mod network {
     }
 
     /// Node A installed into a slot with a recording idle sink in front of it.
-    fn installed_slot(pair: &NodePair) -> (Arc<MeshSlot>, Arc<RecordingIdle>) {
+    pub(crate) fn installed_slot(pair: &NodePair) -> (Arc<MeshSlot>, Arc<RecordingIdle>) {
         let slot = Arc::new(MeshSlot::default());
         let idle = Arc::new(RecordingIdle::default());
         slot.set_idle(idle.clone() as Arc<dyn IdleSink>);
@@ -6545,7 +6545,7 @@ pub(crate) mod network {
 
     /// Node A's global share list allows `docs/**`, and its slot publishes a fresh
     /// workspace as the share root with `docs/` empty and `src/x.rs` outside every allow.
-    fn share_docs_from_a(pair: &NodePair, slot: &MeshSlot, tag: &str) -> TempDir {
+    pub(crate) fn share_docs_from_a(pair: &NodePair, slot: &MeshSlot, tag: &str) -> TempDir {
         let shares = mesh_config_dir(&pair.config_dir_a()).join("shares.yaml");
         fs::create_dir_all(shares.parent().unwrap()).unwrap();
         fs::write(shares, "version: 1\nallow:\n- pattern: 'docs/**'\n").unwrap();
@@ -6687,7 +6687,7 @@ pub(crate) mod network {
         pair.stop_node_a().await;
     }
 
-    fn access_body(id: &str, paths: &[&str], reason: &str) -> Value {
+    pub(crate) fn access_body(id: &str, paths: &[&str], reason: &str) -> Value {
         wire_map(vec![
             ("v", Value::from(PEER_WIRE_VERSION)),
             ("id", Value::from(id)),
@@ -6701,7 +6701,7 @@ pub(crate) mod network {
 
     /// The hook sink on both the node and its slot, since admission fires from the slot
     /// and a served fetch from the node.
-    fn hook_sink_for(pair: &NodePair, slot: &MeshSlot) -> Arc<RecordingHookSink> {
+    pub(crate) fn hook_sink_for(pair: &NodePair, slot: &MeshSlot) -> Arc<RecordingHookSink> {
         let sink = RecordingHookSink::attach(pair.node_a.hooks());
         slot.hooks().set(sink.clone() as Arc<dyn MeshHookSink>);
         sink
