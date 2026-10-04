@@ -614,11 +614,11 @@ The requester's typed errors are `NotServed` (a dispatch error map, `no_provider
 
 ## 10. /message, /list, /fetch and /access
 
-A peer message is a request on `MESSAGE_PATH` = `"/message"` (src/mesh/message.rs), specified in sections 10.1 to 10.8. The same body travels by store-and-forward as `"scope.peer/1"` (section 10.8). The file-sharing paths `/list`, `/fetch` and `/access` follow in the later subsections of this section.
+A peer message is a request on `MESSAGE_PATH` = `"/message"` (src/mesh/message.rs), specified in sections 10.1 to 10.11. The same body travels by store-and-forward as `"scope.peer/1"` (section 10.8). The file-sharing paths `/list`, `/fetch` and `/access` follow in the later subsections of this section.
 
 ### 10.1 Body
 
-Emission order: `v`, `kind`, `id`, `in_reply_to`, `title`, `content`, `fields`, `ts` (`to_r3_body`, `from_r3_body`, src/mesh/message.rs).
+Emission order: `v`, `kind`, `id`, `in_reply_to`, `thread`, `title`, `content`, `fields`, `disposition`, `retry_after`, `parts`, `ts` (`to_r3_body`, `from_r3_body`, src/mesh/message.rs); `disposition` and `retry_after` travel on `kind: reply` only, `retry_after` only beside `disposition` (`reply_entries`), and `parts` only when non-empty.
 
 A wire id is 1 to `PEER_ID_MAX_CHARS` = `64` bytes, each in `[0-9A-Za-z_.:-]` (`is_wire_id`; `a_wire_id_is_our_uuid_or_another_short_ascii_token_and_nothing_else`).
 
@@ -628,13 +628,17 @@ A wire id is 1 to `PEER_ID_MAX_CHARS` = `64` bytes, each in `[0-9A-Za-z_.:-]` (`
 | `kind` | text | one of `message`, `ask`, `reply`, `bulletin` | **[MESH-MSG-002]** Missing or any other value: the receiver MUST refuse with `InvalidData`. |
 | `id` | text, a wire id | a fresh id; the reference implementation mints 32 lowercase hex (UUIDv4 simple form) | **[MESH-MSG-003]** Missing or not a wire id: the receiver MUST refuse with `InvalidData`. |
 | `in_reply_to` | text, a wire id | the `id` of the message answered; omitted otherwise | **[MESH-MSG-004]** Present and not a wire id: the receiver MUST refuse with `InvalidData`. |
+| `thread` | text, a wire id | the thread of the message answered, or omitted (section 10.11); a message without one is its own thread | **[MESH-DISP-001]** Present and not a wire id: the receiver MUST read it as absent, so the message is its own thread (`a_thread_that_is_not_a_wire_id_reads_as_absent_so_the_message_is_its_own_thread`). |
 | `title` | text | at most `PEER_TITLE_MAX_CHARS` = `120` characters; omitted when none | **[MESH-MSG-005]** Present and not text, or longer than 120 characters: the receiver MUST refuse with `InvalidData`. |
 | `content` | text | at most `PEER_CONTENT_MAX_CHARS` = `4000` characters | **[MESH-MSG-006]** Missing, not text, or longer than 4000 characters: the receiver MUST refuse with `InvalidData`. |
 | `fields` | map | a map of depth at most `PEER_FIELDS_MAX_DEPTH` = `8` and at most `PEER_FIELDS_MAX_BYTES` = `4096` bytes when re-serialised as JSON after cleaning (`sanitize_fields`, src/mesh/message.rs); omitted when none | **[MESH-MSG-007]** Present and not a `map`: the receiver MUST refuse with `InvalidData`. **[MESH-MSG-008]** Deeper than 8, or longer than 4096 bytes when re-serialised as JSON after cleaning (`sanitize_fields`, src/mesh/message.rs): the receiver MUST drop `fields` and keep the message, only while the whole frame stays within the decode budget of MESH-ENV-048; past it the frame is undecodable first. |
+| `disposition` | text | on `kind: reply` only, one of `answered`, `escalated`, `refused`, `budget_exhausted` (section 10.10); omitted on every other kind | **[MESH-DISP-002]** On a `reply`, missing or any other value: the receiver MUST read `answered` (`an_unknown_disposition_on_a_reply_reads_as_answered`). **[MESH-DISP-003]** On any other `kind`: the receiver MUST ignore it (`a_disposition_on_a_non_reply_is_ignored`). |
+| `retry_after` | uint fitting `u32` | on `kind: reply` beside `disposition` only: seconds until the sender will take the question again (section 10.7); omitted otherwise | **[MESH-DISP-004]** Not a `uint`, past `u32`, or on any other `kind`: the receiver MUST read it as absent (`a_retry_after_past_u32_reads_as_none`). |
+| `parts` | array | at most `MAX_PARTS` = `8` part maps (section 10.9), at most `MAX_PARTS_BYTES` = `106496` bytes once encoded; omitted when empty | **[MESH-PART-001]** Present and not an `array`: the receiver MUST read no parts and count one dropped (`parts_that_is_not_a_list_reads_as_no_parts_with_one_dropped_on_both_routes`). **[MESH-PART-002]** Every element past the eighth: the receiver MUST drop and count it (`a_ninth_part_is_dropped_and_counted`). **[MESH-PART-003]** When the parts admitted under section 10.9, re-encoded as msgpack, run past `MAX_PARTS_BYTES`: the receiver MUST shed parts from the tail until they fit, counting each (`a_parts_list_over_the_encoded_cap_sheds_trailing_parts_and_the_sender_refuses_it`). |
 | `ts` | f64 | Unix seconds of sending, as an `f64` | **[MESH-MSG-009]** Missing, not a number (`uint`, `int`, `f32` or `f64`), or not finite once read as f64: the receiver MUST refuse with `InvalidData` (`r3_body_round_trips_and_rejects_malformed` accepts a `uint` `ts`). |
 | any other key | any | nothing | **[MESH-MSG-010]** The receiver MUST ignore it (`r3_body_round_trips_and_rejects_malformed`). |
 
-**[MESH-MSG-011]** A sender MUST emit the keys in the order given above.
+**[MESH-MSG-011]** A sender MUST emit the keys it sets in the order given above, `thread` between `in_reply_to` and `title`, `disposition`, `retry_after` and `parts` between `fields` and `ts`.
 
 **[MESH-MSG-012]** A receiver MUST validate in the order of the rows above, after first refusing a body that is not a `map` with `InvalidData`; the first failure decides.
 
@@ -685,7 +689,7 @@ The sender requests `/message` with `PEER_REQUEST_TIMEOUT` = `15` seconds.
 
 **[MESH-MSG-027]** The `id` of an `ask` or `message` MUST serve as its correlation id: a `reply` names it in `in_reply_to`.
 
-**[MESH-MSG-028]** A receiver MUST close an open question when a `reply` arrives whose `in_reply_to` names that question and whose sending identity equals the asked identity, compared case-insensitively as hex (`Correlations::answer`, `answer_correlation`; `an_ask_is_answered_by_a_reply_that_resolves_the_correlation`).
+**[MESH-MSG-028]** A receiver MUST close an open question when a `reply` arrives whose `in_reply_to` names that question and whose sending identity equals the asked identity, compared case-insensitively as hex, unless its `disposition` is `escalated`, which keeps the question open (section 10.10) (`Correlations::answer`, `answer_correlation`; `an_ask_is_answered_by_a_reply_that_resolves_the_correlation`).
 
 **[MESH-MSG-029]** A receiver MUST deliver a `reply` that matches no open question as kind `message`, keeping its `in_reply_to` (`a_reply_that_answers_nothing_lands_in_the_inbox_as_a_message_keeping_in_reply_to`).
 
@@ -702,6 +706,8 @@ What a peer hears after an `ask` or `message` without `in_reply_to` (src/config/
 **[MESH-MSG-032]** The envoy's answer MUST be a `reply` whose `in_reply_to` is the question's `id`, with content of at most 4000 characters.
 
 **[MESH-MSG-033]** When the envoy escalates to the human without an answer, the peer MUST receive a `message` whose `in_reply_to` is the question's `id` and whose content is exactly `escalated to the human; no answer yet (ref <id>)` with `<id>` the question's `id`.
+
+**[MESH-DISP-005]** The `escalated` reply of section 10.10 MUST precede that `message`: the peer hears first that its human was asked, then the hand-off (`over_a_live_link_an_escalation_with_no_wait_is_escalated_then_handed_off`).
 
 **[MESH-MSG-034]** A later human answer MUST be a `reply` with the same `in_reply_to`.
 
@@ -759,15 +765,19 @@ LXMF fields map:
 | `0xfc` (`FIELD_CUSTOM_DATA`) | map | the custom data map below | **[MESH-MSG-047]** When missing or not a `map`, the receiver MUST drop the message as malformed. |
 | any other key | any | nothing | **[MESH-MSG-048]** The receiver MUST ignore it. |
 
-Custom data map (emission order `kind`, `id`, `in_reply_to`, `name_hash`, `fields`):
+Custom data map (emission order `kind`, `id`, `in_reply_to`, `thread`, `name_hash`, `fields`, `disposition`, `retry_after`, `parts`; the last three as section 10.1: `disposition` and `retry_after` on a `reply` only, `parts` only when non-empty):
 
 | Field | Type | Sender puts | Receiver action on any other value |
 |---|---|---|---|
 | `kind` | text | one of `message`, `ask`, `reply`, `bulletin` | **[MESH-MSG-049]** Missing or any other value: the receiver MUST drop the message as malformed. |
 | `id` | text, a wire id | the message id | **[MESH-MSG-050]** Missing, blank or not a wire id: the receiver MUST drop the message as malformed. |
 | `in_reply_to` | text, a wire id | the answered `id`; omitted otherwise | **[MESH-MSG-051]** Present and not a wire id: the receiver MUST drop the message as malformed. |
+| `thread` | text, a wire id | the body `thread`; omitted when none | **[MESH-DISP-006]** Present and not a wire id: the receiver MUST read it as absent, as on the link (`body_extras` reads both routes alike). |
 | `name_hash` | bin(10) | the sender's own name hash | **[MESH-MSG-052]** Missing, not a `bin` or not 10 bytes: the receiver MUST drop the message as malformed. |
 | `fields` | map | the body `fields` map; omitted when none | **[MESH-MSG-053]** The receiver MUST read an absent or `nil` `fields` as none and MUST convert any other value to JSON as `json_from_rmpv` does (`nil` and `ext` become null, `bool` stays, integers and finite floats become numbers, `str` is decoded as lossy UTF-8, `bin` becomes lowercase hex, arrays and maps recurse, a non-`str` map key is rendered as msgpack prints it). **[MESH-MSG-054]** When the value nests deeper than `PEER_FIELDS_MAX_DEPTH` = `8`, the receiver MUST drop `fields` (absent) and keep the message; the sanitising seam (`PeerMessage::new`) then drops a `fields` over `PEER_FIELDS_MAX_BYTES` = `4096` bytes when re-serialised as JSON after cleaning (`sanitize_fields`, src/mesh/message.rs). |
+| `disposition` | text | the body `disposition`, on a `reply` only | **[MESH-DISP-007]** On a `reply`, missing or any other value: the receiver MUST read `answered`; on any other `kind` it is ignored. |
+| `retry_after` | uint fitting `u32` | the body `retry_after`, on a `reply` beside `disposition` only | **[MESH-DISP-008]** Not a `uint`, past `u32`, or on any other `kind`: the receiver MUST read it as absent. |
+| `parts` | array | the body `parts`; omitted when empty | **[MESH-PART-004]** The receiver MUST read it as section 10.1 does: not an `array` reads as no parts with one dropped, and elements past the eighth or over the encoded cap are dropped and counted (`parts_that_is_not_a_list_reads_as_no_parts_with_one_dropped_on_both_routes`, `every_part_shape_round_trips_on_both_routes_byte_for_byte`). |
 | any other key | any | nothing | **[MESH-MSG-055]** The receiver MUST ignore it. |
 
 **[MESH-MSG-056]** A sender MUST put the title's bytes as the LXMF title (absent when there is no title) and the content's bytes as the LXMF content.
@@ -777,6 +787,95 @@ Custom data map (emission order `kind`, `id`, `in_reply_to`, `name_hash`, `field
 **[MESH-MSG-058]** The receiver MUST compute the sending instance as `trunc_16(H(name_hash || signer_identity_hash))` and authorize it as it would a link request (section 6.6, stage 8); an untrusted instance is dropped (`peer_routing_recomputes_the_source_destination_and_drops_untrusted`).
 
 **[MESH-MSG-059]** The receiver MUST take `ts` from the LXMF timestamp.
+
+### 10.9 Parts
+
+A part is one element of `parts` (section 10.1): a string-keyed map with a `type` and the keys of that type (`encode_parts`, `decode_parts`, src/mesh/message.rs). Three types exist, `text`, `data` and `file`, the last in an inline and a reference form. Admission is `admit_parts`: a part that breaks a rule of this section is dropped and counted on the message, which is kept and delivered from `content`. **[MESH-PART-005]** The receiver MUST skip, without counting, an element that is not a `map`.
+
+| Element | Type | Sender puts | Receiver action on any other value |
+|---|---|---|---|
+| `type` | text | `text`, `data` or `file` | **[MESH-PART-006]** Missing, not text, or a type this document does not name: the receiver MUST skip the part without counting it and deliver the message from `content` (`an_unknown_part_type_is_skipped_and_the_message_still_lands_with_its_content`). **[MESH-PART-007]** A named type whose keys do not decode as the tables below say: the receiver MUST drop and count the part (`a_known_part_that_does_not_decode_is_dropped_and_counted_on_the_wire`). |
+| any other key | any | nothing | **[MESH-PART-008]** The receiver MUST ignore it. |
+
+`text`:
+
+| Field | Type | Sender puts | Receiver action on any other value |
+|---|---|---|---|
+| `text` | text | at most `PEER_CONTENT_MAX_CHARS` = `4000` characters, cleaned as section 3.2 | **[MESH-PART-009]** Missing or not text: the receiver MUST drop and count the part. **[MESH-PART-010]** Longer than 4000 characters, or blank once cleaned: the receiver MUST drop and count the part (`a_text_part_over_the_content_cap_is_dropped`). |
+| any other key | any | nothing | **[MESH-PART-011]** The receiver MUST ignore it. |
+
+`data`:
+
+| Field | Type | Sender puts | Receiver action on any other value |
+|---|---|---|---|
+| `data` | any | any value, `nil` included, cleaned like `fields`: depth at most `PEER_FIELDS_MAX_DEPTH` = `8` and at most `PEER_FIELDS_MAX_BYTES` = `4096` bytes when re-serialised as JSON after cleaning (`sanitize_fields`) | **[MESH-PART-012]** Missing: the receiver MUST drop and count the part. **[MESH-PART-013]** Deeper than 8, or longer than 4096 bytes when re-serialised as JSON after cleaning: the receiver MUST drop and count the part (`a_data_part_over_the_fields_cap_is_dropped`, `a_data_part_nesting_past_the_depth_cap_is_dropped_and_the_sender_refuses_it`). |
+| any other key | any | nothing | **[MESH-PART-014]** The receiver MUST ignore it. |
+
+**[MESH-PART-015]** The receiver MUST NOT interpret `data`: it is converted to JSON as `json_from_rmpv` does (MESH-MSG-053) and handed to the reader as it is.
+
+`file` (`decode_file_part`, `part_violation`, src/mesh/message.rs):
+
+| Field | Type | Sender puts | Receiver action on any other value |
+|---|---|---|---|
+| `name` | text, a wire path | the file's name, a wire path (the grammar of section 10.13; `WirePath::parse`, src/mesh/wire_path.rs) | **[MESH-PART-016]** Missing or not text: the receiver MUST drop and count the part. **[MESH-PART-017]** Not a wire path: the receiver MUST drop and count the part before the inbox or the working directory is touched (`a_file_part_named_with_dot_dot_is_dropped`, `every_spec_negative_file_name_drops_the_part_before_the_inbox_or_cwd_is_touched`). |
+| `size` | uint | the file's length in bytes | **[MESH-PART-018]** Missing or not a `uint`: the receiver MUST drop and count the part. **[MESH-PART-019]** In the inline form, not equal to the length of `bytes`: the receiver MUST drop and count the part. |
+| `sha256` | bin(32) | the SHA-256 of the file's bytes | **[MESH-PART-020]** Missing, not a `bin` or not 32 bytes: the receiver MUST drop and count the part. **[MESH-PART-021]** In the inline form, not equal to the SHA-256 of `bytes`: the receiver MUST drop and count the part and keep the message (`a_file_part_whose_sha256_does_not_match_is_dropped_and_the_message_kept`). |
+| `bytes` | bin | inline form: the file's bytes, `size` at most `mesh.fetch.inline_max_bytes` (default `DEFAULT_INLINE_MAX_BYTES` = `65536`) and the message's inline bytes in sum at most `MAX_INLINE_FILE_TOTAL` = `98304`; omitted in the reference form | **[MESH-PART-022]** Present and not a `bin`: the receiver MUST drop and count the part. **[MESH-PART-023]** `size` over `mesh.fetch.inline_max_bytes`, or taking the inline bytes admitted so far in this message past `MAX_INLINE_FILE_TOTAL`: the receiver MUST drop and count the part (`an_inline_file_over_inline_max_bytes_is_dropped`, `inline_files_past_the_per_message_total_are_dropped_from_the_second`). |
+| `ref` | map | reference form: `{path: <a wire path>}`, the file fetchable with `/fetch` (section 10.15) under the one-off grant the sender wrote under the message's `id` when attaching it (`send_peer_lending_reference`, src/mesh/node.rs); omitted in the inline form | **[MESH-PART-024]** Present and not a `map`, or with `path` missing or not text: the receiver MUST drop and count the part. **[MESH-PART-025]** With `path` not a wire path: the receiver MUST drop and count the part (`a_reference_part_whose_ref_path_breaks_the_grammar_is_dropped_and_refused`); any other key of the map is ignored. |
+| any other key | any | nothing | **[MESH-PART-026]** The receiver MUST ignore it. |
+
+**[MESH-PART-027]** A file part MUST carry exactly one of `bytes` and `ref`: the receiver drops and counts one carrying both or neither (`decode_file_part`).
+
+**[MESH-PART-028]** A sender MUST send `content` beside `parts`: it stays required (MESH-MSG-006), so a reader that ignores `parts` still shows something true (`a_wire_reader_that_predates_parts_sees_a_plain_v1_body`).
+
+**[MESH-PART-029]** A sender MUST refuse, without sending, a message with more than `MAX_PARTS` parts, with any part the receiver would drop under the rules above, or with parts over `MAX_PARTS_BYTES` once encoded, the first rule broken naming the refusal (`OutboundPeer::with_parts`; `the_sender_refuses_each_part_rule_the_receiver_would_drop`, `a_parts_list_over_the_encoded_cap_sheds_trailing_parts_and_the_sender_refuses_it`).
+
+**[MESH-PART-030]** A message at every cap of this section and of section 10.1 MUST fit under both receiver bounds, `MAX_R3_PAYLOAD_BYTES` = `262144` bytes on the link (MESH-ENV-024) and `MAX_FETCHED_MESSAGE_BYTES` = `131072` bytes on the LXMF route (MESH-PROP-028); `MAX_PARTS_BYTES` is set for that (`a_message_at_every_cap_fits_under_both_receiver_bounds_on_both_routes`).
+
+**[MESH-PART-031]** A receiver MUST write an inline file's bytes to the staging inbox and never to the working tree: `<cache_dir>/mesh/inbox/<instance_id>/<peer>/<name>`, or `<mesh.fetch.inbox_dir>/<instance_id>/<peer>/<name>` when configured, with `<peer>` the first eight characters of the sending instance's destination hash, lowercased (`InboxStaging::stage`, src/mesh/inbox.rs). The part then carries the staged path (`an_inline_file_is_staged_under_the_peer_directory_and_the_part_carries_the_path`, `two_peers_sending_the_same_file_name_land_in_separate_directories`); with no inbox to land in, the part is dropped and counted (`an_inline_file_with_no_staging_inbox_is_dropped_and_counted`).
+
+**[MESH-PART-032]** A receiver MUST resolve the directory a file will be written into inside the inbox root, before any directory is created under it and again before the write, dropping and counting the part otherwise, so a symlink planted under the inbox cannot lead a write outside it (`a_symlinked_directory_leading_outside_the_root_is_refused_before_any_write`, src/mesh/inbox.rs).
+
+A file already at the target with the same SHA-256 is reused without a write; one holding other bytes keeps its place and the new bytes land beside it as `<stem>-<sha256[..8]><ext>`, the suffix the first eight lowercase hex characters of the digest. **[MESH-PART-033]** A receiver MUST NOT overwrite a staged file: when that name too holds other bytes, or a file appears at the target between the check and the write (`a_pre_planted_target_and_sibling_holding_other_bytes_are_a_collision`, src/mesh/inbox.rs), the part is dropped and counted while the message and the files staged before it stay (`a_colliding_file_part_is_dropped_and_counted_while_the_message_and_earlier_files_stay`, src/mesh/message.rs).
+
+**[MESH-PART-034]** An inline file's bytes MUST exist only on the wire and in the staging inbox: the part the pending store, the inbox envelope and a model see carries the staged path, never the bytes (`a_staged_part_serialises_its_path_and_never_bytes`), and the envoy attaches no part, so a file never traverses a model.
+
+### 10.10 Disposition
+
+What a `reply` says about the question it answers (`Disposition`, src/mesh/message.rs). A `disposition` this document does not name reads as `answered` (MESH-DISP-002); a `message`, `ask` or `bulletin` carries none (MESH-DISP-003).
+
+| `disposition` | Sender contract | Receiver action |
+|---|---|---|
+| `answered` | the default: the envoy's or the human's answer | **[MESH-DISP-009]** The receiver MUST close the open question with the reply filed as its answer (section 10.5). |
+| `escalated` | the peer's human has been asked and the answer will follow | **[MESH-DISP-010]** The receiver MUST keep the question open, marking it escalated, and deliver the reply to its inbox (`PendingState::accepts`, src/mesh/pending.rs; `an_escalated_reply_keeps_the_question_pending_across_a_reopen`). **[MESH-DISP-011]** The receiver MUST accept `escalated` once per question: a second `escalated` reply to a question already escalated is delivered as a `message` (`a_second_escalated_reply_to_an_escalated_question_is_not_an_answer_and_is_not_recorded`). A later `answered`, `refused` or `budget_exhausted` from the asked identity closes it. |
+| `refused` | the question is declined as out of scope, or the run ended without an answer; `retry_after` optional | **[MESH-DISP-012]** The receiver MUST close the question with the reply filed as its answer, the disposition kept on it. |
+| `budget_exhausted` | the sender's token or cost ceiling of section 10.7 is spent on this identity; `retry_after` is the remainder of the window | **[MESH-DISP-013]** The receiver MUST close the question with the reply filed as its answer, `retry_after` kept on it. |
+
+**[MESH-DISP-014]** A sender MUST put `disposition` and `retry_after` on a `reply` only, and `retry_after` only beside a `disposition` (`reply_entries`, src/mesh/message.rs).
+
+The envoy's contract (`envoy_reply`, `escalated_notice`, src/config/mesh_envoy.rs; `refusal_reply`, src/mesh/node.rs), by outcome:
+
+**[MESH-DISP-015]** An answer, the envoy's or the human's, MUST go out as `answered`.
+
+**[MESH-DISP-016]** An escalation MUST be told to the peer at once by a `reply` whose `disposition` is `escalated`, whose `in_reply_to` is the question's `id`, whose `thread` is the question's and whose content is exactly `a human has been asked; the answer will follow (ref <id>)` with `<id>` the question's `id`. **[MESH-DISP-017]** That reply MUST be sent once per run (`a_cut_off_escalated_notice_fires_message_failed_as_cancelled`), ahead of the hand-off `message` of MESH-MSG-033 and of any later `answered` reply (MESH-DISP-005; `over_a_live_link_the_peer_hears_the_answer_the_handoff_and_the_late_reply`).
+
+**[MESH-DISP-018]** A decline, and a run that timed out, was interrupted, found the envoy unavailable or failed, MUST go out as `refused` with no `retry_after`: a decline is an answer whose cleaned text leads with `REFUSED:`, the marker stripped and the words after it the content, `this node will not handle that request` when none follow (`a_leading_refused_marker_makes_the_answer_a_decline`, `a_declined_request_is_recorded_as_the_envoy_reply_and_never_escalated`), and the others carry the content of MESH-MSG-035.
+
+**[MESH-DISP-019]** A typed refusal of section 10.7 MUST go out as `budget_exhausted` for `token_ceiling` and `cost_ceiling` and as `refused` for every other reason, in both cases with `retry_after` equal to `"retry_after_secs"` (`a_refused_message_is_answered_with_a_refused_disposition_and_retry_after`, src/mesh/r3/tests.rs).
+
+A `refused` after an `escalated` is asymmetric: the asking side closes its correlation on it (`PendingState::accepts`), while the answering side's question stays open for its human, since only an answer or a decline settles it (`an_unsent_reply_keeps_the_escalated_question_on_file`). **[MESH-DISP-020]** The human's later `answered` reply MUST then be delivered at the asker as an ordinary `message` (MESH-MSG-029).
+
+**[MESH-DISP-021]** A receiver MUST read `disposition` before closing a question on a `reply`: one that does not reads `escalated` as `answered` and closes the question early, so the minimum interoperable peer is one that reads `disposition`.
+
+### 10.11 Thread
+
+A thread is the conversation a message belongs to, named by a wire id; `in_reply_to` names the one message answered and stays per message. **[MESH-DISP-022]** A receiver MUST read a message without `thread` as its own thread, so a root message's thread is its `id` (`PeerMessage::thread`). **[MESH-DISP-023]** A sender MAY omit `thread` on a message that opens a conversation and MAY name an existing conversation's id to continue it (`OutboundPeer::with_thread`).
+
+**[MESH-DISP-024]** A sender MUST put on a `reply` the thread of the message it answers when it knows it, and omit `thread` otherwise (`inherit_reply_thread`, src/function/mesh.rs).
+
+**[MESH-DISP-025]** A receiver MUST read a `reply` that carries no `thread` and matches an open question (section 10.5) as being in the question's thread, on the filed answer and the delivered copy alike (`answer_correlation`, src/mesh/node.rs; `an_accepted_reply_without_a_thread_inherits_the_question_thread`).
+
+**[MESH-DISP-026]** Inheritance is identity-gated: the receiver MUST take the thread from the correlation only when the `reply` matches an open question from the asked identity, and MUST deliver a `reply` from any other identity, or one matching no open question, as a `message` with `thread`, `disposition` and `retry_after` cleared (`a_reply_from_another_identity_is_a_message_with_neither_thread_nor_disposition`, `usage_probe_a_forged_reply_carrying_its_own_thread_never_inherits_ours`, src/mesh/node.rs; `usage_probe_escalated_and_answered_replies_inherit_a_thread_that_is_not_the_id`, src/config/mesh_envoy.rs).
 
 ## 11. Store-and-forward via LXMF propagation
 
@@ -928,6 +1027,10 @@ Registry of code points allocated by this document:
 | `goal`, `done`, `total` | map key, todo | | 9.6 |
 | `0`, `1`, `2` | `state.code` value | unknown, idle, working | 9.7 |
 | `v`, `kind`, `id`, `in_reply_to`, `title`, `content`, `fields`, `ts` | map key, message body | | 10.1 |
+| `thread`, `disposition`, `retry_after`, `parts` | map key, message body | | 10.1 |
+| `type`, `text`, `data`, `name`, `size`, `sha256`, `bytes`, `ref`, `path` | map key, part | | 10.9 |
+| `text`, `data`, `file` | `type` value, part | | 10.9 |
+| `answered`, `escalated`, `refused`, `budget_exhausted` | `disposition` value | | 10.10 |
 | `message`, `ask`, `reply`, `bulletin` | `kind` name | | 10.2 |
 | `received`, `id` | map key, acknowledgement | | 10.3 |
 | `refusal`, `"retry_after_secs"` | map key, typed refusal | | 10.7 |
@@ -1220,6 +1323,10 @@ A leniency is a place where the reference deliberately does something other than
 | `PREDECESSOR_RECORD_VERSION` | `1` | src/mesh/identity.rs | predecessors_refuses_a_newer_line_and_shows_none_of_the_history |
 | `PEER_TABLE_VERSION` | `2` | src/mesh/peers.rs | load_refuses_a_newer_table_version_naming_the_path |
 | `PROPAGATION_STORE_VERSION` | `1` | src/mesh/propagation_fetch.rs | store_from_a_newer_coyote_is_refused_by_name |
+| `MAX_PARTS` | `8` | src/mesh/message.rs | a_ninth_part_is_dropped_and_counted |
+| `MAX_PARTS_BYTES` | `106496` | src/mesh/message.rs | a_parts_list_over_the_encoded_cap_sheds_trailing_parts_and_the_sender_refuses_it |
+| `MAX_INLINE_FILE_TOTAL` | `98304` | src/config/mesh_config.rs | inline_files_past_the_per_message_total_are_dropped_from_the_second |
+| `DEFAULT_INLINE_MAX_BYTES` | `65536` | src/config/mesh_config.rs | an_inline_file_over_inline_max_bytes_is_dropped |
 
 ## 20. Conformance coverage
 
@@ -1470,10 +1577,17 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 | MESH-MSG-002 | Interop (Invalid), MessageBody (Invalid), MessageBody (Valid) |
 | MESH-MSG-003 | MessageBody (Boundary), MessageBody (Invalid), MessageBody (Valid) |
 | MESH-MSG-004 | MessageBody (Boundary), MessageBody (Invalid), MessageBody (Valid) |
+| MESH-DISP-001 | no vector yet |
 | MESH-MSG-005 | MessageBody (Boundary), MessageBody (Invalid), MessageBody (Valid) |
 | MESH-MSG-006 | MessageBody (Boundary), MessageBody (Invalid), MessageBody (Valid) |
 | MESH-MSG-007 | MessageBody (Invalid), MessageBody (Valid) |
 | MESH-MSG-008 | Custom (Boundary), Custom (Invalid), MessageBody (Invalid) |
+| MESH-DISP-002 | no vector yet |
+| MESH-DISP-003 | no vector yet |
+| MESH-DISP-004 | no vector yet |
+| MESH-PART-001 | no vector yet |
+| MESH-PART-002 | no vector yet |
+| MESH-PART-003 | no vector yet |
 | MESH-MSG-009 | MessageBody (Boundary), MessageBody (Invalid), MessageBody (Valid) |
 | MESH-MSG-010 | MessageBody (Valid) |
 | MESH-MSG-011 | Custom (Valid), Interop (Valid), MessageBodyEncode (Valid) |
@@ -1499,6 +1613,7 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 | MESH-MSG-031 | no vector yet |
 | MESH-MSG-032 | no vector yet |
 | MESH-MSG-033 | no vector yet |
+| MESH-DISP-005 | no vector yet |
 | MESH-MSG-034 | no vector yet |
 | MESH-MSG-035 | no vector yet |
 | MESH-MSG-036 | no vector yet |
@@ -1517,14 +1632,66 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 | MESH-MSG-049 | LxmfPeer (Invalid), LxmfPeer (Valid) |
 | MESH-MSG-050 | LxmfPeer (Boundary), LxmfPeer (Invalid), LxmfPeer (Valid) |
 | MESH-MSG-051 | LxmfPeer (Boundary), LxmfPeer (Invalid), LxmfPeer (Valid) |
+| MESH-DISP-006 | no vector yet |
 | MESH-MSG-052 | LxmfPeer (Boundary), LxmfPeer (Invalid) |
 | MESH-MSG-053 | LxmfPeer (Valid) |
 | MESH-MSG-054 | Custom (Invalid), LxmfPeer (Boundary), LxmfPeer (Invalid) |
+| MESH-DISP-007 | no vector yet |
+| MESH-DISP-008 | no vector yet |
+| MESH-PART-004 | no vector yet |
 | MESH-MSG-055 | LxmfPeer (Valid) |
 | MESH-MSG-056 | Custom (Valid) |
 | MESH-MSG-057 | Custom (Boundary), LxmfPeer (Valid) |
 | MESH-MSG-058 | no vector yet |
 | MESH-MSG-059 | no vector yet |
+| MESH-PART-005 | no vector yet |
+| MESH-PART-006 | no vector yet |
+| MESH-PART-007 | no vector yet |
+| MESH-PART-008 | no vector yet |
+| MESH-PART-009 | no vector yet |
+| MESH-PART-010 | no vector yet |
+| MESH-PART-011 | no vector yet |
+| MESH-PART-012 | no vector yet |
+| MESH-PART-013 | no vector yet |
+| MESH-PART-014 | no vector yet |
+| MESH-PART-015 | no vector yet |
+| MESH-PART-016 | no vector yet |
+| MESH-PART-017 | no vector yet |
+| MESH-PART-018 | no vector yet |
+| MESH-PART-019 | no vector yet |
+| MESH-PART-020 | no vector yet |
+| MESH-PART-021 | no vector yet |
+| MESH-PART-022 | no vector yet |
+| MESH-PART-023 | no vector yet |
+| MESH-PART-024 | no vector yet |
+| MESH-PART-025 | no vector yet |
+| MESH-PART-026 | no vector yet |
+| MESH-PART-027 | no vector yet |
+| MESH-PART-028 | no vector yet |
+| MESH-PART-029 | no vector yet |
+| MESH-PART-030 | no vector yet |
+| MESH-PART-031 | no vector yet |
+| MESH-PART-032 | no vector yet |
+| MESH-PART-033 | no vector yet |
+| MESH-PART-034 | no vector yet |
+| MESH-DISP-009 | no vector yet |
+| MESH-DISP-010 | no vector yet |
+| MESH-DISP-011 | no vector yet |
+| MESH-DISP-012 | no vector yet |
+| MESH-DISP-013 | no vector yet |
+| MESH-DISP-014 | no vector yet |
+| MESH-DISP-015 | no vector yet |
+| MESH-DISP-016 | no vector yet |
+| MESH-DISP-017 | no vector yet |
+| MESH-DISP-018 | no vector yet |
+| MESH-DISP-019 | no vector yet |
+| MESH-DISP-020 | no vector yet |
+| MESH-DISP-021 | no vector yet |
+| MESH-DISP-022 | no vector yet |
+| MESH-DISP-023 | no vector yet |
+| MESH-DISP-024 | no vector yet |
+| MESH-DISP-025 | no vector yet |
+| MESH-DISP-026 | no vector yet |
 | MESH-PROP-001 | Custom (Valid) |
 | MESH-PROP-002 | Custom (Valid) |
 | MESH-PROP-003 | Custom (Invalid), Custom (Valid) |
@@ -1808,10 +1975,17 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 - [MESH-MSG-002](#101-body) -- body kind
 - [MESH-MSG-003](#101-body) -- body id
 - [MESH-MSG-004](#101-body) -- body in_reply_to
+- [MESH-DISP-001](#101-body) -- body thread; not a wire id reads as absent
 - [MESH-MSG-005](#101-body) -- body title
 - [MESH-MSG-006](#101-body) -- body content
 - [MESH-MSG-007](#101-body) -- body fields
 - [MESH-MSG-008](#101-body) -- over-deep or over-long fields dropped, message kept
+- [MESH-DISP-002](#101-body) -- body disposition; unknown reads as answered
+- [MESH-DISP-003](#101-body) -- disposition ignored off a reply
+- [MESH-DISP-004](#101-body) -- body retry_after; not a u32 reads as absent
+- [MESH-PART-001](#101-body) -- parts not an array reads as none, one dropped
+- [MESH-PART-002](#101-body) -- ninth part dropped and counted
+- [MESH-PART-003](#101-body) -- parts over the encoded cap shed from the tail
 - [MESH-MSG-009](#101-body) -- body ts
 - [MESH-MSG-010](#101-body) -- body unknown keys
 - [MESH-MSG-011](#101-body) -- body key order
@@ -1837,6 +2011,7 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 - [MESH-MSG-031](#105-correlation) -- replies to open questions uncounted
 - [MESH-MSG-032](#106-envoy-contract) -- envoy answer shape
 - [MESH-MSG-033](#106-envoy-contract) -- escalation notice
+- [MESH-DISP-005](#106-envoy-contract) -- escalated reply precedes the hand-off
 - [MESH-MSG-034](#106-envoy-contract) -- late human answer
 - [MESH-MSG-035](#106-envoy-contract) -- failure texts
 - [MESH-MSG-036](#106-envoy-contract) -- envoy run ceiling
@@ -1855,14 +2030,66 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 - [MESH-MSG-049](#108-peer-message-over-lxmf) -- LXMF peer kind
 - [MESH-MSG-050](#108-peer-message-over-lxmf) -- LXMF peer id
 - [MESH-MSG-051](#108-peer-message-over-lxmf) -- LXMF peer in_reply_to
+- [MESH-DISP-006](#108-peer-message-over-lxmf) -- LXMF peer thread
 - [MESH-MSG-052](#108-peer-message-over-lxmf) -- LXMF peer name hash
 - [MESH-MSG-053](#108-peer-message-over-lxmf) -- LXMF peer fields
 - [MESH-MSG-054](#108-peer-message-over-lxmf) -- LXMF peer fields depth cap
+- [MESH-DISP-007](#108-peer-message-over-lxmf) -- LXMF peer disposition
+- [MESH-DISP-008](#108-peer-message-over-lxmf) -- LXMF peer retry_after
+- [MESH-PART-004](#108-peer-message-over-lxmf) -- LXMF peer parts read as on the link
 - [MESH-MSG-055](#108-peer-message-over-lxmf) -- LXMF peer custom data unknown keys
 - [MESH-MSG-056](#108-peer-message-over-lxmf) -- LXMF title and content bytes
 - [MESH-MSG-057](#108-peer-message-over-lxmf) -- LXMF text decoded, cleaned, capped
 - [MESH-MSG-058](#108-peer-message-over-lxmf) -- sending instance recomputed and authorized
 - [MESH-MSG-059](#108-peer-message-over-lxmf) -- ts from the LXMF timestamp
+- [MESH-PART-005](#109-parts) -- non-map part element skipped
+- [MESH-PART-006](#109-parts) -- unknown part type skipped, message kept
+- [MESH-PART-007](#109-parts) -- known part that does not decode dropped and counted
+- [MESH-PART-008](#109-parts) -- part other keys
+- [MESH-PART-009](#109-parts) -- text part text missing or not text
+- [MESH-PART-010](#109-parts) -- text part over 4000 characters or blank
+- [MESH-PART-011](#109-parts) -- text part other keys
+- [MESH-PART-012](#109-parts) -- data part data missing
+- [MESH-PART-013](#109-parts) -- data part over the fields caps
+- [MESH-PART-014](#109-parts) -- data part other keys
+- [MESH-PART-015](#109-parts) -- data never interpreted
+- [MESH-PART-016](#109-parts) -- file part name missing or not text
+- [MESH-PART-017](#109-parts) -- file part name not a wire path
+- [MESH-PART-018](#109-parts) -- file part size missing or not a uint
+- [MESH-PART-019](#109-parts) -- inline size not the length of bytes
+- [MESH-PART-020](#109-parts) -- file part sha256 missing or not bin(32)
+- [MESH-PART-021](#109-parts) -- inline sha256 mismatch drops the part, keeps the message
+- [MESH-PART-022](#109-parts) -- file part bytes not bin
+- [MESH-PART-023](#109-parts) -- inline file over inline_max_bytes or the per-message total
+- [MESH-PART-024](#109-parts) -- file part ref not a map with a text path
+- [MESH-PART-025](#109-parts) -- file part ref path not a wire path
+- [MESH-PART-026](#109-parts) -- file part other keys
+- [MESH-PART-027](#109-parts) -- exactly one of bytes and ref
+- [MESH-PART-028](#109-parts) -- content sent beside parts
+- [MESH-PART-029](#109-parts) -- sender refuses every part the receiver would drop
+- [MESH-PART-030](#109-parts) -- a message at every cap fits both receiver bounds
+- [MESH-PART-031](#109-parts) -- inline bytes staged in the inbox, never the working tree
+- [MESH-PART-032](#109-parts) -- staging directory resolved inside the inbox root
+- [MESH-PART-033](#109-parts) -- staged files never overwritten; collision drops the part
+- [MESH-PART-034](#109-parts) -- file bytes never traverse a model
+- [MESH-DISP-009](#1010-disposition) -- answered closes the question
+- [MESH-DISP-010](#1010-disposition) -- escalated keeps the question open
+- [MESH-DISP-011](#1010-disposition) -- escalated accepted once per question
+- [MESH-DISP-012](#1010-disposition) -- refused closes the question
+- [MESH-DISP-013](#1010-disposition) -- budget_exhausted closes the question
+- [MESH-DISP-014](#1010-disposition) -- disposition and retry_after on a reply only
+- [MESH-DISP-015](#1010-disposition) -- an answer goes out as answered
+- [MESH-DISP-016](#1010-disposition) -- escalated reply shape and content
+- [MESH-DISP-017](#1010-disposition) -- escalated reply once per run, before the hand-off
+- [MESH-DISP-018](#1010-disposition) -- decline or failed run goes out as refused
+- [MESH-DISP-019](#1010-disposition) -- typed refusal disposition and retry_after
+- [MESH-DISP-020](#1010-disposition) -- human answer after refused lands as a message
+- [MESH-DISP-021](#1010-disposition) -- receiver reads disposition before closing
+- [MESH-DISP-022](#1011-thread) -- a message without thread is its own thread
+- [MESH-DISP-023](#1011-thread) -- sender omits or names a thread
+- [MESH-DISP-024](#1011-thread) -- a reply carries the answered message's thread when known
+- [MESH-DISP-025](#1011-thread) -- a matching reply without thread inherits the question's
+- [MESH-DISP-026](#1011-thread) -- thread inheritance identity-gated; others downgraded
 - [MESH-PROP-001](#111-outbound) -- LXMF addressing
 - [MESH-PROP-002](#111-outbound) -- LXMF payload
 - [MESH-PROP-003](#111-outbound) -- non-map fields refused

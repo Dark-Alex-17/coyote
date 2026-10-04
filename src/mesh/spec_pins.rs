@@ -25,9 +25,9 @@ const BCP14: &str = "The key words \"MUST\", \"MUST NOT\", \"REQUIRED\", \"SHALL
     \"SHOULD\", \"SHOULD NOT\", \"RECOMMENDED\", \"NOT RECOMMENDED\", \"MAY\", and \"OPTIONAL\" in \
     this document are to be interpreted as described in BCP 14 [RFC2119] [RFC8174] when, and \
     only when, they appear in all capitals, as shown here.";
-const AREAS: [&str; 16] = [
+const AREAS: [&str; 18] = [
     "DEST", "ANN", "ENV", "KNOCK", "STATUS", "MSG", "PROP", "VER", "TIME", "CANON", "EXT", "CODE",
-    "SEC", "INV", "LOG", "LEN",
+    "SEC", "INV", "LOG", "LEN", "PART", "DISP",
 ];
 /// Every compound keyword (`MUST NOT`, `NOT RECOMMENDED`, ...) contains one of these.
 const KEYWORDS: [&str; 7] = [
@@ -1010,10 +1010,11 @@ fn check_index_anchors(definitions: &[Definition], entries: &[IndexEntry]) -> Re
 mod tests {
     use super::*;
     use crate::config::mesh_config::{
-        DEFAULT_PEER_MAX_CONCURRENT, DEFAULT_PEER_MAX_MESSAGES_PER_HOUR,
-        DEFAULT_PEER_MAX_TOKENS_PER_HOUR, MAX_FETCH_FILE_BYTES,
+        DEFAULT_INLINE_MAX_BYTES, DEFAULT_PEER_MAX_CONCURRENT, DEFAULT_PEER_MAX_MESSAGES_PER_HOUR,
+        DEFAULT_PEER_MAX_TOKENS_PER_HOUR, MAX_FETCH_FILE_BYTES, MAX_INLINE_FILE_TOTAL,
     };
     use crate::config::mesh_envoy::ENVOY_RUN_TIMEOUT_SECS;
+    use crate::mesh::message::{MAX_PARTS, MAX_PARTS_BYTES};
     use crate::mesh::r3::{MAX_FETCH_RESPONSE_BYTES, RefusalCode, RequestId, ResponseFrame};
     use crate::mesh::{
         announce, card, identity, knock, knocks, limits, message, peers, pending, propagation,
@@ -1024,7 +1025,7 @@ mod tests {
     use rns_transport::hash::ADDRESS_HASH_SIZE;
     use std::time::Duration;
 
-    const EXPECTED_LITERALS: &str = r#"1,1,10,16,262144,128,"/knock","/status","/message",30,10,10,2,20,16,0xf0,0xf1,0xf3,0xf4,0xf5,0xf6,0xfd,0xfe,"SCOPE",64,300,900,3,2700,1800,1024,"scope.knock/1",200,15,10,256,3,600,256,16,1,0,1,2,64,280,64,64,120,280,"scope.peer/1",1,120,4000,64,4096,8,15,10,604800,256,3600,120,256,1,60,100000,120,26,60,2,60,1024,64,240,131072,112,4096,15552000,3,900,256,0,32,0xfb,0xfc,8,64,256,64,8,2,2,2,2,1,2,1"#;
+    const EXPECTED_LITERALS: &str = r#"1,1,10,16,262144,128,"/knock","/status","/message",30,10,10,2,20,16,0xf0,0xf1,0xf3,0xf4,0xf5,0xf6,0xfd,0xfe,"SCOPE",64,300,900,3,2700,1800,1024,"scope.knock/1",200,15,10,256,3,600,256,16,1,0,1,2,64,280,64,64,120,280,"scope.peer/1",1,120,4000,64,4096,8,15,10,604800,256,3600,120,256,1,60,100000,120,26,60,2,60,1024,64,240,131072,112,4096,15552000,3,900,256,0,32,0xfb,0xfc,8,64,256,64,8,2,2,2,2,1,2,1,8,106496,98304,65536"#;
 
     fn expected_constants() -> Vec<(&'static str, String)> {
         let secs = |d: Duration| d.as_secs().to_string();
@@ -1279,6 +1280,13 @@ mod tests {
             (
                 "PROPAGATION_STORE_VERSION",
                 propagation_fetch::PROPAGATION_STORE_VERSION.to_string(),
+            ),
+            ("MAX_PARTS", MAX_PARTS.to_string()),
+            ("MAX_PARTS_BYTES", MAX_PARTS_BYTES.to_string()),
+            ("MAX_INLINE_FILE_TOTAL", MAX_INLINE_FILE_TOTAL.to_string()),
+            (
+                "DEFAULT_INLINE_MAX_BYTES",
+                DEFAULT_INLINE_MAX_BYTES.to_string(),
             ),
         ]
     }
