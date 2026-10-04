@@ -1833,6 +1833,7 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 | DispatchErrorDecode | `dispatch_error_vectors_read_as_section_6_7_mandates` |
 | EnvelopeDecode | `envelope_vectors_decode_as_section_6_5_mandates` |
 | EnvelopeEncode | `envelope_vectors_encode_in_the_key_order_of_section_6_5` |
+| GrantStore | `grant_stores_lend_spend_and_sweep_as_section_10_17_mandates` |
 | HandlerSlots | `the_responder_drops_what_section_6_6_says_it_drops` |
 | HandlerTimeout | `the_timeouts_and_the_outbound_cap_end_requests_as_specified` |
 | HashText | `hash_text_vectors_accept_only_32_hex_digits` |
@@ -1857,7 +1858,9 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 | RequestFrameDecode | `request_frame_vectors_decode_as_section_6_1_mandates` |
 | RequestTimeout | `the_timeouts_and_the_outbound_cap_end_requests_as_specified` |
 | ResponseFrameDecode | `response_frame_vectors_decode_as_section_6_2_mandates` |
+| ShareSet | `share_sets_judge_as_section_10_17_mandates` |
 | SizeBranch | `size_branches_and_correlation_hold_on_a_live_link` |
+| StoreSchema | `store_schemas_refuse_and_default_as_section_14_1_mandates` |
 | Text | `text_vectors_clean_as_section_3_2_mandates` |
 | Trust | `trust_vectors_authorize_as_the_precedence_mandates` |
 | UnacknowledgedReply | `the_sender_outcomes_end_as_sections_8_5_and_10_4_mandate` |
@@ -1865,6 +1868,7 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 | VersionMark | `version_refusals_mark_peers_and_marked_peers_are_refused_outbound` |
 | VersionRefusalDecode | `version_refusal_vectors_hold_the_shape_of_section_7` |
 | VersionRefusalEncode | `version_refusal_vectors_hold_the_shape_of_section_7` |
+| WirePath | `wire_paths_are_held_to_the_fourteen_rules_of_section_10_13` |
 | WrongLink | `the_responder_drops_what_section_6_6_says_it_drops` |
 
 | Requirement | Vectors and tests |
@@ -2180,11 +2184,11 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 | MESH-DISP-024 | Custom (Valid) |
 | MESH-DISP-025 | Custom (Boundary), Custom (Valid) |
 | MESH-DISP-026 | Custom (Invalid) |
-| MESH-FETCH-003 | no vector yet |
+| MESH-FETCH-003 | WirePath (Boundary), WirePath (Invalid), WirePath (Valid) |
 | MESH-FETCH-004 | no vector yet |
-| MESH-FETCH-005 | no vector yet |
+| MESH-FETCH-005 | WirePath (Invalid), WirePath (Valid) |
 | MESH-FETCH-006 | no vector yet |
-| MESH-FETCH-007 | no vector yet |
+| MESH-FETCH-007 | WirePath (Invalid), WirePath (Valid) |
 | MESH-LIST-001 | no vector yet |
 | MESH-LIST-002 | no vector yet |
 | MESH-LIST-003 | no vector yet |
@@ -2266,24 +2270,24 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 | MESH-ACCESS-027 | no vector yet |
 | MESH-ACCESS-028 | no vector yet |
 | MESH-ACCESS-029 | no vector yet |
-| MESH-SHARE-001 | no vector yet |
-| MESH-SHARE-002 | no vector yet |
-| MESH-SHARE-003 | no vector yet |
-| MESH-SHARE-004 | no vector yet |
-| MESH-SHARE-005 | no vector yet |
-| MESH-SHARE-006 | no vector yet |
-| MESH-SHARE-007 | no vector yet |
-| MESH-SHARE-008 | no vector yet |
-| MESH-SHARE-009 | no vector yet |
-| MESH-SHARE-010 | no vector yet |
-| MESH-SHARE-011 | no vector yet |
-| MESH-SHARE-012 | no vector yet |
-| MESH-SHARE-013 | no vector yet |
-| MESH-SHARE-014 | no vector yet |
-| MESH-SHARE-015 | no vector yet |
-| MESH-SHARE-016 | no vector yet |
-| MESH-SHARE-017 | no vector yet |
-| MESH-SHARE-018 | no vector yet |
+| MESH-SHARE-001 | ShareSet (Boundary), ShareSet (Invalid), ShareSet (Valid) |
+| MESH-SHARE-002 | ShareSet (Boundary), ShareSet (Invalid), ShareSet (Valid) |
+| MESH-SHARE-003 | ShareSet (Invalid) |
+| MESH-SHARE-004 | ShareSet (Boundary), ShareSet (Invalid), ShareSet (Valid) |
+| MESH-SHARE-005 | ShareSet (Invalid), ShareSet (Valid) |
+| MESH-SHARE-006 | ShareSet (Invalid), ShareSet (Valid) |
+| MESH-SHARE-007 | ShareSet (Boundary), ShareSet (Invalid), ShareSet (Valid) |
+| MESH-SHARE-008 | ShareSet (Invalid), ShareSet (Valid) |
+| MESH-SHARE-009 | ShareSet (Invalid), ShareSet (Valid) |
+| MESH-SHARE-010 | ShareSet (Boundary), ShareSet (Invalid), ShareSet (Valid) |
+| MESH-SHARE-011 | ShareSet (Valid) |
+| MESH-SHARE-012 | ShareSet (Valid) |
+| MESH-SHARE-013 | ShareSet (Valid) |
+| MESH-SHARE-014 | ShareSet (Invalid), ShareSet (Valid) |
+| MESH-SHARE-015 | GrantStore (Boundary), GrantStore (Invalid), GrantStore (Valid) |
+| MESH-SHARE-016 | GrantStore (Boundary), GrantStore (Valid) |
+| MESH-SHARE-017 | GrantStore (Valid) |
+| MESH-SHARE-018 | GrantStore (Boundary), GrantStore (Invalid) |
 | MESH-SHARE-019 | no vector yet |
 | MESH-SHARE-020 | no vector yet |
 | MESH-PROP-001 | Custom (Valid) |
@@ -2338,10 +2342,10 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 | MESH-EXT-008 | Registry (Valid) |
 | MESH-CODE-001 | Registry (Valid) |
 | MESH-CODE-002 | Registry (Valid) |
-| MESH-SCHEMA-001 | no vector yet |
-| MESH-SCHEMA-002 | no vector yet |
-| MESH-SCHEMA-003 | no vector yet |
-| MESH-SCHEMA-004 | no vector yet |
+| MESH-SCHEMA-001 | StoreSchema (Invalid), StoreSchema (Valid) |
+| MESH-SCHEMA-002 | StoreSchema (Invalid), StoreSchema (Valid) |
+| MESH-SCHEMA-003 | StoreSchema (Boundary), StoreSchema (Invalid), StoreSchema (Valid) |
+| MESH-SCHEMA-004 | StoreSchema (Boundary), StoreSchema (Valid) |
 | MESH-CODE-003 | Registry (Valid) |
 | MESH-CODE-004 | Registry (Valid) |
 | MESH-CODE-005 | Registry (Valid) |

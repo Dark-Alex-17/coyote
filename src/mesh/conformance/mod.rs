@@ -12,6 +12,9 @@
 //!   handler slots and timeouts, response correlation, version marks), run over the loopback
 //!   fixtures of `r3::tests::network`. The table is declared everywhere so coverage counts it;
 //!   the executor is `#[cfg(unix)]` with the fixtures it drives.
+//! - `share_vectors`: the wire-path grammar and the decoders that reuse it, the share set and
+//!   the grant store on a share root built per row, and the versioning of the stores they
+//!   read. Rust only, every platform.
 //! - `interop`: the protocol exercised against the pinned Python Reticulum/LXMF reference,
 //!   spawned as a subprocess. Those tests are `#[ignore]`d and gated on `COYOTE_MESH_INTEROP=1`;
 //!   `scripts/mesh-interop/setup.sh` prepares the reference and prints the environment they need.
@@ -37,6 +40,7 @@
 mod env_vectors;
 mod interop_ids;
 mod link_vectors;
+mod share_vectors;
 mod vectors;
 
 #[cfg(unix)]
@@ -429,6 +433,10 @@ const EXECUTED_BY: &[(&str, &[&str])] = &[
         &["envelope_vectors_encode_in_the_key_order_of_section_6_5"],
     ),
     (
+        "GrantStore",
+        &["grant_stores_lend_spend_and_sweep_as_section_10_17_mandates"],
+    ),
+    (
         "HandlerSlots",
         &["the_responder_drops_what_section_6_6_says_it_drops"],
     ),
@@ -526,11 +534,16 @@ const EXECUTED_BY: &[(&str, &[&str])] = &[
         "ResponseFrameDecode",
         &["response_frame_vectors_decode_as_section_6_2_mandates"],
     ),
+    ("ShareSet", &["share_sets_judge_as_section_10_17_mandates"]),
     (
         "SizeBranch",
         &["size_branches_and_correlation_hold_on_a_live_link"],
     ),
     ("Text", &["text_vectors_clean_as_section_3_2_mandates"]),
+    (
+        "StoreSchema",
+        &["store_schemas_refuse_and_default_as_section_14_1_mandates"],
+    ),
     (
         "Trust",
         &["trust_vectors_authorize_as_the_precedence_mandates"],
@@ -556,6 +569,10 @@ const EXECUTED_BY: &[(&str, &[&str])] = &[
         &["version_refusal_vectors_hold_the_shape_of_section_7"],
     ),
     (
+        "WirePath",
+        &["wire_paths_are_held_to_the_fourteen_rules_of_section_10_13"],
+    ),
+    (
         "WrongLink",
         &["the_responder_drops_what_section_6_6_says_it_drops"],
     ),
@@ -570,6 +587,7 @@ fn all_listed() -> Vec<Listed> {
     let mut listed = vectors::listed();
     listed.extend(env_vectors::listed());
     listed.extend(link_vectors::listed());
+    listed.extend(share_vectors::listed());
     listed.extend(interop_ids::listed());
     listed
 }
