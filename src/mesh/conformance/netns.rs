@@ -1262,7 +1262,7 @@ async fn usage_probe_disable_ingress_control_flips_only_ingress_control_on_every
 
 /// README: "The tests are `#[ignore]`d, so a plain `cargo test` never touches a
 /// namespace." Every test that reaches `gate()` (the only way into a namespace) carries
-/// the ruling's verbatim ignore reason, so a new namespace-touching test cannot slip into
+/// the same verbatim ignore reason, so a new namespace-touching test cannot slip into
 /// the default run.
 #[test]
 fn usage_probe_every_test_that_reaches_a_namespace_is_ignored_with_the_rulings_reason() {

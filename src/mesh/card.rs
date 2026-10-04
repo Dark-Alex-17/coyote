@@ -1083,7 +1083,7 @@ mod tests {
         assert_eq!(StatusCard::from_value(&card.to_value()), Ok(card));
     }
 
-    /// Usage probe, amendment "ignore-on-receipt (card)": the lenient readers must hold
+    /// Ignore-on-receipt for the card: the lenient readers must hold
     /// for the shapes a non-Rust peer can put on the wire that are not `rmpv` strings —
     /// msgpack `bin` and a `str` holding bytes that are not UTF-8 — and must hold after a
     /// real encode→decode, not only on a hand-built `Value`. A wrong-typed `about` is
@@ -1567,7 +1567,7 @@ mod tests {
         assert!(malformed.contains("status card"), "{malformed}");
     }
 
-    /// Spec-first usage probe: `.mesh status <dest>` surfaces `StatusError` through `?`, so
+    /// `.mesh status <dest>` surfaces `StatusError` through `?`, so
     /// the four causes (transport, not served, unsupported card version, malformed) must
     /// read as four DISTINCT texts, each naming its own cause and remedy.
     #[test]

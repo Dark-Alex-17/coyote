@@ -22215,7 +22215,7 @@ mod tests {
                             .mesh
                             .set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
 
-                        // R8: judged before anything is printed, sent or lent.
+                        // The reference is judged before anything is printed, sent or lent.
                         for (args, expected) in [
                             (
                                 "--attach .git/HEAD --force",
@@ -22234,7 +22234,7 @@ mod tests {
                         assert!(fx.stub.seen().is_empty(), "{:?}", fx.stub.seen());
                         assert!(fx.grants().is_empty(), "{:?}", fx.grants());
 
-                        // R3: the peer refuses the reference; the lend is taken back and
+                        // The peer refuses the reference; the lend is taken back and
                         // the correlation is still open for a retry.
                         let gate = Arc::new(Gate::default());
                         gate.armed.store(true, Ordering::SeqCst);

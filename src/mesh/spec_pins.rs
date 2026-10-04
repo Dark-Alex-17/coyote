@@ -3000,6 +3000,7 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
         ];
         let ruling = ["ruling", " "].concat();
         let shorthand = "(r";
+        let round_dash = ["round", "-"].concat();
         let plain = [
             ["plan", " criterion"].concat(),
             ["plan", " ruling"].concat(),
@@ -3040,6 +3041,13 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
                 && (rest.first() == Some(&b')')
                     || rest.strip_prefix(b" ").is_some_and(letter_in_parens))
         };
+        let ruling_shorthand_at_start = |text: &str| {
+            let bytes = text.as_bytes();
+            bytes.first() == Some(&b'r') && bytes.get(1).is_some_and(u8::is_ascii_digit) && {
+                let digits = bytes[1..].iter().take_while(|b| b.is_ascii_digit()).count();
+                bytes.get(1 + digits) == Some(&b':')
+            }
+        };
         let comment_text = line
             .trim_start()
             .strip_prefix("//")
@@ -3061,6 +3069,8 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
                 .any(|needle| follows(&line, needle, starts_with_digit))
             || plain.iter().any(|needle| line.contains(needle.as_str()))
             || comment_text.is_some_and(|text| follows(text, shorthand, round_shorthand))
+            || comment_text.is_some_and(ruling_shorthand_at_start)
+            || follows(&line, &round_dash, starts_with_digit)
             || commit.iter().any(|needle| {
                 line.match_indices(needle)
                     .any(|(at, _)| after_a_short_hash(&line.as_bytes()[..at]))
@@ -3116,6 +3126,9 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
             ["/// g", "-12 covers the relay"].concat(),
             ["// per t", "-3 the cap holds"].concat(),
             ["// see B", "-7"].concat(),
+            ["// R", "8: judged before anything is printed"].concat(),
+            ["// r", "3: the peer refuses the reference"].concat(),
+            ["// The round", "-3 README claimed"].concat(),
         ] {
             assert!(cites_a_plan_label(&hit), "{hit:?}");
         }
@@ -3130,6 +3143,8 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
             "// B6 and G8 are hex here".to_string(),
             "// the R3 transport frames it".to_string(),
             "// the R3 transport (r3 for short) frames it".to_string(),
+            "// r3 frames it".to_string(),
+            "// round trip".to_string(),
             "// the transport (r3, lowercase on the wire) frames it".to_string(),
             "// Err(R3Error::Shutdown) ends it".to_string(),
             "assert_eq!(r1.len(), 2);".to_string(),

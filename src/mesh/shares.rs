@@ -2412,7 +2412,7 @@ mod tests {
     }
 
     /// A file under any `.git` directory is never served, even when a global exact-file
-    /// `override` names it: by ruling, `.git/` sits with the never-lifted protected set,
+    /// `override` names it: `.git/` sits with the never-lifted protected set,
     /// not the override-liftable built-in names. The human's view marks it `Protected`.
     #[test]
     fn usage_probe_an_override_never_lifts_a_file_under_any_git_directory() {

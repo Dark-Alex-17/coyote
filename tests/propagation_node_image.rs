@@ -1494,7 +1494,7 @@ fn usage_probe_docs_say_messages_are_posted_and_held_messages_are_fetched_back_a
 
 #[test]
 fn usage_probe_readme_status_note_matches_what_docker_exec_actually_does() {
-    // The round-3 README claimed that both `lxmd --status` forms write into the
+    // An earlier README draft claimed that both `lxmd --status` forms write into the
     // daemon's live `/data/reticulum/storage/` on exit. Live ground truth
     // (usage_probe_lxmd_status_against_a_live_daemon): inside the
     // daemon's network namespace the second instance never comes up. It dies while
@@ -1802,7 +1802,7 @@ fn usage_probe_readme_multi_node_advice_names_the_knob_coyote_actually_honours()
     );
     assert!(
         !readme.contains("`from_static_only = yes` are the knobs"),
-        "the round-3 recommendation of from_static_only must be gone"
+        "the earlier recommendation of from_static_only must be gone"
     );
     assert!(
         readme.contains("`mesh__send` would answer `no_propagation_node`"),
