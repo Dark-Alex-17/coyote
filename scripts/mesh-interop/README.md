@@ -5,7 +5,8 @@ test spawns the pinned Python Reticulum/LXMF reference as a subprocess, joins th
 node to it as a TCP client (the production `rnsd` relay topology) and proves the two agree
 on the wire: announce filing, request replies, message delivery and store-and-forward
 through a real LXMF propagation node. The vectors half, which needs nothing but Rust, lives
-next to it in `vectors.rs`.
+next to it in the `*_vectors.rs` modules of that directory (and, for the REPL's attachment
+rules, in `src/repl/mesh_share_vectors.rs`).
 
 ## Pins
 
@@ -22,9 +23,9 @@ Last verified 2026-10-04, on Linux, with the Rust side at the crates.io `0.12.0`
 
 | Invocation | Result |
 |---|---|
-| `COYOTE_MESH_INTEROP=1 cargo test --all mesh::conformance -- --include-ignored` (vectors + interop + netns) | 94 passed, 0 ignored |
+| `COYOTE_MESH_INTEROP=1 cargo test --all mesh::conformance -- --include-ignored` (vectors + interop + netns) | 95 passed, 0 ignored |
 | `cargo test --all mesh::fuzz` | 18 passed |
-| `cargo test --all` | 5570 passed, 0 failed in the unit binary; 86 passed across the integration binaries |
+| `cargo test --all` | 5572 passed, 0 failed in the unit binary; 86 passed across the integration binaries |
 
 The macOS and Windows legs are proven by the PR's CI matrix rather than by this record.
 Re-run the three commands and refresh this table whenever either side's pin moves.
@@ -71,9 +72,10 @@ creates a Coyote-shaped destination `scope.session.<instance_id>` serving `/stat
 `destination_hash`, `name_hash` and `instance_id`. The reference peer does not implement
 `/knock`, `/list`, `/fetch` or `/access`; the file-sharing paths are covered by Rust-only
 in-process conformance vectors in `src/mesh/conformance/share_vectors.rs`,
-`access_vectors.rs` and `live_vectors.rs` (the last over the loopback node pair of
-`src/mesh/r3/tests.rs`), so the Python reference still serves only `/status` and
-`/message`, and the interop matrix exercises only those two paths.
+`access_vectors.rs` and `live_vectors.rs` (the last runs its node-pair rows over the
+loopback pair of `src/mesh/r3/tests.rs` and its symlink rows on unix only), so the Python
+reference still serves only `/status` and `/message`, and the interop matrix exercises only
+those two paths.
 
 | Command | Arguments | Reply / effect |
 |---|---|---|

@@ -299,6 +299,30 @@ fn row(id: &'static str, kind: Kind, check: Check) -> Vector {
     Vector { id, kind, check }
 }
 
+/// Runs every row under a config-dir guard and panics on the first set of failures. Called
+/// by the test below and by the conformance slice, so `cargo test mesh::conformance` drives
+/// this family too; callers serialise, since the guard sets the process env.
+pub(crate) fn run_all() {
+    let _guard = crate::testing::TestConfigDirGuard::new("conformance-attachment");
+    let rows = vectors();
+    let ran = rows.len();
+    let failures: Vec<String> = rows
+        .iter()
+        .filter_map(|vector| {
+            (vector.check)()
+                .err()
+                .map(|detail| format!("{} [{FAMILY}, {:?}]: {detail}", vector.id, vector.kind))
+        })
+        .collect();
+    assert!(ran > 0, "no {FAMILY} vectors");
+    assert!(
+        failures.is_empty(),
+        "{} of {ran} {FAMILY} vectors failed:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,23 +330,6 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn attachments_are_held_to_section_10_17_as_the_human_named_them() {
-        let _guard = crate::testing::TestConfigDirGuard::new("conformance-attachment");
-        let rows = vectors();
-        let ran = rows.len();
-        let failures: Vec<String> = rows
-            .iter()
-            .filter_map(|vector| {
-                (vector.check)()
-                    .err()
-                    .map(|detail| format!("{} [{FAMILY}, {:?}]: {detail}", vector.id, vector.kind))
-            })
-            .collect();
-        assert!(ran > 0, "no {FAMILY} vectors");
-        assert!(
-            failures.is_empty(),
-            "{} of {ran} {FAMILY} vectors failed:\n{}",
-            failures.len(),
-            failures.join("\n")
-        );
+        run_all();
     }
 }

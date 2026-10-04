@@ -3,7 +3,8 @@
 //! requester's reading of a fetch reply, the share set's handling of symlinks and the
 //! grant a reference attachment lends. The table is declared on every platform so coverage
 //! counts it; the executor runs over the loopback node pair of `r3::tests::network`, which
-//! is `#[cfg(unix)]`.
+//! is `#[cfg(unix)]`, and the symlink rows share that gate because their fixtures create
+//! symlinks.
 
 use super::{Kind, Listed};
 

@@ -46,8 +46,11 @@
 //! Platform note: `interop`, `link_vectors::loopback` and `live_vectors::loopback` are
 //! `#[cfg(unix)]` because the Python reference harness and the loopback fixtures they drive are
 //! unix-only, not because the mesh is; `netns` is `#[cfg(target_os = "linux")]` because network
-//! namespaces are a Linux kernel feature. Product code under `src/mesh/` is never cfg-gated;
-//! those four are the only exemption. Windows mesh behaviour is covered by the unit tests, the
+//! namespaces are a Linux kernel feature. `live_vectors::loopback` also holds the symlink rows,
+//! whose fixtures create symlinks, and one `share_vectors` row branches inline on unix
+//! permission bits; every vector table and `listed()` stays ungated, so coverage counts the
+//! same rows on every platform. Product code under `src/mesh/` is never cfg-gated; those test
+//! modules and sub-probes are the only exemption. Windows mesh behaviour is covered by the unit tests, the
 //! platform-independent vectors and manual verification, not by the Python interop matrix.
 //!
 //! `coverage_table` renders the same data as the section 20 table of the spec, which
@@ -408,6 +411,10 @@ const ENFORCED_BY: &[(&str, &[&str])] = &[
 /// table is rendered from this.
 const EXECUTED_BY: &[(&str, &[&str])] = &[
     (
+        "Ack",
+        &["acknowledgement_vectors_are_read_only_for_their_id"],
+    ),
+    (
         "Access",
         &["access_admission_and_decisions_hold_over_a_live_pair"],
     ),
@@ -426,10 +433,6 @@ const EXECUTED_BY: &[(&str, &[&str])] = &[
     (
         "Attachment",
         &["attachments_are_held_to_section_10_17_as_the_human_named_them"],
-    ),
-    (
-        "Ack",
-        &["acknowledgement_vectors_are_read_only_for_their_id"],
     ),
     (
         "Announce",
@@ -1106,6 +1109,15 @@ mod tests {
         );
     }
 
+    /// The attachment family is defined beside the REPL predicate it drives; this runs it
+    /// with the rest of the conformance slice so `cargo test mesh::conformance` covers every
+    /// listed family.
+    #[test]
+    #[serial_test::serial]
+    fn the_attachment_family_runs_with_the_conformance_slice() {
+        crate::repl::mesh_share_vectors::run_all();
+    }
+
     // The minimum-coverage rule reads: "every id in areas DEST, ANN, ENV, VER, EXT, CODE,
     // LIST, FETCH, ACCESS, SHARE, SCHEMA and every catch-all/`any other value` row in
     // KNOCK/STATUS/MSG/PROP/PART/DISP". These derive that set from `docs/mesh/PROTOCOL.md`
@@ -1116,7 +1128,10 @@ mod tests {
     const FULLY_COVERED_AREAS: &[&str] = &[
         "DEST", "ANN", "ENV", "VER", "EXT", "CODE", "LIST", "FETCH", "ACCESS", "SHARE", "SCHEMA",
     ];
-    /// Areas where only the catch-all table rows must have a vector.
+    /// Areas where only the catch-all table rows must have a vector. The spec writes the
+    /// disposition's `any other value` rule in the action column of the `disposition` key
+    /// row rather than as a positional catch-all row, so `DISP` contributes no id today and
+    /// is listed for the day a disposition table gains one; MESH-DISP-002 has rows regardless.
     const CATCH_ALL_AREAS: &[&str] = &["KNOCK", "STATUS", "MSG", "PROP", "PART", "DISP"];
 
     /// The `**[MESH-AREA-NNN]**` ids on one spec line, in order.
