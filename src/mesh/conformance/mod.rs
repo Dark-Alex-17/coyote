@@ -174,6 +174,79 @@ const ENFORCED_BY: &[(&str, &[&str])] = &[
             "rotate_is_refused_while_another_process_holds_the_identity_lock",
         ],
     ),
+    (
+        "MESH-SEC-015",
+        &[
+            "an_unadmitted_peer_cannot_tell_a_served_path_from_an_unknown_one",
+            "usage_probe_list_and_fetch_from_an_untrusted_peer_are_silent_like_status_whatever_the_path",
+            "usage_probe_an_unreadable_granted_file_is_not_shared_byte_for_byte_and_keeps_its_use",
+        ],
+    ),
+    (
+        "MESH-SEC-016",
+        &[
+            "an_invalid_wire_path_is_refused_before_the_filesystem_is_touched",
+            "a_symlink_that_leaves_the_root_is_not_shared",
+            "a_symlink_alias_inside_the_root_cannot_reach_a_built_in_denied_file",
+            "a_case_flipped_name_cannot_dodge_a_deny_under_either_fold_flag",
+            "a_candidate_outside_the_canonical_root_is_never_served",
+            "the_grammar_refuses_traversal_before_the_inbox_is_touched",
+            "a_symlinked_directory_leading_outside_the_root_is_refused_before_any_write",
+        ],
+    ),
+    (
+        "MESH-SEC-017",
+        &[
+            "deny_wins_across_layers_and_an_override_lifts_only_the_builtin_deny",
+            "a_workspace_override_is_inert_and_only_a_global_one_lifts_the_builtin_deny",
+            "usage_probe_an_override_never_lifts_a_file_under_any_git_directory",
+            "the_workspace_config_dir_is_never_served_under_allow_everything",
+            "usage_probe_a_grant_on_a_built_in_denied_path_never_serves_it",
+        ],
+    ),
+    (
+        "MESH-SEC-018",
+        &[
+            "too_large_carries_the_local_limit_and_not_modified_carries_no_body",
+            "a_file_above_the_single_segment_ceiling_is_too_large_with_that_limit",
+            "a_fetch_response_at_its_bound_is_delivered_and_one_byte_over_is_dropped",
+            "a_message_at_every_cap_fits_under_both_receiver_bounds_on_both_routes",
+        ],
+    ),
+    (
+        "MESH-SEC-019",
+        &[
+            "wrap_quotes_a_body_line_that_repeats_the_end_marker",
+            "wrap_quotes_an_end_marker_hidden_behind_any_line_terminator",
+            "wrap_quotes_an_end_marker_behind_leading_whitespace_or_an_invisible_character",
+            "a_small_utf8_fetch_carries_its_text_fenced_under_the_peer_label",
+            "usage_probe_a_fetched_file_cannot_close_the_fence_with_a_marker_hidden_behind_a_separator",
+        ],
+    ),
+    (
+        "MESH-SEC-020",
+        &[
+            "the_reason_is_sanitised_before_it_is_shown",
+            "a_path_cannot_close_the_human_lines_frame",
+            "an_access_request_never_reaches_the_envoy_sink",
+        ],
+    ),
+    (
+        "MESH-SEC-021",
+        &[
+            "a_one_off_grant_writes_one_use_per_path_with_the_default_ttl",
+            "a_one_off_grant_whose_send_fails_leaves_no_grant_and_the_request_pending",
+            "a_one_off_grant_is_consumed_by_the_fetch_and_the_second_fetch_is_not_shared",
+            "expired_grants_are_swept_on_open_and_on_every_check",
+        ],
+    ),
+    (
+        "MESH-SEC-022",
+        &[
+            "envoy_sources_never_build_a_file_part",
+            "the_envoy_never_attaches_a_part_whatever_the_outcome",
+        ],
+    ),
     ("MESH-INV-001", &["mesh_module_never_names_the_request_ctx"]),
     (
         "MESH-INV-002",
@@ -222,6 +295,23 @@ const ENFORCED_BY: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "MESH-INV-008",
+        &[
+            "a_full_list_and_fetch_cycle_over_a_live_pair_never_calls_the_envoy",
+            "a_full_access_grant_and_fetch_cycle_over_a_live_pair_never_calls_the_envoy",
+            "an_access_request_never_reaches_the_envoy_sink",
+            "envoy_sources_never_build_a_file_part",
+        ],
+    ),
+    (
+        "MESH-INV-009",
+        &[
+            "a_candidate_that_is_not_canonical_is_refused_rather_than_matched",
+            "a_user_deny_on_the_resolved_file_holds_through_an_alias",
+            "usage_probe_a_peer_directory_that_is_itself_a_link_outside_the_root_is_refused_before_any_write",
+        ],
+    ),
+    (
         "MESH-LOG-001",
         &["mesh_log_lines_never_carry_peer_text_or_a_full_hash"],
     ),
@@ -240,6 +330,16 @@ const ENFORCED_BY: &[(&str, &[&str])] = &[
     (
         "MESH-LOG-004",
         &["redaction_scanner_flags_each_rule_and_passes_the_permitted_forms"],
+    ),
+    (
+        "MESH-LOG-005",
+        &[
+            "serving_a_file_logs_a_hash_prefix_and_size_but_never_the_path",
+            "mutation_logs_name_the_share_file_but_never_a_pattern_or_override_path",
+            "usage_probe_every_refusal_is_logged_at_debug_with_its_rule_and_without_the_path",
+            "a_served_fetch_fires_mesh_fetch_served_with_peer_size_and_hash_prefix_and_no_path",
+            "access_events_carry_peer_count_and_decision_but_never_a_path",
+        ],
     ),
     (
         "MESH-LEN-001",
@@ -270,6 +370,13 @@ const ENFORCED_BY: &[(&str, &[&str])] = &[
     (
         "MESH-LEN-006",
         &["malformed_hashes_are_refused_without_panicking"],
+    ),
+    (
+        "MESH-LEN-007",
+        &[
+            "a_file_above_the_single_segment_ceiling_is_too_large_with_that_limit",
+            "an_ok_reply_at_the_ceiling_fits_one_resource_segment",
+        ],
     ),
 ];
 
