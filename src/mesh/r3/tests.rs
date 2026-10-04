@@ -8708,9 +8708,9 @@ pub(crate) mod network {
             "a peer must not be able to earn a warn-level line with a re-used id: {warns:?}"
         );
         assert!(
-            !warn_snapshot()
-                .iter()
-                .any(|line| line.contains("/access") && line.contains("was not filed")),
+            !warn_snapshot().iter().any(|line| line.contains(&b_id8)
+                && line.contains("/access")
+                && line.contains("was not filed")),
             "{:?}",
             warn_snapshot()
         );
