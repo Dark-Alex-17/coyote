@@ -1150,7 +1150,7 @@ async fn lan_collision() {
 // Usage-probe additions (spec-first, always-on): the acceptance criteria as written, not
 // the implementation as read.
 
-/// Acceptance (c): the relay is "a transport-enabled `rnsd` relay with a
+/// The relay is "a transport-enabled `rnsd` relay with a
 /// `TCPServerInterface`" that the two `private` nodes dial on the bridge address. It must
 /// also never share the host's own Reticulum instance, or the namespace isolation the
 /// suite asserts would be a fiction on a host running `rnsd`.

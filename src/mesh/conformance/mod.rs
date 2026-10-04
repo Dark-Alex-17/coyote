@@ -1271,7 +1271,7 @@ mod tests {
         assert!(!marked.is_empty(), "every id has a vector; drop the marker");
     }
 
-    // Acceptance (f), pinned on the workflow file rather than on a run of it: a Linux-only
+    // The CI job, pinned on the workflow file rather than on a run of it: a Linux-only
     // `mesh-interop` job prepares the reference with `setup.sh`, then runs the conformance
     // suite with the interop tests un-ignored and switched on, under a `timeout-minutes`,
     // records its wall-clock in the step summary, and is kept out of every job's `needs`

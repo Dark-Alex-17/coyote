@@ -7298,7 +7298,7 @@ mod tests {
             assert!(by_command.app.mesh.get().is_none());
         }
 
-        /// Criterion (b): an unmatched `.mesh` verb is refused by the mesh family itself
+        /// An unmatched `.mesh` verb is refused by the mesh family itself
         /// and never falls through to the macro path's generic "Unknown command".
         #[test]
         fn an_unknown_mesh_verb_is_refused_by_mesh_itself_not_the_macro_path() {
@@ -7916,7 +7916,7 @@ mod tests {
                 });
             }
 
-            /// Criterion (i) end to end: the real `.mesh on` path leaves config.yaml
+            /// The status override end to end: the real `.mesh on` path leaves config.yaml
             /// unwritten; `.mesh status "<text>"|clear` drive the objective override; the
             /// read-only listings never error on a fresh node.
             #[test]
@@ -7990,7 +7990,7 @@ mod tests {
                 });
             }
 
-            /// Criterion (e) with the mesh on: a verb missing its arguments prints help and
+            /// With the mesh on: a verb missing its arguments prints help and
             /// takes no action. Under `cargo test` stdin is not a terminal, so any attempt to
             /// send would have failed naming `--yes`; `Ok` is the proof that nothing was tried.
             /// Unknown targets fail with the remedy named.
@@ -8711,7 +8711,7 @@ mod tests {
                 });
             }
 
-            /// Criterion (i), refused by the start itself rather than by `validate`: a
+            /// Refused by the start itself rather than by `validate`: a
             /// private relay nobody listens on makes `MeshRuntime::start` fail after the
             /// trial id was minted. The session keeps its old id and stays clean, no node is
             /// installed, the catalog and the session config are untouched, and the preview
@@ -9196,7 +9196,7 @@ mod tests {
                 });
             }
 
-            /// Usage probe (spec (f)): the reply gate runs BEFORE any notice or prompt and
+            /// The reply gate runs BEFORE any notice or prompt and
             /// refuses every non-Allow verdict. A destination the node has not heard (and
             /// the trust list does not deny) is a not-heard error, never an announcement or
             /// a consent question; a heard peer whose verdict is not Allow ("untrusted",
@@ -9418,7 +9418,7 @@ mod tests {
                 });
             }
 
-            /// Usage probe (spec (f)): `.mesh reply <dest>` applies the SAME trust gate as
+            /// `.mesh reply <dest>` applies the SAME trust gate as
             /// `.mesh status <dest>`, so for one destination both verbs classify the refusal
             /// the same way: plain unheard -> not-heard; unheard but denied at the
             /// destination tier -> denied; heard untrusted/denied/blocked -> that standing.
@@ -17291,7 +17291,7 @@ mod tests {
                     });
                 }
 
-                /// Usage probe (d): `deny` keeps the layer it announced like `allow` does,
+                /// `deny` keeps the layer it announced like `allow` does,
                 /// and a concurrent edit to the announced file made while the question
                 /// stands survives the write.
                 #[test]
@@ -17354,7 +17354,7 @@ mod tests {
                     });
                 }
 
-                /// Usage probe (d): the announced layer is kept in the other direction too —
+                /// The announced layer is kept in the other direction too —
                 /// a workspace file that vanishes while the question stands does not pull
                 /// the write back into the global file.
                 #[test]
@@ -17401,7 +17401,7 @@ mod tests {
                     });
                 }
 
-                /// Usage probe (d): "holders changed" covers a holder that APPEARED in the
+                /// "holders changed" covers a holder that APPEARED in the
                 /// other layer while the question stood, not only one that went away — the
                 /// human confirmed removing it from one file, not from two.
                 #[test]
@@ -17441,7 +17441,7 @@ mod tests {
                     });
                 }
 
-                /// Usage probe (a)+(c): handing `allow` a destination hash is a pure
+                /// Handing `allow` a destination hash is a pure
                 /// classification error — it fires with the mesh OFF (before `MESH_OFF`),
                 /// with `--peer` alongside, and writes nothing in either case.
                 #[test]
@@ -17485,7 +17485,7 @@ mod tests {
                     assert_eq!(err, MESH_OFF);
                 }
 
-                /// Usage probe (g)+(b): `undeny` stays unknown and the three mutating verbs
+                /// `undeny` stays unknown and the three mutating verbs
                 /// print usage (never `MESH_OFF`, never a write) when bare while OFF.
                 #[test]
                 #[serial]
@@ -18016,7 +18016,7 @@ mod tests {
                     });
                 }
 
-                /// (a) A link is judged by the resolved name whether or not its own name
+                /// A link is judged by the resolved name whether or not its own name
                 /// is secret-like: `.env -> notes.txt` is refused naming the real file,
                 /// with and without `--force`, and nothing is written. A teaching error
                 /// teaches a command that works, so the command it quotes is accepted
@@ -18076,7 +18076,7 @@ mod tests {
                     });
                 }
 
-                /// (a) The resolved link target in the refusal is a repo-derived name and
+                /// The resolved link target in the refusal is a repo-derived name and
                 /// goes through `display_text`: a directory whose name carries an escape
                 /// never reaches the terminal raw, while the sentence still names the file.
                 #[test]
@@ -18112,7 +18112,7 @@ mod tests {
                     });
                 }
 
-                /// (a) A `peer:` field is repo-derived text: a non-hash peer carrying an
+                /// A `peer:` field is repo-derived text: a non-hash peer carrying an
                 /// escape is shown as "scoped to no peer" with the escape stripped, both in
                 /// the `shares` row and in the holder row `unshare` prints before asking.
                 #[test]
@@ -18161,7 +18161,7 @@ mod tests {
                     });
                 }
 
-                /// (a) A pattern whose head is a link resolving to `.git/` is a directory
+                /// A pattern whose head is a link resolving to `.git/` is a directory
                 /// the walk never enters: `allow`, `allow --force` and `deny` refuse it with
                 /// the protected reason and write nothing.
                 #[test]
@@ -18201,7 +18201,7 @@ mod tests {
                     });
                 }
 
-                /// (d) + (a) `unshare` of a broad pattern that is held in both files asks
+                /// `unshare` of a broad pattern that is held in both files asks
                 /// one question carrying the breadth words, and a `yes` removes every holder
                 /// while the files are re-read first; no temp file is left beside either.
                 #[test]
@@ -18248,7 +18248,7 @@ mod tests {
                     });
                 }
 
-                /// (b) + (c) The three new mutators and `shares` each have a usage line,
+                /// The three new mutators and `shares` each have a usage line,
                 /// an unknown flag is a usage error that acts on nothing, and `--dry-run`
                 /// with `--yes` is refused as a usage error before the mesh gate on every
                 /// mutator (not just `allow`).
@@ -18289,7 +18289,7 @@ mod tests {
                     });
                 }
 
-                /// (i) The `.mesh on` preview clause counts a file once even when a user
+                /// The `.mesh on` preview clause counts a file once even when a user
                 /// deny removes one of two allows that reach it, and the count is exact
                 /// (no floor words) when the walk finished.
                 #[test]
@@ -18333,7 +18333,7 @@ mod tests {
                     });
                 }
 
-                /// (e) The GLOBAL share file can be a link too: under Auto with no
+                /// The GLOBAL share file can be a link too: under Auto with no
                 /// workspace file the destination is global, and a broad pattern with
                 /// `--yes` would otherwise print the match count and "Will write to …"
                 /// before the write failed. The link is refused before the first line
@@ -18391,7 +18391,7 @@ mod tests {
                     });
                 }
 
-                /// (e) `--dry-run` names the destination it would write; a linked
+                /// `--dry-run` names the destination it would write; a linked
                 /// destination is known at that point, so the dry run reports the link
                 /// refusal rather than a target the real write would refuse.
                 #[test]
@@ -18422,7 +18422,7 @@ mod tests {
                     });
                 }
 
-                /// (e) `unshare` writes every file that holds the pattern: when one holder
+                /// `unshare` writes every file that holds the pattern: when one holder
                 /// is a link the verb refuses before listing holders or asking, even with
                 /// a willing answerer; a layer flag that names only the real file still
                 /// works, because only the destinations that WOULD be written are judged.
@@ -18478,7 +18478,7 @@ mod tests {
                     });
                 }
 
-                /// (a) The bare-directory refusal reaches nested directories, holds under
+                /// The bare-directory refusal reaches nested directories, holds under
                 /// `--dry-run`, and spares what it must: a bare FILE name writes, an absent
                 /// name writes (only an EXISTING directory is refused), and `unshare` of a
                 /// rule that happens to be spelled like a directory still removes it.
@@ -18535,7 +18535,7 @@ mod tests {
                     });
                 }
 
-                /// (c) The directory check needs the root, so it waits behind the mesh
+                /// The directory check needs the root, so it waits behind the mesh
                 /// gate (`MESH_OFF` first); the trailing-slash teaching is pure and fires
                 /// before it — same `<dir>/**` remedy, different place in the order.
                 #[test]
@@ -18568,7 +18568,7 @@ mod tests {
                     assert_eq!(prompt_script::prompts_asked(), 0);
                 }
 
-                /// (a) A link is judged by what it resolves to. A link to a DIRECTORY
+                /// A link is judged by what it resolves to. A link to a DIRECTORY
                 /// resolves to a name the directory rule refuses, and the walk never
                 /// follows a linked directory, so an allow of it could serve nothing;
                 /// the verb refuses instead of writing a dead rule.
@@ -18596,7 +18596,7 @@ mod tests {
                     });
                 }
 
-                /// (a) When only a link's OWN name is secret-like (`*.pem` here) and the
+                /// When only a link's OWN name is secret-like (`*.pem` here) and the
                 /// resolved file is plain, the refusal says so, teaches the plain allow of
                 /// the real file — never `--force` — and never claims the deny names the
                 /// real file; a link whose BOTH names the deny matches still teaches the
@@ -18690,7 +18690,7 @@ mod tests {
                         .unwrap_or_else(|| panic!("no backticked remedy in {sentence:?}"))
                 }
 
-                /// (a) A link as a LEADING segment is judged by what it resolves to: a
+                /// A link as a LEADING segment is judged by what it resolves to: a
                 /// file tail behind a linked directory teaches the plain allow of the real
                 /// file, a nested link head (`sub/dlink`) teaches the pattern re-rooted
                 /// through the real directory, a directory behind a link head is taught
@@ -18780,7 +18780,7 @@ mod tests {
                     });
                 }
 
-                /// (a) A link resolving to the share root itself, or a chain of links,
+                /// A link resolving to the share root itself, or a chain of links,
                 /// still teaches a pattern the verb accepts (never `./**` or `/**`, which
                 /// `validate_pattern` refuses); a link head resolving into `.git` is
                 /// refused as never shared even when the link sits in a subdirectory.
@@ -18874,8 +18874,8 @@ mod tests {
                     });
                 }
 
-                /// (c) Judging a link needs the root, so it waits behind the mesh gate;
-                /// (a) `unshare` removes an entry by its TEXT, so a rule an older build
+                /// Judging a link needs the root, so it waits behind the mesh gate;
+                /// `unshare` removes an entry by its TEXT, so a rule an older build
                 /// wrote through a link can still be removed and still shows in `shares`
                 /// — the link judgement never strands a legacy rule.
                 #[test]
@@ -18966,7 +18966,7 @@ mod tests {
                     });
                 }
 
-                /// (h) Nothing the verb would refuse is offered: a link head is never a
+                /// Nothing the verb would refuse is offered: a link head is never a
                 /// completion, and neither is a path spelled through one, while the real
                 /// directory behind it still is.
                 #[test]
@@ -19025,7 +19025,7 @@ mod tests {
                     });
                 }
 
-                /// (a)/(c) `.git/` with a trailing slash is a pure refusal ("never
+                /// `.git/` with a trailing slash is a pure refusal ("never
                 /// shared") that fires BEFORE the mesh gate for `allow` and `deny`, at any
                 /// depth of a by-name `.git` component, glob segments ahead of it or not;
                 /// `unshare` keeps the `<dir>/**` teaching (a legacy rule under it is
@@ -19083,7 +19083,7 @@ mod tests {
                     assert!(!locations.workspace.exists());
                 }
 
-                /// (a) Every directory the walk never enters — the workspace config dir,
+                /// Every directory the walk never enters — the workspace config dir,
                 /// the configured inbox, and `.git` as ANY component of the resolved path
                 /// (a nested repository) — refuses a pattern whose head is a link into it,
                 /// by name or by resolution, for BOTH verbs, and teaches no remedy under
@@ -19255,7 +19255,7 @@ mod tests {
                     });
                 }
 
-                /// (a) "no teaching sentence ever names a path under such a directory as
+                /// "no teaching sentence ever names a path under such a directory as
                 /// a remedy": a pattern ending in `/` whose directory the walk never enters
                 /// (the workspace config dir, the configured inbox, a nested `.git`) is not
                 /// taught `<dir>/**` — the verb refuses that very pattern a moment later.
@@ -19311,7 +19311,7 @@ mod tests {
                     });
                 }
 
-                /// (a) `deny` judges a link exactly as `allow` does: dangling or escaping
+                /// `deny` judges a link exactly as `allow` does: dangling or escaping
                 /// ⇒ refused saying so (even when the link is named like a secret); a link
                 /// to the root or a chain of links ⇒ a remedy `deny` itself accepts; nothing
                 /// is written and nothing is asked.
@@ -19408,7 +19408,7 @@ mod tests {
                     });
                 }
 
-                /// (h) The share-path completer never offers a directory the walk skips,
+                /// The share-path completer never offers a directory the walk skips,
                 /// at any depth: a nested repository's `.git/` is neither listed under its
                 /// parent nor expanded as a typed prefix, the workspace config dir and the
                 /// inbox are hidden by name and as prefixes, and a prefix through a link
@@ -19491,7 +19491,7 @@ mod tests {
                     });
                 }
 
-                /// Usage probe r9 (a)/(f): "a pattern any of whose literal segments is
+                /// Nested `.git` segments: "a pattern any of whose literal segments is
                 /// `.git` (at ANY depth)" is refused by the verbs — including a literal
                 /// `.git` segment that sits BEHIND a glob segment (`vendor/*/.git/HEAD`,
                 /// `**/.git/**`). Such a rule can never serve anything (the walk never
@@ -19581,7 +19581,7 @@ mod tests {
                     });
                 }
 
-                /// Usage probe r9 (a): the `.git` rule is SEGMENT EQUALITY, not a prefix
+                /// The `.git` rule is SEGMENT EQUALITY, not a prefix
                 /// or substring test — `.gitignore`, `.github/**`, `foo.git/HEAD`,
                 /// `src/git/x.rs` and a `.coyote`-lookalike directory are ordinary paths
                 /// that the verbs accept with the right count, the trailing-slash form
@@ -19696,7 +19696,7 @@ mod tests {
                     });
                 }
 
-                /// Usage probe r9 (a)/(c)/(f): a hand-placed (or pre-fix) row naming a
+                /// A hand-placed (or pre-fix) row naming a
                 /// nested `.git` file is listed by `.mesh shares` with its file, and
                 /// `unshare` removes it — removal is the remedy, so the protected-directory
                 /// refusal the write verbs apply does not stand in its way; `--effective`
@@ -19796,7 +19796,7 @@ mod tests {
                     assert_ne!(err_of(&mut ctx, ".mesh allow vendor/dep/.git/"), MESH_OFF);
                 }
 
-                /// Usage probe r9 (a): a link to a directory that CONTAINS a nested `.git`
+                /// A link to a directory that CONTAINS a nested `.git`
                 /// is an ordinary directory link — `allow dlink` / `dlink/**` teach the
                 /// resolved `vendor/dep/**` (links judged before the bare-directory
                 /// rule), the taught remedy is accepted and counts only what the walk
@@ -22254,7 +22254,7 @@ mod tests {
                         assert!(gate.heard.lock().is_empty(), "{:?}", gate.heard.lock());
                         assert!(fx.ctx.app.mesh.correlations().get("q1").is_some());
 
-                        // (b): at or under inline_max_bytes the file rides inline, lending
+                        // At or under inline_max_bytes the file rides inline, lending
                         // nothing, and the held envoy neither refuses nor sees it.
                         gate.armed.store(false, Ordering::SeqCst);
                         let out = out_of(
@@ -23097,8 +23097,8 @@ mod tests {
                     });
                 }
 
-                /// Usage probe ((b) "the share set is NOT consulted for the INLINE form" +
-                /// (c) with `--attach`): a small file a `deny` rule names still travels
+                /// "The share set is NOT consulted for the INLINE form", with `--attach`
+                /// included: a small file a `deny` rule names still travels
                 /// inline since the human named it, while an access id answered with an
                 /// attachment is sent to its own verb by the cross-kind sentence, with
                 /// nothing read, sent or lent.

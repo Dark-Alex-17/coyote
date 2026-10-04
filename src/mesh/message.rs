@@ -62,7 +62,7 @@ pub(crate) const PEER_FIELDS_MAX_DEPTH: usize = 8;
 pub(crate) const MAX_PARTS: usize = 8;
 /// Ceiling on the msgpack-encoded `parts` array. With content, title, fields and every id
 /// at their caps beside it, this is what keeps a message under the 128 KiB LXMF bound on
-/// the store-and-forward route, with room for the LXMF header (user ruling 2026-09-30).
+/// the store-and-forward route, with room for the LXMF header.
 pub(crate) const MAX_PARTS_BYTES: usize = 104 * 1024;
 const SHA256_MISMATCH: &str = "file part sha256 does not match its bytes";
 const DATA_PART_RULE: &str = "data part is too large or nests too deeply";
@@ -4263,7 +4263,7 @@ mod tests {
 
     // ---- usage-probe tests: spec-first patterns not pinned above ----
 
-    /// User ruling amending (a)/(f): the receiver drops parts from the TAIL until the
+    /// Aggregate cap on the receive side: the receiver drops parts from the TAIL until the
     /// msgpack-encoded `parts` list fits `MAX_PARTS_BYTES`, counting each; the message and
     /// its `content` land. Eight text parts each at the per-part cap pass every per-part
     /// rule yet encode past the aggregate cap, so only the aggregate rule can bite.
@@ -4375,7 +4375,7 @@ mod tests {
         );
     }
 
-    /// Criterion (b): the four spec'd negative names (`../../.bashrc`, `C:\x`, NUL,
+    /// Hostile part names: the four spec'd negative names (`../../.bashrc`, `C:\x`, NUL,
     /// non-NFC) plus the hardened grammar's reserved-name and absolute forms. On receipt
     /// the part is dropped and counted BEFORE the inbox root exists and nothing lands in
     /// cwd; on send the same name is refused outright, so the receiver never sees it.
@@ -4477,7 +4477,7 @@ mod tests {
         }
     }
 
-    /// Criterion (a), sender half: `OutboundPeer` refuses on EVERY rule the receiver would
+    /// Per-part rules, sender half: `OutboundPeer` refuses on EVERY rule the receiver would
     /// drop a part for, not only the encoded total. One case per rule; each `Err` names the
     /// rule and nothing of the part.
     #[test]
@@ -4605,7 +4605,7 @@ mod tests {
         assert_eq!(ok.parts.len(), 3);
     }
 
-    /// Criterion (f) at working sizes: text, `data` (a map and a bare JSON null), an
+    /// Round trip at working sizes: text, `data` (a map and a bare JSON null), an
     /// inline file and a reference file go through both routes as the same `RawPart`s and
     /// re-encode byte-for-byte.
     #[test]

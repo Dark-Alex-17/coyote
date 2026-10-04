@@ -2464,7 +2464,7 @@ mod tests {
         job
     }
 
-    /// (e) amendment: a held escalation whose wait lapses hands the question off (the peer
+    /// A held escalation whose wait lapses hands the question off (the peer
     /// is told there is no answer yet), the run ends, and the QUESTION stays open in the
     /// inbound store so a late `.mesh answer` can still route it. The dead run must not be
     /// able to take that late answer.
@@ -4000,7 +4000,7 @@ mod tests {
                 .is_some_and(|secs| secs >= 1),
             "{fields}"
         );
-        // Usage probe (c): a run-time refusal is not the envoy's answer, so on the wire it
+        // A run-time refusal is not the envoy's answer, so on the wire it
         // carries the typed disposition, the retry hint and the refused message's thread
         // (a root message's thread is its own id).
         assert_eq!(refusal.disposition, Some(Disposition::BudgetExhausted));
@@ -4245,7 +4245,7 @@ mod tests {
             Some(PEER_RETRY_AFTER_CAPACITY.as_secs()),
             "{fields}"
         );
-        // Usage probe (c): the admission refusal carries disposition, retry hint and thread.
+        // The admission refusal carries disposition, retry hint and thread.
         assert_eq!(refusal.disposition, Some(Disposition::Refused));
         assert_eq!(
             refusal.retry_after.map(u64::from),
@@ -4261,7 +4261,7 @@ mod tests {
                 .any(|body| body.in_reply_to.as_deref() == Some("live-r1"))
         })
         .await;
-        // Usage probe (c): the envoy's own answer is `answered` with no retry hint, in
+        // The envoy's own answer is `answered` with no retry hint, in
         // the asker's thread.
         let seen = stub.seen();
         let answer = seen
@@ -5498,7 +5498,7 @@ mod tests {
         assert_eq!(out.thread.as_deref(), Some("long-1"));
     }
 
-    // ---- usage probe, round 2 ----------------------------------------------------------
+    // ---- stalled escalated notices: holds, interrupts, the refused marker ----------------
 
     /// A peer slow to take a `/message`: every body is recorded as it arrives and held
     /// unacknowledged until `release`, so a send to this peer stays in flight.
@@ -5860,7 +5860,7 @@ mod tests {
         ));
     }
 
-    // ---- usage probe, round 3 ----------------------------------------------------------
+    // ---- answers and lapses during a stalled notice; hook reports -----------------------
 
     /// A drive that escalates, then takes `after_answer` to finish once the human has
     /// answered — a model call that still has work to do after the hold is over.

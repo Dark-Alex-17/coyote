@@ -2881,34 +2881,103 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
         assert_eq!(missing, Vec::<&String>::new());
     }
 
+    #[test]
+    fn env_042_lists_exactly_the_known_paths_in_order() {
+        let line = SPEC
+            .lines()
+            .find(|line| line.contains("**[MESH-ENV-042]**"))
+            .expect("MESH-ENV-042 is defined");
+        let listed: Vec<&str> = split_spans(line)
+            .into_iter()
+            .map(|(_, span)| span)
+            .filter(|span| span.starts_with('/'))
+            .collect();
+        assert_eq!(listed, r3::KNOWN_PATHS);
+    }
+
+    #[test]
+    fn wire_path_rule_table_names_the_rules_in_order() {
+        const HEADER: &str = "| Rule | Condition | Receiver action |";
+        let section = section(SPEC, "### 10.13 Wire paths").unwrap();
+        let tables = tables(&section.content);
+        let table = tables
+            .iter()
+            .find(|table| table.rows[0].trim() == HEADER)
+            .unwrap_or_else(|| panic!("no {HEADER:?} table under 10.13"));
+        let listed: Vec<&str> = table.rows[2..]
+            .iter()
+            .map(|row| {
+                let first = cells(row)[0];
+                backticked(first)
+                    .unwrap_or_else(|| panic!("rule cell {first:?} is not a code span"))
+            })
+            .collect();
+        let live: Vec<&str> = wire_path::RULES.iter().map(|(name, _)| *name).collect();
+        assert_eq!(listed, live);
+    }
+
     fn follows(line: &str, needle: &str, accept: impl Fn(&[u8]) -> bool) -> bool {
         line.match_indices(needle)
             .any(|(at, _)| accept(&line.as_bytes()[at + needle.len()..]))
     }
 
     /// A line that cites a planning artefact (a task id, a lettered review criterion, a
-    /// review round) instead of the behaviour it tests. The needles are assembled at
-    /// runtime so this file does not spell them. A task id quoted inside a code span or
-    /// a string literal is fixture input, not a citation, and a line that names the
-    /// `ILLUSTRATIVE_IDS` list is the fixture that keeps one such id on purpose.
+    /// review round, a ruling) instead of the behaviour it tests, in any letter case. The
+    /// needles are assembled at runtime so this file does not spell them. A task id quoted
+    /// inside a code span or a string literal is fixture input, not a citation, and a line
+    /// that names the `ILLUSTRATIVE_IDS` list is the fixture that keeps one such id on
+    /// purpose.
     fn cites_a_plan_label(line: &str) -> bool {
         if line.contains("ILLUSTRATIVE_IDS") {
             return false;
         }
-        let task = ["TASK", "-"].concat();
-        let criterion = ["criterion", " ("].concat();
-        let round = ["review", " round "].concat();
-        let plain = [
-            ["Plan", " criterion"].concat(),
-            ["plan", " ruling"].concat(),
+        let line = line.to_ascii_lowercase();
+        let task = ["task", "-"].concat();
+        let lettered = [
+            "criterion".to_string(),
+            "acceptance".to_string(),
+            "spec".to_string(),
+            ["usage", " probe"].concat(),
+            "amendment".to_string(),
         ];
-        follows(&without_quoted(line), &task, |rest| {
+        let rounds = [
+            ["probe,", " round "].concat(),
+            ["review", " round "].concat(),
+        ];
+        let ruling = ["ruling", " "].concat();
+        let plain = [
+            ["plan", " criterion"].concat(),
+            ["plan", " ruling"].concat(),
+            ["user", " ruling"].concat(),
+        ];
+        let letter_in_parens = |rest: &[u8]| {
+            rest.first() == Some(&b'(')
+                && rest.get(1).is_some_and(u8::is_ascii_lowercase)
+                && rest.get(2) == Some(&b')')
+        };
+        let after_optional_round = |rest: &[u8]| {
+            let rest = match rest {
+                [b' ', b'r', digit, rest @ ..] if digit.is_ascii_digit() => rest,
+                rest => rest,
+            };
+            letter_in_parens(rest.strip_prefix(b" ").unwrap_or(rest))
+        };
+        let comment_text = line
+            .trim_start()
+            .strip_prefix("//")
+            .map(|text| text.trim_start_matches('/').trim_start());
+        follows(&without_quoted(&line), &task, |rest| {
             rest.first().is_some_and(u8::is_ascii_digit)
-        }) || follows(line, &criterion, |rest| {
-            rest.first().is_some_and(u8::is_ascii_lowercase) && rest.get(1) == Some(&b')')
-        }) || follows(line, &round, |rest| {
-            rest.first().is_some_and(u8::is_ascii_digit)
-        }) || plain.iter().any(|needle| line.contains(needle.as_str()))
+        }) || lettered
+            .iter()
+            .any(|needle| follows(&line, needle, after_optional_round))
+            || comment_text.is_some_and(|text| letter_in_parens(text.as_bytes()))
+            || rounds.iter().chain(std::iter::once(&ruling)).any(|needle| {
+                follows(&line, needle, |rest| {
+                    rest.first().is_some_and(u8::is_ascii_digit)
+                })
+            })
+            || plain.iter().any(|needle| line.contains(needle.as_str()))
     }
 
     fn without_quoted(line: &str) -> String {
@@ -2930,8 +2999,19 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
     fn plan_label_scanner_trips_each_shape_and_spares_prose() {
         for hit in [
             ["// see TASK", "-118 for why"].concat(),
+            ["// see task", "-118 for why"].concat(),
             ["/// Usage probe, criterion", " (b): the root"].concat(),
+            ["/// Criterion", " (b): the root"].concat(),
+            ["/// acceptance", " (c): the peer"].concat(),
+            ["// the spec", "(a) says"].concat(),
+            ["/// usage", " probe r2 (d): bare"].concat(),
+            ["/// amendment", " (b) covers"].concat(),
+            "/// (x) the second reply".to_string(),
+            "// (a) the second reply".to_string(),
+            ["// ruling", " 3 settled it"].concat(),
+            ["// per the user", " ruling"].concat(),
             ["// ---- review", " round 2 ----"].concat(),
+            ["// ---- usage probe,", " round 2 ----"].concat(),
             ["/// Plan", " criterion (f): at every cap"].concat(),
             ["// the plan", " ruling was"].concat(),
         ] {
@@ -2940,8 +3020,11 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
         for miss in [
             "// the TASK list is drained".to_string(),
             "// a criterion (the first) applies".to_string(),
+            "// the rule (a) above".to_string(),
+            "// a spec (RFC) is cited".to_string(),
             "// reviewed in round 2 of the audit".to_string(),
-            "// the plan criterion is unmet".to_string(),
+            "// the ruling stands".to_string(),
+            "// a planned criterion is unmet".to_string(),
             "// B6 and G8 are hex here".to_string(),
             ["// the rule quotes `// TASK", "-002` as its example"].concat(),
             ["let id = \"TASK", "-002\";"].concat(),

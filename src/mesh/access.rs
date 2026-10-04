@@ -4449,7 +4449,7 @@ mod tests {
         installed.stop().await;
     }
 
-    /// (c)/(g): a request is decided once. A second `grant` or a `refuse` after the
+    /// A request is decided once. A second `grant` or a `refuse` after the
     /// grant is a typed error naming the id, the peer hears exactly one decision and the
     /// `MeshAccessDecided` hook fires exactly once.
     #[cfg(unix)]
@@ -4869,7 +4869,7 @@ mod tests {
         stub.stop().await;
     }
 
-    /// Spec (b): the human line is "the same tokens in the same order, laid out across
+    /// The human line is "the same tokens in the same order, laid out across
     /// lines so the notification caps never cut the verbs". The longest request the wire
     /// admits is 16 max-byte paths, a 500-char reason AND a 64-char id (the id shares the
     /// message id's cap), and the reason is sanitised so peer text cannot add lines of
@@ -5020,7 +5020,7 @@ mod tests {
 
     /// The 3a3d1d1 fix re-loads the share list AFTER the send, which adds a failure
     /// point the pre-flight cannot see: a list that was fine before the send and is
-    /// poisoned by the time of the write. Spec (d) says the peer must have heard yes
+    /// poisoned by the time of the write. The peer must have heard yes
     /// before standing entries are written, so the peer holds exactly one `granted`
     /// standing reply, the error says so and names the id, the poisoned bytes are left
     /// untouched, nothing standing is written, the request stays pending (no decided
@@ -5134,7 +5134,7 @@ mod tests {
         stub.stop().await;
     }
 
-    /// Spec (d) writes standing entries "per the write rule", and the write rule's
+    /// A grant writes standing entries "per the write rule", and the write rule's
     /// `apply` is idempotent: when the edit made while the decision was in flight already
     /// added the very entry the grant would write (same pattern, same peer) for one of
     /// TWO requested paths, the grant adds nothing for that path and exactly one entry

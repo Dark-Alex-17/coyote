@@ -8159,7 +8159,7 @@ pub(crate) mod network {
         pair.stop_node_a().await;
     }
 
-    /// (d) + ruling 9 as a consumer sees it: a STANDING grant lands as an `allow` entry
+    /// A standing grant as a consumer sees it: it lands as an `allow` entry
     /// scoped to the requesting IDENTITY (never an `override`), the decision reply says
     /// `granted` with no `expires`, and the peer can then fetch the path again and
     /// again — nothing is spent, no one-off grant exists. Asking for the same path a

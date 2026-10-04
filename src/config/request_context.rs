@@ -21512,7 +21512,7 @@ mod tests {
         }
     }
 
-    /// Usage probe (spec (a)): a macro discovered ON DISK with a literal
+    /// A macro discovered ON DISK with a literal
     /// `.mesh` step reaches the `.list macros` row renderer as
     /// `invalid ({reason})`, with the reason naming the offending step —
     /// the same policy object `list_assets("macros")` iterates.
@@ -23309,7 +23309,7 @@ mod tests {
         fixture.stop().await;
     }
 
-    /// Criterion (c), from the cache and with real entries: a peer heard on the mesh is
+    /// Completion from the cache and with real entries: a peer heard on the mesh is
     /// offered for `info`, `status` and `reply` with its name in the description; an
     /// escalated question and one this node asked are offered for `answer`, inbound first,
     /// each described by its question text. No network call is involved.

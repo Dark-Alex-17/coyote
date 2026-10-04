@@ -3760,7 +3760,7 @@ mod tests {
         }
     }
 
-    // Usage probe (spec-first, criterion 5): `-h/--help` wins from ANY
+    // `-h/--help` wins from ANY
     // position — including when it is preceded by a token that would
     // otherwise route to Usage (unknown `-` flag) or Conflict (both scope
     // flags) — while, absent help, an unknown `-` token still routes to

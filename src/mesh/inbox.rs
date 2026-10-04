@@ -718,7 +718,7 @@ mod tests {
         assert_eq!(peer_dest8("AbC"), "abc");
     }
 
-    /// Usage probe, amendment (b): a root that is "gone again" is reported as an I/O
+    /// A root that is "gone again" is reported as an I/O
     /// failure of the inbox, never as a path leading outside it. The deterministic shapes
     /// of a gone root are a symlink whose target does not exist and a symlink to a file:
     /// both are refused as `Io`, nothing appears at the link's target, and the file a

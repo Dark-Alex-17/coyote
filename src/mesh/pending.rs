@@ -2422,7 +2422,7 @@ mod tests {
 
     // ---- usage-probe tests: spec-first patterns not pinned above ----
 
-    /// Criterion (g): both record versions moved 1 → 2 under the refuse-only regime, so a
+    /// Both record versions moved 1 → 2 under the refuse-only regime, so a
     /// file the PREVIOUS build wrote (version 1, no `thread`) is refused whole with the
     /// `schema::version_refusal` wording naming both versions and "no migration" — never
     /// read as a store with zero records, never migrated in place.

@@ -675,7 +675,7 @@ fn run_setup_sh(dir: &std::path::Path) -> (bool, String, String) {
     )
 }
 
-/// Acceptance (d)/(e), probed on the script itself rather than its text: `setup.sh` honours
+/// The setup script, probed on the script itself rather than its text: `setup.sh` honours
 /// `COYOTE_MESH_INTEROP_DIR`, re-pins a clone that drifted off its pin, verifies both `HEAD`s,
 /// prints the environment exports and writes the same to `env.sh`; a second run changes
 /// nothing and fetches nothing; a clone that cannot reach its pin is a failure that leaves
