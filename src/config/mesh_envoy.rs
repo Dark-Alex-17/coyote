@@ -1179,7 +1179,7 @@ mod tests {
     use crate::mesh::idle::IdleSink;
     use crate::mesh::limits::{PEER_RETRY_AFTER_CAPACITY, PeerLimitConfig};
     #[cfg(unix)]
-    use crate::mesh::message::PeerBody;
+    use crate::mesh::message::{PEER_REQUEST_TIMEOUT, PeerBody};
     use crate::mesh::message::{
         PeerMessageHandler, PeerRouting, PeerSurface, RawPeerMessage, is_received_reply,
         peer_lxmf_message, to_r3_body,
@@ -5494,5 +5494,367 @@ mod tests {
         assert_eq!(out.disposition, Some(Disposition::Refused));
         assert_eq!(out.retry_after, None);
         assert_eq!(out.thread.as_deref(), Some("long-1"));
+    }
+
+    // ---- usage probe, round 2 ----------------------------------------------------------
+
+    /// A peer slow to take a `/message`: every body is recorded as it arrives and held
+    /// unacknowledged until `release`, so a send to this peer stays in flight.
+    #[cfg(unix)]
+    struct StallingPeer {
+        arrived: Mutex<Vec<PeerBody>>,
+        gate: Semaphore,
+    }
+
+    #[cfg(unix)]
+    impl StallingPeer {
+        /// Displaces the stub's recorder on `/message`.
+        fn serve_on(stub: &PeerStub) -> Arc<Self> {
+            let peer = Arc::new(Self {
+                arrived: Mutex::new(Vec::new()),
+                gate: Semaphore::new(0),
+            });
+            stub.serve(MESSAGE_PATH, Arc::clone(&peer) as Arc<dyn Handler>);
+            peer
+        }
+
+        fn arrived_for(&self, id: &str) -> Vec<PeerBody> {
+            self.arrived
+                .lock()
+                .iter()
+                .filter(|body| body.in_reply_to.as_deref() == Some(id))
+                .cloned()
+                .collect()
+        }
+
+        /// From here on every held and every later request is acknowledged at once.
+        fn release(&self) {
+            self.gate.close();
+        }
+    }
+
+    #[cfg(unix)]
+    #[async_trait::async_trait]
+    impl Handler for StallingPeer {
+        async fn handle(&self, request: AdmittedRequest) -> Reply {
+            let Ok(body) = crate::mesh::message::from_r3_body(&request.body) else {
+                return Reply::Code(RefusalCode::InvalidData);
+            };
+            let id = body.id.clone();
+            self.arrived.lock().push(body);
+            // Held until the gate is closed; a closed gate refuses the permit at once.
+            let _ = self.gate.acquire().await;
+            Reply::Value(crate::mesh::message::received_reply(&id))
+        }
+    }
+
+    /// The human is told and the hold armed before the peer hears `escalated`: with a
+    /// peer that takes the notice but never acknowledges it, the "asks:" line, the hold
+    /// and the filed question are all there long before the stalled send could have
+    /// ended, and `.mesh answer` given while the notice is still in flight is taken; once
+    /// the peer comes round it hears the notice and then the human's answer, in that
+    /// order, and the human never hears the notice failed.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn usage_probe_a_stalled_escalated_notice_delays_neither_the_human_nor_the_hold() {
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-probe-stall");
+        let (source, _source) = stub_envoy_source();
+        let app = app_holding_for(30);
+        let link = LiveLink::open("envoy-probe-stall", &app).await;
+        let peer = StallingPeer::serve_on(&link.stub);
+        let idle = HoldWatchingSink::attach(&app, "live-stall");
+        let store = app.mesh.inbound_store().expect("install opens the store");
+        let runner = EnvoyRunner::start_with(
+            Arc::clone(&app),
+            escalating_drive(|value| {
+                format!(
+                    "the human said: {}",
+                    value["answer"].as_str().unwrap_or("?")
+                )
+            }),
+        );
+        *idle.runner.lock() = Arc::downgrade(&runner);
+        runner.attach();
+        let asked_at = std::time::Instant::now();
+        app.mesh
+            .deliver_peer(link.ask("live-stall", "merge the branch"));
+        wait_until("the human to be told", || {
+            idle.held_when_pushed("asks: Should we merge?").is_some()
+        })
+        .await;
+        // A stalled send costs the peer request timeout; the human did not pay it.
+        assert!(
+            asked_at.elapsed() < PEER_REQUEST_TIMEOUT / 2,
+            "the human waited on the peer: {:?}",
+            asked_at.elapsed()
+        );
+        assert_eq!(
+            idle.held_when_pushed("asks: Should we merge?"),
+            Some(true),
+            "{:?}",
+            idle.pushed.lock()
+        );
+        assert!(runner.holds("live-stall"));
+        assert!(store.get("live-stall").unwrap().is_some());
+        wait_until("the notice to reach the stalled peer", || {
+            peer.arrived_for("live-stall").len() == 1
+        })
+        .await;
+        assert!(
+            idle.pushed
+                .lock()
+                .iter()
+                .all(|(text, _)| !text.contains("could not tell")),
+            "{:?}",
+            idle.pushed.lock()
+        );
+
+        // The human answers while the notice is still in flight; then the peer comes round.
+        assert!(runner.answer("live-stall", "yes"));
+        peer.release();
+        wait_until("the peer to hear the answer", || {
+            peer.arrived_for("live-stall").len() >= 2
+        })
+        .await;
+        runner.stop().await;
+
+        let heard = peer.arrived_for("live-stall");
+        assert_eq!(heard.len(), 2, "{heard:?}");
+        assert_escalated_notice(&heard[0], "live-stall");
+        assert_eq!(heard[1].kind, PeerKind::Reply);
+        assert_eq!(heard[1].disposition, Some(Disposition::Answered));
+        assert_eq!(heard[1].thread.as_deref(), Some("live-stall"));
+        assert_eq!(heard[1].content, "the human said: yes");
+        assert!(
+            idle.pushed
+                .lock()
+                .iter()
+                .all(|(text, _)| !text.contains("could not tell")),
+            "{:?}",
+            idle.pushed.lock()
+        );
+        assert!(store.get("live-stall").unwrap().is_none());
+        assert!(!runner.holds("live-stall"));
+
+        link.close(&app).await;
+        source.remove_dir();
+    }
+
+    /// A notice the peer has taken but not acknowledged is cut off by the run's
+    /// cancellation: the human hears at once that the peer could not be told, long before
+    /// the stalled send would have timed out, and the run ends as the hand-off an
+    /// escalated run always is, with the question still on file and no "interrupted"
+    /// line; once the peer comes round it hears the hand-off `Message`, and the human's
+    /// late `.mesh answer` still reaches it and closes the question.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn usage_probe_an_interrupt_cuts_a_stalled_notice_short_and_the_run_hands_off() {
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-probe-stall-cut");
+        let (source, _source) = stub_envoy_source();
+        let app = app_holding_for(300);
+        let link = LiveLink::open("envoy-probe-stall-cut", &app).await;
+        let peer = StallingPeer::serve_on(&link.stub);
+        let idle = RecordingIdleSink::attach(&app);
+        let store = app.mesh.inbound_store().expect("install opens the store");
+        let runner = EnvoyRunner::start_with(Arc::clone(&app), stuck_escalating_drive());
+        runner.attach();
+        app.mesh
+            .deliver_peer(link.ask("live-stall-cut", "merge the branch"));
+        wait_until("the notice to reach the stalled peer", || {
+            peer.arrived_for("live-stall-cut").len() == 1
+        })
+        .await;
+        assert!(idle.has("asks: Should we merge?"), "{:?}", idle.texts());
+        assert!(runner.holds("live-stall-cut"));
+        assert!(!idle.has("could not tell"), "{:?}", idle.texts());
+
+        let cut_at = std::time::Instant::now();
+        runner.interrupt();
+        wait_until("the human to hear the notice was cut off", || {
+            idle.has("could not tell")
+        })
+        .await;
+        assert!(
+            cut_at.elapsed() < PEER_REQUEST_TIMEOUT / 2,
+            "the cancellation waited on the peer: {:?}",
+            cut_at.elapsed()
+        );
+        assert!(
+            idle.texts().iter().any(|text| {
+                text.contains("could not tell") && text.contains("its question was escalated")
+            }),
+            "{:?}",
+            idle.texts()
+        );
+
+        // The peer comes round: the hand-off reaches it and the run is over.
+        peer.release();
+        wait_until("the peer to hear the hand-off", || {
+            peer.arrived_for("live-stall-cut").len() >= 2
+        })
+        .await;
+        wait_until("the human to hear the hand-off", || {
+            idle.has("envoy escalated to the human")
+        })
+        .await;
+        runner.stop().await;
+
+        let heard = peer.arrived_for("live-stall-cut");
+        assert_eq!(heard.len(), 2, "{heard:?}");
+        assert_escalated_notice(&heard[0], "live-stall-cut");
+        assert_eq!(heard[1].kind, PeerKind::Message);
+        assert_eq!(heard[1].disposition, None);
+        assert_eq!(heard[1].thread.as_deref(), Some("live-stall-cut"));
+        assert_eq!(
+            heard[1].content,
+            "escalated to the human; no answer yet (ref live-stall-cut)"
+        );
+        assert_eq!(
+            idle.count("envoy escalated to the human"),
+            1,
+            "{:?}",
+            idle.texts()
+        );
+        assert_eq!(idle.count("envoy interrupted"), 0, "{:?}", idle.texts());
+        assert!(!runner.holds("live-stall-cut"));
+        assert!(store.get("live-stall-cut").unwrap().is_some());
+
+        // The human's late answer still reaches the peer and closes the question.
+        app.mesh
+            .answer_inbound("live-stall-cut", "yes, merge it")
+            .await
+            .unwrap();
+        wait_until("the peer to hear the late reply", || {
+            peer.arrived_for("live-stall-cut").len() >= 3
+        })
+        .await;
+        let heard = peer.arrived_for("live-stall-cut");
+        assert_eq!(heard.len(), 3, "{heard:?}");
+        assert_eq!(heard[2].kind, PeerKind::Reply);
+        assert_eq!(heard[2].disposition, Some(Disposition::Answered));
+        assert_eq!(heard[2].content, "yes, merge it");
+        assert!(store.get("live-stall-cut").unwrap().is_none());
+
+        link.close(&app).await;
+        source.remove_dir();
+    }
+
+    /// A notice the run's cancellation cuts off is dropped before `send_peer` could fire
+    /// its hook, so the runner fires `mesh.message.failed` for it instead: exactly one,
+    /// for the notice's id, with class `cancelled`.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn a_cut_off_escalated_notice_fires_message_failed_as_cancelled() {
+        use crate::mesh::events::{RecordingHookSink, env_value};
+
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-stall-hook");
+        let (source, _source) = stub_envoy_source();
+        let app = app_holding_for(300);
+        let link = LiveLink::open("envoy-stall-hook", &app).await;
+        let peer = StallingPeer::serve_on(&link.stub);
+        let hooks = RecordingHookSink::attach(link.started.runtime.hooks());
+        let idle = RecordingIdleSink::attach(&app);
+        let runner = EnvoyRunner::start_with(Arc::clone(&app), stuck_escalating_drive());
+        runner.attach();
+        app.mesh
+            .deliver_peer(link.ask("stall-hook", "merge the branch"));
+        wait_until("the notice to reach the stalled peer", || {
+            peer.arrived_for("stall-hook").len() == 1
+        })
+        .await;
+        assert!(
+            !hooks
+                .snapshot()
+                .iter()
+                .any(|(event, _)| *event == HookEvent::MeshMessageFailed),
+            "{:?}",
+            hooks.snapshot()
+        );
+
+        runner.interrupt();
+        wait_until("the human to hear the notice was cut off", || {
+            idle.has("could not tell")
+        })
+        .await;
+        peer.release();
+        wait_until("the peer to hear the hand-off", || {
+            peer.arrived_for("stall-hook").len() >= 2
+        })
+        .await;
+        runner.stop().await;
+
+        let notice_id = peer.arrived_for("stall-hook")[0].id.clone();
+        let failed: Vec<_> = hooks
+            .snapshot()
+            .into_iter()
+            .filter(|(event, _)| *event == HookEvent::MeshMessageFailed)
+            .map(|(_, envs)| envs)
+            .collect();
+        assert_eq!(failed.len(), 1, "{failed:?}");
+        let envs = &failed[0];
+        assert_eq!(
+            env_value(envs, "COYOTE_MESH_MESSAGE_ID"),
+            Some(notice_id.as_str())
+        );
+        assert_eq!(env_value(envs, "COYOTE_MESH_MESSAGE_KIND"), Some("reply"));
+        assert_eq!(
+            env_value(envs, "COYOTE_MESH_PEER_DESTINATION"),
+            Some(link.to.as_str())
+        );
+        assert_eq!(
+            env_value(envs, "COYOTE_MESH_ERROR_CLASS"),
+            Some("cancelled")
+        );
+        assert_eq!(env_value(envs, "COYOTE_MESH_ERROR"), Some("cancelled"));
+
+        link.close(&app).await;
+        source.remove_dir();
+    }
+
+    /// The marker is read after the text is cleaned the way peer-facing text is, and only
+    /// when it leads: a byte-order mark, a terminal escape or blank lines ahead of
+    /// `REFUSED:` still make a decline whose words omit the marker and lead with no
+    /// blank; a marker whose words are all invisible falls back to the fixed sentence;
+    /// a marker mid-sentence or in another case stays an answer, cleaned the same way.
+    #[test]
+    fn usage_probe_the_refused_marker_is_read_after_cleaning_and_only_when_it_leads() {
+        let declined = |text: &str| match classify_answer(text) {
+            EnvoyOutcome::Declined(words) => words,
+            _ => panic!("{text:?} was not a decline"),
+        };
+        let answered = |text: &str| match classify_answer(text) {
+            EnvoyOutcome::Answered(words) => words,
+            _ => panic!("{text:?} was not an answer"),
+        };
+        assert_eq!(
+            declined("\u{FEFF}REFUSED: ask via /access"),
+            "ask via /access"
+        );
+        assert_eq!(
+            declined("\x1b[31mREFUSED: ask via /access\x1b[0m"),
+            "ask via /access"
+        );
+        assert_eq!(
+            declined("\n\n  REFUSED:  ask via /access\n"),
+            "ask via /access"
+        );
+        assert_eq!(declined("REFUSED:ask via /access"), "ask via /access");
+        assert_eq!(
+            declined("REFUSED: \u{200B}\u{FEFF}\t"),
+            DECLINED_FALLBACK_TEXT
+        );
+        assert_eq!(answered("I REFUSED: nothing"), "I REFUSED: nothing");
+        assert_eq!(answered("refused: lower case"), "refused: lower case");
+        assert_eq!(
+            answered("\u{200B}The word REFUSED: mid-sentence is an answer"),
+            "The word REFUSED: mid-sentence is an answer"
+        );
+        assert!(matches!(
+            classify_answer("\u{200B}\x1b[0m \n"),
+            EnvoyOutcome::Failed(_)
+        ));
     }
 }
