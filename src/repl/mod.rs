@@ -2,6 +2,8 @@ mod completer;
 mod highlighter;
 pub(crate) mod idle;
 pub(crate) mod mesh;
+#[cfg(test)]
+pub(crate) mod mesh_share_vectors;
 mod printer;
 mod prompt;
 mod replay;

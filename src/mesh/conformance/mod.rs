@@ -15,8 +15,8 @@
 //! - `share_vectors`: the wire-path grammar and the decoders that reuse it, the share set and
 //!   the grant store on a share root built per row, the `/list` and `/fetch` handlers driven
 //!   in-process over such a root, the requester's page and reply readers, the versioning
-//!   of the stores they read, and the REPL's attachment predicate over such a root
-//!   (`ListServe`, `FetchServe`, `FetchClient`, `Attachment`). Rust only, every platform.
+//!   of the stores they read (`WirePath`, `ShareSet`, `GrantStore`, `StoreSchema`,
+//!   `ListServe`, `FetchServe`, `FetchClient`). Rust only, every platform.
 //! - `access_vectors`: the `/access` request and reply tables, the rate rule over a bare
 //!   `MeshSlot`, the LXMF carriage and its routing, the human's decision reply and the
 //!   requester's correlation of it, and the envoy's outcome wording (`AccessRequest`,
@@ -27,6 +27,10 @@
 //!   under the share root and the grant a reference attachment lends, run over the loopback
 //!   node pair of `r3::tests::network`. The table is declared everywhere so coverage counts
 //!   it; the executor is `#[cfg(unix)]` with the fixtures it drives.
+//! - `crate::repl::mesh_share_vectors`: the REPL's attachment predicate over a share root
+//!   built per row (`Attachment`). Defined beside the predicate because its rows build the
+//!   request context the mesh module may not name; listed here so coverage counts it. Rust
+//!   only, every platform.
 //! - `interop`: the protocol exercised against the pinned Python Reticulum/LXMF reference,
 //!   spawned as a subprocess. Those tests are `#[ignore]`d and gated on `COYOTE_MESH_INTEROP=1`;
 //!   `scripts/mesh-interop/setup.sh` prepares the reference and prints the environment they need.
@@ -64,7 +68,7 @@ mod netns;
 
 /// Which side of a requirement a vector probes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Kind {
+pub(crate) enum Kind {
     /// A conforming input; the receiver accepts it and the decoded fields are checked.
     Valid,
     /// An input at a cap or an edge the spec fixes (exact length, last allowed value).
@@ -74,7 +78,7 @@ pub(super) enum Kind {
 }
 
 /// One row of a module's vector table, as the coverage report sees it.
-pub(super) struct Listed {
+pub(crate) struct Listed {
     pub id: &'static str,
     pub kind: Kind,
     pub family: &'static str,
@@ -660,6 +664,7 @@ fn all_listed() -> Vec<Listed> {
     listed.extend(share_vectors::listed());
     listed.extend(access_vectors::listed());
     listed.extend(live_vectors::listed());
+    listed.extend(crate::repl::mesh_share_vectors::listed());
     listed.extend(interop_ids::listed());
     listed
 }
@@ -1302,15 +1307,21 @@ mod tests {
     /// Each test of `EXECUTED_BY` is defined in a conformance module that names the family it
     /// is claimed to run, as the `"Family"` literal of a vector table or the `` `Family` `` of
     /// a doc comment, so a test cannot be credited with a family from another module. This
-    /// file names every family in `EXECUTED_BY` itself, so it is left out of the match.
+    /// file names every family in `EXECUTED_BY` itself, so it is left out of the match. The
+    /// one family that drives the REPL's attachment predicate is defined beside that
+    /// predicate, so its module is read alongside the ones in this directory.
     #[test]
     fn executed_by_names_tests_in_the_module_of_their_family() {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mesh/conformance");
-        let sources: Vec<(String, String)> = std::fs::read_dir(&dir)
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(src.join("mesh/conformance"))
             .unwrap()
             .map(|entry| entry.unwrap().path())
             .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
             .filter(|path| path.file_name().is_some_and(|name| name != "mod.rs"))
+            .collect();
+        paths.push(src.join("repl/mesh_share_vectors.rs"));
+        let sources: Vec<(String, String)> = paths
+            .into_iter()
             .map(|path| {
                 let source = std::fs::read_to_string(&path).unwrap();
                 (
@@ -1342,7 +1353,7 @@ mod tests {
         assert_eq!(
             missing,
             Vec::<String>::new(),
-            "EXECUTED_BY names tests that are not defined in a src/mesh/conformance/ module naming their family"
+            "EXECUTED_BY names tests that are not defined in a conformance module naming their family"
         );
     }
 
