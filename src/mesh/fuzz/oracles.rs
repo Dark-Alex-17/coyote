@@ -2180,7 +2180,7 @@ fn check_card(value: &Value) -> Result<(), String> {
 
 /// The rule ids `WirePath::parse` may refuse with, as the `invalid_path` reply carries
 /// them; a new rule is a wire vocabulary change and lands here deliberately.
-const WIRE_PATH_RULES: [&str; 14] = [
+pub(super) const WIRE_PATH_RULES: [&str; 14] = [
     "empty",
     "length",
     "control",

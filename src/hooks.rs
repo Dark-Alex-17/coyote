@@ -1676,9 +1676,18 @@ mod tests {
     fn the_readme_counts_the_hook_events_the_registry_declares() {
         const README: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"));
         let n = HookEvent::ALL.len();
+        let counts: Vec<&str> = README
+            .match_indices('(')
+            .filter_map(|(start, _)| {
+                let rest = &README[start + 1..];
+                let digits = rest.find(|c: char| !c.is_ascii_digit())?;
+                (digits > 0 && rest[digits..].starts_with(" events)"))
+                    .then(|| &README[start..start + 1 + digits + " events)".len()])
+            })
+            .collect();
         assert!(
-            README.contains(&format!("({n} events)")),
-            "README.md must say ({n} events) where n = HookEvent::ALL.len()"
+            counts == [format!("({n} events)")],
+            "README.md must say ({n} events) exactly once, where n = HookEvent::ALL.len(); found {counts:?}"
         );
     }
 

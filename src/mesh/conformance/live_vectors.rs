@@ -654,11 +654,13 @@ mod loopback {
             .await;
         let listed_after_grant = live.b_asks_a(LIST_PATH, listing_body()).await;
 
-        wait_until("the served fetch to fire mesh.fetch.served", || {
+        wait_until("both served fetches to fire mesh.fetch.served", || {
             live.sink
                 .snapshot()
                 .iter()
-                .any(|(event, _)| *event == HookEvent::MeshFetchServed)
+                .filter(|(event, _)| *event == HookEvent::MeshFetchServed)
+                .count()
+                >= 2
         })
         .await;
         Cycle {
@@ -764,6 +766,8 @@ mod loopback {
                 assert_eq!(entries_of(&run.listed_after_grant), ["docs/a.md"]);
             }
             Case::NoSideChannel => {
+                let served = fires_of(&run.fired, HookEvent::MeshFetchServed);
+                assert_eq!(served.len(), 2, "{:?}", run.fired);
                 let requested = fires_of(&run.fired, HookEvent::MeshAccessRequested);
                 assert_eq!(requested.len(), 1, "{:?}", run.fired);
                 assert_eq!(

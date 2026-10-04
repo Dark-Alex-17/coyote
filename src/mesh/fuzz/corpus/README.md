@@ -78,6 +78,10 @@ under kind `0x00`.
 The four `codecs/` files that spell the announce magic or an LXMF type tag are pinned to
 the live constants by `fuzz_codec_corpus_files_carrying_wire_identifiers_are_built_from_the_live_constants`;
 after a rename, `COYOTE_MESH_FUZZ_WRITE_CORPUS=1 cargo test --all fuzz_codec_corpus_files_carrying` rewrites them.
+The `codecs/MESH-FETCH-004-<rule>.bin` files, one per wire-path rule, are pinned to the live
+path limits by `fuzz_codec_corpus_wire_path_seeds_break_exactly_the_rule_their_name_claims`;
+after a limit or rule change, `COYOTE_MESH_FUZZ_WRITE_CORPUS=1 cargo test --all fuzz_codec_corpus_wire_path`
+rewrites them.
 
 `.gitattributes` marks `src/mesh/fuzz/corpus/**/*.bin` as `binary`. Without it Git's text
 heuristic can take a small msgpack file for text and rewrite a `0x0a` byte (`c4 0a`, the

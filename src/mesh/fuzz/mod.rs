@@ -720,6 +720,14 @@ fn fuzz_codec_corpus_wire_path_seeds_break_exactly_the_rule_their_name_claims() 
     }
 }
 
+#[test]
+fn fuzz_wire_path_oracle_names_the_grammar_rules_in_the_order_they_are_checked() {
+    assert_eq!(
+        oracles::WIRE_PATH_RULES,
+        super::wire_path::RULES.map(|(id, _)| id)
+    );
+}
+
 /// Usage probe: the decoder and the fuzz oracle both read the version at a
 /// magic-length-relative offset. Every prefix of a valid announce, the exact one-short
 /// header (magic + 1 byte) and the exact header (magic + 2 bytes) must agree between the
@@ -1124,6 +1132,7 @@ fn fuzz_codec_tag_table_in_the_readme_matches_the_code() {
     for pin in [
         WRITE_CORPUS_ENV,
         "fuzz_codec_corpus_files_carrying_wire_identifiers_are_built_from_the_live_constants",
+        "fuzz_codec_corpus_wire_path_seeds_break_exactly_the_rule_their_name_claims",
     ] {
         assert!(readme.contains(pin), "the README does not name {pin}");
     }
