@@ -3624,8 +3624,8 @@ mod tests {
 
     /// A file whose root-relative path alone is longer than MAX_PATH is served and listed
     /// like any other, since the root and the file resolve to one spelling however deep
-    /// they sit, while an equally deep file outside the root stays unserved and unlisted
-    /// whether or not a link under the root points at it.
+    /// they sit, while an equally deep link under the root that escapes it stays unserved
+    /// and unlisted.
     #[test]
     fn a_file_deeper_than_max_path_is_served_and_an_equally_deep_escape_is_not() {
         let fx = Fixture::new("shares-deep-path");
@@ -3634,14 +3634,17 @@ mod tests {
         let escape = format!("{deep}/escape.md");
         assert!(inside.len() > 260);
         fx.file(&inside);
-        let outside = fx._tmp.path.join(&escape);
-        fs::create_dir_all(outside.parent().unwrap()).unwrap();
+        // The link sits past MAX_PATH; its target is shallow on purpose. Windows accepts
+        // a long link path (std spells it in verbatim form) but hands the target string
+        // to `CreateSymbolicLinkW` as written, where a plain path past MAX_PATH is
+        // refused with ERROR_INVALID_PARAMETER.
+        let outside = fx._tmp.path.join("outside.md");
         fs::write(&outside, "outside").unwrap();
         #[cfg(unix)]
-        fx.link(&escape, &format!("../../../../{escape}"));
+        fx.link(&escape, "../../../../outside.md");
         #[cfg(windows)]
         std::os::windows::fs::symlink_file(&outside, fx.root.join(&escape))
-            .expect("symlink privilege");
+            .expect("create the escape symlink");
         assert!(
             fs::symlink_metadata(fx.root.join(&escape))
                 .unwrap()
