@@ -7,8 +7,9 @@
 //! peer's. A file is written through a randomly named `.tmp-<uuid>` sibling and
 //! hard-linked into place, so no name a peer chooses can alias the temp file and nothing
 //! already at the target is ever overwritten. On Unix every directory the inbox creates
-//! is `0o700` and every file it writes is `0o600`; a directory that already existed, an
-//! operator's `mesh.fetch.inbox_dir` or the cache dir, keeps the mode it had.
+//! is `0o700`, the operator's `mesh.fetch.inbox_dir` and any missing parent of it
+//! included when they do not exist yet, and every file it writes is `0o600`; a directory
+//! that already existed, that same `inbox_dir` or the cache dir, keeps the mode it had.
 
 use crate::mesh::wire_path::WirePath;
 use crate::mesh::{canonical_hash, canonicalize, hex_lower, mesh_cache_dir};
@@ -173,30 +174,18 @@ fn peer_dir(peer_destination: &str) -> String {
     canonical.unwrap_or_else(|| peer_destination.to_ascii_lowercase())
 }
 
-/// `create_dir_all` that leaves every directory it creates owner-only. A `DirBuilder`
-/// mode applies to the leaf alone and the parents get the umask's default, so the
-/// ancestors that do not exist yet are recorded first and set to `0o700` afterwards,
-/// parents first; a directory that already existed is not touched.
+/// `create_dir_all` that creates every directory it has to create owner-only, in the
+/// mkdir itself rather than by a chmod afterwards; a directory that already existed is
+/// not touched.
 fn create_dirs_owner_only(path: &Path) -> io::Result<()> {
-    let missing: Vec<&Path> = path
-        .ancestors()
-        .take_while(|dir| !dir.exists())
-        .filter(|dir| !dir.as_os_str().is_empty())
-        .collect();
-    fs::create_dir_all(path)?;
-    missing.into_iter().rev().try_for_each(make_owner_only)
-}
-
-#[cfg(unix)]
-fn make_owner_only(dir: &Path) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
-}
-
-#[cfg(not(unix))]
-fn make_owner_only(_dir: &Path) -> io::Result<()> {
-    Ok(())
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)
 }
 
 fn ensure_inside(canonical_root: &Path, path: &Path) -> Result<(), StageError> {

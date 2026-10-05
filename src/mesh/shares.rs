@@ -369,6 +369,10 @@ impl ShareLocations {
         workspace_root: &Path,
         workspace_config_dir_names: Vec<String>,
     ) -> Self {
+        debug_assert!(
+            !workspace_config_dir_names.is_empty(),
+            "share locations given no workspace config directory name"
+        );
         let runtime_name = workspace_config_dir_names
             .first()
             .map(String::as_str)
@@ -1574,7 +1578,7 @@ pub(crate) fn is_broad_pattern(pattern: &str) -> bool {
 }
 
 /// What a completion for `allow` or `deny` must not offer: `.git`, the workspace config
-/// directory under either name it goes by, or anything the built-in deny matches by
+/// directory under every name it goes by, or anything the built-in deny matches by
 /// name, judged across case when the root folds it so nothing is offered that the verb
 /// then refuses. Built once per completion, since the built-in set is compiled on
 /// construction and asked about every entry of the directory. No I/O. The built-in set
