@@ -348,6 +348,11 @@ pub(crate) mod test_support {
             let seq = SEQ.fetch_add(1, Ordering::Relaxed);
             let path = env::temp_dir().join(format!("coyote-mesh-{tag}-{nanos}-{seq}"));
             fs::create_dir_all(&path).unwrap();
+            // The temp root is handed out resolved, since what the code under test hands
+            // back is resolved too: macOS reaches /var through a link and Windows may name
+            // the profile by its short form, and a fixture joined on the raw root would
+            // never equal either.
+            let path = dunce::canonicalize(&path).unwrap();
             Self { path }
         }
     }
