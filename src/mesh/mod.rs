@@ -1358,6 +1358,60 @@ mod tests {
         }
     }
 
+    /// A single name of 254 or 255 characters pushes the per-name probe itself past
+    /// MAX_PATH, so dunce keeps the prefix for the name alone and the path keeps its
+    /// prefix here: the edge fails closed rather than resolving to a second spelling.
+    #[cfg(windows)]
+    #[test]
+    fn without_verbatim_disk_keeps_the_prefix_for_a_name_the_probe_cannot_measure() {
+        for len in [254, 255] {
+            let kept = format!(r"\\?\C:\x\{}\a.md", "n".repeat(len));
+            assert_eq!(
+                without_verbatim_disk(PathBuf::from(&kept)),
+                PathBuf::from(&kept),
+                "{len}"
+            );
+        }
+        let stripped = format!(r"\\?\C:\x\{}\a.md", "n".repeat(253));
+        assert_eq!(
+            without_verbatim_disk(PathBuf::from(&stripped)),
+            PathBuf::from(&stripped[4..])
+        );
+    }
+
+    /// A verbatim path takes `.` and `..` literally, so one holding either keeps its
+    /// prefix: stripping it would let the plain form resolve them away.
+    #[cfg(windows)]
+    #[test]
+    fn without_verbatim_disk_keeps_the_prefix_around_dot_components() {
+        let deep = "d".repeat(300);
+        for kept in [
+            format!(r"\\?\C:\x\..\{deep}\a.md"),
+            format!(r"\\?\C:\x\.\{deep}\a.md"),
+            r"\\?\C:\x\..\a.md".to_string(),
+            r"\\?\C:\x\.\a.md".to_string(),
+        ] {
+            assert_eq!(
+                without_verbatim_disk(PathBuf::from(&kept)),
+                PathBuf::from(&kept),
+                "{kept}"
+            );
+        }
+    }
+
+    /// A deep candidate on another drive comes out plain and is still no descendant of a
+    /// root on this one: the prefix check stays a prefix check on the drive letter too.
+    #[cfg(windows)]
+    #[test]
+    fn without_verbatim_disk_keeps_another_drive_outside_the_root() {
+        let deep = format!(r"{}\{}", "a".repeat(200), "b".repeat(200));
+        let candidate = without_verbatim_disk(PathBuf::from(format!(r"\\?\D:\{deep}\a.md")));
+        let root = PathBuf::from(format!(r"C:\{deep}"));
+        assert_eq!(candidate, PathBuf::from(format!(r"D:\{deep}\a.md")));
+        assert_ne!(candidate, root);
+        assert!(!candidate.starts_with(&root));
+    }
+
     #[test]
     fn mesh_module_never_names_the_request_ctx() {
         let sources = rust_sources();

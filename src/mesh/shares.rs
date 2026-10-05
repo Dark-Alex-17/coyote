@@ -3622,6 +3622,36 @@ mod tests {
         assert!(rules.permits(&wire("README.md"), &fx.file("README.md")));
     }
 
+    /// A file whose root-relative path alone is longer than MAX_PATH is served and listed
+    /// like any other, since the root and the file resolve to one spelling however deep
+    /// they sit, while an equally deep file outside the root stays unserved and unlisted
+    /// whether or not a link under the root points at it.
+    #[test]
+    fn a_file_deeper_than_max_path_is_served_and_an_equally_deep_escape_is_not() {
+        let fx = Fixture::new("shares-deep-path");
+        let deep = format!("{}/{}/{}", "a".repeat(90), "b".repeat(90), "c".repeat(90));
+        let inside = format!("{deep}/deep.md");
+        let escape = format!("{deep}/escape.md");
+        assert!(inside.len() > 260);
+        fx.file(&inside);
+        let outside = fx._tmp.path.join(&escape);
+        fs::create_dir_all(outside.parent().unwrap()).unwrap();
+        fs::write(&outside, "outside").unwrap();
+        #[cfg(unix)]
+        fx.link(&escape, &format!("../../../../{escape}"));
+        #[cfg(windows)]
+        let _ = std::os::windows::fs::symlink_file(&outside, fx.root.join(&escape));
+        let mut set = fx.load();
+        set.apply(allow("**"), WriteScope::Global).unwrap();
+
+        assert!(matches!(fetch(&set, &inside), Served::File(_)));
+        assert!(is_not_shared(&fetch(&set, &escape)));
+        assert_eq!(
+            listed_paths(&listing(&set, None, DEFAULT_LIST_WALK_BOUND)),
+            [inside.as_str()]
+        );
+    }
+
     #[test]
     fn a_share_root_that_does_not_resolve_fails_closed_without_naming_it() {
         let fx = Fixture::new("shares-no-root");
