@@ -818,6 +818,82 @@ mod tests {
         assert_eq!(peer_dir(DEST32), DEST32);
     }
 
+    /// A destination that is not a canonical 32-hex hash is a programming error at the
+    /// call sites (both derive it from the proved identity), so a debug build refuses it
+    /// loudly instead of quietly keying a directory on peer-shaped text.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "non-canonical destination")]
+    fn usage_probe_a_non_canonical_destination_is_a_debug_assertion_failure() {
+        let _ = peer_dir("abcdef01");
+    }
+
+    /// The second copy of a name with different bytes lands beside the first under the
+    /// `<stem>-<hash8><ext>` suffix, and that file is owner-only too: every file the
+    /// stage writes, not just the first, is mode 0600 under `umask 0`.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(umask)]
+    fn usage_probe_a_collision_suffixed_copy_is_owner_only_as_well() {
+        let _umask = crate::testing::UmaskGuard::zero();
+        let tmp = TempDir::new("inbox-owner-only-suffix");
+        let inbox = staging(&tmp);
+        let rel = WirePath::parse("docs/a.md").unwrap();
+
+        let first = inbox.stage(PEER, &rel, &digest(b"one"), b"one").unwrap();
+        let second = inbox.stage(PEER, &rel, &digest(b"two"), b"two").unwrap();
+
+        assert_ne!(first, second);
+        assert_eq!(second.parent(), first.parent());
+        let name = second.file_name().unwrap().to_str().unwrap();
+        assert!(
+            name.starts_with("a-") && name.ends_with(".md") && name.len() == "a-12345678.md".len(),
+            "{name}"
+        );
+        assert_eq!(mode_of(&first), 0o600);
+        assert_eq!(mode_of(&second), 0o600);
+        assert_eq!(fs::read(&second).unwrap(), b"two");
+        let leftovers: Vec<_> = files_under(&inbox.root)
+            .into_iter()
+            .filter(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .starts_with(".tmp-")
+            })
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    /// Layout `<root>/<32 lowercase hex>/<rel>`: the peer directory is exactly the
+    /// canonical hash, whatever case the caller spelt it in, and nothing else sits
+    /// between the root and it.
+    #[test]
+    fn usage_probe_the_staged_path_is_root_then_full_lowercase_hash_then_the_wire_path() {
+        let tmp = TempDir::new("inbox-layout-shape");
+        let inbox = staging(&tmp);
+        let rel = WirePath::parse("docs/sub/a.md").unwrap();
+
+        let staged = inbox.stage(PEER, &rel, &digest(b"x"), b"x").unwrap();
+
+        let canonical_root = dunce::canonicalize(&inbox.root).unwrap();
+        let relative = staged.strip_prefix(&canonical_root).unwrap();
+        let mut components = relative.components();
+        let peer = components.next().unwrap().as_os_str().to_str().unwrap();
+        assert_eq!(peer.len(), 32);
+        assert!(
+            peer.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
+        assert_eq!(peer, PEER.to_ascii_lowercase());
+        assert_eq!(components.as_path(), Path::new("docs/sub/a.md"));
+        assert!(
+            !canonical_root.join(&PEER[..8]).exists(),
+            "no 8-char directory"
+        );
+    }
+
     /// A root that is "gone again" is reported as an I/O failure of the inbox, never as a
     /// path leading outside it. The deterministic shapes of a gone root are a symlink
     /// whose target does not exist and a symlink to a file: both are refused as `Io`,

@@ -570,6 +570,50 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// With the workspace config dir overridden, memory discovery still looks only under
+    /// the literal `.coyote`: an index planted under the override's `memory/` is invisible,
+    /// and the one under `.coyote/memory/` is found with its directory reported there.
+    #[test]
+    #[serial_test::serial]
+    fn usage_probe_discovery_ignores_an_index_under_the_overridden_config_dir() {
+        let root = temp_root("override_discovery");
+        let workspace = root.join("ws");
+        let override_dir = workspace.join("custom-cfg");
+        let _set = crate::testing::EnvVarGuard::set(
+            crate::utils::get_env_name("workspace_config_dir"),
+            &override_dir,
+        );
+        let planted = override_dir.join(MEMORY_DIR_NAME);
+        fs::create_dir_all(&planted).unwrap();
+        fs::write(planted.join(MEMORY_INDEX_FILE_NAME), "planted").unwrap();
+        let nested = workspace.join("src");
+        fs::create_dir_all(&nested).unwrap();
+
+        assert!(
+            discover_workspace_memory(&nested).is_none(),
+            "an index under the override dir is not workspace memory"
+        );
+
+        let literal = workspace
+            .join(WORKSPACE_COYOTE_DIR_NAME)
+            .join(MEMORY_DIR_NAME);
+        fs::create_dir_all(&literal).unwrap();
+        fs::write(literal.join(MEMORY_INDEX_FILE_NAME), "idx").unwrap();
+
+        let found = discover_workspace_memory(&nested).expect("the literal dir is found");
+        assert_eq!(found.workspace_root, workspace);
+        assert_eq!(found.dir, literal);
+
+        let bootstrapped = bootstrap_workspace_memory(&workspace).unwrap();
+        assert_eq!(
+            bootstrapped, literal,
+            "bootstrap writes under the literal name too"
+        );
+        assert!(!override_dir.join(".gitignore").exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn find_git_root_returns_dir_containing_git_dir() {
         let root = temp_root("git_root");

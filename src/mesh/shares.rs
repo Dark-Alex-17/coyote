@@ -3482,6 +3482,53 @@ mod tests {
         );
     }
 
+    /// A relative override through the production constructor: the workspace share file
+    /// follows the runtime name, both names are protected directories, both are denied by
+    /// the name glob at any depth, and the literal `.coyote` keeps memory unservable.
+    #[test]
+    #[serial_test::serial]
+    fn usage_probe_a_relative_override_is_denied_under_both_names_by_glob_and_prefix() {
+        let env_name = get_env_name("workspace_config_dir");
+        let (identity, destination) = (fake_hash(0x1a), fake_hash(0x2b));
+        let peer = PeerRef {
+            identity: &identity,
+            destination: &destination,
+        };
+        let _relative = EnvVarGuard::set(&env_name, "conf/.hidden");
+        let fx = Fixture::new("shares-protected-relative-override");
+        let locations = ShareLocations::new(&fx.config_dir, &fx.root);
+        assert_eq!(
+            locations.workspace,
+            fx.root.join("conf/.hidden").join("mesh-shares.yaml")
+        );
+        let overridden = fx.file("conf/.hidden/sessions/notes.md");
+        let memory = fx.file(".coyote/memory/MEMORY.md");
+        let nested = fx.file("vendor/conf/.hidden/x.md");
+        let readme = fx.file("README.md");
+        // Existing directories only: the protected list is canonicalized, so it is read
+        // once the fixture files (and their parents) are on disk.
+        let protected = locations.protected_dirs();
+        for dir in ["conf/.hidden", WORKSPACE_COYOTE_DIR_NAME] {
+            let canonical = canonicalize(&fx.root.join(dir)).unwrap();
+            assert!(protected.contains(&canonical), "{dir}: {protected:?}");
+        }
+
+        let mut set = ShareSet::load(locations);
+        set.apply(allow("**"), WriteScope::Global).unwrap();
+        let rules = set.rules(&peer, false).unwrap();
+
+        assert!(!rules.permits(&wire("conf/.hidden/sessions/notes.md"), &overridden));
+        assert!(!rules.permits(&wire(".coyote/memory/MEMORY.md"), &memory));
+        assert!(
+            !rules.permits(&wire("vendor/conf/.hidden/x.md"), &nested),
+            "the relative name is denied at any depth"
+        );
+        assert!(rules.permits(&wire("README.md"), &readme));
+        assert!(rules.builtin.is_match("conf/.hidden/sessions/notes.md"));
+        assert!(rules.builtin.is_match("vendor/conf/.hidden/x.md"));
+        assert!(rules.builtin.is_match(".coyote/sessions/notes.md"));
+    }
+
     #[test]
     fn the_global_config_dir_is_never_served_when_the_share_root_encloses_it() {
         let fx = Fixture::enclosing("shares-protected-global");

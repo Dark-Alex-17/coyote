@@ -722,6 +722,35 @@ mod tests {
         );
     }
 
+    /// A relative override is listed as given, ahead of the literal default, and joins
+    /// under the cwd segment by segment; the memory dir never follows it. An empty
+    /// override is passed through as the empty name, which joins to the cwd itself.
+    #[test]
+    #[serial]
+    fn usage_probe_a_relative_override_is_listed_as_given_and_memory_ignores_it() {
+        let env_name = get_env_name("workspace_config_dir");
+        let cwd = env::current_dir().unwrap();
+        let root = Path::new("/ws");
+        {
+            let _relative = EnvVarGuard::set(&env_name, "conf/.hidden");
+            assert_eq!(
+                workspace_config_dirs(),
+                ["conf/.hidden", WORKSPACE_COYOTE_DIR_NAME]
+            );
+            assert_eq!(
+                workspace_config_dir_paths(),
+                [
+                    cwd.join("conf").join(".hidden"),
+                    cwd.join(WORKSPACE_COYOTE_DIR_NAME)
+                ]
+            );
+            assert_eq!(workspace_memory_dir_for(root), root.join(".coyote/memory"));
+        }
+        let _empty = EnvVarGuard::set(&env_name, "");
+        assert_eq!(workspace_config_dirs(), ["", WORKSPACE_COYOTE_DIR_NAME]);
+        assert_eq!(workspace_config_dir_paths()[0], cwd);
+    }
+
     #[test]
     #[serial]
     fn workspace_memory_stays_under_the_literal_name_when_the_config_dir_is_overridden() {

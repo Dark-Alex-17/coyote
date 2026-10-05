@@ -1110,6 +1110,24 @@ mod tests {
         assert_eq!(MeshFetch::default().inbox_dir(), None);
     }
 
+    /// The public method, not just the seam: an `inbox_dir` that exists comes back exactly
+    /// as configured even under `IS_SANDBOX`, with nothing created and the stored field
+    /// untouched (the field and the method share a name, as `vault_password_file` does).
+    #[test]
+    #[serial]
+    fn usage_probe_an_existing_inbox_dir_is_returned_as_configured_by_the_method() {
+        let _sandbox = EnvVarGuard::set("IS_SANDBOX", "1");
+        let tmp = TempDir::new("mesh-config-inbox-method-exists");
+        let fetch = MeshFetch {
+            inbox_dir: Some(tmp.path.clone()),
+            ..Default::default()
+        };
+
+        assert_eq!(fetch.inbox_dir(), Some(tmp.path.clone()));
+        assert_eq!(fetch.inbox_dir.as_deref(), Some(tmp.path.as_path()));
+        assert_eq!(std::fs::read_dir(&tmp.path).unwrap().count(), 0);
+    }
+
     #[test]
     fn fetch_block_reads_max_bytes_and_inbox_dir_and_serialises_an_unset_inbox_dir_as_null() {
         let cfg: Config = serde_yaml::from_str(
