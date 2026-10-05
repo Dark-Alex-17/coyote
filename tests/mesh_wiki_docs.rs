@@ -23,7 +23,6 @@ use std::path::{Path, PathBuf};
 const WIKI_DIR: &str = "COYOTE_WIKI_DIR";
 const RECIPE: &str = "`COYOTE_WIKI_DIR=../coyote.wiki cargo test --test mesh_wiki_docs`";
 const PROTOCOL_PATH: &str = "docs/mesh/PROTOCOL.md";
-const SCOPE_LEAD: &str = "SCOPE — Session Coordination & Presence Exchange";
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -34,10 +33,29 @@ fn read(path: impl AsRef<Path>) -> String {
     fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
+/// The protocol's name as its spec's H1 spells it, which the Mesh pages lead with.
+fn scope_lead() -> String {
+    let spec = read(repo_root().join(PROTOCOL_PATH));
+    let title = spec
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("# "))
+        .unwrap_or_else(|| panic!("{PROTOCOL_PATH} line 1 is not an H1"))
+        .trim();
+    assert!(!title.is_empty(), "{PROTOCOL_PATH} has an empty H1");
+    assert!(
+        title.starts_with("SCOPE"),
+        "{PROTOCOL_PATH}'s H1 does not name SCOPE: {title:?}"
+    );
+    title.to_string()
+}
+
 /// The wiki checkout, or `None` after printing the conventional `skipping:` line.
 /// A set variable that does not point at the wiki is a failure, not a skip.
 fn wiki_dir() -> Option<PathBuf> {
-    let value = env::var_os(WIKI_DIR).filter(|value| !value.to_string_lossy().trim().is_empty());
+    let value = env::var_os(WIKI_DIR)
+        .map(|value| value.to_string_lossy().trim().to_string())
+        .filter(|value| !value.is_empty());
     let Some(value) = value else {
         eprintln!(
             "skipping: {WIKI_DIR} unset; point it at a coyote.wiki checkout and run {RECIPE}"
@@ -297,6 +315,16 @@ fn the_hooks_page_counts_the_events_the_code_registers() {
         read(wiki.join("Hooks.md")).contains(&needle),
         "Hooks.md does not say {needle:?}; src/hooks.rs ALL has {count} events"
     );
+    let parenthetical = format!("({count} events)");
+    for (label, path) in [
+        ("README.md", repo_root().join("README.md")),
+        ("Home.md", wiki.join("Home.md")),
+    ] {
+        assert!(
+            read(path).contains(&parenthetical),
+            "{label} does not say {parenthetical:?}; src/hooks.rs ALL has {count} events"
+        );
+    }
 }
 
 #[test]
@@ -403,22 +431,24 @@ fn no_mesh_page_or_the_readme_spells_the_pre_scope_wire_vocabulary() {
 #[test]
 fn the_mesh_page_and_the_readme_mesh_section_lead_with_the_scope_expansion() {
     let Some(wiki) = wiki_dir() else { return };
+    let scope_lead = scope_lead();
     let page = read(wiki.join("Mesh.md"));
     let first = page.lines().next().unwrap_or_default();
     assert!(
-        first.starts_with(SCOPE_LEAD),
-        "Mesh.md line 1 does not open with {SCOPE_LEAD:?}: {first:?}"
+        first.starts_with(&scope_lead),
+        "Mesh.md line 1 does not open with {scope_lead:?}: {first:?}"
     );
 
     let readme = read(repo_root().join("README.md"));
-    let lead = readme
-        .lines()
-        .skip_while(|line| *line != "### Mesh")
-        .skip(1)
+    let mut after_heading = readme.lines().skip_while(|line| *line != "### Mesh");
+    after_heading
+        .next()
+        .expect("README.md has a `### Mesh` heading");
+    let lead = after_heading
         .find(|line| !line.trim().is_empty())
         .expect("README.md has text under `### Mesh`");
     assert!(
-        lead.starts_with(SCOPE_LEAD),
-        "README.md's `### Mesh` section does not open with {SCOPE_LEAD:?}: {lead:?}"
+        lead.starts_with(&scope_lead),
+        "README.md's `### Mesh` section does not open with {scope_lead:?}: {lead:?}"
     );
 }

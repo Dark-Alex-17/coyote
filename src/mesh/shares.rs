@@ -361,9 +361,23 @@ pub(crate) struct ShareLocations {
 
 impl ShareLocations {
     pub(crate) fn new(config_dir: &Path, workspace_root: &Path) -> Self {
-        Self::with_dir_names(config_dir, workspace_root, paths::workspace_config_dirs())
+        let workspace_config_dir_names = paths::workspace_config_dirs();
+        Self {
+            global: mesh_config_dir(config_dir).join("shares.yaml"),
+            workspace: workspace_root
+                .join(&workspace_config_dir_names[0])
+                .join("mesh-shares.yaml"),
+            config_dir: config_dir.to_path_buf(),
+            workspace_root: workspace_root.to_path_buf(),
+            workspace_config_dir_names,
+            mesh_cache_dir: None,
+            protected: Vec::new(),
+        }
     }
 
+    /// `new` with the names given rather than read from the process, so a test does not
+    /// depend on the env override another test may be holding.
+    #[cfg(test)]
     pub(crate) fn with_dir_names(
         config_dir: &Path,
         workspace_root: &Path,
@@ -373,13 +387,11 @@ impl ShareLocations {
             !workspace_config_dir_names.is_empty(),
             "share locations given no workspace config directory name"
         );
-        let runtime_name = workspace_config_dir_names
-            .first()
-            .map(String::as_str)
-            .unwrap_or_default();
         Self {
             global: mesh_config_dir(config_dir).join("shares.yaml"),
-            workspace: workspace_root.join(runtime_name).join("mesh-shares.yaml"),
+            workspace: workspace_root
+                .join(&workspace_config_dir_names[0])
+                .join("mesh-shares.yaml"),
             config_dir: config_dir.to_path_buf(),
             workspace_root: workspace_root.to_path_buf(),
             workspace_config_dir_names,
