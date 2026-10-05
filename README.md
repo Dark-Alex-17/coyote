@@ -343,9 +343,10 @@ The appearance of Coyote can be modified using the following settings:
 | `save_shell_history` | `true`        | Enables or disables REPL command history                                                                         |
 
 ### Mesh
-SCOPE - Session Coordination & Presence Exchange. SCOPE is a peer protocol by which running LLM sessions announce
+SCOPE — Session Coordination & Presence Exchange. SCOPE is a peer protocol by which running LLM sessions announce
 presence, share status, and exchange messages on their owners' behalf, over Reticulum, without a broker. Coyote is
 the reference implementation of SCOPE, and "mesh" is Coyote's name for its SCOPE feature.
+
 The `mesh` block controls the [Coyote Mesh](https://github.com/Dark-Alex-17/coyote/wiki/Mesh), which lets Coyote
 instances discover and message each other. It is off by default, and setting `mesh.enabled: true` requires
 `function_calling_support: true`; config loading is refused otherwise. Interface entries under `mesh.interfaces` are
