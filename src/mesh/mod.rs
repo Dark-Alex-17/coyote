@@ -223,6 +223,50 @@ pub(crate) fn refuse_symlink(path: &Path) -> Result<()> {
     }
 }
 
+/// `dunce::canonicalize`, with the `\\?\` prefix that dunce keeps on a Windows path
+/// longer than MAX_PATH dropped as well. A share root and a file deep beneath it must
+/// resolve to the same spelling or no prefix check between them can hold, and the
+/// standard library re-applies the prefix itself whenever a path needs it, so nothing
+/// below is lost. The prefix is kept whenever dunce would keep it for another reason:
+/// a reserved device name or a name the legacy form would trim.
+pub(crate) fn canonicalize(path: &Path) -> std::io::Result<PathBuf> {
+    let resolved = dunce::canonicalize(path)?;
+    #[cfg(windows)]
+    let resolved = without_verbatim_disk(resolved);
+    Ok(resolved)
+}
+
+#[cfg(windows)]
+fn without_verbatim_disk(path: PathBuf) -> PathBuf {
+    use std::path::{Component, Prefix};
+
+    let mut components = path.components();
+    if !matches!(
+        components.next(),
+        Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::VerbatimDisk(_))
+    ) {
+        return path;
+    }
+    // dunce's per-name rules are reused by asking it about each name alone, where length
+    // cannot be the reason it keeps the prefix.
+    let names_are_plain = components.all(|component| match component {
+        Component::RootDir => true,
+        Component::Normal(name) => !dunce::simplified(&Path::new(r"\\?\C:\").join(name))
+            .as_os_str()
+            .as_encoded_bytes()
+            .starts_with(br"\\?\"),
+        _ => false,
+    });
+    if !names_are_plain {
+        return path;
+    }
+    let plain = path
+        .to_str()
+        .and_then(|text| text.strip_prefix(r"\\?\"))
+        .map(PathBuf::from);
+    plain.unwrap_or(path)
+}
+
 #[cfg(test)]
 pub(crate) mod test_support {
     #[cfg(unix)]
@@ -1261,6 +1305,54 @@ mod tests {
                 .is_symlink()
         );
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 3, "no temp is left");
+    }
+
+    #[test]
+    fn canonicalize_agrees_with_dunce_on_a_short_path() {
+        let tmp = TempDir::new("canonicalize-short");
+        let file = tmp.path.join("a.md");
+        fs::write(&file, b"a").unwrap();
+
+        assert_eq!(
+            canonicalize(&file).unwrap(),
+            dunce::canonicalize(&file).unwrap()
+        );
+        assert!(canonicalize(&tmp.path.join("missing")).is_err());
+    }
+
+    /// The verbatim prefix dunce keeps for length alone goes; the one it keeps for a
+    /// name goes nowhere, and a path without one is untouched.
+    #[cfg(windows)]
+    #[test]
+    fn without_verbatim_disk_drops_the_prefix_only_when_length_was_the_reason() {
+        let deep = format!(r"\\?\C:\{}\{}\a.md", "a".repeat(200), "b".repeat(200));
+        assert!(deep.len() > 260);
+        assert_eq!(
+            without_verbatim_disk(PathBuf::from(&deep)),
+            PathBuf::from(&deep[4..])
+        );
+        assert_eq!(
+            without_verbatim_disk(PathBuf::from(r"\\?\C:\x\a.md")),
+            PathBuf::from(r"C:\x\a.md")
+        );
+
+        for kept in [r"\\?\C:\x\CON\y", r"\\?\C:\x\name.\y", r"\\?\C:\x\name \y"] {
+            assert_eq!(
+                without_verbatim_disk(PathBuf::from(kept)),
+                PathBuf::from(kept)
+            );
+        }
+
+        for plain in [
+            r"C:\x\a.md",
+            r"\\server\share\a.md",
+            r"\\?\UNC\server\share\a.md",
+        ] {
+            assert_eq!(
+                without_verbatim_disk(PathBuf::from(plain)),
+                PathBuf::from(plain)
+            );
+        }
     }
 
     #[test]

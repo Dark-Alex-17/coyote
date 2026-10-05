@@ -35,8 +35,8 @@ use crate::mesh::wire_path::{WIRE_PATH_MAX_BYTES, WirePath};
 use crate::mesh::{
     FetchError, FetchReport, LoggingInboundSink, MAX_WANTS_PER_FETCH, MESH_ALREADY_ON, MeshPaths,
     MeshRuntime, NodeOptions, PeerRecord, PropagationNodeRecord, age_text, canonical_hash,
-    decode_hex, destination_address, display_text, hex_lower, human_size, parse_rfc3339,
-    redact_hashes, refuse_symlink, rfc3339_utc, short,
+    canonicalize, decode_hex, destination_address, display_text, hex_lower, human_size,
+    parse_rfc3339, redact_hashes, refuse_symlink, rfc3339_utc, short,
 };
 use crate::supervisor::mailbox::EnvelopePayload;
 use crate::utils::{AbortSignal, drain_stale_tty_input, wait_user_interrupt};
@@ -683,9 +683,9 @@ fn purge_inbox_files(ctx: &RequestContext, yes: bool, dry_run: bool) -> Result<(
                 .with_context(|| format!("Failed to read metadata of '{}'", inbox_root.display()));
         }
     }
-    let resolved_root = dunce::canonicalize(inbox_root)
+    let resolved_root = canonicalize(inbox_root)
         .with_context(|| format!("Failed to resolve '{}'", inbox_root.display()))?;
-    let resolved_parent = dunce::canonicalize(parent)
+    let resolved_parent = canonicalize(parent)
         .with_context(|| format!("Failed to resolve '{}'", parent.display()))?;
     if !resolved_root.starts_with(&resolved_parent) {
         bail!(
@@ -1157,9 +1157,9 @@ pub(crate) fn attachment(
     if !metadata.is_file() {
         bail!("`{shown}` is not a regular file.");
     }
-    let canonical = dunce::canonicalize(&root)
+    let canonical = canonicalize(&root)
         .and_then(|canonical_root| {
-            let canonical = dunce::canonicalize(&file_path)?;
+            let canonical = canonicalize(&file_path)?;
             Ok(canonical.starts_with(canonical_root).then_some(canonical))
         })
         .ok()
@@ -3151,7 +3151,7 @@ fn refuse_link_in_pattern(
     verb: &str,
     does: &str,
 ) -> Result<()> {
-    let Ok(canonical_root) = dunce::canonicalize(root) else {
+    let Ok(canonical_root) = canonicalize(root) else {
         return Ok(());
     };
     let mut end = 0;
@@ -3166,7 +3166,7 @@ fn refuse_link_in_pattern(
         if !fs::symlink_metadata(&link).is_ok_and(|meta| meta.file_type().is_symlink()) {
             continue;
         }
-        let Some(canonical) = dunce::canonicalize(&link)
+        let Some(canonical) = canonicalize(&link)
             .ok()
             .filter(|canonical| canonical.starts_with(&canonical_root))
         else {

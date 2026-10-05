@@ -29,7 +29,7 @@ use crate::mesh::trust::same_hash;
 use crate::mesh::wire_path::WirePath;
 use crate::mesh::write_atomically;
 use crate::mesh::{
-    canonical_hash, hex_lower, mesh_cache_dir, mesh_config_dir, redact_hashes, short,
+    canonical_hash, canonicalize, hex_lower, mesh_cache_dir, mesh_config_dir, redact_hashes, short,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -544,8 +544,7 @@ impl ShareSet {
     }
 
     fn canonical_root(&self) -> Result<PathBuf> {
-        dunce::canonicalize(&self.locations.workspace_root)
-            .context("Failed to resolve the share root")
+        canonicalize(&self.locations.workspace_root).context("Failed to resolve the share root")
     }
 
     fn builtin(&self, case_insensitive: bool) -> Result<GlobSet> {
@@ -583,7 +582,7 @@ impl ShareSet {
             Err(invalid) => return Served::InvalidPath { rule: invalid.rule },
         };
         let candidate = self.locations.workspace_root.join(wire.to_relative_path());
-        let Ok(canonical) = dunce::canonicalize(candidate) else {
+        let Ok(canonical) = canonicalize(&candidate) else {
             return Served::NotShared;
         };
         let rules = match self.rules(peer, case_insensitive) {
@@ -699,7 +698,7 @@ impl ShareSet {
             return false;
         };
         let candidate = self.locations.workspace_root.join(wire.to_relative_path());
-        let Ok(canonical) = dunce::canonicalize(candidate) else {
+        let Ok(canonical) = canonicalize(&candidate) else {
             return false;
         };
         if !fs::metadata(&canonical).is_ok_and(|metadata| metadata.is_file()) {
@@ -729,7 +728,7 @@ impl ShareSet {
             return Ok(None);
         };
         let candidate = self.locations.workspace_root.join(wire.to_relative_path());
-        let Ok(canonical) = dunce::canonicalize(candidate) else {
+        let Ok(canonical) = canonicalize(&candidate) else {
             return Ok(None);
         };
         Ok(Some((rules.verdict(&wire, &canonical), canonical)))
@@ -1006,7 +1005,7 @@ impl ShareSet {
         // under whatever the prefix lands in.
         let resolved = (1..=literal.len())
             .rev()
-            .find_map(|depth| dunce::canonicalize(root.join(literal[..depth].join("/"))).ok())?;
+            .find_map(|depth| canonicalize(&root.join(literal[..depth].join("/"))).ok())?;
         // The walk skips `.git` by name, so a link into one is not among `protected_dirs`.
         if resolved
             .strip_prefix(&root)
@@ -1062,7 +1061,7 @@ impl ShareSet {
     /// when it does not exist or lands outside the root.
     fn resolved_name(&self, path: &str) -> Option<String> {
         let root = self.canonical_root().ok()?;
-        let canonical = dunce::canonicalize(root.join(path)).ok()?;
+        let canonical = canonicalize(&root.join(path)).ok()?;
         Some(segments_under(&root, &canonical)?.join("/"))
     }
 
@@ -1109,11 +1108,12 @@ impl ShareRules {
         self.judge(wire, canonical) == Judgement::Allowed
     }
 
-    /// `wire` is the path as the peer sent it; `canonical` is `dunce::canonicalize` of
-    /// `root/wire`, which a symlink may have taken anywhere. A `std::fs::canonicalize`
-    /// `\\?\` path on Windows fails the root prefix check. A candidate outside the share
-    /// root, the root itself, or one whose resolved path is not UTF-8, is `Denied` like
-    /// anything a deny names, so no grant reaches it either.
+    /// `wire` is the path as the peer sent it; `canonical` is `crate::mesh::canonicalize`
+    /// of `root/wire`, which a symlink may have taken anywhere. The caller resolves with
+    /// that helper so root and file share one spelling on Windows, where a `\\?\` path
+    /// would fail the root prefix check. A candidate outside the share root, the root
+    /// itself, or one whose resolved path is not UTF-8, is `Denied` like anything a deny
+    /// names, so no grant reaches it either.
     pub(crate) fn judge(&self, wire: &WirePath, canonical: &Path) -> Judgement {
         match self.verdict(wire, canonical) {
             Verdict::Shared => Judgement::Allowed,
@@ -1285,7 +1285,7 @@ impl<'a> Walk<'a> {
             // A pattern's literal head may itself pass through a link, and the walk only
             // refuses links it meets on the way down; so the start is resolved and must
             // still lie in the root, or there is nothing under it an allow could name.
-            let Ok(start) = dunce::canonicalize(start) else {
+            let Ok(start) = canonicalize(&start) else {
                 continue;
             };
             if !start.starts_with(&self.rules.canonical_root) || self.rules.is_protected(&start) {
@@ -1335,7 +1335,7 @@ impl<'a> Walk<'a> {
         let Ok(wire) = WirePath::parse(&wire_text) else {
             return;
         };
-        let Ok(canonical) = dunce::canonicalize(path) else {
+        let Ok(canonical) = canonicalize(path) else {
             return;
         };
         if !self.rules.allow_names(&canonical) {
@@ -1539,7 +1539,7 @@ fn protected_dirs(locations: &ShareLocations) -> Vec<PathBuf> {
         .chain([locations.config_dir.clone()])
         .chain(locations.mesh_cache_dir.clone())
         .chain(locations.protected.iter().cloned())
-        .filter_map(|dir| dunce::canonicalize(dir).ok())
+        .filter_map(|dir| canonicalize(&dir).ok())
         .collect();
     dirs.sort();
     dirs.dedup();

@@ -9,7 +9,7 @@
 //! already at the target is ever overwritten.
 
 use crate::mesh::wire_path::WirePath;
-use crate::mesh::{hex_lower, mesh_cache_dir};
+use crate::mesh::{canonicalize, hex_lower, mesh_cache_dir};
 
 use sha2::{Digest, Sha256};
 use std::fs::File;
@@ -106,7 +106,7 @@ impl InboxStaging {
     ) -> Result<PathBuf, StageError> {
         let dest8 = peer_dest8(peer_destination);
         fs::create_dir_all(self.root.join(&dest8))?;
-        let canonical_root = dunce::canonicalize(&self.root)?;
+        let canonical_root = canonicalize(&self.root)?;
         Self::stage_under(&canonical_root, &dest8, rel, sha256, bytes)
     }
 
@@ -168,7 +168,7 @@ fn peer_dest8(peer_destination: &str) -> String {
 }
 
 fn ensure_inside(canonical_root: &Path, path: &Path) -> Result<(), StageError> {
-    if dunce::canonicalize(path)?.starts_with(canonical_root) {
+    if canonicalize(path)?.starts_with(canonical_root) {
         Ok(())
     } else {
         Err(StageError::Escaped)

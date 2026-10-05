@@ -42,7 +42,7 @@ use crate::mesh::shares::{Mutation, ShareSet, WriteScope};
 use crate::mesh::trust::{Decision, TrustStore, same_hash};
 use crate::mesh::wire_path::WirePath;
 use crate::mesh::{
-    destination_address, display_text, human_size, redact_hashes, rfc3339_utc, short,
+    canonicalize, destination_address, display_text, human_size, redact_hashes, rfc3339_utc, short,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -1464,9 +1464,9 @@ fn path_state(root: Option<&Path>, path: &str) -> String {
     let Ok(wire) = WirePath::parse(path) else {
         return "missing".to_string();
     };
-    dunce::canonicalize(root)
+    canonicalize(root)
         .ok()
-        .zip(dunce::canonicalize(root.join(wire.to_relative_path())).ok())
+        .zip(canonicalize(&root.join(wire.to_relative_path())).ok())
         .filter(|(root, file)| file.starts_with(root))
         .and_then(|(_, file)| fs::metadata(file).ok())
         .filter(fs::Metadata::is_file)
