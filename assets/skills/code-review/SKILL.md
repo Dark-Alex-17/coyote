@@ -46,8 +46,23 @@ Contract changes that ripple (check the callers against each one that applies):
 - **Ordering / uniqueness guarantees** — output was sorted/deduped, now isn't (or vice versa).
 - **Error semantics** — a function that returned an error now panics/throws, or swallows what it used to propagate.
 - **Sync→async / blocking behavior** — callers on hot paths or in handlers now block or need awaiting.
+- **Acceptance condition tightened or loosened** — an input, header, token, or precondition that
+  used to be accepted is now rejected (or vice versa). Every caller that relied on the old
+  acceptance is a breaking change in disguise.
 
 This check is MANDATORY and produces output even when clean: state `Blast radius: N call sites checked, all compatible` in your findings, or one finding per incompatible/unverifiable caller (`caller at path:line still assumes <old contract>`). Greps are cheap — the file-read budget does not apply to `fs_grep`/`fs_glob`; spend greps freely here and targeted reads only on suspicious callers.
+
+**Cross-repo consumers.** When the changed symbol is consumed outside this repo — an RPC or
+route, a published module or client library, a CLI flag, a message/event schema, a proto or
+OpenAPI contract — the caller sweep does not stop at the repo boundary. Enumerate the external
+consumers you can reach (sibling checkouts, an org-wide code search, the generated-client
+repos) and classify each as SAFE / BREAKS / UNTRACED at `repo:path:line`. When the author
+names a consumer-side mitigation ("the frontend already sends X", "clients opt in via Y"),
+READ the consumer code and confirm the mitigation actually does what is claimed — a
+mitigation that is a no-op in the consumer is the finding, at the severity of the breakage it
+was supposed to prevent. The clean line extends to `cross-repo: N consumers checked`; when the
+consumer set is unenumerable (a public library), say so and state what you checked instead
+(semver bump, changelog entry, deprecation window). An UNTRACED list is a 🟡 finding on its own.
 
 Skip the test files in this search; do the test sweep next.
 
@@ -62,6 +77,14 @@ doesn't need it. A twin missing the guard is a finding at the twin's `path:line`
 severity as the bug the guard fixes. Report even when clean: `Guard symmetry: N sibling
 paths checked`. (Guards REMOVED are the removed-guards check below — this is about the ones
 added: a fix applied to one of N twins is N-1 latent bugs.)
+
+When the fix lands in a SHARED helper (an authorization gate, a validator, a parser used by
+many handlers) — or in one of that helper's N callers — every other caller of the helper is a
+twin. Enumerate them all. A caller left on the old behaviour is IN SCOPE for this review,
+never `Pre-existing, out of scope:` — the diff has just proven the shared path is wrong, so
+every unpatched caller is a known-live instance of the bug, not a pre-existing nit. Report
+each at the fixed bug's severity; downgrade one tier only when the author links a tracked
+follow-up that names that specific caller. "Not touched by this PR" is not an exemption.
 
 ### Read the tests for the change
 
@@ -111,12 +134,26 @@ These are review findings that only surface in a diff context, not in a whole-fi
   the governed tree for PRE-EXISTING violations of the new rule (the doc is wrong or the tree
   is — say which). Runbooks/docs hardcoding mutable environment identifiers (personal accounts,
   org names, pool IDs) are a maintenance hazard — flag unless marked with an ownership note.
+- **Behavior change vs. the repo's documented rollout convention** — when the diff changes
+  observable behavior for existing callers (tightens acceptance, changes a default, alters an
+  error path, removes a code path), check whether the repo PRESCRIBES how such changes ship.
+  `fs_grep` the convention docs the context pack points at (`CLAUDE.md`, `AGENTS.md`,
+  `CONTRIBUTING.md`, `README.md`, `docs/**`) for `flag|rollout|behavio?ur? change|backward|
+  deprecat|migration order`. If a convention exists (feature-flag-first, migration-before-code,
+  additive-then-remove, two-PR deprecation) and the diff skips a step with no stated rationale,
+  that is a 🟡 `[convention]` finding citing the doc at `path:line` — the convention is the
+  repo's own rule, not yours. If the author states an exception (e.g. "security tightening ships
+  flag-off-exempt"), report it as a 🟢 note so the reviewer of record sees it was weighed, not
+  missed. No convention found ⇒ stay silent; this rule never invents a rollout policy the repo
+  does not have.
 
 ### Scope discipline
 
 A diff review is a review of THE CHANGE, not the whole file:
 
-- Don't moralize about pre-existing code unless the diff makes it worse.
+- Don't moralize about pre-existing code unless the diff makes it worse — or proves it wrong.
+  A fix to a shared helper or one of its callers proves every unpatched sibling caller wrong;
+  those are in scope (see Guard symmetry above), not `Pre-existing, out of scope:`.
 - Don't suggest refactors outside the scope of the change. ("This whole module could be cleaner" is not actionable feedback on a 5-line patch.)
 - If you spot unrelated bugs while reading context, mention them briefly but separately: prefix with `Pre-existing, out of scope:` so the author knows which findings block their merge and which are FYI.
 - The author's job is to ship THIS change. Your job is to catch what's wrong with THIS change.
