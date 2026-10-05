@@ -10713,6 +10713,48 @@ mod tests {
         }
     }
 
+    /// The `.save session` completer describes `--workspace` by the workspace config
+    /// directory the process runs with, so an override renames it in the completion
+    /// popup too; `--global` keeps its own wording and nothing offered spells the default.
+    #[test]
+    #[serial]
+    fn usage_probe_save_session_completion_describes_workspace_by_the_runtime_config_dir() {
+        let ctx = create_test_ctx();
+        let describe = |ctx: &RequestContext, flag: &str| -> String {
+            ctx.repl_complete(".save", &["session", ""], "")
+                .into_iter()
+                .find(|(name, _)| name == flag)
+                .unwrap_or_else(|| panic!("{flag} is not offered"))
+                .1
+                .unwrap_or_else(|| panic!("{flag} has no description"))
+        };
+        {
+            let _unset = EnvVarGuard::unset(get_env_name("workspace_config_dir"));
+            assert_eq!(
+                describe(&ctx, "--workspace"),
+                format!(
+                    "Save the session under {WORKSPACE_COYOTE_DIR_NAME}/ in the current workspace"
+                )
+            );
+        }
+        let _override = EnvVarGuard::set(get_env_name("workspace_config_dir"), ".cfg-complete");
+        assert_eq!(
+            describe(&ctx, "--workspace"),
+            "Save the session under .cfg-complete/ in the current workspace"
+        );
+        assert_eq!(
+            describe(&ctx, "--global"),
+            "Save the session under the global config dir"
+        );
+        for (name, description) in ctx.repl_complete(".save", &["session", ""], "") {
+            let description = description.unwrap_or_default();
+            assert!(
+                !description.contains(WORKSPACE_COYOTE_DIR_NAME),
+                "{name}'s description spells the default under an override: {description}"
+            );
+        }
+    }
+
     #[test]
     #[serial]
     fn save_session_failed_write_leaves_scope_and_path_untouched() {

@@ -2061,3 +2061,121 @@ fn usage_probe_list_sessions_merges_cwd_workspace_scope_with_global() {
         "listing is read-only for the workspace sessions dir"
     );
 }
+
+/// `--help` on a pristine env, with the workspace config directory override set as given
+/// (`None` scrubs it). Help is an inspection flag: exit 0, nothing written.
+fn run_help(flag: &str, workspace_config_dir: Option<&str>) -> String {
+    let home_dir = fresh_config_dir("help-home");
+    let config_dir = home_dir.join("config");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_coyote"));
+    cmd.arg(flag)
+        .env("HOME", &home_dir)
+        .env("USERPROFILE", &home_dir)
+        .env("COYOTE_CONFIG_DIR", &config_dir)
+        .env("COYOTE_CACHE_DIR", home_dir.join("cache"))
+        .env_remove("IS_SANDBOX")
+        .env_remove("COYOTE_PROVIDER")
+        .env_remove("COYOTE_PLATFORM")
+        .env_remove("COYOTE_WORKSPACE_CONFIG_DIR")
+        .current_dir(&home_dir)
+        .stdin(Stdio::null());
+    if let Some(dir) = workspace_config_dir {
+        cmd.env("COYOTE_WORKSPACE_CONFIG_DIR", dir);
+    }
+    let output = cmd.output().unwrap();
+    let config_written = config_dir.exists();
+    let _ = fs::remove_dir_all(&home_dir);
+    assert!(
+        output.status.success(),
+        "{flag} with override {workspace_config_dir:?}: {:?}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !config_written,
+        "{flag} must write nothing into the config dir"
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
+/// The CLI help derives the workspace config directory's name from the process it runs
+/// in: every flag that mentions it (`--no-workspace-mcp`, `--no-workspace-macros`,
+/// `--scope`) spells the override, and nothing else about the help changes.
+#[test]
+fn usage_probe_help_names_the_workspace_config_dir_the_process_runs_with() {
+    let default = run_help("--help", None);
+    for needle in [
+        ".coyote/mcp.json",
+        ".coyote/.mcp.json",
+        ".coyote/macros",
+        "(.coyote/mcp.json)",
+    ] {
+        assert!(
+            default.contains(needle),
+            "default --help does not say {needle:?}:\n{default}"
+        );
+    }
+
+    // Same length as the default so clap's wrapping cannot move text between lines:
+    // the two renderings must then differ only where the name stands.
+    let same_length = run_help("--help", Some(".cfgdir"));
+    assert!(
+        !same_length.contains(".coyote"),
+        "--help under an override still spells .coyote:\n{same_length}"
+    );
+    let default_lines: Vec<&str> = default.lines().collect();
+    let override_lines: Vec<&str> = same_length.lines().collect();
+    assert_eq!(default_lines.len(), override_lines.len(), "{same_length}");
+    let mut renamed = Vec::new();
+    for (before, after) in default_lines.iter().zip(&override_lines) {
+        if before != after {
+            assert!(
+                after.contains(".cfgdir"),
+                "a line changed that does not name the dir: {before:?} -> {after:?}"
+            );
+            assert_eq!(
+                after.replace(".cfgdir", ".coyote"),
+                *before,
+                "the override changed more than the directory name"
+            );
+            renamed.push(*after);
+        }
+    }
+    assert_eq!(
+        renamed.len(),
+        3,
+        "exactly the three flags that mention the dir are renamed: {renamed:#?}"
+    );
+    for needle in ["--no-workspace-mcp", "--no-workspace-macros", "--scope"] {
+        let flag_at = default_lines
+            .iter()
+            .position(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("{needle} is not in --help"));
+        let help_text = &override_lines[flag_at..flag_at + 4].join(" ");
+        assert!(
+            help_text.contains(".cfgdir/"),
+            "{needle}'s help does not name the override: {help_text}"
+        );
+    }
+
+    // A longer, nested relative override reaches every one of the three help strings
+    // whole, and the short form renders the same strings.
+    for flag in ["--help", "-h"] {
+        let nested = run_help(flag, Some("conf/.hidden"));
+        for needle in [
+            "conf/.hidden/mcp.json",
+            "conf/.hidden/.mcp.json",
+            "conf/.hidden/macros",
+            "(conf/.hidden/mcp.json)",
+        ] {
+            assert!(
+                nested.contains(needle),
+                "{flag} under a nested override does not say {needle:?}:\n{nested}"
+            );
+        }
+        assert!(
+            !nested.contains(".coyote"),
+            "{flag} under a nested override still spells .coyote:\n{nested}"
+        );
+    }
+}
