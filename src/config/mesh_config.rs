@@ -112,7 +112,9 @@ impl Default for MeshFetch {
 
 impl MeshFetch {
     /// `inbox_dir` as configured, or its sandboxed-home translation when the configured
-    /// directory does not exist and the translation does; `None` when unset.
+    /// directory does not exist and the translation does; `None` when unset. Resolving
+    /// is quiet and repeatable, so callers may resolve as often as they like; the node
+    /// announces the translation once, when it starts.
     pub fn inbox_dir(&self) -> Option<PathBuf> {
         self.inbox_dir
             .as_deref()
@@ -127,7 +129,7 @@ fn resolve_inbox_dir(configured: &Path, translate: impl Fn(&Path) -> Option<Path
     if let Some(translated) = translate(configured)
         && translated.exists()
     {
-        info!(
+        debug!(
             "mesh.fetch.inbox_dir '{}' not found; resolved to sandboxed path '{}'",
             configured.display(),
             translated.display()
@@ -1071,6 +1073,21 @@ mod tests {
         });
 
         assert_eq!(resolved, translated);
+    }
+
+    #[test]
+    fn resolving_the_same_missing_inbox_dir_twice_translates_it_the_same_way_both_times() {
+        let tmp = TempDir::new("mesh-config-inbox-twice");
+        let configured = Path::new("/home/someone/inbox");
+        let translated = tmp.path.join("inbox");
+        std::fs::create_dir_all(&translated).unwrap();
+        let translate = |_: &Path| Some(translated.clone());
+
+        let first = resolve_inbox_dir(configured, translate);
+        let second = resolve_inbox_dir(configured, translate);
+
+        assert_eq!(first, translated);
+        assert_eq!(second, first);
     }
 
     #[test]

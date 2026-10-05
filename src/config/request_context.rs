@@ -5528,11 +5528,12 @@ impl RequestContext {
     }
 
     /// The share root and its two share files, the configured inbox protected whether or
-    /// not a node is running; `None` before a snapshot names the root.
+    /// not a node is running; `None` before a snapshot names the root. The inbox is
+    /// resolved from config only when no node is running to protect its own.
     pub(crate) fn share_locations(&self) -> Option<(PathBuf, crate::mesh::shares::ShareLocations)> {
         self.app
             .mesh
-            .share_locations(self.app.config.mesh.fetch.inbox_dir().as_deref())
+            .share_locations(|| self.app.config.mesh.fetch.inbox_dir())
     }
 
     /// Root-relative paths for `.mesh allow <TAB>` and `.mesh deny <TAB>`: the entries of

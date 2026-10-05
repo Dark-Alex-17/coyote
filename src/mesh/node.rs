@@ -313,6 +313,16 @@ impl MeshRuntime {
         )?);
         let grants = GrantStore::open(&paths.cache_dir, &instance_id, SystemTime::now())?;
         let inbox_dir = config.fetch.inbox_dir();
+        if let (Some(configured), Some(resolved)) =
+            (config.fetch.inbox_dir.as_deref(), inbox_dir.as_deref())
+            && resolved != configured
+        {
+            info!(
+                "mesh.fetch.inbox_dir '{}' not found; resolved to sandboxed path '{}'",
+                configured.display(),
+                resolved.display()
+            );
+        }
         let serving = Arc::new(FetchServing::new(
             paths.config_dir,
             paths.cache_dir.clone(),
@@ -3057,13 +3067,14 @@ impl ShareSource for MeshSlot {
 impl MeshSlot {
     /// The share root, the published snapshot's `cwd`, and where its two share files
     /// live; `None` before a snapshot exists. With a running node this is the node's own
-    /// `FetchServing::share_locations`, cache dir and configured inbox protected; while
-    /// the mesh is off it is built from `MeshPaths::from_env()` with `inbox_dir`, the
-    /// configured `mesh.fetch.inbox_dir`, protected the same way, so `.mesh shares` and
-    /// the `.mesh on` preview see exactly what the node will serve.
+    /// `FetchServing::share_locations`, cache dir and configured inbox protected, and
+    /// `inbox_dir` is never called; while the mesh is off it is built from
+    /// `MeshPaths::from_env()` with the directory `inbox_dir` resolves, the configured
+    /// `mesh.fetch.inbox_dir`, protected the same way, so `.mesh shares` and the
+    /// `.mesh on` preview see exactly what the node will serve.
     pub(crate) fn share_locations(
         &self,
-        inbox_dir: Option<&Path>,
+        inbox_dir: impl FnOnce() -> Option<PathBuf>,
     ) -> Option<(PathBuf, ShareLocations)> {
         let root = ShareSource::share_root(self)?;
         let locations = match self.get() {
@@ -3072,8 +3083,8 @@ impl MeshSlot {
                 let paths = MeshPaths::from_env();
                 let locations =
                     ShareLocations::new(&paths.config_dir, &root).with_cache_dir(&paths.cache_dir);
-                match inbox_dir {
-                    Some(inbox_dir) => locations.with_protected(inbox_dir),
+                match inbox_dir() {
+                    Some(inbox_dir) => locations.with_protected(&inbox_dir),
                     None => locations,
                 }
             }
@@ -7469,20 +7480,62 @@ mod tests {
         let _default_name =
             crate::testing::EnvVarGuard::unset(crate::utils::get_env_name("workspace_config_dir"));
         let slot = MeshSlot::default();
-        assert!(slot.share_locations(None).is_none(), "nothing published");
+        assert!(slot.share_locations(|| None).is_none(), "nothing published");
 
         let tmp = TempDir::new("slot-share-locations");
         let mut snapshot = snapshot_fixture();
         snapshot.cwd = tmp.path.clone();
         slot.publish(snapshot);
 
-        let (root, locations) = slot.share_locations(None).unwrap();
+        let (root, locations) = slot.share_locations(|| None).unwrap();
         assert_eq!(root, tmp.path);
         assert!(
             locations.global.ends_with("mesh/shares.yaml"),
             "{locations:?}"
         );
         assert!(locations.workspace.starts_with(&tmp.path), "{locations:?}");
+    }
+
+    #[test]
+    fn the_slot_without_a_node_resolves_the_inbox_dir_once_and_protects_it() {
+        let slot = MeshSlot::default();
+        let tmp = TempDir::new("slot-share-locations-inbox");
+        let inbox = tmp.path.join("inbox");
+        std::fs::create_dir_all(&inbox).unwrap();
+        let mut snapshot = snapshot_fixture();
+        snapshot.cwd = tmp.path.clone();
+        slot.publish(snapshot);
+        let resolutions = std::cell::Cell::new(0);
+
+        let (_, locations) = slot
+            .share_locations(|| {
+                resolutions.set(resolutions.get() + 1);
+                Some(inbox.clone())
+            })
+            .unwrap();
+
+        assert_eq!(resolutions.get(), 1);
+        assert!(locations.protected_dirs().contains(&inbox), "{locations:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_slot_with_a_running_node_never_resolves_the_inbox_dir_itself() {
+        let started = started_runtime("node-share-locations-live").await;
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(started.runtime.clone()).unwrap();
+        let mut snapshot = snapshot_fixture();
+        snapshot.cwd = started.tmp.path.clone();
+        slot.publish(snapshot);
+
+        let (root, locations) = slot
+            .share_locations(|| panic!("a running node protects its own inbox"))
+            .unwrap();
+
+        assert_eq!(root, started.tmp.path);
+        assert_eq!(locations, started.runtime.serving().share_locations(&root));
+        assert!(slot.stop().await.unwrap());
+        started.relay_handle.abort();
     }
 
     /// A fork serves from its own grants file: a path granted to the fork's instance is
