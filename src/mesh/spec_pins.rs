@@ -3469,10 +3469,19 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
         let name = [".coy", "ote"].concat();
         let spells_the_name = |line: &str| {
             line.match_indices(&name).any(|(at, _)| {
-                let opener = line[..at].chars().next_back();
-                let next = line[at + name.len()..].chars().next();
-                opener.is_some_and(|c| "\"` /{(".contains(c))
-                    && !next.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                // The name is a whole word: whatever precedes it is not part of an
+                // identifier, and neither is whatever follows, so `.coyote_password` and
+                // `.coyote-case-probe` are other names while `\.coyote\` and `=.coyote` are
+                // hits. A string escape such as `\n` or `\t` ends in a letter but is not a
+                // word either.
+                let part_of_a_word = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
+                let before = &line[..at];
+                let after_an_escape = before.ends_with("\\n") || before.ends_with("\\t");
+                (after_an_escape || !before.chars().next_back().is_some_and(part_of_a_word))
+                    && !line[at + name.len()..]
+                        .chars()
+                        .next()
+                        .is_some_and(part_of_a_word)
             })
         };
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -3523,6 +3532,9 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
             format!("/// The `{name}` directory holds it.\n"),
             format!("/// Saved under {name}, beside the sources.\n"),
             format!("let name = {constant};\n"),
+            format!("let key = \"C:\\\\Users\\\\me\\\\{name}\\\\mesh\\\\identity.key\";\n"),
+            format!("let entry = \"target/\\n{name}/memory/\\n\";\n"),
+            format!("/// e.g. COYOTE_WORKSPACE_CONFIG_DIR={name}\n"),
         ] {
             let control = scan("src/fixture.rs", &red);
             assert_eq!(

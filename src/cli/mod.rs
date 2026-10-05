@@ -415,7 +415,7 @@ fn no_workspace_macros_help() -> String {
 
 fn mcp_scope_help() -> String {
     format!(
-        "Scope for MCP config: user (~/.config/coyote/mcp.json) or workspace (./{}/mcp.json). Default: user",
+        "Scope for MCP config: user (~/.config/coyote/mcp.json) or workspace ({}/mcp.json). Default: user",
         paths::workspace_config_dir_name()
     )
 }

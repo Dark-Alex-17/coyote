@@ -30,7 +30,11 @@ fn repo_root() -> PathBuf {
 
 fn read(path: impl AsRef<Path>) -> String {
     let path = path.as_ref();
-    fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    // Line endings are normalised so the `\n`-anchored block and heading searches below
+    // hold on a CRLF checkout.
+    fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+        .replace("\r\n", "\n")
 }
 
 /// The protocol's name as its spec's H1 spells it, which the Mesh pages lead with.
@@ -376,7 +380,8 @@ fn the_mesh_page_lists_every_registered_tool_and_counts_them_in_words() {
 #[test]
 fn no_mesh_page_or_the_readme_spells_the_pre_scope_wire_vocabulary() {
     let Some(wiki) = wiki_dir() else { return };
-    // Assembled at runtime so the mesh source guard does not match this test's text.
+    // Assembled at runtime so a repo-wide guard against the old identifiers never trips on
+    // this test's own text.
     let magic = ["COY", "M"].concat();
     let backticked_old_name = ["`coy", "ote."].concat();
     // A backticked `<name>.<ext>` with one of these extensions is a file name the
@@ -400,7 +405,24 @@ fn no_mesh_page_or_the_readme_spells_the_pre_scope_wire_vocabulary() {
         "a file name is not wire vocabulary: {control:?}"
     );
 
-    let mut pages: Vec<PathBuf> = fs::read_dir(&wiki)
+    let mut pages = mesh_pages(&wiki);
+    pages.push(repo_root().join("README.md"));
+
+    let mut hits = Vec::new();
+    for path in &pages {
+        hits.extend(pre_scope_vocabulary_hits(
+            &path.display().to_string(),
+            &read(path),
+            &needles,
+            &file_names,
+        ));
+    }
+    assert!(hits.is_empty(), "{}", hits.join("\n"));
+}
+
+/// Every `Mesh*.md` page in the wiki checkout.
+fn mesh_pages(wiki: &Path) -> Vec<PathBuf> {
+    let pages: Vec<PathBuf> = fs::read_dir(wiki)
         .unwrap_or_else(|e| panic!("read {}: {e}", wiki.display()))
         .map(|entry| entry.unwrap().path())
         .filter(|path| {
@@ -414,18 +436,69 @@ fn no_mesh_page_or_the_readme_spells_the_pre_scope_wire_vocabulary() {
         "no Mesh*.md pages under {}",
         wiki.display()
     );
-    pages.push(repo_root().join("README.md"));
+    pages
+}
 
+/// `label:line` for every staged-path example in `text` whose peer segment, the one right
+/// after `inbox/<instance id>/` (or `inbox/<instance_id>/`), is not the full 32-hex
+/// destination hash: a placeholder such as `<peer-dest32>` passes, a literal shorter than
+/// 32 hex digits does not.
+fn short_peer_directory_hits(label: &str, text: &str) -> Vec<String> {
+    let markers = ["inbox/<instance id>/", "inbox/<instance_id>/"];
     let mut hits = Vec::new();
-    for path in &pages {
-        hits.extend(pre_scope_vocabulary_hits(
-            &path.display().to_string(),
-            &read(path),
-            &needles,
-            &file_names,
-        ));
+    for (index, line) in text.lines().enumerate() {
+        for marker in markers {
+            for (at, _) in line.match_indices(marker) {
+                let rest = &line[at + marker.len()..];
+                let segment: &str = rest.split(['/', '`', ' ']).next().unwrap_or_default();
+                let literal_hex =
+                    !segment.is_empty() && segment.bytes().all(|b| b.is_ascii_hexdigit());
+                if literal_hex && segment.len() != 32 {
+                    hits.push(format!(
+                        "{label}:{}: peer directory `{segment}` is not a full 32-hex destination",
+                        index + 1
+                    ));
+                }
+            }
+        }
     }
+    hits
+}
+
+#[test]
+fn every_staged_path_example_names_the_peer_directory_by_the_full_destination_hash() {
+    let Some(wiki) = wiki_dir() else { return };
+    let short = "inbox/<instance id>/5e6f7a8b/ci.log\n";
+    let control = short_peer_directory_hits("fixture", short);
+    assert_eq!(
+        control.len(),
+        1,
+        "the scan does not go red on an 8-hex peer directory: {control:?}"
+    );
+    let full = format!(
+        "inbox/<instance id>/{}/ci.log\ninbox/<instance_id>/<peer-dest32>/<path>\n",
+        "5e6f7a8b".repeat(4)
+    );
+    let control = short_peer_directory_hits("fixture", &full);
+    assert!(
+        control.is_empty(),
+        "a full hash or a placeholder is not a short peer directory: {control:?}"
+    );
+
+    let mut pages = mesh_pages(&wiki);
+    pages.push(repo_root().join("README.md"));
+    let hits: Vec<String> = pages
+        .iter()
+        .flat_map(|path| short_peer_directory_hits(&path.display().to_string(), &read(path)))
+        .collect();
     assert!(hits.is_empty(), "{}", hits.join("\n"));
+    let documented = pages
+        .iter()
+        .any(|path| read(path).contains("inbox/<instance_id>/<peer-dest32>/"));
+    assert!(
+        documented,
+        "no Mesh*.md page documents the `inbox/<instance_id>/<peer-dest32>/` layout"
+    );
 }
 
 #[test]

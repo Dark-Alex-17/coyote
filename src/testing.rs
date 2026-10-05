@@ -139,12 +139,13 @@ impl Log for TestLogCollector {
     fn flush(&self) {}
 }
 
-/// Installs the process-wide log collector capturing warn-level messages and
-/// debug messages from the [`DEBUG_TARGET_PREFIXES`] modules.
+/// Installs the process-wide log collector capturing warn-level messages,
+/// debug messages from the [`DEBUG_TARGET_PREFIXES`] modules and info messages
+/// from the [`INFO_TARGET_PREFIXES`] modules.
 /// `log::set_logger` accepts one logger per process, so every test that
-/// captures either stream must install through this shared entry point. The
-/// max level is Debug so the debug capture sees its records; warn capture is
-/// unaffected.
+/// captures any of the three streams must install through this shared entry
+/// point. The max level is Debug so the debug capture sees its records; warn
+/// and info capture are unaffected.
 pub(crate) fn install_log_collector() {
     static INSTALL: Once = Once::new();
     INSTALL.call_once(|| {
