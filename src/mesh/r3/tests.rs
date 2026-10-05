@@ -6189,7 +6189,7 @@ pub(crate) mod network {
         let b_instance = pair.responder.desc.address_hash.to_hex_string();
         assert!(
             staged.ends_with(
-                PathBuf::from(&b_instance[..8])
+                PathBuf::from(b_instance.to_lowercase())
                     .join("docs")
                     .join("notes.md")
             ),
@@ -7321,7 +7321,7 @@ pub(crate) mod network {
         assert_eq!(
             path,
             inbox_root
-                .join(b_hex[..8].to_lowercase())
+                .join(b_hex.to_lowercase())
                 .join("docs")
                 .join("a.md")
         );
@@ -7517,7 +7517,7 @@ pub(crate) mod network {
             .join("mesh")
             .join("inbox")
             .join(pair.node_a.current_instance_id())
-            .join(b_hex[..8].to_lowercase())
+            .join(b_hex.to_lowercase())
             .join("docs")
             .join("c.md");
 

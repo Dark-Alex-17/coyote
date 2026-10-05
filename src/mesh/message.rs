@@ -3851,7 +3851,7 @@ mod tests {
         let tmp = TempDir::new("message-staged");
         let bytes = b"# notes\n".to_vec();
         let raw = with_parts(vec![inline_file("docs/notes.md", bytes.clone())]);
-        let dest8 = raw.source_destination[..8].to_lowercase();
+        let peer_dir = raw.source_destination.to_lowercase();
         let message = PeerMessage::new_with(raw, &PartLimits::default(), Some(&staging(&tmp)));
         assert_eq!(message.dropped_parts, 0);
         let [
@@ -3871,7 +3871,7 @@ mod tests {
         assert_eq!(*sha256, hex_lower(&Sha256::digest(&bytes)));
         assert!(staged.is_absolute());
         let root = dunce::canonicalize(tmp.path.join("inbox")).unwrap();
-        assert_eq!(*staged, root.join(dest8).join("docs").join("notes.md"));
+        assert_eq!(*staged, root.join(peer_dir).join("docs").join("notes.md"));
         assert_eq!(std::fs::read(staged).unwrap(), bytes);
     }
 
@@ -4874,7 +4874,7 @@ mod tests {
     }
 
     /// The staging path is keyed by the sending peer, so two peers sending a file under
-    /// the same name each get their own copy under their own `<peer-dest8>` directory,
+    /// the same name each get their own copy under their own `<peer-dest32>` directory,
     /// neither suffixed and neither overwriting the other.
     #[test]
     fn two_peers_sending_the_same_file_name_land_in_separate_directories() {
@@ -4901,15 +4901,11 @@ mod tests {
         let root = dunce::canonicalize(tmp.path.join("inbox")).unwrap();
         assert_eq!(
             path_a,
-            root.join(&hash_of("alpha-peer")[..8])
-                .join("docs")
-                .join("a.md")
+            root.join(hash_of("alpha-peer")).join("docs").join("a.md")
         );
         assert_eq!(
             path_b,
-            root.join(&hash_of("bravo-peer")[..8])
-                .join("docs")
-                .join("a.md")
+            root.join(hash_of("bravo-peer")).join("docs").join("a.md")
         );
         assert_eq!(std::fs::read(&path_a).unwrap(), b"from a");
         assert_eq!(std::fs::read(&path_b).unwrap(), b"from b");

@@ -1,5 +1,5 @@
 //! The staging inbox, where a peer's file lands before anyone looks at it. One layout,
-//! `<root>/<peer-dest8>/<rel>` where the root is `<cache_dir>/mesh/inbox/<instance_id>` or
+//! `<root>/<peer-dest32>/<rel>` where the root is `<cache_dir>/mesh/inbox/<instance_id>` or
 //! `<mesh.fetch.inbox_dir>/<instance_id>`, and one guard: the directory a file will be
 //! written into must resolve inside the inbox root, checked before any directory is
 //! created under it and again before the file is written, so a symlink planted under the
@@ -11,7 +11,7 @@
 //! operator's `mesh.fetch.inbox_dir` or the cache dir, keeps the mode it had.
 
 use crate::mesh::wire_path::WirePath;
-use crate::mesh::{canonicalize, hex_lower, mesh_cache_dir};
+use crate::mesh::{canonical_hash, canonicalize, hex_lower, mesh_cache_dir};
 
 use sha2::{Digest, Sha256};
 use std::io::Write;
@@ -88,9 +88,9 @@ impl InboxStaging {
         &self.root
     }
 
-    /// Writes `bytes` under `<root>/<peer-dest8>/<rel>` and returns the absolute staged
-    /// path. `peer_destination` is the peer's destination hash; its first eight characters,
-    /// lower-cased, name the peer's directory. A file already at the target with the same
+    /// Writes `bytes` under `<root>/<peer-dest32>/<rel>` and returns the absolute staged
+    /// path. `peer_destination` is the peer's destination hash; the full hash, lower-cased,
+    /// names the peer's directory. A file already at the target with the same
     /// `sha256` is reused without a write; one with a different hash keeps its place and
     /// the new bytes land beside it as `<stem>-<sha256[..8]><ext>`. When that name too
     /// holds other bytes, or a file appears at the target between the check and the
@@ -105,23 +105,23 @@ impl InboxStaging {
         sha256: &[u8; 32],
         bytes: &[u8],
     ) -> Result<PathBuf, StageError> {
-        let dest8 = peer_dest8(peer_destination);
-        create_dirs_owner_only(&self.root.join(&dest8))?;
+        let peer_dir = peer_dir(peer_destination);
+        create_dirs_owner_only(&self.root.join(&peer_dir))?;
         let canonical_root = canonicalize(&self.root)?;
-        Self::stage_under(&canonical_root, &dest8, rel, sha256, bytes)
+        Self::stage_under(&canonical_root, &peer_dir, rel, sha256, bytes)
     }
 
     /// `stage` after the root has been created and canonicalised; separate so the walk
     /// can be exercised against a root that no longer exists.
     fn stage_under(
         canonical_root: &Path,
-        dest8: &str,
+        peer_dir: &str,
         rel: &WirePath,
         sha256: &[u8; 32],
         bytes: &[u8],
     ) -> Result<PathBuf, StageError> {
         let relative = rel.to_relative_path();
-        let peer_dir = canonical_root.join(dest8);
+        let peer_dir = canonical_root.join(peer_dir);
         let parent = peer_dir.join(relative.parent().unwrap_or(Path::new("")));
         let target = peer_dir.join(&relative);
         let Some(existing) = parent
@@ -160,12 +160,17 @@ impl InboxStaging {
     }
 }
 
-fn peer_dest8(peer_destination: &str) -> String {
-    peer_destination
-        .chars()
-        .take(8)
-        .collect::<String>()
-        .to_lowercase()
+/// The directory a peer's files land under: its destination hash, lower-cased. Every
+/// caller holds a canonical destination already, so anything else is a programming
+/// error; the lower-cased text is still used so a release build stages rather than
+/// panics.
+fn peer_dir(peer_destination: &str) -> String {
+    let canonical = canonical_hash(peer_destination);
+    debug_assert!(
+        canonical.is_some(),
+        "staging inbox given a non-canonical destination: {peer_destination:?}"
+    );
+    canonical.unwrap_or_else(|| peer_destination.to_ascii_lowercase())
 }
 
 /// `create_dir_all` that leaves every directory it creates owner-only. A `DirBuilder`
@@ -253,7 +258,7 @@ mod tests {
     use crate::mesh::test_support::TempDir;
 
     const PEER: &str = "ABCDEF0123456789abcdef0123456789";
-    const DEST8: &str = "abcdef01";
+    const DEST32: &str = "abcdef0123456789abcdef0123456789";
 
     fn digest(bytes: &[u8]) -> [u8; 32] {
         Sha256::digest(bytes).into()
@@ -327,7 +332,10 @@ mod tests {
         let canonical_root = dunce::canonicalize(&inbox.root).unwrap();
         assert!(staged.is_absolute());
         assert!(staged.starts_with(&canonical_root), "{}", staged.display());
-        assert_eq!(staged, canonical_root.join(DEST8).join("docs").join("a.md"));
+        assert_eq!(
+            staged,
+            canonical_root.join(DEST32).join("docs").join("a.md")
+        );
         assert_eq!(fs::read(&staged).unwrap(), b"hello");
         assert_eq!(files_under(&inbox.root), [staged]);
     }
@@ -417,7 +425,7 @@ mod tests {
     fn a_pre_planted_target_and_sibling_holding_other_bytes_are_a_collision() {
         let tmp = TempDir::new("inbox-planted-collision");
         let inbox = staging(&tmp);
-        let peer_dir = inbox.root.join(DEST8);
+        let peer_dir = inbox.root.join(DEST32);
         fs::create_dir_all(peer_dir.join("docs")).unwrap();
         let sha = digest(b"third");
         let target = peer_dir.join("docs").join("a.md");
@@ -445,7 +453,7 @@ mod tests {
     fn a_pre_planted_target_holding_the_same_bytes_is_reused_without_a_write() {
         let tmp = TempDir::new("inbox-planted-reuse");
         let inbox = staging(&tmp);
-        let peer_dir = inbox.root.join(DEST8);
+        let peer_dir = inbox.root.join(DEST32);
         fs::create_dir_all(peer_dir.join("docs")).unwrap();
         let target = peer_dir.join("docs").join("a.md");
         fs::write(&target, b"same").unwrap();
@@ -497,12 +505,12 @@ mod tests {
     fn a_root_removed_after_canonicalisation_is_not_found_not_an_escape() {
         let tmp = TempDir::new("inbox-root-vanished");
         let inbox = staging(&tmp);
-        fs::create_dir_all(inbox.root.join(DEST8)).unwrap();
+        fs::create_dir_all(inbox.root.join(DEST32)).unwrap();
         let canonical_root = dunce::canonicalize(&inbox.root).unwrap();
         fs::remove_dir_all(&inbox.root).unwrap();
 
         let rel = WirePath::parse("docs/a.md").unwrap();
-        let err = InboxStaging::stage_under(&canonical_root, DEST8, &rel, &digest(b"x"), b"x")
+        let err = InboxStaging::stage_under(&canonical_root, DEST32, &rel, &digest(b"x"), b"x")
             .unwrap_err();
 
         assert!(
@@ -619,7 +627,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(mode_of(&staged), 0o600);
-        let peer_dir = inbox.root.join(DEST8);
+        let peer_dir = inbox.root.join(DEST32);
         for dir in [&inbox.root, &peer_dir, &peer_dir.join("docs")] {
             assert_eq!(mode_of(dir), 0o700, "{}", dir.display());
         }
@@ -647,8 +655,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(mode_of(&inbox.root), 0o755);
-        assert_eq!(mode_of(&inbox.root.join(DEST8)), 0o700);
-        assert_eq!(mode_of(&inbox.root.join(DEST8).join("docs")), 0o700);
+        assert_eq!(mode_of(&inbox.root.join(DEST32)), 0o700);
+        assert_eq!(mode_of(&inbox.root.join(DEST32).join("docs")), 0o700);
         assert_eq!(mode_of(&staged), 0o600);
     }
 
@@ -659,7 +667,7 @@ mod tests {
         let inbox = staging(&tmp);
         let outside = tmp.path.join("outside");
         fs::create_dir_all(&outside).unwrap();
-        let peer_dir = inbox.root.join(DEST8);
+        let peer_dir = inbox.root.join(DEST32);
         fs::create_dir_all(&peer_dir).unwrap();
         std::os::unix::fs::symlink(&outside, peer_dir.join("link")).unwrap();
 
@@ -701,7 +709,7 @@ mod tests {
         let resolved_root = dunce::canonicalize(inbox_root(&real_cache, "inst")).unwrap();
         assert_eq!(
             staged,
-            resolved_root.join(DEST8).join("docs").join("a.md"),
+            resolved_root.join(DEST32).join("docs").join("a.md"),
             "resolved through the link, under the real root"
         );
         assert!(
@@ -727,7 +735,7 @@ mod tests {
     fn the_grammar_refuses_traversal_before_the_inbox_is_touched() {
         let tmp = TempDir::new("inbox-grammar");
         let inbox = staging(&tmp);
-        fs::create_dir_all(inbox.root.join(DEST8)).unwrap();
+        fs::create_dir_all(inbox.root.join(DEST32)).unwrap();
 
         for (text, rule) in [
             ("../../.bashrc", "segment"),
@@ -745,7 +753,7 @@ mod tests {
                 .unwrap()
                 .map(|entry| entry.unwrap().file_name())
                 .collect::<Vec<_>>(),
-            [DEST8]
+            [DEST32]
         );
     }
 
@@ -805,9 +813,9 @@ mod tests {
     }
 
     #[test]
-    fn the_peer_directory_is_the_lower_cased_first_eight_characters() {
-        assert_eq!(peer_dest8(PEER), DEST8);
-        assert_eq!(peer_dest8("AbC"), "abc");
+    fn the_peer_directory_is_the_lower_cased_destination_hash() {
+        assert_eq!(peer_dir(PEER), DEST32);
+        assert_eq!(peer_dir(DEST32), DEST32);
     }
 
     /// A root that is "gone again" is reported as an I/O failure of the inbox, never as a
@@ -893,7 +901,7 @@ mod tests {
             .unwrap();
 
         let canonical_root = dunce::canonicalize(&inbox.root).unwrap();
-        let peer_dir = canonical_root.join(DEST8);
+        let peer_dir = canonical_root.join(DEST32);
         assert!(deep.is_absolute() && beside.is_absolute());
         assert_eq!(deep, peer_dir.join("a").join("b").join("c").join("d.txt"));
         assert_eq!(
@@ -912,7 +920,7 @@ mod tests {
         assert_eq!(found, [deep, beside]);
     }
 
-    /// Layout `<peer-dest8>/<rel>`: two peers staging the same name with different bytes
+    /// Layout `<peer-dest32>/<rel>`: two peers staging the same name with different bytes
     /// do not collide — each lands under its own directory with no hash suffix and its
     /// own bytes, and a peer's directory is named by *its* destination, not the other's.
     #[test]
@@ -929,10 +937,13 @@ mod tests {
             .unwrap();
 
         let canonical_root = dunce::canonicalize(&inbox.root).unwrap();
-        assert_eq!(first, canonical_root.join(DEST8).join("docs").join("a.md"));
+        assert_eq!(first, canonical_root.join(DEST32).join("docs").join("a.md"));
         assert_eq!(
             second,
-            canonical_root.join("fedcba98").join("docs").join("a.md")
+            canonical_root
+                .join("fedcba9876543210fedcba9876543210")
+                .join("docs")
+                .join("a.md")
         );
         assert_eq!(
             first.file_name(),
@@ -948,8 +959,40 @@ mod tests {
         assert_eq!(found, expected);
     }
 
+    /// Two peers whose destinations share a prefix still get their own directories: the
+    /// directory is the whole hash, so the same name from each lands apart and unsuffixed.
+    #[test]
+    fn two_peers_sharing_a_hash_prefix_stage_the_same_name_into_their_own_directories() {
+        const NEAR: &str = "abcdef01FFFFFFFFffffffffffffffff";
+        let tmp = TempDir::new("inbox-shared-prefix");
+        let inbox = staging(&tmp);
+        let rel = WirePath::parse("docs/a.md").unwrap();
+
+        let first = inbox.stage(PEER, &rel, &digest(b"mine"), b"mine").unwrap();
+        let second = inbox
+            .stage(NEAR, &rel, &digest(b"theirs"), b"theirs")
+            .unwrap();
+
+        let canonical_root = dunce::canonicalize(&inbox.root).unwrap();
+        assert_eq!(first, canonical_root.join(DEST32).join("docs").join("a.md"));
+        assert_eq!(
+            second,
+            canonical_root
+                .join("abcdef01ffffffffffffffffffffffff")
+                .join("docs")
+                .join("a.md")
+        );
+        assert_eq!(
+            first.file_name(),
+            second.file_name(),
+            "no hash suffix on either"
+        );
+        assert_eq!(fs::read(&first).unwrap(), b"mine");
+        assert_eq!(fs::read(&second).unwrap(), b"theirs");
+    }
+
     /// Prefix check on the parent's canonical path: the guard holds at the shallowest
-    /// level a peer-named path can reach. When the peer's own `<dest8>` directory is a
+    /// level a peer-named path can reach. When the peer's own `<dest32>` directory is a
     /// symlink leading outside the root, a stage of any name (one level or deep) is
     /// `Escaped` before anything is created or written at the link's target, and the
     /// error names no path.
@@ -962,7 +1005,7 @@ mod tests {
         let outside = tmp.path.join("outside");
         fs::create_dir_all(&outside).unwrap();
         fs::create_dir_all(&inbox.root).unwrap();
-        std::os::unix::fs::symlink(&outside, inbox.root.join(DEST8)).unwrap();
+        std::os::unix::fs::symlink(&outside, inbox.root.join(DEST32)).unwrap();
 
         for text in ["a.md", "docs/a.md", "docs/deep/er/a.md"] {
             let rel = WirePath::parse(text).unwrap();
@@ -982,7 +1025,7 @@ mod tests {
         assert!(
             inbox
                 .root
-                .join(DEST8)
+                .join(DEST32)
                 .symlink_metadata()
                 .unwrap()
                 .file_type()
@@ -1012,7 +1055,7 @@ mod tests {
             first,
             dunce::canonicalize(&inbox.root)
                 .unwrap()
-                .join(DEST8)
+                .join(DEST32)
                 .join("docs")
                 .join("empty.md")
         );

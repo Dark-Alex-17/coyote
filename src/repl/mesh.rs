@@ -23516,7 +23516,7 @@ mod tests {
                 /// ago" oracle), and the lend leaves no rule behind for `/list`. An inline
                 /// attachment arrives as a `file` part with the bytes that, admitted through
                 /// the receiver's own `PeerMessage::new_with`, lands at
-                /// `<cache_dir>/mesh/inbox/<instance_id>/<dest8>/<name>` with the bytes the
+                /// `<cache_dir>/mesh/inbox/<instance_id>/<dest32>/<name>` with the bytes the
                 /// human attached and no grant written on either side.
                 #[test]
                 #[serial]
@@ -23664,7 +23664,7 @@ mod tests {
                         let expected =
                             dunce::canonicalize(inbox_root(&peer_cache.path, "peer-inst"))
                                 .unwrap()
-                                .join(a_hex[..8].to_ascii_lowercase())
+                                .join(a_hex.to_ascii_lowercase())
                                 .join("docs")
                                 .join("notes.md");
                         assert_eq!(
@@ -23833,7 +23833,7 @@ mod tests {
 
                         let staged = dunce::canonicalize(fx.inbox_root())
                             .unwrap()
-                            .join(fx.stub.destination_hex()[..8].to_lowercase())
+                            .join(fx.stub.destination_hex().to_lowercase())
                             .join("docs")
                             .join("a.md");
                         let lines: Vec<&str> = out.lines().collect();
@@ -24172,7 +24172,7 @@ mod tests {
                         let out1 = out_of(&mut fx.ctx, &line).await.unwrap();
                         let peer_dir = dunce::canonicalize(fx.inbox_root())
                             .unwrap()
-                            .join(dest[..8].to_lowercase());
+                            .join(dest.to_lowercase());
                         let staged1 = peer_dir.join("docs").join("a.md");
                         assert!(
                             out1.contains(&format!("at {}.", staged1.display())),

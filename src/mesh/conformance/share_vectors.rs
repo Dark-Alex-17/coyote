@@ -3034,7 +3034,7 @@ fn the_inbox_stages_under_the_instance_and_peer_and_refuses_a_collision() -> Res
     let staged = stage(first).map_err(|err| err.to_string())?;
     let expected = dunce::canonicalize(staging.root())
         .unwrap()
-        .join("abcdef01")
+        .join("abcdef0123456789abcdef0123456789")
         .join("docs")
         .join("a.md");
     same("staged path", staged.clone(), expected.clone())?;

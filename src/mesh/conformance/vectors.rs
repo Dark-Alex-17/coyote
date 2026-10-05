@@ -9256,9 +9256,9 @@ fn part_vectors() -> Vec<Vector> {
                 let root =
                     dunce::canonicalize(tmp.path.join("inbox")).map_err(|err| err.to_string())?;
                 same(
-                    "staged under <inbox>/<peer8>/<name>",
+                    "staged under <inbox>/<peer32>/<name>",
                     &path,
-                    &root.join(&DESTINATION_A[..8]).join("docs").join("notes.md"),
+                    &root.join(DESTINATION_A).join("docs").join("notes.md"),
                 )?;
                 same("the bytes on disk", read_staged(&path)?, bytes.clone())?;
                 same(
@@ -9292,14 +9292,14 @@ fn part_vectors() -> Vec<Vector> {
                 let b = PeerMessage::new_with(from_b, &PartLimits::default(), Some(&inbox));
                 let root = dunce::canonicalize(inbox.root()).map_err(|err| err.to_string())?;
                 same(
-                    "the peer directory is dest8, lower-cased",
+                    "the peer directory is the full destination, lower-cased",
                     staged_path(&a)?,
-                    root.join(&DESTINATION_A[..8]).join("a.md"),
+                    root.join(DESTINATION_A).join("a.md"),
                 )?;
                 same(
                     "another peer's same name lands apart",
                     staged_path(&b)?,
-                    root.join(&DESTINATION_B[..8]).join("a.md"),
+                    root.join(DESTINATION_B).join("a.md"),
                 )?;
                 same(
                     "a's bytes",
