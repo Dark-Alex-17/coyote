@@ -6042,7 +6042,9 @@ mod tests {
                 name: "docs/notes.md".into(),
                 size: 8,
                 sha256: "ab".repeat(32),
-                staged: Some(PathBuf::from("/tmp/inbox/abcdef01/docs/notes.md")),
+                staged: Some(PathBuf::from(
+                    "/tmp/inbox/abcdef01abcdef01abcdef01abcdef01/docs/notes.md",
+                )),
                 reference: None,
             },
         ];
@@ -6055,7 +6057,7 @@ mod tests {
         assert_eq!(lines[2], "  data: 9 bytes");
         assert_eq!(
             lines[3],
-            "  file: docs/notes.md (8 B) staged at /tmp/inbox/abcdef01/docs/notes.md"
+            "  file: docs/notes.md (8 B) staged at /tmp/inbox/abcdef01abcdef01abcdef01abcdef01/docs/notes.md"
         );
         assert_eq!(lines[4], "  (2 parts dropped)");
     }
@@ -24217,6 +24219,7 @@ mod tests {
                 use super::*;
 
                 const ROOT_TAG: &str = "repl-mesh-inbox-purge";
+                const PEER_DIR: &str = "aabbccddaabbccddaabbccddaabbccdd";
 
                 /// A node whose staging inbox holds two files and a link out of the tree,
                 /// beside another instance's directory under the same inbox root.
@@ -24238,7 +24241,7 @@ mod tests {
                             ctx,
                             outside,
                         };
-                        let peer_dir = fx.root().join("aabbccdd");
+                        let peer_dir = fx.root().join(PEER_DIR);
                         fs::create_dir_all(peer_dir.join("docs")).unwrap();
                         fs::write(peer_dir.join("docs").join("a.md"), b"hello").unwrap();
                         fs::write(peer_dir.join("b.bin"), b"1234567").unwrap();
@@ -24268,15 +24271,15 @@ mod tests {
                     fn assert_tree_intact(&self) {
                         let root = self.root();
                         assert_eq!(
-                            fs::read(root.join("aabbccdd").join("docs").join("a.md")).unwrap(),
+                            fs::read(root.join(PEER_DIR).join("docs").join("a.md")).unwrap(),
                             b"hello"
                         );
                         assert_eq!(
-                            fs::read(root.join("aabbccdd").join("b.bin")).unwrap(),
+                            fs::read(root.join(PEER_DIR).join("b.bin")).unwrap(),
                             b"1234567"
                         );
                         assert!(
-                            fs::symlink_metadata(root.join("aabbccdd").join("link.txt"))
+                            fs::symlink_metadata(root.join(PEER_DIR).join("link.txt"))
                                 .unwrap()
                                 .file_type()
                                 .is_symlink()
@@ -24382,9 +24385,9 @@ mod tests {
                                     "Would remove 3 files (12 bytes) staged under {}:",
                                     root.display()
                                 ),
-                                "  aabbccdd/b.bin".to_string(),
-                                "  aabbccdd/docs/a.md".to_string(),
-                                "  aabbccdd/link.txt (link)".to_string(),
+                                format!("  {PEER_DIR}/b.bin"),
+                                format!("  {PEER_DIR}/docs/a.md"),
+                                format!("  {PEER_DIR}/link.txt (link)"),
                                 DRY_RUN_NOTHING_CHANGED.to_string(),
                             ],
                             "{out}"
@@ -24569,7 +24572,7 @@ mod tests {
                         let inbox_root = instance_dir.parent().unwrap().to_path_buf();
                         let instance_id = instance_dir.file_name().unwrap().to_owned();
                         let elsewhere = TempDir::new(&format!("{ROOT_TAG}-elsewhere"));
-                        let behind = elsewhere.path.join(&instance_id).join("aabbccdd");
+                        let behind = elsewhere.path.join(&instance_id).join(PEER_DIR);
                         fs::create_dir_all(&behind).unwrap();
                         fs::write(behind.join("a.md"), b"hello").unwrap();
                         if inbox_root.exists() {
@@ -24577,7 +24580,7 @@ mod tests {
                         }
                         fs::create_dir_all(inbox_root.parent().unwrap()).unwrap();
                         std::os::unix::fs::symlink(&elsewhere.path, &inbox_root).unwrap();
-                        assert!(instance_dir.join("aabbccdd").join("a.md").exists());
+                        assert!(instance_dir.join(PEER_DIR).join("a.md").exists());
 
                         let before = stdout_lines().len();
                         let text = match run(&mut ctx, ".mesh inbox --purge-files --yes").await {
@@ -24630,7 +24633,7 @@ mod tests {
                         let root = started.runtime.inbox_staging().root().to_path_buf();
                         let outside = TempDir::new(&format!("{ROOT_TAG}-outside-dir"));
                         fs::write(outside.path.join("big.txt"), vec![b'x'; 1000]).unwrap();
-                        let peer_dir = root.join("aabbccdd");
+                        let peer_dir = root.join(PEER_DIR);
                         fs::create_dir_all(&peer_dir).unwrap();
                         fs::write(peer_dir.join("b.bin"), b"1234567").unwrap();
                         std::os::unix::fs::symlink(&outside.path, peer_dir.join("docs")).unwrap();

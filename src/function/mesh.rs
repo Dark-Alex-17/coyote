@@ -2417,7 +2417,7 @@ mod tests {
         let slot = MeshSlot::default();
         let staged = std::env::temp_dir()
             .join("coyote-mesh-inbox")
-            .join("abcdef01")
+            .join("abcdef01abcdef01abcdef01abcdef01")
             .join("docs")
             .join("notes.md");
         assert!(staged.is_absolute());
@@ -3731,7 +3731,7 @@ mod tests {
         /// dir is where a fetch stages its file.
         struct TrustedStub {
             _guard: TestConfigDirGuard,
-            _started: StartedRuntime,
+            started: StartedRuntime,
             stub: PeerStub,
             ctx: RequestContext,
             to: String,
@@ -3760,7 +3760,7 @@ mod tests {
                 .unwrap();
             TrustedStub {
                 _guard: guard,
-                _started: started,
+                started,
                 stub,
                 ctx,
                 to,
@@ -4194,6 +4194,14 @@ mod tests {
             );
             let staged_path = PathBuf::from(staged["staged_path"].as_str().unwrap());
             assert!(staged_path.is_absolute(), "{staged_path:?}");
+            let peer_dir = dunce::canonicalize(live.started.runtime.inbox_staging().root())
+                .unwrap()
+                .join(live.to.to_ascii_lowercase());
+            assert_eq!(
+                staged_path,
+                peer_dir.join("docs").join("notes.md"),
+                "the peer's full destination hash, lower-cased, names its directory"
+            );
             assert_eq!(std::fs::read(&staged_path).unwrap(), SHARED_TEXT.as_bytes());
             let label = format!("peer {}", live.to);
             assert_eq!(staged["text"], wrap(&label, SHARED_TEXT), "{staged}");
