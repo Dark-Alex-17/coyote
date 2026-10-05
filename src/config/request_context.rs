@@ -18,8 +18,8 @@ use super::{
     Input, InstallFilter, LEFT_PROMPT, LastMessage, MESSAGES_FILE_NAME, MacroAllowlistLevel,
     MacroPolicy, MacroSource, MacroState, RESERVED_MACRO_NAMES, RIGHT_PROMPT, ResolvedMacro, Role,
     RoleLike, SUMMARIZATION_PROMPT, SUMMARY_CONTEXT_PROMPT, StateFlags, TEMP_ROLE_NAME,
-    TEMP_SESSION_NAME, WORKSPACE_COYOTE_DIR_NAME, WorkingMode, bundles, ensure_parent_exists,
-    list_agents_for_humans, memory, paths,
+    TEMP_SESSION_NAME, WorkingMode, bundles, ensure_parent_exists, list_agents_for_humans, memory,
+    paths,
 };
 use super::{MessageContentToolCalls, prompts};
 use crate::client::{
@@ -4893,7 +4893,8 @@ impl RequestContext {
                 values.push((
                     "--workspace".to_string(),
                     Some(format!(
-                        "Save the session under {WORKSPACE_COYOTE_DIR_NAME}/ in the current workspace"
+                        "Save the session under {}/ in the current workspace",
+                        paths::workspace_config_dir_name()
                     )),
                 ));
                 values.push((
@@ -5599,7 +5600,7 @@ impl RequestContext {
         let Ok(entries) = fs::read_dir(&dir) else {
             return Vec::new();
         };
-        let filter = CompletionFilter::new(&paths::workspace_config_dir_name(), case_insensitive);
+        let filter = CompletionFilter::new(&paths::workspace_config_dirs(), case_insensitive);
         let protected = locations.protected_dirs();
         let mut values: Vec<(String, Option<String>)> = entries
             .flatten()

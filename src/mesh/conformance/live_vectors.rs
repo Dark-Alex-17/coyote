@@ -1018,10 +1018,10 @@ mod loopback {
         }
 
         fn locations(&self) -> ShareLocations {
-            ShareLocations::with_dir_name(
+            ShareLocations::with_dir_names(
                 &self.config_dir,
                 &self.root,
-                WORKSPACE_COYOTE_DIR_NAME.to_string(),
+                vec![WORKSPACE_COYOTE_DIR_NAME.to_string()],
             )
         }
 

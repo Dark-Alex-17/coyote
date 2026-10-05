@@ -3062,7 +3062,7 @@ fn refuse_protected_directory_pattern(
     let dir = pattern.trim_end_matches('/');
     let protected = match share_locations(ctx) {
         Some((_, locations)) => ShareSet::load_quietly(locations).0.protected_head(dir),
-        None => protected_segment(dir, &paths::workspace_config_dir_name()).map(str::to_string),
+        None => protected_segment(dir, &paths::workspace_config_dirs()).map(str::to_string),
     };
     if let Some(head) = protected {
         bail!(never_shared_sentence(pattern, &head, verb));

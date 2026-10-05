@@ -22,7 +22,7 @@
 //! the one path a fetch takes through all of this, and `list` walks only what the allows
 //! name.
 
-use crate::config::{WORKSPACE_COYOTE_DIR_NAME, paths};
+use crate::config::paths;
 use crate::mesh::grants::GrantStore;
 use crate::mesh::schema::{Remedy, VersionProbe, unversioned_refusal, version_refusal};
 use crate::mesh::trust::same_hash;
@@ -342,9 +342,10 @@ pub(crate) enum RawKind {
 }
 
 /// Where the two files live for one share root, and the directories nothing may serve out
-/// of. Path arithmetic only; nothing is read. The workspace config directory's name is
-/// taken from the process once, here, so every rule derived from it agrees with where the
-/// workspace file was looked up. `with_cache_dir` adds the mesh cache directory, where
+/// of. Path arithmetic only; nothing is read. The workspace config directory's names are
+/// taken from the process once, here, so every rule derived from them agrees with where
+/// the workspace file was looked up: the first name is the runtime one, where that file
+/// lives; every name is protected. `with_cache_dir` adds the mesh cache directory, where
 /// grants, the inbox and pending questions live, to what is protected; `with_protected`
 /// adds any other directory, such as a configured inbox that lies outside the cache.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -353,33 +354,31 @@ pub(crate) struct ShareLocations {
     pub workspace: PathBuf,
     config_dir: PathBuf,
     workspace_root: PathBuf,
-    workspace_config_dir_name: String,
+    workspace_config_dir_names: Vec<String>,
     mesh_cache_dir: Option<PathBuf>,
     protected: Vec<PathBuf>,
 }
 
 impl ShareLocations {
     pub(crate) fn new(config_dir: &Path, workspace_root: &Path) -> Self {
-        Self::with_dir_name(
-            config_dir,
-            workspace_root,
-            paths::workspace_config_dir_name(),
-        )
+        Self::with_dir_names(config_dir, workspace_root, paths::workspace_config_dirs())
     }
 
-    pub(crate) fn with_dir_name(
+    pub(crate) fn with_dir_names(
         config_dir: &Path,
         workspace_root: &Path,
-        workspace_config_dir_name: String,
+        workspace_config_dir_names: Vec<String>,
     ) -> Self {
+        let runtime_name = workspace_config_dir_names
+            .first()
+            .map(String::as_str)
+            .unwrap_or_default();
         Self {
             global: mesh_config_dir(config_dir).join("shares.yaml"),
-            workspace: workspace_root
-                .join(&workspace_config_dir_name)
-                .join("mesh-shares.yaml"),
+            workspace: workspace_root.join(runtime_name).join("mesh-shares.yaml"),
             config_dir: config_dir.to_path_buf(),
             workspace_root: workspace_root.to_path_buf(),
-            workspace_config_dir_name,
+            workspace_config_dir_names,
             mesh_cache_dir: None,
             protected: Vec::new(),
         }
@@ -549,7 +548,7 @@ impl ShareSet {
 
     fn builtin(&self, case_insensitive: bool) -> Result<GlobSet> {
         compile(
-            builtin_deny_patterns(&self.locations.workspace_config_dir_name)
+            builtin_deny_patterns(&self.locations.workspace_config_dir_names)
                 .iter()
                 .map(String::as_str),
             case_insensitive,
@@ -995,7 +994,8 @@ impl ShareSet {
     /// path, or into any directory the walk skips, such as a configured inbox under the
     /// root. Names the protected directory, not the pattern's first segment.
     pub(crate) fn protected_head(&self, pattern: &str) -> Option<String> {
-        if let Some(segment) = protected_segment(pattern, &self.locations.workspace_config_dir_name)
+        if let Some(segment) =
+            protected_segment(pattern, &self.locations.workspace_config_dir_names)
         {
             return Some(segment.to_string());
         }
@@ -1483,13 +1483,13 @@ pub(crate) fn list_cursor(path: &str) -> String {
 
 /// Every built-in pattern at the share root and at any depth below it, plus the workspace
 /// config directory under each name it goes by, escaped so a name is matched literally.
-fn builtin_deny_patterns(workspace_config_dir_name: &str) -> Vec<String> {
+fn builtin_deny_patterns(workspace_config_dir_names: &[String]) -> Vec<String> {
     BUILTIN_DENY
         .iter()
         .map(|pattern| (*pattern).to_string())
         .chain(
-            workspace_config_dir_names(workspace_config_dir_name)
-                .into_iter()
+            workspace_config_dir_names
+                .iter()
                 .map(|name| format!("{}/**", globset::escape(name))),
         )
         .flat_map(|pattern| [format!("**/{pattern}"), pattern])
@@ -1498,18 +1498,20 @@ fn builtin_deny_patterns(workspace_config_dir_name: &str) -> Vec<String> {
 
 /// The first segment of `pattern`, at any depth and behind any glob, that names a
 /// directory nothing may serve out of by name alone: `.git`, or the workspace config
-/// directory under either name it goes by. Whole-segment equality, so `.github` and
+/// directory under any name it goes by. Whole-segment equality, so `.github` and
 /// `foo.git` are ordinary, and a glob segment never matches. The walk never enters such a
 /// directory, so a rule under one is dead at any depth. Needs no root, so a verb can say
 /// so before the gate.
 pub(crate) fn protected_segment<'a>(
     pattern: &'a str,
-    workspace_config_dir_name: &str,
+    workspace_config_dir_names: &[String],
 ) -> Option<&'a str> {
-    let names = workspace_config_dir_names(workspace_config_dir_name);
-    pattern
-        .split('/')
-        .find(|segment| *segment == ".git" || names.contains(segment))
+    pattern.split('/').find(|segment| {
+        *segment == ".git"
+            || workspace_config_dir_names
+                .iter()
+                .any(|name| name == segment)
+    })
 }
 
 fn literal_segments(pattern: &str) -> Vec<&str> {
@@ -1519,22 +1521,15 @@ fn literal_segments(pattern: &str) -> Vec<&str> {
         .collect()
 }
 
-/// The runtime name and the literal default, which memory and the sbx mixin keep using
-/// under an env override; one entry when they agree.
-fn workspace_config_dir_names(workspace_config_dir_name: &str) -> Vec<&str> {
-    let mut names = vec![workspace_config_dir_name, WORKSPACE_COYOTE_DIR_NAME];
-    names.dedup();
-    names
-}
-
 /// The directories nothing lifts, as they resolve on disk: the workspace config directory
 /// under each name it goes by, since an absolute env override lands where a name glob
 /// would miss, and the global config directory, which a share root above it would
 /// otherwise serve, the mesh cache directory when the caller named one, and whatever else
 /// `with_protected` added. A directory that does not resolve holds nothing to protect.
 fn protected_dirs(locations: &ShareLocations) -> Vec<PathBuf> {
-    let mut dirs: Vec<PathBuf> = workspace_config_dir_names(&locations.workspace_config_dir_name)
-        .into_iter()
+    let mut dirs: Vec<PathBuf> = locations
+        .workspace_config_dir_names
+        .iter()
         .map(|name| locations.workspace_root.join(name))
         .chain([locations.config_dir.clone()])
         .chain(locations.mesh_cache_dir.clone())
@@ -1591,13 +1586,10 @@ pub(crate) struct CompletionFilter {
 }
 
 impl CompletionFilter {
-    pub(crate) fn new(workspace_config_dir_name: &str, case_insensitive: bool) -> Self {
-        let patterns = builtin_deny_patterns(workspace_config_dir_name);
+    pub(crate) fn new(workspace_config_dir_names: &[String], case_insensitive: bool) -> Self {
+        let patterns = builtin_deny_patterns(workspace_config_dir_names);
         Self {
-            config_dir_names: workspace_config_dir_names(workspace_config_dir_name)
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
+            config_dir_names: workspace_config_dir_names.to_vec(),
             builtin: compile(patterns.iter().map(String::as_str), case_insensitive).ok(),
         }
     }
@@ -1780,6 +1772,7 @@ fn validate_entries(file: &SharesFile) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::WORKSPACE_COYOTE_DIR_NAME;
     use crate::config::mesh_config::MAX_FETCH_FILE_BYTES;
     use crate::mesh::hex_lower;
     use crate::mesh::test_support::TempDir;
@@ -1821,10 +1814,10 @@ mod tests {
         /// env override another test may be holding; the override itself is exercised
         /// under `serial` below.
         fn locations(&self) -> ShareLocations {
-            ShareLocations::with_dir_name(
+            ShareLocations::with_dir_names(
                 &self.config_dir,
                 &self.root,
-                WORKSPACE_COYOTE_DIR_NAME.to_string(),
+                vec![WORKSPACE_COYOTE_DIR_NAME.to_string()],
             )
         }
 
@@ -1990,10 +1983,10 @@ mod tests {
 
     #[test]
     fn locations_put_the_global_file_under_mesh_and_the_workspace_file_in_its_config_dir() {
-        let locations = ShareLocations::with_dir_name(
+        let locations = ShareLocations::with_dir_names(
             Path::new("cfg"),
             Path::new("ws"),
-            WORKSPACE_COYOTE_DIR_NAME.to_string(),
+            vec![WORKSPACE_COYOTE_DIR_NAME.to_string()],
         );
 
         assert_eq!(locations.global, Path::new("cfg/mesh/shares.yaml"));
@@ -3353,7 +3346,8 @@ mod tests {
 
     #[test]
     fn the_completion_filter_hides_git_the_config_dir_and_built_in_denied_names() {
-        let filter = CompletionFilter::new(".coyote-custom", false);
+        let names = [".coyote-custom".to_string(), ".coyote".to_string()];
+        let filter = CompletionFilter::new(&names, false);
         for (name, hidden) in [
             (".git", true),
             (".coyote", true),
@@ -3371,13 +3365,14 @@ mod tests {
 
     #[test]
     fn the_completion_filter_hides_built_in_denied_names_across_case_only_on_a_folding_root() {
+        let names = [".coyote".to_string()];
         for name in [".ENV", "X.PEM", "ID_RSA", ".GIT"] {
             assert!(
-                CompletionFilter::new(".coyote", true).is_hidden(name),
+                CompletionFilter::new(&names, true).is_hidden(name),
                 "{name} is hidden when the root folds case"
             );
             assert!(
-                !CompletionFilter::new(".coyote", false).is_hidden(name),
+                !CompletionFilter::new(&names, false).is_hidden(name),
                 "{name} is offered when the root does not"
             );
         }
@@ -3449,7 +3444,7 @@ mod tests {
             rules.builtin.is_match(".coyote/sessions/notes.md"),
             "the name glob denies the directory on its own, before the prefix check"
         );
-        let patterns = builtin_deny_patterns(&paths::workspace_config_dir_name());
+        let patterns = builtin_deny_patterns(&paths::workspace_config_dirs());
         assert!(
             patterns.contains(&format!("{WORKSPACE_COYOTE_DIR_NAME}/**")),
             "{patterns:?}"
@@ -3784,10 +3779,13 @@ mod tests {
     #[test]
     fn a_config_dir_name_with_glob_metacharacters_is_still_denied_by_name() {
         let fx = Fixture::new("shares-protected-metacharacters");
-        let mut set = ShareSet::load(ShareLocations::with_dir_name(
+        let mut set = ShareSet::load(ShareLocations::with_dir_names(
             &fx.config_dir,
             &fx.root,
-            "cfg[dev]".to_string(),
+            vec![
+                "cfg[dev]".to_string(),
+                WORKSPACE_COYOTE_DIR_NAME.to_string(),
+            ],
         ));
         set.apply(allow("**"), WriteScope::Global).unwrap();
         let inside = fx.file("cfg[dev]/sessions/x.md");
@@ -3798,7 +3796,9 @@ mod tests {
         assert!(rules.builtin.is_match("cfg[dev]/sessions/x.md"));
         assert!(rules.permits(&wire("README.md"), &fx.file("README.md")));
         compile(
-            builtin_deny_patterns("cfg[").iter().map(String::as_str),
+            builtin_deny_patterns(&["cfg[".to_string()])
+                .iter()
+                .map(String::as_str),
             false,
         )
         .expect("an unclosed bracket in the name must not break every share");

@@ -229,10 +229,34 @@ pub fn workspace_config_dir_name() -> String {
     }
 }
 
+/// Every name the workspace config directory goes by under a workspace root. The first
+/// is the runtime name: the env override as given, which may be a relative or an
+/// absolute path, and is where sessions, agent sessions, skills, macros and the
+/// workspace mcp.json live. The literal default follows when it differs: workspace
+/// memory and the sbx mixin always live under it, override or not. Everything that
+/// protects or denies the workspace config directory protects every name listed here.
+pub fn workspace_config_dirs() -> Vec<String> {
+    let mut names = vec![
+        workspace_config_dir_name(),
+        WORKSPACE_COYOTE_DIR_NAME.to_string(),
+    ];
+    names.dedup();
+    names
+}
+
 pub fn workspace_config_dir() -> PathBuf {
     env::current_dir()
         .unwrap_or_default()
         .join(workspace_config_dir_name())
+}
+
+/// `workspace_config_dirs` joined under the current directory, in the same order.
+pub fn workspace_config_dir_paths() -> Vec<PathBuf> {
+    let cwd = env::current_dir().unwrap_or_default();
+    workspace_config_dirs()
+        .iter()
+        .map(|name| cwd.join(name))
+        .collect()
 }
 
 pub fn workspace_skills_dir() -> PathBuf {
@@ -434,6 +458,13 @@ pub fn workspace_memory_dir_for(workspace_root: &Path) -> PathBuf {
 
 pub fn workspace_memory_index_file_for(workspace_root: &Path) -> PathBuf {
     workspace_memory_dir_for(workspace_root).join(MEMORY_INDEX_FILE_NAME)
+}
+
+/// The `.gitignore` line that keeps workspace memory out of the repository: a
+/// slash-separated, slash-terminated path relative to the repository root, not an OS
+/// path, since `.gitignore` reads it the same way on every platform.
+pub fn workspace_memory_gitignore_entry() -> String {
+    format!("{WORKSPACE_COYOTE_DIR_NAME}/{MEMORY_DIR_NAME}/")
 }
 
 pub fn repl_history_dir() -> PathBuf {
@@ -660,6 +691,60 @@ mod tests {
         assert_eq!(workspace_config_dir(), absolute);
         let _relative = EnvVarGuard::set(&env_name, "conf/.hidden");
         assert_eq!(workspace_config_dir_name(), "conf/.hidden");
+    }
+
+    #[test]
+    #[serial]
+    fn workspace_config_dirs_lists_the_override_first_and_the_default_once() {
+        let env_name = get_env_name("workspace_config_dir");
+        let cwd = env::current_dir().unwrap();
+        {
+            let _unset = EnvVarGuard::unset(&env_name);
+            assert_eq!(workspace_config_dirs(), [WORKSPACE_COYOTE_DIR_NAME]);
+            assert_eq!(
+                workspace_config_dir_paths(),
+                [cwd.join(WORKSPACE_COYOTE_DIR_NAME)]
+            );
+        }
+        {
+            let _same = EnvVarGuard::set(&env_name, WORKSPACE_COYOTE_DIR_NAME);
+            assert_eq!(workspace_config_dirs(), [WORKSPACE_COYOTE_DIR_NAME]);
+        }
+        let absolute = env::temp_dir().join("coyote-ws-dirs-override");
+        let _set = EnvVarGuard::set(&env_name, &absolute);
+        assert_eq!(
+            workspace_config_dirs(),
+            [absolute.to_str().unwrap(), WORKSPACE_COYOTE_DIR_NAME]
+        );
+        assert_eq!(
+            workspace_config_dir_paths(),
+            [absolute.clone(), cwd.join(WORKSPACE_COYOTE_DIR_NAME)]
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn workspace_memory_stays_under_the_literal_name_when_the_config_dir_is_overridden() {
+        let env_name = get_env_name("workspace_config_dir");
+        let root = env::temp_dir().join("coyote-ws-memory-override-root");
+        let override_dir = env::temp_dir().join("coyote-ws-memory-override-cfg");
+        let _set = EnvVarGuard::set(&env_name, &override_dir);
+
+        assert_eq!(
+            workspace_config_dirs(),
+            [override_dir.to_str().unwrap(), WORKSPACE_COYOTE_DIR_NAME]
+        );
+        assert_eq!(
+            workspace_memory_dir_for(&root),
+            root.join(WORKSPACE_COYOTE_DIR_NAME).join(MEMORY_DIR_NAME)
+        );
+        assert_eq!(
+            workspace_memory_index_file_for(&root),
+            root.join(WORKSPACE_COYOTE_DIR_NAME)
+                .join(MEMORY_DIR_NAME)
+                .join(MEMORY_INDEX_FILE_NAME)
+        );
+        assert_eq!(workspace_memory_gitignore_entry(), ".coyote/memory/");
     }
 
     mod sandbox_home_translation {

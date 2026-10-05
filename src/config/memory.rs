@@ -5,10 +5,7 @@ use anyhow::{Context, Result};
 use log::warn;
 use serde::{Deserialize, Serialize};
 
-use crate::config::{
-    GIT_DIR_NAME, GITIGNORE_FILE_NAME, MEMORY_DIR_NAME, MEMORY_INDEX_FILE_NAME,
-    WORKSPACE_COYOTE_DIR_NAME, paths,
-};
+use crate::config::{GIT_DIR_NAME, GITIGNORE_FILE_NAME, MEMORY_INDEX_FILE_NAME, paths};
 
 pub const DEFAULT_MEMORY_CAP_WITH_TOOLS: usize = 6_000;
 pub const DEFAULT_MEMORY_CAP_WITHOUT_TOOLS: usize = 12_000;
@@ -21,11 +18,10 @@ pub struct WorkspaceMemory {
 
 pub fn discover_workspace_memory(start: &Path) -> Option<WorkspaceMemory> {
     for dir in start.ancestors() {
-        let structured = dir.join(WORKSPACE_COYOTE_DIR_NAME).join(MEMORY_DIR_NAME);
-        if structured.join(MEMORY_INDEX_FILE_NAME).exists() {
+        if paths::workspace_memory_index_file_for(dir).exists() {
             return Some(WorkspaceMemory {
                 workspace_root: dir.to_path_buf(),
-                dir: structured,
+                dir: paths::workspace_memory_dir_for(dir),
             });
         }
     }
@@ -55,9 +51,12 @@ pub fn bootstrap_workspace_memory(git_root: &Path) -> Result<PathBuf> {
 
     let gitignore_appended = append_gitignore_entry(git_root)?;
     let suffix = if gitignore_appended {
-        " (appended .coyote/memory/ to .gitignore)"
+        format!(
+            " (appended {} to {GITIGNORE_FILE_NAME})",
+            paths::workspace_memory_gitignore_entry()
+        )
     } else {
-        ""
+        String::new()
     };
     warn!(
         "auto-bootstrapped workspace memory at {}{}",
@@ -70,8 +69,8 @@ pub fn bootstrap_workspace_memory(git_root: &Path) -> Result<PathBuf> {
 
 pub fn append_gitignore_entry(git_root: &Path) -> Result<bool> {
     let gitignore = git_root.join(GITIGNORE_FILE_NAME);
-    let entry = format!("{WORKSPACE_COYOTE_DIR_NAME}/{MEMORY_DIR_NAME}/");
-    let entry_no_slash = format!("{WORKSPACE_COYOTE_DIR_NAME}/{MEMORY_DIR_NAME}");
+    let entry = paths::workspace_memory_gitignore_entry();
+    let entry_no_slash = entry.trim_end_matches('/');
 
     let existing = fs::read_to_string(&gitignore).unwrap_or_default();
     let already_present = existing.lines().any(|line| {
@@ -314,6 +313,7 @@ fn collect_md_files(dir: &Path, out: &mut Vec<MemoryFile>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{MEMORY_DIR_NAME, WORKSPACE_COYOTE_DIR_NAME};
     use std::{env, time};
     use time::SystemTime;
 
@@ -564,6 +564,8 @@ mod tests {
 
         let found = discover_workspace_memory(&nested).expect("workspace memory should be found");
         assert_eq!(found.dir, mem_dir);
+        assert_eq!(found.workspace_root, workspace);
+        assert_eq!(found.dir, paths::workspace_memory_dir_for(&workspace));
 
         let _ = fs::remove_dir_all(&root);
     }

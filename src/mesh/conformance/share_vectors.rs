@@ -677,10 +677,10 @@ impl Fixture {
     /// Pins the default directory name so the rows neither read nor depend on the env
     /// override another test may be holding.
     fn locations(&self) -> ShareLocations {
-        ShareLocations::with_dir_name(
+        ShareLocations::with_dir_names(
             &self.config_dir,
             &self.root,
-            WORKSPACE_COYOTE_DIR_NAME.to_string(),
+            vec![WORKSPACE_COYOTE_DIR_NAME.to_string()],
         )
     }
 
