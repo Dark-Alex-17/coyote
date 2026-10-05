@@ -4093,7 +4093,11 @@ mod tests {
     #[test]
     fn a_socket_under_an_allow_is_neither_served_nor_listed() {
         let fx = Fixture::new("serve-socket");
-        let _listener = std::os::unix::net::UnixListener::bind(fx.root.join("sock")).unwrap();
+        // macOS caps a socket path at 104 bytes and the fixture root is longer, so the
+        // socket is bound somewhere short and moved into the root; the node keeps its kind.
+        let short = std::env::temp_dir().join(format!("cy-sock-{}", std::process::id()));
+        let _listener = std::os::unix::net::UnixListener::bind(&short).unwrap();
+        fs::rename(&short, fx.root.join("sock")).unwrap();
         fx.file("docs/a.md");
         let mut set = fx.load();
         set.apply(allow("**"), WriteScope::Global).unwrap();
