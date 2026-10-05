@@ -3421,6 +3421,107 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
         );
     }
 
+    /// `source` line for line, so line numbers hold, with every `#[cfg(test)]`-attributed
+    /// inline module and every comment-only line blanked. A top-level module closes at
+    /// the first `}` on a line of its own, as rustfmt lays it out.
+    fn lines_outside_test_modules(source: &str) -> Vec<&str> {
+        let mut lines: Vec<&str> = source.lines().collect();
+        let mut at = 0;
+        while at < lines.len() {
+            let opens_test_module = lines[at] == "#[cfg(test)]"
+                && lines.get(at + 1).is_some_and(|opener| {
+                    opener.ends_with('{')
+                        && (opener.starts_with("mod ") || opener.starts_with("pub(crate) mod "))
+                });
+            if opens_test_module {
+                while at < lines.len() && lines[at] != "}" {
+                    lines[at] = "";
+                    at += 1;
+                }
+            } else if lines[at].trim_start().starts_with("//") {
+                lines[at] = "";
+            }
+            at += 1;
+        }
+        lines
+    }
+
+    /// The workspace config directory's name reaches the code through
+    /// `paths::workspace_config_dir_name` and `paths::workspace_config_dirs`, so an
+    /// override renames it everywhere at once, help and display strings included. Only
+    /// `paths.rs` and the constant's own definition may spell it; test code may, since a
+    /// fixture lays out a directory by its default name. A file whose module is declared
+    /// under `#[cfg(test)]` is test code wholesale; a comment may say what it likes, so
+    /// the `clap` doc comments that double as CLI help are not held to the helper.
+    #[test]
+    fn only_the_paths_helper_spells_the_workspace_config_dir_name() {
+        // Assembled at runtime so the scan does not match this test's own text.
+        let constant = ["WORKSPACE_", "COYOTE_DIR_NAME"].concat();
+        let quoted = ["\".coy", "ote\""].concat();
+        let in_a_path = [["\".coy", "ote/"].concat(), [" .coy", "ote/"].concat()];
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let files = rust_source_files(root).unwrap();
+        let test_modules: HashSet<String> = files
+            .iter()
+            .flat_map(|(_, source)| {
+                source
+                    .lines()
+                    .zip(source.lines().skip(1))
+                    .filter_map(|(attribute, item)| {
+                        (attribute.trim() == "#[cfg(test)]")
+                            .then(|| item.trim().trim_start_matches("pub(crate) "))
+                            .and_then(|item| item.strip_prefix("mod "))
+                            .and_then(|item| item.strip_suffix(';'))
+                            .map(str::to_string)
+                    })
+            })
+            .collect();
+        let is_test_file = |path: &str| {
+            path.split('/')
+                .any(|part| test_modules.contains(part.strip_suffix(".rs").unwrap_or(part)))
+        };
+        let scan = |path: &str, source: &str| -> Vec<String> {
+            if path == "src/config/paths.rs" || is_test_file(path) {
+                return Vec::new();
+            }
+            lines_outside_test_modules(source)
+                .iter()
+                .enumerate()
+                .filter(|(_, line)| {
+                    let defines_the_constant = path == "src/config/mod.rs"
+                        && line
+                            .trim_start()
+                            .starts_with(&format!("pub(crate) const {constant}"));
+                    !defines_the_constant
+                        && (line.contains(&constant)
+                            || line.contains(&quoted)
+                            || in_a_path.iter().any(|needle| line.contains(needle)))
+                })
+                .map(|(index, line)| format!("{path}:{}: {}", index + 1, line.trim()))
+                .collect()
+        };
+        let fixture = format!(
+            "fn help() -> &'static str {{\n    \"Save under{} in the workspace\"\n}}\n",
+            in_a_path[1]
+        );
+        let control = scan("src/fixture.rs", &fixture);
+        assert_eq!(
+            control.len(),
+            1,
+            "the scan does not go red on a fixture: {control:?}"
+        );
+        let hits: Vec<String> = files
+            .iter()
+            .flat_map(|(path, source)| scan(path, source))
+            .collect();
+        assert!(
+            hits.is_empty(),
+            "spell the workspace config directory through paths::workspace_config_dir_name \
+             or paths::workspace_config_dirs:\n{}",
+            hits.join("\n")
+        );
+    }
+
     #[test]
     fn spec_constants_are_pinned_by_tests_that_exist() {
         let sources = rust_sources(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src")).unwrap();

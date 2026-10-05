@@ -67,7 +67,9 @@ fn string_literals(source: &str) -> Vec<String> {
                 Some('"') => break,
                 Some('\\') => match chars.next() {
                     Some(escaped @ ('"' | '\\')) => literal.push(escaped),
-                    other => panic!("unexpected escape {other:?} in {literal:?}"),
+                    other => panic!(
+                        "unexpected escape {other:?} in {literal:?}; extend string_literals in tests/mesh_wiki_docs.rs"
+                    ),
                 },
                 Some(c) => literal.push(c),
                 None => panic!("unterminated string literal: {literal:?}"),
@@ -128,8 +130,8 @@ fn unbacktick<'a>(cell: &'a str, what: &str) -> &'a str {
         .unwrap_or_else(|| panic!("{what} cell is not a code span: {cell:?}"))
 }
 
-/// The `(verb, usage)` rows of the verb table on `Mesh-Commands.md`.
-fn wiki_verb_rows(page: &str) -> Vec<(String, String)> {
+/// The `(verb, usage, description)` rows of the verb table on `Mesh-Commands.md`.
+fn wiki_verb_rows(page: &str) -> Vec<(String, String, String)> {
     let section = page
         .split("\n## The verbs\n")
         .nth(1)
@@ -150,6 +152,7 @@ fn wiki_verb_rows(page: &str) -> Vec<(String, String)> {
             (
                 unbacktick(&cells[0], "verb").to_string(),
                 unbacktick(&cells[1], "usage").to_string(),
+                cells[2].clone(),
             )
         })
         .collect()
@@ -169,6 +172,20 @@ fn hook_event_count() -> usize {
         .unwrap_or_else(|e| panic!("ALL length {digits:?}: {e}"))
 }
 
+/// How many `HookEvent::as_str` arms name a `mesh.*` event.
+fn mesh_hook_event_count() -> usize {
+    let source = read(repo_root().join("src").join("hooks.rs"));
+    let start = source
+        .find("pub fn as_str(self)")
+        .expect("src/hooks.rs defines HookEvent::as_str");
+    let body = &source[start..];
+    let end = body.find("\n    }\n").expect("the as_str body closes");
+    body[..end]
+        .lines()
+        .filter(|line| line.contains("=> \"mesh."))
+        .count()
+}
+
 /// The tool names `mesh_function_declarations()` registers, without their `mesh__` prefix.
 fn mesh_tool_names() -> Vec<String> {
     let source = read(repo_root().join("src").join("function").join("mesh.rs"));
@@ -183,6 +200,28 @@ fn mesh_tool_names() -> Vec<String> {
         .filter_map(|line| line.trim_start().strip_prefix(marker))
         .map(|rest| rest[..rest.find('"').expect("the name literal closes")].to_string())
         .collect()
+}
+
+/// `label:line: spells <needle>` for every line of `text` that spells one of `needles`,
+/// each of `file_names` removed from the line first.
+fn pre_scope_vocabulary_hits(
+    label: &str,
+    text: &str,
+    needles: &[String],
+    file_names: &[String],
+) -> Vec<String> {
+    let mut hits = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        let line = file_names.iter().fold(line.to_string(), |line, file_name| {
+            line.replace(file_name, "")
+        });
+        for needle in needles {
+            if line.contains(needle.as_str()) {
+                hits.push(format!("{label}:{}: spells {needle}", index + 1));
+            }
+        }
+    }
+    hits
 }
 
 #[test]
@@ -203,14 +242,18 @@ fn every_verb_row_in_the_wiki_table_matches_the_repl_verbs_table() {
         rows.len(),
         verbs.len()
     );
-    for (verb, _, usage) in &verbs {
-        let (_, documented) = rows
+    for (verb, description, usage) in &verbs {
+        let (_, documented_usage, documented_description) = rows
             .iter()
-            .find(|(row_verb, _)| row_verb == verb)
+            .find(|(row_verb, _, _)| row_verb == verb)
             .unwrap_or_else(|| panic!("Mesh-Commands.md's verb table has no `{verb}` row"));
         assert_eq!(
-            documented, usage,
+            documented_usage, usage,
             "Mesh-Commands.md's usage for `{verb}` differs from src/repl/mesh.rs"
+        );
+        assert_eq!(
+            documented_description, description,
+            "Mesh-Commands.md's \"What it does\" for `{verb}` differs from src/repl/mesh.rs"
         );
     }
 }
@@ -257,6 +300,23 @@ fn the_hooks_page_counts_the_events_the_code_registers() {
 }
 
 #[test]
+fn the_hooks_page_counts_the_mesh_events_in_words() {
+    let Some(wiki) = wiki_dir() else { return };
+    let count = mesh_hook_event_count();
+    let word = match count {
+        15 => "fifteen",
+        count => panic!(
+            "src/hooks.rs names {count} mesh.* events; update Hooks.md and the number word here"
+        ),
+    };
+    let needle = format!("The {word} `mesh.*` events");
+    assert!(
+        read(wiki.join("Hooks.md")).contains(&needle),
+        "Hooks.md does not say {needle:?}; src/hooks.rs as_str names {count} mesh.* events"
+    );
+}
+
+#[test]
 fn the_mesh_page_lists_every_registered_tool_and_counts_them_in_words() {
     let Some(wiki) = wiki_dir() else { return };
     let names = mesh_tool_names();
@@ -291,9 +351,26 @@ fn no_mesh_page_or_the_readme_spells_the_pre_scope_wire_vocabulary() {
     // Assembled at runtime so the mesh source guard does not match this test's text.
     let magic = ["COY", "M"].concat();
     let backticked_old_name = ["`coy", "ote."].concat();
-    // The Windows executable name in the README's install steps, not wire vocabulary.
-    let windows_executable = format!("{backticked_old_name}exe`");
+    // A backticked `<name>.<ext>` with one of these extensions is a file name the
+    // install steps spell, not wire vocabulary.
+    let file_names: Vec<String> = ["exe", "log", "yaml", "json"]
+        .iter()
+        .map(|ext| format!("{backticked_old_name}{ext}`"))
+        .collect();
     let needles = [magic, backticked_old_name];
+    let fixture = ["fine line\nthe `coy", "ote.mesh destination\n"].concat();
+    let control = pre_scope_vocabulary_hits("fixture", &fixture, &needles, &file_names);
+    assert_eq!(
+        control.len(),
+        1,
+        "the scan does not go red on a fixture: {control:?}"
+    );
+    let file_name_only = ["run `coy", "ote.exe` first\n"].concat();
+    let control = pre_scope_vocabulary_hits("fixture", &file_name_only, &needles, &file_names);
+    assert!(
+        control.is_empty(),
+        "a file name is not wire vocabulary: {control:?}"
+    );
 
     let mut pages: Vec<PathBuf> = fs::read_dir(&wiki)
         .unwrap_or_else(|e| panic!("read {}: {e}", wiki.display()))
@@ -313,14 +390,12 @@ fn no_mesh_page_or_the_readme_spells_the_pre_scope_wire_vocabulary() {
 
     let mut hits = Vec::new();
     for path in &pages {
-        for (index, line) in read(path).lines().enumerate() {
-            let line = line.replace(&windows_executable, "");
-            for needle in &needles {
-                if line.contains(needle.as_str()) {
-                    hits.push(format!("{}:{}: spells {needle}", path.display(), index + 1));
-                }
-            }
-        }
+        hits.extend(pre_scope_vocabulary_hits(
+            &path.display().to_string(),
+            &read(path),
+            &needles,
+            &file_names,
+        ));
     }
     assert!(hits.is_empty(), "{}", hits.join("\n"));
 }

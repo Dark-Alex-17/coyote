@@ -43,8 +43,10 @@ venv under the interop directory.
 scripts/mesh-interop/setup.sh
 source "${COYOTE_MESH_INTEROP_DIR:-$HOME/.cache/coyote/mesh-interop}/env.sh"
 COYOTE_MESH_INTEROP=1 cargo test --all mesh::conformance -- --include-ignored
-COYOTE_WIKI_DIR=../coyote.wiki cargo test --test mesh_wiki_docs
 ```
+
+Independently of the interop setup, the wiki lint runs with
+`COYOTE_WIKI_DIR=../coyote.wiki cargo test --test mesh_wiki_docs`.
 
 `setup.sh` is idempotent: a second run verifies the pins and the imports and does nothing
 else. The interop tests are `#[ignore]`d, so a plain `cargo test` never spawns Python; without

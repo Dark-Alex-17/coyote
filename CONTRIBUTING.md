@@ -140,8 +140,6 @@ numbers there.
 
 The matching functional record, which release of the mesh crates the conformance, interop and fuzz
 suites were last run against and with what result, lives in `scripts/mesh-interop/README.md`.
-The same file documents the opt-in wiki lint that pins the wiki's mesh pages to the verbs, hooks and
-tools in the source: `COYOTE_WIKI_DIR=../coyote.wiki cargo test --test mesh_wiki_docs`.
 
 | Measurement | Before mesh dependencies | After |
 | --- | --- | --- |
@@ -269,6 +267,13 @@ emulator, so those assertions would not transfer. `expectrl` therefore sits unde
 prompt-integrity assertions are not exercised on windows-latest. That lane still compiles
 `examples/pty-reedline-target.rs` and the printer wiring in `src/repl/printer.rs` under
 `-D warnings`.
+
+### Opt-in doc lint
+
+`tests/mesh_wiki_docs.rs` pins the wiki's mesh pages to the verbs, hooks and tools in the source.
+The wiki is a separate clone, so the lint runs only when pointed at one:
+`COYOTE_WIKI_DIR=../coyote.wiki cargo test --test mesh_wiki_docs`. Without the variable it prints
+`skipping:` and passes. `scripts/mesh-interop/README.md` documents the variable.
 
  ## Authorship Policy
 

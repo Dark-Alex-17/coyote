@@ -2190,18 +2190,20 @@ fn parse_repl_uninstall(args: Option<&str>) -> ReplUninstallDispatch {
 }
 
 fn repl_save_session_help() -> String {
-    r#"Save the current session to a file.
+    format!(
+        r#"Save the current session to a file.
 
 Usage:
   .save session [name] [--workspace|--global]
 
 Flags:
-  --workspace   Save under .coyote/ in the current workspace
+  --workspace   Save under {}/ in the current workspace
   --global      Save under the global config dir
 
 Without a flag the session is re-saved wherever it currently lives; a brand-new
-session lives in the global scope. Re-homing a session never deletes the old file."#
-        .to_string()
+session lives in the global scope. Re-homing a session never deletes the old file."#,
+        paths::workspace_config_dir_name()
+    )
 }
 
 #[derive(Debug, PartialEq)]
@@ -3760,6 +3762,19 @@ mod tests {
         ] {
             assert!(help.contains(needle), "save session help missing {needle}");
         }
+    }
+
+    #[test]
+    #[serial]
+    fn repl_save_session_help_names_the_workspace_config_dir_the_process_runs_with() {
+        let _override = EnvVarGuard::set(get_env_name("workspace_config_dir"), ".cfg-help");
+
+        let help = repl_save_session_help();
+
+        assert!(
+            help.contains("  --workspace   Save under .cfg-help/ in the current workspace\n"),
+            "{help}"
+        );
     }
 
     // `-h/--help` wins from ANY
