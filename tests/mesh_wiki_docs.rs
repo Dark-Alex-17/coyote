@@ -440,22 +440,40 @@ fn mesh_pages(wiki: &Path) -> Vec<PathBuf> {
 }
 
 /// `label:line` for every staged-path example in `text` whose peer segment, the one right
-/// after `inbox/<instance id>/` (or `inbox/<instance_id>/`), is not the full 32-hex
-/// destination hash: a placeholder such as `<peer-dest32>` passes, a literal shorter than
-/// 32 hex digits does not.
+/// after `inbox/<instance id>/`, `inbox/<instance_id>/` or the `<inbox_dir>/…` spellings
+/// of the same root, is not the full lowercase 32-hex destination hash: the
+/// `<peer-dest32>` placeholder and other non-hex names pass; a literal that starts with a
+/// hex digit but is not exactly 32 lowercase hex digits (shortened, truncated with an
+/// ellipsis, or upper-cased) does not, and neither does a retired `<peer-dest8>` or
+/// `<dest8>` placeholder.
 fn short_peer_directory_hits(label: &str, text: &str) -> Vec<String> {
-    let markers = ["inbox/<instance id>/", "inbox/<instance_id>/"];
+    let markers = [
+        "inbox/<instance id>/",
+        "inbox/<instance_id>/",
+        "<inbox_dir>/<instance id>/",
+        "<inbox_dir>/<instance_id>/",
+    ];
+    let retired = ["<peer-dest8>", "<dest8>", "<peer8>"];
     let mut hits = Vec::new();
     for (index, line) in text.lines().enumerate() {
         for marker in markers {
             for (at, _) in line.match_indices(marker) {
                 let rest = &line[at + marker.len()..];
-                let segment: &str = rest.split(['/', '`', ' ']).next().unwrap_or_default();
-                let literal_hex =
-                    !segment.is_empty() && segment.bytes().all(|b| b.is_ascii_hexdigit());
-                if literal_hex && segment.len() != 32 {
+                let segment: &str = rest
+                    .split(['/', '`', ' ', ')', ',', ';'])
+                    .next()
+                    .unwrap_or_default();
+                let looks_literal = segment
+                    .bytes()
+                    .next()
+                    .is_some_and(|b| b.is_ascii_hexdigit());
+                let full_lowercase_hash = segment.len() == 32
+                    && segment
+                        .bytes()
+                        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase());
+                if (looks_literal && !full_lowercase_hash) || retired.contains(&segment) {
                     hits.push(format!(
-                        "{label}:{}: peer directory `{segment}` is not a full 32-hex destination",
+                        "{label}:{}: peer directory `{segment}` is not a full lowercase 32-hex destination",
                         index + 1
                     ));
                 }
@@ -468,12 +486,19 @@ fn short_peer_directory_hits(label: &str, text: &str) -> Vec<String> {
 #[test]
 fn every_staged_path_example_names_the_peer_directory_by_the_full_destination_hash() {
     let Some(wiki) = wiki_dir() else { return };
-    let short = "inbox/<instance id>/5e6f7a8b/ci.log\n";
-    let control = short_peer_directory_hits("fixture", short);
+    let short = format!(
+        "inbox/<instance id>/5e6f7a8b/ci.log\n\
+         inbox/<instance id>/5e6f7a8b…/ci.log\n\
+         <inbox_dir>/<instance_id>/5e6f7a8b)\n\
+         inbox/<instance_id>/{}/x\n\
+         inbox/<instance_id>/<peer-dest8>/x\n",
+        "5E6F7A8B".repeat(4)
+    );
+    let control = short_peer_directory_hits("fixture", &short);
     assert_eq!(
         control.len(),
-        1,
-        "the scan does not go red on an 8-hex peer directory: {control:?}"
+        5,
+        "the scan does not go red on each short, truncated, upper-cased or retired peer directory: {control:?}"
     );
     let full = format!(
         "inbox/<instance id>/{}/ci.log\ninbox/<instance_id>/<peer-dest32>/<path>\n",
@@ -498,6 +523,97 @@ fn every_staged_path_example_names_the_peer_directory_by_the_full_destination_ha
     assert!(
         documented,
         "no Mesh*.md page documents the `inbox/<instance_id>/<peer-dest32>/` layout"
+    );
+}
+
+/// The staged-path scan judges the segment right after either `inbox/<instance id>/`
+/// marker on its own: every literal hex run that is not exactly 32 digits is a hit (8, 16,
+/// 31 and 33), a placeholder or any non-hex name is not, several examples on one line are
+/// each judged with that line's number, and a CRLF checkout reads back as the LF text with
+/// the same hits. The wiki itself keeps at least one literal 32-hex staged path (the
+/// `.mesh inbox` example) so the pin never passes vacuously.
+#[test]
+fn usage_probe_the_peer_directory_scan_judges_each_literal_and_reads_crlf_alike() {
+    let Some(wiki) = wiki_dir() else { return };
+    let full = "5e6f7a8b".repeat(4);
+    let thirty_one = &full[..31];
+    let text = format!(
+        "intro\n\
+         `inbox/<instance id>/{full}/a.log` and `inbox/<instance_id>/5e6f7a8b9c0d1e2f/b.log`\n\
+         inbox/<instance id>/<peer-dest32>/<path> inbox/<instance_id>/<peer>/x inbox/<instance id>/peer-dir/y\n\
+         staged at <cache>/mesh/inbox/<instance id>/{full}a/c.log\n\
+         inbox/<instance_id>/{thirty_one}/d.log inbox/<instance id>/5e6f7a8b/e.log\n\
+         inbox/<instance id>/{full}\n"
+    );
+    // Within one line the order of hits is not a contract; across lines it is the line number.
+    let mut hits = short_peer_directory_hits("page", &text);
+    hits.sort();
+    let mut expected = vec![
+        "page:2: peer directory `5e6f7a8b9c0d1e2f` is not a full lowercase 32-hex destination"
+            .to_string(),
+        format!("page:4: peer directory `{full}a` is not a full lowercase 32-hex destination"),
+        format!("page:5: peer directory `{thirty_one}` is not a full lowercase 32-hex destination"),
+        "page:5: peer directory `5e6f7a8b` is not a full lowercase 32-hex destination".to_string(),
+    ];
+    expected.sort();
+    assert_eq!(hits, expected);
+
+    // A CRLF checkout of the same page reads back as the LF text and yields the same hits
+    // at the same line numbers.
+    let dir = env::temp_dir().join(format!("probe-wiki-crlf-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let page = dir.join("Mesh-Probe.md");
+    fs::write(&page, text.replace('\n', "\r\n")).unwrap();
+    let read_back = read(&page);
+    let _ = fs::remove_dir_all(&dir);
+    assert_eq!(
+        read_back, text,
+        "CRLF read is not normalised to the LF text"
+    );
+    let mut crlf_hits = short_peer_directory_hits("page", &read_back);
+    crlf_hits.sort();
+    assert_eq!(crlf_hits, hits);
+
+    // The real wiki carries a literal, full-hash staged path example, so the lint judges
+    // at least one concrete example rather than only placeholders.
+    let markers = ["inbox/<instance id>/", "inbox/<instance_id>/"];
+    let literal_examples: Vec<String> = mesh_pages(&wiki)
+        .iter()
+        .flat_map(|path| {
+            let label = path
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_default();
+            read(path)
+                .lines()
+                .enumerate()
+                .filter(|(_, line)| {
+                    markers.iter().any(|marker| {
+                        line.match_indices(marker).any(|(at, _)| {
+                            let segment = line[at + marker.len()..]
+                                .split(['/', '`', ' '])
+                                .next()
+                                .unwrap_or_default();
+                            segment.len() == 32
+                                && segment
+                                    .bytes()
+                                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+                        })
+                    })
+                })
+                .map(|(index, _)| format!("{label}:{}", index + 1))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert!(
+        !literal_examples.is_empty(),
+        "no Mesh*.md page shows a staged path with a literal 32-lowercase-hex peer directory"
+    );
+    assert!(
+        literal_examples
+            .iter()
+            .any(|at| at.starts_with("Mesh-Commands.md:")),
+        "the `.mesh inbox` example on Mesh-Commands.md shows no literal full-hash staged path: {literal_examples:?}"
     );
 }
 

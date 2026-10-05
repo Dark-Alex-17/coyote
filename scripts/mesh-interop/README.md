@@ -62,7 +62,7 @@ Reticulum's interfaces and LXMF's router on first import starts late enough to m
 | `COYOTE_MESH_INTEROP_DIR` | Where the clones and venv live (default `~/.cache/coyote/mesh-interop`). |
 | `COYOTE_MESH_INTEROP_PYTHON` | The interpreter to spawn (default `<dir>/venv/bin/python`, else `python3`). |
 | `COYOTE_MESH_INTEROP_DEBUG` | Set to have the reference log at `RNS.LOG_DEBUG` on stderr, and to print this crate's captured `mesh` debug log to stderr when each reference shuts down. |
-| `COYOTE_WIKI_DIR` | A checkout of the project wiki (relative paths resolve against the crate root). Switches on `tests/mesh_wiki_docs.rs`, which pins the `Mesh*` and `Hooks` wiki pages and the README to the REPL verb table, hook events and `mesh__*` tools in the source; unset or blank, those tests print `skipping: ...` and pass. |
+| `COYOTE_WIKI_DIR` | A checkout of the project wiki (relative paths resolve against the crate root). Switches on `tests/mesh_wiki_docs.rs`, which pins the `Mesh*`, `Hooks` and `Home` wiki pages and the README to the REPL verb table, hook events, `mesh__*` tools and staging-inbox layout in the source; unset or blank, those tests print `skipping: ...` and pass. |
 
 ## `reference_peer.py`
 

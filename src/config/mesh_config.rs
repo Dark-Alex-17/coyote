@@ -1063,11 +1063,11 @@ mod tests {
     #[test]
     fn a_missing_inbox_dir_whose_translation_exists_resolves_to_the_translation() {
         let tmp = TempDir::new("mesh-config-inbox-translated");
-        let configured = Path::new("/home/someone/inbox");
+        let configured = tmp.path.join("missing");
         let translated = tmp.path.join("inbox");
         std::fs::create_dir_all(&translated).unwrap();
 
-        let resolved = resolve_inbox_dir(configured, |path| {
+        let resolved = resolve_inbox_dir(&configured, |path| {
             assert_eq!(path, configured);
             Some(translated.clone())
         });
@@ -1078,13 +1078,13 @@ mod tests {
     #[test]
     fn resolving_the_same_missing_inbox_dir_twice_translates_it_the_same_way_both_times() {
         let tmp = TempDir::new("mesh-config-inbox-twice");
-        let configured = Path::new("/home/someone/inbox");
+        let configured = tmp.path.join("missing");
         let translated = tmp.path.join("inbox");
         std::fs::create_dir_all(&translated).unwrap();
         let translate = |_: &Path| Some(translated.clone());
 
-        let first = resolve_inbox_dir(configured, translate);
-        let second = resolve_inbox_dir(configured, translate);
+        let first = resolve_inbox_dir(&configured, translate);
+        let second = resolve_inbox_dir(&configured, translate);
 
         assert_eq!(first, translated);
         assert_eq!(second, first);

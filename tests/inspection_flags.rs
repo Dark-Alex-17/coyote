@@ -2179,3 +2179,56 @@ fn usage_probe_help_names_the_workspace_config_dir_the_process_runs_with() {
         );
     }
 }
+
+/// The `--scope` help joins the workspace config dir name and `mcp.json` bare, so an
+/// absolute `COYOTE_WORKSPACE_CONFIG_DIR` renders as the path the process really reads
+/// (`/abs/cfg/mcp.json`), never as `.//abs/cfg/mcp.json`; the default and a relative
+/// override render without a `./` prefix for the same reason.
+#[test]
+fn usage_probe_scope_help_renders_an_absolute_override_as_the_path_it_reads() {
+    // Collapse clap's wrapping so a needle spanning a wrapped line still matches; the
+    // path tokens themselves hold no whitespace, so they survive the wrap whole.
+    let flat = |help: &str| help.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    let absolute = env::temp_dir()
+        .join(format!("probe-abs-cfg-{}", process::id()))
+        .display()
+        .to_string();
+    assert!(
+        Path::new(&absolute).is_absolute(),
+        "fixture override is not absolute: {absolute}"
+    );
+    for flag in ["--help", "-h"] {
+        let help = flat(&run_help(flag, Some(&absolute)));
+        for needle in [
+            format!("({absolute}/mcp.json)"),
+            format!("{absolute}/mcp.json, {absolute}/.mcp.json"),
+            format!("{absolute}/macros"),
+        ] {
+            assert!(
+                help.contains(&needle),
+                "{flag} under an absolute override does not say {needle:?}:\n{help}"
+            );
+        }
+        assert!(
+            !help.contains(".//") && !help.contains(&format!("./{absolute}")),
+            "{flag} prefixes the absolute override with ./:\n{help}"
+        );
+        assert!(
+            !help.contains(".coyote"),
+            "{flag} under an absolute override still spells .coyote:\n{help}"
+        );
+    }
+
+    let default = flat(&run_help("--help", None));
+    assert!(default.contains("(.coyote/mcp.json)"), "{default}");
+    assert!(
+        !default.contains("(./.coyote/"),
+        "the default --scope help carries a ./ prefix:\n{default}"
+    );
+    let relative = flat(&run_help("--help", Some("conf/.hidden")));
+    assert!(
+        relative.contains("(conf/.hidden/mcp.json)") && !relative.contains("(./conf/"),
+        "a relative override is not rendered bare:\n{relative}"
+    );
+}
