@@ -3,8 +3,9 @@ use super::input::TOOL_LOOP_CHECKPOINT_TEXT;
 use super::mcp_tool_policy::{McpToolPolicy, SkillMcpLayer, ToolFilter, expand_mcp_server_alias};
 use super::rag_cache::{RagCache, RagKey};
 use super::session::{
-    INTERRUPTED_RESPONSE_TEXT, KeepPolicy, Session, SessionScope, labeled_session_names,
-    merged_session_names, session_scope_dirs, valve_limit,
+    CompressionInfo, INTERRUPTED_RESPONSE_TEXT, KeepPolicy, Session, SessionScope,
+    keep_token_budget, labeled_session_names, merged_session_names, min_reclaim_tokens,
+    session_scope_dirs, valve_limit,
 };
 use super::skill::{SKILL_SCAFFOLD, Skill};
 use super::skill_policy::SkillPolicy;
@@ -1126,6 +1127,37 @@ impl RequestContext {
             .or_else(|| self.app.config.compression_model.clone())
     }
 
+    pub fn compression_info(&self, app: &AppConfig) -> Result<CompressionInfo> {
+        let session = self.session.as_ref();
+        let threshold = session
+            .and_then(Session::compression_threshold)
+            .unwrap_or(app.compression_threshold);
+        let valve = app.compression_safety_valve;
+        let window = match session {
+            Some(session) => session.model().max_input_tokens(),
+            None => self.extract_role(app)?.model().max_input_tokens(),
+        };
+        let keep = self.compression_keep_policy(None);
+        let tail = session.map(|session| session.kept_tail(keep));
+        Ok(CompressionInfo {
+            threshold,
+            keep_last: keep.last,
+            safety_valve: valve,
+            model: self.compression_model(),
+            valve_limit: valve_limit(valve, window),
+            keep_tokens: keep_token_budget(threshold, valve, window),
+            checkpoint_tokens: tool_loop_checkpoint_tokens(window),
+            min_reclaim: min_reclaim_tokens(threshold),
+            last_prompt_tokens: self.last_prompt_token_usage,
+            reclaimable_tokens: session.map(|session| session.reclaimable_tokens(keep)),
+            kept_tail_messages: tail.map(<[Message]>::len),
+            kept_tail_tokens: session
+                .zip(tail)
+                .map(|(session, tail)| session.model().total_tokens(tail)),
+            archived_messages: session.map(|session| session.compressed_messages().len()),
+        })
+    }
+
     pub fn role_like_mut(&mut self) -> Option<&mut dyn RoleLike> {
         if let Some(session) = self.session.as_mut() {
             Some(session)
@@ -2188,10 +2220,7 @@ impl RequestContext {
         if in_flight < TOOL_LOOP_CHECKPOINT_MIN_TOKENS {
             return None;
         }
-        let window = model
-            .max_input_tokens()
-            .unwrap_or(SUMMARIZATION_WINDOW_FALLBACK_TOKENS);
-        if in_flight >= (window as f32 * TOOL_LOOP_CHECKPOINT_WINDOW_RATIO) as usize {
+        if in_flight >= tool_loop_checkpoint_tokens(model.max_input_tokens()) {
             return Some(CheckpointTrigger::InFlightShare);
         }
         if self
@@ -2305,18 +2334,9 @@ impl RequestContext {
                 "save_session",
                 super::format_option_value(&app.save_session),
             ),
-            (
-                "compression_threshold",
-                self.session
-                    .as_ref()
-                    .and_then(Session::compression_threshold)
-                    .unwrap_or(app.compression_threshold)
-                    .to_string(),
-            ),
-            (
-                "compression_keep_last",
-                self.compression_keep_last().to_string(),
-            ),
+        ];
+        items.extend(self.compression_info(app)?.rows());
+        items.extend([
             ("memory", super::format_option_value(&app.memory)),
             (
                 "memory_cap_with_tools",
@@ -2384,7 +2404,7 @@ impl RequestContext {
             ("mcp_config_file", display_path(&paths::mcp_config_file())),
             ("sbx_kit_dir", display_path(&paths::sbx_kit_dir())),
             ("messages_file", display_path(&self.messages_file())),
-        ];
+        ]);
 
         match &app.secrets_provider {
             None => {
@@ -2455,7 +2475,7 @@ impl RequestContext {
             let output = agent.export()?;
             if let Some(session) = &self.session {
                 let session = session
-                    .export()?
+                    .export(Some(&self.compression_info(app)?))?
                     .split('\n')
                     .map(|v| format!("  {v}"))
                     .collect::<Vec<_>>()
@@ -2465,7 +2485,7 @@ impl RequestContext {
                 Ok(output)
             }
         } else if let Some(session) = &self.session {
-            session.export()
+            session.export(Some(&self.compression_info(app)?))
         } else if let Some(role) = &self.role {
             Ok(role.export())
         } else if let Some(rag) = &self.rag {
@@ -2488,7 +2508,11 @@ impl RequestContext {
                     .collect();
                 (agent.name().to_string(), functions)
             });
-            session.render(&mut markdown_render, &agent_info)
+            session.render(
+                &mut markdown_render,
+                &agent_info,
+                Some(&self.compression_info(app)?),
+            )
         } else {
             bail!("No session")
         }
@@ -5961,6 +5985,12 @@ const TOOL_LOOP_CHECKPOINT_WINDOW_RATIO: f32 = 0.25;
 /// Floor below which a mid-loop checkpoint never fires, so short tool
 /// loops on small-window models keep their single-turn shape.
 const TOOL_LOOP_CHECKPOINT_MIN_TOKENS: usize = 2_000;
+
+/// In-flight tool-round size at which a mid-loop checkpoint commits them.
+fn tool_loop_checkpoint_tokens(window: Option<usize>) -> usize {
+    (window.unwrap_or(SUMMARIZATION_WINDOW_FALLBACK_TOKENS) as f32
+        * TOOL_LOOP_CHECKPOINT_WINDOW_RATIO) as usize
+}
 
 /// Which bound the in-flight tool rounds crossed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -10434,7 +10464,7 @@ mod tests {
         write_session_file(&ctx, "notes", SessionScope::Global, "messages: []\n");
         let app = ctx.app.config.clone();
         run_async(ctx.use_session(&app, Some("notes"), utils::create_abort_signal())).unwrap();
-        let before = ctx.session.as_ref().unwrap().export().unwrap();
+        let before = ctx.session.as_ref().unwrap().export(None).unwrap();
         write(
             ctx.sessions_dir_for(SessionScope::Workspace),
             "not a directory",
@@ -10448,7 +10478,7 @@ mod tests {
 
         let session = ctx.session.as_ref().unwrap();
         assert_eq!(session.scope(), SessionScope::Global);
-        assert_eq!(session.export().unwrap(), before);
+        assert_eq!(session.export(None).unwrap(), before);
     }
 
     #[test]
@@ -10719,6 +10749,7 @@ mod tests {
         let mut ctx = create_test_ctx();
         let app = ctx.app.config.clone();
         let mut session = Session::default();
+        session.set_model(windowed_model(200_000));
         session.set_compression_threshold(Some(123_456));
         session.set_compression_keep_last(Some(7));
         ctx.session = Some(session);
@@ -10733,6 +10764,58 @@ mod tests {
         };
         assert!(row("compression_threshold").ends_with("123456"));
         assert!(row("compression_keep_last").ends_with('7'));
+        assert!(row("compression_valve_limit").ends_with("160000"));
+        assert!(row("compression_keep_tokens").ends_with("40000"));
+        assert!(row("compression_checkpoint_tokens").ends_with("50000"));
+        assert!(row("compression_min_reclaim").ends_with("24691"));
+        let lines: Vec<&str> = info.lines().collect();
+        let save_session = lines
+            .iter()
+            .position(|line| line.starts_with("save_session"))
+            .unwrap();
+        let memory = lines
+            .iter()
+            .position(|line| line.starts_with("memory "))
+            .unwrap();
+        assert!(
+            lines[save_session + 1..memory]
+                .iter()
+                .all(|line| line.starts_with("compression_")),
+            "compression rows sit between save_session and memory:\n{info}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn compression_info_rows_without_session_use_role_model_window() {
+        let _config = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        ctx.update_app_config(|app| {
+            app.compression_threshold = 100_000;
+            app.compression_keep_last = 3;
+            app.compression_safety_valve = 0.8;
+        });
+        let mut role = Role::new("windowed", "prompt");
+        role.set_model(windowed_model(200_000));
+        ctx.role = Some(role);
+        let app = ctx.app.config.clone();
+
+        let info = ctx.compression_info(&app).unwrap();
+
+        assert_eq!(info.threshold, 100_000);
+        assert_eq!(info.keep_last, 3);
+        assert_eq!(info.safety_valve, 0.8);
+        assert_eq!(info.model, None);
+        assert_eq!(info.valve_limit, Some(160_000));
+        assert_eq!(info.keep_tokens, 40_000);
+        assert_eq!(info.checkpoint_tokens, 50_000);
+        assert_eq!(info.min_reclaim, Some(20_000));
+        assert_eq!(info.last_prompt_tokens, None);
+        assert_eq!(info.reclaimable_tokens, None);
+        assert_eq!(info.kept_tail_messages, None);
+        assert_eq!(info.kept_tail_tokens, None);
+        assert_eq!(info.archived_messages, None);
+        assert_eq!(info.rows().len(), 9);
     }
 
     // --- usage-probe (spec-first) coverage for the workspace-sessions surface ---
@@ -11029,7 +11112,7 @@ mod tests {
         let mut ctx = create_test_ctx();
         let app = ctx.app.config.clone();
         run_async(ctx.use_session(&app, None, utils::create_abort_signal())).unwrap();
-        let before = ctx.session.as_ref().unwrap().export().unwrap();
+        let before = ctx.session.as_ref().unwrap().export(None).unwrap();
 
         let err = ctx
             .save_session(Some(TEMP_SESSION_NAME), Some(SessionScope::Workspace))
@@ -11050,7 +11133,7 @@ mod tests {
         assert_eq!(session.name(), TEMP_SESSION_NAME);
         assert_eq!(session.scope(), SessionScope::Global);
         assert_eq!(
-            session.export().unwrap(),
+            session.export(None).unwrap(),
             before,
             "rejected save must leave name/scope/path untouched"
         );
@@ -13396,6 +13479,133 @@ mod tests {
                 String::from_utf8_lossy(&out.stdout)
             )
         })
+    }
+
+    /// A repo checked out on `pr` whose base `main` advanced past the fork
+    /// point. A two-dot `git diff main` here reports main_only.txt as a
+    /// phantom deletion; merge-base semantics report only pr.txt.
+    fn diverged_pr_repo() -> PathBuf {
+        let dir = temp_file("-diverged-pr-", "");
+        create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        write(dir.join("base.txt"), "a\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "A"]);
+        git(&["checkout", "-qb", "pr"]);
+        write(dir.join("pr.txt"), "p\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "pr"]);
+        git(&["checkout", "-q", "main"]);
+        write(dir.join("main_only.txt"), "m\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "main_only"]);
+        git(&["checkout", "-q", "pr"]);
+        dir
+    }
+
+    fn changed_files(out: &serde_json::Value) -> Vec<&str> {
+        out["changed_files"]
+            .as_array()
+            .unwrap_or_else(|| panic!("changed_files missing: {out}"))
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn adversary_diff_facts_bare_ref_diffs_from_merge_base() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = diverged_pr_repo();
+        let out = run_adversary_script(
+            "diff_facts.py",
+            &json!({"project_dir_in": repo.to_string_lossy(), "diff_spec": "main"}),
+        );
+        let _ = remove_dir_all(&repo);
+        assert_eq!(
+            changed_files(&out),
+            vec!["pr.txt"],
+            "a bare base ref must not surface commits that landed on the base after branching: {out}"
+        );
+        // changed_files only reads `+++ b/` lines, so the phantom deletion of
+        // main_only.txt would hide in diff_text — the text criteria verify against.
+        assert!(
+            out["diff_text"]
+                .as_str()
+                .is_some_and(|t| !t.contains("main_only.txt")),
+            "diff_text must not carry inverse hunks of post-fork base commits: {out}"
+        );
+        assert!(
+            out["diff_note"]
+                .as_str()
+                .is_some_and(|n| n.contains("normalized to merge-base")),
+            "normalization must be surfaced in diff_note: {out}"
+        );
+    }
+
+    /// An explicit `..` range is the caller's choice and must stay two-dot,
+    /// so main_only.txt legitimately appears in every lane's file list.
+    #[test]
+    fn review_scripts_pass_explicit_range_through_untouched() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = diverged_pr_repo();
+        let project_dir = repo.to_string_lossy().to_string();
+        let state = json!({"project_dir_in": project_dir, "diff_spec": "main..pr"});
+        let adversary = run_adversary_script("diff_facts.py", &state);
+        let reviewer = run_code_reviewer_script("facts.py", &state);
+        let gauntlet = run_gauntlet_script("signals.py", &state);
+        let _ = remove_dir_all(&repo);
+        for (script, out) in [("facts.py", &reviewer), ("signals.py", &gauntlet)] {
+            assert_eq!(
+                changed_files(out),
+                vec!["main_only.txt", "pr.txt"],
+                "{script} must diff an explicit range exactly as given: {out}"
+            );
+        }
+        assert!(
+            adversary["diff_text"]
+                .as_str()
+                .is_some_and(|t| t.contains("a/main_only.txt")),
+            "diff_facts.py must diff an explicit range exactly as given: {adversary}"
+        );
+        assert_eq!(
+            adversary["diff_note"], "",
+            "no normalization note for an explicit range: {adversary}"
+        );
+        assert_eq!(
+            reviewer["resolved_diff_spec"], "main..pr",
+            "the explicit range must flow downstream unchanged: {reviewer}"
+        );
+        assert!(
+            reviewer.get("facts_note").is_none(),
+            "no normalization note for an explicit range: {reviewer}"
+        );
     }
 
     #[test]
@@ -17866,6 +18076,25 @@ mod tests {
     }
 
     #[test]
+    fn gauntlet_signals_bare_ref_diffs_from_merge_base() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = diverged_pr_repo();
+        let out = run_gauntlet_script(
+            "signals.py",
+            &json!({"project_dir_in": repo.to_string_lossy(), "diff_spec": "main"}),
+        );
+        let _ = remove_dir_all(&repo);
+        assert_eq!(
+            changed_files(&out),
+            vec!["pr.txt"],
+            "a bare base ref must not surface commits that landed on the base after branching: {out}"
+        );
+    }
+
+    #[test]
     fn gauntlet_retry_loop_wiring() {
         use crate::graph::NodeType;
         let graph = load_bundled_graph("review-gauntlet");
@@ -18102,6 +18331,39 @@ mod tests {
                 String::from_utf8_lossy(&out.stdout)
             )
         })
+    }
+
+    #[test]
+    fn code_reviewer_facts_bare_ref_diffs_from_merge_base() {
+        if !cmd_available("python3") || !cmd_available("git") {
+            eprintln!("skipping: python3 or git not available");
+            return;
+        }
+        let repo = diverged_pr_repo();
+        let out = run_code_reviewer_script(
+            "facts.py",
+            &json!({"project_dir_in": repo.to_string_lossy(), "diff_spec": "main"}),
+        );
+        let _ = remove_dir_all(&repo);
+        assert_eq!(
+            changed_files(&out),
+            vec!["pr.txt"],
+            "a bare base ref must not surface commits that landed on the base after branching: {out}"
+        );
+        // File-reviewers and downstream_sweep.py consume resolved_diff_spec
+        // verbatim, so it must carry the merge-base SHA, not the bare ref.
+        assert!(
+            out["resolved_diff_spec"]
+                .as_str()
+                .is_some_and(|s| s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit())),
+            "resolved_diff_spec must be the merge-base SHA: {out}"
+        );
+        assert!(
+            out["facts_note"]
+                .as_str()
+                .is_some_and(|n| n.contains("normalized to merge-base")),
+            "normalization must be surfaced in facts_note: {out}"
+        );
     }
 
     #[test]

@@ -27,6 +27,12 @@ pub const INTERRUPTED_RESPONSE_TEXT: &str = "[Response interrupted due to error]
 /// instead of thrashing every turn.
 const COMPRESSION_MIN_RECLAIM_DIVISOR: usize = 5;
 
+/// Reclaimable tokens the threshold trigger needs before it fires. `None`
+/// when the threshold is off.
+pub fn min_reclaim_tokens(threshold: usize) -> Option<usize> {
+    (threshold >= 1).then(|| (threshold / COMPRESSION_MIN_RECLAIM_DIVISOR).max(1))
+}
+
 /// What compression keeps verbatim: at most `last` trailing messages, and
 /// only as many of those as fit in `tokens`. A count alone cannot bound the
 /// kept tail, because one tool-loop message can hold hundreds of results.
@@ -56,6 +62,99 @@ pub fn keep_token_budget(threshold: usize, valve: f32, window: Option<usize>) ->
         .chain(valve_term)
         .min()
         .unwrap_or(usize::MAX)
+}
+
+/// Effective compression settings, the limits derived from them and, when
+/// built inside a session, what a compression right now would do.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CompressionInfo {
+    pub threshold: usize,
+    pub keep_last: usize,
+    pub safety_valve: f32,
+    pub model: Option<String>,
+    pub valve_limit: Option<usize>,
+    pub keep_tokens: usize,
+    pub checkpoint_tokens: usize,
+    pub min_reclaim: Option<usize>,
+    pub last_prompt_tokens: Option<usize>,
+    pub reclaimable_tokens: Option<usize>,
+    pub kept_tail_messages: Option<usize>,
+    pub kept_tail_tokens: Option<usize>,
+    pub archived_messages: Option<usize>,
+}
+
+impl CompressionInfo {
+    pub fn rows(&self) -> Vec<(&'static str, String)> {
+        let mut rows = vec![
+            ("compression_threshold", self.threshold.to_string()),
+            ("compression_keep_last", self.keep_last.to_string()),
+            ("compression_safety_valve", self.safety_valve.to_string()),
+            ("compression_model", format_option_value(&self.model)),
+            (
+                "compression_valve_limit",
+                format_option_value(&self.valve_limit),
+            ),
+            (
+                "compression_keep_tokens",
+                match self.keep_tokens {
+                    usize::MAX => "unlimited".to_string(),
+                    tokens => tokens.to_string(),
+                },
+            ),
+            (
+                "compression_checkpoint_tokens",
+                self.checkpoint_tokens.to_string(),
+            ),
+            (
+                "compression_min_reclaim",
+                format_option_value(&self.min_reclaim),
+            ),
+            (
+                "compression_last_prompt_tokens",
+                format_option_value(&self.last_prompt_tokens),
+            ),
+        ];
+        let live = [
+            ("compression_reclaimable", self.reclaimable_tokens),
+            ("compression_kept_tail_messages", self.kept_tail_messages),
+            ("compression_kept_tail_tokens", self.kept_tail_tokens),
+            ("compression_archived_messages", self.archived_messages),
+        ];
+        rows.extend(
+            live.into_iter()
+                .filter_map(|(key, value)| Some((key, value?.to_string()))),
+        );
+        rows
+    }
+
+    pub fn to_json(&self) -> serde_json::Value {
+        let mut data = json!({
+            "threshold": self.threshold,
+            "keep_last": self.keep_last,
+            "safety_valve": (f64::from(self.safety_valve) * 1e6).round() / 1e6,
+            "model": self.model,
+            "valve_limit": self.valve_limit,
+            "keep_tokens": match self.keep_tokens {
+                usize::MAX => json!("unlimited"),
+                tokens => tokens.into(),
+            },
+            "checkpoint_tokens": self.checkpoint_tokens,
+            "min_reclaim": self.min_reclaim,
+            "last_prompt_tokens": self.last_prompt_tokens,
+        });
+        let live = [
+            ("reclaimable", self.reclaimable_tokens),
+            ("kept_tail_messages", self.kept_tail_messages),
+            ("kept_tail_tokens", self.kept_tail_tokens),
+            ("archived_messages", self.archived_messages),
+        ];
+        for (key, value) in live {
+            if let Some(value) = value {
+                data[key] = value.into();
+            }
+        }
+        data
+    }
 }
 
 fn cost_is_zero(v: &f64) -> bool {
@@ -413,7 +512,7 @@ impl Session {
         self.messages.iter().filter(|v| v.role.is_user()).count()
     }
 
-    pub fn export(&self) -> Result<String> {
+    pub fn export(&self, compression: Option<&CompressionInfo>) -> Result<String> {
         let mut data = json!({
             "path": self.path,
             "scope": self.scope.to_string(),
@@ -475,6 +574,9 @@ impl Session {
         if percent != 0.0 {
             data["total/max"] = format!("{percent}%").into();
         }
+        if let Some(compression) = compression {
+            data["compression"] = compression.to_json();
+        }
         if let Some(value) = self.token_usage.input_tokens {
             data["real_input_tokens"] = value.into();
         }
@@ -501,6 +603,7 @@ impl Session {
         &self,
         render: &mut MarkdownRender,
         agent_info: &Option<(String, Vec<String>)>,
+        compression: Option<&CompressionInfo>,
     ) -> Result<String> {
         let mut items = vec![];
 
@@ -553,11 +656,15 @@ impl Session {
             items.push(("save_session", save_session.to_string()));
         }
 
-        if let Some(compression_threshold) = self.compression_threshold {
-            items.push(("compression_threshold", compression_threshold.to_string()));
-        }
-        if let Some(compression_keep_last) = self.compression_keep_last {
-            items.push(("compression_keep_last", compression_keep_last.to_string()));
+        if let Some(compression) = compression {
+            items.extend(compression.rows());
+        } else {
+            if let Some(compression_threshold) = self.compression_threshold {
+                items.push(("compression_threshold", compression_threshold.to_string()));
+            }
+            if let Some(compression_keep_last) = self.compression_keep_last {
+                items.push(("compression_keep_last", compression_keep_last.to_string()));
+            }
         }
 
         if let Some(auto_continue) = self.auto_continue() {
@@ -588,8 +695,13 @@ impl Session {
             items.push(("memory", memory.to_string()));
         }
 
+        let (tokens, percent) = self.tokens_usage();
+        items.push(("total_tokens", tokens.to_string()));
         if let Some(max_input_tokens) = self.model().max_input_tokens() {
             items.push(("max_input_tokens", max_input_tokens.to_string()));
+        }
+        if percent != 0.0 {
+            items.push(("total/max", format!("{percent}%")));
         }
 
         if let Some(value) = self.token_usage.input_tokens {
@@ -830,9 +942,9 @@ impl Session {
         let threshold = self
             .compression_threshold
             .unwrap_or(global_compression_threshold);
-        if threshold < 1 {
+        let Some(min_reclaim) = min_reclaim_tokens(threshold) else {
             return false;
-        }
+        };
         if self.tokens() <= threshold {
             return false;
         }
@@ -842,7 +954,7 @@ impl Session {
         // guard, a session whose sticky floor (system prompt + kept tail) sits
         // near the threshold re-compresses after every single turn, burning a
         // summarization LLM call each time for almost no reduction.
-        self.reclaimable_tokens(keep) >= (threshold / COMPRESSION_MIN_RECLAIM_DIVISOR).max(1)
+        self.reclaimable_tokens(keep) >= min_reclaim
     }
 
     /// Whether the prompt is close enough to the model's hard input limit
@@ -906,8 +1018,13 @@ impl Session {
         &self.messages[start..self.keep_tail_start(keep)]
     }
 
+    /// The messages compression would keep verbatim.
+    pub fn kept_tail(&self, keep: KeepPolicy) -> &[Message] {
+        &self.messages[self.keep_tail_start(keep)..]
+    }
+
     /// Estimated tokens of the messages compression would fold away.
-    fn reclaimable_tokens(&self, keep: KeepPolicy) -> usize {
+    pub fn reclaimable_tokens(&self, keep: KeepPolicy) -> usize {
         self.model().total_tokens(self.foldable_messages(keep))
     }
 
@@ -1340,6 +1457,7 @@ mod tests {
     };
     use crate::config::{AppConfig, AppState, RequestContext, WorkingMode};
     use crate::function::{Functions, ToolCall, ToolResult};
+    use serial_test::serial;
     use std::sync::Arc;
 
     #[test]
@@ -1593,7 +1711,7 @@ mod tests {
 
     #[test]
     fn session_export_includes_real_usage_only_when_reported() {
-        let empty = Session::default().export().unwrap();
+        let empty = Session::default().export(None).unwrap();
         assert!(!empty.contains("real_input_tokens"));
         assert!(empty.contains("scope: global"));
 
@@ -1605,7 +1723,7 @@ mod tests {
             cache_creation_input_tokens: None,
             cache_read_input_tokens: Some(3),
         });
-        let exported = session.export().unwrap();
+        let exported = session.export(None).unwrap();
         assert!(exported.contains("scope: workspace"));
         assert!(exported.contains("real_input_tokens: 5"));
         assert!(exported.contains("real_output_tokens: 7"));
@@ -1613,18 +1731,214 @@ mod tests {
         assert!(!exported.contains("cache_creation_tokens"));
     }
 
-    fn rendered_lines(session: &Session) -> Vec<String> {
+    fn sample_compression_info() -> CompressionInfo {
+        CompressionInfo {
+            threshold: 100_000,
+            keep_last: 4,
+            safety_valve: 0.8,
+            model: None,
+            valve_limit: Some(160_000),
+            keep_tokens: 40_000,
+            checkpoint_tokens: 50_000,
+            min_reclaim: Some(20_000),
+            last_prompt_tokens: Some(90_000),
+            reclaimable_tokens: Some(30_000),
+            kept_tail_messages: Some(3),
+            kept_tail_tokens: Some(5_000),
+            archived_messages: Some(12),
+        }
+    }
+
+    #[test]
+    fn session_export_includes_compression_block() {
+        let exported = Session::default()
+            .export(Some(&sample_compression_info()))
+            .unwrap();
+        assert!(exported.contains("compression:\n"));
+        assert!(exported.contains("  threshold: 100000\n"));
+        assert!(exported.contains("  keep_last: 4\n"));
+        assert!(exported.contains("  safety_valve: 0.8\n"));
+        assert!(exported.contains("  model: null\n"));
+        assert!(exported.contains("  valve_limit: 160000\n"));
+        assert!(exported.contains("  keep_tokens: 40000\n"));
+        assert!(exported.contains("  checkpoint_tokens: 50000\n"));
+        assert!(exported.contains("  min_reclaim: 20000\n"));
+        assert!(exported.contains("  last_prompt_tokens: 90000\n"));
+        assert!(exported.contains("  reclaimable: 30000\n"));
+        assert!(exported.contains("  kept_tail_messages: 3\n"));
+        assert!(exported.contains("  kept_tail_tokens: 5000\n"));
+        assert!(exported.contains("  archived_messages: 12\n"));
+
+        assert!(
+            !Session::default()
+                .export(None)
+                .unwrap()
+                .contains("compression")
+        );
+    }
+
+    #[test]
+    fn compression_info_formats_null_and_unlimited() {
+        let info = CompressionInfo {
+            threshold: 0,
+            keep_last: 0,
+            safety_valve: 0.0,
+            model: None,
+            valve_limit: valve_limit(0.0, None),
+            keep_tokens: keep_token_budget(0, 0.0, None),
+            checkpoint_tokens: 50_000,
+            min_reclaim: min_reclaim_tokens(0),
+            last_prompt_tokens: None,
+            reclaimable_tokens: None,
+            kept_tail_messages: None,
+            kept_tail_tokens: None,
+            archived_messages: None,
+        };
+
+        let rows = info.rows();
+        let row = |key: &str| {
+            rows.iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| value.as_str())
+                .unwrap_or_else(|| panic!("{key} row missing from {rows:?}"))
+        };
+        assert_eq!(row("compression_threshold"), "0");
+        assert_eq!(row("compression_safety_valve"), "0");
+        assert_eq!(row("compression_model"), "null");
+        assert_eq!(row("compression_valve_limit"), "null");
+        assert_eq!(row("compression_keep_tokens"), "unlimited");
+        assert_eq!(row("compression_min_reclaim"), "null");
+        assert_eq!(row("compression_last_prompt_tokens"), "null");
+        assert_eq!(rows.len(), 9, "live rows are absent without a session");
+
+        let json = info.to_json();
+        assert_eq!(json["model"], serde_json::Value::Null);
+        assert_eq!(json["valve_limit"], serde_json::Value::Null);
+        assert_eq!(json["keep_tokens"], json!("unlimited"));
+        assert_eq!(json["min_reclaim"], serde_json::Value::Null);
+        assert_eq!(json["last_prompt_tokens"], serde_json::Value::Null);
+        assert!(json.get("reclaimable").is_none());
+        assert!(json.get("archived_messages").is_none());
+    }
+
+    #[test]
+    fn compression_info_rows_keep_their_order() {
+        let keys: Vec<&str> = sample_compression_info()
+            .rows()
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "compression_threshold",
+                "compression_keep_last",
+                "compression_safety_valve",
+                "compression_model",
+                "compression_valve_limit",
+                "compression_keep_tokens",
+                "compression_checkpoint_tokens",
+                "compression_min_reclaim",
+                "compression_last_prompt_tokens",
+                "compression_reclaimable",
+                "compression_kept_tail_messages",
+                "compression_kept_tail_tokens",
+                "compression_archived_messages",
+            ]
+        );
+    }
+
+    fn rendered_lines_with(
+        session: &Session,
+        compression: Option<&CompressionInfo>,
+    ) -> Vec<String> {
         let options = crate::render::RenderOptions {
             raw_markdown: true,
             ..Default::default()
         };
         let mut render = MarkdownRender::init(options).unwrap();
         session
-            .render(&mut render, &None)
+            .render(&mut render, &None, compression)
             .unwrap()
             .lines()
             .map(str::to_string)
             .collect()
+    }
+
+    fn rendered_lines(session: &Session) -> Vec<String> {
+        rendered_lines_with(session, None)
+    }
+
+    #[test]
+    fn session_render_reports_estimated_tokens_like_export() {
+        let mut session = Session::default();
+        let mut data = ModelData::new("windowed");
+        data.max_input_tokens = Some(1_000);
+        session.set_model(Model::from_config("provider", &[data]).remove(0));
+        session.messages.push(text(MessageRole::System, "system"));
+        session
+            .messages
+            .push(text(MessageRole::User, "hello there"));
+        session.update_tokens();
+        let (tokens, percent) = session.tokens_usage();
+        assert!(tokens > 0 && percent > 0.0);
+
+        let lines = rendered_lines(&session);
+        let row = |key: &str| {
+            lines
+                .iter()
+                .find(|line| line.starts_with(key))
+                .unwrap_or_else(|| panic!("{key} row missing from:\n{}", lines.join("\n")))
+                .clone()
+        };
+        assert!(row("total_tokens").ends_with(&tokens.to_string()));
+        assert!(row("max_input_tokens").ends_with("1000"));
+        assert!(row("total/max").ends_with(&format!("{percent}%")));
+
+        let exported = session.export(None).unwrap();
+        assert!(exported.contains(&format!("total_tokens: {tokens}\n")));
+        assert!(exported.contains(&format!("total/max: {percent}%\n")));
+    }
+
+    #[test]
+    fn session_render_uses_compression_rows_when_given() {
+        let mut session = Session::default();
+        session.set_compression_threshold(Some(123));
+
+        let plain = rendered_lines(&session);
+        assert!(
+            plain
+                .iter()
+                .any(|line| line.starts_with("compression_threshold") && line.ends_with("123"))
+        );
+        assert!(
+            !plain
+                .iter()
+                .any(|line| line.starts_with("compression_keep_tokens"))
+        );
+
+        let full = rendered_lines_with(&session, Some(&sample_compression_info()));
+        assert!(
+            full.iter().any(|line| {
+                line.starts_with("compression_threshold") && line.ends_with("100000")
+            }),
+            "the info block replaces the session override row"
+        );
+        assert!(
+            full.iter()
+                .any(|line| line.starts_with("compression_keep_tokens") && line.ends_with("40000"))
+        );
+        assert!(
+            full.iter()
+                .any(|line| line.starts_with("compression_archived_messages")
+                    && line.ends_with("12"))
+        );
+        assert_eq!(
+            full.iter()
+                .filter(|line| line.starts_with("compression_"))
+                .count(),
+            13
+        );
     }
 
     #[test]
@@ -2017,6 +2331,74 @@ mod tests {
         };
 
         assert!(session.safety_valve_triggered(0.8, keep, Some(900_000)));
+    }
+
+    #[test]
+    #[serial]
+    fn compression_info_live_numbers_match_keep_policy() {
+        let mut app_state = AppState::test_default();
+        app_state.config = Arc::new(AppConfig {
+            compression_threshold: 4000,
+            compression_keep_last: 2,
+            ..AppConfig::default()
+        });
+        let mut ctx = RequestContext::new(Arc::new(app_state), WorkingMode::Cmd);
+        ctx.last_prompt_token_usage = Some(7_777);
+        let mut session = giant_tail_session(Some(200_000));
+        session
+            .messages
+            .push(text(MessageRole::User, "last question"));
+        session
+            .messages
+            .push(text(MessageRole::Assistant, "last answer"));
+        session.update_tokens();
+        ctx.session = Some(session);
+        let app = ctx.app.config.clone();
+
+        let keep = ctx.compression_keep_policy(None);
+        assert_eq!(keep.last, 2);
+        assert_eq!(keep.tokens, 2000);
+        let session = ctx.session.as_ref().unwrap();
+        let tail_start = session.keep_tail_start(keep);
+        assert_eq!(tail_start, 4, "keep_last 2 keeps the final exchange");
+
+        let info = ctx.compression_info(&app).unwrap();
+
+        assert_eq!(info.threshold, 4000);
+        assert_eq!(info.keep_last, 2);
+        assert_eq!(info.keep_tokens, 2000);
+        assert_eq!(info.last_prompt_tokens, Some(7_777));
+        assert_eq!(
+            info.reclaimable_tokens,
+            Some(
+                session
+                    .model()
+                    .total_tokens(session.foldable_messages(keep))
+            )
+        );
+        assert!(info.reclaimable_tokens.unwrap() > 100_000);
+        assert_eq!(
+            info.kept_tail_messages,
+            Some(session.messages.len() - tail_start)
+        );
+        assert_eq!(
+            info.kept_tail_tokens,
+            Some(
+                session
+                    .model()
+                    .total_tokens(&session.messages[tail_start..])
+            )
+        );
+        assert_eq!(info.archived_messages, Some(0));
+
+        ctx.session
+            .as_mut()
+            .unwrap()
+            .compress("summary".to_string(), keep);
+        let after = ctx.compression_info(&app).unwrap();
+        assert_eq!(after.archived_messages, Some(tail_start));
+        assert_eq!(after.kept_tail_messages, Some(2));
+        assert_eq!(after.reclaimable_tokens, Some(0));
     }
 
     #[test]
