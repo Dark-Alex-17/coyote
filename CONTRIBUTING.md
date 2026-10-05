@@ -270,7 +270,7 @@ prompt-integrity assertions are not exercised on windows-latest. That lane still
 
 ### Opt-in doc lint
 
-`tests/mesh_wiki_docs.rs` pins the wiki's mesh pages to the verbs, hooks and tools in the source.
+`tests/mesh_wiki_docs.rs` pins the wiki's mesh pages, `Hooks`, `Home` and the README to the verbs, hooks, tools and staging-inbox layout in the source.
 The wiki is a separate clone, so the lint runs only when pointed at one:
 `COYOTE_WIKI_DIR=../coyote.wiki cargo test --test mesh_wiki_docs`. Without the variable it prints
 `skipping:` and passes. `scripts/mesh-interop/README.md` documents the variable.

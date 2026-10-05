@@ -609,7 +609,14 @@ mod tests {
             bootstrapped, literal,
             "bootstrap writes under the literal name too"
         );
-        assert!(!override_dir.join(".gitignore").exists());
+        let ignored = fs::read_to_string(workspace.join(GITIGNORE_FILE_NAME)).unwrap();
+        assert!(
+            ignored
+                .lines()
+                .any(|line| line == paths::workspace_memory_gitignore_entry()),
+            "{ignored}"
+        );
+        assert!(!override_dir.join(GITIGNORE_FILE_NAME).exists());
 
         let _ = fs::remove_dir_all(&root);
     }

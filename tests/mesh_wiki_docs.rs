@@ -12,9 +12,9 @@
 //! `cargo test` is unaffected. With it set to a directory that has no `Mesh.md`
 //! the tests fail rather than pass against nothing.
 //!
-//! There is no lib target, so the code side of each pin is read from the source
-//! text under `src/`: the REPL `VERBS` table, the hook event count and the
-//! `mesh__*` tool names.
+//! There is no lib target, so the code side of each pin is read from the repo's
+//! text: the REPL `VERBS` table, the hook counts and the `mesh__*` tool names under
+//! `src/`, the spec's H1 in `docs/mesh/PROTOCOL.md`, and the README.
 
 use std::env;
 use std::fs;
@@ -444,8 +444,9 @@ fn mesh_pages(wiki: &Path) -> Vec<PathBuf> {
 /// of the same root, is not the full lowercase 32-hex destination hash: the
 /// `<peer-dest32>` placeholder and other non-hex names pass; a literal that starts with a
 /// hex digit but is not exactly 32 lowercase hex digits (shortened, truncated with an
-/// ellipsis, or upper-cased) does not, and neither does a retired `<peer-dest8>` or
-/// `<dest8>` placeholder.
+/// ellipsis, or upper-cased) does not, and neither does a retired 8-hex placeholder
+/// (`<peer-dest8>`, `<dest8>`, `<peer8>`). A segment ends at a path separator, a
+/// backtick, a space or sentence punctuation, so prose around an example is not judged.
 fn short_peer_directory_hits(label: &str, text: &str) -> Vec<String> {
     let markers = [
         "inbox/<instance id>/",
@@ -460,7 +461,7 @@ fn short_peer_directory_hits(label: &str, text: &str) -> Vec<String> {
             for (at, _) in line.match_indices(marker) {
                 let rest = &line[at + marker.len()..];
                 let segment: &str = rest
-                    .split(['/', '`', ' ', ')', ',', ';'])
+                    .split(['/', '`', ' ', ')', ',', ';', '.', ':'])
                     .next()
                     .unwrap_or_default();
                 let looks_literal = segment
@@ -639,5 +640,162 @@ fn the_mesh_page_and_the_readme_mesh_section_lead_with_the_scope_expansion() {
     assert!(
         lead.starts_with(&scope_lead),
         "README.md's `### Mesh` section does not open with {scope_lead:?}: {lead:?}"
+    );
+}
+
+/// Every spelling of the staging root the wiki uses (`inbox/<instance id>/`,
+/// `inbox/<instance_id>/` and the two `<inbox_dir>/…` forms) is judged alike: the peer
+/// segment ends at `/`, a backtick, a space, `)`, `,`, `;` or the line end, so a shortened
+/// hash followed by sentence punctuation is quoted WITHOUT that punctuation in the hit; the
+/// full lowercase hash in the same positions is never a hit; and each retired placeholder
+/// is named in its own hit. The wiki itself exercises the `<inbox_dir>` spelling (the
+/// `Mesh-Configuration.md` `inbox_dir` paragraph), so that marker is not a dead branch.
+#[test]
+fn usage_probe_every_root_spelling_and_segment_terminator_judges_the_peer_segment_alike() {
+    let Some(wiki) = wiki_dir() else { return };
+    let full = "5e6f7a8b".repeat(4);
+    let roots = [
+        "inbox/<instance id>/",
+        "inbox/<instance_id>/",
+        "<inbox_dir>/<instance id>/",
+        "<inbox_dir>/<instance_id>/",
+    ];
+    let terminators = ["/ci.log", ")", ",", ";", " then", "`", ""];
+
+    for root in roots {
+        for terminator in terminators {
+            // A shortened hash is a hit and the hit quotes only the hash, never the
+            // punctuation after it.
+            let short = format!("staged at <cache_dir>/mesh/{root}5e6f7a8b{terminator}\n");
+            assert_eq!(
+                short_peer_directory_hits("page", &short),
+                vec![
+                    "page:1: peer directory `5e6f7a8b` is not a full lowercase 32-hex destination"
+                        .to_string()
+                ],
+                "root {root:?} + terminator {terminator:?}"
+            );
+            // The full lowercase hash in the same slot is never a hit.
+            let ok = format!("staged at <cache_dir>/mesh/{root}{full}{terminator}\n");
+            assert!(
+                short_peer_directory_hits("page", &ok).is_empty(),
+                "root {root:?} + terminator {terminator:?} flags the full hash: {:?}",
+                short_peer_directory_hits("page", &ok)
+            );
+        }
+        // Upper- and mixed-case full-length hashes are hits under every root spelling.
+        for cased in [
+            full.to_uppercase(),
+            format!("{}{}", full[..8].to_uppercase(), &full[8..]),
+        ] {
+            let hits = short_peer_directory_hits("page", &format!("{root}{cased}/x\n"));
+            assert_eq!(
+                hits,
+                vec![format!(
+                    "page:1: peer directory `{cased}` is not a full lowercase 32-hex destination"
+                )],
+                "root {root:?}"
+            );
+        }
+        // Each retired placeholder is a hit naming itself; the current one and prose
+        // placeholders are not.
+        for retired in ["<peer-dest8>", "<dest8>", "<peer8>"] {
+            let hits = short_peer_directory_hits("page", &format!("{root}{retired}/x\n"));
+            assert_eq!(
+                hits,
+                vec![format!(
+                    "page:1: peer directory `{retired}` is not a full lowercase 32-hex destination"
+                )],
+                "root {root:?}"
+            );
+        }
+        for placeholder in [
+            "<peer-dest32>",
+            "<peer's full destination hash, lowercase>",
+            "<peer>",
+        ] {
+            let text = format!("{root}{placeholder}/<path>\n");
+            assert!(
+                short_peer_directory_hits("page", &text).is_empty(),
+                "root {root:?} flags the placeholder {placeholder:?}"
+            );
+        }
+    }
+
+    // Two short examples on one line under different root spellings are two hits with the
+    // same line number; a full hash between them is not.
+    let mixed = format!(
+        "a\n`inbox/<instance id>/5e6f7a8b/x` or `<inbox_dir>/<instance_id>/{full}/y` or <inbox_dir>/<instance id>/<dest8>/z\n"
+    );
+    let mut hits = short_peer_directory_hits("page", &mixed);
+    hits.sort();
+    assert_eq!(
+        hits,
+        vec![
+            "page:2: peer directory `5e6f7a8b` is not a full lowercase 32-hex destination"
+                .to_string(),
+            "page:2: peer directory `<dest8>` is not a full lowercase 32-hex destination"
+                .to_string(),
+        ]
+    );
+
+    // The wiki really uses the `<inbox_dir>/<instance id>/` spelling in a scanned page, so
+    // that marker is exercised by the lint rather than only by this fixture.
+    let inbox_dir_examples: Vec<String> = mesh_pages(&wiki)
+        .iter()
+        .flat_map(|path| {
+            let label = path.file_name().unwrap().to_string_lossy().to_string();
+            read(path)
+                .lines()
+                .enumerate()
+                .filter(|(_, line)| {
+                    line.contains("<inbox_dir>/<instance id>/")
+                        || line.contains("<inbox_dir>/<instance_id>/")
+                })
+                .map(|(index, _)| format!("{label}:{}", index + 1))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert!(
+        inbox_dir_examples
+            .iter()
+            .any(|at| at.starts_with("Mesh-Configuration.md:")),
+        "no scanned Mesh*.md page spells the staging root as `<inbox_dir>/<instance id>/`: {inbox_dir_examples:?}"
+    );
+}
+
+/// The interop README's `COYOTE_WIKI_DIR` row and CONTRIBUTING.md carry the opt-in recipe,
+/// and the row names every page family this file reads (`Mesh*`, `Hooks`, `Home`, the
+/// README) and the staging-inbox layout pin, so an operator can tell from the docs what
+/// turning the variable on will judge.
+#[test]
+fn usage_probe_the_docs_name_the_recipe_and_every_page_family_the_lint_reads() {
+    let Some(_wiki) = wiki_dir() else { return };
+    let readme = read(repo_root().join("scripts/mesh-interop/README.md"));
+    let row = readme
+        .lines()
+        .find(|line| line.starts_with("| `COYOTE_WIKI_DIR`"))
+        .expect("scripts/mesh-interop/README.md has a `COYOTE_WIKI_DIR` table row");
+    for needle in [
+        "`Mesh*`",
+        "`Hooks`",
+        "`Home`",
+        "README",
+        "staging-inbox layout",
+        "skipping:",
+    ] {
+        assert!(
+            row.contains(needle),
+            "the COYOTE_WIKI_DIR row does not say {needle:?}: {row}"
+        );
+    }
+    assert!(
+        readme.contains(RECIPE),
+        "scripts/mesh-interop/README.md lacks the recipe {RECIPE}"
+    );
+    let contributing = read(repo_root().join("CONTRIBUTING.md"));
+    assert!(
+        contributing.contains(RECIPE),
+        "CONTRIBUTING.md lacks the recipe {RECIPE}"
     );
 }

@@ -113,8 +113,8 @@ impl Default for MeshFetch {
 impl MeshFetch {
     /// `inbox_dir` as configured, or its sandboxed-home translation when the configured
     /// directory does not exist and the translation does; `None` when unset. Resolving
-    /// is quiet and repeatable, so callers may resolve as often as they like; the node
-    /// announces the translation once, when it starts.
+    /// emits no info-level line and is repeatable, so callers may resolve as often as
+    /// they like; the node announces the translation once, when it starts.
     pub fn inbox_dir(&self) -> Option<PathBuf> {
         self.inbox_dir
             .as_deref()

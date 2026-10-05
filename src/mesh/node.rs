@@ -238,7 +238,8 @@ pub(crate) struct MeshRuntime {
     about: Option<String>,
     peer_limits: PeerLimitConfig,
     inline_max_bytes: u64,
-    /// `mesh.fetch.inbox_dir`; `None` stages under the cache dir.
+    /// The directory `mesh.fetch.inbox_dir` resolved to at node start; `None` stages
+    /// under the cache dir.
     inbox_dir: Option<PathBuf>,
     cache_dir: PathBuf,
     serving: Arc<FetchServing>,
@@ -530,8 +531,9 @@ impl MeshRuntime {
         &self.memory
     }
 
-    /// Where a file fetched from a peer is staged: under `mesh.fetch.inbox_dir` when set,
-    /// else under the cache dir, keyed by the instance this node speaks for right now.
+    /// Where a file fetched from a peer is staged: under the directory
+    /// `mesh.fetch.inbox_dir` resolved to at node start when set, else under the cache
+    /// dir, keyed by the instance this node speaks for right now.
     pub(crate) fn inbox_staging(&self) -> InboxStaging {
         InboxStaging::for_instance_under(
             self.inbox_dir.as_deref(),

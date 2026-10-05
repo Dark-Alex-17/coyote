@@ -97,7 +97,7 @@ impl InboxStaging {
     /// holds other bytes, or a file appears at the target between the check and the
     /// write, nothing is overwritten: `Collision`. A root that is gone again by the time
     /// its ancestors are walked is `Io(NotFound)`, not `Escaped`; a root that is not a
-    /// directory fails at the first `create_dir_all` with the filesystem's own kind,
+    /// directory fails at the first mkdir with the filesystem's own kind,
     /// before any path is resolved.
     pub(crate) fn stage(
         &self,
