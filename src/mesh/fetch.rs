@@ -66,8 +66,9 @@ const UNKNOWN_RULE: &str = "unknown";
 /// `an_ok_reply_at_the_ceiling_fits_one_resource_segment` and
 /// `a_file_above_the_single_segment_ceiling_is_too_large_with_that_limit` go, and the
 /// multi-segment reassembly test returns; the ceiling clauses on the `mesh.fetch.max_bytes`
-/// row of README.md and in the config template and example go with it, as do the ceiling
-/// clauses in MESH-FETCH-026, MESH-FETCH-027 and MESH-SEC-018 and the section 15.5 bounds
+/// row of README.md (pinned by `readme_fetch_row_spells_the_single_segment_ceiling_as_a_number`)
+/// and in the config template and example go with it, as do the ceiling clauses in
+/// MESH-FETCH-026, MESH-FETCH-027 and MESH-SEC-018 and the section 15.5 bounds
 /// table, the leniency MESH-LEN-007 in docs/mesh/PROTOCOL.md, both constants'
 /// `expected_constants` entries in src/mesh/spec_pins.rs and their section 19 rows.
 /// Recorded as draft A4 in docs/mesh/upstream-issues.md.

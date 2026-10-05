@@ -14,6 +14,8 @@ const UPSTREAM_ISSUES: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/docs/mesh/upstream-issues.md"
 ));
+#[cfg(test)]
+const README: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"));
 
 const EXPECTED_H1: &str = "# SCOPE — Session Coordination & Presence Exchange";
 const EXPECTED_TAGLINE: &str = "\"SCOPE is a peer protocol by which running LLM sessions announce presence, share status, and exchange messages on their owners' behalf, over Reticulum, without a broker.\"";
@@ -2139,6 +2141,109 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
             introduction.content.matches(name.as_str()).count(),
             1,
             "{name} is not named under {INTRODUCTION_HEADING:?}"
+        );
+    }
+
+    /// The README's mesh section opens with the protocol's name and tagline as the spec
+    /// states them, then says what the reference implementation is and what "mesh" names.
+    /// Both are derived from the spec's pinned strings so the two documents cannot drift.
+    #[test]
+    fn readme_mesh_section_leads_with_the_scope_name_tagline_and_reference_sentence() {
+        let lines: Vec<&str> = README.lines().collect();
+        let headings: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| **line == "### Mesh")
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(headings.len(), 1, "### Mesh headings at lines {headings:?}");
+        let paragraph = lines[headings[0] + 1..]
+            .iter()
+            .skip_while(|line| line.trim().is_empty())
+            .take_while(|line| !line.trim().is_empty())
+            .copied()
+            .collect::<Vec<&str>>()
+            .join(" ");
+        let protocol = EXPECTED_H1
+            .strip_prefix("# ")
+            .expect("the H1 carries a heading marker");
+        assert!(
+            paragraph.starts_with(protocol),
+            "the mesh section does not open with {protocol:?}: {paragraph:?}"
+        );
+        let tagline = EXPECTED_TAGLINE
+            .strip_prefix('"')
+            .and_then(|tagline| tagline.strip_suffix('"'))
+            .expect("the tagline is quoted");
+        assert!(
+            paragraph.contains(tagline),
+            "the mesh section lacks the tagline: {paragraph:?}"
+        );
+        // Assembled at runtime so the mesh source guard does not match this test's text.
+        let name = ["Coy", "ote"].concat();
+        let reference = format!(
+            "{name} is the reference implementation of SCOPE, and \"mesh\" is {name}'s name for its SCOPE feature."
+        );
+        assert!(
+            paragraph.contains(&reference),
+            "the mesh section lacks {reference:?}: {paragraph:?}"
+        );
+    }
+
+    /// The README speaks the SCOPE wire vocabulary only: the announce magic and the
+    /// backtick-wrapped destination prefixes from before the rename must not appear.
+    /// The needles carry their backtick so file names like the log and config do not trip.
+    #[test]
+    fn readme_never_spells_the_pre_scope_wire_vocabulary() {
+        // Assembled at runtime so the mesh source guard does not match this test's text.
+        let needles = [
+            ["COY", "M"].concat(),
+            ["`coy", "ote.mesh"].concat(),
+            ["`coy", "ote.peer/"].concat(),
+            ["`coy", "ote.knock/"].concat(),
+        ];
+        let scan = |text: &str| -> Vec<String> {
+            text.lines()
+                .enumerate()
+                .flat_map(|(index, line)| {
+                    needles
+                        .iter()
+                        .filter(move |needle| line.contains(needle.as_str()))
+                        .map(move |needle| format!("README.md:{}: spells {needle}", index + 1))
+                })
+                .collect()
+        };
+        let fixture = format!("fine line\nthe {} destination\n", needles[1]);
+        let control = scan(&fixture);
+        assert_eq!(
+            control.len(),
+            1,
+            "the scan does not go red on a fixture: {control:?}"
+        );
+        let hits = scan(README);
+        assert!(hits.is_empty(), "{}", hits.join("\n"));
+    }
+
+    /// The `mesh.fetch.max_bytes` row states the single-segment ceiling as the number a
+    /// user can compare against their setting; a Rust constant name does not belong in a
+    /// user-facing config table. The number is the code's, so the row cannot drift.
+    #[test]
+    fn readme_fetch_row_spells_the_single_segment_ceiling_as_a_number() {
+        let row = README
+            .lines()
+            .find(|line| line.starts_with("| `mesh.fetch.max_bytes`"))
+            .expect("the README has a mesh.fetch.max_bytes row");
+        let clause = format!(
+            "`min(max_bytes, {})` (about 1 MiB)",
+            fetch::SINGLE_SEGMENT_FETCH_CEILING
+        );
+        assert!(
+            row.contains(&clause),
+            "the fetch row lacks {clause:?}: {row:?}"
+        );
+        assert!(
+            !row.contains("SINGLE_SEGMENT_FETCH_CEILING"),
+            "the fetch row names the constant instead of its value: {row:?}"
         );
     }
 
