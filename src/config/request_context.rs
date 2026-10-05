@@ -5544,7 +5544,9 @@ impl RequestContext {
     /// has one, by the read-only hint otherwise, and case-insensitively when neither can
     /// tell, the direction that hides more. Empty for a directory prefix the verbs would
     /// refuse as a pattern or that passes through a symlink, and for a root whose probe
-    /// failed, since the node serves nothing from it; sorted and cut at 200.
+    /// failed, since the node serves nothing from it; sorted and cut at 200. The root and
+    /// the typed directory resolve through the mesh canonicaliser so each candidate and
+    /// the protected directories share one spelling past MAX_PATH on Windows.
     fn mesh_completion_share_paths(&self, typed: &str) -> Vec<(String, Option<String>)> {
         use crate::mesh::shares::{CompletionFilter, case_folding_hint, validate_pattern};
 
@@ -5584,10 +5586,10 @@ impl RequestContext {
                 return Vec::new();
             }
         }
-        let Ok(canonical_root) = dunce::canonicalize(&root) else {
+        let Ok(canonical_root) = crate::mesh::canonicalize(&root) else {
             return Vec::new();
         };
-        let Ok(dir) = dunce::canonicalize(root.join(dir_part)) else {
+        let Ok(dir) = crate::mesh::canonicalize(&root.join(dir_part)) else {
             return Vec::new();
         };
         if !dir.starts_with(&canonical_root) {
@@ -22824,7 +22826,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     fn completion_values(rows: &[(String, Option<String>)]) -> Vec<&str> {
         rows.iter().map(|(value, _)| value.as_str()).collect()
     }
@@ -23492,7 +23493,6 @@ mod tests {
 
     /// A share-root workspace published as the fixture's snapshot, so the share verbs
     /// complete against it.
-    #[cfg(unix)]
     fn publish_share_root(ctx: &RequestContext, tag: &str) -> crate::mesh::test_support::TempDir {
         let tmp = crate::mesh::test_support::TempDir::new(tag);
         let mut snapshot = crate::mesh::test_support::snapshot_fixture();
@@ -23501,7 +23501,6 @@ mod tests {
         tmp
     }
 
-    #[cfg(unix)]
     fn seed_share_files(root: &Path, files: &[&str]) {
         for relative in files {
             let path = root.join(relative);
@@ -24154,6 +24153,52 @@ mod tests {
         assert!(fixture.ctx.mesh_completion_share_paths("inbox/").is_empty());
 
         fixture.stop().await;
+    }
+
+    /// The completer leaves the configured inbox off the list while the mesh is off too,
+    /// where the protected directories come from the configured paths rather than a node;
+    /// candidates and protected directories must therefore agree on one spelling.
+    #[test]
+    #[serial]
+    fn mesh_completion_share_paths_never_offers_the_configured_inbox_while_the_mesh_is_off() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let root = publish_share_root(&ctx, "rc-mesh-complete-inbox-off-root");
+        seed_share_files(
+            &root.path,
+            &["README.md", "inbox/fetched.md", "inbound/x.md"],
+        );
+        let inbox = root.path.join("inbox");
+        ctx.update_app_config(|app| app.mesh.fetch.inbox_dir = Some(inbox));
+
+        let rows = ctx.mesh_completion_share_paths("");
+        assert_eq!(completion_values(&rows), ["README.md", "inbound/"]);
+        assert!(ctx.mesh_completion_share_paths("inbox/").is_empty());
+    }
+
+    /// A typed directory deeper than MAX_PATH resolves to a verbatim path on Windows unless
+    /// the mesh canonicaliser strips the prefix, and the protected inbox beneath it is
+    /// recognised only when both sides carry the same spelling.
+    #[cfg(windows)]
+    #[test]
+    #[serial]
+    fn mesh_completion_share_paths_never_offers_an_inbox_deeper_than_max_path() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let root = publish_share_root(&ctx, "rc-mesh-complete-inbox-deep-root");
+        let deep = format!("{}/{}/{}", "a".repeat(90), "b".repeat(90), "c".repeat(90));
+        let fetched = format!("{deep}/inbox/fetched.md");
+        let keep = format!("{deep}/keep.md");
+        seed_share_files(&root.path, &[fetched.as_str(), keep.as_str()]);
+        let inbox = root.path.join(&deep).join("inbox");
+        ctx.update_app_config(|app| app.mesh.fetch.inbox_dir = Some(inbox));
+
+        let rows = ctx.mesh_completion_share_paths(&format!("{deep}/"));
+        assert_eq!(completion_values(&rows), [keep.as_str()]);
+        assert!(
+            ctx.mesh_completion_share_paths(&format!("{deep}/inbox/"))
+                .is_empty()
+        );
     }
 
     #[cfg(unix)]
