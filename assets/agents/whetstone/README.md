@@ -42,7 +42,33 @@ suite's own lanes flagged — ground truth that offline comment mining could onl
   `suite_repo` — most users, whose live config IS the suite — edits apply directly under
   `runtime_config`, with per-file backups to `share/whetstone-backups/` as the revert
   path. Empty proposal lists are a fine outcome; whetstone never invents findings to
-  justify its spawn.
+  justify its spawn. Every surviving proposal is written to disk before the approval
+  prompt, so an unanswered prompt never loses it — see "Pending proposals" below.
+
+## Pending proposals
+
+Approval cannot always happen in the run that drafted the proposal: whetstone may be
+spawned headless from a watcher round, the approval prompt may time out, or the session
+may lack write tools. Three early runs lost their proposals exactly that way — the last
+pushed its draft to Slack with a three-minute budget, timed out, and the text survived
+only in the Slack thread. So whetstone now persists first and asks second: before any
+approval prompt it writes the run's proposals to
+`share/whetstone-pending/<UTC ts>-<owner>-<repo>-<N>.md` under `runtime_config`, one
+`## P<n>` block per proposal with the quoted evidence and the full remediation draft.
+Writing the file is bookkeeping, not a suite write — it needs no approval. A run with
+zero proposals writes nothing.
+
+Lifecycle: a block that is approved and applied is deleted, as is one the user
+explicitly declines (recurrence evidence still goes to the candidates inbox); a block
+whose approval timed out, ran headless, or was never asked stays `status: pending`.
+Emptied files are deleted. Every report states the pending file path, or "none pending".
+
+To resume later: `coyote --agent whetstone`, then `apply pending`. That mode skips
+classification, lists every pending block oldest first, asks which to apply, and runs
+the approved ones through the normal apply path (ledger append, suite edit with backups,
+optional runtime mirror). A block whose rule already exists in the suite is marked
+applied without writing; declined blocks are deleted and never re-raised except through
+normal recurrence.
 
 ## Relationship to the other ledger tools
 
@@ -61,7 +87,8 @@ auto-appends to the LEDGER itself — candidates wait in the inbox until a human
 
 Additive only (never weakens or removes an existing rule); writes only to the suite
 skills/review-agent configs (repo when configured, live config otherwise — always
-backed up first), the ledger, the candidates inbox, and — with its own approval,
-drift-guarded — the runtime mirror of this run's applied repo edits; never commits,
+backed up first), the ledger, the candidates inbox, the pending store
+(`share/whetstone-pending/`), and — with its own approval, drift-guarded — the runtime
+mirror of this run's applied repo edits; never commits,
 never pushes, never touches source repos, never makes runtime-only changes when a
 suite repo is configured; one proposal per defect class; verbatim citations only.

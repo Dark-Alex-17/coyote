@@ -10,8 +10,22 @@ _project_dir() {
   (cd "${dir}" 2>/dev/null && pwd) || echo "${dir}"
 }
 
+# Bare refs are diffed from their merge-base with HEAD (three-dot semantics) so
+# commits that landed on the base after branching never surface as changes.
+# Explicit `..` ranges pass through. Returns nonzero when no merge-base exists.
+_resolve_base() {
+  local project_dir="$1" base="$2" mb
+  case "${base}" in *..*) printf '%s' "${base}"; return ;; esac
+  if mb=$(cd "${project_dir}" && git merge-base "${base}" HEAD 2>/dev/null) && [[ -n "${mb}" ]]; then
+    printf '%s' "${mb}"
+  else
+    printf '%s' "${base}"
+    return 1
+  fi
+}
+
 # @cmd Get the git diff for this domain's file slice. Defaults to staged changes, falls back to unstaged, then HEAD~1. Pass --base for a ref or range (e.g. "main...HEAD").
-# @option --base Optional base ref or range to diff against (e.g. "main...HEAD", "HEAD~3", a SHA)
+# @option --base Optional base ref or range to diff against (e.g. "main...HEAD", "HEAD~3", a SHA). Bare refs are diffed from their merge-base with HEAD; explicit ranges are used as given.
 # @option --files Comma-separated list of file paths to limit the diff to (your assignment's files)
 get_diff() {
   local project_dir
@@ -41,7 +55,10 @@ get_diff() {
 
   local diff_output=""
   if [[ -n "${base}" ]]; then
-    diff_output=$(_diff "${base}")
+    local resolved
+    resolved=$(_resolve_base "${project_dir}" "${base}") ||
+      echo "No merge-base between '${base}' and HEAD; diffing against '${base}' directly." >> "$LLM_OUTPUT"
+    diff_output=$(_diff "${resolved}")
   else
     diff_output=$(_diff --cached)
     [[ -z "${diff_output}" ]] && diff_output=$(_diff)

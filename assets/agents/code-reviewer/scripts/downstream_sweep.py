@@ -34,8 +34,21 @@ if not state.get("consumer_surface"):
     raise SystemExit(0)
 
 
+def normalize_base(spec):
+    """Bare refs diff from their merge-base with HEAD (three-dot semantics), so
+    commits that landed on the base after branching never surface as changes.
+    Explicit `..` ranges are the caller's choice and pass through untouched."""
+    if ".." in spec:
+        return spec
+    r = subprocess.run(
+        ["git", "-C", proj, "merge-base", spec, "HEAD"], capture_output=True, text=True, timeout=30
+    )
+    return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else spec
+
+
 def diff_text():
-    args = {"staged": ["--cached"], "worktree": ["HEAD"], "HEAD~1": ["HEAD~1"]}.get(spec, [spec])
+    fixed = {"staged": ["--cached"], "worktree": ["HEAD"], "HEAD~1": ["HEAD~1"]}
+    args = fixed.get(spec) or [normalize_base(spec)]
     r = subprocess.run(["git", "-C", proj, "diff", *args], capture_output=True, text=True, timeout=90)
     return r.stdout if r.returncode == 0 else ""
 

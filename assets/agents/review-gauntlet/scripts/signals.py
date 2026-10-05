@@ -51,6 +51,18 @@ def git(*args):
     return r.stdout
 
 
+def normalize_base(spec):
+    """Bare refs diff from their merge-base with HEAD (three-dot semantics), so
+    commits that landed on the base after branching never surface as changes.
+    Explicit `..` ranges are the caller's choice and pass through untouched."""
+    if ".." in spec:
+        return spec
+    try:
+        return git("merge-base", spec, "HEAD").strip()
+    except Exception:  # noqa: BLE001 — the plain diff below reports the real error
+        return spec
+
+
 out = {"project_dir": proj}
 
 # Deterministic plan_context recovery: the parse LLM proved a lossy channel
@@ -80,8 +92,9 @@ try:
         names = git("diff", "--name-only", "HEAD")
         difftext = git("diff", "HEAD")
     else:
-        names = git("diff", "--name-only", spec)
-        difftext = git("diff", spec)
+        base = normalize_base(spec)
+        names = git("diff", "--name-only", base)
+        difftext = git("diff", base)
     files = [f.strip() for f in names.splitlines() if f.strip()]
     added = "\n".join(
         l for l in difftext.splitlines() if l.startswith("+") and not l.startswith("+++")

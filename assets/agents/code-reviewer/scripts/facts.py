@@ -38,6 +38,19 @@ def git(*args, timeout=60):
     return r.stdout
 
 
+def normalize_base(spec):
+    """Bare refs diff from their merge-base with HEAD (three-dot semantics), so
+    commits that landed on the base after branching never surface as changes.
+    Explicit `..` ranges are the caller's choice and pass through untouched."""
+    if ".." in spec:
+        return spec, ""
+    try:
+        base = git("merge-base", spec, "HEAD").strip()
+    except Exception as e:  # noqa: BLE001
+        return spec, f"no merge-base for {spec!r}: {e}; diffing against it directly"
+    return base, f"diff spec {spec!r} normalized to merge-base {base[:12]} (three-dot semantics)"
+
+
 def scrubbed_env():
     env = dict(os.environ)
     env.pop("CLICOLOR_FORCE", None)
@@ -65,7 +78,10 @@ try:
     elif spec == "worktree":
         names = git("diff", "HEAD", "--numstat")
     else:
-        names = git("diff", spec, "--numstat")
+        resolved, note = normalize_base(spec)
+        if note:
+            notes.append(note)
+        names = git("diff", resolved, "--numstat")
     for line in names.splitlines():
         parts = line.split("\t")
         if len(parts) == 3:
