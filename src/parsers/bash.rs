@@ -35,6 +35,7 @@ pub fn build_bash_tool(src: &str, file_name: &str) -> Result<(String, Vec<Functi
         env::var("TERM_WIDTH").ok().and_then(|v| v.parse().ok()),
     )?;
     let build_script = allow_empty_required_values(&build_script);
+    let build_script = keep_attached_option_values(&build_script);
 
     let command_value = argc::export(&build_script, file_name)
         .with_context(|| format!("Failed to parse script '{file_name}'"))?;
@@ -95,6 +96,21 @@ fn allow_empty_required_values(build_script: &str) -> String {
     build_script.replace(
         r#"if [[ -z "${!name:-}" ]]; then"#,
         r#"if [[ -z "${!name+x}" ]]; then"#,
+    )
+}
+
+/// argc 1.24.0's `take_args.sh` extracts an attached option value with
+/// `${_argc_item##*=}`, which strips the longest prefix through the *last*
+/// `=`, so `--pattern='*=*.nothing'` yields `*.nothing` and
+/// `--summary='before (count == 0) after'` yields ` 0) after`. Our shims
+/// always pass values in attached form, so any value containing `=` is
+/// silently truncated. The key side already uses `%%=*` (first `=`); fix the
+/// value side to match with `#*=`. Applied post-build so it survives every
+/// regeneration.
+fn keep_attached_option_values(build_script: &str) -> String {
+    build_script.replace(
+        r#"_argc_take_args_values=("${_argc_item##*=}")"#,
+        r#"_argc_take_args_values=("${_argc_item#*=}")"#,
     )
 }
 
@@ -189,6 +205,58 @@ mod tests {
 
         assert!(fixed.contains(r#"if [[ -z "${!name+x}" ]]; then"#));
         assert!(!fixed.contains(r#"if [[ -z "${!name:-}" ]]; then"#));
+    }
+
+    #[test]
+    fn rewrites_argc_attached_value_strip_to_first_equals_test() {
+        let src = "# @describe test tool\n# @option --v The value\nmain() { :; }\n";
+        let built = argc::build(src, "", None).expect("argc build failed");
+        assert!(
+            built.contains(r#"_argc_take_args_values=("${_argc_item##*=}")"#),
+            "argc changed its take_args template; update keep_attached_option_values()"
+        );
+
+        let fixed = keep_attached_option_values(&built);
+
+        assert!(fixed.contains(r#"_argc_take_args_values=("${_argc_item#*=}")"#));
+        assert!(!fixed.contains(r#"_argc_take_args_values=("${_argc_item##*=}")"#));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn built_tool_keeps_equals_in_attached_option_values_test() {
+        use std::fs;
+        use std::process::Command;
+
+        if which::which("bash").is_err() {
+            eprintln!("skipping: bash not available");
+            return;
+        }
+
+        let src = "#!/usr/bin/env bash\n# @describe t\n# @option --v! value\nmain() { printf '%s' \"$argc_v\" >> \"$LLM_OUTPUT\"; }\n";
+        let path = crate::utils::temp_file("bash-attached", ".sh");
+        fs::write(&path, src).expect("failed to write temp script");
+        generate_bash_declarations(File::open(&path).unwrap(), &path, "t").expect("build failed");
+
+        let run = |args: &[&str]| -> String {
+            let out = crate::utils::temp_file("bash-attached-out", ".txt");
+            let status = Command::new("bash")
+                .arg(&path)
+                .args(args)
+                .env("LLM_OUTPUT", &out)
+                .status()
+                .expect("failed to run built script");
+            assert!(status.success(), "built script failed for {args:?}");
+            let value = fs::read_to_string(&out).unwrap();
+            fs::remove_file(&out).unwrap();
+            value
+        };
+
+        assert_eq!(run(&["--v=a=b=c"]), "a=b=c");
+        assert_eq!(run(&["--v", "a=b=c"]), "a=b=c");
+        assert_eq!(run(&["--v=plain"]), "plain");
+
+        fs::remove_file(&path).unwrap();
     }
 
     #[cfg(unix)]
