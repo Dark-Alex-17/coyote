@@ -1,9 +1,10 @@
 use super::bundles::installed_bundle_names;
+use super::input::TOOL_LOOP_CHECKPOINT_TEXT;
 use super::mcp_tool_policy::{McpToolPolicy, SkillMcpLayer, ToolFilter, expand_mcp_server_alias};
 use super::rag_cache::{RagCache, RagKey};
 use super::session::{
-    INTERRUPTED_RESPONSE_TEXT, Session, SessionScope, labeled_session_names, merged_session_names,
-    session_scope_dirs,
+    INTERRUPTED_RESPONSE_TEXT, KeepPolicy, Session, SessionScope, labeled_session_names,
+    merged_session_names, session_scope_dirs, valve_limit,
 };
 use super::skill::{SKILL_SCAFFOLD, Skill};
 use super::skill_policy::SkillPolicy;
@@ -23,6 +24,7 @@ use super::{
 use super::{MessageContentToolCalls, prompts};
 use crate::client::{
     Message, MessageContent, MessageRole, Model, ModelType, TokenUsage, list_models,
+    tool_result_tokens,
 };
 use crate::function::{
     FunctionDeclaration, Functions, ToolCallTracker, ToolResult,
@@ -45,8 +47,8 @@ use crate::supervisor::escalation::EscalationQueue;
 use crate::supervisor::mailbox::{Inbox, PeerRegistry};
 use crate::supervisor::notification::NotificationQueue;
 use crate::utils::{
-    AbortSignal, abortable_run_with_spinner, edit_file, fuzzy_filter, get_env_name,
-    list_file_names, now, render_prompt, temp_file,
+    AbortSignal, abortable_run_with_spinner, edit_file, estimate_token_length, fuzzy_filter,
+    get_env_name, list_file_names, now, render_prompt, temp_file,
 };
 use comfy_table::{ContentArrangement, Table, presets::UTF8_FULL};
 
@@ -69,6 +71,7 @@ use log::warn;
 use parking_lot::RwLock;
 use prompts::DEFAULT_SKILL_INSTRUCTIONS;
 use rand::distr::{Alphanumeric, SampleString};
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{File, OpenOptions, read_dir, read_to_string, remove_dir_all, remove_file};
 use std::io::Write;
@@ -202,7 +205,7 @@ fn complete_skills_with_descriptions(names: Vec<String>) -> Vec<(String, Option<
         .collect()
 }
 
-const SET_COMPLETION_KEYS: [&str; 27] = [
+const SET_COMPLETION_KEYS: [&str; 28] = [
     "auto_continue",
     "continuation_prompt",
     "temperature",
@@ -219,6 +222,7 @@ const SET_COMPLETION_KEYS: [&str; 27] = [
     "memory",
     "save_session",
     "compression_threshold",
+    "compression_keep_last",
     "rag_reranker_model",
     "rag_top_k",
     "max_output_tokens",
@@ -330,6 +334,12 @@ pub struct RequestContext {
     /// measurement.
     pub last_prompt_token_usage: Option<usize>,
 
+    /// Session size when the last valve-driven tool-loop checkpoint fired.
+    /// Until a compression brings the session below it, the valve stays at
+    /// or above its limit and would otherwise checkpoint every round.
+    /// Runtime-only, like `last_prompt_token_usage`.
+    pub valve_checkpoint_floor: Option<usize>,
+
     pub tool_scope: ToolScope,
 
     pub declared_function_names: HashSet<String>,
@@ -400,6 +410,7 @@ impl RequestContext {
             last_token_usage: None,
             last_cost: None,
             last_prompt_token_usage: None,
+            valve_checkpoint_floor: None,
             tool_scope: ToolScope::default(),
             declared_function_names: Default::default(),
             node_job_scope: None,
@@ -473,6 +484,7 @@ impl RequestContext {
             last_token_usage: None,
             last_cost: None,
             last_prompt_token_usage: None,
+            valve_checkpoint_floor: None,
             tool_scope: ToolScope {
                 functions,
                 mcp_runtime,
@@ -539,6 +551,7 @@ impl RequestContext {
             last_token_usage: self.last_token_usage.clone(),
             last_cost: self.last_cost,
             last_prompt_token_usage: self.last_prompt_token_usage,
+            valve_checkpoint_floor: self.valve_checkpoint_floor,
             tool_scope: self.tool_scope.clone(),
             declared_function_names: self.declared_function_names.clone(),
             node_job_scope: None,
@@ -595,6 +608,7 @@ impl RequestContext {
             last_token_usage: None,
             last_cost: None,
             last_prompt_token_usage: None,
+            valve_checkpoint_floor: None,
             tool_scope: ToolScope {
                 functions: Functions::default(),
                 mcp_runtime: McpRuntime::default(),
@@ -1089,10 +1103,20 @@ impl RequestContext {
     }
 
     pub fn compression_keep_last(&self) -> usize {
-        self.agent
+        self.session
             .as_ref()
-            .and_then(|a| a.compression_keep_last())
+            .and_then(|s| s.compression_keep_last())
+            .or_else(|| self.agent.as_ref().and_then(|a| a.compression_keep_last()))
             .unwrap_or(self.app.config.compression_keep_last)
+    }
+
+    pub fn compression_keep_policy(&self, last_override: Option<usize>) -> KeepPolicy {
+        KeepPolicy {
+            last: last_override.unwrap_or_else(|| self.compression_keep_last()),
+            tokens: self.session.as_ref().map_or(usize::MAX, |session| {
+                session.keep_tail_token_budget(&self.app.config)
+            }),
+        }
     }
 
     pub fn compression_model(&self) -> Option<String> {
@@ -2042,6 +2066,16 @@ impl RequestContext {
         }
     }
 
+    pub fn set_compression_keep_last_on_session(&mut self, value: Option<usize>) -> bool {
+        match self.session.as_mut() {
+            Some(session) => {
+                session.set_compression_keep_last(value);
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn set_max_output_tokens_on_role_like(&mut self, value: Option<isize>) -> bool {
         match self.role_like_mut() {
             Some(role_like) => {
@@ -2136,6 +2170,92 @@ impl RequestContext {
         Ok(())
     }
 
+    /// Whether the in-flight tool rounds have grown large enough to commit
+    /// mid-loop: either on their own (a quarter of the model window) or
+    /// because the whole prompt they belong to is already at the safety
+    /// valve, where only committed messages can be compressed. The valve
+    /// branch is latched: once it has checkpointed, it stays quiet until
+    /// the session shrinks below `valve_checkpoint_floor`, since committing
+    /// more rounds cannot lower a prompt that is already over the valve.
+    fn tool_loop_checkpoint_due(&self, input: &Input) -> Option<CheckpointTrigger> {
+        let tool_calls = input.tool_calls().as_ref()?;
+        let session = input.session(&self.session)?;
+        if self.app.config.dry_run || input.regenerate() || input.continue_output().is_some() {
+            return None;
+        }
+        let model = session.model();
+        let in_flight = model.tool_calls_tokens(tool_calls);
+        if in_flight < TOOL_LOOP_CHECKPOINT_MIN_TOKENS {
+            return None;
+        }
+        let window = model
+            .max_input_tokens()
+            .unwrap_or(SUMMARIZATION_WINDOW_FALLBACK_TOKENS);
+        if in_flight >= (window as f32 * TOOL_LOOP_CHECKPOINT_WINDOW_RATIO) as usize {
+            return Some(CheckpointTrigger::InFlightShare);
+        }
+        if self
+            .valve_checkpoint_floor
+            .is_some_and(|floor| session.tokens() >= floor)
+        {
+            return None;
+        }
+        let limit = valve_limit(
+            self.app.config.compression_safety_valve,
+            model.max_input_tokens(),
+        )?;
+        (self
+            .last_prompt_token_usage
+            .unwrap_or(0)
+            .max(session.tokens() + in_flight)
+            >= limit)
+            .then_some(CheckpointTrigger::SafetyValve)
+    }
+
+    /// Commits the in-flight tool rounds to the session as a completed turn
+    /// (User + Tool + Assistant checkpoint text) so the next auto-compress
+    /// can fold them, and returns the input that resumes the loop. Returns
+    /// the input unchanged with `None` when no checkpoint is due.
+    pub fn maybe_checkpoint_tool_loop(
+        &mut self,
+        input: Input,
+    ) -> Result<(Input, Option<ToolLoopCheckpoint>)> {
+        let Some(trigger) = self.tool_loop_checkpoint_due(&input) else {
+            return Ok((input, None));
+        };
+        let mut committed = input.clone();
+        committed.clear_patch();
+        let Some(session) = committed.session_mut(&mut self.session) else {
+            return Ok((input, None));
+        };
+        let committed_results = committed
+            .tool_calls()
+            .as_ref()
+            .map_or(0, |v| v.tool_results.len());
+        session.add_message(&committed, TOOL_LOOP_CHECKPOINT_TEXT)?;
+        let committed_tokens = committed
+            .tool_calls()
+            .as_ref()
+            .map_or(0, |v| session.model().tool_calls_tokens(v));
+        if trigger == CheckpointTrigger::SafetyValve {
+            self.valve_checkpoint_floor = Some(session.tokens());
+        }
+        self.last_message = Some(LastMessage::new(
+            committed,
+            TOOL_LOOP_CHECKPOINT_TEXT.to_string(),
+        ));
+        debug!(
+            "tool-loop checkpoint: {committed_results} tool results ({committed_tokens} est tokens) committed"
+        );
+        Ok((
+            input.into_checkpoint_continuation(self),
+            Some(ToolLoopCheckpoint {
+                committed_results,
+                committed_tokens,
+            }),
+        ))
+    }
+
     pub fn sysinfo(&self, app: &AppConfig) -> Result<String> {
         let display_path = |path: &Path| path.display().to_string();
         let wrap = app
@@ -2187,7 +2307,15 @@ impl RequestContext {
             ),
             (
                 "compression_threshold",
-                app.compression_threshold.to_string(),
+                self.session
+                    .as_ref()
+                    .and_then(Session::compression_threshold)
+                    .unwrap_or(app.compression_threshold)
+                    .to_string(),
+            ),
+            (
+                "compression_keep_last",
+                self.compression_keep_last().to_string(),
             ),
             ("memory", super::format_option_value(&app.memory)),
             (
@@ -3866,6 +3994,14 @@ impl RequestContext {
                     });
                 }
             }
+            "compression_keep_last" => {
+                let value = super::parse_value(value)?;
+                if !self.set_compression_keep_last_on_session(value) {
+                    self.update_app_config(|app| {
+                        app.compression_keep_last = value.unwrap_or_default();
+                    });
+                }
+            }
             "rag_reranker_model" => {
                 let value = super::parse_value(value)?;
                 let app = Arc::clone(&self.app.config);
@@ -5447,31 +5583,41 @@ impl RequestContext {
     }
 
     pub async fn compress_session(&mut self) -> Result<()> {
+        self.compress_session_with(None).await
+    }
+
+    /// `keep_last_override` replaces the configured `compression_keep_last`
+    /// for this one compression, so an operator can fold away a tail the
+    /// configured policy would keep.
+    pub async fn compress_session_with(&mut self, keep_last_override: Option<usize>) -> Result<()> {
         async fn timed_fetch(input: Input) -> Result<String> {
             tokio::time::timeout(Duration::from_secs(120), input.fetch_chat_text())
                 .await
                 .map_err(|_| anyhow!("Compression LLM call timed out after 120 s"))?
         }
 
-        self.compress_session_impl(timed_fetch).await
+        self.compress_session_impl(keep_last_override, timed_fetch)
+            .await
     }
 
     /// The summarization flow with the LLM call injectable, so tests can
     /// capture and answer each chunk request without a network round trip.
-    async fn compress_session_impl<F, Fut>(&mut self, fetch: F) -> Result<()>
+    async fn compress_session_impl<F, Fut>(
+        &mut self,
+        keep_last_override: Option<usize>,
+        fetch: F,
+    ) -> Result<()>
     where
         F: Fn(Input) -> Fut,
         Fut: Future<Output = Result<String>>,
     {
-        let session_window = match self.session.as_ref() {
-            Some(session) => {
-                if !session.has_user_messages() {
-                    bail!("No need to compress since there are no messages in the session")
-                }
-                session.model().max_input_tokens()
-            }
-            None => bail!("No session"),
+        let Some(session) = self.session.as_ref() else {
+            bail!("No session")
         };
+        if !session.has_user_messages() {
+            bail!("No need to compress since there are no messages in the session")
+        }
+        let session_window = session.model().max_input_tokens();
 
         let prompt = self
             .app
@@ -5509,23 +5655,21 @@ impl RequestContext {
             .unwrap_or(SUMMARIZATION_WINDOW_FALLBACK_TOKENS);
         let chunk_budget = (window as f32 * SUMMARIZATION_CHUNK_BUDGET_RATIO) as usize;
 
-        let keep_last = self.compression_keep_last();
-        let chunks: Vec<String> = self
-            .session
-            .as_ref()
-            .map(|session| {
-                // `Session::compress` archives every message when `keep_last`
-                // covers the whole list, so summarize them all in that case.
-                let mut foldable = session.foldable_messages(keep_last);
-                if foldable.is_empty() {
-                    foldable = session.foldable_messages(0);
-                }
-                slice_summarization_chunks(session.model(), foldable, chunk_budget)
-                    .into_iter()
-                    .map(render_summarization_chunk)
-                    .collect()
-            })
-            .unwrap_or_default();
+        let keep = self.compression_keep_policy(keep_last_override);
+        let foldable = session.foldable_messages(keep);
+        if foldable.is_empty() {
+            let mut message =
+                String::from("Nothing to compress: the kept tail is the whole session");
+            if keep_last_override.is_none() && self.working_mode.is_repl() {
+                message.push_str("; lower compression_keep_last or run `.compress session 0`");
+            }
+            bail!(message);
+        }
+        let chunks: Vec<String> =
+            slice_summarization_chunks(session.model(), foldable, chunk_budget)
+                .iter()
+                .map(|units| render_summarization_chunk(units))
+                .collect();
 
         // Fold forward, oldest chunk first: each call carries the summary of
         // everything before it, and the summarization prompt instructs the
@@ -5569,13 +5713,14 @@ impl RequestContext {
             String::new()
         };
 
-        let keep_last = self.compression_keep_last();
         if let Some(session) = self.session.as_mut() {
             session.compress(
                 format!("{todo_prefix}{summary_context_prompt}{summary}"),
-                keep_last,
+                keep,
             );
         }
+        self.last_prompt_token_usage = None;
+        self.valve_checkpoint_floor = None;
         self.discontinuous_last_message();
         Ok(())
     }
@@ -5810,57 +5955,342 @@ fn session_delete_label(name: &str, scope: SessionScope) -> String {
 /// Assumed summarizer window when neither the compression model nor the
 /// session model declares `max_input_tokens`.
 const SUMMARIZATION_WINDOW_FALLBACK_TOKENS: usize = 200_000;
+/// Share of the model window the in-flight tool rounds may reach before
+/// they are committed to the session mid-loop.
+const TOOL_LOOP_CHECKPOINT_WINDOW_RATIO: f32 = 0.25;
+/// Floor below which a mid-loop checkpoint never fires, so short tool
+/// loops on small-window models keep their single-turn shape.
+const TOOL_LOOP_CHECKPOINT_MIN_TOKENS: usize = 2_000;
+
+/// Which bound the in-flight tool rounds crossed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CheckpointTrigger {
+    InFlightShare,
+    SafetyValve,
+}
+
+/// What a mid-loop checkpoint committed to the session.
+pub struct ToolLoopCheckpoint {
+    pub committed_results: usize,
+    pub committed_tokens: usize,
+}
+
 /// Share of the summarizer's window a single history chunk may occupy; the
 /// rest is headroom for the summarization prompt, the folded-forward prior
 /// summary, and the response.
 const SUMMARIZATION_CHUNK_BUDGET_RATIO: f32 = 0.6;
 
-/// Splits `messages` into consecutive runs whose estimated tokens each stay
-/// within `budget`. A message that alone exceeds the budget forms its own
-/// chunk: messages are the smallest unit summarization can fold.
+/// Room reserved inside a truncated result's budget for the omission marker
+/// and JSON escaping of the kept prefix.
+const SUMMARY_TRUNCATION_RESERVE_TOKENS: usize = 16;
+
+/// One summarizer-sized piece of history. A message that fits the chunk
+/// budget travels whole; one that does not is split along tool-call rounds,
+/// then results, then characters, so that a single tool-loop message can
+/// never make a summarization request larger than its window.
+enum SummaryUnit<'a> {
+    Message(&'a Message),
+    ToolPart {
+        role: MessageRole,
+        text: Option<&'a str>,
+        results: Vec<Cow<'a, ToolResult>>,
+        part: usize,
+        parts: usize,
+        first: usize,
+        last: usize,
+        total: usize,
+    },
+    TextPart {
+        role: MessageRole,
+        text: &'a str,
+        part: usize,
+        parts: usize,
+    },
+}
+
+/// Splits `messages` into consecutive runs of units whose estimated tokens
+/// each stay within `budget`. Units are never split further, so a single
+/// unit over budget (a truncated result at a tiny budget) forms its own run.
 fn slice_summarization_chunks<'a>(
     model: &Model,
     messages: &'a [Message],
     budget: usize,
-) -> Vec<&'a [Message]> {
+) -> Vec<Vec<SummaryUnit<'a>>> {
     let mut chunks = vec![];
-    let mut start = 0;
+    let mut chunk = vec![];
     let mut tokens = 0;
-    for (i, message) in messages.iter().enumerate() {
-        let message_tokens = model.total_tokens(slice::from_ref(message));
-        if i > start && tokens + message_tokens > budget {
-            chunks.push(&messages[start..i]);
-            start = i;
-            tokens = 0;
+    for message in messages {
+        for (unit, unit_tokens) in summary_units(model, message, budget) {
+            if !chunk.is_empty() && tokens + unit_tokens > budget {
+                chunks.push(std::mem::take(&mut chunk));
+                tokens = 0;
+            }
+            chunk.push(unit);
+            tokens += unit_tokens;
         }
-        tokens += message_tokens;
     }
-    if start < messages.len() {
-        chunks.push(&messages[start..]);
+    if !chunk.is_empty() {
+        chunks.push(chunk);
     }
     chunks
 }
 
-/// Renders messages as a role-prefixed transcript for the summarizer. Tool
+fn summary_units<'a>(
+    model: &Model,
+    message: &'a Message,
+    budget: usize,
+) -> Vec<(SummaryUnit<'a>, usize)> {
+    let message_tokens = model.total_tokens(slice::from_ref(message));
+    if message_tokens <= budget {
+        return vec![(SummaryUnit::Message(message), message_tokens)];
+    }
+    match &message.content {
+        MessageContent::ToolCalls(tool_calls) if !tool_calls.tool_results.is_empty() => {
+            tool_call_units(message.role, tool_calls, budget)
+        }
+        MessageContent::Text(text) => text_units(message.role, text, budget),
+        _ => vec![(SummaryUnit::Message(message), message_tokens)],
+    }
+}
+
+fn tool_call_units<'a>(
+    role: MessageRole,
+    tool_calls: &'a MessageContentToolCalls,
+    budget: usize,
+) -> Vec<(SummaryUnit<'a>, usize)> {
+    let results = &tool_calls.tool_results;
+    let total = results.len();
+    // `round_starts` comes from session YAML an operator may have edited, so
+    // only strictly increasing interior starts are trusted as round seams.
+    let mut bounds = vec![0];
+    for &start in &tool_calls.round_starts {
+        if start < total && bounds.last().is_some_and(|&last| last < start) {
+            bounds.push(start);
+        }
+    }
+    bounds.push(total);
+
+    // Pieces are the smallest things that travel together: a whole round
+    // when it fits, else each result, truncated when even one is too big.
+    let mut pieces: Vec<(usize, Vec<Cow<'a, ToolResult>>, usize)> = vec![];
+    for window in bounds.windows(2) {
+        let (start, end) = (window[0], window[1]);
+        let round = &results[start..end];
+        let round_tokens: usize = round.iter().map(tool_result_tokens).sum();
+        if round_tokens <= budget {
+            pieces.push((
+                start,
+                round.iter().map(Cow::Borrowed).collect(),
+                round_tokens,
+            ));
+            continue;
+        }
+        for (offset, result) in round.iter().enumerate() {
+            let tokens = tool_result_tokens(result);
+            let piece = if tokens <= budget {
+                (start + offset, vec![Cow::Borrowed(result)], tokens)
+            } else {
+                let truncated = truncate_result_for_summary(result, budget);
+                let tokens = tool_result_tokens(&truncated);
+                (start + offset, vec![Cow::Owned(truncated)], tokens)
+            };
+            pieces.push(piece);
+        }
+    }
+
+    // The narration travels with part 1, so it counts toward that part's
+    // budget from the start.
+    let narration = (!tool_calls.text.is_empty()).then_some(tool_calls.text.as_str());
+    let narration_tokens = narration.map_or(0, estimate_token_length);
+    let mut groups: Vec<(usize, Vec<Cow<'a, ToolResult>>, usize)> = vec![];
+    for (first, piece, piece_tokens) in pieces {
+        match groups.last_mut() {
+            Some((_, group, tokens)) if *tokens + piece_tokens <= budget => {
+                group.extend(piece);
+                *tokens += piece_tokens;
+            }
+            Some(_) => groups.push((first, piece, piece_tokens)),
+            None => groups.push((first, piece, narration_tokens + piece_tokens)),
+        }
+    }
+
+    let parts = groups.len();
+    groups
+        .into_iter()
+        .enumerate()
+        .map(|(i, (first, group, tokens))| {
+            let unit = SummaryUnit::ToolPart {
+                role,
+                text: narration.filter(|_| i == 0),
+                last: first + group.len(),
+                results: group,
+                part: i + 1,
+                parts,
+                first: first + 1,
+                total,
+            };
+            (unit, tokens)
+        })
+        .collect()
+}
+
+/// A copy of `result` whose output (and, if that alone cannot fit, its call
+/// arguments) is cut down so the summarizer can see its head; the session's
+/// own message is left untouched.
+fn truncate_result_for_summary(result: &ToolResult, budget: usize) -> ToolResult {
+    let mut truncated = result.clone();
+    let output = summary_field_text(&result.output);
+    let fits = truncate_field_for_summary(&mut truncated, &output, budget, |result, text| {
+        result.output = serde_json::Value::String(text)
+    });
+    if fits {
+        return truncated;
+    }
+    let arguments = summary_field_text(&result.call.arguments);
+    truncate_field_for_summary(&mut truncated, &arguments, budget, |result, text| {
+        result.call.arguments = serde_json::Value::String(text)
+    });
+    truncated
+}
+
+fn summary_field_text(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => text.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Writes a head of `text` into `truncated` via `place`, halving the head
+/// until the whole result fits `budget`; returns whether it ever did.
+fn truncate_field_for_summary(
+    truncated: &mut ToolResult,
+    text: &str,
+    budget: usize,
+    place: impl Fn(&mut ToolResult, String),
+) -> bool {
+    place(truncated, String::new());
+    let overhead = tool_result_tokens(truncated) + SUMMARY_TRUNCATION_RESERVE_TOKENS;
+    let mut weighted_limit = budget.saturating_sub(overhead) * 4;
+    loop {
+        let cut = prefix_within_weight(text, weighted_limit);
+        let omitted = text[cut..].chars().count();
+        place(
+            truncated,
+            format!(
+                "{}[… {omitted} chars omitted for summarization]",
+                &text[..cut]
+            ),
+        );
+        if tool_result_tokens(truncated) <= budget {
+            return true;
+        }
+        if weighted_limit == 0 {
+            return false;
+        }
+        weighted_limit /= 2;
+    }
+}
+
+/// Byte length of the longest prefix of `text` whose token-estimate weight
+/// (1 per ASCII char, 2 otherwise) stays within `limit`.
+fn prefix_within_weight(text: &str, limit: usize) -> usize {
+    let mut weight = 0;
+    for (index, c) in text.char_indices() {
+        weight += if c.is_ascii() { 1 } else { 2 };
+        if weight > limit {
+            return index;
+        }
+    }
+    text.len()
+}
+
+fn text_units<'a>(
+    role: MessageRole,
+    text: &'a str,
+    budget: usize,
+) -> Vec<(SummaryUnit<'a>, usize)> {
+    let weighted_limit = budget * 4;
+    let mut windows = vec![];
+    let mut rest = text;
+    while !rest.is_empty() {
+        let first_char = rest.chars().next().map_or(0, char::len_utf8);
+        let cut = prefix_within_weight(rest, weighted_limit).max(first_char);
+        windows.push(&rest[..cut]);
+        rest = &rest[cut..];
+    }
+    let parts = windows.len();
+    windows
+        .into_iter()
+        .enumerate()
+        .map(|(i, window)| {
+            let unit = SummaryUnit::TextPart {
+                role,
+                text: window,
+                part: i + 1,
+                parts,
+            };
+            (unit, estimate_token_length(window))
+        })
+        .collect()
+}
+
+fn summary_role_label(role: MessageRole) -> &'static str {
+    match role {
+        MessageRole::System => "SYSTEM",
+        MessageRole::Assistant => "ASSISTANT",
+        MessageRole::User => "USER",
+        MessageRole::Tool => "TOOL",
+    }
+}
+
+/// Renders units as a role-prefixed transcript for the summarizer. Tool
 /// transcripts are serialized whole rather than dropped: their results often
 /// carry the facts the summary must preserve.
-fn render_summarization_chunk(messages: &[Message]) -> String {
-    messages
+fn render_summarization_chunk(units: &[SummaryUnit<'_>]) -> String {
+    units
         .iter()
-        .map(|message| {
-            let role = match message.role {
-                MessageRole::System => "SYSTEM",
-                MessageRole::Assistant => "ASSISTANT",
-                MessageRole::User => "USER",
-                MessageRole::Tool => "TOOL",
-            };
-            let content = match &message.content {
-                MessageContent::ToolCalls(tool_calls) => {
-                    serde_json::to_string(tool_calls).unwrap_or_else(|_| tool_calls.text.clone())
-                }
-                content => content.to_text(),
-            };
-            format!("{role}: {content}")
+        .map(|unit| match unit {
+            SummaryUnit::Message(message) => {
+                let content = match &message.content {
+                    MessageContent::ToolCalls(tool_calls) => serde_json::to_string(tool_calls)
+                        .unwrap_or_else(|_| tool_calls.text.clone()),
+                    content => content.to_text(),
+                };
+                format!("{}: {content}", summary_role_label(message.role))
+            }
+            SummaryUnit::ToolPart {
+                role,
+                text,
+                results,
+                part,
+                parts,
+                first,
+                last,
+                total,
+            } => {
+                let mut rendered = format!(
+                    "{} [transcript part {part}/{parts}: results {first}..{last} of {total}]: ",
+                    summary_role_label(*role)
+                );
+                let body = match serde_json::to_string(results) {
+                    Ok(json) => match text {
+                        Some(text) => format!("{text}\n{json}"),
+                        None => json,
+                    },
+                    Err(_) => text.unwrap_or("[results unserializable]").to_string(),
+                };
+                rendered.push_str(&body);
+                rendered
+            }
+            SummaryUnit::TextPart {
+                role,
+                text,
+                part,
+                parts,
+            } => format!(
+                "{} [part {part}/{parts}]: {text}",
+                summary_role_label(*role)
+            ),
         })
         .collect::<Vec<_>>()
         .join("\n\n")
@@ -5878,7 +6308,7 @@ fn compose_summarization_request(prompt: &str, prior_summary: &str, chunk: &str)
 mod tests {
     use super::super::mcp_factory::McpFactory;
     use super::*;
-    use crate::client::ModelData;
+    use crate::client::{MessageContentPart, ModelData};
     use crate::config::agent::AgentConfig;
     use crate::config::bundles::BundleStore;
     use crate::config::conflict::InstallMode;
@@ -6208,6 +6638,25 @@ mod tests {
     }
 
     #[test]
+    fn set_compression_keep_last_updates_app_config() {
+        // Without a session the override has nowhere else to live.
+        let mut ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
+
+        run_async(ctx.update("compression_keep_last 6", utils::create_abort_signal())).unwrap();
+        assert_eq!(ctx.app.config.compression_keep_last, 6);
+        assert_eq!(ctx.compression_keep_policy(None).last, 6);
+        assert_eq!(ctx.compression_keep_policy(Some(0)).last, 0);
+
+        run_async(ctx.update("compression_keep_last null", utils::create_abort_signal())).unwrap();
+        assert_eq!(ctx.app.config.compression_keep_last, 0);
+
+        let err = run_async(ctx.update("compression_keep_last many", utils::create_abort_signal()))
+            .unwrap_err();
+        assert!(err.to_string().contains("Invalid value"));
+        assert!(SET_COMPLETION_KEYS.contains(&"compression_keep_last"));
+    }
+
+    #[test]
     fn memory_config_app_some_false_disables_via_cascade() {
         let mut ctx = create_test_ctx();
 
@@ -6424,6 +6873,48 @@ mod tests {
         Message::new(role, MessageContent::Text(text.to_string()))
     }
 
+    fn unit_messages<'a>(chunk: &[SummaryUnit<'a>]) -> Vec<Message> {
+        chunk
+            .iter()
+            .map(|unit| match unit {
+                SummaryUnit::Message(message) => (*message).clone(),
+                _ => panic!("expected a whole-message unit"),
+            })
+            .collect()
+    }
+
+    fn tool_results(ids: std::ops::Range<usize>, output_chars: usize) -> Vec<ToolResult> {
+        ids.map(|i| {
+            ToolResult::new(
+                ToolCall::new("t".into(), json!({}), Some(format!("id-{i}"))),
+                json!("x".repeat(output_chars)),
+            )
+        })
+        .collect()
+    }
+
+    fn tool_message(tool_calls: MessageContentToolCalls) -> Message {
+        Message::new(MessageRole::Tool, MessageContent::ToolCalls(tool_calls))
+    }
+
+    /// `(part, parts, first, last, total, results)` of a `ToolPart` unit.
+    fn tool_part<'a>(
+        unit: &'a SummaryUnit<'a>,
+    ) -> (usize, usize, usize, usize, usize, &'a [Cow<'a, ToolResult>]) {
+        match unit {
+            SummaryUnit::ToolPart {
+                results,
+                part,
+                parts,
+                first,
+                last,
+                total,
+                ..
+            } => (*part, *parts, *first, *last, *total, results),
+            _ => panic!("expected a tool part"),
+        }
+    }
+
     #[test]
     fn summarization_chunks_respect_budget_and_preserve_order() {
         let model = Model::default();
@@ -6445,17 +6936,20 @@ mod tests {
         assert!(chunks.len() > 1, "a history over budget must be split");
         for chunk in &chunks {
             assert!(
-                model.total_tokens(chunk) <= budget,
+                model.total_tokens(&unit_messages(chunk)) <= budget,
                 "each chunk must fit the budget"
             );
         }
-        let flattened: Vec<&Message> = chunks.iter().flat_map(|chunk| chunk.iter()).collect();
+        let flattened: Vec<Message> = chunks
+            .iter()
+            .flat_map(|chunk| unit_messages(chunk))
+            .collect();
         assert_eq!(
             flattened.len(),
             messages.len(),
             "chunks must cover every message"
         );
-        for (original, chunked) in messages.iter().zip(flattened) {
+        for (original, chunked) in messages.iter().zip(&flattened) {
             assert_eq!(original.content.to_text(), chunked.content.to_text());
         }
 
@@ -6469,9 +6963,15 @@ mod tests {
     #[test]
     fn summarization_chunk_slicing_isolates_oversized_message() {
         let model = Model::default();
+        // Array content (text + image parts) has no sub-message seam.
         let messages = vec![
             text_message(MessageRole::User, "small question"),
-            text_message(MessageRole::Assistant, &"y".repeat(8000)),
+            Message::new(
+                MessageRole::User,
+                MessageContent::Array(vec![MessageContentPart::Text {
+                    text: "y".repeat(8000),
+                }]),
+            ),
             text_message(MessageRole::User, "another small question"),
         ];
         let chunks = slice_summarization_chunks(&model, &messages, 100);
@@ -6481,6 +6981,279 @@ mod tests {
             1,
             "an over-budget message forms its own chunk"
         );
+        assert!(matches!(chunks[1][0], SummaryUnit::Message(_)));
+    }
+
+    #[test]
+    fn slice_summarization_chunks_splits_oversized_tool_message_by_round() {
+        let model = Model::default();
+        // Six ~114-token results in three rounds of two.
+        let mut tool_calls =
+            MessageContentToolCalls::new(tool_results(0..2, 400), "round one".into());
+        tool_calls.merge(tool_results(2..4, 400), String::new());
+        tool_calls.merge(tool_results(4..6, 400), String::new());
+        assert_eq!(tool_calls.round_starts, vec![2, 4]);
+        let messages = vec![tool_message(tool_calls)];
+        let budget = 250;
+
+        let chunks = slice_summarization_chunks(&model, &messages, budget);
+
+        let units: Vec<&SummaryUnit<'_>> = chunks.iter().flatten().collect();
+        assert_eq!(units.len(), 3, "one unit per round when a round fits");
+        for (i, unit) in units.iter().enumerate() {
+            let (part, parts, first, last, total, results) = tool_part(unit);
+            assert_eq!((part, parts, total), (i + 1, 3, 6));
+            assert_eq!((first, last), (2 * i + 1, 2 * i + 2));
+            assert_eq!(results.len(), 2);
+            assert!(results.iter().all(|r| matches!(r, Cow::Borrowed(_))));
+        }
+        match units[0] {
+            SummaryUnit::ToolPart { text, .. } => assert_eq!(*text, Some("round one")),
+            _ => panic!("expected a tool part"),
+        }
+        match units[1] {
+            SummaryUnit::ToolPart { text, .. } => {
+                assert!(text.is_none(), "narration travels with part 1 only")
+            }
+            _ => panic!("expected a tool part"),
+        }
+        for chunk in &chunks {
+            let rendered = render_summarization_chunk(chunk);
+            assert!(estimate_token_length(&rendered) <= budget);
+        }
+    }
+
+    #[test]
+    fn slice_summarization_chunks_packs_consecutive_rounds_into_one_part() {
+        let model = Model::default();
+        // Four ~115-token rounds of two results; pairs of rounds fit a
+        // 250-token budget, the whole message does not.
+        let mut tool_calls =
+            MessageContentToolCalls::new(tool_results(0..2, 170), "packing".into());
+        tool_calls.merge(tool_results(2..4, 170), String::new());
+        tool_calls.merge(tool_results(4..6, 170), String::new());
+        tool_calls.merge(tool_results(6..8, 170), String::new());
+        assert_eq!(tool_calls.round_starts, vec![2, 4, 6]);
+        let messages = vec![tool_message(tool_calls)];
+        let budget = 250;
+        assert!(model.total_tokens(&messages) > budget);
+
+        let chunks = slice_summarization_chunks(&model, &messages, budget);
+
+        let units: Vec<&SummaryUnit<'_>> = chunks.iter().flatten().collect();
+        assert_eq!(units.len(), 2, "rounds that fit together share a part");
+        let (part, parts, first, last, total, results) = tool_part(units[0]);
+        assert_eq!((part, parts, first, last, total), (1, 2, 1, 4, 8));
+        assert_eq!(results.len(), 4);
+        let (part, parts, first, last, total, results) = tool_part(units[1]);
+        assert_eq!((part, parts, first, last, total), (2, 2, 5, 8, 8));
+        assert_eq!(results.len(), 4);
+        for chunk in &chunks {
+            assert!(estimate_token_length(&render_summarization_chunk(chunk)) <= budget);
+        }
+    }
+
+    #[test]
+    fn slice_summarization_chunks_counts_part_one_narration_when_packing() {
+        let model = Model::default();
+        // Two ~100-token rounds fit a 250-token budget together, but not
+        // once the ~80-token narration that rides with part 1 is counted.
+        let narration = "n".repeat(320);
+        let mut tool_calls =
+            MessageContentToolCalls::new(tool_results(0..2, 140), narration.clone());
+        tool_calls.merge(tool_results(2..4, 140), String::new());
+        assert_eq!(tool_calls.round_starts, vec![2]);
+        let messages = vec![tool_message(tool_calls)];
+        let budget = 250;
+        assert!(model.total_tokens(&messages) > budget);
+
+        let chunks = slice_summarization_chunks(&model, &messages, budget);
+
+        let units: Vec<&SummaryUnit<'_>> = chunks.iter().flatten().collect();
+        assert_eq!(units.len(), 2, "narration pushes round 2 into its own part");
+        let (part, parts, first, last, total, results) = tool_part(units[0]);
+        assert_eq!((part, parts, first, last, total), (1, 2, 1, 2, 4));
+        assert_eq!(results.len(), 2);
+        match units[0] {
+            SummaryUnit::ToolPart { text, .. } => assert_eq!(*text, Some(narration.as_str())),
+            _ => panic!("expected a tool part"),
+        }
+        let (part, parts, first, last, total, results) = tool_part(units[1]);
+        assert_eq!((part, parts, first, last, total), (2, 2, 3, 4, 4));
+        assert_eq!(results.len(), 2);
+        match units[1] {
+            SummaryUnit::ToolPart { text, .. } => assert!(text.is_none()),
+            _ => panic!("expected a tool part"),
+        }
+        for chunk in &chunks {
+            assert!(estimate_token_length(&render_summarization_chunk(chunk)) <= budget);
+        }
+    }
+
+    #[test]
+    fn slice_summarization_chunks_splits_oversized_round_by_result() {
+        let model = Model::default();
+        let messages = vec![tool_message(MessageContentToolCalls::new(
+            tool_results(0..6, 400),
+            String::new(),
+        ))];
+
+        let chunks = slice_summarization_chunks(&model, &messages, 120);
+
+        let units: Vec<&SummaryUnit<'_>> = chunks.iter().flatten().collect();
+        assert_eq!(units.len(), 6, "a round over budget splits per result");
+        for (i, unit) in units.iter().enumerate() {
+            let (part, parts, first, last, total, results) = tool_part(unit);
+            assert_eq!(
+                (part, parts, first, last, total),
+                (i + 1, 6, i + 1, i + 1, 6)
+            );
+            assert_eq!(results.len(), 1);
+            assert!(matches!(results[0], Cow::Borrowed(_)));
+        }
+    }
+
+    #[test]
+    fn slice_summarization_chunks_truncates_single_oversized_result_for_summary_only() {
+        let model = Model::default();
+        let messages = vec![tool_message(MessageContentToolCalls::new(
+            tool_results(0..1, 4000),
+            String::new(),
+        ))];
+        let before = serde_json::to_string(&messages[0]).unwrap();
+        let budget = 200;
+
+        let chunks = slice_summarization_chunks(&model, &messages, budget);
+
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].len(), 1);
+        let (part, parts, first, last, total, results) = tool_part(&chunks[0][0]);
+        assert_eq!((part, parts, first, last, total), (1, 1, 1, 1, 1));
+        let Cow::Owned(truncated) = &results[0] else {
+            panic!("an oversized result must be a truncated copy");
+        };
+        let output = truncated.output.as_str().unwrap();
+        assert!(output.starts_with("xxxx"));
+        assert!(output.contains("chars omitted for summarization]"));
+        assert!(
+            tool_result_tokens(truncated) <= budget,
+            "the truncated result must fit the budget"
+        );
+        assert_eq!(
+            serde_json::to_string(&messages[0]).unwrap(),
+            before,
+            "truncation is for the summarizer only; the session message is untouched"
+        );
+    }
+
+    #[test]
+    fn truncate_result_for_summary_bounds_oversized_arguments() {
+        let result = ToolResult::new(
+            ToolCall::new(
+                "t".into(),
+                json!({"content": "a".repeat(20_000)}),
+                Some("id-0".into()),
+            ),
+            json!("tiny"),
+        );
+        let before = serde_json::to_string(&result).unwrap();
+        let budget = 500;
+
+        let truncated = truncate_result_for_summary(&result, budget);
+
+        assert!(
+            tool_result_tokens(&truncated) <= budget,
+            "oversized arguments must be cut down when the output alone cannot fit"
+        );
+        assert!(
+            truncated
+                .call
+                .arguments
+                .as_str()
+                .unwrap()
+                .contains("chars omitted for summarization]")
+        );
+        assert_eq!(serde_json::to_string(&result).unwrap(), before);
+    }
+
+    #[test]
+    fn slice_summarization_chunks_splits_oversized_text_message() {
+        let model = Model::default();
+        // A 100-token budget is a 400-weight window; the two-byte 'é' straddles
+        // byte 4400, so a byte-offset slicer would cut inside the character and
+        // a weight-blind one would land it a window late.
+        let text = format!("{}é{}", "y".repeat(4399), "z".repeat(3600));
+        let messages = vec![text_message(MessageRole::Assistant, &text)];
+        let budget = 100;
+
+        let chunks = slice_summarization_chunks(&model, &messages, budget);
+
+        let units: Vec<&SummaryUnit<'_>> = chunks.iter().flatten().collect();
+        assert!(units.len() > 1);
+        let mut rebuilt = String::new();
+        for (i, unit) in units.iter().enumerate() {
+            let SummaryUnit::TextPart {
+                role,
+                text,
+                part,
+                parts,
+            } = unit
+            else {
+                panic!("expected a text part");
+            };
+            assert_eq!(*role, MessageRole::Assistant);
+            assert_eq!((*part, *parts), (i + 1, units.len()));
+            assert!(estimate_token_length(text) <= budget);
+            rebuilt.push_str(text);
+        }
+        assert_eq!(rebuilt, text, "parts must cover the text exactly");
+        let accented = units
+            .iter()
+            .find_map(|unit| match unit {
+                SummaryUnit::TextPart { text, .. } if text.contains('é') => Some(*text),
+                _ => None,
+            })
+            .expect("the accented character lands in exactly one part");
+        assert_eq!(
+            accented.chars().count(),
+            399,
+            "é weighs two so its window holds one fewer char"
+        );
+        for chunk in &chunks {
+            assert_eq!(chunk.len(), 1, "budget-sized parts never share a chunk");
+        }
+    }
+
+    #[test]
+    fn render_summarization_chunk_labels_partial_tool_transcripts() {
+        let results = tool_results(0..2, 10);
+        let units = vec![
+            SummaryUnit::ToolPart {
+                role: MessageRole::Tool,
+                text: Some("looking around"),
+                results: results.iter().map(Cow::Borrowed).collect(),
+                part: 1,
+                parts: 3,
+                first: 1,
+                last: 2,
+                total: 6,
+            },
+            SummaryUnit::TextPart {
+                role: MessageRole::Assistant,
+                text: "half a reply",
+                part: 2,
+                parts: 2,
+            },
+        ];
+
+        let rendered = render_summarization_chunk(&units);
+
+        assert!(
+            rendered
+                .starts_with("TOOL [transcript part 1/3: results 1..2 of 6]: looking around\n[")
+        );
+        assert!(rendered.contains("\"id\":\"id-1\""));
+        assert!(rendered.ends_with("ASSISTANT [part 2/2]: half a reply"));
     }
 
     #[test]
@@ -6496,17 +7269,543 @@ mod tests {
             )],
             "reading the file".to_string(),
         );
-        let messages = vec![
+        let messages = [
             text_message(MessageRole::User, "read notes.txt"),
             Message::new(MessageRole::Tool, MessageContent::ToolCalls(tool_calls)),
         ];
+        let units: Vec<SummaryUnit<'_>> = messages.iter().map(SummaryUnit::Message).collect();
 
-        let rendered = render_summarization_chunk(&messages);
+        let rendered = render_summarization_chunk(&units);
 
         assert!(rendered.contains("USER: read notes.txt"));
         assert!(rendered.contains("TOOL: "));
         assert!(rendered.contains("fs_cat"));
         assert!(rendered.contains("the file contents"));
+    }
+
+    #[test]
+    fn compress_session_impl_bails_when_kept_tail_covers_session() {
+        let mut app = AppState::test_default();
+        app.config = Arc::new(AppConfig {
+            compression_keep_last: 10,
+            ..AppConfig::default()
+        });
+        let mut ctx = RequestContext::new(Arc::new(app), WorkingMode::Cmd);
+        ctx.session = Some(Session::default());
+        let input = Input::from_str(&ctx, "hello", Some(Role::new("", ""))).unwrap();
+        ctx.session
+            .as_mut()
+            .unwrap()
+            .add_message(&input, "hi")
+            .unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let fetch = |_: Input| async { Ok("summary".to_string()) };
+
+        let err = runtime
+            .block_on(ctx.compress_session_impl(None, fetch))
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Nothing to compress: the kept tail is the whole session",
+            "a Cmd ctx has no `.compress` command to point at"
+        );
+        assert_eq!(ctx.session.as_ref().unwrap().messages().len(), 2);
+
+        ctx.working_mode = WorkingMode::Repl;
+        let err = runtime
+            .block_on(ctx.compress_session_impl(None, fetch))
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .ends_with("; lower compression_keep_last or run `.compress session 0`"),
+            "unexpected error: {err}"
+        );
+        let err = runtime
+            .block_on(ctx.compress_session_impl(Some(10), fetch))
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Nothing to compress: the kept tail is the whole session",
+            "an explicit keep_last already bypassed the configured policy"
+        );
+
+        runtime
+            .block_on(ctx.compress_session_impl(Some(0), fetch))
+            .unwrap();
+        let session = ctx.session.as_ref().unwrap();
+        assert_eq!(session.messages().len(), 1, "keep_last 0 folds everything");
+        assert!(session.messages()[0].content.to_text().contains("summary"));
+    }
+
+    #[test]
+    fn compress_session_impl_clears_runtime_readings_on_success() {
+        let mut app = AppState::test_default();
+        app.config = Arc::new(AppConfig {
+            compression_keep_last: 1,
+            ..AppConfig::default()
+        });
+        let mut ctx = RequestContext::new(Arc::new(app), WorkingMode::Cmd);
+        ctx.session = Some(Session::default());
+        for text in ["first", "second"] {
+            let input = Input::from_str(&ctx, text, Some(Role::new("", ""))).unwrap();
+            ctx.session
+                .as_mut()
+                .unwrap()
+                .add_message(&input, "reply")
+                .unwrap();
+        }
+        ctx.last_prompt_token_usage = Some(90_000);
+        ctx.valve_checkpoint_floor = Some(123);
+        let fetch = |_: Input| async { Ok("summary".to_string()) };
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(ctx.compress_session_impl(None, fetch))
+            .unwrap();
+
+        assert_eq!(ctx.last_prompt_token_usage, None);
+        assert_eq!(ctx.valve_checkpoint_floor, None);
+    }
+
+    #[test]
+    fn compress_session_sub_chunks_giant_tool_message_within_window() {
+        let mut ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
+        let mut session = Session::default();
+        // A 2_000-token window gives a 1_200-token chunk budget; the tool
+        // message built below holds four ~1_140-token rounds.
+        session.set_model(windowed_model(2_000));
+        ctx.session = Some(session);
+        let mut input = Input::from_str(&ctx, "do everything", Some(Role::new("", ""))).unwrap();
+        for round in 0..4 {
+            let ids = round * 10..(round + 1) * 10;
+            input = input.merge_tool_results(String::new(), tool_results(ids, 400));
+        }
+        ctx.session
+            .as_mut()
+            .unwrap()
+            .add_message(&input, "done")
+            .unwrap();
+        {
+            let session = ctx.session.as_ref().unwrap();
+            assert_eq!(session.messages().len(), 3);
+            assert!(
+                session.model().total_tokens(&session.messages()[1..2]) > 2_000,
+                "the tool message alone must not fit the summarizer window"
+            );
+        }
+
+        let requests = std::cell::RefCell::new(Vec::new());
+        let requests_ref = &requests;
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(
+                ctx.compress_session_impl(None, move |input: Input| async move {
+                    // The real request pipeline, guard_max_input_tokens included.
+                    input.prepare_completion_data(input.role().model(), false)?;
+                    requests_ref.borrow_mut().push(input.text());
+                    Ok(format!("folded-summary-{}", requests_ref.borrow().len()))
+                }),
+            )
+            .unwrap();
+
+        let requests = requests.into_inner();
+        assert_eq!(requests.len(), 4, "one request per round-sized part");
+        assert!(requests[0].contains("USER: do everything"));
+        assert!(requests[0].contains("[transcript part 1/4: results 1..10 of 40]"));
+        assert!(requests[3].contains("[transcript part 4/4: results 31..40 of 40]"));
+        assert!(requests[3].contains("ASSISTANT: done"));
+        for (i, request) in requests.iter().enumerate() {
+            assert!(
+                request.contains(&format!("\"id\":\"id-{}\"", i * 10)),
+                "request {i} must carry its round's results"
+            );
+        }
+
+        let session = ctx.session.as_ref().unwrap();
+        assert_eq!(session.messages().len(), 1);
+        assert!(
+            session.messages()[0]
+                .content
+                .to_text()
+                .contains("folded-summary-4")
+        );
+    }
+
+    /// A ctx holding a session whose model declares `window` as
+    /// `max_input_tokens`, or no window at all for `None`.
+    fn checkpoint_ctx(window: Option<usize>, config: AppConfig) -> RequestContext {
+        let mut app = AppState::test_default();
+        app.config = Arc::new(config);
+        let mut ctx = RequestContext::new(Arc::new(app), WorkingMode::Cmd);
+        let mut session = Session::default();
+        if let Some(window) = window {
+            session.set_model(windowed_model(window));
+        }
+        ctx.session = Some(session);
+        ctx
+    }
+
+    /// An input bound to `ctx`'s session holding `rounds` tool rounds of ten
+    /// results each, as a live tool loop would.
+    fn in_flight_input(ctx: &RequestContext, rounds: usize, output_chars: usize) -> Input {
+        let mut input = Input::from_str(ctx, "do things", None).unwrap();
+        for round in 0..rounds {
+            let ids = round * 10..(round + 1) * 10;
+            input = input.merge_tool_results(String::new(), tool_results(ids, output_chars));
+        }
+        input
+    }
+
+    fn in_flight_tokens(input: &Input) -> usize {
+        Model::default().tool_calls_tokens(input.tool_calls().as_ref().unwrap())
+    }
+
+    #[test]
+    fn tool_loop_checkpoint_due_below_min_tokens() {
+        // A quarter of a 4_000 window is 1_000 tokens; one ~1_150-token
+        // round crosses that share but not the absolute floor.
+        let ctx = checkpoint_ctx(Some(4_000), AppConfig::default());
+        let input = in_flight_input(&ctx, 1, 400);
+        let tokens = in_flight_tokens(&input);
+        assert!((1_000..TOOL_LOOP_CHECKPOINT_MIN_TOKENS).contains(&tokens));
+
+        assert_eq!(ctx.tool_loop_checkpoint_due(&input), None);
+    }
+
+    #[test]
+    fn tool_loop_checkpoint_due_at_window_quarter() {
+        let tokens = in_flight_tokens(&in_flight_input(
+            &checkpoint_ctx(None, AppConfig::default()),
+            3,
+            400,
+        ));
+        assert!(tokens >= TOOL_LOOP_CHECKPOINT_MIN_TOKENS);
+
+        let ctx = checkpoint_ctx(Some(tokens * 4), AppConfig::default());
+        assert_eq!(
+            ctx.tool_loop_checkpoint_due(&in_flight_input(&ctx, 3, 400)),
+            Some(CheckpointTrigger::InFlightShare)
+        );
+
+        let ctx = checkpoint_ctx(Some((tokens + 1) * 4), AppConfig::default());
+        assert_eq!(
+            ctx.tool_loop_checkpoint_due(&in_flight_input(&ctx, 3, 400)),
+            None
+        );
+    }
+
+    #[test]
+    fn tool_loop_checkpoint_due_uses_fallback_window_when_model_has_none() {
+        let ctx = checkpoint_ctx(None, AppConfig::default());
+        assert!(
+            ctx.session
+                .as_ref()
+                .unwrap()
+                .model()
+                .max_input_tokens()
+                .is_none()
+        );
+        let quarter = (SUMMARIZATION_WINDOW_FALLBACK_TOKENS as f32
+            * TOOL_LOOP_CHECKPOINT_WINDOW_RATIO) as usize;
+
+        let small = in_flight_input(&ctx, 3, 400);
+        assert!(in_flight_tokens(&small) >= TOOL_LOOP_CHECKPOINT_MIN_TOKENS);
+        assert_eq!(ctx.tool_loop_checkpoint_due(&small), None);
+
+        let large = in_flight_input(&ctx, 5, 4_000);
+        assert!(in_flight_tokens(&large) >= quarter);
+        assert_eq!(
+            ctx.tool_loop_checkpoint_due(&large),
+            Some(CheckpointTrigger::InFlightShare)
+        );
+    }
+
+    #[test]
+    fn tool_loop_checkpoint_due_at_valve_level_prompt() {
+        let config = AppConfig {
+            compression_safety_valve: 0.8,
+            ..AppConfig::default()
+        };
+        let mut ctx = checkpoint_ctx(Some(100_000), config);
+        let input = in_flight_input(&ctx, 3, 400);
+        let tokens = in_flight_tokens(&input);
+        assert!((TOOL_LOOP_CHECKPOINT_MIN_TOKENS..25_000).contains(&tokens));
+        assert_eq!(ctx.tool_loop_checkpoint_due(&input), None);
+
+        ctx.last_prompt_token_usage = Some(79_999);
+        assert_eq!(ctx.tool_loop_checkpoint_due(&input), None);
+
+        ctx.last_prompt_token_usage = Some(80_000);
+        assert_eq!(
+            ctx.tool_loop_checkpoint_due(&input),
+            Some(CheckpointTrigger::SafetyValve)
+        );
+
+        // The local estimate counts too: committed history plus the
+        // in-flight rounds reaching the valve is enough on its own.
+        ctx.last_prompt_token_usage = None;
+        let filler = Input::from_str(&ctx, &"y".repeat(320_000), None).unwrap();
+        ctx.session
+            .as_mut()
+            .unwrap()
+            .add_message(&filler, "ok")
+            .unwrap();
+        assert!(ctx.session.as_ref().unwrap().tokens() + tokens >= 80_000);
+        assert_eq!(
+            ctx.tool_loop_checkpoint_due(&input),
+            Some(CheckpointTrigger::SafetyValve)
+        );
+    }
+
+    #[test]
+    fn tool_loop_checkpoint_due_noop_on_dry_run() {
+        let config = AppConfig {
+            dry_run: true,
+            ..AppConfig::default()
+        };
+        let ctx = checkpoint_ctx(Some(8_000), config);
+        let input = in_flight_input(&ctx, 3, 400);
+        assert!(in_flight_tokens(&input) >= 2_000);
+
+        assert_eq!(ctx.tool_loop_checkpoint_due(&input), None);
+    }
+
+    #[test]
+    fn tool_loop_checkpoint_due_noop_without_session() {
+        let mut ctx = checkpoint_ctx(Some(8_000), AppConfig::default());
+        let mut detached = Input::from_str(&ctx, "do things", Some(Role::new("", ""))).unwrap();
+        for round in 0..3 {
+            detached = detached.merge_tool_results(
+                String::new(),
+                tool_results(round * 10..(round + 1) * 10, 400),
+            );
+        }
+        assert!(!detached.with_session());
+        assert_eq!(ctx.tool_loop_checkpoint_due(&detached), None);
+
+        let bound = in_flight_input(&ctx, 3, 400);
+        ctx.session = None;
+        assert_eq!(ctx.tool_loop_checkpoint_due(&bound), None);
+    }
+
+    #[test]
+    fn tool_loop_checkpoint_due_noop_on_regenerate_and_continue_output() {
+        let ctx = checkpoint_ctx(Some(8_000), AppConfig::default());
+        let input = in_flight_input(&ctx, 3, 400);
+        assert!(ctx.tool_loop_checkpoint_due(&input).is_some());
+
+        let mut regenerate = input.clone();
+        regenerate.set_regenerate(input.role().clone());
+        let regenerate = regenerate.merge_tool_results(String::new(), tool_results(0..30, 400));
+        assert!(regenerate.tool_calls().is_some());
+        assert_eq!(ctx.tool_loop_checkpoint_due(&regenerate), None);
+
+        let mut continued = input;
+        continued.set_continue_output("partial");
+        assert_eq!(ctx.tool_loop_checkpoint_due(&continued), None);
+    }
+
+    #[test]
+    fn maybe_checkpoint_tool_loop_commits_user_tool_assistant_and_returns_fresh_input() {
+        let mut ctx = checkpoint_ctx(Some(8_000), AppConfig::default());
+        let earlier = Input::from_str(&ctx, "earlier", None).unwrap();
+        ctx.session
+            .as_mut()
+            .unwrap()
+            .add_message(&earlier, "answer")
+            .unwrap();
+        let before = ctx.session.as_ref().unwrap().messages().len();
+        let mut input = in_flight_input(&ctx, 3, 400);
+        // A RAG patch is request-only; the session records what was typed.
+        input.set_patched_text("patched: do things");
+        let in_flight = input.tool_calls().clone().unwrap();
+        assert!(ctx.last_message.is_none());
+
+        let (next, checkpoint) = ctx.maybe_checkpoint_tool_loop(input).unwrap();
+
+        let checkpoint = checkpoint.expect("a 3-round loop on an 8k window must checkpoint");
+        assert_eq!(checkpoint.committed_results, 30);
+        assert!(checkpoint.committed_tokens >= TOOL_LOOP_CHECKPOINT_MIN_TOKENS);
+
+        let session = ctx.session.as_ref().unwrap();
+        assert_eq!(session.messages().len(), before + 3);
+        let messages = &session.messages()[before..];
+        assert!(messages[0].role.is_user());
+        assert_eq!(messages[0].content.to_text(), "do things");
+        assert_eq!(messages[1].role, MessageRole::Tool);
+        let MessageContent::ToolCalls(committed) = &messages[1].content else {
+            panic!("the second message must hold the tool rounds");
+        };
+        assert_eq!(committed.tool_results.len(), in_flight.tool_results.len());
+        assert_eq!(committed.round_starts, in_flight.round_starts);
+        assert!(messages[2].role.is_assistant());
+        assert_eq!(messages[2].content.to_text(), TOOL_LOOP_CHECKPOINT_TEXT);
+        assert!(!session.has_interrupted_error_checkpoint());
+
+        assert!(next.tool_calls().is_none());
+        assert!(next.with_session());
+        assert_eq!(
+            next.build_messages().unwrap().len(),
+            before + 4,
+            "the continuation must build on the committed turn plus its own user message"
+        );
+        assert_eq!(
+            ctx.last_message.as_ref().unwrap().input.text(),
+            "do things",
+            "last_message records the unpatched input"
+        );
+
+        let (unchanged, again) = ctx.maybe_checkpoint_tool_loop(next).unwrap();
+        assert!(again.is_none(), "nothing in flight, nothing to checkpoint");
+        assert!(unchanged.tool_calls().is_none());
+    }
+
+    /// A session at 80% of a 100k window with `last_prompt_token_usage`
+    /// reporting the same, as the REPL would see after a valve-level turn.
+    fn over_valve_ctx() -> RequestContext {
+        let config = AppConfig {
+            compression_safety_valve: 0.8,
+            compression_threshold: 1_000_000,
+            ..AppConfig::default()
+        };
+        let mut ctx = checkpoint_ctx(Some(100_000), config);
+        let filler = Input::from_str(&ctx, &"y".repeat(320_000), None).unwrap();
+        ctx.session
+            .as_mut()
+            .unwrap()
+            .add_message(&filler, "ok")
+            .unwrap();
+        ctx.last_prompt_token_usage = Some(80_000);
+        ctx
+    }
+
+    #[test]
+    fn tool_loop_checkpoint_due_valve_branch_latches_until_tokens_drop() {
+        let mut ctx = over_valve_ctx();
+        let input = in_flight_input(&ctx, 3, 400);
+        assert!(in_flight_tokens(&input) >= TOOL_LOOP_CHECKPOINT_MIN_TOKENS);
+        assert_eq!(
+            ctx.tool_loop_checkpoint_due(&input),
+            Some(CheckpointTrigger::SafetyValve)
+        );
+
+        let (next, checkpoint) = ctx.maybe_checkpoint_tool_loop(input).unwrap();
+        assert!(checkpoint.is_some());
+        let committed_tokens = ctx.session.as_ref().unwrap().tokens();
+        assert_eq!(ctx.valve_checkpoint_floor, Some(committed_tokens));
+
+        // The loop continues and grows another ≥2k round, but the session
+        // has not shrunk: committing more rounds cannot help, so no second
+        // checkpoint turn is cut.
+        let again = next.merge_tool_results(String::new(), tool_results(30..60, 400));
+        assert!(in_flight_tokens(&again) >= TOOL_LOOP_CHECKPOINT_MIN_TOKENS);
+        assert_eq!(ctx.tool_loop_checkpoint_due(&again), None);
+        let (again, checkpoint) = ctx.maybe_checkpoint_tool_loop(again).unwrap();
+        assert!(checkpoint.is_none());
+        assert_eq!(ctx.session.as_ref().unwrap().tokens(), committed_tokens);
+
+        // A compression folds the history and releases the latch. The next
+        // request still reports a valve-level prompt: the valve branch is
+        // live again.
+        let fetch = |_: Input| async { Ok("recap".to_string()) };
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(ctx.compress_session_impl(Some(0), fetch))
+            .unwrap();
+        assert!(ctx.session.as_ref().unwrap().tokens() < committed_tokens);
+        assert_eq!(ctx.valve_checkpoint_floor, None);
+        ctx.last_prompt_token_usage = Some(80_000);
+        assert_eq!(
+            ctx.tool_loop_checkpoint_due(&again),
+            Some(CheckpointTrigger::SafetyValve)
+        );
+    }
+
+    #[test]
+    fn tool_loop_checkpoint_quarter_window_branch_ignores_latch() {
+        let mut ctx = over_valve_ctx();
+        let input = in_flight_input(&ctx, 3, 400);
+        let (next, checkpoint) = ctx.maybe_checkpoint_tool_loop(input).unwrap();
+        assert!(checkpoint.is_some());
+        assert!(ctx.valve_checkpoint_floor.is_some());
+        let committed = ctx.session.as_ref().unwrap().messages().len();
+
+        // Rounds that alone reach a quarter of the 100k window are
+        // committed regardless of the valve latch.
+        let mut large = next;
+        for round in 0..6 {
+            large = large.merge_tool_results(
+                String::new(),
+                tool_results(100 + round * 10..110 + round * 10, 4_000),
+            );
+        }
+        assert!(in_flight_tokens(&large) >= 25_000);
+        assert_eq!(
+            ctx.tool_loop_checkpoint_due(&large),
+            Some(CheckpointTrigger::InFlightShare)
+        );
+        let (_, checkpoint) = ctx.maybe_checkpoint_tool_loop(large).unwrap();
+        assert!(checkpoint.is_some());
+        assert_eq!(
+            ctx.session.as_ref().unwrap().messages().len(),
+            committed + 3
+        );
+    }
+
+    #[test]
+    fn set_compression_keep_last_overrides_agent_value() {
+        let mut ctx = RequestContext::new(default_app_state(), WorkingMode::Cmd);
+        let agent = Agent::test_new(AgentConfig {
+            name: "keeper".to_string(),
+            compression_keep_last: Some(10),
+            ..AgentConfig::default()
+        });
+        let mut session = Session::default();
+        session.sync_agent(&agent);
+        ctx.agent = Some(agent);
+        ctx.session = Some(session);
+        assert_eq!(ctx.compression_keep_policy(None).last, 10);
+
+        run_async(ctx.update("compression_keep_last 0", utils::create_abort_signal())).unwrap();
+
+        assert_eq!(ctx.compression_keep_policy(None).last, 0);
+        assert_eq!(
+            ctx.app.config.compression_keep_last, 0,
+            "a session override leaves the app config alone"
+        );
+        assert_eq!(
+            ctx.session.as_ref().unwrap().compression_keep_last(),
+            Some(0)
+        );
+
+        // Clearing the session override falls back to the agent's value.
+        run_async(ctx.update("compression_keep_last null", utils::create_abort_signal())).unwrap();
+        assert_eq!(ctx.compression_keep_policy(None).last, 10);
+    }
+
+    #[test]
+    fn tool_call_units_tolerates_non_monotonic_round_starts() {
+        let mut tool_calls = MessageContentToolCalls::new(tool_results(0..6, 400), String::new());
+        tool_calls.round_starts = vec![5, 2];
+
+        let units = tool_call_units(MessageRole::Tool, &tool_calls, 250);
+
+        let covered: Vec<&str> = units
+            .iter()
+            .flat_map(|(unit, _)| tool_part(unit).5)
+            .map(|result| result.call.id.as_deref().unwrap())
+            .collect();
+        let expected: Vec<String> = (0..6).map(|i| format!("id-{i}")).collect();
+        assert_eq!(covered, expected, "every result exactly once, in order");
     }
 
     #[test]
@@ -6542,14 +7841,16 @@ mod tests {
             .enable_all()
             .build()
             .unwrap()
-            .block_on(ctx.compress_session_impl(move |input: Input| async move {
-                // The real request pipeline, guard_max_input_tokens included.
-                let data = input.prepare_completion_data(input.role().model(), false)?;
-                requests_ref
-                    .borrow_mut()
-                    .push((input.text(), data.messages, data.functions));
-                Ok(format!("folded-summary-{}", requests_ref.borrow().len()))
-            }))
+            .block_on(
+                ctx.compress_session_impl(None, move |input: Input| async move {
+                    // The real request pipeline, guard_max_input_tokens included.
+                    let data = input.prepare_completion_data(input.role().model(), false)?;
+                    requests_ref
+                        .borrow_mut()
+                        .push((input.text(), data.messages, data.functions));
+                    Ok(format!("folded-summary-{}", requests_ref.borrow().len()))
+                }),
+            )
             .unwrap();
 
         let requests = requests.into_inner();
@@ -7153,6 +8454,22 @@ mod tests {
         assert!(
             branch.in_graph_llm_node,
             "parallel map branches inside a node must keep the node's tool gating"
+        );
+    }
+
+    #[test]
+    fn fork_for_branch_carries_valve_readings() {
+        let mut ctx = create_test_ctx();
+        ctx.last_prompt_token_usage = Some(90_000);
+        ctx.valve_checkpoint_floor = Some(123);
+
+        let branch = ctx.fork_for_branch();
+
+        assert_eq!(branch.last_prompt_token_usage, Some(90_000));
+        assert_eq!(
+            branch.valve_checkpoint_floor,
+            Some(123),
+            "the latch travels with the prompt measurement it guards"
         );
     }
 
@@ -9393,6 +10710,29 @@ mod tests {
 
         assert!(info.contains("sessions_dir"));
         assert!(info.contains("workspace_sessions_dir"));
+    }
+
+    #[test]
+    #[serial]
+    fn sysinfo_reports_effective_compression_rows() {
+        let _config = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let app = ctx.app.config.clone();
+        let mut session = Session::default();
+        session.set_compression_threshold(Some(123_456));
+        session.set_compression_keep_last(Some(7));
+        ctx.session = Some(session);
+
+        let info = ctx.sysinfo(&app).unwrap();
+
+        let row = |key: &str| {
+            info.lines()
+                .find(|line| line.trim_start().starts_with(key))
+                .unwrap_or_else(|| panic!("{key} row missing from:\n{info}"))
+                .to_string()
+        };
+        assert!(row("compression_threshold").ends_with("123456"));
+        assert!(row("compression_keep_last").ends_with('7'));
     }
 
     // --- usage-probe (spec-first) coverage for the workspace-sessions surface ---

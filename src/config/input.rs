@@ -20,6 +20,9 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 const IMAGE_EXTS: [&str; 5] = ["png", "jpeg", "jpg", "webp", "gif"];
 const SUMMARY_MAX_WIDTH: usize = 80;
 
+pub const TOOL_LOOP_CHECKPOINT_TEXT: &str = "[Context checkpoint: the tool activity above was committed to session history mid-turn so it can be compressed. The task is not finished; it continues in the next turn.]";
+pub const TOOL_LOOP_CONTINUE_TEXT: &str = "Continue exactly where you left off. This is an automatic context checkpoint, not a new instruction: the original request and your progress so far are in the history above. Do not restart or re-summarize; proceed with the next step.";
+
 #[derive(Debug, Clone)]
 pub struct Input {
     app_config: Arc<AppConfig>,
@@ -213,6 +216,11 @@ impl Input {
         self.patched_text = None;
     }
 
+    #[cfg(test)]
+    pub fn set_patched_text(&mut self, text: &str) {
+        self.patched_text = Some(text.to_string());
+    }
+
     pub fn set_text(&mut self, text: String) {
         self.text = text;
     }
@@ -270,6 +278,21 @@ impl Input {
             }
             None => self.tool_calls = Some(MessageContentToolCalls::new(tool_results, output)),
         }
+        self
+    }
+
+    pub fn into_checkpoint_continuation(mut self, ctx: &RequestContext) -> Self {
+        self.tool_calls = None;
+        self.text = TOOL_LOOP_CONTINUE_TEXT.into();
+        self.raw = (TOOL_LOOP_CONTINUE_TEXT.into(), vec![]);
+        self.patched_text = None;
+        self.rag_name = None;
+        self.medias.clear();
+        self.data_urls.clear();
+        self.last_reply = None;
+        self.continue_output = None;
+        self.regenerate = false;
+        self.refresh_session(ctx);
         self
     }
 
@@ -343,6 +366,10 @@ impl Input {
 
     pub fn role(&self) -> &Role {
         &self.role
+    }
+
+    pub fn app_config(&self) -> &AppConfig {
+        &self.app_config
     }
 
     pub fn set_role_model(&mut self, model: Model) {
@@ -644,6 +671,7 @@ fn read_media_to_data_url(image_path: &str) -> Result<String> {
 mod tests {
     use super::*;
     use crate::config::request_context::RequestContext;
+    use crate::config::session::KeepPolicy;
     use crate::config::{AppState, WorkingMode};
     use crate::function::ToolCall;
     use serde_json::json;
@@ -734,7 +762,13 @@ mod tests {
         let mut input = Input::from_str(&ctx, "retry me", None).unwrap();
         let stale = serde_json::to_string(&input.build_messages().unwrap()).unwrap();
 
-        ctx.session.as_mut().unwrap().compress("recap".into(), 1);
+        ctx.session.as_mut().unwrap().compress(
+            "recap".into(),
+            KeepPolicy {
+                last: 1,
+                tokens: usize::MAX,
+            },
+        );
 
         assert_eq!(
             serde_json::to_string(&input.build_messages().unwrap()).unwrap(),
@@ -1181,5 +1215,49 @@ mod tests {
             unreachable!();
         };
         assert_eq!(tool_calls.tool_results.len(), 2);
+    }
+
+    #[test]
+    fn into_checkpoint_continuation_resets_turn_state_keeps_role_session_functions() {
+        let mut ctx = create_test_ctx();
+        ctx.session = Some(Session::default());
+        let mut input = Input::from_str(&ctx, "do things", None)
+            .unwrap()
+            .merge_tool_results("round one".into(), vec![tool_result("id-1", "ok")]);
+        input.patched_text = Some("patched".into());
+        input.rag_name = Some("docs".into());
+        input.medias.push("data:image/png;base64,abc".into());
+        input.data_urls.insert("hash".into(), "/img.png".into());
+        input.last_reply = Some("earlier".into());
+        let role_name = input.role().name().to_string();
+        let functions = input.declared_function_names();
+
+        let earlier = Input::from_str(&ctx, "earlier", None).unwrap();
+        ctx.session
+            .as_mut()
+            .unwrap()
+            .add_message(&earlier, "answer")
+            .unwrap();
+
+        let next = input.into_checkpoint_continuation(&ctx);
+
+        assert!(next.tool_calls().is_none());
+        assert_eq!(next.text(), TOOL_LOOP_CONTINUE_TEXT);
+        assert_eq!(next.raw(), TOOL_LOOP_CONTINUE_TEXT);
+        assert!(next.patched_text.is_none());
+        assert!(next.rag_name().is_none());
+        assert!(next.medias.is_empty());
+        assert!(next.data_urls().is_empty());
+        assert!(next.last_reply.is_none());
+        assert!(next.continue_output().is_none());
+        assert!(!next.regenerate());
+        assert_eq!(next.role().name(), role_name);
+        assert_eq!(next.declared_function_names(), functions);
+        assert!(next.with_session());
+        assert_eq!(
+            next.session.as_ref().unwrap().messages().len(),
+            ctx.session.as_ref().unwrap().messages().len(),
+            "the continuation must carry the ctx session, not the stale snapshot"
+        );
     }
 }

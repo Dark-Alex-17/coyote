@@ -714,6 +714,8 @@ async fn start_directive_inner(
 
         if !tool_results.is_empty() {
             input = input.merge_tool_results(output, tool_results);
+            let (next, _) = ctx.maybe_checkpoint_tool_loop(input)?;
+            input = next;
             continue;
         }
 

@@ -1470,6 +1470,14 @@ clients:
     }
 
     #[test]
+    fn config_template_documents_keep_last_semantics() {
+        assert!(CONFIG_TEMPLATE.contains("Upper bound on the most-recent messages kept verbatim"));
+        assert!(CONFIG_TEMPLATE.contains("always starts at a user message"));
+        assert!(CONFIG_TEMPLATE.contains("derived token budget"));
+        assert!(CONFIG_TEMPLATE.contains("Set at runtime with .set compression_keep_last"));
+    }
+
+    #[test]
     fn config_template_carries_hooks_block_without_global_hooks() {
         // `global_hooks` is a per-agent whitelist; the global template must never grow it.
         assert!(CONFIG_TEMPLATE.contains("\nhooks:"));

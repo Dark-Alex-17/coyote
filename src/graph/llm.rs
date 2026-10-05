@@ -398,6 +398,10 @@ async fn run_chat_loop(
                 );
             }
             input = input.merge_tool_results(output, tool_results);
+            // A no-op today: the node's inline role detaches the input from
+            // the parent session, so there is nothing to commit rounds into.
+            let (next, _) = ctx.maybe_checkpoint_tool_loop(input)?;
+            input = next;
         }
         turn = turn.saturating_add(1);
     }
@@ -1296,5 +1300,71 @@ mod tests {
             ctx.in_graph_llm_node,
             "a nested run must restore the outer scope's flag"
         );
+    }
+
+    /// The llm node's inline role detaches its input from the parent
+    /// session, so the tool-loop checkpoint never commits node rounds —
+    /// including the checkpoint's own User/Assistant pair — into that
+    /// session. A role-resolution change that re-attached node inputs
+    /// would silently start doing so; this pins the current contract.
+    #[tokio::test]
+    async fn giant_tool_round_in_llm_node_leaves_parent_session_untouched() {
+        use crate::client::ModelData;
+        use crate::config::Session;
+        use crate::function::ToolCall;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let node = node_with(None);
+        let mut ctx = plain_ctx();
+        ctx.role = Some(Role::new("llm_node", ""));
+        let mut session = Session::default();
+        let mut data = ModelData::new("tiny-window");
+        data.max_input_tokens = Some(8_000);
+        session.set_model(Model::from_config("openai", &[data]).remove(0));
+        ctx.session = Some(session);
+        let before = ctx.session.as_ref().unwrap().messages().len();
+        let abort = create_abort_signal();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let giant_round = || -> Vec<ToolResult> {
+            (0..5)
+                .map(|i| {
+                    let call = ToolCall::new("t".into(), json!({}), Some(format!("id-{i}")));
+                    ToolResult::new(call, json!("x".repeat(2_000)))
+                })
+                .collect()
+        };
+        let out = bounded_run(
+            &node,
+            "user",
+            &mut ctx,
+            &abort,
+            &mut completion_runner(move |_input, _ctx, _abort| {
+                let first = calls.fetch_add(1, Ordering::SeqCst) == 0;
+                boxed_completion(async move {
+                    if first {
+                        Ok((String::new(), giant_round()))
+                    } else {
+                        Ok(("done".to_string(), vec![]))
+                    }
+                })
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out, "done");
+        assert_eq!(ctx.session.as_ref().unwrap().messages().len(), before);
+
+        // Positive control: the same round on an attached input is
+        // checkpoint-worthy, so the node path is the only reason nothing
+        // was committed.
+        ctx.role = None;
+        let attached = Input::from_str(&ctx, "user", None)
+            .unwrap()
+            .merge_tool_results(String::new(), giant_round());
+        assert!(attached.with_session());
+        let (_, checkpoint) = ctx.maybe_checkpoint_tool_loop(attached).unwrap();
+        assert!(checkpoint.is_some());
     }
 }

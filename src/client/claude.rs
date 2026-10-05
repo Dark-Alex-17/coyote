@@ -1100,6 +1100,68 @@ mod tests {
         assert!(!body.to_string().contains("cache_control"), "body: {body}");
     }
 
+    /// The serializer keys on `MessageContent::ToolCalls`, not the wrapper
+    /// role, so rounds committed to the session mid-loop (role Tool) must
+    /// produce the same wire prefix they did in flight (role Assistant);
+    /// otherwise a checkpoint would invalidate the prompt cache.
+    #[test]
+    fn checkpointed_rounds_serialize_byte_identical_prefix() {
+        use crate::config::{AppState, Input, RequestContext, RoleLike, Session, WorkingMode};
+
+        let mut data = ModelData::new("claude-test");
+        data.max_input_tokens = Some(20_000);
+        let model = Model::from_config("claude", &[data]).remove(0);
+        // Hermetic: the test must not read the host's instruction files or
+        // memory store.
+        let mut app = AppState::test_default();
+        app.config = Arc::new(AppConfig {
+            workspace_instructions: Some(false),
+            memory: Some(false),
+            ..AppConfig::default()
+        });
+        let mut ctx = RequestContext::new(Arc::new(app), WorkingMode::Cmd);
+        let mut session = Session::default();
+        session.set_model(model.clone());
+        ctx.session = Some(session);
+
+        let rounds = 3;
+        let mut input = Input::from_str(&ctx, "do things", None).unwrap();
+        for round in 0..rounds {
+            let results = (round * 10..(round + 1) * 10)
+                .map(|i| ToolResult {
+                    output: json!("x".repeat(1_200)),
+                    ..tool_result(&format!("id-{i}"), None)
+                })
+                .collect();
+            input = input.merge_tool_results(format!("round {round}"), results);
+        }
+        let body_for = |input: &Input| {
+            let data = input.prepare_completion_data(&model, false).unwrap();
+            claude_build_chat_completions_body(data, &model, false).unwrap()["messages"]
+                .as_array()
+                .unwrap()
+                .clone()
+        };
+
+        let in_flight = body_for(&input);
+        let (continuation, checkpoint) = ctx.maybe_checkpoint_tool_loop(input).unwrap();
+        assert!(checkpoint.is_some(), "the fixture must be large enough to checkpoint");
+        let committed = body_for(&continuation);
+
+        // User question, then one assistant/user pair per round.
+        let prefix_len = 1 + 2 * rounds;
+        assert_eq!(in_flight.len(), prefix_len);
+        assert_eq!(
+            committed.len(),
+            prefix_len + 2,
+            "checkpoint text and the continuation prompt follow the committed rounds"
+        );
+        assert_eq!(
+            serde_json::to_string(&in_flight[..prefix_len]).unwrap(),
+            serde_json::to_string(&committed[..prefix_len]).unwrap()
+        );
+    }
+
     #[test]
     fn extract_populates_usage() {
         let data = json!({

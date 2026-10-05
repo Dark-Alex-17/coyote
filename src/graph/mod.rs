@@ -71,6 +71,31 @@ fn is_transient_status(status: u16) -> bool {
     matches!(status, 429 | 500 | 502 | 503 | 504 | 529)
 }
 
+/// A 400 whose body says the prompt outgrew the model's context. Providers
+/// phrase it differently and some models declare no `max_input_tokens`, so
+/// this is the only signal the session is too big for its model. A typed
+/// non-400 status is never an overflow, whatever its text says.
+pub(crate) fn is_context_overflow_error(err: &Error) -> bool {
+    let message = match err.chain().find_map(|c| c.downcast_ref::<ApiStatusError>()) {
+        Some(api) if api.status != 400 => return false,
+        Some(api) => api.message.to_lowercase(),
+        None => format!("{err:#}").to_lowercase(),
+    };
+    [
+        "prompt is too long",
+        "context_length_exceeded",
+        "maximum context length",
+        "input is too long",
+        "too many tokens",
+        "exceeds the context window",
+        "exceeds the maximum number of input tokens",
+        "exceed max_input_tokens",
+        "request_too_large",
+    ]
+    .iter()
+    .any(|anchor| message.contains(anchor))
+}
+
 pub const MAX_STATE_SIZE_BYTES: usize = 32 * 1024;
 
 pub(in crate::graph) fn type_name(value: &Value) -> &'static str {
@@ -205,6 +230,63 @@ mod tests {
         assert!(is_transient_error(&anyhow!("Rate Limit reached")));
         assert!(is_transient_error(&anyhow!("Request Timed Out")));
         assert!(is_transient_error(&anyhow!("connection reset by peer")));
+    }
+
+    #[test]
+    fn is_context_overflow_error_table() {
+        let overflow_messages = [
+            "prompt is too long: 250000 tokens > 200000 maximum",
+            "This model's maximum context length is 128000 tokens",
+            "Request failed: context_length_exceeded",
+            "Input is too long for requested model.",
+            "Too many tokens in the request",
+            "The input exceeds the context window of this model",
+            "Request exceeds the maximum number of input tokens (1048576)",
+            "Exceed max_input_tokens limit",
+            "Error code: request_too_large",
+        ];
+        for message in overflow_messages {
+            let err = client::catch_error(&serde_json::json!({ "message": message }), 400)
+                .unwrap_err()
+                .context("Failed to call chat-completions api");
+            assert!(is_context_overflow_error(&err), "typed 400: {message}");
+            assert!(
+                is_context_overflow_error(&anyhow!("{message}")),
+                "untyped: {message}"
+            );
+            // 413 `request_too_large` is a byte cap, not a token cap, so it
+            // is deliberately not an overflow.
+            for status in [413, 429, 500, 503, 529] {
+                let err = client::catch_error(&serde_json::json!({ "message": message }), status)
+                    .unwrap_err();
+                assert!(
+                    !is_context_overflow_error(&err),
+                    "status {status} is never an overflow: {message}"
+                );
+            }
+        }
+
+        let mut data = client::ModelData::new("windowed");
+        data.max_input_tokens = Some(100);
+        let model = client::Model::from_config("openai", &[data]).remove(0);
+        let messages = vec![client::Message::new(
+            client::MessageRole::User,
+            client::MessageContent::Text("x".repeat(4_000)),
+        )];
+        let err = model
+            .guard_max_input_tokens(&messages)
+            .unwrap_err()
+            .context("Failed to call chat-completions api");
+        assert!(is_context_overflow_error(&err), "local guard: {err:#}");
+
+        let err = client::catch_error(
+            &serde_json::json!({ "message": "invalid tool schema" }),
+            400,
+        )
+        .unwrap_err();
+        assert!(!is_context_overflow_error(&err));
+        assert!(!is_context_overflow_error(&anyhow!("Unknown model 'foo'")));
+        assert!(!is_context_overflow_error(&anyhow!("rate limit reached")));
     }
 
     #[tokio::test(start_paused = true)]

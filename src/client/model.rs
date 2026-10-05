@@ -6,6 +6,7 @@ use super::{
 };
 
 use crate::config::AppConfig;
+use crate::function::ToolResult;
 use crate::utils::{estimate_token_length, strip_think_tag};
 
 use super::oauth::OAuthConfig;
@@ -280,21 +281,16 @@ impl Model {
                         MessageContentPart::ImageUrl { .. } => 0,
                     })
                     .sum(),
-                MessageContent::ToolCalls(MessageContentToolCalls {
-                    tool_results, text, ..
-                }) => {
-                    estimate_token_length(text)
-                        + tool_results
-                            .iter()
-                            .map(|v| {
-                                serde_json::to_string(v)
-                                    .map(|v| estimate_token_length(&v))
-                                    .unwrap_or_default()
-                            })
-                            .sum::<usize>()
-                }
+                MessageContent::ToolCalls(tool_calls) => self.tool_calls_tokens(tool_calls),
             })
             .sum()
+    }
+
+    pub fn tool_calls_tokens(&self, tool_calls: &MessageContentToolCalls) -> usize {
+        let MessageContentToolCalls {
+            tool_results, text, ..
+        } = tool_calls;
+        estimate_token_length(text) + tool_results.iter().map(tool_result_tokens).sum::<usize>()
     }
 
     pub fn total_tokens(&self, messages: &[Message]) -> usize {
@@ -397,6 +393,12 @@ pub struct ProviderModels {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth: Option<OAuthConfig>,
     pub models: Vec<ModelData>,
+}
+
+pub fn tool_result_tokens(result: &ToolResult) -> usize {
+    serde_json::to_string(result)
+        .map(|v| estimate_token_length(&v))
+        .unwrap_or_default()
 }
 
 fn default_model_type() -> String {
@@ -648,5 +650,36 @@ reasoning_levels: [none, low, medium, high]
         let models = crate::client::OpenAICompatibleClient::list_models(&config);
         assert_eq!(models.len(), catalog_len + 1);
         assert_eq!(models.last().unwrap().name(), "test-net-new-model");
+    }
+
+    #[test]
+    fn tool_calls_tokens_matches_messages_tokens_arm() {
+        use crate::client::MessageRole;
+        use crate::function::{ToolCall, ToolResult};
+        use serde_json::json;
+
+        let model = Model::new("openai", "test");
+        let tool_calls = MessageContentToolCalls::new(
+            (0..3)
+                .map(|i| {
+                    ToolResult::new(
+                        ToolCall::new("t".into(), json!({"i": i}), Some(format!("id-{i}"))),
+                        json!("x".repeat(300)),
+                    )
+                })
+                .collect(),
+            "narration".into(),
+        );
+        let message = Message::new(
+            MessageRole::Tool,
+            MessageContent::ToolCalls(tool_calls.clone()),
+        );
+
+        let tokens = model.tool_calls_tokens(&tool_calls);
+        assert!(tokens > 200);
+        assert_eq!(
+            tokens,
+            model.messages_tokens(std::slice::from_ref(&message))
+        );
     }
 }

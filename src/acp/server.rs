@@ -209,6 +209,8 @@ async fn run_prompt_turn(
         ctx.after_chat_completion(app.as_ref(), &input, &output, &tool_results)?;
         if !tool_results.is_empty() {
             input = input.merge_tool_results(output, tool_results);
+            let (next, _) = ctx.maybe_checkpoint_tool_loop(input)?;
+            input = next;
             continue;
         }
         match check_pending_tasks_guardrail(ctx) {

@@ -733,6 +733,8 @@ fn run_child_agent_with_graph_inputs(
             }
 
             input = input.merge_tool_results(output, tool_results);
+            let (next, _) = child_ctx.maybe_checkpoint_tool_loop(input)?;
+            input = next;
         }
 
         if let Some(supervisor) = child_ctx.supervisor.clone() {
