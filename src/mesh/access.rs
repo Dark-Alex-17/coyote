@@ -1523,7 +1523,8 @@ mod tests {
     use crate::mesh::r3::MESSAGE_PATH;
     #[cfg(unix)]
     use crate::mesh::test_support::{
-        PeerStub, derived_sighting, loopback_relay, mesh_paths, private_config, wait_until,
+        INTEROP_TIMEOUT, POLL, PeerStub, derived_sighting, loopback_relay, mesh_paths,
+        private_config, wait_until,
     };
     #[cfg(unix)]
     use crate::mesh::trust::TrustOptions;
@@ -2577,12 +2578,25 @@ mod tests {
             });
         }
 
-        /// Hears `stub` announce, which is what gives the node a path to it.
+        /// Hears `stub` announce, which is what gives the node a path to it. The peer
+        /// table is persisted, so after a restart the stub is filed before the announce
+        /// even arrives; the wait is on what a send actually needs: the transport's
+        /// announce-learned identity behind `resolve_destination` and a route.
         async fn learn(&self, stub: &PeerStub) {
             stub.announce(Some("Stub")).await;
             let peers = self.runtime.peers();
             let to = stub.destination_hex();
             wait_until("the node to file the stub", || peers.get(&to).is_some()).await;
+            let deadline = tokio::time::Instant::now() + INTEROP_TIMEOUT;
+            while self.runtime.resolve_destination(&to).await.is_none()
+                || !self.runtime.path_known(&to).await
+            {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "timed out waiting for the node to learn a path to the stub"
+                );
+                tokio::time::sleep(POLL).await;
+            }
         }
 
         /// Files a pending access request from `stub` for `paths`.
