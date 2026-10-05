@@ -228,7 +228,9 @@ pub(crate) fn refuse_symlink(path: &Path) -> Result<()> {
 /// resolve to the same spelling or no prefix check between them can hold, and the
 /// standard library re-applies the prefix itself whenever a path needs it, so nothing
 /// below is lost. The prefix is kept whenever dunce would keep it for another reason:
-/// a reserved device name or a name the legacy form would trim.
+/// a reserved device name or a name the legacy form would trim. One edge stays closed:
+/// a single name of 254 or 255 characters is too long for the probe below on its own,
+/// so a path holding one keeps the prefix and fails the root check as before.
 pub(crate) fn canonicalize(path: &Path) -> std::io::Result<PathBuf> {
     let resolved = dunce::canonicalize(path)?;
     #[cfg(windows)]
@@ -395,8 +397,9 @@ pub(crate) mod test_support {
             // The temp root is handed out resolved, since what the code under test hands
             // back is resolved too: macOS reaches /var through a link and Windows may name
             // the profile by its short form, and a fixture joined on the raw root would
-            // never equal either.
-            let path = dunce::canonicalize(&path).unwrap();
+            // never equal either. It goes through the same helper production uses, so a
+            // temp root deeper than MAX_PATH is spelled the same way on both sides too.
+            let path = super::canonicalize(&path).unwrap();
             Self { path }
         }
     }
