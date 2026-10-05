@@ -343,6 +343,9 @@ The appearance of Coyote can be modified using the following settings:
 | `save_shell_history` | `true`        | Enables or disables REPL command history                                                                         |
 
 ### Mesh
+SCOPE - Session Coordination & Presence Exchange. SCOPE is a peer protocol by which running LLM sessions announce
+presence, share status, and exchange messages on their owners' behalf, over Reticulum, without a broker. Coyote is
+the reference implementation of SCOPE, and "mesh" is Coyote's name for its SCOPE feature.
 The `mesh` block controls the [Coyote Mesh](https://github.com/Dark-Alex-17/coyote/wiki/Mesh), which lets Coyote
 instances discover and message each other. It is off by default, and setting `mesh.enabled: true` requires
 `function_calling_support: true`; config loading is refused otherwise. Interface entries under `mesh.interfaces` are
@@ -350,6 +353,8 @@ always checked when config is parsed; the remaining `mesh` keys (rate limits, re
 requirement) are only checked when `mesh.enabled` is `true`.
 The wire format Coyote instances speak to each other is specified normatively in
 [docs/mesh/PROTOCOL.md](https://github.com/Dark-Alex-17/coyote/blob/main/docs/mesh/PROTOCOL.md).
+Trusted peers can also fetch the files you share and ask for others; see
+[Mesh File Sharing](https://github.com/Dark-Alex-17/coyote/wiki/Mesh-File-Sharing).
 Interoperability is exercised against the reference Reticulum/LXMF implementation by the
 [mesh interop harness](https://github.com/Dark-Alex-17/coyote/blob/main/scripts/mesh-interop/README.md),
 run in the informational `Mesh Interop` CI job.
