@@ -140,6 +140,8 @@ numbers there.
 
 The matching functional record, which release of the mesh crates the conformance, interop and fuzz
 suites were last run against and with what result, lives in `scripts/mesh-interop/README.md`.
+The same file documents the opt-in wiki lint that pins the wiki's mesh pages to the verbs, hooks and
+tools in the source: `COYOTE_WIKI_DIR=../coyote.wiki cargo test --test mesh_wiki_docs`.
 
 | Measurement | Before mesh dependencies | After |
 | --- | --- | --- |
