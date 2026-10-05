@@ -5544,9 +5544,10 @@ impl RequestContext {
     /// has one, by the read-only hint otherwise, and case-insensitively when neither can
     /// tell, the direction that hides more. Empty for a directory prefix the verbs would
     /// refuse as a pattern or that passes through a symlink, and for a root whose probe
-    /// failed, since the node serves nothing from it; sorted and cut at 200. The root and
-    /// the typed directory resolve through the mesh canonicaliser so each candidate and
-    /// the protected directories share one spelling past MAX_PATH on Windows.
+    /// failed, since the node serves nothing from it; sorted and cut at 200. The root,
+    /// the typed directory and each candidate resolve through the mesh canonicaliser so
+    /// they and the protected directories share one spelling past MAX_PATH on Windows; a
+    /// candidate that does not resolve is left off.
     fn mesh_completion_share_paths(&self, typed: &str) -> Vec<(String, Option<String>)> {
         use crate::mesh::shares::{CompletionFilter, case_folding_hint, validate_pattern};
 
@@ -5615,7 +5616,7 @@ impl RequestContext {
                 if file_type.is_symlink() {
                     return None;
                 }
-                let path = dir.join(&name);
+                let path = crate::mesh::canonicalize(&dir.join(&name)).ok()?;
                 if protected.iter().any(|skipped| path.starts_with(skipped)) {
                     return None;
                 }
@@ -24197,6 +24198,33 @@ mod tests {
         assert_eq!(completion_values(&rows), [keep.as_str()]);
         assert!(
             ctx.mesh_completion_share_paths(&format!("{deep}/inbox/"))
+                .is_empty()
+        );
+    }
+
+    /// An inbox whose own final component is 254 characters keeps the verbatim prefix the
+    /// mesh canonicaliser cannot strip, so a candidate spelt by joining the plain typed
+    /// directory would never match it; the candidate must resolve through the same
+    /// helper for the protected check to see one spelling on both sides.
+    #[cfg(windows)]
+    #[test]
+    #[serial]
+    fn mesh_completion_share_paths_never_offers_an_inbox_whose_name_the_probe_cannot_measure() {
+        let _guard = TestConfigDirGuard::new();
+        let mut ctx = create_test_ctx();
+        let root = publish_share_root(&ctx, "rc-mesh-complete-inbox-254-root");
+        let deep = format!("{}/{}/{}", "a".repeat(90), "b".repeat(90), "c".repeat(90));
+        let inbox_name = "n".repeat(254);
+        let fetched = format!("{deep}/{inbox_name}/fetched.md");
+        let keep = format!("{deep}/keep.md");
+        seed_share_files(&root.path, &[fetched.as_str(), keep.as_str()]);
+        let inbox = root.path.join(&deep).join(&inbox_name);
+        ctx.update_app_config(|app| app.mesh.fetch.inbox_dir = Some(inbox));
+
+        let rows = ctx.mesh_completion_share_paths(&format!("{deep}/"));
+        assert_eq!(completion_values(&rows), [keep.as_str()]);
+        assert!(
+            ctx.mesh_completion_share_paths(&format!("{deep}/{inbox_name}/"))
                 .is_empty()
         );
     }
