@@ -11,6 +11,7 @@ struct TestLogCollector;
 
 static WARN_MESSAGES: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 static DEBUG_MESSAGES: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+static INFO_MESSAGES: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 
 /// Debug capture is restricted to the modules whose tests assert on debug
 /// output so the buffer is not flooded by the rest of the crate. Matching is
@@ -20,6 +21,15 @@ const DEBUG_TARGET_PREFIXES: [&str; 3] = [
     concat!(env!("CARGO_CRATE_NAME"), "::hooks"),
     concat!(env!("CARGO_CRATE_NAME"), "::config::agent"),
     concat!(env!("CARGO_CRATE_NAME"), "::mesh"),
+];
+
+/// Info capture is narrower still: the node start and the `inbox_dir` resolver,
+/// whose tests assert that a translation is announced at info level exactly once
+/// and never by the resolver itself. Same module-boundary matching as the debug
+/// prefixes.
+const INFO_TARGET_PREFIXES: [&str; 2] = [
+    concat!(env!("CARGO_CRATE_NAME"), "::mesh::node"),
+    concat!(env!("CARGO_CRATE_NAME"), "::config::mesh_config"),
 ];
 
 fn captures_warn(metadata: &Metadata) -> bool {
@@ -32,6 +42,19 @@ fn captures_module_debug(metadata: &Metadata) -> bool {
     }
     let target = metadata.target();
     DEBUG_TARGET_PREFIXES.iter().any(|prefix| {
+        target == *prefix
+            || target
+                .strip_prefix(prefix)
+                .is_some_and(|rest| rest.starts_with("::"))
+    })
+}
+
+fn captures_module_info(metadata: &Metadata) -> bool {
+    if metadata.level() != Level::Info {
+        return false;
+    }
+    let target = metadata.target();
+    INFO_TARGET_PREFIXES.iter().any(|prefix| {
         target == *prefix
             || target
                 .strip_prefix(prefix)
@@ -54,6 +77,12 @@ pub(crate) fn debug_messages() -> &'static Mutex<Vec<String>> {
     DEBUG_MESSAGES.get_or_init(Mutex::default)
 }
 
+/// Every info-level message from the [`INFO_TARGET_PREFIXES`] modules captured
+/// since the collector was installed. Same marker-filtering discipline.
+pub(crate) fn info_messages() -> &'static Mutex<Vec<String>> {
+    INFO_MESSAGES.get_or_init(Mutex::default)
+}
+
 /// A copy of everything in [`warn_messages`], recovering from poisoning the
 /// same way the collector itself does.
 pub(crate) fn warn_snapshot() -> Vec<String> {
@@ -66,6 +95,14 @@ pub(crate) fn debug_snapshot() -> Vec<String> {
     snapshot_of(debug_messages())
 }
 
+/// A copy of everything in [`info_messages`], recovering from poisoning the
+/// same way the collector itself does. Its only readers are the unix-gated node
+/// start tests.
+#[cfg(unix)]
+pub(crate) fn info_snapshot() -> Vec<String> {
+    snapshot_of(info_messages())
+}
+
 fn snapshot_of(buffer: &Mutex<Vec<String>>) -> Vec<String> {
     buffer
         .lock()
@@ -75,7 +112,7 @@ fn snapshot_of(buffer: &Mutex<Vec<String>>) -> Vec<String> {
 
 impl Log for TestLogCollector {
     fn enabled(&self, metadata: &Metadata) -> bool {
-        captures_warn(metadata) || captures_module_debug(metadata)
+        captures_warn(metadata) || captures_module_debug(metadata) || captures_module_info(metadata)
     }
 
     // A test that panics while holding a buffer poisons its mutex; the logger
@@ -88,6 +125,11 @@ impl Log for TestLogCollector {
                 .push(record.args().to_string());
         } else if captures_module_debug(record.metadata()) {
             debug_messages()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(record.args().to_string());
+        } else if captures_module_info(record.metadata()) {
+            info_messages()
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push(record.args().to_string());

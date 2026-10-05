@@ -3189,7 +3189,7 @@ mod tests {
     use crate::mesh::rfc3339_utc;
     #[cfg(unix)]
     use crate::mesh::test_support::{
-        PeerStub, loopback_relay, started_runtime, started_runtime_on,
+        PeerStub, loopback_relay, started_runtime, started_runtime_on, started_runtime_with,
     };
     use crate::mesh::test_support::{
         TempDir, TrustList, mesh_paths, private_config, snapshot_fixture,
@@ -7535,6 +7535,135 @@ mod tests {
         assert_eq!(root, started.tmp.path);
         assert_eq!(locations, started.runtime.serving().share_locations(&root));
         assert!(slot.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    /// The info lines announcing an `inbox_dir` translation that mention `configured`.
+    #[cfg(unix)]
+    fn inbox_translation_lines(configured: &Path) -> Vec<String> {
+        let needle = format!("mesh.fetch.inbox_dir '{}' not found", configured.display());
+        crate::testing::info_snapshot()
+            .into_iter()
+            .filter(|line| line.contains(&needle))
+            .collect()
+    }
+
+    /// An `inbox_dir` that exists is the node's staging root as configured, with no
+    /// translation announced at start; the node protects exactly that directory.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_a_node_adopts_an_existing_inbox_dir_as_is_and_announces_nothing() {
+        install_log_collector();
+        let inbox_home = TempDir::new("node-inbox-exists");
+        let configured = inbox_home.path.join("inbox");
+        std::fs::create_dir_all(&configured).unwrap();
+        let configured_for_node = configured.clone();
+
+        let started = started_runtime_with("node-inbox-exists-rt", move |config| {
+            config.fetch.inbox_dir = Some(configured_for_node);
+        })
+        .await;
+
+        let instance = started.runtime.current_instance_id();
+        assert_eq!(
+            started.runtime.inbox_staging().root(),
+            configured.join(&instance)
+        );
+        assert!(
+            inbox_translation_lines(&configured).is_empty(),
+            "{:?}",
+            inbox_translation_lines(&configured)
+        );
+        let root = started.tmp.path.clone();
+        let locations = started.runtime.serving().share_locations(&root);
+        assert!(
+            locations.protected_dirs().contains(&configured),
+            "{locations:?}"
+        );
+        started.runtime.shutdown().await.unwrap();
+        started.relay_handle.abort();
+    }
+
+    /// An `inbox_dir` that does not exist but whose sandbox-home translation does is
+    /// adopted as the staging root, announced at info level exactly once by the node
+    /// start, and never again by later resolutions of the same config. The translation
+    /// lands under the literal `/home/agent`, so the test runs only where that is
+    /// writable (the sandbox) and prints `skipping:` elsewhere.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn usage_probe_a_node_announces_a_translated_inbox_dir_once_at_start() {
+        install_log_collector();
+        let unique = format!("coyote-probe-inbox-{}", uuid::Uuid::new_v4().simple());
+        let translated = PathBuf::from("/home/agent").join(&unique);
+        if std::fs::create_dir(&translated).is_err() {
+            eprintln!(
+                "skipping: /home/agent is not writable; the sandbox translation cannot be exercised here"
+            );
+            return;
+        }
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(translated.clone());
+        let _sandbox = crate::testing::EnvVarGuard::set("IS_SANDBOX", "1");
+        let configured = PathBuf::from("/home/probe-user").join(&unique);
+        assert!(!configured.exists());
+        assert_eq!(
+            crate::config::paths::translate_sandboxed_home_dir(&configured).as_deref(),
+            Some(translated.as_path())
+        );
+        let configured_for_node = configured.clone();
+
+        let started = started_runtime_with("node-inbox-translated", move |config| {
+            config.fetch.inbox_dir = Some(configured_for_node);
+        })
+        .await;
+
+        let instance = started.runtime.current_instance_id();
+        assert_eq!(
+            started.runtime.inbox_staging().root(),
+            translated.join(&instance),
+            "the node stages under the translation"
+        );
+        let lines = inbox_translation_lines(&configured);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].contains(&format!(
+                "resolved to sandboxed path '{}'",
+                translated.display()
+            )),
+            "{}",
+            lines[0]
+        );
+        let root = started.tmp.path.clone();
+        let locations = started.runtime.serving().share_locations(&root);
+        assert!(
+            locations.protected_dirs().contains(&translated),
+            "the translated inbox is protected: {locations:?}"
+        );
+
+        // Later resolutions, as the REPL's `.mesh shares` would do with no node, are quiet.
+        let fetch = crate::config::mesh_config::MeshFetch {
+            inbox_dir: Some(configured.clone()),
+            ..Default::default()
+        };
+        for _ in 0..3 {
+            assert_eq!(fetch.inbox_dir(), Some(translated.clone()));
+        }
+        assert_eq!(
+            inbox_translation_lines(&configured).len(),
+            1,
+            "the resolver announces nothing at info level"
+        );
+        assert!(
+            !configured.exists(),
+            "nothing is created at the configured path"
+        );
+        started.runtime.shutdown().await.unwrap();
         started.relay_handle.abort();
     }
 

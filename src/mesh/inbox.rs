@@ -1143,4 +1143,61 @@ mod tests {
         expected.sort();
         assert_eq!(found, expected);
     }
+
+    /// The operator's `mesh.fetch.inbox_dir` and every missing parent of it: the first
+    /// stage into `<override>/<instance_id>` where only the override's grandparent
+    /// exists creates each directory on the way down owner-only, in the mkdir itself,
+    /// under `umask 0`; the one directory that existed beforehand keeps its own mode.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(umask)]
+    fn usage_probe_a_missing_inbox_dir_and_its_missing_parents_are_created_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _umask = crate::testing::UmaskGuard::zero();
+        let tmp = TempDir::new("inbox-override-parents");
+        let existing = tmp.path.join("existing");
+        fs::create_dir_all(&existing).unwrap();
+        fs::set_permissions(&existing, fs::Permissions::from_mode(0o755)).unwrap();
+        let override_dir = existing.join("deeper").join("inbox");
+        assert!(!override_dir.parent().unwrap().exists());
+
+        let inbox = InboxStaging::for_instance_under(
+            Some(&override_dir),
+            &tmp.path.join("cache-unused"),
+            "inst-01",
+        );
+        assert_eq!(inbox.root(), override_dir.join("inst-01"));
+
+        let staged = inbox
+            .stage(
+                PEER,
+                &WirePath::parse("docs/sub/a.md").unwrap(),
+                &digest(b"x"),
+                b"x",
+            )
+            .unwrap();
+
+        assert_eq!(mode_of(&staged), 0o600);
+        let peer_dir = inbox.root().join(DEST32);
+        for dir in [
+            override_dir.parent().unwrap().to_path_buf(),
+            override_dir.clone(),
+            inbox.root().to_path_buf(),
+            peer_dir.clone(),
+            peer_dir.join("docs"),
+            peer_dir.join("docs").join("sub"),
+        ] {
+            assert_eq!(mode_of(&dir), 0o700, "{}", dir.display());
+        }
+        assert_eq!(
+            mode_of(&existing),
+            0o755,
+            "a pre-existing parent is not touched"
+        );
+        assert!(
+            !tmp.path.join("cache-unused").exists(),
+            "the cache dir is not consulted when an override is set"
+        );
+    }
 }
