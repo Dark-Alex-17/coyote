@@ -1102,10 +1102,20 @@ pub(crate) mod test_support {
         tag: &str,
         adjust: impl FnOnce(&mut MeshConfig),
     ) -> StartedRuntime {
+        started_runtime_with_options(tag, NodeOptions::default(), adjust).await
+    }
+
+    /// `started_runtime_with` starting the node with `options` instead of the defaults.
+    #[cfg(unix)]
+    pub(crate) async fn started_runtime_with_options(
+        tag: &str,
+        options: NodeOptions,
+        adjust: impl FnOnce(&mut MeshConfig),
+    ) -> StartedRuntime {
         let (addr, relay_handle, _) = loopback_relay().await;
         let mut config = private_config(addr.port());
         adjust(&mut config);
-        started_runtime_at(tag, config, relay_handle).await
+        started_runtime_at(tag, config, options, relay_handle).await
     }
 
     /// A runtime joined to whatever listens on `port`, such as a `PeerStub`. There is no
@@ -1125,26 +1135,27 @@ pub(crate) mod test_support {
     ) -> StartedRuntime {
         let mut config = private_config(port);
         adjust(&mut config);
-        started_runtime_at(tag, config, tokio::spawn(std::future::ready(()))).await
+        started_runtime_at(
+            tag,
+            config,
+            NodeOptions::default(),
+            tokio::spawn(std::future::ready(())),
+        )
+        .await
     }
 
     #[cfg(unix)]
     async fn started_runtime_at(
         tag: &str,
         config: MeshConfig,
+        options: NodeOptions,
         relay_handle: JoinHandle<()>,
     ) -> StartedRuntime {
         let tmp = TempDir::new(tag);
         let mut session = Session::default();
-        let runtime = MeshRuntime::start(
-            &config,
-            true,
-            &mut session,
-            mesh_paths(&tmp),
-            NodeOptions::default(),
-        )
-        .await
-        .unwrap();
+        let runtime = MeshRuntime::start(&config, true, &mut session, mesh_paths(&tmp), options)
+            .await
+            .unwrap();
         StartedRuntime {
             runtime,
             session,

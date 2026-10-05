@@ -116,9 +116,18 @@ impl MeshFetch {
     /// emits no info-level line and is repeatable, so callers may resolve as often as
     /// they like; the node announces the translation once, when it starts.
     pub fn inbox_dir(&self) -> Option<PathBuf> {
+        self.inbox_dir_with(paths::translate_sandboxed_home_dir)
+    }
+
+    /// `inbox_dir` with `translate` standing in for the sandboxed-home translation, so a
+    /// node start can be exercised against a translation of the caller's choosing.
+    pub(crate) fn inbox_dir_with(
+        &self,
+        translate: impl Fn(&Path) -> Option<PathBuf>,
+    ) -> Option<PathBuf> {
         self.inbox_dir
             .as_deref()
-            .map(|configured| resolve_inbox_dir(configured, paths::translate_sandboxed_home_dir))
+            .map(|configured| resolve_inbox_dir(configured, translate))
     }
 }
 

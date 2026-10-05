@@ -117,11 +117,16 @@ impl MeshPaths {
     }
 }
 
+/// The translation `MeshRuntime::start` applies to a `mesh.fetch.inbox_dir` that does
+/// not exist; `paths::translate_sandboxed_home_dir` by default, a stand-in in tests.
+pub(crate) type InboxDirTranslation = Arc<dyn Fn(&Path) -> Option<PathBuf> + Send + Sync>;
+
 pub(crate) struct NodeOptions {
     pub connect_timeout: Duration,
     /// The handle the node fires its `mesh.*` events through; the slot that installs
     /// the node shares it, so pass `MeshSlot::hooks`.
     pub hooks: MeshHooks,
+    pub translate_inbox_dir: InboxDirTranslation,
 }
 
 impl Default for NodeOptions {
@@ -129,6 +134,7 @@ impl Default for NodeOptions {
         Self {
             connect_timeout: TcpClient::DEFAULT_CONNECT_TIMEOUT,
             hooks: MeshHooks::default(),
+            translate_inbox_dir: Arc::new(paths::translate_sandboxed_home_dir),
         }
     }
 }
@@ -313,7 +319,9 @@ impl MeshRuntime {
             SystemTime::now(),
         )?);
         let grants = GrantStore::open(&paths.cache_dir, &instance_id, SystemTime::now())?;
-        let inbox_dir = config.fetch.inbox_dir();
+        let inbox_dir = config
+            .fetch
+            .inbox_dir_with(|configured| (options.translate_inbox_dir)(configured));
         if let (Some(configured), Some(resolved)) =
             (config.fetch.inbox_dir.as_deref(), inbox_dir.as_deref())
             && resolved != configured
@@ -3192,6 +3200,7 @@ mod tests {
     #[cfg(unix)]
     use crate::mesh::test_support::{
         PeerStub, loopback_relay, started_runtime, started_runtime_on, started_runtime_with,
+        started_runtime_with_options,
     };
     use crate::mesh::test_support::{
         TempDir, TrustList, mesh_paths, private_config, snapshot_fixture,
@@ -7588,41 +7597,34 @@ mod tests {
 
     /// An `inbox_dir` that does not exist but whose sandbox-home translation does is
     /// adopted as the staging root, announced at info level exactly once by the node
-    /// start, and never again by later resolutions of the same config. The translation
-    /// lands under the literal `/home/agent`, so the test runs only where that is
-    /// writable (the sandbox) and prints `skipping:` elsewhere.
+    /// start, and never again by later resolutions of the same config. A temp dir stands
+    /// in for the sandbox home through `NodeOptions::translate_inbox_dir`, so the test
+    /// needs no writable `/home/agent`.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[serial_test::serial]
     async fn usage_probe_a_node_announces_a_translated_inbox_dir_once_at_start() {
         install_log_collector();
-        let unique = format!("coyote-probe-inbox-{}", uuid::Uuid::new_v4().simple());
-        let translated = PathBuf::from("/home/agent").join(&unique);
-        if std::fs::create_dir(&translated).is_err() {
-            eprintln!(
-                "skipping: /home/agent is not writable; the sandbox translation cannot be exercised here"
-            );
-            return;
-        }
-        struct Cleanup(PathBuf);
-        impl Drop for Cleanup {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
-        let _cleanup = Cleanup(translated.clone());
-        let _sandbox = crate::testing::EnvVarGuard::set("IS_SANDBOX", "1");
-        let configured = PathBuf::from("/home/probe-user").join(&unique);
+        let home = TempDir::new("node-inbox-translated-home");
+        let configured = home.path.join("probe-user").join("inbox");
+        let translated = home.path.join("agent").join("inbox");
+        std::fs::create_dir_all(&translated).unwrap();
         assert!(!configured.exists());
-        assert_eq!(
-            crate::config::paths::translate_sandboxed_home_dir(&configured).as_deref(),
-            Some(translated.as_path())
-        );
+        let translate: InboxDirTranslation = {
+            let (configured, translated) = (configured.clone(), translated.clone());
+            Arc::new(move |path: &Path| (path == configured).then(|| translated.clone()))
+        };
         let configured_for_node = configured.clone();
 
-        let started = started_runtime_with("node-inbox-translated", move |config| {
-            config.fetch.inbox_dir = Some(configured_for_node);
-        })
+        let started = started_runtime_with_options(
+            "node-inbox-translated",
+            NodeOptions {
+                translate_inbox_dir: Arc::clone(&translate),
+                ..NodeOptions::default()
+            },
+            move |config| {
+                config.fetch.inbox_dir = Some(configured_for_node);
+            },
+        )
         .await;
 
         let instance = started.runtime.current_instance_id();
@@ -7654,7 +7656,10 @@ mod tests {
             ..Default::default()
         };
         for _ in 0..3 {
-            assert_eq!(fetch.inbox_dir(), Some(translated.clone()));
+            assert_eq!(
+                fetch.inbox_dir_with(|path| translate(path)),
+                Some(translated.clone())
+            );
         }
         assert_eq!(
             inbox_translation_lines(&configured).len(),
@@ -7667,6 +7672,24 @@ mod tests {
         );
         started.runtime.shutdown().await.unwrap();
         started.relay_handle.abort();
+    }
+
+    /// The node's default translation is the sandboxed-home one, so a configured
+    /// `/home/<user>/…` inbox resolves under `/home/agent` only inside a sandbox.
+    #[test]
+    #[serial_test::serial]
+    fn the_default_inbox_dir_translation_is_the_sandboxed_home_one() {
+        let configured = Path::new("/home/probe-user/inbox");
+        let translate = NodeOptions::default().translate_inbox_dir;
+        {
+            let _outside = crate::testing::EnvVarGuard::unset("IS_SANDBOX");
+            assert_eq!(translate(configured), None);
+        }
+        let _sandbox = crate::testing::EnvVarGuard::set("IS_SANDBOX", "1");
+        assert_eq!(
+            translate(configured).as_deref(),
+            Some(Path::new("/home/agent/inbox"))
+        );
     }
 
     /// A fork serves from its own grants file: a path granted to the fork's instance is
