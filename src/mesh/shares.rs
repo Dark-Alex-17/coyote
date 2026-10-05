@@ -3640,7 +3640,14 @@ mod tests {
         #[cfg(unix)]
         fx.link(&escape, &format!("../../../../{escape}"));
         #[cfg(windows)]
-        let _ = std::os::windows::fs::symlink_file(&outside, fx.root.join(&escape));
+        std::os::windows::fs::symlink_file(&outside, fx.root.join(&escape))
+            .expect("symlink privilege");
+        assert!(
+            fs::symlink_metadata(fx.root.join(&escape))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         let mut set = fx.load();
         set.apply(allow("**"), WriteScope::Global).unwrap();
 
