@@ -312,10 +312,11 @@ impl MeshRuntime {
             SystemTime::now(),
         )?);
         let grants = GrantStore::open(&paths.cache_dir, &instance_id, SystemTime::now())?;
+        let inbox_dir = config.fetch.inbox_dir();
         let serving = Arc::new(FetchServing::new(
             paths.config_dir,
             paths.cache_dir.clone(),
-            config.fetch.inbox_dir.clone(),
+            inbox_dir.clone(),
             config.fetch.max_bytes,
             grants,
             options.hooks.clone(),
@@ -411,7 +412,7 @@ impl MeshRuntime {
             about: config.about.clone(),
             peer_limits: PeerLimitConfig::from(config),
             inline_max_bytes: config.fetch.inline_max_bytes,
-            inbox_dir: config.fetch.inbox_dir.clone(),
+            inbox_dir,
             cache_dir: paths.cache_dir,
             serving,
             memory: PeerMemory::default(),

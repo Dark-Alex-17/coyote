@@ -5532,7 +5532,7 @@ impl RequestContext {
     pub(crate) fn share_locations(&self) -> Option<(PathBuf, crate::mesh::shares::ShareLocations)> {
         self.app
             .mesh
-            .share_locations(self.app.config.mesh.fetch.inbox_dir.as_deref())
+            .share_locations(self.app.config.mesh.fetch.inbox_dir().as_deref())
     }
 
     /// Root-relative paths for `.mesh allow <TAB>` and `.mesh deny <TAB>`: the entries of

@@ -6,13 +6,14 @@
 //! inbox cannot lead a write outside it. Nothing here logs: the path and the bytes are the
 //! peer's. A file is written through a randomly named `.tmp-<uuid>` sibling and
 //! hard-linked into place, so no name a peer chooses can alias the temp file and nothing
-//! already at the target is ever overwritten.
+//! already at the target is ever overwritten. On Unix every directory the inbox creates
+//! is `0o700` and every file it writes is `0o600`; a directory that already existed, an
+//! operator's `mesh.fetch.inbox_dir` or the cache dir, keeps the mode it had.
 
 use crate::mesh::wire_path::WirePath;
 use crate::mesh::{canonicalize, hex_lower, mesh_cache_dir};
 
 use sha2::{Digest, Sha256};
-use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::{fmt, fs, io};
@@ -105,7 +106,7 @@ impl InboxStaging {
         bytes: &[u8],
     ) -> Result<PathBuf, StageError> {
         let dest8 = peer_dest8(peer_destination);
-        fs::create_dir_all(self.root.join(&dest8))?;
+        create_dirs_owner_only(&self.root.join(&dest8))?;
         let canonical_root = canonicalize(&self.root)?;
         Self::stage_under(&canonical_root, &dest8, rel, sha256, bytes)
     }
@@ -131,7 +132,7 @@ impl InboxStaging {
             return Err(StageError::Io(io::Error::from(io::ErrorKind::NotFound)));
         };
         ensure_inside(canonical_root, existing)?;
-        fs::create_dir_all(&parent)?;
+        create_dirs_owner_only(&parent)?;
         ensure_inside(canonical_root, &parent)?;
 
         let target = match existing_matches(&target, sha256)? {
@@ -167,6 +168,32 @@ fn peer_dest8(peer_destination: &str) -> String {
         .to_lowercase()
 }
 
+/// `create_dir_all` that leaves every directory it creates owner-only. A `DirBuilder`
+/// mode applies to the leaf alone and the parents get the umask's default, so the
+/// ancestors that do not exist yet are recorded first and set to `0o700` afterwards,
+/// parents first; a directory that already existed is not touched.
+fn create_dirs_owner_only(path: &Path) -> io::Result<()> {
+    let missing: Vec<&Path> = path
+        .ancestors()
+        .take_while(|dir| !dir.exists())
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .collect();
+    fs::create_dir_all(path)?;
+    missing.into_iter().rev().try_for_each(make_owner_only)
+}
+
+#[cfg(unix)]
+fn make_owner_only(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(not(unix))]
+fn make_owner_only(_dir: &Path) -> io::Result<()> {
+    Ok(())
+}
+
 fn ensure_inside(canonical_root: &Path, path: &Path) -> Result<(), StageError> {
     if canonicalize(path)?.starts_with(canonical_root) {
         Ok(())
@@ -194,15 +221,23 @@ fn with_hash_suffix(target: &Path, sha256: &[u8; 32]) -> PathBuf {
     target.with_file_name(name)
 }
 
-/// Writes `bytes` to `.tmp-<uuid>` beside `target`, syncs and hard-links it into place,
-/// which fails with `AlreadyExists` rather than replacing a file already at `target`. The
-/// temp name is removed either way, best-effort.
+/// Writes `bytes` to `.tmp-<uuid>` beside `target`, owner-only on Unix, syncs and
+/// hard-links it into place, which fails with `AlreadyExists` rather than replacing a
+/// file already at `target`. The temp name is removed either way, best-effort.
 fn write_staged(target: &Path, bytes: &[u8]) -> io::Result<()> {
     let Some(parent) = target.parent() else {
         return Err(io::Error::other("the staging target has no parent"));
     };
     let tmp = parent.join(format!(".tmp-{}", uuid::Uuid::new_v4().simple()));
-    let written = File::create(&tmp)
+    let mut open = fs::OpenOptions::new();
+    open.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        open.mode(0o600);
+    }
+    let written = open
+        .open(&tmp)
         .and_then(|mut file| {
             file.write_all(bytes)?;
             file.sync_all()
@@ -558,6 +593,63 @@ mod tests {
                 .is_some_and(|name| name.to_string_lossy().starts_with(".tmp-"))),
             "{found:?}"
         );
+    }
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(umask)]
+    fn a_staged_file_and_every_directory_the_stage_created_are_owner_only() {
+        let _umask = crate::testing::UmaskGuard::zero();
+        let tmp = TempDir::new("inbox-owner-only");
+        let inbox = staging(&tmp);
+
+        let staged = inbox
+            .stage(
+                PEER,
+                &WirePath::parse("docs/a.md").unwrap(),
+                &digest(b"x"),
+                b"x",
+            )
+            .unwrap();
+
+        assert_eq!(mode_of(&staged), 0o600);
+        let peer_dir = inbox.root.join(DEST8);
+        for dir in [&inbox.root, &peer_dir, &peer_dir.join("docs")] {
+            assert_eq!(mode_of(dir), 0o700, "{}", dir.display());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(umask)]
+    fn a_directory_that_existed_before_the_stage_keeps_its_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _umask = crate::testing::UmaskGuard::zero();
+        let tmp = TempDir::new("inbox-existing-mode");
+        let inbox = staging(&tmp);
+        fs::create_dir_all(&inbox.root).unwrap();
+        fs::set_permissions(&inbox.root, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let staged = inbox
+            .stage(
+                PEER,
+                &WirePath::parse("docs/a.md").unwrap(),
+                &digest(b"x"),
+                b"x",
+            )
+            .unwrap();
+
+        assert_eq!(mode_of(&inbox.root), 0o755);
+        assert_eq!(mode_of(&inbox.root.join(DEST8)), 0o700);
+        assert_eq!(mode_of(&inbox.root.join(DEST8).join("docs")), 0o700);
+        assert_eq!(mode_of(&staged), 0o600);
     }
 
     #[cfg(unix)]

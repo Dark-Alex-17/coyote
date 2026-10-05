@@ -151,6 +151,28 @@ impl Drop for EnvVarGuard {
     }
 }
 
+/// Clears the process umask so the modes a test reads back are the ones the code
+/// asked for, and restores the previous umask on drop, including on panic. The umask
+/// is process-global, so tests using it must serialize (`#[serial]`).
+#[cfg(unix)]
+pub(crate) struct UmaskGuard(libc::mode_t);
+
+#[cfg(unix)]
+impl UmaskGuard {
+    pub(crate) fn zero() -> Self {
+        Self(unsafe { libc::umask(0) })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for UmaskGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::umask(self.0);
+        }
+    }
+}
+
 /// Points the config dir and the workspace config dir at fresh temp
 /// directories for the guard's lifetime and removes them on drop, including
 /// on panic, so the developer's real `./.coyote/` never leaks into a test.

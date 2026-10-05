@@ -1,8 +1,9 @@
+use super::paths;
 use crate::mesh::card::ABOUT_MAX_CHARS;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub const DEFAULT_KNOCK_RETENTION_HOURS: u64 = 24;
 pub const DEFAULT_PEER_MAX_CONCURRENT: u32 = 1;
@@ -107,6 +108,33 @@ impl Default for MeshFetch {
             inbox_dir: None,
         }
     }
+}
+
+impl MeshFetch {
+    /// `inbox_dir` as configured, or its sandboxed-home translation when the configured
+    /// directory does not exist and the translation does; `None` when unset.
+    pub fn inbox_dir(&self) -> Option<PathBuf> {
+        self.inbox_dir
+            .as_deref()
+            .map(|configured| resolve_inbox_dir(configured, paths::translate_sandboxed_home_dir))
+    }
+}
+
+fn resolve_inbox_dir(configured: &Path, translate: impl Fn(&Path) -> Option<PathBuf>) -> PathBuf {
+    if configured.exists() {
+        return configured.to_path_buf();
+    }
+    if let Some(translated) = translate(configured)
+        && translated.exists()
+    {
+        info!(
+            "mesh.fetch.inbox_dir '{}' not found; resolved to sandboxed path '{}'",
+            configured.display(),
+            translated.display()
+        );
+        return translated;
+    }
+    configured.to_path_buf()
 }
 
 impl Default for MeshConfig {
@@ -425,6 +453,9 @@ pub fn render_mesh_info(mesh: &MeshConfig) -> String {
 mod tests {
     use super::*;
     use crate::config::Config;
+    use crate::mesh::test_support::TempDir;
+    use crate::testing::EnvVarGuard;
+    use serial_test::serial;
 
     fn interface_error(yaml: &str) -> String {
         serde_yaml::from_str::<Config>(yaml)
@@ -1014,6 +1045,69 @@ mod tests {
             err,
             "mesh.fetch.inbox_dir is 'relative/inbox', which is not absolute; use an absolute path"
         );
+    }
+
+    #[test]
+    fn an_existing_inbox_dir_is_used_as_configured_without_translating() {
+        let tmp = TempDir::new("mesh-config-inbox-exists");
+
+        let resolved = resolve_inbox_dir(&tmp.path, |_| {
+            panic!("an inbox_dir that exists is not translated")
+        });
+
+        assert_eq!(resolved, tmp.path);
+    }
+
+    #[test]
+    fn a_missing_inbox_dir_whose_translation_exists_resolves_to_the_translation() {
+        let tmp = TempDir::new("mesh-config-inbox-translated");
+        let configured = Path::new("/home/someone/inbox");
+        let translated = tmp.path.join("inbox");
+        std::fs::create_dir_all(&translated).unwrap();
+
+        let resolved = resolve_inbox_dir(configured, |path| {
+            assert_eq!(path, configured);
+            Some(translated.clone())
+        });
+
+        assert_eq!(resolved, translated);
+    }
+
+    #[test]
+    fn a_missing_inbox_dir_with_no_usable_translation_is_returned_as_configured() {
+        let tmp = TempDir::new("mesh-config-inbox-untranslated");
+        let configured = tmp.path.join("missing");
+        let also_missing = tmp.path.join("also-missing");
+
+        assert_eq!(resolve_inbox_dir(&configured, |_| None), configured);
+        assert_eq!(
+            resolve_inbox_dir(&configured, |_| Some(also_missing.clone())),
+            configured
+        );
+        assert!(!configured.exists(), "resolving creates nothing");
+        assert!(!also_missing.exists());
+    }
+
+    /// The real translator is wired in: under `IS_SANDBOX` a `/home/<user>` path maps to
+    /// `/home/agent`, and when nothing is there either the configured path comes back.
+    #[test]
+    #[serial]
+    fn inbox_dir_falls_through_to_the_configured_path_when_the_sandbox_translation_is_missing() {
+        let _sandbox = EnvVarGuard::set("IS_SANDBOX", "1");
+        let unique = format!("coyote-inbox-{}", uuid::Uuid::new_v4().simple());
+        let configured = PathBuf::from(format!("/home/someone/{unique}"));
+        assert_eq!(
+            paths::translate_sandboxed_home_dir(&configured),
+            Some(PathBuf::from(format!("/home/agent/{unique}")))
+        );
+        assert!(!Path::new(&format!("/home/agent/{unique}")).exists());
+        let fetch = MeshFetch {
+            inbox_dir: Some(configured.clone()),
+            ..Default::default()
+        };
+
+        assert_eq!(fetch.inbox_dir(), Some(configured));
+        assert_eq!(MeshFetch::default().inbox_dir(), None);
     }
 
     #[test]
