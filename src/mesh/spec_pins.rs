@@ -3422,8 +3422,9 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
     }
 
     /// `source` line for line, so line numbers hold, with every `#[cfg(test)]`-attributed
-    /// inline module and every comment-only line blanked. A top-level module closes at
-    /// the first `}` on a line of its own, as rustfmt lays it out.
+    /// inline module and every plain `//` comment line blanked. Doc comments (`///`,
+    /// `//!`) stay: they render as rustdoc and as `clap` help. A top-level module closes
+    /// at the first `}` on a line of its own, as rustfmt lays it out.
     fn lines_outside_test_modules(source: &str) -> Vec<&str> {
         let mut lines: Vec<&str> = source.lines().collect();
         let mut at = 0;
@@ -3438,7 +3439,7 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
                     lines[at] = "";
                     at += 1;
                 }
-            } else if lines[at].trim_start().starts_with("//") {
+            } else if is_a_plain_comment(lines[at]) {
                 lines[at] = "";
             }
             at += 1;
@@ -3446,19 +3447,34 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
         lines
     }
 
+    fn is_a_plain_comment(line: &str) -> bool {
+        let rest = line.trim_start().strip_prefix("//");
+        rest.is_some_and(|rest| !rest.starts_with('/') && !rest.starts_with('!'))
+    }
+
     /// The workspace config directory's name reaches the code through
     /// `paths::workspace_config_dir_name` and `paths::workspace_config_dirs`, so an
     /// override renames it everywhere at once, help and display strings included. Only
     /// `paths.rs` and the constant's own definition may spell it; test code may, since a
     /// fixture lays out a directory by its default name. A file whose module is declared
-    /// under `#[cfg(test)]` is test code wholesale; a comment may say what it likes, so
-    /// the `clap` doc comments that double as CLI help are not held to the helper.
+    /// under `#[cfg(test)]` is test code wholesale. A plain `//` comment may say what it
+    /// likes; a doc comment is held to the helper because it renders, as rustdoc or as
+    /// `clap` help. The name counts when it stands as a word: opened by a quote, a
+    /// backtick, a space, a slash, a brace or a parenthesis and not run on into a longer
+    /// identifier, so `.coyote_password` and `.coyote-case-probe` are other names.
     #[test]
     fn only_the_paths_helper_spells_the_workspace_config_dir_name() {
         // Assembled at runtime so the scan does not match this test's own text.
         let constant = ["WORKSPACE_", "COYOTE_DIR_NAME"].concat();
-        let quoted = ["\".coy", "ote\""].concat();
-        let in_a_path = [["\".coy", "ote/"].concat(), [" .coy", "ote/"].concat()];
+        let name = [".coy", "ote"].concat();
+        let spells_the_name = |line: &str| {
+            line.match_indices(&name).any(|(at, _)| {
+                let opener = line[..at].chars().next_back();
+                let next = line[at + name.len()..].chars().next();
+                opener.is_some_and(|c| "\"` /{(".contains(c))
+                    && !next.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            })
+        };
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let files = rust_source_files(root).unwrap();
         let test_modules: HashSet<String> = files
@@ -3492,24 +3508,40 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
                         && line
                             .trim_start()
                             .starts_with(&format!("pub(crate) const {constant}"));
-                    !defines_the_constant
-                        && (line.contains(&constant)
-                            || line.contains(&quoted)
-                            || in_a_path.iter().any(|needle| line.contains(needle)))
+                    !defines_the_constant && (line.contains(&constant) || spells_the_name(line))
                 })
                 .map(|(index, line)| format!("{path}:{}: {}", index + 1, line.trim()))
                 .collect()
         };
-        let fixture = format!(
-            "fn help() -> &'static str {{\n    \"Save under{} in the workspace\"\n}}\n",
-            in_a_path[1]
-        );
-        let control = scan("src/fixture.rs", &fixture);
-        assert_eq!(
-            control.len(),
-            1,
-            "the scan does not go red on a fixture: {control:?}"
-        );
+        for red in [
+            format!(
+                "fn help() -> &'static str {{\n    \"Save under {name}/ in the workspace\"\n}}\n"
+            ),
+            format!("/// Disable loading workspace macros from {name}/macros\n"),
+            format!("let dir = \"{name}\";\n"),
+            format!("let file = root.join(\"/{name}/mcp.json\");\n"),
+            format!("/// The `{name}` directory holds it.\n"),
+            format!("/// Saved under {name}, beside the sources.\n"),
+            format!("let name = {constant};\n"),
+        ] {
+            let control = scan("src/fixture.rs", &red);
+            assert_eq!(
+                control.len(),
+                1,
+                "the scan does not go red on {red:?}: {control:?}"
+            );
+        }
+        for green in [
+            format!("let probe = \"{name}-case-probe\";\n"),
+            format!("let file = home.join(\"{name}_password\");\n"),
+            format!("// a {name} comment is not help\n"),
+        ] {
+            let control = scan("src/fixture.rs", &green);
+            assert!(
+                control.is_empty(),
+                "the scan goes red on {green:?}: {control:?}"
+            );
+        }
         let hits: Vec<String> = files
             .iter()
             .flat_map(|(path, source)| scan(path, source))

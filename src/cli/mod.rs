@@ -4,6 +4,7 @@ use crate::cli::completer::{
     ShellCompletion, agent_completer, bundle_completer, macro_completer, mcp_server_completer,
     model_completer, rag_completer, role_completer, secrets_completer, session_completer,
 };
+use crate::config::paths;
 use crate::config::{AssetCategory, InstallFilter, MemoryScope};
 use anyhow::{Context, Result};
 use clap::{ArgGroup, ValueHint};
@@ -95,11 +96,9 @@ pub struct Cli {
     /// Display the message without sending it
     #[arg(long)]
     pub dry_run: bool,
-    /// Disable loading workspace MCP servers from .coyote/mcp.json, .coyote/.mcp.json, or .mcp.json
-    #[arg(long)]
+    #[arg(long, help = no_workspace_mcp_help())]
     pub no_workspace_mcp: bool,
-    /// Disable loading workspace macros from .coyote/macros
-    #[arg(long)]
+    #[arg(long, help = no_workspace_macros_help())]
     pub no_workspace_macros: bool,
     /// Disable memory for this invocation
     #[arg(long)]
@@ -326,8 +325,13 @@ pub struct Cli {
     /// URL for http/sse MCP server (used with --mcp-add)
     #[arg(long, value_name = "URL", help_heading = "MCP Servers")]
     pub url: Option<String>,
-    /// Scope for MCP config: user (~/.config/coyote/mcp.json) or workspace (./.coyote/mcp.json). Default: user
-    #[arg(long, value_enum, value_name = "SCOPE", help_heading = "MCP Servers")]
+    #[arg(
+        long,
+        value_enum,
+        value_name = "SCOPE",
+        help_heading = "MCP Servers",
+        help = mcp_scope_help()
+    )]
     pub scope: Option<McpScopeArg>,
     /// Environment variable for stdio MCP server (repeatable): --env KEY=VALUE
     #[arg(long, value_name = "KEY=VALUE", help_heading = "MCP Servers")]
@@ -393,6 +397,27 @@ pub struct Cli {
         help_heading = "MCP Servers"
     )]
     pub mcp_command: Vec<String>,
+}
+
+fn no_workspace_mcp_help() -> String {
+    let dir = paths::workspace_config_dir_name();
+    format!(
+        "Disable loading workspace MCP servers from {dir}/mcp.json, {dir}/.mcp.json, or .mcp.json"
+    )
+}
+
+fn no_workspace_macros_help() -> String {
+    format!(
+        "Disable loading workspace macros from {}/macros",
+        paths::workspace_config_dir_name()
+    )
+}
+
+fn mcp_scope_help() -> String {
+    format!(
+        "Scope for MCP config: user (~/.config/coyote/mcp.json) or workspace (./{}/mcp.json). Default: user",
+        paths::workspace_config_dir_name()
+    )
 }
 
 impl Cli {
