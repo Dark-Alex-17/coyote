@@ -4918,6 +4918,133 @@ mod tests {
         );
     }
 
+    /// The early return for a reply to our own open question stays first, ahead of every
+    /// link gate (MESH-MSG-031 before MESH-MSG-041). With an envoy attached, the
+    /// identity's hourly count spent and one of its runs in flight, its correlated reply
+    /// is still admitted and not counted; its question is refused for the run in flight
+    /// (the pre-ack gate runs before the hourly count) and its bulletin for the hourly
+    /// count alone. Nothing is counted by any refusal.
+    #[test]
+    fn usage_probe_a_reply_to_our_open_question_passes_every_link_gate_uncounted() {
+        let slot = MeshSlot::default();
+        slot.limits().configure(PeerLimitConfig {
+            messages_per_hour: 1,
+            ..PeerLimitConfig::default()
+        });
+        let envoy = RecordingEnvoy::new(true, false);
+        slot.set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
+        slot.correlations().open(pending("q-ours")).unwrap();
+        let identity = hex_lower(&PEER_IDENTITY);
+        let instance = hex_lower(&PEER_INSTANCE);
+        let admit = |kind: PeerKind, id: &str, in_reply_to: Option<&str>| {
+            PeerSurface::admit_peer_message(
+                &slot,
+                &PeerAdmission {
+                    source_identity: &identity,
+                    source_destination: &instance,
+                    message_id: id,
+                    kind,
+                    in_reply_to,
+                    thread: None,
+                    disposition: None,
+                    via: PeerVia::Direct,
+                },
+            )
+        };
+        let messages = || {
+            slot.limits()
+                .window_of(&identity, Instant::now())
+                .unwrap()
+                .messages
+        };
+
+        assert!(admit(PeerKind::Ask, "ask-0", None).is_ok());
+        assert_eq!(messages(), 1, "the hour is spent");
+        let _held = slot
+            .limits()
+            .try_reserve(&identity, Instant::now())
+            .unwrap();
+
+        assert!(
+            admit(PeerKind::Reply, "reply-1", Some("q-ours")).is_ok(),
+            "a reply to our open question passes before any gate"
+        );
+        assert_eq!(messages(), 1, "and is not counted");
+        assert_eq!(
+            admit(PeerKind::Ask, "ask-1", None).unwrap_err().reason,
+            RefusalReason::PeerConcurrency,
+            "an envoy-bound question meets the run in flight before the hourly count"
+        );
+        assert_eq!(
+            admit(PeerKind::Message, "msg-1", None).unwrap_err().reason,
+            RefusalReason::PeerConcurrency
+        );
+        assert_eq!(
+            admit(PeerKind::Bulletin, "bulletin-1", None)
+                .unwrap_err()
+                .reason,
+            RefusalReason::RateLimited,
+            "a bulletin sees the hourly count alone"
+        );
+        assert_eq!(
+            admit(
+                PeerKind::Message,
+                "notice-1",
+                Some("a-question-of-ours-to-them")
+            )
+            .unwrap_err()
+            .reason,
+            RefusalReason::RateLimited,
+            "an interim notice sees the hourly count alone"
+        );
+        assert_eq!(messages(), 1, "no refusal counts");
+        assert!(
+            envoy.job_ids().is_empty(),
+            "admission offers nothing to the envoy"
+        );
+    }
+
+    /// `retry_after` is whole seconds, at least 1 (MESH-MSG-038). A window ceiling whose
+    /// remainder is under a second still says 1; a whole-second remainder is reported as
+    /// it is, never rounded past itself.
+    #[test]
+    fn usage_probe_a_sub_second_window_remainder_is_told_as_one_second() {
+        for reason in [
+            RefusalReason::RateLimited,
+            RefusalReason::TokenCeiling,
+            RefusalReason::CostCeiling,
+        ] {
+            let name = reason.as_str();
+            for (left, expected) in [
+                (Duration::from_millis(1), 1),
+                (Duration::from_millis(300), 1),
+                (Duration::from_millis(999), 1),
+                (Duration::from_secs(1), 1),
+                (Duration::from_millis(1_001), 2),
+                (Duration::from_secs(3_600), 3_600),
+            ] {
+                let refusal = PeerRefusal {
+                    reason,
+                    retry_after: left,
+                };
+                let reply = refusal_reply("m-1", None, &refusal).unwrap();
+                assert_eq!(
+                    reply.disposition,
+                    Some(Disposition::BudgetExhausted),
+                    "{name}"
+                );
+                assert_eq!(reply.retry_after, Some(expected), "{name} {left:?}");
+                let fields = reply.fields.as_ref().unwrap();
+                assert_eq!(fields["refusal"], name);
+                assert_eq!(
+                    fields["retry_after_secs"].as_u64(),
+                    Some(u64::from(expected)),
+                    "{name} {left:?}: the advisory key agrees with the top-level hint"
+                );
+            }
+        }
+    }
+
     #[test]
     fn record_envoy_exchange_files_both_sides_with_one_note_and_one_line() {
         let slot = MeshSlot::default();

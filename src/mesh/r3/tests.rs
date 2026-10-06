@@ -6477,6 +6477,175 @@ pub(crate) mod network {
         pair.stop_node_a().await;
     }
 
+    /// The cost window gates a link message before the acknowledgement like the token
+    /// window does (MESH-MSG-041). Node B has spent its hour's cost ceiling at node A, so
+    /// B's next question is refused on its link with the bare `Throttled` code before any
+    /// acknowledgement and nothing is filed or counted; a bulletin from the same identity,
+    /// which no envoy would run, is still acknowledged and filed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_a_link_message_from_an_identity_whose_cost_window_is_spent_is_refused_before_the_ack()
+     {
+        let pair = NodePair::start_with(
+            "r3-peer-link-cost-spent",
+            |config| config.peer_max_cost_usd_per_hour = 0.5,
+            trusting_b,
+        )
+        .await;
+        pair.introduce_b_to_a().await;
+        let (slot, idle) = installed_slot(&pair);
+        let envoy = RecordingEnvoy::new(true, false);
+        slot.set_envoy(envoy.clone() as Arc<dyn EnvoySink>);
+        assert_eq!(slot.limits().config().cost_usd_per_hour, 0.5);
+        slot.limits()
+            .debit(&b_identity(&pair), 1, Some(0.5), Instant::now());
+        let ask = OutboundPeer::new(PeerKind::Ask, "how much?", None, None, None).unwrap();
+
+        let refused = b_sends_to_a(&pair, &ask).await.unwrap_err();
+
+        assert_eq!(refused, R3Error::Refused(RefusalCode::Throttled));
+        assert!(envoy.job_ids().is_empty());
+        nothing_filed(&pair, &slot);
+        let lines: Vec<String> = idle.0.lock().iter().map(|note| note.text.clone()).collect();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("cost_ceiling"), "{lines:?}");
+        assert!(lines[0].contains("refused on its link"), "{lines:?}");
+
+        let bulletin = OutboundPeer::new(PeerKind::Bulletin, "fyi", None, None, None).unwrap();
+        let outcome = b_sends_to_a(&pair, &bulletin).await.unwrap();
+        assert!(is_received_reply(&outcome.value, &bulletin.id));
+        let (envelopes, _) = slot.peer_inbox().drain();
+        assert_eq!(only_peer(&envelopes).message_id, bulletin.id);
+        assert_eq!(
+            slot.limits()
+                .window_of(&b_identity(&pair), Instant::now())
+                .unwrap()
+                .messages,
+            1,
+            "the bulletin is counted, the refused question never was"
+        );
+        assert!(envoy.job_ids().is_empty());
+        pair.stop_node_a().await;
+    }
+
+    /// The gates before the acknowledgement exist for what the envoy would run
+    /// (MESH-MSG-041), so with no envoy attached a spent token window refuses nothing.
+    /// Node B's question is acknowledged, filed for the human and counted against the
+    /// hour like any message, and no refusal line is shown.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_without_an_envoy_a_spent_token_window_refuses_nothing_on_the_link() {
+        let pair = NodePair::start_with("r3-peer-link-no-envoy-spent", |_| {}, trusting_b).await;
+        pair.introduce_b_to_a().await;
+        let (slot, idle) = installed_slot(&pair);
+        let identity = b_identity(&pair);
+        let ceiling = slot.limits().config().tokens_per_hour;
+        slot.limits()
+            .debit(&identity, ceiling, None, Instant::now());
+        assert!(
+            slot.limits()
+                .check_run_admissible(&identity, Instant::now())
+                .is_err(),
+            "the window really is spent"
+        );
+        let ask = OutboundPeer::new(PeerKind::Ask, "anyone there?", None, None, None).unwrap();
+
+        let outcome = b_sends_to_a(&pair, &ask).await.unwrap();
+
+        assert!(
+            is_received_reply(&outcome.value, &ask.id),
+            "{:?}",
+            outcome.value
+        );
+        let (envelopes, dropped) = slot.peer_inbox().drain();
+        assert_eq!(dropped, 0);
+        assert_eq!(only_peer(&envelopes).message_id, ask.id);
+        assert_eq!(
+            slot.limits()
+                .window_of(&identity, Instant::now())
+                .unwrap()
+                .messages,
+            1
+        );
+        let lines: Vec<String> = idle.0.lock().iter().map(|note| note.text.clone()).collect();
+        assert!(
+            lines.iter().all(|line| !line.contains("refus")),
+            "{lines:?}"
+        );
+        pair.stop_node_a().await;
+    }
+
+    /// A full envoy queue gates only what the envoy would run (MESH-MSG-041). With node
+    /// A's queue full, node B's bulletin and its interim notice are acknowledged, filed
+    /// and counted; B's question is refused `Throttled` before the acknowledgement and
+    /// never offered to the envoy; a message from B that is a correlated reply to A's own
+    /// question is acknowledged and not counted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_a_full_envoy_queue_gates_only_what_the_envoy_would_run() {
+        let pair = NodePair::start_with("r3-peer-link-queue-full-kinds", |_| {}, trusting_b).await;
+        pair.introduce_b_to_a().await;
+        let (slot, idle) = installed_slot(&pair);
+        slot.set_envoy(Arc::new(FullEnvoy) as Arc<dyn EnvoySink>);
+        let identity = b_identity(&pair);
+        let ours = OutboundPeer::new(PeerKind::Ask, "from A", None, None, None).unwrap();
+        slot.correlations()
+            .open(pending_for(&ours, &pair.responder))
+            .unwrap();
+
+        let bulletin =
+            OutboundPeer::new(PeerKind::Bulletin, "all hands", None, None, None).unwrap();
+        let notice = OutboundPeer::new(
+            PeerKind::Message,
+            "still thinking",
+            None,
+            Some("a-question-of-yours"),
+            None,
+        )
+        .unwrap();
+        let reply = outbound_from_args(
+            PeerKind::Message,
+            "here you go",
+            &serde_json::json!({ "in_reply_to": ours.id }),
+        )
+        .unwrap();
+        for message in [&bulletin, &notice, &reply] {
+            let outcome = b_sends_to_a(&pair, message).await.unwrap();
+            assert!(
+                is_received_reply(&outcome.value, &message.id),
+                "{:?}: {:?}",
+                message.kind,
+                outcome.value
+            );
+        }
+        let question = OutboundPeer::new(PeerKind::Message, "and this?", None, None, None).unwrap();
+        assert_eq!(
+            b_sends_to_a(&pair, &question).await.unwrap_err(),
+            R3Error::Refused(RefusalCode::Throttled)
+        );
+
+        let (envelopes, dropped) = slot.peer_inbox().drain();
+        assert_eq!(dropped, 0);
+        let filed: Vec<&str> = envelopes
+            .iter()
+            .map(|envelope| match &envelope.payload {
+                EnvelopePayload::Peer(message) => message.message_id.as_str(),
+                other => panic!("not a peer envelope: {other:?}"),
+            })
+            .collect();
+        assert_eq!(filed, [&bulletin.id, &notice.id, &reply.id]);
+        assert_eq!(
+            slot.limits()
+                .window_of(&identity, Instant::now())
+                .unwrap()
+                .messages,
+            2,
+            "the bulletin and the notice are counted; the reply and the refused question are not"
+        );
+        let lines: Vec<String> = idle.0.lock().iter().map(|note| note.text.clone()).collect();
+        let refusals: Vec<&String> = lines.iter().filter(|line| line.contains("refus")).collect();
+        assert_eq!(refusals.len(), 1, "{lines:?}");
+        assert!(refusals[0].contains("envoy_busy"), "{lines:?}");
+        pair.stop_node_a().await;
+    }
+
     /// Trust is checked before anything touches the wire: a destination node A has heard
     /// but does not trust, or has never heard at all, gets the same refusal and node B
     /// sees no request.
