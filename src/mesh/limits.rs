@@ -389,8 +389,9 @@ impl PeerLimits {
     }
 
     /// Whether `try_reserve` would admit a run for the identity right now: a run already
-    /// in flight, then the ceilings. Reserves nothing and counts nothing, so a link can
-    /// ask before it acknowledges and the answer holds only until something else moves.
+    /// in flight, then the ceilings. Reserves no run and counts no message; it files the
+    /// identity's window like any other look. A link can ask before it acknowledges, and
+    /// the answer holds only until something else moves.
     pub(crate) fn check_run_admissible(
         &self,
         identity: &str,
