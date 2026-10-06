@@ -525,6 +525,7 @@ const EXECUTED_BY: &[(&str, &[&str])] = &[
             "reference_requests_hear_the_specified_replies",
             "our_requests_are_decoded_by_the_reference",
             "a_propagation_node_demanding_a_raised_stamp_cost_still_takes_our_message",
+            "a_reference_message_the_envoy_could_not_run_hears_throttled_before_any_ack",
         ],
     ),
     (

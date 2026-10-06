@@ -8,10 +8,12 @@
 
 use super::interop_ids::{
     ANNOUNCE_IDS, PROPAGATION_COST_IDS, PROPAGATION_IDS, REPLY_INVALID_IDS, REPLY_VALID_IDS,
-    REQUEST_IDS,
+    REQUEST_IDS, THROTTLED_IDS,
 };
 use crate::config::Session;
 use crate::mesh::announce::ANNOUNCE_MAGIC;
+use crate::mesh::envoy::{EnvoyJob, EnvoySink};
+use crate::mesh::limits::{PeerRefusal, RefusalReason};
 use crate::mesh::message::{OutboundPeer, PEER_MESSAGE_TYPE, PeerKind, PeerVia};
 use crate::mesh::node::{MeshRuntime, MeshSlot, NodeOptions, session_destination_name};
 use crate::mesh::notify::{NotificationSink, RenderedNotification};
@@ -67,6 +69,7 @@ const POLL: Duration = Duration::from_millis(50);
 
 const NO_ACCESS: u64 = 0xf1;
 const INVALID_DATA: u64 = 0xf4;
+const THROTTLED: u64 = 0xf6;
 /// LXMF's custom-type and custom-data field keys (`lxmf_core::constants`), as the reference
 /// serialises them: integer map keys become decimal strings in JSON.
 const FIELD_CUSTOM_TYPE: &str = "251";
@@ -1154,6 +1157,107 @@ async fn reference_requests_hear_the_specified_replies() {
         .as_str()
         .unwrap_or_else(|| panic!("{unknown}"));
     assert!(is_hex_of_len(path_hash, 32), "{unknown}");
+
+    node.stop().await;
+    drop(reference);
+}
+
+/// An envoy whose queue reads as full before anything is offered to it.
+struct FullEnvoy;
+
+impl EnvoySink for FullEnvoy {
+    fn accept(&self, _job: EnvoyJob) -> Result<(), PeerRefusal> {
+        Err(PeerRefusal::capacity(RefusalReason::EnvoyBusy))
+    }
+
+    fn has_room(&self) -> bool {
+        false
+    }
+
+    fn answer(&self, _id: &str, _text: &str) -> bool {
+        false
+    }
+
+    fn holds(&self, _id: &str) -> bool {
+        false
+    }
+
+    fn interrupt(&self) {}
+}
+
+/// Ids: `THROTTLED_IDS`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs COYOTE_MESH_INTEROP=1 and scripts/mesh-interop/setup.sh"]
+async fn a_reference_message_the_envoy_could_not_run_hears_throttled_before_any_ack() {
+    let Some(mut reference) = Reference::spawn().await else {
+        return;
+    };
+    let (session, _) = session_with_instance_id();
+    let node = Node::start(
+        "interop-throttled",
+        reference.ready.relay_port,
+        session,
+        &TrustList::default(),
+    )
+    .await;
+    reference.announce(Some("Reference")).await;
+    node.trust_reference(&reference).await;
+    node.slot
+        .set_envoy(Arc::new(FullEnvoy) as Arc<dyn EnvoySink>);
+
+    let body = json!({
+        "v": 1,
+        "kind": "message",
+        "id": "py-throttled",
+        "content": "words the envoy has no room for",
+        "ts": unix_now(),
+    });
+    let refused = reference
+        .request(&node, "/message", reference.envelope(body))
+        .await;
+    assert_eq!(refused, json!(THROTTLED), "{THROTTLED_IDS:?}");
+    assert_eq!(node.slot.peer_inbox().len(), 0, "{THROTTLED_IDS:?}");
+    let pending = node
+        .slot
+        .inbound_store()
+        .unwrap()
+        .list(SystemTime::now())
+        .unwrap();
+    assert!(pending.is_empty(), "{THROTTLED_IDS:?}: {pending:?}");
+    assert_eq!(
+        node.slot
+            .limits()
+            .window_of(&reference.ready.identity_hash, Instant::now())
+            .unwrap()
+            .messages,
+        0,
+        "{THROTTLED_IDS:?}: a refused message is not counted"
+    );
+
+    let bulletin = json!({
+        "v": 1,
+        "kind": "bulletin",
+        "id": "py-bulletin",
+        "content": "a bulletin is not the envoy's",
+        "ts": unix_now(),
+    });
+    let received = reference
+        .request(&node, "/message", reference.envelope(bulletin))
+        .await;
+    assert_eq!(
+        received,
+        json!({ "received": true, "id": "py-bulletin" }),
+        "{THROTTLED_IDS:?}"
+    );
+    let inbox = node.slot.peer_inbox();
+    wait_until("the bulletin to reach the inbox", || inbox.len() == 1).await;
+    let (envelopes, dropped) = inbox.drain();
+    assert_eq!(dropped, 0);
+    let EnvelopePayload::Peer(message) = &envelopes[0].payload else {
+        panic!("not a peer envelope: {:?}", envelopes[0].payload);
+    };
+    assert_eq!(message.kind, PeerKind::Bulletin);
+    assert_eq!(message.message_id, "py-bulletin");
 
     node.stop().await;
     drop(reference);

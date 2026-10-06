@@ -75,6 +75,11 @@ pub(super) const PROPAGATION_COST_IDS: &[&str] = &[
 /// A silent peer's message falls back to the propagation node and is stored there.
 pub(super) const PROPAGATION_IDS: &[&str] = &["MESH-PROP-015", "MESH-MSG-024"];
 
+/// The reference's message hears the bare `Throttled` code before any acknowledgement
+/// while the envoy queue is full, and nothing is filed or counted; its bulletin is
+/// acknowledged as ever.
+pub(super) const THROTTLED_IDS: &[&str] = &["MESH-MSG-019", "MESH-MSG-041", "MESH-MSG-042"];
+
 pub(super) fn listed() -> Vec<Listed> {
     [
         (ANNOUNCE_IDS, Kind::Valid),
@@ -83,6 +88,7 @@ pub(super) fn listed() -> Vec<Listed> {
         (REQUEST_IDS, Kind::Valid),
         (PROPAGATION_COST_IDS, Kind::Boundary),
         (PROPAGATION_IDS, Kind::Valid),
+        (THROTTLED_IDS, Kind::Invalid),
     ]
     .into_iter()
     .flat_map(|(ids, kind)| {

@@ -1850,7 +1850,7 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 | Identified | `size_branches_and_correlation_hold_on_a_live_link` |
 | InboundCap | `the_responder_drops_what_section_6_6_says_it_drops` |
 | IncompatibleOutbound | `version_refusals_mark_peers_and_marked_peers_are_refused_outbound` |
-| Interop | `the_reference_announce_is_filed_and_it_derives_our_destination_from_our_announce`, `reference_requests_hear_the_specified_replies`, `our_requests_are_decoded_by_the_reference`, `a_propagation_node_demanding_a_raised_stamp_cost_still_takes_our_message` |
+| Interop | `the_reference_announce_is_filed_and_it_derives_our_destination_from_our_announce`, `reference_requests_hear_the_specified_replies`, `our_requests_are_decoded_by_the_reference`, `a_propagation_node_demanding_a_raised_stamp_cost_still_takes_our_message`, `a_reference_message_the_envoy_could_not_run_hears_throttled_before_any_ack` |
 | KnockBody | `knock_body_vectors_read_the_intro_as_section_8_1_mandates` |
 | KnockIntro | `knock_intro_vectors_clean_and_refuse_as_section_8_1_mandates` |
 | Lending | `a_reference_attachment_lends_a_grant_only_for_a_message_the_peer_heard` |
@@ -2104,7 +2104,7 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 | MESH-MSG-016 | Ack (Invalid), Ack (Valid), Interop (Valid) |
 | MESH-MSG-017 | Ack (Valid) |
 | MESH-MSG-018 | Interop (Invalid) |
-| MESH-MSG-019 | no vector yet |
+| MESH-MSG-019 | Interop (Invalid) |
 | MESH-MSG-020 | no vector yet |
 | MESH-MSG-021 | no vector yet |
 | MESH-MSG-022 | Interop (Valid) |
@@ -2127,8 +2127,8 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 | MESH-MSG-038 | Custom (Valid), MessageBody (Valid) |
 | MESH-MSG-039 | MessageBody (Valid) |
 | MESH-MSG-040 | no vector yet |
-| MESH-MSG-041 | no vector yet |
-| MESH-MSG-042 | no vector yet |
+| MESH-MSG-041 | Interop (Invalid) |
+| MESH-MSG-042 | Interop (Invalid) |
 | MESH-MSG-043 | no vector yet |
 | MESH-MSG-044 | no vector yet |
 | MESH-MSG-045 | no vector yet |
