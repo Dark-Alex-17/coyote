@@ -817,6 +817,9 @@ impl EnvoyRunner {
     /// run that took the human's answer and then failed to deliver still gets that
     /// answer to the peer. An escalated question leaves the store only once the peer has
     /// heard its answer; an unsent one stays open so `.mesh answer` can send it again.
+    /// A run-time refusal of a stored message is replied to once per identity, per
+    /// reason, per hour, on the claim the accept-time refusals spend; one withheld here
+    /// is still filed and surfaced, but nothing is sent and nothing is reported unsent.
     async fn deliver(
         &self,
         message: PeerMessage,
@@ -873,17 +876,28 @@ impl EnvoyRunner {
                 Some(format!("refused: {}", refusal.reason.as_str())),
             ),
         };
-        let unsent = match (
-            app.mesh.get(),
-            envoy_reply(&outcome, human_answer.as_deref(), reply_text, &message),
-        ) {
-            (Some(runtime), Ok(out)) => runtime
-                .send_peer(&message.source_destination, &out)
-                .await
-                .err()
-                .map(|err| err.to_string()),
-            (None, _) => Some("mesh is off".to_string()),
-            (_, Err(err)) => Some(err.to_string()),
+        let owed = match &outcome {
+            EnvoyOutcome::Refused(refusal) if message.via == PeerVia::StoreAndForward => app
+                .mesh
+                .limits()
+                .claim_peer_reply(&message.source_identity, refusal.reason, Instant::now()),
+            _ => true,
+        };
+        let unsent = if !owed {
+            None
+        } else {
+            match (
+                app.mesh.get(),
+                envoy_reply(&outcome, human_answer.as_deref(), reply_text, &message),
+            ) {
+                (Some(runtime), Ok(out)) => runtime
+                    .send_peer(&message.source_destination, &out)
+                    .await
+                    .err()
+                    .map(|err| err.to_string()),
+                (None, _) => Some("mesh is off".to_string()),
+                (_, Err(err)) => Some(err.to_string()),
+            }
         };
         if let Some(why) = unsent {
             warn!(
@@ -4057,6 +4071,159 @@ mod tests {
             ids.contains(&"live-c2"),
             "the refused original is filed: {ids:?}"
         );
+
+        assert!(app.mesh.stop().await.unwrap());
+        stub.stop().await;
+        started.relay_handle.abort();
+        source.remove_dir();
+    }
+
+    /// A run-time refusal of a stored message spends the same once-per-identity, per
+    /// reason, per hour reply the accept-time refusals do, so a peer whose stored
+    /// messages pile up behind a run that spent the window hears one typed reply, not
+    /// one per message. Two stored jobs must queue behind the run that spends the
+    /// window, and each queued job holds an in-flight reservation, so the concurrency
+    /// ceiling is three. Every refused original is still filed for the owner.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn a_store_and_forward_run_time_refusal_shares_the_hourly_reply_with_the_accept_time_one()
+    {
+        use crate::mesh::trust::TrustOptions;
+        use rns_transport::iface::tcp_server::TcpServer;
+
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-stored-ceiling");
+        let (source, _source) = stub_envoy_source();
+        let stub =
+            PeerStub::listen("envoy-stored-ceiling-stub", TcpServer::DEFAULT_CLIENT_MTU).await;
+        let started = started_runtime_on("envoy-stored-ceiling-node", stub.port()).await;
+        let runtime = started.runtime.clone();
+        let app = test_app();
+        app.mesh.install(runtime.clone()).unwrap();
+        stub.trust(&runtime.current_destination_hash(), runtime.fingerprint());
+        stub.announce(Some("Stub")).await;
+        let to = stub.destination_hex();
+        let peers = runtime.peers();
+        wait_until("the node to file the stub", || peers.get(&to).is_some()).await;
+        runtime
+            .trust()
+            .trust_destination(
+                app.mesh.as_ref(),
+                &to,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        let idle = RecordingIdleSink::attach(&app);
+        app.mesh.limits().configure(PeerLimitConfig {
+            concurrency: 3,
+            tokens_per_hour: 100,
+            ..PeerLimitConfig::default()
+        });
+
+        let gate = Arc::new(Semaphore::new(0));
+        let runs = Arc::new(AtomicUsize::new(0));
+        let runner = EnvoyRunner::start_with(Arc::clone(&app), {
+            let gate = Arc::clone(&gate);
+            let runs = Arc::clone(&runs);
+            drive_of(move |mut ctx, input, _| {
+                let gate = Arc::clone(&gate);
+                let runs = Arc::clone(&runs);
+                async move {
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    ctx.record_token_usage(
+                        Some(TokenUsage {
+                            input_tokens: Some(400),
+                            output_tokens: Some(50),
+                            ..TokenUsage::default()
+                        }),
+                        input.role().model(),
+                    );
+                    gate.acquire().await.unwrap().forget();
+                    Ok("one".into())
+                }
+            })
+        });
+        runner.attach();
+        let identity = stub.identity_hex();
+        let stored = |id: &str| {
+            let mut message = job_from(PeerKind::Message, id, "stored", &to, &identity).message;
+            message.via = PeerVia::StoreAndForward;
+            message
+        };
+        app.mesh
+            .deliver_peer(job_from(PeerKind::Ask, "stored-c1", "first", &to, &identity).message);
+        wait_until("the first run to start", || {
+            runs.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        // Admitted and queued: the window is empty until the first run debits it.
+        app.mesh.deliver_peer(stored("stored-c2"));
+        app.mesh.deliver_peer(stored("stored-c3"));
+        assert_eq!(
+            app.mesh
+                .limits()
+                .window_of(&identity, Instant::now())
+                .unwrap()
+                .in_flight,
+            3
+        );
+        gate.add_permits(1);
+
+        let token_ceiling = |body: &PeerBody| {
+            body.fields
+                .as_ref()
+                .is_some_and(|fields| fields["refusal"] == "token_ceiling")
+        };
+        // The answered exchange files two, each refused original one.
+        wait_until("both queued jobs to be refused and filed", || {
+            app.mesh.peer_inbox().len() >= 4 && stub.seen().iter().any(token_ceiling)
+        })
+        .await;
+        let refusals: Vec<PeerBody> = stub.seen().into_iter().filter(token_ceiling).collect();
+        assert_eq!(refusals.len(), 1, "{refusals:?}");
+        assert!(
+            matches!(
+                refusals[0].in_reply_to.as_deref(),
+                Some("stored-c2" | "stored-c3")
+            ),
+            "{refusals:?}"
+        );
+        assert_eq!(refusals[0].kind, PeerKind::Reply);
+        assert_eq!(refusals[0].disposition, Some(Disposition::BudgetExhausted));
+        assert_eq!(runs.load(Ordering::SeqCst), 1, "neither queued job drove");
+
+        // The envoy's accept refuses the next stored message outright, and the claim the
+        // run-time refusal spent means it hears nothing more this hour.
+        app.mesh.deliver_peer(stored("stored-c4"));
+        wait_until("the third stored message to be filed", || {
+            app.mesh.peer_inbox().len() >= 5
+        })
+        .await;
+        runner.stop().await;
+        assert_eq!(
+            stub.seen()
+                .iter()
+                .filter(|body| token_ceiling(body))
+                .count(),
+            1,
+            "{:?}",
+            stub.seen()
+        );
+        assert_eq!(
+            idle.count("further token_ceiling refusals"),
+            1,
+            "{:?}",
+            idle.texts()
+        );
+        let (envelopes, _) = app.mesh.peer_inbox().drain();
+        let ids: Vec<&str> = envelopes
+            .iter()
+            .map(|envelope| peer_of(envelope).message_id.as_str())
+            .collect();
+        for id in ["stored-c2", "stored-c3", "stored-c4"] {
+            assert!(ids.contains(&id), "{id} is filed: {ids:?}");
+        }
 
         assert!(app.mesh.stop().await.unwrap());
         stub.stop().await;

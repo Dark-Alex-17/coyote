@@ -752,7 +752,7 @@ The reference emits the typed refusal but does not yet read one: a receiving ses
 
 **[MESH-MSG-042]** Over a live link, an over-limit message MUST be answered with the bare `Throttled` code and MUST NOT be filed.
 
-**[MESH-MSG-043]** By store-and-forward, an over-limit message MUST be filed in the inbox without an envoy run, and the receiver MUST send at most one typed refusal `reply` per identity per reason per hour, whether the admission or the envoy refused it (`a_store_and_forward_refusal_is_answered_once_per_identity_per_reason_per_hour`, `a_store_and_forward_envoy_refusal_is_answered_once_per_identity_per_reason_per_hour`).
+**[MESH-MSG-043]** By store-and-forward, an over-limit message MUST be filed in the inbox without an envoy run, and the receiver MUST send at most one typed refusal `reply` per identity per reason per hour, whether the admission, the envoy's accept, or its run-time second look refused it (a job queued while the window was open and refused once a run ahead of it spent the window) (`a_store_and_forward_refusal_is_answered_once_per_identity_per_reason_per_hour`, `a_store_and_forward_envoy_refusal_is_answered_once_per_identity_per_reason_per_hour`, src/mesh/node.rs; `a_store_and_forward_run_time_refusal_shares_the_hourly_reply_with_the_accept_time_one`, src/config/mesh_envoy.rs).
 
 **[MESH-MSG-044]** A receiver MUST NOT send a typed refusal in response to a message that itself carries `in_reply_to`.
 
