@@ -10235,10 +10235,8 @@ fn disp_vectors() -> Vec<Vector> {
                     let out = refusal_reply("q-1", Some("t-1"), &refusal)
                         .map_err(|err| err.to_string())?;
                     let expected = match reason {
-                        RefusalReason::TokenCeiling | RefusalReason::CostCeiling => {
-                            Disposition::BudgetExhausted
-                        }
-                        _ => Disposition::Refused,
+                        RefusalReason::LoopGuard => Disposition::Refused,
+                        _ => Disposition::BudgetExhausted,
                     };
                     let name = reason.as_str();
                     same(

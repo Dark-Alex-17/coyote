@@ -1626,10 +1626,8 @@ mod tests {
                             }
                             (EnvoyOutcome::Refused(refusal), None) => {
                                 let expected = match refusal.reason {
-                                    RefusalReason::TokenCeiling | RefusalReason::CostCeiling => {
-                                        Disposition::BudgetExhausted
-                                    }
-                                    _ => Disposition::Refused,
+                                    RefusalReason::LoopGuard => Disposition::Refused,
+                                    _ => Disposition::BudgetExhausted,
                                 };
                                 assert_eq!(
                                     out.retry_after,
@@ -4247,7 +4245,7 @@ mod tests {
             "{fields}"
         );
         // The admission refusal carries disposition, retry hint and thread.
-        assert_eq!(refusal.disposition, Some(Disposition::Refused));
+        assert_eq!(refusal.disposition, Some(Disposition::BudgetExhausted));
         assert_eq!(
             refusal.retry_after.map(u64::from),
             fields["retry_after_secs"].as_u64()

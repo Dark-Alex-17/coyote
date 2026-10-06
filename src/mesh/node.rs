@@ -2806,18 +2806,19 @@ impl MeshSlot {
     }
 }
 
-/// The correlated reply that closes a peer's message `id` with a typed refusal: the
-/// disposition says whether waiting out a budget window or a capacity limit is the
-/// remedy, `retry_after` how long, and `fields` repeats both for readers of the old
-/// shape. The reply inherits `thread`, or names the original as its own root.
+/// The correlated reply that closes a peer's message `id` with a typed refusal:
+/// `budget_exhausted` whatever the budget, `retry_after` how long to wait, and `fields`
+/// naming the reason and repeating the wait for readers of the old shape. A loop-guard
+/// refusal is built `refused`, since it is never sent. The reply inherits `thread`, or
+/// names the original as its own root.
 pub(crate) fn refusal_reply(
     id: &str,
     thread: Option<&str>,
     refusal: &PeerRefusal,
 ) -> Result<OutboundPeer, SendError> {
     let disposition = match refusal.reason {
-        RefusalReason::TokenCeiling | RefusalReason::CostCeiling => Disposition::BudgetExhausted,
-        _ => Disposition::Refused,
+        RefusalReason::LoopGuard => Disposition::Refused,
+        _ => Disposition::BudgetExhausted,
     };
     let retry_after = u32::try_from(refusal.retry_after_secs()).unwrap_or(u32::MAX);
     let text = refusal.reason.peer_text();
@@ -3181,6 +3182,7 @@ mod tests {
     use crate::mesh::access::{access_message, validate_access};
     use crate::mesh::destination_address;
     use crate::mesh::events::{RecordingHookSink, env_value, one_fire};
+    use crate::mesh::limits::PEER_RETRY_AFTER_CAPACITY;
     use crate::mesh::message::{
         PEER_ID_MAX_CHARS, is_received_reply, peer_lxmf_message, to_r3_body,
     };
@@ -5443,7 +5445,7 @@ mod tests {
         assert_eq!(seen[0].kind, PeerKind::Reply);
         assert_eq!(seen[0].in_reply_to.as_deref(), Some("stored-1"));
         assert_eq!(seen[0].thread.as_deref(), Some("t-9"));
-        assert_eq!(seen[0].disposition, Some(Disposition::Refused));
+        assert_eq!(seen[0].disposition, Some(Disposition::BudgetExhausted));
         assert!(slot.stop().await.unwrap());
         stub.stop().await;
     }
@@ -5731,7 +5733,7 @@ mod tests {
         assert_eq!(reply.kind, PeerKind::Reply);
         assert_eq!(reply.in_reply_to.as_deref(), Some("m-1"));
         assert_eq!(reply.thread.as_deref(), Some("t-root"));
-        assert_eq!(reply.disposition, Some(Disposition::Refused));
+        assert_eq!(reply.disposition, Some(Disposition::BudgetExhausted));
         assert_eq!(reply.retry_after, Some(91), "rounded up like the fields");
         assert_eq!(reply.fields, Some(refusal.fields()));
         assert_eq!(reply.content, RefusalReason::RateLimited.peer_text());
@@ -5742,15 +5744,54 @@ mod tests {
             Some("m-1"),
             "an original with no thread of its own is the root"
         );
+    }
 
-        for reason in [RefusalReason::TokenCeiling, RefusalReason::CostCeiling] {
-            let reply = refusal_reply("m-1", None, &PeerRefusal::capacity(reason)).unwrap();
-            assert_eq!(reply.disposition, Some(Disposition::BudgetExhausted));
-            assert!(reply.retry_after.is_some_and(|secs| secs >= 1));
-        }
-        for reason in [RefusalReason::EnvoyBusy, RefusalReason::PeerConcurrency] {
-            let reply = refusal_reply("m-1", None, &PeerRefusal::capacity(reason)).unwrap();
-            assert_eq!(reply.disposition, Some(Disposition::Refused));
+    /// Every reason a peer can be told goes out `budget_exhausted`, with `retry_after`
+    /// the rounded-up window remainder for a window ceiling and the capacity wait for the
+    /// rest; `fields` keeps the typed reason and the same wait. The loop guard, which is
+    /// never sent, is the one `refused`.
+    #[test]
+    fn every_sent_refusal_reason_is_a_budget_exhausted_reply_with_its_retry_after() {
+        let window_left = Duration::from_millis(1_800_200);
+        for reason in RefusalReason::ALL {
+            let refusal = match reason {
+                RefusalReason::RateLimited
+                | RefusalReason::TokenCeiling
+                | RefusalReason::CostCeiling => PeerRefusal {
+                    reason,
+                    retry_after: window_left,
+                },
+                RefusalReason::EnvoyBusy
+                | RefusalReason::EnvoyStopping
+                | RefusalReason::PeerConcurrency
+                | RefusalReason::LoopGuard => PeerRefusal::capacity(reason),
+            };
+            let name = reason.as_str();
+            let expected_wait = if refusal.retry_after == window_left {
+                1_801
+            } else {
+                u32::try_from(PEER_RETRY_AFTER_CAPACITY.as_secs()).unwrap()
+            };
+            let expected_disposition = if reason == RefusalReason::LoopGuard {
+                Disposition::Refused
+            } else {
+                Disposition::BudgetExhausted
+            };
+
+            let reply = refusal_reply("m-1", Some("t-root"), &refusal).unwrap();
+
+            assert_eq!(reply.disposition, Some(expected_disposition), "{name}");
+            assert_eq!(reply.retry_after, Some(expected_wait), "{name}");
+            assert!(reply.retry_after.is_some_and(|secs| secs >= 1), "{name}");
+            let fields = reply.fields.as_ref().unwrap_or_else(|| panic!("{name}"));
+            assert_eq!(fields["refusal"], name, "{name}");
+            assert_eq!(
+                fields["retry_after_secs"].as_u64(),
+                Some(u64::from(expected_wait)),
+                "{name}"
+            );
+            assert_eq!(reply.fields, Some(refusal.fields()), "{name}");
+            assert_eq!(reply.content, reason.peer_text(), "{name}");
         }
     }
 

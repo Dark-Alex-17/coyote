@@ -6220,10 +6220,10 @@ pub(crate) mod network {
     }
 
     /// Node A's envoy refuses node B's message, so A files it and sends B a reply that
-    /// closes the message with the refusal: its thread, a `refused` disposition and how
-    /// long to wait, with the typed reason still in `fields`.
+    /// closes the message with the refusal: its thread, a `budget_exhausted` disposition
+    /// and how long to wait, with the typed reason still in `fields`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_refused_message_is_answered_with_a_refused_disposition_and_retry_after() {
+    async fn a_refused_message_is_answered_with_a_budget_exhausted_disposition_and_retry_after() {
         let pair = NodePair::start_with("r3-peer-refusal-reply", |_| {}, trusting_b).await;
         pair.introduce_b_to_a().await;
         let (slot, _idle) = installed_slot(&pair);
@@ -6245,7 +6245,7 @@ pub(crate) mod network {
         assert_eq!(reply.kind, PeerKind::Reply);
         assert_eq!(reply.in_reply_to.as_deref(), Some(message.id.as_str()));
         assert_eq!(reply.thread.as_deref(), Some("t-1"));
-        assert_eq!(reply.disposition, Some(Disposition::Refused));
+        assert_eq!(reply.disposition, Some(Disposition::BudgetExhausted));
         assert!(reply.retry_after.is_some_and(|secs| secs >= 1), "{reply:?}");
         let refusal = PeerRefusal::capacity(RefusalReason::EnvoyBusy);
         assert_eq!(reply.fields, Some(refusal.fields()));
