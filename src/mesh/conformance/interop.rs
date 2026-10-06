@@ -14,7 +14,9 @@ use crate::config::Session;
 use crate::mesh::announce::ANNOUNCE_MAGIC;
 use crate::mesh::envoy::EnvoySink;
 use crate::mesh::message::{OutboundPeer, PEER_MESSAGE_TYPE, PeerKind, PeerVia};
-use crate::mesh::node::{FullEnvoy, MeshRuntime, MeshSlot, NodeOptions, session_destination_name};
+use crate::mesh::node::{
+    FullEnvoy, MeshRuntime, MeshSlot, NodeOptions, RecordingEnvoy, session_destination_name,
+};
 use crate::mesh::notify::{NotificationSink, RenderedNotification};
 use crate::mesh::test_support::{
     Compatibility, OriginName, TempDir, TrustList, disable_ingress_control, mesh_paths,
@@ -1161,7 +1163,9 @@ async fn reference_requests_hear_the_specified_replies() {
     drop(reference);
 }
 
-/// Ids: `THROTTLED_IDS`.
+/// Ids: `THROTTLED_IDS`. The node-wide gate first (a full envoy queue), then a
+/// per-identity one (the reference already has a run in flight): both answer the
+/// reference's message with the bare `Throttled` code before any acknowledgement.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs COYOTE_MESH_INTEROP=1 and scripts/mesh-interop/setup.sh"]
 async fn a_reference_message_the_envoy_could_not_run_hears_throttled_before_any_ack() {
@@ -1200,11 +1204,15 @@ async fn a_reference_message_the_envoy_could_not_run_hears_throttled_before_any_
         .list(SystemTime::now())
         .unwrap();
     assert!(pending.is_empty(), "{THROTTLED_IDS:?}: {pending:?}");
-    assert_eq!(
+    let identity = reference.ready.identity_hash.clone();
+    let messages = || {
         node.slot
             .limits()
-            .window_of(&reference.ready.identity_hash, Instant::now())
-            .map_or(0, |window| window.messages),
+            .window_of(&identity, Instant::now())
+            .map_or(0, |window| window.messages)
+    };
+    assert_eq!(
+        messages(),
         0,
         "{THROTTLED_IDS:?}: a refused message is not counted"
     );
@@ -1233,6 +1241,56 @@ async fn a_reference_message_the_envoy_could_not_run_hears_throttled_before_any_
     };
     assert_eq!(message.kind, PeerKind::Bulletin);
     assert_eq!(message.message_id, "py-bulletin");
+    assert_eq!(messages(), 1, "{THROTTLED_IDS:?}: the bulletin is counted");
+
+    let envoy = RecordingEnvoy::new(true, false);
+    node.slot.set_envoy(envoy.clone() as Arc<dyn EnvoySink>);
+    let held = node
+        .slot
+        .limits()
+        .try_reserve(&identity, Instant::now())
+        .unwrap();
+    let while_in_flight = json!({
+        "v": 1,
+        "kind": "message",
+        "id": "py-in-flight",
+        "content": "words while a run of ours is in flight",
+        "ts": unix_now(),
+    });
+    let refused = reference
+        .request(&node, "/message", reference.envelope(while_in_flight))
+        .await;
+    assert_eq!(refused, json!(THROTTLED), "{THROTTLED_IDS:?}");
+    assert!(envoy.job_ids().is_empty(), "{THROTTLED_IDS:?}");
+    assert_eq!(inbox.len(), 0, "{THROTTLED_IDS:?}");
+    assert_eq!(
+        messages(),
+        1,
+        "{THROTTLED_IDS:?}: the message refused for the run in flight is not counted"
+    );
+
+    drop(held);
+    let after = json!({
+        "v": 1,
+        "kind": "message",
+        "id": "py-after",
+        "content": "words once the run has ended",
+        "ts": unix_now(),
+    });
+    let received = reference
+        .request(&node, "/message", reference.envelope(after))
+        .await;
+    assert_eq!(
+        received,
+        json!({ "received": true, "id": "py-after" }),
+        "{THROTTLED_IDS:?}"
+    );
+    wait_until("the envoy to take the message", || {
+        envoy.job_ids() == ["py-after"]
+    })
+    .await;
+    assert_eq!(inbox.len(), 0, "{THROTTLED_IDS:?}");
+    assert_eq!(messages(), 2, "{THROTTLED_IDS:?}");
 
     node.stop().await;
     drop(reference);

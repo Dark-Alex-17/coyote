@@ -76,8 +76,9 @@ pub(super) const PROPAGATION_COST_IDS: &[&str] = &[
 pub(super) const PROPAGATION_IDS: &[&str] = &["MESH-PROP-015", "MESH-MSG-024"];
 
 /// The reference's message hears the bare `Throttled` code before any acknowledgement
-/// while the envoy queue is full, and nothing is filed or counted; its bulletin is
-/// acknowledged as ever.
+/// while the envoy queue is full and again while the reference already has a run in
+/// flight, and nothing is filed or counted either time; its bulletin is acknowledged as
+/// ever, and so is its message once the run has ended.
 pub(super) const THROTTLED_IDS: &[&str] = &["MESH-MSG-019", "MESH-MSG-041", "MESH-MSG-042"];
 
 pub(super) fn listed() -> Vec<Listed> {
