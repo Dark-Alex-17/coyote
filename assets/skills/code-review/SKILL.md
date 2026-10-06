@@ -146,6 +146,22 @@ These are review findings that only surface in a diff context, not in a whole-fi
   flag-off-exempt"), report it as a 🟢 note so the reviewer of record sees it was weighed, not
   missed. No convention found ⇒ stay silent; this rule never invents a rollout policy the repo
   does not have.
+- **Chatty DB access — minimize round trips** — when one logical operation in the diff issues
+  multiple sequential queries (read-then-read to assemble one result, read-modify-write pairs,
+  any query inside a loop), ask whether a single query could do the job. Tiered:
+  - **Query in a loop over a previous query's rows (N+1)** — 🟡 by default; batch it (JOIN,
+    `IN (...)`, a window function, or a bulk write).
+  - **Sole caller** — the function is the only consumer of every templated query it strings
+    together: nothing else constrains their shape, so they can collapse into one dedicated
+    query for free. 🟡, naming the queries that merge.
+  - **Shared queries** — the function composes queries other call sites also use: a bake-off,
+    not a rule. A dedicated single query buys fewer round trips at the cost of another template
+    to maintain; two or three cheap reuses off the hot path are fine. 🟢 at most, naming the
+    dedicated-query alternative so the author can weigh it — stay silent when the composed
+    queries are small and the call site is cold.
+  - **Consistency escalation** — multiple reads composing one result OUTSIDE a transaction see
+    a torn snapshot; when the pieces must be mutually consistent, that is a correctness finding
+    (🟡, 🔴 when money or auth decisions read the torn state), independent of performance.
 
 ### Scope discipline
 
