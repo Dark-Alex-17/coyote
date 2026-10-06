@@ -4083,7 +4083,9 @@ mod tests {
     /// messages pile up behind a run that spent the window hears one typed reply, not
     /// one per message. Two stored jobs must queue behind the run that spends the
     /// window, and each queued job holds an in-flight reservation, so the concurrency
-    /// ceiling is three. Every refused original is still filed for the owner.
+    /// ceiling is three. Every refused original is still filed for the owner, and a
+    /// refusal the peer never hears about leaves the same lifecycle trace as one it
+    /// does: none, since neither job reached `prepare`.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
@@ -4094,11 +4096,12 @@ mod tests {
 
         let _cfg = TestConfigDirGuard::new("mesh-envoy-stored-ceiling");
         let (source, _source) = stub_envoy_source();
+        let _sink = test_sink::install();
         let stub =
             PeerStub::listen("envoy-stored-ceiling-stub", TcpServer::DEFAULT_CLIENT_MTU).await;
         let started = started_runtime_on("envoy-stored-ceiling-node", stub.port()).await;
         let runtime = started.runtime.clone();
-        let app = test_app();
+        let app = app_with_hooks(agent_hooks("t129"));
         app.mesh.install(runtime.clone()).unwrap();
         stub.trust(&runtime.current_destination_hash(), runtime.fingerprint());
         stub.announce(Some("Stub")).await;
@@ -4215,6 +4218,18 @@ mod tests {
             1,
             "{:?}",
             idle.texts()
+        );
+        assert!(!idle.has("could not be sent"), "{:?}", idle.texts());
+        let captures = test_sink::snapshot();
+        let names: Vec<&str> = captures
+            .iter()
+            .map(|capture| capture.hook_name.as_str())
+            .filter(|name| name.starts_with("t129_"))
+            .collect();
+        assert_eq!(
+            names,
+            ["t129_started", "t129_completed"],
+            "only the run that spent the window has a lifecycle: {captures:?}"
         );
         let (envelopes, _) = app.mesh.peer_inbox().drain();
         let ids: Vec<&str> = envelopes
