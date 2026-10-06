@@ -12,10 +12,9 @@ use super::interop_ids::{
 };
 use crate::config::Session;
 use crate::mesh::announce::ANNOUNCE_MAGIC;
-use crate::mesh::envoy::{EnvoyJob, EnvoySink};
-use crate::mesh::limits::{PeerRefusal, RefusalReason};
+use crate::mesh::envoy::EnvoySink;
 use crate::mesh::message::{OutboundPeer, PEER_MESSAGE_TYPE, PeerKind, PeerVia};
-use crate::mesh::node::{MeshRuntime, MeshSlot, NodeOptions, session_destination_name};
+use crate::mesh::node::{FullEnvoy, MeshRuntime, MeshSlot, NodeOptions, session_destination_name};
 use crate::mesh::notify::{NotificationSink, RenderedNotification};
 use crate::mesh::test_support::{
     Compatibility, OriginName, TempDir, TrustList, disable_ingress_control, mesh_paths,
@@ -1160,29 +1159,6 @@ async fn reference_requests_hear_the_specified_replies() {
 
     node.stop().await;
     drop(reference);
-}
-
-/// An envoy whose queue reads as full before anything is offered to it.
-struct FullEnvoy;
-
-impl EnvoySink for FullEnvoy {
-    fn accept(&self, _job: EnvoyJob) -> Result<(), PeerRefusal> {
-        Err(PeerRefusal::capacity(RefusalReason::EnvoyBusy))
-    }
-
-    fn has_room(&self) -> bool {
-        false
-    }
-
-    fn answer(&self, _id: &str, _text: &str) -> bool {
-        false
-    }
-
-    fn holds(&self, _id: &str) -> bool {
-        false
-    }
-
-    fn interrupt(&self) {}
 }
 
 /// Ids: `THROTTLED_IDS`.

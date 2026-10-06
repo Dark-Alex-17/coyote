@@ -3257,6 +3257,31 @@ impl EnvoySink for RecordingEnvoy {
     }
 }
 
+/// An envoy whose queue reads as full before anything is offered to it.
+#[cfg(test)]
+pub(crate) struct FullEnvoy;
+
+#[cfg(test)]
+impl EnvoySink for FullEnvoy {
+    fn accept(&self, _job: EnvoyJob) -> Result<(), PeerRefusal> {
+        Err(PeerRefusal::capacity(RefusalReason::EnvoyBusy))
+    }
+
+    fn has_room(&self) -> bool {
+        false
+    }
+
+    fn answer(&self, _id: &str, _text: &str) -> bool {
+        false
+    }
+
+    fn holds(&self, _id: &str) -> bool {
+        false
+    }
+
+    fn interrupt(&self) {}
+}
+
 // Tests that start a runtime are unix-only: they run on the loopback fixtures under
 // `test_support`, which have only been run on unix so far. Lifting that gate is future work.
 #[cfg(test)]

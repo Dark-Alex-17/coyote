@@ -519,7 +519,7 @@ pub(crate) mod network {
         to_r3_body,
     };
     use crate::mesh::node::{
-        KnockOptions, MeshRuntime, MeshSlot, NodeOptions, REKEY_GRACE, RecordingEnvoy,
+        FullEnvoy, KnockOptions, MeshRuntime, MeshSlot, NodeOptions, REKEY_GRACE, RecordingEnvoy,
         SHUTDOWN_GRACE,
     };
     use crate::mesh::notify::Source;
@@ -6319,29 +6319,6 @@ pub(crate) mod network {
         })
         .await;
         pair.stop_node_a().await;
-    }
-
-    /// An envoy whose queue reads as full before anything is offered to it.
-    struct FullEnvoy;
-
-    impl EnvoySink for FullEnvoy {
-        fn accept(&self, _job: EnvoyJob) -> Result<(), PeerRefusal> {
-            Err(PeerRefusal::capacity(RefusalReason::EnvoyBusy))
-        }
-
-        fn has_room(&self) -> bool {
-            false
-        }
-
-        fn answer(&self, _id: &str, _text: &str) -> bool {
-            false
-        }
-
-        fn holds(&self, _id: &str) -> bool {
-            false
-        }
-
-        fn interrupt(&self) {}
     }
 
     /// Node A's envoy queue is full, so node B's question is refused on its link with the
