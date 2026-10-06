@@ -27,6 +27,12 @@ pub(crate) trait EnvoySink: Send + Sync {
     /// job carries `in_reply_to` and is refused as a loop guard. The caller files it
     /// in the inbox and tells the peer and the person at the keyboard.
     fn accept(&self, job: EnvoyJob) -> Result<(), PeerRefusal>;
+    /// Whether `accept` has a place for one more job right now, read without taking it,
+    /// so a link can refuse before it acknowledges. A sink that never says no here still
+    /// has `accept` to refuse with.
+    fn has_room(&self) -> bool {
+        true
+    }
     /// A human answer for an escalated question that a run may still be holding on.
     /// `true` when a live run consumed it; otherwise the caller sends it to the peer.
     fn answer(&self, id: &str, text: &str) -> bool;

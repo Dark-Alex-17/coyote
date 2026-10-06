@@ -748,7 +748,7 @@ Typed refusal `fields` (`PeerRefusal::fields`; `refusal_fields_carry_the_reason_
 
 The reference emits the typed refusal but does not yet read one: a receiving session files it as an ordinary `reply`.
 
-**[MESH-MSG-041]** A receiver MUST count messages against `mesh.peer_max_messages_per_hour` in fixed windows of `PEER_WINDOW` per sending identity; the `"retry_after_secs"` of `rate_limited` is the remainder of the window (`admit_message_refuses_the_sixty_first_in_an_hour_and_resets_after_rollover`).
+**[MESH-MSG-041]** A receiver MUST count messages against `mesh.peer_max_messages_per_hour` in fixed windows of `PEER_WINDOW` per sending identity; the `"retry_after_secs"` of `rate_limited` is the remainder of the window (`admit_message_refuses_the_sixty_first_in_an_hour_and_resets_after_rollover`). Over a live link, a `message` or `ask` without `in_reply_to` arriving while an envoy is attached is also refused `Throttled` before acknowledgement, and nothing filed, when the sending identity already has a run in flight, when the envoy queue is full, or when the identity's token or cost window for the hour is already spent; the refused message is not counted (`a_link_message_from_an_identity_with_a_run_in_flight_is_refused_before_the_ack`, `a_link_message_is_refused_before_the_ack_while_the_envoy_queue_is_full`, `a_link_message_from_an_identity_whose_token_window_is_spent_is_refused_before_the_ack`, src/mesh/r3/tests.rs; `check_run_admissible_mirrors_try_reserve_without_reserving_or_counting`, src/mesh/limits.rs). A `bulletin`, an interim notice (a `message` carrying `in_reply_to`) and a correlated `reply` are held to the hourly count alone (`a_run_in_flight_does_not_refuse_bulletins_notices_or_correlated_replies_on_the_link`, src/mesh/r3/tests.rs).
 
 **[MESH-MSG-042]** Over a live link, an over-limit message MUST be answered with the bare `Throttled` code and MUST NOT be filed.
 
@@ -2649,7 +2649,7 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 - [MESH-MSG-038](#107-peer-limits) -- retry_after_secs key
 - [MESH-MSG-039](#107-peer-limits) -- typed refusal unknown keys
 - [MESH-MSG-040](#107-peer-limits) -- typed refusal carried in a reply
-- [MESH-MSG-041](#107-peer-limits) -- fixed hourly windows per identity
+- [MESH-MSG-041](#107-peer-limits) -- fixed hourly windows per identity; link pre-ack run gates
 - [MESH-MSG-042](#107-peer-limits) -- live link over-limit is bare Throttled
 - [MESH-MSG-043](#107-peer-limits) -- store-and-forward over-limit filed and refused once
 - [MESH-MSG-044](#107-peer-limits) -- no typed refusal for a message with in_reply_to

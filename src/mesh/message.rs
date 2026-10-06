@@ -1823,9 +1823,11 @@ pub(crate) struct PeerAdmission<'a> {
 /// slot owns the runtime that owns both. `deliver_peer` may write the pending store, so
 /// the request path runs it on a blocking thread; the fetch task calls it in place.
 pub(crate) trait PeerSurface: Send + Sync {
-    /// Counts one message from the sender against its hourly limit; `Err` means the
-    /// message must not reach the envoy: a link caller refuses it, a store-and-forward
-    /// caller files it with `file_peer`.
+    /// Counts one message from the sender against its hourly limit, and on a link first
+    /// asks whether a message the envoy would run could run now: a sender with a run in
+    /// flight, an already-spent token or cost window, or a full envoy queue is refused
+    /// uncounted. `Err` means the message must not reach the envoy: a link caller
+    /// refuses it, a store-and-forward caller files it with `file_peer`.
     fn admit_peer_message(&self, request: &PeerAdmission) -> Result<(), PeerRefusal>;
     fn deliver_peer(&self, message: PeerMessage);
     /// The inbox path only, for a message admission refused: the human still sees it,
@@ -1844,8 +1846,10 @@ pub(crate) trait PeerSurface: Send + Sync {
 
 /// Serves `/message` to whoever the dispatcher has already let through: decodes and
 /// bounds the body, hands the message to the surface and acknowledges by id. A sender
-/// over its hourly limit is refused with `Throttled` before anything is delivered, so
-/// it never earns an acknowledgement. A surface that is gone means the node is
+/// over its hourly limit, or one whose message or question the envoy could not run now
+/// (a run of its already in flight, its token or cost window spent, the envoy queue
+/// full), is refused with `Throttled` before anything is delivered, so it never earns
+/// an acknowledgement and nothing is filed. A surface that is gone means the node is
 /// stopping, and a message nobody will read is left unacknowledged so the sender falls
 /// back to storing it; so is one whose delivery thread failed, since nothing says it
 /// landed.

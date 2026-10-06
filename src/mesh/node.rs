@@ -2385,6 +2385,31 @@ impl MeshSlot {
         }
     }
 
+    /// Whether a message arriving over a link could start an envoy run right now, asked
+    /// before the link acknowledges it. Only a message or question with no `in_reply_to`
+    /// is the envoy's, and only when one is attached; anything else, and anything that
+    /// arrived store-and-forward, passes here and is judged by the hourly count alone.
+    /// Reserves nothing: `EnvoySink::accept` takes the slot and remains the backstop.
+    fn link_run_admissible(
+        &self,
+        request: &PeerAdmission,
+        now: Instant,
+    ) -> Result<(), PeerRefusal> {
+        let for_envoy = request.via == PeerVia::Direct
+            && request.in_reply_to.is_none()
+            && matches!(request.kind, PeerKind::Message | PeerKind::Ask);
+        let Some(sink) = for_envoy.then(|| self.envoy.load_full()).flatten() else {
+            return Ok(());
+        };
+        self.limits
+            .check_run_admissible(request.source_identity, now)?;
+        if sink.has_room() {
+            Ok(())
+        } else {
+            Err(PeerRefusal::capacity(RefusalReason::EnvoyBusy))
+        }
+    }
+
     /// Notes one refusal of `identity` for folding and prints what the fold says: the
     /// first refusal of each reason in the hour, and the counts of any window that has
     /// since rolled over.
@@ -2990,12 +3015,19 @@ impl PeerSurface for MeshSlot {
     /// A reply to a question this Coyote asked is admitted without being counted: a peer
     /// past its limit must still be able to answer a `mesh__ask`, and the correlation
     /// only accepts the one reply (one escalation, then the answer), from the identity
-    /// it was asked of, so the exemption is spent with it. A refusal on the
-    /// store-and-forward path also earns the peer one typed reply per identity, per
-    /// reason, per hour, since no link carries a code back; on a link the caller's code
-    /// is the typed refusal. A refused reply neither earns nor spends one: a reply to a
-    /// reply is the loop the envoy guards against. The REPL line is folded on its own
-    /// count, so it prints whether or not the peer is told.
+    /// it was asked of, so the exemption is spent with it. On a link, a message or
+    /// question the envoy would run is refused before the hourly count is consulted
+    /// when the sender already has a run in flight, when its token or cost window for
+    /// the hour is already spent, or when the envoy's queue is full: the link caller's
+    /// code is the refusal, nothing is filed, and the refused message is not counted. A
+    /// bulletin, an interim notice (a message carrying `in_reply_to`), a reply to a
+    /// question nobody here asked, and anything that arrived store-and-forward see the
+    /// hourly count alone; what the envoy then refuses is handled where it is offered.
+    /// A refusal on the store-and-forward path also earns the peer one typed reply per
+    /// identity, per reason, per hour, since no link carries a code back. A refused
+    /// reply neither earns nor spends one: a reply to a reply is the loop the envoy
+    /// guards against. The REPL line is folded on its own count, so it prints whether
+    /// or not the peer is told.
     fn admit_peer_message(&self, request: &PeerAdmission) -> Result<(), PeerRefusal> {
         if request.kind == PeerKind::Reply
             && let Some(id) = request.in_reply_to
@@ -3010,7 +3042,10 @@ impl PeerSurface for MeshSlot {
         let identity = request.source_identity;
         let who = self.peer_label(identity, request.source_destination);
         let now = Instant::now();
-        match self.limits.admit_message(identity, now) {
+        let admitted = self
+            .link_run_admissible(request, now)
+            .and_then(|()| self.limits.admit_message(identity, now));
+        match admitted {
             Ok(()) => {
                 self.surface_fold_reports(identity, &who);
                 Ok(())

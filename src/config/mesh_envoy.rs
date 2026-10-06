@@ -986,6 +986,10 @@ impl EnvoySink for EnvoyRunner {
             .map_err(|_| PeerRefusal::capacity(RefusalReason::EnvoyBusy))
     }
 
+    fn has_room(&self) -> bool {
+        self.jobs.capacity() > 0
+    }
+
     fn answer(&self, id: &str, text: &str) -> bool {
         let mut held = self.held.lock();
         if !held.as_ref().is_some_and(|held| held.id == id) {
@@ -1757,6 +1761,8 @@ mod tests {
         source.remove_dir();
     }
 
+    /// The queue takes `ENVOY_QUEUE_MAX` jobs behind the one running; `has_room` reads
+    /// the same bound without taking a place, and says so again once the queue drains.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
     async fn a_ninth_job_is_refused_while_the_worker_is_parked() {
@@ -1786,6 +1792,7 @@ mod tests {
             ..PeerLimitConfig::default()
         });
         assert_eq!(ENVOY_QUEUE_MAX, 8);
+        assert!(runner.has_room());
         assert!(
             runner
                 .accept(job(PeerKind::Message, "msg-q0", "hello"))
@@ -1796,6 +1803,7 @@ mod tests {
         })
         .await;
         for n in 1..=ENVOY_QUEUE_MAX {
+            assert!(runner.has_room(), "job {n} still has a place");
             assert!(
                 runner
                     .accept(job(PeerKind::Message, &format!("msg-q{n}"), "hello"))
@@ -1803,6 +1811,7 @@ mod tests {
                 "job {n} should be queued"
             );
         }
+        assert!(!runner.has_room(), "the queue is full");
         let refusal = runner
             .accept(job(PeerKind::Message, "msg-q9", "hello"))
             .unwrap_err();
@@ -1814,6 +1823,7 @@ mod tests {
             idle.count("envoy replied: ok") == ENVOY_QUEUE_MAX + 1
         })
         .await;
+        assert!(runner.has_room());
         runner.stop().await;
         assert_eq!(app.mesh.peer_inbox().len(), 2 * (ENVOY_QUEUE_MAX + 1));
         assert_eq!(

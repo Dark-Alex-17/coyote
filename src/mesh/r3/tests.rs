@@ -519,7 +519,8 @@ pub(crate) mod network {
         to_r3_body,
     };
     use crate::mesh::node::{
-        KnockOptions, MeshRuntime, MeshSlot, NodeOptions, REKEY_GRACE, SHUTDOWN_GRACE,
+        KnockOptions, MeshRuntime, MeshSlot, NodeOptions, REKEY_GRACE, RecordingEnvoy,
+        SHUTDOWN_GRACE,
     };
     use crate::mesh::notify::Source;
     use crate::mesh::peers::PeerTable;
@@ -6252,6 +6253,227 @@ pub(crate) mod network {
         assert_eq!(reply.content, RefusalReason::EnvoyBusy.peer_text());
         let (envelopes, _) = slot.peer_inbox().drain();
         assert_eq!(only_peer(&envelopes).message_id, message.id);
+        pair.stop_node_a().await;
+    }
+
+    /// Node B's identity as node A's limiter keys it.
+    fn b_identity(pair: &NodePair) -> String {
+        pair.responder.desc.identity.address_hash.to_hex_string()
+    }
+
+    /// A message refused on its link left no trace on node A: nothing in the inbox or
+    /// the pending store, nothing counted against the sender's hour, nothing sent back
+    /// beyond the code itself.
+    fn nothing_filed(pair: &NodePair, slot: &MeshSlot) {
+        assert_eq!(slot.peer_inbox().len(), 0);
+        let pending = slot
+            .inbound_store()
+            .unwrap()
+            .list(SystemTime::now())
+            .unwrap();
+        assert!(pending.is_empty(), "{pending:?}");
+        assert_eq!(
+            slot.limits()
+                .window_of(&b_identity(pair), Instant::now())
+                .unwrap()
+                .messages,
+            0,
+            "a refused message is not counted"
+        );
+        assert_eq!(pair.recorder_b.seen_count(), 0, "no reply follows the code");
+    }
+
+    /// Node B already has a run with node A's envoy, so B's next message is refused on
+    /// its link with the bare `Throttled` code before any acknowledgement: nothing is
+    /// filed, nothing counted, no reply sent, and the person at the keyboard gets the
+    /// one folded line. Once the run ends the same message is acknowledged and handed
+    /// to the envoy.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_link_message_from_an_identity_with_a_run_in_flight_is_refused_before_the_ack() {
+        let pair = NodePair::start_with("r3-peer-link-in-flight", |_| {}, trusting_b).await;
+        pair.introduce_b_to_a().await;
+        let (slot, idle) = installed_slot(&pair);
+        let envoy = RecordingEnvoy::new(true, false);
+        slot.set_envoy(envoy.clone() as Arc<dyn EnvoySink>);
+        let held = slot
+            .limits()
+            .try_reserve(&b_identity(&pair), Instant::now())
+            .unwrap();
+        let message =
+            OutboundPeer::new(PeerKind::Message, "still there?", None, None, None).unwrap();
+
+        let refused = b_sends_to_a(&pair, &message).await.unwrap_err();
+
+        assert_eq!(refused, R3Error::Refused(RefusalCode::Throttled));
+        assert!(envoy.job_ids().is_empty());
+        nothing_filed(&pair, &slot);
+        let lines: Vec<String> = idle.0.lock().iter().map(|note| note.text.clone()).collect();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("peer_concurrency"), "{lines:?}");
+
+        drop(held);
+        let outcome = b_sends_to_a(&pair, &message).await.unwrap();
+        assert!(is_received_reply(&outcome.value, &message.id));
+        wait_until("the envoy to take the message", || {
+            envoy.job_ids() == [message.id.clone()]
+        })
+        .await;
+        pair.stop_node_a().await;
+    }
+
+    /// An envoy whose queue reads as full before anything is offered to it.
+    struct FullEnvoy;
+
+    impl EnvoySink for FullEnvoy {
+        fn accept(&self, _job: EnvoyJob) -> Result<(), PeerRefusal> {
+            Err(PeerRefusal::capacity(RefusalReason::EnvoyBusy))
+        }
+
+        fn has_room(&self) -> bool {
+            false
+        }
+
+        fn answer(&self, _id: &str, _text: &str) -> bool {
+            false
+        }
+
+        fn holds(&self, _id: &str) -> bool {
+            false
+        }
+
+        fn interrupt(&self) {}
+    }
+
+    /// Node A's envoy queue is full, so node B's question is refused on its link with the
+    /// bare `Throttled` code before any acknowledgement and nothing is filed; the envoy
+    /// is never offered it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_link_message_is_refused_before_the_ack_while_the_envoy_queue_is_full() {
+        let pair = NodePair::start_with("r3-peer-link-queue-full", |_| {}, trusting_b).await;
+        pair.introduce_b_to_a().await;
+        let (slot, idle) = installed_slot(&pair);
+        slot.set_envoy(Arc::new(FullEnvoy) as Arc<dyn EnvoySink>);
+        let ask = OutboundPeer::new(PeerKind::Ask, "anyone free?", None, None, None).unwrap();
+
+        let refused = b_sends_to_a(&pair, &ask).await.unwrap_err();
+
+        assert_eq!(refused, R3Error::Refused(RefusalCode::Throttled));
+        nothing_filed(&pair, &slot);
+        let lines: Vec<String> = idle.0.lock().iter().map(|note| note.text.clone()).collect();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("envoy_busy"), "{lines:?}");
+        pair.stop_node_a().await;
+    }
+
+    /// Node B has already spent its hour's token ceiling at node A, so B's next message
+    /// is refused on its link with the bare `Throttled` code before any acknowledgement
+    /// and nothing is filed; the overshoot reply belongs to the run that crossed the
+    /// ceiling, not to a message that never ran.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_link_message_from_an_identity_whose_token_window_is_spent_is_refused_before_the_ack()
+    {
+        let pair = NodePair::start_with("r3-peer-link-tokens-spent", |_| {}, trusting_b).await;
+        pair.introduce_b_to_a().await;
+        let (slot, idle) = installed_slot(&pair);
+        let envoy = RecordingEnvoy::new(true, false);
+        slot.set_envoy(envoy.clone() as Arc<dyn EnvoySink>);
+        let ceiling = slot.limits().config().tokens_per_hour;
+        slot.limits()
+            .debit(&b_identity(&pair), ceiling, None, Instant::now());
+        let message = OutboundPeer::new(PeerKind::Message, "one more", None, None, None).unwrap();
+
+        let refused = b_sends_to_a(&pair, &message).await.unwrap_err();
+
+        assert_eq!(refused, R3Error::Refused(RefusalCode::Throttled));
+        assert!(envoy.job_ids().is_empty());
+        nothing_filed(&pair, &slot);
+        let lines: Vec<String> = idle.0.lock().iter().map(|note| note.text.clone()).collect();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("token_ceiling"), "{lines:?}");
+        pair.stop_node_a().await;
+    }
+
+    /// The gates before the acknowledgement are for what the envoy would run. With node
+    /// B's run in flight at node A, B's bulletin, its interim notice on a question (a
+    /// message carrying `in_reply_to`) and its reply to a question A asked are all
+    /// acknowledged and filed as ever; only the hourly count saw the first two, and the
+    /// correlated reply not even that.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_run_in_flight_does_not_refuse_bulletins_notices_or_correlated_replies_on_the_link() {
+        let pair = NodePair::start_with("r3-peer-link-not-for-envoy", |_| {}, trusting_b).await;
+        pair.introduce_b_to_a().await;
+        let (slot, idle) = installed_slot(&pair);
+        let envoy = RecordingEnvoy::new(true, false);
+        slot.set_envoy(envoy.clone() as Arc<dyn EnvoySink>);
+        let identity = b_identity(&pair);
+        let _held = slot
+            .limits()
+            .try_reserve(&identity, Instant::now())
+            .unwrap();
+        let ask = OutboundPeer::new(PeerKind::Ask, "what is up", None, None, None).unwrap();
+        slot.correlations()
+            .open(pending_for(&ask, &pair.responder))
+            .unwrap();
+
+        let bulletin =
+            OutboundPeer::new(PeerKind::Bulletin, "all hands", None, None, None).unwrap();
+        let notice = OutboundPeer::new(
+            PeerKind::Message,
+            "still thinking",
+            None,
+            Some("a-question-of-yours"),
+            None,
+        )
+        .unwrap();
+        let reply = outbound_from_args(
+            PeerKind::Message,
+            "all good here",
+            &serde_json::json!({ "in_reply_to": ask.id }),
+        )
+        .unwrap();
+        assert_eq!(reply.kind, PeerKind::Reply);
+        for message in [&bulletin, &notice, &reply] {
+            let outcome = b_sends_to_a(&pair, message).await.unwrap();
+            assert!(
+                is_received_reply(&outcome.value, &message.id),
+                "{:?}: {:?}",
+                message.kind,
+                outcome.value
+            );
+        }
+        let lines: Vec<String> = idle.0.lock().iter().map(|note| note.text.clone()).collect();
+        assert!(
+            lines.iter().all(|line| !line.contains("refus")),
+            "{lines:?}"
+        );
+
+        let question =
+            OutboundPeer::new(PeerKind::Message, "and this one?", None, None, None).unwrap();
+        assert_eq!(
+            b_sends_to_a(&pair, &question).await.unwrap_err(),
+            R3Error::Refused(RefusalCode::Throttled),
+            "the same identity's own message is still gated"
+        );
+
+        assert!(envoy.job_ids().is_empty());
+        let (envelopes, dropped) = slot.peer_inbox().drain();
+        assert_eq!(dropped, 0);
+        let filed: Vec<&str> = envelopes
+            .iter()
+            .map(|envelope| match &envelope.payload {
+                EnvelopePayload::Peer(message) => message.message_id.as_str(),
+                other => panic!("not a peer envelope: {other:?}"),
+            })
+            .collect();
+        assert_eq!(filed, [&bulletin.id, &notice.id, &reply.id]);
+        assert_eq!(
+            slot.limits()
+                .window_of(&identity, Instant::now())
+                .unwrap()
+                .messages,
+            2,
+            "the bulletin and the notice are counted, the correlated reply is not"
+        );
         pair.stop_node_a().await;
     }
 
