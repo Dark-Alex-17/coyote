@@ -3779,12 +3779,13 @@ mod tests {
         Model::from_config("provider", &[data]).remove(0)
     }
 
-    /// Fifty asks from one identity on each inbound path: the hourly message limit
-    /// refuses the wire path with `Throttled` and files the propagated path in the inbox
-    /// without an envoy run (its one typed reply for the hour was already spent on the
-    /// link), the per-identity concurrency cap files the admitted extras in the inbox,
-    /// the envoy runs exactly one, the REPL hears one refusal line per reason, and
-    /// another identity is untouched.
+    /// Fifty asks from one identity on each inbound path. On the link the first is
+    /// admitted and handed to the envoy; the forty-nine behind it are refused
+    /// `Throttled` before any acknowledgement, since a run of the sender's is in
+    /// flight, and nothing is filed or counted. By store-and-forward the hourly message
+    /// limit files every ask in the inbox without an envoy run and owes the peer one
+    /// typed reply for the hour. The envoy runs exactly one, the REPL hears one refusal
+    /// line per reason, and another identity is untouched.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
     async fn a_flood_from_one_identity_is_bounded_on_both_inbound_paths() {
@@ -3827,28 +3828,29 @@ mod tests {
                 Reply::Silent => panic!("ask {n} was neither acknowledged nor refused"),
             }
         }
-        assert_eq!((acked, throttled), (10, 40));
+        assert_eq!((acked, throttled), (1, 49));
         wait_until("the worker to take the first ask", || {
             runs.load(Ordering::SeqCst) == 1
         })
         .await;
         assert_eq!(
             app.mesh.peer_inbox().len(),
-            9,
-            "the admitted asks the envoy would not take"
+            0,
+            "a link refusal before the ack files nothing"
+        );
+        assert_eq!(
+            app.mesh
+                .limits()
+                .window_of(&a_hex, Instant::now())
+                .unwrap()
+                .messages,
+            1,
+            "only the admitted ask is counted"
         );
         let a8 = short(&a_hex);
         assert_eq!(
             idle.count(&format!(
-                "{a8}: over the hourly message limit, refused on its link; further rate_limited refusals from this peer are folded for the hour"
-            )),
-            1,
-            "{:?}",
-            idle.texts()
-        );
-        assert_eq!(
-            idle.count(&format!(
-                "{a8}: already has a message with the envoy, filed in the inbox; further peer_concurrency refusals from this peer are folded for the hour"
+                "{a8}: already has a message with the envoy, refused on its link; further peer_concurrency refusals from this peer are folded for the hour"
             )),
             1,
             "{:?}",
@@ -3872,17 +3874,24 @@ mod tests {
         }
         assert_eq!(
             app.mesh.peer_inbox().len(),
-            59,
+            50,
             "every refused propagated ask is filed"
         );
         assert_eq!(runs.load(Ordering::SeqCst), 1);
         assert_eq!(
             idle.texts().len(),
-            lines_before + 50,
-            "one inbox line per filed ask and no new refusal line: {:?}",
+            lines_before + 51,
+            "one inbox line per filed ask and the hour's first rate_limited line: {:?}",
             idle.texts()
         );
-        assert_eq!(idle.count("rate_limited refusals"), 1, "{:?}", idle.texts());
+        assert_eq!(
+            idle.count(&format!(
+                "{a8}: over the hourly message limit; arrived store-and-forward, the peer is told once an hour; further rate_limited refusals from this peer are folded for the hour"
+            )),
+            1,
+            "{:?}",
+            idle.texts()
+        );
 
         let b = PrivateIdentity::new_from_rand(OsRng);
         let b_destination = destination_address(&origin.0, b.address_hash()).to_hex_string();
@@ -3902,8 +3911,8 @@ mod tests {
         runner.stop().await;
         assert_eq!(
             app.mesh.peer_inbox().len(),
-            63,
-            "nine refused originals, fifty filed propagated asks and two exchanges"
+            54,
+            "fifty filed propagated asks and two exchanges"
         );
         source.remove_dir();
     }

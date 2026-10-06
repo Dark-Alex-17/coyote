@@ -2327,7 +2327,7 @@ impl MeshSlot {
         let identity = original.source_identity.clone();
         let via = original.via;
         self.deliver_to_inbox(original, false);
-        self.surface_refusal(&identity, refusal, &who, via);
+        self.surface_refusal(&identity, refusal, &who, RefusalPath::Filed(via));
     }
 
     /// `record_envoy_refusal` plus the correlated reply that tells the peer why, sent
@@ -2428,11 +2428,11 @@ impl MeshSlot {
     /// Notes one refusal of `identity` for folding and prints what the fold says: the
     /// first refusal of each reason in the hour, and the counts of any window that has
     /// since rolled over.
-    fn surface_refusal(&self, identity: &str, refusal: &PeerRefusal, who: &str, via: PeerVia) {
+    fn surface_refusal(&self, identity: &str, refusal: &PeerRefusal, who: &str, path: RefusalPath) {
         let notice = self
             .limits
             .note_refusal(identity, refusal.reason, Instant::now());
-        self.push_peer_lines(identity, fold_lines(who, refusal.reason, via, &notice));
+        self.push_peer_lines(identity, fold_lines(who, refusal.reason, path, &notice));
     }
 
     /// Prints the folded counts of a rolled-over window when a message from `identity`
@@ -2949,12 +2949,25 @@ fn first_words(message: &PeerMessage, max_chars: usize) -> String {
 
 /// The REPL lines for one refusal of `reason` from `who`, as `note_refusal` folds it:
 /// the rolled-over counts first, then the one line the first refusal of the hour earns.
-fn fold_lines(who: &str, reason: RefusalReason, via: PeerVia, notice: &FoldNotice) -> Vec<String> {
+/// What became of a refused message, for the REPL line: refused on its link before the
+/// acknowledgement with nothing filed, or filed in the inbox after arriving by `via`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RefusalPath {
+    Link,
+    Filed(PeerVia),
+}
+
+fn fold_lines(
+    who: &str,
+    reason: RefusalReason,
+    path: RefusalPath,
+    notice: &FoldNotice,
+) -> Vec<String> {
     let mut lines = fold_report_lines(who, &notice.reports);
     if notice.surface {
         lines.push(format!(
             "{who}: {}; further {} refusals from this peer are folded for the hour",
-            refusal_phrase(reason, via),
+            refusal_phrase(reason, path),
             reason.as_str()
         ));
     }
@@ -2978,21 +2991,30 @@ fn fold_report_lines(who: &str, reports: &[(RefusalReason, u32)]) -> Vec<String>
         .collect()
 }
 
-fn refusal_phrase(reason: RefusalReason, via: PeerVia) -> &'static str {
-    match (reason, via) {
-        (RefusalReason::RateLimited, PeerVia::Direct) => {
-            "over the hourly message limit, refused on its link"
-        }
-        (RefusalReason::RateLimited, PeerVia::StoreAndForward) => {
+fn refusal_phrase(reason: RefusalReason, path: RefusalPath) -> &'static str {
+    use RefusalPath::{Filed, Link};
+    match (reason, path) {
+        (RefusalReason::RateLimited, Filed(PeerVia::StoreAndForward)) => {
             "over the hourly message limit; arrived store-and-forward, the peer is told once an hour"
         }
-        (RefusalReason::EnvoyBusy, _) => "the envoy queue is full, filed in the inbox",
+        (RefusalReason::RateLimited, _) => "over the hourly message limit, refused on its link",
+        (RefusalReason::EnvoyBusy, Link) => "the envoy queue is full, refused on its link",
+        (RefusalReason::EnvoyBusy, Filed(_)) => "the envoy queue is full, filed in the inbox",
         (RefusalReason::EnvoyStopping, _) => "the envoy is stopping, filed in the inbox",
-        (RefusalReason::PeerConcurrency, _) => {
+        (RefusalReason::PeerConcurrency, Link) => {
+            "already has a message with the envoy, refused on its link"
+        }
+        (RefusalReason::PeerConcurrency, Filed(_)) => {
             "already has a message with the envoy, filed in the inbox"
         }
-        (RefusalReason::TokenCeiling, _) => "over its hourly token ceiling, filed in the inbox",
-        (RefusalReason::CostCeiling, _) => "over its hourly cost ceiling, filed in the inbox",
+        (RefusalReason::TokenCeiling, Link) => "over its hourly token ceiling, refused on its link",
+        (RefusalReason::TokenCeiling, Filed(_)) => {
+            "over its hourly token ceiling, filed in the inbox"
+        }
+        (RefusalReason::CostCeiling, Link) => "over its hourly cost ceiling, refused on its link",
+        (RefusalReason::CostCeiling, Filed(_)) => {
+            "over its hourly cost ceiling, filed in the inbox"
+        }
         (RefusalReason::LoopGuard, _) => {
             "sent a reply the envoy will not answer, filed in the inbox"
         }
@@ -3066,7 +3088,11 @@ impl PeerSurface for MeshSlot {
                 Ok(())
             }
             Err(refusal) => {
-                self.surface_refusal(identity, &refusal, &who, request.via);
+                let path = match request.via {
+                    PeerVia::Direct => RefusalPath::Link,
+                    PeerVia::StoreAndForward => RefusalPath::Filed(PeerVia::StoreAndForward),
+                };
+                self.surface_refusal(identity, &refusal, &who, path);
                 if request.via == PeerVia::StoreAndForward
                     && request.in_reply_to.is_none()
                     && self.limits.claim_peer_reply(identity, refusal.reason, now)
@@ -4209,7 +4235,7 @@ mod tests {
             fold_lines(
                 "alice",
                 RefusalReason::PeerConcurrency,
-                PeerVia::Direct,
+                RefusalPath::Filed(PeerVia::Direct),
                 &surfaced
             ),
             [
@@ -4222,7 +4248,7 @@ mod tests {
             fold_lines(
                 "alice",
                 RefusalReason::RateLimited,
-                PeerVia::Direct,
+                RefusalPath::Link,
                 &FoldNotice::default()
             )
             .is_empty()
@@ -4231,9 +4257,13 @@ mod tests {
             surface: true,
             reports: Vec::new(),
         };
-        for via in [PeerVia::Direct, PeerVia::StoreAndForward] {
+        for path in [
+            RefusalPath::Link,
+            RefusalPath::Filed(PeerVia::Direct),
+            RefusalPath::Filed(PeerVia::StoreAndForward),
+        ] {
             for reason in RefusalReason::ALL {
-                let lines = fold_lines("cdcdcdcd", reason, via, &first);
+                let lines = fold_lines("cdcdcdcd", reason, path, &first);
                 assert_eq!(lines.len(), 1);
                 assert!(lines[0].starts_with("cdcdcdcd: "), "{}", lines[0]);
                 assert!(
@@ -4245,7 +4275,12 @@ mod tests {
             }
         }
         assert_eq!(
-            fold_lines("alice", RefusalReason::RateLimited, PeerVia::Direct, &first),
+            fold_lines(
+                "alice",
+                RefusalReason::RateLimited,
+                RefusalPath::Link,
+                &first
+            ),
             [
                 "alice: over the hourly message limit, refused on its link; further rate_limited refusals from this peer are folded for the hour"
             ]
@@ -4254,11 +4289,22 @@ mod tests {
             fold_lines(
                 "alice",
                 RefusalReason::RateLimited,
-                PeerVia::StoreAndForward,
+                RefusalPath::Filed(PeerVia::StoreAndForward),
                 &first
             ),
             [
                 "alice: over the hourly message limit; arrived store-and-forward, the peer is told once an hour; further rate_limited refusals from this peer are folded for the hour"
+            ]
+        );
+        assert_eq!(
+            fold_lines(
+                "alice",
+                RefusalReason::PeerConcurrency,
+                RefusalPath::Link,
+                &first
+            ),
+            [
+                "alice: already has a message with the envoy, refused on its link; further peer_concurrency refusals from this peer are folded for the hour"
             ]
         );
     }
