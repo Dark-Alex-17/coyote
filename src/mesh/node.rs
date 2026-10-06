@@ -2272,14 +2272,16 @@ impl MeshSlot {
     /// `record_envoy_exchange`, what it could not through `record_envoy_fallback`. An
     /// envoy that refuses (its queue is full, or the sender is over one of its
     /// ceilings), a bulletin, or no envoy at all means the inbox path as ever; a
-    /// refusal also goes back to the peer with its typed reason and earns the person at
-    /// the keyboard one refusal line per reason per hour (the inbox summary line still
-    /// prints per message; over-limit store-and-forward messages are filed too, bounded
-    /// by the inbox and idle-sink caps, not by the hourly gate), so a flood cannot flood
-    /// the terminal. Anything that arrived naming a message in `in_reply_to` takes the
-    /// inbox path too, whatever its kind: a peer's envoy replying to our envoy's reply
-    /// would otherwise keep the two talking forever. Runs on a blocking thread off the
-    /// server's request path or on the fetch task, so nothing here awaits.
+    /// refusal also goes back to the peer with its typed reason, every time over a link
+    /// and once per identity, per reason, per hour by store-and-forward, and earns the
+    /// person at the keyboard one refusal line per reason per hour (the inbox summary
+    /// line still prints per message; over-limit store-and-forward messages are filed
+    /// too, bounded by the inbox and idle-sink caps, not by the hourly gate), so a flood
+    /// cannot flood the terminal or the peer's inbox. Anything that arrived naming a
+    /// message in `in_reply_to` takes the inbox path too, whatever its kind: a peer's
+    /// envoy replying to our envoy's reply would otherwise keep the two talking forever.
+    /// Runs on a blocking thread off the server's request path or on the fetch task, so
+    /// nothing here awaits.
     pub(crate) fn deliver_peer(&self, mut message: PeerMessage) {
         let wire_reply = message.in_reply_to.is_some();
         let answered = self.answer_correlation(&mut message);
@@ -2330,13 +2332,26 @@ impl MeshSlot {
 
     /// `record_envoy_refusal` plus the correlated reply that tells the peer why, sent
     /// off the request path since this runs where nothing may await. A loop-guard
-    /// refusal is never sent: a reply to a reply is the loop it guards against.
+    /// refusal is never sent: a reply to a reply is the loop it guards against. Over a
+    /// link the reply goes every time, since the peer is waiting on it; by
+    /// store-and-forward it goes once per identity, per reason, per hour, on the same
+    /// claim the admission refusal spends, so a flood of stored messages does not come
+    /// back as a flood of replies.
     pub(crate) fn refuse_for_envoy(&self, message: PeerMessage, refusal: PeerRefusal) {
         let destination = message.source_destination.clone();
         let id = message.message_id.clone();
         let thread = message.thread().to_string();
+        let identity = message.source_identity.clone();
+        let via = message.via;
         self.record_envoy_refusal(message, &refusal);
-        if refusal.reason != RefusalReason::LoopGuard {
+        if refusal.reason == RefusalReason::LoopGuard {
+            return;
+        }
+        let owed = via == PeerVia::Direct
+            || self
+                .limits
+                .claim_peer_reply(&identity, refusal.reason, Instant::now());
+        if owed {
             self.send_refusal_reply(&destination, &id, Some(&thread), &refusal);
         }
     }
@@ -4120,6 +4135,64 @@ mod tests {
             pushed.len(),
             6,
             "five summary lines and one folded refusal line: {pushed:?}"
+        );
+    }
+
+    /// An envoy refusal of a stored message owes the peer one typed reply per identity,
+    /// per reason, per hour, like a refused admission; over a link the peer is waiting,
+    /// so every refusal is answered. Both originals are filed either way. With the mesh
+    /// off the reply has nowhere to go, and the warning that says so is the one
+    /// observable attempt.
+    #[test]
+    fn a_store_and_forward_envoy_refusal_is_answered_once_per_identity_per_reason_per_hour() {
+        install_log_collector();
+        let slot = MeshSlot::default();
+        let idle = RecordingIdleSink::new(true);
+        slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+        let envoy = RecordingEnvoy::refusing(RefusalReason::EnvoyBusy);
+        slot.set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
+
+        for id in ["stored-envoy-0", "stored-envoy-1"] {
+            let mut message = peer_message(PeerKind::Message, id, None);
+            message.via = PeerVia::StoreAndForward;
+            slot.deliver_peer(message);
+        }
+        for id in ["linked-envoy-0", "linked-envoy-1"] {
+            slot.deliver_peer(peer_message(PeerKind::Message, id, None));
+        }
+
+        assert!(envoy.job_ids().is_empty());
+        let (envelopes, _) = slot.peer_inbox().drain();
+        assert_eq!(
+            peer_ids(&envelopes),
+            [
+                "stored-envoy-0",
+                "stored-envoy-1",
+                "linked-envoy-0",
+                "linked-envoy-1"
+            ]
+        );
+        let warned = warn_snapshot();
+        let attempts: Vec<&String> = warned
+            .iter()
+            .filter(|line| line.starts_with("Mesh refusal of "))
+            .filter(|line| line.contains("-envoy-"))
+            .collect();
+        let dest8 = short(&hex_lower(&PEER_INSTANCE)).to_string();
+        assert_eq!(
+            attempts,
+            [
+                &format!(
+                    "Mesh refusal of stored-envoy-0 to instance {dest8} could not be sent: mesh is off"
+                ),
+                &format!(
+                    "Mesh refusal of linked-envoy-0 to instance {dest8} could not be sent: mesh is off"
+                ),
+                &format!(
+                    "Mesh refusal of linked-envoy-1 to instance {dest8} could not be sent: mesh is off"
+                ),
+            ],
+            "{warned:#?}"
         );
     }
 
