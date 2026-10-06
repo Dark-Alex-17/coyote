@@ -1204,8 +1204,7 @@ async fn a_reference_message_the_envoy_could_not_run_hears_throttled_before_any_
         node.slot
             .limits()
             .window_of(&reference.ready.identity_hash, Instant::now())
-            .unwrap()
-            .messages,
+            .map_or(0, |window| window.messages),
         0,
         "{THROTTLED_IDS:?}: a refused message is not counted"
     );

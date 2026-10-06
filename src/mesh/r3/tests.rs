@@ -6318,6 +6318,11 @@ pub(crate) mod network {
             envoy.job_ids() == [message.id.clone()]
         })
         .await;
+        assert_eq!(
+            pair.recorder_b.seen_count(),
+            0,
+            "no reply followed the refusal while the run was in flight"
+        );
         pair.stop_node_a().await;
     }
 
@@ -6335,6 +6340,7 @@ pub(crate) mod network {
         let refused = b_sends_to_a(&pair, &ask).await.unwrap_err();
 
         assert_eq!(refused, R3Error::Refused(RefusalCode::Throttled));
+        sleep(Duration::from_millis(500)).await;
         nothing_filed(&pair, &slot);
         let lines: Vec<String> = idle.0.lock().iter().map(|note| note.text.clone()).collect();
         assert_eq!(lines.len(), 1, "{lines:?}");
@@ -6363,6 +6369,7 @@ pub(crate) mod network {
 
         assert_eq!(refused, R3Error::Refused(RefusalCode::Throttled));
         assert!(envoy.job_ids().is_empty());
+        sleep(Duration::from_millis(500)).await;
         nothing_filed(&pair, &slot);
         let lines: Vec<String> = idle.0.lock().iter().map(|note| note.text.clone()).collect();
         assert_eq!(lines.len(), 1, "{lines:?}");
@@ -6481,6 +6488,7 @@ pub(crate) mod network {
 
         assert_eq!(refused, R3Error::Refused(RefusalCode::Throttled));
         assert!(envoy.job_ids().is_empty());
+        sleep(Duration::from_millis(500)).await;
         nothing_filed(&pair, &slot);
         let lines: Vec<String> = idle.0.lock().iter().map(|note| note.text.clone()).collect();
         assert_eq!(lines.len(), 1, "{lines:?}");
