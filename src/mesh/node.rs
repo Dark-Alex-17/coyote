@@ -2947,8 +2947,6 @@ fn first_words(message: &PeerMessage, max_chars: usize) -> String {
     display_text(words, max_chars).unwrap_or_default()
 }
 
-/// The REPL lines for one refusal of `reason` from `who`, as `note_refusal` folds it:
-/// the rolled-over counts first, then the one line the first refusal of the hour earns.
 /// What became of a refused message, for the REPL line: refused on its link before the
 /// acknowledgement with nothing filed, or filed in the inbox after arriving by `via`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2957,6 +2955,8 @@ enum RefusalPath {
     Filed(PeerVia),
 }
 
+/// The REPL lines for one refusal of `reason` from `who`, as `note_refusal` folds it:
+/// the rolled-over counts first, then the one line the first refusal of the hour earns.
 fn fold_lines(
     who: &str,
     reason: RefusalReason,
