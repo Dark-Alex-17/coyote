@@ -2999,10 +2999,14 @@ fn refusal_phrase(reason: RefusalReason, path: RefusalPath) -> &'static str {
         (RefusalReason::RateLimited, Filed(PeerVia::StoreAndForward)) => {
             "over the hourly message limit; arrived store-and-forward, the peer is told once an hour"
         }
-        (RefusalReason::RateLimited, _) => "over the hourly message limit, refused on its link",
+        (RefusalReason::RateLimited, Link) => "over the hourly message limit, refused on its link",
+        (RefusalReason::RateLimited, Filed(PeerVia::Direct)) => {
+            "over the hourly message limit, filed in the inbox"
+        }
         (RefusalReason::EnvoyBusy, Link) => "the envoy queue is full, refused on its link",
         (RefusalReason::EnvoyBusy, Filed(_)) => "the envoy queue is full, filed in the inbox",
-        (RefusalReason::EnvoyStopping, _) => "the envoy is stopping, filed in the inbox",
+        (RefusalReason::EnvoyStopping, Link) => "the envoy is stopping, refused on its link",
+        (RefusalReason::EnvoyStopping, Filed(_)) => "the envoy is stopping, filed in the inbox",
         (RefusalReason::PeerConcurrency, Link) => {
             "already has a message with the envoy, refused on its link"
         }
@@ -3017,7 +3021,10 @@ fn refusal_phrase(reason: RefusalReason, path: RefusalPath) -> &'static str {
         (RefusalReason::CostCeiling, Filed(_)) => {
             "over its hourly cost ceiling, filed in the inbox"
         }
-        (RefusalReason::LoopGuard, _) => {
+        (RefusalReason::LoopGuard, Link) => {
+            "sent a reply the envoy will not answer, refused on its link"
+        }
+        (RefusalReason::LoopGuard, Filed(_)) => {
             "sent a reply the envoy will not answer, filed in the inbox"
         }
     }
@@ -4268,6 +4275,14 @@ mod tests {
                 let lines = fold_lines("cdcdcdcd", reason, path, &first);
                 assert_eq!(lines.len(), 1);
                 assert!(lines[0].starts_with("cdcdcdcd: "), "{}", lines[0]);
+                let became = match (reason, path) {
+                    (_, RefusalPath::Link) => "refused on its link",
+                    (RefusalReason::RateLimited, RefusalPath::Filed(PeerVia::StoreAndForward)) => {
+                        "arrived store-and-forward, the peer is told once an hour"
+                    }
+                    (_, RefusalPath::Filed(_)) => "filed in the inbox",
+                };
+                assert!(lines[0].contains(became), "{}", lines[0]);
                 assert!(
                     lines[0].contains(&format!("further {} refusals", reason.as_str())),
                     "{}",
