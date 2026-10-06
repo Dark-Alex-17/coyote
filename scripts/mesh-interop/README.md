@@ -17,15 +17,15 @@ rules, in `src/repl/mesh_share_vectors.rs`).
 
 ### Verification record
 
-Last verified 2026-10-04, on Linux, with the Rust side at the crates.io `0.12.0` release of
+Last verified 2026-10-06, on Linux, with the Rust side at the crates.io `0.12.0` release of
 `lxmf-wire`, `reticulum-rs-transport` and `reticulum-rs-core`, and the Python side at RNS
 `1.5.2` / LXMF `0.9.6` (the two commits pinned above):
 
 | Invocation | Result |
 |---|---|
-| `COYOTE_MESH_INTEROP=1 cargo test --all mesh::conformance -- --include-ignored` (vectors + interop + netns) | 95 passed, 0 ignored |
+| `COYOTE_MESH_INTEROP=1 cargo test --all mesh::conformance -- --include-ignored` (vectors + interop + netns) | 96 passed, 0 ignored |
 | `cargo test --all mesh::fuzz` | 20 passed |
-| `cargo test --all` | 5574 passed, 0 failed in the unit binary; 86 passed across the integration binaries |
+| `cargo test --all` | 5622 passed, 0 failed in the unit binary; 99 passed across the integration binaries |
 
 The macOS and Windows legs are proven by the PR's CI matrix rather than by this record.
 Re-run the three commands and refresh this table whenever either side's pin moves.
