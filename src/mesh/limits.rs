@@ -247,6 +247,14 @@ impl IdentityWindow {
         Ok(())
     }
 
+    /// Whether one more run may start now: the concurrency slot, then the ceilings.
+    fn admissible(&self, config: &PeerLimitConfig, now: Instant) -> Result<(), PeerRefusal> {
+        if self.in_flight >= config.concurrency {
+            return Err(PeerRefusal::capacity(RefusalReason::PeerConcurrency));
+        }
+        self.check_ceilings(config, now)
+    }
+
     #[cfg(test)]
     fn view(&self) -> WindowView {
         WindowView {
@@ -361,10 +369,7 @@ impl PeerLimits {
         let Some(window) = state.entry(identity, now) else {
             return Err(PeerRefusal::capacity(RefusalReason::PeerConcurrency));
         };
-        if window.in_flight >= config.concurrency {
-            return Err(PeerRefusal::capacity(RefusalReason::PeerConcurrency));
-        }
-        window.check_ceilings(&config, now)?;
+        window.admissible(&config, now)?;
         window.in_flight = window.in_flight.saturating_add(1);
         Ok(Reservation {
             limits: Arc::clone(self),
@@ -396,10 +401,7 @@ impl PeerLimits {
         let Some(window) = state.entry(identity, now) else {
             return Err(PeerRefusal::capacity(RefusalReason::PeerConcurrency));
         };
-        if window.in_flight >= config.concurrency {
-            return Err(PeerRefusal::capacity(RefusalReason::PeerConcurrency));
-        }
-        window.check_ceilings(&config, now)
+        window.admissible(&config, now)
     }
 
     fn release(&self, identity: &str) {
