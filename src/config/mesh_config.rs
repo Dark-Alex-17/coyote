@@ -56,10 +56,11 @@ pub struct MeshConfig {
     pub envoy_escalation_timeout: u64,
     pub knock_retention_hours: u64,
     /// Envoy runs one sending identity may have queued or running at once; on a live
-    /// link a message that would start a run while one of the sender's is in flight is
-    /// refused with a typed reason before it is acknowledged and is not filed; by
-    /// store-and-forward it is filed in the inbox for the human without an envoy run
-    /// and the peer gets one typed reply per identity, per reason, per hour.
+    /// link a message that would start a run while the sender already has that many
+    /// queued or running is refused with a typed reason before it is acknowledged and
+    /// is not filed; by store-and-forward it is filed in the inbox for the human
+    /// without an envoy run and the peer gets one typed reply per identity, per
+    /// reason, per hour.
     pub peer_max_concurrent: u32,
     /// Messages accepted from one sending identity per hour. Windows are fixed hours
     /// kept in memory, so a restart opens a fresh window; further messages are refused
@@ -74,17 +75,20 @@ pub struct MeshConfig {
     /// run, so the runs in flight may overshoot the ceiling by at most
     /// `peer_max_concurrent` runs; on a live link a message that would start a run
     /// after the hour's token ceiling is already spent is refused with a typed reason
-    /// before it is acknowledged and is not filed; by store-and-forward it is filed in
-    /// the inbox for the human without an envoy run and the peer gets one typed reply
-    /// per identity, per reason, per hour.
+    /// before it is acknowledged and is not filed; one acknowledged before the ceiling
+    /// was reached and refused when its turn comes is filed and answered like a
+    /// store-and-forward message; by store-and-forward it is filed in the inbox for
+    /// the human without an envoy run and the peer gets one typed reply per identity,
+    /// per reason, per hour.
     pub peer_max_tokens_per_hour: u64,
     /// USD one sending identity may cost per hour, counted like the token ceiling; 0 =
     /// no cost ceiling. Enforced only when the envoy model's prices are known; on a
     /// live link a message that would start a run after the hour's cost ceiling is
     /// already spent is refused with a typed reason before it is acknowledged and is
-    /// not filed; by store-and-forward it is filed in the inbox for the human without
-    /// an envoy run and the peer gets one typed reply per identity, per reason, per
-    /// hour.
+    /// not filed; one acknowledged before the ceiling was reached and refused when its
+    /// turn comes is filed and answered like a store-and-forward message; by
+    /// store-and-forward it is filed in the inbox for the human without an envoy run
+    /// and the peer gets one typed reply per identity, per reason, per hour.
     pub peer_max_cost_usd_per_hour: f64,
     /// Seconds between automatic fetches of the messages a propagation node holds for
     /// this node, the first running once a propagation node is heard after the node
