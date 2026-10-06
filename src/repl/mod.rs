@@ -23,7 +23,7 @@ use crate::render::render_error;
 use crate::supervisor::Supervisor;
 use crate::utils::{
     AbortSignal, SHELL, abortable_run_with_spinner, create_abort_signal, dimmed_text,
-    drain_stale_tty_input, run_command, set_text, temp_file,
+    drain_stale_tty_input, resync_cursor_queries, run_command, set_text, temp_file,
 };
 
 use crate::sandbox::SANDBOX_ENV_FLAG;
@@ -510,6 +510,8 @@ Type ".help" for additional help.
             if self.abort_signal.aborted_ctrld() {
                 break;
             }
+            // Drain stale ESC[6n replies so reedline anchors the prompt on the real row.
+            resync_cursor_queries();
             let sig = self.editor.read_line(&self.prompt);
             match sig {
                 Ok(Signal::Success(line)) => {

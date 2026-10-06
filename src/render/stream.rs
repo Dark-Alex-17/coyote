@@ -1,6 +1,9 @@
 use super::{MarkdownRender, SseEvent};
 
-use crate::utils::{AbortSignal, DrainOutcome, drain_terminal_events, spawn_spinner};
+use crate::utils::{
+    AbortSignal, DrainOutcome, Resync, backoff_armed, drain_terminal_events, next_sentinel_start,
+    pop_stale, resync, spawn_spinner,
+};
 
 use anyhow::Result;
 use crossterm::{
@@ -8,6 +11,7 @@ use crossterm::{
     terminal::{self, disable_raw_mode, enable_raw_mode},
 };
 use std::{
+    cell::RefCell,
     io::{self, Write, stdout},
     time::Duration,
 };
@@ -72,7 +76,16 @@ async fn markdown_stream_inner(
     render: &mut MarkdownRender,
     abort_signal: &AbortSignal,
 ) -> Result<()> {
-    let mut painter = StreamPainter::new(stdout(), CrosstermProbe { abort_signal });
+    let mut painter = StreamPainter::new(
+        stdout(),
+        CrosstermProbe { abort_signal },
+        Box::new(next_sentinel_start),
+    );
+    // A terminal that stopped answering the prompt's DSR should not cost 2 s
+    // at every response start either.
+    if backoff_armed() {
+        painter = painter.with_lost_trust();
+    }
 
     let mut spinner = Some(spawn_spinner("Generating"));
 
@@ -139,6 +152,7 @@ async fn gather_events(rx: &mut UnboundedReceiver<SseEvent>) -> Vec<SseEvent> {
 trait TerminalProbe {
     fn size(&mut self) -> io::Result<(u16, u16)>;
     fn cursor(&mut self) -> io::Result<(u16, u16)>;
+    fn pop_stale(&mut self) -> io::Result<(u16, u16)>;
     fn drain(&mut self, timeout: Duration) -> Result<DrainOutcome>;
 }
 
@@ -152,17 +166,11 @@ impl TerminalProbe for CrosstermProbe<'_> {
     }
 
     fn cursor(&mut self) -> io::Result<(u16, u16)> {
-        let mut attempts = 0;
-        loop {
-            match cursor::position() {
-                Ok(pos) => return Ok(pos),
-                Err(_) if attempts < 5 => {
-                    attempts += 1;
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                Err(err) => return Err(err),
-            }
-        }
+        cursor::position()
+    }
+
+    fn pop_stale(&mut self) -> io::Result<(u16, u16)> {
+        pop_stale()
     }
 
     fn drain(&mut self, timeout: Duration) -> Result<DrainOutcome> {
@@ -181,6 +189,17 @@ struct LastPaint {
     size: (u16, u16),
 }
 
+// Whether cursor replies can be matched to our queries. `Lost` means a query
+// went unanswered and its late reply would be handed to whoever asks next.
+// A resync batch skips the eager-wrap correction below, so a rows-only resize
+// right after a full-width line can anchor one row low on kitty; accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Trust {
+    NeedResync,
+    Trusted,
+    Lost,
+}
+
 struct StreamPainter<W: Write, P: TerminalProbe> {
     writer: W,
     probe: P,
@@ -188,13 +207,15 @@ struct StreamPainter<W: Write, P: TerminalProbe> {
     buffer_rows: u16,
     painted_width: usize,
     suspended: bool,
-    last_cursor: (u16, u16),
+    last_cursor: Option<(u16, u16)>,
     last_paint: Option<LastPaint>,
     resized_since_paint: bool,
+    trust: Trust,
+    next_start: Box<dyn FnMut() -> usize + Send>,
 }
 
 impl<W: Write, P: TerminalProbe> StreamPainter<W, P> {
-    fn new(writer: W, probe: P) -> Self {
+    fn new(writer: W, probe: P, next_start: Box<dyn FnMut() -> usize + Send>) -> Self {
         Self {
             writer,
             probe,
@@ -202,10 +223,17 @@ impl<W: Write, P: TerminalProbe> StreamPainter<W, P> {
             buffer_rows: 1,
             painted_width: 0,
             suspended: false,
-            last_cursor: (0, 0),
+            last_cursor: None,
             last_paint: None,
             resized_since_paint: false,
+            trust: Trust::NeedResync,
+            next_start,
         }
+    }
+
+    fn with_lost_trust(mut self) -> Self {
+        self.trust = Trust::Lost;
+        self
     }
 
     fn poll_abort(&mut self) -> Result<bool> {
@@ -275,6 +303,7 @@ impl<W: Write, P: TerminalProbe> StreamPainter<W, P> {
         {
             self.last_paint = None;
             self.resized_since_paint = false;
+            self.trust = Trust::NeedResync;
         }
         Ok(size)
     }
@@ -297,17 +326,15 @@ impl<W: Write, P: TerminalProbe> StreamPainter<W, P> {
     }
 
     fn locate(&mut self, columns: u16, rows: u16) -> u16 {
-        let (col, mut row) = match self.probe.cursor() {
-            Ok(pos) => {
-                self.last_cursor = pos;
-                pos
-            }
-            Err(_) => self.last_cursor,
+        let (col, mut row) = match self.trust {
+            Trust::NeedResync => self.resync(columns, rows),
+            Trust::Trusted => self.query(rows),
+            Trust::Lost => (None, self.remembered_row(rows)),
         };
 
         // Fix unexpected duplicate lines on kitty. Only the width painted last
         // batch describes the screen; text accumulated while suspended does not.
-        if col == 0 && row > 0 && self.painted_width == columns as usize {
+        if col == Some(0) && row > 0 && self.painted_width == columns as usize {
             row -= 1;
         }
 
@@ -323,6 +350,81 @@ impl<W: Write, P: TerminalProbe> StreamPainter<W, P> {
             }
         }
         row
+    }
+
+    // The sentinel reply is a valid position query, but its column is ours.
+    // Only query replies anchor the row: a pop match may be a coincidence. The
+    // start is drawn per run so a re-arm never reopens on the column of a
+    // reply this painter orphaned.
+    fn resync(&mut self, columns: u16, rows: u16) -> (Option<u16>, u16) {
+        let start = (self.next_start)();
+        let writer = &mut self.writer;
+        let probe = RefCell::new(&mut self.probe);
+        let mut last = None;
+        let outcome = resync(
+            columns,
+            start,
+            |col| {
+                queue!(writer, cursor::MoveToColumn(col))?;
+                writer.flush()
+            },
+            || {
+                let reply = probe.borrow_mut().cursor();
+                if let Ok(pos) = reply {
+                    last = Some(pos);
+                }
+                reply
+            },
+            || probe.borrow_mut().pop_stale(),
+        );
+        match outcome {
+            Resync::Synced { .. } => {
+                self.trust = Trust::Trusted;
+                self.last_cursor = last.or(self.last_cursor);
+                // `Synced` follows an Ok query, so `last` is set; the fallback only avoids an unwrap.
+                (
+                    None,
+                    last.map_or_else(|| self.remembered_row(rows), |pos| pos.1),
+                )
+            }
+            Resync::Skipped => {
+                self.trust = Trust::Trusted;
+                self.query(rows)
+            }
+            Resync::Unanswered | Resync::GaveUp { .. } => {
+                debug!("stream painter lost cursor sync: {outcome:?}");
+                self.trust = Trust::Lost;
+                (None, self.remembered_row(rows))
+            }
+        }
+    }
+
+    fn query(&mut self, rows: u16) -> (Option<u16>, u16) {
+        match self.probe.cursor() {
+            Ok(pos) => {
+                self.last_cursor = Some(pos);
+                (Some(pos.0), pos.1)
+            }
+            Err(err) => {
+                debug!("stream painter lost cursor sync: query failed: {err}");
+                self.trust = Trust::Lost;
+                (None, self.remembered_row(rows))
+            }
+        }
+    }
+
+    // `last_paint` is cleared on size change, so its row still describes the screen.
+    // With nothing measured, the bottom row is the only guess that errs on the
+    // repairable side: at worst one extra scroll, never an erased viewport.
+    fn remembered_row(&self, rows: u16) -> u16 {
+        self.last_paint
+            .as_ref()
+            .map(|last| last.expected_row)
+            .or_else(|| {
+                self.last_cursor
+                    .map(|cursor| cursor.1.min(rows.saturating_sub(1)))
+            })
+            .unwrap_or(rows.saturating_sub(1))
     }
 
     fn render_block(&mut self, render: &mut MarkdownRender, columns: u16) -> String {
@@ -485,22 +587,104 @@ fn need_rows(text: &str, columns: u16) -> u16 {
 mod tests {
     use super::*;
     use crate::render::RenderOptions;
+    use std::{cell::RefCell, collections::VecDeque, rc::Rc};
 
+    // Tracks the column the painter last moved to so the probe can answer
+    // sentinel queries the way a terminal would.
+    #[derive(Default)]
+    struct Tty {
+        bytes: Vec<u8>,
+        column: Option<u16>,
+    }
+
+    struct TtyWriter(Rc<RefCell<Tty>>);
+
+    impl TtyWriter {
+        fn is_empty(&self) -> bool {
+            self.0.borrow().bytes.is_empty()
+        }
+    }
+
+    impl Write for TtyWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let mut tty = self.0.borrow_mut();
+            tty.bytes.extend_from_slice(buf);
+            tty.column = last_column_move(&tty.bytes);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    // `MoveToColumn` sets the column; `MoveTo` hands control back to the probe's fixed cursor.
+    fn last_column_move(bytes: &[u8]) -> Option<u16> {
+        let mut column = None;
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] != 0x1b || bytes.get(i + 1) != Some(&b'[') {
+                i += 1;
+                continue;
+            }
+            let start = i + 2;
+            let mut end = start;
+            while end < bytes.len() && !(0x40..=0x7e).contains(&bytes[end]) {
+                end += 1;
+            }
+            match bytes.get(end) {
+                Some(b'G') => {
+                    column = std::str::from_utf8(&bytes[start..end])
+                        .ok()
+                        .and_then(|params| params.parse::<u16>().ok())
+                        .map(|col| col.saturating_sub(1));
+                }
+                Some(b'H') => column = None,
+                _ => {}
+            }
+            i = end + 1;
+        }
+        column
+    }
+
+    // FIFO model of crossterm's reply queue: a query appends the terminal's
+    // reply to the back and hands out the front. Stalled replies land in
+    // `late` instead; `honest` false means the terminal answers with its real
+    // cursor, ignoring our column moves.
     struct ScriptedProbe {
         size: (u16, u16),
         cursor: (u16, u16),
         cursor_calls: usize,
+        pops: usize,
         next_drain: DrainOutcome,
+        queue: VecDeque<(u16, u16)>,
+        late: Vec<(u16, u16)>,
+        stall_queries: usize,
+        // Queries up to and including this count answer normally before stalling.
+        stall_after: usize,
+        honest: bool,
+        tty: Rc<RefCell<Tty>>,
     }
 
     impl ScriptedProbe {
-        fn new(size: (u16, u16), cursor: (u16, u16)) -> Self {
+        fn new(size: (u16, u16), cursor: (u16, u16), tty: Rc<RefCell<Tty>>) -> Self {
             Self {
                 size,
                 cursor,
                 cursor_calls: 0,
+                pops: 0,
                 next_drain: DrainOutcome::default(),
+                queue: VecDeque::new(),
+                late: vec![],
+                stall_queries: 0,
+                stall_after: 0,
+                honest: true,
+                tty,
             }
+        }
+
+        fn deliver_late(&mut self) {
+            self.queue.extend(self.late.drain(..));
         }
     }
 
@@ -511,7 +695,20 @@ mod tests {
 
         fn cursor(&mut self) -> io::Result<(u16, u16)> {
             self.cursor_calls += 1;
-            Ok(self.cursor)
+            let moved = self.tty.borrow().column.filter(|_| self.honest);
+            let reply = (moved.unwrap_or(self.cursor.0), self.cursor.1);
+            if self.stall_queries > 0 && self.cursor_calls > self.stall_after {
+                self.stall_queries -= 1;
+                self.late.push(reply);
+            } else {
+                self.queue.push_back(reply);
+            }
+            self.queue.pop_front().ok_or_else(timeout)
+        }
+
+        fn pop_stale(&mut self) -> io::Result<(u16, u16)> {
+            self.pops += 1;
+            self.queue.pop_front().ok_or_else(timeout)
         }
 
         fn drain(&mut self, _timeout: Duration) -> Result<DrainOutcome> {
@@ -519,10 +716,37 @@ mod tests {
         }
     }
 
-    type TestPainter = StreamPainter<Vec<u8>, ScriptedProbe>;
+    type TestPainter = StreamPainter<TtyWriter, ScriptedProbe>;
 
     fn painter(size: (u16, u16), cursor: (u16, u16)) -> TestPainter {
-        StreamPainter::new(Vec::new(), ScriptedProbe::new(size, cursor))
+        painter_with_starts(size, cursor, || 0)
+    }
+
+    fn painter_with_starts(
+        size: (u16, u16),
+        cursor: (u16, u16),
+        next_start: impl FnMut() -> usize + Send + 'static,
+    ) -> TestPainter {
+        let tty = Rc::new(RefCell::new(Tty::default()));
+        StreamPainter::new(
+            TtyWriter(Rc::clone(&tty)),
+            ScriptedProbe::new(size, cursor, tty),
+            Box::new(next_start),
+        )
+    }
+
+    // What `next_sentinel_start()` yields to a painter that is its only caller.
+    fn stepping_starts() -> impl FnMut() -> usize + Send {
+        let mut next = 0;
+        move || {
+            let start = next;
+            next += crate::utils::START_STEP;
+            start
+        }
+    }
+
+    fn timeout() -> io::Error {
+        io::Error::new(io::ErrorKind::TimedOut, "no reply")
     }
 
     fn render() -> MarkdownRender {
@@ -534,7 +758,7 @@ mod tests {
     }
 
     fn sink(painter: &mut TestPainter) -> String {
-        String::from_utf8(std::mem::take(&mut painter.writer)).unwrap()
+        String::from_utf8(std::mem::take(&mut painter.writer.0.borrow_mut().bytes)).unwrap()
     }
 
     fn strip_ansi(text: &str) -> String {
@@ -574,6 +798,11 @@ mod tests {
 
     fn move_to(col: u16, row: u16) -> String {
         format!("\x1b[{};{}H", row + 1, col + 1)
+    }
+
+    // A batch that resyncs moves to sentinel column 5 (1-based `6G`) before anchoring.
+    fn resync_then_move_to(row: u16) -> String {
+        format!("\x1b[6G{}", move_to(0, row))
     }
 
     /// Minimal ASCII terminal: autowrap with pending-wrap, scroll into history.
@@ -670,9 +899,10 @@ mod tests {
         let mut painter = painter((40, 40), (0, 12));
 
         painter.paint(&mut render, "hel\tlo").unwrap();
-        let expected = format!("{}\x1b[J{}", move_to(0, 12), "hel    lo");
+        let expected = format!("{}\x1b[J{}", resync_then_move_to(12), "hel    lo");
         assert_eq!(sink(&mut painter), expected);
         assert_eq!(painter.buffer_rows, 1);
+        assert_eq!(painter.probe.cursor_calls, 1);
 
         painter.paint(&mut render, " world\nnext").unwrap();
         let expected = format!(
@@ -738,7 +968,7 @@ mod tests {
         let out = sink(&mut painter);
         let finals = csi_finals(&out);
         assert_eq!(finals.iter().filter(|c| **c == 'H').count(), 1);
-        assert!(out.starts_with(&move_to(0, 39)), "{out:?}");
+        assert!(out.starts_with(&resync_then_move_to(39)), "{out:?}");
         assert_eq!(strip_ansi(&out), format!("{}tail", lines.concat()));
         assert_eq!(painter.buffer, "tail");
         assert_eq!(painter.probe.cursor_calls, 1);
@@ -829,7 +1059,7 @@ mod tests {
         let (mut painter, _) = teleport_scenario(false, (40, 40));
         assert!(sink(&mut painter).starts_with(&move_to(0, 39)));
         let (mut painter, _) = teleport_scenario(true, (40, 41));
-        assert!(sink(&mut painter).starts_with(&move_to(0, 39)));
+        assert!(sink(&mut painter).starts_with(&resync_then_move_to(39)));
     }
 
     #[test]
@@ -855,7 +1085,7 @@ mod tests {
         };
         painter.paint(&mut render, "ghi").unwrap();
         let out = sink(&mut painter);
-        assert!(out.starts_with(&move_to(0, 39)), "{out:?}");
+        assert!(out.starts_with(&resync_then_move_to(39)), "{out:?}");
     }
 
     #[test]
@@ -902,7 +1132,7 @@ mod tests {
         painter.finish(&mut render).unwrap();
         let out = sink(&mut painter);
         assert_eq!(out.matches("hello world").count(), 1);
-        assert!(out.starts_with(&move_to(0, 10)), "{out:?}");
+        assert!(out.starts_with(&resync_then_move_to(10)), "{out:?}");
         assert_eq!(painter.probe.cursor_calls, 1);
     }
 
@@ -976,6 +1206,8 @@ mod tests {
 
         painter.probe.size = (40, 40);
         painter.probe.cursor = (0, 10);
+        // Take the plain-query path so the hack's width check is what is tested.
+        painter.trust = Trust::Trusted;
         painter.paint(&mut render, "").unwrap();
         let out = sink(&mut painter);
         assert!(out.starts_with(&move_to(0, 10)), "{out:?}");
@@ -995,7 +1227,7 @@ mod tests {
         painter.probe.size = (40, 40);
         painter.paint(&mut render, "").unwrap();
         let out = sink(&mut painter);
-        assert!(out.starts_with(&move_to(0, 37)), "{out:?}");
+        assert!(out.starts_with(&resync_then_move_to(37)), "{out:?}");
         assert_eq!(strip_ansi(&out).matches(block.as_str()).count(), 1);
 
         let mut term = Terminal::new(40, &[""; 40]);
@@ -1038,5 +1270,474 @@ mod tests {
         painter.finish(&mut render).unwrap();
         assert!(painter.writer.is_empty());
         assert_eq!(painter.probe.cursor_calls, 0);
+    }
+
+    #[test]
+    fn first_paint_queries_at_sentinel_column() {
+        let mut render = render();
+        let mut painter = painter((40, 40), (0, 12));
+        painter.paint(&mut render, "abc").unwrap();
+        let out = sink(&mut painter);
+        assert!(out.starts_with(&resync_then_move_to(12)), "{out:?}");
+        assert_eq!(painter.probe.cursor_calls, 1);
+        assert_eq!(painter.probe.pops, 0);
+        assert_eq!(painter.trust, Trust::Trusted);
+    }
+
+    // The row comes from the second confirm, not from the pop match.
+    #[test]
+    fn stale_replies_are_drained_before_first_paint() {
+        let mut render = render();
+        let mut painter = painter((40, 40), (0, 9));
+        painter.probe.queue.push_back((0, 7));
+        painter.paint(&mut render, "abc").unwrap();
+        let out = sink(&mut painter);
+        let expected = format!("\x1b[6G\x1b[9G\x1b[12G{}", move_to(0, 9));
+        assert!(out.starts_with(&expected), "{out:?}");
+        assert_eq!(painter.probe.cursor_calls, 3);
+        assert_eq!(painter.probe.pops, 1);
+        assert_eq!(painter.trust, Trust::Trusted);
+        assert_eq!(painter.last_cursor, Some((11, 9)));
+    }
+
+    // Nothing was measured before Lost, so the batch anchors on the bottom row.
+    #[test]
+    fn unanswered_pop_stops_asking() {
+        let mut render = render();
+        let mut painter = painter((40, 40), (0, 12));
+        painter.probe.honest = false;
+        painter.paint(&mut render, "abc").unwrap();
+        assert_eq!(painter.trust, Trust::Lost);
+        assert_eq!(painter.probe.cursor_calls, 1);
+        assert_eq!(painter.probe.pops, 1);
+        let out = sink(&mut painter);
+        assert!(out.starts_with(&resync_then_move_to(39)), "{out:?}");
+        assert_eq!(painter.last_cursor, None);
+
+        for _ in 0..3 {
+            painter.paint(&mut render, "d").unwrap();
+            let out = sink(&mut painter);
+            assert!(out.starts_with(&move_to(0, 39)), "{out:?}");
+        }
+        assert_eq!(painter.probe.cursor_calls, 1);
+        assert_eq!(painter.probe.pops, 1);
+    }
+
+    #[test]
+    fn unanswered_query_while_trusted_stops_asking() {
+        let mut render = render();
+        let mut painter = painter((40, 40), (0, 12));
+        painter.paint(&mut render, "abc").unwrap();
+        sink(&mut painter);
+        assert_eq!(painter.probe.cursor_calls, 1);
+
+        painter.probe.stall_queries = 1;
+        painter.paint(&mut render, "def").unwrap();
+        assert_eq!(painter.trust, Trust::Lost);
+        assert!(sink(&mut painter).starts_with(&move_to(0, 12)));
+
+        painter.probe.cursor = (0, 30);
+        for _ in 0..3 {
+            painter.paint(&mut render, "g").unwrap();
+            let out = sink(&mut painter);
+            assert!(out.starts_with(&move_to(0, 12)), "{out:?}");
+        }
+        assert_eq!(painter.probe.cursor_calls, 2);
+    }
+
+    // Nothing was measured before Lost, so the batch anchors on the bottom row.
+    #[test]
+    fn unanswered_sentinel_query_anchors_on_the_bottom_row() {
+        let mut render = render();
+        let mut painter = painter((40, 40), (0, 12));
+        painter.probe.stall_queries = 1;
+        painter.paint(&mut render, "abc").unwrap();
+        assert_eq!(painter.trust, Trust::Lost);
+        assert_eq!(painter.probe.late, [(5, 12)]);
+        let out = sink(&mut painter);
+        assert!(out.starts_with(&resync_then_move_to(39)), "{out:?}");
+        assert_eq!(painter.last_cursor, None);
+
+        for _ in 0..3 {
+            painter.paint(&mut render, "d").unwrap();
+            let out = sink(&mut painter);
+            assert!(out.starts_with(&move_to(0, 39)), "{out:?}");
+        }
+        assert_eq!(painter.probe.cursor_calls, 1);
+    }
+
+    // The late reply from the stalled trusted query heads the queue when the
+    // size change re-arms the resync, which drains it as a mismatch and
+    // anchors on the confirm's row rather than the stale one.
+    #[test]
+    fn late_reply_is_drained_by_the_resync_after_a_size_change() {
+        let mut render = render();
+        let mut painter = painter((40, 40), (0, 12));
+        painter.paint(&mut render, "abc").unwrap();
+        sink(&mut painter);
+        painter.probe.stall_queries = 1;
+        painter.paint(&mut render, "def").unwrap();
+        assert_eq!(painter.trust, Trust::Lost);
+        assert_eq!(painter.probe.late, [(0, 12)]);
+        sink(&mut painter);
+
+        painter.probe.deliver_late();
+        painter.probe.size = (50, 40);
+        painter.probe.cursor = (0, 20);
+        painter.paint(&mut render, "ghi").unwrap();
+        assert_eq!(painter.trust, Trust::Trusted);
+        assert_eq!(painter.probe.cursor_calls, 5);
+        assert_eq!(painter.probe.pops, 1);
+        assert!(painter.probe.queue.is_empty());
+        assert_eq!(painter.last_cursor, Some((11, 20)));
+        let out = sink(&mut painter);
+        let expected = format!("\x1b[6G\x1b[9G\x1b[12G{}", move_to(0, 20));
+        assert!(out.starts_with(&expected), "{out:?}");
+    }
+
+    #[test]
+    fn size_change_resyncs_exactly_once() {
+        let mut render = render();
+        let mut painter = painter((40, 40), (0, 12));
+        painter.paint(&mut render, "abc").unwrap();
+        sink(&mut painter);
+        painter.paint(&mut render, "def").unwrap();
+        assert!(!sink(&mut painter).contains("\x1b[6G"));
+        assert_eq!(painter.probe.cursor_calls, 2);
+
+        painter.probe.size = (50, 40);
+        painter.paint(&mut render, "ghi").unwrap();
+        let out = sink(&mut painter);
+        assert_eq!(out.matches("\x1b[6G").count(), 1, "{out:?}");
+        assert_eq!(painter.probe.cursor_calls, 3);
+
+        painter.paint(&mut render, "jkl").unwrap();
+        assert!(!sink(&mut painter).contains("\x1b[6G"));
+        assert_eq!(painter.probe.cursor_calls, 4);
+    }
+
+    #[test]
+    fn resync_batch_skips_kitty_correction() {
+        let mut render = render();
+        let mut painter = painter((40, 40), (0, 2));
+        painter.paint(&mut render, &"x".repeat(40)).unwrap();
+        sink(&mut painter);
+        assert_eq!(painter.painted_width, 40);
+
+        painter.probe.size = (40, 41);
+        painter.probe.cursor = (0, 4);
+        painter.paint(&mut render, "y").unwrap();
+        let out = sink(&mut painter);
+        assert!(out.starts_with(&resync_then_move_to(4)), "{out:?}");
+    }
+
+    // Spec: `Skipped` (fewer than 4 columns) falls back to a plain query —
+    // no sentinel move, one cursor call, and the painter is Trusted after.
+    #[test]
+    fn usage_probe_narrow_terminal_skips_resync_and_queries_plainly() {
+        let mut render = render();
+        let mut painter = painter((3, 40), (0, 12));
+        painter.paint(&mut render, "ab").unwrap();
+        let out = sink(&mut painter);
+        assert!(out.starts_with(&move_to(0, 12)), "{out:?}");
+        assert!(!out.contains('G'), "{out:?}");
+        assert_eq!(painter.probe.cursor_calls, 1);
+        assert_eq!(painter.probe.pops, 0);
+        assert_eq!(painter.trust, Trust::Trusted);
+    }
+
+    // Spec: `GaveUp` ⇒ Lost; nothing was painted or measured yet, so the row
+    // is the bottom one, and no further queries follow.
+    #[test]
+    fn usage_probe_budget_exhaustion_turns_lost() {
+        let mut render = render();
+        let mut painter = painter((80, 40), (0, 12));
+        for col in 40..70 {
+            painter.probe.queue.push_back((col, 7));
+        }
+        painter.paint(&mut render, "abc").unwrap();
+        assert_eq!(painter.trust, Trust::Lost);
+        assert_eq!(painter.probe.cursor_calls, 1);
+        assert_eq!(painter.probe.pops, crate::utils::MAX_POPS - 1);
+        let out = sink(&mut painter);
+        assert!(out.starts_with(&resync_then_move_to(39)), "{out:?}");
+        assert_eq!(painter.last_cursor, None);
+
+        painter.paint(&mut render, "d").unwrap();
+        assert_eq!(painter.probe.cursor_calls, 1);
+        assert_eq!(painter.probe.pops, crate::utils::MAX_POPS - 1);
+    }
+
+    // Spec: a size change re-arms NeedResync even from Lost, so a terminal
+    // that has started answering again is trusted after one clean round-trip.
+    #[test]
+    fn usage_probe_size_change_recovers_from_lost() {
+        let mut render = render();
+        let mut painter = painter((40, 40), (0, 12));
+        painter.probe.honest = false;
+        painter.paint(&mut render, "abc").unwrap();
+        assert_eq!(painter.trust, Trust::Lost);
+        sink(&mut painter);
+
+        painter.probe.honest = true;
+        painter.probe.size = (50, 40);
+        painter.probe.cursor = (0, 20);
+        painter.paint(&mut render, "def").unwrap();
+        assert_eq!(painter.trust, Trust::Trusted);
+        assert_eq!(painter.probe.cursor_calls, 2);
+        let out = sink(&mut painter);
+        assert!(out.starts_with(&resync_then_move_to(20)), "{out:?}");
+    }
+
+    // Spec: `Synced` anchors on the LAST Ok query reply's row, never on the
+    // pop match, which here is a stale coincidence at the sentinel column
+    // carrying the wrong row.
+    #[test]
+    fn usage_probe_coincidental_pop_match_does_not_anchor_the_row() {
+        let mut render = render();
+        let mut painter = painter((40, 40), (0, 9));
+        painter.probe.queue.push_back((0, 7));
+        painter.probe.queue.push_back((5, 7));
+        painter.paint(&mut render, "abc").unwrap();
+        let out = sink(&mut painter);
+        let expected = format!("\x1b[6G\x1b[9G\x1b[12G\x1b[15G{}", move_to(0, 9));
+        assert!(out.starts_with(&expected), "{out:?}");
+        assert_eq!(painter.probe.cursor_calls, 4);
+        assert_eq!(painter.probe.pops, 2);
+        assert_eq!(painter.trust, Trust::Trusted);
+        assert_eq!(painter.last_cursor, Some((14, 9)));
+        assert!(painter.probe.queue.is_empty());
+    }
+
+    // Spec: once Trusted, a batch is a single plain query with no sentinel
+    // traffic, and the queue stays clean across batches.
+    #[test]
+    fn usage_probe_trusted_batches_leave_the_queue_clean() {
+        let mut render = render();
+        let mut painter = painter((40, 40), (0, 12));
+        painter.paint(&mut render, "abc").unwrap();
+        sink(&mut painter);
+        for i in 0..5 {
+            painter.paint(&mut render, "d").unwrap();
+            let out = sink(&mut painter);
+            assert!(!out.contains('G'), "{out:?}");
+            assert_eq!(painter.probe.cursor_calls, 2 + i);
+            assert!(painter.probe.queue.is_empty());
+        }
+        assert_eq!(painter.probe.pops, 0);
+    }
+
+    // Spec: Lost row precedence is `last_paint.expected_row`, else the measured
+    // `last_cursor` row, else the bottom row. A size change clears `last_paint`,
+    // so a resync that then goes Unanswered must anchor on the row measured
+    // before the resize — not the bottom row and not the terminal's real cursor.
+    #[test]
+    fn usage_probe_lost_after_a_size_change_anchors_on_the_last_measurement() {
+        let mut render = render();
+        let mut painter = painter((40, 40), (0, 12));
+        painter.paint(&mut render, "abc").unwrap();
+        sink(&mut painter);
+        assert_eq!(painter.last_cursor, Some((5, 12)));
+
+        painter.probe.size = (50, 40);
+        painter.probe.cursor = (0, 30);
+        painter.probe.stall_queries = 1;
+        painter.paint(&mut render, "def").unwrap();
+        assert_eq!(painter.trust, Trust::Lost);
+        assert_eq!(painter.probe.cursor_calls, 2);
+        assert_eq!(painter.probe.pops, 0);
+        // Only real measurements set `last_cursor`; the stalled query did not.
+        assert_eq!(painter.last_cursor, Some((5, 12)));
+        let out = sink(&mut painter);
+        assert!(out.starts_with(&resync_then_move_to(12)), "{out:?}");
+
+        // Once a Lost batch has painted, its expected row outranks the
+        // measurement: the one-row tail starts where the last paint ended.
+        painter.paint(&mut render, "\nxyz").unwrap();
+        sink(&mut painter);
+        let expected = painter.last_paint.as_ref().unwrap().expected_row;
+        assert_eq!(expected, 13);
+        painter.paint(&mut render, "w").unwrap();
+        let out = sink(&mut painter);
+        assert!(out.starts_with(&move_to(0, 13)), "{out:?}");
+        assert_eq!(painter.probe.cursor_calls, 2);
+    }
+
+    // Spec: the painter hands the drawn start to `resync`, so production
+    // (`next_sentinel_start()`) rotates the first sentinel away from the REPL
+    // prompt's column; with start 3 a lag-1 queue is drained at 14/17/20.
+    #[test]
+    fn usage_probe_sentinel_start_rotates_the_painter_columns() {
+        let mut render = render();
+        let mut rotated = painter_with_starts((40, 40), (0, 9), || 3);
+        rotated.probe.queue.push_back((5, 7));
+        rotated.paint(&mut render, "abc").unwrap();
+        let out = sink(&mut rotated);
+        let expected = format!("\x1b[15G\x1b[18G\x1b[21G{}", move_to(0, 9));
+        assert!(out.starts_with(&expected), "{out:?}");
+        assert_eq!(rotated.probe.cursor_calls, 3);
+        assert_eq!(rotated.probe.pops, 1);
+        assert_eq!(rotated.trust, Trust::Trusted);
+        assert_eq!(rotated.last_cursor, Some((20, 9)));
+        assert!(rotated.probe.queue.is_empty());
+
+        // The same stale (5, 7) at start 0 is the documented false-clean
+        // residual: the first query matches and the row comes from it.
+        let mut unrotated = painter((40, 40), (0, 9));
+        unrotated.probe.queue.push_back((5, 7));
+        unrotated.paint(&mut render, "abc").unwrap();
+        let out = sink(&mut unrotated);
+        assert!(out.starts_with(&resync_then_move_to(7)), "{out:?}");
+        assert_eq!(unrotated.probe.cursor_calls, 1);
+        assert_eq!(unrotated.probe.pops, 0);
+        assert_eq!(unrotated.probe.queue.len(), 1);
+    }
+
+    // Spec: the start is drawn when a resync RUNS, so the re-arm after a size
+    // change opens on a different column from the one whose reply this
+    // painter orphaned, and drains that orphan instead of matching it.
+    #[test]
+    fn usage_probe_rearmed_resync_draws_a_fresh_start() {
+        let mut render = render();
+        let mut rotated = painter_with_starts((40, 40), (0, 12), stepping_starts());
+        rotated.probe.stall_queries = 1;
+        rotated.paint(&mut render, "abc").unwrap();
+        assert_eq!(rotated.trust, Trust::Lost);
+        assert_eq!(rotated.probe.late, [(5, 12)]);
+        assert!(sink(&mut rotated).starts_with(&resync_then_move_to(39)));
+
+        rotated.probe.deliver_late();
+        rotated.probe.size = (50, 40);
+        rotated.probe.cursor = (0, 20);
+        rotated.paint(&mut render, "def").unwrap();
+        assert_eq!(rotated.trust, Trust::Trusted);
+        assert_eq!(rotated.probe.cursor_calls, 4);
+        assert_eq!(rotated.probe.pops, 1);
+        assert!(rotated.probe.queue.is_empty());
+        assert_eq!(rotated.last_cursor, Some((20, 20)));
+        let out = sink(&mut rotated);
+        let expected = format!("\x1b[15G\x1b[18G\x1b[21G{}", move_to(0, 20));
+        assert!(out.starts_with(&expected), "{out:?}");
+
+        // Reusing the start reopens on the orphan's column and anchors on its
+        // stale row with the orphan still queued behind the real reply.
+        let mut reused = painter((40, 40), (0, 12));
+        reused.probe.stall_queries = 1;
+        reused.paint(&mut render, "abc").unwrap();
+        sink(&mut reused);
+        reused.probe.deliver_late();
+        reused.probe.size = (50, 40);
+        reused.probe.cursor = (0, 20);
+        reused.paint(&mut render, "def").unwrap();
+        assert_eq!(reused.trust, Trust::Trusted);
+        assert_eq!(reused.probe.pops, 0);
+        assert_eq!(reused.probe.queue.len(), 1);
+        assert!(sink(&mut reused).starts_with(&resync_then_move_to(12)));
+    }
+
+    // Spec: a painter started Lost (REPL backoff armed) never asks the
+    // terminal anything: it anchors on the bottom row, then on the row the
+    // last paint ended on.
+    #[test]
+    fn usage_probe_lost_from_the_start_never_queries() {
+        let mut render = render();
+        let mut painter = painter((40, 40), (0, 12)).with_lost_trust();
+        painter.paint(&mut render, "abc").unwrap();
+        let out = sink(&mut painter);
+        assert!(out.starts_with(&move_to(0, 39)), "{out:?}");
+        assert!(!out.contains('G'), "{out:?}");
+        assert_eq!(painter.last_cursor, None);
+
+        painter.paint(&mut render, "\ndef").unwrap();
+        sink(&mut painter);
+        let expected = painter.last_paint.as_ref().unwrap().expected_row;
+        assert_eq!(expected, 39);
+        painter.paint(&mut render, "g").unwrap();
+        let out = sink(&mut painter);
+        assert!(out.starts_with(&move_to(0, expected)), "{out:?}");
+        assert_eq!(painter.probe.cursor_calls, 0);
+        assert_eq!(painter.probe.pops, 0);
+        assert_eq!(painter.trust, Trust::Lost);
+    }
+
+    // Spec: a measurement taken before a rows-shrinking resize is clamped to
+    // the new bottom row, like the other two rungs.
+    #[test]
+    fn usage_probe_remembered_row_clamps_the_last_measurement_to_the_viewport() {
+        let mut painter = painter((40, 40), (0, 30));
+        painter.last_cursor = Some((5, 30));
+        assert_eq!(painter.remembered_row(40), 30);
+        assert_eq!(painter.remembered_row(20), 19);
+    }
+
+    // Spec: a painter started Lost (backoff armed) draws no start — the start
+    // source is consulted only at the moment a resync RUNS — and a size change
+    // re-arms it like any other painter: the first draw happens then, the
+    // clean queue syncs in one query, and the row is the terminal's.
+    #[test]
+    fn usage_probe_lost_painter_draws_its_first_start_only_when_a_resync_runs() {
+        let mut render = render();
+        // The boxed start source must be `Send`, so draws are counted through a channel.
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let mut painter = painter_with_starts((40, 40), (0, 12), move || {
+            tx.send(()).unwrap();
+            3
+        })
+        .with_lost_trust();
+        assert_eq!(rx.try_iter().count(), 0, "construction must not draw");
+
+        painter.paint(&mut render, "abc").unwrap();
+        assert!(sink(&mut painter).starts_with(&move_to(0, 39)));
+        assert_eq!(rx.try_iter().count(), 0, "a Lost batch must not draw");
+        assert_eq!(painter.probe.cursor_calls, 0);
+
+        painter.probe.size = (50, 40);
+        painter.probe.cursor = (0, 20);
+        painter.paint(&mut render, "def").unwrap();
+        assert_eq!(rx.try_iter().count(), 1, "the re-armed resync draws once");
+        assert_eq!(painter.trust, Trust::Trusted);
+        assert_eq!(painter.probe.cursor_calls, 1);
+        assert_eq!(painter.probe.pops, 0);
+        let out = sink(&mut painter);
+        assert!(
+            out.starts_with(&format!("\x1b[15G{}", move_to(0, 20))),
+            "{out:?}"
+        );
+        assert_eq!(painter.last_cursor, Some((14, 20)));
+
+        painter.paint(&mut render, "g").unwrap();
+        assert_eq!(rx.try_iter().count(), 0, "Trusted batches never draw");
+        assert_eq!(painter.probe.cursor_calls, 2);
+    }
+
+    // Spec: any Err from a CONFIRM query ⇒ `Unanswered` immediately ⇒ Lost
+    // with no retry. The pop matched and the first query returned a stale
+    // reply, but neither is a real measurement, so nothing is remembered and
+    // the batch anchors on the bottom row; nothing more is asked this stream.
+    #[test]
+    fn usage_probe_stall_at_a_confirm_turns_lost_without_anchoring_on_the_pop() {
+        let mut render = render();
+        let mut painter = painter((40, 40), (0, 9));
+        painter.probe.queue.push_back((0, 7));
+        painter.probe.stall_queries = 1;
+        painter.probe.stall_after = 1;
+        painter.paint(&mut render, "abc").unwrap();
+        assert_eq!(painter.trust, Trust::Lost);
+        assert_eq!(painter.probe.cursor_calls, 2);
+        assert_eq!(painter.probe.pops, 1);
+        assert_eq!(painter.probe.late, [(8, 9)]);
+        assert!(painter.probe.queue.is_empty());
+        assert_eq!(painter.last_cursor, None);
+        let out = sink(&mut painter);
+        let expected = format!("\x1b[6G\x1b[9G{}", move_to(0, 39));
+        assert!(out.starts_with(&expected), "{out:?}");
+
+        for _ in 0..3 {
+            painter.paint(&mut render, "d").unwrap();
+            sink(&mut painter);
+        }
+        assert_eq!(painter.probe.cursor_calls, 2);
+        assert_eq!(painter.probe.pops, 1);
+        assert_eq!(painter.trust, Trust::Lost);
     }
 }
