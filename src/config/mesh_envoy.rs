@@ -3782,10 +3782,12 @@ mod tests {
     /// Fifty asks from one identity on each inbound path. On the link the first is
     /// admitted and handed to the envoy; the forty-nine behind it are refused
     /// `Throttled` before any acknowledgement, since a run of the sender's is in
-    /// flight, and nothing is filed or counted. By store-and-forward the hourly message
-    /// limit files every ask in the inbox without an envoy run and owes the peer one
-    /// typed reply for the hour. The envoy runs exactly one, the REPL hears one refusal
-    /// line per reason, and another identity is untouched.
+    /// flight, and nothing is filed or counted. By store-and-forward the nine asks still
+    /// under the hourly count of ten are refused by the envoy for the run in flight and
+    /// the rest are over the hourly limit; every one is filed in the inbox without an
+    /// envoy run and the peer is owed one typed reply per reason for the hour. The envoy
+    /// runs exactly one, the REPL hears one refusal line per reason, and another
+    /// identity is untouched.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
     async fn a_flood_from_one_identity_is_bounded_on_both_inbound_paths() {

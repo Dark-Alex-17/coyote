@@ -5046,6 +5046,111 @@ mod tests {
         );
     }
 
+    /// The link gate counts the sender's own runs against `peer_max_concurrent`
+    /// (MESH-MSG-041): under a concurrency of two an identity with one run in flight is
+    /// still admitted, with two it is refused before the ack; a second identity's
+    /// question is admitted while the first sits at its cap; a message the envoy would
+    /// not run (a bulletin) passes the gate at the cap. No refusal counts, and the gate
+    /// itself reserves nothing.
+    #[test]
+    fn usage_probe_the_link_gate_admits_up_to_the_configured_concurrency_per_identity() {
+        let slot = MeshSlot::default();
+        slot.limits().configure(PeerLimitConfig {
+            concurrency: 2,
+            ..PeerLimitConfig::default()
+        });
+        let envoy = RecordingEnvoy::new(true, false);
+        slot.set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
+        let x = hex_lower(&PEER_IDENTITY);
+        let z = hex_lower(&[0x5a; 16]);
+        let instance = hex_lower(&PEER_INSTANCE);
+        let admit = |identity: &str, kind: PeerKind, id: &str| {
+            PeerSurface::admit_peer_message(
+                &slot,
+                &PeerAdmission {
+                    source_identity: identity,
+                    source_destination: &instance,
+                    message_id: id,
+                    kind,
+                    in_reply_to: None,
+                    thread: None,
+                    disposition: None,
+                    via: PeerVia::Direct,
+                },
+            )
+        };
+        let window = |identity: &str| slot.limits().window_of(identity, Instant::now()).unwrap();
+
+        let first = slot.limits().try_reserve(&x, Instant::now()).unwrap();
+        assert!(
+            admit(&x, PeerKind::Ask, "x-ask-1").is_ok(),
+            "one run in flight under a concurrency of two is admitted"
+        );
+        assert_eq!(window(&x).messages, 1);
+        assert_eq!(
+            window(&x).in_flight,
+            1,
+            "admission reserves nothing; the envoy's accept takes the slot"
+        );
+
+        let second = slot.limits().try_reserve(&x, Instant::now()).unwrap();
+        let refused = admit(&x, PeerKind::Ask, "x-ask-2").unwrap_err();
+        assert_eq!(refused.reason, RefusalReason::PeerConcurrency);
+        assert_eq!(refused.retry_after, PEER_RETRY_AFTER_CAPACITY);
+        assert_eq!(
+            admit(&x, PeerKind::Message, "x-msg-2").unwrap_err().reason,
+            RefusalReason::PeerConcurrency
+        );
+        assert_eq!(window(&x).messages, 1, "a refusal is not counted");
+
+        assert!(
+            admit(&z, PeerKind::Ask, "z-ask-1").is_ok(),
+            "another identity's question is admitted while x sits at its cap"
+        );
+        assert_eq!(window(&z).messages, 1);
+        assert_eq!(window(&z).in_flight, 0);
+        assert!(
+            admit(&x, PeerKind::Bulletin, "x-bulletin").is_ok(),
+            "a bulletin is not the envoy's and passes the gate at the cap"
+        );
+        assert_eq!(window(&x).messages, 2);
+
+        drop(second);
+        assert!(
+            admit(&x, PeerKind::Ask, "x-ask-3").is_ok(),
+            "one run ended: back under the cap"
+        );
+        drop(first);
+        assert_eq!(window(&x).in_flight, 0);
+        assert!(
+            envoy.job_ids().is_empty(),
+            "admission offers nothing to the envoy"
+        );
+    }
+
+    /// With one envoy-bound message and a run in flight, the gate answers the same
+    /// whether the body is a `message` or an `ask`, and never for a `reply` or a
+    /// `bulletin`: the envoy-bound predicate is one and the same for the gate and for
+    /// delivery, so nothing the gate waves through is later handed to the envoy.
+    #[test]
+    fn usage_probe_envoy_bound_is_one_predicate_for_the_gate_and_for_delivery() {
+        for (kind, in_reply_to, expected) in [
+            (PeerKind::Message, None, true),
+            (PeerKind::Ask, None, true),
+            (PeerKind::Message, Some("q-1"), false),
+            (PeerKind::Ask, Some("q-1"), false),
+            (PeerKind::Bulletin, None, false),
+            (PeerKind::Reply, None, false),
+            (PeerKind::Reply, Some("q-1"), false),
+        ] {
+            assert_eq!(
+                envoy_bound(kind, in_reply_to),
+                expected,
+                "{kind:?} in_reply_to={in_reply_to:?}"
+            );
+        }
+    }
+
     /// `retry_after` is whole seconds, at least 1 (MESH-MSG-038). A window ceiling whose
     /// remainder is under a second still says 1; a whole-second remainder is reported as
     /// it is, never rounded past itself.

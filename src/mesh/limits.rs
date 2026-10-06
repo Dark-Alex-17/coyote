@@ -767,6 +767,67 @@ mod tests {
         assert_eq!(limits.window_of("a", rolled).unwrap().in_flight, 0);
     }
 
+    /// The pre-ack look counts the sender's own runs against the configured concurrency
+    /// (MESH-MSG-041): under a concurrency of two, one run in flight still admits, two
+    /// refuse; another identity's runs never count. When the slot and a ceiling are both
+    /// spent the slot is named first, as `try_reserve` would, and the ceiling shows once
+    /// a run ends.
+    #[test]
+    fn usage_probe_check_run_admissible_counts_the_senders_runs_against_the_concurrency() {
+        let limits = limits(PeerLimitConfig {
+            concurrency: 2,
+            tokens_per_hour: 100,
+            ..PeerLimitConfig::default()
+        });
+        let start = now();
+
+        let first = limits.try_reserve("a", start).unwrap();
+        assert!(
+            limits.check_run_admissible("a", start).is_ok(),
+            "one run in flight under a concurrency of two admits"
+        );
+        let second = limits.try_reserve("a", start).unwrap();
+        let at_cap = refusal_of(limits.check_run_admissible("a", start));
+        assert_eq!(at_cap.reason, RefusalReason::PeerConcurrency);
+        assert_eq!(at_cap.retry_after, PEER_RETRY_AFTER_CAPACITY);
+        assert!(
+            limits.check_run_admissible("b", start).is_ok(),
+            "another identity's runs do not count against b"
+        );
+        assert_eq!(limits.window_of("a", start).unwrap().in_flight, 2);
+        assert_eq!(
+            limits.window_of("b", start).unwrap().in_flight,
+            0,
+            "asking reserves nothing for b"
+        );
+
+        // Both the slot and the token ceiling spent: the slot is named, and the answer
+        // is the one `try_reserve` gives.
+        let at = start + Duration::from_secs(60);
+        limits.debit("a", 100, None, at);
+        let both = refusal_of(limits.check_run_admissible("a", at));
+        assert_eq!(both.reason, RefusalReason::PeerConcurrency);
+        assert_eq!(
+            reason_of(limits.try_reserve("a", at)),
+            RefusalReason::PeerConcurrency
+        );
+
+        drop(second);
+        let ceiling = refusal_of(limits.check_run_admissible("a", at));
+        assert_eq!(ceiling.reason, RefusalReason::TokenCeiling);
+        assert_eq!(ceiling.retry_after, PEER_WINDOW - Duration::from_secs(60));
+        assert_eq!(
+            reason_of(limits.try_reserve("a", at)),
+            RefusalReason::TokenCeiling
+        );
+        drop(first);
+        assert_eq!(limits.window_of("a", at).unwrap().in_flight, 0);
+        assert!(
+            limits.check_run_admissible("b", at).is_ok(),
+            "b's window is untouched by a's spend"
+        );
+    }
+
     #[test]
     fn in_flight_survives_rollover() {
         let limits = default_limits();

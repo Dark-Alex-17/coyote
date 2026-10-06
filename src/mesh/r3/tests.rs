@@ -6631,6 +6631,82 @@ pub(crate) mod network {
         pair.stop_node_a().await;
     }
 
+    /// The gate before the acknowledgement counts the sender's runs against
+    /// `peer_max_concurrent`, not against one (MESH-MSG-041). With node A allowing two
+    /// runs per identity and one of node B's in flight, B's question is acknowledged and
+    /// handed to the envoy; with two in flight the next is refused on its link with the
+    /// bare `Throttled` code, nothing filed and nothing counted, and the keyboard hears
+    /// one `peer_concurrency` line. Once a run ends, B is admitted again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_the_link_gate_admits_a_second_run_when_two_are_allowed() {
+        let pair = NodePair::start_with(
+            "r3-peer-link-two-allowed",
+            |config| config.peer_max_concurrent = 2,
+            trusting_b,
+        )
+        .await;
+        pair.introduce_b_to_a().await;
+        let (slot, idle) = installed_slot(&pair);
+        assert_eq!(slot.limits().config().concurrency, 2);
+        let envoy = RecordingEnvoy::new(true, false);
+        slot.set_envoy(envoy.clone() as Arc<dyn EnvoySink>);
+        let identity = b_identity(&pair);
+        let first = slot
+            .limits()
+            .try_reserve(&identity, Instant::now())
+            .unwrap();
+
+        let ask = OutboundPeer::new(PeerKind::Ask, "room for one more?", None, None, None).unwrap();
+        let outcome = b_sends_to_a(&pair, &ask).await.unwrap();
+        assert!(
+            is_received_reply(&outcome.value, &ask.id),
+            "one run in flight under a cap of two is acknowledged: {:?}",
+            outcome.value
+        );
+        wait_until("the envoy to take the question", || {
+            envoy.job_ids() == [ask.id.clone()]
+        })
+        .await;
+        let messages = || {
+            slot.limits()
+                .window_of(&identity, Instant::now())
+                .unwrap()
+                .messages
+        };
+        assert_eq!(messages(), 1);
+
+        let second = slot
+            .limits()
+            .try_reserve(&identity, Instant::now())
+            .unwrap();
+        let again = OutboundPeer::new(PeerKind::Ask, "and another?", None, None, None).unwrap();
+        assert_eq!(
+            b_sends_to_a(&pair, &again).await.unwrap_err(),
+            R3Error::Refused(RefusalCode::Throttled),
+            "two in flight under a cap of two is refused before the ack"
+        );
+        sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            envoy.job_ids(),
+            std::slice::from_ref(&ask.id),
+            "the envoy is not offered it"
+        );
+        assert_eq!(messages(), 1, "a refused message is not counted");
+        assert_eq!(pair.recorder_b.seen_count(), 0, "no reply follows the code");
+        let lines: Vec<String> = idle.0.lock().iter().map(|note| note.text.clone()).collect();
+        let refusals: Vec<&String> = lines.iter().filter(|line| line.contains("refus")).collect();
+        assert_eq!(refusals.len(), 1, "{lines:?}");
+        assert!(refusals[0].contains("peer_concurrency"), "{lines:?}");
+        assert!(refusals[0].contains("refused on its link"), "{lines:?}");
+
+        drop(second);
+        let outcome = b_sends_to_a(&pair, &again).await.unwrap();
+        assert!(is_received_reply(&outcome.value, &again.id));
+        assert_eq!(messages(), 2);
+        drop(first);
+        pair.stop_node_a().await;
+    }
+
     /// Trust is checked before anything touches the wire: a destination node A has heard
     /// but does not trust, or has never heard at all, gets the same refusal and node B
     /// sees no request.
