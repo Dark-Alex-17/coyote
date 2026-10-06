@@ -2283,10 +2283,8 @@ impl MeshSlot {
     /// Runs on a blocking thread off the server's request path or on the fetch task, so
     /// nothing here awaits.
     pub(crate) fn deliver_peer(&self, mut message: PeerMessage) {
-        let wire_reply = message.in_reply_to.is_some();
         let answered = self.answer_correlation(&mut message);
-        let for_envoy =
-            !answered && !wire_reply && matches!(message.kind, PeerKind::Message | PeerKind::Ask);
+        let for_envoy = !answered && envoy_bound(message.kind, message.in_reply_to.as_deref());
         let envoy = for_envoy.then(|| self.envoy.load_full()).flatten();
         let received = ReceivedFacts::of(&message);
         let routed = match envoy {
@@ -2410,9 +2408,8 @@ impl MeshSlot {
         request: &PeerAdmission,
         now: Instant,
     ) -> Result<(), PeerRefusal> {
-        let for_envoy = request.via == PeerVia::Direct
-            && request.in_reply_to.is_none()
-            && matches!(request.kind, PeerKind::Message | PeerKind::Ask);
+        let for_envoy =
+            request.via == PeerVia::Direct && envoy_bound(request.kind, request.in_reply_to);
         let Some(sink) = for_envoy.then(|| self.envoy.load_full()).flatten() else {
             return Ok(());
         };
@@ -2945,6 +2942,11 @@ fn first_words(message: &PeerMessage, max_chars: usize) -> String {
         &message.content
     };
     display_text(words, max_chars).unwrap_or_default()
+}
+
+/// Whether a message is the envoy's to run: a message or question carrying no `in_reply_to`.
+fn envoy_bound(kind: PeerKind, in_reply_to: Option<&str>) -> bool {
+    in_reply_to.is_none() && matches!(kind, PeerKind::Message | PeerKind::Ask)
 }
 
 /// What became of a refused message, for the REPL line: refused on its link before the
