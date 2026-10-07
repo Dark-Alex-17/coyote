@@ -1520,8 +1520,16 @@ impl MeshRuntime {
         destination_hex: &str,
         message: &OutboundPeer,
     ) -> Result<SendOutcome, SendError> {
-        self.send_peer_with(destination_hex, message, PeerSendOptions::default())
+        self.send_peer_with(destination_hex, message, self.peer_send_options())
             .await
+    }
+
+    /// `PeerSendOptions::default()` with the configured deadlines raising the direct
+    /// attempt's.
+    fn peer_send_options(&self) -> PeerSendOptions {
+        let mut options = PeerSendOptions::default();
+        options.request = self.request_timeouts().raise(options.request);
+        options
     }
 
     /// `send_peer` with its timeouts chosen. Trust is checked before anything touches
@@ -1679,8 +1687,7 @@ impl MeshRuntime {
         &self,
         message: &OutboundPeer,
     ) -> Result<BroadcastOutcome, SendError> {
-        self.broadcast_with(message, PeerSendOptions::default())
-            .await
+        self.broadcast_with(message, self.peer_send_options()).await
     }
 
     pub(crate) async fn broadcast_with(

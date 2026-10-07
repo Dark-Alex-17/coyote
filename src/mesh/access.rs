@@ -471,9 +471,9 @@ impl MeshSlot {
                 reply: None,
             })
             .map_err(|err| AccessError::NotFiled(format!("{err:#}")))?;
-        let outcome = runtime
-            .request_access_wire(&desc, &request, AccessOptions::default())
-            .await;
+        let mut options = AccessOptions::default();
+        options.request = runtime.request_timeouts().raise(options.request);
+        let outcome = runtime.request_access_wire(&desc, &request, options).await;
         if !matches!(
             outcome,
             Ok(AccessRequestOutcome {

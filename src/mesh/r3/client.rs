@@ -35,7 +35,7 @@ pub(crate) const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Ceiling on link establishment, before the request itself is sent.
 pub(crate) const DEFAULT_LINK_TIMEOUT: Duration = Duration::from_secs(10);
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RequestOptions {
     pub request_timeout: Duration,
     pub link_timeout: Duration,

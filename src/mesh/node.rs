@@ -160,6 +160,39 @@ impl Default for KnockOptions {
     }
 }
 
+/// `mesh.request_timeout_secs` and `mesh.link_timeout_secs` as deadlines; `None` leaves a
+/// path's own. Applied to `/message`, `/knock`, `/list`, `/access` and `/status`; `/fetch`
+/// and the `mesh__peers` status sweep keep their constants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RequestTimeouts {
+    request: Option<Duration>,
+    link: Option<Duration>,
+}
+
+impl From<&MeshConfig> for RequestTimeouts {
+    fn from(mesh: &MeshConfig) -> Self {
+        Self {
+            request: mesh.request_timeout_secs.map(Duration::from_secs),
+            link: mesh.link_timeout_secs.map(Duration::from_secs),
+        }
+    }
+}
+
+impl RequestTimeouts {
+    /// `defaults` with each configured deadline applied where it is the longer; a
+    /// configured value never shortens a path's own.
+    pub(crate) fn raise(&self, defaults: RequestOptions) -> RequestOptions {
+        RequestOptions {
+            request_timeout: self.request.map_or(defaults.request_timeout, |configured| {
+                configured.max(defaults.request_timeout)
+            }),
+            link_timeout: self.link.map_or(defaults.link_timeout, |configured| {
+                configured.max(defaults.link_timeout)
+            }),
+        }
+    }
+}
+
 /// One configured interface, resolved to what the transport will be asked to join.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum InterfacePlan {
@@ -245,6 +278,7 @@ pub(crate) struct MeshRuntime {
     display_name: Option<String>,
     about: Option<String>,
     peer_limits: PeerLimitConfig,
+    request_timeouts: RequestTimeouts,
     inline_max_bytes: u64,
     /// The directory `mesh.fetch.inbox_dir` resolved to at node start; `None` stages
     /// under the cache dir.
@@ -286,6 +320,10 @@ pub(crate) struct MeshRuntime {
     posting: Mutex<()>,
     cancel: CancellationToken,
     tasks: parking_lot::Mutex<Vec<JoinHandle<()>>>,
+    /// Every request's path and deadlines in the order they were made, for the tests
+    /// that pin which deadline a path hands the client.
+    #[cfg(test)]
+    requests_made: parking_lot::Mutex<Vec<(String, RequestOptions)>>,
 }
 
 impl MeshRuntime {
@@ -433,6 +471,7 @@ impl MeshRuntime {
             display_name: config.display_name.clone(),
             about: config.about.clone(),
             peer_limits: PeerLimitConfig::from(config),
+            request_timeouts: RequestTimeouts::from(config),
             inline_max_bytes: config.fetch.inline_max_bytes,
             inbox_dir,
             cache_dir: paths.cache_dir,
@@ -469,6 +508,8 @@ impl MeshRuntime {
             posting: Mutex::new(()),
             cancel: CancellationToken::new(),
             tasks: parking_lot::Mutex::new(Vec::new()),
+            #[cfg(test)]
+            requests_made: parking_lot::Mutex::new(Vec::new()),
         });
         runtime.register_task(tokio::spawn(runtime.r3_client.clone().run(
             out_link_events,
@@ -572,6 +613,16 @@ impl MeshRuntime {
     /// The per-peer ceilings the node was started with, for the slot that installs it.
     pub(crate) fn peer_limits(&self) -> PeerLimitConfig {
         self.peer_limits
+    }
+
+    /// The configured deadlines, for the paths that raise their own by them.
+    pub(crate) fn request_timeouts(&self) -> RequestTimeouts {
+        self.request_timeouts
+    }
+
+    #[cfg(test)]
+    pub(crate) fn requests_made(&self) -> Vec<(String, RequestOptions)> {
+        self.requests_made.lock().clone()
     }
 
     /// The ceilings an inbound message's parts are admitted under.
@@ -795,6 +846,8 @@ impl MeshRuntime {
         envelope: Envelope,
         options: RequestOptions,
     ) -> Result<RequestOutcome, R3Error> {
+        #[cfg(test)]
+        self.requests_made.lock().push((path.to_string(), options));
         let dest_hex = destination.address_hash.to_hex_string();
         refuse_incompatible_peer(&self.peers, &dest_hex, path)?;
         let transport = self
@@ -834,8 +887,9 @@ impl MeshRuntime {
         destination: &DestinationDesc,
         intro: &KnockIntro,
     ) -> Result<KnockOutcome, KnockError> {
-        self.knock_with(destination, intro, KnockOptions::default())
-            .await
+        let mut options = KnockOptions::default();
+        options.request = self.request_timeouts.raise(options.request);
+        self.knock_with(destination, intro, options).await
     }
 
     /// `knock` with its timeouts chosen. The dispatcher answers a knock with `NoAccess` by
@@ -3316,7 +3370,7 @@ mod tests {
     use crate::mesh::events::{RecordingHookSink, env_value, one_fire};
     use crate::mesh::limits::PEER_RETRY_AFTER_CAPACITY;
     use crate::mesh::message::{
-        PEER_ID_MAX_CHARS, is_received_reply, peer_lxmf_message, to_r3_body,
+        PEER_ID_MAX_CHARS, PeerSendOptions, is_received_reply, peer_lxmf_message, to_r3_body,
     };
     use crate::mesh::notify::RenderedNotification;
     use crate::mesh::peers::PEER_TTL;
@@ -3333,8 +3387,8 @@ mod tests {
     use crate::mesh::rfc3339_utc;
     #[cfg(unix)]
     use crate::mesh::test_support::{
-        PeerStub, loopback_relay, started_runtime, started_runtime_on, started_runtime_with,
-        started_runtime_with_options,
+        PeerStub, loopback_relay, started_runtime, started_runtime_on, started_runtime_on_with,
+        started_runtime_with, started_runtime_with_options,
     };
     use crate::mesh::test_support::{
         TempDir, TrustList, mesh_paths, private_config, snapshot_fixture,
@@ -3358,6 +3412,71 @@ mod tests {
     const POLL: Duration = Duration::from_millis(100);
     #[cfg(unix)]
     const INTEROP_TIMEOUT: Duration = Duration::from_secs(15);
+
+    /// Unset timers leave every path's deadlines as they are; set ones apply only where
+    /// they are the longer, so a configured value can never shorten a deadline: the one
+    /// `validate` refuses would, if it got this far, leave each path's own in place.
+    #[test]
+    fn request_timeouts_raise_a_deadline_and_never_lower_one() {
+        let message = PeerSendOptions::default().request;
+        let knock = KnockOptions::default().request;
+        let status = RequestOptions::default();
+        assert_eq!(message.request_timeout, Duration::from_secs(15));
+        assert_eq!(knock.request_timeout, Duration::from_secs(15));
+        assert_eq!(status.request_timeout, Duration::from_secs(30));
+        assert_eq!(status.link_timeout, Duration::from_secs(10));
+
+        let unset = RequestTimeouts::from(&MeshConfig::default());
+        assert_eq!(
+            unset,
+            RequestTimeouts {
+                request: None,
+                link: None
+            }
+        );
+        for defaults in [message, knock, status] {
+            assert_eq!(unset.raise(defaults), defaults);
+        }
+
+        let lower = RequestTimeouts::from(&MeshConfig {
+            request_timeout_secs: Some(1),
+            link_timeout_secs: Some(1),
+            ..Default::default()
+        });
+        for defaults in [message, knock, status] {
+            assert_eq!(lower.raise(defaults), defaults, "{defaults:?}");
+        }
+
+        let between = RequestTimeouts::from(&MeshConfig {
+            request_timeout_secs: Some(20),
+            link_timeout_secs: Some(10),
+            ..Default::default()
+        });
+        assert_eq!(
+            between.raise(message).request_timeout,
+            Duration::from_secs(20)
+        );
+        assert_eq!(
+            between.raise(status).request_timeout,
+            Duration::from_secs(30)
+        );
+        assert_eq!(between.raise(status).link_timeout, Duration::from_secs(10));
+
+        let higher = RequestTimeouts::from(&MeshConfig {
+            request_timeout_secs: Some(90),
+            link_timeout_secs: Some(45),
+            ..Default::default()
+        });
+        for defaults in [message, knock, status] {
+            assert_eq!(
+                higher.raise(defaults),
+                RequestOptions {
+                    request_timeout: Duration::from_secs(90),
+                    link_timeout: Duration::from_secs(45),
+                }
+            );
+        }
+    }
 
     #[test]
     fn slot_publish_then_read_returns_the_latest_snapshot() {
@@ -8958,11 +9077,27 @@ mod tests {
         String,
         usize,
     ) {
+        marked_incompatible_stub_with(tag, |_| {}).await
+    }
+
+    /// `marked_incompatible_stub` with the node's config adjusted first.
+    #[cfg(unix)]
+    async fn marked_incompatible_stub_with(
+        tag: &str,
+        adjust: impl FnOnce(&mut MeshConfig),
+    ) -> (
+        PeerStub,
+        Arc<MeshRuntime>,
+        Arc<MeshSlot>,
+        DestinationDesc,
+        String,
+        usize,
+    ) {
         use crate::mesh::trust::TrustOptions;
 
         install_log_collector();
         let stub = PeerStub::listen(&format!("{tag}-stub"), TcpServer::DEFAULT_CLIENT_MTU).await;
-        let started = started_runtime_on(tag, stub.port()).await;
+        let started = started_runtime_on_with(tag, stub.port(), adjust).await;
         let runtime = started.runtime.clone();
         let slot = Arc::new(MeshSlot::default());
         slot.install(runtime.clone()).unwrap();
@@ -9043,6 +9178,217 @@ mod tests {
         assert!(
             links.is_empty(),
             "a marked peer is never asked for status over a link: {links:?}"
+        );
+        assert!(slot.stop().await.unwrap());
+        stub.stop().await;
+    }
+
+    /// The deadlines `path` hands the client when driven once against a node whose
+    /// `mesh.request_timeout_secs` / `mesh.link_timeout_secs` are `timers`. The peer is
+    /// marked incompatible, so every request is recorded and refused before a link opens.
+    #[cfg(unix)]
+    async fn deadlines_handed_to(
+        tag: &str,
+        timers: (Option<u64>, Option<u64>),
+        path: &str,
+    ) -> RequestOptions {
+        let (stub, runtime, slot, desc, to, _) = marked_incompatible_stub_with(tag, |config| {
+            config.request_timeout_secs = timers.0;
+            config.link_timeout_secs = timers.1;
+        })
+        .await;
+        drive(&runtime, &slot, &desc, &to, path).await;
+        let recorded = runtime.requests_made();
+        let options = recorded
+            .iter()
+            .find(|(made, _)| made == path)
+            .map(|(_, options)| *options)
+            .unwrap_or_else(|| panic!("{path} made no request: {recorded:?}"));
+        assert!(slot.stop().await.unwrap());
+        stub.stop().await;
+        options
+    }
+
+    /// Makes one request on `path` through the entry point a caller of the runtime uses,
+    /// so the recorded deadlines are the ones that entry point chose.
+    #[cfg(unix)]
+    async fn drive(
+        runtime: &Arc<MeshRuntime>,
+        slot: &Arc<MeshSlot>,
+        desc: &DestinationDesc,
+        to: &str,
+        path: &str,
+    ) {
+        match path {
+            MESSAGE_PATH => {
+                let message = OutboundPeer::new(PeerKind::Message, "hi", None, None, None).unwrap();
+                runtime.send_peer(to, &message).await.unwrap_err();
+            }
+            KNOCK_PATH => {
+                runtime
+                    .knock(desc, &KnockIntro::new("hi").unwrap())
+                    .await
+                    .unwrap_err();
+            }
+            LIST_PATH => {
+                runtime.list_shares(desc, None, None).await.unwrap_err();
+            }
+            ACCESS_PATH => {
+                slot.request_access(to, &["docs/a.md".to_string()], "")
+                    .await
+                    .unwrap_err();
+            }
+            STATUS_PATH => {
+                runtime.request_status(desc).await.unwrap_err();
+            }
+            FETCH_PATH => {
+                runtime
+                    .fetch_file(desc, "docs/a.md", None)
+                    .await
+                    .unwrap_err();
+            }
+            other => panic!("no driver for {other}"),
+        }
+    }
+
+    #[cfg(unix)]
+    const RAISED_TIMERS: (Option<u64>, Option<u64>) = (Some(90), Some(45));
+    #[cfg(unix)]
+    const RAISED: RequestOptions = RequestOptions {
+        request_timeout: Duration::from_secs(90),
+        link_timeout: Duration::from_secs(45),
+    };
+
+    /// With both timers unset every path hands the client its own constants, and the
+    /// constants are today's: 15 s / 10 s on the four peer paths, 30 s / 10 s on
+    /// `/status`, 120 s / 10 s on `/fetch`.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unset_timers_leave_every_paths_own_deadlines() {
+        let (stub, runtime, slot, desc, to, _) =
+            marked_incompatible_stub("node-timers-unset").await;
+        for path in [
+            MESSAGE_PATH,
+            KNOCK_PATH,
+            LIST_PATH,
+            ACCESS_PATH,
+            STATUS_PATH,
+            FETCH_PATH,
+        ] {
+            drive(&runtime, &slot, &desc, &to, path).await;
+        }
+
+        let peer = RequestOptions {
+            request_timeout: Duration::from_secs(15),
+            link_timeout: Duration::from_secs(10),
+        };
+        assert_eq!(
+            runtime.requests_made(),
+            vec![
+                (MESSAGE_PATH.to_string(), peer),
+                (KNOCK_PATH.to_string(), peer),
+                (LIST_PATH.to_string(), peer),
+                (ACCESS_PATH.to_string(), peer),
+                (
+                    STATUS_PATH.to_string(),
+                    RequestOptions {
+                        request_timeout: Duration::from_secs(30),
+                        link_timeout: Duration::from_secs(10),
+                    }
+                ),
+                (
+                    FETCH_PATH.to_string(),
+                    RequestOptions {
+                        request_timeout: Duration::from_secs(120),
+                        link_timeout: Duration::from_secs(10),
+                    }
+                ),
+            ]
+        );
+        assert!(slot.stop().await.unwrap());
+        stub.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn message_deadlines_come_from_the_configured_timers() {
+        assert_eq!(
+            deadlines_handed_to("node-timers-message", RAISED_TIMERS, MESSAGE_PATH).await,
+            RAISED
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn knock_deadlines_come_from_the_configured_timers() {
+        assert_eq!(
+            deadlines_handed_to("node-timers-knock", RAISED_TIMERS, KNOCK_PATH).await,
+            RAISED
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn list_deadlines_come_from_the_configured_timers() {
+        assert_eq!(
+            deadlines_handed_to("node-timers-list", RAISED_TIMERS, LIST_PATH).await,
+            RAISED
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn access_deadlines_come_from_the_configured_timers() {
+        assert_eq!(
+            deadlines_handed_to("node-timers-access", RAISED_TIMERS, ACCESS_PATH).await,
+            RAISED
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn status_deadlines_come_from_the_configured_timers() {
+        assert_eq!(
+            deadlines_handed_to("node-timers-status", RAISED_TIMERS, STATUS_PATH).await,
+            RAISED
+        );
+    }
+
+    /// `/fetch` is not governed: under the raised timers it still hands the client its own
+    /// 120 s / 10 s.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fetch_deadlines_ignore_the_configured_timers() {
+        assert_eq!(
+            deadlines_handed_to("node-timers-fetch", RAISED_TIMERS, FETCH_PATH).await,
+            RequestOptions {
+                request_timeout: Duration::from_secs(120),
+                link_timeout: Duration::from_secs(10),
+            }
+        );
+    }
+
+    /// `mesh__peers --with_status` sweeps with `request_status_with` at 5 s / 5 s; the
+    /// caller's deadlines pass through untouched under the raised timers.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn request_status_with_keeps_the_callers_deadlines_under_the_configured_timers() {
+        let (stub, runtime, slot, desc, _, _) =
+            marked_incompatible_stub_with("node-timers-sweep", |config| {
+                config.request_timeout_secs = RAISED_TIMERS.0;
+                config.link_timeout_secs = RAISED_TIMERS.1;
+            })
+            .await;
+        let sweep = RequestOptions {
+            request_timeout: Duration::from_secs(5),
+            link_timeout: Duration::from_secs(5),
+        };
+
+        runtime.request_status_with(&desc, sweep).await.unwrap_err();
+
+        assert_eq!(
+            runtime.requests_made(),
+            vec![(STATUS_PATH.to_string(), sweep)]
         );
         assert!(slot.stop().await.unwrap());
         stub.stop().await;

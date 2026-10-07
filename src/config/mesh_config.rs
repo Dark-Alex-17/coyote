@@ -1,5 +1,7 @@
 use super::paths;
+use crate::mesh::DEFAULT_LINK_TIMEOUT;
 use crate::mesh::card::ABOUT_MAX_CHARS;
+use crate::mesh::message::PEER_REQUEST_TIMEOUT;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -103,6 +105,16 @@ pub struct MeshConfig {
     /// filed in the inbox for the human without an envoy run and the peer gets one
     /// typed reply per identity, per reason, per hour.
     pub peer_max_cost_usd_per_hour: f64,
+    /// Seconds to wait for a peer's answer on `/message`, `/knock`, `/list`, `/access`
+    /// and `/status`; unset keeps each path's built-in deadline (15 s, 30 s for
+    /// `/status`). Set, it raises a path's deadline to this and never lowers one, so a
+    /// value under the shortest built-in deadline is out of range. `/fetch` keeps its
+    /// own 120 s.
+    pub request_timeout_secs: Option<u64>,
+    /// Seconds to wait for the link to open and identify before a request on the same
+    /// five paths; unset keeps the built-in 10 s. Set, it raises the deadline and never
+    /// lowers it, so a value under 10 is out of range.
+    pub link_timeout_secs: Option<u64>,
     /// Seconds between automatic fetches of the messages a propagation node holds for
     /// this node, the first running once a propagation node is heard after the node
     /// joins; 0 = fetch only on `.mesh sync`; off while `announce` is false, since a
@@ -194,6 +206,8 @@ impl Default for MeshConfig {
             peer_max_messages_per_hour: DEFAULT_PEER_MAX_MESSAGES_PER_HOUR,
             peer_max_tokens_per_hour: DEFAULT_PEER_MAX_TOKENS_PER_HOUR,
             peer_max_cost_usd_per_hour: DEFAULT_PEER_MAX_COST_USD_PER_HOUR,
+            request_timeout_secs: None,
+            link_timeout_secs: None,
             propagation_sync_interval_secs: DEFAULT_PROPAGATION_SYNC_INTERVAL_SECS,
             fetch: MeshFetch::default(),
         }
@@ -255,6 +269,27 @@ impl MeshConfig {
             bail!(
                 "mesh.peer_max_cost_usd_per_hour is {cost}, which is out of range; use 0 (no ceiling) or a positive amount"
             );
+        }
+        for (name, value, floor) in [
+            (
+                "request_timeout_secs",
+                self.request_timeout_secs,
+                PEER_REQUEST_TIMEOUT,
+            ),
+            (
+                "link_timeout_secs",
+                self.link_timeout_secs,
+                DEFAULT_LINK_TIMEOUT,
+            ),
+        ] {
+            let floor = floor.as_secs();
+            if let Some(value) = value
+                && value < floor
+            {
+                bail!(
+                    "mesh.{name} is {value}, which is out of range; use {floor} (the shortest built-in deadline, which this key raises but never lowers) or more"
+                );
+            }
         }
         let sync = self.propagation_sync_interval_secs;
         if sync > MAX_PROPAGATION_SYNC_INTERVAL_SECS {
@@ -467,6 +502,14 @@ pub fn render_mesh_info(mesh: &MeshConfig) -> String {
         } else {
             cost.to_string()
         },
+    );
+    row(
+        "request_timeout_secs",
+        super::format_option_value(&mesh.request_timeout_secs),
+    );
+    row(
+        "link_timeout_secs",
+        super::format_option_value(&mesh.link_timeout_secs),
     );
     let sync = mesh.propagation_sync_interval_secs;
     row(
@@ -900,6 +943,71 @@ mod tests {
         }
     }
 
+    /// Both timers default to unset, which serialises as `null` and reads back as unset;
+    /// set, each is accepted at its floor and above and refused below it with a message
+    /// naming the key, the value and the floor. The floors are the shortest built-in
+    /// deadlines on the paths the timers govern, so a value valid for one path is valid
+    /// for all.
+    #[test]
+    fn validate_accepts_timers_from_their_floors_and_refuses_lower_ones_naming_the_floor() {
+        assert_eq!(MeshConfig::default().request_timeout_secs, None);
+        assert_eq!(MeshConfig::default().link_timeout_secs, None);
+        assert_eq!(PEER_REQUEST_TIMEOUT.as_secs(), 15);
+        assert_eq!(DEFAULT_LINK_TIMEOUT.as_secs(), 10);
+        let serialized = serde_yaml::to_string(&MeshConfig::default()).unwrap();
+        assert!(
+            serialized.contains("request_timeout_secs: null\n"),
+            "{serialized}"
+        );
+        assert!(
+            serialized.contains("link_timeout_secs: null\n"),
+            "{serialized}"
+        );
+        let null: Config = serde_yaml::from_str(
+            "mesh:\n  request_timeout_secs: null\n  link_timeout_secs: null\n",
+        )
+        .unwrap();
+        assert_eq!(null.mesh, MeshConfig::default());
+
+        let enabled = MeshConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let with = |request: Option<u64>, link: Option<u64>| MeshConfig {
+            request_timeout_secs: request,
+            link_timeout_secs: link,
+            ..enabled.clone()
+        };
+        for (request, link) in [(None, None), (Some(15), Some(10)), (Some(90), Some(45))] {
+            with(request, link)
+                .validate(true)
+                .unwrap_or_else(|err| panic!("{request:?}/{link:?}: {err}"));
+        }
+        let err = with(Some(14), None).validate(true).unwrap_err().to_string();
+        assert!(
+            err.contains("mesh.request_timeout_secs is 14, which is out of range; use 15 ("),
+            "{err}"
+        );
+        assert!(err.contains("or more"), "{err}");
+        let err = with(None, Some(9)).validate(true).unwrap_err().to_string();
+        assert!(
+            err.contains("mesh.link_timeout_secs is 9, which is out of range; use 10 ("),
+            "{err}"
+        );
+        let err = with(Some(1), Some(1))
+            .validate(true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("mesh.request_timeout_secs is 1"), "{err}");
+
+        let disabled = MeshConfig {
+            request_timeout_secs: Some(1),
+            link_timeout_secs: Some(1),
+            ..Default::default()
+        };
+        disabled.validate(false).unwrap();
+    }
+
     /// Usage probe: the documented `0 = fetch only on .mesh sync` is a VALID setting for an
     /// enabled mesh, unlike the rate and retention keys where 0 is out of range; an absent
     /// key reads as the documented 300; a negative or fractional value is refused at parse
@@ -1293,6 +1401,33 @@ mod tests {
         let info = render_mesh_info(&manual);
         assert!(
             info.contains("  propagation_sync_interval_secs  0 (manual)\n"),
+            "{info}"
+        );
+    }
+
+    #[test]
+    fn render_mesh_info_shows_unset_timers_as_null_and_set_ones_in_seconds() {
+        let info = render_mesh_info(&MeshConfig::default());
+        assert!(
+            info.contains("  request_timeout_secs            null\n"),
+            "{info}"
+        );
+        assert!(
+            info.contains("  link_timeout_secs               null\n"),
+            "{info}"
+        );
+        let raised = MeshConfig {
+            request_timeout_secs: Some(90),
+            link_timeout_secs: Some(45),
+            ..Default::default()
+        };
+        let info = render_mesh_info(&raised);
+        assert!(
+            info.contains("  request_timeout_secs            90\n"),
+            "{info}"
+        );
+        assert!(
+            info.contains("  link_timeout_secs               45\n"),
             "{info}"
         );
     }

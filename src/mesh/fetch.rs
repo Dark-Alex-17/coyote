@@ -1084,10 +1084,10 @@ impl MeshRuntime {
                 cursor.map_or(Value::Nil, Value::from),
             ),
         ]);
-        let options = RequestOptions {
+        let options = self.request_timeouts().raise(RequestOptions {
             request_timeout: PEER_REQUEST_TIMEOUT,
             link_timeout: PEER_LINK_TIMEOUT,
-        };
+        });
         let outcome = self
             .request(destination, LIST_PATH, body, options)
             .await
