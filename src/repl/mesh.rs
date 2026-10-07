@@ -7347,6 +7347,62 @@ mod tests {
             assert!(!ctx.app.config.mesh.enabled);
         }
 
+        /// Usage probe: a timer the loader let through because the mesh was off (the
+        /// structural checks wait for `enabled`) is refused by `.mesh on` with the
+        /// loader's own sentence, naming the key, the value, the floor and the one-year
+        /// cap, before the preview or the prompt; the node stays off and the live config
+        /// keeps `enabled: false`. Both keys, both edges: over the cap and under the floor.
+        #[test]
+        fn usage_probe_mesh_on_refuses_a_timer_outside_its_range_with_the_loaders_sentence() {
+            use crate::config::mesh_config::MAX_TIMEOUT_SECS;
+
+            for (request, link, key, value, floor) in [
+                (
+                    Some(MAX_TIMEOUT_SECS + 1),
+                    None,
+                    "request_timeout_secs",
+                    MAX_TIMEOUT_SECS + 1,
+                    15,
+                ),
+                (None, Some(9), "link_timeout_secs", 9, 10),
+                (
+                    Some(14),
+                    Some(MAX_TIMEOUT_SECS),
+                    "request_timeout_secs",
+                    14,
+                    15,
+                ),
+            ] {
+                let mesh = MeshConfig {
+                    request_timeout_secs: request,
+                    link_timeout_secs: link,
+                    ..MeshConfig::default()
+                };
+                assert!(
+                    mesh.validate(true).is_ok(),
+                    "the loader accepts the timers while the mesh is off: {request:?}/{link:?}"
+                );
+                let mut ctx = ctx_with(mesh, true);
+                ctx.session = Some(Session::default());
+
+                let err = err_of(&mut ctx, ".mesh on --yes");
+
+                assert_eq!(
+                    err,
+                    format!(
+                        "mesh.{key} is {value}, which is out of range; use {floor} (the shortest \
+                         built-in deadline, which this key raises but never lowers) to \
+                         {MAX_TIMEOUT_SECS} (one year), or null to keep each path's built-in deadline"
+                    ),
+                    "{request:?}/{link:?}"
+                );
+                assert!(ctx.app.mesh.get().is_none(), "{request:?}/{link:?}");
+                assert!(!ctx.app.config.mesh.enabled, "{request:?}/{link:?}");
+                assert_eq!(ctx.app.config.mesh.request_timeout_secs, request);
+                assert_eq!(ctx.app.config.mesh.link_timeout_secs, link);
+            }
+        }
+
         // `autostart` prints its leading notice through `out_text`, which lands in the
         // process-global `capture` when another `#[serial]` test has one installed, so this
         // test must not overlap them (it broke `bare_info_while_off_puts_every_value_in_the_same_column`).

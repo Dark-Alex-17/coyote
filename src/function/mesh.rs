@@ -3767,6 +3767,104 @@ mod tests {
             }
         }
 
+        /// Serves `/status` by never answering, so only the requester's deadline ends the
+        /// request.
+        struct NeverAnswers;
+
+        #[async_trait]
+        impl Handler for NeverAnswers {
+            async fn handle(&self, _request: AdmittedRequest) -> Reply {
+                std::future::pending().await
+            }
+        }
+
+        /// Usage probe: `mesh__peers` with `with_status: true` sweeps `/status` at its own
+        /// 5 s / 5 s while this node's `mesh.request_timeout_secs` and `link_timeout_secs`
+        /// sit at the one-year cap. A trusted, reachable peer that never answers costs the
+        /// sweep about five seconds, not a year; its row carries `status_error` naming the
+        /// 5 s the sweep waited; and the deadlines the node handed its client for the one
+        /// `/status` request are the sweep's, not the raised ones.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial]
+        async fn usage_probe_the_status_sweep_keeps_its_five_seconds_while_the_nodes_timers_sit_at_the_cap()
+         {
+            use crate::config::mesh_config::MAX_TIMEOUT_SECS;
+            use crate::mesh::r3::STATUS_PATH;
+            use crate::mesh::test_support::started_runtime_on_with;
+
+            let tag = "mesh-tool-peers-sweep-at-cap";
+            let _guard = TestConfigDirGuard::new(tag);
+            let stub = PeerStub::listen(tag, TcpServer::DEFAULT_CLIENT_MTU).await;
+            let started = started_runtime_on_with(tag, stub.port(), |config| {
+                config.request_timeout_secs = Some(MAX_TIMEOUT_SECS);
+                config.link_timeout_secs = Some(MAX_TIMEOUT_SECS);
+            })
+            .await;
+            let runtime = started.runtime.clone();
+            let mut ctx = plain_ctx();
+            ctx.app.mesh.install(runtime.clone()).unwrap();
+            stub.trust(&runtime.current_destination_hash(), runtime.fingerprint());
+            stub.serve(STATUS_PATH, Arc::new(NeverAnswers));
+            stub.announce(Some("Stub")).await;
+            let to = stub.destination_hex();
+            let peers = runtime.peers();
+            wait_until("the node to file the stub", || peers.get(&to).is_some()).await;
+            runtime
+                .trust()
+                .trust_destination(
+                    ctx.app.mesh.as_ref(),
+                    &to,
+                    TrustOptions::default(),
+                    SystemTime::now(),
+                )
+                .unwrap();
+
+            let asked_at = std::time::Instant::now();
+            let result = tokio::time::timeout(
+                Duration::from_secs(60),
+                handle_mesh_tool(
+                    &mut ctx,
+                    &format!("{MESH_FUNCTION_PREFIX}peers"),
+                    &json!({"with_status": true}),
+                ),
+            )
+            .await
+            .expect("the sweep ended within a minute, not under the node's one-year timers")
+            .unwrap();
+            let elapsed = asked_at.elapsed();
+
+            let rows = result["peers"].as_array().unwrap();
+            assert_eq!(rows.len(), 1, "{result}");
+            let row = &rows[0];
+            assert_eq!(row["destination"], to, "{row}");
+            assert_eq!(row["trust"], "trusted", "{row}");
+            assert_eq!(row["reachable"], true, "{row}");
+            assert!(row.get("status").is_none(), "{row}");
+            let error = row["status_error"]
+                .as_str()
+                .unwrap_or_else(|| panic!("no status_error: {row}"));
+            assert!(
+                error.starts_with("No response to the mesh request /status within 5.0s"),
+                "{error}"
+            );
+            assert!(
+                elapsed >= Duration::from_millis(4_500) && elapsed < Duration::from_secs(60),
+                "the sweep waited {elapsed:?}, not about five seconds"
+            );
+            let sweep = RequestOptions {
+                request_timeout: Duration::from_secs(5),
+                link_timeout: Duration::from_secs(5),
+            };
+            assert_eq!(
+                runtime.requests_made(),
+                vec![(STATUS_PATH.to_string(), sweep)],
+                "the one /status request ran under the sweep's deadlines, not the node's"
+            );
+
+            assert!(ctx.app.mesh.stop().await.unwrap());
+            stub.stop().await;
+        }
+
         /// Every `mesh__peers` row carries `compatibility` next to `trust`, worded by
         /// `compatibility_line()` so a model reading the JSON sees the same warning
         /// `.mesh peers` prints (null when the peer speaks a supported protocol).
