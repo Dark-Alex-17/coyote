@@ -19,7 +19,8 @@ use crate::mesh::r3::{
     redact_hashes, short,
 };
 use crate::mesh::trust::{
-    Decision, IdentityStanding, Rule, TrustStore, Verdict, decode_name_hash, parse_hash,
+    BindingConflict, Decision, IdentityStanding, KeyChangeOutcome, OriginVerdict, Rule, TrustStore,
+    Verdict, decode_name_hash, parse_hash,
 };
 use crate::mesh::{destination_address, display_text, hex_lower, rfc3339_utc};
 
@@ -433,10 +434,12 @@ impl KnockGate {
 
     /// Decides one knock. Every refusal returns before the gate's own state is touched, so
     /// an identity the list does not admit leaves no trace here. The verdict is
-    /// `authorize_origin`'s when the knock's hashes decode, so a standing identity naming
-    /// an instance bound to another identity is refused as identity changed and marks that
-    /// record instead of knocking; a knock without a readable name hash is judged by
-    /// `authorize` alone.
+    /// `authorize_origin`'s when the knock's hashes decode, and every arm does to a
+    /// colliding record what the request path does: a standing identity naming an
+    /// instance bound to another identity is refused as identity changed and marks that
+    /// record instead of knocking, one trusted for all destinations admitted over such a
+    /// record marks it and warns, and one whose own destination is denied is denied and
+    /// still marks it. A knock without a readable name hash is judged by `authorize` alone.
     pub(crate) fn admit(
         &self,
         knock: InboundKnock,
@@ -451,7 +454,7 @@ impl KnockGate {
         if self.trust.identity_standing(&knock.identity_hash) == IdentityStanding::Unknown {
             return Admission::Unknown;
         }
-        let verdict = self.verdict(&knock);
+        let (verdict, collisions) = self.verdict(&knock);
         match (verdict.decision, verdict.rule) {
             (Decision::Refuse, Rule::DefaultClosed) => {}
             (Decision::Allow, _) => {
@@ -459,6 +462,14 @@ impl KnockGate {
                     "Mesh knock from {id8} via {:?} is not a knock: already trusted from {dest8}",
                     knock.via
                 );
+                if !collisions.is_empty() {
+                    self.trust.note_key_change(
+                        &knock.identity_hash,
+                        &knock.name_hash,
+                        KeyChangeOutcome::Served,
+                        received_at,
+                    );
+                }
                 return Admission::AlreadyTrusted;
             }
             (Decision::Refuse, Rule::IdentityBlocked) => return Admission::Blocked,
@@ -466,12 +477,26 @@ impl KnockGate {
                 debug!(
                     "Mesh knock from {id8} for destination {dest8} is not a knock: the instance is bound to another identity"
                 );
-                self.trust
-                    .note_key_change(&knock.identity_hash, &knock.name_hash, received_at);
+                if !collisions.is_empty() {
+                    self.trust.note_key_change(
+                        &knock.identity_hash,
+                        &knock.name_hash,
+                        KeyChangeOutcome::Refused,
+                        received_at,
+                    );
+                }
                 return Admission::IdentityChanged;
             }
             (Decision::Refuse, _) => {
                 debug!("Mesh knock from {id8} for destination {dest8} dropped: destination denied");
+                if !collisions.is_empty() {
+                    self.trust.note_key_change(
+                        &knock.identity_hash,
+                        &knock.name_hash,
+                        KeyChangeOutcome::Refused,
+                        received_at,
+                    );
+                }
                 return Admission::Denied;
             }
         }
@@ -531,17 +556,26 @@ impl KnockGate {
         Admission::Admitted { surfaced: shown }
     }
 
-    fn verdict(&self, knock: &InboundKnock) -> Verdict {
+    /// The verdict with the records the knock's origin collides with; none when the hashes
+    /// do not decode and `authorize` alone judges it.
+    fn verdict(&self, knock: &InboundKnock) -> (Verdict, Vec<BindingConflict>) {
         match (
             parse_hash(&knock.identity_hash),
             decode_name_hash(&knock.name_hash),
         ) {
             (Some(identity), Some(name_hash)) => {
-                self.trust.authorize_origin(&identity, &name_hash).0
+                let OriginVerdict {
+                    verdict,
+                    collisions,
+                    ..
+                } = self.trust.authorize_origin(&identity, &name_hash);
+                (verdict, collisions)
             }
-            _ => self
-                .trust
-                .authorize(&knock.identity_hash, &knock.destination_hash),
+            _ => (
+                self.trust
+                    .authorize(&knock.identity_hash, &knock.destination_hash),
+                Vec::new(),
+            ),
         }
     }
 
@@ -1380,6 +1414,200 @@ mod tests {
         let texts = rig.surface.texts();
         assert_eq!(texts.len(), 1, "{texts:#?}");
         assert!(texts[0].contains("announced under"), "{}", texts[0]);
+    }
+
+    /// Identity I2, trusted for all destinations, knocks for the instance the list binds
+    /// to I1. It is already trusted, so it is no knock, but the record is marked all the
+    /// same and the human gets the warning the request path would give: the gate is the
+    /// store-and-forward twin of the dispatcher's allow arm.
+    #[test]
+    fn an_all_destinations_identity_knocking_for_a_foreign_instance_is_trusted_and_marks_the_record()
+     {
+        let bound = hash_of("id-bound-all");
+        let knocker = hash_of("id-trusted-all");
+        let name_hash = [8u8; NAME_HASH_LEN];
+        let bound_destination = destination_address(
+            &name_hash,
+            &AddressHash::new_from_hex_string(&bound).unwrap(),
+        )
+        .to_hex_string();
+        let rig = Rig::new(
+            "knock-gate-all-destinations-collision",
+            TrustList::default()
+                .identity(&knocker, true)
+                .destination(&bound_destination, &bound),
+        );
+        rig.gate
+            .trust
+            .attach_surface(Arc::downgrade(&rig.surface) as Weak<dyn KnockSurface>);
+        let knock = InboundKnock {
+            identity_hash: knocker.clone(),
+            destination_hash: destination_address(
+                &name_hash,
+                &AddressHash::new_from_hex_string(&knocker).unwrap(),
+            )
+            .to_hex_string(),
+            name_hash: hex_lower(&name_hash),
+            via: KnockVia::StoreAndForward,
+            intro: Some("hello".to_string()),
+        };
+
+        let admission = rig.gate.admit(knock, now(), SystemTime::now());
+
+        assert_eq!(admission, Admission::AlreadyTrusted);
+        let record = rig
+            .gate
+            .trust
+            .records()
+            .into_iter()
+            .find(|record| record.hash == bound_destination)
+            .unwrap();
+        assert_eq!(
+            record.key_changed.map(|mark| mark.seen_identity),
+            Some(knocker)
+        );
+        assert!(!rig.gate.cache().path().exists());
+        let texts = rig.surface.texts();
+        assert_eq!(texts.len(), 1, "{texts:#?}");
+        assert!(texts[0].starts_with("warning: "), "{}", texts[0]);
+        assert!(texts[0].contains("announced under"), "{}", texts[0]);
+    }
+
+    /// Usage probe: the store-and-forward twin of the protected request path. Under
+    /// collision protection the all-destinations knocker over a foreign instance is
+    /// identity changed, not a knock: refused, nothing cached, the record marked, and
+    /// exactly one error line naming the knocker, the holder check and the one clearing
+    /// action (`.mesh trust <new destination>`).
+    #[test]
+    fn usage_probe_a_protected_all_destinations_knocker_over_a_foreign_instance_is_refused_and_marks()
+     {
+        let bound = hash_of("id-bound-protected");
+        let knocker = hash_of("id-trusted-all-protected");
+        let name_hash = [9u8; NAME_HASH_LEN];
+        let bound_destination = destination_address(
+            &name_hash,
+            &AddressHash::new_from_hex_string(&bound).unwrap(),
+        )
+        .to_hex_string();
+        let new_destination = destination_address(
+            &name_hash,
+            &AddressHash::new_from_hex_string(&knocker).unwrap(),
+        )
+        .to_hex_string();
+        let rig = Rig::new(
+            "knock-gate-protected-collision",
+            TrustList::default()
+                .identity(&knocker, true)
+                .destination(&bound_destination, &bound),
+        );
+        rig.gate.trust.set_collision_protection(true);
+        rig.gate
+            .trust
+            .attach_surface(Arc::downgrade(&rig.surface) as Weak<dyn KnockSurface>);
+        let knock = InboundKnock {
+            identity_hash: knocker.clone(),
+            destination_hash: new_destination.clone(),
+            name_hash: hex_lower(&name_hash),
+            via: KnockVia::StoreAndForward,
+            intro: Some("hello".to_string()),
+        };
+
+        let admission = rig.gate.admit(knock.clone(), now(), SystemTime::now());
+
+        assert_eq!(admission, Admission::IdentityChanged);
+        let record = rig
+            .gate
+            .trust
+            .records()
+            .into_iter()
+            .find(|record| record.hash == bound_destination)
+            .unwrap();
+        assert_eq!(record.identity.as_deref(), Some(bound.as_str()));
+        assert_eq!(
+            record
+                .key_changed
+                .as_ref()
+                .map(|mark| mark.seen_identity.as_str()),
+            Some(knocker.as_str())
+        );
+        assert!(!rig.gate.cache().path().exists());
+        assert!(rig.gate.tracked_identities().is_empty());
+        let texts = rig.surface.texts();
+        assert_eq!(texts.len(), 1, "{texts:#?}");
+        let text = &texts[0];
+        assert!(text.starts_with("error: "), "{text}");
+        assert!(text.contains(&knocker), "{text}");
+        assert!(text.contains("holder out of band"), "{text}");
+        assert!(
+            text.contains(&format!(".mesh trust {new_destination}")),
+            "{text}"
+        );
+        assert!(text.contains(&format!(".mesh block {knocker}")), "{text}");
+
+        // First wins: the same knock again neither re-marks nor speaks again.
+        assert_eq!(
+            rig.gate.admit(knock, now(), SystemTime::now()),
+            Admission::IdentityChanged
+        );
+        assert_eq!(rig.surface.texts().len(), 1);
+    }
+
+    /// The store-and-forward twin of the dispatcher's denied-requester arm: a known
+    /// identity whose own derived destination is denied knocks for an instance the list
+    /// binds to another identity. The deny decides (no knock, nothing cached), and the
+    /// colliding record is marked with the human told, as on the request path.
+    #[test]
+    fn a_denied_knocker_over_a_foreign_instance_is_denied_and_still_marks_the_record() {
+        let bound = hash_of("id-bound-denied-knock");
+        let knocker = hash_of("id-known-denied-knock");
+        let name_hash = [10u8; NAME_HASH_LEN];
+        let bound_destination = destination_address(
+            &name_hash,
+            &AddressHash::new_from_hex_string(&bound).unwrap(),
+        )
+        .to_hex_string();
+        let own_destination = destination_address(
+            &name_hash,
+            &AddressHash::new_from_hex_string(&knocker).unwrap(),
+        )
+        .to_hex_string();
+        let rig = Rig::new(
+            "knock-gate-denied-collision",
+            TrustList::default()
+                .identity(&knocker, false)
+                .deny(&own_destination)
+                .destination(&bound_destination, &bound),
+        );
+        rig.gate
+            .trust
+            .attach_surface(Arc::downgrade(&rig.surface) as Weak<dyn KnockSurface>);
+        let knock = InboundKnock {
+            identity_hash: knocker.clone(),
+            destination_hash: own_destination,
+            name_hash: hex_lower(&name_hash),
+            via: KnockVia::StoreAndForward,
+            intro: Some("hello".to_string()),
+        };
+
+        let admission = rig.gate.admit(knock, now(), SystemTime::now());
+
+        assert_eq!(admission, Admission::Denied);
+        assert!(!rig.gate.cache().path().exists());
+        let record = rig
+            .gate
+            .trust
+            .records()
+            .into_iter()
+            .find(|record| record.hash == bound_destination)
+            .unwrap();
+        assert_eq!(
+            record.key_changed.map(|mark| mark.seen_identity),
+            Some(knocker),
+            "a collision observed in a knock marks the bound record whatever the verdict"
+        );
+        let texts = rig.surface.texts();
+        assert_eq!(texts.len(), 1, "{texts:#?}");
+        assert!(texts[0].starts_with("error: "), "{}", texts[0]);
     }
 
     #[test]

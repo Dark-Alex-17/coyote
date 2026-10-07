@@ -50,7 +50,9 @@ use crate::mesh::r3::{
 };
 use crate::mesh::shares::ShareLocations;
 use crate::mesh::snapshot::MeshSnapshot;
-use crate::mesh::trust::TrustStore;
+use crate::mesh::trust::{
+    Decision, InstancePresence, KeyChangeOutcome, TrustStore, decode_name_hash, parse_hash,
+};
 use crate::mesh::{display_text, hex_lower, identity, mesh_cache_dir};
 use crate::supervisor::notification::{SystemNotification, mesh_notification};
 
@@ -307,6 +309,7 @@ impl MeshRuntime {
         let app_data = announce_app_data(config)?;
         let trust = Arc::new(TrustStore::open(&paths.config_dir)?);
         trust.set_observer(Arc::new(TrustHookObserver(options.hooks.clone())));
+        trust.set_collision_protection(config.collision_protection);
 
         let instance_id = session.ensure_mesh_instance_id().to_string();
         let lock = InstanceLock::acquire(&paths.cache_dir, &instance_id)?;
@@ -1605,7 +1608,23 @@ impl AnnounceFiler<'_> {
         )?;
         self.trust
             .mark_seen(&destination_hash, &identity_hash, &name_hash, now);
-        self.trust.note_key_change(&identity_hash, &name_hash, now);
+        if let (Some(identity), Some(name_hash_bytes)) =
+            (parse_hash(&identity_hash), decode_name_hash(&name_hash))
+        {
+            // The line the owner gets says how the identity fares when it asks, so it is
+            // judged as its request would be.
+            let outcome = match self
+                .trust
+                .authorize_origin(&identity, &name_hash_bytes)
+                .verdict
+                .decision
+            {
+                Decision::Allow => KeyChangeOutcome::Served,
+                Decision::Refuse => KeyChangeOutcome::Refused,
+            };
+            self.trust
+                .note_key_change(&identity_hash, &name_hash, outcome, now);
+        }
         if self.throttle.admits(&destination_hash, &filed, hops, now) {
             self.hooks.fire(MeshEvent::PeerDiscovered {
                 destination: destination_hash,
@@ -1896,6 +1915,9 @@ impl MeshSlot {
         runtime
             .trust()
             .attach_surface(Arc::downgrade(self) as Weak<dyn KnockSurface>);
+        runtime
+            .trust()
+            .attach_presence(Arc::downgrade(&runtime.peers()) as Weak<dyn InstancePresence>);
         // A node started on its own handle takes the slot's sink, so what it fires
         // reaches the same place as what the slot fires.
         if !self.hooks.same_handle(runtime.hooks())
@@ -3319,7 +3341,7 @@ mod tests {
     };
     use crate::mesh::trust::KeyChange;
     #[cfg(unix)]
-    use crate::mesh::trust::TrustOptions;
+    use crate::mesh::trust::{KeyChangeOutcome, TrustOptions};
     use crate::supervisor::mailbox::EnvelopePayload;
     use crate::testing::{debug_snapshot, install_log_collector, warn_snapshot};
     #[cfg(unix)]
@@ -7730,7 +7752,12 @@ mod tests {
             .address_hash()
             .to_hex_string();
 
-        let marked = trust.note_key_change(&new_hex, &hex_lower(&origin), now);
+        let marked = trust.note_key_change(
+            &new_hex,
+            &hex_lower(&origin),
+            KeyChangeOutcome::Refused,
+            now,
+        );
 
         assert_eq!(marked.len(), 1);
         let received = notifier.0.lock().clone();

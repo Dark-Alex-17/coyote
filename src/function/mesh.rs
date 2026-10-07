@@ -657,10 +657,9 @@ async fn handle_peers(runtime: &MeshRuntime, args: &Value) -> Result<Value> {
 
     let mut peers = Vec::with_capacity(records.len());
     let mut status_lookups = Vec::new();
+    let trust = runtime.trust();
     for (index, peer) in records.iter().enumerate() {
-        let verdict = runtime
-            .trust()
-            .authorize(&peer.identity_hash, &peer.destination_hash);
+        let grant = trust.authorize(&peer.identity_hash, &peer.destination_hash);
         let reachable = runtime.path_known(&peer.destination_hash).await;
         peers.push(json!({
             "destination": peer.destination_hash,
@@ -670,7 +669,7 @@ async fn handle_peers(runtime: &MeshRuntime, args: &Value) -> Result<Value> {
                 .as_deref()
                 .and_then(|name| display_text(name, DISPLAY_NAME_MAX_CHARS)),
             "name_hash": peer.name_hash,
-            "trust": trust_label(verdict),
+            "trust": trust_label(trust.served_verdict(peer)),
             "compatibility": peer.compatibility_line(),
             "last_seen_secs_ago": now.duration_since(peer.last_seen).unwrap_or_default().as_secs(),
             "first_seen": rfc3339_utc(peer.first_seen),
@@ -679,7 +678,7 @@ async fn handle_peers(runtime: &MeshRuntime, args: &Value) -> Result<Value> {
         }));
         if with_status
             && reachable
-            && verdict.decision == Decision::Allow
+            && grant.decision == Decision::Allow
             && let Some(desc) = runtime.resolve_destination(&peer.destination_hash).await
         {
             status_lookups.push((index, desc));
@@ -3614,6 +3613,7 @@ mod tests {
         use super::*;
         use crate::mesh::access::{access_reply, validate_access};
         use crate::mesh::fetch::{field, versioned_map};
+        use crate::mesh::idle::{IdleNotify, IdleSink};
         use crate::mesh::test_support::{
             ACCESS_PATH, AdmittedRequest, Compatibility, FETCH_PATH, Handler, LIST_PATH,
             PeerSighting, PeerStub, RefusalCode, Reply, StartedRuntime, derived_sighting,
@@ -3832,6 +3832,116 @@ mod tests {
                 "{warned}"
             );
             assert_eq!(warned["trust"], "untrusted", "{warned}");
+
+            assert!(ctx.app.mesh.stop().await.unwrap());
+            started.relay_handle.abort();
+        }
+
+        #[derive(Default)]
+        struct RecordingIdle(parking_lot::Mutex<Vec<String>>);
+
+        impl IdleSink for RecordingIdle {
+            fn push(&self, note: IdleNotify) -> std::result::Result<(), IdleNotify> {
+                self.0.lock().push(note.text);
+                Ok(())
+            }
+
+            fn request_sync(&self) {}
+        }
+
+        /// The `mesh__peers` row of an identity trusted for all destinations over another
+        /// identity's recorded instance is labelled by the verdict the node serves it under,
+        /// as `.mesh peers` labels it: `trusted` with `mesh.collision_protection` off,
+        /// `untrusted` with it on. Listing marks no record and tells the owner nothing.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[serial]
+        async fn peers_labels_a_colliding_trusted_for_all_row_by_the_verdict_it_is_served() {
+            let _guard = TestConfigDirGuard::new("mesh-tool-peers-collision-label");
+            let started = started_runtime("mesh-tool-peers-collision-label").await;
+            let mut ctx = plain_ctx();
+            ctx.app.mesh.install(started.runtime.clone()).unwrap();
+            let idle = Arc::new(RecordingIdle::default());
+            ctx.app.mesh.set_idle(idle.clone());
+            let runtime = started.runtime.clone();
+            let now = SystemTime::now();
+            let old = derived_sighting("rot", Some("Tia"));
+            let new = derived_sighting("rot", Some("Tia again"));
+            assert_eq!(old.name_hash, new.name_hash);
+            let (old_dest, new_dest, new_identity) = (
+                old.destination_hash.clone(),
+                new.destination_hash.clone(),
+                new.identity_hash.clone(),
+            );
+            runtime.peers().observe(old, now);
+            runtime.peers().observe(new, now);
+            runtime
+                .trust()
+                .trust_destination(
+                    ctx.app.mesh.as_ref(),
+                    &old_dest,
+                    TrustOptions::default(),
+                    now,
+                )
+                .unwrap();
+            runtime
+                .trust()
+                .trust_identity(
+                    ctx.app.mesh.as_ref(),
+                    &new_identity,
+                    TrustOptions::default(),
+                    now,
+                )
+                .unwrap();
+            let trust_path = started
+                .tmp
+                .path
+                .join("config")
+                .join("mesh")
+                .join("trust.yaml");
+            let before = std::fs::read(&trust_path).unwrap();
+
+            for (protection, label) in [(false, "trusted"), (true, "untrusted")] {
+                runtime.trust().set_collision_protection(protection);
+                let result = handle_mesh_tool(
+                    &mut ctx,
+                    &format!("{MESH_FUNCTION_PREFIX}peers"),
+                    &json!({}),
+                )
+                .await
+                .unwrap();
+                let rows = result["peers"].as_array().unwrap();
+                let row = |destination: &str| {
+                    rows.iter()
+                        .find(|row| row["destination"] == destination)
+                        .unwrap_or_else(|| panic!("{destination} missing from {result}"))
+                };
+                assert_eq!(row(&new_dest)["trust"], label, "protection {protection}");
+                assert_eq!(
+                    row(&old_dest)["trust"],
+                    "trusted",
+                    "protection {protection}"
+                );
+            }
+
+            assert_eq!(
+                std::fs::read(&trust_path).unwrap(),
+                before,
+                "listing writes nothing"
+            );
+            assert!(
+                runtime
+                    .trust()
+                    .records()
+                    .iter()
+                    .all(|record| record.key_changed.is_none()),
+                "{:#?}",
+                runtime.trust().records()
+            );
+            assert!(
+                idle.0.lock().is_empty(),
+                "listing tells the owner nothing: {:?}",
+                idle.0.lock()
+            );
 
             assert!(ctx.app.mesh.stop().await.unwrap());
             started.relay_handle.abort();

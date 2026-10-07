@@ -55,6 +55,14 @@ pub struct MeshConfig {
     /// off; 0 = hand off at once, the question stays open for `.mesh answer`.
     pub envoy_escalation_timeout: u64,
     pub knock_retention_hours: u64,
+    /// Whether a name-hash collision refuses an identity trusted for all destinations: off,
+    /// the collision rung is judged after identity allow and such an identity is served
+    /// with a warning to the human; on, it is judged before and the identity is refused
+    /// with an error until the human trusts its new destination. A destination allow
+    /// admits in either mode. The rung judges what the node serves, the requests, knocks,
+    /// stored messages and stored access requests it receives; what it sends or broadcasts
+    /// is unchanged.
+    pub collision_protection: bool,
     /// Envoy runs one sending identity may have queued or running at once; on a live
     /// link a message that would start a run while the sender already has that many
     /// queued or running is refused before it is acknowledged with the bare throttled
@@ -176,6 +184,7 @@ impl Default for MeshConfig {
             envoy_model: None,
             envoy_escalation_timeout: 0,
             knock_retention_hours: DEFAULT_KNOCK_RETENTION_HOURS,
+            collision_protection: false,
             peer_max_concurrent: DEFAULT_PEER_MAX_CONCURRENT,
             peer_max_messages_per_hour: DEFAULT_PEER_MAX_MESSAGES_PER_HOUR,
             peer_max_tokens_per_hour: DEFAULT_PEER_MAX_TOKENS_PER_HOUR,
@@ -432,6 +441,10 @@ pub fn render_mesh_info(mesh: &MeshConfig) -> String {
         "knock_retention_hours",
         mesh.knock_retention_hours.to_string(),
     );
+    row(
+        "collision_protection",
+        mesh.collision_protection.to_string(),
+    );
     row("peer_max_concurrent", mesh.peer_max_concurrent.to_string());
     row(
         "peer_max_messages_per_hour",
@@ -502,6 +515,7 @@ mod tests {
         assert_eq!(mesh.envoy_model, None);
         assert_eq!(mesh.envoy_escalation_timeout, 0);
         assert_eq!(mesh.knock_retention_hours, 24);
+        assert!(!mesh.collision_protection);
         assert_eq!(mesh.peer_max_concurrent, 1);
         assert_eq!(mesh.peer_max_messages_per_hour, 60);
         assert_eq!(mesh.peer_max_tokens_per_hour, 100_000);
@@ -538,6 +552,35 @@ mod tests {
         let cfg: Config =
             serde_yaml::from_str("mesh:\n  fetch:\n    inline_max_bytes: 1024\n").unwrap();
         assert_eq!(cfg.mesh.fetch.inline_max_bytes, 1024);
+    }
+
+    /// `collision_protection` reads as a plain boolean, is absent-means-off beside other
+    /// mesh keys, rejects a non-boolean, and shows in `.mesh info`.
+    #[test]
+    fn usage_probe_collision_protection_parses_as_a_bool_and_defaults_off() {
+        let cfg: Config = serde_yaml::from_str("mesh:\n  knock_retention_hours: 5\n").unwrap();
+        assert!(!cfg.mesh.collision_protection);
+        let cfg: Config = serde_yaml::from_str("mesh:\n  collision_protection: true\n").unwrap();
+        assert!(cfg.mesh.collision_protection);
+        assert!(
+            serde_yaml::from_str::<Config>("mesh:\n  collision_protection: sometimes\n").is_err()
+        );
+        let on = MeshConfig {
+            collision_protection: true,
+            ..MeshConfig::default()
+        };
+        let on_row = render_mesh_info(&on)
+            .lines()
+            .find(|line| line.contains("collision_protection"))
+            .map(str::to_string)
+            .expect("a collision_protection row");
+        assert!(on_row.trim_end().ends_with("true"), "{on_row}");
+        let default_row = render_mesh_info(&MeshConfig::default())
+            .lines()
+            .find(|line| line.contains("collision_protection"))
+            .map(str::to_string)
+            .expect("a collision_protection row");
+        assert!(default_row.trim_end().ends_with("false"), "{default_row}");
     }
 
     #[test]

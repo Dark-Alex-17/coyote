@@ -20,7 +20,7 @@ use crate::mesh::r3::{
     AdmittedRequest, DEFAULT_LINK_TIMEOUT, Handler, MESSAGE_PATH, NAME_HASH_LEN, OriginName,
     R3Error, RefusalCode, Reply, RequestOptions, redact_hashes, short,
 };
-use crate::mesh::trust::{Decision, TrustStore};
+use crate::mesh::trust::{Decision, IdentityStanding, KeyChangeOutcome, OriginVerdict, TrustStore};
 use crate::mesh::wire_path::WirePath;
 use crate::mesh::{canonical_hash, decode_hex, destination_address, display_text, hex_lower};
 use crate::supervisor::mailbox::{Envelope, EnvelopePayload, Inbox};
@@ -1957,7 +1957,10 @@ impl Handler for PeerMessageHandler {
 /// An `InboundSink` in front of another: fetched peer messages go to the surface once the
 /// trust list allows the instance they name, everything else to `inner`. A payload typed
 /// as a peer message is never a plain message, so a malformed or untrusted one is dropped
-/// rather than forwarded.
+/// rather than forwarded. As on the link and knock paths, an unknown or blocked signer is
+/// dropped before any record is consulted; past that gate the verdict is
+/// `authorize_origin`'s, so a message naming an instance bound to another identity marks
+/// the record and tells the human as a link request would, whichever way it is judged.
 ///
 /// A sender over its hourly limit still has its message filed in the inbox, without an
 /// envoy run. Store-and-forward has no link to carry a refusal code back on, so the
@@ -2013,14 +2016,35 @@ impl InboundSink for PeerRouting<'_> {
             debug!("Propagated peer message from {id8} dropped: the signer's hash is malformed");
             return;
         };
-        raw.source_destination = destination_address(&name_hash, &identity).to_hex_string();
+        let standing = match self.trust.identity_standing(&message.source_identity_hash) {
+            IdentityStanding::Trusted { .. } => None,
+            IdentityStanding::Unknown => Some("unknown"),
+            IdentityStanding::Blocked => Some("blocked"),
+        };
+        if let Some(standing) = standing {
+            debug!("Propagated {kind} from {id8} dropped: {standing} identity");
+            return;
+        }
+        let OriginVerdict {
+            verdict,
+            destination,
+            collisions,
+        } = self.trust.authorize_origin(&identity, &name_hash);
+        raw.source_destination = destination.to_hex_string();
         let dest8 = short(&raw.source_destination).to_string();
-        if self
-            .trust
-            .authorize(&message.source_identity_hash, &raw.source_destination)
-            .decision
-            != Decision::Allow
-        {
+        if !collisions.is_empty() {
+            let outcome = match verdict.decision {
+                Decision::Allow => KeyChangeOutcome::Served,
+                Decision::Refuse => KeyChangeOutcome::Refused,
+            };
+            self.trust.note_key_change(
+                &message.source_identity_hash,
+                &hex_lower(&name_hash),
+                outcome,
+                SystemTime::now(),
+            );
+        }
+        if verdict.decision != Decision::Allow {
             debug!("Propagated {kind} from {id8} dropped: instance {dest8} is not trusted");
             return;
         }
@@ -2150,7 +2174,9 @@ impl ModelNotes {
 mod tests {
     use super::*;
     use crate::mesh::events::env_value;
-    use crate::mesh::knock::{KNOCK_TYPE, KnockIntro, knock_message};
+    use crate::mesh::knock::{
+        KNOCK_TYPE, KnockIntro, KnockSurface, RecordingSurface as KeyChangeSurface, knock_message,
+    };
     use crate::mesh::limits::RefusalReason;
     use crate::mesh::r3::{PathHash, RequestId, SizeBranch};
     use crate::mesh::test_support::{TempDir, TrustList};
@@ -3386,6 +3412,569 @@ mod tests {
             inner.messages.lock().len(),
             1,
             "a peer message never falls through to the inner sink"
+        );
+    }
+
+    /// A trust list holding `identity` for all destinations and binding `origin` to
+    /// another identity, with a key-change recorder attached; the store's protection flag
+    /// is left at its default.
+    fn colliding_routing(
+        tag: &str,
+        identity: &str,
+        origin: &OriginName,
+    ) -> (Arc<TrustStore>, Arc<KeyChangeSurface>, String, TempDir) {
+        let bound_to = hash_of("id-bound-elsewhere");
+        let bound = destination_address(
+            &origin.0,
+            &AddressHash::new_from_hex_string(&bound_to).unwrap(),
+        )
+        .to_hex_string();
+        let (trust, tmp) = TrustList::default()
+            .identity(identity, true)
+            .destination(&bound, &bound_to)
+            .open(tag);
+        let surface = Arc::new(KeyChangeSurface::default());
+        trust.attach_surface(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
+        (trust, surface, bound, tmp)
+    }
+
+    fn mark_on(trust: &TrustStore, bound: &str) -> Option<String> {
+        trust
+            .records()
+            .into_iter()
+            .find(|record| record.hash == bound)
+            .and_then(|record| record.key_changed)
+            .map(|mark| mark.seen_identity)
+    }
+
+    /// A stored message from an identity trusted for all destinations, naming an instance
+    /// bound to another identity, is judged as its link request would be: with collision
+    /// protection off it is delivered, the bound record is marked with the sender as the
+    /// identity seen, and the human gets one warning.
+    #[test]
+    fn a_stored_message_from_a_trusted_for_all_identity_over_a_colliding_record_is_delivered_with_a_warning()
+     {
+        let identity = hash_of("id-rotated-stored");
+        let origin = OriginName([7u8; NAME_HASH_LEN]);
+        let (trust, notes, bound, _tmp) =
+            colliding_routing("peer-routing-collision-served", &identity, &origin);
+        let surface = Arc::new(RecordingSurface::default());
+        let inner = CountingSink::default();
+        let routing = PeerRouting {
+            trust: &trust,
+            surface: Some(surface.clone() as Arc<dyn PeerSurface>),
+            inner: &inner,
+        };
+        let stored = peer_lxmf_message(&outbound(PeerKind::Message, "stored"), &origin);
+
+        routing.deliver(inbound(
+            stored.fields.clone(),
+            None,
+            Some(stored.content.clone()),
+            &identity,
+        ));
+
+        let delivered = surface.delivered.lock();
+        assert_eq!(delivered.len(), 1, "{delivered:#?}");
+        assert_eq!(delivered[0].source_identity, identity);
+        assert_eq!(delivered[0].via, PeerVia::StoreAndForward);
+        drop(delivered);
+        assert_eq!(mark_on(&trust, &bound), Some(identity.clone()));
+        let texts = notes.texts();
+        assert_eq!(texts.len(), 1, "{texts:#?}");
+        assert!(texts[0].starts_with("warning: "), "{}", texts[0]);
+        assert!(texts[0].contains("is served"), "{}", texts[0]);
+    }
+
+    /// The same message under collision protection is dropped as any untrusted instance's
+    /// is, the record is marked all the same, and the human gets the error.
+    #[test]
+    fn collision_protection_refuses_a_stored_message_over_a_colliding_record_with_an_error() {
+        crate::testing::install_log_collector();
+        let identity = hash_of("id-rotated-refused");
+        let origin = OriginName([8u8; NAME_HASH_LEN]);
+        let (trust, notes, bound, _tmp) =
+            colliding_routing("peer-routing-collision-refused", &identity, &origin);
+        trust.set_collision_protection(true);
+        let surface = Arc::new(RecordingSurface::default());
+        let inner = CountingSink::default();
+        let routing = PeerRouting {
+            trust: &trust,
+            surface: Some(surface.clone() as Arc<dyn PeerSurface>),
+            inner: &inner,
+        };
+        let stored = peer_lxmf_message(&outbound(PeerKind::Message, "stored"), &origin);
+
+        routing.deliver(inbound(
+            stored.fields.clone(),
+            None,
+            Some(stored.content.clone()),
+            &identity,
+        ));
+
+        assert!(surface.delivered.lock().is_empty());
+        assert_eq!(surface.offered(), 0, "admission is never asked");
+        assert!(inner.messages.lock().is_empty());
+        let dest8 = &destination_address(
+            &origin.0,
+            &AddressHash::new_from_hex_string(&identity).unwrap(),
+        )
+        .to_hex_string()[..8];
+        let expected = format!(
+            "Propagated message from {} dropped: instance {dest8} is not trusted",
+            &identity[..8]
+        );
+        let logs = crate::testing::debug_snapshot();
+        assert!(logs.contains(&expected), "{logs:#?}");
+        assert_eq!(mark_on(&trust, &bound), Some(identity.clone()));
+        let texts = notes.texts();
+        assert_eq!(texts.len(), 1, "{texts:#?}");
+        assert!(texts[0].starts_with("error: "), "{}", texts[0]);
+        assert!(texts[0].contains("is refused"), "{}", texts[0]);
+    }
+
+    /// Recorders for what a routing hands the surface and the inner sink.
+    fn recorders() -> (Arc<RecordingSurface>, Arc<CountingSink>) {
+        (
+            Arc::new(RecordingSurface::default()),
+            Arc::new(CountingSink::default()),
+        )
+    }
+
+    fn deliver_stored(
+        trust: &TrustStore,
+        surface: &Arc<RecordingSurface>,
+        inner: &Arc<CountingSink>,
+        identity: &str,
+        origin: &OriginName,
+        content: &str,
+    ) {
+        let routing = PeerRouting {
+            trust,
+            surface: Some(surface.clone() as Arc<dyn PeerSurface>),
+            inner: inner.as_ref(),
+        };
+        let stored = peer_lxmf_message(&outbound(PeerKind::Message, content), origin);
+        routing.deliver(inbound(
+            stored.fields.clone(),
+            None,
+            Some(stored.content.clone()),
+            identity,
+        ));
+    }
+
+    /// The mark is first-wins: a second stored message from the same rotated identity over
+    /// the already-marked record is delivered like the first and the human is not told
+    /// again.
+    #[test]
+    fn usage_probe_a_second_stored_message_over_a_marked_record_is_delivered_and_warns_no_more() {
+        let identity = hash_of("id-rotated-twice");
+        let origin = OriginName([9u8; NAME_HASH_LEN]);
+        let (trust, notes, bound, _tmp) =
+            colliding_routing("peer-routing-collision-twice", &identity, &origin);
+        let (surface, inner) = recorders();
+
+        deliver_stored(&trust, &surface, &inner, &identity, &origin, "first");
+        deliver_stored(&trust, &surface, &inner, &identity, &origin, "second");
+
+        let delivered = surface.delivered.lock();
+        assert_eq!(delivered.len(), 2, "{delivered:#?}");
+        assert_eq!(delivered[0].content, "first");
+        assert_eq!(delivered[1].content, "second");
+        drop(delivered);
+        assert!(inner.messages.lock().is_empty());
+        assert_eq!(mark_on(&trust, &bound), Some(identity.clone()));
+        let texts = notes.texts();
+        assert_eq!(texts.len(), 1, "one line per record: {texts:#?}");
+        assert!(texts[0].starts_with("warning: "), "{}", texts[0]);
+    }
+
+    /// An explicit destination allow admits in either mode: the sender's own recomputed
+    /// destination is on the list, so the old record it supersedes is no collision — the
+    /// message is delivered under protection too, nothing is marked and nobody is told.
+    #[test]
+    fn usage_probe_an_explicit_destination_allow_admits_a_stored_message_under_protection_without_a_mark()
+     {
+        for protection in [false, true] {
+            let identity = hash_of("id-rotated-allowed");
+            let origin = OriginName([10u8; NAME_HASH_LEN]);
+            let bound_to = hash_of("id-bound-elsewhere");
+            let old = destination_address(
+                &origin.0,
+                &AddressHash::new_from_hex_string(&bound_to).unwrap(),
+            )
+            .to_hex_string();
+            let new = destination_address(
+                &origin.0,
+                &AddressHash::new_from_hex_string(&identity).unwrap(),
+            )
+            .to_hex_string();
+            let (trust, _tmp) = TrustList::default()
+                .destination(&new, &identity)
+                .destination(&old, &bound_to)
+                .open("peer-routing-collision-allowed");
+            trust.set_collision_protection(protection);
+            let notes = Arc::new(KeyChangeSurface::default());
+            trust.attach_surface(Arc::downgrade(&notes) as Weak<dyn KnockSurface>);
+            let (surface, inner) = recorders();
+
+            deliver_stored(&trust, &surface, &inner, &identity, &origin, "allowed");
+
+            let delivered = surface.delivered.lock();
+            assert_eq!(
+                delivered.len(),
+                1,
+                "protection {protection}: {delivered:#?}"
+            );
+            assert_eq!(delivered[0].source_destination, new);
+            drop(delivered);
+            assert_eq!(mark_on(&trust, &old), None, "protection {protection}");
+            assert_eq!(mark_on(&trust, &new), None, "protection {protection}");
+            assert!(
+                notes.texts().is_empty(),
+                "protection {protection}: {:#?}",
+                notes.texts()
+            );
+        }
+    }
+
+    /// A blocked identity is silence before any record is touched: its stored message over
+    /// a colliding record is dropped, the record stays clean and the human hears nothing.
+    #[test]
+    fn usage_probe_a_blocked_identitys_stored_message_over_a_colliding_record_marks_nothing() {
+        let identity = hash_of("id-rotated-blocked");
+        let origin = OriginName([11u8; NAME_HASH_LEN]);
+        let bound_to = hash_of("id-bound-elsewhere");
+        let bound = destination_address(
+            &origin.0,
+            &AddressHash::new_from_hex_string(&bound_to).unwrap(),
+        )
+        .to_hex_string();
+        let (trust, tmp) = TrustList::default()
+            .block(&identity)
+            .destination(&bound, &bound_to)
+            .open("peer-routing-collision-blocked");
+        let notes = Arc::new(KeyChangeSurface::default());
+        trust.attach_surface(Arc::downgrade(&notes) as Weak<dyn KnockSurface>);
+        let trust_path = crate::mesh::mesh_config_dir(&tmp.path).join("trust.yaml");
+        let before = std::fs::read(&trust_path).unwrap();
+        let (surface, inner) = recorders();
+
+        deliver_stored(&trust, &surface, &inner, &identity, &origin, "blocked");
+
+        assert!(surface.delivered.lock().is_empty());
+        assert_eq!(surface.offered(), 0);
+        assert!(inner.messages.lock().is_empty());
+        assert_eq!(mark_on(&trust, &bound), None);
+        assert!(notes.texts().is_empty(), "{:#?}", notes.texts());
+        assert_eq!(
+            std::fs::read(&trust_path).unwrap(),
+            before,
+            "trust.yaml untouched"
+        );
+    }
+
+    /// A stranger (no record at all) is silenced before the destination tier on the
+    /// store-and-forward path: its stored message over a colliding record is dropped and
+    /// the path neither marks nor tells — the announce is where a stranger's collision is
+    /// caught.
+    #[test]
+    fn usage_probe_a_strangers_stored_message_over_a_colliding_record_is_silent() {
+        let identity = hash_of("id-rotated-stranger");
+        let origin = OriginName([12u8; NAME_HASH_LEN]);
+        let bound_to = hash_of("id-bound-elsewhere");
+        let bound = destination_address(
+            &origin.0,
+            &AddressHash::new_from_hex_string(&bound_to).unwrap(),
+        )
+        .to_hex_string();
+        let (trust, _tmp) = TrustList::default()
+            .destination(&bound, &bound_to)
+            .open("peer-routing-collision-stranger");
+        let notes = Arc::new(KeyChangeSurface::default());
+        trust.attach_surface(Arc::downgrade(&notes) as Weak<dyn KnockSurface>);
+        let (surface, inner) = recorders();
+
+        deliver_stored(&trust, &surface, &inner, &identity, &origin, "stranger");
+
+        assert!(surface.delivered.lock().is_empty());
+        assert_eq!(surface.offered(), 0);
+        assert!(inner.messages.lock().is_empty());
+        assert_eq!(
+            mark_on(&trust, &bound),
+            None,
+            "a stranger's stored message marked the record; surfaced: {:#?}",
+            notes.texts()
+        );
+        assert!(notes.texts().is_empty(), "{:#?}", notes.texts());
+    }
+
+    /// No collision, no write: a trusted sender whose instance is on no record leaves
+    /// `trust.yaml` byte for byte and surfaces nothing.
+    #[test]
+    fn usage_probe_a_non_colliding_stored_message_writes_no_trust_file_and_tells_nobody() {
+        let identity = hash_of("id-plain-sender");
+        let origin = OriginName([13u8; NAME_HASH_LEN]);
+        let (trust, tmp) = TrustList::default()
+            .identity(&identity, true)
+            .open("peer-routing-no-collision");
+        let notes = Arc::new(KeyChangeSurface::default());
+        trust.attach_surface(Arc::downgrade(&notes) as Weak<dyn KnockSurface>);
+        let trust_path = crate::mesh::mesh_config_dir(&tmp.path).join("trust.yaml");
+        let before = std::fs::read(&trust_path).unwrap();
+        let (surface, inner) = recorders();
+
+        deliver_stored(&trust, &surface, &inner, &identity, &origin, "plain");
+
+        assert_eq!(surface.delivered.lock().len(), 1);
+        assert!(notes.texts().is_empty(), "{:#?}", notes.texts());
+        assert_eq!(
+            std::fs::read(&trust_path).unwrap(),
+            before,
+            "trust.yaml untouched"
+        );
+    }
+
+    /// Deny wins first, and a collision is marked in every case: a sender whose own
+    /// recomputed destination is denied, naming an instance bound to another identity, has
+    /// its stored message dropped, the bound record marked and one error surfaced.
+    #[test]
+    fn usage_probe_a_denied_senders_stored_message_over_a_colliding_record_is_dropped_marked_and_an_error()
+     {
+        let identity = hash_of("id-rotated-denied");
+        let origin = OriginName([14u8; NAME_HASH_LEN]);
+        let bound_to = hash_of("id-bound-elsewhere");
+        let bound = destination_address(
+            &origin.0,
+            &AddressHash::new_from_hex_string(&bound_to).unwrap(),
+        )
+        .to_hex_string();
+        let denied = destination_address(
+            &origin.0,
+            &AddressHash::new_from_hex_string(&identity).unwrap(),
+        )
+        .to_hex_string();
+        let (trust, _tmp) = TrustList::default()
+            .identity(&identity, true)
+            .deny(&denied)
+            .destination(&bound, &bound_to)
+            .open("peer-routing-collision-denied");
+        let notes = Arc::new(KeyChangeSurface::default());
+        trust.attach_surface(Arc::downgrade(&notes) as Weak<dyn KnockSurface>);
+        let (surface, inner) = recorders();
+
+        deliver_stored(&trust, &surface, &inner, &identity, &origin, "denied");
+
+        assert!(surface.delivered.lock().is_empty());
+        assert_eq!(surface.offered(), 0);
+        assert!(inner.messages.lock().is_empty());
+        assert_eq!(mark_on(&trust, &bound), Some(identity.clone()));
+        let texts = notes.texts();
+        assert_eq!(texts.len(), 1, "{texts:#?}");
+        assert!(texts[0].starts_with("error: "), "{}", texts[0]);
+        assert!(texts[0].contains("is refused"), "{}", texts[0]);
+    }
+
+    /// The standing gate sits before the protection flag: a stranger's stored message over
+    /// a colliding record is dropped in either mode, nothing is marked, `trust.yaml` is
+    /// byte for byte, the human hears nothing, and the drop is logged as an unknown
+    /// identity rather than an untrusted instance.
+    #[test]
+    fn usage_probe_a_strangers_stored_message_is_silent_in_either_mode_and_leaves_trust_yaml_alone()
+    {
+        crate::testing::install_log_collector();
+        for protection in [false, true] {
+            let identity = hash_of("id-rotated-stranger-2");
+            let origin = OriginName([15u8; NAME_HASH_LEN]);
+            let bound_to = hash_of("id-bound-elsewhere");
+            let bound = destination_address(
+                &origin.0,
+                &AddressHash::new_from_hex_string(&bound_to).unwrap(),
+            )
+            .to_hex_string();
+            let (trust, tmp) = TrustList::default()
+                .destination(&bound, &bound_to)
+                .open("peer-routing-collision-stranger-modes");
+            trust.set_collision_protection(protection);
+            let notes = Arc::new(KeyChangeSurface::default());
+            trust.attach_surface(Arc::downgrade(&notes) as Weak<dyn KnockSurface>);
+            let trust_path = crate::mesh::mesh_config_dir(&tmp.path).join("trust.yaml");
+            let before = std::fs::read(&trust_path).unwrap();
+            let (surface, inner) = recorders();
+
+            deliver_stored(&trust, &surface, &inner, &identity, &origin, "stranger");
+
+            assert!(
+                surface.delivered.lock().is_empty(),
+                "protection {protection}"
+            );
+            assert_eq!(surface.offered(), 0, "protection {protection}");
+            assert!(inner.messages.lock().is_empty(), "protection {protection}");
+            assert_eq!(mark_on(&trust, &bound), None, "protection {protection}");
+            assert!(
+                notes.texts().is_empty(),
+                "protection {protection}: {:#?}",
+                notes.texts()
+            );
+            assert_eq!(
+                std::fs::read(&trust_path).unwrap(),
+                before,
+                "protection {protection}: trust.yaml untouched"
+            );
+            let expected = format!(
+                "Propagated message from {} dropped: unknown identity",
+                &identity[..8]
+            );
+            let logs = crate::testing::debug_snapshot();
+            assert!(
+                logs.contains(&expected),
+                "protection {protection}: {logs:#?}"
+            );
+        }
+    }
+
+    /// The store-and-forward twin of the link path's identity-changed refusal: an identity
+    /// trusted for its own instance only, whose stored message names an instance bound to
+    /// another identity, passes the standing gate, is refused by the verdict, marks the
+    /// bound record with itself as the identity seen and earns the human one error — in
+    /// either mode, since protection only widens what an all-destinations identity is
+    /// refused. Its own grant is untouched: the next stored message under its own instance
+    /// is delivered and the human is not told again.
+    #[test]
+    fn usage_probe_a_destination_tier_senders_stored_message_naming_a_foreign_instance_is_refused_marked_and_an_error()
+     {
+        for protection in [false, true] {
+            let sender = hash_of("id-standing-elsewhere");
+            let shared = OriginName([16u8; NAME_HASH_LEN]);
+            let own = OriginName([17u8; NAME_HASH_LEN]);
+            let bound_to = hash_of("id-bound-elsewhere");
+            let bound = destination_address(
+                &shared.0,
+                &AddressHash::new_from_hex_string(&bound_to).unwrap(),
+            )
+            .to_hex_string();
+            let own_destination =
+                destination_address(&own.0, &AddressHash::new_from_hex_string(&sender).unwrap())
+                    .to_hex_string();
+            let (trust, _tmp) = TrustList::default()
+                .destination(&bound, &bound_to)
+                .destination(&own_destination, &sender)
+                .open("peer-routing-collision-standing");
+            trust.set_collision_protection(protection);
+            let notes = Arc::new(KeyChangeSurface::default());
+            trust.attach_surface(Arc::downgrade(&notes) as Weak<dyn KnockSurface>);
+            let (surface, inner) = recorders();
+
+            deliver_stored(&trust, &surface, &inner, &sender, &shared, "foreign");
+
+            assert!(
+                surface.delivered.lock().is_empty(),
+                "protection {protection}"
+            );
+            assert_eq!(surface.offered(), 0, "protection {protection}");
+            assert!(inner.messages.lock().is_empty(), "protection {protection}");
+            assert_eq!(
+                mark_on(&trust, &bound),
+                Some(sender.clone()),
+                "protection {protection}: the bound record is marked with the sender"
+            );
+            assert_eq!(
+                mark_on(&trust, &own_destination),
+                None,
+                "protection {protection}: the sender's own record is not marked"
+            );
+            let texts = notes.texts();
+            assert_eq!(texts.len(), 1, "protection {protection}: {texts:#?}");
+            assert!(texts[0].starts_with("error: "), "{}", texts[0]);
+            assert!(texts[0].contains("is refused"), "{}", texts[0]);
+
+            deliver_stored(&trust, &surface, &inner, &sender, &own, "mine");
+
+            let delivered = surface.delivered.lock();
+            assert_eq!(
+                delivered.len(),
+                1,
+                "protection {protection}: {delivered:#?}"
+            );
+            assert_eq!(delivered[0].content, "mine");
+            assert_eq!(delivered[0].source_destination, own_destination);
+            drop(delivered);
+            assert_eq!(
+                notes.texts().len(),
+                1,
+                "protection {protection}: no second line: {:#?}",
+                notes.texts()
+            );
+        }
+    }
+
+    /// A session-only grant is standing too: the standing gate on the store-and-forward
+    /// path lets a peer trusted with `.mesh trust --session` through, its stored message is
+    /// delivered under its own instance, and the file the session never wrote to stays
+    /// byte for byte.
+    #[test]
+    fn usage_probe_a_session_trusted_senders_stored_message_passes_the_standing_gate() {
+        use crate::mesh::peers::{PeerSighting, PeerTable};
+        use crate::mesh::trust::{KnockProof, LiveMesh};
+
+        struct Heard(Arc<PeerTable>);
+        impl LiveMesh for Heard {
+            fn peers(&self) -> Option<Arc<PeerTable>> {
+                Some(self.0.clone())
+            }
+            fn knock(&self, _destination_hash: &str, _now: SystemTime) -> Option<KnockProof> {
+                None
+            }
+        }
+
+        let key = PrivateIdentity::new_from_rand(OsRng);
+        let identity = key.address_hash().to_hex_string();
+        let origin = OriginName([18u8; NAME_HASH_LEN]);
+        let destination = destination_address(&origin.0, key.address_hash()).to_hex_string();
+        let (trust, tmp) = TrustList::default().open("peer-routing-session-standing");
+        let notes = Arc::new(KeyChangeSurface::default());
+        trust.attach_surface(Arc::downgrade(&notes) as Weak<dyn KnockSurface>);
+        let now = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_790_000_100);
+        let peers = Arc::new(PeerTable::load(tmp.path.join("peers.json"), now).unwrap());
+        peers.observe(
+            PeerSighting {
+                destination_hash: destination.clone(),
+                identity_hash: identity.clone(),
+                name_hash: hex_lower(&origin.0),
+                display_name: Some("Bob".to_string()),
+                protocol_version: 1,
+                hops: 1,
+            },
+            now,
+        );
+        let (surface, inner) = recorders();
+
+        deliver_stored(&trust, &surface, &inner, &identity, &origin, "before");
+        assert!(
+            surface.delivered.lock().is_empty(),
+            "a stranger until the session grant"
+        );
+
+        let trust_path = crate::mesh::mesh_config_dir(&tmp.path).join("trust.yaml");
+        let before = std::fs::read(&trust_path).unwrap();
+        trust
+            .trust_destination_for_session(&Heard(peers), &destination, now)
+            .unwrap();
+        assert_eq!(std::fs::read(&trust_path).unwrap(), before);
+
+        deliver_stored(&trust, &surface, &inner, &identity, &origin, "after");
+
+        let delivered = surface.delivered.lock();
+        assert_eq!(delivered.len(), 1, "{delivered:#?}");
+        assert_eq!(delivered[0].content, "after");
+        assert_eq!(delivered[0].source_destination, destination);
+        assert_eq!(delivered[0].via, PeerVia::StoreAndForward);
+        drop(delivered);
+        assert!(notes.texts().is_empty(), "{:#?}", notes.texts());
+        assert_eq!(
+            std::fs::read(&trust_path).unwrap(),
+            before,
+            "a session grant never reaches the file"
         );
     }
 

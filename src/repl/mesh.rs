@@ -28,8 +28,8 @@ use crate::mesh::shares::{
     validate_override, validate_pattern,
 };
 use crate::mesh::trust::{
-    Decision, KeyChange, LiveMesh, Rule, Tier, TrustChange, TrustOptions, TrustRecord, TrustStore,
-    UntrustOutcome, Verdict, decode_name_hash, parse_hash,
+    BindingConflict, Decision, KeyChange, LiveMesh, Rule, Tier, TrustChange, TrustOptions,
+    TrustRecord, TrustStore, UntrustOutcome, Verdict, decode_name_hash, parse_hash,
 };
 use crate::mesh::wire_path::{WIRE_PATH_MAX_BYTES, WirePath};
 use crate::mesh::{
@@ -386,7 +386,7 @@ fn peers(ctx: &RequestContext) -> Result<()> {
     let mut rows: Vec<PeerRow> = records
         .iter()
         .map(|peer| {
-            let label = trust_label(trust.authorize(&peer.identity_hash, &peer.destination_hash));
+            let label = trust_label(trust.served_verdict(peer));
             let mark = key_change_mark(peer, &trust_records);
             PeerRow::Heard(peer.clone(), label, mark)
         })
@@ -420,17 +420,17 @@ fn unheard_label(trust: &TrustStore, record: &TrustRecord) -> &'static str {
 /// The key-change mark on `peer`'s trust record, paired with the destination the same
 /// instance derives under the identity that caused the mark.
 fn key_change_mark(peer: &PeerRecord, trust_records: &[TrustRecord]) -> Option<KeyChangeMark> {
-    let change = trust_records
+    let record = trust_records
         .iter()
-        .find(|record| record.hash == peer.destination_hash)?
-        .key_changed
-        .clone()?;
+        .find(|record| record.hash == peer.destination_hash)?;
+    let change = record.key_changed.clone()?;
     let new_destination = decode_name_hash(&peer.name_hash)
         .zip(parse_hash(&change.seen_identity))
         .map(|(name_hash, seen)| destination_address(&name_hash, &seen).to_hex_string());
     Some(KeyChangeMark {
         change,
         new_destination,
+        denied: record.denied,
     })
 }
 
@@ -497,7 +497,7 @@ fn info(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     }
     let trust = peer
         .as_ref()
-        .map(|peer| trust_label(runtime.trust().authorize(&peer.identity_hash, &destination)));
+        .map(|peer| trust_label(runtime.trust().served_verdict(peer)));
     out_text(&render_peer_detail(
         &destination,
         peer.as_ref(),
@@ -1667,17 +1667,19 @@ fn trust(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             if outcome.deny_lifted {
                 lines.push("The refusal on this instance is lifted.".to_string());
             }
+            let peers = mesh.peers();
             lines.extend(outcome.superseded.iter().map(|old| {
-                format!(
-                    "  This instance was trusted before as {old} under another identity; that record's key-change mark is cleared. The old record stays trusted for the old key until you run .mesh untrust {old}."
-                )
+                let heard = peers
+                    .as_ref()
+                    .is_some_and(|peers| peers.get(&old.destination_hash).is_some());
+                superseded_line(old, heard)
             }));
             out_text(&lines.join("\n"));
         }
         TrustArg::Identity { target, label, yes } => {
             let identity = identity_hash(&target)?;
             let mut preview = format!(
-                "This trusts identity {} and every instance it announces, now or later: each of them can message this node and ask it questions. A rotation of this identity is not detected; trust its instances with .mesh trust <destination> instead if you want a key-change notice.",
+                "This trusts identity {} and every instance it announces, now or later: each of them can message this node and ask it questions. A rotation of this identity is surfaced from the peer table when heard, never marked; .mesh trust <destination> is the grant that carries a mark.",
                 short(&identity)
             );
             let refused = store
@@ -4395,10 +4397,12 @@ enum PeerRow {
 }
 
 /// A trust record's key-change mark with, when the peer table has heard it, the destination
-/// the same instance announces under the new identity, so the marker can name what to trust.
+/// the same instance announces under the new identity, so the marker can name what to trust,
+/// and whether the marked record is denied, so it says what stays with the old key.
 struct KeyChangeMark {
     change: KeyChange,
     new_destination: Option<String>,
+    denied: bool,
 }
 
 /// The rows for trust records no heard peer announces from, at most one per record: a
@@ -4425,6 +4429,7 @@ fn unheard_rows(
                 KeyChangeMark {
                     change,
                     new_destination,
+                    denied: record.denied,
                 }
             });
             if record.denied && record.tier == Tier::Destination {
@@ -4466,6 +4471,7 @@ fn render_peers(rows: &[PeerRow], now: SystemTime) -> String {
                         mark,
                         &peer.identity_hash,
                         &peer.destination_hash,
+                        true,
                         now,
                     ));
                 }
@@ -4482,7 +4488,7 @@ fn render_peers(rows: &[PeerRow], now: SystemTime) -> String {
                     "never"
                 ));
                 if let Some(mark) = key_changed {
-                    lines.push(key_change_line(mark, bound, &record.hash, now));
+                    lines.push(key_change_line(mark, bound, &record.hash, false, now));
                 }
             }
             PeerRow::MarkedOnly(record, trust, mark) => {
@@ -4501,7 +4507,7 @@ fn render_peers(rows: &[PeerRow], now: SystemTime) -> String {
                     "-",
                     age_text(now, record.last_seen_at),
                 ));
-                lines.push(key_change_line(mark, bound, &record.hash, now));
+                lines.push(key_change_line(mark, bound, &record.hash, false, now));
             }
         }
     }
@@ -4512,21 +4518,71 @@ fn render_peers(rows: &[PeerRow], now: SystemTime) -> String {
     lines.join("\n")
 }
 
+/// The verbs that change what a denied old record keeps, worded the same under `.mesh
+/// peers`' marker and `.mesh trust`'s superseded line. `.mesh trust <destination>` proves
+/// the destination against the peer table, so for one no peer announces from the lift
+/// waits until it is heard again; `.mesh untrust` on a denied record answers "already
+/// refused", so the refusal is forgotten with its identity.
+fn denied_remedy(destination: &str, identity: &str, heard: bool) -> String {
+    let lifts = if heard {
+        "lifts the refusal"
+    } else {
+        "lifts the refusal once it is heard again"
+    };
+    format!(
+        ".mesh trust {destination} {lifts}, .mesh untrust --identity {identity} forgets the old key"
+    )
+}
+
+/// The line `.mesh trust` adds for a record the newly trusted instance supersedes: its mark
+/// is cleared, and what the old key keeps, a grant or a refusal, stays, with the verb that
+/// changes it; `heard` is whether the peer table still holds the old destination.
+fn superseded_line(old: &BindingConflict, heard: bool) -> String {
+    let destination = &old.destination_hash;
+    let standing = if old.denied {
+        format!(
+            "The old key stays refused there; {}.",
+            denied_remedy(destination, &old.bound_identity, heard)
+        )
+    } else {
+        format!(
+            "The old record stays trusted for the old key until you run .mesh untrust {destination}."
+        )
+    };
+    format!(
+        "  This instance was trusted before as {destination} under another identity; that record's key-change mark is cleared. {standing}"
+    )
+}
+
 /// The indented marker under a row whose trust record was marked `key_changed`, ending with
 /// the same exits as the notification: trust the instance under its new key if the peer
-/// rotated, otherwise block the identity that announced it; and forget the old key.
+/// rotated, otherwise block the identity that announced it; and what to do with the old
+/// key. A denied record keeps its refusal rather than a grant (`denied_remedy`); a grant is
+/// forgotten with `.mesh untrust`. `heard` is whether the row is a peer table row.
 fn key_change_line(
     mark: &KeyChangeMark,
     bound_identity: &str,
     old_destination: &str,
+    heard: bool,
     now: SystemTime,
 ) -> String {
     let trust = match &mark.new_destination {
         Some(destination) => format!(".mesh trust {destination}"),
         None => ".mesh trust its new destination once heard".to_string(),
     };
+    let (standing, old_key) = if mark.denied {
+        (
+            "the old key stays refused under",
+            denied_remedy(old_destination, bound_identity, heard),
+        )
+    } else {
+        (
+            "the grant stays with",
+            format!(".mesh untrust {old_destination} forgets the old key"),
+        )
+    };
     format!(
-        "{:<20} key changed: announced under identity {} {}; the grant stays with {}. If the peer rotated, verify out of band, then {trust}; otherwise .mesh block {}; .mesh untrust {old_destination} forgets the old key",
+        "{:<20} key changed: announced under identity {} {}; {standing} {}. If the peer rotated, verify out of band, then {trust}; otherwise .mesh block {}; {old_key}",
         "",
         short(&mark.change.seen_identity),
         age_text(now, mark.change.at),
@@ -4593,7 +4649,7 @@ fn render_node_facts(
         match key_changes {
             0 => "none".to_string(),
             n => {
-                format!("{n} trusted instance(s) announced under another identity; see .mesh peers")
+                format!("{n} instance(s) announced under another identity; see .mesh peers")
             }
         },
     );
@@ -5556,17 +5612,19 @@ mod tests {
                         at: now - Duration::from_secs(120),
                     },
                     new_destination: Some(new_destination.clone()),
+                    denied: false,
                 }),
             ),
             PeerRow::Heard(
                 peer(Some("Bob"), 5, now),
-                "trusted",
+                "denied",
                 Some(KeyChangeMark {
                     change: KeyChange {
                         seen_identity: seen_identity.clone(),
                         at: now,
                     },
                     new_destination: None,
+                    denied: true,
                 }),
             ),
             PeerRow::Heard(peer(Some("Cy"), 5, now), "trusted", None),
@@ -5604,9 +5662,18 @@ mod tests {
         assert!(lines[3].contains("Bob"), "{text}");
         assert!(
             lines[4].contains(&format!(
-                "then .mesh trust its new destination once heard; otherwise .mesh block {seen_identity}; .mesh untrust "
+                "; the old key stays refused under {}. If the peer rotated",
+                "cd".repeat(4)
             )),
-            "a mark without a heard new destination still says what to do: {text}"
+            "a heard denied row says the old key keeps a refusal, not a grant: {text}"
+        );
+        assert!(
+            lines[4].ends_with(&format!(
+                "then .mesh trust its new destination once heard; otherwise .mesh block {seen_identity}; .mesh trust {} lifts the refusal, .mesh untrust --identity {} forgets the old key",
+                "ab".repeat(16),
+                "cd".repeat(16)
+            )),
+            "a mark without a heard new destination still says what to do, and a heard row's lift is unqualified: {text}"
         );
         assert!(lines[5].contains("Cy"), "{text}");
         assert!(
@@ -5799,17 +5866,19 @@ mod tests {
         assert!(lines[2].starts_with(&" ".repeat(20)), "{text}");
         assert!(
             lines[2].contains(&format!(
-                "key changed: announced under identity {} 2m ago; the grant stays with {}",
+                "key changed: announced under identity {} 2m ago; the old key stays refused under {}",
                 short(&seen_identity),
                 "88".repeat(4)
             )),
-            "the deny row still shows the mark: {text}"
+            "the deny row still shows the mark, and what stays with the old key is a refusal: {text}"
         );
+        assert!(!text.contains("the grant stays"), "{text}");
         assert!(
             lines[2].ends_with(&format!(
-                "otherwise .mesh block {seen_identity}; .mesh untrust {old_destination} forgets the old key"
+                "otherwise .mesh block {seen_identity}; .mesh trust {old_destination} lifts the refusal once it is heard again, .mesh untrust --identity {} forgets the old key",
+                "88".repeat(16)
             )),
-            "{text}"
+            "a refusal is lifted by trusting the old destination, which an unheard one cannot be until it announces again, not by an untrust that is already refused: {text}"
         );
         assert!(lines[3].starts_with("1 peer(s)."), "{text}");
     }
@@ -7602,11 +7671,11 @@ mod tests {
             use crate::mesh::pending::INBOUND_RECORD_VERSION;
             use crate::mesh::rfc3339_utc;
             use crate::mesh::test_support::{
-                FakeNode, PeerSighting, PeerStub, StartedRuntime, TempDir, loopback_relay,
-                private_config, snapshot_fixture, started_runtime, started_runtime_on,
-                started_runtime_on_with, started_runtime_with, wait_until,
+                FakeNode, PEER_TTL, PeerSighting, PeerStub, StartedRuntime, TempDir,
+                loopback_relay, private_config, snapshot_fixture, started_runtime,
+                started_runtime_on, started_runtime_on_with, started_runtime_with, wait_until,
             };
-            use crate::mesh::trust::{LiveMesh, TrustOptions};
+            use crate::mesh::trust::{KeyChangeOutcome, LiveMesh, TrustOptions};
             use crate::testing::EnvVarGuard;
             use crate::utils::get_env_name;
             use parking_lot::Mutex;
@@ -8181,7 +8250,12 @@ mod tests {
                     assert_eq!(
                         runtime
                             .trust()
-                            .note_key_change(&new_identity, &name_hash, SystemTime::now())
+                            .note_key_change(
+                                &new_identity,
+                                &name_hash,
+                                KeyChangeOutcome::Refused,
+                                SystemTime::now()
+                            )
                             .len(),
                         1
                     );
@@ -8194,7 +8268,7 @@ mod tests {
                     );
                     assert_eq!(
                         info_row(&out, "key changes"),
-                        "1 trusted instance(s) announced under another identity; see .mesh peers",
+                        "1 instance(s) announced under another identity; see .mesh peers",
                         "{out}"
                     );
 
@@ -8239,9 +8313,12 @@ mod tests {
                         name_hash,
                         "both announces name the same instance"
                     );
-                    runtime
-                        .trust()
-                        .note_key_change(&new_identity, &name_hash, SystemTime::now());
+                    runtime.trust().note_key_change(
+                        &new_identity,
+                        &name_hash,
+                        KeyChangeOutcome::Refused,
+                        SystemTime::now(),
+                    );
 
                     let out = out_of(&mut ctx, ".mesh peers").await.unwrap();
                     let marker = out
@@ -8276,6 +8353,781 @@ mod tests {
                     assert!(!out.contains("key changed:"), "{out}");
                     let out = out_of(&mut ctx, ".mesh info").await.unwrap();
                     assert_eq!(info_row(&out, "key changes"), "none", "{out}");
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// The superseded record is a denied one: `.mesh peers` marks its heard row with
+            /// the refusal it keeps, `.mesh trust` of the new destination still clears the
+            /// mark, and its line says the old key keeps a refusal, not a grant.
+            #[test]
+            #[serial]
+            fn trusting_the_new_key_over_a_denied_record_says_the_old_key_stays_refused() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-trust-superseded-denied");
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-trust-superseded-denied").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let runtime = started.runtime.clone();
+                    let slot: &dyn LiveMesh = ctx.app.mesh.as_ref();
+                    let old_dest = heard_trusted_peer(&runtime, slot);
+                    runtime
+                        .trust()
+                        .deny_destination(slot, &old_dest, None, SystemTime::now())
+                        .unwrap();
+                    let (new_dest, new_identity) =
+                        heard_peer(&runtime, "Tia again", SystemTime::now());
+                    let old_peer = runtime.peers().get(&old_dest).unwrap();
+                    let (name_hash, old_identity) = (old_peer.name_hash, old_peer.identity_hash);
+                    assert_eq!(
+                        runtime
+                            .trust()
+                            .note_key_change(
+                                &new_identity,
+                                &name_hash,
+                                KeyChangeOutcome::Refused,
+                                SystemTime::now()
+                            )
+                            .len(),
+                        1
+                    );
+
+                    let out = out_of(&mut ctx, ".mesh peers").await.unwrap();
+                    let marker = out
+                        .lines()
+                        .find(|line| line.contains("key changed:"))
+                        .unwrap_or_else(|| panic!("no marker line: {out}"));
+                    assert!(
+                        marker.contains(&format!(
+                            "the old key stays refused under {}",
+                            short(&old_identity)
+                        )),
+                        "{out}"
+                    );
+                    assert!(
+                        marker.ends_with(&format!(
+                            ".mesh trust {old_dest} lifts the refusal, .mesh untrust --identity {old_identity} forgets the old key"
+                        )),
+                        "{out}"
+                    );
+
+                    let out = out_of(&mut ctx, &format!(".mesh trust {new_dest} --yes"))
+                        .await
+                        .unwrap();
+                    assert!(out.contains("added"), "{out}");
+                    assert!(
+                        out.contains(&format!(
+                            "trusted before as {old_dest} under another identity; that record's key-change mark is cleared. The old key stays refused there; .mesh trust {old_dest} lifts the refusal, .mesh untrust --identity {old_identity} forgets the old key."
+                        )),
+                        "{out}"
+                    );
+                    assert!(!out.contains("stays trusted"), "{out}");
+                    let old = runtime
+                        .trust()
+                        .records()
+                        .into_iter()
+                        .find(|record| record.hash == old_dest)
+                        .unwrap();
+                    assert!(old.denied, "the deny stands");
+                    assert!(old.key_changed.is_none(), "the mark is cleared");
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// The denied record built the way an operator builds one: trust the identity
+            /// for all destinations, untrust one of its instances. When that instance is
+            /// then trusted under a new key, the line about the old record advises verbs
+            /// that do something: `.mesh untrust <old>` answers "already refused" and
+            /// changes nothing, `.mesh trust <old>` lifts the refusal.
+            #[test]
+            #[serial]
+            fn the_denied_old_record_line_advises_the_trust_that_lifts_it_not_an_untrust_that_is_a_no_op()
+             {
+                let _guard = TestConfigDirGuard::new("repl-mesh-trust-superseded-refused-instance");
+                let _capture = capture::install();
+                run_async(async {
+                    let started =
+                        started_runtime("repl-mesh-trust-superseded-refused-instance").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let runtime = started.runtime.clone();
+                    let (old_dest, old_identity) = heard_peer(&runtime, "Tia", SystemTime::now());
+                    out_of(
+                        &mut ctx,
+                        &format!(".mesh trust --identity {old_identity} --yes"),
+                    )
+                    .await
+                    .unwrap();
+                    let out = out_of(&mut ctx, &format!(".mesh untrust {old_dest} --yes"))
+                        .await
+                        .unwrap();
+                    assert!(out.contains("Refused"), "{out}");
+                    let (new_dest, new_identity) =
+                        heard_peer(&runtime, "Tia again", SystemTime::now());
+                    let name_hash = runtime.peers().get(&old_dest).unwrap().name_hash;
+                    assert_eq!(
+                        runtime
+                            .trust()
+                            .note_key_change(
+                                &new_identity,
+                                &name_hash,
+                                KeyChangeOutcome::Refused,
+                                SystemTime::now()
+                            )
+                            .len(),
+                        1
+                    );
+
+                    let out = out_of(&mut ctx, &format!(".mesh trust {new_dest} --yes"))
+                        .await
+                        .unwrap();
+
+                    assert!(out.contains("added"), "{out}");
+                    assert!(
+                        out.contains(&format!(
+                            "The old key stays refused there; .mesh trust {old_dest} lifts the refusal, .mesh untrust --identity {old_identity} forgets the old key."
+                        )),
+                        "{out}"
+                    );
+                    assert!(
+                        !out.contains(&format!(".mesh untrust {old_dest}")),
+                        "the line must not advise a verb that changes nothing: {out}"
+                    );
+
+                    let out = out_of(&mut ctx, &format!(".mesh untrust {old_dest} --yes"))
+                        .await
+                        .unwrap();
+                    assert!(out.contains("already refused"), "{out}");
+                    assert!(out.contains(NOTHING_CHANGED), "{out}");
+                    let out = out_of(&mut ctx, &format!(".mesh trust {old_dest} --yes"))
+                        .await
+                        .unwrap();
+                    assert!(
+                        out.contains("The refusal on this instance is lifted."),
+                        "{out}"
+                    );
+                    assert_eq!(
+                        runtime.trust().authorize(&old_identity, &old_dest).rule,
+                        Rule::DestinationTrusted
+                    );
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// The identity heard under the new key is then trusted for all destinations.
+            /// That grant clears nothing; `.mesh peers` still shows the collision and names
+            /// the new destination as its successor; `.mesh trust <new destination>` is what
+            /// names the superseded record and clears the mark.
+            #[test]
+            #[serial]
+            fn usage_probe_peers_and_trust_see_the_collision_of_an_identity_trusted_for_all() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-probe-collision-all");
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-probe-collision-all").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let runtime = started.runtime.clone();
+                    let slot: &dyn LiveMesh = ctx.app.mesh.as_ref();
+                    let old_dest = heard_trusted_peer(&runtime, slot);
+                    let (new_dest, new_identity) =
+                        heard_peer(&runtime, "Tia again", SystemTime::now());
+                    let name_hash = runtime.peers().get(&old_dest).unwrap().name_hash;
+                    let mark_of = |dest: &str| {
+                        runtime
+                            .trust()
+                            .records()
+                            .into_iter()
+                            .find(|record| record.hash == dest)
+                            .unwrap()
+                            .key_changed
+                    };
+                    assert_eq!(
+                        runtime
+                            .trust()
+                            .note_key_change(
+                                &new_identity,
+                                &name_hash,
+                                KeyChangeOutcome::Refused,
+                                SystemTime::now()
+                            )
+                            .len(),
+                        1
+                    );
+
+                    let out = out_of(
+                        &mut ctx,
+                        &format!(".mesh trust --identity {new_identity} --yes"),
+                    )
+                    .await
+                    .unwrap();
+                    assert!(out.contains("added"), "{out}");
+                    assert!(
+                        mark_of(&old_dest).is_some(),
+                        "trusting the identity for all destinations clears no mark"
+                    );
+
+                    let out = out_of(&mut ctx, ".mesh peers").await.unwrap();
+                    let marker = out
+                        .lines()
+                        .find(|line| line.contains("key changed:"))
+                        .unwrap_or_else(|| panic!("no key-change marker in {out}"));
+                    assert!(marker.contains(short(&new_identity)), "{out}");
+                    assert!(
+                        marker.contains(&format!("then .mesh trust {new_dest}; ")),
+                        "the successor is named although its identity is trusted for all: {out}"
+                    );
+
+                    let out = out_of(&mut ctx, &format!(".mesh trust {new_dest} --yes"))
+                        .await
+                        .unwrap();
+                    assert!(out.contains("added"), "{out}");
+                    assert!(
+                        out.contains(&format!(
+                            "trusted before as {old_dest} under another identity"
+                        )),
+                        "{out}"
+                    );
+                    assert!(
+                        mark_of(&old_dest).is_none(),
+                        "cleared by the new-destination trust"
+                    );
+                    let out = out_of(&mut ctx, ".mesh peers").await.unwrap();
+                    assert!(!out.contains("key changed:"), "{out}");
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// The old record's row has aged out of the peer table while the instance is
+            /// heard under its new key, whose identity the human trusted for all
+            /// destinations: `.mesh peers` lists the marked record as not heard and its
+            /// marker names the heard successor to trust, not a destination still to come.
+            #[test]
+            #[serial]
+            fn peers_names_the_heard_successor_of_a_marked_record_whose_row_aged_out() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-peers-aged-out-successor");
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-peers-aged-out-successor").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let runtime = started.runtime.clone();
+                    let slot: &dyn LiveMesh = ctx.app.mesh.as_ref();
+                    let now = SystemTime::now();
+                    let (old_dest, old_identity) = heard_peer(&runtime, "Tia", now - PEER_TTL);
+                    runtime
+                        .trust()
+                        .trust_destination(slot, &old_dest, TrustOptions::default(), now)
+                        .unwrap();
+                    let (new_dest, new_identity) = heard_peer(&runtime, "Tia again", now);
+                    let name_hash = runtime.peers().get(&new_dest).unwrap().name_hash;
+                    assert_eq!(
+                        runtime
+                            .trust()
+                            .note_key_change(
+                                &new_identity,
+                                &name_hash,
+                                KeyChangeOutcome::Refused,
+                                now
+                            )
+                            .len(),
+                        1
+                    );
+                    assert_eq!(runtime.peers().sweep(now), vec![old_dest.clone()]);
+                    let out = out_of(
+                        &mut ctx,
+                        &format!(".mesh trust --identity {new_identity} --yes"),
+                    )
+                    .await
+                    .unwrap();
+                    assert!(out.contains("added"), "{out}");
+
+                    let out = out_of(&mut ctx, ".mesh peers").await.unwrap();
+                    let unheard = out
+                        .lines()
+                        .find(|line| line.starts_with("(not heard) "))
+                        .unwrap_or_else(|| panic!("no unheard row in {out}"));
+                    assert!(unheard.contains(short(&old_dest)), "{out}");
+                    assert!(unheard.contains(short(&old_identity)), "{out}");
+                    let marker = out
+                        .lines()
+                        .find(|line| line.contains("key changed:"))
+                        .unwrap_or_else(|| panic!("no key-change marker in {out}"));
+                    assert!(marker.contains(short(&new_identity)), "{out}");
+                    assert!(
+                        marker.contains(&format!("then .mesh trust {new_dest}; ")),
+                        "the marker names the heard successor: {out}"
+                    );
+                    assert!(!marker.contains("its new destination once heard"), "{out}");
+
+                    let out = out_of(&mut ctx, &format!(".mesh trust {new_dest} --yes"))
+                        .await
+                        .unwrap();
+                    assert!(out.contains("added"), "{out}");
+                    let out = out_of(&mut ctx, ".mesh peers").await.unwrap();
+                    assert!(!out.contains("key changed:"), "{out}");
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// The same aged-out record, denied rather than trusted: its one row reads
+            /// `denied`, and the marker still names the heard successor.
+            #[test]
+            #[serial]
+            fn peers_names_the_heard_successor_of_a_denied_record_whose_row_aged_out() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-peers-aged-out-denied");
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-peers-aged-out-denied").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let runtime = started.runtime.clone();
+                    let slot: &dyn LiveMesh = ctx.app.mesh.as_ref();
+                    let now = SystemTime::now();
+                    let (old_dest, old_identity) = heard_peer(&runtime, "Tia", now - PEER_TTL);
+                    runtime
+                        .trust()
+                        .trust_destination(slot, &old_dest, TrustOptions::default(), now)
+                        .unwrap();
+                    runtime
+                        .trust()
+                        .deny_destination(slot, &old_dest, None, now)
+                        .unwrap();
+                    let (new_dest, new_identity) = heard_peer(&runtime, "Tia again", now);
+                    let name_hash = runtime.peers().get(&new_dest).unwrap().name_hash;
+                    assert_eq!(
+                        runtime
+                            .trust()
+                            .note_key_change(
+                                &new_identity,
+                                &name_hash,
+                                KeyChangeOutcome::Refused,
+                                now
+                            )
+                            .len(),
+                        1
+                    );
+                    assert_eq!(runtime.peers().sweep(now), vec![old_dest.clone()]);
+
+                    let out = out_of(&mut ctx, ".mesh peers").await.unwrap();
+                    let rows: Vec<&str> = out
+                        .lines()
+                        .filter(|line| {
+                            line.contains(short(&old_dest)) && !line.contains("key changed:")
+                        })
+                        .collect();
+                    assert_eq!(rows.len(), 1, "one row for the denied record: {out}");
+                    assert!(rows[0].contains("denied"), "{out}");
+                    let marker = out
+                        .lines()
+                        .find(|line| line.contains("key changed:"))
+                        .unwrap_or_else(|| panic!("no key-change marker in {out}"));
+                    assert!(
+                        marker.contains(&format!(
+                            "the old key stays refused under {}",
+                            short(&old_identity)
+                        )),
+                        "{out}"
+                    );
+                    assert!(
+                        marker.contains(&format!("then .mesh trust {new_dest}; ")),
+                        "the marker names the heard successor: {out}"
+                    );
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// Under `mesh.collision_protection` the heard row of an identity trusted for all
+            /// destinations over a colliding record reads as the node serves it: refused,
+            /// not `trusted`, while the record it collides with keeps its own label.
+            #[test]
+            #[serial]
+            fn peers_labels_a_colliding_trusted_for_all_row_as_refused_under_protection() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-peers-protected-label");
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-peers-protected-label").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let runtime = started.runtime.clone();
+                    let slot: &dyn LiveMesh = ctx.app.mesh.as_ref();
+                    let old_dest = heard_trusted_peer(&runtime, slot);
+                    let (new_dest, new_identity) =
+                        heard_peer(&runtime, "Tia again", SystemTime::now());
+                    runtime
+                        .trust()
+                        .trust_identity(
+                            slot,
+                            &new_identity,
+                            TrustOptions::default(),
+                            SystemTime::now(),
+                        )
+                        .unwrap();
+                    runtime.trust().set_collision_protection(true);
+
+                    let out = out_of(&mut ctx, ".mesh peers").await.unwrap();
+                    let row_of = |dest: &str| {
+                        out.lines()
+                            .find(|line| line.contains(short(dest)))
+                            .unwrap_or_else(|| panic!("no row for {dest} in {out}"))
+                    };
+                    assert!(row_of(&new_dest).contains("untrusted"), "{out}");
+                    assert!(!row_of(&old_dest).contains("untrusted"), "{out}");
+                    assert!(row_of(&old_dest).contains("trusted"), "{out}");
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// `.mesh info <destination>` says what `.mesh peers` says of the same row: the
+            /// colliding identity trusted for all destinations is `trusted` with
+            /// `mesh.collision_protection` off and `untrusted` with it on.
+            #[test]
+            #[serial]
+            fn info_labels_a_colliding_trusted_for_all_row_by_the_verdict_it_is_served() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-info-protected-label");
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-info-protected-label").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let runtime = started.runtime.clone();
+                    let slot: &dyn LiveMesh = ctx.app.mesh.as_ref();
+                    heard_trusted_peer(&runtime, slot);
+                    let (new_dest, new_identity) =
+                        heard_peer(&runtime, "Tia again", SystemTime::now());
+                    runtime
+                        .trust()
+                        .trust_identity(
+                            slot,
+                            &new_identity,
+                            TrustOptions::default(),
+                            SystemTime::now(),
+                        )
+                        .unwrap();
+
+                    for (protection, line) in
+                        [(false, "trust: trusted"), (true, "trust: untrusted")]
+                    {
+                        runtime.trust().set_collision_protection(protection);
+                        let out = out_of(&mut ctx, &format!(".mesh info {new_dest}"))
+                            .await
+                            .unwrap();
+                        assert!(
+                            out.lines().any(|l| l == line),
+                            "protection {protection}: {out}"
+                        );
+                    }
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// Usage probe: `.mesh peers` JUDGES a colliding heard row, it never marks it.
+            /// The row of an identity trusted for all destinations over another identity's
+            /// recorded instance reads `trusted` with protection off and `untrusted` with it
+            /// on — the verdict the node would serve — while listing writes nothing to
+            /// `trust.yaml`, marks no record and tells the owner nothing: the collision rung
+            /// marks on the inbound paths only.
+            #[test]
+            #[serial]
+            fn usage_probe_peers_judges_a_colliding_row_in_both_modes_without_marking_or_telling() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-probe-peers-judges-only");
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-probe-peers-judges-only").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let idle = Arc::new(Recording::default());
+                    ctx.app.mesh.set_idle(idle.clone());
+                    let runtime = started.runtime.clone();
+                    let slot: &dyn LiveMesh = ctx.app.mesh.as_ref();
+                    let old_dest = heard_trusted_peer(&runtime, slot);
+                    let (new_dest, new_identity) =
+                        heard_peer(&runtime, "Tia again", SystemTime::now());
+                    runtime
+                        .trust()
+                        .trust_identity(
+                            slot,
+                            &new_identity,
+                            TrustOptions::default(),
+                            SystemTime::now(),
+                        )
+                        .unwrap();
+                    let trust_path = started
+                        .tmp
+                        .path
+                        .join("config")
+                        .join("mesh")
+                        .join("trust.yaml");
+                    let before = fs::read(&trust_path).unwrap();
+
+                    for (protection, label, not) in [
+                        (false, "trusted", "untrusted"),
+                        (true, "untrusted", "nothing"),
+                    ] {
+                        runtime.trust().set_collision_protection(protection);
+                        let out = out_of(&mut ctx, ".mesh peers").await.unwrap();
+                        let row = out
+                            .lines()
+                            .find(|line| line.contains(short(&new_dest)))
+                            .unwrap_or_else(|| panic!("no row for {new_dest} in {out}"));
+                        assert!(
+                            row.contains(label) && !row.contains(not),
+                            "protection {protection}: {out}"
+                        );
+                        assert!(
+                            !out.contains("key changed:"),
+                            "protection {protection}: listing marks nothing: {out}"
+                        );
+                    }
+
+                    assert_eq!(
+                        fs::read(&trust_path).unwrap(),
+                        before,
+                        "listing writes nothing"
+                    );
+                    assert!(
+                        runtime
+                            .trust()
+                            .records()
+                            .iter()
+                            .all(|record| record.key_changed.is_none()),
+                        "{:#?}",
+                        runtime.trust().records()
+                    );
+                    assert!(
+                        idle.0.lock().is_empty(),
+                        "listing tells the owner nothing: {:?}",
+                        idle.0.lock()
+                    );
+                    assert!(runtime.trust().records().iter().any(|r| r.hash == old_dest));
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// Puts a heard peer announcing under its own instance (`aspect`) in the peer
+            /// table so it collides with nothing and returns its (destination, identity).
+            fn heard_peer_under(
+                runtime: &MeshRuntime,
+                aspect: &str,
+                name: &str,
+                at: SystemTime,
+            ) -> (String, String) {
+                use crate::mesh::session_destination_name;
+                use rand_core::OsRng;
+                use rns_transport::destination::SingleInputDestination;
+                use rns_transport::identity::PrivateIdentity;
+
+                let dest_name = session_destination_name(aspect);
+                let announced =
+                    SingleInputDestination::new(PrivateIdentity::new_from_rand(OsRng), dest_name);
+                let destination = announced.desc.address_hash.to_hex_string();
+                let identity = announced.desc.identity.address_hash.to_hex_string();
+                runtime.peers().observe(
+                    PeerSighting {
+                        destination_hash: destination.clone(),
+                        identity_hash: identity.clone(),
+                        name_hash: hex_lower(dest_name.as_name_hash_slice()),
+                        display_name: Some(name.to_string()),
+                        protocol_version: 1,
+                        hops: 1,
+                    },
+                    at,
+                );
+                (destination, identity)
+            }
+
+            /// Usage probe: `.mesh info <destination>` labels every heard row by the verdict
+            /// the node serves it under, and only the colliding row moves with
+            /// `mesh.collision_protection`: the identity trusted for all destinations over
+            /// another identity's recorded instance reads `trusted` off and `untrusted` on,
+            /// while the record's own row, a destination-trusted peer under its own
+            /// instance, a blocked identity and a stranger read `trusted`, `trusted`,
+            /// `blocked` and `untrusted` in both modes. Describing judges only: `trust.yaml`
+            /// is byte-identical, no record is marked and the owner hears nothing.
+            #[test]
+            #[serial]
+            fn usage_probe_info_labels_every_heard_row_by_the_served_verdict_without_marking_or_telling()
+             {
+                let _guard = TestConfigDirGuard::new("repl-mesh-probe-info-served-labels");
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-probe-info-served-labels").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let idle = Arc::new(Recording::default());
+                    ctx.app.mesh.set_idle(idle.clone());
+                    let runtime = started.runtime.clone();
+                    let slot: &dyn LiveMesh = ctx.app.mesh.as_ref();
+                    let now = SystemTime::now();
+                    let old_dest = heard_trusted_peer(&runtime, slot);
+                    let (new_dest, new_identity) = heard_peer(&runtime, "Tia again", now);
+                    runtime
+                        .trust()
+                        .trust_identity(slot, &new_identity, TrustOptions::default(), now)
+                        .unwrap();
+                    let (other_dest, _) = heard_peer_under(&runtime, "other", "Ola", now);
+                    runtime
+                        .trust()
+                        .trust_destination(slot, &other_dest, TrustOptions::default(), now)
+                        .unwrap();
+                    let (blocked_dest, blocked_identity) =
+                        heard_peer_under(&runtime, "shunned", "Sly", now);
+                    runtime
+                        .trust()
+                        .block_identity(slot, &blocked_identity, None, now)
+                        .unwrap();
+                    let (stranger_dest, _) = heard_peer_under(&runtime, "passer", "Pat", now);
+                    let trust_path = started
+                        .tmp
+                        .path
+                        .join("config")
+                        .join("mesh")
+                        .join("trust.yaml");
+                    let before = fs::read(&trust_path).unwrap();
+
+                    for (protection, colliding_label) in [(false, "trusted"), (true, "untrusted")] {
+                        runtime.trust().set_collision_protection(protection);
+                        for (dest, label) in [
+                            (&new_dest, colliding_label),
+                            (&old_dest, "trusted"),
+                            (&other_dest, "trusted"),
+                            (&blocked_dest, "blocked"),
+                            (&stranger_dest, "untrusted"),
+                        ] {
+                            let out = out_of(&mut ctx, &format!(".mesh info {dest}"))
+                                .await
+                                .unwrap();
+                            let trust_lines: Vec<&str> = out
+                                .lines()
+                                .filter(|line| line.starts_with("trust: "))
+                                .collect();
+                            assert_eq!(
+                                trust_lines,
+                                vec![format!("trust: {label}").as_str()],
+                                "protection {protection}, {dest}: {out}"
+                            );
+                            assert!(
+                                out.lines()
+                                    .any(|line| line == format!("destination: {dest}")),
+                                "protection {protection}: {out}"
+                            );
+                        }
+                    }
+
+                    assert_eq!(
+                        fs::read(&trust_path).unwrap(),
+                        before,
+                        "describing writes nothing"
+                    );
+                    assert!(
+                        runtime
+                            .trust()
+                            .records()
+                            .iter()
+                            .all(|record| record.key_changed.is_none()),
+                        "{:#?}",
+                        runtime.trust().records()
+                    );
+                    assert!(
+                        idle.0.lock().is_empty(),
+                        "describing tells the owner nothing: {:?}",
+                        idle.0.lock()
+                    );
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// Through the operator's own verbs, neither re-trusting
+            /// the OLD destination nor blocking the identity seen under the new key clears a
+            /// key-change mark. `.mesh peers` keeps showing it after each, and only the
+            /// trust of the new destination (the one clearing path) takes it away.
+            #[test]
+            #[serial]
+            fn usage_probe_re_trusting_the_old_destination_and_blocking_the_seen_identity_keep_the_mark()
+             {
+                let _guard = TestConfigDirGuard::new("repl-mesh-probe-mark-keepers");
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-probe-mark-keepers").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let runtime = started.runtime.clone();
+                    let slot: &dyn LiveMesh = ctx.app.mesh.as_ref();
+                    let old_dest = heard_trusted_peer(&runtime, slot);
+                    let (_new_dest, new_identity) =
+                        heard_peer(&runtime, "Tia again", SystemTime::now());
+                    let name_hash = runtime.peers().get(&old_dest).unwrap().name_hash;
+                    let mark_of = |dest: &str| {
+                        runtime
+                            .trust()
+                            .records()
+                            .into_iter()
+                            .find(|record| record.hash == dest)
+                            .unwrap()
+                            .key_changed
+                    };
+                    assert_eq!(
+                        runtime
+                            .trust()
+                            .note_key_change(
+                                &new_identity,
+                                &name_hash,
+                                KeyChangeOutcome::Refused,
+                                SystemTime::now()
+                            )
+                            .len(),
+                        1
+                    );
+
+                    let out = out_of(&mut ctx, &format!(".mesh trust {old_dest} --yes"))
+                        .await
+                        .unwrap();
+                    assert!(out.contains("updated"), "{out}");
+                    assert!(
+                        mark_of(&old_dest).is_some(),
+                        "re-trusting the marked destination itself answers nothing about the new key"
+                    );
+                    let out = out_of(&mut ctx, ".mesh peers").await.unwrap();
+                    assert!(out.contains("key changed:"), "{out}");
+
+                    let out = out_of(&mut ctx, &format!(".mesh block {new_identity} --yes"))
+                        .await
+                        .unwrap();
+                    assert!(
+                        out.contains(&format!("Blocked {}", short(&new_identity))),
+                        "{out}"
+                    );
+                    assert!(
+                        !out.contains("marks cleared"),
+                        "the block is no longer presented as clearing anything: {out}"
+                    );
+                    assert!(
+                        mark_of(&old_dest).is_some(),
+                        "blocking silences, it does not clear"
+                    );
+                    let out = out_of(&mut ctx, ".mesh peers").await.unwrap();
+                    assert!(out.contains("key changed:"), "{out}");
 
                     assert!(ctx.app.mesh.stop().await.unwrap());
                     started.relay_handle.abort();
@@ -9696,7 +10548,7 @@ mod tests {
                     assert!(out.contains("every instance"), "{out}");
                     assert!(out.contains("added"), "{out}");
                     assert!(
-                        out.contains("A rotation of this identity is not detected"),
+                        out.contains("A rotation of this identity is surfaced from the peer table when heard, never marked"),
                         "{out}"
                     );
                     assert!(out.contains(".mesh trust <destination>"), "{out}");
@@ -9819,7 +10671,12 @@ mod tests {
                     let name_hash = started.runtime.peers().get(&marked).unwrap().name_hash;
                     assert_eq!(
                         trust
-                            .note_key_change(&seen, &name_hash, SystemTime::now())
+                            .note_key_change(
+                                &seen,
+                                &name_hash,
+                                KeyChangeOutcome::Refused,
+                                SystemTime::now()
+                            )
                             .len(),
                         1
                     );
@@ -12763,9 +13620,12 @@ mod tests {
                     let (new_dest, new_identity) =
                         heard_peer(&runtime, "Tia again", SystemTime::now());
                     let name_hash = runtime.peers().get(&old_dest).unwrap().name_hash;
-                    runtime
-                        .trust()
-                        .note_key_change(&new_identity, &name_hash, SystemTime::now());
+                    runtime.trust().note_key_change(
+                        &new_identity,
+                        &name_hash,
+                        KeyChangeOutcome::Refused,
+                        SystemTime::now(),
+                    );
                     let verdict = runtime.trust().authorize(&new_identity, &new_dest);
                     assert_eq!(
                         verdict.decision,

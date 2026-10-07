@@ -796,10 +796,11 @@ enum Verdict {
 }
 
 impl Gate {
-    /// MESH-ENV-039: destination deny, identity block, destination allow, identity allow,
-    /// identity changed, default closed. `FIXED_ORIGIN` is the one origin whose destination
-    /// the list binds to another identity (`bound`), so a default-closed instance from it is
-    /// refused as identity changed instead of knocking. `Silent` never gets here.
+    /// The MESH-ENV-039 order with `mesh.collision_protection` off, which is how the harness
+    /// runs: destination deny, identity block, destination allow, identity allow, identity
+    /// changed, default closed. `FIXED_ORIGIN` is the one origin whose destination the list
+    /// binds to another identity (`bound`), so a default-closed instance from it is refused
+    /// as identity changed instead of knocking. `Silent` never gets here.
     fn verdict(self, origin: &[u8; NAME_HASH_LEN], destination: &AddressHash) -> Verdict {
         let closed = if *origin == FIXED_ORIGIN {
             Verdict::IdentityChanged

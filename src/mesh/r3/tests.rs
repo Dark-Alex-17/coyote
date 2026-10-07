@@ -523,7 +523,7 @@ pub(crate) mod network {
         SHUTDOWN_GRACE,
     };
     use crate::mesh::notify::Source;
-    use crate::mesh::peers::PeerTable;
+    use crate::mesh::peers::{PeerSighting, PeerTable};
     use crate::mesh::pending::{PENDING_RECORD_VERSION, PendingRecord, PendingState, WaitOutcome};
     use crate::mesh::propagation::test_support::{FakeNode, stored_message};
     use crate::mesh::propagation::{PropagationNode, PropagationOptions, pn_announce_app_data};
@@ -2712,7 +2712,7 @@ pub(crate) mod network {
             path_hash: PathHash::of(KNOCK_PATH),
             data: Some(Value::Nil),
         };
-        dispatcher.refusal(rule, knock, &|id8, outcome| {
+        dispatcher.refusal(rule, &[], knock, &|id8, outcome| {
             logged.lock().push((id8.to_string(), outcome.to_string()))
         })
     }
@@ -4527,6 +4527,987 @@ pub(crate) mod network {
                 "{text}"
             );
         }
+        pair.stop_node_a().await;
+    }
+
+    /// Node A's list binds B's instance to another identity and trusts B's identity for all
+    /// destinations. B's `/status` is served as any trusted identity's is, the bound record
+    /// is marked with B as the identity seen, and one warning reaches the slot's idle sink:
+    /// a second round-trip over the same marked record adds nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_trusted_for_all_identity_over_a_colliding_record_is_served_its_status_with_one_warning()
+     {
+        install_log_collector();
+        let bound_to = TransportIdentity::new_from_rand(OsRng)
+            .as_identity()
+            .address_hash;
+        let pair = NodePair::start_with(
+            "r3-collision-served",
+            |_| {},
+            |responder| {
+                TrustList::default()
+                    .identity(&responder.desc.identity.address_hash.to_hex_string(), true)
+                    .destination(
+                        &destination_address(&responder.origin().0, &bound_to).to_hex_string(),
+                        &bound_to.to_hex_string(),
+                    )
+            },
+        )
+        .await;
+        let (_slot, idle) = installed_slot(&pair);
+        let b_identity = pair.responder.desc.identity.address_hash.to_hex_string();
+        let b_instance = pair.responder.desc.address_hash.to_hex_string();
+        let bound = destination_address(&pair.responder.origin().0, &bound_to).to_hex_string();
+
+        let card = pair.status_of_a(&pair.responder.identity, Value::Nil).await;
+
+        assert_eq!(card.display_name, None, "a card came back");
+        assert_debug_logged(&format!("for /status from {} on link ", &b_identity[..8]));
+        assert_debug_logged(": served: IdentityTrusted (over a colliding record)");
+        let marked = pair
+            .node_a
+            .trust()
+            .records()
+            .into_iter()
+            .find(|record| record.hash == bound)
+            .unwrap();
+        assert_eq!(
+            marked.identity.as_deref(),
+            Some(bound_to.to_hex_string().as_str()),
+            "the grant stays with the identity that proved it"
+        );
+        assert_eq!(
+            marked.key_changed.map(|mark| mark.seen_identity),
+            Some(b_identity.clone())
+        );
+        wait_until("the warning to surface", || !idle.0.lock().is_empty()).await;
+        {
+            let notes = idle.0.lock();
+            assert_eq!(notes.len(), 1, "{notes:#?}");
+            assert_eq!(notes[0].source, Source::Mesh);
+            assert_eq!(notes[0].origin, Origin::Peer(b_identity[..8].to_string()));
+            let text = &notes[0].text;
+            assert!(text.starts_with("warning: "), "{text}");
+            assert!(text.contains("is served while it asks"), "{text}");
+            assert!(
+                text.contains(&format!(".mesh trust {b_instance}")),
+                "{text}"
+            );
+            assert!(
+                text.contains(&format!(".mesh block {b_identity}")),
+                "{text}"
+            );
+        }
+
+        pair.status_of_a(&pair.responder.identity, Value::Nil).await;
+
+        assert_eq!(
+            idle.0.lock().len(),
+            1,
+            "the marked record earns no second warning"
+        );
+        pair.stop_node_a().await;
+    }
+
+    /// The same list under `mesh.collision_protection: true`: B's `/knock` is refused
+    /// `NoAccess`, no knock is filed, the record is marked all the same, and the human
+    /// gets the error rather than the warning, once: a second refusal over the marked
+    /// record adds nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn collision_protection_refuses_a_trusted_for_all_identity_over_a_colliding_record() {
+        install_log_collector();
+        let bound_to = TransportIdentity::new_from_rand(OsRng)
+            .as_identity()
+            .address_hash;
+        let pair = NodePair::start_with(
+            "r3-collision-protected",
+            |config| config.collision_protection = true,
+            |responder| {
+                TrustList::default()
+                    .identity(&responder.desc.identity.address_hash.to_hex_string(), true)
+                    .destination(
+                        &destination_address(&responder.origin().0, &bound_to).to_hex_string(),
+                        &bound_to.to_hex_string(),
+                    )
+            },
+        )
+        .await;
+        let (_slot, idle) = installed_slot(&pair);
+        let b_identity = pair.responder.desc.identity.address_hash.to_hex_string();
+        let b_instance = pair.responder.desc.address_hash.to_hex_string();
+        let bound = destination_address(&pair.responder.origin().0, &bound_to).to_hex_string();
+        let knock = || {
+            pair.client_b.request(
+                &pair.responder.transport,
+                &pair.responder.identity,
+                &pair.a_desc,
+                KNOCK_PATH,
+                pair.responder
+                    .envelope(KnockIntro::new("hello").unwrap().to_r3_body()),
+                short_options(),
+            )
+        };
+
+        let err = knock().await.unwrap_err();
+
+        assert_eq!(err, R3Error::Refused(RefusalCode::NoAccess));
+        assert_debug_logged(&format!("for /knock from {} on link ", &b_identity[..8]));
+        assert_debug_logged(": refused: IdentityChanged");
+        let marked = pair
+            .node_a
+            .trust()
+            .records()
+            .into_iter()
+            .find(|record| record.hash == bound)
+            .unwrap();
+        assert_eq!(
+            marked.key_changed.map(|mark| mark.seen_identity),
+            Some(b_identity.clone())
+        );
+        wait_until("the error to surface", || !idle.0.lock().is_empty()).await;
+        {
+            let notes = idle.0.lock();
+            assert_eq!(notes.len(), 1, "no knock is filed: {notes:#?}");
+            assert_eq!(notes[0].source, Source::Mesh);
+            let text = &notes[0].text;
+            assert!(text.starts_with("error: "), "{text}");
+            assert!(text.contains("is refused when it asks"), "{text}");
+            assert!(
+                text.contains(&format!(".mesh trust {b_instance}")),
+                "{text}"
+            );
+        }
+
+        let err = knock().await.unwrap_err();
+
+        assert_eq!(err, R3Error::Refused(RefusalCode::NoAccess));
+        assert_eq!(
+            idle.0.lock().len(),
+            1,
+            "the marked record earns no second error"
+        );
+        pair.stop_node_a().await;
+    }
+
+    /// Node A has heard B's instance under another identity trusted for all destinations,
+    /// and B's identity is trusted for all destinations too. B's announce finds no record
+    /// to mark, so `install`'s peer-table attachment is the only way the rotation shows:
+    /// one warning reaches the slot's idle sink and `trust.yaml` is left byte for byte.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_identity_tier_rotation_heard_by_a_started_node_is_warned_about_and_writes_nothing()
+    {
+        let earlier = TransportIdentity::new_from_rand(OsRng)
+            .as_identity()
+            .address_hash;
+        let pair = NodePair::start_with(
+            "r3-collision-presence",
+            |_| {},
+            |responder| {
+                TrustList::default()
+                    .identity(&responder.desc.identity.address_hash.to_hex_string(), true)
+                    .identity(&earlier.to_hex_string(), true)
+            },
+        )
+        .await;
+        let (_slot, idle) = installed_slot(&pair);
+        let b_identity = pair.responder.desc.identity.address_hash.to_hex_string();
+        let name_hash = hex_lower(&pair.responder.origin().0);
+        let earlier_destination = destination_address(&pair.responder.origin().0, &earlier);
+        pair.node_a.peers().observe(
+            PeerSighting {
+                destination_hash: earlier_destination.to_hex_string(),
+                identity_hash: earlier.to_hex_string(),
+                name_hash,
+                display_name: None,
+                protocol_version: MESH_PROTOCOL_VERSION,
+                hops: 1,
+            },
+            SystemTime::now(),
+        );
+        let trust_path = mesh_config_dir(&pair.config_dir_a()).join("trust.yaml");
+        let before = fs::read(&trust_path).unwrap();
+
+        pair.introduce_b_to_a().await;
+
+        wait_until("the warning to surface", || !idle.0.lock().is_empty()).await;
+        {
+            let notes = idle.0.lock();
+            assert_eq!(notes.len(), 1, "{notes:#?}");
+            assert_eq!(notes[0].source, Source::Mesh);
+            assert_eq!(notes[0].origin, Origin::Peer(b_identity[..8].to_string()));
+            let text = &notes[0].text;
+            assert!(text.starts_with("warning: "), "{text}");
+            assert!(text.contains(&earlier.to_hex_string()), "{text}");
+            assert!(text.contains(&b_identity), "{text}");
+            assert!(text.contains("nothing is marked"), "{text}");
+        }
+        assert_eq!(fs::read(&trust_path).unwrap(), before);
+        assert!(
+            pair.node_a
+                .trust()
+                .records()
+                .iter()
+                .all(|record| record.key_changed.is_none())
+        );
+        pair.stop_node_a().await;
+    }
+
+    /// Usage probe: the same identity-tier rotation under `mesh.collision_protection:
+    /// true`. No record carries the instance, so the owner line raised by B's announce
+    /// must tell the owner what B then actually gets when it asks: a line that says
+    /// "refused" must be followed by a refusal, a line that says "served" by a served
+    /// card — the line and the verdict are one story, whichever way the mode decides.
+    /// Nothing is marked and `trust.yaml` is untouched either way.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_a_protected_identity_tier_rotation_line_matches_what_the_peer_then_gets() {
+        let earlier = TransportIdentity::new_from_rand(OsRng)
+            .as_identity()
+            .address_hash;
+        let pair = NodePair::start_with(
+            "r3-probe-presence-protected",
+            |config| config.collision_protection = true,
+            |responder| {
+                TrustList::default()
+                    .identity(&responder.desc.identity.address_hash.to_hex_string(), true)
+                    .identity(&earlier.to_hex_string(), true)
+            },
+        )
+        .await;
+        let (_slot, idle) = installed_slot(&pair);
+        let name_hash = hex_lower(&pair.responder.origin().0);
+        let earlier_destination = destination_address(&pair.responder.origin().0, &earlier);
+        pair.node_a.peers().observe(
+            PeerSighting {
+                destination_hash: earlier_destination.to_hex_string(),
+                identity_hash: earlier.to_hex_string(),
+                name_hash,
+                display_name: None,
+                protocol_version: MESH_PROTOCOL_VERSION,
+                hops: 1,
+            },
+            SystemTime::now(),
+        );
+        let trust_path = mesh_config_dir(&pair.config_dir_a()).join("trust.yaml");
+        let before = fs::read(&trust_path).unwrap();
+
+        pair.introduce_b_to_a().await;
+        wait_until("the collision line to surface", || {
+            !idle.0.lock().is_empty()
+        })
+        .await;
+        let text = idle.0.lock()[0].text.clone();
+        assert_eq!(idle.0.lock().len(), 1, "{:#?}", idle.0.lock());
+        assert!(text.contains("nothing is marked"), "{text}");
+
+        let served = pair
+            .client_b
+            .request(
+                &pair.responder.transport,
+                &pair.responder.identity,
+                &pair.a_desc,
+                STATUS_PATH,
+                pair.responder.envelope(Value::Nil),
+                short_options(),
+            )
+            .await
+            .is_ok();
+
+        let claims_served = text.contains("is served while it asks");
+        let claims_refused = text.contains("is refused when it asks");
+        assert!(claims_served ^ claims_refused, "{text}");
+        assert_eq!(
+            served, claims_served,
+            "the owner was told one thing and the peer got another (served = {served}): {text}"
+        );
+        // The collision rung judges records only, so a presence-only rotation is served
+        // even under protection.
+        assert!(served, "{text}");
+        assert!(text.starts_with("warning: "), "{text}");
+        assert_eq!(fs::read(&trust_path).unwrap(), before);
+        assert_eq!(idle.0.lock().len(), 1, "{:#?}", idle.0.lock());
+        pair.stop_node_a().await;
+    }
+
+    /// Usage probe: the collision rung judges what the node SERVES, never what it sends.
+    /// Under `mesh.collision_protection: true` node A hears B, trusted for all
+    /// destinations, announce the instance a trust record binds to another identity:
+    /// B's row is labelled by the verdict A serves it under — refused by identity
+    /// changed, what `.mesh peers`, `.mesh info` and `mesh__peers` print as `untrusted` —
+    /// yet A's own `/status` request to B still goes out, judged by the grant alone (the
+    /// gate `mesh__peers with_status: true` and `send_peer` use). Sending marks nothing
+    /// further and earns the owner no second line.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_a_colliding_identity_the_node_refuses_to_serve_is_still_one_it_sends_to() {
+        let bound_to = TransportIdentity::new_from_rand(OsRng)
+            .as_identity()
+            .address_hash;
+        let pair = NodePair::start_with(
+            "r3-probe-served-verdict-outbound",
+            |config| config.collision_protection = true,
+            |responder| {
+                TrustList::default()
+                    .identity(&responder.desc.identity.address_hash.to_hex_string(), true)
+                    .destination(
+                        &destination_address(&responder.origin().0, &bound_to).to_hex_string(),
+                        &bound_to.to_hex_string(),
+                    )
+            },
+        )
+        .await;
+        let (_slot, idle) = installed_slot(&pair);
+        let b_identity = pair.responder.desc.identity.address_hash.to_hex_string();
+        let b_instance = pair.responder.desc.address_hash.to_hex_string();
+        let bound = destination_address(&pair.responder.origin().0, &bound_to).to_hex_string();
+        let trust_path = mesh_config_dir(&pair.config_dir_a()).join("trust.yaml");
+
+        // B's announce is the inbound event: the record is marked and the owner hears
+        // the one error line for it.
+        pair.introduce_b_to_a().await;
+        wait_until("the collision line to surface", || {
+            !idle.0.lock().is_empty()
+        })
+        .await;
+        {
+            let notes = idle.0.lock();
+            assert_eq!(notes.len(), 1, "{notes:#?}");
+            assert!(notes[0].text.starts_with("error: "), "{}", notes[0].text);
+            assert!(
+                notes[0].text.contains("is refused when it asks"),
+                "{}",
+                notes[0].text
+            );
+        }
+        let marked = pair
+            .node_a
+            .trust()
+            .records()
+            .into_iter()
+            .find(|record| record.hash == bound)
+            .unwrap();
+        assert_eq!(
+            marked.key_changed.map(|mark| mark.seen_identity),
+            Some(b_identity.clone())
+        );
+        let after_mark = fs::read(&trust_path).unwrap();
+
+        // The label every listing surface reports for B's row is the served verdict …
+        let b_row = pair.node_a.peers().get(&b_instance).unwrap();
+        let trust = pair.node_a.trust();
+        assert_eq!(
+            trust.served_verdict(&b_row),
+            crate::mesh::trust::Verdict {
+                decision: crate::mesh::trust::Decision::Refuse,
+                rule: Rule::IdentityChanged,
+            }
+        );
+        // … while the grant alone, which gates what A sends, still allows B.
+        assert_eq!(
+            trust.authorize(&b_identity, &b_instance).decision,
+            crate::mesh::trust::Decision::Allow
+        );
+
+        let seen_before = pair.recorder_b.seen_count();
+        let outcome = pair
+            .node_a
+            .request_status_with(&pair.responder.desc, short_options())
+            .await;
+
+        assert!(
+            pair.recorder_b.seen_count() > seen_before,
+            "A's /status request never reached B: {outcome:?}"
+        );
+        let seen = pair.recorder_b.last();
+        assert_eq!(seen.path_hash, PathHash::of(STATUS_PATH));
+        assert_eq!(
+            seen.identity.map(|hash| hash.to_hex_string()),
+            Some(pair.a_desc.identity.address_hash.to_hex_string()),
+            "A asked as itself"
+        );
+        assert_eq!(
+            fs::read(&trust_path).unwrap(),
+            after_mark,
+            "sending rewrites no trust record"
+        );
+        assert_eq!(idle.0.lock().len(), 1, "{:#?}", idle.0.lock());
+        pair.stop_node_a().await;
+    }
+
+    /// A trusted instance asking `/status` without any collision is the hot path: the card
+    /// is served, `trust.yaml` is not rewritten (not even with identical bytes) and the
+    /// human hears nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_a_non_colliding_allow_writes_no_trust_file_and_says_nothing() {
+        let pair = NodePair::start_with("r3-probe-allow-no-write", |_| {}, trusting_b).await;
+        let (_slot, idle) = installed_slot(&pair);
+        let trust_path = mesh_config_dir(&pair.config_dir_a()).join("trust.yaml");
+        let before = fs::metadata(&trust_path).unwrap().modified().unwrap();
+        let before_bytes = fs::read(&trust_path).unwrap();
+        // A coarse clock still separates a rewrite from the start's own write.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let card = pair.status_of_a(&pair.responder.identity, Value::Nil).await;
+        assert_eq!(card.display_name, None, "a card came back");
+        let card = pair.status_of_a(&pair.responder.identity, Value::Nil).await;
+        assert_eq!(card.display_name, None, "a card came back");
+
+        assert_eq!(
+            fs::metadata(&trust_path).unwrap().modified().unwrap(),
+            before,
+            "a served request over a clean record rewrites nothing"
+        );
+        assert_eq!(fs::read(&trust_path).unwrap(), before_bytes);
+        assert!(idle.0.lock().is_empty(), "{:#?}", idle.0.lock());
+        assert!(
+            pair.node_a
+                .trust()
+                .records()
+                .iter()
+                .all(|record| record.key_changed.is_none())
+        );
+        pair.stop_node_a().await;
+    }
+
+    /// The whole served-collision flow for an identity trusted for all destinations with
+    /// protection off: B's announce marks the bound record and warns once; B's `/status`
+    /// is served and neither re-marks nor warns again (first wins); the human trusts B's
+    /// new destination, which is the one action that clears the mark; B's next `/status` is
+    /// served over a record B now holds, so nothing is marked or said.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_trusting_the_new_destination_after_a_served_collision_clears_and_stays_quiet()
+     {
+        install_log_collector();
+        let bound_to = TransportIdentity::new_from_rand(OsRng)
+            .as_identity()
+            .address_hash;
+        let pair = NodePair::start_with(
+            "r3-probe-served-then-trust",
+            |_| {},
+            |responder| {
+                TrustList::default()
+                    .identity(&responder.desc.identity.address_hash.to_hex_string(), true)
+                    .destination(
+                        &destination_address(&responder.origin().0, &bound_to).to_hex_string(),
+                        &bound_to.to_hex_string(),
+                    )
+            },
+        )
+        .await;
+        let (slot, idle) = installed_slot(&pair);
+        let b_identity = pair.responder.desc.identity.address_hash.to_hex_string();
+        let b_instance = pair.responder.desc.address_hash.to_hex_string();
+        let bound = destination_address(&pair.responder.origin().0, &bound_to).to_hex_string();
+        let trust_path = mesh_config_dir(&pair.config_dir_a()).join("trust.yaml");
+        let record = |hash: &str| {
+            pair.node_a
+                .trust()
+                .records()
+                .into_iter()
+                .find(|record| record.hash == hash)
+        };
+
+        // The announce path marks and warns.
+        pair.introduce_b_to_a().await;
+        wait_until("the announce to mark the bound record", || {
+            record(&bound).unwrap().key_changed.is_some()
+        })
+        .await;
+        wait_until("the warning to surface", || !idle.0.lock().is_empty()).await;
+        assert_eq!(idle.0.lock().len(), 1, "{:#?}", idle.0.lock());
+        assert!(idle.0.lock()[0].text.starts_with("warning: "));
+        let marked_at = fs::metadata(&trust_path).unwrap().modified().unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        // The link path serves the already-marked collision without a second mark or line.
+        let card = pair.status_of_a(&pair.responder.identity, Value::Nil).await;
+        assert_eq!(card.display_name, None, "a card came back");
+        assert_debug_logged(": served: IdentityTrusted");
+        assert_eq!(
+            record(&bound).unwrap().key_changed.map(|m| m.seen_identity),
+            Some(b_identity.clone())
+        );
+        assert_eq!(
+            fs::metadata(&trust_path).unwrap().modified().unwrap(),
+            marked_at,
+            "a standing mark is not written again"
+        );
+        assert_eq!(idle.0.lock().len(), 1, "first wins: {:#?}", idle.0.lock());
+
+        // Trusting the new destination is the one clearing action.
+        let granted = pair
+            .node_a
+            .trust()
+            .trust_destination(
+                slot.as_ref(),
+                &b_instance,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        assert_eq!(granted.identity_hash, b_identity);
+        assert_eq!(
+            granted
+                .superseded
+                .iter()
+                .map(|conflict| conflict.destination_hash.clone())
+                .collect::<Vec<_>>(),
+            vec![bound.clone()],
+            "the grant names the record it supersedes even though B is trusted for all"
+        );
+        assert!(record(&bound).unwrap().key_changed.is_none(), "cleared");
+        assert_eq!(
+            record(&bound).unwrap().identity.as_deref(),
+            Some(bound_to.to_hex_string().as_str()),
+            "the old grant still belongs to the old key"
+        );
+
+        // B now holds the instance: served by its destination, nothing marked, nothing said.
+        let card = pair.status_of_a(&pair.responder.identity, Value::Nil).await;
+        assert_eq!(card.display_name, None, "a card came back");
+        assert_debug_logged(": served: DestinationTrusted");
+        assert!(record(&bound).unwrap().key_changed.is_none());
+        assert!(record(&b_instance).unwrap().key_changed.is_none());
+        assert_eq!(idle.0.lock().len(), 1, "{:#?}", idle.0.lock());
+        pair.stop_node_a().await;
+    }
+
+    /// Under protection B's announce marks the bound record and surfaces the one error,
+    /// whose advice names the holder and the clearing trust; the refusal that follows
+    /// files no knock (the knock cache stays empty) and neither re-marks nor re-surfaces.
+    /// The same identity trusted for the new destination explicitly is then served in
+    /// protected mode.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_protected_refusal_files_no_knock_and_a_destination_allow_lifts_it() {
+        install_log_collector();
+        let bound_to = TransportIdentity::new_from_rand(OsRng)
+            .as_identity()
+            .address_hash;
+        let pair = NodePair::start_with(
+            "r3-probe-protected-knockless",
+            |config| config.collision_protection = true,
+            |responder| {
+                TrustList::default()
+                    .identity(&responder.desc.identity.address_hash.to_hex_string(), true)
+                    .destination(
+                        &destination_address(&responder.origin().0, &bound_to).to_hex_string(),
+                        &bound_to.to_hex_string(),
+                    )
+            },
+        )
+        .await;
+        let (slot, idle) = installed_slot(&pair);
+        pair.introduce_b_to_a().await;
+        let b_identity = pair.responder.desc.identity.address_hash.to_hex_string();
+        let b_instance = pair.responder.desc.address_hash.to_hex_string();
+        let bound = destination_address(&pair.responder.origin().0, &bound_to).to_hex_string();
+
+        let err = pair
+            .client_b
+            .request(
+                &pair.responder.transport,
+                &pair.responder.identity,
+                &pair.a_desc,
+                STATUS_PATH,
+                pair.responder.envelope(Value::Nil),
+                short_options(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err, R3Error::Refused(RefusalCode::NoAccess));
+        assert_debug_logged(": refused: IdentityChanged");
+        assert!(
+            pair.node_a
+                .knock_gate()
+                .cache()
+                .list(SystemTime::now())
+                .unwrap()
+                .is_empty(),
+            "no knock is filed for a collision"
+        );
+        wait_until("the error to surface", || !idle.0.lock().is_empty()).await;
+        {
+            let notes = idle.0.lock();
+            assert_eq!(notes.len(), 1, "{notes:#?}");
+            let text = &notes[0].text;
+            assert!(text.starts_with("error: "), "{text}");
+            assert!(text.contains(&b_identity), "names the peer: {text}");
+            assert!(
+                text.contains(&bound_to.to_hex_string()),
+                "names the bound identity: {text}"
+            );
+            assert!(
+                text.contains("holder") && text.contains("out of band"),
+                "advises confirming with the identity's holder: {text}"
+            );
+            assert!(
+                text.contains(&format!(".mesh trust {b_instance}")),
+                "{text}"
+            );
+            assert!(
+                text.contains(&format!(".mesh block {b_identity}")),
+                "{text}"
+            );
+        }
+        let record = |hash: &str| {
+            pair.node_a
+                .trust()
+                .records()
+                .into_iter()
+                .find(|record| record.hash == hash)
+                .unwrap()
+        };
+        assert_eq!(
+            record(&bound).key_changed.map(|m| m.seen_identity),
+            Some(b_identity.clone())
+        );
+
+        // An explicit destination allow admits in protected mode and clears the mark.
+        pair.node_a
+            .trust()
+            .trust_destination(
+                slot.as_ref(),
+                &b_instance,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        assert!(record(&bound).key_changed.is_none());
+        let card = pair.status_of_a(&pair.responder.identity, Value::Nil).await;
+        assert_eq!(card.display_name, None, "a card came back");
+        assert_debug_logged(": served: DestinationTrusted");
+        assert!(record(&bound).key_changed.is_none());
+        assert_eq!(idle.0.lock().len(), 1, "{:#?}", idle.0.lock());
+        pair.stop_node_a().await;
+    }
+
+    /// A known identity (not trusted for all) presenting an instance bound to another
+    /// identity while its own derived destination is on the deny list: deny wins the
+    /// verdict, and the collision is still observed in the Envelope, so the bound record
+    /// is marked and the human told.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_a_denied_requester_over_a_colliding_record_still_marks_it() {
+        install_log_collector();
+        let bound_to = TransportIdentity::new_from_rand(OsRng)
+            .as_identity()
+            .address_hash;
+        let pair = NodePair::start_with(
+            "r3-probe-denied-requester",
+            |_| {},
+            |responder| {
+                TrustList::default()
+                    .identity(&responder.desc.identity.address_hash.to_hex_string(), false)
+                    .deny(&responder.desc.address_hash.to_hex_string())
+                    .destination(
+                        &destination_address(&responder.origin().0, &bound_to).to_hex_string(),
+                        &bound_to.to_hex_string(),
+                    )
+            },
+        )
+        .await;
+        let (_slot, idle) = installed_slot(&pair);
+        let b_identity = pair.responder.desc.identity.address_hash.to_hex_string();
+        let bound = destination_address(&pair.responder.origin().0, &bound_to).to_hex_string();
+
+        let err = pair
+            .client_b
+            .request(
+                &pair.responder.transport,
+                &pair.responder.identity,
+                &pair.a_desc,
+                STATUS_PATH,
+                pair.responder.envelope(Value::Nil),
+                short_options(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err, R3Error::Refused(RefusalCode::NoAccess));
+        assert_debug_logged(": refused: DestinationDenied");
+        let marked = pair
+            .node_a
+            .trust()
+            .records()
+            .into_iter()
+            .find(|record| record.hash == bound)
+            .unwrap();
+        assert_eq!(
+            marked.key_changed.map(|mark| mark.seen_identity),
+            Some(b_identity.clone()),
+            "a collision observed in an Envelope marks the bound record whatever the verdict"
+        );
+        wait_until("the error to surface", || !idle.0.lock().is_empty()).await;
+        assert_eq!(idle.0.lock().len(), 1, "{:#?}", idle.0.lock());
+        assert!(idle.0.lock()[0].text.starts_with("error: "));
+        pair.stop_node_a().await;
+    }
+
+    /// Usage probe: the rotated peer's *new* key holds no grant at all. Its announce is
+    /// the observation that marks the bound record and earns the owner exactly one error
+    /// naming both keys and advising the out-of-band check; the stranger itself then hears
+    /// nothing when it asks (it is silenced before the collision rung) and files no knock;
+    /// the mark survives that request. The one action that lifts it is the human's trust
+    /// of the recomputed destination, after which the peer is served over a record it now
+    /// holds and nothing more is said.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_a_stranger_announcing_a_bound_instance_marks_once_hears_nothing_and_trust_of_the_new_destination_lifts_it()
+     {
+        install_log_collector();
+        let bound_to = TransportIdentity::new_from_rand(OsRng)
+            .as_identity()
+            .address_hash;
+        let pair = NodePair::start_with(
+            "r3-probe-stranger-over-record",
+            |_| {},
+            |responder| {
+                TrustList::default().destination(
+                    &destination_address(&responder.origin().0, &bound_to).to_hex_string(),
+                    &bound_to.to_hex_string(),
+                )
+            },
+        )
+        .await;
+        let (slot, idle) = installed_slot(&pair);
+        let b_identity = pair.responder.desc.identity.address_hash.to_hex_string();
+        let b_instance = pair.responder.desc.address_hash.to_hex_string();
+        let bound = destination_address(&pair.responder.origin().0, &bound_to).to_hex_string();
+        let record = |hash: &str| {
+            pair.node_a
+                .trust()
+                .records()
+                .into_iter()
+                .find(|record| record.hash == hash)
+                .unwrap()
+        };
+        assert!(record(&bound).key_changed.is_none());
+
+        pair.introduce_b_to_a().await;
+
+        wait_until("the error to surface", || !idle.0.lock().is_empty()).await;
+        {
+            let notes = idle.0.lock();
+            assert_eq!(notes.len(), 1, "{notes:#?}");
+            assert_eq!(notes[0].source, Source::Mesh);
+            assert_eq!(notes[0].origin, Origin::Peer(b_identity[..8].to_string()));
+            let text = &notes[0].text;
+            assert!(text.starts_with("error: "), "{text}");
+            assert!(text.contains(&b_identity), "names the stranger: {text}");
+            assert!(
+                text.contains(&bound_to.to_hex_string()),
+                "names the bound identity: {text}"
+            );
+            assert!(
+                text.contains("holder") && text.contains("out of band"),
+                "advises confirming with the identity's holder: {text}"
+            );
+            assert!(
+                text.contains(&format!(".mesh trust {b_instance}")),
+                "names the clearing trust: {text}"
+            );
+        }
+        assert_eq!(
+            record(&bound).key_changed.map(|mark| mark.seen_identity),
+            Some(b_identity.clone()),
+            "the announce alone marks the bound record"
+        );
+
+        // The stranger asks: silence, no knock, and the mark stands.
+        let err = pair
+            .client_b
+            .request(
+                &pair.responder.transport,
+                &pair.responder.identity,
+                &pair.a_desc,
+                STATUS_PATH,
+                pair.responder.envelope(Value::Nil),
+                short_options(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err, timed_out(STATUS_PATH), "a stranger hears nothing");
+        assert!(
+            pair.node_a
+                .knock_gate()
+                .cache()
+                .list(SystemTime::now())
+                .unwrap()
+                .is_empty(),
+            "an unknown identity never knocks"
+        );
+        assert_eq!(
+            record(&bound).key_changed.map(|mark| mark.seen_identity),
+            Some(b_identity.clone())
+        );
+        assert_eq!(idle.0.lock().len(), 1, "{:#?}", idle.0.lock());
+
+        // The human confirms the rotation by trusting the recomputed destination.
+        let outcome = pair
+            .node_a
+            .trust()
+            .trust_destination(
+                slot.as_ref(),
+                &b_instance,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        assert_eq!(
+            outcome
+                .superseded
+                .iter()
+                .map(|old| old.destination_hash.clone())
+                .collect::<Vec<_>>(),
+            vec![bound.clone()],
+            "the trust names the record it supersedes"
+        );
+        assert!(record(&bound).key_changed.is_none(), "the mark is cleared");
+        let card = pair.status_of_a(&pair.responder.identity, Value::Nil).await;
+        assert_eq!(card.display_name, None, "a card came back");
+        assert_debug_logged(": served: DestinationTrusted");
+        assert!(record(&bound).key_changed.is_none());
+        assert_eq!(idle.0.lock().len(), 1, "{:#?}", idle.0.lock());
+        pair.stop_node_a().await;
+    }
+
+    /// Usage probe: the identity-tier twin of the stranger case. Node A has heard B's
+    /// instance under another identity trusted for all destinations and B's key holds no
+    /// grant: there is no record to mark, so the presence cache is the only witness, and
+    /// the owner gets one error that names both keys and matches what B then gets —
+    /// silence. `trust.yaml` is left byte for byte and the request raises no second line.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_a_stranger_presenting_an_instance_heard_under_an_all_destinations_identity_is_an_error_and_hears_nothing()
+     {
+        install_log_collector();
+        let earlier = TransportIdentity::new_from_rand(OsRng)
+            .as_identity()
+            .address_hash;
+        let pair = NodePair::start_with(
+            "r3-probe-stranger-presence",
+            |_| {},
+            |_| TrustList::default().identity(&earlier.to_hex_string(), true),
+        )
+        .await;
+        let (_slot, idle) = installed_slot(&pair);
+        let b_identity = pair.responder.desc.identity.address_hash.to_hex_string();
+        let name_hash = hex_lower(&pair.responder.origin().0);
+        let earlier_destination = destination_address(&pair.responder.origin().0, &earlier);
+        pair.node_a.peers().observe(
+            PeerSighting {
+                destination_hash: earlier_destination.to_hex_string(),
+                identity_hash: earlier.to_hex_string(),
+                name_hash,
+                display_name: None,
+                protocol_version: MESH_PROTOCOL_VERSION,
+                hops: 1,
+            },
+            SystemTime::now(),
+        );
+        let trust_path = mesh_config_dir(&pair.config_dir_a()).join("trust.yaml");
+        let before = fs::read(&trust_path).unwrap();
+
+        pair.introduce_b_to_a().await;
+
+        wait_until("the error to surface", || !idle.0.lock().is_empty()).await;
+        {
+            let notes = idle.0.lock();
+            assert_eq!(notes.len(), 1, "{notes:#?}");
+            assert_eq!(notes[0].origin, Origin::Peer(b_identity[..8].to_string()));
+            let text = &notes[0].text;
+            assert!(text.starts_with("error: "), "{text}");
+            assert!(text.contains(&earlier.to_hex_string()), "{text}");
+            assert!(text.contains(&b_identity), "{text}");
+            assert!(
+                text.contains("holder") && text.contains("out of band"),
+                "advises confirming with the identity's holder: {text}"
+            );
+        }
+        assert_eq!(fs::read(&trust_path).unwrap(), before);
+        assert!(
+            pair.node_a
+                .trust()
+                .records()
+                .iter()
+                .all(|record| record.key_changed.is_none()),
+            "nothing to mark, nothing marked"
+        );
+
+        let err = pair
+            .client_b
+            .request(
+                &pair.responder.transport,
+                &pair.responder.identity,
+                &pair.a_desc,
+                STATUS_PATH,
+                pair.responder.envelope(Value::Nil),
+                short_options(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err, timed_out(STATUS_PATH), "the line said refused; it is");
+        assert_eq!(idle.0.lock().len(), 1, "{:#?}", idle.0.lock());
+        assert_eq!(fs::read(&trust_path).unwrap(), before);
+        pair.stop_node_a().await;
+    }
+
+    /// Usage probe: a blocked identity's announce over a bound record is the one collision
+    /// that is neither marked nor told — the human has already answered that key. Through
+    /// the started node: B's announce is filed as a peer, the bound record stays clean,
+    /// `trust.yaml` is left byte for byte, the sink hears nothing, and B's request is
+    /// silence.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_a_blocked_identity_announcing_a_bound_instance_marks_nothing_and_is_not_told()
+     {
+        install_log_collector();
+        let bound_to = TransportIdentity::new_from_rand(OsRng)
+            .as_identity()
+            .address_hash;
+        let pair = NodePair::start_with(
+            "r3-probe-blocked-over-record",
+            |_| {},
+            |responder| {
+                TrustList::default()
+                    .destination(
+                        &destination_address(&responder.origin().0, &bound_to).to_hex_string(),
+                        &bound_to.to_hex_string(),
+                    )
+                    .block(&responder.desc.identity.address_hash.to_hex_string())
+            },
+        )
+        .await;
+        let (_slot, idle) = installed_slot(&pair);
+        let bound = destination_address(&pair.responder.origin().0, &bound_to).to_hex_string();
+        let trust_path = mesh_config_dir(&pair.config_dir_a()).join("trust.yaml");
+        let before = fs::read(&trust_path).unwrap();
+
+        pair.introduce_b_to_a().await;
+        let err = pair
+            .client_b
+            .request(
+                &pair.responder.transport,
+                &pair.responder.identity,
+                &pair.a_desc,
+                STATUS_PATH,
+                pair.responder.envelope(Value::Nil),
+                short_options(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            timed_out(STATUS_PATH),
+            "a blocked identity hears nothing"
+        );
+
+        let record = pair
+            .node_a
+            .trust()
+            .records()
+            .into_iter()
+            .find(|record| record.hash == bound)
+            .unwrap();
+        assert!(
+            record.key_changed.is_none(),
+            "a blocked identity marks nothing"
+        );
+        assert_eq!(fs::read(&trust_path).unwrap(), before);
+        assert!(idle.0.lock().is_empty(), "{:#?}", idle.0.lock());
         pair.stop_node_a().await;
     }
 

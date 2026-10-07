@@ -178,28 +178,6 @@ const ENFORCED_BY: &[(&str, &[&str])] = &[
         &["costs_above_the_ceiling_are_refused_before_any_mining"],
     ),
     (
-        "MESH-SEC-014",
-        &[
-            "a_rotated_peer_is_a_stranger_to_its_old_grant",
-            "identity_changed_is_never_an_allow",
-            "a_new_identity_on_a_known_instance_marks_the_record_once_and_notifies_once",
-            "key_change_mark_survives_restart",
-            "explicit_re_trust_clears_the_key_change_mark",
-            "trusting_the_new_destination_clears_the_old_records_mark_and_names_it",
-            "blocking_the_seen_identity_clears_its_marks",
-            "trusting_the_seen_identity_for_all_destinations_clears_its_marks",
-            "a_blocked_identity_marks_nothing",
-            "an_all_destinations_identity_marks_nothing",
-            "an_identity_tier_grants_rotation_is_fail_closed_but_unmarked",
-            "a_denied_record_marks_nothing",
-            "a_standing_identity_knocking_for_a_foreign_instance_marks_the_record_and_is_not_a_knock",
-            "filing_an_announce_marks_a_trusted_record_seen_under_a_new_identity",
-            "rotate_identity_is_refused_while_a_node_holds_the_identity_lock",
-            "a_running_node_holds_the_identity_lock_and_stop_releases_it",
-            "rotate_is_refused_while_another_process_holds_the_identity_lock",
-        ],
-    ),
-    (
         "MESH-SEC-015",
         &[
             "an_unadmitted_peer_cannot_tell_a_served_path_from_an_unknown_one",
@@ -270,6 +248,58 @@ const ENFORCED_BY: &[(&str, &[&str])] = &[
         &[
             "envoy_sources_never_build_a_file_part",
             "the_envoy_never_attaches_a_part_whatever_the_outcome",
+        ],
+    ),
+    (
+        "MESH-SEC-023",
+        &[
+            "a_rotated_peer_is_a_stranger_to_its_old_grant",
+            "identity_changed_is_never_an_allow",
+            "a_new_identity_on_a_known_instance_marks_the_record_once_and_notifies_once",
+            "key_change_mark_survives_restart",
+            "authorize_origin_returns_the_collisions_its_verdict_was_judged_on",
+            "binding_conflicts_reports_a_denied_record_and_an_all_destinations_identity",
+            "note_key_change_marks_every_record_binding_conflicts_reports",
+            "a_denied_record_is_marked_too",
+            "a_blocked_identity_marks_nothing",
+            "re_trusting_the_marked_destination_keeps_its_mark",
+            "blocking_the_seen_identity_keeps_the_mark",
+            "trusting_the_seen_identity_for_all_destinations_keeps_the_mark",
+            "trusting_the_new_destination_clears_the_old_records_mark_and_names_it",
+            "trusting_the_new_destination_clears_the_old_record_even_when_its_identity_is_trusted_for_all",
+            "a_standing_identity_knocking_for_a_foreign_instance_marks_the_record_and_is_not_a_knock",
+            "an_all_destinations_identity_knocking_for_a_foreign_instance_is_trusted_and_marks_the_record",
+            "a_denied_knocker_over_a_foreign_instance_is_denied_and_still_marks_the_record",
+            "filing_an_announce_marks_a_trusted_record_seen_under_a_new_identity",
+            "an_all_destinations_identity_is_served_and_marks_with_a_warning",
+            "collision_protection_refuses_an_all_destinations_identity_over_a_colliding_record",
+            "an_all_destinations_identity_with_a_denied_destination_marks_with_an_error",
+            "a_destination_allow_admits_in_either_collision_protection_mode",
+            "a_stored_message_from_a_trusted_for_all_identity_over_a_colliding_record_is_delivered_with_a_warning",
+            "collision_protection_refuses_a_stored_message_over_a_colliding_record_with_an_error",
+            "usage_probe_a_strangers_stored_message_over_a_colliding_record_is_silent",
+            "a_stored_access_request_from_a_trusted_for_all_identity_over_a_colliding_record_is_filed_with_a_warning",
+            "collision_protection_refuses_a_stored_access_request_over_a_colliding_record_with_an_error",
+            "a_strangers_stored_access_request_over_a_colliding_record_is_silent",
+            "a_non_colliding_stored_access_request_writes_no_trust_file_and_tells_nobody",
+            "a_trusted_for_all_identity_over_a_colliding_record_is_served_its_status_with_one_warning",
+            "collision_protection_refuses_a_trusted_for_all_identity_over_a_colliding_record",
+            "usage_probe_a_non_colliding_allow_writes_no_trust_file_and_says_nothing",
+            "a_denied_requester_over_a_colliding_record_gets_the_collisions_with_its_verdict",
+            "usage_probe_a_denied_requester_over_a_colliding_record_still_marks_it",
+            "an_identity_tier_grants_rotation_is_surfaced_from_the_peer_table_but_unmarked",
+            "a_presence_collision_writes_nothing_and_is_surfaced_once_per_pair",
+            "two_fresh_identities_presenting_the_same_instance_earn_one_presence_line",
+            "a_presence_collision_between_two_all_destinations_identities_is_a_warning",
+            "an_identity_tier_rotation_heard_by_a_started_node_is_warned_about_and_writes_nothing",
+            "rotate_identity_is_refused_while_a_node_holds_the_identity_lock",
+            "a_running_node_holds_the_identity_lock_and_stop_releases_it",
+            "rotate_is_refused_while_another_process_holds_the_identity_lock",
+            "peers_names_the_heard_successor_of_a_marked_record_whose_row_aged_out",
+            "peers_names_the_heard_successor_of_a_denied_record_whose_row_aged_out",
+            "peers_labels_a_colliding_trusted_for_all_row_as_refused_under_protection",
+            "info_labels_a_colliding_trusted_for_all_row_by_the_verdict_it_is_served",
+            "peers_labels_a_colliding_trusted_for_all_row_by_the_verdict_it_is_served",
         ],
     ),
     ("MESH-INV-001", &["mesh_module_never_names_the_request_ctx"]),
@@ -660,6 +690,8 @@ const COVERAGE_HEADING: &str = "## 20. Conformance coverage";
 const FAMILY_TABLE_HEADER: &str = "| Family | Executed by |\n|---|---|";
 const COVERAGE_TABLE_HEADER: &str = "| Requirement | Vectors and tests |\n|---|---|";
 const NO_VECTOR: &str = "no vector yet";
+/// What section 14 puts in place of a retired requirement's body and in its index entry.
+const RETIRED: &str = "[RETIRED]";
 
 fn all_listed() -> Vec<Listed> {
     let mut listed = vectors::listed();
@@ -692,19 +724,39 @@ fn spec_ids() -> Vec<String> {
         .expect("the spec index parses")
 }
 
-/// The spec ids with neither a vector in `all_listed` nor a test in `ENFORCED_BY`.
+/// The spec ids whose definition is followed by the `RETIRED` marker, `**[id]** [RETIRED]`,
+/// wherever on its line the definition sits (a table row opens with `|`): they keep their
+/// number and index entry and nothing covers them. A line that merely mentions the marker
+/// away from the definition retires nothing.
+fn retired_ids() -> std::collections::BTreeSet<String> {
+    let spec = crate::mesh::spec_pins::SPEC;
+    spec_ids()
+        .into_iter()
+        .filter(|id| {
+            let opener = format!("**[{id}]** {RETIRED}");
+            spec.lines().any(|line| line.contains(&opener))
+        })
+        .collect()
+}
+
+/// The spec ids, retired ones aside, with neither a vector in `all_listed` nor a test in
+/// `ENFORCED_BY`.
 fn uncovered_ids() -> std::collections::BTreeSet<String> {
     let covered: std::collections::BTreeSet<&str> =
         all_listed().iter().map(|listed| listed.id).collect();
+    let retired = retired_ids();
     spec_ids()
         .into_iter()
-        .filter(|id| !covered.contains(id.as_str()) && enforced_by(id).is_empty())
+        .filter(|id| {
+            !retired.contains(id) && !covered.contains(id.as_str()) && enforced_by(id).is_empty()
+        })
         .collect()
 }
 
 /// The section 20 tables: one row per vector family in name order naming the tests of
 /// `EXECUTED_BY` that run it, then one row per requirement id in index order naming each
-/// vector family with the kinds it feeds and the tests of `ENFORCED_BY`, or `no vector yet`.
+/// vector family with the kinds it feeds and the tests of `ENFORCED_BY`, or `no vector yet`,
+/// or `[RETIRED]` for a retired id.
 fn coverage_table() -> String {
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -727,6 +779,7 @@ fn coverage_table() -> String {
     }
     table.push_str("\n\n");
     table.push_str(COVERAGE_TABLE_HEADER);
+    let retired = retired_ids();
     for id in spec_ids() {
         let mut cells: Vec<String> = families
             .remove(id.as_str())
@@ -734,7 +787,9 @@ fn coverage_table() -> String {
             .into_iter()
             .collect();
         cells.extend(enforced_by(&id).iter().map(|test| format!("`{test}`")));
-        let coverage = if cells.is_empty() {
+        let coverage = if retired.contains(&id) {
+            RETIRED.to_string()
+        } else if cells.is_empty() {
             NO_VECTOR.to_string()
         } else {
             cells.join(", ")
@@ -747,8 +802,8 @@ fn coverage_table() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        COVERAGE_HEADING, ENFORCED_BY, EXECUTED_BY, Kind, NO_VECTOR, all_listed, coverage_table,
-        spec_ids, uncovered_ids,
+        COVERAGE_HEADING, ENFORCED_BY, EXECUTED_BY, Kind, NO_VECTOR, RETIRED, all_listed,
+        coverage_table, retired_ids, spec_ids, uncovered_ids,
     };
     use crate::mesh::r3::{
         ACCESS_PATH, FETCH_PATH, KNOCK_PATH, LIST_PATH, MESSAGE_PATH, STATUS_PATH,
@@ -1147,18 +1202,22 @@ mod tests {
     }
 
     fn required_ids_from_the_spec() -> BTreeSet<String> {
-        let mut required: BTreeSet<String> = spec_ids()
+        spec_ids()
             .into_iter()
             .filter(|id| FULLY_COVERED_AREAS.contains(&area(id)))
-            .collect();
-        for line in table_rows().filter(|line| is_catch_all_row(line)) {
-            for id in ids_on(line) {
-                if CATCH_ALL_AREAS.contains(&area(id)) {
-                    required.insert(id.to_string());
-                }
-            }
-        }
-        required
+            .chain(catch_all_row_ids())
+            .collect()
+    }
+
+    /// The ids a catch-all row cites from a catch-all area: the second source of
+    /// `REQUIRED_IDS`, next to the fully covered areas.
+    fn catch_all_row_ids() -> BTreeSet<String> {
+        table_rows()
+            .filter(|line| is_catch_all_row(line))
+            .flat_map(ids_on)
+            .filter(|id| CATCH_ALL_AREAS.contains(&area(id)))
+            .map(str::to_string)
+            .collect()
     }
 
     fn table_rows() -> impl Iterator<Item = &'static str> {
@@ -1224,6 +1283,22 @@ mod tests {
         assert!(derived.iter().all(|id| {
             FULLY_COVERED_AREAS.contains(&area(id)) || CATCH_ALL_AREAS.contains(&area(id))
         }));
+    }
+
+    #[test]
+    fn no_retired_id_lies_in_a_fully_covered_area() {
+        let cited_by_a_catch_all_row = catch_all_row_ids();
+        let retired: Vec<String> = retired_ids()
+            .into_iter()
+            .filter(|id| {
+                FULLY_COVERED_AREAS.contains(&area(id)) || cited_by_a_catch_all_row.contains(id)
+            })
+            .collect();
+        assert_eq!(
+            retired,
+            Vec::<String>::new(),
+            "every id in a fully covered area or cited by a catch-all row needs a vector (the minimum-coverage rule behind REQUIRED_IDS); retire by rewording in place rather than marking the id retired"
+        );
     }
 
     #[test]
@@ -1308,10 +1383,70 @@ mod tests {
     }
 
     #[test]
+    fn retired_ids_are_exactly_the_ones_section_14_has_retired() {
+        let retired: Vec<String> = retired_ids().into_iter().collect();
+        assert_eq!(retired, vec!["MESH-SEC-014".to_string()]);
+
+        let index = SPEC
+            .split_once("\n## 21. Requirements index\n")
+            .expect("the spec has a requirements index")
+            .1;
+        let marked_in_index: BTreeSet<String> = index
+            .lines()
+            .filter(|line| line.contains(RETIRED))
+            .map(|line| {
+                line.strip_prefix("- [")
+                    .and_then(|rest| rest.split_once("]("))
+                    .map(|(id, _)| id.to_string())
+                    .unwrap_or_else(|| panic!("index line marked retired is not an entry: {line}"))
+            })
+            .collect();
+        assert_eq!(
+            marked_in_index,
+            retired_ids(),
+            "the index marks [RETIRED] exactly the ids whose definition is retired"
+        );
+    }
+
+    /// A retired id has no vector, is not required to have one and is enforced by no named
+    /// test: `coverage_table` reads it as retired before it looks for any of those.
+    #[test]
+    fn a_retired_id_has_no_vector_and_is_neither_required_nor_enforced() {
+        let retired = retired_ids();
+        let listed: BTreeSet<&str> = all_listed()
+            .iter()
+            .map(|listed| listed.id)
+            .filter(|id| retired.contains(*id))
+            .collect();
+        assert_eq!(listed, BTreeSet::new(), "a vector names a retired id");
+        let required: Vec<&str> = REQUIRED_IDS
+            .iter()
+            .copied()
+            .filter(|id| retired.contains(*id))
+            .collect();
+        assert_eq!(
+            required,
+            Vec::<&str>::new(),
+            "REQUIRED_IDS names a retired id"
+        );
+        let enforced: Vec<&str> = ENFORCED_BY
+            .iter()
+            .map(|(id, _)| *id)
+            .filter(|id| retired.contains(*id))
+            .collect();
+        assert_eq!(
+            enforced,
+            Vec::<&str>::new(),
+            "ENFORCED_BY names a retired id"
+        );
+    }
+
+    #[test]
     fn enforced_by_covers_exactly_the_ids_that_have_no_vector_by_design() {
+        let retired = retired_ids();
         let by_design: BTreeSet<String> = spec_ids()
             .into_iter()
-            .filter(|id| ["SEC", "INV", "LOG", "LEN"].contains(&area(id)))
+            .filter(|id| ["SEC", "INV", "LOG", "LEN"].contains(&area(id)) && !retired.contains(id))
             .collect();
         let keys: Vec<String> = ENFORCED_BY.iter().map(|(id, _)| id.to_string()).collect();
         let unique: BTreeSet<String> = keys.iter().cloned().collect();

@@ -283,7 +283,7 @@ pub(crate) mod test_support {
     #[cfg(unix)]
     use super::node::{MeshRuntime, NodeOptions};
     #[cfg(unix)]
-    pub(crate) use super::peers::PeerSighting;
+    pub(crate) use super::peers::{PEER_TTL, PeerSighting};
     pub(crate) use super::propagation::PropagationNode;
     #[cfg(unix)]
     use super::propagation::pn_announce_app_data;

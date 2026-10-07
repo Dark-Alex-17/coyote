@@ -5,7 +5,9 @@ use crate::mesh::r3::error::RefusalCode;
 use crate::mesh::r3::frame::{Envelope, EnvelopeError, PathHash, RequestId};
 use crate::mesh::r3::server::{Admission, InboundRequest, Reply, RequestHandler};
 use crate::mesh::r3::short;
-use crate::mesh::trust::{Decision, IdentityStanding, Rule, TrustStore};
+use crate::mesh::trust::{
+    BindingConflict, Decision, IdentityStanding, KeyChangeOutcome, OriginVerdict, Rule, TrustStore,
+};
 
 use async_trait::async_trait;
 use parking_lot::RwLock;
@@ -247,13 +249,21 @@ impl Dispatcher {
         Ok(displaced)
     }
 
-    /// Answers a verdict the store refused under `rule`. A default-closed refusal knocks
-    /// first, since nobody has trusted the instance yet. A blocked identity hears nothing,
-    /// as it would have from `admit`: the block may have landed after `handle` read its
-    /// standing, and the refusal taxonomy promises blocked peers silence either way. An
-    /// identity naming an instance bound to another identity does not knock: the store's
-    /// key-change line to the human replaces the knock.
-    pub(super) fn refusal(&self, rule: Rule, knock: KnockEvent, log: &dyn Fn(&str, &str)) -> Reply {
+    /// Answers a verdict the store refused under `rule`, `collisions` being the records the
+    /// origin re-derives under another identity. A default-closed refusal knocks first,
+    /// since nobody has trusted the instance yet. A blocked identity hears nothing, as it
+    /// would have from `admit`: the block may have landed after `handle` read its standing,
+    /// and the refusal taxonomy promises blocked peers silence either way. An identity
+    /// naming an instance bound to another identity does not knock: the store's key-change
+    /// error to the human replaces the knock. A denied requester over a colliding record is
+    /// refused for the deny and still marks the record: the human is told in every case.
+    pub(super) fn refusal(
+        &self,
+        rule: Rule,
+        collisions: &[BindingConflict],
+        knock: KnockEvent,
+        log: &dyn Fn(&str, &str),
+    ) -> Reply {
         let id8 = short(&knock.identity_hash).to_string();
         match rule {
             Rule::IdentityBlocked => {
@@ -265,13 +275,16 @@ impl Dispatcher {
                 log(&id8, &format!("refused: {rule:?} (knocked)"));
                 self.refuse()
             }
-            Rule::IdentityChanged => {
+            Rule::IdentityChanged | Rule::DestinationDenied => {
                 log(&id8, &format!("refused: {rule:?}"));
-                self.trust.note_key_change(
-                    &knock.identity_hash,
-                    &knock.name_hash,
-                    SystemTime::now(),
-                );
+                if !collisions.is_empty() {
+                    self.trust.note_key_change(
+                        &knock.identity_hash,
+                        &knock.name_hash,
+                        KeyChangeOutcome::Refused,
+                        SystemTime::now(),
+                    );
+                }
                 self.refuse()
             }
             _ => {
@@ -351,7 +364,11 @@ impl RequestHandler for Dispatcher {
                 return self.refuse();
             }
         };
-        let (verdict, destination_hash) = self
+        let OriginVerdict {
+            verdict,
+            destination: destination_hash,
+            collisions,
+        } = self
             .trust
             .authorize_origin(&identity.address_hash, &envelope.origin.0);
         let rule = verdict.rule;
@@ -360,6 +377,7 @@ impl RequestHandler for Dispatcher {
                 let data = (request.path_hash == PathHash::of(KNOCK_PATH)).then_some(envelope.body);
                 self.refusal(
                     rule,
+                    &collisions,
                     KnockEvent {
                         identity_hash: identity_hex,
                         destination_hash: destination_hash.to_hex_string(),
@@ -372,6 +390,19 @@ impl RequestHandler for Dispatcher {
                 )
             }
             Decision::Allow => {
+                // Only an identity trusted for all destinations can be admitted over a
+                // colliding record; the human hears of it as a warning, the record is
+                // marked, and the request is served all the same. The peer-table check for
+                // an identity with no colliding record is the announce path's; a served
+                // request does not pay for it.
+                if !collisions.is_empty() {
+                    self.trust.note_key_change(
+                        &identity_hex,
+                        &hex_lower(&envelope.origin.0),
+                        KeyChangeOutcome::Served,
+                        SystemTime::now(),
+                    );
+                }
                 let route = self
                     .routes
                     .read()
@@ -400,7 +431,12 @@ impl RequestHandler for Dispatcher {
                         )
                     }
                     Some(Route::Provided(handler)) => {
-                        log(short(&identity_hex), &format!("served: {rule:?}"));
+                        let over = if collisions.is_empty() {
+                            ""
+                        } else {
+                            " (over a colliding record)"
+                        };
+                        log(short(&identity_hex), &format!("served: {rule:?}{over}"));
                         handler
                             .handle(AdmittedRequest {
                                 link_id,

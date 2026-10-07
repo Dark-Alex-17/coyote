@@ -2230,8 +2230,16 @@ fn authorize(list: TrustList) -> Verdict {
 /// `TrustStore::authorize_origin` for a fresh identity naming `ORIGIN` while a second fresh
 /// identity holds the destination `ORIGIN` derives under it. `list` receives the requester's
 /// identity and the destination `ORIGIN` derives under it, then the holder's identity and
-/// destination.
+/// destination. Collision protection is off.
 fn authorize_rotated_origin(list: fn(&str, &str, &str, &str) -> TrustList) -> Verdict {
+    authorize_rotated_origin_with(false, list)
+}
+
+/// `authorize_rotated_origin` with `mesh.collision_protection` set to `protection`.
+fn authorize_rotated_origin_with(
+    protection: bool,
+    list: fn(&str, &str, &str, &str) -> TrustList,
+) -> Verdict {
     let identity = PrivateIdentity::new_from_rand(OsRng)
         .as_identity()
         .address_hash;
@@ -2247,7 +2255,8 @@ fn authorize_rotated_origin(list: fn(&str, &str, &str, &str) -> TrustList) -> Ve
         &held,
     )
     .open("conformance-env");
-    store.authorize_origin(&identity, &ORIGIN).0
+    store.set_collision_protection(protection);
+    store.authorize_origin(&identity, &ORIGIN).verdict
 }
 
 const IDENTITY: &str = "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a";
@@ -2482,16 +2491,38 @@ fn custom_vectors() -> Vec<Vector> {
                 verdict(Decision::Refuse, Rule::IdentityChanged),
             )
         }),
-        custom("MESH-ENV-039", Kind::Invalid, || {
+        custom("MESH-ENV-039", Kind::Valid, || {
             same(
-                "denied held record is default closed",
+                "denied held record is identity changed",
                 authorize_rotated_origin(|identity, _, holder, held| {
                     TrustList::default()
                         .identity(identity, false)
                         .deny(held)
                         .destination(held, holder)
                 }),
-                verdict(Decision::Refuse, Rule::DefaultClosed),
+                verdict(Decision::Refuse, Rule::IdentityChanged),
+            )
+        }),
+        custom("MESH-ENV-039", Kind::Valid, || {
+            same(
+                "identity changed over identity allow under collision protection",
+                authorize_rotated_origin_with(true, |identity, _, holder, held| {
+                    TrustList::default()
+                        .identity(identity, true)
+                        .destination(held, holder)
+                }),
+                verdict(Decision::Refuse, Rule::IdentityChanged),
+            )
+        }),
+        custom("MESH-ENV-039", Kind::Valid, || {
+            same(
+                "destination allow over identity changed under collision protection",
+                authorize_rotated_origin_with(true, |identity, derived, holder, held| {
+                    TrustList::default()
+                        .destination(derived, identity)
+                        .destination(held, holder)
+                }),
+                verdict(Decision::Allow, Rule::DestinationTrusted),
             )
         }),
         custom("MESH-ENV-044", Kind::Valid, || {

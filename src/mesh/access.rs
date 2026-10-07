@@ -39,10 +39,12 @@ use crate::mesh::r3::{
 };
 use crate::mesh::shares::PeerRef;
 use crate::mesh::shares::{Mutation, ShareSet, WriteScope};
-use crate::mesh::trust::{Decision, TrustStore, same_hash};
+use crate::mesh::trust::{
+    Decision, IdentityStanding, KeyChangeOutcome, OriginVerdict, TrustStore, same_hash,
+};
 use crate::mesh::wire_path::WirePath;
 use crate::mesh::{
-    canonicalize, destination_address, display_text, human_size, redact_hashes, rfc3339_utc, short,
+    canonicalize, display_text, hex_lower, human_size, redact_hashes, rfc3339_utc, short,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -948,14 +950,35 @@ impl InboundSink for AccessRouting<'_> {
             debug!("Propagated access request from {id8} dropped: the signer's hash is malformed");
             return;
         };
-        let source_destination = destination_address(&name_hash, &identity).to_hex_string();
+        let standing = match self.trust.identity_standing(&message.source_identity_hash) {
+            IdentityStanding::Trusted { .. } => None,
+            IdentityStanding::Unknown => Some("unknown"),
+            IdentityStanding::Blocked => Some("blocked"),
+        };
+        if let Some(standing) = standing {
+            debug!("Propagated access request from {id8} dropped: {standing} identity");
+            return;
+        }
+        let OriginVerdict {
+            verdict,
+            destination,
+            collisions,
+        } = self.trust.authorize_origin(&identity, &name_hash);
+        let source_destination = destination.to_hex_string();
         let dest8 = short(&source_destination).to_string();
-        if self
-            .trust
-            .authorize(&message.source_identity_hash, &source_destination)
-            .decision
-            != Decision::Allow
-        {
+        if !collisions.is_empty() {
+            let outcome = match verdict.decision {
+                Decision::Allow => KeyChangeOutcome::Served,
+                Decision::Refuse => KeyChangeOutcome::Refused,
+            };
+            self.trust.note_key_change(
+                &message.source_identity_hash,
+                &hex_lower(&name_hash),
+                outcome,
+                SystemTime::now(),
+            );
+        }
+        if verdict.decision != Decision::Allow {
             debug!("Propagated access request from {id8} dropped: instance {dest8} is not trusted");
             return;
         }
@@ -1480,11 +1503,11 @@ fn path_state(root: Option<&Path>, path: &str) -> String {
 mod tests {
     use super::*;
     use crate::hooks::HookEvent;
+    use crate::mesh::destination_address;
     use crate::mesh::events::{RecordingHookSink, env_value};
     use crate::mesh::grants::GRANT_MAX_PATHS;
-    use crate::mesh::hex_lower;
     use crate::mesh::idle::IdleSink;
-    use crate::mesh::knock::{KnockIntro, knock_message};
+    use crate::mesh::knock::{KnockIntro, KnockSurface, RecordingSurface, knock_message};
     use crate::mesh::message::{
         Part, PeerMessage, RawPeerMessage, from_r3_body, peer_lxmf_message, to_r3_body,
     };
@@ -3875,6 +3898,466 @@ mod tests {
         assert_eq!(refusing.admissions(), 1);
         assert!(refusing.settled.lock().is_empty());
         assert_eq!(inner.count(), 0);
+    }
+
+    /// A trust list holding `identity()` for all destinations and binding `origin` to
+    /// another identity, with a key-change recorder attached; the store's protection flag
+    /// is left at its default. Returns the bound destination too.
+    fn colliding_routing(
+        tag: &str,
+        origin: &OriginName,
+    ) -> (Arc<TrustStore>, Arc<RecordingSurface>, String, TempDir) {
+        let bound_to = hex_lower(&[0xcd; 16]);
+        let bound = destination_address(
+            &origin.0,
+            &AddressHash::new_from_hex_string(&bound_to).unwrap(),
+        )
+        .to_hex_string();
+        let (trust, tmp) = TrustList::default()
+            .identity(&identity(), true)
+            .destination(&bound, &bound_to)
+            .open(tag);
+        let notes = Arc::new(RecordingSurface::default());
+        trust.attach_surface(Arc::downgrade(&notes) as Weak<dyn KnockSurface>);
+        (trust, notes, bound, tmp)
+    }
+
+    fn mark_on(trust: &TrustStore, bound: &str) -> Option<String> {
+        trust
+            .records()
+            .into_iter()
+            .find(|record| record.hash == bound)
+            .and_then(|record| record.key_changed)
+            .map(|mark| mark.seen_identity)
+    }
+
+    /// Routes a stored `a-1` request for `src/x.rs` signed by `identity()` from `origin`
+    /// into a surface that holds it, and returns that surface and the inner sink.
+    fn deliver_stored(
+        trust: &TrustStore,
+        origin: &OriginName,
+    ) -> (Arc<ScriptedSurface>, CountingSink) {
+        let request = validate_access("a-1", strings(&["src/x.rs"]), "please").unwrap();
+        let surface = ScriptedSurface::answering(AccessOutcome::Pending);
+        let inner = CountingSink::default();
+        AccessRouting {
+            trust,
+            surface: Some(Arc::clone(&surface) as Arc<dyn AccessSurface>),
+            inner: &inner,
+        }
+        .deliver(fetched(&access_message(&request, origin), &identity()));
+        (surface, inner)
+    }
+
+    /// A stored access request from an identity trusted for all destinations, naming an
+    /// instance bound to another identity, is judged as its link request would be: with
+    /// collision protection off it is filed, the bound record is marked with the sender
+    /// as the identity seen, and the human gets one warning.
+    #[test]
+    fn a_stored_access_request_from_a_trusted_for_all_identity_over_a_colliding_record_is_filed_with_a_warning()
+     {
+        let origin = OriginName([9u8; NAME_HASH_LEN]);
+        let (trust, notes, bound, _tmp) =
+            colliding_routing("access-route-collision-served", &origin);
+
+        let (surface, inner) = deliver_stored(&trust, &origin);
+
+        let admitted = surface.admitted.lock();
+        assert_eq!(admitted.len(), 1);
+        assert_eq!(admitted[0].identity, identity());
+        assert_eq!(admitted[0].destination, origin_destination(&origin));
+        assert_eq!(admitted[0].via, PeerVia::StoreAndForward);
+        drop(admitted);
+        assert_eq!(inner.count(), 0);
+        assert_eq!(mark_on(&trust, &bound), Some(identity()));
+        let texts = notes.texts();
+        assert_eq!(texts.len(), 1, "{texts:#?}");
+        assert!(texts[0].starts_with("warning: "), "{}", texts[0]);
+        assert!(texts[0].contains("is served"), "{}", texts[0]);
+    }
+
+    /// The same request under collision protection is dropped as any untrusted instance's
+    /// is, the record is marked all the same, and the human gets the error.
+    #[test]
+    fn collision_protection_refuses_a_stored_access_request_over_a_colliding_record_with_an_error()
+    {
+        crate::testing::install_log_collector();
+        let origin = OriginName([10u8; NAME_HASH_LEN]);
+        let (trust, notes, bound, _tmp) =
+            colliding_routing("access-route-collision-refused", &origin);
+        trust.set_collision_protection(true);
+
+        let (surface, inner) = deliver_stored(&trust, &origin);
+
+        assert_eq!(surface.admissions(), 0, "admission is never asked");
+        assert_eq!(inner.count(), 0);
+        let expected = format!(
+            "Propagated access request from {} dropped: instance {} is not trusted",
+            &identity()[..8],
+            &origin_destination(&origin)[..8]
+        );
+        let logs = crate::testing::debug_snapshot();
+        assert!(logs.contains(&expected), "{logs:#?}");
+        assert_eq!(mark_on(&trust, &bound), Some(identity()));
+        let texts = notes.texts();
+        assert_eq!(texts.len(), 1, "{texts:#?}");
+        assert!(texts[0].starts_with("error: "), "{}", texts[0]);
+        assert!(texts[0].contains("is refused"), "{}", texts[0]);
+    }
+
+    /// A stranger (no record at all) is silenced before the destination tier: its stored
+    /// access request over a colliding record is dropped in either mode, nothing is
+    /// marked, `trust.yaml` keeps its bytes and the human hears nothing.
+    #[test]
+    fn a_strangers_stored_access_request_over_a_colliding_record_is_silent() {
+        for protection in [false, true] {
+            let origin = OriginName([11u8; NAME_HASH_LEN]);
+            let bound_to = hex_lower(&[0xcd; 16]);
+            let bound = destination_address(
+                &origin.0,
+                &AddressHash::new_from_hex_string(&bound_to).unwrap(),
+            )
+            .to_hex_string();
+            let (trust, tmp) = TrustList::default()
+                .destination(&bound, &bound_to)
+                .open("access-route-collision-stranger");
+            trust.set_collision_protection(protection);
+            let notes = Arc::new(RecordingSurface::default());
+            trust.attach_surface(Arc::downgrade(&notes) as Weak<dyn KnockSurface>);
+            let trust_path = crate::mesh::mesh_config_dir(&tmp.path).join("trust.yaml");
+            let before = std::fs::read(&trust_path).unwrap();
+
+            let (surface, inner) = deliver_stored(&trust, &origin);
+
+            assert_eq!(surface.admissions(), 0, "protection {protection}");
+            assert_eq!(inner.count(), 0, "protection {protection}");
+            assert_eq!(mark_on(&trust, &bound), None, "protection {protection}");
+            assert!(
+                notes.texts().is_empty(),
+                "protection {protection}: {:#?}",
+                notes.texts()
+            );
+            assert_eq!(
+                std::fs::read(&trust_path).unwrap(),
+                before,
+                "protection {protection}: trust.yaml untouched"
+            );
+        }
+    }
+
+    /// No collision, no write: a trusted sender whose instance is on no record has its
+    /// request filed, leaves `trust.yaml` byte for byte and surfaces nothing.
+    #[test]
+    fn a_non_colliding_stored_access_request_writes_no_trust_file_and_tells_nobody() {
+        let origin = OriginName([12u8; NAME_HASH_LEN]);
+        let (trust, tmp) = TrustList::default()
+            .identity(&identity(), true)
+            .open("access-route-no-collision");
+        let notes = Arc::new(RecordingSurface::default());
+        trust.attach_surface(Arc::downgrade(&notes) as Weak<dyn KnockSurface>);
+        let trust_path = crate::mesh::mesh_config_dir(&tmp.path).join("trust.yaml");
+        let before = std::fs::read(&trust_path).unwrap();
+
+        let (surface, inner) = deliver_stored(&trust, &origin);
+
+        assert_eq!(surface.admissions(), 1);
+        assert_eq!(inner.count(), 0);
+        assert!(notes.texts().is_empty(), "{:#?}", notes.texts());
+        assert_eq!(
+            std::fs::read(&trust_path).unwrap(),
+            before,
+            "trust.yaml untouched"
+        );
+    }
+
+    /// Usage probe: a blocked identity is silenced at the identity tier, so its stored
+    /// access request over a colliding record is dropped in either mode, nothing is
+    /// marked, `trust.yaml` keeps its bytes and the human hears nothing.
+    #[test]
+    fn usage_probe_a_blocked_identitys_stored_access_request_over_a_colliding_record_is_silent() {
+        crate::testing::install_log_collector();
+        for protection in [false, true] {
+            let origin = OriginName([13u8; NAME_HASH_LEN]);
+            let bound_to = hex_lower(&[0xcd; 16]);
+            let bound = destination_address(
+                &origin.0,
+                &AddressHash::new_from_hex_string(&bound_to).unwrap(),
+            )
+            .to_hex_string();
+            let (trust, tmp) = TrustList::default()
+                .block(&identity())
+                .destination(&bound, &bound_to)
+                .open("access-route-collision-blocked");
+            trust.set_collision_protection(protection);
+            let notes = Arc::new(RecordingSurface::default());
+            trust.attach_surface(Arc::downgrade(&notes) as Weak<dyn KnockSurface>);
+            let trust_path = crate::mesh::mesh_config_dir(&tmp.path).join("trust.yaml");
+            let before = std::fs::read(&trust_path).unwrap();
+
+            let (surface, inner) = deliver_stored(&trust, &origin);
+
+            assert_eq!(surface.admissions(), 0, "protection {protection}");
+            assert_eq!(inner.count(), 0, "protection {protection}");
+            assert_eq!(mark_on(&trust, &bound), None, "protection {protection}");
+            assert!(
+                notes.texts().is_empty(),
+                "protection {protection}: {:#?}",
+                notes.texts()
+            );
+            assert_eq!(
+                std::fs::read(&trust_path).unwrap(),
+                before,
+                "protection {protection}: trust.yaml untouched"
+            );
+        }
+        let logs = crate::testing::debug_snapshot();
+        assert!(
+            logs.contains(&format!(
+                "Propagated access request from {} dropped: blocked identity",
+                &identity()[..8]
+            )),
+            "{logs:#?}"
+        );
+    }
+
+    /// Usage probe: the identity-standing gate must not regress destination-tier senders.
+    /// An identity trusted for its own instance only (no all-destinations grant) still has
+    /// its stored access request filed in either mode, with no mark, no line and no write.
+    #[test]
+    fn usage_probe_a_destination_tier_senders_stored_access_request_for_its_own_instance_is_filed()
+    {
+        for protection in [false, true] {
+            let origin = OriginName([14u8; NAME_HASH_LEN]);
+            let (trust, tmp) = TrustList::default()
+                .destination(&origin_destination(&origin), &identity())
+                .open("access-route-destination-tier-own");
+            trust.set_collision_protection(protection);
+            let notes = Arc::new(RecordingSurface::default());
+            trust.attach_surface(Arc::downgrade(&notes) as Weak<dyn KnockSurface>);
+            let trust_path = crate::mesh::mesh_config_dir(&tmp.path).join("trust.yaml");
+            let before = std::fs::read(&trust_path).unwrap();
+
+            let (surface, inner) = deliver_stored(&trust, &origin);
+
+            let admitted = surface.admitted.lock();
+            assert_eq!(admitted.len(), 1, "protection {protection}");
+            assert_eq!(admitted[0].identity, identity());
+            assert_eq!(admitted[0].destination, origin_destination(&origin));
+            drop(admitted);
+            assert_eq!(inner.count(), 0);
+            assert_eq!(mark_on(&trust, &origin_destination(&origin)), None);
+            assert!(notes.texts().is_empty(), "{:#?}", notes.texts());
+            assert_eq!(std::fs::read(&trust_path).unwrap(), before);
+        }
+    }
+
+    /// Usage probe: an explicit destination allow admits in either mode. With the sender's
+    /// recomputed destination on record (and, under protection, the identity trusted for
+    /// all destinations too) the stored access request over the old colliding record is
+    /// filed, the old record is left unmarked and the human hears nothing.
+    #[test]
+    fn usage_probe_an_explicit_destination_allow_files_a_stored_access_request_in_either_mode() {
+        for (protection, all_destinations) in [(false, false), (true, true), (true, false)] {
+            let origin = OriginName([15u8; NAME_HASH_LEN]);
+            let bound_to = hex_lower(&[0xcd; 16]);
+            let bound = destination_address(
+                &origin.0,
+                &AddressHash::new_from_hex_string(&bound_to).unwrap(),
+            )
+            .to_hex_string();
+            let mut list = TrustList::default();
+            if all_destinations {
+                list = list.identity(&identity(), true);
+            }
+            let (trust, tmp) = list
+                .destination(&bound, &bound_to)
+                .destination(&origin_destination(&origin), &identity())
+                .open("access-route-collision-destination-allow");
+            trust.set_collision_protection(protection);
+            let notes = Arc::new(RecordingSurface::default());
+            trust.attach_surface(Arc::downgrade(&notes) as Weak<dyn KnockSurface>);
+            let trust_path = crate::mesh::mesh_config_dir(&tmp.path).join("trust.yaml");
+            let before = std::fs::read(&trust_path).unwrap();
+
+            let (surface, inner) = deliver_stored(&trust, &origin);
+
+            let tag = format!("protection {protection}, all_destinations {all_destinations}");
+            assert_eq!(surface.admissions(), 1, "{tag}");
+            assert_eq!(inner.count(), 0, "{tag}");
+            assert_eq!(mark_on(&trust, &bound), None, "{tag}: old record unmarked");
+            assert_eq!(
+                mark_on(&trust, &origin_destination(&origin)),
+                None,
+                "{tag}: new record unmarked"
+            );
+            assert!(notes.texts().is_empty(), "{tag}: {:#?}", notes.texts());
+            assert_eq!(std::fs::read(&trust_path).unwrap(), before, "{tag}");
+        }
+    }
+
+    /// Usage probe: the mark is first-wins. A second stored access request from the same
+    /// rotated identity over the already-marked record is filed like the first and the
+    /// human is not told again.
+    #[test]
+    fn usage_probe_a_second_stored_access_request_over_a_marked_record_is_filed_and_warns_no_more()
+    {
+        let origin = OriginName([16u8; NAME_HASH_LEN]);
+        let (trust, notes, bound, tmp) = colliding_routing("access-route-collision-twice", &origin);
+        let trust_path = crate::mesh::mesh_config_dir(&tmp.path).join("trust.yaml");
+
+        let (first, _) = deliver_stored(&trust, &origin);
+        assert_eq!(first.admissions(), 1);
+        assert_eq!(mark_on(&trust, &bound), Some(identity()));
+        let marked = std::fs::read(&trust_path).unwrap();
+
+        let (second, inner) = deliver_stored(&trust, &origin);
+
+        assert_eq!(second.admissions(), 1, "the second request is filed too");
+        assert_eq!(inner.count(), 0);
+        assert_eq!(mark_on(&trust, &bound), Some(identity()), "the mark stands");
+        assert_eq!(
+            std::fs::read(&trust_path).unwrap(),
+            marked,
+            "an already-marked record is not written again"
+        );
+        let texts = notes.texts();
+        assert_eq!(texts.len(), 1, "told once: {texts:#?}");
+        assert!(texts[0].starts_with("warning: "), "{}", texts[0]);
+    }
+
+    /// Usage probe: a destination-tier sender (its own instance on record, no
+    /// all-destinations grant) whose stored access request names a FOREIGN instance bound
+    /// to someone else passes the standing gate, is refused default-closed, marks the
+    /// foreign record with itself as the identity seen and earns the human one error; its
+    /// own instance's request is then filed as before and the human is not told again.
+    #[test]
+    fn usage_probe_a_destination_tier_senders_stored_access_request_naming_a_foreign_instance_is_refused_marked_and_an_error()
+     {
+        let own = OriginName([17u8; NAME_HASH_LEN]);
+        let foreign = OriginName([18u8; NAME_HASH_LEN]);
+        let bound_to = hex_lower(&[0xcd; 16]);
+        let bound = destination_address(
+            &foreign.0,
+            &AddressHash::new_from_hex_string(&bound_to).unwrap(),
+        )
+        .to_hex_string();
+        let (trust, _tmp) = TrustList::default()
+            .destination(&origin_destination(&own), &identity())
+            .destination(&bound, &bound_to)
+            .open("access-route-destination-tier-foreign");
+        let notes = Arc::new(RecordingSurface::default());
+        trust.attach_surface(Arc::downgrade(&notes) as Weak<dyn KnockSurface>);
+
+        let (surface, inner) = deliver_stored(&trust, &foreign);
+
+        assert_eq!(surface.admissions(), 0, "refused, never offered");
+        assert_eq!(inner.count(), 0);
+        assert_eq!(mark_on(&trust, &bound), Some(identity()));
+        assert_eq!(mark_on(&trust, &origin_destination(&own)), None);
+        let texts = notes.texts();
+        assert_eq!(texts.len(), 1, "{texts:#?}");
+        assert!(texts[0].starts_with("error: "), "{}", texts[0]);
+        assert!(texts[0].contains("is refused"), "{}", texts[0]);
+
+        let (surface, inner) = deliver_stored(&trust, &own);
+        assert_eq!(surface.admissions(), 1, "its own instance is still served");
+        assert_eq!(inner.count(), 0);
+        assert_eq!(notes.texts().len(), 1, "{:#?}", notes.texts());
+    }
+
+    /// Hands every stored peer message straight on, standing in for the slot.
+    #[derive(Default)]
+    struct HoldingPeerSurface(parking_lot::Mutex<Vec<PeerMessage>>);
+
+    impl crate::mesh::message::PeerSurface for HoldingPeerSurface {
+        fn admit_peer_message(
+            &self,
+            _request: &crate::mesh::message::PeerAdmission,
+        ) -> std::result::Result<(), crate::mesh::limits::PeerRefusal> {
+            Ok(())
+        }
+
+        fn deliver_peer(&self, message: PeerMessage) {
+            self.0.lock().push(message);
+        }
+
+        fn file_peer(&self, message: PeerMessage) {
+            self.0.lock().push(message);
+        }
+
+        fn local_destination(&self) -> Option<String> {
+            Some(hex_lower(&[0x77; 16]))
+        }
+    }
+
+    /// Routes a stored peer MESSAGE signed by `identity()` from `origin` the way the
+    /// store-and-forward message path does, returning how many reached the surface.
+    fn deliver_stored_message(trust: &TrustStore, origin: &OriginName) -> usize {
+        let surface = Arc::new(HoldingPeerSurface::default());
+        let inner = CountingSink::default();
+        let stored = peer_lxmf_message(
+            &OutboundPeer::new(PeerKind::Message, "hello", None, None, None).unwrap(),
+            origin,
+        );
+        crate::mesh::message::PeerRouting {
+            trust,
+            surface: Some(Arc::clone(&surface) as Arc<dyn crate::mesh::message::PeerSurface>),
+            inner: &inner,
+        }
+        .deliver(fetched(&stored, &identity()));
+        assert_eq!(inner.count(), 0, "a peer message never falls through");
+        surface.0.lock().len()
+    }
+
+    /// Usage probe: the two store-and-forward ingress paths share one mark. A rotated
+    /// all-destinations identity's stored message and stored access request over the same
+    /// colliding record, in either order, mark the record once and tell the human once;
+    /// both are served with protection off.
+    #[test]
+    fn usage_probe_a_stored_message_and_a_stored_access_request_over_one_colliding_record_tell_the_human_once()
+     {
+        for message_first in [true, false] {
+            let origin = OriginName([19u8; NAME_HASH_LEN]);
+            let (trust, notes, bound, tmp) =
+                colliding_routing("access-route-collision-cross-path", &origin);
+            let trust_path = crate::mesh::mesh_config_dir(&tmp.path).join("trust.yaml");
+
+            let (messages, admissions) = if message_first {
+                let messages = deliver_stored_message(&trust, &origin);
+                let marked = std::fs::read(&trust_path).unwrap();
+                let (surface, _) = deliver_stored(&trust, &origin);
+                assert_eq!(
+                    std::fs::read(&trust_path).unwrap(),
+                    marked,
+                    "the access request finds the record already marked"
+                );
+                (messages, surface.admissions())
+            } else {
+                let (surface, _) = deliver_stored(&trust, &origin);
+                let marked = std::fs::read(&trust_path).unwrap();
+                let messages = deliver_stored_message(&trust, &origin);
+                assert_eq!(
+                    std::fs::read(&trust_path).unwrap(),
+                    marked,
+                    "the message finds the record already marked"
+                );
+                (messages, surface.admissions())
+            };
+
+            assert_eq!(messages, 1, "message first {message_first}: message served");
+            assert_eq!(
+                admissions, 1,
+                "message first {message_first}: access request filed"
+            );
+            assert_eq!(mark_on(&trust, &bound), Some(identity()));
+            let texts = notes.texts();
+            assert_eq!(
+                texts.len(),
+                1,
+                "message first {message_first}: told once: {texts:#?}"
+            );
+            assert!(texts[0].starts_with("warning: "), "{}", texts[0]);
+        }
     }
 
     fn reply_with(entries: Vec<(&str, Value)>) -> Value {

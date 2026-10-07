@@ -1,12 +1,14 @@
 use crate::mesh::announce::{HEARTBEAT_SECS, PEER_MISSED_HEARTBEATS_BEFORE_AGE_OUT};
 use crate::mesh::protocol::Compatibility;
 use crate::mesh::schema::{Remedy, VersionProbe, unversioned_cause, version_refusal};
+use crate::mesh::trust::InstancePresence;
 use crate::mesh::{redact_hashes, short, write_atomically};
 
 use anyhow::{Context, Result, bail};
 use log::warn;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -307,6 +309,29 @@ fn set_aside_corrupt(path: &Path, what_happened: String) -> Vec<PeerRecord> {
 fn is_expired(record: &PeerRecord, now: SystemTime) -> bool {
     // A `last_seen` in the future (clock stepped back) reads as just seen, not as expired.
     now.duration_since(record.last_seen).unwrap_or_default() >= PEER_TTL
+}
+
+impl InstancePresence for PeerTable {
+    fn heard_under_other_identities(
+        &self,
+        name_hash: &str,
+        identity_hash: &str,
+        now: SystemTime,
+    ) -> Vec<(String, String)> {
+        let inner = self.inner.lock();
+        let mut rows: Vec<&PeerRecord> = inner
+            .values()
+            .filter(|peer| {
+                peer.name_hash == name_hash
+                    && peer.identity_hash != identity_hash
+                    && !is_expired(peer, now)
+            })
+            .collect();
+        rows.sort_by_key(|peer| Reverse(peer.last_seen));
+        rows.into_iter()
+            .map(|peer| (peer.destination_hash.clone(), peer.identity_hash.clone()))
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -849,5 +874,69 @@ mod tests {
             "the SCOPE wire rename bumps the peer table 1 -> 2"
         );
         assert_version_is_refused("peers-pre-scope-v1", 1, "no migration");
+    }
+
+    /// Usage probe: the presence query the trust store asks for identity-tier rotation
+    /// returns only rows that ARE a presence at `now` — the same instance id under another
+    /// identity, not expired — freshest first, and never the presenting identity's own row
+    /// or another instance's rows. An expired row is not a presence (the cache would sweep
+    /// it), so a rotation older than the TTL surfaces nothing.
+    #[test]
+    fn usage_probe_presence_query_skips_expired_rows_other_instances_and_the_presenter_itself() {
+        let (table, _tmp) = table("peers-presence-query");
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(100_000);
+        let same_instance = |destination: &str, identity: &str| PeerSighting {
+            destination_hash: destination.to_string(),
+            identity_hash: identity.to_string(),
+            name_hash: "name-shared".to_string(),
+            display_name: None,
+            protocol_version: MESH_PROTOCOL_VERSION,
+            hops: 1,
+        };
+        table.observe(same_instance("dest-old", "id-old"), t0);
+        table.observe(
+            same_instance("dest-older", "id-older"),
+            t0 - Duration::from_secs(60),
+        );
+        table.observe(
+            same_instance("dest-new", "id-new"),
+            t0 + Duration::from_secs(5),
+        );
+        table.observe(sighting("unrelated", None), t0 + Duration::from_secs(5));
+
+        let heard = table.heard_under_other_identities(
+            "name-shared",
+            "id-new",
+            t0 + Duration::from_secs(10),
+        );
+        assert_eq!(
+            heard,
+            vec![
+                ("dest-old".to_string(), "id-old".to_string()),
+                ("dest-older".to_string(), "id-older".to_string()),
+            ],
+            "freshest first, presenter and other instances excluded"
+        );
+
+        // At the TTL the older row is no longer a presence; one heartbeat later neither is.
+        assert_eq!(
+            table.heard_under_other_identities(
+                "name-shared",
+                "id-new",
+                t0 - Duration::from_secs(60) + PEER_TTL
+            ),
+            vec![("dest-old".to_string(), "id-old".to_string())]
+        );
+        assert!(
+            table
+                .heard_under_other_identities("name-shared", "id-new", t0 + PEER_TTL)
+                .is_empty(),
+            "an expired row is not a presence"
+        );
+        assert!(
+            table
+                .heard_under_other_identities("name-nobody", "id-new", t0)
+                .is_empty()
+        );
     }
 }
