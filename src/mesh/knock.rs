@@ -455,7 +455,7 @@ impl KnockGate {
         if self.trust.identity_standing(&knock.identity_hash) == IdentityStanding::Unknown {
             return Admission::Unknown;
         }
-        let (verdict, collisions) = self.verdict(&knock);
+        let (verdict, collisions) = self.verdict(&knock, received_at);
         match (verdict.decision, verdict.rule) {
             (Decision::Refuse, Rule::DefaultClosed) => {}
             (Decision::Allow, _) => {
@@ -557,7 +557,11 @@ impl KnockGate {
 
     /// The verdict with the records the knock's origin collides with; none when the hashes
     /// do not decode and `authorize` alone judges it.
-    fn verdict(&self, knock: &InboundKnock) -> (Verdict, Vec<BindingConflict>) {
+    fn verdict(
+        &self,
+        knock: &InboundKnock,
+        received_at: SystemTime,
+    ) -> (Verdict, Vec<BindingConflict>) {
         match (
             parse_hash(&knock.identity_hash),
             decode_name_hash(&knock.name_hash),
@@ -567,7 +571,9 @@ impl KnockGate {
                     verdict,
                     collisions,
                     ..
-                } = self.trust.authorize_origin(&identity, &name_hash);
+                } = self
+                    .trust
+                    .authorize_origin_at(&identity, &name_hash, received_at);
                 (verdict, collisions)
             }
             _ => (

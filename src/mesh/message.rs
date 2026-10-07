@@ -2027,11 +2027,12 @@ impl InboundSink for PeerRouting<'_> {
             debug!("Propagated {kind} from {id8} dropped: {standing} identity");
             return;
         }
+        let now = SystemTime::now();
         let OriginVerdict {
             verdict,
             destination,
             collisions,
-        } = self.trust.authorize_origin(&identity, &name_hash);
+        } = self.trust.authorize_origin_at(&identity, &name_hash, now);
         raw.source_destination = destination.to_hex_string();
         let dest8 = short(&raw.source_destination).to_string();
         if !collisions.is_empty() || verdict.rule == Rule::IdentityChanged {
@@ -2043,7 +2044,7 @@ impl InboundSink for PeerRouting<'_> {
                 &message.source_identity_hash,
                 &hex_lower(&name_hash),
                 outcome,
-                SystemTime::now(),
+                now,
             );
         }
         if verdict.decision != Decision::Allow {

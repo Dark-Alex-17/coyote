@@ -799,3 +799,106 @@ fn usage_probe_the_docs_name_the_recipe_and_every_page_family_the_lint_reads() {
         "CONTRIBUTING.md lacks the recipe {RECIPE}"
     );
 }
+
+/// The `collision_protection:` comment on `Mesh-Configuration.md` is the template's line;
+/// the setting's section there and the identity-tier Note on `Mesh-Trust-Model.md` each
+/// name what sets the presence case apart (nothing marked, the refusal remembered); and
+/// the Note quotes the two presence lines with the wording `presence_collision_text` emits.
+#[test]
+fn the_collision_protection_prose_in_the_wiki_matches_the_template_and_names_the_presence_case() {
+    let Some(wiki) = wiki_dir() else { return };
+    let comment_line = |label: &str, text: &str| -> String {
+        text.lines()
+            .find(|line| line.starts_with("  collision_protection: false    #"))
+            .unwrap_or_else(|| panic!("{label} has no `  collision_protection: false    #` line"))
+            .trim()
+            .to_string()
+    };
+    let configuration = read(wiki.join("Mesh-Configuration.md"));
+    assert_eq!(
+        comment_line("Mesh-Configuration.md", &configuration),
+        comment_line(
+            "assets/config-template.yaml",
+            &read(repo_root().join("assets/config-template.yaml"))
+        ),
+        "the collision_protection comment on Mesh-Configuration.md is not the template's"
+    );
+
+    let heading = "\n## `collision_protection`\n";
+    let section = &configuration[configuration
+        .find(heading)
+        .expect("Mesh-Configuration.md has a `## collision_protection` section")..];
+    let section = section[1..].split("\n## ").next().unwrap();
+    let trust_model = read(wiki.join("Mesh-Trust-Model.md"));
+    let note_lead = "\n> **Note:** An identity-tier grant";
+    let note = &trust_model[trust_model
+        .find(note_lead)
+        .expect("Mesh-Trust-Model.md has the identity-tier Note")..];
+    let note = note[1..].split("\n\n").next().unwrap();
+    for (label, text) in [
+        ("Mesh-Configuration.md's `## collision_protection`", section),
+        ("Mesh-Trust-Model.md's identity-tier Note", note),
+    ] {
+        for needle in ["collision_protection", "nothing is marked", "remembered"] {
+            assert!(
+                text.contains(needle),
+                "{label} does not say {needle:?}:\n{text}"
+            );
+        }
+    }
+
+    let source = read(repo_root().join("src/mesh/trust.rs"));
+    let body = source
+        .split("\nfn presence_collision_text(")
+        .nth(1)
+        .expect("src/mesh/trust.rs defines presence_collision_text")
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    // The format strings continue over `\`-ended lines; join them as the compiler does.
+    let mut emitted = String::new();
+    let mut rest = body;
+    while let Some(at) = rest.find("\\\n") {
+        emitted.push_str(&rest[..at]);
+        rest = rest[at + 2..].trim_start();
+    }
+    emitted.push_str(rest);
+    let quoted = |lead: &str| -> String {
+        note.lines()
+            .find(|line| line.starts_with(lead))
+            .unwrap_or_else(|| panic!("the identity-tier Note quotes no {lead:?} line:\n{note}"))
+            .to_string()
+    };
+    let shared = [
+        "was heard under identity",
+        "is now presented under identity",
+        "no record carries the instance, so nothing is marked",
+        "otherwise .mesh block",
+    ];
+    let served = ["is served while it asks because collision_protection is off"];
+    let refused = ["is refused when it asks", "run .mesh trust"];
+    for fragment in shared.iter().chain(&served).chain(&refused) {
+        assert!(
+            emitted.contains(fragment),
+            "presence_collision_text no longer says {fragment:?}; update the wiki and this test"
+        );
+    }
+    for (lead, own, absent) in [
+        ("> warning: instance ", &served[..], &refused[..]),
+        ("> error: instance ", &refused[..], &served[..]),
+    ] {
+        let line = quoted(lead);
+        for fragment in shared.iter().chain(own) {
+            assert!(
+                line.contains(fragment),
+                "the quoted {lead:?} line does not say {fragment:?}: {line}"
+            );
+        }
+        for fragment in absent {
+            assert!(
+                !line.contains(fragment),
+                "the quoted {lead:?} line says {fragment:?}, which the emitted one does not: {line}"
+            );
+        }
+    }
+}

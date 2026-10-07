@@ -1615,7 +1615,7 @@ impl AnnounceFiler<'_> {
             // judged as its request would be.
             let outcome = match self
                 .trust
-                .authorize_origin(&identity, &name_hash_bytes)
+                .authorize_origin_at(&identity, &name_hash_bytes, now)
                 .verdict
                 .decision
             {

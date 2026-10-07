@@ -8,6 +8,7 @@
 //! instead of asserting it, and fails when the flag goes stale.
 
 use super::{Kind, Listed};
+use crate::mesh::peers::{PeerSighting, PeerTable};
 use crate::mesh::protocol::{
     MESH_PROTOCOL_MIN_SUPPORTED, MESH_PROTOCOL_VERSION, VersionRefusal, protocol_supported,
 };
@@ -18,8 +19,8 @@ use crate::mesh::r3::{
     PathHash, R3Error, RefusalCode, Reply, RequestFrame, RequestHandler, RequestId, ResponseFrame,
     STATUS_PATH, SizeBranch,
 };
-use crate::mesh::test_support::TrustList;
-use crate::mesh::trust::{Decision, Rule, Verdict};
+use crate::mesh::test_support::{TempDir, TrustList};
+use crate::mesh::trust::{Decision, InstancePresence, Rule, Verdict};
 use crate::mesh::{destination_address, hex_lower};
 
 use async_trait::async_trait;
@@ -30,8 +31,8 @@ use rns_transport::identity::PrivateIdentity;
 use std::fmt::Debug;
 use std::future::Future;
 use std::io::Cursor;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, UNIX_EPOCH};
 
 /// One requirement id, one input, one mandated receiver action.
 struct Vector {
@@ -2259,6 +2260,47 @@ fn authorize_rotated_origin_with(
     store.authorize_origin(&identity, &ORIGIN).verdict
 }
 
+/// `authorize_rotated_origin_with` for the presence rung: no record carries `ORIGIN`, the
+/// peer table has heard it under the holder's identity instead. `list` receives the same
+/// four arguments.
+fn authorize_presence_origin_with(
+    protection: bool,
+    list: fn(&str, &str, &str, &str) -> TrustList,
+) -> Verdict {
+    let identity = PrivateIdentity::new_from_rand(OsRng)
+        .as_identity()
+        .address_hash;
+    let derived = destination_address(&ORIGIN, &identity).to_hex_string();
+    let holder = PrivateIdentity::new_from_rand(OsRng)
+        .as_identity()
+        .address_hash;
+    let held = destination_address(&ORIGIN, &holder).to_hex_string();
+    let (store, _tmp) = list(
+        &identity.to_hex_string(),
+        &derived,
+        &holder.to_hex_string(),
+        &held,
+    )
+    .open("conformance-env");
+    store.set_collision_protection(protection);
+    let now = UNIX_EPOCH + Duration::from_secs(2_000);
+    let peers = TempDir::new("conformance-env-peers");
+    let table = Arc::new(PeerTable::load(peers.path.join("peers.json"), now).unwrap());
+    store.attach_presence(Arc::downgrade(&table) as Weak<dyn InstancePresence>);
+    table.observe(
+        PeerSighting {
+            destination_hash: held,
+            identity_hash: holder.to_hex_string(),
+            name_hash: hex_lower(&ORIGIN),
+            display_name: None,
+            protocol_version: MESH_PROTOCOL_VERSION,
+            hops: 1,
+        },
+        now,
+    );
+    store.authorize_origin_at(&identity, &ORIGIN, now).verdict
+}
+
 const IDENTITY: &str = "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a";
 const DESTINATION: &str = "d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1";
 
@@ -2521,6 +2563,48 @@ fn custom_vectors() -> Vec<Vector> {
                     TrustList::default()
                         .destination(derived, identity)
                         .destination(held, holder)
+                }),
+                verdict(Decision::Allow, Rule::DestinationTrusted),
+            )
+        }),
+        custom("MESH-ENV-039", Kind::Valid, || {
+            same(
+                "presence under identity allow under collision protection",
+                authorize_presence_origin_with(true, |identity, _, holder, _| {
+                    TrustList::default()
+                        .identity(identity, true)
+                        .identity(holder, true)
+                }),
+                verdict(Decision::Refuse, Rule::IdentityChanged),
+            )
+        }),
+        custom("MESH-ENV-039", Kind::Valid, || {
+            same(
+                "presence under identity allow with collision protection off",
+                authorize_presence_origin_with(false, |identity, _, holder, _| {
+                    TrustList::default()
+                        .identity(identity, true)
+                        .identity(holder, true)
+                }),
+                verdict(Decision::Allow, Rule::IdentityTrusted),
+            )
+        }),
+        custom("MESH-ENV-039", Kind::Valid, || {
+            same(
+                "presence with no allow is default closed under collision protection",
+                authorize_presence_origin_with(true, |_, _, holder, _| {
+                    TrustList::default().identity(holder, true)
+                }),
+                verdict(Decision::Refuse, Rule::DefaultClosed),
+            )
+        }),
+        custom("MESH-ENV-039", Kind::Valid, || {
+            same(
+                "destination allow over presence under collision protection",
+                authorize_presence_origin_with(true, |identity, derived, holder, _| {
+                    TrustList::default()
+                        .destination(derived, identity)
+                        .identity(holder, true)
                 }),
                 verdict(Decision::Allow, Rule::DestinationTrusted),
             )

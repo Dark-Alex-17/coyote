@@ -4816,6 +4816,7 @@ pub(crate) mod network {
             assert!(text.contains(&earlier.to_hex_string()), "{text}");
             assert!(text.contains(&b_identity), "{text}");
             assert!(text.contains("is refused when it asks"), "{text}");
+            assert!(!text.contains("is served while it asks"), "{text}");
             assert!(text.contains("nothing is marked"), "{text}");
             assert!(
                 text.contains(&format!(".mesh trust {b_instance}")),

@@ -9018,7 +9018,7 @@ mod tests {
             /// blocked and admits the old key; `.mesh unblock` restores the remembered
             /// refusal; `.mesh untrust --identity <old> --confirm untrust-<short>` admits the
             /// new key, the memory refusing only for a holder still trusted for all
-            /// destinations. The listing keeps labelling the refused key `trusted` with no
+            /// destinations. The listing keeps labelling the old key's row `trusted` with no
             /// marker row, no record is ever marked and the owner hears the one line only.
             #[test]
             #[serial]
