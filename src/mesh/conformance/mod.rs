@@ -163,6 +163,8 @@ const ENFORCED_BY: &[(&str, &[&str])] = &[
             "try_reserve_refuses_while_a_run_is_in_flight_and_admits_once_the_guard_drops",
             "try_reserve_refuses_past_the_token_ceiling_until_rollover",
             "cost_ceiling_is_off_at_zero_and_ignores_unpriced_debits",
+            "concurrency_is_unlimited_at_zero_through_check_and_reserve",
+            "tokens_are_unlimited_at_zero_through_check_and_reserve",
         ],
     ),
     (
