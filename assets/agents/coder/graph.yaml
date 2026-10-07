@@ -276,7 +276,7 @@ nodes:
       - fs_write
       - fs_patch
       - execute_command
-    max_iterations: 100
+    max_iterations: 200
     timeout: 1800
     state_updates:
       last_node_output: '{{output}}'
