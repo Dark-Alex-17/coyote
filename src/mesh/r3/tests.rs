@@ -2960,6 +2960,202 @@ pub(crate) mod network {
         assert_eq!(fs::read(trust.path()).unwrap(), before);
     }
 
+    /// Usage probe: the one-clock presence rung guards every dispatched path, not only
+    /// `/knock`, and what it tells it remembers. On a registered path a presenter trusted
+    /// for all destinations is refused `NoAccess` one second before the holder's row
+    /// expires, the handler never runs, the one `error:` line is shown; the request after
+    /// the row has aged out is still refused by memory, silently, and the handler still
+    /// never runs; the holder the memory names is served on the same path at the same
+    /// instant. `trust.yaml` is byte-identical throughout.
+    #[tokio::test]
+    async fn usage_probe_a_presence_refusal_told_through_the_dispatcher_outlives_the_holders_row_on_a_registered_path()
+     {
+        let at = |secs: u64| UNIX_EPOCH + Duration::from_secs(secs);
+        let holder = *TransportIdentity::new_from_rand(OsRng).as_identity();
+        let presenter = *TransportIdentity::new_from_rand(OsRng).as_identity();
+        let holder_hex = holder.address_hash.to_hex_string();
+        let presenter_hex = presenter.address_hash.to_hex_string();
+        let origin = OriginName::of(&fresh_destination_name());
+        let holder_destination =
+            destination_address(&origin.0, &holder.address_hash).to_hex_string();
+        let (trust, tmp) = TrustList::default()
+            .identity(&holder_hex, true)
+            .identity(&presenter_hex, true)
+            .open("r3-dispatch-presence-memory-registered-path");
+        trust.set_collision_protection(true);
+        let peers = Arc::new(PeerTable::load(tmp.path.join("peers.json"), at(2_000)).unwrap());
+        peers.observe(
+            PeerSighting {
+                destination_hash: holder_destination.clone(),
+                identity_hash: holder_hex.clone(),
+                name_hash: hex_lower(&origin.0),
+                display_name: None,
+                protocol_version: MESH_PROTOCOL_VERSION,
+                hops: 1,
+            },
+            at(2_000),
+        );
+        let surface = Arc::new(RecordingSurface::default());
+        trust.attach_surface(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
+        trust.attach_presence(Arc::downgrade(&peers) as Weak<dyn InstancePresence>);
+        let sink = Arc::new(SpySink::default());
+        let dispatcher = Dispatcher::new(trust.clone(), sink.clone());
+        let recorder = Arc::new(Recorder::default());
+        dispatcher.register(TEST_PATH, recorder.clone()).unwrap();
+        let on_test_path = |identity: Identity| {
+            let mut request = admitted_knock(identity, origin);
+            request.path_hash = PathHash::of(TEST_PATH);
+            request.data = Envelope::new(origin, Value::from("hello")).into_value();
+            request
+        };
+        let before = fs::read(trust.path()).unwrap();
+
+        // One second before the row expires: refused, untouched handler, one error line.
+        let reply = dispatcher
+            .handle_at(on_test_path(presenter), at(4_699))
+            .await;
+        assert!(matches!(reply, Reply::Code(RefusalCode::NoAccess)));
+        assert_eq!(
+            recorder.seen_count(),
+            0,
+            "a refused request never reaches the handler"
+        );
+        assert_eq!(
+            sink.count(),
+            0,
+            "a presence collision on a registered path is not a knock"
+        );
+        let (source, from, text) = surface.only();
+        assert_eq!(source, Source::Mesh);
+        assert_eq!(from, Origin::Peer(presenter_hex[..8].to_string()));
+        assert!(text.starts_with("error: "), "{text}");
+        assert!(text.contains("is now presented under identity"), "{text}");
+        assert!(text.contains("is refused when it asks"), "{text}");
+
+        // The row has aged out: the memory refuses, silently, and the handler still never runs.
+        let reply = dispatcher
+            .handle_at(on_test_path(presenter), at(4_701))
+            .await;
+        assert!(
+            matches!(reply, Reply::Code(RefusalCode::NoAccess)),
+            "the refusal shown at t(4699) is remembered past the row's life"
+        );
+        assert_eq!(recorder.seen_count(), 0);
+        assert_eq!(
+            surface.count(),
+            1,
+            "the memory refuses without a second line"
+        );
+
+        // The holder the memory names is served on the same path at the same instant.
+        let reply = dispatcher.handle_at(on_test_path(holder), at(4_701)).await;
+        assert!(matches!(reply, Reply::Value(_)));
+        assert_eq!(
+            recorder.seen_count(),
+            1,
+            "the memory never refuses the holder it names"
+        );
+        assert_eq!(recorder.last().identity, Some(holder.address_hash));
+        assert_eq!(surface.count(), 1);
+
+        assert!(
+            trust
+                .records()
+                .iter()
+                .all(|record| record.key_changed.is_none()),
+            "nothing is marked for a presence collision"
+        );
+        assert_eq!(fs::read(trust.path()).unwrap(), before);
+    }
+
+    /// Usage probe: with `collision_protection` off a presence collision is the announce
+    /// path's to surface ("when heard"); the dispatcher serves the presenter and says
+    /// nothing on request ingress. One second before the holder's row expires the registered
+    /// handler runs, no line is told, nothing is marked and `trust.yaml` is byte-identical;
+    /// and a served presence arms no memory: protection switched on afterwards, with the
+    /// row gone, still serves the presenter.
+    #[tokio::test]
+    async fn usage_probe_with_protection_off_the_dispatcher_serves_a_presence_collision_silently_and_remembers_nothing()
+     {
+        let at = |secs: u64| UNIX_EPOCH + Duration::from_secs(secs);
+        let holder = *TransportIdentity::new_from_rand(OsRng).as_identity();
+        let presenter = *TransportIdentity::new_from_rand(OsRng).as_identity();
+        let holder_hex = holder.address_hash.to_hex_string();
+        let presenter_hex = presenter.address_hash.to_hex_string();
+        let origin = OriginName::of(&fresh_destination_name());
+        let holder_destination =
+            destination_address(&origin.0, &holder.address_hash).to_hex_string();
+        let (trust, tmp) = TrustList::default()
+            .identity(&holder_hex, true)
+            .identity(&presenter_hex, true)
+            .open("r3-dispatch-presence-off-silent");
+        let peers = Arc::new(PeerTable::load(tmp.path.join("peers.json"), at(2_000)).unwrap());
+        peers.observe(
+            PeerSighting {
+                destination_hash: holder_destination.clone(),
+                identity_hash: holder_hex.clone(),
+                name_hash: hex_lower(&origin.0),
+                display_name: None,
+                protocol_version: MESH_PROTOCOL_VERSION,
+                hops: 1,
+            },
+            at(2_000),
+        );
+        let surface = Arc::new(RecordingSurface::default());
+        trust.attach_surface(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
+        trust.attach_presence(Arc::downgrade(&peers) as Weak<dyn InstancePresence>);
+        let sink = Arc::new(SpySink::default());
+        let dispatcher = Dispatcher::new(trust.clone(), sink.clone());
+        let recorder = Arc::new(Recorder::default());
+        dispatcher.register(TEST_PATH, recorder.clone()).unwrap();
+        let on_test_path = |identity: Identity| {
+            let mut request = admitted_knock(identity, origin);
+            request.path_hash = PathHash::of(TEST_PATH);
+            request.data = Envelope::new(origin, Value::from("hello")).into_value();
+            request
+        };
+        let before = fs::read(trust.path()).unwrap();
+
+        for _ in 0..2 {
+            let reply = dispatcher
+                .handle_at(on_test_path(presenter), at(4_699))
+                .await;
+            assert!(
+                matches!(reply, Reply::Value(_)),
+                "with protection off the identity's own grant serves it"
+            );
+        }
+        assert_eq!(recorder.seen_count(), 2);
+        assert_eq!(recorder.last().identity, Some(presenter.address_hash));
+        assert_eq!(sink.count(), 0, "a trusted presenter is not a knock");
+        assert_eq!(
+            surface.count(),
+            0,
+            "the protection-off warning is the announce path's, told when the instance is heard"
+        );
+        assert!(
+            trust
+                .records()
+                .iter()
+                .all(|record| record.key_changed.is_none()),
+            "nothing is marked for a presence collision"
+        );
+        assert_eq!(fs::read(trust.path()).unwrap(), before);
+
+        // Served, so never remembered: protection on with the holder's row gone admits.
+        trust.set_collision_protection(true);
+        let reply = dispatcher
+            .handle_at(on_test_path(presenter), at(4_701))
+            .await;
+        assert!(
+            matches!(reply, Reply::Value(_)),
+            "a served presence collision armed no memory"
+        );
+        assert_eq!(recorder.seen_count(), 3);
+        assert_eq!(surface.count(), 0);
+        assert_eq!(fs::read(trust.path()).unwrap(), before);
+    }
+
     /// `/knock` is the dispatcher's own. Registering over it is refused, and the built-in
     /// handler goes on serving it: nil back, nothing knocked, the usurper never entered.
     #[tokio::test]

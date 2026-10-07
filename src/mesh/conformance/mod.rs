@@ -320,6 +320,8 @@ const ENFORCED_BY: &[(&str, &[&str])] = &[
             "usage_probe_trusting_the_named_destination_ends_a_presence_refusal_under_protection",
             "usage_probe_a_stranger_presenting_an_instance_heard_under_an_all_destinations_identity_is_an_error_and_hears_nothing",
             "usage_probe_a_dispatched_requests_verdict_and_its_owner_line_see_the_same_peer_table_instant",
+            "usage_probe_a_presence_refusal_told_through_the_dispatcher_outlives_the_holders_row_on_a_registered_path",
+            "usage_probe_with_protection_off_the_dispatcher_serves_a_presence_collision_silently_and_remembers_nothing",
             "peers_labels_a_presence_refused_trusted_for_all_row_by_its_grant_under_protection",
             "usage_probe_block_and_untrust_identity_through_the_repl_are_the_remedies_of_a_remembered_presence_refusal",
             "the_collision_protection_comment_is_one_text_across_readme_template_and_example",

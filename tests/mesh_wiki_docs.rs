@@ -902,3 +902,129 @@ fn the_collision_protection_prose_in_the_wiki_matches_the_template_and_names_the
         }
     }
 }
+
+/// Usage probe: the identity-tier Note on `Mesh-Trust-Model.md` quotes the two presence
+/// lines with the instance as `<dest8>` — `presence_collision_text` shortens the old
+/// destination and has no label to print — while the record-collision lines quoted above
+/// it keep `<label or dest8>`, as `key_change_text` prints the record's label when it has
+/// one. The placeholders are not interchangeable: a reader copying the wiki's line must
+/// know which one names a labelled record and which one never does.
+#[test]
+fn the_identity_tier_note_quotes_the_presence_lines_with_the_instance_as_dest8() {
+    let Some(wiki) = wiki_dir() else { return };
+    let trust_model = read(wiki.join("Mesh-Trust-Model.md"));
+    let note_lead = "\n> **Note:** An identity-tier grant";
+    let note_at = trust_model
+        .find(note_lead)
+        .expect("Mesh-Trust-Model.md has the identity-tier Note");
+    let note = trust_model[note_at + 1..].split("\n\n").next().unwrap();
+    for lead in ["> warning: instance ", "> error: instance "] {
+        let line = note
+            .lines()
+            .find(|line| line.starts_with(lead))
+            .unwrap_or_else(|| panic!("the identity-tier Note quotes no {lead:?} line:\n{note}"));
+        assert!(
+            line.starts_with(&format!("{lead}<dest8> was heard under identity <old>")),
+            "the quoted presence line does not name the instance as <dest8>: {line}"
+        );
+        assert!(
+            !line.contains("<label or dest8>"),
+            "a presence line has no label to print: {line}"
+        );
+    }
+
+    let record_lines: Vec<&str> = trust_model[..note_at]
+        .lines()
+        .filter(|line| {
+            line.starts_with("error: instance ") || line.starts_with("warning: instance ")
+        })
+        .collect();
+    assert!(
+        !record_lines.is_empty(),
+        "Mesh-Trust-Model.md quotes the record-collision lines above the Note"
+    );
+    for line in record_lines {
+        assert!(
+            line.starts_with("error: instance <label or dest8> is bound to identity <old>")
+                || line
+                    .starts_with("warning: instance <label or dest8> is bound to identity <old>"),
+            "a record-collision line keeps its label: {line}"
+        );
+    }
+
+    let source = read(repo_root().join("src/mesh/trust.rs"));
+    let body = source
+        .split("\nfn presence_collision_text(")
+        .nth(1)
+        .expect("src/mesh/trust.rs defines presence_collision_text")
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(
+        body.contains("let instance = short(old_destination);"),
+        "presence_collision_text no longer shortens the destination; re-read the wiki's <dest8>"
+    );
+}
+
+/// The `.mesh peers` section on `Mesh-Commands.md` lists the trust labels `trust_label`
+/// prints and reads `denied` as the grant's standing, not as how the node answered the
+/// row: nothing there ties a label to `collision_protection` or to a served verdict.
+#[test]
+fn the_mesh_peers_section_labels_rows_by_the_grant_and_says_nothing_of_a_served_verdict() {
+    let Some(wiki) = wiki_dir() else { return };
+    let commands = read(wiki.join("Mesh-Commands.md"));
+    let heading = "\n### `.mesh peers`\n";
+    let section_at = commands
+        .find(heading)
+        .expect("Mesh-Commands.md has a `### .mesh peers` section");
+    let section = commands[section_at + 1..]
+        .split("\n### ")
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let lead = "Trust is one of ";
+    let sentence_at = section.find(lead).unwrap_or_else(|| {
+        panic!("the `.mesh peers` section does not list the trust labels:\n{section}")
+    });
+    let sentence = section[sentence_at..].split(". ").next().unwrap();
+    assert_eq!(
+        sentence,
+        "Trust is one of `trusted`, `untrusted`, `denied`, `blocked`; `denied` is an instance `.mesh untrust` refused while its identity stays trusted"
+    );
+    for phrase in [
+        "collision_protection",
+        "by the verdict",
+        "serves it under",
+        "reads as refused",
+        "how the node answers",
+    ] {
+        assert!(
+            !section.contains(phrase),
+            "the `.mesh peers` section ties a trust label to the verdict ({phrase:?}):\n{section}"
+        );
+    }
+
+    let source = read(repo_root().join("src/function/mesh.rs"));
+    let body = source
+        .split("\npub(crate) fn trust_label(")
+        .nth(1)
+        .expect("src/function/mesh.rs defines trust_label")
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    let mut labels = string_literals(body);
+    labels.sort();
+    let (listed, _) = sentence[lead.len()..].split_once(';').unwrap();
+    let mut named: Vec<String> = listed
+        .split(", ")
+        .map(|label| unbacktick(label, "trust label").to_string())
+        .collect();
+    named.sort();
+    assert_eq!(
+        named, labels,
+        "the wiki's trust labels are not trust_label's"
+    );
+}
