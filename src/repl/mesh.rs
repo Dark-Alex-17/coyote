@@ -8817,9 +8817,9 @@ mod tests {
 
             /// The row the presence rung refuses reads the same way: two identities trusted
             /// for all destinations share an instance the peer table alone holds, so under
-            /// `mesh.collision_protection` the node refuses what either asks, while both
-            /// rows read `trusted` by their grant and, with no record to mark, no `key
-            /// changed:` marker is shown.
+            /// `mesh.collision_protection` the node refuses what the later-heard key asks
+            /// and serves the first-heard holder, while both rows read `trusted` by their
+            /// grant and, with no record to mark, no `key changed:` marker is shown.
             #[test]
             #[serial]
             fn peers_labels_a_presence_refused_trusted_for_all_row_by_its_grant_under_protection() {
@@ -8833,8 +8833,12 @@ mod tests {
                     let slot: &dyn LiveMesh = ctx.app.mesh.as_ref();
                     runtime.trust().set_collision_protection(true);
                     let now = SystemTime::now();
-                    let (old_dest, old_identity) =
-                        heard_peer_under(&runtime, "shared-inst", "Old", now);
+                    let (old_dest, old_identity) = heard_peer_under(
+                        &runtime,
+                        "shared-inst",
+                        "Old",
+                        now - Duration::from_secs(60),
+                    );
                     let (new_dest, new_identity) =
                         heard_peer_under(&runtime, "shared-inst", "New", now);
                     for identity in [&old_identity, &new_identity] {
@@ -8850,8 +8854,11 @@ mod tests {
                     assert_eq!(served_verdict(&runtime, &new_dest), refused);
                     assert_eq!(
                         served_verdict(&runtime, &old_dest),
-                        refused,
-                        "both rows live, the rung is symmetric"
+                        Verdict {
+                            decision: Decision::Allow,
+                            rule: Rule::IdentityTrusted,
+                        },
+                        "the first-heard holder is served"
                     );
 
                     let out = out_of(&mut ctx, ".mesh peers").await.unwrap();
@@ -9014,12 +9021,14 @@ mod tests {
             /// operator runs them, against a real node under `collision_protection: true`.
             /// The new key presents an instance the peer table holds under the old key, is
             /// refused and earns the one owner line; the old row then ages out and the
-            /// refusal stands from memory. `.mesh block <new> --yes` refuses the new key as
-            /// blocked and admits the old key; `.mesh unblock` restores the remembered
-            /// refusal; `.mesh untrust --identity <old> --confirm untrust-<short>` admits the
-            /// new key, the memory refusing only for a holder still trusted for all
-            /// destinations. The listing keeps labelling the old key's row `trusted` with no
-            /// marker row, no record is ever marked and the owner hears the one line only.
+            /// refusal stands from memory. `.mesh untrust --identity <old> --confirm
+            /// untrust-<short>` admits the new key, the memo refusing only for a holder still
+            /// trusted for all destinations, and trusting the old key again refuses it again
+            /// from the same memo; `.mesh block <new> --yes` refuses the new key as blocked,
+            /// admits the old key and clears the memo, so `.mesh unblock` and a fresh identity
+            /// grant admit the new key with the old row gone. The listing keeps labelling the
+            /// old key's row `trusted` with no marker row, no record is ever marked and the
+            /// owner hears the one line only.
             #[test]
             #[serial]
             fn usage_probe_block_and_untrust_identity_through_the_repl_are_the_remedies_of_a_remembered_presence_refusal()
@@ -9122,6 +9131,36 @@ mod tests {
                     );
                     assert!(!out.contains("key changed:"), "no marker row: {out}");
 
+                    let out = out_of(
+                        &mut ctx,
+                        &format!(
+                            ".mesh untrust --identity {old_identity} --confirm untrust-{}",
+                            short(&old_identity)
+                        ),
+                    )
+                    .await
+                    .unwrap();
+                    assert!(out.contains("Untrusted identity"), "{out}");
+                    assert_eq!(
+                        judge(&new_identity, aged_out),
+                        admitted,
+                        "the remembered holder is no longer trusted for all destinations: the \
+                         memo refuses nobody"
+                    );
+                    trust
+                        .trust_identity(
+                            ctx.app.mesh.as_ref(),
+                            &old_identity,
+                            TrustOptions::default(),
+                            aged_out,
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        judge(&new_identity, aged_out),
+                        refused,
+                        "the old key trusted again, its memo refuses again"
+                    );
+
                     let out = out_of(&mut ctx, &format!(".mesh block {new_identity} --yes"))
                         .await
                         .unwrap();
@@ -9136,7 +9175,7 @@ mod tests {
                     assert_eq!(
                         judge(&old_identity, aged_out),
                         admitted,
-                        "the memory never refuses the holder it names"
+                        "the holder is admitted"
                     );
 
                     out_of(&mut ctx, &format!(".mesh unblock {new_identity} --yes"))
@@ -9152,25 +9191,9 @@ mod tests {
                         .unwrap();
                     assert_eq!(
                         judge(&new_identity, aged_out),
-                        refused,
-                        "unblocked and trusted again, the memory still refuses the new key"
-                    );
-
-                    let out = out_of(
-                        &mut ctx,
-                        &format!(
-                            ".mesh untrust --identity {old_identity} --confirm untrust-{}",
-                            short(&old_identity)
-                        ),
-                    )
-                    .await
-                    .unwrap();
-                    assert!(out.contains("Untrusted identity"), "{out}");
-                    assert_eq!(
-                        judge(&new_identity, aged_out),
                         admitted,
-                        "the remembered holder is no longer trusted for all destinations: the \
-                         memory refuses nobody"
+                        "the block cleared the memo: unblocked and trusted again, the new key is \
+                         admitted with the old row gone"
                     );
 
                     assert_eq!(

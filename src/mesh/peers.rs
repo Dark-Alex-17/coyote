@@ -1,14 +1,13 @@
 use crate::mesh::announce::{HEARTBEAT_SECS, PEER_MISSED_HEARTBEATS_BEFORE_AGE_OUT};
 use crate::mesh::protocol::Compatibility;
 use crate::mesh::schema::{Remedy, VersionProbe, unversioned_cause, version_refusal};
-use crate::mesh::trust::InstancePresence;
+use crate::mesh::trust::{InstancePresence, PresenceRow};
 use crate::mesh::{redact_hashes, short, write_atomically};
 
 use anyhow::{Context, Result, bail};
 use log::warn;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -312,25 +311,23 @@ fn is_expired(record: &PeerRecord, now: SystemTime) -> bool {
 }
 
 impl InstancePresence for PeerTable {
-    fn heard_under_other_identities(
-        &self,
-        name_hash: &str,
-        identity_hash: &str,
-        now: SystemTime,
-    ) -> Vec<(String, String)> {
+    fn heard_rows(&self, name_hash: &str, now: SystemTime) -> Vec<PresenceRow> {
         let inner = self.inner.lock();
-        let mut rows: Vec<&PeerRecord> = inner
+        let mut rows: Vec<PresenceRow> = inner
             .values()
-            .filter(|peer| {
-                peer.name_hash == name_hash
-                    && peer.identity_hash != identity_hash
-                    && !is_expired(peer, now)
+            .filter(|peer| peer.name_hash == name_hash && !is_expired(peer, now))
+            .map(|peer| PresenceRow {
+                destination_hash: peer.destination_hash.clone(),
+                identity_hash: peer.identity_hash.clone(),
+                first_seen: peer.first_seen,
             })
             .collect();
-        rows.sort_by_key(|peer| Reverse(peer.last_seen));
-        rows.into_iter()
-            .map(|peer| (peer.destination_hash.clone(), peer.identity_hash.clone()))
-            .collect()
+        rows.sort_by(|a, b| {
+            a.first_seen
+                .cmp(&b.first_seen)
+                .then_with(|| a.destination_hash.cmp(&b.destination_hash))
+        });
+        rows
     }
 }
 
@@ -877,12 +874,15 @@ mod tests {
     }
 
     /// Usage probe: the presence query the trust store asks for identity-tier rotation
-    /// returns only rows that ARE a presence at `now` — the same instance id under another
-    /// identity, not expired — freshest first, and never the presenting identity's own row
-    /// or another instance's rows. An expired row is not a presence (the cache would sweep
-    /// it), so a rotation older than the TTL surfaces nothing.
+    /// returns only rows that ARE a presence at `now` — the same instance id, not expired —
+    /// with the row first heard earliest first, so the store's first-heard holder is the
+    /// head whatever order the rows were refreshed in; a refresh keeps `first_seen`, so a
+    /// row heard again does not move. Another instance's rows are never returned. An
+    /// expired row is not a presence (the cache would sweep it), so a rotation older than
+    /// the TTL surfaces nothing.
     #[test]
-    fn usage_probe_presence_query_skips_expired_rows_other_instances_and_the_presenter_itself() {
+    fn usage_probe_presence_query_orders_live_rows_by_first_seen_and_skips_expired_rows_and_other_instances()
+     {
         let (table, _tmp) = table("peers-presence-query");
         let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(100_000);
         let same_instance = |destination: &str, identity: &str| PeerSighting {
@@ -892,6 +892,11 @@ mod tests {
             display_name: None,
             protocol_version: MESH_PROTOCOL_VERSION,
             hops: 1,
+        };
+        let row = |destination: &str, identity: &str, first_seen: SystemTime| PresenceRow {
+            destination_hash: destination.to_string(),
+            identity_hash: identity.to_string(),
+            first_seen,
         };
         table.observe(same_instance("dest-old", "id-old"), t0);
         table.observe(
@@ -903,40 +908,36 @@ mod tests {
             t0 + Duration::from_secs(5),
         );
         table.observe(sighting("unrelated", None), t0 + Duration::from_secs(5));
-
-        let heard = table.heard_under_other_identities(
-            "name-shared",
-            "id-new",
-            t0 + Duration::from_secs(10),
+        // Heard again: `last_seen` moves, `first_seen` and the order do not.
+        table.observe(
+            same_instance("dest-older", "id-older"),
+            t0 + Duration::from_secs(8),
         );
+
         assert_eq!(
-            heard,
+            table.heard_rows("name-shared", t0 + Duration::from_secs(10)),
             vec![
-                ("dest-old".to_string(), "id-old".to_string()),
-                ("dest-older".to_string(), "id-older".to_string()),
+                row("dest-older", "id-older", t0 - Duration::from_secs(60)),
+                row("dest-old", "id-old", t0),
+                row("dest-new", "id-new", t0 + Duration::from_secs(5)),
             ],
-            "freshest first, presenter and other instances excluded"
+            "first heard first, other instances excluded"
         );
 
-        // At the TTL the older row is no longer a presence; one heartbeat later neither is.
+        // At the TTL the old row is no longer a presence; the refreshed older row still is.
         assert_eq!(
-            table.heard_under_other_identities(
-                "name-shared",
-                "id-new",
-                t0 - Duration::from_secs(60) + PEER_TTL
-            ),
-            vec![("dest-old".to_string(), "id-old".to_string())]
+            table.heard_rows("name-shared", t0 + PEER_TTL),
+            vec![
+                row("dest-older", "id-older", t0 - Duration::from_secs(60)),
+                row("dest-new", "id-new", t0 + Duration::from_secs(5)),
+            ]
         );
         assert!(
             table
-                .heard_under_other_identities("name-shared", "id-new", t0 + PEER_TTL)
+                .heard_rows("name-shared", t0 + Duration::from_secs(8) + PEER_TTL)
                 .is_empty(),
             "an expired row is not a presence"
         );
-        assert!(
-            table
-                .heard_under_other_identities("name-nobody", "id-new", t0)
-                .is_empty()
-        );
+        assert!(table.heard_rows("name-nobody", t0).is_empty());
     }
 }
