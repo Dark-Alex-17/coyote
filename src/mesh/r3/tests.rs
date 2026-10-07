@@ -523,7 +523,7 @@ pub(crate) mod network {
         SHUTDOWN_GRACE,
     };
     use crate::mesh::notify::Source;
-    use crate::mesh::peers::{PeerSighting, PeerTable};
+    use crate::mesh::peers::{PEER_TTL, PeerSighting, PeerTable};
     use crate::mesh::pending::{PENDING_RECORD_VERSION, PendingRecord, PendingState, WaitOutcome};
     use crate::mesh::propagation::test_support::{FakeNode, stored_message};
     use crate::mesh::propagation::{PropagationNode, PropagationOptions, pn_announce_app_data};
@@ -4756,10 +4756,11 @@ pub(crate) mod network {
     /// carries the instance, but the peer table does, so B's announce earns the owner one
     /// `error:` line naming both identities and `.mesh trust <B's destination>`, and B's
     /// `/status` request is refused `NoAccess` until then. Nothing is marked, `trust.yaml`
-    /// is untouched, and the refused request restates nothing.
+    /// is untouched, and the refused request restates nothing. The refusal outlives the
+    /// earlier row: swept from the table at `PEER_TTL`, B's next request is refused the
+    /// same way from the remembered line.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn collision_protection_refuses_a_presence_detected_rotation_of_a_trusted_for_all_identity()
-     {
+    async fn collision_protection_refuses_a_presence_detected_rotation_at_runtime() {
         let earlier = TransportIdentity::new_from_rand(OsRng)
             .as_identity()
             .address_hash;
@@ -4798,6 +4799,7 @@ pub(crate) mod network {
             let notes = idle.0.lock();
             assert_eq!(notes.len(), 1, "{notes:#?}");
             assert_eq!(notes[0].source, Source::Mesh);
+            assert_eq!(notes[0].origin, Origin::Peer(b_identity[..8].to_string()));
             let text = &notes[0].text;
             assert!(text.starts_with("error: "), "{text}");
             assert!(text.contains(&earlier.to_hex_string()), "{text}");
@@ -4836,6 +4838,149 @@ pub(crate) mod network {
             idle.0.lock().len(),
             1,
             "the refused request restates nothing: {:#?}",
+            idle.0.lock()
+        );
+
+        let swept = pair.node_a.peers().sweep(SystemTime::now() + PEER_TTL);
+        assert!(
+            swept.contains(&earlier_destination.to_hex_string()),
+            "the earlier row is gone: {swept:?}"
+        );
+        let err = pair
+            .client_b
+            .request(
+                &pair.responder.transport,
+                &pair.responder.identity,
+                &pair.a_desc,
+                STATUS_PATH,
+                pair.responder.envelope(Value::Nil),
+                short_options(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            R3Error::Refused(RefusalCode::NoAccess),
+            "the refusal is remembered after the row aged out"
+        );
+        assert_eq!(fs::read(&trust_path).unwrap(), before);
+        assert_eq!(idle.0.lock().len(), 1, "{:#?}", idle.0.lock());
+        pair.stop_node_a().await;
+    }
+
+    /// Usage probe: the one action the `error:` line names ends the presence refusal.
+    /// Under `mesh.collision_protection: true` node A refuses B's `/status` (B, trusted
+    /// for all destinations, presents an instance A's peer table holds under another such
+    /// identity). The human runs the named `.mesh trust <B's destination>`: B's next
+    /// `/status` is served, the record written is B's own destination grant with no
+    /// key-change mark, and the owner hears nothing further — the destination allow is
+    /// judged before the identity allow, so the peer table is no longer consulted for B.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_trusting_the_named_destination_ends_a_presence_refusal_under_protection() {
+        let earlier = TransportIdentity::new_from_rand(OsRng)
+            .as_identity()
+            .address_hash;
+        let pair = NodePair::start_with(
+            "r3-probe-presence-protected-then-trusted",
+            |config| config.collision_protection = true,
+            |responder| {
+                TrustList::default()
+                    .identity(&responder.desc.identity.address_hash.to_hex_string(), true)
+                    .identity(&earlier.to_hex_string(), true)
+            },
+        )
+        .await;
+        let (slot, idle) = installed_slot(&pair);
+        let b_identity = pair.responder.desc.identity.address_hash.to_hex_string();
+        let b_instance = pair.responder.desc.address_hash.to_hex_string();
+        let name_hash = hex_lower(&pair.responder.origin().0);
+        let earlier_destination = destination_address(&pair.responder.origin().0, &earlier);
+        pair.node_a.peers().observe(
+            PeerSighting {
+                destination_hash: earlier_destination.to_hex_string(),
+                identity_hash: earlier.to_hex_string(),
+                name_hash,
+                display_name: None,
+                protocol_version: MESH_PROTOCOL_VERSION,
+                hops: 1,
+            },
+            SystemTime::now(),
+        );
+        let trust_path = mesh_config_dir(&pair.config_dir_a()).join("trust.yaml");
+        let before = fs::read(&trust_path).unwrap();
+
+        pair.introduce_b_to_a().await;
+        wait_until("the error to surface", || !idle.0.lock().is_empty()).await;
+        let err = pair
+            .client_b
+            .request(
+                &pair.responder.transport,
+                &pair.responder.identity,
+                &pair.a_desc,
+                STATUS_PATH,
+                pair.responder.envelope(Value::Nil),
+                short_options(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err, R3Error::Refused(RefusalCode::NoAccess));
+        assert_eq!(fs::read(&trust_path).unwrap(), before);
+        let line = idle.0.lock()[0].text.clone();
+        assert!(line.starts_with("error: "), "{line}");
+        assert!(
+            line.contains(&format!(".mesh trust {b_instance}")),
+            "the line names the action: {line}"
+        );
+
+        let outcome = pair
+            .node_a
+            .trust()
+            .trust_destination(
+                slot.as_ref(),
+                &b_instance,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        assert_eq!(outcome.change, crate::mesh::trust::TrustChange::Added);
+        assert!(
+            outcome.superseded.is_empty(),
+            "no record carried the instance, so nothing is superseded: {:?}",
+            outcome.superseded
+        );
+
+        let card = pair.status_of_a(&pair.responder.identity, Value::Nil).await;
+        assert_eq!(card.display_name, None, "a card came back");
+        assert_eq!(
+            pair.node_a
+                .trust()
+                .authorize_origin(
+                    &pair.responder.desc.identity.address_hash,
+                    &pair.responder.origin().0
+                )
+                .verdict,
+            crate::mesh::trust::Verdict {
+                decision: crate::mesh::trust::Decision::Allow,
+                rule: Rule::DestinationTrusted,
+            }
+        );
+        let records = pair.node_a.trust().records();
+        let b_record = records
+            .iter()
+            .find(|record| record.hash == b_instance)
+            .unwrap_or_else(|| panic!("B's destination grant missing from {records:#?}"));
+        assert_eq!(b_record.identity.as_deref(), Some(b_identity.as_str()));
+        assert!(b_record.key_changed.is_none(), "{b_record:#?}");
+        assert!(records.iter().all(|record| record.key_changed.is_none()));
+        assert_ne!(
+            fs::read(&trust_path).unwrap(),
+            before,
+            "the grant is on disk"
+        );
+        assert_eq!(
+            idle.0.lock().len(),
+            1,
+            "trusting and the served request say nothing further: {:#?}",
             idle.0.lock()
         );
         pair.stop_node_a().await;

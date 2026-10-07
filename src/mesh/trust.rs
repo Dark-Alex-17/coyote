@@ -23,7 +23,7 @@
 //! it has none; the human is told once per record while the mark stands; the first
 //! conflicting identity is what the mark records, and later conflicts against an
 //! already-marked record write nothing, so an attacker cannot drive disk churn; the wording
-//! says "announced under another identity", never "rotated"; and nothing is ever re-bound
+//! says "presented under another identity", never "rotated"; and nothing is ever re-bound
 //! or re-trusted on its own. Every colliding record is marked, a denied one and one whose
 //! seen identity is trusted for all destinations included; only a blocked identity seen, or
 //! one that already holds its own record for the instance (both bindings then being the
@@ -44,7 +44,13 @@
 //! best effort, and nothing is marked. With protection off the presenting identity is
 //! served and the line is a warning; on, the verdict itself reads the table, for an
 //! identity-allow verdict alone, and the identity is refused by rule identity changed with
-//! an error until the human trusts its new destination. The collision rung judges what
+//! an error until the human trusts its new destination. Once that line has been earned
+//! the refusal is remembered for the node's lifetime (bounded by the surfacing cap), so
+//! the old key's row ageing out of the table does not lift it; blocking or untrusting the
+//! old key does, as does trusting the new destination. While both rows are live the rung
+//! is symmetric: the old key presenting the instance is refused too, earning no second
+//! line, and is admitted again once the new key's row is gone or the new key is blocked.
+//! The listings label a refused identity by its grant. The collision rung judges what
 //! this node serves: the requests, knocks, stored messages and stored access requests it
 //! receives. What it sends or broadcasts is gated by plain `authorize` and does not change
 //! with the setting.
@@ -78,7 +84,7 @@ use arc_swap::ArcSwapOption;
 use parking_lot::Mutex;
 use rns_transport::hash::AddressHash;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -404,7 +410,7 @@ impl fmt::Display for TrustMutation {
                 seen_identity,
             } => write!(
                 f,
-                "key change marked on {} destinations announced under identity {}",
+                "key change marked on {} destinations presented under identity {}",
                 destinations.len(),
                 short(seen_identity)
             ),
@@ -649,7 +655,7 @@ pub(crate) trait InstancePresence: Send + Sync {
 
 /// Pairs of (name hash, identity the peer row holds it under) whose presence-cache
 /// collision has been surfaced; the oldest pair is forgotten when the set outgrows this,
-/// so a long run stays bounded.
+/// so a long run stays bounded. Forgetting a pair also lifts the refusal it remembers.
 const PRESENCE_SURFACED_CAP: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -692,8 +698,12 @@ struct State {
     session_identities: BTreeMap<String, IdentityEntry>,
     session_destinations: BTreeMap<String, DestinationEntry>,
     seen: BTreeMap<String, SystemTime>,
+    /// `(name hash, identity the row held it under)` for every presence collision whose
+    /// line was earned, with insertion order for eviction and a per-instance index of the
+    /// holders for the verdict's lookup. `remember_presence` keeps the three in step.
     presence_surfaced: HashSet<(String, String)>,
     presence_surfaced_order: VecDeque<(String, String)>,
+    presence_remembered: HashMap<String, BTreeSet<String>>,
 }
 
 /// Equality of two hashes that takes the same time whether they differ in the first byte
@@ -831,7 +841,12 @@ impl TrustStore {
     /// record collides with is judged once more against the peer table: the instance heard
     /// there under another identity trusted for all destinations is a rotation with no
     /// record to mark, and it is refused by rule identity changed with empty collisions.
-    /// No other rule and no unprotected store reads the table here.
+    /// That refusal is remembered: once the owner line for the pair (instance, holder) has
+    /// been earned, the presenter stays refused while the holder is trusted for all
+    /// destinations, whether or not the holder's row is still in the table, until the
+    /// memory is evicted by `PRESENCE_SURFACED_CAP` or the node restarts. The memory is
+    /// consulted before the table and never refuses the holder it names. No other rule and
+    /// no unprotected store reads either here.
     pub(crate) fn authorize_origin(
         &self,
         identity: &AddressHash,
@@ -861,15 +876,19 @@ impl TrustStore {
             verdict.rule == Rule::IdentityTrusted
                 && self.collision_protection()
                 && collisions.is_empty()
-                && self
-                    .heard_under_trusted_for_all(
-                        &state,
-                        &hex_lower(name_hash),
-                        name_hash,
-                        &identity_hex,
-                        now,
-                    )
-                    .is_some()
+                && {
+                    let name_hash_hex = hex_lower(name_hash);
+                    state.remembered_under_trusted_for_all(&name_hash_hex, &identity_hex)
+                        || self
+                            .heard_under_trusted_for_all(
+                                &state,
+                                &name_hash_hex,
+                                name_hash,
+                                &identity_hex,
+                                now,
+                            )
+                            .is_some()
+                }
         };
         if self.collision_refuses(verdict.rule, &collisions) || presence_refuses() {
             verdict = Verdict {
@@ -1263,14 +1282,8 @@ impl TrustStore {
             now,
         )?;
         let key = (name_hash.to_string(), old_identity.clone());
-        if !state.presence_surfaced.insert(key.clone()) {
+        if !state.remember_presence(key) {
             return None;
-        }
-        state.presence_surfaced_order.push_back(key);
-        if state.presence_surfaced_order.len() > PRESENCE_SURFACED_CAP
-            && let Some(oldest) = state.presence_surfaced_order.pop_front()
-        {
-            state.presence_surfaced.remove(&oldest);
         }
         debug!(
             "Mesh instance {} heard under identity {} is presented by identity {}; no record carries it",
@@ -1904,6 +1917,45 @@ impl State {
             .identities
             .get(identity)
             .is_some_and(|entry| entry.all_destinations)
+    }
+
+    /// Whether a remembered presence collision for `name_hash` names a holder other than
+    /// `identity` that is still trusted for all destinations. The holder itself is never
+    /// refused by its own memory.
+    fn remembered_under_trusted_for_all(&self, name_hash: &str, identity: &str) -> bool {
+        self.presence_remembered
+            .get(name_hash)
+            .is_some_and(|holders| {
+                holders
+                    .iter()
+                    .any(|holder| holder != identity && self.trusted_for_all(holder))
+            })
+    }
+
+    /// Records `(name hash, holder)` as surfaced, evicting the oldest pair past
+    /// `PRESENCE_SURFACED_CAP`; false when the pair was already remembered.
+    fn remember_presence(&mut self, key: (String, String)) -> bool {
+        if !self.presence_surfaced.insert(key.clone()) {
+            return false;
+        }
+        self.presence_remembered
+            .entry(key.0.clone())
+            .or_default()
+            .insert(key.1.clone());
+        self.presence_surfaced_order.push_back(key);
+        if self.presence_surfaced_order.len() > PRESENCE_SURFACED_CAP
+            && let Some((name_hash, holder)) = self.presence_surfaced_order.pop_front()
+        {
+            self.presence_surfaced
+                .remove(&(name_hash.clone(), holder.clone()));
+            if let Some(holders) = self.presence_remembered.get_mut(&name_hash) {
+                holders.remove(&holder);
+                if holders.is_empty() {
+                    self.presence_remembered.remove(&name_hash);
+                }
+            }
+        }
+        true
     }
 
     /// `identity` is canonical lower hex. An entry whose bound identity does not parse is
@@ -7339,6 +7391,334 @@ mod tests {
             scans(),
             1,
             "a blocked identity is not judged against the table"
+        );
+    }
+
+    /// The presence rung's memory is of a detection, not a guess: before any owner line
+    /// was earned, and with the old row aged past `PEER_TTL`, the presenter is admitted.
+    /// Once `note_key_change` has surfaced the line, the refusal outlives the old row:
+    /// still identity changed at `+PEER_TTL`. Blocking the presenter admits the holder,
+    /// since the memory never refuses the identity it names; blocking (or untrusting) the
+    /// holder admits the presenter, since the memory refuses only for a holder still
+    /// trusted for all destinations. Trusting the presenter's destination admits it
+    /// regardless. Judging writes nothing and marks nothing throughout.
+    #[test]
+    fn a_presence_refusal_outlives_the_old_row_once_its_line_was_earned() {
+        let fx = Fixture::new("trust-presence-refusal-outlives-row");
+        let surface = Arc::new(RecordingSurface::default());
+        fx.store
+            .attach_surface(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
+        fx.store.set_collision_protection(true);
+        let old = announced("alpha");
+        fx.announce(&old, t(2_000));
+        fx.trust_identity(&old.identity_hash, t(3_000));
+        let new = announced("alpha");
+        assert_eq!(new.name_hash, old.name_hash);
+        fx.announce(&new, t(4_000));
+        fx.trust_identity(&new.identity_hash, t(5_000));
+        let before = fx.file_bytes().unwrap();
+        let name_hash = decode_name_hash(&new.name_hash).unwrap();
+        let origin = |peer: &Announced, now| {
+            fx.store
+                .authorize_origin_at(&parse_hash(&peer.identity_hash).unwrap(), &name_hash, now)
+                .verdict
+        };
+        let aged_out = t(4_000) + PEER_TTL;
+
+        assert_eq!(
+            origin(&new, t(4_500)),
+            verdict(Decision::Allow, Rule::IdentityTrusted),
+            "no peer table attached: nothing to consult, the identity allow stands"
+        );
+
+        fx.store
+            .attach_presence(Arc::downgrade(&fx.mesh.0) as Weak<dyn InstancePresence>);
+        assert_eq!(
+            origin(&new, aged_out),
+            verdict(Decision::Allow, Rule::IdentityTrusted),
+            "no line earned and both rows aged out: nothing is remembered"
+        );
+        assert_eq!(
+            origin(&new, t(4_500)),
+            verdict(Decision::Refuse, Rule::IdentityChanged),
+            "the old row is live at 4 500 s"
+        );
+        assert_eq!(
+            origin(&old, t(4_500)),
+            verdict(Decision::Refuse, Rule::IdentityChanged),
+            "while both rows are live the holder is refused too"
+        );
+
+        assert!(
+            fx.store
+                .note_key_change(
+                    &new.identity_hash,
+                    &new.name_hash,
+                    KeyChangeOutcome::Refused,
+                    t(4_500),
+                )
+                .is_empty(),
+            "nothing is marked"
+        );
+        assert_eq!(surface.texts().len(), 1, "{:#?}", surface.texts());
+        assert_eq!(
+            origin(&new, aged_out),
+            verdict(Decision::Refuse, Rule::IdentityChanged),
+            "the line was earned, so the refusal outlives the old row"
+        );
+        assert_eq!(
+            origin(&old, aged_out),
+            verdict(Decision::Allow, Rule::IdentityTrusted),
+            "the memory never refuses the holder it names; with the presenter's row gone too, \
+             the holder is admitted"
+        );
+        assert_eq!(fx.file_bytes().unwrap(), before, "judging writes nothing");
+
+        fx.store
+            .block_identity(&fx.mesh, &new.identity_hash, None, t(5_000))
+            .unwrap();
+        assert_eq!(
+            origin(&new, t(4_500)),
+            verdict(Decision::Refuse, Rule::IdentityBlocked)
+        );
+        assert_eq!(
+            origin(&old, t(4_500)),
+            verdict(Decision::Allow, Rule::IdentityTrusted),
+            "blocking the presenter restores the holder while the presenter's row is still live"
+        );
+        fx.store
+            .unblock_identity(&fx.mesh, &new.identity_hash)
+            .unwrap();
+        fx.trust_identity(&new.identity_hash, t(5_100));
+        assert_eq!(
+            origin(&new, aged_out),
+            verdict(Decision::Refuse, Rule::IdentityChanged),
+            "re-trusting the presenter for all destinations does not lift the memory"
+        );
+
+        fx.store
+            .untrust_identity(&fx.mesh, &old.identity_hash)
+            .unwrap();
+        assert_eq!(
+            origin(&new, aged_out),
+            verdict(Decision::Allow, Rule::IdentityTrusted),
+            "the holder no longer trusted for all destinations: the memory refuses nobody"
+        );
+        fx.trust_identity(&old.identity_hash, t(5_200));
+        assert_eq!(
+            origin(&new, aged_out),
+            verdict(Decision::Refuse, Rule::IdentityChanged),
+            "the memory stands while the node runs; the holder trusted again, it refuses again"
+        );
+        fx.store
+            .block_identity(&fx.mesh, &old.identity_hash, None, t(5_300))
+            .unwrap();
+        assert_eq!(
+            origin(&new, aged_out),
+            verdict(Decision::Allow, Rule::IdentityTrusted),
+            "blocking the holder admits the presenter"
+        );
+        fx.store
+            .unblock_identity(&fx.mesh, &old.identity_hash)
+            .unwrap();
+        fx.trust_identity(&old.identity_hash, t(5_400));
+
+        assert_eq!(fx.trust_destination(&new, t(6_000)), TrustChange::Added);
+        assert_eq!(
+            origin(&new, aged_out),
+            verdict(Decision::Allow, Rule::DestinationTrusted),
+            "the human trusting the new destination admits it under protection"
+        );
+        assert_eq!(surface.texts().len(), 1, "{:#?}", surface.texts());
+        assert!(
+            fx.store
+                .records()
+                .iter()
+                .all(|record| record.key_changed.is_none()),
+            "{:#?}",
+            fx.store.records()
+        );
+    }
+
+    /// The remembered pairs and their per-instance index stay in step across the
+    /// `PRESENCE_SURFACED_CAP` eviction: a pair evicted from the oldest end refuses nobody,
+    /// a remembered one still does, and the index holds no instance without a holder.
+    #[test]
+    fn remembered_presence_pairs_and_their_index_evict_together_at_the_cap() {
+        let holder = fake_hash(0x11);
+        let presenter = fake_hash(0x22);
+        let mut state = State::default();
+        state
+            .file
+            .identities
+            .insert(holder.clone(), identity_entry(t(1_000), t(1_000), true));
+        let instance = |n: usize| format!("instance-{n}");
+
+        assert!(state.remember_presence((instance(0), holder.clone())));
+        assert!(
+            !state.remember_presence((instance(0), holder.clone())),
+            "a pair is remembered once"
+        );
+        assert!(state.remembered_under_trusted_for_all(&instance(0), &presenter));
+        assert!(
+            !state.remembered_under_trusted_for_all(&instance(0), &holder),
+            "the holder is never refused by its own memory"
+        );
+
+        for n in 1..=PRESENCE_SURFACED_CAP {
+            assert!(state.remember_presence((instance(n), holder.clone())));
+        }
+        assert_eq!(state.presence_surfaced.len(), PRESENCE_SURFACED_CAP);
+        assert_eq!(state.presence_surfaced_order.len(), PRESENCE_SURFACED_CAP);
+        assert_eq!(state.presence_remembered.len(), PRESENCE_SURFACED_CAP);
+        assert!(
+            !state
+                .presence_surfaced
+                .contains(&(instance(0), holder.clone())),
+            "the oldest pair was evicted"
+        );
+        assert!(
+            !state.remembered_under_trusted_for_all(&instance(0), &presenter),
+            "the evicted pair refuses nobody"
+        );
+        assert!(
+            state.remembered_under_trusted_for_all(&instance(1), &presenter),
+            "the next-oldest pair still does"
+        );
+        assert!(
+            state.remembered_under_trusted_for_all(&instance(PRESENCE_SURFACED_CAP), &presenter),
+            "and so does the newest"
+        );
+        assert!(
+            state
+                .presence_remembered
+                .values()
+                .all(|holders| !holders.is_empty())
+        );
+        assert!(
+            state.remember_presence((instance(0), holder.clone())),
+            "an evicted pair can be remembered again"
+        );
+        assert!(!state.presence_surfaced.contains(&(instance(1), holder)));
+        assert!(!state.remembered_under_trusted_for_all(&instance(1), &presenter));
+    }
+
+    /// Usage probe: a presence-only rotation is refused by the verdict alone; the line it
+    /// earns is deduped once per (instance, recorded identity) while the refusal itself
+    /// holds for every request, and the dedupe is shared with the protection-off warning,
+    /// so flipping the setting after the line was earned restates nothing.
+    #[test]
+    fn usage_probe_a_presence_refusal_holds_per_request_while_its_line_is_earned_once() {
+        let fx = Fixture::new("trust-probe-presence-refusal-holds");
+        let surface = Arc::new(RecordingSurface::default());
+        fx.store
+            .attach_surface(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
+        fx.store
+            .attach_presence(Arc::downgrade(&fx.mesh.0) as Weak<dyn InstancePresence>);
+        fx.store.set_collision_protection(true);
+        let old = announced("alpha");
+        fx.announce(&old, t(2_000));
+        fx.trust_identity(&old.identity_hash, t(3_000));
+        let new = announced("alpha");
+        fx.announce(&new, t(4_000));
+        fx.trust_identity(&new.identity_hash, t(5_000));
+        let identity = parse_hash(&new.identity_hash).unwrap();
+        let name_hash = decode_name_hash(&new.name_hash).unwrap();
+
+        for round in 0..3 {
+            let origin = fx
+                .store
+                .authorize_origin_at(&identity, &name_hash, t(4_500 + round));
+            assert_eq!(
+                origin.verdict,
+                verdict(Decision::Refuse, Rule::IdentityChanged),
+                "round {round}"
+            );
+            assert!(
+                fx.store
+                    .note_key_change(
+                        &new.identity_hash,
+                        &new.name_hash,
+                        KeyChangeOutcome::Refused,
+                        t(4_500 + round),
+                    )
+                    .is_empty(),
+                "round {round}: nothing is marked"
+            );
+        }
+        let texts = surface.texts();
+        assert_eq!(texts.len(), 1, "one line for three refusals: {texts:#?}");
+        assert!(texts[0].starts_with("error: "), "{}", texts[0]);
+
+        fx.store.set_collision_protection(false);
+        assert!(
+            fx.store
+                .note_key_change(
+                    &new.identity_hash,
+                    &new.name_hash,
+                    KeyChangeOutcome::Served,
+                    t(4_600),
+                )
+                .is_empty()
+        );
+        assert_eq!(
+            surface.texts().len(),
+            1,
+            "the served variant shares the dedupe: {:#?}",
+            surface.texts()
+        );
+    }
+
+    /// Usage probe: the served presence line, the one `mesh.collision_protection: false`
+    /// earns, names the setting that let the identity through and no longer promises that
+    /// "nothing is needed"; both variants say "presented under", never "announced under",
+    /// since the same line serves an announce, a link, a knock and a stored request.
+    #[test]
+    fn usage_probe_the_served_presence_line_names_the_setting_and_promises_nothing() {
+        let fx = Fixture::new("trust-probe-presence-served-line");
+        let surface = Arc::new(RecordingSurface::default());
+        fx.store
+            .attach_surface(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
+        fx.store
+            .attach_presence(Arc::downgrade(&fx.mesh.0) as Weak<dyn InstancePresence>);
+        let old = announced("alpha");
+        fx.announce(&old, t(2_000));
+        fx.trust_identity(&old.identity_hash, t(3_000));
+        let new = announced("alpha");
+        fx.announce(&new, t(4_000));
+        fx.trust_identity(&new.identity_hash, t(5_000));
+        assert_eq!(
+            origin_verdict(&fx.store, &new),
+            verdict(Decision::Allow, Rule::IdentityTrusted),
+            "protection off: served"
+        );
+
+        fx.store.note_key_change(
+            &new.identity_hash,
+            &new.name_hash,
+            KeyChangeOutcome::Served,
+            t(4_500),
+        );
+
+        let texts = surface.texts();
+        assert_eq!(texts.len(), 1, "{texts:#?}");
+        let text = &texts[0];
+        assert!(text.starts_with("warning: "), "{text}");
+        assert!(
+            text.contains("is served while it asks because collision_protection is off"),
+            "{text}"
+        );
+        assert!(!text.contains("nothing is needed"), "{text}");
+        assert!(text.contains("presented under"), "{text}");
+        assert!(!text.contains("announced under"), "{text}");
+        assert!(text.contains("nothing is marked"), "{text}");
+        assert!(
+            text.contains("confirm with its holder out of band"),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(".mesh block {}", new.identity_hash)),
+            "{text}"
         );
     }
 }

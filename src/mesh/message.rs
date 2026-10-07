@@ -3535,6 +3535,122 @@ mod tests {
         assert!(texts[0].contains("is refused"), "{}", texts[0]);
     }
 
+    /// Usage probe: the store-and-forward message path judges a presence-only rotation as
+    /// the link does. The sender is trusted for all destinations and names an instance no
+    /// record carries but the peer table holds under another identity trusted for all
+    /// destinations. Under `mesh.collision_protection` the message is dropped as any
+    /// untrusted instance's is, admission is never asked, the human gets one `error:` line
+    /// naming both identities, nothing is marked (there is no record to mark) and
+    /// `trust.yaml` keeps its bytes; with protection off the same message is delivered and
+    /// the path adds no line of its own (the warning for that mode is the announce path's).
+    #[test]
+    fn usage_probe_a_stored_message_over_an_instance_heard_under_another_trusted_for_all_identity_is_refused_under_protection()
+     {
+        crate::testing::install_log_collector();
+        let sender = hash_of("id-sender-now");
+        let earlier = hash_of("id-heard-earlier");
+        let origin = OriginName([0x5b_u8; NAME_HASH_LEN]);
+        let (trust, tmp) = TrustList::default()
+            .identity(&sender, true)
+            .identity(&earlier, true)
+            .open("peer-routing-presence-collision-protected");
+        let notes = Arc::new(KeyChangeSurface::default());
+        trust.attach_surface(Arc::downgrade(&notes) as Weak<dyn KnockSurface>);
+        let peers = Arc::new(
+            crate::mesh::peers::PeerTable::load(tmp.path.join("peers.json"), SystemTime::now())
+                .unwrap(),
+        );
+        trust.attach_presence(
+            Arc::downgrade(&peers) as Weak<dyn crate::mesh::trust::InstancePresence>
+        );
+        let earlier_destination = destination_address(
+            &origin.0,
+            &AddressHash::new_from_hex_string(&earlier).unwrap(),
+        )
+        .to_hex_string();
+        peers.observe(
+            crate::mesh::peers::PeerSighting {
+                destination_hash: earlier_destination,
+                identity_hash: earlier.clone(),
+                name_hash: hex_lower(&origin.0),
+                display_name: None,
+                protocol_version: 1,
+                hops: 1,
+            },
+            SystemTime::now(),
+        );
+        let sender_destination = destination_address(
+            &origin.0,
+            &AddressHash::new_from_hex_string(&sender).unwrap(),
+        )
+        .to_hex_string();
+        let before = std::fs::read(trust.path()).unwrap();
+        trust.set_collision_protection(true);
+        let (surface, inner) = recorders();
+
+        deliver_stored(&trust, &surface, &inner, &sender, &origin, "first");
+
+        assert!(surface.delivered.lock().is_empty());
+        assert_eq!(surface.offered(), 0, "admission is never asked");
+        assert!(inner.messages.lock().is_empty());
+        let expected = format!(
+            "Propagated message from {} dropped: instance {} is not trusted",
+            &sender[..8],
+            &sender_destination[..8]
+        );
+        let logs = crate::testing::debug_snapshot();
+        assert!(logs.contains(&expected), "{logs:#?}");
+        assert!(
+            trust
+                .records()
+                .iter()
+                .all(|record| record.key_changed.is_none()),
+            "{:#?}",
+            trust.records()
+        );
+        assert_eq!(std::fs::read(trust.path()).unwrap(), before);
+        let texts = notes.texts();
+        assert_eq!(texts.len(), 1, "{texts:#?}");
+        let text = &texts[0];
+        assert!(text.starts_with("error: "), "{text}");
+        assert!(text.contains(&earlier), "{text}");
+        assert!(text.contains(&sender), "{text}");
+        assert!(text.contains("is refused when it asks"), "{text}");
+        assert!(text.contains("nothing is marked"), "{text}");
+        assert!(
+            text.contains(&format!(".mesh trust {sender_destination}")),
+            "{text}"
+        );
+
+        deliver_stored(&trust, &surface, &inner, &sender, &origin, "second");
+        assert!(
+            surface.delivered.lock().is_empty(),
+            "the refusal holds per message"
+        );
+        assert_eq!(notes.texts().len(), 1, "the line is earned once");
+
+        trust.set_collision_protection(false);
+        deliver_stored(&trust, &surface, &inner, &sender, &origin, "third");
+        let delivered = surface.delivered.lock();
+        assert_eq!(delivered.len(), 1, "{delivered:#?}");
+        assert_eq!(delivered[0].content, "third");
+        assert_eq!(delivered[0].source_identity, sender);
+        drop(delivered);
+        assert_eq!(
+            notes.texts().len(),
+            1,
+            "protection off: the message path adds no line of its own: {:#?}",
+            notes.texts()
+        );
+        assert!(
+            trust
+                .records()
+                .iter()
+                .all(|record| record.key_changed.is_none())
+        );
+        assert_eq!(std::fs::read(trust.path()).unwrap(), before);
+    }
+
     /// Recorders for what a routing hands the surface and the inner sink.
     fn recorders() -> (Arc<RecordingSurface>, Arc<CountingSink>) {
         (

@@ -4005,6 +4005,107 @@ mod tests {
         assert!(texts[0].contains("is refused"), "{}", texts[0]);
     }
 
+    /// Usage probe: the store-and-forward access path judges a presence-only rotation as
+    /// the link does. `identity()` is trusted for all destinations and names an instance no
+    /// record carries but the peer table holds under another identity trusted for all
+    /// destinations. Under `mesh.collision_protection` the request is dropped before
+    /// admission is asked, the human gets one `error:` line naming both identities and
+    /// `.mesh trust <requester's destination>`, nothing is marked (there is no record to
+    /// mark) and `trust.yaml` keeps its bytes; with protection off the same request is
+    /// filed and the path adds no line of its own.
+    #[test]
+    fn usage_probe_a_stored_access_request_over_an_instance_heard_under_another_trusted_for_all_identity_is_refused_under_protection()
+     {
+        crate::testing::install_log_collector();
+        let earlier = hex_lower(&[0x5c; 16]);
+        let origin = OriginName([0x5c_u8; NAME_HASH_LEN]);
+        let (trust, tmp) = TrustList::default()
+            .identity(&identity(), true)
+            .identity(&earlier, true)
+            .open("access-route-presence-collision-protected");
+        let notes = Arc::new(RecordingSurface::default());
+        trust.attach_surface(Arc::downgrade(&notes) as Weak<dyn KnockSurface>);
+        let peers = Arc::new(
+            crate::mesh::peers::PeerTable::load(tmp.path.join("peers.json"), SystemTime::now())
+                .unwrap(),
+        );
+        trust.attach_presence(
+            Arc::downgrade(&peers) as Weak<dyn crate::mesh::trust::InstancePresence>
+        );
+        peers.observe(
+            PeerSighting {
+                destination_hash: destination_address(
+                    &origin.0,
+                    &AddressHash::new_from_hex_string(&earlier).unwrap(),
+                )
+                .to_hex_string(),
+                identity_hash: earlier.clone(),
+                name_hash: hex_lower(&origin.0),
+                display_name: None,
+                protocol_version: 1,
+                hops: 1,
+            },
+            SystemTime::now(),
+        );
+        let trust_path = crate::mesh::mesh_config_dir(&tmp.path).join("trust.yaml");
+        let before = std::fs::read(&trust_path).unwrap();
+        trust.set_collision_protection(true);
+
+        let (surface, inner) = deliver_stored(&trust, &origin);
+
+        assert_eq!(surface.admissions(), 0, "admission is never asked");
+        assert_eq!(inner.count(), 0);
+        let expected = format!(
+            "Propagated access request from {} dropped: instance {} is not trusted",
+            &identity()[..8],
+            &origin_destination(&origin)[..8]
+        );
+        let logs = crate::testing::debug_snapshot();
+        assert!(logs.contains(&expected), "{logs:#?}");
+        assert!(
+            trust
+                .records()
+                .iter()
+                .all(|record| record.key_changed.is_none()),
+            "{:#?}",
+            trust.records()
+        );
+        assert_eq!(std::fs::read(&trust_path).unwrap(), before);
+        let texts = notes.texts();
+        assert_eq!(texts.len(), 1, "{texts:#?}");
+        let text = &texts[0];
+        assert!(text.starts_with("error: "), "{text}");
+        assert!(text.contains(&earlier), "{text}");
+        assert!(text.contains(&identity()), "{text}");
+        assert!(text.contains("is refused when it asks"), "{text}");
+        assert!(text.contains("nothing is marked"), "{text}");
+        assert!(
+            text.contains(&format!(".mesh trust {}", origin_destination(&origin))),
+            "{text}"
+        );
+
+        trust.set_collision_protection(false);
+        let (surface, inner) = deliver_stored(&trust, &origin);
+        let admitted = surface.admitted.lock();
+        assert_eq!(admitted.len(), 1, "protection off: filed");
+        assert_eq!(admitted[0].identity, identity());
+        assert_eq!(admitted[0].destination, origin_destination(&origin));
+        drop(admitted);
+        assert_eq!(inner.count(), 0);
+        assert_eq!(
+            notes.texts().len(),
+            1,
+            "the access path adds no line of its own"
+        );
+        assert!(
+            trust
+                .records()
+                .iter()
+                .all(|record| record.key_changed.is_none())
+        );
+        assert_eq!(std::fs::read(&trust_path).unwrap(), before);
+    }
+
     /// A stranger (no record at all) is silenced before the destination tier: its stored
     /// access request over a colliding record is dropped in either mode, nothing is
     /// marked, `trust.yaml` keeps its bytes and the human hears nothing.

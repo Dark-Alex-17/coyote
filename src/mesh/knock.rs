@@ -437,7 +437,8 @@ impl KnockGate {
     /// `authorize_origin`'s when the knock's hashes decode, and every arm does to a
     /// colliding record what the request path does: a standing identity naming an
     /// instance bound to another identity is refused as identity changed and marks that
-    /// record instead of knocking, one trusted for all destinations admitted over such a
+    /// record instead of knocking when a record collides (a collision known only from the
+    /// peer table marks nothing), one trusted for all destinations admitted over such a
     /// record marks it and warns, and one whose own destination is denied is denied and
     /// still marks it. A knock without a readable name hash is judged by `authorize` alone.
     pub(crate) fn admit(
@@ -1469,6 +1470,114 @@ mod tests {
         assert_eq!(texts.len(), 1, "{texts:#?}");
         assert!(texts[0].starts_with("warning: "), "{}", texts[0]);
         assert!(texts[0].contains("presented under"), "{}", texts[0]);
+    }
+
+    /// Usage probe: the knock path judges a presence-only rotation as the request path
+    /// does. Identity I2, trusted for all destinations, knocks for an instance no record
+    /// carries but the peer table holds under I1, another identity trusted for all
+    /// destinations. Under `mesh.collision_protection` that is identity changed, not a
+    /// knock: the knocker is refused, the human gets one `error:` line naming both
+    /// identities and `.mesh trust <knocker's destination>`, nothing is marked (there is
+    /// no record to mark), `trust.yaml` keeps its bytes and the cache and bucket are
+    /// untouched. With protection off the same knock is no knock either, already
+    /// trusted, and the request path earns no second line: the dedupe is shared and the
+    /// warning for that mode is the announce path's.
+    #[test]
+    fn usage_probe_a_trusted_for_all_knocker_over_an_instance_heard_under_another_such_identity_is_refused_under_protection()
+     {
+        let earlier = hash_of("id-heard-earlier");
+        let knocker = hash_of("id-knocks-now");
+        let name_hash = [0x5a_u8; NAME_HASH_LEN];
+        let rig = Rig::new(
+            "knock-gate-presence-collision-protected",
+            TrustList::default()
+                .identity(&earlier, true)
+                .identity(&knocker, true),
+        );
+        rig.gate
+            .trust
+            .attach_surface(Arc::downgrade(&rig.surface) as Weak<dyn KnockSurface>);
+        rig.gate.trust.attach_presence(
+            Arc::downgrade(&rig.peers) as Weak<dyn crate::mesh::trust::InstancePresence>
+        );
+        rig.gate.trust.set_collision_protection(true);
+        let earlier_destination = destination_address(
+            &name_hash,
+            &AddressHash::new_from_hex_string(&earlier).unwrap(),
+        )
+        .to_hex_string();
+        rig.peers.observe(
+            PeerSighting {
+                destination_hash: earlier_destination.clone(),
+                identity_hash: earlier.clone(),
+                name_hash: hex_lower(&name_hash),
+                display_name: None,
+                protocol_version: 1,
+                hops: 1,
+            },
+            SystemTime::now(),
+        );
+        let knocker_destination = destination_address(
+            &name_hash,
+            &AddressHash::new_from_hex_string(&knocker).unwrap(),
+        )
+        .to_hex_string();
+        let knock = || InboundKnock {
+            identity_hash: knocker.clone(),
+            destination_hash: knocker_destination.clone(),
+            name_hash: hex_lower(&name_hash),
+            via: KnockVia::StoreAndForward,
+            intro: Some("hello".to_string()),
+        };
+        let before = std::fs::read(rig.gate.trust.path()).unwrap();
+
+        let admission = rig.gate.admit(knock(), now(), SystemTime::now());
+
+        assert_eq!(admission, Admission::IdentityChanged);
+        assert!(
+            rig.gate
+                .trust
+                .records()
+                .iter()
+                .all(|record| record.key_changed.is_none()),
+            "no record carries the instance, so nothing is marked: {:#?}",
+            rig.gate.trust.records()
+        );
+        assert_eq!(std::fs::read(rig.gate.trust.path()).unwrap(), before);
+        assert!(!rig.gate.cache().path().exists());
+        assert!(rig.gate.tracked_identities().is_empty());
+        let texts = rig.surface.texts();
+        assert_eq!(texts.len(), 1, "{texts:#?}");
+        let text = &texts[0];
+        assert!(text.starts_with("error: "), "{text}");
+        assert!(text.contains(&earlier), "{text}");
+        assert!(text.contains(&knocker), "{text}");
+        assert!(text.contains("is refused when it asks"), "{text}");
+        assert!(text.contains("nothing is marked"), "{text}");
+        assert!(text.contains("presented under"), "{text}");
+        assert!(
+            text.contains(&format!(".mesh trust {knocker_destination}")),
+            "{text}"
+        );
+
+        let again = rig.gate.admit(knock(), now(), SystemTime::now());
+        assert_eq!(
+            again,
+            Admission::IdentityChanged,
+            "the refusal holds per knock"
+        );
+        assert_eq!(rig.surface.texts().len(), 1, "the line is earned once");
+
+        rig.gate.trust.set_collision_protection(false);
+        let served = rig.gate.admit(knock(), now(), SystemTime::now());
+        assert_eq!(served, Admission::AlreadyTrusted);
+        assert_eq!(
+            rig.surface.texts().len(),
+            1,
+            "protection off: the knock path adds no line of its own: {:#?}",
+            rig.surface.texts()
+        );
+        assert_eq!(std::fs::read(rig.gate.trust.path()).unwrap(), before);
     }
 
     /// Usage probe: the store-and-forward twin of the protected request path. Under

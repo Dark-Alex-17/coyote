@@ -60,9 +60,10 @@ pub struct MeshConfig {
     /// with a warning to the human; on, it is judged before and the identity is refused
     /// with an error until the human trusts its new destination, whether the instance is
     /// recorded under another identity or only heard in the peer table under one trusted
-    /// for all destinations. A destination allow admits in either mode. The rung judges
-    /// what the node serves, the requests, knocks, stored messages and stored access
-    /// requests it receives; what it sends or broadcasts is unchanged.
+    /// for all destinations; a refusal from the peer table is remembered while the node
+    /// runs once its line to the human was earned. A destination allow admits in either
+    /// mode. The rung judges what the node serves, the requests, knocks, stored messages
+    /// and stored access requests it receives; what it sends or broadcasts is unchanged.
     pub collision_protection: bool,
     /// Envoy runs one sending identity may have queued or running at once; on a live
     /// link a message that would start a run while the sender already has that many

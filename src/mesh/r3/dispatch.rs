@@ -392,9 +392,10 @@ impl RequestHandler for Dispatcher {
             Decision::Allow => {
                 // Only an identity trusted for all destinations can be admitted over a
                 // colliding record; the human hears of it as a warning, the record is
-                // marked, and the request is served all the same. The peer-table check for
-                // an identity with no colliding record is the announce path's; a served
-                // request does not pay for it.
+                // marked, and the request is served all the same. With no colliding record
+                // an identity-allow verdict under collision protection has already paid the
+                // remembered-presence lookup and, on a miss, the peer-table scan inside
+                // `authorize_origin`; a served request pays nothing more here.
                 if !collisions.is_empty() {
                     self.trust.note_key_change(
                         &identity_hex,
