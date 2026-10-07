@@ -355,7 +355,7 @@ impl PeerLimits {
                 retry_after: window.remaining(now),
             });
         }
-        window.messages += 1;
+        window.messages = window.messages.saturating_add(1);
         Ok(())
     }
 

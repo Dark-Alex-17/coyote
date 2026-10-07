@@ -1,7 +1,7 @@
 use super::paths;
-use crate::mesh::DEFAULT_LINK_TIMEOUT;
 use crate::mesh::card::ABOUT_MAX_CHARS;
 use crate::mesh::message::PEER_REQUEST_TIMEOUT;
+use crate::mesh::r3::DEFAULT_LINK_TIMEOUT;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -15,6 +15,9 @@ pub const DEFAULT_PEER_MAX_COST_USD_PER_HOUR: f64 = 0.0;
 pub const DEFAULT_PROPAGATION_SYNC_INTERVAL_SECS: u64 = 300;
 /// One year: the longest automatic sync interval `validate` accepts.
 pub const MAX_PROPAGATION_SYNC_INTERVAL_SECS: u64 = 31_536_000;
+/// The longest request or link timer `validate` accepts; `Instant` cannot hold a deadline
+/// anywhere near `u64::MAX` seconds away.
+pub const MAX_TIMEOUT_SECS: u64 = MAX_PROPAGATION_SYNC_INTERVAL_SECS;
 pub const DEFAULT_INLINE_MAX_BYTES: u64 = 64 * 1024;
 /// Σ inline file bytes one message may carry; `inline_max_bytes` cannot exceed it.
 pub const MAX_INLINE_FILE_TOTAL: u64 = 96 * 1024;
@@ -284,10 +287,10 @@ impl MeshConfig {
         ] {
             let floor = floor.as_secs();
             if let Some(value) = value
-                && value < floor
+                && !(floor..=MAX_TIMEOUT_SECS).contains(&value)
             {
                 bail!(
-                    "mesh.{name} is {value}, which is out of range; use {floor} (the shortest built-in deadline, which this key raises but never lowers) or more"
+                    "mesh.{name} is {value}, which is out of range; use {floor} (the shortest built-in deadline, which this key raises but never lowers) to {MAX_TIMEOUT_SECS} (one year), or null to keep each path's built-in deadline"
                 );
             }
         }
@@ -704,11 +707,11 @@ mod tests {
     #[test]
     fn disabled_block_with_out_of_range_rate_limit_parses_and_validates() {
         let cfg: Config = serde_yaml::from_str(
-            "mesh:\n  enabled: false\n  interfaces: []\n  peer_max_concurrent: 0\n  knock_retention_hours: 0\n",
+            "mesh:\n  enabled: false\n  interfaces: []\n  request_timeout_secs: 1\n  knock_retention_hours: 0\n",
         )
         .unwrap();
         assert!(!cfg.mesh.enabled);
-        assert_eq!(cfg.mesh.peer_max_concurrent, 0);
+        assert_eq!(cfg.mesh.request_timeout_secs, Some(1));
         cfg.mesh.validate(false).unwrap();
     }
 
@@ -853,7 +856,7 @@ mod tests {
         let mesh = MeshConfig {
             enabled: false,
             interfaces: vec![],
-            peer_max_concurrent: 0,
+            request_timeout_secs: Some(1),
             ..Default::default()
         };
         mesh.validate(false).unwrap();
@@ -944,16 +947,17 @@ mod tests {
     }
 
     /// Both timers default to unset, which serialises as `null` and reads back as unset;
-    /// set, each is accepted at its floor and above and refused below it with a message
-    /// naming the key, the value and the floor. The floors are the shortest built-in
-    /// deadlines on the paths the timers govern, so a value valid for one path is valid
-    /// for all.
+    /// set, each is accepted from its floor to the one-year cap and refused outside that
+    /// with a message naming the key, the value, the floor, the cap and `null`. The floors
+    /// are the shortest built-in deadlines on the paths the timers govern, so a value valid
+    /// for one path is valid for all; the cap is the sync interval's.
     #[test]
     fn validate_accepts_timers_from_their_floors_and_refuses_lower_ones_naming_the_floor() {
         assert_eq!(MeshConfig::default().request_timeout_secs, None);
         assert_eq!(MeshConfig::default().link_timeout_secs, None);
         assert_eq!(PEER_REQUEST_TIMEOUT.as_secs(), 15);
         assert_eq!(DEFAULT_LINK_TIMEOUT.as_secs(), 10);
+        assert_eq!(MAX_TIMEOUT_SECS, MAX_PROPAGATION_SYNC_INTERVAL_SECS);
         let serialized = serde_yaml::to_string(&MeshConfig::default()).unwrap();
         assert!(
             serialized.contains("request_timeout_secs: null\n"),
@@ -978,7 +982,12 @@ mod tests {
             link_timeout_secs: link,
             ..enabled.clone()
         };
-        for (request, link) in [(None, None), (Some(15), Some(10)), (Some(90), Some(45))] {
+        for (request, link) in [
+            (None, None),
+            (Some(15), Some(10)),
+            (Some(90), Some(45)),
+            (Some(MAX_TIMEOUT_SECS), Some(MAX_TIMEOUT_SECS)),
+        ] {
             with(request, link)
                 .validate(true)
                 .unwrap_or_else(|err| panic!("{request:?}/{link:?}: {err}"));
@@ -988,7 +997,10 @@ mod tests {
             err.contains("mesh.request_timeout_secs is 14, which is out of range; use 15 ("),
             "{err}"
         );
-        assert!(err.contains("or more"), "{err}");
+        assert!(
+            err.contains(") to 31536000 (one year), or null to keep each path's built-in deadline"),
+            "{err}"
+        );
         let err = with(None, Some(9)).validate(true).unwrap_err().to_string();
         assert!(
             err.contains("mesh.link_timeout_secs is 9, which is out of range; use 10 ("),
@@ -999,6 +1011,24 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("mesh.request_timeout_secs is 1"), "{err}");
+        for (request, link, key) in [
+            (Some(MAX_TIMEOUT_SECS + 1), None, "request_timeout_secs"),
+            (None, Some(MAX_TIMEOUT_SECS + 1), "link_timeout_secs"),
+            (Some(u64::MAX), Some(u64::MAX), "request_timeout_secs"),
+        ] {
+            let err = with(request, link).validate(true).unwrap_err().to_string();
+            assert!(
+                err.starts_with(&format!(
+                    "mesh.{key} is {}, which is out of range; use ",
+                    request.or(link).unwrap()
+                )),
+                "{request:?}/{link:?}: {err}"
+            );
+            assert!(
+                err.contains("to 31536000 (one year), or null"),
+                "{request:?}/{link:?}: {err}"
+            );
+        }
 
         let disabled = MeshConfig {
             request_timeout_secs: Some(1),
@@ -1009,7 +1039,7 @@ mod tests {
     }
 
     /// Usage probe: the documented `0 = fetch only on .mesh sync` is a VALID setting for an
-    /// enabled mesh, unlike the rate and retention keys where 0 is out of range; an absent
+    /// enabled mesh, unlike `knock_retention_hours`, where 0 is out of range; an absent
     /// key reads as the documented 300; a negative or fractional value is refused at parse
     /// time naming the key rather than silently clamped.
     #[test]

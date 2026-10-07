@@ -3363,14 +3363,15 @@ impl EnvoySink for FullEnvoy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::mesh_config::MeshBrief;
+    use crate::config::mesh_config::{MAX_TIMEOUT_SECS, MeshBrief};
     use crate::hooks::HookEvent;
-    use crate::mesh::access::{access_message, validate_access};
+    use crate::mesh::access::{AccessOptions, access_message, validate_access};
     use crate::mesh::destination_address;
     use crate::mesh::events::{RecordingHookSink, env_value, one_fire};
     use crate::mesh::limits::PEER_RETRY_AFTER_CAPACITY;
     use crate::mesh::message::{
-        PEER_ID_MAX_CHARS, PeerSendOptions, is_received_reply, peer_lxmf_message, to_r3_body,
+        PEER_ID_MAX_CHARS, PEER_LINK_TIMEOUT, PEER_REQUEST_TIMEOUT, PeerSendOptions,
+        is_received_reply, peer_lxmf_message, to_r3_body,
     };
     use crate::mesh::notify::RenderedNotification;
     use crate::mesh::peers::PEER_TTL;
@@ -3382,7 +3383,8 @@ mod tests {
     };
     use crate::mesh::propagation_fetch::InboundMessage;
     use crate::mesh::r3::{
-        AdmittedRequest, Handler, NAME_HASH_LEN, PathHash, Reply, RequestId, SizeBranch,
+        AdmittedRequest, DEFAULT_LINK_TIMEOUT, Deadline, Handler, NAME_HASH_LEN, PathHash, Reply,
+        RequestId, SizeBranch,
     };
     use crate::mesh::rfc3339_utc;
     #[cfg(unix)]
@@ -3416,15 +3418,31 @@ mod tests {
     /// Unset timers leave every path's deadlines as they are; set ones apply only where
     /// they are the longer, so a configured value can never shorten a deadline: the one
     /// `validate` refuses would, if it got this far, leave each path's own in place.
+    /// The floors `validate` enforces are the shortest request and link defaults among the
+    /// five governed paths.
     #[test]
     fn request_timeouts_raise_a_deadline_and_never_lower_one() {
         let message = PeerSendOptions::default().request;
         let knock = KnockOptions::default().request;
+        let list = RequestOptions {
+            request_timeout: PEER_REQUEST_TIMEOUT,
+            link_timeout: PEER_LINK_TIMEOUT,
+        };
+        let access = AccessOptions::default().request;
         let status = RequestOptions::default();
         assert_eq!(message.request_timeout, Duration::from_secs(15));
         assert_eq!(knock.request_timeout, Duration::from_secs(15));
         assert_eq!(status.request_timeout, Duration::from_secs(30));
         assert_eq!(status.link_timeout, Duration::from_secs(10));
+        let governed = [message, knock, list, access, status];
+        assert_eq!(
+            governed.iter().map(|options| options.request_timeout).min(),
+            Some(PEER_REQUEST_TIMEOUT)
+        );
+        assert_eq!(
+            governed.iter().map(|options| options.link_timeout).min(),
+            Some(DEFAULT_LINK_TIMEOUT)
+        );
 
         let unset = RequestTimeouts::from(&MeshConfig::default());
         assert_eq!(
@@ -3434,7 +3452,7 @@ mod tests {
                 link: None
             }
         );
-        for defaults in [message, knock, status] {
+        for defaults in governed {
             assert_eq!(unset.raise(defaults), defaults);
         }
 
@@ -3443,7 +3461,7 @@ mod tests {
             link_timeout_secs: Some(1),
             ..Default::default()
         });
-        for defaults in [message, knock, status] {
+        for defaults in governed {
             assert_eq!(lower.raise(defaults), defaults, "{defaults:?}");
         }
 
@@ -3467,7 +3485,7 @@ mod tests {
             link_timeout_secs: Some(45),
             ..Default::default()
         });
-        for defaults in [message, knock, status] {
+        for defaults in governed {
             assert_eq!(
                 higher.raise(defaults),
                 RequestOptions {
@@ -3475,6 +3493,32 @@ mod tests {
                     link_timeout: Duration::from_secs(45),
                 }
             );
+        }
+    }
+
+    /// The cap `validate` puts on both timers keeps a raised deadline within what the
+    /// clock can hold: at `MAX_TIMEOUT_SECS` every governed path still gets a `Deadline`,
+    /// where `u64::MAX` seconds would overflow `Instant` on the first request.
+    #[test]
+    fn timers_at_the_cap_still_make_a_deadline() {
+        let capped = RequestTimeouts::from(&MeshConfig {
+            request_timeout_secs: Some(MAX_TIMEOUT_SECS),
+            link_timeout_secs: Some(MAX_TIMEOUT_SECS),
+            ..Default::default()
+        });
+        for defaults in [
+            PeerSendOptions::default().request,
+            RequestOptions::default(),
+        ] {
+            let options = capped.raise(defaults);
+            assert_eq!(
+                options.request_timeout,
+                Duration::from_secs(MAX_TIMEOUT_SECS)
+            );
+            assert!(
+                Deadline::after(options.request_timeout).remaining() > defaults.request_timeout
+            );
+            assert!(Deadline::after(options.link_timeout).remaining() > defaults.link_timeout);
         }
     }
 
