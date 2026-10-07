@@ -20,7 +20,9 @@ use crate::mesh::r3::{
     AdmittedRequest, DEFAULT_LINK_TIMEOUT, Handler, MESSAGE_PATH, NAME_HASH_LEN, OriginName,
     R3Error, RefusalCode, Reply, RequestOptions, redact_hashes, short,
 };
-use crate::mesh::trust::{Decision, IdentityStanding, KeyChangeOutcome, OriginVerdict, TrustStore};
+use crate::mesh::trust::{
+    Decision, IdentityStanding, KeyChangeOutcome, OriginVerdict, Rule, TrustStore,
+};
 use crate::mesh::wire_path::WirePath;
 use crate::mesh::{canonical_hash, decode_hex, destination_address, display_text, hex_lower};
 use crate::supervisor::mailbox::{Envelope, EnvelopePayload, Inbox};
@@ -2032,7 +2034,7 @@ impl InboundSink for PeerRouting<'_> {
         } = self.trust.authorize_origin(&identity, &name_hash);
         raw.source_destination = destination.to_hex_string();
         let dest8 = short(&raw.source_destination).to_string();
-        if !collisions.is_empty() {
+        if !collisions.is_empty() || verdict.rule == Rule::IdentityChanged {
             let outcome = match verdict.decision {
                 Decision::Allow => KeyChangeOutcome::Served,
                 Decision::Refuse => KeyChangeOutcome::Refused,

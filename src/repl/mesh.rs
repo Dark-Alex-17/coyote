@@ -386,7 +386,7 @@ fn peers(ctx: &RequestContext) -> Result<()> {
     let mut rows: Vec<PeerRow> = records
         .iter()
         .map(|peer| {
-            let label = trust_label(trust.served_verdict(peer));
+            let label = trust_label(trust.authorize(&peer.identity_hash, &peer.destination_hash));
             let mark = key_change_mark(peer, &trust_records);
             PeerRow::Heard(peer.clone(), label, mark)
         })
@@ -497,7 +497,7 @@ fn info(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     }
     let trust = peer
         .as_ref()
-        .map(|peer| trust_label(runtime.trust().served_verdict(peer)));
+        .map(|peer| trust_label(runtime.trust().authorize(&peer.identity_hash, &destination)));
     out_text(&render_peer_detail(
         &destination,
         peer.as_ref(),
@@ -7731,6 +7731,19 @@ mod tests {
                 hash
             }
 
+            /// The verdict `runtime` serves the heard row `destination`'s requests by, as
+            /// opposed to the grant its trust label reports.
+            fn served_verdict(runtime: &MeshRuntime, destination: &str) -> Verdict {
+                let row = runtime.peers().get(destination).unwrap();
+                runtime
+                    .trust()
+                    .authorize_origin(
+                        &parse_hash(&row.identity_hash).unwrap(),
+                        &decode_name_hash(&row.name_hash).unwrap(),
+                    )
+                    .verdict
+            }
+
             #[derive(Default)]
             struct Recording(Mutex<Vec<String>>);
 
@@ -8751,11 +8764,12 @@ mod tests {
             }
 
             /// Under `mesh.collision_protection` the heard row of an identity trusted for all
-            /// destinations over a colliding record reads as the node serves it: refused,
-            /// not `trusted`, while the record it collides with keeps its own label.
+            /// destinations over a colliding record still reads `trusted`: the label is the
+            /// grant, which gates what the node sends it, while the node refuses what it asks.
+            /// The collision is told on the record it collides with, whose own label stands.
             #[test]
             #[serial]
-            fn peers_labels_a_colliding_trusted_for_all_row_as_refused_under_protection() {
+            fn peers_labels_a_colliding_trusted_for_all_row_by_its_grant_under_protection() {
                 let _guard = TestConfigDirGuard::new("repl-mesh-peers-protected-label");
                 let _capture = capture::install();
                 run_async(async {
@@ -8777,6 +8791,13 @@ mod tests {
                         )
                         .unwrap();
                     runtime.trust().set_collision_protection(true);
+                    assert_eq!(
+                        served_verdict(&runtime, &new_dest),
+                        Verdict {
+                            decision: Decision::Refuse,
+                            rule: Rule::IdentityChanged,
+                        }
+                    );
 
                     let out = out_of(&mut ctx, ".mesh peers").await.unwrap();
                     let row_of = |dest: &str| {
@@ -8784,7 +8805,8 @@ mod tests {
                             .find(|line| line.contains(short(dest)))
                             .unwrap_or_else(|| panic!("no row for {dest} in {out}"))
                     };
-                    assert!(row_of(&new_dest).contains("untrusted"), "{out}");
+                    assert!(!row_of(&new_dest).contains("untrusted"), "{out}");
+                    assert!(row_of(&new_dest).contains("trusted"), "{out}");
                     assert!(!row_of(&old_dest).contains("untrusted"), "{out}");
                     assert!(row_of(&old_dest).contains("trusted"), "{out}");
 
@@ -8794,11 +8816,11 @@ mod tests {
             }
 
             /// `.mesh info <destination>` says what `.mesh peers` says of the same row: the
-            /// colliding identity trusted for all destinations is `trusted` with
-            /// `mesh.collision_protection` off and `untrusted` with it on.
+            /// colliding identity trusted for all destinations is `trusted` by its grant in
+            /// both modes, while what the node serves it moves with `mesh.collision_protection`.
             #[test]
             #[serial]
-            fn info_labels_a_colliding_trusted_for_all_row_by_the_verdict_it_is_served() {
+            fn info_labels_a_colliding_trusted_for_all_row_by_its_grant_in_both_modes() {
                 let _guard = TestConfigDirGuard::new("repl-mesh-info-protected-label");
                 let _capture = capture::install();
                 run_async(async {
@@ -8820,15 +8842,15 @@ mod tests {
                         )
                         .unwrap();
 
-                    for (protection, line) in
-                        [(false, "trust: trusted"), (true, "trust: untrusted")]
+                    for (protection, served) in [(false, Decision::Allow), (true, Decision::Refuse)]
                     {
                         runtime.trust().set_collision_protection(protection);
+                        assert_eq!(served_verdict(&runtime, &new_dest).decision, served);
                         let out = out_of(&mut ctx, &format!(".mesh info {new_dest}"))
                             .await
                             .unwrap();
                         assert!(
-                            out.lines().any(|l| l == line),
+                            out.lines().any(|l| l == "trust: trusted"),
                             "protection {protection}: {out}"
                         );
                     }
@@ -8838,15 +8860,16 @@ mod tests {
                 });
             }
 
-            /// Usage probe: `.mesh peers` JUDGES a colliding heard row, it never marks it.
-            /// The row of an identity trusted for all destinations over another identity's
-            /// recorded instance reads `trusted` with protection off and `untrusted` with it
-            /// on — the verdict the node would serve — while listing writes nothing to
+            /// Usage probe: `.mesh peers` LABELS a colliding heard row, it never judges or
+            /// marks it. The row of an identity trusted for all destinations over another
+            /// identity's recorded instance reads `trusted` in both modes — the grant, not
+            /// the verdict the node would serve — while listing writes nothing to
             /// `trust.yaml`, marks no record and tells the owner nothing: the collision rung
             /// marks on the inbound paths only.
             #[test]
             #[serial]
-            fn usage_probe_peers_judges_a_colliding_row_in_both_modes_without_marking_or_telling() {
+            fn usage_probe_peers_labels_a_colliding_row_by_its_grant_in_both_modes_without_marking_or_telling()
+             {
                 let _guard = TestConfigDirGuard::new("repl-mesh-probe-peers-judges-only");
                 let _capture = capture::install();
                 run_async(async {
@@ -8877,10 +8900,7 @@ mod tests {
                         .join("trust.yaml");
                     let before = fs::read(&trust_path).unwrap();
 
-                    for (protection, label, not) in [
-                        (false, "trusted", "untrusted"),
-                        (true, "untrusted", "nothing"),
-                    ] {
+                    for protection in [false, true] {
                         runtime.trust().set_collision_protection(protection);
                         let out = out_of(&mut ctx, ".mesh peers").await.unwrap();
                         let row = out
@@ -8888,7 +8908,7 @@ mod tests {
                             .find(|line| line.contains(short(&new_dest)))
                             .unwrap_or_else(|| panic!("no row for {new_dest} in {out}"));
                         assert!(
-                            row.contains(label) && !row.contains(not),
+                            row.contains("trusted") && !row.contains("untrusted"),
                             "protection {protection}: {out}"
                         );
                         assert!(
@@ -8955,18 +8975,17 @@ mod tests {
                 (destination, identity)
             }
 
-            /// Usage probe: `.mesh info <destination>` labels every heard row by the verdict
-            /// the node serves it under, and only the colliding row moves with
-            /// `mesh.collision_protection`: the identity trusted for all destinations over
-            /// another identity's recorded instance reads `trusted` off and `untrusted` on,
-            /// while the record's own row, a destination-trusted peer under its own
-            /// instance, a blocked identity and a stranger read `trusted`, `trusted`,
-            /// `blocked` and `untrusted` in both modes. Describing judges only: `trust.yaml`
-            /// is byte-identical, no record is marked and the owner hears nothing.
+            /// Usage probe: `.mesh info <destination>` labels every heard row by its grant,
+            /// so no label moves with `mesh.collision_protection`: the identity trusted for
+            /// all destinations over another identity's recorded instance, the record's own
+            /// row, a destination-trusted peer under its own instance, a blocked identity and
+            /// a stranger read `trusted`, `trusted`, `trusted`, `blocked` and `untrusted` in
+            /// both modes, while the node serves the colliding row only with protection off.
+            /// Describing reads only: `trust.yaml` is byte-identical, no record is marked and
+            /// the owner hears nothing.
             #[test]
             #[serial]
-            fn usage_probe_info_labels_every_heard_row_by_the_served_verdict_without_marking_or_telling()
-             {
+            fn usage_probe_info_labels_every_heard_row_by_its_grant_without_marking_or_telling() {
                 let _guard = TestConfigDirGuard::new("repl-mesh-probe-info-served-labels");
                 let _capture = capture::install();
                 run_async(async {
@@ -9004,10 +9023,12 @@ mod tests {
                         .join("trust.yaml");
                     let before = fs::read(&trust_path).unwrap();
 
-                    for (protection, colliding_label) in [(false, "trusted"), (true, "untrusted")] {
+                    for (protection, served) in [(false, Decision::Allow), (true, Decision::Refuse)]
+                    {
                         runtime.trust().set_collision_protection(protection);
+                        assert_eq!(served_verdict(&runtime, &new_dest).decision, served);
                         for (dest, label) in [
-                            (&new_dest, colliding_label),
+                            (&new_dest, "trusted"),
                             (&old_dest, "trusted"),
                             (&other_dest, "trusted"),
                             (&blocked_dest, "blocked"),

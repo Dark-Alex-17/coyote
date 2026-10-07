@@ -41,9 +41,13 @@
 //! trust the new key as a stranger. An identity trusted for all destinations carries no
 //! per-instance record of its own, so a rotation of it is detected only against the peer
 //! table: when a row holds the instance under such an identity the human is told once,
-//! best effort, and nothing is marked. The collision rung judges what this node serves:
-//! the requests, knocks, stored messages and stored access requests it receives. What it
-//! sends or broadcasts is gated by plain `authorize` and does not change with the setting.
+//! best effort, and nothing is marked. With protection off the presenting identity is
+//! served and the line is a warning; on, the verdict itself reads the table, for an
+//! identity-allow verdict alone, and the identity is refused by rule identity changed with
+//! an error until the human trusts its new destination. The collision rung judges what
+//! this node serves: the requests, knocks, stored messages and stored access requests it
+//! receives. What it sends or broadcasts is gated by plain `authorize` and does not change
+//! with the setting.
 //!
 //! The store-and-forward peer-MESSAGE path (`src/mesh/message.rs`) and ACCESS path
 //! (`src/mesh/access.rs`) judge through `authorize_origin` and mark like the link, knock
@@ -823,11 +827,25 @@ impl TrustStore {
     /// reported for marking. A destination allow is never asked, the identity then holding
     /// the instance itself, so its collisions are empty without a scan, and a blocked
     /// identity's are empty too. The conflicting records' grants stay with the identities
-    /// they are bound to.
+    /// they are bound to. An identity-allow verdict under collision protection that no
+    /// record collides with is judged once more against the peer table: the instance heard
+    /// there under another identity trusted for all destinations is a rotation with no
+    /// record to mark, and it is refused by rule identity changed with empty collisions.
+    /// No other rule and no unprotected store reads the table here.
     pub(crate) fn authorize_origin(
         &self,
         identity: &AddressHash,
         name_hash: &[u8; NAME_HASH_LEN],
+    ) -> OriginVerdict {
+        self.authorize_origin_at(identity, name_hash, SystemTime::now())
+    }
+
+    /// `authorize_origin` with the instant that decides which peer table rows have expired.
+    pub(crate) fn authorize_origin_at(
+        &self,
+        identity: &AddressHash,
+        name_hash: &[u8; NAME_HASH_LEN],
+        now: SystemTime,
     ) -> OriginVerdict {
         let destination = destination_address(name_hash, identity);
         let identity_hex = identity.to_hex_string();
@@ -839,7 +857,21 @@ impl TrustStore {
             }
             _ => Vec::new(),
         };
-        if self.collision_refuses(verdict.rule, &collisions) {
+        let presence_refuses = || {
+            verdict.rule == Rule::IdentityTrusted
+                && self.collision_protection()
+                && collisions.is_empty()
+                && self
+                    .heard_under_trusted_for_all(
+                        &state,
+                        &hex_lower(name_hash),
+                        name_hash,
+                        &identity_hex,
+                        now,
+                    )
+                    .is_some()
+        };
+        if self.collision_refuses(verdict.rule, &collisions) || presence_refuses() {
             verdict = Verdict {
                 decision: Decision::Refuse,
                 rule: Rule::IdentityChanged,
@@ -849,22 +881,6 @@ impl TrustStore {
             verdict,
             destination,
             collisions,
-        }
-    }
-
-    /// The verdict the node serves this peer's requests by; what it sends is judged by the
-    /// grant alone (`authorize`). This is what a trust label for a heard row reports, so a
-    /// row trusted for all destinations over a colliding record reads as refused under
-    /// `mesh.collision_protection`. A row whose hashes do not decode is judged by `authorize`.
-    pub(crate) fn served_verdict(&self, peer: &PeerRecord) -> Verdict {
-        match (
-            parse_hash(&peer.identity_hash),
-            decode_name_hash(&peer.name_hash),
-        ) {
-            (Some(identity), Some(name_hash)) => {
-                self.authorize_origin(&identity, &name_hash).verdict
-            }
-            _ => self.authorize(&peer.identity_hash, &peer.destination_hash),
         }
     }
 
@@ -1186,20 +1202,15 @@ impl TrustStore {
         marked
     }
 
-    /// The presence-cache half of detection, for an identity no record collides with: a
+    /// The presence-cache half of detection, for an identity no record collides with: the
     /// peer table row holding `name_hash` under an identity trusted for all destinations
-    /// (the freshest such row when several), other than `seen_identity`, not yet surfaced
-    /// for that row's (instance, identity) and not superseded by `seen_identity` holding
-    /// the instance itself. The dedupe key is the row's identity, not the one presenting:
-    /// only the holder's own signed announces make such rows, so any number of keys
-    /// presenting the instance earn one line, and a presenter that was itself the recorded
-    /// identity of an earlier line for the instance earns none, so the old key heard again
-    /// after a rotation line does not restate it with the roles swapped. Nothing on disk
-    /// changes, and the table is not read at all while no identity is trusted for all
-    /// destinations.
-    fn presence_collision(
+    /// (the freshest such row when several), other than `seen_identity`, unless
+    /// `seen_identity` holds the instance itself, as `(destination, identity)`. Reads
+    /// nothing but the table and the store, and the table not at all while no identity is
+    /// trusted for all destinations.
+    fn heard_under_trusted_for_all(
         &self,
-        state: &mut State,
+        state: &State,
         name_hash: &str,
         name_hash_bytes: &[u8; NAME_HASH_LEN],
         seen_identity: &str,
@@ -1217,16 +1228,40 @@ impl TrustStore {
         if state.holds_instance(seen_identity, name_hash_bytes) {
             return None;
         }
+        presence
+            .heard_under_other_identities(name_hash, seen_identity, now)
+            .into_iter()
+            .find(|(_, identity)| state.trusted_for_all(identity))
+    }
+
+    /// `heard_under_trusted_for_all` surfaced once per (instance, identity the row holds it
+    /// under) while the node runs. The dedupe key is the row's identity, not the one presenting:
+    /// only the holder's own signed announces make such rows, so any number of keys
+    /// presenting the instance earn one line, and a presenter that was itself the recorded
+    /// identity of an earlier line for the instance earns none, so the old key heard again
+    /// after a rotation line does not restate it with the roles swapped. Nothing on disk
+    /// changes.
+    fn presence_collision(
+        &self,
+        state: &mut State,
+        name_hash: &str,
+        name_hash_bytes: &[u8; NAME_HASH_LEN],
+        seen_identity: &str,
+        now: SystemTime,
+    ) -> Option<(String, String)> {
         if state
             .presence_surfaced
             .contains(&(name_hash.to_string(), seen_identity.to_string()))
         {
             return None;
         }
-        let (old_destination, old_identity) = presence
-            .heard_under_other_identities(name_hash, seen_identity, now)
-            .into_iter()
-            .find(|(_, identity)| state.trusted_for_all(identity))?;
+        let (old_destination, old_identity) = self.heard_under_trusted_for_all(
+            state,
+            name_hash,
+            name_hash_bytes,
+            seen_identity,
+            now,
+        )?;
         let key = (name_hash.to_string(), old_identity.clone());
         if !state.presence_surfaced.insert(key.clone()) {
             return None;
@@ -2248,13 +2283,13 @@ pub(crate) fn decode_name_hash(hex: &str) -> Option<[u8; NAME_HASH_LEN]> {
 }
 
 /// The one line a key change earns, opening with a literal `warning: ` or `error: ` so
-/// the severity reads without colour. It says "announced under", not "rotated": anyone
-/// who has heard the instance id can announce it under their own key, so the human
+/// the severity reads without colour. It says "presented under", not "rotated": anyone
+/// who has heard the instance id can present it under their own key, so the human
 /// confirms with the identity's holder out of band before trusting the new destination,
 /// which clears the mark, or blocks the new identity, which silences it. The same line
-/// serves a mark raised by an announce and one raised by a request, so it speaks of what
-/// the identity gets when it asks, not of what it got. Full hashes, because the human
-/// pastes them.
+/// serves a mark raised by an announce and one raised by a link, knock or stored request,
+/// so it names no path and speaks of what the identity gets when it asks, not of what it
+/// got. Full hashes, because the human pastes them.
 fn key_change_text(
     change: &MarkedKeyChange,
     new_destination: &str,
@@ -2273,14 +2308,14 @@ fn key_change_text(
     };
     match outcome {
         KeyChangeOutcome::Served => format!(
-            "warning: instance {instance} is bound to identity {bound} but was announced under \
+            "warning: instance {instance} is bound to identity {bound} but was presented under \
              identity {seen}, which is trusted for all destinations and is served while it \
              asks; the record is marked and {standing}. If the peer rotated, confirm with its \
              holder out of band and run .mesh trust {new_destination} to clear the mark; \
              otherwise .mesh block {seen}"
         ),
         KeyChangeOutcome::Refused => format!(
-            "error: instance {instance} is bound to identity {bound} but was announced under \
+            "error: instance {instance} is bound to identity {bound} but was presented under \
              identity {seen} and is refused when it asks; {standing} and the new key is a \
              stranger. Confirm with the identity's holder out of band before granting anything: \
              if the peer rotated, run .mesh trust {new_destination} to trust the new key and \
@@ -2291,7 +2326,8 @@ fn key_change_text(
 
 /// The line a collision found only in the peer table earns: the instance was heard under
 /// `old_identity`, trusted for all destinations, and is now presented by `seen_identity`.
-/// No record carries the instance, so nothing is marked and the line says so.
+/// No record carries the instance, so nothing is marked and the line says so. It is served
+/// only while `mesh.collision_protection` is off, and the warning names the setting.
 fn presence_collision_text(
     old_destination: &str,
     old_identity: &str,
@@ -2303,17 +2339,18 @@ fn presence_collision_text(
     match outcome {
         KeyChangeOutcome::Served => format!(
             "warning: instance {instance} was heard under identity {old_identity}, trusted for all \
-             destinations, and is now announced under identity {seen_identity}, which is also \
-             trusted for all destinations and is served while it asks; no record carries the \
-             instance, so nothing is marked. If the peer rotated nothing is needed; otherwise \
+             destinations, and is now presented under identity {seen_identity}, which is also \
+             trusted for all destinations and is served while it asks because \
+             collision_protection is off; no record carries the instance, so nothing is marked. \
+             If the peer rotated, confirm with its holder out of band; otherwise \
              .mesh block {seen_identity}"
         ),
         KeyChangeOutcome::Refused => format!(
             "error: instance {instance} was heard under identity {old_identity}, trusted for all \
-             destinations, and is now announced under identity {seen_identity}, which is \
+             destinations, and is now presented under identity {seen_identity}, which is \
              refused when it asks; no record carries the instance, so nothing is marked. Confirm \
              with the identity's holder out of band before granting anything: if the peer rotated, run \
-             .mesh trust {new_destination} ; otherwise .mesh block {seen_identity}"
+             .mesh trust {new_destination}; otherwise .mesh block {seen_identity}"
         ),
     }
 }
@@ -2334,6 +2371,7 @@ mod tests {
     use rand_core::OsRng;
     use rns_transport::destination::SingleInputDestination;
     use rns_transport::identity::PrivateIdentity;
+    use std::sync::atomic::AtomicUsize;
 
     struct MeshOff;
 
@@ -5835,7 +5873,7 @@ mod tests {
             text.contains(&format!(".mesh block {}", new.identity_hash)),
             "{text}"
         );
-        assert!(text.contains("announced under"), "{text}");
+        assert!(text.contains("presented under"), "{text}");
         let after_first = fx.file_bytes().unwrap();
         assert!(
             String::from_utf8(after_first.clone())
@@ -6241,95 +6279,6 @@ mod tests {
         assert!(
             text.contains(&format!(".mesh block {}", new.identity_hash)),
             "{text}"
-        );
-    }
-
-    /// Usage probe: `served_verdict` is the one verdict every trust label for a heard row
-    /// reports. For a decodable row it is the verdict `authorize_origin` serves — so an
-    /// identity trusted for all destinations over a colliding record reads Allow with
-    /// collision protection off and Refuse by identity changed with it on — while the
-    /// plain grant (`authorize`) says Allow in both modes. For a row whose name hash is
-    /// empty (a peer table that omits it) or whose identity hash does not decode, it falls
-    /// back to `authorize` and never panics. Judging writes nothing and marks nothing.
-    #[test]
-    fn usage_probe_served_verdict_follows_the_origin_verdict_and_falls_back_to_the_grant() {
-        let fx = Fixture::new("trust-served-verdict");
-        let old = announced("alpha");
-        fx.announce(&old, t(2_000));
-        assert_eq!(fx.trust_destination(&old, t(3_000)), TrustChange::Added);
-        let new = announced("alpha");
-        assert_eq!(new.name_hash, old.name_hash);
-        fx.announce(&new, t(4_000));
-        assert_eq!(
-            fx.trust_identity(&new.identity_hash, t(5_000)),
-            TrustChange::Added
-        );
-        let before = fx.file_bytes().unwrap();
-        let old_row = fx.mesh.0.get(&old.destination_hash).unwrap();
-        let new_row = fx.mesh.0.get(&new.destination_hash).unwrap();
-
-        for (protection, expected) in [
-            (false, verdict(Decision::Allow, Rule::IdentityTrusted)),
-            (true, verdict(Decision::Refuse, Rule::IdentityChanged)),
-        ] {
-            fx.store.set_collision_protection(protection);
-            assert_eq!(
-                fx.store.served_verdict(&new_row),
-                expected,
-                "protection {protection}"
-            );
-            assert_eq!(
-                fx.store.served_verdict(&new_row),
-                origin_verdict(&fx.store, &new),
-                "protection {protection}: the label is the served verdict"
-            );
-            assert_eq!(
-                fx.store
-                    .authorize(&new.identity_hash, &new.destination_hash)
-                    .decision,
-                Decision::Allow,
-                "protection {protection}: the grant alone still allows what it sends"
-            );
-            assert_eq!(
-                fx.store.served_verdict(&old_row),
-                verdict(Decision::Allow, Rule::DestinationTrusted),
-                "protection {protection}: the record's own identity holds the instance"
-            );
-
-            let mut no_name_hash = new_row.clone();
-            no_name_hash.name_hash.clear();
-            assert_eq!(
-                fx.store.served_verdict(&no_name_hash),
-                fx.store
-                    .authorize(&new.identity_hash, &new.destination_hash),
-                "protection {protection}: no name hash, no collision to judge: the grant"
-            );
-            assert_eq!(
-                fx.store.served_verdict(&no_name_hash).decision,
-                Decision::Allow
-            );
-
-            let mut bad_identity = new_row.clone();
-            bad_identity.identity_hash = "not-a-hash".to_string();
-            assert_eq!(
-                fx.store.served_verdict(&bad_identity),
-                fx.store.authorize("not-a-hash", &new.destination_hash),
-                "protection {protection}: an undecodable identity is judged by the grant"
-            );
-            assert_eq!(
-                fx.store.served_verdict(&bad_identity).decision,
-                Decision::Refuse
-            );
-        }
-
-        assert_eq!(fx.file_bytes().unwrap(), before, "judging writes nothing");
-        assert!(
-            fx.store
-                .records()
-                .iter()
-                .all(|record| record.key_changed.is_none()),
-            "judging marks nothing: {:#?}",
-            fx.store.records()
         );
     }
 
@@ -7127,7 +7076,7 @@ mod tests {
         assert!(text.starts_with("error: "), "{text}");
         assert!(text.contains("the old key stays refused"), "{text}");
         assert!(!text.contains("grant stays"), "{text}");
-        assert!(text.contains("announced under"), "{text}");
+        assert!(text.contains("presented under"), "{text}");
         assert!(
             text.contains(&format!(".mesh block {}", new.identity_hash)),
             "{text}"
@@ -7192,6 +7141,204 @@ mod tests {
             surface.texts().len(),
             1,
             "an identity holding its own record for the instance is not a presence collision"
+        );
+    }
+
+    /// The presence rung of `authorize_origin`: under collision protection an identity
+    /// trusted for all destinations that presents an instance the peer table holds under
+    /// another such identity is refused by identity changed, with no record collisions to
+    /// report. The grant alone still allows, the refusal earns one `error:` line naming
+    /// both identities and `.mesh trust <new destination>`, nothing is marked or written,
+    /// the destination allow then admits, and protection off serves as before.
+    #[test]
+    fn collision_protection_refuses_a_presence_detected_rotation_of_an_identity_trusted_for_all() {
+        let fx = Fixture::new("trust-presence-collision-protected");
+        let surface = Arc::new(RecordingSurface::default());
+        fx.store
+            .attach_surface(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
+        fx.store
+            .attach_presence(Arc::downgrade(&fx.mesh.0) as Weak<dyn InstancePresence>);
+        fx.store.set_collision_protection(true);
+        let old = announced("alpha");
+        fx.announce(&old, t(2_000));
+        fx.trust_identity(&old.identity_hash, t(3_000));
+        let new = announced("alpha");
+        assert_eq!(new.name_hash, old.name_hash);
+        fx.announce(&new, t(4_000));
+        fx.trust_identity(&new.identity_hash, t(5_000));
+        let before = fx.file_bytes().unwrap();
+        let identity = parse_hash(&new.identity_hash).unwrap();
+        let name_hash = decode_name_hash(&new.name_hash).unwrap();
+
+        let origin = fx
+            .store
+            .authorize_origin_at(&identity, &name_hash, t(4_500));
+        assert_eq!(
+            origin.verdict,
+            verdict(Decision::Refuse, Rule::IdentityChanged)
+        );
+        assert!(origin.collisions.is_empty(), "{:?}", origin.collisions);
+        assert_eq!(
+            fx.store
+                .authorize(&new.identity_hash, &new.destination_hash),
+            verdict(Decision::Allow, Rule::IdentityTrusted),
+            "the grant alone still allows what the node sends"
+        );
+        assert_eq!(
+            fx.store
+                .authorize_origin_at(
+                    &parse_hash(&old.identity_hash).unwrap(),
+                    &name_hash,
+                    t(4_500)
+                )
+                .verdict,
+            verdict(Decision::Refuse, Rule::IdentityChanged),
+            "the table does not say which key is the rotation, so the old key is judged alike"
+        );
+
+        let marked = fx.store.note_key_change(
+            &new.identity_hash,
+            &new.name_hash,
+            KeyChangeOutcome::Refused,
+            t(4_500),
+        );
+        assert!(marked.is_empty(), "{marked:?}");
+        let texts = surface.texts();
+        assert_eq!(texts.len(), 1, "{texts:#?}");
+        let text = &texts[0];
+        assert!(text.starts_with("error: "), "{text}");
+        assert!(text.contains(&old.identity_hash), "{text}");
+        assert!(text.contains(&new.identity_hash), "{text}");
+        assert!(text.contains("is refused when it asks"), "{text}");
+        assert!(text.contains("nothing is marked"), "{text}");
+        assert!(text.contains("presented under"), "{text}");
+        assert!(!text.contains("announced under"), "{text}");
+        assert!(
+            text.contains(&format!(
+                ".mesh trust {}; otherwise .mesh block {}",
+                new.destination_hash, new.identity_hash
+            )),
+            "{text}"
+        );
+        assert_eq!(fx.file_bytes().unwrap(), before, "nothing is written");
+        assert!(
+            fx.store
+                .records()
+                .iter()
+                .all(|record| record.key_changed.is_none()),
+            "{:#?}",
+            fx.store.records()
+        );
+
+        fx.store.set_collision_protection(false);
+        assert_eq!(
+            fx.store
+                .authorize_origin_at(&identity, &name_hash, t(4_500))
+                .verdict,
+            verdict(Decision::Allow, Rule::IdentityTrusted),
+            "protection off serves the identity allow"
+        );
+        fx.store.set_collision_protection(true);
+
+        assert_eq!(fx.trust_destination(&new, t(6_000)), TrustChange::Added);
+        assert_eq!(
+            fx.store
+                .authorize_origin_at(&identity, &name_hash, t(6_500))
+                .verdict,
+            verdict(Decision::Allow, Rule::DestinationTrusted),
+            "the human trusting the new destination admits it under protection"
+        );
+        assert_eq!(surface.texts().len(), 1, "{:#?}", surface.texts());
+    }
+
+    /// `InstancePresence` that counts how often the store consults it.
+    struct CountingPresence(Arc<PeerTable>, AtomicUsize);
+
+    impl InstancePresence for CountingPresence {
+        fn heard_under_other_identities(
+            &self,
+            name_hash: &str,
+            identity_hash: &str,
+            now: SystemTime,
+        ) -> Vec<(String, String)> {
+            self.1.fetch_add(1, Ordering::SeqCst);
+            self.0
+                .heard_under_other_identities(name_hash, identity_hash, now)
+        }
+    }
+
+    /// The presence rung costs a peer table scan, so `authorize_origin` pays it only for
+    /// an identity-allow verdict under collision protection: a stranger (default closed),
+    /// a destination allow and a blocked identity never reach the table, and with
+    /// protection off neither does the identity allow.
+    #[test]
+    fn authorize_origin_consults_the_peer_table_only_for_an_identity_allow_under_protection() {
+        let fx = Fixture::new("trust-presence-rung-is-identity-allow-only");
+        let presence = Arc::new(CountingPresence(fx.mesh.0.clone(), AtomicUsize::new(0)));
+        fx.store
+            .attach_presence(Arc::downgrade(&presence) as Weak<dyn InstancePresence>);
+        let old = announced("alpha");
+        fx.announce(&old, t(4_000));
+        fx.trust_identity(&old.identity_hash, t(4_000));
+        let new = announced("alpha");
+        fx.announce(&new, t(4_100));
+        let identity = parse_hash(&new.identity_hash).unwrap();
+        let name_hash = decode_name_hash(&new.name_hash).unwrap();
+        let origin = |now| {
+            fx.store
+                .authorize_origin_at(&identity, &name_hash, now)
+                .verdict
+        };
+        let scans = || presence.1.load(Ordering::SeqCst);
+
+        fx.store.set_collision_protection(true);
+        assert_eq!(
+            origin(t(4_500)),
+            verdict(Decision::Refuse, Rule::DefaultClosed)
+        );
+        assert_eq!(scans(), 0, "a stranger is not judged against the table");
+
+        fx.trust_identity(&new.identity_hash, t(5_000));
+        fx.store.set_collision_protection(false);
+        assert_eq!(
+            origin(t(5_500)),
+            verdict(Decision::Allow, Rule::IdentityTrusted)
+        );
+        assert_eq!(scans(), 0, "protection off never reads the table");
+
+        fx.store.set_collision_protection(true);
+        assert_eq!(
+            origin(t(5_500)),
+            verdict(Decision::Refuse, Rule::IdentityChanged)
+        );
+        assert_eq!(
+            scans(),
+            1,
+            "the identity allow under protection is the one rung that scans"
+        );
+
+        assert_eq!(fx.trust_destination(&new, t(6_000)), TrustChange::Added);
+        assert_eq!(
+            origin(t(6_500)),
+            verdict(Decision::Allow, Rule::DestinationTrusted)
+        );
+        assert_eq!(
+            scans(),
+            1,
+            "a destination allow is not judged against the table"
+        );
+
+        fx.store
+            .block_identity(&fx.mesh, &new.identity_hash, None, t(7_000))
+            .unwrap();
+        assert_eq!(
+            origin(t(7_500)),
+            verdict(Decision::Refuse, Rule::IdentityBlocked)
+        );
+        assert_eq!(
+            scans(),
+            1,
+            "a blocked identity is not judged against the table"
         );
     }
 }

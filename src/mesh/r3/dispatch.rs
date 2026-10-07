@@ -277,7 +277,7 @@ impl Dispatcher {
             }
             Rule::IdentityChanged | Rule::DestinationDenied => {
                 log(&id8, &format!("refused: {rule:?}"));
-                if !collisions.is_empty() {
+                if !collisions.is_empty() || rule == Rule::IdentityChanged {
                     self.trust.note_key_change(
                         &knock.identity_hash,
                         &knock.name_hash,

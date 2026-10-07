@@ -669,7 +669,7 @@ async fn handle_peers(runtime: &MeshRuntime, args: &Value) -> Result<Value> {
                 .as_deref()
                 .and_then(|name| display_text(name, DISPLAY_NAME_MAX_CHARS)),
             "name_hash": peer.name_hash,
-            "trust": trust_label(trust.served_verdict(peer)),
+            "trust": trust_label(grant),
             "compatibility": peer.compatibility_line(),
             "last_seen_secs_ago": now.duration_since(peer.last_seen).unwrap_or_default().as_secs(),
             "first_seen": rfc3339_utc(peer.first_seen),
@@ -3850,12 +3850,13 @@ mod tests {
         }
 
         /// The `mesh__peers` row of an identity trusted for all destinations over another
-        /// identity's recorded instance is labelled by the verdict the node serves it under,
-        /// as `.mesh peers` labels it: `trusted` with `mesh.collision_protection` off,
-        /// `untrusted` with it on. Listing marks no record and tells the owner nothing.
+        /// identity's recorded instance is labelled by its grant, as `.mesh peers` labels it:
+        /// `trusted` in both modes, the gate `with_status` uses, while what the node serves
+        /// it moves with `mesh.collision_protection`. Listing marks no record and tells the
+        /// owner nothing.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         #[serial]
-        async fn peers_labels_a_colliding_trusted_for_all_row_by_the_verdict_it_is_served() {
+        async fn peers_labels_a_colliding_trusted_for_all_row_by_its_grant_in_both_modes() {
             let _guard = TestConfigDirGuard::new("mesh-tool-peers-collision-label");
             let started = started_runtime("mesh-tool-peers-collision-label").await;
             let mut ctx = plain_ctx();
@@ -3867,6 +3868,10 @@ mod tests {
             let old = derived_sighting("rot", Some("Tia"));
             let new = derived_sighting("rot", Some("Tia again"));
             assert_eq!(old.name_hash, new.name_hash);
+            let new_origin = (
+                crate::mesh::trust::parse_hash(&new.identity_hash).unwrap(),
+                crate::mesh::trust::decode_name_hash(&new.name_hash).unwrap(),
+            );
             let (old_dest, new_dest, new_identity) = (
                 old.destination_hash.clone(),
                 new.destination_hash.clone(),
@@ -3900,8 +3905,17 @@ mod tests {
                 .join("trust.yaml");
             let before = std::fs::read(&trust_path).unwrap();
 
-            for (protection, label) in [(false, "trusted"), (true, "untrusted")] {
+            for (protection, served) in [(false, Decision::Allow), (true, Decision::Refuse)] {
                 runtime.trust().set_collision_protection(protection);
+                assert_eq!(
+                    runtime
+                        .trust()
+                        .authorize_origin(&new_origin.0, &new_origin.1)
+                        .verdict
+                        .decision,
+                    served,
+                    "protection {protection}"
+                );
                 let result = handle_mesh_tool(
                     &mut ctx,
                     &format!("{MESH_FUNCTION_PREFIX}peers"),
@@ -3915,7 +3929,11 @@ mod tests {
                         .find(|row| row["destination"] == destination)
                         .unwrap_or_else(|| panic!("{destination} missing from {result}"))
                 };
-                assert_eq!(row(&new_dest)["trust"], label, "protection {protection}");
+                assert_eq!(
+                    row(&new_dest)["trust"],
+                    "trusted",
+                    "protection {protection}"
+                );
                 assert_eq!(
                     row(&old_dest)["trust"],
                     "trusted",

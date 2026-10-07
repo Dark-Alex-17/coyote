@@ -4752,19 +4752,19 @@ pub(crate) mod network {
         pair.stop_node_a().await;
     }
 
-    /// Usage probe: the same identity-tier rotation under `mesh.collision_protection:
-    /// true`. No record carries the instance, so the owner line raised by B's announce
-    /// must tell the owner what B then actually gets when it asks: a line that says
-    /// "refused" must be followed by a refusal, a line that says "served" by a served
-    /// card — the line and the verdict are one story, whichever way the mode decides.
-    /// Nothing is marked and `trust.yaml` is untouched either way.
+    /// The same identity-tier rotation under `mesh.collision_protection: true`: no record
+    /// carries the instance, but the peer table does, so B's announce earns the owner one
+    /// `error:` line naming both identities and `.mesh trust <B's destination>`, and B's
+    /// `/status` request is refused `NoAccess` until then. Nothing is marked, `trust.yaml`
+    /// is untouched, and the refused request restates nothing.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn usage_probe_a_protected_identity_tier_rotation_line_matches_what_the_peer_then_gets() {
+    async fn collision_protection_refuses_a_presence_detected_rotation_of_a_trusted_for_all_identity()
+     {
         let earlier = TransportIdentity::new_from_rand(OsRng)
             .as_identity()
             .address_hash;
         let pair = NodePair::start_with(
-            "r3-probe-presence-protected",
+            "r3-collision-presence-protected",
             |config| config.collision_protection = true,
             |responder| {
                 TrustList::default()
@@ -4774,6 +4774,8 @@ pub(crate) mod network {
         )
         .await;
         let (_slot, idle) = installed_slot(&pair);
+        let b_identity = pair.responder.desc.identity.address_hash.to_hex_string();
+        let b_instance = pair.responder.desc.address_hash.to_hex_string();
         let name_hash = hex_lower(&pair.responder.origin().0);
         let earlier_destination = destination_address(&pair.responder.origin().0, &earlier);
         pair.node_a.peers().observe(
@@ -4791,15 +4793,24 @@ pub(crate) mod network {
         let before = fs::read(&trust_path).unwrap();
 
         pair.introduce_b_to_a().await;
-        wait_until("the collision line to surface", || {
-            !idle.0.lock().is_empty()
-        })
-        .await;
-        let text = idle.0.lock()[0].text.clone();
-        assert_eq!(idle.0.lock().len(), 1, "{:#?}", idle.0.lock());
-        assert!(text.contains("nothing is marked"), "{text}");
+        wait_until("the error to surface", || !idle.0.lock().is_empty()).await;
+        {
+            let notes = idle.0.lock();
+            assert_eq!(notes.len(), 1, "{notes:#?}");
+            assert_eq!(notes[0].source, Source::Mesh);
+            let text = &notes[0].text;
+            assert!(text.starts_with("error: "), "{text}");
+            assert!(text.contains(&earlier.to_hex_string()), "{text}");
+            assert!(text.contains(&b_identity), "{text}");
+            assert!(text.contains("is refused when it asks"), "{text}");
+            assert!(text.contains("nothing is marked"), "{text}");
+            assert!(
+                text.contains(&format!(".mesh trust {b_instance}")),
+                "{text}"
+            );
+        }
 
-        let served = pair
+        let err = pair
             .client_b
             .request(
                 &pair.responder.transport,
@@ -4810,32 +4821,33 @@ pub(crate) mod network {
                 short_options(),
             )
             .await
-            .is_ok();
+            .unwrap_err();
 
-        let claims_served = text.contains("is served while it asks");
-        let claims_refused = text.contains("is refused when it asks");
-        assert!(claims_served ^ claims_refused, "{text}");
-        assert_eq!(
-            served, claims_served,
-            "the owner was told one thing and the peer got another (served = {served}): {text}"
-        );
-        // The collision rung judges records only, so a presence-only rotation is served
-        // even under protection.
-        assert!(served, "{text}");
-        assert!(text.starts_with("warning: "), "{text}");
+        assert_eq!(err, R3Error::Refused(RefusalCode::NoAccess));
         assert_eq!(fs::read(&trust_path).unwrap(), before);
-        assert_eq!(idle.0.lock().len(), 1, "{:#?}", idle.0.lock());
+        assert!(
+            pair.node_a
+                .trust()
+                .records()
+                .iter()
+                .all(|record| record.key_changed.is_none())
+        );
+        assert_eq!(
+            idle.0.lock().len(),
+            1,
+            "the refused request restates nothing: {:#?}",
+            idle.0.lock()
+        );
         pair.stop_node_a().await;
     }
 
     /// Usage probe: the collision rung judges what the node SERVES, never what it sends.
     /// Under `mesh.collision_protection: true` node A hears B, trusted for all
     /// destinations, announce the instance a trust record binds to another identity:
-    /// B's row is labelled by the verdict A serves it under — refused by identity
-    /// changed, what `.mesh peers`, `.mesh info` and `mesh__peers` print as `untrusted` —
-    /// yet A's own `/status` request to B still goes out, judged by the grant alone (the
-    /// gate `mesh__peers with_status: true` and `send_peer` use). Sending marks nothing
-    /// further and earns the owner no second line.
+    /// A serves B's requests by the origin verdict — refused by identity changed — yet
+    /// A's own `/status` request to B still goes out, judged by the grant alone (the gate
+    /// `mesh__peers with_status: true`, `send_peer` and every trust label use). Sending
+    /// marks nothing further and earns the owner no second line.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn usage_probe_a_colliding_identity_the_node_refuses_to_serve_is_still_one_it_sends_to() {
         let bound_to = TransportIdentity::new_from_rand(OsRng)
@@ -4890,17 +4902,21 @@ pub(crate) mod network {
         );
         let after_mark = fs::read(&trust_path).unwrap();
 
-        // The label every listing surface reports for B's row is the served verdict …
-        let b_row = pair.node_a.peers().get(&b_instance).unwrap();
+        // What A serves B is the origin verdict …
         let trust = pair.node_a.trust();
         assert_eq!(
-            trust.served_verdict(&b_row),
+            trust
+                .authorize_origin(
+                    &pair.responder.desc.identity.address_hash,
+                    &pair.responder.origin().0
+                )
+                .verdict,
             crate::mesh::trust::Verdict {
                 decision: crate::mesh::trust::Decision::Refuse,
                 rule: Rule::IdentityChanged,
             }
         );
-        // … while the grant alone, which gates what A sends, still allows B.
+        // … while the grant alone, which gates what A sends and labels B's row, allows B.
         assert_eq!(
             trust.authorize(&b_identity, &b_instance).decision,
             crate::mesh::trust::Decision::Allow

@@ -40,7 +40,7 @@ use crate::mesh::r3::{
 use crate::mesh::shares::PeerRef;
 use crate::mesh::shares::{Mutation, ShareSet, WriteScope};
 use crate::mesh::trust::{
-    Decision, IdentityStanding, KeyChangeOutcome, OriginVerdict, TrustStore, same_hash,
+    Decision, IdentityStanding, KeyChangeOutcome, OriginVerdict, Rule, TrustStore, same_hash,
 };
 use crate::mesh::wire_path::WirePath;
 use crate::mesh::{
@@ -966,7 +966,7 @@ impl InboundSink for AccessRouting<'_> {
         } = self.trust.authorize_origin(&identity, &name_hash);
         let source_destination = destination.to_hex_string();
         let dest8 = short(&source_destination).to_string();
-        if !collisions.is_empty() {
+        if !collisions.is_empty() || verdict.rule == Rule::IdentityChanged {
             let outcome = match verdict.decision {
                 Decision::Allow => KeyChangeOutcome::Served,
                 Decision::Refuse => KeyChangeOutcome::Refused,

@@ -58,10 +58,11 @@ pub struct MeshConfig {
     /// Whether a name-hash collision refuses an identity trusted for all destinations: off,
     /// the collision rung is judged after identity allow and such an identity is served
     /// with a warning to the human; on, it is judged before and the identity is refused
-    /// with an error until the human trusts its new destination. A destination allow
-    /// admits in either mode. The rung judges what the node serves, the requests, knocks,
-    /// stored messages and stored access requests it receives; what it sends or broadcasts
-    /// is unchanged.
+    /// with an error until the human trusts its new destination, whether the instance is
+    /// recorded under another identity or only heard in the peer table under one trusted
+    /// for all destinations. A destination allow admits in either mode. The rung judges
+    /// what the node serves, the requests, knocks, stored messages and stored access
+    /// requests it receives; what it sends or broadcasts is unchanged.
     pub collision_protection: bool,
     /// Envoy runs one sending identity may have queued or running at once; on a live
     /// link a message that would start a run while the sender already has that many

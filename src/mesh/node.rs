@@ -7763,7 +7763,7 @@ mod tests {
         let received = notifier.0.lock().clone();
         assert_eq!(received.len(), 1, "{received:#?}");
         let line = &received[0].lines()[0];
-        assert!(line.contains("announced under"), "{line}");
+        assert!(line.contains("presented under"), "{line}");
         assert!(line.contains(&new_hex), "{line}");
         assert!(slot.stop().await.unwrap());
         started.relay_handle.abort();

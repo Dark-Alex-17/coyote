@@ -477,14 +477,12 @@ impl KnockGate {
                 debug!(
                     "Mesh knock from {id8} for destination {dest8} is not a knock: the instance is bound to another identity"
                 );
-                if !collisions.is_empty() {
-                    self.trust.note_key_change(
-                        &knock.identity_hash,
-                        &knock.name_hash,
-                        KeyChangeOutcome::Refused,
-                        received_at,
-                    );
-                }
+                self.trust.note_key_change(
+                    &knock.identity_hash,
+                    &knock.name_hash,
+                    KeyChangeOutcome::Refused,
+                    received_at,
+                );
                 return Admission::IdentityChanged;
             }
             (Decision::Refuse, _) => {
@@ -1413,7 +1411,7 @@ mod tests {
         assert!(rig.gate.tracked_identities().is_empty());
         let texts = rig.surface.texts();
         assert_eq!(texts.len(), 1, "{texts:#?}");
-        assert!(texts[0].contains("announced under"), "{}", texts[0]);
+        assert!(texts[0].contains("presented under"), "{}", texts[0]);
     }
 
     /// Identity I2, trusted for all destinations, knocks for the instance the list binds
@@ -1470,7 +1468,7 @@ mod tests {
         let texts = rig.surface.texts();
         assert_eq!(texts.len(), 1, "{texts:#?}");
         assert!(texts[0].starts_with("warning: "), "{}", texts[0]);
-        assert!(texts[0].contains("announced under"), "{}", texts[0]);
+        assert!(texts[0].contains("presented under"), "{}", texts[0]);
     }
 
     /// Usage probe: the store-and-forward twin of the protected request path. Under
