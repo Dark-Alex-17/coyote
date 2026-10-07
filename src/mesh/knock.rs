@@ -1586,6 +1586,127 @@ mod tests {
         assert_eq!(std::fs::read(rig.gate.trust.path()).unwrap(), before);
     }
 
+    /// Usage probe: the knock's verdict and the owner line are judged at one instant, the
+    /// `received_at` the gate is handed, so the peer table rows the two see expired are the
+    /// same rows. The holder's row was heard at t(2000) and lives until t(4700). A knock
+    /// received one second before that, long after the row has aged out of the real clock,
+    /// is still a presence collision: refused as identity changed with the one `error:`
+    /// line, nothing marked, `trust.yaml` unchanged. A knock received at the very instant
+    /// the row expires sees no presence at all: already trusted, no line, so nothing is
+    /// remembered and the knock that follows is admitted too. Neither branch splits
+    /// into a served knock with an error line or a refused knock with no line.
+    #[test]
+    fn usage_probe_a_knocks_verdict_and_its_owner_line_see_the_same_peer_table_instant() {
+        let at = |secs: u64| SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
+        let holder = hash_of("id-held-at-2000");
+        let knocker = hash_of("id-knocks-at-4699");
+        let name_hash = [0x6b_u8; NAME_HASH_LEN];
+        let holder_destination = destination_address(
+            &name_hash,
+            &AddressHash::new_from_hex_string(&holder).unwrap(),
+        )
+        .to_hex_string();
+        let knocker_destination = destination_address(
+            &name_hash,
+            &AddressHash::new_from_hex_string(&knocker).unwrap(),
+        )
+        .to_hex_string();
+        let rig_at = |tag: &str| {
+            let rig = Rig::new(
+                tag,
+                TrustList::default()
+                    .identity(&holder, true)
+                    .identity(&knocker, true),
+            );
+            rig.gate
+                .trust
+                .attach_surface(Arc::downgrade(&rig.surface) as Weak<dyn KnockSurface>);
+            rig.gate.trust.attach_presence(
+                Arc::downgrade(&rig.peers) as Weak<dyn crate::mesh::trust::InstancePresence>
+            );
+            rig.gate.trust.set_collision_protection(true);
+            rig.peers.observe(
+                PeerSighting {
+                    destination_hash: holder_destination.clone(),
+                    identity_hash: holder.clone(),
+                    name_hash: hex_lower(&name_hash),
+                    display_name: None,
+                    protocol_version: 1,
+                    hops: 1,
+                },
+                at(2_000),
+            );
+            rig
+        };
+        let knock = || InboundKnock {
+            identity_hash: knocker.clone(),
+            destination_hash: knocker_destination.clone(),
+            name_hash: hex_lower(&name_hash),
+            via: KnockVia::StoreAndForward,
+            intro: Some("hello".to_string()),
+        };
+
+        // One second before the holder's row expires: the row is a presence for the
+        // verdict and for the line alike.
+        let live = rig_at("knock-gate-presence-one-clock-live");
+        let before = std::fs::read(live.gate.trust.path()).unwrap();
+        assert_eq!(
+            live.gate.admit(knock(), now(), at(4_699)),
+            Admission::IdentityChanged,
+            "the row is live at the instant the knock was received"
+        );
+        let texts = live.surface.texts();
+        assert_eq!(texts.len(), 1, "{texts:#?}");
+        assert!(texts[0].starts_with("error: "), "{}", texts[0]);
+        assert!(texts[0].contains(&holder), "{}", texts[0]);
+        assert!(texts[0].contains(&knocker), "{}", texts[0]);
+        assert!(texts[0].contains("is refused when it asks"), "{}", texts[0]);
+        assert!(
+            texts[0].contains(&format!(".mesh trust {knocker_destination}")),
+            "{}",
+            texts[0]
+        );
+        assert!(
+            live.gate
+                .trust
+                .records()
+                .iter()
+                .all(|record| record.key_changed.is_none())
+        );
+        assert_eq!(std::fs::read(live.gate.trust.path()).unwrap(), before);
+        assert!(!live.gate.cache().path().exists());
+        assert_eq!(
+            live.gate.admit(knock(), now(), at(4_699)),
+            Admission::IdentityChanged,
+            "the refusal holds per knock"
+        );
+        assert_eq!(live.surface.texts().len(), 1, "the line is earned once");
+
+        // At the instant the row expires there is no presence for either half.
+        let gone = rig_at("knock-gate-presence-one-clock-gone");
+        assert_eq!(
+            gone.gate.admit(knock(), now(), at(4_700)),
+            Admission::AlreadyTrusted,
+            "no live row, no memory: the identity's own grant admits it"
+        );
+        assert!(
+            gone.surface.texts().is_empty(),
+            "{:#?}",
+            gone.surface.texts()
+        );
+        assert_eq!(
+            gone.gate.admit(knock(), now(), at(4_701)),
+            Admission::AlreadyTrusted,
+            "no line was shown, so nothing was remembered"
+        );
+        assert!(
+            gone.surface.texts().is_empty(),
+            "{:#?}",
+            gone.surface.texts()
+        );
+        assert!(!gone.gate.cache().path().exists());
+    }
+
     /// Usage probe: the store-and-forward twin of the protected request path. Under
     /// collision protection the all-destinations knocker over a foreign instance is
     /// identity changed, not a knock: refused, nothing cached, the record marked, and

@@ -537,7 +537,7 @@ pub(crate) mod network {
         loopback_relay, mesh_paths, private_config, snapshot_fixture, started_runtime, wait_until,
     };
     use crate::mesh::trust::{
-        IdentityStanding, Rule, TRUST_FILE_VERSION, TrustChange, TrustOptions,
+        IdentityStanding, InstancePresence, Rule, TRUST_FILE_VERSION, TrustChange, TrustOptions,
     };
     use crate::mesh::{destination_address, hex_lower, mesh_config_dir, rfc3339_utc};
     use crate::supervisor::mailbox::EnvelopePayload;
@@ -2712,7 +2712,7 @@ pub(crate) mod network {
             path_hash: PathHash::of(KNOCK_PATH),
             data: Some(Value::Nil),
         };
-        dispatcher.refusal(rule, &[], knock, &|id8, outcome| {
+        dispatcher.refusal(rule, &[], knock, SystemTime::now(), &|id8, outcome| {
             logged.lock().push((id8.to_string(), outcome.to_string()))
         })
     }
@@ -2851,6 +2851,113 @@ pub(crate) mod network {
                 .all(|record| record.key_changed.is_none()),
             "only the conflicting record is marked"
         );
+    }
+
+    /// Usage probe: the dispatcher's verdict and the owner line it tells are judged at
+    /// one instant, the one `handle_at` is handed, so the peer table rows the two see
+    /// expired are the same rows. The holder's row was heard at t(2000) and lives until
+    /// t(4700). A request from another identity trusted for all destinations, received
+    /// one second before that, is a presence collision for both halves: `NoAccess`, no
+    /// knock, the one `error:` line, nothing marked. Received at the instant the row
+    /// expires it is a presence for neither: served, no line, so nothing is remembered
+    /// and the request after it is served too. Neither branch splits into a refusal with
+    /// no line or a served request with an error line.
+    #[tokio::test]
+    async fn usage_probe_a_dispatched_requests_verdict_and_its_owner_line_see_the_same_peer_table_instant()
+     {
+        let at = |secs: u64| UNIX_EPOCH + Duration::from_secs(secs);
+        let holder = *TransportIdentity::new_from_rand(OsRng).as_identity();
+        let presenter = *TransportIdentity::new_from_rand(OsRng).as_identity();
+        let holder_hex = holder.address_hash.to_hex_string();
+        let presenter_hex = presenter.address_hash.to_hex_string();
+        let origin = OriginName::of(&fresh_destination_name());
+        let holder_destination =
+            destination_address(&origin.0, &holder.address_hash).to_hex_string();
+        let presenter_destination =
+            destination_address(&origin.0, &presenter.address_hash).to_hex_string();
+        let rig = |tag: &str| {
+            let (trust, tmp) = TrustList::default()
+                .identity(&holder_hex, true)
+                .identity(&presenter_hex, true)
+                .open(tag);
+            trust.set_collision_protection(true);
+            let peers = Arc::new(PeerTable::load(tmp.path.join("peers.json"), at(2_000)).unwrap());
+            peers.observe(
+                PeerSighting {
+                    destination_hash: holder_destination.clone(),
+                    identity_hash: holder_hex.clone(),
+                    name_hash: hex_lower(&origin.0),
+                    display_name: None,
+                    protocol_version: MESH_PROTOCOL_VERSION,
+                    hops: 1,
+                },
+                at(2_000),
+            );
+            let surface = Arc::new(RecordingSurface::default());
+            trust.attach_surface(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
+            trust.attach_presence(Arc::downgrade(&peers) as Weak<dyn InstancePresence>);
+            let sink = Arc::new(SpySink::default());
+            let dispatcher = Dispatcher::new(trust.clone(), sink.clone());
+            (tmp, peers, trust, surface, sink, dispatcher)
+        };
+
+        let (_tmp, _peers, trust, surface, sink, dispatcher) =
+            rig("r3-dispatch-presence-one-clock-live");
+        let before = fs::read(trust.path()).unwrap();
+        let reply = dispatcher
+            .handle_at(admitted_knock(presenter, origin), at(4_699))
+            .await;
+        assert!(
+            matches!(reply, Reply::Code(RefusalCode::NoAccess)),
+            "the row is live at the instant the request was received"
+        );
+        assert_eq!(sink.count(), 0, "a presence collision is not a knock");
+        let (source, from, text) = surface.only();
+        assert_eq!(source, Source::Mesh);
+        assert_eq!(from, Origin::Peer(presenter_hex[..8].to_string()));
+        assert!(text.starts_with("error: "), "{text}");
+        assert!(text.contains(&holder_hex), "{text}");
+        assert!(text.contains(&presenter_hex), "{text}");
+        assert!(text.contains("is refused when it asks"), "{text}");
+        assert!(
+            text.contains(&format!(".mesh trust {presenter_destination}")),
+            "{text}"
+        );
+        assert!(
+            trust
+                .records()
+                .iter()
+                .all(|record| record.key_changed.is_none())
+        );
+        assert_eq!(fs::read(trust.path()).unwrap(), before);
+        let reply = dispatcher
+            .handle_at(admitted_knock(presenter, origin), at(4_699))
+            .await;
+        assert!(
+            matches!(reply, Reply::Code(RefusalCode::NoAccess)),
+            "the refusal holds per request"
+        );
+        assert_eq!(surface.count(), 1, "the line is earned once");
+
+        let (_tmp, _peers, trust, surface, sink, dispatcher) =
+            rig("r3-dispatch-presence-one-clock-gone");
+        let before = fs::read(trust.path()).unwrap();
+        for when in [at(4_700), at(4_701)] {
+            let reply = dispatcher
+                .handle_at(admitted_knock(presenter, origin), when)
+                .await;
+            assert!(
+                matches!(reply, Reply::Value(Value::Nil)),
+                "no live row, no memory: the identity's own grant admits it"
+            );
+        }
+        assert_eq!(sink.count(), 0, "a trusted knocker is not a knock");
+        assert_eq!(
+            surface.count(),
+            0,
+            "no line was shown, so nothing was remembered"
+        );
+        assert_eq!(fs::read(trust.path()).unwrap(), before);
     }
 
     /// `/knock` is the dispatcher's own. Registering over it is refused, and the built-in

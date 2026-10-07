@@ -872,16 +872,9 @@ impl TrustStore {
     /// destinations, whether or not the holder's row is still in the table, until the
     /// memory is evicted by `PRESENCE_SURFACED_CAP` or the node restarts. The memory is
     /// consulted before the table and never refuses the holder it names. No other rule and
-    /// no unprotected store reads either here.
-    pub(crate) fn authorize_origin(
-        &self,
-        identity: &AddressHash,
-        name_hash: &[u8; NAME_HASH_LEN],
-    ) -> OriginVerdict {
-        self.authorize_origin_at(identity, name_hash, SystemTime::now())
-    }
-
-    /// `authorize_origin` with the instant that decides which peer table rows have expired.
+    /// no unprotected store reads either here. `now` decides which peer table rows have
+    /// expired; every ingress hands the same instant to `note_key_change`, so the rows the
+    /// verdict sees are the rows the owner line sees.
     pub(crate) fn authorize_origin_at(
         &self,
         identity: &AddressHash,
@@ -927,6 +920,16 @@ impl TrustStore {
             destination,
             collisions,
         }
+    }
+
+    /// `authorize_origin_at` judged now.
+    #[cfg(test)]
+    pub(crate) fn authorize_origin(
+        &self,
+        identity: &AddressHash,
+        name_hash: &[u8; NAME_HASH_LEN],
+    ) -> OriginVerdict {
+        self.authorize_origin_at(identity, name_hash, SystemTime::now())
     }
 
     /// The verdict half of a collision: whether `collisions`, found for a verdict under
@@ -7841,6 +7844,149 @@ mod tests {
             text.contains(&format!(".mesh block {}", new.identity_hash)),
             "{text}"
         );
+    }
+
+    /// Usage probe: two memos for one instance. A stranger presents the instance while
+    /// the table holds it under A (trusted for all destinations) and earns the pair line
+    /// naming A; later, with the table holding it under B too (also trusted for all
+    /// destinations, the fresher row), the stranger presents again and earns the pair line
+    /// naming B. Both memos now stand. A remembered holder refused by the OTHER holder's
+    /// memory earns no line of its own: A presenting is refused as identity changed by
+    /// B's memo, B by A's, silently, and both stay refused once every row has aged out.
+    /// `.mesh block <B>` restores A, whose grant admits it again, while B is blocked.
+    /// Nothing is marked and `trust.yaml` keeps its bytes until the block writes it.
+    #[test]
+    fn usage_probe_a_remembered_holder_refused_by_another_holders_memory_earns_no_line_and_block_restores_it()
+     {
+        let fx = Fixture::new("trust-probe-presence-two-memos");
+        let surface = Arc::new(RecordingSurface::default());
+        fx.store
+            .attach_surface(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
+        fx.store
+            .attach_presence(Arc::downgrade(&fx.mesh.0) as Weak<dyn InstancePresence>);
+        fx.store.set_collision_protection(true);
+        let a = announced("alpha");
+        fx.announce(&a, t(2_000));
+        fx.trust_identity(&a.identity_hash, t(2_100));
+        let stranger = announced("alpha");
+        let name_hash = decode_name_hash(&a.name_hash).unwrap();
+        let judge = |peer: &Announced, now| {
+            let origin = fx.store.authorize_origin_at(
+                &parse_hash(&peer.identity_hash).unwrap(),
+                &name_hash,
+                now,
+            );
+            let outcome = match origin.verdict.decision {
+                Decision::Allow => KeyChangeOutcome::Served,
+                Decision::Refuse => KeyChangeOutcome::Refused,
+            };
+            assert!(
+                fx.store
+                    .note_key_change(&peer.identity_hash, &peer.name_hash, outcome, now)
+                    .is_empty(),
+                "a presence-only collision marks nothing"
+            );
+            origin.verdict
+        };
+
+        assert_eq!(
+            judge(&stranger, t(2_500)),
+            verdict(Decision::Refuse, Rule::DefaultClosed),
+            "a stranger with no allow is default closed, presence or not"
+        );
+        let texts = surface.texts();
+        assert_eq!(texts.len(), 1, "{texts:#?}");
+        assert!(texts[0].starts_with("error: "), "{}", texts[0]);
+        assert!(texts[0].contains(&a.identity_hash), "{}", texts[0]);
+        assert!(texts[0].contains(&stranger.identity_hash), "{}", texts[0]);
+
+        let b = announced("alpha");
+        fx.announce(&b, t(3_000));
+        fx.trust_identity(&b.identity_hash, t(3_100));
+        let before = fx.file_bytes().unwrap();
+        assert_eq!(
+            judge(&stranger, t(3_500)),
+            verdict(Decision::Refuse, Rule::DefaultClosed)
+        );
+        let texts = surface.texts();
+        assert_eq!(
+            texts.len(),
+            2,
+            "the fresher row under B earns the pair line naming B: {texts:#?}"
+        );
+        assert!(texts[1].starts_with("error: "), "{}", texts[1]);
+        assert!(texts[1].contains(&b.identity_hash), "{}", texts[1]);
+        assert!(!texts[1].contains(&a.identity_hash), "{}", texts[1]);
+
+        for (holder, label) in [(&a, "A"), (&b, "B")] {
+            assert_eq!(
+                judge(holder, t(3_600)),
+                verdict(Decision::Refuse, Rule::IdentityChanged),
+                "{label} is refused by the other holder's memory while both rows live"
+            );
+        }
+        assert_eq!(
+            surface.texts().len(),
+            2,
+            "a remembered holder refused by another holder's memory earns no line: {:#?}",
+            surface.texts()
+        );
+
+        let every_row_gone = t(3_000) + PEER_TTL + Duration::from_secs(1);
+        for (holder, label) in [(&a, "A"), (&b, "B")] {
+            assert_eq!(
+                judge(holder, every_row_gone),
+                verdict(Decision::Refuse, Rule::IdentityChanged),
+                "{label} stays refused from the memory once every row has aged out"
+            );
+        }
+        assert_eq!(
+            judge(&stranger, every_row_gone),
+            verdict(Decision::Refuse, Rule::DefaultClosed)
+        );
+        assert_eq!(surface.texts().len(), 2, "{:#?}", surface.texts());
+        assert_eq!(fx.file_bytes().unwrap(), before, "judging writes nothing");
+        assert!(
+            fx.store
+                .records()
+                .iter()
+                .all(|record| record.key_changed.is_none()),
+            "{:#?}",
+            fx.store.records()
+        );
+
+        fx.store
+            .block_identity(&fx.mesh, &b.identity_hash, None, t(6_000))
+            .unwrap();
+        assert_eq!(
+            judge(&a, t(6_100)),
+            verdict(Decision::Allow, Rule::IdentityTrusted),
+            "blocking B restores A: B's memo refuses only while B is trusted for all destinations"
+        );
+        assert_eq!(
+            judge(&b, t(6_100)),
+            verdict(Decision::Refuse, Rule::IdentityBlocked)
+        );
+        assert_eq!(
+            surface.texts().len(),
+            2,
+            "the restoration tells nobody: {:#?}",
+            surface.texts()
+        );
+
+        fx.store
+            .block_identity(&fx.mesh, &a.identity_hash, None, t(6_200))
+            .unwrap();
+        fx.store
+            .unblock_identity(&fx.mesh, &b.identity_hash)
+            .unwrap();
+        fx.trust_identity(&b.identity_hash, t(6_400));
+        assert_eq!(
+            judge(&b, t(6_500)),
+            verdict(Decision::Allow, Rule::IdentityTrusted),
+            "with A blocked, A's memo refuses nobody: B's restored grant admits it"
+        );
+        assert_eq!(surface.texts().len(), 2, "{:#?}", surface.texts());
     }
 
     /// Usage probe: the symmetric half of the presence rung, driven the way every ingress

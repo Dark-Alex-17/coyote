@@ -6666,6 +6666,136 @@ mod tests {
         );
     }
 
+    /// Usage probe: the announce path judges the owner line at the instant the announce is
+    /// filed, the same instant it hands `note_key_change`, so the rows the verdict sees
+    /// expired are the rows the line sees expired. Identity A, trusted for all
+    /// destinations, announced the instance at t(2000); its row lives until t(4700). Under
+    /// `collision_protection` an announce of the same instance by B, also trusted for all
+    /// destinations, filed at t(4699) (long past the row's life on the real clock) is a
+    /// presence collision judged as B's request would be at that instant: one `error:`
+    /// line, B refused, nothing marked, `trust.yaml` unchanged. Filed at t(4700) instead,
+    /// A's row is no presence for the verdict or the line: no line at all, and B is
+    /// served. Neither announce yields a `warning:` for an identity the rung refuses.
+    #[test]
+    fn usage_probe_an_announces_owner_line_is_judged_at_the_instant_it_is_filed() {
+        let at = |secs: u64| SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
+        let origin = OriginName([0x6c_u8; NAME_HASH_LEN]);
+        let name_hex = hex_lower(&origin.0);
+        let a = TransportIdentity::new_from_rand(OsRng);
+        let a_hex = a.address_hash().to_hex_string();
+        let a_destination = destination_address(&origin.0, a.address_hash()).to_hex_string();
+        let b = TransportIdentity::new_from_rand(OsRng);
+        let b_hex = b.address_hash().to_hex_string();
+        let b_destination = destination_address(&origin.0, b.address_hash()).to_hex_string();
+        let app_data = AnnounceAppData {
+            version: MESH_PROTOCOL_VERSION,
+            display_name: None,
+        }
+        .encode()
+        .unwrap();
+        let fixture = |tag: &str| {
+            let tmp = TempDir::new(tag);
+            let peers = Arc::new(PeerTable::load(tmp.path.join("peers.json"), at(2_000)).unwrap());
+            let (trust, trust_dir) = TrustList::default()
+                .identity(&a_hex, true)
+                .identity(&b_hex, true)
+                .open(&format!("{tag}-trust"));
+            trust.set_collision_protection(true);
+            let surface = Arc::new(crate::mesh::knock::RecordingSurface::default());
+            trust.attach_surface(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
+            trust.attach_presence(Arc::downgrade(&peers) as Weak<dyn InstancePresence>);
+            (tmp, trust_dir, peers, trust, surface)
+        };
+        let file =
+            |filer: &mut AnnounceFiler<'_>, destination: &str, identity: &str, when: SystemTime| {
+                filer.file(
+                    destination.to_string(),
+                    identity.to_string(),
+                    name_hex.clone(),
+                    &app_data,
+                    1,
+                    when,
+                )
+            };
+
+        let (_tmp, _trust_dir, peers, trust, surface) = fixture("node-announce-one-clock-live");
+        let hooks = MeshHooks::default();
+        let mut filer = AnnounceFiler {
+            peers: &peers,
+            trust: &trust,
+            hooks: &hooks,
+            throttle: DiscoveredThrottle::default(),
+        };
+        assert_eq!(
+            file(&mut filer, &a_destination, &a_hex, at(2_000)),
+            Some(PeerChange::Added)
+        );
+        assert!(surface.texts().is_empty(), "{:#?}", surface.texts());
+        let before = std::fs::read(trust.path()).unwrap();
+        assert_eq!(
+            file(&mut filer, &b_destination, &b_hex, at(4_699)),
+            Some(PeerChange::Added)
+        );
+        let texts = surface.texts();
+        assert_eq!(texts.len(), 1, "{texts:#?}");
+        assert!(texts[0].starts_with("error: "), "{}", texts[0]);
+        assert!(texts[0].contains(&a_hex), "{}", texts[0]);
+        assert!(texts[0].contains(&b_hex), "{}", texts[0]);
+        assert!(texts[0].contains("is refused when it asks"), "{}", texts[0]);
+        assert!(
+            !texts[0].contains("is served while it asks"),
+            "{}",
+            texts[0]
+        );
+        assert!(
+            texts[0].contains(&format!(".mesh trust {b_destination}")),
+            "{}",
+            texts[0]
+        );
+        assert!(
+            trust
+                .records()
+                .iter()
+                .all(|record| record.key_changed.is_none())
+        );
+        assert_eq!(std::fs::read(trust.path()).unwrap(), before);
+        let (b_identity, b_name) = (parse_hash(&b_hex).unwrap(), origin.0);
+        assert_eq!(
+            trust
+                .authorize_origin_at(&b_identity, &b_name, at(4_699))
+                .verdict,
+            crate::mesh::trust::Verdict {
+                decision: Decision::Refuse,
+                rule: crate::mesh::trust::Rule::IdentityChanged
+            },
+            "the request B would make at that instant is refused as the line says"
+        );
+
+        let (_tmp, _trust_dir, peers, trust, surface) = fixture("node-announce-one-clock-gone");
+        let mut filer = AnnounceFiler {
+            peers: &peers,
+            trust: &trust,
+            hooks: &hooks,
+            throttle: DiscoveredThrottle::default(),
+        };
+        file(&mut filer, &a_destination, &a_hex, at(2_000));
+        assert_eq!(
+            file(&mut filer, &b_destination, &b_hex, at(4_700)),
+            Some(PeerChange::Added)
+        );
+        assert!(surface.texts().is_empty(), "{:#?}", surface.texts());
+        assert_eq!(
+            trust
+                .authorize_origin_at(&parse_hash(&b_hex).unwrap(), &origin.0, at(4_700))
+                .verdict,
+            crate::mesh::trust::Verdict {
+                decision: Decision::Allow,
+                rule: crate::mesh::trust::Rule::IdentityTrusted
+            },
+            "no live row and nothing remembered: B's own grant admits it"
+        );
+    }
+
     #[test]
     fn peer_discovered_fires_are_capped_across_peers_and_refill_with_time() {
         let tmp = TempDir::new("node-announce-hook-bucket");

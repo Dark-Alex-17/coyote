@@ -8,7 +8,8 @@
 //! instead of asserting it, and fails when the flag goes stale.
 
 use super::{Kind, Listed};
-use crate::mesh::peers::{PeerSighting, PeerTable};
+use crate::mesh::knock::{KnockSurface, RecordingSurface};
+use crate::mesh::peers::{PEER_TTL, PeerSighting, PeerTable};
 use crate::mesh::protocol::{
     MESH_PROTOCOL_MIN_SUPPORTED, MESH_PROTOCOL_VERSION, VersionRefusal, protocol_supported,
 };
@@ -20,19 +21,20 @@ use crate::mesh::r3::{
     STATUS_PATH, SizeBranch,
 };
 use crate::mesh::test_support::{TempDir, TrustList};
-use crate::mesh::trust::{Decision, InstancePresence, Rule, Verdict};
+use crate::mesh::trust::{Decision, InstancePresence, KeyChangeOutcome, Rule, TrustStore, Verdict};
 use crate::mesh::{destination_address, hex_lower};
 
 use async_trait::async_trait;
 use rand_core::OsRng;
 use rmpv::Value;
 use rns_transport::destination::link::LinkId;
+use rns_transport::hash::AddressHash;
 use rns_transport::identity::PrivateIdentity;
 use std::fmt::Debug;
 use std::future::Future;
 use std::io::Cursor;
 use std::sync::{Arc, Mutex, Weak};
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// One requirement id, one input, one mandated receiver action.
 struct Vector {
@@ -2262,10 +2264,23 @@ fn authorize_rotated_origin_with(
 
 /// `authorize_rotated_origin_with` for the presence rung: no record carries `ORIGIN`, the
 /// peer table has heard it under the holder's identity instead. `list` receives the same
-/// four arguments.
+/// four arguments. The requester is judged at the instant the holder's row was heard.
 fn authorize_presence_origin_with(
     protection: bool,
     list: fn(&str, &str, &str, &str) -> TrustList,
+) -> Verdict {
+    judge_presence_origin(protection, list, |store, identity, _, heard| {
+        store.authorize_origin_at(identity, &ORIGIN, heard).verdict
+    })
+}
+
+/// `authorize_presence_origin_with` with the judging left to `judge`, which receives the
+/// store, the requester's identity, the holder's identity and the instant the holder's row
+/// was heard. A surface is attached, so an owner line the judge earns arms the memory.
+fn judge_presence_origin(
+    protection: bool,
+    list: fn(&str, &str, &str, &str) -> TrustList,
+    judge: fn(&TrustStore, &AddressHash, &AddressHash, SystemTime) -> Verdict,
 ) -> Verdict {
     let identity = PrivateIdentity::new_from_rand(OsRng)
         .as_identity()
@@ -2283,10 +2298,12 @@ fn authorize_presence_origin_with(
     )
     .open("conformance-env");
     store.set_collision_protection(protection);
-    let now = UNIX_EPOCH + Duration::from_secs(2_000);
+    let heard = UNIX_EPOCH + Duration::from_secs(2_000);
     let peers = TempDir::new("conformance-env-peers");
-    let table = Arc::new(PeerTable::load(peers.path.join("peers.json"), now).unwrap());
+    let table = Arc::new(PeerTable::load(peers.path.join("peers.json"), heard).unwrap());
     store.attach_presence(Arc::downgrade(&table) as Weak<dyn InstancePresence>);
+    let surface = Arc::new(RecordingSurface::default());
+    store.attach_surface(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
     table.observe(
         PeerSighting {
             destination_hash: held,
@@ -2296,9 +2313,25 @@ fn authorize_presence_origin_with(
             protocol_version: MESH_PROTOCOL_VERSION,
             hops: 1,
         },
-        now,
+        heard,
     );
-    store.authorize_origin_at(&identity, &ORIGIN, now).verdict
+    judge(&store, &identity, &holder, heard)
+}
+
+/// Judges the requester at `heard` and tells the owner as every ingress does, arming the
+/// presence memory for the pair when the verdict is a presence refusal.
+fn surface_presence_line(store: &TrustStore, identity: &AddressHash, heard: SystemTime) {
+    let verdict = store.authorize_origin_at(identity, &ORIGIN, heard).verdict;
+    let outcome = match verdict.decision {
+        Decision::Allow => KeyChangeOutcome::Served,
+        Decision::Refuse => KeyChangeOutcome::Refused,
+    };
+    store.note_key_change(
+        &identity.to_hex_string(),
+        &hex_lower(&ORIGIN),
+        outcome,
+        heard,
+    );
 }
 
 const IDENTITY: &str = "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a";
@@ -2607,6 +2640,44 @@ fn custom_vectors() -> Vec<Vector> {
                         .identity(holder, true)
                 }),
                 verdict(Decision::Allow, Rule::DestinationTrusted),
+            )
+        }),
+        custom("MESH-ENV-039", Kind::Valid, || {
+            same(
+                "remembered presence outlives the holder's row under collision protection",
+                judge_presence_origin(
+                    true,
+                    |identity, _, holder, _| {
+                        TrustList::default()
+                            .identity(identity, true)
+                            .identity(holder, true)
+                    },
+                    |store, identity, _, heard| {
+                        surface_presence_line(store, identity, heard);
+                        store
+                            .authorize_origin_at(identity, &ORIGIN, heard + PEER_TTL)
+                            .verdict
+                    },
+                ),
+                verdict(Decision::Refuse, Rule::IdentityChanged),
+            )
+        }),
+        custom("MESH-ENV-039", Kind::Valid, || {
+            same(
+                "remembered presence never refuses the holder it names",
+                judge_presence_origin(
+                    true,
+                    |identity, _, holder, _| {
+                        TrustList::default()
+                            .identity(identity, true)
+                            .identity(holder, true)
+                    },
+                    |store, identity, holder, heard| {
+                        surface_presence_line(store, identity, heard);
+                        store.authorize_origin_at(holder, &ORIGIN, heard).verdict
+                    },
+                ),
+                verdict(Decision::Allow, Rule::IdentityTrusted),
             )
         }),
         custom("MESH-ENV-044", Kind::Valid, || {

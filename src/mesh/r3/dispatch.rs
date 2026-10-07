@@ -201,7 +201,10 @@ enum Route {
 /// instance it is not trusted on is refused, and knocks when that is only because nobody
 /// trusted it there yet; when the instance it names is one the list binds to another
 /// identity, the store marks that record instead and no knock is filed. Both verdicts are
-/// the store's; nothing here reads the trust file or ranks rules itself.
+/// the store's; nothing here reads the trust file or ranks rules itself. Under
+/// `mesh.collision_protection` an identity trusted for all destinations is refused the
+/// same way when the peer table holds its instance under another such identity: no
+/// record to mark, the human told once, verdict and owner line judged at one instant.
 pub(crate) struct Dispatcher {
     trust: Arc<TrustStore>,
     knocks: Arc<dyn KnockSink>,
@@ -257,11 +260,15 @@ impl Dispatcher {
     /// naming an instance bound to another identity does not knock: the store's key-change
     /// error to the human replaces the knock. A denied requester over a colliding record is
     /// refused for the deny and still marks the record: the human is told in every case.
+    /// An identity-changed refusal over no record is a presence collision, told the same
+    /// way with nothing marked; `now` is the instant the verdict was judged at, so the
+    /// peer table rows the line sees expired are the rows the verdict saw expired.
     pub(super) fn refusal(
         &self,
         rule: Rule,
         collisions: &[BindingConflict],
         knock: KnockEvent,
+        now: SystemTime,
         log: &dyn Fn(&str, &str),
     ) -> Reply {
         let id8 = short(&knock.identity_hash).to_string();
@@ -282,7 +289,7 @@ impl Dispatcher {
                         &knock.identity_hash,
                         &knock.name_hash,
                         KeyChangeOutcome::Refused,
-                        SystemTime::now(),
+                        now,
                     );
                 }
                 self.refuse()
@@ -299,31 +306,12 @@ impl Dispatcher {
     fn refuse(&self) -> Reply {
         Reply::Code(RefusalCode::NoAccess)
     }
-}
 
-#[async_trait]
-impl RequestHandler for Dispatcher {
-    fn admit(&self, link_id: LinkId, identity: Option<&Identity>) -> Admission {
-        let (id8, outcome) = match identity {
-            None => ("anonymous".to_string(), "dropped: unauthenticated"),
-            Some(identity) => {
-                let identity_hex = identity.address_hash.to_hex_string();
-                let outcome = match self.trust.identity_standing(&identity_hex) {
-                    IdentityStanding::Trusted { .. } => return Admission::Admit,
-                    IdentityStanding::Unknown => "dropped: unknown identity",
-                    IdentityStanding::Blocked => "dropped: blocked identity",
-                };
-                (short(&identity_hex).to_string(), outcome)
-            }
-        };
-        debug!(
-            "Mesh request (not yet decoded) from {id8} on link {}: {outcome}",
-            link_id.to_hex_string()
-        );
-        Admission::Drop
-    }
-
-    async fn handle(&self, request: InboundRequest) -> Reply {
+    /// `handle` with the instant the verdict and the owner line are judged at. One instant
+    /// decides which peer table rows have expired for both, so a presence collision at
+    /// the edge of `PEER_TTL` is never refused without its line or told without being
+    /// refused.
+    pub(super) async fn handle_at(&self, request: InboundRequest, now: SystemTime) -> Reply {
         let path = describe_path(request.path_hash);
         let (request_id, link_id) = (request.request_id, request.link_id);
         let log = |id8: &str, outcome: &str| {
@@ -370,7 +358,7 @@ impl RequestHandler for Dispatcher {
             collisions,
         } = self
             .trust
-            .authorize_origin(&identity.address_hash, &envelope.origin.0);
+            .authorize_origin_at(&identity.address_hash, &envelope.origin.0, now);
         let rule = verdict.rule;
         match verdict.decision {
             Decision::Refuse => {
@@ -386,6 +374,7 @@ impl RequestHandler for Dispatcher {
                         path_hash: request.path_hash,
                         data,
                     },
+                    now,
                     &log,
                 )
             }
@@ -395,13 +384,13 @@ impl RequestHandler for Dispatcher {
                 // marked, and the request is served all the same. With no colliding record
                 // an identity-allow verdict under collision protection has already paid the
                 // remembered-presence lookup and, on a miss, the peer-table scan inside
-                // `authorize_origin`; a served request pays nothing more here.
+                // `authorize_origin_at`; a served request pays nothing more here.
                 if !collisions.is_empty() {
                     self.trust.note_key_change(
                         &identity_hex,
                         &hex_lower(&envelope.origin.0),
                         KeyChangeOutcome::Served,
-                        SystemTime::now(),
+                        now,
                     );
                 }
                 let route = self
@@ -454,6 +443,33 @@ impl RequestHandler for Dispatcher {
                 }
             }
         }
+    }
+}
+
+#[async_trait]
+impl RequestHandler for Dispatcher {
+    fn admit(&self, link_id: LinkId, identity: Option<&Identity>) -> Admission {
+        let (id8, outcome) = match identity {
+            None => ("anonymous".to_string(), "dropped: unauthenticated"),
+            Some(identity) => {
+                let identity_hex = identity.address_hash.to_hex_string();
+                let outcome = match self.trust.identity_standing(&identity_hex) {
+                    IdentityStanding::Trusted { .. } => return Admission::Admit,
+                    IdentityStanding::Unknown => "dropped: unknown identity",
+                    IdentityStanding::Blocked => "dropped: blocked identity",
+                };
+                (short(&identity_hex).to_string(), outcome)
+            }
+        };
+        debug!(
+            "Mesh request (not yet decoded) from {id8} on link {}: {outcome}",
+            link_id.to_hex_string()
+        );
+        Admission::Drop
+    }
+
+    async fn handle(&self, request: InboundRequest) -> Reply {
+        self.handle_at(request, SystemTime::now()).await
     }
 }
 
