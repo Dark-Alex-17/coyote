@@ -8263,6 +8263,71 @@ pub(crate) mod network {
         pair.stop_node_a().await;
     }
 
+    /// Usage probe: both timers at the cap `validate` allows (one year) carry a live
+    /// request to its reply. Node A, configured at the cap, sends node B a message and
+    /// asks for its status over real links: both complete, the deadlines node A handed
+    /// its client are the one-year ones on both governed paths, and the link opened,
+    /// identified and answered under them with no clock arithmetic giving out. The
+    /// unit-level `timers_at_the_cap_still_make_a_deadline` only builds the `Deadline`;
+    /// this drives it through `link_to` and `request_on_link_with`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_timers_at_the_cap_carry_a_live_request_to_its_reply() {
+        use crate::config::mesh_config::MAX_TIMEOUT_SECS;
+
+        let pair = NodePair::start_with(
+            "r3-peer-timers-at-cap",
+            |config| {
+                config.request_timeout_secs = Some(MAX_TIMEOUT_SECS);
+                config.link_timeout_secs = Some(MAX_TIMEOUT_SECS);
+            },
+            trusting_b,
+        )
+        .await;
+        pair.introduce_b_to_a().await;
+        let b_instance = pair.responder.desc.address_hash.to_hex_string();
+
+        pair.recorder_b.queue(Script::Acknowledge);
+        let message =
+            OutboundPeer::new(PeerKind::Message, "a year to answer", None, None, None).unwrap();
+        let sent = pair.node_a.send_peer(&b_instance, &message).await.unwrap();
+        assert_eq!(
+            sent.via,
+            PeerVia::Direct,
+            "answered on the link, not stored"
+        );
+        assert_eq!(sent.id, message.id);
+
+        let served = FixtureSource::secretive().card(SystemTime::now());
+        pair.recorder_b
+            .queue(Script::Reply(Reply::Value(served.to_value())));
+        let status = pair
+            .node_a
+            .request_status(&pair.responder.desc)
+            .await
+            .unwrap();
+        assert_eq!(timeless(status), timeless(served));
+
+        let year = RequestOptions {
+            request_timeout: Duration::from_secs(MAX_TIMEOUT_SECS),
+            link_timeout: Duration::from_secs(MAX_TIMEOUT_SECS),
+        };
+        assert_eq!(
+            pair.node_a.requests_made(),
+            vec![
+                (MESSAGE_PATH.to_string(), year),
+                (STATUS_PATH.to_string(), year)
+            ],
+            "both governed paths ran under the one-year deadlines"
+        );
+        assert_eq!(pair.recorder_b.seen_count(), 2);
+        assert_eq!(
+            pair.recorder_b.last().identity,
+            Some(pair.a_desc.identity.address_hash),
+            "the link identified node A before the request under the capped link deadline"
+        );
+        pair.stop_node_a().await;
+    }
+
     /// Trust is checked before anything touches the wire: a destination node A has heard
     /// but does not trust, or has never heard at all, gets the same refusal and node B
     /// sees no request.
