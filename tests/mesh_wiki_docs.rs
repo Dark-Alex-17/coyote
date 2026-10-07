@@ -802,8 +802,10 @@ fn usage_probe_the_docs_name_the_recipe_and_every_page_family_the_lint_reads() {
 
 /// The `collision_protection:` comment on `Mesh-Configuration.md` is the template's line;
 /// the setting's section there and the identity-tier Note on `Mesh-Trust-Model.md` each
-/// name what sets the presence case apart (nothing marked, the refusal remembered); and
-/// the Note quotes the two presence lines with the wording `presence_collision_text` emits.
+/// name what sets the presence case apart (nothing marked, the refusal remembered from the
+/// refusal itself, the key first heard never refused, trust of the new destination and
+/// block clearing the memory); and the Note quotes the two presence lines with the wording
+/// `presence_collision_text` emits.
 #[test]
 fn the_collision_protection_prose_in_the_wiki_matches_the_template_and_names_the_presence_case() {
     let Some(wiki) = wiki_dir() else { return };
@@ -839,7 +841,15 @@ fn the_collision_protection_prose_in_the_wiki_matches_the_template_and_names_the
         ("Mesh-Configuration.md's `## collision_protection`", section),
         ("Mesh-Trust-Model.md's identity-tier Note", note),
     ] {
-        for needle in ["collision_protection", "nothing is marked", "remembered"] {
+        for needle in [
+            "collision_protection",
+            "nothing is marked",
+            "remembered for as long as the node runs from the refusal itself",
+            "names the key first heard holding the instance",
+            "`.mesh trust <new destination>` admits the new key and clears the memory",
+            "`.mesh block` of either key clears it too",
+            "`.mesh untrust --identity <old key>` admits the new key",
+        ] {
             assert!(
                 text.contains(needle),
                 "{label} does not say {needle:?}:\n{text}"

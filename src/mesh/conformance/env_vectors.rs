@@ -2318,8 +2318,9 @@ fn judge_presence_origin(
     judge(&store, &identity, &holder, heard)
 }
 
-/// Judges the requester at `heard` and tells the owner as every ingress does, arming the
-/// presence memory for the pair when the verdict is a presence refusal.
+/// Judges the requester at `heard` and tells the owner as every ingress does; the verdict
+/// arms the instance's presence memo when it is a presence refusal, the line only spends
+/// its dedupe.
 fn surface_presence_line(store: &TrustStore, identity: &AddressHash, heard: SystemTime) {
     let verdict = store.authorize_origin_at(identity, &ORIGIN, heard).verdict;
     let outcome = match verdict.decision {
