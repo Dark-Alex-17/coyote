@@ -4693,6 +4693,7 @@ pub(crate) mod network {
     /// and B's identity is trusted for all destinations too. B's announce finds no record
     /// to mark, so `install`'s peer-table attachment is the only way the rotation shows:
     /// one warning reaches the slot's idle sink and `trust.yaml` is left byte for byte.
+    /// With protection off B's `/status` is served, and the served request restates nothing.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_identity_tier_rotation_heard_by_a_started_node_is_warned_about_and_writes_nothing()
     {
@@ -4749,6 +4750,16 @@ pub(crate) mod network {
                 .iter()
                 .all(|record| record.key_changed.is_none())
         );
+
+        let card = pair.status_of_a(&pair.responder.identity, Value::Nil).await;
+        assert_eq!(card.display_name, None, "a card came back");
+        assert_eq!(fs::read(&trust_path).unwrap(), before);
+        assert_eq!(
+            idle.0.lock().len(),
+            1,
+            "the served request restates nothing: {:#?}",
+            idle.0.lock()
+        );
         pair.stop_node_a().await;
     }
 
@@ -4757,8 +4768,8 @@ pub(crate) mod network {
     /// `error:` line naming both identities and `.mesh trust <B's destination>`, and B's
     /// `/status` request is refused `NoAccess` until then. Nothing is marked, `trust.yaml`
     /// is untouched, and the refused request restates nothing. The refusal outlives the
-    /// earlier row: swept from the table at `PEER_TTL`, B's next request is refused the
-    /// same way from the remembered line.
+    /// table: with both rows swept at `PEER_TTL`, B's next request is refused the same way
+    /// from the remembered line.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn collision_protection_refuses_a_presence_detected_rotation_at_runtime() {
         let earlier = TransportIdentity::new_from_rand(OsRng)
@@ -4843,8 +4854,8 @@ pub(crate) mod network {
 
         let swept = pair.node_a.peers().sweep(SystemTime::now() + PEER_TTL);
         assert!(
-            swept.contains(&earlier_destination.to_hex_string()),
-            "the earlier row is gone: {swept:?}"
+            swept.contains(&earlier_destination.to_hex_string()) && swept.contains(&b_instance),
+            "both rows are gone: {swept:?}"
         );
         let err = pair
             .client_b
@@ -4861,7 +4872,7 @@ pub(crate) mod network {
         assert_eq!(
             err,
             R3Error::Refused(RefusalCode::NoAccess),
-            "the refusal is remembered after the row aged out"
+            "the refusal is remembered with no row left to scan"
         );
         assert_eq!(fs::read(&trust_path).unwrap(), before);
         assert_eq!(idle.0.lock().len(), 1, "{:#?}", idle.0.lock());

@@ -1042,7 +1042,7 @@ mod tests {
     use rns_transport::resource::MAX_EFFICIENT_SIZE;
     use std::time::Duration;
 
-    const EXPECTED_LITERALS: &str = r#"1,1,10,16,262144,128,"/knock","/status","/message",30,10,10,2,20,16,0xf0,0xf1,0xf3,0xf4,0xf5,0xf6,0xfd,0xfe,"SCOPE",64,300,900,3,2700,1800,1024,"scope.knock/1",200,15,10,256,3,600,256,16,1,0,1,2,64,280,64,64,120,280,"scope.peer/1",1,120,4000,64,4096,8,15,10,604800,256,3600,120,256,1,60,100000,120,26,60,2,60,1024,64,240,131072,112,4096,15552000,3,900,256,0,32,0xfb,0xfc,8,64,256,64,8,2,2,2,2,1,2,1,8,106496,98304,65536,"/list","/fetch",1024,64,1000,100000,64,2048,120,128,1048447,4194304,4194304,4198400,92 c4 10,200,16,32,"/access","scope.access/1",16,500,5,900,1,1,1,16,32768,1048575"#;
+    const EXPECTED_LITERALS: &str = r#"1,1,10,16,262144,128,"/knock","/status","/message",30,10,10,2,20,16,0xf0,0xf1,0xf3,0xf4,0xf5,0xf6,0xfd,0xfe,"SCOPE",64,300,900,3,2700,1800,1024,"scope.knock/1",200,15,10,256,3,600,256,16,1,0,1,2,64,280,64,64,120,280,"scope.peer/1",1,120,4000,64,4096,8,15,10,604800,256,3600,120,256,1,60,100000,120,26,60,2,60,1024,64,240,131072,112,4096,15552000,3,900,256,0,32,0xfb,0xfc,8,64,256,64,8,2,2,2,2,1,2,1,8,106496,98304,65536,"/list","/fetch",1024,64,1000,100000,64,2048,120,128,1048447,4194304,4194304,4198400,92 c4 10,200,16,32,"/access","scope.access/1",16,500,5,900,1,1,1,16,32768,1048575,4096"#;
 
     fn expected_constants() -> Vec<(&'static str, String)> {
         let secs = |d: Duration| d.as_secs().to_string();
@@ -1381,6 +1381,10 @@ mod tests {
                 FETCH_INLINE_TEXT_MAX_BYTES.to_string(),
             ),
             ("MAX_EFFICIENT_SIZE", MAX_EFFICIENT_SIZE.to_string()),
+            (
+                "PRESENCE_SURFACED_CAP",
+                trust::PRESENCE_SURFACED_CAP.to_string(),
+            ),
         ]
     }
 
