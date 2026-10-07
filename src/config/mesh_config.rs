@@ -1038,6 +1038,110 @@ mod tests {
         disabled.validate(false).unwrap();
     }
 
+    /// Usage probe: the refusal for a timer under its floor or over the cap is the whole
+    /// sentence the Mesh-Configuration page quotes, for both keys; `0` on a timer is NOT
+    /// the "unlimited" its budget neighbours mean, it is a value under the floor and
+    /// refused as one; and a timer written in YAML as a number reads back as that number,
+    /// as `null` reads back unset.
+    #[test]
+    fn usage_probe_timer_refusals_spell_the_documented_sentence_and_zero_is_not_unlimited() {
+        let enabled = MeshConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let with = |request: Option<u64>, link: Option<u64>| MeshConfig {
+            request_timeout_secs: request,
+            link_timeout_secs: link,
+            ..enabled.clone()
+        };
+        let sentence = |key: &str, value: u64, floor: u64| {
+            format!(
+                "mesh.{key} is {value}, which is out of range; use {floor} (the shortest built-in deadline, which this key raises but never lowers) to {MAX_TIMEOUT_SECS} (one year), or null to keep each path's built-in deadline"
+            )
+        };
+        for (request, link, key, value, floor) in [
+            (Some(14), None, "request_timeout_secs", 14, 15),
+            (Some(0), None, "request_timeout_secs", 0, 15),
+            (None, Some(9), "link_timeout_secs", 9, 10),
+            (None, Some(0), "link_timeout_secs", 0, 10),
+            (None, Some(31_536_001), "link_timeout_secs", 31_536_001, 10),
+            // a valid request timer does not excuse a bad link timer
+            (Some(600), Some(9), "link_timeout_secs", 9, 10),
+        ] {
+            let err = with(request, link).validate(true).unwrap_err().to_string();
+            assert_eq!(err, sentence(key, value, floor), "{request:?}/{link:?}");
+            assert!(!err.contains("invalid"), "{err}");
+        }
+
+        let parsed: Config = serde_yaml::from_str(
+            "mesh:\n  enabled: false\n  request_timeout_secs: 20\n  link_timeout_secs: 12\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.mesh.request_timeout_secs, Some(20));
+        assert_eq!(parsed.mesh.link_timeout_secs, Some(12));
+        let absent: Config = serde_yaml::from_str("mesh:\n  enabled: false\n").unwrap();
+        assert_eq!(absent.mesh.request_timeout_secs, None);
+        assert_eq!(absent.mesh.link_timeout_secs, None);
+        let round_trip: MeshConfig =
+            serde_yaml::from_str(&serde_yaml::to_string(&with(Some(20), Some(12))).unwrap())
+                .unwrap();
+        assert_eq!(round_trip.request_timeout_secs, Some(20));
+        assert_eq!(round_trip.link_timeout_secs, Some(12));
+        // a negative number is not a u64: refused at parse time, before validate
+        serde_yaml::from_str::<Config>("mesh:\n  request_timeout_secs: -5\n").unwrap_err();
+    }
+
+    /// Usage probe: every peer budget at `0` at once, alongside timers at their floors,
+    /// validates; the cost ceiling keeps its own `0 = no ceiling` rule and wording, and
+    /// the retention key keeps refusing `0` with the sentence the docs still carry, so a
+    /// config that lifts every peer budget is only one key away from a refusal.
+    #[test]
+    fn usage_probe_every_peer_budget_at_zero_at_once_validates_and_the_other_keys_keep_their_rules()
+    {
+        let lifted = MeshConfig {
+            enabled: true,
+            peer_max_concurrent: 0,
+            peer_max_messages_per_hour: 0,
+            peer_max_tokens_per_hour: 0,
+            peer_max_cost_usd_per_hour: 0.0,
+            request_timeout_secs: Some(15),
+            link_timeout_secs: Some(10),
+            ..Default::default()
+        };
+        lifted.validate(true).unwrap();
+        let parsed: Config = serde_yaml::from_str(
+            "mesh:\n  enabled: true\n  peer_max_concurrent: 0\n  peer_max_messages_per_hour: 0\n  peer_max_tokens_per_hour: 0\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.mesh.peer_max_concurrent, 0);
+        assert_eq!(parsed.mesh.peer_max_messages_per_hour, 0);
+        assert_eq!(parsed.mesh.peer_max_tokens_per_hour, 0);
+        parsed.mesh.validate(true).unwrap();
+
+        let err = MeshConfig {
+            knock_retention_hours: 0,
+            ..lifted.clone()
+        }
+        .validate(true)
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            err,
+            "mesh.knock_retention_hours is 0, which is out of range; use 1 or more"
+        );
+        let err = MeshConfig {
+            peer_max_cost_usd_per_hour: -1.0,
+            ..lifted.clone()
+        }
+        .validate(true)
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            err,
+            "mesh.peer_max_cost_usd_per_hour is -1, which is out of range; use 0 (no ceiling) or a positive amount"
+        );
+    }
+
     /// Usage probe: the documented `0 = fetch only on .mesh sync` is a VALID setting for an
     /// enabled mesh, unlike `knock_retention_hours`, where 0 is out of range; an absent
     /// key reads as the documented 300; a negative or fractional value is refused at parse

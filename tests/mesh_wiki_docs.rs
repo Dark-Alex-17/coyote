@@ -1038,3 +1038,245 @@ fn the_mesh_peers_section_labels_rows_by_the_grant_and_says_nothing_of_a_served_
         "the wiki's trust labels are not trust_label's"
     );
 }
+
+/// The `from_secs(N)` of the one `const NAME: Duration` line in `path`.
+fn const_secs(path: &str, name: &str) -> u64 {
+    let source = read(repo_root().join(path));
+    let line = source
+        .lines()
+        .find(|line| line.contains(&format!("const {name}: Duration = Duration::from_secs(")))
+        .unwrap_or_else(|| panic!("{path} does not define const {name}"));
+    let (_, rest) = line.split_once("from_secs(").unwrap();
+    rest.split(')')
+        .next()
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap_or_else(|e| panic!("{path} {name}: {e}"))
+}
+
+/// The value of the one `const NAME: u64 = ...;` line in `path`, following an alias to
+/// another constant in the same file.
+fn const_u64(path: &str, name: &str) -> u64 {
+    let source = read(repo_root().join(path));
+    let mut name = name.to_string();
+    loop {
+        let line = source
+            .lines()
+            .find(|line| line.contains(&format!("const {name}: u64 = ")))
+            .unwrap_or_else(|| panic!("{path} does not define const {name}"));
+        let (_, value) = line.split_once(" = ").unwrap();
+        let value = value.trim().trim_end_matches(';');
+        if value.starts_with(|c: char| c.is_ascii_digit()) {
+            return value
+                .replace('_', "")
+                .parse()
+                .unwrap_or_else(|e| panic!("{path} {name}: {e}"));
+        }
+        name = value.to_string();
+    }
+}
+
+/// Usage probe: Mesh-Configuration.md promises the budget and timer semantics the code
+/// enforces. The three `peer_max_*` budgets say `0 = unlimited` on every surface that
+/// documents them (wiki, template, example, README) and none still says "must be 1 or
+/// more", which `knock_retention_hours` keeps on all four; the two refusal rows for the
+/// timers quote the sentence `validate` emits, floor and cap and all; the floors, the
+/// cap, `/status`'s 30 s, `/fetch`'s 120 s and the status sweep's 5 s the Timers section
+/// cites are the constants in the code; and the timers are shown as `null` in every
+/// documented default.
+#[test]
+fn usage_probe_the_configuration_page_promises_the_budget_and_timer_semantics_the_code_enforces() {
+    let Some(wiki) = wiki_dir() else { return };
+    let page = read(wiki.join("Mesh-Configuration.md"));
+    let template = read(repo_root().join("assets/config-template.yaml"));
+    let example = read(repo_root().join("config.example.yaml"));
+    let readme = read(repo_root().join("README.md"));
+
+    let yaml_line = |label: &str, text: &str, key: &str| -> String {
+        text.lines()
+            .find(|line| line.trim_start().starts_with(&format!("{key}:")) && line.contains('#'))
+            .unwrap_or_else(|| panic!("{label} has no commented `{key}:` line"))
+            .to_string()
+    };
+    let readme_row = |key: &str| -> String {
+        readme
+            .lines()
+            .find(|line| line.starts_with(&format!("| `mesh.{key}`")))
+            .unwrap_or_else(|| panic!("README.md has no `mesh.{key}` row"))
+            .to_string()
+    };
+    let wiki_row = |key: &str| -> String {
+        page.lines()
+            .find(|line| line.starts_with(&format!("| `{key}`")))
+            .unwrap_or_else(|| panic!("Mesh-Configuration.md has no `{key}` table row"))
+            .to_string()
+    };
+
+    for key in [
+        "peer_max_concurrent",
+        "peer_max_messages_per_hour",
+        "peer_max_tokens_per_hour",
+    ] {
+        for (label, line) in [
+            (
+                "Mesh-Configuration.md",
+                yaml_line("Mesh-Configuration.md", &page, key),
+            ),
+            (
+                "assets/config-template.yaml",
+                yaml_line("template", &template, key),
+            ),
+            ("config.example.yaml", yaml_line("example", &example, key)),
+        ] {
+            assert!(
+                line.ends_with("0 = unlimited)"),
+                "{label}'s `{key}` comment does not end with `0 = unlimited)`: {line}"
+            );
+            assert!(
+                !line.contains("must be 1 or more"),
+                "{label}'s `{key}` comment still says must be 1 or more: {line}"
+            );
+        }
+        for (label, row) in [
+            ("README.md", readme_row(key)),
+            ("Mesh-Configuration.md", wiki_row(key)),
+        ] {
+            assert!(
+                row.contains("`0` = unlimited"),
+                "{label}'s `{key}` row does not say `0` = unlimited: {row}"
+            );
+            assert!(
+                !row.contains("must be `1` or more"),
+                "{label}'s `{key}` row still says must be `1` or more: {row}"
+            );
+        }
+    }
+    for (label, line) in [
+        (
+            "assets/config-template.yaml",
+            yaml_line("template", &template, "knock_retention_hours"),
+        ),
+        (
+            "config.example.yaml",
+            yaml_line("example", &example, "knock_retention_hours"),
+        ),
+        ("README.md", readme_row("knock_retention_hours")),
+    ] {
+        assert!(
+            line.contains("must be 1 or more") || line.contains("must be `1` or more"),
+            "{label}'s knock_retention_hours no longer says must be 1 or more: {line}"
+        );
+    }
+    assert!(
+        wiki_row("knock_retention_hours").contains(">= 1"),
+        "{}",
+        wiki_row("knock_retention_hours")
+    );
+
+    let request_floor = const_secs("src/mesh/message.rs", "PEER_REQUEST_TIMEOUT");
+    let link_floor = const_secs("src/mesh/r3/client.rs", "DEFAULT_LINK_TIMEOUT");
+    let status = const_secs("src/mesh/r3/client.rs", "DEFAULT_REQUEST_TIMEOUT");
+    let fetch = const_secs("src/mesh/fetch.rs", "FILE_FETCH_REQUEST_TIMEOUT");
+    let sweep = const_secs("src/function/mesh.rs", "STATUS_REQUEST_TIMEOUT");
+    let cap = const_u64("src/config/mesh_config.rs", "MAX_TIMEOUT_SECS");
+
+    let config_source = read(repo_root().join("src/config/mesh_config.rs"));
+    let validate_body = config_source
+        .split("\n    pub fn validate(")
+        .nth(1)
+        .expect("src/config/mesh_config.rs defines MeshConfig::validate")
+        .split("\n    }\n")
+        .next()
+        .unwrap();
+    let sentence = string_literals(validate_body)
+        .into_iter()
+        .find(|literal| {
+            literal.starts_with("mesh.{name} is {value}, which is out of range; use {floor} (")
+        })
+        .expect("src/config/mesh_config.rs emits the timer-floor sentence");
+    let refusal_row = |key: &str| -> String {
+        page.lines()
+            .find(|line| line.starts_with(&format!("| `{key}` under ")))
+            .unwrap_or_else(|| panic!("Mesh-Configuration.md has no refusal row for `{key}`"))
+            .to_string()
+    };
+    for (key, floor) in [
+        ("request_timeout_secs", request_floor),
+        ("link_timeout_secs", link_floor),
+    ] {
+        let row = refusal_row(key);
+        let cells = table_cells(&row);
+        assert_eq!(cells.len(), 2, "{row}");
+        assert_eq!(
+            cells[0],
+            format!("`{key}` under {floor} or over {cap}"),
+            "{row}"
+        );
+        let expected = sentence
+            .replace("{name}", key)
+            .replace("{value}", "<value>")
+            .replace("{floor}", &floor.to_string())
+            .replace("{MAX_TIMEOUT_SECS}", &cap.to_string());
+        assert_eq!(
+            unbacktick(&cells[1], "refusal"),
+            expected,
+            "Mesh-Configuration.md's `{key}` refusal row is not validate's sentence"
+        );
+        assert!(
+            wiki_row(key).contains(&format!("| {floor} to {cap} when enabled |")),
+            "{}",
+            wiki_row(key)
+        );
+        for (label, line) in [
+            (
+                "Mesh-Configuration.md",
+                yaml_line("Mesh-Configuration.md", &page, key),
+            ),
+            (
+                "assets/config-template.yaml",
+                yaml_line("template", &template, key),
+            ),
+            ("config.example.yaml", yaml_line("example", &example, key)),
+        ] {
+            assert!(
+                line.trim_start().starts_with(&format!("{key}: null ")),
+                "{label} does not document `{key}: null`: {line}"
+            );
+            assert!(
+                line.contains(&format!("under {floor} is refused")),
+                "{label}'s `{key}` comment does not name the floor {floor}: {line}"
+            );
+            assert!(
+                line.ends_with(&format!("; {floor} to {cap})")),
+                "{label}'s `{key}` comment does not end with the range: {line}"
+            );
+            assert!(line.contains("never lowers"), "{label}: {line}");
+        }
+        assert!(readme_row(key).contains("| `null`"), "{}", readme_row(key));
+    }
+
+    let heading = "\n## Timers\n";
+    let timers = &page[page
+        .find(heading)
+        .expect("Mesh-Configuration.md has a Timers section")..];
+    let timers = timers[1..].split("\n## ").next().unwrap();
+    for needle in [
+        format!(
+            "{request_floor} s / {link_floor} s on `/message`, `/knock`, `/list` and `/access`"
+        ),
+        format!("{status} s / {link_floor} s on `/status`"),
+        format!("{fetch} s / {link_floor} s on `/fetch`"),
+        format!("({request_floor} for the request, {link_floor} for the link)"),
+        format!("`with_status: true` ({sweep} s / {sweep} s)"),
+        format!("over one year ({cap})"),
+        "neither ever lowers one".to_string(),
+        "`.mesh info`".to_string(),
+        "`null` while unset".to_string(),
+    ] {
+        assert!(
+            timers.contains(&needle),
+            "the Timers section does not say {needle:?}:\n{timers}"
+        );
+    }
+}

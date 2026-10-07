@@ -8164,6 +8164,105 @@ pub(crate) mod network {
         pair.stop_node_a().await;
     }
 
+    /// Usage probe: `peer_max_concurrent: 0` lifts the concurrency gate before the ack.
+    /// With three of node B's runs already in flight at node A, B's next question is
+    /// acknowledged, handed to the envoy and counted, and no refusal line is folded.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_the_link_gate_acknowledges_a_run_under_unlimited_concurrency() {
+        let pair = NodePair::start_with(
+            "r3-peer-link-unlimited-concurrency",
+            |config| config.peer_max_concurrent = 0,
+            trusting_b,
+        )
+        .await;
+        pair.introduce_b_to_a().await;
+        let (slot, idle) = installed_slot(&pair);
+        assert_eq!(slot.limits().config().concurrency, 0);
+        let envoy = RecordingEnvoy::new(true, false);
+        slot.set_envoy(envoy.clone() as Arc<dyn EnvoySink>);
+        let identity = b_identity(&pair);
+        let held: Vec<_> = (0..3)
+            .map(|_| {
+                slot.limits()
+                    .try_reserve(&identity, Instant::now())
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            slot.limits()
+                .window_of(&identity, Instant::now())
+                .unwrap()
+                .in_flight,
+            3
+        );
+
+        let ask = OutboundPeer::new(PeerKind::Ask, "room for a fourth?", None, None, None).unwrap();
+        let outcome = b_sends_to_a(&pair, &ask).await.unwrap();
+        assert!(
+            is_received_reply(&outcome.value, &ask.id),
+            "three in flight under no cap is acknowledged: {:?}",
+            outcome.value
+        );
+        wait_until("the envoy to take the question", || {
+            envoy.job_ids() == [ask.id.clone()]
+        })
+        .await;
+        assert_eq!(
+            slot.limits()
+                .window_of(&identity, Instant::now())
+                .unwrap()
+                .messages,
+            1
+        );
+        let lines: Vec<String> = idle.0.lock().iter().map(|note| note.text.clone()).collect();
+        assert!(
+            lines.iter().all(|line| !line.contains("refus")),
+            "{lines:?}"
+        );
+        drop(held);
+        pair.stop_node_a().await;
+    }
+
+    /// Usage probe: `peer_max_tokens_per_hour: 0` lifts the token gate before the ack. A
+    /// window already charged far past any default ceiling still has B's message
+    /// acknowledged and handed to the envoy, where the default refuses it with
+    /// `token_ceiling` (`a_link_message_from_an_identity_whose_token_window_is_spent_is_refused_before_the_ack`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_the_link_gate_acknowledges_a_run_under_unlimited_tokens() {
+        let pair = NodePair::start_with(
+            "r3-peer-link-unlimited-tokens",
+            |config| config.peer_max_tokens_per_hour = 0,
+            trusting_b,
+        )
+        .await;
+        pair.introduce_b_to_a().await;
+        let (slot, idle) = installed_slot(&pair);
+        assert_eq!(slot.limits().config().tokens_per_hour, 0);
+        let envoy = RecordingEnvoy::new(true, false);
+        slot.set_envoy(envoy.clone() as Arc<dyn EnvoySink>);
+        slot.limits()
+            .debit(&b_identity(&pair), 10_000_000, None, Instant::now());
+        let message = OutboundPeer::new(PeerKind::Message, "one more", None, None, None).unwrap();
+
+        let outcome = b_sends_to_a(&pair, &message).await.unwrap();
+
+        assert!(
+            is_received_reply(&outcome.value, &message.id),
+            "{:?}",
+            outcome.value
+        );
+        wait_until("the envoy to take the message", || {
+            envoy.job_ids() == [message.id.clone()]
+        })
+        .await;
+        let lines: Vec<String> = idle.0.lock().iter().map(|note| note.text.clone()).collect();
+        assert!(
+            lines.iter().all(|line| !line.contains("token_ceiling")),
+            "{lines:?}"
+        );
+        pair.stop_node_a().await;
+    }
+
     /// Trust is checked before anything touches the wire: a destination node A has heard
     /// but does not trust, or has never heard at all, gets the same refusal and node B
     /// sees no request.

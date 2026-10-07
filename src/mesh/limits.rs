@@ -967,6 +967,91 @@ mod tests {
         assert!(limits.try_reserve("a", start).is_ok());
     }
 
+    /// Usage probe: `0` lifts one budget alone. With the token budget lifted, the second
+    /// message in an hour under `messages_per_hour: 1` is still rate limited; with the
+    /// concurrency budget lifted, a spent token window still refuses the next run before
+    /// the ack and at reservation; with the message budget lifted, a run in flight under
+    /// `concurrency: 1` still refuses the next run. Each refusal keeps its reason.
+    #[test]
+    fn usage_probe_a_zero_budget_lifts_only_its_own_ceiling() {
+        let start = now();
+
+        let tokens_lifted = limits(PeerLimitConfig {
+            tokens_per_hour: 0,
+            messages_per_hour: 1,
+            ..PeerLimitConfig::default()
+        });
+        tokens_lifted.admit_message("a", start).unwrap();
+        let refusal = tokens_lifted.admit_message("a", start).unwrap_err();
+        assert_eq!(refusal.reason, RefusalReason::RateLimited);
+        assert_eq!(tokens_lifted.window_of("a", start).unwrap().messages, 1);
+
+        let concurrency_lifted = limits(PeerLimitConfig {
+            concurrency: 0,
+            tokens_per_hour: 10,
+            ..PeerLimitConfig::default()
+        });
+        concurrency_lifted.debit("a", 10, None, start);
+        assert_eq!(
+            concurrency_lifted
+                .check_run_admissible("a", start)
+                .unwrap_err()
+                .reason,
+            RefusalReason::TokenCeiling
+        );
+        assert_eq!(
+            concurrency_lifted
+                .try_reserve("a", start)
+                .err()
+                .expect("a spent token window refuses the reservation")
+                .reason,
+            RefusalReason::TokenCeiling
+        );
+
+        let messages_lifted = limits(PeerLimitConfig {
+            messages_per_hour: 0,
+            concurrency: 1,
+            ..PeerLimitConfig::default()
+        });
+        let _held = messages_lifted.try_reserve("a", start).unwrap();
+        assert_eq!(
+            messages_lifted
+                .check_run_admissible("a", start)
+                .unwrap_err()
+                .reason,
+            RefusalReason::PeerConcurrency
+        );
+        messages_lifted.admit_message("a", start).unwrap();
+    }
+
+    /// Usage probe: with all three budgets lifted a flood of messages, reservations and
+    /// tokens from one identity is admitted throughout, and the cost ceiling, which `0`
+    /// already switched off before, is the one budget that can still refuse it.
+    #[test]
+    fn usage_probe_all_three_budgets_lifted_admit_a_flood_and_only_a_cost_ceiling_refuses() {
+        let start = now();
+        let lifted = limits(PeerLimitConfig {
+            messages_per_hour: 0,
+            concurrency: 0,
+            tokens_per_hour: 0,
+            cost_usd_per_hour: 1.0,
+        });
+        let mut held = Vec::new();
+        for n in 0..500u64 {
+            let at = start + Duration::from_secs(n);
+            lifted.admit_message("a", at).unwrap();
+            lifted.check_run_admissible("a", at).unwrap();
+            held.push(lifted.try_reserve("a", at).unwrap());
+            lifted.debit("a", u64::MAX / 1000, None, at);
+        }
+        assert_eq!(lifted.window_of("a", start).unwrap().in_flight, 500);
+        lifted.debit("a", 1, Some(1.0), start);
+        let refusal = lifted.check_run_admissible("a", start).unwrap_err();
+        assert_eq!(refusal.reason, RefusalReason::CostCeiling);
+        drop(held);
+        assert_eq!(lifted.window_of("a", start).unwrap().in_flight, 0);
+    }
+
     #[test]
     fn debit_charges_at_least_one_token_and_only_a_positive_finite_cost() {
         let limits = default_limits();

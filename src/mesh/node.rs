@@ -9398,6 +9398,38 @@ mod tests {
         );
     }
 
+    /// Usage probe: a request timer between the floors is raise-only per path.
+    /// `request_timeout_secs: 20` with `link_timeout_secs: 10` (its floor) gives
+    /// `/message` 20 s where its own is 15 s, and leaves `/status` its own 30 s, the
+    /// link deadline staying 10 s on both; the same timers raise `/knock` to 20 s.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_a_timer_between_the_floors_raises_the_short_paths_and_leaves_status_its_own()
+     {
+        let between = (Some(20), Some(10));
+        assert_eq!(
+            deadlines_handed_to("node-timers-between-message", between, MESSAGE_PATH).await,
+            RequestOptions {
+                request_timeout: Duration::from_secs(20),
+                link_timeout: Duration::from_secs(10),
+            }
+        );
+        assert_eq!(
+            deadlines_handed_to("node-timers-between-status", between, STATUS_PATH).await,
+            RequestOptions {
+                request_timeout: Duration::from_secs(30),
+                link_timeout: Duration::from_secs(10),
+            }
+        );
+        assert_eq!(
+            deadlines_handed_to("node-timers-between-knock", between, KNOCK_PATH).await,
+            RequestOptions {
+                request_timeout: Duration::from_secs(20),
+                link_timeout: Duration::from_secs(10),
+            }
+        );
+    }
+
     /// `/fetch` is not governed: under the raised timers it still hands the client its own
     /// 120 s / 10 s.
     #[cfg(unix)]
