@@ -71,7 +71,7 @@ pub struct MeshConfig {
     /// queued or running is refused before it is acknowledged with the bare throttled
     /// code, which names no reason, and is not filed; by store-and-forward it is filed
     /// in the inbox for the human without an envoy run and the peer gets one typed
-    /// reply per identity, per reason, per hour.
+    /// reply per identity, per reason, per hour. 0 = unlimited.
     pub peer_max_concurrent: u32,
     /// Messages accepted from one sending identity per hour. Windows are fixed hours
     /// kept in memory, so a restart opens a fresh window; further messages are
@@ -80,6 +80,7 @@ pub struct MeshConfig {
     /// per hour, the message filed in the inbox for the human without an envoy run;
     /// plus one folded REPL line per identity, per reason, per hour, with the folded
     /// count reported the next time that peer is heard from after the hour rolls over.
+    /// 0 = unlimited.
     pub peer_max_messages_per_hour: u32,
     /// Model tokens one sending identity may cost per hour, counted after each envoy
     /// run, so the runs in flight may overshoot the ceiling by at most
@@ -90,6 +91,7 @@ pub struct MeshConfig {
     /// turn comes is filed in the inbox and answered with the typed `budget_exhausted`
     /// reply; by store-and-forward it is filed in the inbox for the human without an
     /// envoy run and the peer gets one typed reply per identity, per reason, per hour.
+    /// 0 = unlimited.
     pub peer_max_tokens_per_hour: u64,
     /// USD one sending identity may cost per hour, counted like the token ceiling; 0 =
     /// no cost ceiling. Enforced only when the envoy model's prices are known; on a
@@ -245,18 +247,8 @@ impl MeshConfig {
                 );
             }
         }
-        for (name, value) in [
-            ("knock_retention_hours", self.knock_retention_hours),
-            ("peer_max_concurrent", u64::from(self.peer_max_concurrent)),
-            (
-                "peer_max_messages_per_hour",
-                u64::from(self.peer_max_messages_per_hour),
-            ),
-            ("peer_max_tokens_per_hour", self.peer_max_tokens_per_hour),
-        ] {
-            if value == 0 {
-                bail!("mesh.{name} is 0, which is out of range; use 1 or more");
-            }
+        if self.knock_retention_hours == 0 {
+            bail!("mesh.knock_retention_hours is 0, which is out of range; use 1 or more");
         }
         let cost = self.peer_max_cost_usd_per_hour;
         if !cost.is_finite() || cost < 0.0 {
@@ -448,14 +440,24 @@ pub fn render_mesh_info(mesh: &MeshConfig) -> String {
         "collision_protection",
         mesh.collision_protection.to_string(),
     );
-    row("peer_max_concurrent", mesh.peer_max_concurrent.to_string());
+    let budget = |value: u64| {
+        if value == 0 {
+            "0 (unlimited)".to_string()
+        } else {
+            value.to_string()
+        }
+    };
+    row(
+        "peer_max_concurrent",
+        budget(u64::from(mesh.peer_max_concurrent)),
+    );
     row(
         "peer_max_messages_per_hour",
-        mesh.peer_max_messages_per_hour.to_string(),
+        budget(u64::from(mesh.peer_max_messages_per_hour)),
     );
     row(
         "peer_max_tokens_per_hour",
-        mesh.peer_max_tokens_per_hour.to_string(),
+        budget(mesh.peer_max_tokens_per_hour),
     );
     let cost = mesh.peer_max_cost_usd_per_hour;
     row(
@@ -845,33 +847,31 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_zero_peer_max_concurrent() {
+    fn validate_accepts_zero_peer_max_concurrent_as_unlimited() {
         let mesh = MeshConfig {
             enabled: true,
             peer_max_concurrent: 0,
             ..Default::default()
         };
-        let err = mesh.validate(true).unwrap_err().to_string();
-        assert!(
-            err.contains("mesh.peer_max_concurrent is 0, which is out of range"),
-            "{err}"
-        );
+        mesh.validate(true).unwrap();
     }
 
     #[test]
-    fn validate_rejects_zero_for_every_rate_and_retention_key() {
+    fn validate_rejects_zero_retention_and_accepts_zero_on_every_peer_budget() {
         let enabled = MeshConfig {
             enabled: true,
             ..Default::default()
         };
-        let cases = [
-            (
-                "knock_retention_hours",
-                MeshConfig {
-                    knock_retention_hours: 0,
-                    ..enabled.clone()
-                },
-            ),
+        let retention = MeshConfig {
+            knock_retention_hours: 0,
+            ..enabled.clone()
+        };
+        let err = retention.validate(true).unwrap_err().to_string();
+        assert!(
+            err.contains("mesh.knock_retention_hours is 0, which is out of range; use 1 or more"),
+            "{err}"
+        );
+        let unlimited = [
             (
                 "peer_max_concurrent",
                 MeshConfig {
@@ -894,10 +894,9 @@ mod tests {
                 },
             ),
         ];
-        for (key, mesh) in cases {
-            let err = mesh.validate(true).unwrap_err().to_string();
-            let expected = format!("mesh.{key} is 0, which is out of range; use 1 or more");
-            assert!(err.contains(&expected), "{key}: {err}");
+        for (key, mesh) in unlimited {
+            mesh.validate(true)
+                .unwrap_or_else(|err| panic!("{key}: {err}"));
         }
     }
 
@@ -1246,6 +1245,38 @@ mod tests {
             info.contains("  peer_max_cost_usd_per_hour      1.5\n"),
             "{info}"
         );
+    }
+
+    #[test]
+    fn render_mesh_info_marks_a_zero_peer_budget_as_unlimited() {
+        let info = render_mesh_info(&MeshConfig::default());
+        assert!(
+            info.contains("  peer_max_concurrent             1\n"),
+            "{info}"
+        );
+        assert!(
+            info.contains("  peer_max_messages_per_hour      60\n"),
+            "{info}"
+        );
+        assert!(
+            info.contains("  peer_max_tokens_per_hour        100000\n"),
+            "{info}"
+        );
+        let unlimited = MeshConfig {
+            peer_max_concurrent: 0,
+            peer_max_messages_per_hour: 0,
+            peer_max_tokens_per_hour: 0,
+            ..Default::default()
+        };
+        let info = render_mesh_info(&unlimited);
+        for key in [
+            "peer_max_concurrent",
+            "peer_max_messages_per_hour",
+            "peer_max_tokens_per_hour",
+        ] {
+            let row = format!("  {key:<MESH_INFO_LABEL_WIDTH$}0 (unlimited)\n");
+            assert!(info.contains(&row), "{key}: {info}");
+        }
     }
 
     #[test]

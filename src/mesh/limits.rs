@@ -26,8 +26,11 @@ pub(crate) const PEER_RETRY_AFTER_CAPACITY: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct PeerLimitConfig {
+    /// 0 = unlimited.
     pub messages_per_hour: u32,
+    /// 0 = unlimited.
     pub concurrency: u32,
+    /// 0 = unlimited.
     pub tokens_per_hour: u64,
     /// 0.0 = no cost ceiling.
     pub cost_usd_per_hour: f64,
@@ -230,9 +233,9 @@ impl IdentityWindow {
             .map_or(Duration::ZERO, |end| end.saturating_duration_since(now))
     }
 
-    /// The token ceiling, then the cost ceiling when one is configured.
+    /// The token ceiling, then the cost ceiling, each when one is configured.
     fn check_ceilings(&self, config: &PeerLimitConfig, now: Instant) -> Result<(), PeerRefusal> {
-        if self.tokens >= config.tokens_per_hour {
+        if config.tokens_per_hour > 0 && self.tokens >= config.tokens_per_hour {
             return Err(PeerRefusal {
                 reason: RefusalReason::TokenCeiling,
                 retry_after: self.remaining(now),
@@ -247,9 +250,10 @@ impl IdentityWindow {
         Ok(())
     }
 
-    /// Whether one more run may start now: the concurrency slot, then the ceilings.
+    /// Whether one more run may start now: the concurrency slot when one is configured,
+    /// then the ceilings.
     fn admissible(&self, config: &PeerLimitConfig, now: Instant) -> Result<(), PeerRefusal> {
-        if self.in_flight >= config.concurrency {
+        if config.concurrency > 0 && self.in_flight >= config.concurrency {
             return Err(PeerRefusal::capacity(RefusalReason::PeerConcurrency));
         }
         self.check_ceilings(config, now)
@@ -338,14 +342,14 @@ impl PeerLimits {
     }
 
     /// Counts one inbound message. `RateLimited` once the window already holds
-    /// `messages_per_hour`; the refused message is not counted.
+    /// `messages_per_hour`, when one is configured; the refused message is not counted.
     pub(crate) fn admit_message(&self, identity: &str, now: Instant) -> Result<(), PeerRefusal> {
         let config = self.config();
         let mut state = self.state.lock();
         let Some(window) = state.entry(identity, now) else {
             return Err(PeerRefusal::capacity(RefusalReason::PeerConcurrency));
         };
-        if window.messages >= config.messages_per_hour {
+        if config.messages_per_hour > 0 && window.messages >= config.messages_per_hour {
             return Err(PeerRefusal {
                 reason: RefusalReason::RateLimited,
                 retry_after: window.remaining(now),
@@ -908,6 +912,59 @@ mod tests {
         let rolled = start + PEER_WINDOW;
         assert!(priced.try_reserve("a", rolled).is_ok());
         assert_eq!(priced.window_of("a", rolled).unwrap().cost_usd, 0.0);
+    }
+
+    #[test]
+    fn concurrency_is_unlimited_at_zero_through_check_and_reserve() {
+        let limits = limits(PeerLimitConfig {
+            concurrency: 0,
+            ..PeerLimitConfig::default()
+        });
+        let start = now();
+        let mut held = Vec::new();
+        for n in 0..8 {
+            limits
+                .check_run_admissible("a", start)
+                .unwrap_or_else(|refusal| panic!("run {n}: {refusal:?}"));
+            held.push(limits.try_reserve("a", start).unwrap());
+            assert_eq!(limits.window_of("a", start).unwrap().in_flight, n + 1);
+        }
+        drop(held);
+        assert_eq!(limits.window_of("a", start).unwrap().in_flight, 0);
+    }
+
+    #[test]
+    fn messages_are_unlimited_at_zero_through_admit_message() {
+        let limits = limits(PeerLimitConfig {
+            messages_per_hour: 0,
+            ..PeerLimitConfig::default()
+        });
+        let start = now();
+        for n in 0..200 {
+            let at = start + Duration::from_secs(n);
+            limits
+                .admit_message("a", at)
+                .unwrap_or_else(|refusal| panic!("message {n}: {refusal:?}"));
+        }
+        assert_eq!(limits.window_of("a", start).unwrap().messages, 200);
+    }
+
+    #[test]
+    fn tokens_are_unlimited_at_zero_through_check_and_reserve() {
+        let limits = limits(PeerLimitConfig {
+            tokens_per_hour: 0,
+            ..PeerLimitConfig::default()
+        });
+        let start = now();
+        limits.debit("a", 250_000, None, start);
+        assert_eq!(limits.window_of("a", start).unwrap().tokens, 250_000);
+        limits.check_run_admissible("a", start).unwrap();
+        limits.admit_reserved("a", start).unwrap();
+        let held = limits.try_reserve("a", start).unwrap();
+        limits.debit("a", 250_000, None, start);
+        limits.admit_reserved("a", start).unwrap();
+        drop(held);
+        assert!(limits.try_reserve("a", start).is_ok());
     }
 
     #[test]
