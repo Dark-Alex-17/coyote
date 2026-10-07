@@ -15,6 +15,21 @@ Unavailable diff signals (malformed spec, git failure) mean the surface is
 UNKNOWN — selection degrades WIDER (security on; probe when a recipe
 exists), never narrower.
 
+Re-review narrowing is the ONE deterministic, caller-authorized exception:
+on a re-review round the caller may assert `settled_lanes` (lanes whose
+verdict in the immediately-prior round was green) alongside a
+`Re-review delta` range. A settled lane is skipped iff the delta alone
+would NOT have selected it under the same hard rules (security: no
+attack-surface signals in the delta; probe: no consumer-facing surface;
+adversary: delta is docs-only — a fix that touches tests ALWAYS re-runs
+adversary, since its whole job is checking the tests prove the criteria).
+Everything about it fails open:
+unavailable primary or delta signals disable narrowing entirely; a lane
+the select_lanes judgment explicitly re-added (add_* flag) is never
+narrowed; caller-forced lanes are unioned AFTER narrowing and resurrect
+anything; code-review is never narrowed; a lane that was NOT settled
+(it found problems last round) always re-runs.
+
 A re-run pass (retry_gate emitted `retry_lanes`) skips selection: only the
 named lanes get an item, stamped with their attempt number, and every other
 lane maps over nothing — retry_gate restores their earlier reports.
@@ -169,6 +184,71 @@ def main():
                 continue
             lanes.add(lane)
             reasons.append(f"{lane}: added by lane-selection judgment — {llm_why}")
+
+    # Re-review narrowing: deterministic, caller-authorized, fail-open.
+    # Runs AFTER the LLM additions (an explicitly re-added lane is never
+    # narrowed) and BEFORE forced lanes (forcing resurrects anything).
+    settled_raw = state.get("settled_lanes") or []
+    settled, unknown_settled = set(), []
+    for lane in settled_raw:
+        canon = ALIASES.get(str(lane).strip().lower())
+        (settled.add(canon) if canon else unknown_settled.append(str(lane)))
+    delta_summary = text("delta_summary")
+    delta_ok = bool(delta_summary) and not delta_summary.startswith(
+        "delta signals unavailable"
+    )
+    if settled and delta_ok and text("signals_summary") != "signals unavailable":
+
+        def narrow(lane, delta_unaffected, why):
+            flag = f"add_{lane.replace('-', '_')}"
+            if lane in lanes and lane in settled and delta_unaffected:
+                if state.get(flag):
+                    reasons.append(
+                        f"{lane}: settled and delta-unaffected, but the lane "
+                        "judgment explicitly re-added it — running"
+                    )
+                    return
+                lanes.discard(lane)
+                reasons.append(
+                    f"{lane}: SKIPPED (narrowed) — caller settled it green last "
+                    f"round and {why}"
+                )
+
+        narrow(
+            "security",
+            not (
+                state.get("delta_touches_auth")
+                or state.get("delta_touches_deps")
+                or state.get("delta_touches_exec")
+                or state.get("security_posture") == "hardened"
+            ),
+            f"the re-review delta ({delta_summary}) has no attack-surface signals",
+        )
+        narrow(
+            "probe",
+            not state.get("delta_consumer_surface"),
+            f"the re-review delta ({delta_summary}) touches no consumer-facing surface",
+        )
+        narrow(
+            "adversary",
+            bool(state.get("delta_docs_only")),
+            f"the re-review delta ({delta_summary}) is docs-only — the "
+            "always-on code-review lane still reviews doc changes",
+        )
+        if "code-review" in settled:
+            reasons.append("code-review: never narrowed — always-on floor")
+    elif settled and not delta_ok:
+        reasons.append(
+            "narrowing requested (settled lanes) but no usable re-review delta — "
+            f"fail-open, full selection runs ({delta_summary or 'no delta range given'})"
+        )
+    elif settled:
+        reasons.append(
+            "narrowing requested (settled lanes) but primary diff signals are "
+            "unavailable — fail-open, selection stays widened"
+        )
+    if unknown_settled:
+        reasons.append(f"ignored unknown settled lane name(s): {unknown_settled}")
 
     # Caller-forced lanes are ADDITIVE: they widen the computed selection,
     # never replace it. (Honoring them as the exact set dropped code-review —

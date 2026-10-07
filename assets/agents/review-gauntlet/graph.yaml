@@ -12,7 +12,11 @@ description: |
   reviews spawns this once instead of judging trigger rules and parsing
   verdicts itself — the graph structure makes skipping a lane or misreading a
   verdict impossible. Invariants: lane selection can only be WIDENED by LLM
-  judgment, never narrowed (deterministic rules are the floor); a missing
+  judgment, never narrowed (deterministic rules are the floor) — the ONE
+  narrowing path is deterministic and caller-authorized: on re-review rounds
+  a settled-green lane is skipped iff the fix delta alone would not have
+  selected it under the same hard rules, failing OPEN to the full selection
+  whenever signals are unavailable, and never touching code-review; a missing
   verdict sentinel is a lane failure, never a pass; probe INCONCLUSIVE blocks
   with an environment note (it is never PASS or FAIL); reviewer lanes run
   verdict-independent — no cross-lane messaging.
@@ -59,6 +63,16 @@ initial_state:
   probe_context: ''
   extra_context: ''
   forced_lanes: []
+  rereview_spec: ''
+  settled_lanes: []
+  delta_summary: ''
+  delta_file_count: 0
+  delta_touches_auth: false
+  delta_touches_deps: false
+  delta_touches_exec: false
+  delta_consumer_surface: false
+  delta_docs_only: false
+  delta_tests_docs_only: false
   changed_files: []
   file_count: 0
   signals_summary: ''
@@ -135,6 +149,12 @@ nodes:
         downstream: it widens the computed selection, never replaces it.
       - `extra_context`: any remaining caller context reviewers should see,
         condensed.
+
+      Leave the `Re-review delta:` and `Settled lanes:` prompt lines alone:
+      they are extracted deterministically downstream. NEVER fold the
+      re-review delta range into `diff_spec` (diff_spec is the FULL change
+      under review, not the latest fix delta) and never fold settled lane
+      names into `forced_lanes`.
     prompt: |
       Extract the review-request facts from this request:
 
@@ -198,6 +218,16 @@ nodes:
       probe runs when consumer-facing surface changed and a local-run recipe
       exists. Setting a flag to false NEVER removes a lane the rules selected.
 
+      Re-review rounds: when a re-review delta and settled lanes are present,
+      a deterministic narrowing step downstream may SKIP a settled-green lane
+      whose concerns the fix delta provably cannot touch (docs/tests-only
+      fixes stop re-running security or probe; docs-only fixes the adversary
+      lane — test-touching fixes always re-run it). Your add_* flags VETO that
+      narrowing: when the delta's signals make a settled lane relevant anyway
+      (a dependency bump hiding in docs tooling, a doc edit that rewrites a
+      documented contract worth adversarial re-checking), set the flag —
+      an explicitly added lane is never narrowed.
+
       Reasons to add:
       - `add_security`: the diff handles external/untrusted input, touches
         crypto/secrets handling, or changes trust boundaries in ways the
@@ -227,6 +257,12 @@ nodes:
       - docs-only diff: {{docs_only}}
       - {{signals_summary}}
       {{signals_error}}
+
+      Re-review round (empty = first round):
+      - re-review delta: {{delta_summary}}
+      - delta touches auth/deps/exec: {{delta_touches_auth}}/{{delta_touches_deps}}/{{delta_touches_exec}}
+      - delta consumer surface: {{delta_consumer_surface}}; docs-only: {{delta_docs_only}}; tests/docs-only: {{delta_tests_docs_only}}
+      - caller-settled lanes (green last round): {{settled_lanes}}
 
       Caller context:
       - rigor: {{rigor}}; security posture: {{security_posture}}

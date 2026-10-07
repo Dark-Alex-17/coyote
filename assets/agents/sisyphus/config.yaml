@@ -1,6 +1,6 @@
 name: sisyphus
 description: OpenCode-style orchestrator - classifies intent, delegates to specialists, tracks progress with todos, enforces OMO-grade verification discipline
-version: 3.18.0
+version: 3.19.0
 
 agent_session: temp
 auto_continue: true
@@ -319,6 +319,13 @@ instructions: |
   Prior review decisions: <on re-review rounds ONLY: earlier rounds' resolved/rejected
   findings verbatim (rejected-finding log lines, round-comment reconciliations) — settled
   decisions the reviewers must not re-litigate; omit on the first round>
+  Re-review delta: <on re-review rounds ONLY, when the fixes landed as commits: the HEAD SHA
+  recorded when you spawned the PRIOR round (`git rev-parse HEAD` — record it at EVERY gauntlet
+  spawn), or an explicit <sha>..HEAD range; omit on the first round or while fixes are uncommitted>
+  Settled lanes: <on re-review rounds ONLY: the lanes whose verdict in the immediately-prior
+  round was green (code-review PASS with 0 criticals, adversary CONFORMS, security PASS, probe
+  PASS) — NEVER a lane that reported findings: it must re-run to verify your fix; omit on the
+  first round>
   Local-run recipe / usage suites: <from the plan — enables the probe lane; omit when none>"
   --variables {"verification_commands": "[\"cargo test --all\", \"cargo clippy -- -D warnings\"]"}
   <— the cargo commands above are only an EXAMPLE: replace them with THIS project's exact build/test/lint commands; never guess, and pass "[]" when none apply>
@@ -344,7 +351,13 @@ instructions: |
     the findings-handling rules in the reviewer sections below (🔴 → coder fix in the SAME session;
     DIVERGES → the adversary rules; security FAIL → the security rules; probe INCONCLUSIVE → fix the
     ENVIRONMENT per the plan's local-run recipe first — it is never a code verdict). Then spawn a
-    FRESH gauntlet run; lane selection re-runs from the new diff. A BLOCKED whose only blockers are
+    FRESH gauntlet run; lane selection re-runs from the new diff. On that re-review spawn, pass
+    `Re-review delta:` + `Settled lanes:` (template above) so lanes that were green last round and
+    that the fix delta provably cannot affect are skipped instead of re-run — docs- or test-only
+    fixes stop re-running the security and probe lanes (and docs-only fixes the adversary lane),
+    while every lane that reported findings re-runs to verify the fix. The narrowing is
+    deterministic and fail-open: when in doubt (uncommitted fixes, unclear prior verdicts), omit
+    the fields and the full selection runs. A BLOCKED whose only blockers are
     review faults (`PIPELINE-FAULT` / `review incomplete` entries) is NOT a code failure — the next
     rule owns it.
   - `GAUNTLET_REVIEW_INCOMPLETE: <lane>[, <lane>]` (the line directly under `GAUNTLET: BLOCKED`)
