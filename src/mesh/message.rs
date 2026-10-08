@@ -44,6 +44,7 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use subtle::ConstantTimeEq;
 
 /// The LXMF custom type a stored peer message carries, so a fetch can tell it from a
 /// knock or a plain LXMF message before reading anything else. Versioned in the name.
@@ -1799,7 +1800,11 @@ impl MeshRuntime {
             .await?
             .destination_identity(&address_hash)
             .await?;
-        if destination_address(&name_hash, &identity.address_hash) != address_hash {
+        if !bool::from(
+            destination_address(&name_hash, &identity.address_hash)
+                .as_slice()
+                .ct_eq(address_hash.as_slice()),
+        ) {
             return None;
         }
         Some(DestinationDesc {

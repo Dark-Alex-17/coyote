@@ -1596,7 +1596,9 @@ impl TrustStore {
         let last_seen = peers
             .snapshot()
             .iter()
-            .filter(|peer| peer.identity_hash == identity && verified_identity(peer).is_ok())
+            .filter(|peer| {
+                same_hash(&peer.identity_hash, &identity) && verified_identity(peer).is_ok()
+            })
             .map(|peer| peer.last_seen)
             .max();
         let mut state = self.inner.lock();
@@ -2763,31 +2765,53 @@ mod tests {
         assert!(same_hash("", ""));
     }
 
-    /// The destination binding is the one equality against a peer-derived value, so
-    /// every production line of this file compares hashes through `same_hash` or
-    /// `ct_eq`, never through `==` or `!=` on an `AddressHash` or its `Option`.
+    /// Every production compare of a destination or identity address against a derived
+    /// or recorded one, here and in message.rs, goes through `same_hash` or `ct_eq`,
+    /// never through `==` or `!=` on an `AddressHash` or its `Option`.
     #[test]
     fn production_code_never_compares_hashes_with_the_equality_operators() {
-        let source = include_str!("trust.rs");
+        let sources = [
+            ("trust.rs", include_str!("trust.rs")),
+            ("message.rs", include_str!("message.rs")),
+        ];
         let test_module = ["\n#[cfg(test)]\n", "mod tests {"].concat();
-        let production = &source[..source.find(&test_module).expect("the test module opens")];
         // Assembled at runtime so this test's own text does not match the probes.
-        let parsed = ["parse_", "hash("].concat();
+        let subjects = [
+            ["parse_", "hash("].concat(),
+            ["destination_", "address("].concat(),
+            ["address", "_hash"].concat(),
+        ];
         let operators = [[" =", "= "].concat(), [" !", "= "].concat()];
         let shapes = [
             ["expected !", "= claimed"].concat(),
             ["expected =", "= claimed"].concat(),
             ["== Some(destination_", "address("].concat(),
         ];
-        let hits: Vec<String> = production
-            .lines()
-            .enumerate()
-            .filter(|(_, line)| {
-                (line.contains(&parsed) && operators.iter().any(|op| line.contains(op.as_str())))
-                    || shapes.iter().any(|shape| line.contains(shape.as_str()))
-            })
-            .map(|(index, line)| format!("{}: {}", index + 1, line.trim()))
-            .collect();
+        let mut hits = Vec::new();
+        for (file, source) in sources {
+            let production = &source[..source.find(&test_module).expect("the test module opens")];
+            let lines: Vec<&str> = production.lines().map(str::trim).collect();
+            for (index, line) in lines.iter().enumerate() {
+                if line.starts_with("//") {
+                    continue;
+                }
+                // A compare rustfmt split leaves its operator at one line's edge; probe it
+                // joined with its other half.
+                let neighbour = |offset: usize| lines.get(offset).copied().unwrap_or("");
+                let joined = if operators.iter().any(|op| line.ends_with(op.trim())) {
+                    [line, " ", neighbour(index + 1)].concat()
+                } else if operators.iter().any(|op| line.starts_with(op.trim())) {
+                    [neighbour(index.wrapping_sub(1)), " ", line].concat()
+                } else {
+                    line.to_string()
+                };
+                let compares = subjects.iter().any(|s| joined.contains(s.as_str()))
+                    && operators.iter().any(|op| joined.contains(op.as_str()));
+                if compares || shapes.iter().any(|shape| joined.contains(shape.as_str())) {
+                    hits.push(format!("{file}:{}: {line}", index + 1));
+                }
+            }
+        }
         assert!(
             hits.is_empty(),
             "compare hashes with same_hash or ct_eq, not == or !=:\n{}",
