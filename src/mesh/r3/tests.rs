@@ -575,6 +575,14 @@ pub(crate) mod network {
     const ABANDON_DELAY: Duration = Duration::from_millis(250);
     /// How long a request these tests never answer waits before it gives up.
     pub(crate) const SHORT_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
+    /// How long a request these tests answer with a `MAX_R3_PAYLOAD_BYTES` resource waits.
+    /// The per-path bound is judged against the pending table once the resource has
+    /// assembled, so the request has to outlive the transfer: a response that assembles
+    /// after its request timed out gets the coarse bound and `Unmatched`, never `Dropped`.
+    /// The 525-part random body takes under a second over loopback on an idle machine and
+    /// closer to two at a third of one core, and the receiver's window shrinks on every
+    /// part it judges late, so the budget is several times the slowest transfer measured.
+    const TRANSFER_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
     /// Bytes of array header, request id and bin32 header around a response frame's body.
     const RESPONSE_FRAME_OVERHEAD: usize = 24;
     /// Bytes of array header, time, path hash and bin32 header around a request frame's body.
@@ -1003,9 +1011,13 @@ pub(crate) mod network {
     }
 
     pub(crate) fn timed_out(path: &str) -> R3Error {
+        timed_out_after(path, SHORT_REQUEST_TIMEOUT)
+    }
+
+    pub(crate) fn timed_out_after(path: &str, after: Duration) -> R3Error {
         R3Error::Timeout {
             path: path.to_string(),
-            after: SHORT_REQUEST_TIMEOUT,
+            after,
         }
     }
 
@@ -1137,15 +1149,18 @@ pub(crate) mod network {
         recorder: &Recorder,
         desc: &DestinationDesc,
     ) -> (JoinHandle<Result<RequestOutcome, R3Error>>, Seen) {
-        hanging_request_on(requester, recorder, desc, "/slow").await
+        hanging_request_on(requester, recorder, desc, "/slow", SHORT_REQUEST_TIMEOUT).await
     }
 
-    /// `hanging_request` on `path`, for tests where the path decides the response bound.
+    /// `hanging_request` on `path` with `request_timeout`: `TRANSFER_REQUEST_TIMEOUT` when
+    /// the test goes on to answer the request as a resource, `SHORT_REQUEST_TIMEOUT` when
+    /// it never answers.
     async fn hanging_request_on(
         requester: &Requester,
         recorder: &Recorder,
         desc: &DestinationDesc,
         path: &'static str,
+        request_timeout: Duration,
     ) -> (JoinHandle<Result<RequestOutcome, R3Error>>, Seen) {
         recorder.queue(Script::Hang);
         let before = recorder.seen_count();
@@ -1163,7 +1178,7 @@ pub(crate) mod network {
                     path,
                     Envelope::new(origin, Value::Nil),
                     RequestOptions {
-                        request_timeout: SHORT_REQUEST_TIMEOUT,
+                        request_timeout,
                         ..RequestOptions::default()
                     },
                 )
@@ -1177,10 +1192,40 @@ pub(crate) mod network {
     }
 
     pub(crate) fn timed_out_slow_request() -> R3Error {
-        R3Error::Timeout {
-            path: "/slow".to_string(),
-            after: SHORT_REQUEST_TIMEOUT,
-        }
+        timed_out_after("/slow", SHORT_REQUEST_TIMEOUT)
+    }
+
+    /// Answers the request the responder `seen` with `bytes` sent as a resource, and
+    /// returns once the responder can serve part requests for it.
+    ///
+    /// The transport registers the sender that answers part requests only after the
+    /// advertisement has gone out (`track_prepared` fills `pending_outgoing`, and
+    /// `confirm_outbound_dispatch` moves it to `outgoing` once the write has returned),
+    /// and a part request that arrives in between is dropped unanswered
+    /// (`[resource-diag] request_received ... sender_present=false`); the receiver's
+    /// retries then leave through the path table and are dropped the way draft A4 in
+    /// docs/mesh/upstream-issues.md describes for advertisements, so the transfer never
+    /// completes. Both ends of these tests live in one process on a loopback link, where
+    /// a starved tokio worker lets the requester's first request overtake the responder's
+    /// own continuation (macOS CI, run 37649401108). Holding the requester's interface
+    /// manager, which its inbound path takes before it reads a packet, until
+    /// `send_response_resource` has returned keeps that first request behind the
+    /// registration, without changing what either transport does afterwards.
+    async fn answer_as_resource(
+        responder: &Responder,
+        requester: &Requester,
+        seen: &Seen,
+        bytes: Vec<u8>,
+    ) -> Hash {
+        let manager = requester.transport.iface_manager();
+        let held = manager.lock().await;
+        let hash = responder
+            .transport
+            .send_response_resource(&seen.link_id, seen.request_id.to_vec(), bytes, None)
+            .await
+            .unwrap();
+        drop(held);
+        hash
     }
 
     /// A response frame for `request_id` that encodes to one byte over the cap.
@@ -1201,6 +1246,18 @@ pub(crate) mod network {
         let mut random = vec![0u8; MAX_R3_PAYLOAD_BYTES + 1 - RESPONSE_FRAME_OVERHEAD];
         rand_core::RngCore::fill_bytes(&mut OsRng, &mut random);
         random
+    }
+
+    /// A response body that encodes one byte over the cap and compresses to a single
+    /// part: a repeating byte sequence rather than a constant, so a body reassembled out
+    /// of order would not compare equal. For the per-path bound only the assembled length
+    /// matters, and a one-part transfer keeps the window ladder, and the time it takes to
+    /// climb on a loaded machine, out of a test about that bound.
+    fn compressible_response_body() -> Vec<u8> {
+        (0..=u8::MAX)
+            .cycle()
+            .take(MAX_R3_PAYLOAD_BYTES + 1 - RESPONSE_FRAME_OVERHEAD)
+            .collect()
     }
 
     /// A request frame for `/big` that encodes one byte over the cap, with a random body for
@@ -1775,20 +1832,24 @@ pub(crate) mod network {
         let mut requester = Requester::connect(responder.port, TcpClient::DEFAULT_MTU).await;
         responder.announce(None).await;
         let desc = requester.learn(&responder.desc.address_hash).await;
-        let (in_flight, seen) = hanging_request(&requester, &recorder, &desc).await;
+        let (in_flight, seen) = hanging_request_on(
+            &requester,
+            &recorder,
+            &desc,
+            "/slow",
+            TRANSFER_REQUEST_TIMEOUT,
+        )
+        .await;
 
         // With no response-size limit registered the advertisement is accepted whatever its
         // size, and the assembled bytes are dropped by the client instead.
-        responder
-            .transport
-            .send_response_resource(
-                &seen.link_id,
-                seen.request_id.to_vec(),
-                oversize_response(seen.request_id, incompressible_response_body()),
-                None,
-            )
-            .await
-            .unwrap();
+        answer_as_resource(
+            &responder,
+            &requester,
+            &seen,
+            oversize_response(seen.request_id, incompressible_response_body()),
+        )
+        .await;
 
         let dropped = format!(
             "Dropped an oversize mesh response on link {} ({} bytes, max {MAX_R3_PAYLOAD_BYTES})",
@@ -1800,7 +1861,10 @@ pub(crate) mod network {
         })
         .await;
         let result = timeout(INTEROP_TIMEOUT, in_flight).await.unwrap().unwrap();
-        assert_eq!(result.unwrap_err(), timed_out_slow_request());
+        assert_eq!(
+            result.unwrap_err(),
+            timed_out_after("/slow", TRANSFER_REQUEST_TIMEOUT)
+        );
         assert_eq!(requester.client.pending_len(), 0);
 
         let outcome = requester
@@ -1890,21 +1954,25 @@ pub(crate) mod network {
         let mut requester = Requester::connect(responder.port, TcpClient::DEFAULT_MTU).await;
         responder.announce(None).await;
         let desc = requester.learn(&responder.desc.address_hash).await;
-        let (in_flight, seen) = hanging_request(&requester, &recorder, &desc).await;
+        let (in_flight, seen) = hanging_request_on(
+            &requester,
+            &recorder,
+            &desc,
+            "/slow",
+            TRANSFER_REQUEST_TIMEOUT,
+        )
+        .await;
 
         // A repeating body compresses far below the cap, so the advertisement passes the
         // transport's check and the assembled bytes reach the client.
         let body = vec![0xcd; MAX_R3_PAYLOAD_BYTES + 1 - RESPONSE_FRAME_OVERHEAD];
-        responder
-            .transport
-            .send_response_resource(
-                &seen.link_id,
-                seen.request_id.to_vec(),
-                oversize_response(seen.request_id, body),
-                None,
-            )
-            .await
-            .unwrap();
+        answer_as_resource(
+            &responder,
+            &requester,
+            &seen,
+            oversize_response(seen.request_id, body),
+        )
+        .await;
 
         let dropped = format!(
             "Dropped an oversize mesh response on link {} ({} bytes, max {MAX_R3_PAYLOAD_BYTES})",
@@ -1917,7 +1985,10 @@ pub(crate) mod network {
         .await;
         assert_eq!(requester.client.pending_len(), 1);
         let result = timeout(INTEROP_TIMEOUT, in_flight).await.unwrap().unwrap();
-        assert_eq!(result.unwrap_err(), timed_out_slow_request());
+        assert_eq!(
+            result.unwrap_err(),
+            timed_out_after("/slow", TRANSFER_REQUEST_TIMEOUT)
+        );
         requester.stop().await;
         responder.stop().await;
     }
@@ -1932,18 +2003,22 @@ pub(crate) mod network {
         responder.announce(None).await;
         let desc = requester.learn(&responder.desc.address_hash).await;
 
-        let (in_flight, seen) = hanging_request_on(&requester, &recorder, &desc, FETCH_PATH).await;
-        let body = incompressible_response_body();
-        responder
-            .transport
-            .send_response_resource(
-                &seen.link_id,
-                seen.request_id.to_vec(),
-                oversize_response(seen.request_id, body.clone()),
-                None,
-            )
-            .await
-            .unwrap();
+        let (in_flight, seen) = hanging_request_on(
+            &requester,
+            &recorder,
+            &desc,
+            FETCH_PATH,
+            TRANSFER_REQUEST_TIMEOUT,
+        )
+        .await;
+        let body = compressible_response_body();
+        answer_as_resource(
+            &responder,
+            &requester,
+            &seen,
+            oversize_response(seen.request_id, body.clone()),
+        )
+        .await;
         let outcome = timeout(INTEROP_TIMEOUT, in_flight)
             .await
             .unwrap()
@@ -1953,17 +2028,21 @@ pub(crate) mod network {
         assert_eq!(outcome.response_branch, SizeBranch::Resource);
         assert_eq!(requester.client.pending_len(), 0);
 
-        let (in_flight, seen) = hanging_request_on(&requester, &recorder, &desc, STATUS_PATH).await;
-        responder
-            .transport
-            .send_response_resource(
-                &seen.link_id,
-                seen.request_id.to_vec(),
-                oversize_response(seen.request_id, incompressible_response_body()),
-                None,
-            )
-            .await
-            .unwrap();
+        let (in_flight, seen) = hanging_request_on(
+            &requester,
+            &recorder,
+            &desc,
+            STATUS_PATH,
+            TRANSFER_REQUEST_TIMEOUT,
+        )
+        .await;
+        answer_as_resource(
+            &responder,
+            &requester,
+            &seen,
+            oversize_response(seen.request_id, compressible_response_body()),
+        )
+        .await;
         let dropped = format!(
             "Dropped an oversize mesh response on link {} ({} bytes, max {MAX_R3_PAYLOAD_BYTES})",
             seen.link_id.to_hex_string(),
@@ -1973,8 +2052,16 @@ pub(crate) mod network {
             debug_snapshot().contains(&dropped)
         })
         .await;
+        assert_eq!(
+            requester.client.pending_len(),
+            1,
+            "a dropped response leaves the request pending"
+        );
         let result = timeout(INTEROP_TIMEOUT, in_flight).await.unwrap().unwrap();
-        assert_eq!(result.unwrap_err(), timed_out(STATUS_PATH));
+        assert_eq!(
+            result.unwrap_err(),
+            timed_out_after(STATUS_PATH, TRANSFER_REQUEST_TIMEOUT)
+        );
         requester.stop().await;
         responder.stop().await;
     }
