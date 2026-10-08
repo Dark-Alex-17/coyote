@@ -28,6 +28,7 @@ if [[ -z "$format_cmd" ]]; then
 else
   fmt_rc=0
   fmt_out=$(cd "$project_dir" && eval "$format_cmd" 2>&1) || fmt_rc=$?
+  fmt_out=$(trim_output "$fmt_out")
   format_output="Ran: $format_cmd
 Exit code: $fmt_rc
 
@@ -41,9 +42,13 @@ fi
 # The skip message must read as a WARNING, never a reassurance: the previous
 # wording ("linting is covered by the build/check command") was quoted
 # verbatim by workers as false evidence that linting passed
+#
+# Neither transcript rides argv: a single argv string is capped at 128 KiB on
+# Linux (MAX_ARG_STRLEN) and COYOTE_GATE_OUTPUT_MAX_BYTES may be raised past
+# it. format_output goes in via --rawfile on a process-substitution fd.
 if [[ -z "$lint_cmd" || "$lint_cmd" == "null" ]]; then
   jq -nc \
-    --arg fo "$format_output" \
+    --rawfile fo <(printf '%s' "$format_output") \
     '{
       "format_output": $fo,
       "lint_ok": true,
@@ -57,28 +62,24 @@ lint_rc=0
 lint_out=$(cd "$project_dir" && eval "$lint_cmd" 2>&1) || lint_rc=$?
 
 if (( lint_rc == 0 )); then
-  jq -nc \
-    --arg fo "$format_output" \
-    --arg lo "Ran: $lint_cmd
-
-$lint_out" \
+  trim_output "$lint_out" | jq -Rsc \
+    --rawfile fo <(printf '%s' "$format_output") \
+    --arg cmd "$lint_cmd" \
     '{
       "format_output": $fo,
       "lint_ok": true,
-      "lint_output": $lo,
+      "lint_output": ("Ran: " + $cmd + "\n\n" + .),
       "_next": "verify_build"
     }'
 else
-  jq -nc \
-    --arg fo "$format_output" \
-    --arg lo "Ran: $lint_cmd
-Exit code: $lint_rc
-
-$lint_out" \
+  trim_output "$lint_out" | jq -Rsc \
+    --rawfile fo <(printf '%s' "$format_output") \
+    --arg cmd "$lint_cmd" \
+    --argjson rc "$lint_rc" \
     '{
       "format_output": $fo,
       "lint_ok": false,
-      "lint_output": $lo,
+      "lint_output": ("Ran: " + $cmd + "\nExit code: " + ($rc | tostring) + "\n\n" + .),
       "_next": "fix_loop_gate"
     }'
 fi

@@ -97,6 +97,17 @@ pub(crate) fn is_context_overflow_error(err: &Error) -> bool {
 }
 
 pub const MAX_STATE_SIZE_BYTES: usize = 32 * 1024;
+pub const SCRIPT_FALLBACK_ERROR_KEY: &str = "last_script_error";
+pub(crate) const SCRIPT_FALLBACK_ERROR_MAX_BYTES: usize = 8 * 1024;
+
+const _: () = assert!(
+    SCRIPT_FALLBACK_ERROR_MAX_BYTES < 128 * 1024,
+    "shipped gate scripts pass this value to jq via --arg; keep it far below MAX_ARG_STRLEN"
+);
+
+pub fn script_fallback_error(node: &str, err: &str) -> String {
+    format!("script '{node}' failed: {err}")
+}
 
 pub(in crate::graph) fn type_name(value: &Value) -> &'static str {
     match value {
@@ -123,6 +134,23 @@ mod tests {
     #[test]
     fn wall_clock_nonzero_is_that_many_seconds() {
         assert_eq!(wall_clock(7), Some(Duration::from_secs(7)));
+    }
+
+    #[test]
+    fn shipped_gates_match_the_script_fallback_error_contract() {
+        let prefix = script_fallback_error("verify_x", "");
+        assert!(prefix.starts_with("script 'verify_"), "{prefix}");
+        assert_eq!(prefix, "script 'verify_x' failed: ");
+        for rel in [
+            "assets/agents/coder/scripts/fix_loop_gate.sh",
+            "assets/agents/step-runner/scripts/fix_loop_gate.sh",
+        ] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
+            let script = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+            assert!(script.contains(SCRIPT_FALLBACK_ERROR_KEY), "{rel}");
+            assert!(script.contains("== \"script 'verify_\"*"), "{rel}");
+        }
     }
 
     #[test]

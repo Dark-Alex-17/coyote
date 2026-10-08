@@ -9,7 +9,8 @@ else
   state='{}'
 fi
 
-review_clean=$(echo "$state" | jq -r '.review_clean // true')
+# `//` treats false as absent; null-check keeps the boolean so findings actually route to implement.
+review_clean=$(echo "$state" | jq -r '.review_clean | if . == null then "true" else (. | tostring) end')
 review_attempts=$(echo "$state" | jq -r '.review_attempts // 0')
 max_review_attempts=$(echo "$state" | jq -r '.max_review_attempts // 1')
 review_notes=$(echo "$state" | jq -r '.review_notes // ""')
@@ -35,12 +36,10 @@ if [[ "$review_clean" == "true" ]]; then
 fi
 
 if (( review_attempts >= max_review_attempts )); then
-  jq -nc \
-    --arg n "$review_notes" \
-    '{
-      "_next": "end_success",
-      "review_notes_unresolved": ("Shipped with unresolved review notes (budget exhausted):\n" + $n)
-    }'
+  printf '%s' "$review_notes" | jq -Rsc '{
+    "_next": "end_success",
+    "review_notes_unresolved": ("Shipped with unresolved review notes (budget exhausted):\n" + .)
+  }'
   exit 0
 fi
 
@@ -48,11 +47,15 @@ next_review=$((review_attempts + 1))
 fix_instr=$(printf '## Self-review feedback (attempt %d of %d)\n\nThe code review found concrete issues. Address them with minimal edits. Do not refactor unrelated code.\n\n%s' \
   "$next_review" "$max_review_attempts" "$review_notes")
 
-jq -nc \
+# Review text goes to jq on stdin (128 KiB per-argument cap). Looping back to
+# implement starts a fresh verify cycle, so the gate-crash bookkeeping is reset.
+printf '%s' "$fix_instr" | jq -Rsc \
   --argjson n "$next_review" \
-  --arg fi "$fix_instr" \
   '{
     "review_attempts": $n,
-    "fix_instructions": $fi,
+    "fix_instructions": .,
+    "gate_retries": 0,
+    "gate_error": "",
+    "last_script_error": "",
     "_next": "implement"
   }'

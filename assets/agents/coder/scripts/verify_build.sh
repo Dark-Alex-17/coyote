@@ -34,23 +34,24 @@ fi
 exit_code=0
 output=$(cd "$project_dir" && eval "$cmd" 2>&1) || exit_code=$?
 
+# Transcript goes to jq on stdin, not as an argument — a single argv string is
+# capped at 128 KiB on Linux (MAX_ARG_STRLEN) and a verbose build exceeds it.
+# See verify_tests.sh for the failure mode this prevents.
 if (( exit_code == 0 )); then
-  jq -nc \
-    --arg out "$output" \
+  trim_output "$output" | jq -Rsc \
     --arg cmd "$cmd" \
     '{
       "build_ok": true,
-      "build_output": ("Ran: " + $cmd + "\n\n" + $out),
+      "build_output": ("Ran: " + $cmd + "\n\n" + .),
       "_next": "verify_tests"
     }'
 else
-  jq -nc \
-    --arg out "$output" \
+  trim_output "$output" | jq -Rsc \
     --arg cmd "$cmd" \
     --argjson rc "$exit_code" \
     '{
       "build_ok": false,
-      "build_output": ("Ran: " + $cmd + "\nExit code: " + ($rc | tostring) + "\n\n" + $out),
+      "build_output": ("Ran: " + $cmd + "\nExit code: " + ($rc | tostring) + "\n\n" + .),
       "_next": "fix_loop_gate"
     }'
 fi

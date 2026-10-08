@@ -34,23 +34,26 @@ fi
 exit_code=0
 output=$(cd "$project_dir" && eval "$cmd" 2>&1) || exit_code=$?
 
+# The transcript reaches jq on stdin, never as an argument: Linux caps a single
+# argv string at 128 KiB (MAX_ARG_STRLEN), and a green `cargo test --all` run
+# on a large crate exceeds that. With `--arg out "$output"` the exec failed
+# E2BIG (exit 126), the node fell back to fix_loop_gate with tests_ok still
+# true, and the loop burned every fix attempt on a suite that had passed.
 if (( exit_code == 0 )); then
-  jq -nc \
-    --arg out "$output" \
+  trim_output "$output" | jq -Rsc \
     --arg cmd "$cmd" \
     '{
       "tests_ok": true,
-      "tests_output": ("Ran: " + $cmd + "\n\n" + $out),
+      "tests_output": ("Ran: " + $cmd + "\n\n" + .),
       "_next": "self_review"
     }'
 else
-  jq -nc \
-    --arg out "$output" \
+  trim_output "$output" | jq -Rsc \
     --arg cmd "$cmd" \
     --argjson rc "$exit_code" \
     '{
       "tests_ok": false,
-      "tests_output": ("Ran: " + $cmd + "\nExit code: " + ($rc | tostring) + "\n\n" + $out),
+      "tests_output": ("Ran: " + $cmd + "\nExit code: " + ($rc | tostring) + "\n\n" + .),
       "_next": "fix_loop_gate"
     }'
 fi

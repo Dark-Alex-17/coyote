@@ -43,6 +43,9 @@ initial_state:
   fix_instructions: ''
   build_output: ''
   tests_output: ''
+  gate_retries: 0
+  gate_error: ''
+  last_script_error: ''
   last_node_output: ''
   plan_summary: ''
   files_to_modify: []
@@ -294,7 +297,7 @@ nodes:
   verify_tests:
     id: verify_tests
     type: script
-    description: Run the project's test command. Routes to end_success on pass, fix_loop_gate on failure.
+    description: Run the project's test command. Routes to self_review on pass, fix_loop_gate on failure.
     script: scripts/verify_tests.sh
     timeout: 600
     fallback: fix_loop_gate
@@ -302,7 +305,7 @@ nodes:
   fix_loop_gate:
     id: fix_loop_gate
     type: script
-    description: Budget gate. Loops back to implement with fix_instructions populated, or terminates as end_failure.
+    description: Budget gate. Loops back to implement with fix_instructions populated, or terminates as end_failure. Reached via a verify_* fallback edge (engine-recorded `last_script_error`, or both gates still green) — re-runs verification once per cycle (from verify_build), then end_failure.
     script: scripts/fix_loop_gate.sh
     timeout: 5
     fallback: end_failure
@@ -402,6 +405,12 @@ nodes:
       CODER_FAILED
       Plan: {{plan_summary}}
       Attempts: {{fix_attempts}}/{{max_fix_attempts}}
+
+      Verification gate error:
+      {{gate_error}}
+
+      Last script error:
+      {{last_script_error}}
 
       Last node output:
       {{last_node_output}}

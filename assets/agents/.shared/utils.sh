@@ -362,6 +362,34 @@ resolve_gate_dir() {
   echo "${dir}"
 }
 
+# trim_output bounds a command transcript before it is embedded in graph
+# state (and from there into LLM prompts). Keeps the head and the tail —
+# test runners put failures and `test result:` summaries at the end — and
+# replaces the middle with a marker. Emits the text unchanged when it fits.
+# Usage: trim_output "$output" [max_bytes]   (default 64 KiB, override via
+#        COYOTE_GATE_OUTPUT_MAX_BYTES)
+# Pure parameter expansion on purpose: a `printf | head -c` pipeline takes a
+# SIGPIPE, and callers run under `set -e -o pipefail` (inherited from this file).
+trim_output() {
+  local text="${1-}"
+  local max="${2:-${COYOTE_GATE_OUTPUT_MAX_BYTES:-65536}}"
+  [[ "$max" =~ ^[0-9]+$ ]] || max=65536
+  max=$(( 10#$max ))
+  # Byte semantics for ${#text} and ${text:off:len}.
+  local LC_ALL=C
+  local bytes=${#text}
+  if (( bytes <= max )); then
+    printf '%s' "${text}"
+    return 0
+  fi
+  local head_bytes=$(( max / 4 ))
+  local tail_bytes=$(( max - head_bytes ))
+  printf '%s' "${text:0:head_bytes}"
+  printf '\n\n[... %d bytes trimmed: output exceeded %d bytes; showing the first %d and last %d ...]\n\n' \
+    "$(( bytes - head_bytes - tail_bytes ))" "${max}" "${head_bytes}" "${tail_bytes}"
+  printf '%s' "${text:bytes-tail_bytes}"
+}
+
 ###########################
 ## FILE SEARCH UTILITIES ##
 ###########################
