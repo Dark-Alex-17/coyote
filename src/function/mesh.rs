@@ -1837,7 +1837,7 @@ mod tests {
                 since_secs: Some(7),
             },
             repo: Some(CardRepo {
-                name: "coyote".into(),
+                name: "widgets".into(),
                 branch: Some("main".into()),
             }),
             plan: Some(CardPlan {
@@ -1859,7 +1859,7 @@ mod tests {
         assert_eq!(value["about"], wrap(&label, "reviews Rust"), "{value}");
         assert_eq!(value["plan"]["title"], wrap(&label, "ship it"), "{value}");
         assert_eq!(value["todo"]["goal"], wrap(&label, "finish"), "{value}");
-        assert_eq!(value["repo"]["name"], wrap(&label, "coyote"), "{value}");
+        assert_eq!(value["repo"]["name"], wrap(&label, "widgets"), "{value}");
         assert_eq!(value["repo"]["branch"], wrap(&label, "main"), "{value}");
         assert_eq!(value["display_name"], "Alex");
         assert_eq!(value["caps"], json!(["review", "rust"]));
@@ -1870,7 +1870,7 @@ mod tests {
         let sparse = StatusCard {
             objective: None,
             repo: Some(CardRepo {
-                name: "coyote".into(),
+                name: "widgets".into(),
                 branch: None,
             }),
             plan: None,
