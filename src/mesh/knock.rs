@@ -2240,21 +2240,34 @@ mod tests {
         }
     }
 
+    /// The sink hands every knock to its bounded channel with `try_send`, so a flood
+    /// against a channel of one that nobody reads is dropped, counted and never waited
+    /// on. The flood runs on its own thread: a sink that did wait would hang that thread,
+    /// and the bound only turns the hang into a failure. It is not a speed claim: ten
+    /// thousand debug lines through the collector take over a second on a loaded runner,
+    /// so the bound sits far above that.
     #[test]
     fn the_channel_sink_never_waits_on_a_reader_and_counts_what_it_drops() {
+        const HUNG: Duration = Duration::from_secs(60);
         install_log_collector();
         let (sink, _rx) = ChannelKnockSink::new(1);
-        let started = Instant::now();
-
-        for _ in 0..10_000 {
-            sink.knock(event(&hash_of("id-flood"), &hash_of("inst"), None));
-        }
-
+        let (finished, flooded) = std::sync::mpsc::channel();
+        let flood = std::thread::spawn({
+            let sink = Arc::clone(&sink);
+            move || {
+                for _ in 0..10_000 {
+                    sink.knock(event(&hash_of("id-flood"), &hash_of("inst"), None));
+                }
+                finished.send(()).unwrap();
+            }
+        });
         assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "{:?}",
-            started.elapsed()
+            flooded.recv_timeout(HUNG).is_ok(),
+            "the sink waited on a reader: {} knocks dropped when the flood stalled",
+            sink.overflow()
         );
+        flood.join().unwrap();
+
         assert_eq!(sink.overflow(), 9_999);
         let logs = debug_snapshot();
         assert!(
