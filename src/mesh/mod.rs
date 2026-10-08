@@ -810,6 +810,9 @@ pub(crate) mod test_support {
         list: Mutex<TrustList>,
         extra: Mutex<Vec<(&'static str, Arc<dyn Handler>)>>,
         trust_dir: TempDir,
+        /// What the last `announce` carried, so a wait on the node filing this stub can
+        /// announce it again unchanged.
+        last_announce: Mutex<Option<Vec<u8>>>,
     }
 
     #[cfg(unix)]
@@ -834,6 +837,7 @@ pub(crate) mod test_support {
                 list: Mutex::new(TrustList::default()),
                 extra: Mutex::new(Vec::new()),
                 trust_dir,
+                last_announce: Mutex::new(None),
             }
         }
 
@@ -891,7 +895,38 @@ pub(crate) mod test_support {
             }
             .encode()
             .unwrap();
+            *self.last_announce.lock() = Some(app_data.clone());
             self.listener.announce(Some(&app_data)).await;
+        }
+
+        /// Waits for `peers` to hold this stub under `to`, announcing again every
+        /// `REANNOUNCE` until it does. An announce is one packet with no retry of its own,
+        /// and the node reports its relay connected as soon as the socket is while the stub
+        /// registers the accepted client a task later, so the first packet can leave with
+        /// nobody to receive it. A node that heard it files the stub within one poll and
+        /// never hears a second; the cadence stays far below the announce burst rate that
+        /// trips ingress control.
+        pub(crate) async fn wait_to_be_filed(
+            &self,
+            peers: &crate::mesh::peers::PeerTable,
+            to: &str,
+        ) {
+            const REANNOUNCE: Duration = Duration::from_secs(1);
+            let deadline = tokio::time::Instant::now() + INTEROP_TIMEOUT;
+            let mut next_announce = tokio::time::Instant::now() + REANNOUNCE;
+            while peers.get(to).is_none() {
+                let now = tokio::time::Instant::now();
+                assert!(
+                    now < deadline,
+                    "timed out waiting for the node to file the stub"
+                );
+                if now >= next_announce {
+                    let app_data = self.last_announce.lock().clone();
+                    self.listener.announce(app_data.as_deref()).await;
+                    next_announce = now + REANNOUNCE;
+                }
+                sleep(POLL).await;
+            }
         }
 
         pub(crate) fn port(&self) -> u16 {

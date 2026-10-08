@@ -12832,9 +12832,7 @@ mod tests {
     async fn mesh_ask_and_send_succeed_against_a_trusted_reachable_peer() {
         use crate::function::mesh::handle_mesh_tool;
         use crate::mesh::message::{PeerKind, PeerMessage, PeerVia, RawPeerMessage};
-        use crate::mesh::test_support::{
-            PeerStub, derived_sighting, started_runtime_on, wait_until,
-        };
+        use crate::mesh::test_support::{PeerStub, derived_sighting, started_runtime_on};
         use crate::mesh::trust::TrustOptions;
         use crate::utils::untrusted_content::wrap;
         use rns_transport::iface::tcp_server::TcpServer;
@@ -12851,7 +12849,7 @@ mod tests {
         stub.announce(Some("Stub")).await;
         let to = stub.destination_hex();
         let peers = runtime.peers();
-        wait_until("node A to file the stub", || peers.get(&to).is_some()).await;
+        stub.wait_to_be_filed(&peers, &to).await;
         runtime
             .trust()
             .trust_destination(

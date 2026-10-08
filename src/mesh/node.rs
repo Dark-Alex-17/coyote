@@ -5697,7 +5697,7 @@ mod tests {
         stub.announce(Some("Stub")).await;
         let to = stub.destination_hex();
         let peers = runtime.peers();
-        wait_until("the node to file the stub", || peers.get(&to).is_some()).await;
+        stub.wait_to_be_filed(&peers, &to).await;
         runtime
             .trust()
             .trust_destination(
@@ -5769,7 +5769,7 @@ mod tests {
         stub.announce(Some("Stub")).await;
         let to = stub.destination_hex();
         let peers = runtime.peers();
-        wait_until("the node to file the stub", || peers.get(&to).is_some()).await;
+        stub.wait_to_be_filed(&peers, &to).await;
         runtime
             .trust()
             .trust_destination(
@@ -5855,7 +5855,7 @@ mod tests {
         stub.announce(Some("Stub")).await;
         let to = stub.destination_hex();
         let peers = runtime.peers();
-        wait_until("the node to file the stub", || peers.get(&to).is_some()).await;
+        stub.wait_to_be_filed(&peers, &to).await;
         runtime
             .trust()
             .trust_destination(
@@ -5924,7 +5924,7 @@ mod tests {
         stub.announce(Some("Stub")).await;
         let to = stub.destination_hex();
         let peers = runtime.peers();
-        wait_until("the node to file the stub", || peers.get(&to).is_some()).await;
+        stub.wait_to_be_filed(&peers, &to).await;
         runtime
             .trust()
             .trust_destination(
@@ -6018,7 +6018,7 @@ mod tests {
         stub.announce(Some("Stub")).await;
         let to = stub.destination_hex();
         let peers = runtime.peers();
-        wait_until("the node to file the stub", || peers.get(&to).is_some()).await;
+        stub.wait_to_be_filed(&peers, &to).await;
         runtime
             .trust()
             .trust_destination(
@@ -7618,7 +7618,7 @@ mod tests {
         stub.announce(Some("Stub")).await;
         let to = stub.destination_hex();
         let peers = runtime.peers();
-        wait_until("the node to file the stub", || peers.get(&to).is_some()).await;
+        stub.wait_to_be_filed(&peers, &to).await;
         runtime
             .trust()
             .trust_destination(
@@ -9145,7 +9145,7 @@ mod tests {
         stub.announce(Some("Stub")).await;
         let to = stub.destination_hex();
         let peers = runtime.peers();
-        wait_until("the node to file the stub", || peers.get(&to).is_some()).await;
+        stub.wait_to_be_filed(&peers, &to).await;
         assert_eq!(
             peers.get(&to).unwrap().compatibility,
             Compatibility::Compatible
@@ -9269,7 +9269,7 @@ mod tests {
         stub.announce(Some("Stub")).await;
         let to = stub.destination_hex();
         let peers = runtime.peers();
-        wait_until("the node to file the stub", || peers.get(&to).is_some()).await;
+        stub.wait_to_be_filed(&peers, &to).await;
         let filed = peers.get(&to).unwrap();
         assert_eq!(
             record_announce(
@@ -9433,7 +9433,7 @@ mod tests {
         stub.announce(Some("Stub")).await;
         let to = stub.destination_hex();
         let peers = runtime.peers();
-        wait_until("the node to file the stub", || peers.get(&to).is_some()).await;
+        stub.wait_to_be_filed(&peers, &to).await;
         runtime
             .trust()
             .trust_destination(

@@ -2905,7 +2905,7 @@ mod tests {
             stub.announce(Some("Stub")).await;
             let peers = self.runtime.peers();
             let to = stub.destination_hex();
-            wait_until("the node to file the stub", || peers.get(&to).is_some()).await;
+            stub.wait_to_be_filed(&peers, &to).await;
             let deadline = tokio::time::Instant::now() + INTEROP_TIMEOUT;
             while self.runtime.resolve_destination(&to).await.is_none()
                 || !self.runtime.path_known(&to).await
