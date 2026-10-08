@@ -976,7 +976,8 @@ pub(crate) struct PeerBody {
     pub title: Option<String>,
     pub content: String,
     pub fields: Option<serde_json::Value>,
-    pub timestamp: f64,
+    /// The sender's clock in Unix seconds, when it sent a finite number.
+    pub timestamp: Option<f64>,
     pub thread: Option<String>,
     pub disposition: Option<Disposition>,
     pub retry_after: Option<u32>,
@@ -1110,8 +1111,7 @@ pub(crate) fn from_r3_body(body: &Value) -> Result<PeerBody, &'static str> {
     };
     let timestamp = entry(entries, "ts")
         .and_then(Value::as_f64)
-        .filter(|ts| ts.is_finite())
-        .ok_or("ts is missing or not a finite number")?;
+        .filter(|ts| ts.is_finite());
     let BodyExtras {
         thread,
         disposition,
@@ -1927,7 +1927,7 @@ impl Handler for PeerMessageHandler {
             title: body.title,
             content: body.content,
             fields: body.fields,
-            timestamp: body.timestamp,
+            timestamp: body.timestamp.unwrap_or(0.0),
             message_id: body.id,
             in_reply_to: body.in_reply_to,
             kind: body.kind,
@@ -2488,7 +2488,7 @@ mod tests {
                 title: Some("Re: question".into()),
                 content: "the answer".into(),
                 fields: message.fields.clone(),
-                timestamp: 1_700_000_000.5,
+                timestamp: Some(1_700_000_000.5),
                 thread: None,
                 disposition: Some(Disposition::Answered),
                 retry_after: None,
@@ -2613,18 +2613,21 @@ mod tests {
                 good(|e| set(e, "fields", Value::from(3))),
                 "fields is not a map",
             ),
-            (
-                "no ts",
-                good(|e| drop_key(e, "ts")),
-                "ts is missing or not a finite number",
-            ),
-            (
-                "nan ts",
-                good(|e| set(e, "ts", Value::F64(f64::NAN))),
-                "ts is missing or not a finite number",
-            ),
         ] {
             assert_eq!(from_r3_body(&body), Err(why), "{what}");
+        }
+
+        for (what, body) in [
+            ("no ts", good(|e| drop_key(e, "ts"))),
+            ("nil ts", good(|e| set(e, "ts", Value::Nil))),
+            ("text ts", good(|e| set(e, "ts", Value::from("1.5")))),
+            ("nan ts", good(|e| set(e, "ts", Value::F64(f64::NAN)))),
+        ] {
+            assert_eq!(
+                from_r3_body(&body).map(|body| body.timestamp),
+                Ok(None),
+                "{what} reads as absent"
+            );
         }
 
         let binary_text = good(|e| {
@@ -2637,7 +2640,7 @@ mod tests {
         assert_eq!(decoded.id, "bin-id");
         assert_eq!(decoded.kind, PeerKind::Bulletin, "a binary kind reads too");
         assert_eq!(decoded.content, "\u{FFFD}hi");
-        assert_eq!(decoded.timestamp, 1_700_000_000.0);
+        assert_eq!(decoded.timestamp, Some(1_700_000_000.0));
 
         let unknown_key = good(|e| e.push((Value::from("unknown"), Value::from(1))));
         assert_eq!(
@@ -4227,6 +4230,45 @@ mod tests {
         assert_eq!(fresh.filed.lock().len(), 1);
     }
 
+    /// A link message without `ts` is acknowledged and delivered; its clock reads zero,
+    /// as a non-finite one does.
+    #[tokio::test]
+    async fn a_link_message_without_ts_is_acked_and_delivered_with_a_zero_clock() {
+        let identity = PrivateIdentity::new_from_rand(OsRng);
+        let origin = OriginName([6u8; NAME_HASH_LEN]);
+        let destination = destination_address(&origin.0, identity.address_hash()).to_hex_string();
+        let surface = Arc::new(RecordingSurface::admitting(1));
+        let handler = PeerMessageHandler::new(Arc::downgrade(&surface) as Weak<dyn PeerSurface>);
+        let out = OutboundPeer::new(PeerKind::Ask, "no clock", None, None, None).unwrap();
+        let Value::Map(mut entries) = to_r3_body(&out, 1_700_000_000.0) else {
+            unreachable!()
+        };
+        entries.retain(|(key, _)| key.as_str() != Some("ts"));
+        let request = AdmittedRequest {
+            link_id: LinkId::new_from_rand(OsRng),
+            identity: *identity.as_identity(),
+            destination_hash: AddressHash::new_from_hex_string(&destination).unwrap(),
+            request_id: RequestId::from([1u8; 16]),
+            path_hash: PathHash::of(MESSAGE_PATH),
+            requested_at: 1_700_000_000.0,
+            body: Value::Map(entries),
+            branch: SizeBranch::Packet,
+        };
+
+        match handler.handle(request).await {
+            Reply::Value(value) | Reply::Settled { value, .. } => {
+                assert!(is_received_reply(&value, &out.id), "{value}")
+            }
+            Reply::Code(code) => panic!("a message without ts is refused: {code:?}"),
+            Reply::Silent => panic!("a message without ts is not acknowledged"),
+        }
+        let delivered = surface.delivered.lock();
+        assert_eq!(delivered.len(), 1, "{delivered:#?}");
+        assert_eq!(delivered[0].message_id, out.id);
+        assert_eq!(delivered[0].content, "no clock");
+        assert_eq!(delivered[0].timestamp, 0.0);
+    }
+
     /// A propagated message from a sender over its limit is filed, but its inline
     /// files never touch the staging inbox: the throttle is consulted before any peer
     /// bytes land on disk, and the dropped part is counted. The same message from an
@@ -5021,7 +5063,7 @@ mod tests {
                 title: Some(title.clone()),
                 content: content.clone(),
                 fields: Some(fields.clone()),
-                timestamp: ts,
+                timestamp: Some(ts),
                 thread: Some(thread.clone()),
                 disposition: Some(Disposition::Refused),
                 retry_after: Some(u32::MAX),

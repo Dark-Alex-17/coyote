@@ -1729,7 +1729,7 @@ mod tests {
             title: body.title,
             content: body.content,
             fields: body.fields,
-            timestamp: body.timestamp,
+            timestamp: body.timestamp.unwrap_or(0.0),
             message_id: body.id,
             in_reply_to: body.in_reply_to,
             kind: body.kind,

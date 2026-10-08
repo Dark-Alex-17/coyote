@@ -644,7 +644,7 @@ A wire id is 1 to `PEER_ID_MAX_CHARS` = `64` bytes, each in `[0-9A-Za-z_.:-]` (`
 | `disposition` | text | on `kind: reply` only, one of `answered`, `escalated`, `refused`, `budget_exhausted` (section 10.10); omitted on every other kind | **[MESH-DISP-002]** On a `reply`, missing or any other value: the receiver MUST read `answered` (`an_unknown_disposition_on_a_reply_reads_as_answered`). **[MESH-DISP-003]** On any other `kind`: the receiver MUST ignore it (`a_disposition_on_a_non_reply_is_ignored`). |
 | `retry_after` | uint fitting `u32` | on `kind: reply` beside `disposition` only: seconds until the sender will take the question again (section 10.7); omitted otherwise | **[MESH-DISP-004]** Not a `uint`, past `u32`, or on any other `kind`: the receiver MUST read it as absent (`a_retry_after_past_u32_reads_as_none`). |
 | `parts` | array | at most `MAX_PARTS` = `8` part maps (section 10.9), at most `MAX_PARTS_BYTES` = `106496` bytes once encoded; omitted when empty | **[MESH-PART-001]** Present and not an `array`: the receiver MUST read no parts and count one dropped (`parts_that_is_not_a_list_reads_as_no_parts_with_one_dropped_on_both_routes`). **[MESH-PART-002]** Every element past the eighth: the receiver MUST drop and count it (`a_ninth_part_is_dropped_and_counted`). **[MESH-PART-003]** When the parts admitted under section 10.9, re-encoded as msgpack, run past `MAX_PARTS_BYTES`: the receiver MUST shed parts from the tail until they fit, counting each (`a_parts_list_over_the_encoded_cap_sheds_trailing_parts_and_the_sender_refuses_it`). |
-| `ts` | f64 | Unix seconds of sending, as an `f64` | **[MESH-MSG-009]** Missing, not a number (`uint`, `int`, `f32` or `f64`), or not finite once read as f64: the receiver MUST refuse with `InvalidData` (`r3_body_round_trips_and_rejects_malformed` accepts a `uint` `ts`). |
+| `ts` | f64 | Unix seconds of sending, as an `f64` | **[MESH-MSG-009]** Informational and OPTIONAL: missing, nil, not a number (`uint`, `int`, `f32` or `f64`), or not finite once read as f64, the receiver MUST treat it as absent and MUST NOT refuse (`r3_body_round_trips_and_rejects_malformed` accepts a `uint` `ts` and a missing one; `a_link_message_without_ts_is_acked_and_delivered_with_a_zero_clock`, src/mesh/message.rs). |
 | any other key | any | nothing | **[MESH-MSG-010]** The receiver MUST ignore it (`r3_body_round_trips_and_rejects_malformed`). |
 
 **[MESH-MSG-011]** A sender MUST emit the keys it sets in the order given above, `thread` between `in_reply_to` and `title`, `disposition`, `retry_after` and `parts` between `fields` and `ts` (`a_reply_with_every_optional_key_is_emitted_in_the_specified_order`, src/mesh/message.rs).
@@ -2102,7 +2102,7 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 | MESH-PART-001 | MessageBody (Boundary), MessageBody (Invalid), MessageBody (Valid) |
 | MESH-PART-002 | Custom (Boundary), Custom (Invalid) |
 | MESH-PART-003 | Custom (Boundary), Custom (Invalid) |
-| MESH-MSG-009 | MessageBody (Boundary), MessageBody (Invalid), MessageBody (Valid) |
+| MESH-MSG-009 | MessageBody (Boundary), MessageBody (Valid) |
 | MESH-MSG-010 | MessageBody (Valid) |
 | MESH-MSG-011 | Custom (Valid), Interop (Valid), MessageBodyEncode (Valid) |
 | MESH-MSG-012 | MessageBody (Invalid) |

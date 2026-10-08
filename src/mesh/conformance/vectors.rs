@@ -460,7 +460,7 @@ fn run(case: &Case) -> Result<(), String> {
             )?;
             same("parts", &body.parts, &message.parts)?;
             same("dropped_parts", body.dropped_parts, 0)?;
-            same("ts", body.timestamp, *timestamp)
+            same("ts", body.timestamp, Some(*timestamp))
         }
         Case::Outbound {
             kind,
@@ -771,7 +771,7 @@ fn body() -> PeerBody {
         title: None,
         content: "hi".to_string(),
         fields: None,
-        timestamp: 1.5,
+        timestamp: Some(1.5),
         thread: None,
         disposition: None,
         retry_after: None,
@@ -6050,7 +6050,6 @@ const IN_REPLY_TO_ERR: &str = "in_reply_to is not a message id";
 const TITLE_ERR: &str = "title is not text or is too long";
 const CONTENT_ERR: &str = "content is missing, not text or too long";
 const FIELDS_ERR: &str = "fields is not a map";
-const TS_ERR: &str = "ts is missing or not a finite number";
 
 fn message_vectors() -> Vec<Vector> {
     let sixty_four = text(PEER_ID_MAX_CHARS);
@@ -6616,58 +6615,82 @@ fn message_vectors() -> Vec<Vector> {
         ),
         message(
             "MESH-MSG-009",
-            Kind::Invalid,
+            Kind::Valid,
             without(body_value(), "ts"),
-            refused(TS_ERR),
+            accepted_body(PeerBody {
+                timestamp: None,
+                ..body()
+            }),
         ),
         message(
             "MESH-MSG-009",
-            Kind::Invalid,
+            Kind::Valid,
             set(body_value(), "ts", Value::Nil),
-            refused(TS_ERR),
+            accepted_body(PeerBody {
+                timestamp: None,
+                ..body()
+            }),
         ),
         message(
             "MESH-MSG-009",
-            Kind::Invalid,
+            Kind::Valid,
             set(body_value(), "ts", Value::from("1.5")),
-            refused(TS_ERR),
+            accepted_body(PeerBody {
+                timestamp: None,
+                ..body()
+            }),
         ),
         message(
             "MESH-MSG-009",
-            Kind::Invalid,
+            Kind::Valid,
             set(body_value(), "ts", Value::Boolean(true)),
-            refused(TS_ERR),
+            accepted_body(PeerBody {
+                timestamp: None,
+                ..body()
+            }),
         ),
         message(
             "MESH-MSG-009",
-            Kind::Invalid,
+            Kind::Valid,
             set(body_value(), "ts", Value::F64(f64::NAN)),
-            refused(TS_ERR),
+            accepted_body(PeerBody {
+                timestamp: None,
+                ..body()
+            }),
         ),
         message(
             "MESH-MSG-009",
-            Kind::Invalid,
+            Kind::Valid,
             set(body_value(), "ts", Value::F64(f64::INFINITY)),
-            refused(TS_ERR),
+            accepted_body(PeerBody {
+                timestamp: None,
+                ..body()
+            }),
         ),
         message(
             "MESH-MSG-009",
-            Kind::Invalid,
+            Kind::Valid,
             set(body_value(), "ts", Value::F64(f64::NEG_INFINITY)),
-            refused(TS_ERR),
+            accepted_body(PeerBody {
+                timestamp: None,
+                ..body()
+            }),
         ),
         message(
             "MESH-MSG-009",
-            Kind::Invalid,
+            Kind::Valid,
             set(body_value(), "ts", Value::F32(f32::NAN)),
-            refused(TS_ERR),
+            accepted_body(PeerBody {
+                timestamp: None,
+                ..body()
+            }),
         ),
         message(
             "MESH-MSG-009",
             Kind::Valid,
             set(body_value(), "ts", Value::from(1_700_000_000u64)),
             accepted_body(PeerBody {
-                timestamp: 1_700_000_000.0,
+                timestamp: Some(1_700_000_000.0),
                 ..body()
             }),
         ),
@@ -6676,7 +6699,7 @@ fn message_vectors() -> Vec<Vector> {
             Kind::Valid,
             set(body_value(), "ts", Value::from(-1)),
             accepted_body(PeerBody {
-                timestamp: -1.0,
+                timestamp: Some(-1.0),
                 ..body()
             }),
         ),
@@ -6691,7 +6714,7 @@ fn message_vectors() -> Vec<Vector> {
             Kind::Boundary,
             set(body_value(), "ts", Value::F64(f64::MAX)),
             accepted_body(PeerBody {
-                timestamp: f64::MAX,
+                timestamp: Some(f64::MAX),
                 ..body()
             }),
         ),
@@ -6700,7 +6723,7 @@ fn message_vectors() -> Vec<Vector> {
             Kind::Boundary,
             set(body_value(), "ts", Value::F64(0.0)),
             accepted_body(PeerBody {
-                timestamp: 0.0,
+                timestamp: Some(0.0),
                 ..body()
             }),
         ),
@@ -6897,10 +6920,10 @@ fn message_vectors() -> Vec<Vector> {
             Kind::Invalid,
             set(
                 with(body_value(), "unknown", Value::from(1)),
-                "ts",
-                Value::Nil,
+                "fields",
+                Value::from(7),
             ),
-            refused(TS_ERR),
+            refused(FIELDS_ERR),
         ),
         message(
             "MESH-MSG-013",
@@ -6943,8 +6966,12 @@ fn message_vectors() -> Vec<Vector> {
         message(
             "MESH-MSG-013",
             Kind::Invalid,
-            set(body_value(), "ts", Value::Nil),
-            refused(TS_ERR),
+            set(
+                set(body_value(), "title", Value::Nil),
+                "fields",
+                Value::from(7),
+            ),
+            refused(FIELDS_ERR),
         ),
         outbound_row(
             "MESH-MSG-014",

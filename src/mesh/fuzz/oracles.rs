@@ -3267,7 +3267,7 @@ fn check_access_fields(fields: &Value) -> Result<(), String> {
 
 // --- /message body (section 10) --------------------------------------------------------
 
-const BODY_REASONS: [&str; 9] = [
+const BODY_REASONS: [&str; 8] = [
     "the body is not a map",
     "v is missing or not the supported version",
     "kind is missing or unknown",
@@ -3276,7 +3276,6 @@ const BODY_REASONS: [&str; 9] = [
     "title is not text or is too long",
     "content is missing, not text or too long",
     "fields is not a map",
-    "ts is missing or not a finite number",
 ];
 
 const KINDS: [&str; 4] = ["message", "ask", "reply", "bulletin"];
@@ -3672,6 +3671,16 @@ fn check_body(value: &Value) -> Result<(), String> {
             let entries = value
                 .as_map()
                 .ok_or_else(|| "MESH-MSG-012: a decoded body came from a map".to_string())?;
+            let sent_ts = first(entries, "ts")
+                .and_then(Value::as_f64)
+                .filter(|ts| ts.is_finite());
+            ensure(body.timestamp == sent_ts, || {
+                format!(
+                    "MESH-MSG-009: ts reads as the finite number sent or as absent; expected {sent_ts:?}, got {:?} for {:?}",
+                    body.timestamp,
+                    first(entries, "ts")
+                )
+            })?;
             check_extras(entries, &DecodedExtras::of_body(&body))?;
             let peer = OutboundPeer {
                 kind: body.kind,
@@ -3685,9 +3694,11 @@ fn check_body(value: &Value) -> Result<(), String> {
                 disposition: body.disposition,
                 retry_after: body.retry_after,
             };
-            let again = from_r3_body(&to_r3_body(&peer, body.timestamp));
+            let ts = body.timestamp.unwrap_or(0.0);
+            let again = from_r3_body(&to_r3_body(&peer, ts));
             let re_sent = PeerBody {
                 dropped_parts: 0,
+                timestamp: Some(ts),
                 ..body.clone()
             };
             ensure(again.as_ref() == Ok(&re_sent), || {

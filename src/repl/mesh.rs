@@ -24862,7 +24862,7 @@ mod tests {
                             title: heard.title.clone(),
                             content: heard.content.clone(),
                             fields: heard.fields.clone(),
-                            timestamp: heard.timestamp,
+                            timestamp: heard.timestamp.unwrap_or(0.0),
                             message_id: heard.id.clone(),
                             in_reply_to: heard.in_reply_to.clone(),
                             kind: heard.kind,
