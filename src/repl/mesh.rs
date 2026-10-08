@@ -4827,22 +4827,14 @@ fn render_inbox(rows: &[InboxRow], awaiting_collect: &[String]) -> String {
                     reference,
                     ..
                 } => {
-                    let shown = |path: &str, max_chars: usize| {
-                        display_text(path, max_chars).unwrap_or_default()
-                    };
+                    let shown =
+                        |path: &str| display_text(path, WIRE_PATH_MAX_BYTES).unwrap_or_default();
                     let location = match (staged, reference) {
-                        (Some(path), _) => {
-                            format!(
-                                "staged at {}",
-                                shown(&path.display().to_string(), usize::MAX)
-                            )
-                        }
-                        (None, Some(path)) => {
-                            format!("fetchable as {}", shown(path, WIRE_PATH_MAX_BYTES))
-                        }
+                        (Some(path), _) => format!("staged at {}", path.display()),
+                        (None, Some(path)) => format!("fetchable as {}", shown(path)),
                         (None, None) => "not kept".to_string(),
                     };
-                    let name = shown(name, WIRE_PATH_MAX_BYTES);
+                    let name = shown(name);
                     lines.push(format!("  file: {name} ({size} B) {location}"));
                 }
             }
@@ -6144,9 +6136,10 @@ mod tests {
 
     /// A file part's name and reference are the peer's own paths: the wire-path grammar
     /// admits a variation selector, and the inbox line shows both cleaned of that and of
-    /// anything else `display_text` strips, the staged path included.
+    /// anything else `display_text` strips. The staged path is receiver-composed under
+    /// the inbox root and printed as it is on disk, variation selector and all.
     #[test]
-    fn inbox_lines_clean_a_file_parts_name_and_paths_of_escapes_and_invisible_characters() {
+    fn inbox_lines_clean_a_file_parts_name_and_reference_but_show_the_staged_path_verbatim() {
         let mut with_file = message(PeerKind::Message, "see attached", None);
         with_file.parts = vec![Part::File {
             name: "docs/\u{1b}[31mnotes\u{FE0F}.md".into(),
@@ -6177,8 +6170,8 @@ mod tests {
         assert_eq!(lines.len(), 2, "{text}");
         assert_eq!(
             lines[1],
-            format!("  file: {long_name} (8 B) staged at /inbox/peer/{long_name}"),
-            "a staged path longer than a wire path is shown whole: {text}"
+            format!("  file: {long_name} (8 B) staged at /inbox/peer/{long_name}\u{FE0F}"),
+            "the staged path is shown whole and as it is on disk: {text}"
         );
     }
 
@@ -7356,11 +7349,13 @@ mod tests {
             );
         }
 
-        /// Spec-first usage probe: a file part's `name`, its `reference` and the staged
-        /// path beside it are peer-chosen paths, so `.mesh inbox` passes all three through
-        /// `display_text` — a line terminator, a carriage return, an escape sequence, a
-        /// line separator or a variation selector in any of them can neither split the
-        /// row nor reach the terminal, and a clean path renders byte for byte.
+        /// Spec-first usage probe: a file part's `name` and its `reference` are
+        /// peer-chosen paths, so `.mesh inbox` passes both through `display_text` — a
+        /// line terminator, a carriage return, an escape sequence, a line separator or a
+        /// variation selector in either can neither split the row nor reach the
+        /// terminal, and a clean path renders byte for byte. The staged path is the
+        /// receiver's own, composed under the inbox root from the grammar-admitted wire
+        /// path, and prints as it is on disk, a variation selector included.
         #[test]
         #[serial]
         fn usage_probe_inbox_file_line_stays_one_clean_line_whatever_the_peer_put_in_its_paths() {
@@ -7407,7 +7402,7 @@ mod tests {
                         size: 9,
                         sha256: "cd".repeat(32),
                         staged: Some(PathBuf::from(format!(
-                            "/inbox/{}/{hostile}",
+                            "/inbox/{}/docs/notes\u{FE0F}.md",
                             "ab".repeat(16)
                         ))),
                         reference: Some("ignored-when-staged".into()),
@@ -7439,7 +7434,7 @@ mod tests {
             assert_eq!(
                 rows[2],
                 format!(
-                    "  file: docs/ README  notes.md (9 B) staged at /inbox/{}/docs/ README  notes.md",
+                    "  file: docs/ README  notes.md (9 B) staged at /inbox/{}/docs/notes\u{FE0F}.md",
                     "ab".repeat(16)
                 )
             );
@@ -7447,12 +7442,17 @@ mod tests {
                 rows[3],
                 "  file: docs/notes.md (10 B) fetchable as docs/notes.md"
             );
-            for leaked in ['\x1b', '\r', '\u{2028}', '\u{FE0F}'] {
+            for leaked in ['\x1b', '\r', '\u{2028}'] {
                 assert!(
                     !out.contains(leaked),
                     "{leaked:?} leaked into `.mesh inbox`: {out:?}"
                 );
             }
+            assert_eq!(
+                out.matches('\u{FE0F}').count(),
+                1,
+                "the variation selector survives in the staged path alone: {out:?}"
+            );
             assert!(!out.contains("[31m"), "{out}");
             assert!(stderr_lines().is_empty(), "{:?}", stderr_lines());
         }
