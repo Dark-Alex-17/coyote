@@ -140,6 +140,7 @@ const ENFORCED_BY: &[(&str, &[&str])] = &[
             "same_hash_is_constant_time_shaped",
             "trust_destination_refuses_a_forged_name_hash",
             "a_claimed_instance_is_bound_to_the_proven_identity",
+            "production_code_never_compares_hashes_with_the_equality_operators",
         ],
     ),
     (
