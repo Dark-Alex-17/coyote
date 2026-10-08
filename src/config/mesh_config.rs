@@ -24,6 +24,11 @@ pub const MAX_INLINE_FILE_TOTAL: u64 = 96 * 1024;
 pub const DEFAULT_FETCH_MAX_BYTES: u64 = 4 * 1024 * 1024;
 /// Largest file a fetch may serve; `max_bytes` cannot exceed it.
 pub const MAX_FETCH_FILE_BYTES: u64 = 4 * 1024 * 1024;
+pub const DEFAULT_ENVOY_MEMORY_MAX_SESSIONS: u64 = 256;
+pub const DEFAULT_ENVOY_MEMORY_MAX_PER_IDENTITY: u64 = 16;
+pub const DEFAULT_ENVOY_MEMORY_MAX_TURNS: u64 = 40;
+pub const DEFAULT_ENVOY_MEMORY_MAX_BYTES: u64 = 65536;
+pub const DEFAULT_ENVOY_MEMORY_TTL_HOURS: u64 = 168;
 /// Width of the label column in `.mesh info`, shared by every row so the values line up
 /// whichever module renders them.
 pub const MESH_INFO_LABEL_WIDTH: usize = 32;
@@ -41,6 +46,8 @@ Omit secrets, credentials, tokens, API keys, file contents, and anything the use
 Be dense and factual; prefer bullet points; no preamble or commentary before or after the digest. Keep it under roughly 200 words."#;
 
 /// The `mesh:` block of config.yaml: how this Coyote joins and behaves on the Coyote Mesh.
+/// `envoy_memory` governs what the envoy retains of each trusted peer's thread between
+/// messages.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MeshConfig {
@@ -126,6 +133,7 @@ pub struct MeshConfig {
     /// NomadNet's to 21600 s; neither fits an interactive REPL, so 300 s is used.
     pub propagation_sync_interval_secs: u64,
     pub fetch: MeshFetch,
+    pub envoy_memory: EnvoyMemoryConfig,
 }
 
 /// File-sharing knobs; later work adds the rest of the block, the name is fixed.
@@ -147,6 +155,42 @@ impl Default for MeshFetch {
             inline_max_bytes: DEFAULT_INLINE_MAX_BYTES,
             max_bytes: DEFAULT_FETCH_MAX_BYTES,
             inbox_dir: None,
+        }
+    }
+}
+
+/// What the envoy remembers of a trusted peer's thread between messages: the peer's turns
+/// and the envoy's answers, keyed by the proved sender identity and the thread, never the
+/// owner's own transcript.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EnvoyMemoryConfig {
+    /// Off by default: nothing a peer says is kept once its run ends, and no store
+    /// directory is created.
+    pub enabled: bool,
+    /// Most threads remembered across all peers; past it the least recently used go.
+    pub max_sessions: u64,
+    /// Most threads remembered for one peer identity; past it that identity's least
+    /// recently used go, other identities' threads untouched.
+    pub max_per_identity: u64,
+    /// Most turns kept per thread; past it the oldest exchange goes, cut at the next
+    /// turn the peer spoke so a reply is never kept without what it answered.
+    pub max_turns: u64,
+    /// Most bytes of turn text kept per thread, cut the same way as `max_turns`.
+    pub max_bytes: u64,
+    /// Hours a thread is remembered after its last message.
+    pub ttl_hours: u64,
+}
+
+impl Default for EnvoyMemoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_sessions: DEFAULT_ENVOY_MEMORY_MAX_SESSIONS,
+            max_per_identity: DEFAULT_ENVOY_MEMORY_MAX_PER_IDENTITY,
+            max_turns: DEFAULT_ENVOY_MEMORY_MAX_TURNS,
+            max_bytes: DEFAULT_ENVOY_MEMORY_MAX_BYTES,
+            ttl_hours: DEFAULT_ENVOY_MEMORY_TTL_HOURS,
         }
     }
 }
@@ -213,6 +257,7 @@ impl Default for MeshConfig {
             link_timeout_secs: None,
             propagation_sync_interval_secs: DEFAULT_PROPAGATION_SYNC_INTERVAL_SECS,
             fetch: MeshFetch::default(),
+            envoy_memory: EnvoyMemoryConfig::default(),
         }
     }
 }
@@ -319,6 +364,18 @@ impl MeshConfig {
                 "mesh.fetch.inbox_dir is '{}', which is not absolute; use an absolute path",
                 dir.display()
             );
+        }
+        let memory = &self.envoy_memory;
+        for (name, value) in [
+            ("max_sessions", memory.max_sessions),
+            ("max_per_identity", memory.max_per_identity),
+            ("max_turns", memory.max_turns),
+            ("max_bytes", memory.max_bytes),
+            ("ttl_hours", memory.ttl_hours),
+        ] {
+            if value == 0 {
+                bail!("mesh.envoy_memory.{name} is 0, which is out of range; use 1 or more");
+            }
         }
         Ok(())
     }
@@ -534,6 +591,16 @@ pub fn render_mesh_info(mesh: &MeshConfig) -> String {
         "fetch.inbox_dir",
         super::format_option_value(&mesh.fetch.inbox_dir.as_ref().map(|dir| dir.display())),
     );
+    let memory = &mesh.envoy_memory;
+    row("envoy_memory.enabled", memory.enabled.to_string());
+    row("envoy_memory.max_sessions", memory.max_sessions.to_string());
+    row(
+        "envoy_memory.max_per_identity",
+        memory.max_per_identity.to_string(),
+    );
+    row("envoy_memory.max_turns", memory.max_turns.to_string());
+    row("envoy_memory.max_bytes", memory.max_bytes.to_string());
+    row("envoy_memory.ttl_hours", memory.ttl_hours.to_string());
     output
 }
 
@@ -575,10 +642,21 @@ mod tests {
         assert_eq!(mesh.fetch.inline_max_bytes, 65_536);
         assert_eq!(mesh.fetch.max_bytes, 4_194_304);
         assert_eq!(mesh.fetch.inbox_dir, None);
+        assert!(!mesh.envoy_memory.enabled);
+        assert_eq!(mesh.envoy_memory.max_sessions, 256);
+        assert_eq!(mesh.envoy_memory.max_per_identity, 16);
+        assert_eq!(mesh.envoy_memory.max_turns, 40);
+        assert_eq!(mesh.envoy_memory.max_bytes, 65_536);
+        assert_eq!(mesh.envoy_memory.ttl_hours, 168);
         assert_eq!(DEFAULT_INLINE_MAX_BYTES, 65_536);
         assert_eq!(MAX_INLINE_FILE_TOTAL, 98_304);
         assert_eq!(DEFAULT_FETCH_MAX_BYTES, 4_194_304);
         assert_eq!(MAX_FETCH_FILE_BYTES, 4_194_304);
+        assert_eq!(DEFAULT_ENVOY_MEMORY_MAX_SESSIONS, 256);
+        assert_eq!(DEFAULT_ENVOY_MEMORY_MAX_PER_IDENTITY, 16);
+        assert_eq!(DEFAULT_ENVOY_MEMORY_MAX_TURNS, 40);
+        assert_eq!(DEFAULT_ENVOY_MEMORY_MAX_BYTES, 65_536);
+        assert_eq!(DEFAULT_ENVOY_MEMORY_TTL_HOURS, 168);
     }
 
     #[test]
@@ -1358,6 +1436,94 @@ mod tests {
         );
     }
 
+    fn envoy_memory_error(memory: EnvoyMemoryConfig) -> String {
+        let mesh = MeshConfig {
+            enabled: true,
+            envoy_memory: memory,
+            ..Default::default()
+        };
+        mesh.validate(true).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn mesh_envoy_memory_max_sessions_zero_is_out_of_range() {
+        let err = envoy_memory_error(EnvoyMemoryConfig {
+            max_sessions: 0,
+            ..Default::default()
+        });
+        assert_eq!(
+            err,
+            "mesh.envoy_memory.max_sessions is 0, which is out of range; use 1 or more"
+        );
+    }
+
+    #[test]
+    fn mesh_envoy_memory_max_per_identity_zero_is_out_of_range() {
+        let err = envoy_memory_error(EnvoyMemoryConfig {
+            max_per_identity: 0,
+            ..Default::default()
+        });
+        assert_eq!(
+            err,
+            "mesh.envoy_memory.max_per_identity is 0, which is out of range; use 1 or more"
+        );
+    }
+
+    #[test]
+    fn mesh_envoy_memory_max_turns_zero_is_out_of_range() {
+        let err = envoy_memory_error(EnvoyMemoryConfig {
+            max_turns: 0,
+            ..Default::default()
+        });
+        assert_eq!(
+            err,
+            "mesh.envoy_memory.max_turns is 0, which is out of range; use 1 or more"
+        );
+    }
+
+    #[test]
+    fn mesh_envoy_memory_max_bytes_zero_is_out_of_range() {
+        let err = envoy_memory_error(EnvoyMemoryConfig {
+            max_bytes: 0,
+            ..Default::default()
+        });
+        assert_eq!(
+            err,
+            "mesh.envoy_memory.max_bytes is 0, which is out of range; use 1 or more"
+        );
+    }
+
+    #[test]
+    fn mesh_envoy_memory_ttl_hours_zero_is_out_of_range() {
+        let err = envoy_memory_error(EnvoyMemoryConfig {
+            ttl_hours: 0,
+            ..Default::default()
+        });
+        assert_eq!(
+            err,
+            "mesh.envoy_memory.ttl_hours is 0, which is out of range; use 1 or more"
+        );
+    }
+
+    #[test]
+    fn mesh_envoy_memory_accepts_the_floor() {
+        for enabled in [false, true] {
+            let mesh = MeshConfig {
+                enabled: true,
+                envoy_memory: EnvoyMemoryConfig {
+                    enabled,
+                    max_sessions: 1,
+                    max_per_identity: 1,
+                    max_turns: 1,
+                    max_bytes: 1,
+                    ttl_hours: 1,
+                },
+                ..Default::default()
+            };
+            mesh.validate(true).unwrap();
+        }
+    }
+
     #[test]
     fn an_existing_inbox_dir_is_used_as_configured_without_translating() {
         let tmp = TempDir::new("mesh-config-inbox-exists");
@@ -1641,9 +1807,16 @@ mod tests {
             "{info}"
         );
         assert!(
-            info.ends_with(
-                "  fetch.max_bytes                 4194304\n  fetch.inbox_dir                 null\n"
-            ),
+            info.ends_with(concat!(
+                "  fetch.max_bytes                 4194304\n",
+                "  fetch.inbox_dir                 null\n",
+                "  envoy_memory.enabled            false\n",
+                "  envoy_memory.max_sessions       256\n",
+                "  envoy_memory.max_per_identity   16\n",
+                "  envoy_memory.max_turns          40\n",
+                "  envoy_memory.max_bytes          65536\n",
+                "  envoy_memory.ttl_hours          168\n",
+            )),
             "{info}"
         );
     }
@@ -1661,7 +1834,11 @@ mod tests {
         let info = render_mesh_info(&mesh);
 
         assert!(
-            info.ends_with("  fetch.inbox_dir                 /srv/inbox\n"),
+            info.contains("  fetch.inbox_dir                 /srv/inbox\n"),
+            "{info}"
+        );
+        assert!(
+            info.ends_with("  envoy_memory.ttl_hours          168\n"),
             "{info}"
         );
     }
