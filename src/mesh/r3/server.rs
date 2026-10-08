@@ -360,8 +360,12 @@ impl R3Server {
                 let frame = match RequestFrame::decode(&packed) {
                     Ok(frame) => frame,
                     Err(err) => {
+                        let id8 = identity.as_ref().map_or_else(
+                            || "anonymous".to_string(),
+                            |identity| short(&identity.address_hash.to_hex_string()).to_string(),
+                        );
                         debug!(
-                            "Dropped an undecodable mesh request {} on link {}: {}",
+                            "Dropped an undecodable mesh request {} from {id8} on link {}: {}",
                             request_id.to_hex_string(),
                             link_id.to_hex_string(),
                             redact_hashes(&err.to_string())

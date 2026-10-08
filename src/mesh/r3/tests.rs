@@ -2556,6 +2556,58 @@ pub(crate) mod network {
         responder.stop().await;
     }
 
+    /// A trusted peer's request that is not a request frame is dropped after admission,
+    /// and the drop names who sent it by the truncated identity, like every other
+    /// per-request line.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_undecodable_request_from_a_trusted_peer_is_dropped_naming_its_truncated_identity() {
+        install_log_collector();
+        let recorder = Arc::new(Recorder::default());
+        let (responder, requester, desc) = pair(recorder.clone()).await;
+        let _gate = gate(
+            &responder,
+            recorder.clone(),
+            &TrustList::default().identity(&identity_hex(&requester), true),
+            "r3-gate-undecodable",
+        );
+        let link = identified_link(&requester, &responder, &desc).await;
+        let link_id = *link.lock().await.id();
+
+        let two_element_request =
+            super::packed(Value::Array(vec![Value::F64(1.0), super::sixteen(1)]));
+        let packet = link
+            .lock()
+            .await
+            .request_packet(&two_element_request)
+            .unwrap();
+        let request_id = RequestId::from_packet(&packet);
+        requester
+            .transport
+            .send_link_packet_on_bound_iface(&link, packet)
+            .await;
+
+        let dropped = format!(
+            "Dropped an undecodable mesh request {} from {} on link {}: ",
+            request_id.to_hex_string(),
+            &identity_hex(&requester)[..8],
+            link_id.to_hex_string()
+        );
+        wait_until("the responder to drop the undecodable request", || {
+            debug_snapshot()
+                .iter()
+                .any(|message| message.contains(&dropped))
+        })
+        .await;
+        assert_eq!(
+            responder.server.decoded_count(),
+            1,
+            "the drop came after admission"
+        );
+        assert_eq!(recorder.seen_count(), 0, "the handler was never entered");
+        requester.stop().await;
+        responder.stop().await;
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unknown_path_is_silent_to_strangers_and_a_typed_error_to_peers() {
         install_log_collector();
