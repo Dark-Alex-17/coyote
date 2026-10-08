@@ -4832,6 +4832,7 @@ fn render_inbox(rows: &[InboxRow], awaiting_collect: &[String]) -> String {
                         (None, Some(path)) => format!("fetchable as {path}"),
                         (None, None) => "not kept".to_string(),
                     };
+                    let name = display_text(name, WIRE_PATH_MAX_BYTES).unwrap_or_default();
                     lines.push(format!("  file: {name} ({size} B) {location}"));
                 }
             }
@@ -6129,6 +6130,25 @@ mod tests {
             "  file: docs/notes.md (8 B) staged at /tmp/inbox/abcdef01abcdef01abcdef01abcdef01/docs/notes.md"
         );
         assert_eq!(lines[4], "  (2 parts dropped)");
+    }
+
+    /// A stored file part that predates the wire-path grammar may carry a name with
+    /// terminal escapes or invisible characters; the inbox line shows it cleaned.
+    #[test]
+    fn inbox_lines_clean_a_file_parts_name_of_escapes_and_invisible_characters() {
+        let mut with_file = message(PeerKind::Message, "see attached", None);
+        with_file.parts = vec![Part::File {
+            name: "docs/\u{1b}[31mnotes\u{FE0F}.md".into(),
+            size: 8,
+            sha256: "ab".repeat(32),
+            staged: None,
+            reference: Some("ref-1".into()),
+        }];
+
+        let text = render_inbox(&[inbox_row(with_file)], &[]);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "{text}");
+        assert_eq!(lines[1], "  file: docs/notes.md (8 B) fetchable as ref-1");
     }
 
     fn correlation(id: &str, state: PendingState) -> Correlation {
