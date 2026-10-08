@@ -1233,10 +1233,13 @@ mod tests {
         let (done, total) = card.todo.as_ref().map(|t| (t.done, t.total)).unwrap();
         assert_eq!((done, total), (u32::MAX, 5));
 
+        // The far end is the last second RFC 3339 can spell (9999-12-31T23:59:59Z): a
+        // `SystemTime` on every platform, where Windows' clock, i64 100-ns ticks ending in
+        // the year 30828, cannot hold `UNIX_EPOCH + u64::MAX / 2` seconds.
         for at in [
             UNIX_EPOCH,
             now(),
-            UNIX_EPOCH + Duration::from_secs(u64::MAX / 2),
+            UNIX_EPOCH + Duration::from_secs(253_402_300_799),
         ] {
             let text = render_for_human(&card, at);
             assert!(
