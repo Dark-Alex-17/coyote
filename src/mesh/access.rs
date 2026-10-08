@@ -2099,6 +2099,145 @@ mod tests {
         );
     }
 
+    /// The pending cap is one count for the identity however its requests are spread
+    /// over its instances, and it is judged after the per-instance duplicate rule: with
+    /// three sets pending from one instance and two from another, a fresh set from
+    /// either is `too_many_pending`, a set the *other* instance has pending is
+    /// `too_many_pending` too (it is not this instance's duplicate), and a set this
+    /// instance already has pending is `duplicate` even at the cap.
+    #[test]
+    fn usage_probe_the_pending_cap_counts_every_instance_of_one_identity_together_after_the_duplicate_rule()
+     {
+        let fixture = bare_slot("access-cap-across-instances");
+        let first_instance = destination();
+        let second_instance = hex_lower(&[0x3c; 16]);
+        let mut n = 0;
+        for (instance, count) in [(&first_instance, 3), (&second_instance, 2)] {
+            for _ in 0..count {
+                let path = format!("src/{n}.rs");
+                let outcome = fixture.slot.admit_access(inbound_from(
+                    &identity(),
+                    instance,
+                    &format!("a-{n}"),
+                    &[&path],
+                    "",
+                ));
+                assert_eq!(outcome, AccessOutcome::Pending, "{n}");
+                n += 1;
+            }
+        }
+        assert_eq!(n, ACCESS_MAX_PENDING_PER_IDENTITY);
+        assert_eq!(access_records(&fixture.slot).len(), n);
+
+        for (what, instance) in [
+            ("the instance with three", &first_instance),
+            ("the instance with two", &second_instance),
+        ] {
+            let fresh = fixture.slot.admit_access(inbound_from(
+                &identity(),
+                instance,
+                "a-fresh",
+                &["src/fresh.rs"],
+                "",
+            ));
+            assert_eq!(
+                fresh,
+                AccessOutcome::Refused(AccessRefusal::TooManyPending),
+                "a fresh set from {what}"
+            );
+        }
+        let others_set = fixture.slot.admit_access(inbound_from(
+            &identity(),
+            &second_instance,
+            "a-theirs",
+            &["src/0.rs"],
+            "",
+        ));
+        assert_eq!(
+            others_set,
+            AccessOutcome::Refused(AccessRefusal::TooManyPending),
+            "a set the other instance has pending is not this instance's duplicate"
+        );
+        let own_set = fixture.slot.admit_access(inbound_from(
+            &identity(),
+            &second_instance,
+            "a-mine",
+            &["src/4.rs"],
+            "",
+        ));
+        assert_eq!(
+            own_set,
+            AccessOutcome::Refused(AccessRefusal::Duplicate),
+            "the duplicate rule is judged before the cap"
+        );
+        let stranger = fixture.slot.admit_access(inbound_from(
+            &hex_lower(&[0xcd; 16]),
+            &hex_lower(&[0x4d; 16]),
+            "b-1",
+            &["src/0.rs"],
+            "",
+        ));
+        assert_eq!(
+            stranger,
+            AccessOutcome::Pending,
+            "another identity has its own cap"
+        );
+        assert_eq!(access_records(&fixture.slot).len(), n + 1);
+        assert_eq!(
+            fixture.idle.texts().len(),
+            n + 1,
+            "only filings reach the human"
+        );
+        assert_eq!(fixture.hooks.snapshot().len(), n + 1);
+    }
+
+    /// A set two instances of one identity both have pending is freed per instance:
+    /// once the first instance's request is decided, that instance may ask the set
+    /// again while the other instance's identical ask is still its own duplicate.
+    #[test]
+    fn usage_probe_a_decided_set_is_freed_for_the_instance_that_asked_it_not_its_sibling() {
+        let fixture = bare_slot("access-decided-per-instance");
+        let second_instance = hex_lower(&[0x3c; 16]);
+        let paths = ["docs/y.md", "src/x.rs"];
+        assert_eq!(
+            fixture
+                .slot
+                .admit_access(inbound(&identity(), "a-1", &paths, "")),
+            AccessOutcome::Pending
+        );
+        assert_eq!(
+            fixture.slot.admit_access(inbound_from(
+                &identity(),
+                &second_instance,
+                "a-2",
+                &paths,
+                ""
+            )),
+            AccessOutcome::Pending
+        );
+        assert!(store_of(&fixture.slot).remove("a-1").unwrap());
+
+        assert_eq!(
+            fixture
+                .slot
+                .admit_access(inbound(&identity(), "a-3", &["src/x.rs", "docs/y.md"], "")),
+            AccessOutcome::Pending,
+            "the decided instance asks the same set again, in another order"
+        );
+        assert_eq!(
+            fixture.slot.admit_access(inbound_from(
+                &identity(),
+                &second_instance,
+                "a-4",
+                &paths,
+                ""
+            )),
+            AccessOutcome::Refused(AccessRefusal::Duplicate),
+            "the sibling instance's copy is still pending"
+        );
+        assert_eq!(access_records(&fixture.slot).len(), 2);
+    }
+
     /// Both sides of the identity and destination compares are canonical lowercase hex,
     /// so the serving path neither case-folds nor short-circuits on them. The
     /// per-destination rule is the path-set one and the per-identity rule the cap: a

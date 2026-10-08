@@ -6121,6 +6121,56 @@ mod tests {
     }
 
     #[test]
+    fn usage_probe_a_reply_answering_no_open_question_inherits_no_thread_from_the_questions_that_are_open()
+     {
+        let slot = MeshSlot::default();
+        slot.correlations()
+            .open(PendingRecord {
+                thread: "t-root".to_string(),
+                ..pending("q-1")
+            })
+            .unwrap();
+
+        // Without a thread of its own: it is its own thread, not `q-1`'s.
+        slot.deliver_peer(peer_message(PeerKind::Reply, "r-1", Some("q-unknown")));
+        // Claiming a thread of its own: the claim is shed, like every downgraded reply.
+        let mut claiming = peer_message(PeerKind::Reply, "r-2", Some("q-unknown"));
+        claiming.thread = Some("t-claimed".to_string());
+        claiming.disposition = Some(Disposition::Escalated);
+        slot.deliver_peer(claiming);
+
+        let (envelopes, _) = slot.peer_inbox().drain();
+        assert_eq!(peer_ids(&envelopes), ["r-1", "r-2"]);
+        for envelope in &envelopes {
+            let delivered = peer_payload(envelope);
+            assert_eq!(
+                delivered.kind,
+                PeerKind::Message,
+                "{}",
+                delivered.message_id
+            );
+            assert_eq!(
+                delivered.in_reply_to.as_deref(),
+                Some("q-unknown"),
+                "{} keeps the id it named",
+                delivered.message_id
+            );
+            assert_eq!(delivered.thread, None, "{}", delivered.message_id);
+            assert_eq!(delivered.disposition, None, "{}", delivered.message_id);
+        }
+        assert!(
+            slot.correlations().is_open("q-1"),
+            "an unrelated reply leaves the open question open"
+        );
+        assert!(slot.correlations().take_answer("q-1").is_none());
+        let notes = slot.take_model_notes();
+        assert!(
+            notes.iter().all(|note| note.event == "peer_message"),
+            "{notes:#?}"
+        );
+    }
+
+    #[test]
     fn a_reply_that_answers_an_open_question_keeps_its_kind_in_the_inbox() {
         let slot = MeshSlot::default();
         slot.correlations().open(pending("q-1")).unwrap();

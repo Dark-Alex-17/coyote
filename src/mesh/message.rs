@@ -4399,6 +4399,237 @@ mod tests {
         );
     }
 
+    // ---- usage-probe spec-first tests: `ts` is informational on the link, a reply
+    // names its question on both routes, `in_reply_to` is judged per kind.
+
+    /// Every `ts` the receiver cannot read as a finite number (wrong type, nil, ±inf,
+    /// NaN in either float width) is treated as absent on the handler path: the message
+    /// is acknowledged and delivered with a zero clock, never refused. A finite `ts` of
+    /// any numeric width is conveyed as sent, and the sender still emits one.
+    #[tokio::test]
+    async fn usage_probe_a_link_message_with_an_unreadable_ts_is_acked_and_delivered_with_a_zero_clock()
+     {
+        let identity = PrivateIdentity::new_from_rand(OsRng);
+        let origin = OriginName([6u8; NAME_HASH_LEN]);
+        let destination = destination_address(&origin.0, identity.address_hash()).to_hex_string();
+        let out = OutboundPeer::new(PeerKind::Message, "any clock", None, None, None).unwrap();
+        let Value::Map(sent) = to_r3_body(&out, 1_700_000_000.25) else {
+            unreachable!()
+        };
+        assert!(
+            matches!(
+                sent.iter().find(|(key, _)| key.as_str() == Some("ts")),
+                Some((_, Value::F64(ts))) if *ts == 1_700_000_000.25
+            ),
+            "the sender still emits ts as an f64: {sent:?}"
+        );
+
+        let unreadable = [
+            ("bool ts", Value::Boolean(true)),
+            ("array ts", Value::Array(vec![Value::from(1)])),
+            (
+                "map ts",
+                Value::Map(vec![(Value::from("s"), Value::from(1))]),
+            ),
+            ("binary ts", Value::Binary(vec![1, 2])),
+            ("+inf ts", Value::F64(f64::INFINITY)),
+            ("-inf ts", Value::F64(f64::NEG_INFINITY)),
+            ("f32 nan ts", Value::F32(f32::NAN)),
+            ("text ts", Value::from("1700000000")),
+            ("nil ts", Value::Nil),
+        ];
+        let conveyed = [
+            ("uint ts", Value::from(1_700_000_000u64), 1_700_000_000.0),
+            ("negative int ts", Value::from(-5i64), -5.0),
+            ("f32 ts", Value::F32(1.5), 1.5),
+            ("f64 ts", Value::F64(2.25), 2.25),
+        ];
+        let cases = unreadable
+            .into_iter()
+            .map(|(what, ts)| (what, ts, 0.0))
+            .chain(conveyed);
+        for (what, ts, expected_clock) in cases {
+            let surface = Arc::new(RecordingSurface::admitting(1));
+            let handler =
+                PeerMessageHandler::new(Arc::downgrade(&surface) as Weak<dyn PeerSurface>);
+            let mut entries = sent.clone();
+            entries.retain(|(key, _)| key.as_str() != Some("ts"));
+            entries.push((Value::from("ts"), ts));
+            let request = AdmittedRequest {
+                link_id: LinkId::new_from_rand(OsRng),
+                identity: *identity.as_identity(),
+                destination_hash: AddressHash::new_from_hex_string(&destination).unwrap(),
+                request_id: RequestId::from([1u8; 16]),
+                path_hash: PathHash::of(MESSAGE_PATH),
+                requested_at: 1_700_000_000.0,
+                body: Value::Map(entries),
+                branch: SizeBranch::Packet,
+            };
+            match handler.handle(request).await {
+                Reply::Value(value) | Reply::Settled { value, .. } => {
+                    assert!(is_received_reply(&value, &out.id), "{what}: {value}")
+                }
+                Reply::Code(code) => panic!("{what}: refused {code:?}"),
+                Reply::Silent => panic!("{what}: not acknowledged"),
+            }
+            let delivered = surface.delivered.lock();
+            assert_eq!(delivered.len(), 1, "{what}: {delivered:#?}");
+            assert_eq!(delivered[0].message_id, out.id, "{what}");
+            assert_eq!(delivered[0].timestamp, expected_clock, "{what}");
+        }
+    }
+
+    /// `in_reply_to` is optional on a `message` and an `ask` (an interim notice) and
+    /// judged only when present: a valid id is kept, anything else present (a number,
+    /// a non-id string) is `InvalidData` on every kind, and `nil` reads as absent as
+    /// every optional body key does. A `reply` needs one, so `nil` there is refused as
+    /// missing; a `bulletin` carrying one is not refused.
+    #[test]
+    fn usage_probe_in_reply_to_is_optional_on_a_message_or_ask_required_on_a_reply_and_judged_when_present()
+     {
+        fn body(kind: &str, in_reply_to: Option<Value>) -> Value {
+            let Value::Map(mut entries) = to_r3_body(&outbound(PeerKind::Message, "hi"), 1.0)
+            else {
+                unreachable!()
+            };
+            entries
+                .retain(|(k, _)| k.as_str() != Some("kind") && k.as_str() != Some("in_reply_to"));
+            entries.push((Value::from("kind"), Value::from(kind)));
+            if let Some(value) = in_reply_to {
+                entries.push((Value::from("in_reply_to"), value));
+            }
+            Value::Map(entries)
+        }
+
+        for kind in ["message", "ask"] {
+            assert_eq!(
+                from_r3_body(&body(kind, None)).map(|b| b.in_reply_to),
+                Ok(None),
+                "{kind} without in_reply_to"
+            );
+            assert_eq!(
+                from_r3_body(&body(kind, Some(Value::from("q-1")))).map(|b| b.in_reply_to),
+                Ok(Some("q-1".to_string())),
+                "{kind} naming an earlier message is an interim notice"
+            );
+        }
+        for kind in ["message", "ask", "reply", "bulletin"] {
+            for (what, bad) in [
+                ("number", Value::from(7)),
+                ("blank", Value::from("")),
+                ("non-id text", Value::from("q 1")),
+            ] {
+                assert_eq!(
+                    from_r3_body(&body(kind, Some(bad))),
+                    Err("in_reply_to is not a message id"),
+                    "{kind} with a {what} in_reply_to is present and invalid"
+                );
+            }
+        }
+        for kind in ["message", "ask", "bulletin"] {
+            assert_eq!(
+                from_r3_body(&body(kind, Some(Value::Nil))).map(|b| b.in_reply_to),
+                Ok(None),
+                "a nil in_reply_to on a {kind} reads as absent"
+            );
+        }
+        assert_eq!(
+            from_r3_body(&body("reply", None)),
+            Err(REPLY_WITHOUT_IN_REPLY_TO)
+        );
+        assert_eq!(
+            from_r3_body(&body("reply", Some(Value::Nil))),
+            Err(REPLY_WITHOUT_IN_REPLY_TO),
+            "a nil in_reply_to on a reply is a missing one"
+        );
+        assert_eq!(
+            from_r3_body(&body("reply", Some(Value::from("q-1")))).map(|b| b.in_reply_to),
+            Ok(Some("q-1".to_string()))
+        );
+        let bulletin = from_r3_body(&body("bulletin", Some(Value::from("q-1"))))
+            .expect("a bulletin carrying an in_reply_to is not refused");
+        assert_eq!(bulletin.kind, PeerKind::Bulletin);
+        assert_eq!(
+            from_r3_body(&body("bulletin", None)).map(|b| b.in_reply_to),
+            Ok(None)
+        );
+    }
+
+    /// On the store-and-forward route a `message` or an `ask` without `in_reply_to`
+    /// decodes, a `reply` naming its question decodes with it, and the sender's clock
+    /// stays the LXMF timestamp whatever the custom data says.
+    #[test]
+    fn usage_probe_a_propagated_message_without_in_reply_to_decodes_and_the_clock_is_the_lxmf_timestamp()
+     {
+        let origin = OriginName([6u8; NAME_HASH_LEN]);
+        for kind in [PeerKind::Message, PeerKind::Ask, PeerKind::Bulletin] {
+            let stored = peer_lxmf_message(&outbound(kind, "stored words"), &origin);
+            match decode_peer_lxmf(&inbound(
+                stored.fields.clone(),
+                None,
+                Some(stored.content.clone()),
+                &hash_of("s"),
+            )) {
+                PeerLxmf::Peer(peer) => {
+                    assert_eq!(peer.kind, kind);
+                    assert_eq!(peer.in_reply_to, None);
+                    assert_eq!(peer.content, "stored words");
+                }
+                other => panic!("{kind:?} without in_reply_to: {other:?}"),
+            }
+        }
+        let answered =
+            OutboundPeer::new(PeerKind::Reply, "an answer", None, Some("q-1"), None).unwrap();
+        let stored = peer_lxmf_message(&answered, &origin);
+        let Some(Value::Map(mut data)) = stored.fields.clone() else {
+            panic!("custom data is a map")
+        };
+        // A `ts` smuggled into the custom data is neither read nor refused.
+        if let Some((_, Value::Map(custom))) = data
+            .iter_mut()
+            .find(|(key, _)| key.as_u64() == Some(u64::from(FIELD_CUSTOM_DATA)))
+        {
+            custom.push((Value::from("ts"), Value::from("tomorrow")));
+        } else {
+            panic!("custom data is under FIELD_CUSTOM_DATA: {data:?}");
+        }
+        let identity = hash_of("id-peer-lxmf-clock");
+        let destination = destination_address(
+            &origin.0,
+            &AddressHash::new_from_hex_string(&identity).unwrap(),
+        )
+        .to_hex_string();
+        let mut message = inbound(
+            Some(Value::Map(data)),
+            None,
+            Some(stored.content),
+            &identity,
+        );
+        message.timestamp = 1_234_567_890.5;
+        match decode_peer_lxmf(&message) {
+            PeerLxmf::Peer(peer) => {
+                assert_eq!(peer.kind, PeerKind::Reply);
+                assert_eq!(peer.in_reply_to.as_deref(), Some("q-1"));
+            }
+            other => panic!("a stored reply naming its question: {other:?}"),
+        }
+        let (trust, _tmp) = TrustList::default()
+            .destination(&destination, &identity)
+            .open("peer-routing-lxmf-clock");
+        let surface = Arc::new(RecordingSurface::default());
+        let inner = CountingSink::default();
+        PeerRouting {
+            trust: &trust,
+            surface: Some(surface.clone() as Arc<dyn PeerSurface>),
+            inner: &inner,
+        }
+        .deliver(message);
+        let delivered = surface.delivered.lock();
+        assert_eq!(delivered.len(), 1, "{delivered:#?}");
+        assert_eq!(delivered[0].in_reply_to.as_deref(), Some("q-1"));
+        assert_eq!(delivered[0].timestamp, 1_234_567_890.5);
+    }
+
     /// A propagated message from a sender over its limit is filed, but its inline
     /// files never touch the staging inbox: the throttle is consulted before any peer
     /// bytes land on disk, and the dropped part is counted. The same message from an
