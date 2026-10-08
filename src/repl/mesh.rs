@@ -4827,16 +4827,22 @@ fn render_inbox(rows: &[InboxRow], awaiting_collect: &[String]) -> String {
                     reference,
                     ..
                 } => {
-                    let shown =
-                        |path: &str| display_text(path, WIRE_PATH_MAX_BYTES).unwrap_or_default();
+                    let shown = |path: &str, max_chars: usize| {
+                        display_text(path, max_chars).unwrap_or_default()
+                    };
                     let location = match (staged, reference) {
                         (Some(path), _) => {
-                            format!("staged at {}", shown(&path.display().to_string()))
+                            format!(
+                                "staged at {}",
+                                shown(&path.display().to_string(), usize::MAX)
+                            )
                         }
-                        (None, Some(path)) => format!("fetchable as {}", shown(path)),
+                        (None, Some(path)) => {
+                            format!("fetchable as {}", shown(path, WIRE_PATH_MAX_BYTES))
+                        }
                         (None, None) => "not kept".to_string(),
                     };
-                    let name = shown(name);
+                    let name = shown(name, WIRE_PATH_MAX_BYTES);
                     lines.push(format!("  file: {name} ({size} B) {location}"));
                 }
             }
@@ -6156,18 +6162,23 @@ mod tests {
         assert_eq!(lines[1], "  file: docs/notes.md (8 B) fetchable as ref-1");
 
         let mut staged = message(PeerKind::Message, "see attached", None);
+        let long_name = "n".repeat(WIRE_PATH_MAX_BYTES - 3) + ".md";
         staged.parts = vec![Part::File {
-            name: "notes.md".into(),
+            name: long_name.clone(),
             size: 8,
             sha256: "ab".repeat(32),
-            staged: Some(std::path::PathBuf::from("/inbox/peer/notes\u{FE0F}.md")),
+            staged: Some(std::path::PathBuf::from(format!(
+                "/inbox/peer/{long_name}\u{FE0F}"
+            ))),
             reference: None,
         }];
         let text = render_inbox(&[inbox_row(staged)], &[]);
         let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "{text}");
         assert_eq!(
-            lines[1], "  file: notes.md (8 B) staged at /inbox/peer/notes.md",
-            "{text}"
+            lines[1],
+            format!("  file: {long_name} (8 B) staged at /inbox/peer/{long_name}"),
+            "a staged path longer than a wire path is shown whole: {text}"
         );
     }
 
@@ -7343,6 +7354,107 @@ mod tests {
                 warned[0].contains("1 peer message(s) were dropped"),
                 "{warned:?}"
             );
+        }
+
+        /// Spec-first usage probe: a file part's `name`, its `reference` and the staged
+        /// path beside it are peer-chosen paths, so `.mesh inbox` passes all three through
+        /// `display_text` — a line terminator, a carriage return, an escape sequence, a
+        /// line separator or a variation selector in any of them can neither split the
+        /// row nor reach the terminal, and a clean path renders byte for byte.
+        #[test]
+        #[serial]
+        fn usage_probe_inbox_file_line_stays_one_clean_line_whatever_the_peer_put_in_its_paths() {
+            use crate::mesh::message::{Part, RawPeerMessage};
+
+            let hostile = "docs/\nREADME\r\u{1b}[31m\u{2028}notes\u{FE0F}.md";
+            let raw = |id: &str, parts: Vec<Part>| {
+                let mut message = PeerMessage::new(RawPeerMessage {
+                    source_identity: "cd".repeat(16),
+                    source_destination: "ab".repeat(16),
+                    destination: "01".repeat(16),
+                    title: None,
+                    content: "see attached".into(),
+                    fields: None,
+                    timestamp: 0.0,
+                    message_id: id.repeat(16),
+                    in_reply_to: None,
+                    kind: PeerKind::Message,
+                    via: PeerVia::Direct,
+                    thread: None,
+                    disposition: None,
+                    retry_after: None,
+                    parts: Vec::new(),
+                    dropped_parts: 0,
+                });
+                message.parts = parts;
+                message
+            };
+            let _capture = capture::install();
+            let mut ctx = off_ctx();
+
+            ctx.app.mesh.peer_inbox().deliver(raw(
+                "f1",
+                vec![
+                    Part::File {
+                        name: hostile.into(),
+                        size: 8,
+                        sha256: "ab".repeat(32),
+                        staged: None,
+                        reference: Some(hostile.into()),
+                    },
+                    Part::File {
+                        name: hostile.into(),
+                        size: 9,
+                        sha256: "cd".repeat(32),
+                        staged: Some(PathBuf::from(format!(
+                            "/inbox/{}/{hostile}",
+                            "ab".repeat(16)
+                        ))),
+                        reference: Some("ignored-when-staged".into()),
+                    },
+                    Part::File {
+                        name: "docs/notes.md".into(),
+                        size: 10,
+                        sha256: "ef".repeat(32),
+                        staged: None,
+                        reference: Some("docs/notes.md".into()),
+                    },
+                ],
+            ));
+
+            run_async(run(&mut ctx, ".mesh inbox")).unwrap();
+
+            let out = stdout_lines().join("\n");
+            let rows: Vec<&str> = out.lines().collect();
+            assert_eq!(
+                rows.len(),
+                4,
+                "one message row and three file lines: {out:?}"
+            );
+            assert!(rows[0].starts_with("[message] from"), "{out}");
+            assert_eq!(
+                rows[1],
+                "  file: docs/ README  notes.md (8 B) fetchable as docs/ README  notes.md"
+            );
+            assert_eq!(
+                rows[2],
+                format!(
+                    "  file: docs/ README  notes.md (9 B) staged at /inbox/{}/docs/ README  notes.md",
+                    "ab".repeat(16)
+                )
+            );
+            assert_eq!(
+                rows[3],
+                "  file: docs/notes.md (10 B) fetchable as docs/notes.md"
+            );
+            for leaked in ['\x1b', '\r', '\u{2028}', '\u{FE0F}'] {
+                assert!(
+                    !out.contains(leaked),
+                    "{leaked:?} leaked into `.mesh inbox`: {out:?}"
+                );
+            }
+            assert!(!out.contains("[31m"), "{out}");
+            assert!(stderr_lines().is_empty(), "{:?}", stderr_lines());
         }
 
         fn stdout_lines() -> Vec<String> {

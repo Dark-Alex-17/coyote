@@ -151,6 +151,7 @@ const ENFORCED_BY: &[(&str, &[&str])] = &[
             "peers_with_status_fences_a_live_cards_objective_under_the_peers_label",
             "inbox_lines_clean_a_file_parts_name_and_paths_of_escapes_and_invisible_characters",
             "usage_probe_an_access_decision_collected_for_a_pending_request_stays_structured_data",
+            "usage_probe_a_collected_data_part_is_structured_yet_every_string_in_it_is_cleaned",
         ],
     ),
     (
