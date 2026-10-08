@@ -2118,7 +2118,10 @@ impl State {
             .filter(|(_, entry)| !same_hash(&entry.identity, identity))
             .filter(|(hash, entry)| {
                 parse_hash(&entry.identity).is_some_and(|bound| {
-                    parse_hash(hash) == Some(destination_address(name_hash, &bound))
+                    same_hash(
+                        hash,
+                        &destination_address(name_hash, &bound).to_hex_string(),
+                    )
                 })
             })
             .map(|(hash, entry)| BindingConflict {
@@ -2459,7 +2462,7 @@ fn verify_binding(
         anyhow!("'{destination}' is not a destination hash: expected 32 hex characters.")
     })?;
     let expected = destination_address(&name_hash, &identity);
-    if expected != claimed {
+    if !bool::from(expected.as_slice().ct_eq(claimed.as_slice())) {
         bail!(
             "Destination {destination} does not match identity {} in {source} (that identity would announce {}); nothing was trusted.",
             identity.to_hex_string(),
@@ -2758,6 +2761,38 @@ mod tests {
         assert!(!same_hash(&hash, &last_byte_differs));
         assert!(!same_hash("ab", "abc"));
         assert!(same_hash("", ""));
+    }
+
+    /// The destination binding is the one equality against a peer-derived value, so
+    /// every production line of this file compares hashes through `same_hash` or
+    /// `ct_eq`, never through `==` or `!=` on an `AddressHash` or its `Option`.
+    #[test]
+    fn production_code_never_compares_hashes_with_the_equality_operators() {
+        let source = include_str!("trust.rs");
+        let test_module = ["\n#[cfg(test)]\n", "mod tests {"].concat();
+        let production = &source[..source.find(&test_module).expect("the test module opens")];
+        // Assembled at runtime so this test's own text does not match the probes.
+        let parsed = ["parse_", "hash("].concat();
+        let operators = [[" =", "= "].concat(), [" !", "= "].concat()];
+        let shapes = [
+            ["expected !", "= claimed"].concat(),
+            ["expected =", "= claimed"].concat(),
+            ["== Some(destination_", "address("].concat(),
+        ];
+        let hits: Vec<String> = production
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| {
+                (line.contains(&parsed) && operators.iter().any(|op| line.contains(op.as_str())))
+                    || shapes.iter().any(|shape| line.contains(shape.as_str()))
+            })
+            .map(|(index, line)| format!("{}: {}", index + 1, line.trim()))
+            .collect();
+        assert!(
+            hits.is_empty(),
+            "compare hashes with same_hash or ct_eq, not == or !=:\n{}",
+            hits.join("\n")
+        );
     }
 
     #[test]
