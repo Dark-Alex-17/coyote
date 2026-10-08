@@ -1550,7 +1550,6 @@ mod tests {
     use crate::mesh::message::{PeerBody, received_reply};
     #[cfg(unix)]
     use crate::mesh::node::{MeshRuntime, NodeOptions};
-    #[cfg(unix)]
     use crate::mesh::peers::PeerSighting;
     #[cfg(unix)]
     use crate::mesh::pending::PendingStore;

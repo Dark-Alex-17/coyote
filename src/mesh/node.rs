@@ -321,8 +321,9 @@ pub(crate) struct MeshRuntime {
     cancel: CancellationToken,
     tasks: parking_lot::Mutex<Vec<JoinHandle<()>>>,
     /// Every request's path and deadlines in the order they were made, for the tests
-    /// that pin which deadline a path hands the client.
-    #[cfg(test)]
+    /// that pin which deadline a path hands the client; those tests drive a live node,
+    /// which the loopback fixtures only do on unix.
+    #[cfg(all(test, unix))]
     requests_made: parking_lot::Mutex<Vec<(String, RequestOptions)>>,
 }
 
@@ -508,7 +509,7 @@ impl MeshRuntime {
             posting: Mutex::new(()),
             cancel: CancellationToken::new(),
             tasks: parking_lot::Mutex::new(Vec::new()),
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             requests_made: parking_lot::Mutex::new(Vec::new()),
         });
         runtime.register_task(tokio::spawn(runtime.r3_client.clone().run(
@@ -620,7 +621,7 @@ impl MeshRuntime {
         self.request_timeouts
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn requests_made(&self) -> Vec<(String, RequestOptions)> {
         self.requests_made.lock().clone()
     }
@@ -846,7 +847,7 @@ impl MeshRuntime {
         envelope: Envelope,
         options: RequestOptions,
     ) -> Result<RequestOutcome, R3Error> {
-        #[cfg(test)]
+        #[cfg(all(test, unix))]
         self.requests_made.lock().push((path.to_string(), options));
         let dest_hex = destination.address_hash.to_hex_string();
         refuse_incompatible_peer(&self.peers, &dest_hex, path)?;
@@ -3333,11 +3334,12 @@ impl EnvoySink for RecordingEnvoy {
     }
 }
 
-/// An envoy whose queue reads as full before anything is offered to it.
-#[cfg(test)]
+/// An envoy whose queue reads as full before anything is offered to it. Used only by the
+/// loopback runtime tests, which run on unix alone.
+#[cfg(all(test, unix))]
 pub(crate) struct FullEnvoy;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl EnvoySink for FullEnvoy {
     fn accept(&self, _job: EnvoyJob) -> Result<(), PeerRefusal> {
         Err(PeerRefusal::capacity(RefusalReason::EnvoyBusy))
