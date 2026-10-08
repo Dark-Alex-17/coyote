@@ -511,6 +511,51 @@ mod tests {
     }
 
     #[test]
+    fn usage_probe_brief_treats_a_code_above_a_byte_exactly_like_unknown() {
+        // The brief is the envoy's view of a card: a state code it does not know adds no
+        // line (as code 0 does), is never an error, and the saturated todo counts render.
+        let empty = TodoList::default();
+        let with_code = |code: u64| StatusCard {
+            display_name: Some("Alex".into()),
+            objective: None,
+            state: CardState {
+                code,
+                since_secs: Some(1),
+            },
+            repo: None,
+            plan: None,
+            todo: Some(CardTodo {
+                goal: None,
+                done: u32::MAX,
+                total: u32::MAX,
+            }),
+            about: None,
+            caps: Vec::new(),
+            snapshot_age_secs: None,
+            served_at_secs: 1,
+        };
+        let unknown = assemble_brief(
+            MeshBrief::Auto,
+            Some(&with_code(STATE_UNKNOWN)),
+            None,
+            None,
+            &empty,
+        )
+        .unwrap();
+        for code in [256u64, 1 << 40, u64::MAX] {
+            let wide = assemble_brief(MeshBrief::Auto, Some(&with_code(code)), None, None, &empty)
+                .unwrap();
+            assert_eq!(wide.text, unknown.text, "code {code}");
+            assert!(!wide.text.contains("State:"), "{}", wide.text);
+            assert!(
+                wide.text.contains("Todo: 4294967295/4294967295 done"),
+                "{}",
+                wide.text
+            );
+        }
+    }
+
+    #[test]
     fn brief_is_capped() {
         let long_digest = Digest {
             text: "d".repeat(3 * DIGEST_MAX_CHARS),

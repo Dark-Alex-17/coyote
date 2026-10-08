@@ -1378,7 +1378,7 @@ mod tests {
     use super::*;
     use crate::config::{AppConfig, AppState, WorkingMode, mesh_tools_available};
     use crate::function::{ToolCall, ToolResult, drain_live_notifications, merge_system_channel};
-    use crate::mesh::card::CardState;
+    use crate::mesh::card::{CardState, CardTodo};
     use crate::mesh::hex_lower;
     use crate::mesh::message::{
         Disposition, PEER_INBOX_CAPACITY, Part, PeerMessage, PeerVia, RawPart, RawPeerMessage,
@@ -1805,6 +1805,57 @@ mod tests {
         let full = card_value(&card);
         assert_eq!(full["about"], "reviews Rust");
         assert_eq!(full["caps"], json!(["review", "rust"]));
+    }
+
+    #[test]
+    fn usage_probe_card_value_keeps_a_wide_state_code_exact_and_the_saturated_counts() {
+        // `mesh__peers --with_status` is the JSON consumer of a decoded card: a code the
+        // peer sent above a byte comes through as the exact integer (not a float, not
+        // truncated) with a name that is neither of the known states, and the counts a
+        // reader saturated to `u32::MAX` are emitted as that count.
+        let card = StatusCard {
+            display_name: None,
+            objective: None,
+            state: CardState {
+                code: 1 << 40,
+                since_secs: Some(3),
+            },
+            repo: None,
+            plan: None,
+            todo: Some(CardTodo {
+                goal: None,
+                done: u32::MAX,
+                total: u32::MAX,
+            }),
+            about: None,
+            caps: Vec::new(),
+            snapshot_age_secs: None,
+            served_at_secs: 1,
+        };
+        let value = card_value(&card);
+        assert_eq!(value["state"]["code"].as_u64(), Some(1 << 40));
+        assert_eq!(value["state"]["since_secs"].as_u64(), Some(3));
+        let name = value["state"]["name"]
+            .as_str()
+            .expect("state.name is a string");
+        assert!(
+            !name.is_empty() && name != "idle" && name != "working",
+            "an unknown code is not shown as a known state: {name}"
+        );
+        assert_eq!(value["todo"]["done"].as_u64(), Some(u64::from(u32::MAX)));
+        assert_eq!(value["todo"]["total"].as_u64(), Some(u64::from(u32::MAX)));
+        let text = value.to_string();
+        assert!(text.contains("\"code\":1099511627776"), "{text}");
+        assert!(text.contains("\"done\":4294967295"), "{text}");
+
+        let max = StatusCard {
+            state: CardState {
+                code: u64::MAX,
+                since_secs: None,
+            },
+            ..card
+        };
+        assert_eq!(card_value(&max)["state"]["code"].as_u64(), Some(u64::MAX));
     }
 
     #[test]

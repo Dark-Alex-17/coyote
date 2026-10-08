@@ -19,9 +19,9 @@ pub(crate) const STATUS_CARD_VERSION: u64 = 1;
 
 /// `state.code` values. A code point is never renumbered or reused; new ones are only
 /// appended, and a reader keeps a code it does not know rather than refusing the card.
-pub(crate) const STATE_UNKNOWN: u8 = 0;
-pub(crate) const STATE_IDLE: u8 = 1;
-pub(crate) const STATE_WORKING: u8 = 2;
+pub(crate) const STATE_UNKNOWN: u64 = 0;
+pub(crate) const STATE_IDLE: u64 = 1;
+pub(crate) const STATE_WORKING: u64 = 2;
 
 /// Caps on the text the card carries, in characters, applied on the serving side.
 /// `DISPLAY_NAME_MAX_CHARS` is the peer-facing cap; announces enforce a separate 64-byte
@@ -57,9 +57,12 @@ pub(crate) const CAP_MAX_CHARS: usize = 32;
 /// repository root and nothing more.
 ///
 /// A decoded card is peer-supplied data. Its text has been through `display_text`, so it is
-/// clean and within the caps, but `since_secs`, `snapshot_age_secs` and `served_at_secs` are
-/// kept as sent: clock skew between peers is normal, so no value is refused as too large,
-/// and a consumer turning them into ages or instants must use saturating arithmetic.
+/// clean and within the caps, but the numbers are not clamped. `state.code` is kept as
+/// sent, and a code this reader does not know is rendered as unknown. `since_secs`,
+/// `snapshot_age_secs` and `served_at_secs` are kept as sent too: clock skew between peers
+/// is normal, so no value is refused as too large, and a consumer turning them into ages or
+/// instants must use saturating arithmetic. `todo.done` and `todo.total` are the exception
+/// and saturate to `u32::MAX` on read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StatusCard {
     pub display_name: Option<String>,
@@ -76,7 +79,7 @@ pub(crate) struct StatusCard {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CardState {
-    pub code: u8,
+    pub code: u64,
     pub since_secs: Option<u64>,
 }
 
@@ -156,8 +159,7 @@ impl StatusCard {
             .ok_or_else(|| malformed("`state` is missing"))?;
         let code = state
             .u64("code")?
-            .and_then(|code| u8::try_from(code).ok())
-            .ok_or_else(|| malformed("`state.code` is missing or not a byte"))?;
+            .ok_or_else(|| malformed("`state.code` is missing"))?;
         let repo = match card.map("repo")? {
             Some(repo) => Some(CardRepo {
                 name: repo
@@ -296,10 +298,12 @@ impl<'a> Fields<'a> {
             .transpose()
     }
 
+    /// The uint at `key`, saturated to `u32::MAX`; missing or nil is malformed.
     fn u32(&self, key: &str) -> Result<u32, StatusError> {
-        self.u64(key)?
-            .and_then(|number| u32::try_from(number).ok())
-            .ok_or_else(|| malformed(&format!("`{key}` is missing or not a 32-bit count")))
+        let number = self
+            .u64(key)?
+            .ok_or_else(|| malformed(&format!("`{key}` is missing")))?;
+        Ok(u32::try_from(number).unwrap_or(u32::MAX))
     }
 
     fn map(&self, key: &str) -> Result<Option<Fields<'a>>, StatusError> {
@@ -995,6 +999,261 @@ mod tests {
             (Value::from(key), value),
             (Value::from("served_at_secs"), Value::from(5u64)),
         ])
+    }
+
+    fn card_with_state(state: Vec<(Value, Value)>) -> Value {
+        Value::Map(vec![
+            (Value::from("v"), Value::from(1u64)),
+            (Value::from("state"), Value::Map(state)),
+            (Value::from("served_at_secs"), Value::from(5u64)),
+        ])
+    }
+
+    #[test]
+    fn state_codes_above_a_byte_are_kept_and_rendered_as_unknown() {
+        for code in [256u64, 1u64 << 40, u64::MAX] {
+            let value = card_with_state(vec![(Value::from("code"), Value::from(code))]);
+            let card = StatusCard::from_value(&value).unwrap();
+            assert_eq!(card.state.code, code);
+            let text = render_for_human(&card, now());
+            assert!(text.contains(&format!("state: unknown ({code})")), "{text}");
+        }
+        assert!(matches!(
+            StatusCard::from_value(&card_with_state(vec![(
+                Value::from("code"),
+                Value::from("x")
+            )])),
+            Err(StatusError::Malformed(_))
+        ));
+        assert!(matches!(
+            StatusCard::from_value(&card_with_state(vec![(Value::from("code"), Value::Nil)])),
+            Err(StatusError::Malformed(_))
+        ));
+        assert!(matches!(
+            StatusCard::from_value(&card_with_state(Vec::new())),
+            Err(StatusError::Malformed(_))
+        ));
+    }
+
+    fn todo_map(done: Value, total: Value) -> Value {
+        Value::Map(vec![
+            (Value::from("done"), done),
+            (Value::from("total"), total),
+        ])
+    }
+
+    #[test]
+    fn todo_counts_above_u32_saturate_on_read() {
+        let card = StatusCard::from_value(&card_with(
+            "todo",
+            todo_map(Value::from(1u64 << 33), Value::from(u64::MAX)),
+        ))
+        .unwrap();
+        let todo = card.todo.unwrap();
+        assert_eq!(todo.done, u32::MAX);
+        assert_eq!(todo.total, u32::MAX);
+
+        let card = StatusCard::from_value(&card_with(
+            "todo",
+            todo_map(Value::from(u64::from(u32::MAX)), Value::from(3u64)),
+        ))
+        .unwrap();
+        assert_eq!(card.todo.unwrap().done, u32::MAX);
+
+        assert!(matches!(
+            StatusCard::from_value(&card_with(
+                "todo",
+                todo_map(Value::from("1"), Value::from(2u64))
+            )),
+            Err(StatusError::Malformed(_))
+        ));
+        assert!(matches!(
+            StatusCard::from_value(&card_with("todo", todo_map(Value::Nil, Value::from(2u64)))),
+            Err(StatusError::Malformed(_))
+        ));
+    }
+
+    /// A hand-packed card so the test controls the msgpack *format family* of each
+    /// number, which `Value::from` would normalise away.
+    fn packed_card(code: &[u8], done: &[u8], total: &[u8]) -> Vec<u8> {
+        fn fixstr(text: &str) -> Vec<u8> {
+            let mut out = vec![0xa0 | u8::try_from(text.len()).unwrap()];
+            out.extend_from_slice(text.as_bytes());
+            out
+        }
+        let mut bytes = vec![0x84];
+        bytes.extend(fixstr("v"));
+        bytes.push(0x01);
+        bytes.extend(fixstr("state"));
+        bytes.push(0x82);
+        bytes.extend(fixstr("code"));
+        bytes.extend_from_slice(code);
+        bytes.extend(fixstr("extra"));
+        bytes.push(0xc0);
+        bytes.extend(fixstr("todo"));
+        bytes.push(0x82);
+        bytes.extend(fixstr("done"));
+        bytes.extend_from_slice(done);
+        bytes.extend(fixstr("total"));
+        bytes.extend_from_slice(total);
+        bytes.extend(fixstr("served_at_secs"));
+        bytes.push(0x05);
+        bytes
+    }
+
+    fn read_packed(bytes: &[u8]) -> Result<StatusCard, StatusError> {
+        let value = rmpv::decode::read_value(&mut &bytes[..]).unwrap();
+        StatusCard::from_value(&value)
+    }
+
+    #[test]
+    fn usage_probe_a_uint_is_accepted_from_every_non_negative_msgpack_int_format() {
+        // `uint` means a non-negative integer, whichever int format family the encoder
+        // picked: positive values in the signed formats are kept, negatives and floats are
+        // not, and an unknown `state` sub-key alongside is ignored.
+        let int16_256 = [0xd1, 0x01, 0x00];
+        let int64_2_pow_33 = {
+            let mut out = vec![0xd3];
+            out.extend_from_slice(&(1i64 << 33).to_be_bytes());
+            out
+        };
+        let uint64_2_pow_40 = {
+            let mut out = vec![0xcf];
+            out.extend_from_slice(&(1u64 << 40).to_be_bytes());
+            out
+        };
+        let card = read_packed(&packed_card(&int16_256, &int64_2_pow_33, &uint64_2_pow_40))
+            .expect("positive signed-format ints are uints");
+        assert_eq!(card.state.code, 256);
+        let todo = card.todo.clone().unwrap();
+        assert_eq!((todo.done, todo.total), (u32::MAX, u32::MAX));
+        assert!(
+            render_for_human(&card, now()).contains("state: unknown (256)"),
+            "{}",
+            render_for_human(&card, now())
+        );
+
+        let card = read_packed(&packed_card(&uint64_2_pow_40, &[0x01], &[0x02])).unwrap();
+        assert_eq!(card.state.code, 1 << 40);
+        assert_eq!(card.todo.map(|todo| (todo.done, todo.total)), Some((1, 2)));
+
+        let int8_1 = [0xd0, 0x01];
+        let card = read_packed(&packed_card(&int8_1, &int8_1, &int8_1)).unwrap();
+        assert_eq!(card.state.code, STATE_IDLE);
+        assert!(render_for_human(&card, now()).contains("state: idle"));
+
+        let negative_fixint = [0xff];
+        let float64_one = {
+            let mut out = vec![0xcb];
+            out.extend_from_slice(&1.0f64.to_be_bytes());
+            out
+        };
+        for wrong in [&negative_fixint[..], &float64_one[..]] {
+            for (label, bytes) in [
+                ("code", packed_card(wrong, &[0x01], &[0x02])),
+                ("done", packed_card(&[0x01], wrong, &[0x02])),
+                ("total", packed_card(&[0x01], &[0x01], wrong)),
+            ] {
+                match read_packed(&bytes) {
+                    Err(StatusError::Malformed(message)) => assert!(
+                        message.contains(label) && message.contains("non-negative integer"),
+                        "{label}: {message}"
+                    ),
+                    other => panic!("{label} = {wrong:?} must be Malformed, got {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn usage_probe_saturated_counts_and_wide_codes_are_a_decode_encode_fixed_point() {
+        // Reading saturates `todo.*`; what a consumer then re-emits is the saturated
+        // count, and reading that back changes nothing. The code is re-emitted verbatim.
+        let value = Value::Map(vec![
+            (Value::from("v"), Value::from(1u64)),
+            (
+                Value::from("state"),
+                Value::Map(vec![
+                    (Value::from("code"), Value::from(u64::MAX)),
+                    (Value::from("since_secs"), Value::from(7u64)),
+                ]),
+            ),
+            (
+                Value::from("todo"),
+                todo_map(Value::from(1u64 << 33), Value::from(u64::MAX)),
+            ),
+            (Value::from("served_at_secs"), Value::from(5u64)),
+        ]);
+        let card = StatusCard::from_value(&value).unwrap();
+        assert_eq!(card.state.since_secs, Some(7));
+
+        let reencoded = card.to_value();
+        let fields = Fields::of(&reencoded).unwrap();
+        let state = fields.map("state").unwrap().unwrap();
+        assert_eq!(state.u64("code").unwrap(), Some(u64::MAX));
+        let todo = fields.map("todo").unwrap().unwrap();
+        assert_eq!(todo.u64("done").unwrap(), Some(u64::from(u32::MAX)));
+        assert_eq!(todo.u64("total").unwrap(), Some(u64::from(u32::MAX)));
+
+        assert_eq!(StatusCard::from_value(&reencoded), Ok(card.clone()));
+        let twice = StatusCard::from_value(&reencoded).unwrap().to_value();
+        assert_eq!(encoded(&card), {
+            let mut bytes = Vec::new();
+            rmpv::encode::write_value(&mut bytes, &twice).unwrap();
+            bytes
+        });
+    }
+
+    #[test]
+    fn usage_probe_a_wire_card_at_every_numeric_extreme_renders_both_counts_verbatim() {
+        // Saturation can leave `done` past `total`; the human rendering prints the two
+        // counts as read and computes nothing from them, an unknown code is named with its
+        // value, and the ages at `u64::MAX` are kept as sent and rendered at either end of
+        // the clock without arithmetic overflow.
+        let value = Value::Map(vec![
+            (Value::from("v"), Value::from(1u64)),
+            (
+                Value::from("state"),
+                Value::Map(vec![
+                    (Value::from("code"), Value::from(1u64 << 40)),
+                    (Value::from("since_secs"), Value::from(u64::MAX)),
+                ]),
+            ),
+            (
+                Value::from("todo"),
+                todo_map(Value::from(1u64 << 33), Value::from(5u64)),
+            ),
+            (Value::from("snapshot_age_secs"), Value::from(u64::MAX)),
+            (Value::from("served_at_secs"), Value::from(u64::MAX)),
+        ]);
+        let card = StatusCard::from_value(&value).expect("every number is a uint");
+        assert_eq!(card.state.since_secs, Some(u64::MAX));
+        assert_eq!(card.snapshot_age_secs, Some(u64::MAX));
+        assert_eq!(card.served_at_secs, u64::MAX);
+        let (done, total) = card.todo.as_ref().map(|t| (t.done, t.total)).unwrap();
+        assert_eq!((done, total), (u32::MAX, 5));
+
+        for at in [
+            UNIX_EPOCH,
+            now(),
+            UNIX_EPOCH + Duration::from_secs(u64::MAX / 2),
+        ] {
+            let text = render_for_human(&card, at);
+            assert!(
+                text.contains("\nstate: unknown (1099511627776)\n"),
+                "{text}"
+            );
+            assert!(text.contains("\ntodo: 4294967295/5\n"), "{text}");
+            assert!(text.contains("\nsince: "), "{text}");
+            assert!(
+                text.contains(&format!("\nsnapshot: {}s old when served\n", u64::MAX)),
+                "{text}"
+            );
+            assert!(
+                text.lines().last().unwrap().starts_with("served: "),
+                "{text}"
+            );
+        }
     }
 
     #[test]

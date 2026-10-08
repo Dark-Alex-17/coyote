@@ -575,7 +575,7 @@ Emission order: `code`, `since_secs`.
 
 | Field | Type | Sender puts | Receiver action on any other value |
 |---|---|---|---|
-| `code` | uint fitting u8 | `STATE_UNKNOWN` = `0`, `STATE_IDLE` = `1` or `STATE_WORKING` = `2` | **[MESH-STATUS-017]** Missing or not a byte: the receiver MUST reject the card as `Malformed`; any other byte value is kept (MESH-STATUS-029). |
+| `code` | uint | `STATE_UNKNOWN` = `0`, `STATE_IDLE` = `1` or `STATE_WORKING` = `2` | **[MESH-STATUS-017]** Missing or not a uint: the receiver MUST reject the card as `Malformed`; any other value is kept and one outside `0..=2` is rendered as unknown (MESH-STATUS-029). |
 | `since_secs` | uint | seconds in the current state; omitted when unknown | **[MESH-STATUS-018]** Not a non-negative integer: the receiver MUST reject the card as `Malformed`; absent or `nil`: none. |
 | any other key | any | nothing | **[MESH-STATUS-019]** The receiver MUST ignore it. |
 
@@ -603,8 +603,8 @@ Emission order: `goal`, `done`, `total`.
 | Field | Type | Sender puts | Receiver action on any other value |
 |---|---|---|---|
 | `goal` | str | the todo goal, at most `TODO_GOAL_MAX_CHARS` = `280` characters; omitted when none | **[MESH-STATUS-025]** Not a `str`: the receiver MUST reject the card as `Malformed`; absent or `nil`: none; longer than 280 characters: truncated. |
-| `done` | uint fitting u32 | items done | **[MESH-STATUS-026]** Missing, `nil` or not a 32-bit count: the receiver MUST reject the card as `Malformed`. |
-| `total` | uint fitting u32 | items in total | **[MESH-STATUS-027]** Missing, `nil` or not a 32-bit count: the receiver MUST reject the card as `Malformed`. |
+| `done` | uint | items done | **[MESH-STATUS-026]** Missing, `nil` or not a uint: the receiver MUST reject the card as `Malformed`; a value above `u32::MAX` is saturated to `u32::MAX` on read. |
+| `total` | uint | items in total | **[MESH-STATUS-027]** Missing, `nil` or not a uint: the receiver MUST reject the card as `Malformed`; a value above `u32::MAX` is saturated to `u32::MAX` on read. |
 | any other key | any | nothing | **[MESH-STATUS-028]** The receiver MUST ignore it. |
 
 ### 9.7 Reserved codes and client errors
@@ -617,7 +617,7 @@ Emission order: `goal`, `done`, `total`.
 
 **[MESH-STATUS-029]** A receiver MUST keep a `state.code` it does not know, render it as unknown, and MUST NOT reject the card for it.
 
-**[MESH-STATUS-030]** A receiver MUST keep numeric fields as sent; consumers saturate when they compute with them.
+**[MESH-STATUS-030]** A receiver MUST keep `state.code`, `since_secs`, `snapshot_age_secs` and `served_at_secs` as sent; consumers saturate when they compute with them. `todo.done` and `todo.total` are the exception and saturate to `u32::MAX` on read (MESH-STATUS-026, MESH-STATUS-027).
 
 The requester's typed errors are `NotServed` (a dispatch error map, `no_provider` or `unknown_path`, section 6.6), `Malformed`, `UnsupportedVersion` and `Transport`; the requester tries `DispatchError::from_value` before `StatusCard::from_value`.
 

@@ -5303,25 +5303,55 @@ fn status_vectors() -> Vec<Vector> {
             "MESH-STATUS-016",
             Kind::Invalid,
             set(card_value(), "state", map(vec![("code", Value::Nil)])),
-            malformed("`state.code` is missing or not a byte"),
+            malformed("`state.code` is missing"),
         ),
         card(
             "MESH-STATUS-017",
             Kind::Invalid,
             set(card_value(), "state", Value::Map(vec![])),
-            malformed("`state.code` is missing or not a byte"),
+            malformed("`state.code` is missing"),
         ),
         card(
             "MESH-STATUS-017",
             Kind::Invalid,
             set(card_value(), "state", state(Value::Nil)),
-            malformed("`state.code` is missing or not a byte"),
+            malformed("`state.code` is missing"),
         ),
         card(
             "MESH-STATUS-017",
-            Kind::Invalid,
+            Kind::Boundary,
             set(card_value(), "state", state(Value::from(256u64))),
-            malformed("`state.code` is missing or not a byte"),
+            accepted(StatusCard {
+                state: CardState {
+                    code: 256,
+                    since_secs: None,
+                },
+                ..minimal_card()
+            }),
+        ),
+        card(
+            "MESH-STATUS-017",
+            Kind::Boundary,
+            set(card_value(), "state", state(Value::from(1u64 << 40))),
+            accepted(StatusCard {
+                state: CardState {
+                    code: 1 << 40,
+                    since_secs: None,
+                },
+                ..minimal_card()
+            }),
+        ),
+        card(
+            "MESH-STATUS-017",
+            Kind::Boundary,
+            set(card_value(), "state", state(Value::from(u64::MAX))),
+            accepted(StatusCard {
+                state: CardState {
+                    code: u64::MAX,
+                    since_secs: None,
+                },
+                ..minimal_card()
+            }),
         ),
         card(
             "MESH-STATUS-017",
@@ -5748,19 +5778,25 @@ fn status_vectors() -> Vec<Vector> {
             "MESH-STATUS-026",
             Kind::Invalid,
             card_sub("todo", vec![("total", Value::from(2u32))]),
-            malformed("`done` is missing or not a 32-bit count"),
+            malformed("`done` is missing"),
         ),
         card(
             "MESH-STATUS-026",
             Kind::Invalid,
             todo_map(None, Value::Nil, Value::from(2u32)),
-            malformed("`done` is missing or not a 32-bit count"),
+            malformed("`done` is missing"),
         ),
         card(
             "MESH-STATUS-026",
-            Kind::Invalid,
+            Kind::Boundary,
             todo_map(None, Value::from(1u64 << 32), Value::from(2u32)),
-            malformed("`done` is missing or not a 32-bit count"),
+            accepted(with_todo(None, u32::MAX, 2)),
+        ),
+        card(
+            "MESH-STATUS-026",
+            Kind::Boundary,
+            todo_map(None, Value::from(1u64 << 33), Value::from(2u32)),
+            accepted(with_todo(None, u32::MAX, 2)),
         ),
         card(
             "MESH-STATUS-026",
@@ -5783,6 +5819,12 @@ fn status_vectors() -> Vec<Vector> {
         card(
             "MESH-STATUS-026",
             Kind::Boundary,
+            todo_map(None, Value::from(u64::MAX), Value::from(u64::MAX)),
+            accepted(with_todo(None, u32::MAX, u32::MAX)),
+        ),
+        card(
+            "MESH-STATUS-026",
+            Kind::Boundary,
             todo_map(None, Value::from(0u32), Value::from(0u32)),
             accepted(with_todo(None, 0, 0)),
         ),
@@ -5790,19 +5832,25 @@ fn status_vectors() -> Vec<Vector> {
             "MESH-STATUS-027",
             Kind::Invalid,
             card_sub("todo", vec![("done", Value::from(1u32))]),
-            malformed("`total` is missing or not a 32-bit count"),
+            malformed("`total` is missing"),
         ),
         card(
             "MESH-STATUS-027",
             Kind::Invalid,
             todo_map(None, Value::from(1u32), Value::Nil),
-            malformed("`total` is missing or not a 32-bit count"),
+            malformed("`total` is missing"),
         ),
         card(
             "MESH-STATUS-027",
-            Kind::Invalid,
+            Kind::Boundary,
             todo_map(None, Value::from(1u32), Value::from(1u64 << 32)),
-            malformed("`total` is missing or not a 32-bit count"),
+            accepted(with_todo(None, 1, u32::MAX)),
+        ),
+        card(
+            "MESH-STATUS-027",
+            Kind::Boundary,
+            todo_map(None, Value::from(1u32), Value::from(1u64 << 33)),
+            accepted(with_todo(None, 1, u32::MAX)),
         ),
         card(
             "MESH-STATUS-027",
@@ -5820,6 +5868,12 @@ fn status_vectors() -> Vec<Vector> {
             "MESH-STATUS-027",
             Kind::Boundary,
             todo_map(None, Value::from(1u32), Value::from(u32::MAX)),
+            accepted(with_todo(None, 1, u32::MAX)),
+        ),
+        card(
+            "MESH-STATUS-027",
+            Kind::Boundary,
+            todo_map(None, Value::from(1u32), Value::from(u64::MAX)),
             accepted(with_todo(None, 1, u32::MAX)),
         ),
         card(
@@ -5899,7 +5953,7 @@ fn status_vectors() -> Vec<Vector> {
                         set(card_value(), "served_at_secs", Value::from(u64::MAX)),
                         "state",
                         map(vec![
-                            ("code", Value::from(STATE_WORKING)),
+                            ("code", Value::from(u64::MAX)),
                             ("since_secs", Value::from(u64::MAX)),
                         ]),
                     ),
@@ -5908,7 +5962,7 @@ fn status_vectors() -> Vec<Vector> {
                 ),
                 expect: accepted(StatusCard {
                     state: CardState {
-                        code: STATE_WORKING,
+                        code: u64::MAX,
                         since_secs: Some(u64::MAX),
                     },
                     snapshot_age_secs: Some(u64::MAX),
