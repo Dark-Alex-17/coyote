@@ -3537,12 +3537,18 @@ impl<'a> DecodedExtras<'a> {
     }
 }
 
-/// MESH-MSG-004/051: a decoded reply always names the message it answers.
-fn check_reply_names_its_question(kind: PeerKind, in_reply_to: Option<&str>) -> Result<(), String> {
+/// MESH-MSG-004/051: a decoded reply always names the message it answers and a decoded
+/// bulletin never names one.
+fn check_in_reply_to_per_kind(kind: PeerKind, in_reply_to: Option<&str>) -> Result<(), String> {
     ensure(
         kind != PeerKind::Reply || in_reply_to.is_some_and(is_wire_id),
         || format!("MESH-MSG-004/051: a decoded reply carries in_reply_to, got {in_reply_to:?}"),
-    )
+    )?;
+    ensure(kind != PeerKind::Bulletin || in_reply_to.is_none(), || {
+        format!(
+            "MESH-MSG-004/051: a decoded bulletin reads in_reply_to as absent, got {in_reply_to:?}"
+        )
+    })
 }
 
 fn check_extras(entries: &[(Value, Value)], extras: &DecodedExtras<'_>) -> Result<(), String> {
@@ -3690,7 +3696,7 @@ fn check_body(value: &Value) -> Result<(), String> {
                     first(entries, "ts")
                 )
             })?;
-            check_reply_names_its_question(body.kind, body.in_reply_to.as_deref())?;
+            check_in_reply_to_per_kind(body.kind, body.in_reply_to.as_deref())?;
             check_extras(entries, &DecodedExtras::of_body(&body))?;
             let peer = OutboundPeer {
                 kind: body.kind,
@@ -4145,7 +4151,7 @@ fn check_peer_fields(fields: &Value) -> Result<(), String> {
             })?;
             let data = custom_data(fields)
                 .ok_or_else(|| "MESH-MSG-052: a peer came from a custom data map".to_string())?;
-            check_reply_names_its_question(peer.kind, peer.in_reply_to.as_deref())?;
+            check_in_reply_to_per_kind(peer.kind, peer.in_reply_to.as_deref())?;
             check_extras(data, &DecodedExtras::of_peer(peer))?;
             check_admission(&peer.parts, peer.dropped_parts)
         }

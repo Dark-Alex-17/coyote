@@ -1072,7 +1072,8 @@ fn body_extras(entries: &[(Value, Value)], kind: PeerKind) -> BodyExtras {
 
 /// Reads a `/message` body. Anything the sender's own `OutboundPeer::new` would have
 /// refused is refused here too: a well-behaved peer never sends it, so it is not worth
-/// truncating for. Fields that nest too deeply are dropped and the message kept.
+/// truncating for. Fields that nest too deeply are dropped and the message kept, and a
+/// bulletin's `in_reply_to` is read as absent once it has passed the id check.
 pub(crate) fn from_r3_body(body: &Value) -> Result<PeerBody, &'static str> {
     let entries = body.as_map().ok_or("the body is not a map")?;
     if entry(entries, "v").and_then(Value::as_u64) != Some(PEER_WIRE_VERSION) {
@@ -1096,6 +1097,7 @@ pub(crate) fn from_r3_body(body: &Value) -> Result<PeerBody, &'static str> {
     if kind == PeerKind::Reply && in_reply_to.is_none() {
         return Err(REPLY_WITHOUT_IN_REPLY_TO);
     }
+    let in_reply_to = in_reply_to.filter(|_| kind != PeerKind::Bulletin);
     let title = match entry(entries, "title") {
         None => None,
         Some(value) => Some(
@@ -1260,6 +1262,7 @@ pub(crate) fn decode_peer_lxmf(message: &InboundMessage) -> PeerLxmf {
     if kind == PeerKind::Reply && in_reply_to.is_none() {
         return PeerLxmf::Malformed(REPLY_WITHOUT_IN_REPLY_TO);
     }
+    let in_reply_to = in_reply_to.filter(|_| kind != PeerKind::Bulletin);
     let BodyExtras {
         thread,
         disposition,
@@ -2643,6 +2646,23 @@ mod tests {
             Ok(Some("q-1".into())),
             "a reply naming its question decodes"
         );
+        assert_eq!(
+            from_r3_body(&good(|e| {
+                set(e, "kind", Value::from("bulletin"));
+                set(e, "in_reply_to", Value::from("q-1"))
+            }))
+            .map(|body| (body.kind, body.in_reply_to)),
+            Ok((PeerKind::Bulletin, None)),
+            "a bulletin's in_reply_to reads as absent"
+        );
+        assert_eq!(
+            from_r3_body(&good(|e| {
+                set(e, "kind", Value::from("bulletin"));
+                set(e, "in_reply_to", Value::from(7))
+            })),
+            Err("in_reply_to is not a message id"),
+            "a bulletin's in_reply_to is still judged before it is dropped"
+        );
 
         for (what, body) in [
             ("no ts", good(|e| drop_key(e, "ts"))),
@@ -2893,6 +2913,15 @@ mod tests {
             (
                 Value::Map(vec![
                     name_hash.clone(),
+                    (Value::from("kind"), Value::from("bulletin")),
+                    (Value::from("id"), Value::from("b-1")),
+                    (Value::from("in_reply_to"), Value::from(7)),
+                ]),
+                "in_reply_to is not a message id",
+            ),
+            (
+                Value::Map(vec![
+                    name_hash.clone(),
                     (Value::from("kind"), Value::from("reply")),
                     (Value::from("id"), Value::from("r-1")),
                 ]),
@@ -2915,7 +2944,7 @@ mod tests {
         );
 
         let minimal = with_data(Value::Map(vec![
-            name_hash,
+            name_hash.clone(),
             (Value::from("kind"), Value::Binary(b"bulletin".to_vec())),
             (Value::from("id"), Value::from("b-1")),
         ]));
@@ -2942,6 +2971,28 @@ mod tests {
             })),
             "invalid UTF-8 is read lossily, never refused"
         );
+
+        let bulletin_naming_a_message = with_data(Value::Map(vec![
+            name_hash,
+            (Value::from("kind"), Value::from("bulletin")),
+            (Value::from("id"), Value::from("b-1")),
+            (Value::from("in_reply_to"), Value::from("q-1")),
+        ]));
+        match decode_peer_lxmf(&inbound(
+            Some(bulletin_naming_a_message),
+            None,
+            Some(b"hi".to_vec()),
+            &hash_of("s"),
+        )) {
+            PeerLxmf::Peer(peer) => {
+                assert_eq!(peer.kind, PeerKind::Bulletin);
+                assert_eq!(
+                    peer.in_reply_to, None,
+                    "a bulletin's in_reply_to reads as absent"
+                );
+            }
+            other => panic!("bulletin with in_reply_to: {other:?}"),
+        }
     }
 
     #[test]
@@ -4483,7 +4534,7 @@ mod tests {
     /// judged only when present: a valid id is kept, anything else present (a number,
     /// a non-id string) is `InvalidData` on every kind, and `nil` reads as absent as
     /// every optional body key does. A `reply` needs one, so `nil` there is refused as
-    /// missing; a `bulletin` carrying one is not refused.
+    /// missing; a `bulletin` carrying a valid one is not refused and reads it as absent.
     #[test]
     fn usage_probe_in_reply_to_is_optional_on_a_message_or_ask_required_on_a_reply_and_judged_when_present()
      {
@@ -4549,6 +4600,10 @@ mod tests {
         let bulletin = from_r3_body(&body("bulletin", Some(Value::from("q-1"))))
             .expect("a bulletin carrying an in_reply_to is not refused");
         assert_eq!(bulletin.kind, PeerKind::Bulletin);
+        assert_eq!(
+            bulletin.in_reply_to, None,
+            "a bulletin's in_reply_to reads as absent"
+        );
         assert_eq!(
             from_r3_body(&body("bulletin", None)).map(|b| b.in_reply_to),
             Ok(None)

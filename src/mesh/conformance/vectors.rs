@@ -6339,6 +6339,19 @@ fn message_vectors() -> Vec<Vector> {
         ),
         message(
             "MESH-MSG-004",
+            Kind::Valid,
+            set(
+                set(body_value(), "kind", Value::from("bulletin")),
+                "in_reply_to",
+                Value::from("m-0"),
+            ),
+            accepted_body(PeerBody {
+                kind: PeerKind::Bulletin,
+                ..body()
+            }),
+        ),
+        message(
+            "MESH-MSG-004",
             Kind::Boundary,
             set(
                 body_value(),
@@ -7634,6 +7647,16 @@ fn message_vectors() -> Vec<Vector> {
                 Value::from("m-0"),
             ))),
             peer(PeerKind::Message, "m-1", Some("m-0")),
+        ),
+        lxmf_peer(
+            "MESH-MSG-051",
+            Kind::Valid,
+            peer_inbound(peer_fields(set(
+                set(peer_data(), "kind", Value::from("bulletin")),
+                "in_reply_to",
+                Value::from("m-0"),
+            ))),
+            peer(PeerKind::Bulletin, "m-1", None),
         ),
         lxmf_peer(
             "MESH-MSG-051",
