@@ -3759,10 +3759,13 @@ fn code_vectors() -> Vec<Vector> {
                     ("reply", PeerKind::Reply),
                     ("bulletin", PeerKind::Bulletin),
                 ] {
+                    let body = match kind {
+                        PeerKind::Reply => reply_value(),
+                        _ => set(body_value(), "kind", Value::from(name)),
+                    };
                     same(
                         &format!("kind {name}"),
-                        from_r3_body(&set(body_value(), "kind", Value::from(name)))
-                            .map(|body| body.kind),
+                        from_r3_body(&body).map(|body| body.kind),
                         Ok(kind),
                     )?;
                     same(
@@ -6047,6 +6050,7 @@ const V_ERR: &str = "v is missing or not the supported version";
 const KIND_ERR: &str = "kind is missing or unknown";
 const ID_ERR: &str = "id is missing, blank, too long or outside the id alphabet";
 const IN_REPLY_TO_ERR: &str = "in_reply_to is not a message id";
+const REPLY_WITHOUT_IN_REPLY_TO: &str = "in_reply_to is missing on a reply";
 const TITLE_ERR: &str = "title is not text or is too long";
 const CONTENT_ERR: &str = "content is missing, not text or too long";
 const FIELDS_ERR: &str = "fields is not a map";
@@ -6163,12 +6167,8 @@ fn message_vectors() -> Vec<Vector> {
         message(
             "MESH-MSG-002",
             Kind::Valid,
-            set(body_value(), "kind", Value::from("reply")),
-            accepted_body(PeerBody {
-                kind: PeerKind::Reply,
-                disposition: Some(Disposition::Answered),
-                ..body()
-            }),
+            reply_value(),
+            accepted_body(reply_body()),
         ),
         message(
             "MESH-MSG-002",
@@ -6309,6 +6309,12 @@ fn message_vectors() -> Vec<Vector> {
             Kind::Invalid,
             set(body_value(), "in_reply_to", Value::Array(vec![])),
             refused(IN_REPLY_TO_ERR),
+        ),
+        message(
+            "MESH-MSG-004",
+            Kind::Invalid,
+            set(body_value(), "kind", Value::from("reply")),
+            refused(REPLY_WITHOUT_IN_REPLY_TO),
         ),
         message(
             "MESH-MSG-004",
@@ -7492,8 +7498,8 @@ fn message_vectors() -> Vec<Vector> {
         lxmf_peer(
             "MESH-MSG-049",
             Kind::Valid,
-            peer_inbound(peer_fields(set(peer_data(), "kind", Value::from("reply")))),
-            peer(PeerKind::Reply, "m-1", None),
+            peer_inbound(peer_fields(peer_reply_data())),
+            peer(PeerKind::Reply, "m-1", Some("q-1")),
         ),
         lxmf_peer(
             "MESH-MSG-049",
@@ -7600,6 +7606,12 @@ fn message_vectors() -> Vec<Vector> {
                 Value::from(text(PEER_ID_MAX_CHARS + 1)),
             ))),
             peer_malformed("in_reply_to is not a message id"),
+        ),
+        lxmf_peer(
+            "MESH-MSG-051",
+            Kind::Invalid,
+            peer_inbound(peer_fields(set(peer_data(), "kind", Value::from("reply")))),
+            peer_malformed(REPLY_WITHOUT_IN_REPLY_TO),
         ),
         lxmf_peer(
             "MESH-MSG-051",
@@ -9579,12 +9591,17 @@ fn part_vectors() -> Vec<Vector> {
 // ---------------------------------------------------------------------------------------
 
 fn reply_value() -> Value {
-    set(body_value(), "kind", Value::from("reply"))
+    set(
+        set(body_value(), "kind", Value::from("reply")),
+        "in_reply_to",
+        Value::from("q-1"),
+    )
 }
 
 fn reply_body() -> PeerBody {
     PeerBody {
         kind: PeerKind::Reply,
+        in_reply_to: Some("q-1".to_string()),
         disposition: Some(Disposition::Answered),
         ..body()
     }
@@ -9611,6 +9628,7 @@ fn lxmf_body() -> LxmfPeer {
 fn lxmf_reply() -> LxmfPeer {
     LxmfPeer {
         kind: PeerKind::Reply,
+        in_reply_to: Some("q-1".to_string()),
         disposition: Some(Disposition::Answered),
         ..lxmf_body()
     }
@@ -9621,7 +9639,11 @@ fn lxmf(peer: LxmfPeer) -> PeerLxmf {
 }
 
 fn peer_reply_data() -> Value {
-    set(peer_data(), "kind", Value::from("reply"))
+    set(
+        set(peer_data(), "kind", Value::from("reply")),
+        "in_reply_to",
+        Value::from("q-1"),
+    )
 }
 
 /// A reply with every optional key set, for the key-order and sender-contract rows.

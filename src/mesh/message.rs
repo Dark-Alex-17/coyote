@@ -68,6 +68,7 @@ pub(crate) const MAX_PARTS: usize = 8;
 pub(crate) const MAX_PARTS_BYTES: usize = 104 * 1024;
 const SHA256_MISMATCH: &str = "file part sha256 does not match its bytes";
 const DATA_PART_RULE: &str = "data part is too large or nests too deeply";
+const REPLY_WITHOUT_IN_REPLY_TO: &str = "in_reply_to is missing on a reply";
 /// Peer envelopes the inbox holds before the oldest is dropped; the loss is counted.
 pub(crate) const PEER_INBOX_CAPACITY: usize = 64;
 /// Ceiling on the direct attempt. The handler answers before anything slow happens, so a
@@ -1092,6 +1093,9 @@ pub(crate) fn from_r3_body(body: &Value) -> Result<PeerBody, &'static str> {
                 .ok_or("in_reply_to is not a message id")?,
         ),
     };
+    if kind == PeerKind::Reply && in_reply_to.is_none() {
+        return Err(REPLY_WITHOUT_IN_REPLY_TO);
+    }
     let title = match entry(entries, "title") {
         None => None,
         Some(value) => Some(
@@ -1253,6 +1257,9 @@ pub(crate) fn decode_peer_lxmf(message: &InboundMessage) -> PeerLxmf {
         Some(Some(id)) if is_wire_id(&id) => Some(id),
         Some(_) => return PeerLxmf::Malformed("in_reply_to is not a message id"),
     };
+    if kind == PeerKind::Reply && in_reply_to.is_none() {
+        return PeerLxmf::Malformed(REPLY_WITHOUT_IN_REPLY_TO);
+    }
     let BodyExtras {
         thread,
         disposition,
@@ -2582,6 +2589,11 @@ mod tests {
                 "in_reply_to is not a message id",
             ),
             (
+                "reply without in_reply_to",
+                good(|e| set(e, "kind", Value::from("reply"))),
+                REPLY_WITHOUT_IN_REPLY_TO,
+            ),
+            (
                 "long title",
                 good(|e| {
                     set(
@@ -2616,6 +2628,21 @@ mod tests {
         ] {
             assert_eq!(from_r3_body(&body), Err(why), "{what}");
         }
+
+        assert_eq!(
+            from_r3_body(&good(|_| {})).map(|body| body.in_reply_to),
+            Ok(None),
+            "a message may omit in_reply_to"
+        );
+        assert_eq!(
+            from_r3_body(&good(|e| {
+                set(e, "kind", Value::from("reply"));
+                set(e, "in_reply_to", Value::from("q-1"))
+            }))
+            .map(|body| body.in_reply_to),
+            Ok(Some("q-1".into())),
+            "a reply naming its question decodes"
+        );
 
         for (what, body) in [
             ("no ts", good(|e| drop_key(e, "ts"))),
@@ -2862,6 +2889,14 @@ mod tests {
                     (Value::from("in_reply_to"), Value::from(7)),
                 ]),
                 "in_reply_to is not a message id",
+            ),
+            (
+                Value::Map(vec![
+                    name_hash.clone(),
+                    (Value::from("kind"), Value::from("reply")),
+                    (Value::from("id"), Value::from("r-1")),
+                ]),
+                REPLY_WITHOUT_IN_REPLY_TO,
             ),
         ] {
             assert_eq!(
@@ -4267,6 +4302,101 @@ mod tests {
         assert_eq!(delivered[0].message_id, out.id);
         assert_eq!(delivered[0].content, "no clock");
         assert_eq!(delivered[0].timestamp, 0.0);
+    }
+
+    /// A link reply that names no `in_reply_to` is refused with `InvalidData` before the
+    /// surface sees it.
+    #[tokio::test]
+    async fn a_link_reply_without_in_reply_to_is_refused_as_invalid_data() {
+        let identity = PrivateIdentity::new_from_rand(OsRng);
+        let origin = OriginName([6u8; NAME_HASH_LEN]);
+        let destination = destination_address(&origin.0, identity.address_hash()).to_hex_string();
+        let surface = Arc::new(RecordingSurface::admitting(1));
+        let handler = PeerMessageHandler::new(Arc::downgrade(&surface) as Weak<dyn PeerSurface>);
+        let out = OutboundPeer::new(PeerKind::Reply, "an answer", None, Some("q-1"), None).unwrap();
+        let Value::Map(mut entries) = to_r3_body(&out, 1_700_000_000.0) else {
+            unreachable!()
+        };
+        entries.retain(|(key, _)| key.as_str() != Some("in_reply_to"));
+        let request = AdmittedRequest {
+            link_id: LinkId::new_from_rand(OsRng),
+            identity: *identity.as_identity(),
+            destination_hash: AddressHash::new_from_hex_string(&destination).unwrap(),
+            request_id: RequestId::from([1u8; 16]),
+            path_hash: PathHash::of(MESSAGE_PATH),
+            requested_at: 1_700_000_000.0,
+            body: Value::Map(entries),
+            branch: SizeBranch::Packet,
+        };
+
+        assert!(matches!(
+            handler.handle(request).await,
+            Reply::Code(RefusalCode::InvalidData)
+        ));
+        assert_eq!(surface.offered(), 0);
+        assert!(surface.delivered.lock().is_empty());
+        assert!(surface.filed.lock().is_empty());
+    }
+
+    /// A propagated reply that names no `in_reply_to` is dropped as malformed, like any
+    /// other mis-shaped peer message, and never reaches the surface or the inner sink.
+    #[test]
+    fn a_propagated_reply_without_in_reply_to_is_dropped_as_malformed() {
+        crate::testing::install_log_collector();
+        let identity = hash_of("id-peer-bare-reply");
+        let origin = OriginName([6u8; NAME_HASH_LEN]);
+        let destination = destination_address(
+            &origin.0,
+            &AddressHash::new_from_hex_string(&identity).unwrap(),
+        )
+        .to_hex_string();
+        let (trust, _tmp) = TrustList::default()
+            .destination(&destination, &identity)
+            .open("peer-routing-bare-reply");
+        let surface = Arc::new(RecordingSurface::default());
+        let inner = CountingSink::default();
+        let routing = PeerRouting {
+            trust: &trust,
+            surface: Some(surface.clone() as Arc<dyn PeerSurface>),
+            inner: &inner,
+        };
+        let bare = OutboundPeer::new(PeerKind::Reply, "an answer", None, None, None).unwrap();
+        let stored = peer_lxmf_message(&bare, &origin);
+        routing.deliver(inbound(
+            stored.fields.clone(),
+            None,
+            Some(stored.content.clone()),
+            &identity,
+        ));
+
+        assert_eq!(surface.offered(), 0);
+        assert!(surface.delivered.lock().is_empty());
+        assert!(surface.filed.lock().is_empty());
+        assert!(inner.messages.lock().is_empty());
+        let logs = crate::testing::debug_snapshot();
+        assert!(
+            logs.iter().any(|line| line
+                == &format!(
+                    "Propagated peer message from {} dropped: {REPLY_WITHOUT_IN_REPLY_TO}",
+                    &identity[..8]
+                )),
+            "{logs:#?}"
+        );
+
+        let answered =
+            OutboundPeer::new(PeerKind::Reply, "an answer", None, Some("q-1"), None).unwrap();
+        let stored = peer_lxmf_message(&answered, &origin);
+        routing.deliver(inbound(
+            stored.fields.clone(),
+            None,
+            Some(stored.content),
+            &identity,
+        ));
+        assert_eq!(surface.delivered.lock().len(), 1);
+        assert_eq!(
+            surface.delivered.lock()[0].in_reply_to.as_deref(),
+            Some("q-1")
+        );
     }
 
     /// A propagated message from a sender over its limit is filed, but its inline

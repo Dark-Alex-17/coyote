@@ -3267,12 +3267,13 @@ fn check_access_fields(fields: &Value) -> Result<(), String> {
 
 // --- /message body (section 10) --------------------------------------------------------
 
-const BODY_REASONS: [&str; 8] = [
+const BODY_REASONS: [&str; 9] = [
     "the body is not a map",
     "v is missing or not the supported version",
     "kind is missing or unknown",
     "id is missing, blank, too long or outside the id alphabet",
     "in_reply_to is not a message id",
+    "in_reply_to is missing on a reply",
     "title is not text or is too long",
     "content is missing, not text or too long",
     "fields is not a map",
@@ -3536,6 +3537,14 @@ impl<'a> DecodedExtras<'a> {
     }
 }
 
+/// MESH-MSG-004/051: a decoded reply always names the message it answers.
+fn check_reply_names_its_question(kind: PeerKind, in_reply_to: Option<&str>) -> Result<(), String> {
+    ensure(
+        kind != PeerKind::Reply || in_reply_to.is_some_and(is_wire_id),
+        || format!("MESH-MSG-004/051: a decoded reply carries in_reply_to, got {in_reply_to:?}"),
+    )
+}
+
 fn check_extras(entries: &[(Value, Value)], extras: &DecodedExtras<'_>) -> Result<(), String> {
     ensure(extras.thread.is_none_or(is_wire_id), || {
         format!(
@@ -3681,6 +3690,7 @@ fn check_body(value: &Value) -> Result<(), String> {
                     first(entries, "ts")
                 )
             })?;
+            check_reply_names_its_question(body.kind, body.in_reply_to.as_deref())?;
             check_extras(entries, &DecodedExtras::of_body(&body))?;
             let peer = OutboundPeer {
                 kind: body.kind,
@@ -3955,7 +3965,7 @@ fn check_announce(bytes: &[u8]) -> Result<(), String> {
 
 // --- LXMF custom fields (sections 8.6 and 10.8) ----------------------------------------
 
-const PEER_REASONS: [&str; 7] = [
+const PEER_REASONS: [&str; 8] = [
     "custom data is missing or not a map",
     "name_hash is missing or not binary",
     "name_hash is not 10 bytes",
@@ -3963,6 +3973,7 @@ const PEER_REASONS: [&str; 7] = [
     "id is missing or blank",
     "id is too long or has characters outside the id alphabet",
     "in_reply_to is not a message id",
+    "in_reply_to is missing on a reply",
 ];
 
 const KNOCK_REASONS: [&str; 3] = [
@@ -4134,6 +4145,7 @@ fn check_peer_fields(fields: &Value) -> Result<(), String> {
             })?;
             let data = custom_data(fields)
                 .ok_or_else(|| "MESH-MSG-052: a peer came from a custom data map".to_string())?;
+            check_reply_names_its_question(peer.kind, peer.in_reply_to.as_deref())?;
             check_extras(data, &DecodedExtras::of_peer(peer))?;
             check_admission(&peer.parts, peer.dropped_parts)
         }
