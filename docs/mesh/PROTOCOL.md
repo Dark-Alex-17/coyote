@@ -680,7 +680,7 @@ Acknowledgement (`received_reply`; `received_reply_is_recognised_only_for_its_id
 
 **[MESH-MSG-020]** A receiver MUST answer with silence when its inbox surface is gone or delivery fails.
 
-**[MESH-MSG-021]** A receiver MUST send the acknowledgement as soon as the message is filed, before any envoy run.
+**[MESH-MSG-021]** A receiver MUST send the acknowledgement as soon as the message is filed, before any envoy run, and MUST NOT run the envoy twice for one body: a `message` or `ask` whose sending identity and `id` it has already handed to the envoy within `BODY_DEDUP_HORIZON` = `86400` seconds, over a window of at most `BODY_DEDUP_CAPACITY` = `4096` pairs with the oldest forgotten first and nothing persisted, is filed in the inbox as a separate entry instead, so a body acknowledged on a link whose acknowledgement was lost and re-sent by store-and-forward is read by the human twice and run once (`a_body_handed_to_the_envoy_once_is_filed_not_run_again_when_it_returns_by_store_and_forward`, `the_envoy_window_keys_on_the_sending_identity_and_the_id_together`, `the_envoy_window_forgets_a_body_past_its_horizon`, `the_envoy_window_forgets_the_oldest_body_past_its_capacity`, src/mesh/node.rs).
 
 ### 10.4 Sender outcome
 
@@ -1509,7 +1509,7 @@ The attacker is on the path between two nodes or operates a propagation node. Th
 | Eavesdropping on a Link | Reticulum's: every R3 exchange runs inside a Link, whose encryption this document inherits | MESH-SEC-001 |
 | Eavesdropping on an announce | In scope: announce application data is plaintext by design and carries nothing private | MESH-SEC-002 |
 | Eavesdropping at rest | In scope for the mesh log lines of section 17 and out of scope for the on-disk stores, the staging inbox and the model client's own log lines, as section 15.6 and the close of section 17 set out | section 17, section 15.6 |
-| Replay | In scope: identity is bound to the Link, and store-and-forward bodies are deduplicated by id inside a stated window | MESH-SEC-003, MESH-SEC-007 |
+| Replay | In scope: identity is bound to the Link, and store-and-forward bodies are deduplicated by id inside a stated window, and a body re-sent by store-and-forward after a lost link acknowledgement runs the envoy once | MESH-SEC-003, MESH-SEC-007, MESH-MSG-021 |
 | Insertion | In scope: an unproven or unknown identity hears silence, and a fetched body needs a verifying signature and a trusted signer | MESH-SEC-001, MESH-SEC-005 |
 | Deletion | Out of scope: neither Reticulum nor LXMF guarantees delivery, so a dropped request is a timeout and a dropped spooled message is invisible to both ends | MESH-SEC-004 |
 | Modification | Reticulum's on a Link; in scope for a spooled message, whose signature covers destination, source and payload | MESH-SEC-006 |
@@ -1767,6 +1767,8 @@ A leniency is a place where the reference deliberately does something other than
 | `MIN_FETCHED_MESSAGE_BYTES` | `112` | src/mesh/propagation_fetch.rs | bounds_leave_room_under_the_transport_and_response_caps |
 | `DEDUP_CAPACITY` | `4096` | src/mesh/propagation_fetch.rs | dedup_evicts_the_oldest_past_capacity_and_logs_it |
 | `DEDUP_HORIZON` | `15552000` | src/mesh/propagation_fetch.rs | bounds_leave_room_under_the_transport_and_response_caps |
+| `BODY_DEDUP_CAPACITY` | `4096` | src/mesh/node.rs | the_envoy_window_forgets_the_oldest_body_past_its_capacity |
+| `BODY_DEDUP_HORIZON` | `86400` | src/mesh/node.rs | the_envoy_window_forgets_a_body_past_its_horizon |
 | `MAX_UNKNOWN_SOURCE_DEFERRALS` | `3` | src/mesh/propagation_fetch.rs | an_unknown_source_is_deferred_for_three_sightings_and_a_heartbeat_then_given_up_on |
 | `UNKNOWN_SOURCE_DEFERRAL_HORIZON` | `900` | src/mesh/propagation_fetch.rs | an_unknown_source_is_deferred_for_three_sightings_and_a_heartbeat_then_given_up_on |
 | `MAX_DEFERRED_IDS` | `256` | src/mesh/propagation_fetch.rs | deferrals_evict_the_longest_deferred_past_capacity_and_log_it |

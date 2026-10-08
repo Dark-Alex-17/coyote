@@ -73,7 +73,7 @@ use rns_transport::iface::auto_runtime::{
 use rns_transport::iface::tcp_client::TcpClient;
 use rns_transport::iface::{IfaceRole, InterfaceMode};
 use rns_transport::transport::{AnnounceEvent, Transport, TransportConfig};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -101,6 +101,20 @@ const LAN_CHANNEL_CAPACITY: usize = 128;
 const PEER_PERSIST_INTERVAL_SECS: u64 = 30;
 /// Refusal shared by `MeshSlot::install` and the `.mesh on` pre-check.
 pub(crate) const MESH_ALREADY_ON: &str = "Mesh is already on in this process. Run `.mesh off` first, then `.mesh on` to start it again with the current settings.";
+
+/// How many (sending identity, message id) pairs the slot remembers as handed to the
+/// envoy. A body reaches a receiver twice when a link delivery's acknowledgement is
+/// lost and the sender falls back to store-and-forward (section 10.4 of the protocol
+/// document); the repeat arrives on the receiver's next propagation sync. 4096 matches
+/// the fetch path's `DEDUP_CAPACITY` and is far above a day's admitted messages across
+/// trusted peers. Past this bound the oldest pair is forgotten first and a repeat of it
+/// is simply filed twice, which the inbox tolerates. The window lives in memory alone: a
+/// restart forgets it.
+pub(crate) const BODY_DEDUP_CAPACITY: usize = 4096;
+/// How long a pair stays remembered. The repeat comes with the next propagation sync,
+/// every `DEFAULT_PROPAGATION_SYNC_INTERVAL_SECS` by default and raisable, so a day
+/// covers a receiver whose sync was paused; a repeat older than that is filed twice.
+pub(crate) const BODY_DEDUP_HORIZON: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Where a node keeps its identity, the user's trust list and its disposable state.
 pub(crate) struct MeshPaths {
@@ -1844,6 +1858,63 @@ async fn announce_periodically(runtime: Arc<MeshRuntime>, cancel: CancellationTo
     }
 }
 
+/// The (sending identity, message id) pairs handed to the envoy within
+/// `BODY_DEDUP_HORIZON`, at most `BODY_DEDUP_CAPACITY` of them with the oldest forgotten
+/// first. Consulted on the envoy path alone: a reply, a bulletin or a body arriving while
+/// no envoy is attached never enters it. A pair the envoy refused is forgotten at once,
+/// since the envoy never had that body: its repeat is offered afresh, and a second
+/// refusal is bounded by the refusal path's own per-identity, per-reason, per-hour gate.
+#[derive(Default)]
+struct BodyDedup {
+    at: BTreeMap<(String, String), SystemTime>,
+    by_age: BTreeSet<(SystemTime, (String, String))>,
+}
+
+impl BodyDedup {
+    fn key(message: &PeerMessage) -> (String, String) {
+        (message.source_identity.clone(), message.message_id.clone())
+    }
+
+    /// `true` when the pair is new to the window, `false` when it was recorded within the
+    /// horizon.
+    fn insert_at(&mut self, key: (String, String), now: SystemTime) -> bool {
+        self.expire(now);
+        if self.at.contains_key(&key) {
+            return false;
+        }
+        self.at.insert(key.clone(), now);
+        self.by_age.insert((now, key));
+        while self.at.len() > BODY_DEDUP_CAPACITY {
+            let (_, oldest) = self
+                .by_age
+                .pop_first()
+                .expect("a window over its capacity is not empty");
+            self.at.remove(&oldest);
+            debug!(
+                "Forgot envoy body {} from {} to stay within {BODY_DEDUP_CAPACITY} remembered",
+                oldest.1,
+                short(&oldest.0)
+            );
+        }
+        true
+    }
+
+    fn forget(&mut self, key: &(String, String)) {
+        if let Some(recorded_at) = self.at.remove(key) {
+            self.by_age.remove(&(recorded_at, key.clone()));
+        }
+    }
+
+    fn expire(&mut self, now: SystemTime) {
+        while let Some((recorded_at, key)) = self.by_age.first()
+            && now.duration_since(*recorded_at).unwrap_or_default() >= BODY_DEDUP_HORIZON
+        {
+            self.at.remove(key);
+            self.by_age.pop_first();
+        }
+    }
+}
+
 /// The process-wide home of the running node. Empty until the mesh is turned on; shared by
 /// every `AppState` clone so replacing the config never detaches the runtime.
 ///
@@ -1882,6 +1953,9 @@ async fn announce_periodically(runtime: Arc<MeshRuntime>, cancel: CancellationTo
 /// `limits` holds each peer's hourly windows and in-flight envoy runs. It belongs to the
 /// slot rather than the node so a `.mesh off`/`.mesh on` does not hand a flooding peer
 /// a fresh window; `install` configures it from the node's config.
+///
+/// `envoy_bodies` is the window of bodies already handed to the envoy, so one that comes
+/// back by store-and-forward after a lost link acknowledgement is filed and not run again.
 #[derive(Default)]
 pub(crate) struct MeshSlot {
     inner: RwLock<Option<Arc<MeshRuntime>>>,
@@ -1895,6 +1969,7 @@ pub(crate) struct MeshSlot {
     notifier: ArcSwapOption<Arc<dyn NotificationSink>>,
     idle: ArcSwapOption<Arc<dyn IdleSink>>,
     envoy: ArcSwapOption<Arc<dyn EnvoySink>>,
+    envoy_bodies: parking_lot::Mutex<BodyDedup>,
     hooks: MeshHooks,
     limits: Arc<PeerLimits>,
     peer_inbox: PeerInbox,
@@ -2357,9 +2432,17 @@ impl MeshSlot {
     /// cannot flood the terminal or the peer's inbox. Anything that arrived naming a
     /// message in `in_reply_to` takes the inbox path too, whatever its kind: a peer's
     /// envoy replying to our envoy's reply would otherwise keep the two talking forever.
+    /// A message or question whose sending identity and id the envoy already has, within
+    /// `BODY_DEDUP_HORIZON`, is filed in the inbox as a separate entry instead of being
+    /// run again: the acknowledgement precedes the run, so one lost on a link brings the
+    /// same body back by store-and-forward.
     /// Runs on a blocking thread off the server's request path or on the fetch task, so
     /// nothing here awaits.
-    pub(crate) fn deliver_peer(&self, mut message: PeerMessage) {
+    pub(crate) fn deliver_peer(&self, message: PeerMessage) {
+        self.deliver_peer_at(message, SystemTime::now());
+    }
+
+    pub(crate) fn deliver_peer_at(&self, mut message: PeerMessage, now: SystemTime) {
         let answered = self.answer_correlation(&mut message);
         let for_envoy = !answered && envoy_bound(message.kind, message.in_reply_to.as_deref());
         let envoy = for_envoy.then(|| self.envoy.load_full()).flatten();
@@ -2372,21 +2455,31 @@ impl MeshSlot {
             Some(sink) => {
                 let (kind, id) = (message.kind, message.message_id.clone());
                 let id8 = short(&message.source_identity).to_string();
-                match sink.accept(EnvoyJob {
-                    message: message.clone(),
-                    reservation: None,
-                }) {
-                    Ok(()) => {
-                        debug!("Mesh {kind} {id} from {id8} handed to the envoy");
-                        Routed::Envoy
-                    }
-                    Err(refusal) => {
-                        debug!(
-                            "Mesh {kind} {id} from {id8} refused by the envoy: {}; delivering it to the inbox",
-                            refusal.reason.as_str()
-                        );
-                        self.refuse_for_envoy(message, refusal);
-                        Routed::Inbox
+                let key = BodyDedup::key(&message);
+                if !self.envoy_bodies.lock().insert_at(key.clone(), now) {
+                    debug!(
+                        "Mesh {kind} {id} from {id8} already handed to the envoy; delivering the repeat to the inbox"
+                    );
+                    self.deliver_to_inbox(message, answered);
+                    Routed::Inbox
+                } else {
+                    match sink.accept(EnvoyJob {
+                        message: message.clone(),
+                        reservation: None,
+                    }) {
+                        Ok(()) => {
+                            debug!("Mesh {kind} {id} from {id8} handed to the envoy");
+                            Routed::Envoy
+                        }
+                        Err(refusal) => {
+                            self.envoy_bodies.lock().forget(&key);
+                            debug!(
+                                "Mesh {kind} {id} from {id8} refused by the envoy: {}; delivering it to the inbox",
+                                refusal.reason.as_str()
+                            );
+                            self.refuse_for_envoy(message, refusal);
+                            Routed::Inbox
+                        }
                     }
                 }
             }
@@ -4313,6 +4406,134 @@ mod tests {
         let (envelopes, _) = slot.peer_inbox().drain();
         assert_eq!(peer_ids(&envelopes), ["a-1"]);
         assert_eq!(slot.take_model_notes()[0].event, "peer_ask");
+    }
+
+    #[test]
+    fn a_body_handed_to_the_envoy_once_is_filed_not_run_again_when_it_returns_by_store_and_forward()
+    {
+        let slot = MeshSlot::default();
+        let idle = RecordingIdleSink::new(true);
+        slot.set_idle(Arc::clone(&idle) as Arc<dyn IdleSink>);
+        let envoy = RecordingEnvoy::new(true, false);
+        slot.set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
+        let first = peer_message(PeerKind::Message, "m-1", None);
+        let mut repeat = first.clone();
+        repeat.via = PeerVia::StoreAndForward;
+
+        slot.deliver_peer(first.clone());
+        slot.record_envoy_exchange(&first, "answered");
+        slot.deliver_peer(repeat);
+
+        assert_eq!(envoy.job_ids(), ["m-1"]);
+        let (envelopes, _) = slot.peer_inbox().drain();
+        let ids = peer_ids(&envelopes);
+        assert_eq!(ids.len(), 3, "{ids:?}");
+        assert_eq!(ids.iter().filter(|id| **id == "m-1").count(), 2);
+        assert_eq!(peer_of(&envelopes[2]).via, PeerVia::StoreAndForward);
+        let dest8 = &hex_lower(&PEER_INSTANCE)[..8];
+        let pushed = idle.pushed.lock();
+        assert_eq!(
+            pushed.len(),
+            2,
+            "the exchange line and the repeat's summary line"
+        );
+        assert!(
+            pushed[0].text.contains("envoy replied: answered"),
+            "{}",
+            pushed[0].text
+        );
+        assert_eq!(pushed[1].text, format!("{dest8} says: words of m-1"));
+    }
+
+    #[test]
+    fn the_envoy_window_keys_on_the_sending_identity_and_the_id_together() {
+        let slot = MeshSlot::default();
+        let envoy = RecordingEnvoy::new(true, false);
+        slot.set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
+        let mut other_identity = peer_message(PeerKind::Ask, "a-1", None);
+        other_identity.source_identity = hex_lower(&[0xdc; 16]);
+
+        slot.deliver_peer(peer_message(PeerKind::Ask, "a-1", None));
+        slot.deliver_peer(other_identity);
+        slot.deliver_peer(peer_message(PeerKind::Ask, "a-2", None));
+
+        assert_eq!(envoy.job_ids(), ["a-1", "a-1", "a-2"]);
+        assert!(slot.peer_inbox().drain().0.is_empty());
+    }
+
+    #[test]
+    fn a_body_the_envoy_refused_is_offered_to_it_afresh_when_it_returns() {
+        let slot = MeshSlot::default();
+        slot.set_envoy(RecordingEnvoy::new(false, false) as Arc<dyn EnvoySink>);
+        slot.deliver_peer(peer_message(PeerKind::Ask, "a-1", None));
+        assert_eq!(peer_ids(&slot.peer_inbox().drain().0), ["a-1"]);
+
+        let envoy = RecordingEnvoy::new(true, false);
+        slot.set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
+        let mut repeat = peer_message(PeerKind::Ask, "a-1", None);
+        repeat.via = PeerVia::StoreAndForward;
+        slot.deliver_peer(repeat);
+
+        assert_eq!(envoy.job_ids(), ["a-1"]);
+        assert!(slot.peer_inbox().drain().0.is_empty());
+    }
+
+    #[test]
+    fn the_envoy_window_forgets_a_body_past_its_horizon() {
+        let slot = MeshSlot::default();
+        let envoy = RecordingEnvoy::new(true, false);
+        slot.set_envoy(Arc::clone(&envoy) as Arc<dyn EnvoySink>);
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+
+        slot.deliver_peer_at(peer_message(PeerKind::Message, "m-1", None), t0);
+        slot.deliver_peer_at(
+            peer_message(PeerKind::Message, "m-1", None),
+            t0 + BODY_DEDUP_HORIZON - Duration::from_secs(1),
+        );
+        slot.deliver_peer_at(
+            peer_message(PeerKind::Message, "m-1", None),
+            t0 + BODY_DEDUP_HORIZON,
+        );
+
+        assert_eq!(envoy.job_ids(), ["m-1", "m-1"]);
+        assert_eq!(peer_ids(&slot.peer_inbox().drain().0), ["m-1"]);
+
+        let mut window = BodyDedup::default();
+        let key = ("cd".repeat(16), "m-1".to_string());
+        assert!(window.insert_at(key.clone(), t0));
+        assert!(!window.insert_at(
+            key.clone(),
+            t0 + BODY_DEDUP_HORIZON - Duration::from_secs(1)
+        ));
+        assert!(window.insert_at(key.clone(), t0 + BODY_DEDUP_HORIZON));
+        assert!(
+            !window.insert_at(key, t0),
+            "a clock stepped back reads as just recorded"
+        );
+    }
+
+    #[test]
+    fn the_envoy_window_forgets_the_oldest_body_past_its_capacity() {
+        let mut window = BodyDedup::default();
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let key = |n: usize| ("cd".repeat(16), format!("m-{n}"));
+
+        for n in 0..BODY_DEDUP_CAPACITY {
+            assert!(window.insert_at(key(n), t0 + Duration::from_secs(n as u64)));
+        }
+        assert!(!window.insert_at(key(0), t0 + Duration::from_secs(5_000)));
+        assert!(window.insert_at(key(BODY_DEDUP_CAPACITY), t0 + Duration::from_secs(5_000)));
+
+        assert_eq!(window.at.len(), BODY_DEDUP_CAPACITY);
+        assert_eq!(window.by_age.len(), BODY_DEDUP_CAPACITY);
+        assert!(
+            window.insert_at(key(0), t0 + Duration::from_secs(5_001)),
+            "the oldest pair is forgotten and admitted as fresh"
+        );
+        assert!(
+            !window.insert_at(key(2), t0 + Duration::from_secs(5_001)),
+            "a pair inside the capacity is still remembered"
+        );
     }
 
     #[test]
