@@ -1865,6 +1865,9 @@ async fn announce_periodically(runtime: Arc<MeshRuntime>, cancel: CancellationTo
 /// no envoy is attached never enters it. A pair the envoy refused is forgotten at once,
 /// since the envoy never had that body: its repeat is offered afresh, and a second
 /// refusal is bounded by the refusal path's own per-identity, per-reason, per-hour gate.
+/// A pair the envoy accepted but could not run — the node went off, the run timed out,
+/// was interrupted or failed — stays remembered: the envoy had the body, and the human
+/// already has the fallback line in the inbox, so its repeat is filed and not run again.
 #[derive(Default)]
 struct BodyDedup {
     at: BTreeMap<(String, String), SystemTime>,
@@ -4551,7 +4554,8 @@ mod tests {
     #[test]
     fn the_envoy_window_is_held_in_memory_alone_and_touched_only_on_delivery() {
         let source = include_str!("node.rs");
-        let production = &source[..source.find("\n#[cfg(test)]\n").expect("test code opens")];
+        let test_module = ["\n#[cfg(test)]\n", "mod tests {"].concat();
+        let production = &source[..source.find(&test_module).expect("the test module opens")];
 
         let declared = production
             .find("struct BodyDedup {")

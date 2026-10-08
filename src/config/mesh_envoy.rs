@@ -6479,7 +6479,7 @@ mod tests {
         let message = job(PeerKind::Ask, "msg-prompt", "merge the branch").message;
         let card = PeerCard {
             who: "alice".into(),
-            instance: "abcd1234".into(),
+            instance: short(&message.source_destination).into(),
             verb: "asked",
             message_id: "msg-prompt".into(),
             via: "direct link",

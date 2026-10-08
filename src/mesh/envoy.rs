@@ -63,7 +63,9 @@ pub(crate) fn peer_fence_end(destination: &str) -> String {
 /// `untrusted_content::wrap` of a peer's `text` under a label the receiver composes: the
 /// short form of `destination`, the hash it derived from the origin the peer named and
 /// the identity it proved. Never the peer's name or title: the fence must not carry a
-/// word a peer chose, so nothing but a destination builds one.
+/// word a peer chose, so nothing but a destination builds one. The caller owns the
+/// contract that `destination` is the receiver-derived `source_destination` in its
+/// canonical 32-lower-hex form; nothing here re-canonicalises it.
 pub(crate) fn fence_peer_text(destination: &str, text: &str) -> String {
     wrap(&fence_label(destination), text)
 }
@@ -90,11 +92,6 @@ mod tests {
             .strip_prefix("=== Untrusted content from peer ")
             .expect("the begin line opens the fence");
         let (dest8, rest) = after_label.split_at(8);
-        assert!(
-            dest8
-                .bytes()
-                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-        );
         assert_eq!(dest8, short(DESTINATION));
         assert!(rest.starts_with(" begins "), "{rest}");
         assert!(

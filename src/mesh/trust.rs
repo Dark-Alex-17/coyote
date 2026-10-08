@@ -2765,9 +2765,10 @@ mod tests {
         assert!(same_hash("", ""));
     }
 
-    /// Every production compare of a destination or identity address against a derived
-    /// or recorded one, here and in message.rs, goes through `same_hash` or `ct_eq`,
-    /// never through `==` or `!=` on an `AddressHash` or its `Option`.
+    /// Every production compare of a typed address hash, or of a destination against the
+    /// one an identity derives, here and in message.rs, goes through `same_hash` or
+    /// `ct_eq`, never through `==` or `!=`. Keyed lookups of a hash the peer already knows
+    /// (the knock cache, the peer table) are not a timing boundary and stay ordinary compares.
     #[test]
     fn production_code_never_compares_hashes_with_the_equality_operators() {
         let sources = [
@@ -2785,6 +2786,8 @@ mod tests {
         let shapes = [
             ["expected !", "= claimed"].concat(),
             ["expected =", "= claimed"].concat(),
+            ["claimed !", "= expected"].concat(),
+            ["claimed =", "= expected"].concat(),
             ["== Some(destination_", "address("].concat(),
         ];
         let mut hits = Vec::new();
