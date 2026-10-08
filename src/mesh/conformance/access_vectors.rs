@@ -342,11 +342,11 @@ impl BareSlot {
         Arc::downgrade(&self.slot) as Weak<dyn AccessSurface>
     }
 
-    fn admitted(&self, body: Value, peer: &PrivateIdentity) -> AdmittedRequest {
+    fn admitted(&self, body: Value, peer: &PrivateIdentity, destination: &str) -> AdmittedRequest {
         AdmittedRequest {
             link_id: LinkId::new_from_rand(OsRng),
             identity: *peer.as_identity(),
-            destination_hash: AddressHash::new_from_hex_string(&destination()).unwrap(),
+            destination_hash: AddressHash::new_from_hex_string(destination).unwrap(),
             request_id: RequestId::from([1u8; 16]),
             path_hash: PathHash::of(ACCESS_PATH),
             requested_at: 1_700_000_000.0,
@@ -360,7 +360,11 @@ impl BareSlot {
     }
 
     fn ask_as(&self, body: Value, peer: &PrivateIdentity) -> Reply {
-        block_on(AccessHandler::new(self.surface()).handle(self.admitted(body, peer)))
+        self.ask_from(body, peer, &destination())
+    }
+
+    fn ask_from(&self, body: Value, peer: &PrivateIdentity, destination: &str) -> Reply {
+        block_on(AccessHandler::new(self.surface()).handle(self.admitted(body, peer, destination)))
     }
 
     /// The handler's answer to `body`, read back as the requester would.
@@ -369,7 +373,16 @@ impl BareSlot {
     }
 
     fn outcome_as(&self, body: Value, peer: &PrivateIdentity) -> Result<AccessOutcome, String> {
-        let reply = self.ask_as(body.clone(), peer);
+        self.outcome_from(body, peer, &destination())
+    }
+
+    fn outcome_from(
+        &self,
+        body: Value,
+        peer: &PrivateIdentity,
+        destination: &str,
+    ) -> Result<AccessOutcome, String> {
+        let reply = self.ask_from(body.clone(), peer, destination);
         let value = value_of(&reply)?;
         let id = body
             .as_map()
@@ -942,14 +955,28 @@ fn the_rate_rule_fires_in_order_and_only_open_records_count() -> Result<(), Stri
         fixture.outcome(body("a-2", &["docs/y.md", "src/x.rs"], "")),
         refused(AccessRefusal::Duplicate),
     )?;
+    let second_instance = hex_lower(&[0x3c; 16]);
     same(
-        "the same path set from another identity is its own request",
-        fixture.outcome_as(body("a-3", &["docs/y.md", "src/x.rs"], ""), &other),
+        "the same path set from another instance of this identity is its own request",
+        fixture.outcome_from(
+            body("a-3", &["docs/y.md", "src/x.rs"], ""),
+            &fixture.peer,
+            &second_instance,
+        ),
+        pending(),
+    )?;
+    same(
+        "the same path set from another identity at its own instance is its own request",
+        fixture.outcome_from(
+            body("a-4", &["docs/y.md", "src/x.rs"], ""),
+            &other,
+            &hex_lower(&[0x4d; 16]),
+        ),
         pending(),
     )?;
     same(
         "a subset is its own request",
-        fixture.outcome(body("a-4", &["src/x.rs"], "")),
+        fixture.outcome(body("a-5", &["src/x.rs"], "")),
         pending(),
     )?;
     let records = fixture.records()?;
@@ -961,20 +988,20 @@ fn the_rate_rule_fires_in_order_and_only_open_records_count() -> Result<(), Stri
             .map(|record| record.paths.clone()),
         Some(strings(&["src/x.rs", "docs/y.md"])),
     )?;
-    same("records filed", records.len(), 4)?;
-    same("the human was told per filing", fixture.idle.count(), 3)?;
-    same("one hook per filing", fixture.hooks.snapshot().len(), 3)?;
+    same("records filed", records.len(), 5)?;
+    same("the human was told per filing", fixture.idle.count(), 4)?;
+    same("one hook per filing", fixture.hooks.snapshot().len(), 4)?;
 
     ensure(
         fixture
             .store()
-            .remove("a-4")
+            .remove("a-5")
             .map_err(|err| err.to_string())?,
         "the record was on file",
     )?;
     same(
         "a decided set can be asked for again",
-        fixture.outcome(body("a-5", &["src/x.rs"], "")),
+        fixture.outcome(body("a-6", &["src/x.rs"], "")),
         pending(),
     )
 }
@@ -991,6 +1018,15 @@ fn the_sixth_open_request_from_one_identity_is_too_many_pending() -> Result<(), 
     same(
         "the sixth",
         fixture.outcome(body("a-6", &["src/6.rs"], "")),
+        refused(AccessRefusal::TooManyPending),
+    )?;
+    same(
+        "another instance of this identity is counted against it",
+        fixture.outcome_from(
+            body("a-7", &["src/7.rs"], ""),
+            &fixture.peer,
+            &hex_lower(&[0x3c; 16]),
+        ),
         refused(AccessRefusal::TooManyPending),
     )?;
     same(

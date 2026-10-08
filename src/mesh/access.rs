@@ -715,7 +715,13 @@ impl AccessSurface for MeshSlot {
         // Every open record is judged, whatever its kind or peer, so a re-used id is a
         // duplicate and never a filing failure the peer would hear as `too_many_pending`.
         match store.file_unless(record, now, |open| {
-            rate_rule(open, &identity_hash, &request.id, &request.paths)
+            rate_rule(
+                open,
+                &identity_hash,
+                &destination_hash,
+                &request.id,
+                &request.paths,
+            )
         }) {
             Ok(Ok(())) => {}
             Ok(Err(refusal)) => {
@@ -1389,29 +1395,36 @@ fn already_shared(
 /// The refusal, if any, that the open records earn a new access request for `paths`
 /// under `id`: any open record under the same id, of either kind and from any peer, is
 /// a duplicate whatever the new one names, so the paths the human read stand and an id
-/// is never filed twice; among `identity`'s own open access requests the same set of
-/// paths already waiting, in any order, is a duplicate; and past
-/// `ACCESS_MAX_PENDING_PER_IDENTITY` of them nothing more is filed.
+/// is never filed twice; among `destination`'s own open access requests the same set of
+/// paths already waiting, in any order, is a duplicate, grants being keyed to the
+/// instance so another instance of the same identity asking the same set is its own
+/// request; and past `ACCESS_MAX_PENDING_PER_IDENTITY` open access requests from
+/// `identity`, whichever of its instances asked, nothing more is filed.
 fn rate_rule(
     open: &[InboundRecord],
     identity: &str,
+    destination: &str,
     id: &str,
     paths: &[String],
 ) -> Option<AccessRefusal> {
     if open.iter().any(|record| record.id == id) {
         return Some(AccessRefusal::Duplicate);
     }
-    let mine: Vec<&InboundRecord> = open
+    let access: Vec<&InboundRecord> = open
         .iter()
-        .filter(|record| {
-            record.kind == InboundKind::Access && same_hash(&record.peer_identity, identity)
-        })
+        .filter(|record| record.kind == InboundKind::Access)
         .collect();
     let asked = path_set(paths);
-    if mine.iter().any(|record| path_set(&record.paths) == asked) {
+    if access.iter().any(|record| {
+        same_hash(&record.peer_destination, destination) && path_set(&record.paths) == asked
+    }) {
         return Some(AccessRefusal::Duplicate);
     }
-    if mine.len() >= ACCESS_MAX_PENDING_PER_IDENTITY {
+    let from_identity = access
+        .iter()
+        .filter(|record| same_hash(&record.peer_identity, identity))
+        .count();
+    if from_identity >= ACCESS_MAX_PENDING_PER_IDENTITY {
         return Some(AccessRefusal::TooManyPending);
     }
     None
@@ -1610,9 +1623,19 @@ mod tests {
     }
 
     fn inbound(identity: &str, id: &str, paths: &[&str], reason: &str) -> InboundAccess {
+        inbound_from(identity, &destination(), id, paths, reason)
+    }
+
+    fn inbound_from(
+        identity: &str,
+        destination: &str,
+        id: &str,
+        paths: &[&str],
+        reason: &str,
+    ) -> InboundAccess {
         InboundAccess {
             identity_hash: identity.to_string(),
-            destination_hash: destination(),
+            destination_hash: destination.to_string(),
             request: validate_access(id, strings(paths), reason).unwrap(),
             via: PeerVia::Direct,
         }
@@ -1927,6 +1950,48 @@ mod tests {
     }
 
     #[test]
+    fn two_instances_of_one_identity_asking_the_same_path_set_are_each_filed_pending() {
+        let fixture = bare_slot("access-two-instances");
+        let second_instance = hex_lower(&[0x3c; 16]);
+        let paths = ["src/x.rs", "docs/y.md"];
+        let first = fixture
+            .slot
+            .admit_access(inbound(&identity(), "a-1", &paths, ""));
+        assert_eq!(first, AccessOutcome::Pending);
+        let other_instance = fixture.slot.admit_access(inbound_from(
+            &identity(),
+            &second_instance,
+            "a-2",
+            &paths,
+            "",
+        ));
+        assert_eq!(other_instance, AccessOutcome::Pending);
+        assert_eq!(access_records(&fixture.slot).len(), 2);
+        assert_eq!(fixture.idle.texts().len(), 2);
+        assert_eq!(fixture.hooks.snapshot().len(), 2);
+
+        let first_again = fixture
+            .slot
+            .admit_access(inbound(&identity(), "a-3", &paths, ""));
+        assert_eq!(
+            first_again,
+            AccessOutcome::Refused(AccessRefusal::Duplicate)
+        );
+
+        let stranger = fixture.slot.admit_access(inbound_from(
+            &hex_lower(&[0xcd; 16]),
+            &hex_lower(&[0x4d; 16]),
+            "b-1",
+            &paths,
+            "",
+        ));
+        assert_eq!(stranger, AccessOutcome::Pending);
+        assert_eq!(access_records(&fixture.slot).len(), 3);
+        assert_eq!(fixture.idle.texts().len(), 3);
+        assert_eq!(fixture.hooks.snapshot().len(), 3);
+    }
+
+    #[test]
     fn a_second_request_reusing_a_pending_id_with_other_paths_is_refused_as_duplicate_and_the_first_paths_stand()
      {
         let fixture = bare_slot("access-duplicate-id");
@@ -1953,11 +2018,23 @@ mod tests {
         assert_eq!(fixture.idle.texts().len(), 1);
         assert_eq!(fixture.hooks.snapshot().len(), 1);
         assert_eq!(
-            rate_rule(&records, &identity(), "a-1", &strings(&["src/secrets.rs"])),
+            rate_rule(
+                &records,
+                &identity(),
+                &destination(),
+                "a-1",
+                &strings(&["src/secrets.rs"])
+            ),
             Some(AccessRefusal::Duplicate)
         );
         assert_eq!(
-            rate_rule(&records, &identity(), "a-2", &strings(&["src/secrets.rs"])),
+            rate_rule(
+                &records,
+                &identity(),
+                &destination(),
+                "a-2",
+                &strings(&["src/secrets.rs"])
+            ),
             None
         );
     }
@@ -1996,6 +2073,17 @@ mod tests {
             sixth,
             AccessOutcome::Refused(AccessRefusal::TooManyPending)
         ));
+        let other_instance = fixture.slot.admit_access(inbound_from(
+            &identity(),
+            &hex_lower(&[0x3c; 16]),
+            "a-7",
+            &["src/7.rs"],
+            "",
+        ));
+        assert!(matches!(
+            other_instance,
+            AccessOutcome::Refused(AccessRefusal::TooManyPending)
+        ));
         let other = hex_lower(&[0xcd; 16]);
         let elsewhere = fixture
             .slot
@@ -2011,9 +2099,10 @@ mod tests {
         );
     }
 
-    /// Both sides of the identity compare are canonical lowercase hex, so the serving
-    /// path neither case-folds nor short-circuits on them. The per-identity rule is the
-    /// path-set one: a re-used id is a duplicate whoever sends it.
+    /// Both sides of the identity and destination compares are canonical lowercase hex,
+    /// so the serving path neither case-folds nor short-circuits on them. The
+    /// per-destination rule is the path-set one and the per-identity rule the cap: a
+    /// re-used id is a duplicate whoever sends it.
     #[test]
     fn rate_rule_compares_identities_in_constant_time_shape() {
         let source = include_str!("access.rs");
@@ -2021,27 +2110,49 @@ mod tests {
         let needle = ["eq_ignore_", "ascii_case"].concat();
         assert!(
             !production.contains(&needle),
-            "the serving path compares identities with same_hash, not {needle}"
+            "the serving path compares identities and destinations with same_hash, not {needle}"
         );
 
-        let open = [InboundRecord {
-            peer_identity: "ab".repeat(16),
-            kind: InboundKind::Access,
-            paths: vec!["src/x.rs".to_string()],
-            question: String::new(),
-            ..question_record("a-1")
-        }];
+        let (identity, destination) = ("ab".repeat(16), "2b".repeat(16));
+        let open: Vec<InboundRecord> = (0..ACCESS_MAX_PENDING_PER_IDENTITY)
+            .map(|n| InboundRecord {
+                peer_identity: identity.clone(),
+                peer_destination: destination.clone(),
+                kind: InboundKind::Access,
+                paths: vec![format!("src/{n}.rs")],
+                question: String::new(),
+                ..question_record(&format!("a-{n}"))
+            })
+            .collect();
+        let (mixed_identity, mixed_destination) = ("AB".repeat(16), "2B".repeat(16));
+        let filed = ["src/0.rs".to_string()];
+        let fresh = ["src/9.rs".to_string()];
         assert_eq!(
-            rate_rule(&open, &"AB".repeat(16), "a-2", &["src/x.rs".to_string()]),
+            rate_rule(&open, &mixed_identity, &mixed_destination, "a-9", &filed),
+            None,
+            "mixed case is another instance under the canonical compare"
+        );
+        assert_eq!(
+            rate_rule(&open, &mixed_identity, &destination, "a-9", &filed),
+            Some(AccessRefusal::Duplicate)
+        );
+        assert_eq!(
+            rate_rule(&open, &mixed_identity, &mixed_destination, "a-9", &fresh),
             None,
             "mixed case is another identity under the canonical compare"
         );
         assert_eq!(
-            rate_rule(&open, &"ab".repeat(16), "a-2", &["src/x.rs".to_string()]),
-            Some(AccessRefusal::Duplicate)
+            rate_rule(&open, &identity, &mixed_destination, "a-9", &fresh),
+            Some(AccessRefusal::TooManyPending)
         );
         assert_eq!(
-            rate_rule(&open, &"AB".repeat(16), "a-1", &["x".to_string()]),
+            rate_rule(
+                &open,
+                &mixed_identity,
+                &mixed_destination,
+                "a-1",
+                &["x".to_string()]
+            ),
             Some(AccessRefusal::Duplicate)
         );
     }
@@ -5811,15 +5922,16 @@ mod tests {
         stub.stop().await;
     }
 
-    // ---- usage-probe spec-first tests: per-identity sets, deny-first admission, the
+    // ---- usage-probe spec-first tests: per-instance sets, deny-first admission, the
     // debug log and a re-used id ----
 
-    /// Duplicate-set admission is judged per identity and on the collapsed set: a
-    /// second identity may ask for exactly the set a first one has pending, while the
-    /// first identity's re-ask that only repeats a path is still the same set.
+    /// Duplicate-set admission is judged per instance and on the collapsed set: a
+    /// second peer, at its own instance, may ask for exactly the set a first one has
+    /// pending, while the first instance's re-ask that only repeats a path is still the
+    /// same set.
     #[test]
-    fn usage_probe_duplicate_sets_are_judged_per_identity_and_after_collapsing_repeats() {
-        let fixture = bare_slot("access-dup-identity");
+    fn usage_probe_duplicate_sets_are_judged_per_instance_and_after_collapsing_repeats() {
+        let fixture = bare_slot("access-dup-instance");
         let other = hex_lower(&[0xcd; 16]);
         let first =
             fixture
@@ -5827,10 +5939,13 @@ mod tests {
                 .admit_access(inbound(&identity(), "a-1", &["src/x.rs", "docs/y.md"], ""));
         assert_eq!(first, AccessOutcome::Pending);
 
-        let elsewhere =
-            fixture
-                .slot
-                .admit_access(inbound(&other, "c-1", &["docs/y.md", "src/x.rs"], ""));
+        let elsewhere = fixture.slot.admit_access(inbound_from(
+            &other,
+            &hex_lower(&[0x4d; 16]),
+            "c-1",
+            &["docs/y.md", "src/x.rs"],
+            "",
+        ));
         assert_eq!(elsewhere, AccessOutcome::Pending);
 
         let repeated = fixture.slot.admit_access(inbound(
