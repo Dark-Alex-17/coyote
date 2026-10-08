@@ -680,7 +680,7 @@ Acknowledgement (`received_reply`; `received_reply_is_recognised_only_for_its_id
 
 **[MESH-MSG-020]** A receiver MUST answer with silence when its inbox surface is gone or delivery fails.
 
-**[MESH-MSG-021]** A receiver MUST send the acknowledgement as soon as the message is filed, before any envoy run, and MUST NOT run the envoy twice for one body: a `message` or `ask` whose sending identity and `id` it has already handed to the envoy within `BODY_DEDUP_HORIZON` = `86400` seconds, over a window of at most `BODY_DEDUP_CAPACITY` = `4096` pairs with the oldest forgotten first and nothing persisted, is filed in the inbox as a separate entry instead, so a body acknowledged on a link whose acknowledgement was lost and re-sent by store-and-forward is read by the human twice and run once (`a_body_handed_to_the_envoy_once_is_filed_not_run_again_when_it_returns_by_store_and_forward`, `the_envoy_window_keys_on_the_sending_identity_and_the_id_together`, `the_envoy_window_forgets_a_body_past_its_horizon`, `the_envoy_window_forgets_the_oldest_body_past_its_capacity`, src/mesh/node.rs).
+**[MESH-MSG-021]** A receiver MUST send the acknowledgement as soon as the message is filed, before any envoy run, and MUST NOT run the envoy twice for one body: a `message` or `ask` whose sending identity and `id` it has already handed to the envoy within `BODY_DEDUP_HORIZON` = `86400` seconds, over a window of at most `BODY_DEDUP_CAPACITY` = `4096` pairs with the oldest forgotten first and nothing persisted, is filed in the inbox as a separate entry instead, so a body acknowledged on a link whose acknowledgement was lost and re-sent by store-and-forward is read by the human twice and run once (`a_body_handed_to_the_envoy_once_is_filed_not_run_again_when_it_returns_by_store_and_forward`, `the_envoy_window_keys_on_the_sending_identity_and_the_id_together`, `the_envoy_window_forgets_a_body_past_its_horizon`, `the_envoy_window_forgets_the_oldest_body_past_its_capacity`, `the_envoy_window_is_held_in_memory_alone_and_touched_only_on_delivery`, src/mesh/node.rs).
 
 ### 10.4 Sender outcome
 
@@ -2639,7 +2639,7 @@ Every requirement id and what exercises it: the vector families of `src/mesh/con
 - [MESH-MSG-018](#103-reply-values) -- InvalidData for validation failures
 - [MESH-MSG-019](#103-reply-values) -- Throttled before filing
 - [MESH-MSG-020](#103-reply-values) -- silence when delivery fails
-- [MESH-MSG-021](#103-reply-values) -- acknowledgement precedes the envoy
+- [MESH-MSG-021](#103-reply-values) -- acknowledgement precedes the envoy; one envoy run per (identity, id) within the window
 - [MESH-MSG-022](#104-sender-outcome) -- acknowledgement is direct delivery
 - [MESH-MSG-023](#104-sender-outcome) -- other reply value not acknowledged
 - [MESH-MSG-024](#104-sender-outcome) -- transport failure falls back

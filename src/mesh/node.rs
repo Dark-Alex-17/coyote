@@ -111,9 +111,10 @@ pub(crate) const MESH_ALREADY_ON: &str = "Mesh is already on in this process. Ru
 /// is simply filed twice, which the inbox tolerates. The window lives in memory alone: a
 /// restart forgets it.
 pub(crate) const BODY_DEDUP_CAPACITY: usize = 4096;
-/// How long a pair stays remembered. The repeat comes with the next propagation sync,
-/// every `DEFAULT_PROPAGATION_SYNC_INTERVAL_SECS` by default and raisable, so a day
-/// covers a receiver whose sync was paused; a repeat older than that is filed twice.
+/// How long a pair stays remembered. A day covers the default sync interval and the
+/// default request timeout with a wide margin; a receiver syncing less often than daily,
+/// or a sender whose request timeout exceeds a day, may see the envoy run a late repeat
+/// again — the behaviour before the window existed, bounded by the sender's budgets.
 pub(crate) const BODY_DEDUP_HORIZON: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Where a node keeps its identity, the user's trust list and its disposable state.
@@ -1910,6 +1911,12 @@ impl BodyDedup {
             && now.duration_since(*recorded_at).unwrap_or_default() >= BODY_DEDUP_HORIZON
         {
             self.at.remove(key);
+            debug!(
+                "Forgot envoy body {} from {} older than {} s",
+                key.1,
+                short(&key.0),
+                BODY_DEDUP_HORIZON.as_secs()
+            );
             self.by_age.pop_first();
         }
     }
@@ -2573,6 +2580,9 @@ impl MeshSlot {
     /// is the envoy's, and only when one is attached; anything else, and anything that
     /// arrived store-and-forward, passes here and is judged by the hourly count alone.
     /// Reserves nothing: `EnvoySink::accept` takes the slot and remains the backstop.
+    /// A repeat of a pair the envoy already has is still gated here when it arrives over a
+    /// link; a conforming sender re-sends only by store-and-forward, which skips this gate,
+    /// so the window is consulted after admission by design.
     fn link_run_admissible(
         &self,
         request: &PeerAdmission,
@@ -4533,6 +4543,75 @@ mod tests {
         assert!(
             !window.insert_at(key(2), t0 + Duration::from_secs(5_001)),
             "a pair inside the capacity is still remembered"
+        );
+    }
+
+    /// The window lives in the slot alone: `BodyDedup` derives nothing that could write
+    /// it to disk, and nothing but the delivery path reads or records through it.
+    #[test]
+    fn the_envoy_window_is_held_in_memory_alone_and_touched_only_on_delivery() {
+        let source = include_str!("node.rs");
+        let production = &source[..source.find("\n#[cfg(test)]\n").expect("test code opens")];
+
+        let declared = production
+            .find("struct BodyDedup {")
+            .expect("the window is declared");
+        let block_start = production[..declared]
+            .rfind("\n\n")
+            .expect("a blank line precedes the declaration");
+        let block_end = declared
+            + production[declared..]
+                .find("\n}\n")
+                .expect("the declaration closes");
+        let block = &production[block_start..block_end];
+        assert!(
+            block.contains("#[derive("),
+            "the derives sit in the scanned block"
+        );
+        assert!(
+            !block.contains("Serialize") && !block.contains("Deserialize"),
+            "the window is never written to disk:\n{block}"
+        );
+
+        let delivery_start = production
+            .find("fn deliver_peer_at(")
+            .expect("the delivery path is declared");
+        let delivery_end = delivery_start
+            + ["\n    pub(crate) fn ", "\n    fn "]
+                .iter()
+                .filter_map(|opener| production[delivery_start..].find(opener))
+                .min()
+                .expect("another method follows the delivery path");
+        let field = "    envoy_bodies: parking_lot::Mutex<BodyDedup>,";
+        let rustdoc = "/// `envoy_bodies` is the window";
+        let (mut field_lines, mut rustdoc_lines, mut delivery_lines) = (0, 0, 0);
+        let mut strays = Vec::new();
+        let mut offset = 0;
+        for (index, line) in production.lines().enumerate() {
+            let at = offset;
+            offset += line.len() + 1;
+            if !line.contains("envoy_bodies") {
+                continue;
+            }
+            if line == field {
+                field_lines += 1;
+            } else if line.starts_with(rustdoc) {
+                rustdoc_lines += 1;
+            } else if (delivery_start..delivery_end).contains(&at) {
+                delivery_lines += 1;
+            } else {
+                strays.push(format!("{}: {}", index + 1, line.trim()));
+            }
+        }
+        assert_eq!((field_lines, rustdoc_lines), (1, 1));
+        assert_eq!(
+            delivery_lines, 2,
+            "the delivery path records and forgets, nothing more"
+        );
+        assert!(
+            strays.is_empty(),
+            "envoy_bodies is touched outside deliver_peer_at:\n{}",
+            strays.join("\n")
         );
     }
 
