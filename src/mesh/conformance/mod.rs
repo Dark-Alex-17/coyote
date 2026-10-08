@@ -149,7 +149,8 @@ const ENFORCED_BY: &[(&str, &[&str])] = &[
             "check_inbox_fences_content_title_fields_text_and_data_parts_under_the_senders_label_and_leaves_files",
             "card_value_fences_each_free_text_field_under_the_peers_label_and_leaves_identifiers_bare",
             "peers_with_status_fences_a_live_cards_objective_under_the_peers_label",
-            "inbox_lines_clean_a_file_parts_name_of_escapes_and_invisible_characters",
+            "inbox_lines_clean_a_file_parts_name_and_paths_of_escapes_and_invisible_characters",
+            "usage_probe_an_access_decision_collected_for_a_pending_request_stays_structured_data",
         ],
     ),
     (

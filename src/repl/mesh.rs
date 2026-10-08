@@ -4827,12 +4827,16 @@ fn render_inbox(rows: &[InboxRow], awaiting_collect: &[String]) -> String {
                     reference,
                     ..
                 } => {
+                    let shown =
+                        |path: &str| display_text(path, WIRE_PATH_MAX_BYTES).unwrap_or_default();
                     let location = match (staged, reference) {
-                        (Some(path), _) => format!("staged at {}", path.display()),
-                        (None, Some(path)) => format!("fetchable as {path}"),
+                        (Some(path), _) => {
+                            format!("staged at {}", shown(&path.display().to_string()))
+                        }
+                        (None, Some(path)) => format!("fetchable as {}", shown(path)),
                         (None, None) => "not kept".to_string(),
                     };
-                    let name = display_text(name, WIRE_PATH_MAX_BYTES).unwrap_or_default();
+                    let name = shown(name);
                     lines.push(format!("  file: {name} ({size} B) {location}"));
                 }
             }
@@ -6132,23 +6136,39 @@ mod tests {
         assert_eq!(lines[4], "  (2 parts dropped)");
     }
 
-    /// A stored file part that predates the wire-path grammar may carry a name with
-    /// terminal escapes or invisible characters; the inbox line shows it cleaned.
+    /// A file part's name and reference are the peer's own paths: the wire-path grammar
+    /// admits a variation selector, and the inbox line shows both cleaned of that and of
+    /// anything else `display_text` strips, the staged path included.
     #[test]
-    fn inbox_lines_clean_a_file_parts_name_of_escapes_and_invisible_characters() {
+    fn inbox_lines_clean_a_file_parts_name_and_paths_of_escapes_and_invisible_characters() {
         let mut with_file = message(PeerKind::Message, "see attached", None);
         with_file.parts = vec![Part::File {
             name: "docs/\u{1b}[31mnotes\u{FE0F}.md".into(),
             size: 8,
             sha256: "ab".repeat(32),
             staged: None,
-            reference: Some("ref-1".into()),
+            reference: Some("ref\u{FE0F}-\u{1b}[0m1".into()),
         }];
 
         let text = render_inbox(&[inbox_row(with_file)], &[]);
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 2, "{text}");
         assert_eq!(lines[1], "  file: docs/notes.md (8 B) fetchable as ref-1");
+
+        let mut staged = message(PeerKind::Message, "see attached", None);
+        staged.parts = vec![Part::File {
+            name: "notes.md".into(),
+            size: 8,
+            sha256: "ab".repeat(32),
+            staged: Some(std::path::PathBuf::from("/inbox/peer/notes\u{FE0F}.md")),
+            reference: None,
+        }];
+        let text = render_inbox(&[inbox_row(staged)], &[]);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines[1], "  file: notes.md (8 B) staged at /inbox/peer/notes.md",
+            "{text}"
+        );
     }
 
     fn correlation(id: &str, state: PendingState) -> Correlation {
