@@ -6321,6 +6321,238 @@ mod tests {
         assert_eq!(filed.disposition(), Disposition::Answered);
     }
 
+    /// Usage probe: a `bulletin` that names one of our open questions in `in_reply_to`
+    /// arrives on both routes as a bulletin naming nothing. Off the link it is
+    /// acknowledged and filed with `in_reply_to` absent, its own thread and no
+    /// disposition; the question stays open for the identity it was asked of and its
+    /// hook env carries no `COYOTE_MESH_IN_REPLY_TO`. A `reply` from the same identity
+    /// over the same route then closes the question, so the bulletin was the one thing
+    /// that did not. A bulletin whose `in_reply_to` is not a wire id is still refused
+    /// before the ack off the link and dropped as malformed off the propagation node.
+    #[tokio::test]
+    async fn usage_probe_a_bulletin_naming_our_open_question_names_nothing_on_either_route_and_leaves_it_open()
+     {
+        use rmpv::Value;
+        let slot = Arc::new(MeshSlot::default());
+        let sink = RecordingHookSink::attach(&slot.hooks());
+        let identity = TransportIdentity::new_from_rand(OsRng);
+        let identity_hex = identity.address_hash().to_hex_string();
+        let origin = OriginName([7u8; NAME_HASH_LEN]);
+        let destination = destination_address(&origin.0, identity.address_hash()).to_hex_string();
+        for id in ["q-link", "q-stored"] {
+            slot.correlations()
+                .open(PendingRecord {
+                    peer_destination: destination.clone(),
+                    peer_identity: identity_hex.clone(),
+                    thread: "t-root".to_string(),
+                    ..pending(id)
+                })
+                .unwrap();
+        }
+        let still_open = |id: &str| {
+            slot.correlations().is_open(id)
+                && slot
+                    .correlations()
+                    .accepts_reply_from(id, &identity_hex, Disposition::Answered)
+        };
+        let drained = || {
+            let (envelopes, dropped) = slot.peer_inbox().drain();
+            assert_eq!(dropped, 0);
+            envelopes
+                .iter()
+                .map(|envelope| peer_payload(envelope).clone())
+                .collect::<Vec<_>>()
+        };
+        let no_in_reply_to = |sink: &RecordingHookSink| {
+            let envs = one_fire(sink, HookEvent::MeshBulletinReceived);
+            assert_eq!(env_value(&envs, "COYOTE_MESH_IN_REPLY_TO"), None);
+        };
+
+        // ---- off the link
+        let handler = PeerMessageHandler::new(Arc::downgrade(&slot) as Weak<dyn PeerSurface>);
+        let naming = |named: Value| {
+            let out = OutboundPeer::new(PeerKind::Bulletin, "heads up", None, None, None).unwrap();
+            let Value::Map(mut entries) = to_r3_body(&out, 1_700_000_000.0) else {
+                unreachable!()
+            };
+            entries.retain(|(key, _)| key.as_str() != Some("in_reply_to"));
+            entries.push((Value::from("in_reply_to"), named));
+            let mut request = admitted_request(&identity, &destination, &out);
+            request.body = Value::Map(entries);
+            (out.id, request)
+        };
+
+        let (bulletin_id, request) = naming(Value::from("q-link"));
+        match handler.handle(request).await {
+            Reply::Value(value) | Reply::Settled { value, .. } => {
+                assert!(is_received_reply(&value, &bulletin_id), "{value}")
+            }
+            Reply::Code(code) => panic!("the bulletin was refused: {code:?}"),
+            Reply::Silent => panic!("the bulletin was not acknowledged"),
+        }
+        let filed = drained();
+        assert_eq!(filed.len(), 1, "{filed:#?}");
+        assert_eq!(filed[0].message_id, bulletin_id);
+        assert_eq!(filed[0].kind, PeerKind::Bulletin);
+        assert_eq!(
+            filed[0].in_reply_to, None,
+            "a bulletin's in_reply_to is read as absent off the link"
+        );
+        assert_eq!(filed[0].thread, None, "a bulletin is its own thread");
+        assert_eq!(filed[0].disposition, None);
+        assert!(still_open("q-link"), "a bulletin answers nothing");
+        assert!(slot.correlations().take_answer("q-link").is_none());
+        no_in_reply_to(&sink);
+        let notes = slot.take_model_notes();
+        assert_eq!(notes.len(), 1, "{notes:#?}");
+        assert_eq!(notes[0].event, "peer_bulletin");
+
+        let (_, invalid) = naming(Value::from("q link"));
+        assert!(matches!(
+            handler.handle(invalid).await,
+            Reply::Code(RefusalCode::InvalidData)
+        ));
+        let (_, invalid) = naming(Value::from(7));
+        assert!(matches!(
+            handler.handle(invalid).await,
+            Reply::Code(RefusalCode::InvalidData)
+        ));
+        assert!(drained().is_empty(), "a refused bulletin is never filed");
+        assert!(sink.drain().is_empty(), "a refused bulletin fires nothing");
+        assert!(still_open("q-link"));
+
+        let answer =
+            OutboundPeer::new(PeerKind::Reply, "the answer", None, Some("q-link"), None).unwrap();
+        match handler
+            .handle(admitted_request(&identity, &destination, &answer))
+            .await
+        {
+            Reply::Value(value) | Reply::Settled { value, .. } => {
+                assert!(is_received_reply(&value, &answer.id), "{value}")
+            }
+            Reply::Code(code) => panic!("the reply was refused: {code:?}"),
+            Reply::Silent => panic!("the reply was not acknowledged"),
+        }
+        assert!(
+            !slot.correlations().is_open("q-link"),
+            "a reply from the asked identity naming the question closes it"
+        );
+        let taken = slot
+            .correlations()
+            .take_answer("q-link")
+            .expect("the reply is the filed answer");
+        assert_eq!(taken.message_id, answer.id);
+        assert_eq!(taken.in_reply_to.as_deref(), Some("q-link"));
+        assert_eq!(taken.thread.as_deref(), Some("t-root"));
+        let filed = drained();
+        assert_eq!(filed.len(), 1);
+        assert_eq!(filed[0].kind, PeerKind::Reply);
+        sink.drain();
+        slot.take_model_notes();
+
+        // ---- off the propagation node
+        let (trust, _trust_dir) = TrustList::default()
+            .destination(&destination, &identity_hex)
+            .open("node-bulletin-in-reply-to");
+        let inner = NullSink;
+        let routing = PeerRouting {
+            trust: &trust,
+            surface: Some(slot.clone() as Arc<dyn PeerSurface>),
+            inner: &inner,
+        };
+        let stored_naming = |named: Value| {
+            let out =
+                OutboundPeer::new(PeerKind::Bulletin, "stored heads up", None, None, None).unwrap();
+            let lxmf = peer_lxmf_message(&out, &origin);
+            let Some(Value::Map(mut fields)) = lxmf.fields else {
+                panic!("a peer message carries custom data")
+            };
+            let custom = fields
+                .iter_mut()
+                .find_map(|(key, value)| match value {
+                    Value::Map(custom)
+                        if key.as_u64()
+                            == Some(u64::from(lxmf_core::constants::FIELD_CUSTOM_DATA)) =>
+                    {
+                        Some(custom)
+                    }
+                    _ => None,
+                })
+                .expect("the custom data map");
+            custom.retain(|(key, _)| key.as_str() != Some("in_reply_to"));
+            custom.push((Value::from("in_reply_to"), named));
+            (
+                out.id,
+                InboundMessage {
+                    transient_id: [1u8; 32],
+                    message_id: [2u8; 32],
+                    source_identity_hash: identity_hex.clone(),
+                    source_delivery_hash: hex_lower(&[0x03; 16]),
+                    timestamp: 1_700_000_000.0,
+                    title: None,
+                    content: Some(lxmf.content),
+                    fields: Some(Value::Map(fields)),
+                    stamp_value: None,
+                },
+            )
+        };
+
+        let (stored_id, stored) = stored_naming(Value::from("q-stored"));
+        routing.deliver(stored);
+        let filed = drained();
+        assert_eq!(filed.len(), 1, "{filed:#?}");
+        assert_eq!(filed[0].message_id, stored_id);
+        assert_eq!(filed[0].kind, PeerKind::Bulletin);
+        assert_eq!(filed[0].via, PeerVia::StoreAndForward);
+        assert_eq!(
+            filed[0].in_reply_to, None,
+            "a bulletin's in_reply_to is read as absent off the propagation node"
+        );
+        assert_eq!(filed[0].thread, None);
+        assert!(still_open("q-stored"), "a stored bulletin answers nothing");
+        no_in_reply_to(&sink);
+        assert_eq!(slot.take_model_notes()[0].event, "peer_bulletin");
+
+        let (_, malformed) = stored_naming(Value::from("q stored"));
+        routing.deliver(malformed);
+        let (_, malformed) = stored_naming(Value::from(7));
+        routing.deliver(malformed);
+        assert!(
+            drained().is_empty(),
+            "a malformed stored bulletin is never filed"
+        );
+        assert!(sink.drain().is_empty());
+        assert!(still_open("q-stored"));
+
+        let answer = OutboundPeer::new(
+            PeerKind::Reply,
+            "the stored answer",
+            None,
+            Some("q-stored"),
+            None,
+        )
+        .unwrap();
+        let lxmf = peer_lxmf_message(&answer, &origin);
+        routing.deliver(InboundMessage {
+            transient_id: [4u8; 32],
+            message_id: [5u8; 32],
+            source_identity_hash: identity_hex.clone(),
+            source_delivery_hash: hex_lower(&[0x03; 16]),
+            timestamp: 1_700_000_000.0,
+            title: None,
+            content: Some(lxmf.content),
+            fields: lxmf.fields,
+            stamp_value: None,
+        });
+        assert!(!slot.correlations().is_open("q-stored"));
+        assert_eq!(
+            slot.correlations()
+                .take_answer("q-stored")
+                .map(|reply| reply.message_id),
+            Some(answer.id)
+        );
+    }
+
     #[test]
     fn an_escalated_reply_tells_the_model_to_check_the_inbox_rather_than_collect() {
         let slot = MeshSlot::default();
