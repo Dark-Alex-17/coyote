@@ -2557,8 +2557,8 @@ pub(crate) mod network {
     }
 
     /// A trusted peer's request that is not a request frame is dropped after admission,
-    /// and the drop names who sent it by the truncated identity, like every other
-    /// per-request line.
+    /// and the drop names who sent it by the truncated identity, like the dispatcher's
+    /// per-request lines.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_undecodable_request_from_a_trusted_peer_is_dropped_naming_its_truncated_identity() {
         install_log_collector();
