@@ -269,9 +269,7 @@ impl<T> Field<T> {
 
 type TextField = Field<String>;
 type UintField = Field<u64>;
-type U32Field = Field<u32>;
 type U16Field = Field<u16>;
-type ByteField = Field<u8>;
 type F64Field = Field<f64>;
 type Bin32Field = Field<[u8; 32]>;
 /// The schema version `1` most of the time.
@@ -2055,7 +2053,7 @@ pub(super) fn check_codec_bytes(fx: &CodecFixture, bytes: &[u8]) -> Result<(), S
 
 #[derive(Debug, Arbitrary)]
 struct StateGen {
-    code: Likely<ByteField>,
+    code: Likely<UintField>,
     since_secs: Unlikely<UintField>,
     shape: Shape,
     replace: Unlikely<Scalar>,
@@ -2079,8 +2077,8 @@ struct PlanGen {
 #[derive(Debug, Arbitrary)]
 struct TodoGen {
     goal: Unlikely<TextField>,
-    done: Likely<U32Field>,
-    total: Likely<U32Field>,
+    done: Likely<UintField>,
+    total: Likely<UintField>,
     shape: Shape,
     replace: Unlikely<Scalar>,
 }
@@ -2108,10 +2106,7 @@ impl CardGen {
     fn into_value(self) -> Value {
         let state = |state: StateGen| {
             let map = state.shape.map(vec![
-                (
-                    key("code"),
-                    present(state.code, |code| code.into_value(Value::from)),
-                ),
+                (key("code"), present(state.code, uint)),
                 (key("since_secs"), rare(state.since_secs, uint)),
             ]);
             sub_map(map, state.replace)
@@ -2132,14 +2127,8 @@ impl CardGen {
         let todo = |todo: TodoGen| {
             let map = todo.shape.map(vec![
                 (key("goal"), rare(todo.goal, text)),
-                (
-                    key("done"),
-                    present(todo.done, |n| n.into_value(Value::from)),
-                ),
-                (
-                    key("total"),
-                    present(todo.total, |n| n.into_value(Value::from)),
-                ),
+                (key("done"), present(todo.done, uint)),
+                (key("total"), present(todo.total, uint)),
             ]);
             sub_map(map, todo.replace)
         };
@@ -2196,6 +2185,10 @@ fn check_card(value: &Value) -> Result<(), String> {
         }),
         (CardClass::Readable, Err(StatusError::Malformed(_))) => Ok(()),
         (CardClass::Readable, Ok(card)) => {
+            let entries = value
+                .as_map()
+                .ok_or_else(|| "MESH-STATUS: a Readable card is a map".to_string())?;
+            numbers_as_sent(entries, card)?;
             let reencoded = card.to_value();
             ensure(
                 StatusCard::from_value(&reencoded) == Ok(card.clone()),
@@ -2215,6 +2208,65 @@ fn check_card(value: &Value) -> Result<(), String> {
             "MESH-STATUS-002..004: the predicate says {class:?}, the decoder says {observed:?}"
         )),
     }
+}
+
+/// MESH-STATUS-030 against the generated input: `state.code`, `since_secs`,
+/// `snapshot_age_secs` and `served_at_secs` are kept verbatim, while `todo.done` and
+/// `todo.total` saturate to `u32::MAX` (MESH-STATUS-026, MESH-STATUS-027). A value that is
+/// nil or not a uint is the decoder's call and is not checked here.
+fn numbers_as_sent(entries: &[(Value, Value)], card: &StatusCard) -> Result<(), String> {
+    let sent_u64 = |map: &str, key: &str| {
+        first(entries, map)
+            .and_then(Value::as_map)
+            .and_then(|nested| first(nested, key))
+            .and_then(Value::as_u64)
+    };
+    let top_u64 = |key: &str| first(entries, key).and_then(Value::as_u64);
+    let kept = [
+        (
+            "state.code",
+            sent_u64("state", "code"),
+            Some(card.state.code),
+        ),
+        (
+            "state.since_secs",
+            sent_u64("state", "since_secs"),
+            card.state.since_secs,
+        ),
+        (
+            "snapshot_age_secs",
+            top_u64("snapshot_age_secs"),
+            card.snapshot_age_secs,
+        ),
+        (
+            "served_at_secs",
+            top_u64("served_at_secs"),
+            Some(card.served_at_secs),
+        ),
+    ];
+    for (field, sent, decoded) in kept {
+        let Some(sent) = sent else {
+            continue;
+        };
+        ensure(decoded == Some(sent), || {
+            format!("MESH-STATUS-030: `{field}` {sent} must be kept as sent, got {decoded:?}")
+        })?;
+    }
+    let todo = card.todo.as_ref();
+    let todo_fields = [
+        ("done", "MESH-STATUS-026", todo.map(|todo| todo.done)),
+        ("total", "MESH-STATUS-027", todo.map(|todo| todo.total)),
+    ];
+    for (key, rule, decoded) in todo_fields {
+        let Some(sent) = sent_u64("todo", key) else {
+            continue;
+        };
+        let saturated = u32::try_from(sent).unwrap_or(u32::MAX);
+        ensure(decoded == Some(saturated), || {
+            format!("{rule}: `todo.{key}` {sent} must read as {saturated}, got {decoded:?}")
+        })?;
+    }
+    Ok(())
 }
 
 // --- wire path (the file part name grammar) --------------------------------------------

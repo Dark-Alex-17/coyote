@@ -1017,6 +1017,169 @@ fn usage_probe_announce_decoder_and_oracle_agree_at_the_magic_relative_header_bo
     agree(&padded);
 }
 
+/// The card oracle cross-checks every decoded number against the generated input, so the
+/// decoder and the oracle must agree on each numeric edge the wire can carry: a code or a
+/// count sent twice (first wins, MESH-CANON-012), a count at and past `u32::MAX`
+/// (MESH-STATUS-026/027 saturate on read), a code or an age at `u64::MAX` kept as sent
+/// (MESH-STATUS-030), a positive value in a signed msgpack int format (still a uint), and the
+/// shapes the oracle leaves to the decoder (nil, negative, float, a scalar in place of a
+/// map). None of these may make the oracle report a false violation, and each decodes as
+/// the spec says.
+#[test]
+fn usage_probe_card_decoder_and_oracle_agree_on_every_numeric_edge() {
+    use super::card::{STATE_IDLE, StatusCard, StatusError};
+    use oracles::{TAG_CARD, packed};
+    use rmpv::Value;
+
+    let fixture = oracles::CodecFixture::new();
+    let agree_bytes = |payload: &[u8]| {
+        let tagged = [&[TAG_CARD][..], payload].concat();
+        oracles::check_codec_bytes(&fixture, &tagged).unwrap_or_else(|what| {
+            panic!("decoder and oracle disagree on card bytes {payload:02x?}: {what}")
+        });
+    };
+    let agree = |value: &Value| agree_bytes(&packed(value));
+    let key = |name: &str| Value::from(name);
+    let card = |state: Vec<(Value, Value)>, todo: Option<Value>, served_at: u64| {
+        let mut entries = vec![
+            (key("v"), Value::from(1u64)),
+            (key("state"), Value::Map(state)),
+        ];
+        if let Some(todo) = todo {
+            entries.push((key("todo"), todo));
+        }
+        entries.push((key("served_at_secs"), Value::from(served_at)));
+        Value::Map(entries)
+    };
+    let todo = |entries: Vec<(Value, Value)>| Some(Value::Map(entries));
+
+    // Duplicate keys: the first `code` and the first `done` win in both the decoder and
+    // the oracle; a different policy on either side would be reported.
+    let twice = card(
+        vec![
+            (key("code"), Value::from(STATE_IDLE)),
+            (key("code"), Value::from(256u64)),
+        ],
+        todo(vec![
+            (key("done"), Value::from(u64::MAX)),
+            (key("done"), Value::from(1u64)),
+            (key("total"), Value::from(2u64)),
+        ]),
+        5,
+    );
+    agree(&twice);
+    let decoded = StatusCard::from_value(&twice).expect("a card with repeated keys decodes");
+    assert_eq!(decoded.state.code, STATE_IDLE, "the first `code` wins");
+    assert_eq!(
+        decoded.todo.as_ref().map(|todo| (todo.done, todo.total)),
+        Some((u32::MAX, 2)),
+        "the first `done` wins and saturates"
+    );
+
+    // The saturation boundary: exact `u32::MAX` is kept, one past it and `u64::MAX` read as
+    // `u32::MAX`; the code and every age at `u64::MAX` are kept as sent.
+    for (done, total) in [
+        (u64::from(u32::MAX), 1u64),
+        (u64::from(u32::MAX) + 1, u64::from(u32::MAX)),
+        (u64::MAX, u64::MAX),
+        (1u64 << 33, 5),
+    ] {
+        let value = card(
+            vec![
+                (key("code"), Value::from(u64::MAX)),
+                (key("since_secs"), Value::from(u64::MAX)),
+            ],
+            todo(vec![
+                (key("done"), Value::from(done)),
+                (key("total"), Value::from(total)),
+            ]),
+            u64::MAX,
+        );
+        agree(&value);
+        let decoded = StatusCard::from_value(&value).unwrap();
+        assert_eq!(decoded.state.code, u64::MAX);
+        assert_eq!(decoded.state.since_secs, Some(u64::MAX));
+        assert_eq!(decoded.served_at_secs, u64::MAX);
+        let read = decoded.todo.map(|todo| (todo.done, todo.total)).unwrap();
+        let saturate = |sent: u64| u32::try_from(sent).unwrap_or(u32::MAX);
+        assert_eq!(
+            read,
+            (saturate(done), saturate(total)),
+            "done={done} total={total}"
+        );
+        // What the reader re-emits is itself a card the oracle agrees on.
+        agree(&StatusCard::from_value(&value).unwrap().to_value());
+    }
+
+    // A positive value in a signed msgpack format is a uint to both sides: `code` as int16
+    // 256, `done` as int64 2^33, `total` as int8 1; a `since_secs` as uint64 2^40.
+    let mut bytes = vec![0x84, 0xa1, b'v', 0x01, 0xa5];
+    bytes.extend_from_slice(b"state");
+    bytes.extend_from_slice(&[0x82, 0xa4]);
+    bytes.extend_from_slice(b"code");
+    bytes.extend_from_slice(&[0xd1, 0x01, 0x00, 0xaa]);
+    bytes.extend_from_slice(b"since_secs");
+    bytes.push(0xcf);
+    bytes.extend_from_slice(&(1u64 << 40).to_be_bytes());
+    bytes.push(0xa4);
+    bytes.extend_from_slice(b"todo");
+    bytes.extend_from_slice(&[0x82, 0xa4]);
+    bytes.extend_from_slice(b"done");
+    bytes.push(0xd3);
+    bytes.extend_from_slice(&(1i64 << 33).to_be_bytes());
+    bytes.push(0xa5);
+    bytes.extend_from_slice(b"total");
+    bytes.extend_from_slice(&[0xd0, 0x01, 0xae]);
+    bytes.extend_from_slice(b"served_at_secs");
+    bytes.push(0x05);
+    agree_bytes(&bytes);
+    let value = rmpv::decode::read_value(&mut &bytes[..]).unwrap();
+    let decoded = StatusCard::from_value(&value).expect("signed-format positives are uints");
+    assert_eq!(decoded.state.code, 256);
+    assert_eq!(decoded.state.since_secs, Some(1 << 40));
+    assert_eq!(
+        decoded.todo.map(|todo| (todo.done, todo.total)),
+        Some((u32::MAX, 1))
+    );
+
+    // Shapes the oracle leaves to the decoder: each is `Malformed` and no false violation.
+    let not_uints = [
+        Value::Nil,
+        Value::from(-1),
+        Value::F64(1.0),
+        Value::from("1"),
+    ];
+    for wrong in &not_uints {
+        for value in [
+            card(vec![(key("code"), wrong.clone())], None, 5),
+            card(
+                vec![(key("code"), Value::from(1u64))],
+                todo(vec![
+                    (key("done"), wrong.clone()),
+                    (key("total"), Value::from(2u64)),
+                ]),
+                5,
+            ),
+            card(
+                vec![(key("code"), Value::from(1u64))],
+                Some(Value::from(7u64)),
+                5,
+            ),
+            card(
+                vec![(key("code"), Value::from(1u64))],
+                todo(vec![]),
+                wrong.as_u64().unwrap_or(5),
+            ),
+        ] {
+            agree(&value);
+        }
+        assert!(matches!(
+            StatusCard::from_value(&card(vec![(key("code"), wrong.clone())], None, 5)),
+            Err(StatusError::Malformed(_))
+        ));
+    }
+}
+
 #[test]
 fn fuzz_corpus_files_belong_to_the_classes_their_names_claim() {
     use super::card::StatusCard;
