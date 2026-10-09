@@ -107,8 +107,8 @@ fn the_windows_script_carries_the_scheduled_task_and_readiness_contract() {
             "a registered task's action is compared with the one this run would write",
         ),
         (
-            "Set-ScheduledTask",
-            "a changed definition is applied, or planned under -DryRun, with Set-ScheduledTask",
+            "    Set-ScheduledTask -TaskName $TaskName -Action $action | Out-Null",
+            "a changed definition is stored with an executed Set-ScheduledTask, not only described",
         ),
         (
             "rnsd.cmd",
@@ -130,6 +130,12 @@ fn the_windows_script_carries_the_scheduled_task_and_readiness_contract() {
     ] {
         assert!(ps1.contains(token), "mesh-relay.ps1 lacks {token:?}: {why}");
     }
+    assert!(
+        ps1.matches("Note: the service definition changed; apply it with:")
+            .count()
+            == 2,
+        "mesh-relay.ps1 must print the changed-definition Note on both the dry run and the real run"
+    );
     assert!(
         !ps1.contains("Test-NetConnection"),
         "Test-NetConnection takes seconds per probe and is absent from pwsh on other OSes"
