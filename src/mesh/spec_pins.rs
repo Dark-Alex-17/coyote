@@ -3231,6 +3231,49 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
     }
 
     #[test]
+    fn sec_024_pins_the_envoy_memory_contract() {
+        let line = SPEC
+            .lines()
+            .find(|line| line.starts_with("**[MESH-SEC-024]**"))
+            .expect("MESH-SEC-024 is defined");
+        let bounds = [
+            format!(
+                "`DEFAULT_ENVOY_MEMORY_MAX_SESSIONS` = `{}`",
+                DEFAULT_ENVOY_MEMORY_MAX_SESSIONS
+            ),
+            format!(
+                "`DEFAULT_ENVOY_MEMORY_MAX_PER_IDENTITY` = `{}`",
+                DEFAULT_ENVOY_MEMORY_MAX_PER_IDENTITY
+            ),
+            format!(
+                "`DEFAULT_ENVOY_MEMORY_MAX_TURNS` = `{}`",
+                DEFAULT_ENVOY_MEMORY_MAX_TURNS
+            ),
+            format!(
+                "`DEFAULT_ENVOY_MEMORY_MAX_BYTES` = `{}`",
+                DEFAULT_ENVOY_MEMORY_MAX_BYTES
+            ),
+            format!(
+                "`DEFAULT_ENVOY_MEMORY_TTL_HOURS` = `{}`",
+                DEFAULT_ENVOY_MEMORY_TTL_HOURS
+            ),
+        ];
+        let clauses = [
+            "keyed by the proved sending identity",
+            "`session_key`",
+            "MUST never be loaded",
+            "MUST NOT assume",
+        ];
+        for clause in clauses
+            .iter()
+            .copied()
+            .chain(bounds.iter().map(String::as_str))
+        {
+            assert!(line.contains(clause), "{line:?} lacks {clause:?}");
+        }
+    }
+
+    #[test]
     fn wire_path_rule_table_names_the_rules_in_order() {
         const HEADER: &str = "| Rule | Condition | Receiver action |";
         let section = section(SPEC, "### 10.13 Wire paths").unwrap();
