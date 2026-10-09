@@ -27531,6 +27531,7 @@ mod tests {
                 ])
             }
 
+            #[cfg(unix)]
             fn all_question() -> String {
                 "Forget 3 remembered conversations of 2 identities? This cannot be undone."
                     .to_string()
