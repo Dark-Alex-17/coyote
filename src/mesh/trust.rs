@@ -1044,6 +1044,27 @@ impl TrustStore {
         IdentityStanding::Unknown
     }
 
+    /// Whether the trust list still has any record of `identity_hash`: trusted at the
+    /// identity tier, or (a trust file edited by hand) bound to a destination record
+    /// alone, on disk or for the session, and not blocked. What the envoy asks before
+    /// writing a thread back for an identity whose standing may have changed while its
+    /// run was going.
+    pub(crate) fn knows_identity(&self, identity_hash: &str) -> bool {
+        let identity = identity_hash.to_ascii_lowercase();
+        let state = self.inner.lock();
+        if state.file.blocked_identities.contains_key(&identity) {
+            return false;
+        }
+        state.file.identities.contains_key(&identity)
+            || state.session_identities.contains_key(&identity)
+            || state
+                .file
+                .destinations
+                .values()
+                .chain(state.session_destinations.values())
+                .any(|entry| entry.identity == identity)
+    }
+
     pub(crate) fn is_blocked_identity(&self, identity_hash: &str) -> bool {
         self.inner
             .lock()
@@ -4667,6 +4688,62 @@ mod tests {
         fx.store.untrust_identity(&fx.mesh, &identity).unwrap();
 
         assert!(fx.store.records().is_empty());
+    }
+
+    /// The identity the envoy writes a thread back for is known while a record names
+    /// it, on disk or for the session, and unknown once blocked or untrusted as an
+    /// identity; the untrust of one destination says nothing about the person.
+    #[test]
+    fn knows_identity_follows_every_record_and_never_a_block() {
+        let fx = Fixture::new("trust-knows-identity");
+        let by_destination = announced("alpha");
+        fx.announce(&by_destination, t(2_000));
+        let for_session = announced("beta");
+        fx.announce(&for_session, t(2_000));
+        let by_identity = fake_hash(0xcc);
+        let stranger = fake_hash(0xdd);
+        assert!(!fx.store.knows_identity(&by_destination.identity_hash));
+
+        fx.trust_destination(&by_destination, t(3_000));
+        fx.store
+            .trust_destination_for_session(&fx.mesh, &for_session.destination_hash, t(3_000))
+            .unwrap();
+        fx.trust_identity(&by_identity, t(3_000));
+
+        assert!(
+            fx.store
+                .knows_identity(&by_destination.identity_hash.to_uppercase()),
+            "bound to a destination record on disk"
+        );
+        assert!(
+            fx.store.knows_identity(&for_session.identity_hash),
+            "bound to a destination record for the session"
+        );
+        assert!(fx.store.knows_identity(&by_identity));
+        assert!(!fx.store.knows_identity(&stranger));
+
+        fx.store
+            .untrust_destination(&fx.mesh, &by_destination.destination_hash, t(4_000), false)
+            .unwrap();
+        assert!(
+            fx.store.knows_identity(&by_destination.identity_hash),
+            "the identity record the destination's trust made stays"
+        );
+        fx.store
+            .untrust_identity(&fx.mesh, &by_destination.identity_hash)
+            .unwrap();
+        assert!(
+            !fx.store.knows_identity(&by_destination.identity_hash),
+            "untrusted as an identity, it is a stranger again"
+        );
+        fx.store
+            .block_identity(&fx.mesh, &by_identity, None, t(4_000))
+            .unwrap();
+        assert!(!fx.store.knows_identity(&by_identity));
+        assert_eq!(
+            fx.store.identity_standing(&by_identity),
+            IdentityStanding::Blocked
+        );
     }
 
     #[test]

@@ -969,8 +969,24 @@ impl EnvoyRunner {
             None
         } else {
             if let Some(memory) = memory {
-                let spoken = human_answer.clone().unwrap_or_else(|| reply_text.clone());
-                remember_exchange(&memory.store, &message, card, spoken);
+                // The sender's standing is judged again here, not at run start: an
+                // owner who blocked or untrusted it meanwhile had its threads forgotten,
+                // and this write must not bring one back. With no node attached there
+                // is no trust list to ask and the write goes ahead.
+                let still_known = app
+                    .mesh
+                    .get()
+                    .is_none_or(|runtime| runtime.trust().knows_identity(&message.source_identity));
+                if still_known {
+                    let spoken = human_answer.clone().unwrap_or_else(|| reply_text.clone());
+                    remember_exchange(&memory.store, &message, card, spoken);
+                } else {
+                    debug!(
+                        "Mesh envoy memory for thread {} not written: {} is no longer trusted; nothing remembered",
+                        message.thread(),
+                        short(&message.source_identity)
+                    );
+                }
             }
             match (
                 app.mesh.get(),
@@ -1334,7 +1350,9 @@ mod tests {
         OriginName, PathHash, RefusalCode, Reply, RequestId, SizeBranch, TempDir, TrustList,
     };
     #[cfg(unix)]
-    use crate::mesh::test_support::{PeerStub, StartedRuntime, started_runtime_on};
+    use crate::mesh::test_support::{
+        PeerStub, StartedRuntime, started_runtime_on, started_runtime_on_with,
+    };
     use crate::mesh::{destination_address, hex_lower};
     use crate::supervisor::mailbox::EnvelopePayload;
     use crate::testing::{TestConfigDirGuard, install_log_collector, warn_snapshot};
@@ -7477,6 +7495,113 @@ mod tests {
             turns[0].text
         );
         assert_eq!(turns[1].text, "answer 0");
+        source.remove_dir();
+    }
+
+    /// The sender's standing is judged when its thread is written back, not when the
+    /// run started: an owner who blocks the sender while its run is going has had the
+    /// sender's threads forgotten, and the run's end does not bring one back.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn a_sender_blocked_during_its_run_is_not_remembered_when_the_run_ends() {
+        use crate::mesh::trust::TrustOptions;
+        use rns_transport::iface::tcp_server::TcpServer;
+
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-memory-blocked");
+        let (source, _source) = stub_envoy_source();
+        let stub =
+            PeerStub::listen("envoy-memory-blocked-stub", TcpServer::DEFAULT_CLIENT_MTU).await;
+        let started = started_runtime_on_with("envoy-memory-blocked-node", stub.port(), |c| {
+            c.envoy_memory.enabled = true;
+        })
+        .await;
+        let runtime = started.runtime.clone();
+        let app = test_app();
+        app.mesh.install(runtime.clone()).unwrap();
+        stub.trust(&runtime.current_destination_hash(), runtime.fingerprint());
+        stub.announce(Some("Stub")).await;
+        let to = stub.destination_hex();
+        let peers = runtime.peers();
+        stub.wait_to_be_filed(&peers, &to).await;
+        runtime
+            .trust()
+            .trust_destination(
+                app.mesh.as_ref(),
+                &to,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        let identity = stub.identity_hex();
+        let store = runtime
+            .envoy_memory()
+            .expect("an enabled store is opened at start");
+        let idle = RecordingIdleSink::attach(&app);
+        let gate = Arc::new(Semaphore::new(0));
+        let held = Arc::new(AtomicBool::new(false));
+        let runs = Arc::new(AtomicUsize::new(0));
+        let runner = EnvoyRunner::start_with(Arc::clone(&app), {
+            let gate = Arc::clone(&gate);
+            let held = Arc::clone(&held);
+            let runs = Arc::clone(&runs);
+            drive_of(move |_, _, _| {
+                let gate = Arc::clone(&gate);
+                let held = Arc::clone(&held);
+                let runs = Arc::clone(&runs);
+                async move {
+                    if runs.fetch_add(1, Ordering::SeqCst) == 1 {
+                        held.store(true, Ordering::SeqCst);
+                        gate.acquire().await.unwrap().forget();
+                    }
+                    Ok("answer".into())
+                }
+            })
+        });
+        let in_thread = |id: &str, content: &str| {
+            let mut job = job_from(PeerKind::Ask, id, content, &to, &identity);
+            job.message.thread = Some("t-9".into());
+            job
+        };
+        let remembered = || {
+            store
+                .load(&identity, "t-9", SystemTime::now())
+                .unwrap()
+                .map(|record| record.turns)
+                .unwrap_or_default()
+        };
+
+        assert!(runner.accept(in_thread("q-1", "first")).is_ok());
+        wait_until("the first reply", || idle.count("envoy replied:") == 1).await;
+        assert_eq!(
+            remembered().len(),
+            2,
+            "a trusted sender's exchange is remembered"
+        );
+        assert!(runner.accept(in_thread("q-2", "second")).is_ok());
+        wait_until("the second run to be held", || held.load(Ordering::SeqCst)).await;
+        runtime
+            .trust()
+            .block_identity(app.mesh.as_ref(), &identity, None, SystemTime::now())
+            .unwrap();
+        assert!(remembered().is_empty(), "the block forgot the thread");
+        gate.add_permits(1);
+        wait_until("the second run to end", || {
+            idle.count("envoy replied:") == 2
+        })
+        .await;
+        runner.stop().await;
+
+        assert!(remembered().is_empty(), "{:?}", remembered());
+        assert!(
+            !store
+                .dir()
+                .join(format!("{}.yaml", session_key(&identity, "t-9").unwrap()))
+                .exists(),
+            "the run's end wrote nothing back for a sender no longer trusted"
+        );
+        assert!(app.mesh.stop().await.unwrap());
+        stub.stop().await;
         source.remove_dir();
     }
 
