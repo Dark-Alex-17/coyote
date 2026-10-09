@@ -41,7 +41,8 @@ $DefaultRnsSpec = 'rns==1.5.2'
 
 $TaskName = 'Coyote rnsd'
 $ListenPort = 4242
-$ReadyTimeoutSeconds = 30
+# The override exists for the test harness; operators get the documented 30 s.
+$ReadyTimeoutSeconds = if ($env:COYOTE_MESH_READY_TIMEOUT) { [int]$env:COYOTE_MESH_READY_TIMEOUT } else { 30 }
 
 function Write-Usage {
   Write-Output 'coyote mesh relay setup (Windows): install rnsd, write its config, run it as a Scheduled Task'
@@ -136,6 +137,8 @@ enable_transport = True
 
 # Shared instance left at the default so rnstatus, rnpath, Sideband and NomadNet on
 # this host attach to this daemon instead of binding 4242 / AutoInterface again.
+# Any other local account on this host can attach to this daemon too, over
+# 127.0.0.1:4242 and the shared instance; that is inherent to Reticulum's shared-instance model.
 
 [logging]
 
@@ -161,13 +164,38 @@ function Write-FirewallWarning {
   Write-Info 'Firewall: AutoInterface listens for LAN peers, and with enable_transport this rnsd forwards traffic for any Reticulum peer on the LAN (and on to the Team Relay when one is configured). Windows will ask whether python/rnsd may accept incoming connections; allow it or discovery of LAN hosts will not work.'
 }
 
+# True when the config has an AutoInterface stanza that is not switched off; comments and
+# disabled stanzas do not count.
+function Test-ConfigEnablesAutoInterface {
+  param([string]$Path)
+  $inAuto = $false
+  $enabled = $true
+  foreach ($line in [IO.File]::ReadAllLines($Path)) {
+    if ($line -match '^\s*\[\[') {
+      if ($inAuto -and $enabled) { return $true }
+      $inAuto = $false
+      $enabled = $true
+    } elseif ($line -match '^\s*type\s*=\s*AutoInterface') {
+      $inAuto = $true
+    } elseif ($line -match '^\s*(interface_)?enabled\s*=\s*(no|false|0)\b') {
+      $enabled = $false
+    }
+  }
+  return ($inAuto -and $enabled)
+}
+
 # Writes to a temp file beside the target and moves it into place, so a crash never leaves a half-written file.
 function Write-TextFile {
   param([string]$Path, [string]$Text, [Text.Encoding]$Encoding = (New-Object System.Text.UTF8Encoding($false)))
   $dir = Split-Path -Parent $Path
   $tmp = Join-Path $dir ('.' + (Split-Path -Leaf $Path) + '.' + [IO.Path]::GetRandomFileName())
-  [IO.File]::WriteAllText($tmp, $Text, $Encoding)
-  Move-Item -LiteralPath $tmp -Destination $Path -Force
+  try {
+    [IO.File]::WriteAllText($tmp, $Text, $Encoding)
+    Move-Item -LiteralPath $tmp -Destination $Path -Force
+  } catch {
+    Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+    throw
+  }
 }
 
 # cmd.exe reads batch files in the OEM code page, so a shim path with non-ASCII characters must be written in it.
@@ -192,7 +220,7 @@ function Write-Config {
     if (-not (Select-String -LiteralPath $script:RnsConfig -Pattern '^\s*enable_transport\s*=\s*(true|yes)' -Quiet)) {
       Write-Info "WARNING: $script:RnsConfig does not set enable_transport = True; without it this rnsd will not relay between Coyote sessions."
     }
-    if (Select-String -LiteralPath $script:RnsConfig -Pattern 'AutoInterface' -Quiet) { Write-FirewallWarning }
+    if (Test-ConfigEnablesAutoInterface -Path $script:RnsConfig) { Write-FirewallWarning }
     return
   }
   if ($DryRun) {
@@ -253,7 +281,10 @@ function Get-RungDescription {
     'present' { return "reuse $script:ExistingRnsd (already works)" }
     'uv' { return "uv tool install --python 3.12 `"$script:RnsSpec`"" }
     'pipx' { return "pipx install `"$script:RnsSpec`"" }
-    'venv' { return "$script:PythonFile $($script:PythonPrefix -join ' ') -m venv `"$script:VenvDir`" && pip install `"$script:RnsSpec`"" }
+    'venv' {
+      $python = (@($script:PythonFile) + @($script:PythonPrefix)) -join ' '
+      return "$python -m venv `"$script:VenvDir`" && pip install `"$script:RnsSpec`""
+    }
   }
 }
 
@@ -371,13 +402,15 @@ function Test-LoopbackPort {
 
 function Wait-Ready {
   Write-Info "Waiting for rnsd on 127.0.0.1:$ListenPort"
-  for ($waited = 0; $waited -lt $ReadyTimeoutSeconds; $waited++) {
+  $deadline = [DateTime]::UtcNow.AddSeconds($ReadyTimeoutSeconds)
+  do {
     if (Test-LoopbackPort) {
       Write-Info "rnsd is listening on 127.0.0.1:$ListenPort"
       return
     }
-    Start-Sleep -Seconds 1
-  }
+    $left = ($deadline - [DateTime]::UtcNow).TotalMilliseconds
+    if ($left -gt 0) { Start-Sleep -Milliseconds ([int][Math]::Min(1000, $left)) }
+  } while ([DateTime]::UtcNow -lt $deadline)
   Write-Failure "rnsd did not open 127.0.0.1:$ListenPort within ${ReadyTimeoutSeconds}s. Logs: $script:LogFile"
   exit 3
 }
@@ -405,8 +438,17 @@ function Install-Service {
   }
 
   New-Item -ItemType Directory -Force -Path (Split-Path -Parent $script:LogFile) | Out-Null
+  $changed = $false
   if ($existing) {
-    Write-Info "Scheduled Task '$TaskName' already registered"
+    $registeredArgument = $null
+    $actions = @($existing.Actions)
+    if ($actions.Count -gt 0) { $registeredArgument = $actions[0].Arguments }
+    if ($registeredArgument -eq $actionArgument) {
+      Write-Info "Scheduled Task '$TaskName' already registered"
+    } else {
+      $changed = $true
+      Write-Info "Note: the service definition changed; apply it with: Set-ScheduledTask -TaskName '$TaskName' -Action (New-ScheduledTaskAction -Execute 'cmd.exe' -Argument '$actionArgument')"
+    }
   } else {
     $action = New-ScheduledTaskAction -Execute 'cmd.exe' -Argument $actionArgument
     $trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
@@ -417,13 +459,16 @@ function Install-Service {
     $existing = Get-ScheduledTask -TaskName $TaskName
   }
   if ($existing.State -eq 'Running') {
-    Write-Info "'$TaskName' is already running; not restarted"
+    if (-not $changed) { Write-Info "'$TaskName' is already running; not restarted" }
   } else {
     Start-ScheduledTask -TaskName $TaskName
     Write-Info "Started '$TaskName'"
   }
   Write-Info "Logs: $script:LogFile"
   Wait-Ready
+  if ((Get-ScheduledTask -TaskName $TaskName).State -ne 'Running') {
+    Write-Info "WARNING: 127.0.0.1:$ListenPort is open but '$TaskName' is not running; something else holds the port"
+  }
 }
 
 function Write-NextStep {

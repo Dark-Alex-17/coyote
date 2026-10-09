@@ -29,7 +29,8 @@ DEFAULT_RNS_SPEC="rns==1.5.2"
 SERVICE_NAME="coyote-rnsd"
 LAUNCHD_LABEL="com.coyote.rnsd"
 LISTEN_PORT=4242
-READY_TIMEOUT=30
+# The override exists for the test harness; operators get the documented 30 s.
+READY_TIMEOUT="${COYOTE_MESH_READY_TIMEOUT:-30}"
 
 usage() {
   echo "coyote mesh relay setup (Linux/macOS): install rnsd, write its config, run it as a user service"
@@ -206,6 +207,13 @@ pipx_bin_dir() {
   echo "$dir"
 }
 
+# A working rnsd on PATH other than BIN_DIR's own entry, as an absolute path; empty when none.
+rnsd_on_path() {
+  local found
+  found="$(command -v rnsd 2>/dev/null || true)"
+  if [[ "$found" == /* && "$found" != "$RNSD" ]] && rnsd_works "$found"; then echo "$found"; fi
+}
+
 link_rnsd() {
   local real="$1"
   if [[ "$real" == "$RNSD" ]]; then return 0; fi
@@ -225,7 +233,7 @@ write_shim() {
 }
 
 install_rnsd() {
-  local real=""
+  local real="" found=""
   case "$INSTALL_RUNG" in
     present)
       log "rnsd already installed: $EXISTING_RNSD"
@@ -235,14 +243,20 @@ install_rnsd() {
       log "Installing $RNS_SPEC with uv (managed CPython 3.12)"
       if ! uv tool install --python 3.12 "$RNS_SPEC"; then err "uv tool install failed"; exit 2; fi
       real="$(uv tool dir --bin --color never)/rnsd"
-      if ! rnsd_works "$real" && command -v rnsd >/dev/null 2>&1; then real="$(command -v rnsd)"; fi
+      if ! rnsd_works "$real"; then
+        found="$(rnsd_on_path)"
+        if [[ -n "$found" ]]; then real="$found"; fi
+      fi
       link_rnsd "$real"
       ;;
     pipx)
       log "Installing $RNS_SPEC with pipx"
       if ! pipx install "$RNS_SPEC"; then err "pipx install failed"; exit 2; fi
       real="$(pipx_bin_dir)/rnsd"
-      if ! rnsd_works "$real" && command -v rnsd >/dev/null 2>&1; then real="$(command -v rnsd)"; fi
+      if ! rnsd_works "$real"; then
+        found="$(rnsd_on_path)"
+        if [[ -n "$found" ]]; then real="$found"; fi
+      fi
       link_rnsd "$real"
       log "Hint: 'pipx ensurepath' adds pipx's bin dir to PATH if it is not there yet"
       ;;
@@ -324,6 +338,8 @@ enable_transport = True
 
 # Shared instance left at the default so rnstatus, rnpath, Sideband and NomadNet on
 # this host attach to this daemon instead of binding 4242 / AutoInterface again.
+# Any other local account on this host can attach to this daemon too, over
+# 127.0.0.1:4242 and the shared instance; that is inherent to Reticulum's shared-instance model.
 
 [logging]
 
@@ -347,7 +363,29 @@ EOF
 }
 
 firewall_warning() {
-  log "Firewall: AutoInterface listens for LAN peers, and with enable_transport this rnsd forwards traffic for any Reticulum peer on the LAN (and on to the Team Relay when one is configured). macOS and Windows will ask whether python/rnsd may accept incoming connections; allow it or discovery of LAN hosts will not work."
+  local sentence="Firewall: AutoInterface listens for LAN peers, and with enable_transport this rnsd forwards traffic for any Reticulum peer on the LAN (and on to the Team Relay when one is configured)."
+  if [[ "$OS" == "darwin" ]]; then
+    log "$sentence macOS will ask whether python/rnsd may accept incoming connections; allow it or discovery of LAN hosts will not work."
+  else
+    log "$sentence"
+  fi
+}
+
+# True when the existing config holds an AutoInterface stanza that is not switched off
+# with `enabled = No` before the next stanza header.
+config_enables_autointerface() {
+  local line in_auto=0 enabled=1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" =~ ^[[:space:]]*\[\[ ]]; then
+      if [[ "$in_auto" -eq 1 && "$enabled" -eq 1 ]]; then return 0; fi
+      in_auto=0; enabled=1
+    elif [[ "$line" =~ ^[[:space:]]*type[[:space:]]*=[[:space:]]*AutoInterface ]]; then
+      in_auto=1
+    elif [[ "$line" =~ ^[[:space:]]*(interface_)?enabled[[:space:]]*=[[:space:]]*([Nn]o|[Ff]alse|0) ]]; then
+      enabled=0
+    fi
+  done < "$RNS_CONFIG"
+  [[ "$in_auto" -eq 1 && "$enabled" -eq 1 ]]
 }
 
 write_config() {
@@ -360,7 +398,7 @@ write_config() {
     if ! grep -qiE '^[[:space:]]*enable_transport[[:space:]]*=[[:space:]]*(true|yes)' "$RNS_CONFIG"; then
       log "WARNING: $RNS_CONFIG does not set enable_transport = True; without it this rnsd will not relay between Coyote sessions."
     fi
-    if grep -q AutoInterface "$RNS_CONFIG"; then firewall_warning; fi
+    if config_enables_autointerface; then firewall_warning; fi
     return 0
   fi
   if [[ "$DRY_RUN" -eq 1 ]]; then
@@ -390,7 +428,7 @@ Description=Reticulum daemon for Coyote mesh
 After=network.target
 
 [Service]
-ExecStart=$RNSD
+ExecStart="$RNSD"
 Environment=PYTHONUNBUFFERED=1
 Restart=on-failure
 RestartSec=5
@@ -400,7 +438,16 @@ WantedBy=default.target
 EOF
 }
 
+# sed rather than ${text//x/y}: bash 3.2 keeps quotes inside the replacement literally,
+# and bash 5.2 reads an unquoted `&` there as the matched text.
+xml_escape() {
+  printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g'
+}
+
 launchd_plist_text() {
+  local rnsd log
+  rnsd="$(xml_escape "$RNSD")"
+  log="$(xml_escape "$LAUNCHD_LOG")"
   cat <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -410,7 +457,7 @@ launchd_plist_text() {
   <string>$LAUNCHD_LABEL</string>
   <key>ProgramArguments</key>
   <array>
-    <string>$RNSD</string>
+    <string>$rnsd</string>
   </array>
   <key>RunAtLoad</key>
   <true/>
@@ -422,9 +469,9 @@ launchd_plist_text() {
     <string>1</string>
   </dict>
   <key>StandardOutPath</key>
-  <string>$LAUNCHD_LOG</string>
+  <string>$log</string>
   <key>StandardErrorPath</key>
-  <string>$LAUNCHD_LOG</string>
+  <string>$log</string>
 </dict>
 </plist>
 EOF
@@ -494,7 +541,9 @@ service_linux() {
     return 0
   fi
 
+  local changed=0
   if write_if_changed "$SYSTEMD_UNIT" "$unit"; then
+    changed=1
     log "Wrote $SYSTEMD_UNIT"
   else
     log "$SYSTEMD_UNIT already present with this content"
@@ -508,13 +557,20 @@ service_linux() {
   fi
   systemctl --user daemon-reload
   if systemctl --user is-active --quiet "$SERVICE_NAME"; then
-    log "$SERVICE_NAME is already running; not restarted"
+    if [[ "$changed" -eq 1 ]]; then
+      log "Note: the service definition changed; apply it with: systemctl --user restart $SERVICE_NAME"
+    else
+      log "$SERVICE_NAME is already running; not restarted"
+    fi
   else
     systemctl --user enable --now "$SERVICE_NAME"
     log "Enabled and started $SERVICE_NAME"
   fi
   linger_hint
   wait_ready "journalctl --user -u $SERVICE_NAME"
+  if ! systemctl --user is-active --quiet "$SERVICE_NAME"; then
+    log "WARNING: 127.0.0.1:$LISTEN_PORT is open but $SERVICE_NAME is not active; something else holds the port"
+  fi
 }
 
 launchd_loaded() {
@@ -542,7 +598,9 @@ service_darwin() {
     return 0
   fi
 
+  local changed=0
   if write_if_changed "$LAUNCHD_PLIST" "$plist"; then
+    changed=1
     log "Wrote $LAUNCHD_PLIST"
   else
     log "$LAUNCHD_PLIST already present with this content"
@@ -551,13 +609,20 @@ service_darwin() {
   mkdir -p "$(dirname "$LAUNCHD_LOG")"
 
   if launchd_loaded; then
-    log "$LAUNCHD_LABEL is already loaded; not restarted"
+    if [[ "$changed" -eq 1 ]]; then
+      log "Note: the service definition changed; apply it with: launchctl bootout gui/$(id -u)/$LAUNCHD_LABEL && launchctl bootstrap gui/$(id -u) \"$LAUNCHD_PLIST\""
+    else
+      log "$LAUNCHD_LABEL is already loaded; not restarted"
+    fi
   else
     launchctl bootstrap "gui/$(id -u)" "$LAUNCHD_PLIST"
     log "Bootstrapped $LAUNCHD_LABEL"
   fi
   log "Logs: $LAUNCHD_LOG"
   wait_ready "$LAUNCHD_LOG"
+  if ! launchd_loaded; then
+    log "WARNING: 127.0.0.1:$LISTEN_PORT is open but $LAUNCHD_LABEL is not loaded; something else holds the port"
+  fi
 }
 
 print_next_steps() {
