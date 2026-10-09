@@ -386,6 +386,15 @@ function Get-TaskActionArgument {
   return "/c set `"PYTHONUNBUFFERED=1`" && `"$script:RnsdCmd`" >> `"$script:LogFile`" 2>&1"
 }
 
+function Write-TaskPlan([string]$ActionArgument) {
+  Write-Output ''
+  Write-Output "  Action:    cmd.exe $ActionArgument"
+  Write-Output '  Trigger:   at logon'
+  Write-Output '  Principal: interactive logon, current user'
+  Write-Output '  Settings:  hidden, no execution time limit, start when available'
+  Write-Output ''
+}
+
 function Test-LoopbackPort {
   $client = New-Object System.Net.Sockets.TcpClient
   try {
@@ -419,18 +428,24 @@ function Install-Service {
   $user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
   $actionArgument = Get-TaskActionArgument
   $existing = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+  $registeredArgument = $null
+  if ($existing) {
+    $actions = @($existing.Actions)
+    if ($actions.Count -gt 0) { $registeredArgument = $actions[0].Arguments }
+  }
 
   if ($DryRun) {
     if ($existing) {
-      Write-Info "Service: Scheduled Task '$TaskName' already registered; nothing to do"
+      if ($registeredArgument -eq $actionArgument) {
+        Write-Info "Service: Scheduled Task '$TaskName' already registered with this action; nothing to do"
+      } else {
+        Write-Info "Would update Scheduled Task '$TaskName' for ${user}:"
+        Write-TaskPlan $actionArgument
+        Write-Output "  Would run: Set-ScheduledTask -TaskName '$TaskName' -Action (New-ScheduledTaskAction -Execute 'cmd.exe' -Argument '$actionArgument')"
+      }
     } else {
       Write-Info "Would register Scheduled Task '$TaskName' for ${user}:"
-      Write-Output ''
-      Write-Output "  Action:    cmd.exe $actionArgument"
-      Write-Output '  Trigger:   at logon'
-      Write-Output '  Principal: interactive logon, current user'
-      Write-Output '  Settings:  hidden, no execution time limit, start when available'
-      Write-Output ''
+      Write-TaskPlan $actionArgument
       Write-Output "  Would run: Register-ScheduledTask -TaskName '$TaskName' ...; Start-ScheduledTask -TaskName '$TaskName'"
     }
     Write-Info "Logs: $script:LogFile"
@@ -440,9 +455,6 @@ function Install-Service {
   New-Item -ItemType Directory -Force -Path (Split-Path -Parent $script:LogFile) | Out-Null
   $changed = $false
   if ($existing) {
-    $registeredArgument = $null
-    $actions = @($existing.Actions)
-    if ($actions.Count -gt 0) { $registeredArgument = $actions[0].Arguments }
     if ($registeredArgument -eq $actionArgument) {
       Write-Info "Scheduled Task '$TaskName' already registered"
     } else {
