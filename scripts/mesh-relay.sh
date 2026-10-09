@@ -477,10 +477,19 @@ launchd_plist_text() {
 EOF
 }
 
+# Returns 1 when $1 already holds exactly the text $2.
+definition_differs() {
+  local path="$1" text="$2"
+  if [[ -f "$path" ]] && [[ "$(cat "$path")" == "$text" ]]; then
+    return 1
+  fi
+  return 0
+}
+
 # Writes $2 to $1 unless the file already holds exactly that text; returns 1 when nothing changed.
 write_if_changed() {
   local path="$1" text="$2"
-  if [[ -f "$path" ]] && [[ "$(cat "$path")" == "$text" ]]; then
+  if ! definition_differs "$path" "$text"; then
     return 1
   fi
   mkdir -p "$(dirname "$path")"
@@ -524,16 +533,21 @@ service_linux() {
   local unit
   unit="$(systemd_unit_text)"
   if [[ "$DRY_RUN" -eq 1 ]]; then
-    if [[ -f "$SYSTEMD_UNIT" ]] && [[ "$(cat "$SYSTEMD_UNIT")" == "$unit" ]]; then
-      log "Service: $SYSTEMD_UNIT already present with this content"
-    else
+    local differs=0
+    if definition_differs "$SYSTEMD_UNIT" "$unit"; then
+      differs=1
       log "Would write $SYSTEMD_UNIT:"
+    else
+      log "Service: $SYSTEMD_UNIT already present with this content"
     fi
     echo
     echo "$unit"
     echo
     if user_bus_reachable; then
       log "Would run: systemctl --user daemon-reload && systemctl --user enable --now $SERVICE_NAME (unless already active)"
+      if [[ "$differs" -eq 1 ]] && systemctl --user is-active --quiet "$SERVICE_NAME"; then
+        log "Note: the service definition changed; apply it with: systemctl --user restart $SERVICE_NAME"
+      fi
     else
       log "No user session bus here; would write the unit and print how to enable it"
     fi
@@ -581,16 +595,22 @@ service_darwin() {
   local plist
   plist="$(launchd_plist_text)"
   if [[ "$DRY_RUN" -eq 1 ]]; then
-    if [[ -f "$LAUNCHD_PLIST" ]] && [[ "$(cat "$LAUNCHD_PLIST")" == "$plist" ]]; then
-      log "Service: $LAUNCHD_PLIST already present with this content"
-    else
+    local differs=0
+    if definition_differs "$LAUNCHD_PLIST" "$plist"; then
+      differs=1
       log "Would write $LAUNCHD_PLIST:"
+    else
+      log "Service: $LAUNCHD_PLIST already present with this content"
     fi
     echo
     echo "$plist"
     echo
     if launchd_loaded; then
-      log "$LAUNCHD_LABEL is already loaded; nothing to do"
+      if [[ "$differs" -eq 1 ]]; then
+        log "Note: the service definition changed; apply it with: launchctl bootout gui/$(id -u)/$LAUNCHD_LABEL && launchctl bootstrap gui/$(id -u) \"$LAUNCHD_PLIST\""
+      else
+        log "$LAUNCHD_LABEL is already loaded; nothing to do"
+      fi
     else
       log "Would run: launchctl bootstrap gui/$(id -u) $LAUNCHD_PLIST"
     fi
