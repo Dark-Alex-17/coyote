@@ -3236,33 +3236,24 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
             .lines()
             .find(|line| line.starts_with("**[MESH-SEC-024]**"))
             .expect("MESH-SEC-024 is defined");
-        let bounds = [
-            format!(
-                "`DEFAULT_ENVOY_MEMORY_MAX_SESSIONS` = `{}`",
-                DEFAULT_ENVOY_MEMORY_MAX_SESSIONS
-            ),
-            format!(
-                "`DEFAULT_ENVOY_MEMORY_MAX_PER_IDENTITY` = `{}`",
-                DEFAULT_ENVOY_MEMORY_MAX_PER_IDENTITY
-            ),
-            format!(
-                "`DEFAULT_ENVOY_MEMORY_MAX_TURNS` = `{}`",
-                DEFAULT_ENVOY_MEMORY_MAX_TURNS
-            ),
-            format!(
-                "`DEFAULT_ENVOY_MEMORY_MAX_BYTES` = `{}`",
-                DEFAULT_ENVOY_MEMORY_MAX_BYTES
-            ),
-            format!(
-                "`DEFAULT_ENVOY_MEMORY_TTL_HOURS` = `{}`",
-                DEFAULT_ENVOY_MEMORY_TTL_HOURS
-            ),
-        ];
+        let bounds: Vec<String> = expected_constants()
+            .into_iter()
+            .filter(|(name, _)| name.starts_with("DEFAULT_ENVOY_MEMORY_"))
+            .map(|(name, value)| format!("`{name}` = `{value}`"))
+            .collect();
+        assert_eq!(bounds.len(), 5, "{bounds:?}");
         let clauses = [
             "keyed by the proved sending identity",
             "`session_key`",
             "MUST never be loaded",
+            "MUST be bounded in count, size and age",
+            "MAY rely on retained state only within a thread",
             "MUST NOT assume",
+            "SHOULD remain answerable",
+            "retains none",
+            "never the brief, the peer card, a system prompt or the owner's own transcript",
+            "nor is such a record ever one of the owner's own sessions",
+            "goes with its trust",
         ];
         for clause in clauses
             .iter()
