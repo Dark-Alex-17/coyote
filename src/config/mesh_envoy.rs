@@ -169,17 +169,29 @@ struct RunMemory {
 }
 
 impl RunMemory {
+    /// The remembered turns as prompt messages, strictly alternating: adjacent turns of
+    /// one role — a hand-off line followed by the owner's late answer — are joined into
+    /// one message, since some providers reject two assistant turns in a row. The
+    /// stored record keeps them apart.
     fn history(&self) -> Vec<Message> {
-        self.turns
-            .iter()
-            .map(|turn| {
-                let role = match turn.role {
-                    EnvoyRole::User => MessageRole::User,
-                    EnvoyRole::Assistant => MessageRole::Assistant,
-                };
-                Message::new(role, MessageContent::Text(turn.text.clone()))
-            })
-            .collect()
+        let mut messages: Vec<Message> = Vec::with_capacity(self.turns.len());
+        for turn in &self.turns {
+            let role = match turn.role {
+                EnvoyRole::User => MessageRole::User,
+                EnvoyRole::Assistant => MessageRole::Assistant,
+            };
+            match messages.last_mut() {
+                Some(Message {
+                    content: MessageContent::Text(text),
+                    role: last,
+                }) if *last == role => {
+                    text.push_str("\n\n");
+                    text.push_str(&turn.text);
+                }
+                _ => messages.push(Message::new(role, MessageContent::Text(turn.text.clone()))),
+            }
+        }
+        messages
     }
 }
 
@@ -7247,6 +7259,49 @@ mod tests {
         messages.iter().map(|message| message.role).collect()
     }
 
+    fn assert_alternates_after_system(messages: &[Message]) {
+        let roles = roles_of(messages);
+        assert_eq!(roles[0], MessageRole::System, "{roles:?}");
+        assert!(
+            roles[1..].windows(2).all(|pair| pair[0] != pair[1]),
+            "{roles:?}"
+        );
+    }
+
+    #[test]
+    fn remembered_turns_of_one_role_in_a_row_are_prompted_as_one_message() {
+        let tmp = TempDir::new("mesh-envoy-memory-fold");
+        let config = EnvoyMemoryConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let turn = |role, text: &str| EnvoyTurn {
+            role,
+            text: text.into(),
+        };
+        let memory = RunMemory {
+            store: Arc::new(EnvoySessions::open(&tmp.path, "inst-a", &config).unwrap()),
+            turns: vec![
+                turn(EnvoyRole::User, "a"),
+                turn(EnvoyRole::Assistant, "b"),
+                turn(EnvoyRole::Assistant, "c"),
+                turn(EnvoyRole::User, "d"),
+                turn(EnvoyRole::Assistant, "e"),
+            ],
+        };
+        let history = memory.history();
+        assert_eq!(
+            roles_of(&history),
+            vec![
+                MessageRole::User,
+                MessageRole::Assistant,
+                MessageRole::User,
+                MessageRole::Assistant
+            ]
+        );
+        assert_eq!(history[1].content.to_text(), "b\n\nc");
+    }
+
     fn turns_of(store: &EnvoySessions, identity: &[u8; 16], thread: &str) -> Vec<EnvoyTurn> {
         store
             .load(&hex_lower(identity), thread, SystemTime::now())
@@ -7441,19 +7496,22 @@ mod tests {
         runner.stop().await;
 
         let seen = seen.lock();
+        assert_alternates_after_system(&seen[2]);
         assert_eq!(
             roles_of(&seen[2]),
             vec![
                 MessageRole::System,
                 MessageRole::User,
                 MessageRole::Assistant,
-                MessageRole::Assistant,
                 MessageRole::User,
                 MessageRole::Assistant,
                 MessageRole::User
             ]
         );
-        assert_eq!(seen[2][3].content.to_text(), "the owner says yes");
+        assert_eq!(
+            seen[2][2].content.to_text(),
+            "answer 0\n\nthe owner says yes"
+        );
         source.remove_dir();
     }
 
@@ -7969,28 +8027,27 @@ mod tests {
 
         assert_eq!(seen.lock().len(), 2);
         let second = seen.lock()[1].clone();
+        assert_alternates_after_system(&second);
         assert_eq!(
             roles_of(&second),
             vec![
                 MessageRole::System,
                 MessageRole::User,
                 MessageRole::Assistant,
-                MessageRole::Assistant,
                 MessageRole::User
             ]
         );
         assert_eq!(
             second[2].content.to_text(),
-            format!("escalated to the human; no answer yet (ref {id})")
+            format!("escalated to the human; no answer yet (ref {id})\n\nthe owner says yes")
         );
-        assert_eq!(second[3].content.to_text(), "the owner says yes");
         assert!(
-            second[4]
+            second[3]
                 .content
                 .to_text()
                 .contains(&format!("Message id: {follow_up}")),
             "{}",
-            second[4].content.to_text()
+            second[3].content.to_text()
         );
         peer.stop().await;
         source.remove_dir();
