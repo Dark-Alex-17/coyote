@@ -74,13 +74,6 @@ impl Input {
 
     /// `from_str` with an explicit role and `history` ahead of `text`: no session
     /// history or agent of the context's rides along, only the turns given.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "called by the envoy run flow once it resumes a peer's thread"
-        )
-    )]
     pub fn with_history(
         ctx: &RequestContext,
         text: &str,

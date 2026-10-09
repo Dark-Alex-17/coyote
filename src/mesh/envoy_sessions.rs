@@ -287,13 +287,6 @@ impl EnvoySessions {
     /// A record under this key that names another identity is refused, never returned.
     /// One past `ttl_hours` since its last save is forgotten here and now rather than
     /// handed back; the rest of the store waits for `prune`.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "called by the envoy run flow once it retains conversation memory"
-        )
-    )]
     pub(crate) fn load(
         &self,
         identity: &str,
@@ -336,13 +329,6 @@ impl EnvoySessions {
     /// of writing an empty one. On either branch a record already under the key that
     /// this build cannot read, or that names another identity, is refused: neither
     /// written over nor removed.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "called by the envoy run flow once it retains conversation memory"
-        )
-    )]
     pub(crate) fn save(
         &self,
         identity: &str,

@@ -2063,6 +2063,8 @@ pub(crate) struct MeshSlot {
     correlations: Correlations,
     model_notes: ModelNotes,
     inbound: parking_lot::Mutex<Option<Arc<InboundStore>>>,
+    #[cfg(test)]
+    envoy_memory_override: ArcSwapOption<EnvoySessions>,
 }
 
 impl MeshSlot {
@@ -2072,6 +2074,24 @@ impl MeshSlot {
 
     pub(crate) fn limits(&self) -> &Arc<PeerLimits> {
         &self.limits
+    }
+
+    /// The envoy's conversation memory of the instance the node serves; `None` while
+    /// the mesh is off or `mesh.envoy_memory` is disabled. Looked up per run, never
+    /// kept: a re-key swaps the node's store.
+    pub(crate) fn envoy_memory(&self) -> Option<Arc<EnvoySessions>> {
+        #[cfg(test)]
+        if let Some(store) = self.envoy_memory_override.load_full() {
+            return Some(store);
+        }
+        self.get().and_then(|runtime| runtime.envoy_memory())
+    }
+
+    /// Gives a slot with no node an envoy memory, so a run that resumes a peer's
+    /// thread can be tested without a runtime to `install`.
+    #[cfg(test)]
+    pub(crate) fn set_envoy_memory_for_tests(&self, store: Arc<EnvoySessions>) {
+        self.envoy_memory_override.store(Some(store));
     }
 
     /// Refuses while a node is already running: two nodes in one process would fight over
