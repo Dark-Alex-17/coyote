@@ -21,7 +21,7 @@ use parking_lot::Mutex;
 use rns_transport::hash::{AddressHash, Hash};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::Digest;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -305,15 +305,101 @@ impl EnvoySessions {
     ) -> Result<usize, EnvoyMemoryError> {
         let identity = canonical_hash(identity)
             .ok_or_else(|| EnvoyMemoryError::NotAnIdentity(identity.to_string()))?;
+        let mut removed = 0;
+        Self::sweep(cache_dir, config, |store| {
+            removed += store.delete_identity(&identity)?;
+            Ok(())
+        })?;
+        Ok(removed)
+    }
+
+    /// Forgets `identity`'s `thread` in every instance's store under `cache_dir`; how
+    /// many stores held it. Same sweep as `delete_identity_everywhere`: every instance,
+    /// on or off, a refusing store logged and skipped, a non-hash `identity`
+    /// `NotAnIdentity`.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the `.mesh memory forget` command's verb")
+    )]
+    pub(crate) fn delete_thread_everywhere(
+        cache_dir: &Path,
+        config: &EnvoyMemoryConfig,
+        identity: &str,
+        thread: &str,
+    ) -> Result<usize, EnvoyMemoryError> {
+        let (identity, _) = resolve(identity, thread)?;
+        let mut removed = 0;
+        Self::sweep(cache_dir, config, |store| {
+            removed += usize::from(store.delete(&identity, thread)?);
+            Ok(())
+        })?;
+        Ok(removed)
+    }
+
+    /// Forgets every conversation in every instance's store under `cache_dir`; how
+    /// many went in all. Same sweep as `delete_identity_everywhere`.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the `.mesh memory forget` command's verb")
+    )]
+    pub(crate) fn delete_all_everywhere(
+        cache_dir: &Path,
+        config: &EnvoyMemoryConfig,
+    ) -> Result<usize, EnvoyMemoryError> {
+        let mut removed = 0;
+        Self::sweep(cache_dir, config, |store| {
+            removed += store.delete_where(|_| true)?;
+            Ok(())
+        })?;
+        Ok(removed)
+    }
+
+    /// Every identity remembered in any instance's store under `cache_dir`, lower-hex,
+    /// with the threads remembered of it, sorted and each named once however many
+    /// instances hold it. Same sweep as `delete_identity_everywhere`: every instance,
+    /// on or off, a refusing store logged and skipped; empty when no store exists.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the `.mesh memory forget` command's verb")
+    )]
+    pub(crate) fn remembered_everywhere(
+        cache_dir: &Path,
+        config: &EnvoyMemoryConfig,
+    ) -> Result<BTreeMap<String, Vec<String>>, EnvoyMemoryError> {
+        let mut remembered: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        Self::sweep(cache_dir, config, |store| {
+            for entry in store.remembered()? {
+                remembered
+                    .entry(entry.identity)
+                    .or_default()
+                    .push(entry.thread);
+            }
+            Ok(())
+        })?;
+        for threads in remembered.values_mut() {
+            threads.sort();
+            threads.dedup();
+        }
+        Ok(remembered)
+    }
+
+    /// Hands every instance's store under `cache_dir` to `visit`, whether or not the
+    /// memory is on: records may remain from a time it was. A store `visit` refuses is
+    /// logged and skipped, the sweep going on to the next; `Err` only when the stores
+    /// directory itself cannot be listed, and nothing is visited when it does not exist.
+    fn sweep(
+        cache_dir: &Path,
+        config: &EnvoyMemoryConfig,
+        mut visit: impl FnMut(&Self) -> Result<(), EnvoyMemoryError>,
+    ) -> Result<(), EnvoyMemoryError> {
         let stores = stores_dir(cache_dir);
         if !stores.exists() {
-            return Ok(0);
+            return Ok(());
         }
         let io_error = |source| EnvoyMemoryError::Io {
             path: stores.clone(),
             source,
         };
-        let mut removed = 0;
         for entry in fs::read_dir(&stores).map_err(io_error)? {
             let path = entry.map_err(io_error)?.path();
             if !path.is_dir() {
@@ -324,16 +410,15 @@ impl EnvoySessions {
                 limits: EnvoyMemoryLimits::from(config),
                 write_lock: Mutex::new(()),
             };
-            match store.delete_identity(&identity) {
-                Ok(count) => removed += count,
-                Err(err) => warn!(
+            if let Err(err) = visit(&store) {
+                warn!(
                     "Mesh envoy memory under '{}' could not be swept: {}",
                     store.dir.display(),
                     redact_hashes(&err.to_string())
-                ),
+                );
             }
         }
-        Ok(removed)
+        Ok(())
     }
 
     #[cfg(test)]
@@ -536,10 +621,6 @@ impl EnvoySessions {
 
     /// `true` when `identity`'s `thread` was there to remove. Removes the record by key
     /// without reading it: the caller asked for it gone, whatever it holds.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the `.mesh memory forget` command's verb")
-    )]
     pub(crate) fn delete(&self, identity: &str, thread: &str) -> Result<bool, EnvoyMemoryError> {
         let (_, key) = resolve(identity, thread)?;
         Ok(self.delete_where(|entry| entry.key == key)? > 0)
@@ -594,6 +675,17 @@ impl EnvoySessions {
             .map(|entry| entry.identity.as_str())
             .collect();
         Ok((index.entries.len(), identities.len()))
+    }
+
+    /// Every conversation the index names, as it names them; empty while the store does
+    /// not exist.
+    fn remembered(&self) -> Result<Vec<EnvoySessionEntry>, EnvoyMemoryError> {
+        if !self.dir.exists() {
+            return Ok(Vec::new());
+        }
+        let _guard = self.write_lock.lock();
+        let _file_lock = self.file_lock()?;
+        Ok(self.read_index()?.entries)
     }
 
     /// Drops every entry `doomed` picks and its record; nothing is created, and the
@@ -1345,6 +1437,167 @@ mod tests {
                 .map(|record| record.turns),
             Some(exchange(2))
         );
+    }
+
+    /// Three instance stores: A has `thread-one` in every one and `thread-two` in the
+    /// first, B has `thread-one` in every one; the third store's index is planted with
+    /// a version this build refuses.
+    fn three_instances(tmp: &TempDir, config: &EnvoyMemoryConfig) -> Vec<EnvoySessions> {
+        let stores: Vec<EnvoySessions> = ["inst-a", "inst-b", "inst-c"]
+            .into_iter()
+            .map(|instance| EnvoySessions::open(&tmp.path, instance, config).unwrap())
+            .collect();
+        for (n, store) in stores.iter().enumerate() {
+            store
+                .save(IDENTITY_A, "thread-one", exchange(n), t(1_000))
+                .unwrap();
+            store
+                .save(IDENTITY_B, "thread-one", exchange(n), t(1_000))
+                .unwrap();
+        }
+        stores[0]
+            .save(IDENTITY_A, "thread-two", exchange(9), t(1_001))
+            .unwrap();
+        let refused_index = stores[2].index_path();
+        let planted = fs::read_to_string(&refused_index)
+            .unwrap()
+            .replace("\"version\":1", "\"version\":2");
+        fs::write(&refused_index, planted).unwrap();
+        fs::write(stores_dir(&tmp.path).join("notes.txt"), "not a store").unwrap();
+        stores
+    }
+
+    #[test]
+    fn remembered_everywhere_merges_every_instance_store_and_skips_one_that_refuses() {
+        let tmp = TempDir::new("envoy-sessions-remembered-everywhere");
+        let config = enabled();
+        assert!(
+            EnvoySessions::remembered_everywhere(&tmp.path, &config)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!tmp.path.join("mesh").exists());
+        let stores = three_instances(&tmp, &config);
+
+        let remembered = EnvoySessions::remembered_everywhere(&tmp.path, &config).unwrap();
+
+        assert_eq!(
+            remembered,
+            BTreeMap::from([
+                (
+                    IDENTITY_A.to_string(),
+                    vec!["thread-one".to_string(), "thread-two".to_string()]
+                ),
+                (IDENTITY_B.to_string(), vec!["thread-one".to_string()]),
+            ]),
+            "a thread held by two stores is named once; the refusing store adds nothing"
+        );
+        assert!(record_path(&stores[2], IDENTITY_A, "thread-one").exists());
+    }
+
+    #[test]
+    fn delete_thread_everywhere_removes_one_thread_from_every_instance_store() {
+        let tmp = TempDir::new("envoy-sessions-delete-thread-everywhere");
+        let config = enabled();
+        assert_eq!(
+            EnvoySessions::delete_thread_everywhere(&tmp.path, &config, IDENTITY_A, "thread-one")
+                .unwrap(),
+            0
+        );
+        assert!(matches!(
+            EnvoySessions::delete_thread_everywhere(&tmp.path, &config, "not-a-hash", "thread-one"),
+            Err(EnvoyMemoryError::NotAnIdentity(_))
+        ));
+        assert!(!tmp.path.join("mesh").exists());
+        let stores = three_instances(&tmp, &config);
+
+        assert_eq!(
+            EnvoySessions::delete_thread_everywhere(&tmp.path, &config, IDENTITY_A, "thread-one")
+                .unwrap(),
+            2,
+            "the two stores that could be read held it; the refusing one is skipped"
+        );
+
+        for store in &stores[..2] {
+            assert!(!record_path(store, IDENTITY_A, "thread-one").exists());
+            assert!(record_path(store, IDENTITY_B, "thread-one").exists());
+        }
+        assert!(record_path(&stores[0], IDENTITY_A, "thread-two").exists());
+        assert!(record_path(&stores[2], IDENTITY_A, "thread-one").exists());
+        assert_eq!(
+            EnvoySessions::delete_thread_everywhere(&tmp.path, &config, IDENTITY_A, "thread-one")
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn delete_all_everywhere_empties_every_instance_store_that_can_be_read() {
+        let tmp = TempDir::new("envoy-sessions-delete-all-everywhere");
+        let config = enabled();
+        assert_eq!(
+            EnvoySessions::delete_all_everywhere(&tmp.path, &config).unwrap(),
+            0
+        );
+        assert!(!tmp.path.join("mesh").exists());
+        let stores = three_instances(&tmp, &config);
+
+        assert_eq!(
+            EnvoySessions::delete_all_everywhere(&tmp.path, &config).unwrap(),
+            5,
+            "two conversations in each readable store plus the first's second thread"
+        );
+
+        for store in &stores[..2] {
+            assert_eq!(store.stats().unwrap(), (0, 0));
+        }
+        assert!(record_path(&stores[2], IDENTITY_A, "thread-one").exists());
+        assert_eq!(
+            EnvoySessions::remembered_everywhere(&tmp.path, &config).unwrap(),
+            BTreeMap::new()
+        );
+    }
+
+    #[test]
+    fn the_everywhere_helpers_read_and_wipe_while_the_memory_is_off() {
+        let tmp = TempDir::new("envoy-sessions-everywhere-while-off");
+        let on = store(&tmp, &enabled());
+        on.save(IDENTITY_A, "thread-one", exchange(1), t(1_000))
+            .unwrap();
+        on.save(IDENTITY_A, "thread-two", exchange(2), t(1_000))
+            .unwrap();
+        on.save(IDENTITY_B, "thread-one", exchange(3), t(1_000))
+            .unwrap();
+
+        let off = EnvoyMemoryConfig::default();
+        assert!(!off.enabled);
+        assert_eq!(
+            EnvoySessions::remembered_everywhere(&tmp.path, &off)
+                .unwrap()
+                .get(IDENTITY_A),
+            Some(&vec!["thread-one".to_string(), "thread-two".to_string()])
+        );
+        assert_eq!(
+            EnvoySessions::delete_thread_everywhere(&tmp.path, &off, IDENTITY_A, "thread-two")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            EnvoySessions::remembered_everywhere(&tmp.path, &off)
+                .unwrap()
+                .get(IDENTITY_A),
+            Some(&vec!["thread-one".to_string()])
+        );
+        assert_eq!(
+            EnvoySessions::delete_all_everywhere(&tmp.path, &off).unwrap(),
+            2
+        );
+        assert!(
+            EnvoySessions::remembered_everywhere(&tmp.path, &off)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(on.stats().unwrap(), (0, 0));
     }
 
     #[test]
