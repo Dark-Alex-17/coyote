@@ -11,18 +11,20 @@
 use crate::config::mesh_config::EnvoyMemoryConfig;
 use crate::mesh::schema::{Remedy, VersionProbe, unversioned_refusal, version_refusal};
 use crate::mesh::trust::parse_hash;
-use crate::mesh::{canonical_hash, mesh_cache_dir, rfc3339_utc, write_atomically_owner_only};
+use crate::mesh::{
+    canonical_hash, mesh_cache_dir, parse_rfc3339, rfc3339_utc, write_atomically_owner_only,
+};
 
 use parking_lot::Mutex;
 use rns_transport::hash::{AddressHash, Hash};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::Digest;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 pub(crate) const ENVOY_SESSION_VERSION: u64 = 1;
 pub(crate) const ENVOY_SESSION_INDEX_VERSION: u64 = 1;
@@ -213,9 +215,33 @@ pub(crate) fn session_key(identity: &str, thread: &str) -> Option<String> {
 /// answers its own peers and must not read the original's.
 pub(crate) struct EnvoySessions {
     dir: PathBuf,
+    limits: EnvoyMemoryLimits,
     /// Orders the read-modify-write of every mutation within this process; `file_lock`
     /// does the same across processes.
     write_lock: Mutex<()>,
+}
+
+/// `mesh.envoy_memory.*` as the store applies it.
+#[derive(Debug, Clone, Copy)]
+struct EnvoyMemoryLimits {
+    max_sessions: usize,
+    max_per_identity: usize,
+    max_turns: usize,
+    max_bytes: u64,
+    ttl: Duration,
+}
+
+impl From<&EnvoyMemoryConfig> for EnvoyMemoryLimits {
+    fn from(config: &EnvoyMemoryConfig) -> Self {
+        let count = |value: u64| usize::try_from(value).unwrap_or(usize::MAX);
+        Self {
+            max_sessions: count(config.max_sessions),
+            max_per_identity: count(config.max_per_identity),
+            max_turns: count(config.max_turns),
+            max_bytes: config.max_bytes,
+            ttl: Duration::from_secs(config.ttl_hours.saturating_mul(3600)),
+        }
+    }
 }
 
 impl EnvoySessions {
@@ -231,6 +257,7 @@ impl EnvoySessions {
             dir: mesh_cache_dir(cache_dir)
                 .join("envoy-sessions")
                 .join(instance_id),
+            limits: EnvoyMemoryLimits::from(config),
             write_lock: Mutex::new(()),
         })
     }
@@ -243,6 +270,8 @@ impl EnvoySessions {
     /// The record for `identity`'s `thread`, or `None` when the store holds none. A
     /// record the index names but the disk lacks is dropped from the index on the way.
     /// A record under this key that names another identity is refused, never returned.
+    /// One past `ttl_hours` since its last save is forgotten here and now rather than
+    /// handed back; the rest of the store waits for `prune`.
     #[cfg_attr(
         not(test),
         expect(
@@ -254,7 +283,7 @@ impl EnvoySessions {
         &self,
         identity: &str,
         thread: &str,
-        _now: SystemTime,
+        now: SystemTime,
     ) -> Result<Option<EnvoySessionFile>, EnvoyMemoryError> {
         let (identity, key) = resolve(identity, thread)?;
         if !self.dir.exists() {
@@ -266,6 +295,16 @@ impl EnvoySessions {
         let Some(indexed) = self.owned(&index, &key, &identity)? else {
             return Ok(None);
         };
+        if is_expired(
+            &index.entries[indexed.position].last_used,
+            now,
+            self.limits.ttl,
+        ) {
+            index.entries.remove(indexed.position);
+            self.remove_record(&key)?;
+            self.write_index(&index)?;
+            return Ok(None);
+        }
         let Some(record) = indexed.record else {
             index.entries.remove(indexed.position);
             self.write_index(&index)?;
@@ -274,10 +313,13 @@ impl EnvoySessions {
         Ok(Some(record))
     }
 
-    /// Writes `turns` as the whole of `identity`'s `thread`, stamped `now`, creating the
-    /// store on the first save. Empty turns delete the record instead of writing an
-    /// empty one. A record already under the key that this build cannot read, or that
-    /// names another identity, is refused rather than written over.
+    /// Writes `turns`, cut to `max_turns` and `max_bytes` oldest exchange first, as the
+    /// whole of `identity`'s `thread`, stamped `now`, creating the store on the first
+    /// save; then evicts what the save pushed over `max_per_identity` or `max_sessions`,
+    /// least recently used first and never the thread just saved. Turns that cut to
+    /// nothing delete the record instead of writing an empty one. A record already under
+    /// the key that this build cannot read, or that names another identity, is refused
+    /// rather than written over.
     #[cfg_attr(
         not(test),
         expect(
@@ -289,10 +331,11 @@ impl EnvoySessions {
         &self,
         identity: &str,
         thread: &str,
-        turns: Vec<EnvoyTurn>,
+        mut turns: Vec<EnvoyTurn>,
         now: SystemTime,
     ) -> Result<(), EnvoyMemoryError> {
         let (identity, key) = resolve(identity, thread)?;
+        truncate(&mut turns, &self.limits);
         if turns.is_empty() {
             self.delete_where(|entry| entry.key == key)?;
             return Ok(());
@@ -322,6 +365,9 @@ impl EnvoySessions {
         match position {
             Some(position) => index.entries[position] = entry,
             None => index.entries.push(entry),
+        }
+        for evicted in evict(&mut index, &self.limits, now, Some(&key)) {
+            self.remove_record(&evicted.key)?;
         }
         self.write_index(&index)
     }
@@ -353,17 +399,26 @@ impl EnvoySessions {
         self.delete_where(|entry| entry.identity == identity)
     }
 
-    /// Removes record files the index does not name. `Ok(0)` without creating anything
-    /// while the store does not exist. Returns how many conversations went.
-    pub(crate) fn prune(&self, _now: SystemTime) -> Result<usize, EnvoyMemoryError> {
+    /// Forgets every conversation past `ttl_hours`, then the least recently used past
+    /// `max_per_identity` and `max_sessions`, and removes record files the index does
+    /// not name. `Ok(0)` without creating anything while the store does not exist; the
+    /// index is rewritten only when a conversation went. Returns how many did.
+    pub(crate) fn prune(&self, now: SystemTime) -> Result<usize, EnvoyMemoryError> {
         if !self.dir.exists() {
             return Ok(0);
         }
         let _guard = self.write_lock.lock();
         let _file_lock = self.file_lock()?;
-        let index = self.read_index()?;
+        let mut index = self.read_index()?;
+        let evicted = evict(&mut index, &self.limits, now, None);
+        for entry in &evicted {
+            self.remove_record(&entry.key)?;
+        }
         self.remove_orphans(&index)?;
-        Ok(0)
+        if !evicted.is_empty() {
+            self.write_index(&index)?;
+        }
+        Ok(evicted.len())
     }
 
     /// `(conversations, distinct identities)`; `(0, 0)` while the store does not exist.
@@ -569,6 +624,83 @@ fn resolve(identity: &str, thread: &str) -> Result<(String, String), EnvoyMemory
 
 fn text_bytes(turns: &[EnvoyTurn]) -> u64 {
     turns.iter().map(|turn| turn.text.len() as u64).sum()
+}
+
+/// Whether `stamp` is `ttl` or more before `now`, or does not parse at all. A stamp in
+/// the future (clock stepped back) reads as just made.
+fn is_expired(stamp: &str, now: SystemTime, ttl: Duration) -> bool {
+    parse_rfc3339(stamp).is_none_or(|at| now.duration_since(at).unwrap_or_default() >= ttl)
+}
+
+/// Drops whole exchanges from the front of `turns`, oldest first, until it fits
+/// `max_turns` and `max_bytes`. An exchange runs from one turn up to the next the peer
+/// spoke, so an answer is never kept without what it answered: `[User, Assistant,
+/// Assistant]` goes as one, `[User, User, Assistant]` as `[User]` then `[User,
+/// Assistant]`, and a leading run of answers goes with the first exchange. An exchange
+/// larger than `max_bytes` on its own leaves nothing.
+fn truncate(turns: &mut Vec<EnvoyTurn>, limits: &EnvoyMemoryLimits) {
+    while turns.len() > limits.max_turns || text_bytes(turns) > limits.max_bytes {
+        let next_exchange = turns
+            .iter()
+            .skip(1)
+            .position(|turn| turn.role == EnvoyRole::User)
+            .map_or(turns.len(), |offset| offset + 1);
+        turns.drain(..next_exchange);
+    }
+}
+
+/// Removes from `index` what the bounds no longer allow and returns it: first every
+/// entry past `ttl`, then, oldest `last_used` first, the ones past `max_per_identity`
+/// for their identity and the ones past `max_sessions` overall. `keep` is never
+/// evicted, so a save always leaves the thread it saved. The entries left are ordered
+/// newest first.
+fn evict(
+    index: &mut EnvoySessionIndex,
+    limits: &EnvoyMemoryLimits,
+    now: SystemTime,
+    keep: Option<&str>,
+) -> Vec<EnvoySessionEntry> {
+    let kept = |entry: &EnvoySessionEntry| Some(entry.key.as_str()) == keep;
+    let mut removed: Vec<EnvoySessionEntry> = index
+        .entries
+        .extract_if(.., |entry| {
+            !kept(entry) && is_expired(&entry.last_used, now, limits.ttl)
+        })
+        .collect();
+    index
+        .entries
+        .sort_by_key(|entry| parse_rfc3339(&entry.last_used));
+    let mut per_identity: HashMap<&str, usize> = HashMap::new();
+    for entry in &index.entries {
+        *per_identity.entry(entry.identity.as_str()).or_default() += 1;
+    }
+    let mut over_identity: HashMap<String, usize> = per_identity
+        .into_iter()
+        .filter(|(_, count)| *count > limits.max_per_identity)
+        .map(|(identity, count)| (identity.to_string(), count - limits.max_per_identity))
+        .collect();
+    removed.extend(index.entries.extract_if(.., |entry| {
+        if kept(entry) {
+            return false;
+        }
+        match over_identity.get_mut(&entry.identity) {
+            Some(over) if *over > 0 => {
+                *over -= 1;
+                true
+            }
+            _ => false,
+        }
+    }));
+    let mut over_all = index.entries.len().saturating_sub(limits.max_sessions);
+    removed.extend(index.entries.extract_if(.., |entry| {
+        if over_all == 0 || kept(entry) {
+            return false;
+        }
+        over_all -= 1;
+        true
+    }));
+    index.entries.reverse();
+    removed
 }
 
 /// `write_atomically_owner_only` with its whole cause chain kept, since the typed error
@@ -1011,6 +1143,324 @@ mod tests {
             assert!(store.delete_identity(identity).is_err());
         }
         assert!(!tmp.path.join("mesh").exists());
+    }
+
+    fn limits(config: &EnvoyMemoryConfig) -> EnvoyMemoryLimits {
+        EnvoyMemoryLimits::from(config)
+    }
+
+    fn roles(turns: &[EnvoyTurn]) -> Vec<EnvoyRole> {
+        turns.iter().map(|turn| turn.role).collect()
+    }
+
+    fn threads_of(store: &EnvoySessions, identity: &str) -> Vec<String> {
+        let mut threads: Vec<String> = store
+            .read_index()
+            .unwrap()
+            .entries
+            .into_iter()
+            .filter(|entry| entry.identity == identity)
+            .map(|entry| entry.thread)
+            .collect();
+        threads.sort();
+        threads
+    }
+
+    #[test]
+    fn truncation_drops_the_oldest_turn_through_the_next_user_boundary() {
+        let config = EnvoyMemoryConfig {
+            max_turns: 2,
+            ..enabled()
+        };
+        let mut turns = vec![user("q1"), assistant("a1"), assistant("a1b"), user("q2")];
+        truncate(&mut turns, &limits(&config));
+        assert_eq!(
+            roles(&turns),
+            [EnvoyRole::User],
+            "a question and both its answers go as one"
+        );
+        assert_eq!(turns[0].text, "q2");
+
+        let mut turns = vec![user("q1"), user("q2"), assistant("a2"), user("q3")];
+        truncate(&mut turns, &limits(&config));
+        assert_eq!(
+            turns,
+            [user("q3")],
+            "[User] then [User, Assistant] are two units; both had to go to fit two turns"
+        );
+
+        let mut turns = vec![user("q1"), user("q2"), assistant("a2")];
+        truncate(&mut turns, &limits(&config));
+        assert_eq!(turns, [user("q2"), assistant("a2")]);
+
+        let mut turns = vec![assistant("a0"), assistant("a0b"), user("q1"), user("q2")];
+        truncate(&mut turns, &limits(&config));
+        assert_eq!(
+            turns,
+            [user("q1"), user("q2")],
+            "a leading run of answers goes with the first exchange"
+        );
+
+        let mut turns = vec![user("q1"), assistant("a1")];
+        truncate(&mut turns, &limits(&config));
+        assert_eq!(
+            turns,
+            [user("q1"), assistant("a1")],
+            "within bounds, untouched"
+        );
+    }
+
+    #[test]
+    fn turns_over_max_turns_are_truncated_on_save() {
+        let tmp = TempDir::new("envoy-sessions-max-turns");
+        let config = EnvoyMemoryConfig {
+            max_turns: 4,
+            ..enabled()
+        };
+        let store = store(&tmp, &config);
+        let turns: Vec<EnvoyTurn> = (1..=3).flat_map(exchange).collect();
+
+        store
+            .save(IDENTITY_A, "thread-one", turns, t(1_000))
+            .unwrap();
+
+        let loaded = store
+            .load(IDENTITY_A, "thread-one", t(1_000))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            loaded.turns,
+            [exchange(2), exchange(3)].concat(),
+            "the oldest exchange went"
+        );
+        let entry = &store.read_index().unwrap().entries[0];
+        assert_eq!(entry.turns, 4);
+        assert_eq!(entry.bytes, text_bytes(&loaded.turns));
+    }
+
+    #[test]
+    fn bytes_over_max_bytes_are_truncated_on_save() {
+        let tmp = TempDir::new("envoy-sessions-max-bytes");
+        let config = EnvoyMemoryConfig {
+            max_bytes: 40,
+            ..enabled()
+        };
+        let store = store(&tmp, &config);
+        let turns: Vec<EnvoyTurn> = (1..=3).flat_map(exchange).collect();
+        assert_eq!(text_bytes(&turns), 54);
+
+        store
+            .save(IDENTITY_A, "thread-one", turns, t(1_000))
+            .unwrap();
+
+        let loaded = store
+            .load(IDENTITY_A, "thread-one", t(1_000))
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.turns, [exchange(2), exchange(3)].concat());
+        assert_eq!(text_bytes(&loaded.turns), 36);
+        assert_eq!(store.read_index().unwrap().entries[0].bytes, 36);
+    }
+
+    #[test]
+    fn a_single_unit_over_max_bytes_leaves_nothing_and_deletes_the_record() {
+        let tmp = TempDir::new("envoy-sessions-oversized-unit");
+        let config = EnvoyMemoryConfig {
+            max_bytes: 20,
+            ..enabled()
+        };
+        let store = store(&tmp, &config);
+        store
+            .save(IDENTITY_A, "thread-one", exchange(1), t(1_000))
+            .unwrap();
+        assert!(record_path(&store, IDENTITY_A, "thread-one").exists());
+
+        store
+            .save(
+                IDENTITY_A,
+                "thread-one",
+                vec![user("q"), assistant(&"a".repeat(32))],
+                t(1_001),
+            )
+            .unwrap();
+
+        assert!(!record_path(&store, IDENTITY_A, "thread-one").exists());
+        assert_eq!(
+            store.load(IDENTITY_A, "thread-one", t(1_001)).unwrap(),
+            None
+        );
+        assert_eq!(store.stats().unwrap(), (0, 0));
+    }
+
+    #[test]
+    fn the_least_recently_used_session_goes_first_over_max_sessions() {
+        let tmp = TempDir::new("envoy-sessions-max-sessions");
+        let config = EnvoyMemoryConfig {
+            max_sessions: 2,
+            ..enabled()
+        };
+        let store = store(&tmp, &config);
+        store
+            .save(IDENTITY_A, "thread-one", exchange(1), t(1_000))
+            .unwrap();
+        store
+            .save(IDENTITY_B, "thread-one", exchange(2), t(1_002))
+            .unwrap();
+        store
+            .save(IDENTITY_A, "thread-two", exchange(3), t(1_001))
+            .unwrap();
+
+        assert_eq!(store.stats().unwrap(), (2, 2));
+        assert!(
+            !record_path(&store, IDENTITY_A, "thread-one").exists(),
+            "the oldest last_used went, wherever it sat in the index"
+        );
+        assert!(record_path(&store, IDENTITY_B, "thread-one").exists());
+        assert!(
+            record_path(&store, IDENTITY_A, "thread-two").exists(),
+            "the thread just saved is never the one evicted, even when its stamp is older"
+        );
+    }
+
+    #[test]
+    fn the_least_recently_used_session_of_one_identity_goes_first_over_max_per_identity() {
+        let tmp = TempDir::new("envoy-sessions-max-per-identity");
+        let config = EnvoyMemoryConfig {
+            max_per_identity: 2,
+            ..enabled()
+        };
+        let store = store(&tmp, &config);
+        store
+            .save(IDENTITY_B, "thread-one", exchange(1), t(900))
+            .unwrap();
+        store
+            .save(IDENTITY_B, "thread-two", exchange(2), t(901))
+            .unwrap();
+        store
+            .save(IDENTITY_A, "thread-two", exchange(3), t(1_000))
+            .unwrap();
+        store
+            .save(IDENTITY_A, "thread-one", exchange(4), t(1_001))
+            .unwrap();
+        store
+            .save(IDENTITY_A, "thread-three", exchange(5), t(1_002))
+            .unwrap();
+
+        assert_eq!(
+            threads_of(&store, IDENTITY_A),
+            ["thread-one", "thread-three"],
+            "A's least recently used thread went"
+        );
+        assert!(!record_path(&store, IDENTITY_A, "thread-two").exists());
+        assert_eq!(
+            threads_of(&store, IDENTITY_B),
+            ["thread-one", "thread-two"],
+            "B's older threads are not A's to lose"
+        );
+        assert_eq!(store.stats().unwrap(), (4, 2));
+    }
+
+    #[test]
+    fn a_session_older_than_ttl_is_not_loaded_and_is_removed() {
+        let tmp = TempDir::new("envoy-sessions-ttl");
+        let config = EnvoyMemoryConfig {
+            ttl_hours: 1,
+            ..enabled()
+        };
+        let store = store(&tmp, &config);
+        store
+            .save(IDENTITY_A, "thread-one", exchange(1), t(1_000))
+            .unwrap();
+        store
+            .save(IDENTITY_A, "thread-two", exchange(2), t(1_000))
+            .unwrap();
+
+        assert!(
+            store
+                .load(IDENTITY_A, "thread-one", t(1_000 + 3_599))
+                .unwrap()
+                .is_some(),
+            "one second short of the ttl is still a conversation"
+        );
+        assert_eq!(
+            store
+                .load(IDENTITY_A, "thread-one", t(1_000 + 3_600))
+                .unwrap(),
+            None
+        );
+
+        assert!(!record_path(&store, IDENTITY_A, "thread-one").exists());
+        assert_eq!(
+            threads_of(&store, IDENTITY_A),
+            ["thread-two"],
+            "only the thread looked at is judged; the rest waits for prune"
+        );
+        assert!(record_path(&store, IDENTITY_A, "thread-two").exists());
+    }
+
+    #[test]
+    fn prune_drops_expired_sessions_enforces_the_caps_and_removes_orphan_files() {
+        let tmp = TempDir::new("envoy-sessions-prune");
+        let lenient = store(&tmp, &enabled());
+        for (identity, thread, at) in [
+            (IDENTITY_A, "expired", 0),
+            (IDENTITY_A, "a-old", 1_000),
+            (IDENTITY_A, "a-mid", 1_001),
+            (IDENTITY_A, "a-new", 1_002),
+            (IDENTITY_B, "b-old", 1_003),
+            (IDENTITY_B, "b-new", 1_004),
+        ] {
+            lenient.save(identity, thread, exchange(1), t(at)).unwrap();
+        }
+        assert_eq!(lenient.stats().unwrap(), (6, 2));
+        let store = store(
+            &tmp,
+            &EnvoyMemoryConfig {
+                max_sessions: 3,
+                max_per_identity: 2,
+                ttl_hours: 1,
+                ..enabled()
+            },
+        );
+        let orphan = store.dir().join(format!("{}.yaml", "ab".repeat(16)));
+        fs::write(&orphan, "version: 1\n").unwrap();
+        let index_before = fs::read_to_string(store.index_path()).unwrap();
+
+        assert_eq!(store.prune(t(3_700)).unwrap(), 3);
+
+        assert_eq!(
+            threads_of(&store, IDENTITY_A),
+            ["a-new"],
+            "expired went first, then A over its cap, then the globally oldest"
+        );
+        assert_eq!(threads_of(&store, IDENTITY_B), ["b-new", "b-old"]);
+        assert_eq!(store.stats().unwrap(), (3, 2));
+        for thread in ["expired", "a-old", "a-mid"] {
+            assert!(
+                !record_path(&store, IDENTITY_A, thread).exists(),
+                "{thread}"
+            );
+        }
+        for (identity, thread) in [
+            (IDENTITY_A, "a-new"),
+            (IDENTITY_B, "b-old"),
+            (IDENTITY_B, "b-new"),
+        ] {
+            assert!(record_path(&store, identity, thread).exists(), "{thread}");
+        }
+        assert!(!orphan.exists());
+        assert_ne!(
+            fs::read_to_string(store.index_path()).unwrap(),
+            index_before
+        );
+
+        let index_after = fs::read_to_string(store.index_path()).unwrap();
+        assert_eq!(store.prune(t(3_700)).unwrap(), 0);
+        assert_eq!(
+            fs::read_to_string(store.index_path()).unwrap(),
+            index_after,
+            "nothing to drop, nothing rewritten"
+        );
     }
 
     fn planted_store(tag: &str) -> (TempDir, EnvoySessions) {
