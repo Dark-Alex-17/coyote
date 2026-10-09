@@ -1483,6 +1483,67 @@ mod tests {
         assert_eq!(held.last_used, rfc3339_utc(late));
     }
 
+    /// Usage probe: a thread's `ttl_hours` run from the time it was last written. A
+    /// load, and a retried turn the record already ends with, extend nothing: the
+    /// thread expires at the hour after its save as if neither had happened. A turn
+    /// that is written starts the hour over.
+    #[test]
+    fn usage_probe_a_threads_life_runs_from_its_last_write_not_a_read_or_a_skipped_retry() {
+        let tmp = TempDir::new("envoy-sessions-ttl-from-write");
+        let config = EnvoyMemoryConfig {
+            ttl_hours: 1,
+            ..enabled()
+        };
+        let store = store(&tmp, &config);
+        let saved = vec![user("may I?"), assistant("yes")];
+        store
+            .save(IDENTITY_A, "thread-one", saved.clone(), t(1_000))
+            .unwrap();
+        store
+            .save(IDENTITY_A, "thread-two", saved.clone(), t(1_000))
+            .unwrap();
+
+        // Half an hour in: a read and a retry of the turn the record ends with.
+        assert!(
+            store
+                .load(IDENTITY_A, "thread-one", t(1_000 + 1_800))
+                .unwrap()
+                .is_some()
+        );
+        store
+            .append_once(IDENTITY_A, "thread-one", assistant("yes"), t(1_000 + 1_800))
+            .unwrap();
+        // The same half hour in: a turn that is written.
+        store
+            .append_once(IDENTITY_A, "thread-two", assistant("no"), t(1_000 + 1_800))
+            .unwrap();
+
+        assert_eq!(
+            store
+                .load(IDENTITY_A, "thread-one", t(1_000 + 3_600))
+                .unwrap(),
+            None,
+            "neither the read nor the skipped retry kept the thread past its hour"
+        );
+        assert!(!record_path(&store, IDENTITY_A, "thread-one").exists());
+        let held = store
+            .load(IDENTITY_A, "thread-two", t(1_000 + 1_800 + 3_599))
+            .unwrap()
+            .expect("the written turn started the hour over");
+        assert_eq!(
+            held.turns,
+            vec![user("may I?"), assistant("yes"), assistant("no")]
+        );
+        assert_eq!(held.last_used, rfc3339_utc(t(1_000 + 1_800)));
+        assert_eq!(
+            store
+                .load(IDENTITY_A, "thread-two", t(1_000 + 1_800 + 3_600))
+                .unwrap(),
+            None
+        );
+        assert_eq!(store.stats().unwrap(), (0, 0));
+    }
+
     #[test]
     fn append_is_bounded_like_save() {
         let tmp = TempDir::new("envoy-sessions-append-bounded");

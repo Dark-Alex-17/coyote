@@ -7431,6 +7431,84 @@ mod tests {
         assert!(fitted.is_empty());
     }
 
+    /// Usage probe: what goes is the fewest whole exchanges, oldest first. Three
+    /// exchanges under a window with room for the last two lose exactly the first; a
+    /// window with room for one keeps the last alone; an answer folded from two
+    /// assistant turns travels with the question it answered. The window is judged
+    /// with the system prompt and the current turn beside the history.
+    #[test]
+    fn usage_probe_the_fewest_whole_exchanges_go_oldest_first() {
+        let filled = |fill: char| -> String { std::iter::repeat_n(fill, 2000).collect() };
+        let text = |role, body: String| Message::new(role, MessageContent::Text(body));
+        let history = vec![
+            text(MessageRole::User, filled('a')),
+            text(MessageRole::Assistant, filled('b')),
+            text(MessageRole::User, filled('c')),
+            // The fold of two assistant turns, as `RunMemory::history` hands it over.
+            text(
+                MessageRole::Assistant,
+                format!("{}\n\n{}", filled('d'), filled('e')),
+            ),
+            text(MessageRole::User, filled('f')),
+            text(MessageRole::Assistant, filled('g')),
+        ];
+        let measure = |history: &[Message]| {
+            let mut messages = vec![text(MessageRole::System, "be terse".into())];
+            messages.extend_from_slice(history);
+            messages.push(text(MessageRole::User, "now?".into()));
+            windowed_model(None).total_tokens(&messages)
+        };
+        // The narrowest window whose seven eighths still hold `tokens`.
+        let window_for = |tokens: usize| ((tokens + 1) * 8).div_ceil(7);
+        let budget_of = |limit: usize| limit - limit / RESUMED_HISTORY_HEADROOM_DIVISOR;
+        let (all, last_two, last_one) = (
+            measure(&history),
+            measure(&history[2..]),
+            measure(&history[4..]),
+        );
+
+        let limit = window_for(last_two);
+        assert!(last_two < budget_of(limit) && budget_of(limit) < all);
+        let fitted = fit_history(
+            &windowed_model(Some(limit)),
+            "be terse",
+            history.clone(),
+            "now?",
+        );
+        assert_eq!(
+            roles_and_texts(&fitted),
+            roles_and_texts(&history[2..]),
+            "exactly the oldest exchange goes"
+        );
+
+        let limit = window_for(last_one);
+        assert!(last_one < budget_of(limit) && budget_of(limit) < last_two);
+        let fitted = fit_history(
+            &windowed_model(Some(limit)),
+            "be terse",
+            history.clone(),
+            "now?",
+        );
+        assert_eq!(
+            roles_and_texts(&fitted),
+            roles_and_texts(&history[4..]),
+            "the folded answer went with its question, never alone"
+        );
+
+        // The window is judged beside the system prompt: a prompt that eats the room
+        // the last two exchanges had leaves one.
+        let long_prompt = filled('s');
+        let limit = window_for(last_two);
+        let fitted = fit_history(&windowed_model(Some(limit)), &long_prompt, history, "now?");
+        assert_eq!(
+            roles_and_texts(&fitted),
+            roles_and_texts(&[
+                text(MessageRole::User, filled('f')),
+                text(MessageRole::Assistant, filled('g')),
+            ])
+        );
+    }
+
     fn turns_of(store: &EnvoySessions, identity: &[u8; 16], thread: &str) -> Vec<EnvoyTurn> {
         store
             .load(&hex_lower(identity), thread, SystemTime::now())
@@ -7871,6 +7949,161 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             planted,
             "the refused record is not written over"
+        );
+        source.remove_dir();
+    }
+
+    /// Usage probe: a root message's thread is its own id and is never loaded, so a
+    /// record already under that key naming another identity is first met by the save.
+    /// The run itself is the one a root always gets, prompt of a fresh thread and no
+    /// turn resumed; the exchange is refused rather than written over the stranger's
+    /// record, which stays byte for byte; and the owner is warned by the save, the one
+    /// place that saw it, with no recall warning ahead of it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn usage_probe_a_roots_exchange_refused_over_a_strangers_record_warns_once_from_the_save()
+    {
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-memory-root-tampered");
+        let (source, _source) = stub_envoy_source();
+        install_log_collector();
+        let tmp = TempDir::new("mesh-envoy-memory-root-tampered");
+        let app = test_app();
+        let store = memory_for(&app, &tmp);
+        let root_id = "q-root-7b2d";
+        let (mine, theirs) = (hex_lower(&PEER_IDENTITY), hex_lower(&OTHER_IDENTITY));
+        store
+            .save(
+                &mine,
+                root_id,
+                vec![
+                    EnvoyTurn {
+                        role: EnvoyRole::User,
+                        text: "earlier".into(),
+                    },
+                    EnvoyTurn {
+                        role: EnvoyRole::Assistant,
+                        text: "earlier answer".into(),
+                    },
+                ],
+                SystemTime::now(),
+            )
+            .unwrap();
+        let path = store
+            .dir()
+            .join(format!("{}.yaml", session_key(&mine, root_id).unwrap()));
+        let planted = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace(&mine, &theirs);
+        std::fs::write(&path, &planted).unwrap();
+        let warned_before = warn_snapshot().len();
+
+        let idle = RecordingIdleSink::attach(&app);
+        let (drive, seen) = prompt_recording_drive();
+        let runner = EnvoyRunner::start_with(Arc::clone(&app), drive);
+        assert!(
+            runner
+                .accept(job(PeerKind::Ask, root_id, "starting over?"))
+                .is_ok()
+        );
+        wait_until("the reply", || idle.count("envoy replied:") == 1).await;
+        runner.stop().await;
+
+        let seen = seen.lock();
+        assert_eq!(
+            roles_of(&seen[0]),
+            vec![MessageRole::System, MessageRole::User]
+        );
+        assert!(
+            !seen[0][0].content.to_text().contains(RESUMED_THREAD_NOTE),
+            "a root is driven as a fresh thread"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            planted,
+            "the stranger's record is neither written over nor removed"
+        );
+        let warned: Vec<String> = warn_snapshot().into_iter().skip(warned_before).collect();
+        let saved_warnings = warned
+            .iter()
+            .filter(|line| {
+                line.contains(&format!("memory for thread {root_id} could not be saved"))
+            })
+            .count();
+        assert_eq!(saved_warnings, 1, "{warned:?}");
+        assert!(
+            !warned
+                .iter()
+                .any(|line| line.contains("names another identity")),
+            "a root's thread is never recalled, so recall warns of nothing: {warned:?}"
+        );
+        source.remove_dir();
+    }
+
+    /// Usage probe: a follow-up naming a thread past `ttl_hours` since it was last
+    /// written names a thread the node no longer holds. It is driven with nothing
+    /// resumed and the prompt of a fresh thread, the expired record goes, and the
+    /// exchange it writes is the whole of the thread from then on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn usage_probe_a_follow_up_in_an_expired_thread_starts_clean_and_the_old_turns_go() {
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-memory-expired");
+        let (source, _source) = stub_envoy_source();
+        let tmp = TempDir::new("mesh-envoy-memory-expired");
+        let app = test_app();
+        let config = EnvoyMemoryConfig {
+            enabled: true,
+            ttl_hours: 1,
+            ..Default::default()
+        };
+        let store = Arc::new(EnvoySessions::open(&tmp.path, "inst-a", &config).unwrap());
+        app.mesh.set_envoy_memory_for_tests(Arc::clone(&store));
+        let mine = hex_lower(&PEER_IDENTITY);
+        let two_hours_ago = SystemTime::now() - Duration::from_secs(2 * 3_600);
+        store
+            .save(
+                &mine,
+                "t-9",
+                vec![
+                    EnvoyTurn {
+                        role: EnvoyRole::User,
+                        text: "earlier".into(),
+                    },
+                    EnvoyTurn {
+                        role: EnvoyRole::Assistant,
+                        text: "earlier answer".into(),
+                    },
+                ],
+                two_hours_ago,
+            )
+            .unwrap();
+        let idle = RecordingIdleSink::attach(&app);
+        let (drive, seen) = prompt_recording_drive();
+        let runner = EnvoyRunner::start_with(Arc::clone(&app), drive);
+        assert!(
+            runner
+                .accept(threaded_job(&PEER_IDENTITY, "q-2", "t-9", "and then?"))
+                .is_ok()
+        );
+        wait_until("the reply", || idle.count("envoy replied:") == 1).await;
+        runner.stop().await;
+
+        let seen = seen.lock();
+        assert_eq!(
+            roles_of(&seen[0]),
+            vec![MessageRole::System, MessageRole::User],
+            "nothing of the expired thread is resumed"
+        );
+        assert!(
+            !seen[0][0].content.to_text().contains(RESUMED_THREAD_NOTE),
+            "and the prompt is a fresh thread's"
+        );
+        let turns = turns_of(&store, &PEER_IDENTITY, "t-9");
+        assert_eq!(turns.len(), 2, "{turns:?}");
+        assert!(turns[0].text.contains("Message id: q-2"), "{turns:?}");
+        assert_eq!(turns[1].text, "answer 0");
+        assert!(
+            !turns.iter().any(|turn| turn.text.contains("earlier")),
+            "the expired turns are gone, not revived under the new exchange: {turns:?}"
         );
         source.remove_dir();
     }

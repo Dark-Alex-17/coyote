@@ -6411,6 +6411,106 @@ mod tests {
         stub.stop().await;
     }
 
+    /// Usage probe: the owner's late answer to a thread the memory has let go, past
+    /// `ttl_hours` since it was last written, still reaches the peer and settles the
+    /// question, and revives nothing: the expired record goes rather than being written
+    /// to, no record of the answer alone takes its place, and a live thread of the same
+    /// sender answered right after is the one that gains the turn.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_a_late_answer_to_an_expired_thread_is_sent_and_revives_nothing() {
+        use crate::mesh::trust::TrustOptions;
+
+        let stub = PeerStub::listen(
+            "node-late-answer-expired-stub",
+            TcpServer::DEFAULT_CLIENT_MTU,
+        )
+        .await;
+        let started =
+            started_runtime_on_with("node-late-answer-expired-memory", stub.port(), |c| {
+                c.envoy_memory.enabled = true;
+                c.envoy_memory.ttl_hours = 1;
+            })
+            .await;
+        let runtime = started.runtime.clone();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime.clone()).unwrap();
+        stub.trust(&runtime.current_destination_hash(), runtime.fingerprint());
+        stub.announce(Some("Stub")).await;
+        let to = stub.destination_hex();
+        let peers = runtime.peers();
+        stub.wait_to_be_filed(&peers, &to).await;
+        runtime
+            .trust()
+            .trust_destination(
+                slot.as_ref(),
+                &to,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        let identity = stub.identity_hex();
+        let memory = runtime
+            .envoy_memory()
+            .expect("an enabled store is opened at start");
+        let now = SystemTime::now();
+        let two_hours_ago = now - Duration::from_secs(2 * 3_600);
+        // The live thread first: a save sweeps the other expired threads of the store.
+        memory.save(&identity, "a-2", peer_turns(), now).unwrap();
+        memory
+            .save(&identity, "a-1", peer_turns(), two_hours_ago)
+            .unwrap();
+        let expired = memory
+            .dir()
+            .join(format!("{}.yaml", session_key(&identity, "a-1").unwrap()));
+        assert!(
+            expired.exists(),
+            "the expired thread is on disk before the answer"
+        );
+        let store = slot.inbound_store().unwrap();
+        for id in ["a-1", "a-2"] {
+            store
+                .upsert(
+                    InboundRecord {
+                        peer_destination: to.clone(),
+                        peer_identity: identity.clone(),
+                        ..inbound_record(id)
+                    },
+                    now,
+                )
+                .unwrap();
+        }
+
+        slot.answer_inbound("a-1", "the owner says yes")
+            .await
+            .unwrap();
+        assert!(
+            store.get("a-1").unwrap().is_none(),
+            "the answer went out and settled the question"
+        );
+        assert_eq!(
+            memory.load(&identity, "a-1", now).unwrap(),
+            None,
+            "an expired thread is not revived by the answer"
+        );
+        assert!(
+            !expired.exists(),
+            "the expired record goes rather than being written to"
+        );
+
+        slot.answer_inbound("a-2", "and no to that").await.unwrap();
+        let turns = memory
+            .load(&identity, "a-2", now)
+            .unwrap()
+            .expect("the live thread stays remembered")
+            .turns;
+        assert_eq!(turns.len(), peer_turns().len() + 1, "{turns:?}");
+        assert_eq!(turns.last().unwrap().role, EnvoyRole::Assistant);
+        assert_eq!(turns.last().unwrap().text, "and no to that");
+        assert!(slot.stop().await.unwrap());
+        stub.stop().await;
+    }
+
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn answer_inbound_with_file_sends_without_the_envoy_and_removes_the_record() {
