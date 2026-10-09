@@ -5,7 +5,7 @@ use crate::config::{MeshConfig, RequestContext, paths};
 use crate::function::mesh::trust_label;
 use crate::mesh::access::GrantKind;
 use crate::mesh::card::{CardSource, DISPLAY_NAME_MAX_CHARS, StatusHandler, render_for_human};
-use crate::mesh::envoy_sessions::{EnvoyMemoryError, EnvoySessions};
+use crate::mesh::envoy_sessions::{EnvoyMemoryError, EnvoySessions, RememberedOf};
 use crate::mesh::fetch::{
     FILE_FETCH_REQUEST_TIMEOUT, FetchError as FileFetchError, Fetched, SINGLE_SEGMENT_FETCH_CEILING,
 };
@@ -1588,7 +1588,10 @@ fn parse_fetch_args(rest: &str) -> Result<Option<FetchArgs>> {
 /// What is reported forgotten is read back from the stores after the sweep: a store that
 /// refused the delete is logged and what it still holds is named instead, with the
 /// command that forgets it once the store can be written. A store whose index cannot be
-/// read is logged and invisible to both the listing and the count.
+/// read is counted as such in the listing and the result: `all` empties it unread, record
+/// files and index alike, while an identity or thread scope leaves it as it is and says
+/// so, naming `.mesh memory forget all` as the way to empty it. `all` also removes record
+/// files no index names, and counts them.
 /// Runs with the mesh off and with `mesh.envoy_memory.enabled` false: the records may be
 /// on disk from when it was on.
 fn memory(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
@@ -1614,29 +1617,75 @@ fn memory(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         .unwrap_or_else(|| MeshPaths::from_env().cache_dir);
     let config = &ctx.app.config.mesh.envoy_memory;
     let remembered = EnvoySessions::remembered_everywhere(&cache_dir, config)?;
-    let preview = forget_preview(&args.scope, &remembered);
-    if preview.count == 0 {
-        out_text(&match &args.scope {
+    let preview = forget_preview(&args.scope, &remembered.by_identity);
+    let all = matches!(args.scope, ForgetScope::All);
+    let unreadable = remembered.unreadable_stores;
+    let orphans = if all { remembered.orphans } else { 0 };
+    let note = if all {
+        None
+    } else {
+        unreadable_note(unreadable)
+    };
+    let nothing_in_reach = if all {
+        remembered.is_empty()
+    } else {
+        preview.count == 0
+    };
+    if nothing_in_reach {
+        let reach = if unreadable > 0 {
+            " in the stores that can be read"
+        } else {
+            ""
+        };
+        let mut lines = vec![match &args.scope {
             ForgetScope::All => "The envoy remembers nothing.".to_string(),
             ForgetScope::Identity(identity) => format!(
-                "The envoy remembers nothing of identity {}.",
+                "The envoy remembers nothing of identity {}{reach}.",
                 short(identity)
             ),
             ForgetScope::Thread { identity, thread } => format!(
-                "The envoy remembers no thread '{thread}' of identity {}.",
+                "The envoy remembers no thread '{thread}' of identity {}{reach}.",
                 short(identity)
             ),
-        });
+        }];
+        lines.extend(note);
+        out_text(&lines.join("\n"));
         return Ok(());
     }
     let conversations =
         |count| plural(count, "remembered conversation", "remembered conversations");
+    let orphan_files = |count| {
+        plural(
+            count,
+            "record file that no index names",
+            "record files that no index names",
+        )
+    };
+    let unreadable_stores = |count| {
+        plural(
+            count,
+            "store whose index cannot be read",
+            "stores whose index cannot be read",
+        )
+    };
     let subject = match &args.scope {
-        ForgetScope::All => format!(
-            "{} of {}",
-            conversations(preview.count),
-            plural(remembered.len(), "identity", "identities")
-        ),
+        ForgetScope::All => {
+            let mut parts = Vec::new();
+            if preview.count > 0 {
+                parts.push(format!(
+                    "{} of {}",
+                    conversations(preview.count),
+                    plural(remembered.by_identity.len(), "identity", "identities")
+                ));
+            }
+            if orphans > 0 {
+                parts.push(orphan_files(orphans));
+            }
+            if unreadable > 0 {
+                parts.push(unreadable_stores(unreadable));
+            }
+            join_and(&parts)
+        }
         ForgetScope::Identity(identity) => {
             format!(
                 "{} of identity {}",
@@ -1658,6 +1707,7 @@ fn memory(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             format!("Would forget {subject}:")
         }];
         lines.extend(preview.rows);
+        lines.extend(note);
         lines.push(DRY_RUN_NOTHING_CHANGED.to_string());
         out_text(&lines.join("\n"));
         return Ok(());
@@ -1672,7 +1722,7 @@ fn memory(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         out_text(NOTHING_CHANGED);
         return Ok(());
     }
-    let removed = match &args.scope {
+    let forgotten = match &args.scope {
         ForgetScope::All => EnvoySessions::delete_all_everywhere(&cache_dir, config)?,
         ForgetScope::Identity(identity) => {
             EnvoySessions::delete_identity_everywhere(&cache_dir, config, identity)?
@@ -1682,8 +1732,23 @@ fn memory(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         }
     };
     let after = EnvoySessions::remembered_everywhere(&cache_dir, config)?;
-    let left = forget_preview(&args.scope, &after).count;
+    let left = forget_preview(&args.scope, &after.by_identity).count;
+    let (left_orphans, left_unreadable) = if all {
+        (after.orphans, after.unreadable_stores)
+    } else {
+        (0, 0)
+    };
+    let mut residue = Vec::new();
     if left > 0 {
+        residue.push(conversations(left));
+    }
+    if left_orphans > 0 {
+        residue.push(orphan_files(left_orphans));
+    }
+    if left_unreadable > 0 {
+        residue.push(unreadable_stores(left_unreadable));
+    }
+    if !residue.is_empty() {
         let remedy = match &args.scope {
             ForgetScope::All => ".mesh memory forget all".to_string(),
             ForgetScope::Identity(identity) => format!(".mesh memory forget {identity}"),
@@ -1691,26 +1756,33 @@ fn memory(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
                 format!(".mesh memory forget {identity} {thread}")
             }
         };
-        let forgot = if removed > 0 {
-            format!("Forgot {}, but ", plural(removed, "record", "records"))
+        let forgot = if forgotten.removed > 0 {
+            format!(
+                "Forgot {}, but ",
+                plural(forgotten.removed, "record", "records")
+            )
         } else {
             String::new()
         };
-        out_text(&format!(
+        let mut lines = vec![format!(
             "{forgot}{} could not be forgotten; see the log for the store that refused, then run {remedy} again.",
-            conversations(left)
-        ));
+            join_and(&residue)
+        )];
+        lines.extend(note);
+        out_text(&lines.join("\n"));
         return Ok(());
     }
-    let records = if removed > preview.count {
+    let records = if forgotten.removed > preview.count {
         format!(
             " ({} across the instance stores)",
-            plural(removed, "record", "records")
+            plural(forgotten.removed, "record", "records")
         )
     } else {
         String::new()
     };
-    out_text(&format!("Forgot {subject}{records}."));
+    let mut lines = vec![format!("Forgot {subject}{records}.")];
+    lines.extend(note);
+    out_text(&lines.join("\n"));
     Ok(())
 }
 
@@ -1821,6 +1893,30 @@ fn forget_preview(
             ),
             rows: Vec::new(),
         },
+    }
+}
+
+/// `a`, `a and b`, `a, b and c`.
+fn join_and(parts: &[String]) -> String {
+    match parts {
+        [] => String::new(),
+        [one] => one.clone(),
+        [init @ .., last] => format!("{} and {last}", init.join(", ")),
+    }
+}
+
+/// What an identity or thread scope cannot reach: the stores whose index cannot be read
+/// are left as they are; only `all` empties them unread.
+fn unreadable_note(stores: usize) -> Option<String> {
+    match stores {
+        0 => None,
+        1 => Some(
+            "1 store whose index cannot be read is left as it is and may hold more; run .mesh memory forget all to empty it."
+                .to_string(),
+        ),
+        n => Some(format!(
+            "{n} stores whose index cannot be read are left as they are and may hold more; run .mesh memory forget all to empty them."
+        )),
     }
 }
 
@@ -2235,6 +2331,14 @@ fn untrust_identity(
         bail!("Identity {identity} is not in the trust list, so there is nothing to untrust.");
     }
     let expected = format!("untrust-{}", short(identity));
+    if let Some(token) = &confirm
+        && *token != expected
+    {
+        bail!(
+            "'{token}' is not the token for identity {}; run .mesh {verb} --identity {identity} --confirm {expected}",
+            short(identity)
+        );
+    }
     let memory = store.remembered_envoy_threads(identity);
     match confirm {
         None => {
@@ -2267,18 +2371,22 @@ fn untrust_identity(
                 String::new()
             };
             let memory_clause = match &memory {
-                Some(Ok(count)) if *count > 0 => {
+                Some(Ok(remembered)) if remembered.threads > 0 => {
                     lines.push(format!(
                         "  {}  forgotten with it",
                         plural(
-                            *count,
+                            remembered.threads,
                             "remembered envoy conversation",
                             "remembered envoy conversations"
                         )
                     ));
                     format!(
                         " and the {} remembered of it",
-                        plural(*count, "envoy conversation", "envoy conversations")
+                        plural(
+                            remembered.threads,
+                            "envoy conversation",
+                            "envoy conversations"
+                        )
                     )
                 }
                 Some(Err(err)) => {
@@ -2290,16 +2398,17 @@ fn untrust_identity(
                 }
                 _ => String::new(),
             };
+            if let Some(Ok(remembered)) = &memory
+                && let Some(stores) = unreadable_memory_stores(remembered.unreadable_stores)
+            {
+                lines.push(format!("  {stores}"));
+            }
             lines.push(format!(
                 "{DRY_RUN_NOTHING_CHANGED} To forget this identity and its {} instance(s){refused_clause}{memory_clause}, run: .mesh {verb} --identity {identity} --confirm {expected}",
                 bound.len()
             ));
             out_text(&lines.join("\n"));
         }
-        Some(token) if token != expected => bail!(
-            "'{token}' is not the token for identity {}; run .mesh {verb} --identity {identity} --confirm {expected}",
-            short(identity)
-        ),
         Some(_) => {
             let removed = store.untrust_identity(mesh, identity)?;
             let mut lines = vec![format!(
@@ -2321,27 +2430,60 @@ fn untrust_identity(
 
 /// What a revocation says of the envoy memory once its sweep has run, from the count
 /// `before` the write and the one read `after` it; nothing when there was nothing to
-/// forget.
+/// forget and no store the sweep could not read.
 fn envoy_memory_sweep_line(
     identity: &str,
-    before: Option<Result<usize, EnvoyMemoryError>>,
-    after: Option<Result<usize, EnvoyMemoryError>>,
+    before: Option<Result<RememberedOf, EnvoyMemoryError>>,
+    after: Option<Result<RememberedOf, EnvoyMemoryError>>,
 ) -> Option<String> {
-    match after {
-        Some(Ok(0)) | None => match before {
-            Some(Ok(count)) if count > 0 => Some(format!(
+    let unreadable = match &after {
+        Some(Ok(remembered)) => unreadable_memory_stores(remembered.unreadable_stores),
+        _ => None,
+    };
+    let sentence = match after {
+        Some(Ok(RememberedOf { threads: 0, .. })) | None => match before {
+            Some(Ok(remembered)) if remembered.threads > 0 => Some(format!(
                 "Forgot the {} remembered of it.",
-                plural(count, "envoy conversation", "envoy conversations")
+                plural(
+                    remembered.threads,
+                    "envoy conversation",
+                    "envoy conversations"
+                )
             )),
             _ => None,
         },
         Some(Ok(remaining)) => Some(format!(
             "{} remembered of it could not be forgotten; run .mesh memory forget {identity}.",
-            plural(remaining, "envoy conversation", "envoy conversations")
+            plural(
+                remaining.threads,
+                "envoy conversation",
+                "envoy conversations"
+            )
         )),
         Some(Err(err)) => Some(format!(
             "Its remembered envoy conversations could not be counted: {}; run .mesh memory forget {identity} to be sure.",
             redact_hashes(&err.to_string())
+        )),
+    };
+    match (sentence, unreadable) {
+        (sentence, None) => sentence,
+        (None, Some(stores)) => Some(format!("{stores}.")),
+        (Some(sentence), Some(stores)) => Some(format!("{sentence} {stores}.")),
+    }
+}
+
+/// What a revocation's disclosure says of the envoy memory stores whose index cannot be
+/// read: they may hold more of the identity, and only `.mesh memory forget all` reaches
+/// them. Nothing when every store could be read.
+fn unreadable_memory_stores(stores: usize) -> Option<String> {
+    match stores {
+        0 => None,
+        1 => Some(
+            "1 envoy memory store whose index cannot be read may hold more of it; run .mesh memory forget all to empty it"
+                .to_string(),
+        ),
+        n => Some(format!(
+            "{n} envoy memory stores whose index cannot be read may hold more of it; run .mesh memory forget all to empty them"
         )),
     }
 }
@@ -2359,11 +2501,15 @@ fn block(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     let store = trust_store(ctx)?;
     let identity = identity_hash(target)?;
     let memory = store.remembered_envoy_threads(&identity);
-    let memory_clause = match &memory {
-        Some(Ok(count)) if *count > 0 => format!(
+    let mut memory_clause = match &memory {
+        Some(Ok(remembered)) if remembered.threads > 0 => format!(
             ", and the {} remembered of it {} forgotten.",
-            plural(*count, "envoy conversation", "envoy conversations"),
-            if *count == 1 { "is" } else { "are" }
+            plural(
+                remembered.threads,
+                "envoy conversation",
+                "envoy conversations"
+            ),
+            if remembered.threads == 1 { "is" } else { "are" }
         ),
         Some(Err(err)) => format!(
             ". Its remembered envoy conversations could not be counted: {}; they are swept all the same.",
@@ -2371,6 +2517,11 @@ fn block(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         ),
         _ => ".".to_string(),
     };
+    if let Some(Ok(remembered)) = &memory
+        && let Some(stores) = unreadable_memory_stores(remembered.unreadable_stores)
+    {
+        memory_clause.push_str(&format!(" {stores}."));
+    }
     out_text(&format!(
         "This blocks identity {}: its knocks are dropped without a word, and every trust record for it, identity and instances alike, is removed{memory_clause}",
         short(&identity)
@@ -7810,6 +7961,61 @@ mod tests {
                 .collect()
         }
 
+        /// What `line` alone printed to stdout, apart from the commands before it.
+        async fn out_of(ctx: &mut RequestContext, line: &str) -> Result<String> {
+            let before = stdout_lines().len();
+            run(ctx, line).await?;
+            Ok(stdout_lines()[before..].join("\n"))
+        }
+
+        #[cfg(unix)]
+        async fn refusal(ctx: &mut RequestContext, line: &str) -> String {
+            run(ctx, line).await.expect_err(line).to_string()
+        }
+
+        /// The row named `name` of the last `.mesh info` printed.
+        fn info_row(out: &str, name: &str) -> String {
+            let head = format!("  {name:<MESH_INFO_LABEL_WIDTH$}");
+            out.lines()
+                .rev()
+                .find_map(|line| line.strip_prefix(&head))
+                .unwrap_or_else(|| panic!("no {name} row in {out}"))
+                .to_string()
+        }
+
+        /// Restores the mode of a directory the test made read-only, panic or not, so
+        /// the config-dir guard can still remove it.
+        #[cfg(unix)]
+        struct ModeRestore {
+            path: std::path::PathBuf,
+            mode: u32,
+        }
+
+        #[cfg(unix)]
+        impl ModeRestore {
+            fn read_only(path: &Path) -> Self {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = fs::metadata(path).unwrap().permissions().mode();
+                fs::set_permissions(path, fs::Permissions::from_mode(0o500)).unwrap();
+                Self {
+                    path: path.to_path_buf(),
+                    mode,
+                }
+            }
+
+            fn restore(&self) {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&self.path, fs::Permissions::from_mode(self.mode));
+            }
+        }
+
+        #[cfg(unix)]
+        impl Drop for ModeRestore {
+            fn drop(&mut self) {
+                self.restore();
+            }
+        }
+
         fn stderr_lines() -> Vec<String> {
             capture::lines()
                 .into_iter()
@@ -8750,16 +8956,6 @@ mod tests {
                     assert!(ctx.app.mesh.stop().await.unwrap());
                     started.relay_handle.abort();
                 });
-            }
-
-            /// The row named `name` of the last `.mesh info` printed.
-            fn info_row(out: &str, name: &str) -> String {
-                let head = format!("  {name:<MESH_INFO_LABEL_WIDTH$}");
-                out.lines()
-                    .rev()
-                    .find_map(|line| line.strip_prefix(&head))
-                    .unwrap_or_else(|| panic!("no {name} row in {out}"))
-                    .to_string()
             }
 
             #[test]
@@ -11362,17 +11558,6 @@ mod tests {
                     .collect()
             }
 
-            /// What `line` alone printed to stdout, apart from the commands before it.
-            async fn out_of(ctx: &mut RequestContext, line: &str) -> Result<String> {
-                let before = stdout_lines().len();
-                run(ctx, line).await?;
-                Ok(stdout_lines()[before..].join("\n"))
-            }
-
-            async fn refusal(ctx: &mut RequestContext, line: &str) -> String {
-                run(ctx, line).await.expect_err(line).to_string()
-            }
-
             /// The answer is the consent: `no` writes nothing, `yes` adds the record with
             /// its label, and `--yes` stands in for the question rather than asking it.
             #[test]
@@ -12992,6 +13177,7 @@ mod tests {
                     let remembered_of = |identity: &str| {
                         EnvoySessions::remembered_everywhere(started.runtime.cache_dir(), &config)
                             .unwrap()
+                            .by_identity
                             .get(identity)
                             .map_or(0, Vec::len)
                     };
@@ -13164,6 +13350,7 @@ mod tests {
                     let remembered_of = |identity: &str| {
                         EnvoySessions::remembered_everywhere(&cache_dir, &config)
                             .unwrap()
+                            .by_identity
                             .get(identity)
                             .cloned()
                             .unwrap_or_default()
@@ -15660,36 +15847,6 @@ mod tests {
                     assert!(ctx.app.mesh.stop().await.unwrap());
                     started.relay_handle.abort();
                 });
-            }
-
-            /// Restores the mode of a directory the test made read-only, panic or not, so
-            /// the config-dir guard can still remove it.
-            struct ModeRestore {
-                path: std::path::PathBuf,
-                mode: u32,
-            }
-
-            impl ModeRestore {
-                fn read_only(path: &Path) -> Self {
-                    use std::os::unix::fs::PermissionsExt;
-                    let mode = fs::metadata(path).unwrap().permissions().mode();
-                    fs::set_permissions(path, fs::Permissions::from_mode(0o500)).unwrap();
-                    Self {
-                        path: path.to_path_buf(),
-                        mode,
-                    }
-                }
-
-                fn restore(&self) {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = fs::set_permissions(&self.path, fs::Permissions::from_mode(self.mode));
-                }
-            }
-
-            impl Drop for ModeRestore {
-                fn drop(&mut self) {
-                    self.restore();
-                }
             }
 
             /// Usage probe: the identity-stays-trusted sentence is printed BEFORE the write,
@@ -27310,99 +27467,108 @@ mod tests {
                     });
                 }
             }
+        }
 
-            mod memory_verb {
+        mod memory_verb {
+            use super::*;
+            use crate::config::mesh_config::EnvoyMemoryConfig;
+            use crate::mesh::envoy_sessions::{EnvoyRole, EnvoySessions, EnvoyTurn};
+            use crate::testing::EnvVarGuard;
+            use crate::utils::get_env_name;
+            use std::collections::BTreeMap;
+
+            const TAG: &str = "repl-mesh-memory-forget";
+            const ID_A: &str = "0123456789abcdef0123456789abcdef";
+            const ID_B: &str = "fedcba9876543210fedcba9876543210";
+
+            fn enabled() -> EnvoyMemoryConfig {
+                EnvoyMemoryConfig {
+                    enabled: true,
+                    ..Default::default()
+                }
+            }
+
+            /// Two instance stores under `cache_dir`: the first holds A's `a-first`
+            /// and `a-second`, the second A's `a-first` again and B's `b-first`, so
+            /// three threads are remembered across four records.
+            fn seed(cache_dir: &Path) {
+                let now = SystemTime::now();
+                let turns = vec![
+                    EnvoyTurn {
+                        role: EnvoyRole::User,
+                        text: "where were we?".into(),
+                    },
+                    EnvoyTurn {
+                        role: EnvoyRole::Assistant,
+                        text: "the build".into(),
+                    },
+                ];
+                let first = EnvoySessions::open(cache_dir, "inst-a", &enabled()).unwrap();
+                let second = EnvoySessions::open(cache_dir, "inst-b", &enabled()).unwrap();
+                for (store, identity, thread) in [
+                    (&first, ID_A, "a-first"),
+                    (&first, ID_A, "a-second"),
+                    (&second, ID_A, "a-first"),
+                    (&second, ID_B, "b-first"),
+                ] {
+                    store.save(identity, thread, turns.clone(), now).unwrap();
+                }
+            }
+
+            fn remembered(cache_dir: &Path) -> BTreeMap<String, Vec<String>> {
+                EnvoySessions::remembered_everywhere(cache_dir, &EnvoyMemoryConfig::default())
+                    .unwrap()
+                    .by_identity
+            }
+
+            fn seeded() -> BTreeMap<String, Vec<String>> {
+                BTreeMap::from([
+                    (
+                        ID_A.to_string(),
+                        vec!["a-first".to_string(), "a-second".to_string()],
+                    ),
+                    (ID_B.to_string(), vec!["b-first".to_string()]),
+                ])
+            }
+
+            fn all_question() -> String {
+                "Forget 3 remembered conversations of 2 identities? This cannot be undone."
+                    .to_string()
+            }
+
+            fn all_rows() -> [String; 2] {
+                [
+                    format!("  {ID_A}  2 conversations"),
+                    format!("  {ID_B}  1 conversation"),
+                ]
+            }
+
+            #[test]
+            #[serial]
+            fn bare_memory_prints_the_usage_and_any_other_sub_command_is_refused_naming_forget() {
+                let _capture = capture::install();
+                let mut ctx = ctx_with(MeshConfig::default(), true);
+
+                run_async(run(&mut ctx, ".mesh memory")).unwrap();
+                assert_eq!(
+                    stdout_lines().join("\n"),
+                    render_verb_help("memory"),
+                    "the bare verb is its usage"
+                );
+                assert_eq!(
+                    err_of(&mut ctx, ".mesh memory list"),
+                    format!(
+                        "'list' is not a `.mesh memory` command; `forget` is the one it takes. {}",
+                        render_verb_help("memory")
+                    )
+                );
+            }
+
+            #[cfg(unix)]
+            mod on_a_started_node {
                 use super::*;
-                use crate::config::mesh_config::EnvoyMemoryConfig;
-                use crate::mesh::envoy_sessions::{EnvoyRole, EnvoySessions, EnvoyTurn};
-                use std::collections::BTreeMap;
-
-                const TAG: &str = "repl-mesh-memory-forget";
-                const ID_A: &str = "0123456789abcdef0123456789abcdef";
-                const ID_B: &str = "fedcba9876543210fedcba9876543210";
-
-                fn enabled() -> EnvoyMemoryConfig {
-                    EnvoyMemoryConfig {
-                        enabled: true,
-                        ..Default::default()
-                    }
-                }
-
-                /// Two instance stores under `cache_dir`: the first holds A's `a-first`
-                /// and `a-second`, the second A's `a-first` again and B's `b-first`, so
-                /// three threads are remembered across four records.
-                fn seed(cache_dir: &Path) {
-                    let now = SystemTime::now();
-                    let turns = vec![
-                        EnvoyTurn {
-                            role: EnvoyRole::User,
-                            text: "where were we?".into(),
-                        },
-                        EnvoyTurn {
-                            role: EnvoyRole::Assistant,
-                            text: "the build".into(),
-                        },
-                    ];
-                    let first = EnvoySessions::open(cache_dir, "inst-a", &enabled()).unwrap();
-                    let second = EnvoySessions::open(cache_dir, "inst-b", &enabled()).unwrap();
-                    for (store, identity, thread) in [
-                        (&first, ID_A, "a-first"),
-                        (&first, ID_A, "a-second"),
-                        (&second, ID_A, "a-first"),
-                        (&second, ID_B, "b-first"),
-                    ] {
-                        store.save(identity, thread, turns.clone(), now).unwrap();
-                    }
-                }
-
-                fn remembered(cache_dir: &Path) -> BTreeMap<String, Vec<String>> {
-                    EnvoySessions::remembered_everywhere(cache_dir, &EnvoyMemoryConfig::default())
-                        .unwrap()
-                }
-
-                fn seeded() -> BTreeMap<String, Vec<String>> {
-                    BTreeMap::from([
-                        (
-                            ID_A.to_string(),
-                            vec!["a-first".to_string(), "a-second".to_string()],
-                        ),
-                        (ID_B.to_string(), vec!["b-first".to_string()]),
-                    ])
-                }
-
-                fn all_question() -> String {
-                    "Forget 3 remembered conversations of 2 identities? This cannot be undone."
-                        .to_string()
-                }
-
-                fn all_rows() -> [String; 2] {
-                    [
-                        format!("  {ID_A}  2 conversations"),
-                        format!("  {ID_B}  1 conversation"),
-                    ]
-                }
-
-                #[test]
-                #[serial]
-                fn bare_memory_prints_the_usage_and_any_other_sub_command_is_refused_naming_forget()
-                {
-                    let _capture = capture::install();
-                    let mut ctx = ctx_with(MeshConfig::default(), true);
-
-                    run_async(run(&mut ctx, ".mesh memory")).unwrap();
-                    assert_eq!(
-                        stdout_lines().join("\n"),
-                        render_verb_help("memory"),
-                        "the bare verb is its usage"
-                    );
-                    assert_eq!(
-                        err_of(&mut ctx, ".mesh memory list"),
-                        format!(
-                            "'list' is not a `.mesh memory` command; `forget` is the one it takes. {}",
-                            render_verb_help("memory")
-                        )
-                    );
-                }
+                use crate::mesh::test_support::started_runtime;
+                use parking_lot::Mutex;
 
                 #[test]
                 #[serial]
@@ -27600,28 +27766,28 @@ mod tests {
                         started.relay_handle.abort();
                     });
                 }
+            }
 
-                #[test]
-                #[serial]
-                fn forget_reaches_the_records_on_disk_while_the_mesh_and_the_memory_are_off() {
-                    let guard = TestConfigDirGuard::new(TAG);
-                    let _cache =
-                        EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
-                    let _capture = capture::install();
-                    let _script = prompt_script::install(&[]);
-                    let cache_dir = MeshPaths::from_env().cache_dir;
-                    seed(&cache_dir);
-                    let mut ctx = ctx_with(MeshConfig::default(), true);
-                    assert!(ctx.app.mesh.get().is_none());
-                    assert!(!ctx.app.config.mesh.envoy_memory.enabled);
+            #[test]
+            #[serial]
+            fn forget_reaches_the_records_on_disk_while_the_mesh_and_the_memory_are_off() {
+                let guard = TestConfigDirGuard::new(TAG);
+                let _cache = EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
+                let _capture = capture::install();
+                let _script = prompt_script::install(&[]);
+                let cache_dir = MeshPaths::from_env().cache_dir;
+                seed(&cache_dir);
+                let mut ctx = ctx_with(MeshConfig::default(), true);
+                assert!(ctx.app.mesh.get().is_none());
+                assert!(!ctx.app.config.mesh.envoy_memory.enabled);
 
-                    let out = run_async(out_of(
-                        &mut ctx,
-                        &format!(".mesh memory forget {ID_A} --yes"),
-                    ))
-                    .unwrap();
+                let out = run_async(out_of(
+                    &mut ctx,
+                    &format!(".mesh memory forget {ID_A} --yes"),
+                ))
+                .unwrap();
 
-                    assert_eq!(
+                assert_eq!(
                         out.lines().last(),
                         Some(
                             format!(
@@ -27632,130 +27798,219 @@ mod tests {
                         ),
                         "{out}"
                     );
-                    assert_eq!(
-                        remembered(&cache_dir),
-                        BTreeMap::from([(ID_B.to_string(), vec!["b-first".to_string()])])
-                    );
-                }
+                assert_eq!(
+                    remembered(&cache_dir),
+                    BTreeMap::from([(ID_B.to_string(), vec!["b-first".to_string()])])
+                );
+            }
 
-                /// The config of a node that is off is not validated, so a zero bound can
-                /// reach the verb; it reads and lists the records on disk all the same.
-                #[test]
-                #[serial]
-                fn forget_runs_on_an_unvalidated_config_while_the_mesh_is_off() {
-                    let guard = TestConfigDirGuard::new(TAG);
-                    let _cache =
-                        EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
-                    let _capture = capture::install();
-                    let _script = prompt_script::install(&[]);
-                    let cache_dir = MeshPaths::from_env().cache_dir;
-                    seed(&cache_dir);
-                    let mut ctx = ctx_with(
-                        MeshConfig {
-                            enabled: false,
-                            envoy_memory: EnvoyMemoryConfig {
-                                max_turns: 0,
-                                ..EnvoyMemoryConfig::default()
-                            },
-                            ..MeshConfig::default()
+            /// The config of a node that is off is not validated, so a zero bound can
+            /// reach the verb; it reads and lists the records on disk all the same.
+            #[test]
+            #[serial]
+            fn forget_runs_on_an_unvalidated_config_while_the_mesh_is_off() {
+                let guard = TestConfigDirGuard::new(TAG);
+                let _cache = EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
+                let _capture = capture::install();
+                let _script = prompt_script::install(&[]);
+                let cache_dir = MeshPaths::from_env().cache_dir;
+                seed(&cache_dir);
+                let mut ctx = ctx_with(
+                    MeshConfig {
+                        enabled: false,
+                        envoy_memory: EnvoyMemoryConfig {
+                            max_turns: 0,
+                            ..EnvoyMemoryConfig::default()
                         },
-                        true,
-                    );
-                    assert!(ctx.app.mesh.get().is_none());
+                        ..MeshConfig::default()
+                    },
+                    true,
+                );
+                assert!(ctx.app.mesh.get().is_none());
 
-                    let out =
-                        run_async(out_of(&mut ctx, ".mesh memory forget all --dry-run")).unwrap();
+                let out = run_async(out_of(&mut ctx, ".mesh memory forget all --dry-run")).unwrap();
 
-                    let [row_a, row_b] = all_rows();
-                    assert_eq!(
-                        out.lines().collect::<Vec<_>>(),
-                        [
-                            "Would forget 3 remembered conversations of 2 identities:",
-                            row_a.as_str(),
-                            row_b.as_str(),
-                            DRY_RUN_NOTHING_CHANGED,
-                        ],
-                        "{out}"
-                    );
-                    assert_eq!(remembered(&cache_dir), seeded());
+                let [row_a, row_b] = all_rows();
+                assert_eq!(
+                    out.lines().collect::<Vec<_>>(),
+                    [
+                        "Would forget 3 remembered conversations of 2 identities:",
+                        row_a.as_str(),
+                        row_b.as_str(),
+                        DRY_RUN_NOTHING_CHANGED,
+                    ],
+                    "{out}"
+                );
+                assert_eq!(remembered(&cache_dir), seeded());
+            }
+
+            #[test]
+            #[serial]
+            fn forget_with_nothing_remembered_says_so_and_asks_nothing() {
+                let guard = TestConfigDirGuard::new(TAG);
+                let _cache = EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
+                let _capture = capture::install();
+                let _script = prompt_script::install(&[]);
+                let mut ctx = ctx_with(MeshConfig::default(), true);
+                let short_a = short(ID_A);
+
+                for (line, expected) in [
+                    (
+                        ".mesh memory forget all".to_string(),
+                        "The envoy remembers nothing.".to_string(),
+                    ),
+                    (
+                        format!(".mesh memory forget {ID_A}"),
+                        format!("The envoy remembers nothing of identity {short_a}."),
+                    ),
+                    (
+                        format!(".mesh memory forget {ID_A} a-first"),
+                        format!("The envoy remembers no thread 'a-first' of identity {short_a}."),
+                    ),
+                ] {
+                    let out = run_async(out_of(&mut ctx, &line)).unwrap();
+                    assert_eq!(out, expected, "{line}");
                 }
+                assert_eq!(prompt_script::prompts_asked(), 0);
+                assert!(!guard.path.join("cache").exists(), "nothing is created");
+            }
 
-                #[test]
-                #[serial]
-                fn forget_with_nothing_remembered_says_so_and_asks_nothing() {
-                    let guard = TestConfigDirGuard::new(TAG);
-                    let _cache =
-                        EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
-                    let _capture = capture::install();
-                    let _script = prompt_script::install(&[]);
-                    let mut ctx = ctx_with(MeshConfig::default(), true);
-                    let short_a = short(ID_A);
+            #[test]
+            #[serial]
+            fn forget_refuses_a_bad_identity_a_bad_thread_a_thread_with_all_and_both_flags() {
+                let _capture = capture::install();
+                let mut ctx = ctx_with(MeshConfig::default(), true);
+                let usage = render_verb_help("memory");
 
-                    for (line, expected) in [
-                        (
-                            ".mesh memory forget all".to_string(),
-                            "The envoy remembers nothing.".to_string(),
-                        ),
-                        (
-                            format!(".mesh memory forget {ID_A}"),
-                            format!("The envoy remembers nothing of identity {short_a}."),
-                        ),
-                        (
-                            format!(".mesh memory forget {ID_A} a-first"),
-                            format!(
-                                "The envoy remembers no thread 'a-first' of identity {short_a}."
-                            ),
-                        ),
-                    ] {
-                        let out = run_async(out_of(&mut ctx, &line)).unwrap();
-                        assert_eq!(out, expected, "{line}");
-                    }
-                    assert_eq!(prompt_script::prompts_asked(), 0);
-                    assert!(!guard.path.join("cache").exists(), "nothing is created");
+                assert_eq!(
+                    err_of(&mut ctx, ".mesh memory forget all --yes --dry-run"),
+                    format!("Unexpected '--yes'. {usage}")
+                );
+                assert_eq!(
+                    err_of(&mut ctx, ".mesh memory forget all some-thread"),
+                    format!("Unexpected 'some-thread'. {usage}")
+                );
+                assert_eq!(
+                    err_of(
+                        &mut ctx,
+                        &format!(".mesh memory forget {ID_A} a-first extra")
+                    ),
+                    format!("Unexpected 'extra'. {usage}")
+                );
+                assert_eq!(
+                    err_of(&mut ctx, &format!(".mesh memory forget {ID_A} --prune")),
+                    format!("Unexpected '--prune'. {usage}")
+                );
+                assert_eq!(
+                    err_of(&mut ctx, ".mesh memory forget nope"),
+                    "'nope' is not an identity hash: expected 32 hex characters, as `.mesh knocks` and `.mesh peers` list them."
+                );
+                assert_eq!(
+                    err_of(
+                        &mut ctx,
+                        &format!(".mesh memory forget {ID_A} \"bad thread!\"")
+                    ),
+                    format!(
+                        "'bad thread!' is not a thread id: expected 1 to {PEER_ID_MAX_CHARS} characters from `[0-9A-Za-z_.:-]`, as `.mesh memory forget <identity> --dry-run` lists them. {usage}"
+                    )
+                );
+                run_async(run(&mut ctx, ".mesh memory forget")).unwrap();
+                assert_eq!(stdout_lines().join("\n"), usage, "no target is the usage");
+            }
+
+            /// Usage probe: when the stores directory itself cannot be listed (a file
+            /// sits where the directory should be), the verb fails before asking or
+            /// writing anything, and its error names the path rather than a bare
+            /// `Forgot`.
+            #[test]
+            #[serial]
+            fn usage_probe_forget_fails_closed_when_the_stores_directory_cannot_be_listed() {
+                let guard = TestConfigDirGuard::new(TAG);
+                let _cache = EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
+                let _capture = capture::install();
+                let _script = prompt_script::install(&[]);
+                let cache_dir = MeshPaths::from_env().cache_dir;
+                let stores = cache_dir.join("mesh").join("envoy-sessions");
+                fs::create_dir_all(stores.parent().unwrap()).unwrap();
+                fs::write(&stores, "not a directory").unwrap();
+                let mut ctx = ctx_with(MeshConfig::default(), true);
+
+                for line in [
+                    ".mesh memory forget all --yes".to_string(),
+                    ".mesh memory forget all --dry-run".to_string(),
+                    format!(".mesh memory forget {ID_A} --yes"),
+                ] {
+                    let printed = stdout_lines().len();
+                    let err = err_of(&mut ctx, &line);
+                    assert!(
+                        err.contains(&stores.display().to_string()),
+                        "{line}: the error names the stores path: {err}"
+                    );
+                    assert!(!err.contains("Forgot"), "{line}: {err}");
+                    assert_eq!(
+                        stdout_lines().len(),
+                        printed,
+                        "{line}: nothing is printed as done"
+                    );
                 }
+                assert_eq!(prompt_script::prompts_asked(), 0);
+                assert_eq!(fs::read_to_string(&stores).unwrap(), "not a directory");
+            }
 
-                #[test]
-                #[serial]
-                fn forget_refuses_a_bad_identity_a_bad_thread_a_thread_with_all_and_both_flags() {
-                    let _capture = capture::install();
-                    let mut ctx = ctx_with(MeshConfig::default(), true);
-                    let usage = render_verb_help("memory");
+            /// Usage probe: with the mesh off, `.mesh info` prints the `envoy_memory.*`
+            /// configuration rows (they describe the config, not the node) and no
+            /// `envoy memory` count row (that describes the store the node serves, and
+            /// there is none); bare `.mesh status` is refused as before. The records on
+            /// disk do not change that.
+            #[test]
+            #[serial]
+            fn usage_probe_info_while_off_prints_the_envoy_memory_config_rows_but_no_count_row() {
+                let guard = TestConfigDirGuard::new(TAG);
+                let _cache = EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
+                let _capture = capture::install();
+                let cache_dir = MeshPaths::from_env().cache_dir;
+                seed(&cache_dir);
+                let mut ctx = ctx_with(MeshConfig::default(), true);
+                assert!(ctx.app.mesh.get().is_none());
 
-                    assert_eq!(
-                        err_of(&mut ctx, ".mesh memory forget all --yes --dry-run"),
-                        format!("Unexpected '--yes'. {usage}")
+                let out = run_async(out_of(&mut ctx, ".mesh info")).unwrap();
+
+                for key in [
+                    "envoy_memory.enabled",
+                    "envoy_memory.max_sessions",
+                    "envoy_memory.max_per_identity",
+                    "envoy_memory.max_turns",
+                    "envoy_memory.max_bytes",
+                    "envoy_memory.ttl_hours",
+                ] {
+                    assert!(
+                        out.lines()
+                            .any(|line| line.starts_with(&format!("  {key} "))),
+                        "{key} row missing: {out}"
                     );
-                    assert_eq!(
-                        err_of(&mut ctx, ".mesh memory forget all some-thread"),
-                        format!("Unexpected 'some-thread'. {usage}")
-                    );
-                    assert_eq!(
-                        err_of(
-                            &mut ctx,
-                            &format!(".mesh memory forget {ID_A} a-first extra")
-                        ),
-                        format!("Unexpected 'extra'. {usage}")
-                    );
-                    assert_eq!(
-                        err_of(&mut ctx, &format!(".mesh memory forget {ID_A} --prune")),
-                        format!("Unexpected '--prune'. {usage}")
-                    );
-                    assert_eq!(
-                        err_of(&mut ctx, ".mesh memory forget nope"),
-                        "'nope' is not an identity hash: expected 32 hex characters, as `.mesh knocks` and `.mesh peers` list them."
-                    );
-                    assert_eq!(
-                        err_of(
-                            &mut ctx,
-                            &format!(".mesh memory forget {ID_A} \"bad thread!\"")
-                        ),
-                        format!(
-                            "'bad thread!' is not a thread id: expected 1 to {PEER_ID_MAX_CHARS} characters from `[0-9A-Za-z_.:-]`, as `.mesh memory forget <identity> --dry-run` lists them. {usage}"
-                        )
-                    );
-                    run_async(run(&mut ctx, ".mesh memory forget")).unwrap();
-                    assert_eq!(stdout_lines().join("\n"), usage, "no target is the usage");
                 }
+                assert_eq!(info_row(&out, "envoy_memory.enabled"), "false", "{out}");
+                assert!(
+                    !out.lines()
+                        .any(|line| line.trim_start().starts_with("envoy memory ")),
+                    "no node, so no count row: {out}"
+                );
+                assert!(
+                    !out.contains("conversation"),
+                    "the records on disk are not counted while off: {out}"
+                );
+                let err = err_of(&mut ctx, ".mesh status");
+                assert!(err.contains(".mesh on"), "{err}");
+                assert_eq!(
+                    remembered(&cache_dir),
+                    seeded(),
+                    "reading the info changes nothing"
+                );
+            }
+
+            #[cfg(unix)]
+            mod read_only_store {
+                use super::*;
 
                 /// Usage probe: a destructive verb reports what it did, not what it was
                 /// asked. When one instance's store refuses the wipe (here: its directory
@@ -27837,98 +28092,374 @@ mod tests {
                     assert_eq!(prompt_script::prompts_asked(), 0);
                 }
 
-                /// Usage probe: when the stores directory itself cannot be listed (a file
-                /// sits where the directory should be), the verb fails before asking or
-                /// writing anything, and its error names the path rather than a bare
-                /// `Forgot`.
+                /// Usage probe: the post-sweep re-read holds for every scope the verb
+                /// takes, each naming its own command as the remedy. With `inst-b`
+                /// read-only: a dry run writes nothing, so it has no refusal to report;
+                /// forgetting one thread both stores hold removes `inst-a`'s record and
+                /// repeats the thread in the remedy; forgetting `all` removes what the
+                /// writable store still held and names `.mesh memory forget all`; and once
+                /// the store can be written, the remedy clears the rest with no
+                /// record-count suffix, two records being two conversations.
                 #[test]
                 #[serial]
-                fn usage_probe_forget_fails_closed_when_the_stores_directory_cannot_be_listed() {
+                fn usage_probe_forget_of_a_thread_and_of_all_name_what_a_refusing_store_kept_and_their_own_remedy()
+                 {
                     let guard = TestConfigDirGuard::new(TAG);
                     let _cache =
                         EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
                     let _capture = capture::install();
                     let _script = prompt_script::install(&[]);
                     let cache_dir = MeshPaths::from_env().cache_dir;
-                    let stores = cache_dir.join("mesh").join("envoy-sessions");
-                    fs::create_dir_all(stores.parent().unwrap()).unwrap();
-                    fs::write(&stores, "not a directory").unwrap();
-                    let mut ctx = ctx_with(MeshConfig::default(), true);
-
-                    for line in [
-                        ".mesh memory forget all --yes".to_string(),
-                        ".mesh memory forget all --dry-run".to_string(),
-                        format!(".mesh memory forget {ID_A} --yes"),
-                    ] {
-                        let printed = stdout_lines().len();
-                        let err = err_of(&mut ctx, &line);
-                        assert!(
-                            err.contains(&stores.display().to_string()),
-                            "{line}: the error names the stores path: {err}"
-                        );
-                        assert!(!err.contains("Forgot"), "{line}: {err}");
-                        assert_eq!(
-                            stdout_lines().len(),
-                            printed,
-                            "{line}: nothing is printed as done"
-                        );
-                    }
-                    assert_eq!(prompt_script::prompts_asked(), 0);
-                    assert_eq!(fs::read_to_string(&stores).unwrap(), "not a directory");
-                }
-
-                /// Usage probe: with the mesh off, `.mesh info` prints the `envoy_memory.*`
-                /// configuration rows (they describe the config, not the node) and no
-                /// `envoy memory` count row (that describes the store the node serves, and
-                /// there is none); bare `.mesh status` is refused as before. The records on
-                /// disk do not change that.
-                #[test]
-                #[serial]
-                fn usage_probe_info_while_off_prints_the_envoy_memory_config_rows_but_no_count_row()
-                {
-                    let guard = TestConfigDirGuard::new(TAG);
-                    let _cache =
-                        EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
-                    let _capture = capture::install();
-                    let cache_dir = MeshPaths::from_env().cache_dir;
                     seed(&cache_dir);
+                    let second = cache_dir.join("mesh").join("envoy-sessions").join("inst-b");
                     let mut ctx = ctx_with(MeshConfig::default(), true);
-                    assert!(ctx.app.mesh.get().is_none());
+                    let short_a = short(ID_A);
 
-                    let out = run_async(out_of(&mut ctx, ".mesh info")).unwrap();
-
-                    for key in [
-                        "envoy_memory.enabled",
-                        "envoy_memory.max_sessions",
-                        "envoy_memory.max_per_identity",
-                        "envoy_memory.max_turns",
-                        "envoy_memory.max_bytes",
-                        "envoy_memory.ttl_hours",
-                    ] {
-                        assert!(
-                            out.lines()
-                                .any(|line| line.starts_with(&format!("  {key} "))),
-                            "{key} row missing: {out}"
-                        );
+                    let locked = ModeRestore::read_only(&second);
+                    if fs::File::create(second.join("probe-write-check")).is_ok() {
+                        // A user that ignores directory modes (root) cannot stage the failure.
+                        let _ = fs::remove_file(second.join("probe-write-check"));
+                        return;
                     }
-                    assert_eq!(info_row(&out, "envoy_memory.enabled"), "false", "{out}");
-                    assert!(
-                        !out.lines()
-                            .any(|line| line.trim_start().starts_with("envoy memory ")),
-                        "no node, so no count row: {out}"
+
+                    let out = run_async(out_of(
+                        &mut ctx,
+                        &format!(".mesh memory forget {ID_A} a-first --dry-run"),
+                    ))
+                    .unwrap();
+                    assert_eq!(
+                        out,
+                        format!(
+                            "Would forget the remembered thread 'a-first' of identity {short_a}.\n{DRY_RUN_NOTHING_CHANGED}"
+                        ),
+                        "a dry run writes nothing, so nothing is refused"
                     );
-                    assert!(
-                        !out.contains("conversation"),
-                        "the records on disk are not counted while off: {out}"
+                    assert_eq!(remembered(&cache_dir), seeded());
+
+                    let out = run_async(out_of(
+                        &mut ctx,
+                        &format!(".mesh memory forget {ID_A} a-first --yes"),
+                    ))
+                    .unwrap();
+                    assert_eq!(
+                        out,
+                        format!(
+                            "Forgot 1 record, but 1 remembered conversation could not be forgotten; see the log for the store that refused, then run .mesh memory forget {ID_A} a-first again."
+                        ),
+                        "the thread scope's remedy repeats the thread"
                     );
-                    let err = err_of(&mut ctx, ".mesh status");
-                    assert!(err.contains(".mesh on"), "{err}");
                     assert_eq!(
                         remembered(&cache_dir),
                         seeded(),
-                        "reading the info changes nothing"
+                        "a-first is still remembered through inst-b, a-second through inst-a"
                     );
+                    let first = EnvoySessions::open(&cache_dir, "inst-a", &enabled()).unwrap();
+                    assert_eq!(first.stats().unwrap(), (1, 1), "inst-a gave up a-first");
+
+                    let out = run_async(out_of(&mut ctx, ".mesh memory forget all --yes")).unwrap();
+                    let [row_a, row_b] = all_rows();
+                    assert_eq!(
+                        out.lines().collect::<Vec<_>>(),
+                        [
+                            "Forgetting 3 remembered conversations of 2 identities:",
+                            row_a.as_str(),
+                            row_b.as_str(),
+                            "Forgot 1 record, but 2 remembered conversations could not be forgotten; see the log for the store that refused, then run .mesh memory forget all again.",
+                        ],
+                        "what the writable store held went; the refusing store's two conversations are named, not folded into a record-count suffix: {out}"
+                    );
+                    assert_eq!(
+                        remembered(&cache_dir),
+                        BTreeMap::from([
+                            (ID_A.to_string(), vec!["a-first".to_string()]),
+                            (ID_B.to_string(), vec!["b-first".to_string()]),
+                        ])
+                    );
+                    assert_eq!(first.stats().unwrap(), (0, 0));
+                    locked.restore();
+
+                    let out = run_async(out_of(&mut ctx, ".mesh memory forget all --yes")).unwrap();
+                    assert_eq!(
+                        out.lines().last(),
+                        Some("Forgot 2 remembered conversations of 2 identities."),
+                        "two records are two conversations, so no record-count suffix: {out}"
+                    );
+                    assert!(remembered(&cache_dir).is_empty());
+                    assert_eq!(prompt_script::prompts_asked(), 0);
                 }
+            }
+
+            /// Usage probe: `forget all` is the one scope that also drops a record file
+            /// the index does not name (a write that never reached the index). A dry
+            /// run leaves it, forgetting one identity leaves it, the listing counts it
+            /// as a record file and never as a conversation, and a file that is not a
+            /// record is never touched.
+            #[test]
+            #[serial]
+            fn usage_probe_forget_all_drops_an_unindexed_record_file_that_a_dry_run_and_an_identity_scope_leave()
+             {
+                let guard = TestConfigDirGuard::new(TAG);
+                let _cache = EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
+                let _capture = capture::install();
+                let _script = prompt_script::install(&[]);
+                let cache_dir = MeshPaths::from_env().cache_dir;
+                seed(&cache_dir);
+                let second = cache_dir.join("mesh").join("envoy-sessions").join("inst-b");
+                let orphan = second.join(format!("{}.yaml", "de".repeat(16)));
+                fs::write(&orphan, "version: 1\n").unwrap();
+                let notes = second.join("notes.txt");
+                fs::write(&notes, "keep").unwrap();
+                let mut ctx = ctx_with(MeshConfig::default(), true);
+
+                let out = run_async(out_of(&mut ctx, ".mesh memory forget all --dry-run")).unwrap();
+                assert_eq!(
+                    out.lines().next(),
+                    Some(
+                        "Would forget 3 remembered conversations of 2 identities and 1 record file that no index names:"
+                    ),
+                    "an unindexed record is counted as a record file, not a conversation: {out}"
+                );
+                assert!(orphan.exists(), "a dry run changes nothing");
+
+                let out = run_async(out_of(
+                    &mut ctx,
+                    &format!(".mesh memory forget {ID_A} --yes"),
+                ))
+                .unwrap();
+                assert_eq!(
+                        out.lines().last(),
+                        Some(
+                            format!(
+                                "Forgot 2 remembered conversations of identity {} (3 records across the instance stores).",
+                                short(ID_A)
+                            )
+                            .as_str()
+                        ),
+                        "{out}"
+                    );
+                assert!(
+                    orphan.exists(),
+                    "one identity's scope reaches the records it is named on alone"
+                );
+
+                let out = run_async(out_of(&mut ctx, ".mesh memory forget all --yes")).unwrap();
+                assert_eq!(
+                    out.lines().last(),
+                    Some(
+                        "Forgot 1 remembered conversation of 1 identity and 1 record file that no index names."
+                    ),
+                    "{out}"
+                );
+                assert!(
+                    !orphan.exists(),
+                    "forget all sweeps the unindexed record too"
+                );
+                assert!(notes.exists(), "only record files are swept");
+                assert!(remembered(&cache_dir).is_empty());
+                assert_eq!(prompt_script::prompts_asked(), 0);
+            }
+
+            /// Usage probe, pinning the documented sentence: a store whose index cannot
+            /// be read is named in the listing and the result. An identity scope leaves
+            /// it as it is and says so, naming `forget all` as the way to empty it;
+            /// `forget all` counts it beside the conversations, empties it unread, index
+            /// and record files alike, and counts its record files among the records.
+            #[test]
+            #[serial]
+            fn usage_probe_a_store_whose_index_cannot_be_read_is_named_and_all_empties_it_unread_while_an_identity_scope_leaves_it()
+             {
+                let guard = TestConfigDirGuard::new(TAG);
+                let _cache = EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
+                let _capture = capture::install();
+                let _script = prompt_script::install(&[]);
+                let cache_dir = MeshPaths::from_env().cache_dir;
+                seed(&cache_dir);
+                let third = cache_dir.join("mesh").join("envoy-sessions").join("inst-c");
+                fs::create_dir_all(&third).unwrap();
+                let index = third.join("index.json");
+                fs::write(&index, "{not json").unwrap();
+                let record = third.join(format!("{}.yaml", "ad".repeat(16)));
+                fs::write(&record, "version: 1\n").unwrap();
+                let mut ctx = ctx_with(MeshConfig::default(), true);
+                let short_a = short(ID_A);
+                let note = "1 store whose index cannot be read is left as it is and may hold more; run .mesh memory forget all to empty it.";
+
+                let out = run_async(out_of(&mut ctx, ".mesh memory forget all --dry-run")).unwrap();
+                let [row_a, row_b] = all_rows();
+                assert_eq!(
+                    out.lines().collect::<Vec<_>>(),
+                    [
+                        "Would forget 3 remembered conversations of 2 identities and 1 store whose index cannot be read:",
+                        row_a.as_str(),
+                        row_b.as_str(),
+                        DRY_RUN_NOTHING_CHANGED,
+                    ],
+                    "the unreadable store is counted in the listing: {out}"
+                );
+
+                let out = run_async(out_of(
+                    &mut ctx,
+                    &format!(".mesh memory forget {ID_A} --dry-run"),
+                ))
+                .unwrap();
+                assert_eq!(
+                    out.lines().collect::<Vec<_>>(),
+                    [
+                        format!("Would forget 2 remembered conversations of identity {short_a}:")
+                            .as_str(),
+                        "  a-first",
+                        "  a-second",
+                        note,
+                        DRY_RUN_NOTHING_CHANGED,
+                    ],
+                    "an identity scope says what it cannot reach: {out}"
+                );
+
+                let out = run_async(out_of(
+                    &mut ctx,
+                    &format!(".mesh memory forget {ID_A} --yes"),
+                ))
+                .unwrap();
+                assert_eq!(
+                        out.lines().rev().take(2).collect::<Vec<_>>(),
+                        [
+                            note,
+                            format!(
+                                "Forgot 2 remembered conversations of identity {short_a} (3 records across the instance stores)."
+                            )
+                            .as_str(),
+                        ],
+                        "{out}"
+                    );
+                assert_eq!(fs::read_to_string(&index).unwrap(), "{not json");
+                assert!(
+                    record.exists(),
+                    "an identity scope leaves an unreadable store as it is"
+                );
+                assert_eq!(
+                    remembered(&cache_dir),
+                    BTreeMap::from([(ID_B.to_string(), vec!["b-first".to_string()])])
+                );
+
+                let out = run_async(out_of(&mut ctx, ".mesh memory forget all --yes")).unwrap();
+                assert_eq!(
+                    out.lines().last(),
+                    Some(
+                        "Forgot 1 remembered conversation of 1 identity and 1 store whose index cannot be read (2 records across the instance stores)."
+                    ),
+                    "the unread store's record file is counted among the records: {out}"
+                );
+                assert!(
+                    !index.exists(),
+                    "forget all empties the store, index included"
+                );
+                assert!(!record.exists(), "and its record files, unread");
+                assert!(remembered(&cache_dir).is_empty());
+                assert_eq!(prompt_script::prompts_asked(), 0);
+            }
+
+            /// Usage probe: a directory under the stores that holds only a record file
+            /// no index names is still a store, and `forget all` is the one scope that
+            /// reaches it; an identity scope has nothing of its own there. A directory
+            /// that holds neither an index nor a record file is no store at all.
+            #[test]
+            #[serial]
+            fn usage_probe_forget_all_reaches_a_store_that_holds_only_a_record_file_no_index_names()
+            {
+                let guard = TestConfigDirGuard::new(TAG);
+                let _cache = EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
+                let _capture = capture::install();
+                let _script = prompt_script::install(&[]);
+                let cache_dir = MeshPaths::from_env().cache_dir;
+                let stores = cache_dir.join("mesh").join("envoy-sessions");
+                let orphan_only = stores.join("inst-z");
+                fs::create_dir_all(&orphan_only).unwrap();
+                let orphan = orphan_only.join(format!("{}.yaml", "de".repeat(16)));
+                fs::write(&orphan, "version: 1\n").unwrap();
+                let notes = orphan_only.join("notes.txt");
+                fs::write(&notes, "keep").unwrap();
+                let mut ctx = ctx_with(MeshConfig::default(), true);
+
+                let out = run_async(out_of(
+                    &mut ctx,
+                    &format!(".mesh memory forget {ID_A} --dry-run"),
+                ))
+                .unwrap();
+                assert_eq!(
+                    out,
+                    format!("The envoy remembers nothing of identity {}.", short(ID_A)),
+                    "a record no index names is nobody's conversation"
+                );
+
+                let out = run_async(out_of(&mut ctx, ".mesh memory forget all --dry-run")).unwrap();
+                assert_eq!(
+                    out.lines().collect::<Vec<_>>(),
+                    [
+                        "Would forget 1 record file that no index names.",
+                        DRY_RUN_NOTHING_CHANGED,
+                    ],
+                    "{out}"
+                );
+                assert!(orphan.exists());
+
+                let out = run_async(out_of(&mut ctx, ".mesh memory forget all --yes")).unwrap();
+                assert_eq!(out, "Forgot 1 record file that no index names.");
+                assert!(!orphan.exists());
+                assert!(notes.exists(), "only record files are swept");
+
+                let out = run_async(out_of(&mut ctx, ".mesh memory forget all --yes")).unwrap();
+                assert_eq!(
+                    out, "The envoy remembers nothing.",
+                    "a directory with neither index nor record file is no store"
+                );
+                assert_eq!(prompt_script::prompts_asked(), 0);
+            }
+
+            /// An identity or thread scope that finds nothing in the stores it can read
+            /// says so in those words when a store could not be read, and names
+            /// `forget all` as the way to empty it.
+            #[test]
+            #[serial]
+            fn forget_of_an_identity_nothing_is_remembered_of_names_the_store_it_could_not_read() {
+                let guard = TestConfigDirGuard::new(TAG);
+                let _cache = EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
+                let _capture = capture::install();
+                let _script = prompt_script::install(&[]);
+                let cache_dir = MeshPaths::from_env().cache_dir;
+                let third = cache_dir.join("mesh").join("envoy-sessions").join("inst-c");
+                fs::create_dir_all(&third).unwrap();
+                let index = third.join("index.json");
+                fs::write(&index, "{not json").unwrap();
+                let mut ctx = ctx_with(MeshConfig::default(), true);
+                let short_b = short(ID_B);
+                let note = "1 store whose index cannot be read is left as it is and may hold more; run .mesh memory forget all to empty it.";
+
+                let out = run_async(out_of(
+                    &mut ctx,
+                    &format!(".mesh memory forget {ID_B} --dry-run"),
+                ))
+                .unwrap();
+                assert_eq!(
+                    out,
+                    format!(
+                        "The envoy remembers nothing of identity {short_b} in the stores that can be read.\n{note}"
+                    )
+                );
+
+                let out = run_async(out_of(
+                    &mut ctx,
+                    &format!(".mesh memory forget {ID_B} x --yes"),
+                ))
+                .unwrap();
+                assert_eq!(
+                    out,
+                    format!(
+                        "The envoy remembers no thread 'x' of identity {short_b} in the stores that can be read.\n{note}"
+                    ),
+                    "nothing is asked or written, --yes or not"
+                );
+                assert_eq!(fs::read_to_string(&index).unwrap(), "{not json");
+                assert_eq!(prompt_script::prompts_asked(), 0);
             }
         }
     }

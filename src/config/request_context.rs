@@ -5284,6 +5284,7 @@ impl RequestContext {
             .map(|runtime| runtime.cache_dir().to_path_buf())
             .unwrap_or_else(|| MeshPaths::from_env().cache_dir);
         EnvoySessions::remembered_everywhere(&cache_dir, &self.app.config.mesh.envoy_memory)
+            .map(|remembered| remembered.by_identity)
             .unwrap_or_else(|err| {
                 debug!(
                     "envoy memory unreadable while completing `.mesh memory`: {}",

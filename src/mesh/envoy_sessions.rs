@@ -44,8 +44,48 @@ pub(crate) trait EnvoyMemorySink: Send + Sync {
     fn forget_identity(&self, identity: &str);
 
     /// How many threads are remembered of `identity` (lower-hex) across every instance
-    /// store; reads only.
-    fn remembered_of(&self, identity: &str) -> Result<usize, EnvoyMemoryError>;
+    /// store, and how many stores could not be read to tell; reads only.
+    fn remembered_of(&self, identity: &str) -> Result<RememberedOf, EnvoyMemoryError>;
+}
+
+/// What every instance store under a cache directory remembers, merged. A store whose
+/// index cannot be read is counted rather than dropped: what it holds is unknown, and a
+/// wipe that cannot reach it must say so.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct Remembered {
+    /// Each identity (lower-hex) to the threads remembered of it, sorted and each named
+    /// once however many stores hold it.
+    pub by_identity: BTreeMap<String, Vec<String>>,
+    /// Record files no index names, across the stores that could be read: a save that
+    /// wrote its record and never reached the index leaves one.
+    pub orphans: usize,
+    /// Stores whose index could not be read, so whose records are not in `by_identity`.
+    pub unreadable_stores: usize,
+}
+
+impl Remembered {
+    /// `true` when there is nothing on disk to forget and no store that might hold
+    /// something.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.by_identity.is_empty() && self.orphans == 0 && self.unreadable_stores == 0
+    }
+}
+
+/// What a sweep removed: `removed` counts conversations in the stores that were read
+/// and record files in the ones `delete_all` wiped unread; `unreadable_stores` the
+/// stores the sweep could neither read nor write, left as they were.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Forgotten {
+    pub removed: usize,
+    pub unreadable_stores: usize,
+}
+
+/// `EnvoyMemorySink::remembered_of`: the threads remembered of one identity and the
+/// stores that could not be read to say whether they hold more.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RememberedOf {
+    pub threads: usize,
+    pub unreadable_stores: usize,
 }
 
 /// One `<key>.yaml`: the retained turns of one peer thread. The shape is a stable on-disk
@@ -229,7 +269,7 @@ pub(crate) fn session_key(identity: &str, thread: &str) -> Option<String> {
 }
 
 /// Where every instance's store lives, one directory each.
-fn stores_dir(cache_dir: &Path) -> PathBuf {
+pub(crate) fn stores_dir(cache_dir: &Path) -> PathBuf {
     mesh_cache_dir(cache_dir).join("envoy-sessions")
 }
 
@@ -308,24 +348,28 @@ impl EnvoySessions {
     /// Forgets every thread of `identity` in every instance's store under `cache_dir`,
     /// not only the one this node serves: trust is per config directory and the stores
     /// are per instance, so a revoked identity's conversations with a fork, or with an
-    /// instance since re-keyed, go too. How many went in all. A store that refuses is
-    /// logged and skipped, the sweep going on to the next; `Ok(0)` when no store exists.
-    /// The sweep runs whether or not the memory is on: records may remain from a time
-    /// it was, and a revocation must reach them before the memory comes back. A
-    /// non-hash `identity` is `NotAnIdentity` whatever is on disk.
+    /// instance since re-keyed, go too. How many went in all, and how many stores
+    /// refused: one that cannot be read or written is logged and skipped, the sweep
+    /// going on to the next, and nothing is counted when no store exists. The sweep
+    /// runs whether or not the memory is on: records may remain from a time it was, and
+    /// a revocation must reach them before the memory comes back. A non-hash
+    /// `identity` is `NotAnIdentity` whatever is on disk.
     pub(crate) fn delete_identity_everywhere(
         cache_dir: &Path,
         config: &EnvoyMemoryConfig,
         identity: &str,
-    ) -> Result<usize, EnvoyMemoryError> {
+    ) -> Result<Forgotten, EnvoyMemoryError> {
         let identity = canonical_hash(identity)
             .ok_or_else(|| EnvoyMemoryError::NotAnIdentity(identity.to_string()))?;
         let mut removed = 0;
-        Self::sweep(cache_dir, config, "swept", |store| {
+        let unreadable_stores = Self::sweep(cache_dir, config, "swept", |store| {
             removed += store.delete_identity(&identity)?;
             Ok(())
         })?;
-        Ok(removed)
+        Ok(Forgotten {
+            removed,
+            unreadable_stores,
+        })
     }
 
     /// Forgets `identity`'s `thread` in every instance's store under `cache_dir`; how
@@ -337,78 +381,100 @@ impl EnvoySessions {
         config: &EnvoyMemoryConfig,
         identity: &str,
         thread: &str,
-    ) -> Result<usize, EnvoyMemoryError> {
+    ) -> Result<Forgotten, EnvoyMemoryError> {
         let (identity, _) = resolve(identity, thread)?;
         let mut removed = 0;
-        Self::sweep(cache_dir, config, "swept", |store| {
+        let unreadable_stores = Self::sweep(cache_dir, config, "swept", |store| {
             removed += usize::from(store.delete(&identity, thread)?);
             Ok(())
         })?;
-        Ok(removed)
+        Ok(Forgotten {
+            removed,
+            unreadable_stores,
+        })
     }
 
     /// Forgets every conversation in every instance's store under `cache_dir`, record
-    /// files the index does not name included; how many conversations went in all. Same
-    /// sweep as `delete_identity_everywhere`.
+    /// files the index does not name included, and empties a store whose index cannot
+    /// be read without reading it; how many conversations went in all, the unread
+    /// store's record files counted among them. Same sweep as
+    /// `delete_identity_everywhere`.
     pub(crate) fn delete_all_everywhere(
         cache_dir: &Path,
         config: &EnvoyMemoryConfig,
-    ) -> Result<usize, EnvoyMemoryError> {
+    ) -> Result<Forgotten, EnvoyMemoryError> {
         let mut removed = 0;
-        Self::sweep(cache_dir, config, "swept", |store| {
+        let unreadable_stores = Self::sweep(cache_dir, config, "swept", |store| {
             removed += store.delete_all()?;
             Ok(())
         })?;
-        Ok(removed)
+        Ok(Forgotten {
+            removed,
+            unreadable_stores,
+        })
     }
 
     /// Every identity remembered in any instance's store under `cache_dir`, lower-hex,
     /// with the threads remembered of it, sorted and each named once however many
-    /// instances hold it. Same sweep as `delete_identity_everywhere`: every instance,
-    /// on or off, a refusing store logged and skipped; empty when no store exists.
+    /// instances hold it, with the record files no index names and the stores that
+    /// could not be read counted beside them. Same sweep as
+    /// `delete_identity_everywhere`: every instance, on or off, a refusing store logged
+    /// and skipped; empty when no store exists.
     pub(crate) fn remembered_everywhere(
         cache_dir: &Path,
         config: &EnvoyMemoryConfig,
-    ) -> Result<BTreeMap<String, Vec<String>>, EnvoyMemoryError> {
-        let mut remembered: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        Self::sweep(cache_dir, config, "read", |store| {
-            for entry in store.remembered()? {
-                remembered
+    ) -> Result<Remembered, EnvoyMemoryError> {
+        let mut by_identity: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut orphans = 0;
+        let unreadable_stores = Self::sweep(cache_dir, config, "read", |store| {
+            let (entries, unnamed) = store.remembered()?;
+            orphans += unnamed;
+            for entry in entries {
+                by_identity
                     .entry(entry.identity)
                     .or_default()
                     .push(entry.thread);
             }
             Ok(())
         })?;
-        for threads in remembered.values_mut() {
+        for threads in by_identity.values_mut() {
             threads.sort();
             threads.dedup();
         }
-        Ok(remembered)
+        Ok(Remembered {
+            by_identity,
+            orphans,
+            unreadable_stores,
+        })
     }
 
     /// Hands every instance's store under `cache_dir` to `visit`, whether or not the
-    /// memory is on: records may remain from a time it was. A store `visit` refuses is
+    /// memory is on: records may remain from a time it was. A store is a directory of
+    /// its own, never one behind a symlink, that holds an index or at least one record
+    /// file; any other entry is passed over uncounted. A store `visit` refuses is
     /// logged as what could not be done to it, `verb` being `swept` or `read`, and
-    /// skipped, the sweep going on to the next; `Err` only when the stores directory
-    /// itself cannot be listed, and nothing is visited when it does not exist.
+    /// skipped, the sweep going on to the next; how many were skipped. `Err` only when
+    /// the stores directory itself cannot be listed, and nothing is visited when it
+    /// does not exist.
     fn sweep(
         cache_dir: &Path,
         config: &EnvoyMemoryConfig,
         verb: &'static str,
         mut visit: impl FnMut(&Self) -> Result<(), EnvoyMemoryError>,
-    ) -> Result<(), EnvoyMemoryError> {
+    ) -> Result<usize, EnvoyMemoryError> {
         let stores = stores_dir(cache_dir);
         if !stores.exists() {
-            return Ok(());
+            return Ok(0);
         }
         let io_error = |source| EnvoyMemoryError::Io {
             path: stores.clone(),
             source,
         };
+        let mut skipped = 0;
         for entry in fs::read_dir(&stores).map_err(io_error)? {
             let path = entry.map_err(io_error)?.path();
-            if !path.is_dir() {
+            let is_dir = fs::symlink_metadata(&path).is_ok_and(|meta| meta.is_dir());
+            if !is_dir || !looks_like_a_store(&path) {
                 continue;
             }
             let store = Self {
@@ -422,9 +488,10 @@ impl EnvoySessions {
                     store.dir.display(),
                     redact_hashes(&err.to_string())
                 );
+                skipped += 1;
             }
         }
-        Ok(())
+        Ok(skipped)
     }
 
     #[cfg(test)]
@@ -679,15 +746,17 @@ impl EnvoySessions {
         Ok((index.entries.len(), identities.len()))
     }
 
-    /// Every conversation the index names, as it names them; empty while the store does
-    /// not exist.
-    fn remembered(&self) -> Result<Vec<EnvoySessionEntry>, EnvoyMemoryError> {
+    /// Every conversation the index names, as it names them, and how many record files
+    /// it does not name; nothing while the store does not exist.
+    fn remembered(&self) -> Result<(Vec<EnvoySessionEntry>, usize), EnvoyMemoryError> {
         if !self.dir.exists() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         }
         let _guard = self.write_lock.lock();
         let _file_lock = self.file_lock()?;
-        Ok(self.read_index()?.entries)
+        let index = self.read_index()?;
+        let orphans = self.orphan_records(&index)?.len();
+        Ok((index.entries, orphans))
     }
 
     /// Drops every entry `doomed` picks and its record; nothing is created, and the
@@ -718,14 +787,26 @@ impl EnvoySessions {
     /// Drops every conversation the index names and every record file it does not, so a
     /// record left by a write that did not reach the index goes too; how many
     /// conversations went. Nothing is created, and the index is rewritten only when a
-    /// conversation went.
+    /// conversation went. An index that cannot be read cannot say what the store
+    /// holds, and the caller asked for all of it gone: every record file and the index
+    /// itself are removed unread, the record files counted.
     fn delete_all(&self) -> Result<usize, EnvoyMemoryError> {
         if !self.dir.exists() {
             return Ok(0);
         }
         let _guard = self.write_lock.lock();
         let _file_lock = self.file_lock()?;
-        let mut index = self.read_index()?;
+        let mut index = match self.read_index() {
+            Ok(index) => index,
+            Err(err) => {
+                warn!(
+                    "Mesh envoy memory under '{}' is emptied unread; its index could not be read: {}",
+                    self.dir.display(),
+                    redact_hashes(&err.to_string())
+                );
+                return self.wipe_unread();
+            }
+        };
         let removed = mem::take(&mut index.entries);
         for entry in &removed {
             self.remove_record(&entry.key)?;
@@ -735,6 +816,30 @@ impl EnvoySessions {
             self.write_index(&index)?;
         }
         Ok(removed.len())
+    }
+
+    /// Removes every record file and the index without reading either; how many record
+    /// files went. Called under both locks by `delete_all`.
+    fn wipe_unread(&self) -> Result<usize, EnvoyMemoryError> {
+        let records = self.record_files()?;
+        for path in &records {
+            fs::remove_file(path).map_err(|source| EnvoyMemoryError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        }
+        let index = self.index_path();
+        match fs::remove_file(&index) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(EnvoyMemoryError::Io {
+                    path: index,
+                    source,
+                });
+            }
+        }
+        Ok(records.len())
     }
 
     /// `key`'s entry and record as far as `identity` may see them: `None` when the index
@@ -848,30 +953,68 @@ impl EnvoySessions {
         }
     }
 
-    /// Removes every `<key>.yaml` in the directory that `index` does not name: a record
-    /// the index does not know is not a conversation, whatever it holds.
+    /// Removes every record file `index` does not name: a record the index does not
+    /// know is not a conversation, whatever it holds.
     fn remove_orphans(&self, index: &EnvoySessionIndex) -> Result<(), EnvoyMemoryError> {
+        for path in self.orphan_records(index)? {
+            fs::remove_file(&path).map_err(|source| EnvoyMemoryError::Io { path, source })?;
+        }
+        Ok(())
+    }
+
+    /// The record files `index` does not name.
+    fn orphan_records(&self, index: &EnvoySessionIndex) -> Result<Vec<PathBuf>, EnvoyMemoryError> {
         let named: HashSet<&str> = index
             .entries
             .iter()
             .map(|entry| entry.key.as_str())
             .collect();
+        let mut records = self.record_files()?;
+        records.retain(|path| {
+            path.file_stem()
+                .and_then(|stem| stem.to_str())
+                .is_some_and(|stem| !named.contains(stem))
+        });
+        Ok(records)
+    }
+
+    /// Every `<key>.yaml` in the directory whose name is a record's, the key 32
+    /// lowercase hex; nothing else in the directory is a record, whatever its extension.
+    fn record_files(&self) -> Result<Vec<PathBuf>, EnvoyMemoryError> {
         let io_error = |source| EnvoyMemoryError::Io {
             path: self.dir.clone(),
             source,
         };
+        let mut records = Vec::new();
         for entry in fs::read_dir(&self.dir).map_err(io_error)? {
             let path = entry.map_err(io_error)?.path();
-            let is_record = path.extension().is_some_and(|ext| ext == RECORD_EXTENSION);
-            let orphan = path
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .is_some_and(|stem| !named.contains(stem));
-            if is_record && orphan {
-                fs::remove_file(&path).map_err(|source| EnvoyMemoryError::Io { path, source })?;
+            if is_record_file(&path) {
+                records.push(path);
             }
         }
-        Ok(())
+        Ok(records)
+    }
+}
+
+/// `true` when `path` is named as a record is: a 32-lowercase-hex key with the record
+/// extension.
+fn is_record_file(path: &Path) -> bool {
+    path.extension().is_some_and(|ext| ext == RECORD_EXTENSION)
+        && path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .is_some_and(|stem| canonical_hash(stem).is_some_and(|key| key == stem))
+}
+
+/// `true` when `dir` holds an index or at least one record file, or cannot be listed to
+/// tell; a directory that holds neither was never a store and is nobody's to sweep.
+fn looks_like_a_store(dir: &Path) -> bool {
+    if dir.join(INDEX_FILE).exists() {
+        return true;
+    }
+    match fs::read_dir(dir) {
+        Ok(entries) => entries.flatten().any(|entry| is_record_file(&entry.path())),
+        Err(_) => true,
     }
 }
 
@@ -1372,9 +1515,13 @@ mod tests {
     fn delete_identity_everywhere_sweeps_every_instance_store_and_skips_one_that_refuses() {
         let tmp = TempDir::new("envoy-sessions-delete-everywhere");
         let config = enabled();
+        let forgot = |removed, unreadable_stores| Forgotten {
+            removed,
+            unreadable_stores,
+        };
         assert_eq!(
             EnvoySessions::delete_identity_everywhere(&tmp.path, &config, IDENTITY_A).unwrap(),
-            0
+            forgot(0, 0)
         );
         assert!(matches!(
             EnvoySessions::delete_identity_everywhere(&tmp.path, &config, "not-a-hash"),
@@ -1405,7 +1552,8 @@ mod tests {
 
         assert_eq!(
             EnvoySessions::delete_identity_everywhere(&tmp.path, &config, IDENTITY_A).unwrap(),
-            3
+            forgot(3, 1),
+            "the two stores that could be read gave up three; the refusing one is counted"
         );
 
         for store in &stores[..2] {
@@ -1446,7 +1594,10 @@ mod tests {
         assert!(!off.enabled);
         assert_eq!(
             EnvoySessions::delete_identity_everywhere(&tmp.path, &off, IDENTITY_A).unwrap(),
-            1
+            Forgotten {
+                removed: 1,
+                unreadable_stores: 0
+            }
         );
 
         let reopened = store(&tmp, &enabled());
@@ -1502,31 +1653,127 @@ mod tests {
         );
         assert!(!tmp.path.join("mesh").exists());
         let stores = three_instances(&tmp, &config);
+        let orphan = stores[1].dir().join(format!("{}.yaml", "de".repeat(16)));
+        fs::write(&orphan, "version: 1\n").unwrap();
 
         let remembered = EnvoySessions::remembered_everywhere(&tmp.path, &config).unwrap();
 
         assert_eq!(
             remembered,
-            BTreeMap::from([
-                (
-                    IDENTITY_A.to_string(),
-                    vec!["thread-one".to_string(), "thread-two".to_string()]
-                ),
-                (IDENTITY_B.to_string(), vec!["thread-one".to_string()]),
-            ]),
-            "a thread held by two stores is named once; the refusing store adds nothing"
+            Remembered {
+                by_identity: BTreeMap::from([
+                    (
+                        IDENTITY_A.to_string(),
+                        vec!["thread-one".to_string(), "thread-two".to_string()]
+                    ),
+                    (IDENTITY_B.to_string(), vec!["thread-one".to_string()]),
+                ]),
+                orphans: 1,
+                unreadable_stores: 1,
+            },
+            "a thread held by two stores is named once; the refusing store is counted, not read"
         );
+        assert!(!remembered.is_empty());
         assert!(record_path(&stores[2], IDENTITY_A, "thread-one").exists());
+        assert!(orphan.exists(), "reading changes nothing");
+    }
+
+    #[test]
+    fn sweep_passes_over_a_directory_that_holds_neither_an_index_nor_a_record_file() {
+        let tmp = TempDir::new("envoy-sessions-sweep-not-a-store");
+        let config = enabled();
+        let stores = stores_dir(&tmp.path);
+        let not_a_store = stores.join("inst-empty");
+        fs::create_dir_all(&not_a_store).unwrap();
+        fs::write(not_a_store.join("notes.txt"), "not a store").unwrap();
+        fs::write(not_a_store.join("README.yaml"), "not a record").unwrap();
+        let orphan_only = stores.join("inst-orphan");
+        fs::create_dir_all(&orphan_only).unwrap();
+        let orphan = orphan_only.join(format!("{}.yaml", "de".repeat(16)));
+        fs::write(&orphan, "version: 1\n").unwrap();
+
+        let remembered = EnvoySessions::remembered_everywhere(&tmp.path, &config).unwrap();
+
+        assert_eq!(
+            remembered,
+            Remembered {
+                by_identity: BTreeMap::new(),
+                orphans: 1,
+                unreadable_stores: 0,
+            },
+            "a directory with a record file is a store without an index; one without is nothing"
+        );
+        assert!(!remembered.is_empty());
+        assert_eq!(
+            EnvoySessions::delete_all_everywhere(&tmp.path, &config).unwrap(),
+            Forgotten {
+                removed: 0,
+                unreadable_stores: 0
+            },
+            "the orphan goes but was never a conversation"
+        );
+        assert!(!orphan.exists());
+        assert!(not_a_store.join("README.yaml").exists());
+        assert!(
+            EnvoySessions::remembered_everywhere(&tmp.path, &config)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sweep_passes_over_a_store_behind_a_symlink() {
+        let tmp = TempDir::new("envoy-sessions-sweep-symlink");
+        let config = enabled();
+        let store = store(&tmp, &config);
+        store
+            .save(IDENTITY_A, "thread-one", exchange(1), t(1_000))
+            .unwrap();
+        let elsewhere = tmp.path.join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        fs::write(elsewhere.join("index.json"), "{not json").unwrap();
+        let linked = stores_dir(&tmp.path).join("inst-linked");
+        std::os::unix::fs::symlink(&elsewhere, &linked).unwrap();
+
+        assert_eq!(
+            EnvoySessions::remembered_everywhere(&tmp.path, &config).unwrap(),
+            Remembered {
+                by_identity: BTreeMap::from([(
+                    IDENTITY_A.to_string(),
+                    vec!["thread-one".to_string()]
+                )]),
+                orphans: 0,
+                unreadable_stores: 0,
+            },
+            "the linked directory is neither read nor counted"
+        );
+        assert_eq!(
+            EnvoySessions::delete_all_everywhere(&tmp.path, &config).unwrap(),
+            Forgotten {
+                removed: 1,
+                unreadable_stores: 0
+            }
+        );
+        assert_eq!(
+            fs::read_to_string(elsewhere.join("index.json")).unwrap(),
+            "{not json",
+            "a wipe never follows the link"
+        );
     }
 
     #[test]
     fn delete_thread_everywhere_removes_one_thread_from_every_instance_store() {
         let tmp = TempDir::new("envoy-sessions-delete-thread-everywhere");
         let config = enabled();
+        let forgot = |removed, unreadable_stores| Forgotten {
+            removed,
+            unreadable_stores,
+        };
         assert_eq!(
             EnvoySessions::delete_thread_everywhere(&tmp.path, &config, IDENTITY_A, "thread-one")
                 .unwrap(),
-            0
+            forgot(0, 0)
         );
         assert!(matches!(
             EnvoySessions::delete_thread_everywhere(&tmp.path, &config, "not-a-hash", "thread-one"),
@@ -1538,8 +1785,8 @@ mod tests {
         assert_eq!(
             EnvoySessions::delete_thread_everywhere(&tmp.path, &config, IDENTITY_A, "thread-one")
                 .unwrap(),
-            2,
-            "the two stores that could be read held it; the refusing one is skipped"
+            forgot(2, 1),
+            "the two stores that could be read held it; the refusing one is skipped and counted"
         );
 
         for store in &stores[..2] {
@@ -1551,34 +1798,74 @@ mod tests {
         assert_eq!(
             EnvoySessions::delete_thread_everywhere(&tmp.path, &config, IDENTITY_A, "thread-one")
                 .unwrap(),
-            0
+            forgot(0, 1)
         );
     }
 
     #[test]
-    fn delete_all_everywhere_empties_every_instance_store_that_can_be_read() {
+    fn delete_all_everywhere_empties_every_instance_store_and_wipes_one_it_cannot_read_unread() {
         let tmp = TempDir::new("envoy-sessions-delete-all-everywhere");
         let config = enabled();
+        let forgot = |removed, unreadable_stores| Forgotten {
+            removed,
+            unreadable_stores,
+        };
         assert_eq!(
             EnvoySessions::delete_all_everywhere(&tmp.path, &config).unwrap(),
-            0
+            forgot(0, 0)
         );
         assert!(!tmp.path.join("mesh").exists());
         let stores = three_instances(&tmp, &config);
+        let refused_index = stores[2].index_path();
+        let notes = stores[2].dir().join("notes.txt");
+        fs::write(&notes, "keep").unwrap();
 
         assert_eq!(
             EnvoySessions::delete_all_everywhere(&tmp.path, &config).unwrap(),
-            5,
-            "two conversations in each readable store plus the first's second thread"
+            forgot(7, 0),
+            "two conversations in each readable store plus the first's second thread, and the two record files of the store wiped unread"
         );
 
         for store in &stores[..2] {
             assert_eq!(store.stats().unwrap(), (0, 0));
         }
-        assert!(record_path(&stores[2], IDENTITY_A, "thread-one").exists());
+        assert!(!record_path(&stores[2], IDENTITY_A, "thread-one").exists());
+        assert!(!record_path(&stores[2], IDENTITY_B, "thread-one").exists());
+        assert!(
+            !refused_index.exists(),
+            "the index that could not be read goes too"
+        );
+        assert!(notes.exists(), "only record files and the index are wiped");
         assert_eq!(
             EnvoySessions::remembered_everywhere(&tmp.path, &config).unwrap(),
-            BTreeMap::new()
+            Remembered::default(),
+            "wiped, the directory holds neither index nor record and is no store"
+        );
+    }
+
+    #[test]
+    fn delete_identity_everywhere_leaves_a_store_whose_index_cannot_be_read_and_counts_it() {
+        let tmp = TempDir::new("envoy-sessions-delete-identity-unreadable");
+        let config = enabled();
+        let stores = three_instances(&tmp, &config);
+        let refused_index = stores[2].index_path();
+        let planted = fs::read_to_string(&refused_index).unwrap();
+
+        assert_eq!(
+            EnvoySessions::delete_identity_everywhere(&tmp.path, &config, IDENTITY_B).unwrap(),
+            Forgotten {
+                removed: 2,
+                unreadable_stores: 1
+            }
+        );
+
+        assert_eq!(fs::read_to_string(&refused_index).unwrap(), planted);
+        assert!(record_path(&stores[2], IDENTITY_B, "thread-one").exists());
+        assert_eq!(
+            EnvoySessions::remembered_everywhere(&tmp.path, &config)
+                .unwrap()
+                .unreadable_stores,
+            1
         );
     }
 
@@ -1597,7 +1884,10 @@ mod tests {
 
         assert_eq!(
             EnvoySessions::delete_all_everywhere(&tmp.path, &config).unwrap(),
-            1,
+            Forgotten {
+                removed: 1,
+                unreadable_stores: 0
+            },
             "the orphan was never a conversation, so it is not counted"
         );
 
@@ -1628,7 +1918,9 @@ mod tests {
         };
 
         assert_eq!(
-            EnvoySessions::remembered_everywhere(&tmp.path, &off).unwrap(),
+            EnvoySessions::remembered_everywhere(&tmp.path, &off)
+                .unwrap()
+                .by_identity,
             BTreeMap::from([
                 (IDENTITY_A.to_string(), vec!["thread-one".to_string()]),
                 (IDENTITY_B.to_string(), vec!["thread-one".to_string()]),
@@ -1636,11 +1928,17 @@ mod tests {
         );
         assert_eq!(
             EnvoySessions::delete_identity_everywhere(&tmp.path, &off, IDENTITY_A).unwrap(),
-            1
+            Forgotten {
+                removed: 1,
+                unreadable_stores: 0
+            }
         );
         assert_eq!(
             EnvoySessions::delete_all_everywhere(&tmp.path, &off).unwrap(),
-            1
+            Forgotten {
+                removed: 1,
+                unreadable_stores: 0
+            }
         );
         assert!(
             EnvoySessions::remembered_everywhere(&tmp.path, &off)
@@ -1665,23 +1963,31 @@ mod tests {
         assert_eq!(
             EnvoySessions::remembered_everywhere(&tmp.path, &off)
                 .unwrap()
+                .by_identity
                 .get(IDENTITY_A),
             Some(&vec!["thread-one".to_string(), "thread-two".to_string()])
         );
         assert_eq!(
             EnvoySessions::delete_thread_everywhere(&tmp.path, &off, IDENTITY_A, "thread-two")
                 .unwrap(),
-            1
+            Forgotten {
+                removed: 1,
+                unreadable_stores: 0
+            }
         );
         assert_eq!(
             EnvoySessions::remembered_everywhere(&tmp.path, &off)
                 .unwrap()
+                .by_identity
                 .get(IDENTITY_A),
             Some(&vec!["thread-one".to_string()])
         );
         assert_eq!(
             EnvoySessions::delete_all_everywhere(&tmp.path, &off).unwrap(),
-            2
+            Forgotten {
+                removed: 2,
+                unreadable_stores: 0
+            }
         );
         assert!(
             EnvoySessions::remembered_everywhere(&tmp.path, &off)

@@ -180,7 +180,7 @@ pub struct EnvoyMemoryConfig {
     /// turns that do not fit the envoy model's context are left out of the run, oldest
     /// first, and stay remembered.
     pub max_bytes: u64,
-    /// Hours a thread is remembered after its last message.
+    /// Hours a thread is remembered after its last written exchange.
     pub ttl_hours: u64,
 }
 

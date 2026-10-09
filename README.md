@@ -401,7 +401,7 @@ trust when you `.mesh untrust --identity` or `.mesh block` it (untrusting one of
 | `mesh.envoy_memory.max_per_identity` | `16`         | Most threads remembered for one peer identity; the least recently used go first; must be `1` or more                                                                         |
 | `mesh.envoy_memory.max_turns`     | `40`            | Most turns kept per thread; the oldest exchange goes first; must be `1` or more                                                                                              |
 | `mesh.envoy_memory.max_bytes`     | `65536`         | Most bytes of turn text kept per thread; the oldest exchange goes first, and kept turns that do not fit the envoy model's context are left out of the run, oldest first, and stay remembered; must be `1` or more |
-| `mesh.envoy_memory.ttl_hours`     | `168`           | Hours a thread is remembered after its last message; must be `1` or more                                                                                                     |
+| `mesh.envoy_memory.ttl_hours`     | `168`           | Hours a thread is remembered after its last written exchange; must be `1` or more                                                                                            |
 
 ---
 

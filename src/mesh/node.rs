@@ -8,7 +8,7 @@ use crate::mesh::brief::{Brief, Digest, assemble_brief, digest_objective_for};
 use crate::mesh::card::{CardSource, DISPLAY_NAME_MAX_CHARS, StatusHandler, build_card};
 use crate::mesh::envoy::{EnvoyJob, EnvoySink};
 use crate::mesh::envoy_sessions::{
-    EnvoyMemoryError, EnvoyMemorySink, EnvoyRole, EnvoySessions, EnvoyTurn,
+    EnvoyMemoryError, EnvoyMemorySink, EnvoyRole, EnvoySessions, EnvoyTurn, Forgotten, RememberedOf,
 };
 use crate::mesh::events::{
     BriefUpdateSource, MeshEvent, MeshHookSink, MeshHooks, NodeFacts, Routed, TrustHookObserver,
@@ -1895,9 +1895,15 @@ impl EnvoyMemorySink for MeshRuntime {
             &self.envoy_memory_config,
             identity,
         ) {
-            Ok(0) => {}
-            Ok(removed) => debug!(
-                "Mesh forgot {removed} remembered envoy conversation(s) of {}",
+            Ok(Forgotten {
+                removed: 0,
+                unreadable_stores: 0,
+            }) => {}
+            Ok(Forgotten {
+                removed,
+                unreadable_stores,
+            }) => debug!(
+                "Mesh forgot {removed} remembered envoy conversation(s) of {}; {unreadable_stores} store(s) could not be read",
                 short(identity)
             ),
             Err(err) => warn!(
@@ -1908,14 +1914,14 @@ impl EnvoyMemorySink for MeshRuntime {
         }
     }
 
-    fn remembered_of(&self, identity: &str) -> Result<usize, EnvoyMemoryError> {
+    fn remembered_of(&self, identity: &str) -> Result<RememberedOf, EnvoyMemoryError> {
         let identity = canonical_hash(identity)
             .ok_or_else(|| EnvoyMemoryError::NotAnIdentity(identity.to_string()))?;
-        Ok(
-            EnvoySessions::remembered_everywhere(&self.cache_dir, &self.envoy_memory_config)?
-                .get(&identity)
-                .map_or(0, Vec::len),
-        )
+        let all = EnvoySessions::remembered_everywhere(&self.cache_dir, &self.envoy_memory_config)?;
+        Ok(RememberedOf {
+            threads: all.by_identity.get(&identity).map_or(0, Vec::len),
+            unreadable_stores: all.unreadable_stores,
+        })
     }
 }
 
@@ -10020,7 +10026,8 @@ mod tests {
         assert_eq!(
             runtime
                 .remembered_of(&REMEMBERED_PEER.to_uppercase())
-                .unwrap(),
+                .unwrap()
+                .threads,
             1,
             "the identity is taken in either case and a thread two stores hold is one"
         );
@@ -10031,7 +10038,7 @@ mod tests {
 
         runtime.forget_identity(REMEMBERED_PEER);
 
-        assert_eq!(runtime.remembered_of(REMEMBERED_PEER).unwrap(), 0);
+        assert_eq!(runtime.remembered_of(REMEMBERED_PEER).unwrap().threads, 0);
         for store in [served.as_ref(), &other_instance] {
             assert_eq!(
                 store.load(REMEMBERED_PEER, "first", now).unwrap(),
