@@ -3,7 +3,9 @@
 //! scripts survive 300 KB command output (the per-argument cap that used to
 //! crash them is 128 KiB), and both `fix_loop_gate.sh` scripts route the
 //! crash / red / green / budget cases the graphs rely on. Skips when `bash`
-//! or `jq` is not on PATH.
+//! or `jq` is not on PATH, and on Windows: a bare `bash` spawned without an
+//! explicit child PATH resolves to the WSL launcher in System32 ahead of Git
+//! Bash, so this POSIX harness is Unix-only (like the step-runner one).
 
 use serde_json::Value;
 use std::env;
@@ -19,6 +21,10 @@ const LAST_LINE: &str = "LAST LINE OF TRANSCRIPT";
 const DEFAULT_GATE_ERROR: &str = "no error recorded in state";
 
 fn tools_missing() -> bool {
+    if cfg!(windows) {
+        eprintln!("skipping: POSIX bash script harness");
+        return true;
+    }
     let missing = which::which("bash").is_err() || which::which("jq").is_err();
     if missing {
         eprintln!("skipping: bash/jq not available");
