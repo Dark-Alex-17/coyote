@@ -130,7 +130,8 @@ function Get-SettingsText {
   return @'
 [reticulum]
 
-# Relay announces and paths between the Coyote sessions that dial in.
+# Relay announces and paths between the Coyote sessions that dial in. A transport
+# node also forwards traffic for any other Reticulum peer it hears on its interfaces.
 enable_transport = True
 
 # Shared instance left at the default so rnstatus, rnpath, Sideband and NomadNet on
@@ -157,7 +158,7 @@ function Get-ConfigText {
 }
 
 function Write-FirewallWarning {
-  Write-Info 'Firewall: AutoInterface listens for LAN peers. Windows will ask whether python/rnsd may accept incoming connections; allow it or discovery of LAN hosts will not work.'
+  Write-Info 'Firewall: AutoInterface listens for LAN peers, and with enable_transport this rnsd forwards traffic for any Reticulum peer on the LAN (and on to the Team Relay when one is configured). Windows will ask whether python/rnsd may accept incoming connections; allow it or discovery of LAN hosts will not work.'
 }
 
 # Writes to a temp file beside the target and moves it into place, so a crash never leaves a half-written file.

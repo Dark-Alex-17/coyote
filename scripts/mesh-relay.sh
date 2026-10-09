@@ -318,7 +318,8 @@ settings_text() {
   cat <<'EOF'
 [reticulum]
 
-# Relay announces and paths between the Coyote sessions that dial in.
+# Relay announces and paths between the Coyote sessions that dial in. A transport
+# node also forwards traffic for any other Reticulum peer it hears on its interfaces.
 enable_transport = True
 
 # Shared instance left at the default so rnstatus, rnpath, Sideband and NomadNet on
@@ -346,7 +347,7 @@ EOF
 }
 
 firewall_warning() {
-  log "Firewall: AutoInterface listens for LAN peers. macOS and Windows will ask whether python/rnsd may accept incoming connections; allow it or discovery of LAN hosts will not work."
+  log "Firewall: AutoInterface listens for LAN peers, and with enable_transport this rnsd forwards traffic for any Reticulum peer on the LAN (and on to the Team Relay when one is configured). macOS and Windows will ask whether python/rnsd may accept incoming connections; allow it or discovery of LAN hosts will not work."
 }
 
 write_config() {
