@@ -10057,6 +10057,96 @@ mod tests {
         started.relay_handle.abort();
     }
 
+    /// Usage probe: the runtime's sweep tells the log what it did, and only when it did
+    /// something. With a store whose index cannot be read beside the served one, forgetting
+    /// an identity logs one debug line that counts the conversations forgotten and the one
+    /// store that could not be swept, naming the identity by its short form only; the store
+    /// it could not sweep is left byte-for-byte as it was. An identity nothing is remembered
+    /// of, with no such store around, logs nothing at all.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_forgetting_an_identity_logs_what_it_forgot_and_the_store_it_could_not_sweep()
+     {
+        install_log_collector();
+        let config = EnvoyMemoryConfig {
+            enabled: true,
+            ..EnvoyMemoryConfig::default()
+        };
+        let started = started_runtime_with("node-forget-logs-the-sweep", |c| {
+            c.envoy_memory = config.clone();
+        })
+        .await;
+        let runtime = started.runtime.clone();
+        let served = runtime
+            .envoy_memory()
+            .expect("an enabled store is opened at start");
+        let now = SystemTime::now();
+        let identity = hex_lower(&[0x5c; 16]);
+        let short_form = short(&identity).to_string();
+        served.save(&identity, "first", peer_turns(), now).unwrap();
+        let broken = runtime
+            .cache_dir()
+            .join("mesh")
+            .join("envoy-sessions")
+            .join("inst-unread");
+        std::fs::create_dir_all(&broken).unwrap();
+        std::fs::write(broken.join("index.json"), "{not json").unwrap();
+        let record = broken.join(format!("{}.yaml", "ad".repeat(16)));
+        std::fs::write(&record, "version: 1\n").unwrap();
+        let sweep_lines = |since: usize| -> Vec<String> {
+            debug_snapshot()
+                .into_iter()
+                .skip(since)
+                .filter(|line| line.starts_with("Mesh forgot ") && line.contains(&short_form))
+                .collect()
+        };
+
+        let since = debug_snapshot().len();
+        runtime.forget_identity(&identity);
+
+        let logged = sweep_lines(since);
+        assert_eq!(
+            logged,
+            [format!(
+                "Mesh forgot 1 remembered envoy conversation(s) of {short_form}; 1 store(s) could not be swept"
+            )],
+            "one sweep, one line: {:?}",
+            debug_snapshot()
+        );
+        assert!(
+            !logged[0].contains(&identity),
+            "the identity is named by its short form only: {}",
+            logged[0]
+        );
+        assert_eq!(served.load(&identity, "first", now).unwrap(), None);
+        assert_eq!(
+            std::fs::read_to_string(broken.join("index.json")).unwrap(),
+            "{not json",
+            "the store that could not be swept is left as it was"
+        );
+        assert!(record.exists());
+
+        // A second sweep of the same identity still finds the unread store and says so,
+        // with nothing left to forget beside it.
+        let since = debug_snapshot().len();
+        runtime.forget_identity(&identity);
+        assert_eq!(
+            sweep_lines(since),
+            [format!(
+                "Mesh forgot 0 remembered envoy conversation(s) of {short_form}; 1 store(s) could not be swept"
+            )]
+        );
+
+        // With the unread store gone and nothing remembered, the sweep is silent.
+        std::fs::remove_dir_all(&broken).unwrap();
+        let since = debug_snapshot().len();
+        runtime.forget_identity(&identity);
+        assert_eq!(sweep_lines(since), Vec::<String>::new());
+
+        runtime.shutdown().await.unwrap();
+        started.relay_handle.abort();
+    }
+
     /// The envoy memory is rebound before the runtime re-keys; when the runtime then
     /// refuses (here: the caller named the wrong original instance), the store rolls back
     /// with the grants, so the node remembers into the original's store and never the

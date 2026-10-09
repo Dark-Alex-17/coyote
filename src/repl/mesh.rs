@@ -28201,6 +28201,101 @@ mod tests {
                 );
             }
 
+            /// Usage probe: the log is the operator's only record of a store that was
+            /// emptied without being read. `forget all` warns once per such store,
+            /// naming the store directory so the operator can find what went; the
+            /// identity and thread scopes, which leave such a store as it is, warn of
+            /// no emptying at all, and a second `forget all` over the now-empty
+            /// directory has nothing left to warn about.
+            #[test]
+            #[serial]
+            fn usage_probe_forget_all_logs_one_warning_per_store_it_empties_unread_and_the_narrower_scopes_log_none()
+             {
+                use crate::testing::{install_log_collector, warn_snapshot};
+
+                install_log_collector();
+                let guard = TestConfigDirGuard::new(TAG);
+                let _cache = EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
+                let _capture = capture::install();
+                let _script = prompt_script::install(&[]);
+                let cache_dir = MeshPaths::from_env().cache_dir;
+                seed(&cache_dir);
+                let stores = cache_dir.join("mesh").join("envoy-sessions");
+                let broken = stores.join("inst-broken-logged");
+                fs::create_dir_all(&broken).unwrap();
+                fs::write(broken.join("index.json"), "{not json").unwrap();
+                fs::write(
+                    broken.join(format!("{}.yaml", "ad".repeat(16))),
+                    "version: 1\n",
+                )
+                .unwrap();
+                let mut ctx = ctx_with(MeshConfig::default(), true);
+                let emptied = |since: &[String]| -> Vec<String> {
+                    warn_snapshot()
+                        .into_iter()
+                        .skip(since.len())
+                        .filter(|line| line.contains("emptied unread"))
+                        .collect()
+                };
+
+                // The narrower scopes leave the store and so have nothing to warn of.
+                let before = warn_snapshot();
+                run_async(out_of(
+                    &mut ctx,
+                    &format!(".mesh memory forget {ID_A} a-second --yes"),
+                ))
+                .unwrap();
+                run_async(out_of(
+                    &mut ctx,
+                    &format!(".mesh memory forget {ID_B} --yes"),
+                ))
+                .unwrap();
+                run_async(out_of(&mut ctx, ".mesh memory forget all --dry-run")).unwrap();
+                assert_eq!(
+                    emptied(&before),
+                    Vec::<String>::new(),
+                    "a thread scope, an identity scope and a dry run empty nothing unread"
+                );
+                assert_eq!(
+                    fs::read_to_string(broken.join("index.json")).unwrap(),
+                    "{not json"
+                );
+
+                // `forget all` empties it and says so once, naming the directory.
+                let before = warn_snapshot();
+                let out = run_async(out_of(&mut ctx, ".mesh memory forget all --yes")).unwrap();
+                assert!(out.contains("1 store whose index cannot be read"), "{out}");
+                let logged = emptied(&before);
+                assert_eq!(
+                    logged.len(),
+                    1,
+                    "one store emptied unread, one warning: {logged:?}"
+                );
+                assert!(
+                    logged[0].contains(&broken.display().to_string()),
+                    "the warning names the store directory: {}",
+                    logged[0]
+                );
+                assert!(
+                    logged[0].contains("its index could not be read"),
+                    "{}",
+                    logged[0]
+                );
+                assert!(
+                    !logged[0].contains(&"ad".repeat(16)),
+                    "the record file names, which are session keys, stay out of the log: {}",
+                    logged[0]
+                );
+                assert!(!broken.join("index.json").exists());
+
+                // Emptied, the directory is no longer a store: nothing more to warn of.
+                let before = warn_snapshot();
+                let out = run_async(out_of(&mut ctx, ".mesh memory forget all --yes")).unwrap();
+                assert_eq!(out, "The envoy remembers nothing.");
+                assert_eq!(emptied(&before), Vec::<String>::new());
+                assert_eq!(prompt_script::prompts_asked(), 0);
+            }
+
             #[cfg(unix)]
             mod read_only_store {
                 use super::*;

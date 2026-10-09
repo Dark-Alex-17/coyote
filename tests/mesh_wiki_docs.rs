@@ -940,6 +940,7 @@ fn the_conversation_memory_section_names_the_wipe_verb_the_isolation_and_every_b
         "identity",
         "thread",
         "`mesh.envoy_memory.*`",
+        "whose index cannot be read is counted and named so you can empty it with `.mesh memory forget all`",
         "256 threads across all peers",
         "16 per identity",
         "40 turns",
