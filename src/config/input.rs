@@ -1312,6 +1312,58 @@ mod tests {
     }
 
     #[test]
+    fn with_history_lands_after_the_roles_few_shot_cases() {
+        let ctx = create_test_ctx();
+        let history = vec![
+            turn(MessageRole::User, "first question"),
+            turn(MessageRole::Assistant, "first answer"),
+        ];
+        let role = Role::new(
+            "r",
+            "be terse\n### INPUT:\nping\n### OUTPUT:\npong\n### INPUT:\nhi\n### OUTPUT:\nhey\n",
+        );
+        let input = Input::with_history(&ctx, "second question", role, history).unwrap();
+
+        assert_eq!(
+            roles_and_texts(&input.build_messages().unwrap()),
+            vec![
+                (MessageRole::System, "be terse".to_string()),
+                (MessageRole::User, "ping".to_string()),
+                (MessageRole::Assistant, "pong".to_string()),
+                (MessageRole::User, "hi".to_string()),
+                (MessageRole::Assistant, "hey".to_string()),
+                (MessageRole::User, "first question".to_string()),
+                (MessageRole::Assistant, "first answer".to_string()),
+                (MessageRole::User, "second question".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn with_history_keeps_the_continuation_last() {
+        let ctx = create_test_ctx();
+        let history = vec![
+            turn(MessageRole::User, "first question"),
+            turn(MessageRole::Assistant, "first answer"),
+        ];
+        let mut input =
+            Input::with_history(&ctx, "second question", Role::new("r", "be terse"), history)
+                .unwrap();
+        input.set_continue_output("so far ");
+
+        assert_eq!(
+            roles_and_texts(&input.build_messages().unwrap()),
+            vec![
+                (MessageRole::System, "be terse".to_string()),
+                (MessageRole::User, "first question".to_string()),
+                (MessageRole::Assistant, "first answer".to_string()),
+                (MessageRole::User, "second question".to_string()),
+                (MessageRole::Assistant, "so far ".to_string()),
+            ]
+        );
+    }
+
+    #[test]
     fn from_str_carries_no_history() {
         let ctx = create_test_ctx();
         let input = Input::from_str(&ctx, "alone", Some(Role::new("r", "be terse"))).unwrap();

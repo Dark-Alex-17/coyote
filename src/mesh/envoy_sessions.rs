@@ -485,10 +485,7 @@ impl EnvoySessions {
     /// without reading it: the caller asked for it gone, whatever it holds.
     #[cfg_attr(
         not(test),
-        expect(
-            dead_code,
-            reason = "called by the envoy run flow once it retains conversation memory"
-        )
+        expect(dead_code, reason = "the `.mesh memory forget` command's verb")
     )]
     pub(crate) fn delete(&self, identity: &str, thread: &str) -> Result<bool, EnvoyMemoryError> {
         let (_, key) = resolve(identity, thread)?;
@@ -529,10 +526,7 @@ impl EnvoySessions {
     /// `(conversations, distinct identities)`; `(0, 0)` while the store does not exist.
     #[cfg_attr(
         not(test),
-        expect(
-            dead_code,
-            reason = "called by the envoy run flow once it retains conversation memory"
-        )
+        expect(dead_code, reason = "the status line's memory count")
     )]
     pub(crate) fn stats(&self) -> Result<(usize, usize), EnvoyMemoryError> {
         if !self.dir.exists() {

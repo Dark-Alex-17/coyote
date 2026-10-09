@@ -3638,7 +3638,7 @@ mod tests {
     use crate::hooks::HookEvent;
     use crate::mesh::access::{AccessOptions, access_message, validate_access};
     use crate::mesh::destination_address;
-    use crate::mesh::envoy_sessions::session_key;
+    use crate::mesh::envoy_sessions::{EnvoyMemoryError, session_key};
     use crate::mesh::events::{RecordingHookSink, env_value, one_fire};
     use crate::mesh::limits::PEER_RETRY_AFTER_CAPACITY;
     use crate::mesh::message::{
@@ -8721,6 +8721,45 @@ mod tests {
             .expect("the planted record is left as it was")
             .turns;
         assert_eq!(turns, peer_turns());
+    }
+
+    /// A record under the asked key that names another identity is the store's
+    /// refusal, not the late answer's to override: the file is left byte for byte.
+    #[test]
+    fn a_late_answer_never_writes_over_another_identitys_record() {
+        let tmp = TempDir::new("node-late-answer-wrong-identity");
+        let config = EnvoyMemoryConfig {
+            enabled: true,
+            ..EnvoyMemoryConfig::default()
+        };
+        let store = Arc::new(EnvoySessions::open(&tmp.path, "inst", &config).unwrap());
+        let now = SystemTime::now();
+        store
+            .save(REMEMBERED_PEER, "t-9", peer_turns(), now)
+            .unwrap();
+        let path = remembered_record(&store, "t-9");
+        let other = "fedcba9876543210fedcba9876543210";
+        let planted = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace(REMEMBERED_PEER, other);
+        std::fs::write(&path, &planted).unwrap();
+        let slot = MeshSlot::default();
+        slot.set_envoy_memory_for_tests(store.clone());
+
+        slot.remember_human_answer(
+            &InboundRecord {
+                peer_identity: REMEMBERED_PEER.to_string(),
+                thread: "t-9".to_string(),
+                ..inbound_record("a-1")
+            },
+            "the owner says yes",
+        );
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), planted);
+        assert!(matches!(
+            store.load(REMEMBERED_PEER, "t-9", now),
+            Err(EnvoyMemoryError::WrongIdentity { .. })
+        ));
     }
 
     #[cfg(unix)]
