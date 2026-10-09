@@ -33,6 +33,14 @@ const STORE_NAME: &str = "envoy memory";
 const INDEX_FILE: &str = "index.json";
 const RECORD_EXTENSION: &str = "yaml";
 
+/// The envoy memory as the trust list sees it: a revoked identity's conversations go
+/// with its trust. Implemented by the node, which knows which instance's store is
+/// current; a no-op while the memory is off.
+pub(crate) trait EnvoyMemorySink: Send + Sync {
+    /// Forgets every thread remembered of `identity` (lower-hex).
+    fn forget_identity(&self, identity: &str);
+}
+
 /// One `<key>.yaml`: the retained turns of one peer thread. The shape is a stable on-disk
 /// record other code reads back; it rejects fields it does not know, so any change to the
 /// layout bumps `ENVOY_SESSION_VERSION` and a reader refuses the file on a version it
@@ -397,13 +405,6 @@ impl EnvoySessions {
 
     /// Forgets every thread of `identity`; how many went. Removes each record by key
     /// without reading it.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "called by the envoy run flow once it retains conversation memory"
-        )
-    )]
     pub(crate) fn delete_identity(&self, identity: &str) -> Result<usize, EnvoyMemoryError> {
         let identity = canonical_hash(identity)
             .ok_or_else(|| EnvoyMemoryError::NotAnIdentity(identity.to_string()))?;

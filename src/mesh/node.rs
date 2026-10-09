@@ -7,7 +7,7 @@ use crate::mesh::announce::{
 use crate::mesh::brief::{Brief, Digest, assemble_brief, digest_objective_for};
 use crate::mesh::card::{CardSource, DISPLAY_NAME_MAX_CHARS, StatusHandler, build_card};
 use crate::mesh::envoy::{EnvoyJob, EnvoySink};
-use crate::mesh::envoy_sessions::{EnvoyRole, EnvoySessions, EnvoyTurn};
+use crate::mesh::envoy_sessions::{EnvoyMemorySink, EnvoyRole, EnvoySessions, EnvoyTurn};
 use crate::mesh::events::{
     BriefUpdateSource, MeshEvent, MeshHookSink, MeshHooks, NodeFacts, Routed, TrustHookObserver,
 };
@@ -572,6 +572,9 @@ impl MeshRuntime {
             runtime.peers.clone(),
             runtime.cancellation_token(),
         )));
+        runtime
+            .trust()
+            .attach_envoy_memory(Arc::downgrade(&runtime) as Weak<dyn EnvoyMemorySink>);
         if config.envoy_memory.enabled {
             let swept = Arc::downgrade(&runtime);
             runtime.register_task(tokio::spawn(sweep_envoy_memory(
@@ -1876,6 +1879,28 @@ fn prune_envoy_memory(store: &EnvoySessions) {
             "Failed to prune the envoy's conversation memory: {}",
             redact_hashes(&err.to_string())
         ),
+    }
+}
+
+/// A revoked identity's conversations go with its trust, out of whichever store the
+/// node currently serves; nothing to do while the memory is off.
+impl EnvoyMemorySink for MeshRuntime {
+    fn forget_identity(&self, identity: &str) {
+        let Some(store) = self.envoy_memory() else {
+            return;
+        };
+        match store.delete_identity(identity) {
+            Ok(0) => {}
+            Ok(removed) => debug!(
+                "Mesh forgot {removed} remembered envoy conversation(s) of {}",
+                short(identity)
+            ),
+            Err(err) => warn!(
+                "Mesh could not forget the remembered envoy conversations of {}: {}",
+                short(identity),
+                redact_hashes(&err.to_string())
+            ),
+        }
     }
 }
 
@@ -9577,6 +9602,52 @@ mod tests {
             remembered_record(&original_store, "original").exists(),
             "the original's record is left on its own disk"
         );
+        assert!(slot.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    /// Revoking an identity's trust forgets every thread the envoy remembered of it, out
+    /// of the store the node serves; another identity's thread stays.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn untrusting_an_identity_forgets_its_remembered_threads() {
+        use crate::mesh::trust::TrustOptions;
+
+        let started = started_runtime_with("node-untrust-envoy-memory", |c| {
+            c.envoy_memory.enabled = true;
+        })
+        .await;
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(started.runtime.clone()).unwrap();
+        let store = started
+            .runtime
+            .envoy_memory()
+            .expect("an enabled store is opened at start");
+        let now = SystemTime::now();
+        let other = hex_lower(&[0x77; 16]);
+        for thread in ["first", "second"] {
+            store
+                .save(REMEMBERED_PEER, thread, peer_turns(), now)
+                .unwrap();
+        }
+        store.save(&other, "theirs", peer_turns(), now).unwrap();
+        let trust = started.runtime.trust();
+        trust
+            .trust_identity(slot.as_ref(), REMEMBERED_PEER, TrustOptions::default(), now)
+            .unwrap();
+
+        trust
+            .untrust_identity(slot.as_ref(), REMEMBERED_PEER)
+            .unwrap();
+
+        for thread in ["first", "second"] {
+            assert!(
+                store.load(REMEMBERED_PEER, thread, now).unwrap().is_none(),
+                "{thread} outlived the identity's trust"
+            );
+            assert!(!remembered_record(&store, thread).exists());
+        }
+        assert!(store.load(&other, "theirs", now).unwrap().is_some());
         assert!(slot.stop().await.unwrap());
         started.relay_handle.abort();
     }

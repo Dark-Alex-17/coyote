@@ -72,6 +72,7 @@
 //! different identity.
 
 use crate::mesh::announce::is_control_or_invisible;
+use crate::mesh::envoy_sessions::EnvoyMemorySink;
 use crate::mesh::idle::{IdleNotify, Origin};
 use crate::mesh::knock::KnockSurface;
 use crate::mesh::node::MeshSlot;
@@ -786,6 +787,9 @@ pub(crate) struct TrustStore {
     surface: Mutex<Option<Weak<dyn KnockSurface>>>,
     /// The peer table, held weakly for the same reason.
     presence: Mutex<Option<Weak<dyn InstancePresence>>>,
+    /// Where a revoked identity's remembered conversations go, held weakly for the same
+    /// reason.
+    envoy_memory: Mutex<Option<Weak<dyn EnvoyMemorySink>>>,
     collision_protection: AtomicBool,
 }
 
@@ -822,6 +826,7 @@ impl TrustStore {
             observer: ArcSwapOption::empty(),
             surface: Mutex::new(None),
             presence: Mutex::new(None),
+            envoy_memory: Mutex::new(None),
             collision_protection: AtomicBool::new(false),
         })
     }
@@ -841,6 +846,21 @@ impl TrustStore {
     /// the rotation of an identity trusted for all destinations is surfaced best effort.
     pub(crate) fn attach_presence(&self, presence: Weak<dyn InstancePresence>) {
         *self.presence.lock() = Some(presence);
+    }
+
+    /// Installs the envoy memory that `untrust_identity` and `block_identity` tell to
+    /// forget the identity's conversations.
+    pub(crate) fn attach_envoy_memory(&self, sink: Weak<dyn EnvoyMemorySink>) {
+        *self.envoy_memory.lock() = Some(sink);
+    }
+
+    /// Called with the state lock released: the memory store takes its own locks and
+    /// touches the disk.
+    fn forget_envoy_memory(&self, identity: &str) {
+        let Some(sink) = self.envoy_memory.lock().as_ref().and_then(Weak::upgrade) else {
+            return;
+        };
+        sink.forget_identity(identity);
     }
 
     /// `mesh.collision_protection`: on, the collision rung of `authorize_origin` precedes
@@ -1741,7 +1761,8 @@ impl TrustStore {
     }
 
     /// Removes an identity record and every destination bound to it, denies included;
-    /// returns the removed destination hashes.
+    /// returns the removed destination hashes. Whatever the envoy remembered of the
+    /// identity's conversations goes with the trust.
     pub(crate) fn untrust_identity(
         &self,
         mesh: &dyn LiveMesh,
@@ -1749,29 +1770,35 @@ impl TrustStore {
     ) -> Result<Vec<String>> {
         live(mesh)?;
         let identity = normalize_hash(identity_hash);
-        let mut state = self.inner.lock();
-        let mut file = state.file.clone();
-        let on_disk = file.identities.remove(&identity);
-        let in_session = state.session_identities.contains_key(&identity);
-        if on_disk.is_none() && !in_session {
-            bail!("Identity {identity} is not in the trust list, so there is nothing to untrust.");
-        }
-        let removed = remove_destinations_of(&mut file, &identity);
-        for hash in &removed {
-            file.denied_destinations.remove(hash);
-        }
-        if on_disk.is_some() || !removed.is_empty() {
-            self.commit(
-                &mut state,
-                file,
-                TrustMutation::UntrustIdentity {
-                    identity: identity.clone(),
-                    was_granting: on_disk.is_some_and(|entry| entry.all_destinations),
-                    removed: removed.clone(),
-                },
-            )?;
-        }
-        state.forget_identity(&identity, &removed);
+        let removed = {
+            let mut state = self.inner.lock();
+            let mut file = state.file.clone();
+            let on_disk = file.identities.remove(&identity);
+            let in_session = state.session_identities.contains_key(&identity);
+            if on_disk.is_none() && !in_session {
+                bail!(
+                    "Identity {identity} is not in the trust list, so there is nothing to untrust."
+                );
+            }
+            let removed = remove_destinations_of(&mut file, &identity);
+            for hash in &removed {
+                file.denied_destinations.remove(hash);
+            }
+            if on_disk.is_some() || !removed.is_empty() {
+                self.commit(
+                    &mut state,
+                    file,
+                    TrustMutation::UntrustIdentity {
+                        identity: identity.clone(),
+                        was_granting: on_disk.is_some_and(|entry| entry.all_destinations),
+                        removed: removed.clone(),
+                    },
+                )?;
+            }
+            state.forget_identity(&identity, &removed);
+            removed
+        };
+        self.forget_envoy_memory(&identity);
         Ok(removed)
     }
 
@@ -1780,7 +1807,8 @@ impl TrustStore {
     /// works on an identity the trust list has never seen. The block silences the identity;
     /// a key-change mark naming it as the one seen stands until the new destination is
     /// trusted. Every presence memo naming it, as holder or as a refused presenter, is
-    /// cleared: the human has answered the collision it stood for.
+    /// cleared: the human has answered the collision it stood for. Whatever the envoy
+    /// remembered of the identity's conversations goes too.
     pub(crate) fn block_identity(
         &self,
         mesh: &dyn LiveMesh,
@@ -1791,25 +1819,29 @@ impl TrustStore {
         live(mesh)?;
         let identity = valid_hash("identity", identity_hash)?;
         check_text("note", note.as_deref())?;
-        let mut state = self.inner.lock();
-        let mut file = state.file.clone();
-        let was_granting = file
-            .identities
-            .remove(&identity)
-            .is_some_and(|entry| entry.all_destinations);
-        let removed = remove_destinations_of(&mut file, &identity);
-        upsert_overlay(&mut file.blocked_identities, identity.clone(), note, now);
-        self.commit(
-            &mut state,
-            file,
-            TrustMutation::BlockIdentity {
-                identity: identity.clone(),
-                was_granting,
-                removed: removed.clone(),
-            },
-        )?;
-        state.forget_identity(&identity, &removed);
-        state.forget_presence_memos_naming(&identity);
+        let removed = {
+            let mut state = self.inner.lock();
+            let mut file = state.file.clone();
+            let was_granting = file
+                .identities
+                .remove(&identity)
+                .is_some_and(|entry| entry.all_destinations);
+            let removed = remove_destinations_of(&mut file, &identity);
+            upsert_overlay(&mut file.blocked_identities, identity.clone(), note, now);
+            self.commit(
+                &mut state,
+                file,
+                TrustMutation::BlockIdentity {
+                    identity: identity.clone(),
+                    was_granting,
+                    removed: removed.clone(),
+                },
+            )?;
+            state.forget_identity(&identity, &removed);
+            state.forget_presence_memos_naming(&identity);
+            removed
+        };
+        self.forget_envoy_memory(&identity);
         Ok(removed)
     }
 
@@ -2681,6 +2713,14 @@ mod tests {
             sink
         }
 
+        /// Attaches an envoy memory that records which identities it was told to forget.
+        fn remembering(&self) -> Arc<RecordingMemory> {
+            let memory = Arc::new(RecordingMemory::default());
+            self.store
+                .attach_envoy_memory(Arc::downgrade(&memory) as Weak<dyn EnvoyMemorySink>);
+            memory
+        }
+
         fn trust_identity(&self, identity_hash: &str, at: SystemTime) -> TrustChange {
             self.store
                 .trust_identity(&self.mesh, identity_hash, TrustOptions::default(), at)
@@ -2702,6 +2742,21 @@ mod tests {
 
     fn fake_hash(fill: u8) -> String {
         hex_lower(&[fill; 16])
+    }
+
+    #[derive(Default)]
+    struct RecordingMemory(Mutex<Vec<String>>);
+
+    impl RecordingMemory {
+        fn forgotten(&self) -> Vec<String> {
+            self.0.lock().clone()
+        }
+    }
+
+    impl EnvoyMemorySink for RecordingMemory {
+        fn forget_identity(&self, identity: &str) {
+            self.0.lock().push(identity.to_string());
+        }
     }
 
     fn verdict(decision: Decision, rule: Rule) -> Verdict {
@@ -4536,6 +4591,82 @@ mod tests {
             .find(|record| record.hash == first.destination_hash)
             .unwrap();
         assert_eq!(retrusted.last_seen_at, t(4_000));
+    }
+
+    /// Untrusting an identity tells the envoy memory to forget it once, by the lower-hex
+    /// identity, however many destinations the cascade removed and however it was spelt.
+    #[test]
+    fn untrust_identity_forgets_the_identitys_envoy_memory_once() {
+        let fx = Fixture::new("trust-untrust-memory");
+        let memory = fx.remembering();
+        let peer = announced("alpha");
+        fx.announce(&peer, t(2_000));
+        fx.trust_destination(&peer, t(3_000));
+        fx.trust_identity(&peer.identity_hash, t(3_000));
+
+        let removed = fx
+            .store
+            .untrust_identity(&fx.mesh, &peer.identity_hash.to_uppercase())
+            .unwrap();
+
+        assert_eq!(removed, std::slice::from_ref(&peer.destination_hash));
+        assert_eq!(
+            memory.forgotten(),
+            std::slice::from_ref(&peer.identity_hash)
+        );
+    }
+
+    /// Blocking forgets the identity's envoy memory even when the trust list never held
+    /// it: a blocked peer's conversations do not outlive the block.
+    #[test]
+    fn block_identity_forgets_the_envoy_memory_of_an_identity_never_trusted() {
+        let fx = Fixture::new("trust-block-memory");
+        let memory = fx.remembering();
+        let identity = fake_hash(0xbb);
+
+        fx.store
+            .block_identity(&fx.mesh, &identity, None, t(3_000))
+            .unwrap();
+
+        assert_eq!(memory.forgotten(), [identity]);
+    }
+
+    /// Revoking a destination says nothing about the person: neither `untrust_destination`
+    /// nor `prune_destinations` touches the envoy memory.
+    #[test]
+    fn revoking_a_destination_leaves_the_envoy_memory_alone() {
+        let fx = Fixture::new("trust-destination-memory");
+        let memory = fx.remembering();
+        let untrusted = announced("alpha");
+        fx.announce(&untrusted, t(2_000));
+        fx.trust_destination(&untrusted, t(3_000));
+        let stale = announced("beta");
+        fx.announce(&stale, t(2_000));
+        fx.trust_destination(&stale, t(3_000));
+
+        fx.store
+            .untrust_destination(&fx.mesh, &untrusted.destination_hash, t(9_000), false)
+            .unwrap();
+        let pruned = fx
+            .store
+            .prune_destinations(&fx.mesh, Duration::from_secs(3_600), t(10_200), false)
+            .unwrap();
+
+        assert_eq!(pruned, std::slice::from_ref(&stale.destination_hash));
+        assert!(memory.forgotten().is_empty());
+    }
+
+    /// An envoy memory that has gone away is no error: the revocation stands on its own.
+    #[test]
+    fn untrust_identity_survives_a_dropped_envoy_memory() {
+        let fx = Fixture::new("trust-dropped-memory");
+        let identity = fake_hash(0xcc);
+        fx.trust_identity(&identity, t(3_000));
+        drop(fx.remembering());
+
+        fx.store.untrust_identity(&fx.mesh, &identity).unwrap();
+
+        assert!(fx.store.records().is_empty());
     }
 
     #[test]
