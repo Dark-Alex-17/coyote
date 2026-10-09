@@ -443,6 +443,8 @@ jobs:
         Write-Output '::group::Administrator is refused without -AllowRoot'
         Invoke-Relay 1 @('-NoService', '-DryRun')
         Write-Output '::endgroup::'
+        # The runner's pwsh wrapper exits with the last native exit code, which the refusal just set to 1.
+        exit 0
 
     - name: Mesh Relay Under Windows PowerShell 5.1
       if: runner.os == 'Windows'
@@ -456,6 +458,7 @@ jobs:
         $ErrorActionPreference = 'Continue'
         powershell -NoProfile -ExecutionPolicy Bypass -File scripts/mesh-relay.ps1 -NoService -DryRun -AllowRoot
         if ($LASTEXITCODE -ne 0) { throw "mesh-relay.ps1 exited $LASTEXITCODE under Windows PowerShell 5.1" }
+        exit 0
 
     - name: Record Wall-Clock
       if: always()
