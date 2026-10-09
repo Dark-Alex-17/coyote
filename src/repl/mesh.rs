@@ -1584,7 +1584,11 @@ fn parse_fetch_args(rest: &str) -> Result<Option<FetchArgs>> {
 /// peer's threads in every instance's store, the one this node serves and any fork's or
 /// re-keyed predecessor's alike. What would go is listed first; nothing is asked or
 /// written when the scope names nothing remembered. A conversation is counted once however
-/// many instance stores hold a record of it; the record count is added when it differs.
+/// many instance stores hold a record of it; the record count is added when more went.
+/// What is reported forgotten is read back from the stores after the sweep: a store that
+/// refused the delete is logged and what it still holds is named instead, with the
+/// command that forgets it once the store can be written. A store whose index cannot be
+/// read is logged and invisible to both the listing and the count.
 /// Runs with the mesh off and with `mesh.envoy_memory.enabled` false: the records may be
 /// on disk from when it was on.
 fn memory(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
@@ -1677,13 +1681,34 @@ fn memory(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
             EnvoySessions::delete_thread_everywhere(&cache_dir, config, identity, thread)?
         }
     };
-    let records = if removed == preview.count {
-        String::new()
-    } else {
+    let after = EnvoySessions::remembered_everywhere(&cache_dir, config)?;
+    let left = forget_preview(&args.scope, &after).count;
+    if left > 0 {
+        let remedy = match &args.scope {
+            ForgetScope::All => ".mesh memory forget all".to_string(),
+            ForgetScope::Identity(identity) => format!(".mesh memory forget {identity}"),
+            ForgetScope::Thread { identity, thread } => {
+                format!(".mesh memory forget {identity} {thread}")
+            }
+        };
+        let forgot = if removed > 0 {
+            format!("Forgot {}, but ", plural(removed, "record", "records"))
+        } else {
+            String::new()
+        };
+        out_text(&format!(
+            "{forgot}{} could not be forgotten; see the log for the store that refused, then run {remedy} again.",
+            conversations(left)
+        ));
+        return Ok(());
+    }
+    let records = if removed > preview.count {
         format!(
             " ({} across the instance stores)",
             plural(removed, "record", "records")
         )
+    } else {
+        String::new()
     };
     out_text(&format!("Forgot {subject}{records}."));
     Ok(())
@@ -13078,6 +13103,248 @@ mod tests {
                         assert!(!out.contains("envoy"), "{line}: {out}");
                     }
                     assert_eq!(prompt_script::prompts_asked(), 0);
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// Usage probe: the revocation's memory sweep is reported from what is on disk
+            /// after it, not from what was asked. With a thread of the identity in a
+            /// store that refuses the wipe (its directory read-only), `.mesh untrust
+            /// --identity --confirm` still untrusts, says how many conversations could not
+            /// be forgotten, and names `.mesh memory forget <identity>` as the remedy — and
+            /// once the store is writable again that very remedy clears it.
+            #[test]
+            #[serial]
+            fn usage_probe_untrust_identity_names_the_threads_a_refusing_store_kept_and_the_remedy_clears_them()
+             {
+                use crate::config::mesh_config::EnvoyMemoryConfig;
+                use crate::mesh::envoy_sessions::{EnvoyRole, EnvoySessions, EnvoyTurn};
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-envoy-memory-refusing-store");
+                let _capture = capture::install();
+                let _script = prompt_script::install(&[]);
+                run_async(async {
+                    let config = EnvoyMemoryConfig {
+                        enabled: true,
+                        ..EnvoyMemoryConfig::default()
+                    };
+                    let started = started_runtime_with("repl-mesh-envoy-memory-refusing-store", {
+                        let config = config.clone();
+                        move |c| c.envoy_memory = config
+                    })
+                    .await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let trust = started.runtime.trust();
+                    let served = started
+                        .runtime
+                        .envoy_memory()
+                        .expect("an enabled store is opened at start");
+                    let cache_dir = started.runtime.cache_dir().to_path_buf();
+                    let unserved =
+                        EnvoySessions::open(&cache_dir, "fork-instance", &config).unwrap();
+                    let slot: &dyn LiveMesh = ctx.app.mesh.as_ref();
+                    let now = SystemTime::now();
+                    let turns = vec![
+                        EnvoyTurn {
+                            role: EnvoyRole::User,
+                            text: "where were we?".into(),
+                        },
+                        EnvoyTurn {
+                            role: EnvoyRole::Assistant,
+                            text: "the build".into(),
+                        },
+                    ];
+                    let dest_a = heard_trusted_peer(&started.runtime, slot);
+                    let id_a = identity_of(&trust, &dest_a);
+                    served.save(&id_a, "a-served", turns.clone(), now).unwrap();
+                    unserved.save(&id_a, "a-forked", turns, now).unwrap();
+                    let remembered_of = |identity: &str| {
+                        EnvoySessions::remembered_everywhere(&cache_dir, &config)
+                            .unwrap()
+                            .get(identity)
+                            .cloned()
+                            .unwrap_or_default()
+                    };
+                    assert_eq!(remembered_of(&id_a), ["a-forked", "a-served"]);
+                    let fork_dir = cache_dir
+                        .join("mesh")
+                        .join("envoy-sessions")
+                        .join("fork-instance");
+
+                    let locked = ModeRestore::read_only(&fork_dir);
+                    if fs::File::create(fork_dir.join("probe-write-check")).is_ok() {
+                        // A user that ignores directory modes (root) cannot stage the failure.
+                        let _ = fs::remove_file(fork_dir.join("probe-write-check"));
+                        assert!(ctx.app.mesh.stop().await.unwrap());
+                        started.relay_handle.abort();
+                        return;
+                    }
+
+                    let token = format!("untrust-{}", short(&id_a));
+                    let out = out_of(
+                        &mut ctx,
+                        &format!(".mesh untrust --identity {id_a} --confirm {token}"),
+                    )
+                    .await
+                    .unwrap();
+                    locked.restore();
+
+                    assert!(out.contains("Untrusted identity"), "{out}");
+                    assert_eq!(
+                        remembered_of(&id_a),
+                        ["a-forked"],
+                        "the served store gave its thread up; the refusing one kept its own: {out}"
+                    );
+                    let last = out.lines().last().unwrap_or_default();
+                    assert!(
+                        last.contains("1 envoy conversation")
+                            && last.contains("could not be forgotten"),
+                        "the count is the one still on disk after the sweep: {out}"
+                    );
+                    assert!(
+                        last.contains(&format!(".mesh memory forget {id_a}")),
+                        "the remedy names the verb with the full identity so it can be pasted: {out}"
+                    );
+                    assert!(
+                        !out.contains("Forgot the"),
+                        "nothing is reported forgotten when a thread remains: {out}"
+                    );
+
+                    // The remedy, now that the store can be written, clears what was kept.
+                    let out = out_of(&mut ctx, &format!(".mesh memory forget {id_a} --yes"))
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        out,
+                        format!(
+                            "Forgetting 1 remembered conversation of identity {}:\n  a-forked\nForgot 1 remembered conversation of identity {}.",
+                            short(&id_a),
+                            short(&id_a)
+                        )
+                    );
+                    assert!(remembered_of(&id_a).is_empty());
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// Usage probe: when the envoy memory cannot be read at all (a file sits where
+            /// the stores directory should be), the identity-level verbs still run — the
+            /// dry runs and the block intro say the count could not be read and that the
+            /// sweep happens all the same, the write says to run `.mesh memory forget` to
+            /// be sure — while the destination-level verbs, which never touch the memory,
+            /// neither mention it nor fail on it.
+            #[test]
+            #[serial]
+            fn usage_probe_revocation_verbs_survive_an_unreadable_envoy_memory_and_say_so() {
+                use crate::config::mesh_config::EnvoyMemoryConfig;
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-envoy-memory-unreadable");
+                let _capture = capture::install();
+                let _script = prompt_script::install(&[]);
+                run_async(async {
+                    let started = started_runtime_with("repl-mesh-envoy-memory-unreadable", |c| {
+                        c.envoy_memory = EnvoyMemoryConfig {
+                            enabled: true,
+                            ..EnvoyMemoryConfig::default()
+                        }
+                    })
+                    .await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let trust = started.runtime.trust();
+                    let slot: &dyn LiveMesh = ctx.app.mesh.as_ref();
+                    let now = SystemTime::now();
+                    let stores = started
+                        .runtime
+                        .cache_dir()
+                        .join("mesh")
+                        .join("envoy-sessions");
+                    fs::create_dir_all(stores.parent().unwrap()).unwrap();
+                    fs::write(&stores, "not a directory").unwrap();
+
+                    let dest_a = heard_trusted_peer(&started.runtime, slot);
+                    let id_a = identity_of(&trust, &dest_a);
+                    let (dest_b, id_b) = heard_peer(&started.runtime, "Bo", now);
+                    trust
+                        .trust_destination(slot, &dest_b, TrustOptions::default(), now)
+                        .unwrap();
+
+                    // Destination-level verbs: no memory read, so no mention and no failure.
+                    for line in [
+                        format!(".mesh forget {dest_b} --dry-run"),
+                        format!(".mesh untrust {dest_b} --dry-run"),
+                        format!(".mesh forget {dest_b} --yes"),
+                    ] {
+                        let out = out_of(&mut ctx, &line).await.unwrap();
+                        assert!(!out.contains("envoy"), "{line}: {out}");
+                        assert!(!out.contains("could not"), "{line}: {out}");
+                    }
+
+                    // Identity-level dry runs and the block intro: the count is unreadable,
+                    // the sweep is promised all the same.
+                    let token = format!("untrust-{}", short(&id_a));
+                    for verb in ["untrust", "forget"] {
+                        let out = out_of(&mut ctx, &format!(".mesh {verb} --identity {id_a}"))
+                            .await
+                            .unwrap();
+                        assert!(
+                            out.lines()
+                                .any(|line| line.contains("remembered envoy conversations")
+                                    && line.contains("could not be counted")
+                                    && line.contains("swept all the same")),
+                            "{verb}: {out}"
+                        );
+                        assert!(out.contains(DRY_RUN_NOTHING_CHANGED), "{verb}: {out}");
+                        assert!(
+                            out.contains(&format!("--confirm {token}")),
+                            "{verb}: the dry run still hands over the token: {out}"
+                        );
+                        assert!(
+                            !out.contains("and the ") || !out.contains("remembered of it, run"),
+                            "{verb}: no count is claimed in the sentence when none could be read: {out}"
+                        );
+                    }
+
+                    let out = out_of(
+                        &mut ctx,
+                        &format!(".mesh untrust --identity {id_a} --confirm {token}"),
+                    )
+                    .await
+                    .unwrap();
+                    assert!(out.contains("Untrusted identity"), "{out}");
+                    let last = out.lines().last().unwrap_or_default();
+                    assert!(last.contains("could not be counted"), "{out}");
+                    assert!(
+                        last.contains(&format!(".mesh memory forget {id_a}")),
+                        "the remedy names the verb: {out}"
+                    );
+
+                    let out = out_of(&mut ctx, &format!(".mesh block {id_b} --yes"))
+                        .await
+                        .unwrap();
+                    let intro = out.lines().next().unwrap_or_default();
+                    assert!(intro.starts_with("This blocks identity"), "{out}");
+                    assert!(
+                        intro.contains("could not be counted")
+                            && intro.contains("swept all the same"),
+                        "{out}"
+                    );
+                    assert!(out.contains("Blocked"), "{out}");
+                    assert!(
+                        out.lines()
+                            .last()
+                            .unwrap_or_default()
+                            .contains(".mesh memory forget"),
+                        "{out}"
+                    );
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+                    assert_eq!(fs::read_to_string(&stores).unwrap(), "not a directory");
 
                     assert!(ctx.app.mesh.stop().await.unwrap());
                     started.relay_handle.abort();
@@ -27371,6 +27638,48 @@ mod tests {
                     );
                 }
 
+                /// The config of a node that is off is not validated, so a zero bound can
+                /// reach the verb; it reads and lists the records on disk all the same.
+                #[test]
+                #[serial]
+                fn forget_runs_on_an_unvalidated_config_while_the_mesh_is_off() {
+                    let guard = TestConfigDirGuard::new(TAG);
+                    let _cache =
+                        EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    let cache_dir = MeshPaths::from_env().cache_dir;
+                    seed(&cache_dir);
+                    let mut ctx = ctx_with(
+                        MeshConfig {
+                            enabled: false,
+                            envoy_memory: EnvoyMemoryConfig {
+                                max_turns: 0,
+                                ..EnvoyMemoryConfig::default()
+                            },
+                            ..MeshConfig::default()
+                        },
+                        true,
+                    );
+                    assert!(ctx.app.mesh.get().is_none());
+
+                    let out =
+                        run_async(out_of(&mut ctx, ".mesh memory forget all --dry-run")).unwrap();
+
+                    let [row_a, row_b] = all_rows();
+                    assert_eq!(
+                        out.lines().collect::<Vec<_>>(),
+                        [
+                            "Would forget 3 remembered conversations of 2 identities:",
+                            row_a.as_str(),
+                            row_b.as_str(),
+                            DRY_RUN_NOTHING_CHANGED,
+                        ],
+                        "{out}"
+                    );
+                    assert_eq!(remembered(&cache_dir), seeded());
+                }
+
                 #[test]
                 #[serial]
                 fn forget_with_nothing_remembered_says_so_and_asks_nothing() {
@@ -27446,6 +27755,179 @@ mod tests {
                     );
                     run_async(run(&mut ctx, ".mesh memory forget")).unwrap();
                     assert_eq!(stdout_lines().join("\n"), usage, "no target is the usage");
+                }
+
+                /// Usage probe: a destructive verb reports what it did, not what it was
+                /// asked. When one instance's store refuses the wipe (here: its directory
+                /// is read-only, so the records cannot be unlinked), the sweep skips it and
+                /// the thread stays remembered there — the operator must be told the wipe
+                /// was partial rather than read a bare `Forgot …` for a conversation that
+                /// a later run can still resume. The sibling revocation verbs re-read the
+                /// count after the write and name the remedy; this verb is held to the
+                /// same bar.
+                #[test]
+                #[serial]
+                fn usage_probe_forget_does_not_claim_a_thread_forgotten_that_a_refusing_store_still_holds()
+                 {
+                    let guard = TestConfigDirGuard::new(TAG);
+                    let _cache =
+                        EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    let cache_dir = MeshPaths::from_env().cache_dir;
+                    seed(&cache_dir);
+                    let second = cache_dir.join("mesh").join("envoy-sessions").join("inst-b");
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+
+                    let locked = ModeRestore::read_only(&second);
+                    if fs::File::create(second.join("probe-write-check")).is_ok() {
+                        // A user that ignores directory modes (root) cannot stage the failure.
+                        let _ = fs::remove_file(second.join("probe-write-check"));
+                        return;
+                    }
+
+                    let out = run_async(out_of(
+                        &mut ctx,
+                        &format!(".mesh memory forget {ID_A} --yes"),
+                    ))
+                    .unwrap();
+                    locked.restore();
+
+                    // inst-a gave up both of A's threads; inst-b still holds `a-first`.
+                    assert_eq!(
+                        remembered(&cache_dir),
+                        BTreeMap::from([
+                            (ID_A.to_string(), vec!["a-first".to_string()]),
+                            (ID_B.to_string(), vec!["b-first".to_string()]),
+                        ]),
+                        "the refusing store keeps its record: {out}"
+                    );
+                    assert_eq!(
+                        out.lines().last(),
+                        Some(
+                            format!(
+                                "Forgot 2 records, but 1 remembered conversation could not be forgotten; see the log for the store that refused, then run .mesh memory forget {ID_A} again."
+                            )
+                            .as_str()
+                        ),
+                        "what went is counted in records, what stays in conversations, and the remedy takes the full identity: {out}"
+                    );
+
+                    // The remedy, now that the store can be written, clears what was kept.
+                    let out = run_async(out_of(
+                        &mut ctx,
+                        &format!(".mesh memory forget {ID_A} --yes"),
+                    ))
+                    .unwrap();
+                    assert_eq!(
+                        out.lines().last(),
+                        Some(
+                            format!(
+                                "Forgot 1 remembered conversation of identity {}.",
+                                short(ID_A)
+                            )
+                            .as_str()
+                        ),
+                        "{out}"
+                    );
+                    assert_eq!(
+                        remembered(&cache_dir),
+                        BTreeMap::from([(ID_B.to_string(), vec!["b-first".to_string()])])
+                    );
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+                }
+
+                /// Usage probe: when the stores directory itself cannot be listed (a file
+                /// sits where the directory should be), the verb fails before asking or
+                /// writing anything, and its error names the path rather than a bare
+                /// `Forgot`.
+                #[test]
+                #[serial]
+                fn usage_probe_forget_fails_closed_when_the_stores_directory_cannot_be_listed() {
+                    let guard = TestConfigDirGuard::new(TAG);
+                    let _cache =
+                        EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    let cache_dir = MeshPaths::from_env().cache_dir;
+                    let stores = cache_dir.join("mesh").join("envoy-sessions");
+                    fs::create_dir_all(stores.parent().unwrap()).unwrap();
+                    fs::write(&stores, "not a directory").unwrap();
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+
+                    for line in [
+                        ".mesh memory forget all --yes".to_string(),
+                        ".mesh memory forget all --dry-run".to_string(),
+                        format!(".mesh memory forget {ID_A} --yes"),
+                    ] {
+                        let printed = stdout_lines().len();
+                        let err = err_of(&mut ctx, &line);
+                        assert!(
+                            err.contains(&stores.display().to_string()),
+                            "{line}: the error names the stores path: {err}"
+                        );
+                        assert!(!err.contains("Forgot"), "{line}: {err}");
+                        assert_eq!(
+                            stdout_lines().len(),
+                            printed,
+                            "{line}: nothing is printed as done"
+                        );
+                    }
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+                    assert_eq!(fs::read_to_string(&stores).unwrap(), "not a directory");
+                }
+
+                /// Usage probe: with the mesh off, `.mesh info` prints the `envoy_memory.*`
+                /// configuration rows (they describe the config, not the node) and no
+                /// `envoy memory` count row (that describes the store the node serves, and
+                /// there is none); bare `.mesh status` is refused as before. The records on
+                /// disk do not change that.
+                #[test]
+                #[serial]
+                fn usage_probe_info_while_off_prints_the_envoy_memory_config_rows_but_no_count_row()
+                {
+                    let guard = TestConfigDirGuard::new(TAG);
+                    let _cache =
+                        EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
+                    let _capture = capture::install();
+                    let cache_dir = MeshPaths::from_env().cache_dir;
+                    seed(&cache_dir);
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    assert!(ctx.app.mesh.get().is_none());
+
+                    let out = run_async(out_of(&mut ctx, ".mesh info")).unwrap();
+
+                    for key in [
+                        "envoy_memory.enabled",
+                        "envoy_memory.max_sessions",
+                        "envoy_memory.max_per_identity",
+                        "envoy_memory.max_turns",
+                        "envoy_memory.max_bytes",
+                        "envoy_memory.ttl_hours",
+                    ] {
+                        assert!(
+                            out.lines()
+                                .any(|line| line.starts_with(&format!("  {key} "))),
+                            "{key} row missing: {out}"
+                        );
+                    }
+                    assert_eq!(info_row(&out, "envoy_memory.enabled"), "false", "{out}");
+                    assert!(
+                        !out.lines()
+                            .any(|line| line.trim_start().starts_with("envoy memory ")),
+                        "no node, so no count row: {out}"
+                    );
+                    assert!(
+                        !out.contains("conversation"),
+                        "the records on disk are not counted while off: {out}"
+                    );
+                    let err = err_of(&mut ctx, ".mesh status");
+                    assert!(err.contains(".mesh on"), "{err}");
+                    assert_eq!(
+                        remembered(&cache_dir),
+                        seeded(),
+                        "reading the info changes nothing"
+                    );
                 }
             }
         }

@@ -25,6 +25,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io;
+use std::mem;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -254,7 +255,8 @@ struct EnvoyMemoryLimits {
 
 impl From<&EnvoyMemoryConfig> for EnvoyMemoryLimits {
     fn from(config: &EnvoyMemoryConfig) -> Self {
-        // `MeshConfig::validate` is the gate: a zero bound never reaches the store.
+        // `MeshConfig::validate` is the gate for a store that is opened: a zero bound
+        // never reaches one that saves or prunes.
         for value in [
             config.max_sessions,
             config.max_per_identity,
@@ -267,6 +269,15 @@ impl From<&EnvoyMemoryConfig> for EnvoyMemoryLimits {
                 "mesh.envoy_memory bounds are validated to 1 or more"
             );
         }
+        Self::unchecked(config)
+    }
+}
+
+impl EnvoyMemoryLimits {
+    /// The config's values as they are. The sweep's stores never save or prune, so their
+    /// limits are never read; they take the config of a node that is off, which
+    /// `MeshConfig::validate` leaves unchecked.
+    fn unchecked(config: &EnvoyMemoryConfig) -> Self {
         let count = |value: u64| usize::try_from(value).unwrap_or(usize::MAX);
         Self {
             max_sessions: count(config.max_sessions),
@@ -310,7 +321,7 @@ impl EnvoySessions {
         let identity = canonical_hash(identity)
             .ok_or_else(|| EnvoyMemoryError::NotAnIdentity(identity.to_string()))?;
         let mut removed = 0;
-        Self::sweep(cache_dir, config, |store| {
+        Self::sweep(cache_dir, config, "swept", |store| {
             removed += store.delete_identity(&identity)?;
             Ok(())
         })?;
@@ -329,22 +340,23 @@ impl EnvoySessions {
     ) -> Result<usize, EnvoyMemoryError> {
         let (identity, _) = resolve(identity, thread)?;
         let mut removed = 0;
-        Self::sweep(cache_dir, config, |store| {
+        Self::sweep(cache_dir, config, "swept", |store| {
             removed += usize::from(store.delete(&identity, thread)?);
             Ok(())
         })?;
         Ok(removed)
     }
 
-    /// Forgets every conversation in every instance's store under `cache_dir`; how
-    /// many went in all. Same sweep as `delete_identity_everywhere`.
+    /// Forgets every conversation in every instance's store under `cache_dir`, record
+    /// files the index does not name included; how many conversations went in all. Same
+    /// sweep as `delete_identity_everywhere`.
     pub(crate) fn delete_all_everywhere(
         cache_dir: &Path,
         config: &EnvoyMemoryConfig,
     ) -> Result<usize, EnvoyMemoryError> {
         let mut removed = 0;
-        Self::sweep(cache_dir, config, |store| {
-            removed += store.delete_where(|_| true)?;
+        Self::sweep(cache_dir, config, "swept", |store| {
+            removed += store.delete_all()?;
             Ok(())
         })?;
         Ok(removed)
@@ -359,7 +371,7 @@ impl EnvoySessions {
         config: &EnvoyMemoryConfig,
     ) -> Result<BTreeMap<String, Vec<String>>, EnvoyMemoryError> {
         let mut remembered: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        Self::sweep(cache_dir, config, |store| {
+        Self::sweep(cache_dir, config, "read", |store| {
             for entry in store.remembered()? {
                 remembered
                     .entry(entry.identity)
@@ -377,11 +389,13 @@ impl EnvoySessions {
 
     /// Hands every instance's store under `cache_dir` to `visit`, whether or not the
     /// memory is on: records may remain from a time it was. A store `visit` refuses is
-    /// logged and skipped, the sweep going on to the next; `Err` only when the stores
-    /// directory itself cannot be listed, and nothing is visited when it does not exist.
+    /// logged as what could not be done to it, `verb` being `swept` or `read`, and
+    /// skipped, the sweep going on to the next; `Err` only when the stores directory
+    /// itself cannot be listed, and nothing is visited when it does not exist.
     fn sweep(
         cache_dir: &Path,
         config: &EnvoyMemoryConfig,
+        verb: &'static str,
         mut visit: impl FnMut(&Self) -> Result<(), EnvoyMemoryError>,
     ) -> Result<(), EnvoyMemoryError> {
         let stores = stores_dir(cache_dir);
@@ -399,12 +413,12 @@ impl EnvoySessions {
             }
             let store = Self {
                 dir: path,
-                limits: EnvoyMemoryLimits::from(config),
+                limits: EnvoyMemoryLimits::unchecked(config),
                 write_lock: Mutex::new(()),
             };
             if let Err(err) = visit(&store) {
                 warn!(
-                    "Mesh envoy memory under '{}' could not be swept: {}",
+                    "Mesh envoy memory under '{}' could not be {verb}: {}",
                     store.dir.display(),
                     redact_hashes(&err.to_string())
                 );
@@ -695,6 +709,28 @@ impl EnvoySessions {
         for entry in &removed {
             self.remove_record(&entry.key)?;
         }
+        if !removed.is_empty() {
+            self.write_index(&index)?;
+        }
+        Ok(removed.len())
+    }
+
+    /// Drops every conversation the index names and every record file it does not, so a
+    /// record left by a write that did not reach the index goes too; how many
+    /// conversations went. Nothing is created, and the index is rewritten only when a
+    /// conversation went.
+    fn delete_all(&self) -> Result<usize, EnvoyMemoryError> {
+        if !self.dir.exists() {
+            return Ok(0);
+        }
+        let _guard = self.write_lock.lock();
+        let _file_lock = self.file_lock()?;
+        let mut index = self.read_index()?;
+        let removed = mem::take(&mut index.entries);
+        for entry in &removed {
+            self.remove_record(&entry.key)?;
+        }
+        self.remove_orphans(&index)?;
         if !removed.is_empty() {
             self.write_index(&index)?;
         }
@@ -1543,6 +1579,73 @@ mod tests {
         assert_eq!(
             EnvoySessions::remembered_everywhere(&tmp.path, &config).unwrap(),
             BTreeMap::new()
+        );
+    }
+
+    #[test]
+    fn delete_all_everywhere_removes_the_record_files_the_index_does_not_name() {
+        let tmp = TempDir::new("envoy-sessions-delete-all-orphans");
+        let config = enabled();
+        let store = store(&tmp, &config);
+        store
+            .save(IDENTITY_A, "thread-one", exchange(1), t(1_000))
+            .unwrap();
+        let orphan = store.dir().join(format!("{}.yaml", "de".repeat(16)));
+        fs::write(&orphan, "version: 1\n").unwrap();
+        let not_a_record = store.dir().join("notes.txt");
+        fs::write(&not_a_record, "keep").unwrap();
+
+        assert_eq!(
+            EnvoySessions::delete_all_everywhere(&tmp.path, &config).unwrap(),
+            1,
+            "the orphan was never a conversation, so it is not counted"
+        );
+
+        let left: Vec<PathBuf> = fs::read_dir(store.dir())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == RECORD_EXTENSION))
+            .collect();
+        assert_eq!(left, Vec::<PathBuf>::new());
+        assert!(not_a_record.exists(), "only record files are swept");
+        assert_eq!(store.stats().unwrap(), (0, 0));
+    }
+
+    /// The config of a node that is off is not validated, so a zero bound can reach the
+    /// sweep; its stores never save or prune and take it as it is.
+    #[test]
+    fn the_everywhere_helpers_take_an_unvalidated_config_while_the_memory_is_off() {
+        let tmp = TempDir::new("envoy-sessions-everywhere-unvalidated");
+        let on = store(&tmp, &enabled());
+        on.save(IDENTITY_A, "thread-one", exchange(1), t(1_000))
+            .unwrap();
+        on.save(IDENTITY_B, "thread-one", exchange(2), t(1_000))
+            .unwrap();
+        let off = EnvoyMemoryConfig {
+            enabled: false,
+            max_turns: 0,
+            ..EnvoyMemoryConfig::default()
+        };
+
+        assert_eq!(
+            EnvoySessions::remembered_everywhere(&tmp.path, &off).unwrap(),
+            BTreeMap::from([
+                (IDENTITY_A.to_string(), vec!["thread-one".to_string()]),
+                (IDENTITY_B.to_string(), vec!["thread-one".to_string()]),
+            ])
+        );
+        assert_eq!(
+            EnvoySessions::delete_identity_everywhere(&tmp.path, &off, IDENTITY_A).unwrap(),
+            1
+        );
+        assert_eq!(
+            EnvoySessions::delete_all_everywhere(&tmp.path, &off).unwrap(),
+            1
+        );
+        assert!(
+            EnvoySessions::remembered_everywhere(&tmp.path, &off)
+                .unwrap()
+                .is_empty()
         );
     }
 

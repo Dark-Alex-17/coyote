@@ -56,7 +56,7 @@ use crate::mesh::snapshot::MeshSnapshot;
 use crate::mesh::trust::{
     Decision, InstancePresence, KeyChangeOutcome, TrustStore, decode_name_hash, parse_hash,
 };
-use crate::mesh::{display_text, hex_lower, identity, mesh_cache_dir};
+use crate::mesh::{canonical_hash, display_text, hex_lower, identity, mesh_cache_dir};
 use crate::supervisor::notification::{SystemNotification, mesh_notification};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -1909,9 +1909,11 @@ impl EnvoyMemorySink for MeshRuntime {
     }
 
     fn remembered_of(&self, identity: &str) -> Result<usize, EnvoyMemoryError> {
+        let identity = canonical_hash(identity)
+            .ok_or_else(|| EnvoyMemoryError::NotAnIdentity(identity.to_string()))?;
         Ok(
             EnvoySessions::remembered_everywhere(&self.cache_dir, &self.envoy_memory_config)?
-                .get(identity)
+                .get(&identity)
                 .map_or(0, Vec::len),
         )
     }
@@ -10015,9 +10017,21 @@ mod tests {
                 .unwrap();
             store.save(&other, "theirs", peer_turns(), now).unwrap();
         }
+        assert_eq!(
+            runtime
+                .remembered_of(&REMEMBERED_PEER.to_uppercase())
+                .unwrap(),
+            1,
+            "the identity is taken in either case and a thread two stores hold is one"
+        );
+        assert!(matches!(
+            runtime.remembered_of("not-a-hash"),
+            Err(EnvoyMemoryError::NotAnIdentity(_))
+        ));
 
         runtime.forget_identity(REMEMBERED_PEER);
 
+        assert_eq!(runtime.remembered_of(REMEMBERED_PEER).unwrap(), 0);
         for store in [served.as_ref(), &other_instance] {
             assert_eq!(
                 store.load(REMEMBERED_PEER, "first", now).unwrap(),

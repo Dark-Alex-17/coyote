@@ -367,7 +367,8 @@ The envoy that answers trusted peers for you starts every run with no memory of 
 thread is answered as if it were the first message. `mesh.envoy_memory.enabled: true` changes that, keeping the
 peer's turns and what the node sent back per (sender identity, thread) so a follow-up is answered in context; the
 record never holds your own transcript, is bounded by the five `mesh.envoy_memory.*` limits, goes with the identity's
-trust when you untrust or block it, and `.mesh memory forget <identity|all> [thread]` wipes it at will. See
+trust when you `.mesh untrust --identity` or `.mesh block` it (untrusting one of its destinations leaves it), and
+`.mesh memory forget <identity|all> [thread]` wipes it at will. See
 [Conversation memory](https://github.com/Dark-Alex-17/coyote/wiki/Mesh#conversation-memory).
 
 | Setting                           | Default Value   | Description                                                                                                                                                                  |
