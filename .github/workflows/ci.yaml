@@ -160,3 +160,287 @@ jobs:
           echo "### Mesh interop wall-clock: $((end - ${start:-$end})) s"
           echo "Outcome: ${{ job.status }}"
         } >> "$GITHUB_STEP_SUMMARY"
+
+  # The shell and PowerShell scripts under scripts/: shellcheck and PSScriptAnalyzer on
+  # the ubuntu leg, then the mesh relay script's install, config and idempotency paths
+  # under a throwaway HOME on all three OSes — a dry run writes nothing, a real run
+  # installs rnsd and writes the Reticulum config, a second run changes nothing, an
+  # existing config is printed around and never touched, usage errors and a root run
+  # without --allow-root exit 1. Service installation is NOT exercised here: GitHub
+  # runners have no user session manager (no `systemctl --user` bus, no logged-in
+  # launchd GUI domain, no interactive logon for a Scheduled Task), so that path is the
+  # manual-VM acceptance.
+  scripts:
+    name: Scripts
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+        - ubuntu-latest
+        - macos-latest
+        - windows-latest
+
+    runs-on: ${{matrix.os}}
+
+    timeout-minutes: 20
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Start The Clock
+      run: echo "start=$(date +%s)" >> "$GITHUB_ENV"
+
+    # Both linters are version-pinned on purpose (shellcheck by the runner image,
+    # PSScriptAnalyzer below): a new rule arriving with an upgrade is a deliberate bump
+    # and a reviewed diff, not a red lane on an unrelated PR.
+    - name: ShellCheck
+      if: runner.os == 'Linux'
+      run: |
+        shellcheck --version
+        shellcheck -S style scripts/*.sh scripts/*/*.sh deployment/propagation-node/entrypoint.sh
+
+    - name: PSScriptAnalyzer
+      if: runner.os == 'Linux'
+      shell: pwsh
+      run: |
+        Install-Module PSScriptAnalyzer -RequiredVersion 1.25.0 -Repository PSGallery -Scope CurrentUser -Force
+        Import-Module PSScriptAnalyzer -RequiredVersion 1.25.0
+        $r = Invoke-ScriptAnalyzer -Path scripts -Recurse -Severity Warning,Error
+        $r | Format-Table -AutoSize | Out-String | Write-Output
+        if ($r) { exit 1 }
+
+    - name: Installer Flags
+      shell: pwsh
+      run: |
+        if (-not (Get-Command ./scripts/install_coyote.ps1).Parameters.ContainsKey('WithMesh')) {
+          throw 'install_coyote.ps1 has no -WithMesh parameter'
+        }
+
+    - name: Installer Flags (bash)
+      if: runner.os != 'Windows'
+      run: bash scripts/install_coyote.sh --help | grep -- --with-mesh
+
+    # macOS runs the relay under the runner's /bin/bash 3.2, the bash the README
+    # one-liner lands in on a Mac. `! cmd` is not an assertion under `set -e`, so
+    # expected failures are checked through an explicit exit-code capture. The pipx
+    # and uv tool directories are pointed under the throwaway HOME because the ubuntu
+    # image exports PIPX_HOME=/opt/pipx image-wide, which would leak the install.
+    - name: Mesh Relay Smoke
+      if: runner.os != 'Windows'
+      env:
+        HOME: ${{ runner.temp }}/mesh-home
+        XDG_CONFIG_HOME: ${{ runner.temp }}/mesh-home/.config
+        BIN_DIR: ${{ runner.temp }}/mesh-home/bin
+        PIPX_HOME: ${{ runner.temp }}/mesh-home/pipx
+        PIPX_BIN_DIR: ${{ runner.temp }}/mesh-home/.local/bin
+        UV_TOOL_DIR: ${{ runner.temp }}/mesh-home/uv-tools
+        UV_TOOL_BIN_DIR: ${{ runner.temp }}/mesh-home/.local/bin
+      run: |
+        set -euo pipefail
+        relay=(bash scripts/mesh-relay.sh)
+        if [ "$RUNNER_OS" = macOS ]; then relay=(/bin/bash scripts/mesh-relay.sh); fi
+        mkdir -p "$HOME"
+        cfg="$HOME/.reticulum/config"
+
+        echo "::group::dry run writes nothing"
+        "${relay[@]}" --no-service --dry-run
+        [ ! -e "$HOME/.reticulum" ]
+        [ ! -e "$BIN_DIR/rnsd" ]
+        echo "::endgroup::"
+
+        echo "::group::a relative --bin-dir resolves against the cwd, --version lands in the plan"
+        out=$(cd "$RUNNER_TEMP" && "${relay[0]}" "$GITHUB_WORKSPACE/scripts/mesh-relay.sh" --bin-dir ./rel-bin --no-service --dry-run)
+        printf '%s\n' "$out"
+        grep -q "BIN_DIR: $RUNNER_TEMP/rel-bin" <<<"$out"
+        [ ! -e "$RUNNER_TEMP/rel-bin" ]
+        out=$("${relay[@]}" --version 1.5.2 --no-service --dry-run)
+        printf '%s\n' "$out"
+        grep -q 'rns==1.5.2' <<<"$out"
+        echo "::endgroup::"
+
+        echo "::group::the PowerShell relay refuses a non-Windows host with exit 2"
+        rc=0; pwsh -NoProfile -File scripts/mesh-relay.ps1 -NoService -DryRun || rc=$?; [ "$rc" -eq 2 ]
+        echo "::endgroup::"
+
+        if [ "$RUNNER_OS" = Linux ]; then
+          echo "::group::the systemd plan from the dry run names the absolute rnsd and writes nothing"
+          plan=$("${relay[@]}" --dry-run)
+          printf '%s\n' "$plan"
+          grep -q "ExecStart=$BIN_DIR/rnsd" <<<"$plan"
+          grep -q 'Environment=PYTHONUNBUFFERED=1' <<<"$plan"
+          grep -q 'WantedBy=default.target' <<<"$plan"
+          grep -q 'enable-linger' <<<"$plan"
+          [ ! -e "$XDG_CONFIG_HOME/systemd" ]
+          echo "::endgroup::"
+        fi
+
+        echo "::group::install rnsd and write the config"
+        "${relay[@]}" --no-service
+        "$BIN_DIR/rnsd" --version
+        test -f "$cfg"
+        grep -q '^loglevel = 4' "$cfg"
+        if grep -q share_instance "$cfg"; then
+          echo "::error::the written config sets share_instance"
+          exit 1
+        fi
+        before=$(shasum -a 256 "$cfg")
+        echo "::endgroup::"
+
+        echo "::group::second run changes nothing"
+        out=$("${relay[@]}" --no-service)
+        printf '%s\n' "$out"
+        grep -q 'already exists' <<<"$out"
+        [ "$(shasum -a 256 "$cfg")" = "$before" ]
+        echo "::endgroup::"
+
+        echo "::group::existing config is printed around, never touched"
+        home2="$RUNNER_TEMP/mesh-home-existing"
+        mkdir -p "$home2/.reticulum"
+        printf 'custom\n' > "$home2/.reticulum/config"
+        printf 'custom\n' > "$RUNNER_TEMP/expected-config"
+        out=$(HOME="$home2" "${relay[@]}" --no-service --relay relay.example:4242)
+        printf '%s\n' "$out"
+        cmp "$RUNNER_TEMP/expected-config" "$home2/.reticulum/config"
+        grep -q '\[\[Team Relay\]\]' <<<"$out"
+        grep -q 'target_host = relay.example' <<<"$out"
+        echo "::endgroup::"
+
+        echo "::group::usage errors exit 1, --help exits 0"
+        rc=0; "${relay[@]}" --bogus || rc=$?; [ "$rc" -eq 1 ]
+        rc=0; "${relay[@]}" --no-service --relay nonsense || rc=$?; [ "$rc" -eq 1 ]
+        "${relay[@]}" --help
+        echo "::endgroup::"
+
+        echo "::group::root is refused without --allow-root"
+        rc=0; sudo -E env HOME="$HOME" "${relay[@]}" --no-service --dry-run || rc=$?; [ "$rc" -eq 1 ]
+        sudo -E env HOME="$HOME" "${relay[@]}" --no-service --dry-run --allow-root
+        echo "::endgroup::"
+
+        if [ "$RUNNER_OS" = macOS ]; then
+          echo "::group::the launchd plist from the dry run is valid"
+          plan=$("${relay[@]}" --dry-run)
+          printf '%s\n' "$plan"
+          plist="$RUNNER_TEMP/com.coyote.rnsd.plist"
+          sed -n '/^<?xml /,/^<\/plist>$/p' <<<"$plan" > "$plist"
+          test -s "$plist"
+          plutil -lint "$plist"
+          echo "::endgroup::"
+        fi
+
+    # The runner is Administrator, so every ordinary invocation passes -AllowRoot and the
+    # root-refusal check is the one without it. The relay runs as a child `pwsh -File` so
+    # $LASTEXITCODE is the script's real exit code every time. The pipx and uv tool
+    # directories sit under the throwaway profile so nothing leaks into the image.
+    - name: Mesh Relay Smoke (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      env:
+        USERPROFILE: ${{ runner.temp }}\mesh-home
+        BIN_DIR: ${{ runner.temp }}\mesh-home\bin
+        COYOTE_CONFIG_DIR: ${{ runner.temp }}\mesh-home\coyote-config
+        PIPX_HOME: ${{ runner.temp }}\mesh-home\pipx
+        PIPX_BIN_DIR: ${{ runner.temp }}\mesh-home\.local\bin
+        UV_TOOL_DIR: ${{ runner.temp }}\mesh-home\uv-tools
+        UV_TOOL_BIN_DIR: ${{ runner.temp }}\mesh-home\.local\bin
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $relay = 'scripts/mesh-relay.ps1'
+        function Invoke-Relay([int]$Expect, [string[]]$Flags) {
+          $out = @(& pwsh -NoProfile -File $relay @Flags)
+          if ($LASTEXITCODE -ne $Expect) {
+            $out | Write-Output
+            throw "expected exit $Expect, got $LASTEXITCODE for: $($Flags -join ' ')"
+          }
+          return $out
+        }
+        New-Item -ItemType Directory -Force -Path $env:USERPROFILE | Out-Null
+        $cfg = Join-Path $env:USERPROFILE '.reticulum\config'
+
+        Write-Output '::group::dry run writes nothing'
+        Invoke-Relay 0 @('-NoService', '-DryRun', '-AllowRoot')
+        if (Test-Path (Join-Path $env:USERPROFILE '.reticulum')) { throw 'dry run created .reticulum' }
+        if (Test-Path (Join-Path $env:BIN_DIR 'rnsd.cmd')) { throw 'dry run created rnsd.cmd' }
+        Write-Output '::endgroup::'
+
+        Write-Output '::group::a relative -BinDir is rooted, -Version lands in the plan'
+        $out = Invoke-Relay 0 @('-BinDir', '.\rel-bin', '-NoService', '-DryRun', '-AllowRoot')
+        $out | Write-Output
+        $binLine = $out | Where-Object { $_ -match 'BIN_DIR: ' } | Select-Object -First 1
+        if (-not $binLine) { throw 'the plan has no BIN_DIR line' }
+        $printed = ($binLine -replace '^.*BIN_DIR: ', '')
+        if ($printed -ne (Join-Path (Get-Location).Path 'rel-bin')) { throw "BIN_DIR is not rooted at the cwd: $printed" }
+        if (Test-Path '.\rel-bin') { throw 'dry run created rel-bin' }
+        $out = Invoke-Relay 0 @('-Version', '1.5.2', '-NoService', '-DryRun', '-AllowRoot')
+        if (($out -join "`n") -notmatch 'rns==1\.5\.2') { throw 'the plan lacks rns==1.5.2' }
+        Write-Output '::endgroup::'
+
+        Write-Output '::group::install rnsd and write the config'
+        Invoke-Relay 0 @('-NoService', '-AllowRoot')
+        & (Join-Path $env:BIN_DIR 'rnsd.cmd') --version
+        if ($LASTEXITCODE -ne 0) { throw "rnsd --version exited $LASTEXITCODE" }
+        if (-not (Test-Path $cfg)) { throw "no config at $cfg" }
+        $text = Get-Content -Raw $cfg
+        if ($text -notmatch '(?m)^loglevel = 4') { throw 'config lacks loglevel = 4' }
+        if ($text -match 'share_instance') { throw 'the written config sets share_instance' }
+        $before = (Get-FileHash -Algorithm SHA256 $cfg).Hash
+        Write-Output '::endgroup::'
+
+        Write-Output '::group::second run changes nothing'
+        $out = Invoke-Relay 0 @('-NoService', '-AllowRoot')
+        $out | Write-Output
+        if (($out -join "`n") -notmatch 'already exists') { throw 'second run did not report the existing config' }
+        if ((Get-FileHash -Algorithm SHA256 $cfg).Hash -ne $before) { throw 'second run changed the config' }
+        Write-Output '::endgroup::'
+
+        Write-Output '::group::existing config is printed around, never touched'
+        $home2 = Join-Path $env:RUNNER_TEMP 'mesh-home-existing'
+        New-Item -ItemType Directory -Force -Path (Join-Path $home2 '.reticulum') | Out-Null
+        $cfg2 = Join-Path $home2 '.reticulum\config'
+        Set-Content -Path $cfg2 -Value 'custom'
+        $before2 = (Get-FileHash -Algorithm SHA256 $cfg2).Hash
+        $mainHome = $env:USERPROFILE
+        $env:USERPROFILE = $home2
+        try {
+          $out = Invoke-Relay 0 @('-NoService', '-AllowRoot', '-Relay', 'relay.example:4242')
+        } finally {
+          $env:USERPROFILE = $mainHome
+        }
+        $out | Write-Output
+        if ((Get-FileHash -Algorithm SHA256 $cfg2).Hash -ne $before2) { throw 'an existing config was modified' }
+        $joined = $out -join "`n"
+        if ($joined -notmatch '\[\[Team Relay\]\]') { throw 'stanzas lack [[Team Relay]]' }
+        if ($joined -notmatch 'target_host = relay\.example') { throw 'stanzas lack target_host = relay.example' }
+        Write-Output '::endgroup::'
+
+        Write-Output '::group::usage errors exit 1, -Help exits 0'
+        # An unknown switch is refused by the parameter binder, so exit 1 here is pwsh's own.
+        Invoke-Relay 1 @('-Bogus')
+        Invoke-Relay 1 @('-NoService', '-AllowRoot', '-Relay', 'nonsense')
+        Invoke-Relay 0 @('-Help')
+        Write-Output '::endgroup::'
+
+        Write-Output '::group::Administrator is refused without -AllowRoot'
+        Invoke-Relay 1 @('-NoService', '-DryRun')
+        Write-Output '::endgroup::'
+
+    - name: Mesh Relay Under Windows PowerShell 5.1
+      if: runner.os == 'Windows'
+      shell: powershell
+      env:
+        USERPROFILE: ${{ runner.temp }}\mesh-home
+        BIN_DIR: ${{ runner.temp }}\mesh-home\bin
+        COYOTE_CONFIG_DIR: ${{ runner.temp }}\mesh-home\coyote-config
+      run: |
+        $ErrorActionPreference = 'Stop'
+        powershell -NoProfile -ExecutionPolicy Bypass -File scripts/mesh-relay.ps1 -NoService -DryRun -AllowRoot
+        if ($LASTEXITCODE -ne 0) { throw "mesh-relay.ps1 exited $LASTEXITCODE under Windows PowerShell 5.1" }
+
+    - name: Record Wall-Clock
+      if: always()
+      run: |
+        end=$(date +%s)
+        {
+          echo "### Scripts wall-clock (${{ matrix.os }}): $((end - ${start:-$end})) s"
+          echo "Outcome: ${{ job.status }}"
+        } >> "$GITHUB_STEP_SUMMARY"
