@@ -252,7 +252,7 @@ fn every_verb_row_in_the_wiki_table_matches_the_repl_verbs_table() {
     let verbs = repl_verbs();
     assert_eq!(
         verbs.len(),
-        27,
+        28,
         "parsed {} VERBS rows from src/repl/mesh.rs; if the table grew, update this count",
         verbs.len()
     );
@@ -1278,5 +1278,152 @@ fn usage_probe_the_configuration_page_promises_the_budget_and_timer_semantics_th
             timers.contains(&needle),
             "the Timers section does not say {needle:?}:\n{timers}"
         );
+    }
+}
+
+/// The `envoy_memory:` block is documented wherever the other mesh keys are: the template,
+/// the example, the README table and the Configuration page's yaml block and Keys table
+/// each carry all six keys; every documented default is the `DEFAULT_ENVOY_MEMORY_*`
+/// constant (and `enabled` the `false` of the `Default` impl); the template, example and
+/// wiki yaml lines are byte-equal; and `enabled`'s README and wiki rows say the memory is
+/// off by default.
+#[test]
+fn every_envoy_memory_key_is_documented_on_every_surface_with_the_default_the_code_uses() {
+    let Some(wiki) = wiki_dir() else { return };
+    let page = read(wiki.join("Mesh-Configuration.md"));
+    let template = read(repo_root().join("assets/config-template.yaml"));
+    let example = read(repo_root().join("config.example.yaml"));
+    let readme = read(repo_root().join("README.md"));
+
+    // The lines indented deeper than `envoy_memory:`, so a leaf such as `enabled:` is
+    // looked for in the block and not found on `mesh.enabled`.
+    let block = |label: &str, text: &str| -> String {
+        let lines: Vec<&str> = text.lines().collect();
+        let start = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("envoy_memory:"))
+            .unwrap_or_else(|| panic!("{label} has no `envoy_memory:` block"));
+        let indent = |line: &str| line.len() - line.trim_start().len();
+        let head = indent(lines[start]);
+        lines[start + 1..]
+            .iter()
+            .take_while(|line| indent(line) > head)
+            .copied()
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let template_block = block("assets/config-template.yaml", &template);
+    let example_block = block("config.example.yaml", &example);
+    let page_block = block("Mesh-Configuration.md", &page);
+    let yaml_line = |label: &str, block: &str, key: &str| -> String {
+        block
+            .lines()
+            .find(|line| line.trim_start().starts_with(&format!("{key}:")) && line.contains('#'))
+            .unwrap_or_else(|| {
+                panic!("{label}'s envoy_memory block has no commented `{key}:` line")
+            })
+            .to_string()
+    };
+    let readme_row = |key: &str| -> String {
+        readme
+            .lines()
+            .find(|line| line.starts_with(&format!("| `mesh.envoy_memory.{key}`")))
+            .unwrap_or_else(|| panic!("README.md has no `mesh.envoy_memory.{key}` row"))
+            .to_string()
+    };
+    let wiki_row = |key: &str| -> String {
+        page.lines()
+            .find(|line| line.starts_with(&format!("| `envoy_memory.{key}`")))
+            .unwrap_or_else(|| {
+                panic!("Mesh-Configuration.md has no `envoy_memory.{key}` table row")
+            })
+            .to_string()
+    };
+
+    let config_source = read(repo_root().join("src/config/mesh_config.rs"));
+    let default_impl = config_source
+        .split("\nimpl Default for EnvoyMemoryConfig {")
+        .nth(1)
+        .expect("src/config/mesh_config.rs implements Default for EnvoyMemoryConfig")
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    assert!(
+        default_impl.contains("enabled: false,"),
+        "EnvoyMemoryConfig::default no longer turns the memory off:\n{default_impl}"
+    );
+    let bound = |name: &str| const_u64("src/config/mesh_config.rs", name).to_string();
+    let keys = [
+        ("enabled", "false".to_string()),
+        ("max_sessions", bound("DEFAULT_ENVOY_MEMORY_MAX_SESSIONS")),
+        (
+            "max_per_identity",
+            bound("DEFAULT_ENVOY_MEMORY_MAX_PER_IDENTITY"),
+        ),
+        ("max_turns", bound("DEFAULT_ENVOY_MEMORY_MAX_TURNS")),
+        ("max_bytes", bound("DEFAULT_ENVOY_MEMORY_MAX_BYTES")),
+        ("ttl_hours", bound("DEFAULT_ENVOY_MEMORY_TTL_HOURS")),
+    ];
+
+    for (key, default) in &keys {
+        let template_line = yaml_line("assets/config-template.yaml", &template_block, key);
+        assert_eq!(
+            yaml_line("config.example.yaml", &example_block, key),
+            template_line,
+            "config.example.yaml's `envoy_memory.{key}` line differs from the template"
+        );
+        assert_eq!(
+            yaml_line("Mesh-Configuration.md", &page_block, key),
+            template_line,
+            "Mesh-Configuration.md's `envoy_memory.{key}` line differs from the template"
+        );
+        assert!(
+            template_line
+                .trim_start()
+                .starts_with(&format!("{key}: {default} ")),
+            "the template's `envoy_memory.{key}` value is not {default}: {template_line}"
+        );
+        assert!(
+            template_line.contains(&format!("(default: {default}")),
+            "the template's `envoy_memory.{key}` comment does not name the default {default}: {template_line}"
+        );
+        for (label, row) in [
+            ("README.md", readme_row(key)),
+            ("Mesh-Configuration.md", wiki_row(key)),
+        ] {
+            assert!(
+                table_cells(&row)
+                    .iter()
+                    .any(|cell| cell == &format!("`{default}`")),
+                "{label}'s `envoy_memory.{key}` row does not carry the default `{default}`: {row}"
+            );
+        }
+        if *key == "enabled" {
+            for (label, row) in [
+                ("README.md", readme_row(key)),
+                ("Mesh-Configuration.md", wiki_row(key)),
+            ] {
+                assert!(
+                    row.contains("off by default"),
+                    "{label}'s `envoy_memory.enabled` row does not say the memory is off by default: {row}"
+                );
+            }
+        } else {
+            assert!(
+                template_line.ends_with("must be 1 or more)"),
+                "the template's `envoy_memory.{key}` comment does not end with `must be 1 or more)`: {template_line}"
+            );
+            assert!(
+                readme_row(key).contains("must be `1` or more"),
+                "{}",
+                readme_row(key)
+            );
+            assert_eq!(
+                table_cells(&wiki_row(key)).last().map(String::as_str),
+                Some(">= 1 when enabled"),
+                "{}",
+                wiki_row(key)
+            );
+        }
     }
 }

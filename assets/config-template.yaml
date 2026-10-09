@@ -286,7 +286,7 @@ mesh:
     max_sessions: 256            # Most threads remembered across all peers; the least recently used go first (default: 256; must be 1 or more)
     max_per_identity: 16         # Most threads remembered for one peer identity; the least recently used go first (default: 16; must be 1 or more)
     max_turns: 40                # Most turns kept per thread; the oldest exchange goes first (default: 40; must be 1 or more)
-    max_bytes: 65536             # Most bytes of turn text kept per thread; the oldest exchange goes first (default: 65536; must be 1 or more)
+    max_bytes: 65536             # Most bytes of turn text kept per thread; the oldest exchange goes first, and kept turns that do not fit the envoy model's context are left out of the run, oldest first, and stay remembered (default: 65536; must be 1 or more)
     ttl_hours: 168               # Hours a thread is remembered after its last message (default: 168; must be 1 or more)
 
 # ---- Appearance ----
