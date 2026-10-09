@@ -69,15 +69,25 @@ fn owned_by_me(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// The asset name the installer derives for a musl Linux host of this machine's arch.
-fn asset_name() -> String {
+fn machine_arch() -> &'static str {
     let machine = Command::new("uname").arg("-m").output().unwrap().stdout;
-    let arch = match String::from_utf8_lossy(&machine).trim() {
+    match String::from_utf8_lossy(&machine).trim() {
         "x86_64" | "amd64" => "x86_64",
         "aarch64" | "arm64" => "aarch64",
         other => panic!("unsupported arch {other}"),
-    };
-    format!("coyote-{arch}-unknown-linux-musl.tar.gz")
+    }
+}
+
+/// The asset name the bash installer derives for a musl Linux host of this machine's
+/// arch (its `uname -s` is shimmed to Linux below).
+fn asset_name() -> String {
+    format!("coyote-{}-unknown-linux-musl.tar.gz", machine_arch())
+}
+
+/// The PowerShell installer reads the OS from .NET, not `uname`, so on a Mac it asks
+/// for the Darwin asset; the stub release lists both names for the same tarball.
+fn darwin_asset_name() -> String {
+    format!("coyote-{}-apple-darwin.tar.gz", machine_arch())
 }
 
 /// A throwaway HOME. `XDG_CONFIG_HOME` and `BIN_DIR` sit inside it so every path the
@@ -226,7 +236,8 @@ impl Tools {
         fs::write(
             &json,
             format!(
-                r#"{{"assets":[{{"name":"{asset}","browser_download_url":"https://example.invalid/{asset}"}}]}}"#
+                r#"{{"assets":[{{"name":"{asset}","browser_download_url":"https://example.invalid/{asset}"}},{{"name":"{darwin}","browser_download_url":"https://example.invalid/{darwin}"}}]}}"#,
+                darwin = darwin_asset_name(),
             ),
         )
         .unwrap();
@@ -248,13 +259,14 @@ while [ $# -gt 0 ]; do
 done
 case "$url" in
   */releases/*) cat "{json}" ;;
-  */{asset}) cp "{tarball}" "$out" ;;
+  */{asset}|*/{darwin}) cp "{tarball}" "$out" ;;
   */mesh-relay.sh) [ -f "{stub}" ] && cat "{stub}" || exit 22 ;;
   *) exit 22 ;;
 esac
 "#,
                 log = log.display(),
                 json = json.display(),
+                darwin = darwin_asset_name(),
                 tarball = tarball.display(),
                 stub = relay_stub.display(),
             ),
@@ -307,7 +319,7 @@ done
 serve() {{ if [ "$out" = - ]; then cat "$1"; else cp "$1" "$out"; fi; }}
 case "$url" in
   */releases/*) serve "{json}" ;;
-  */{asset}) serve "{tarball}" ;;
+  */{asset}|*/{darwin}) serve "{tarball}" ;;
   */mesh-relay.sh) [ -f "{stub}" ] && serve "{stub}" || exit 8 ;;
   *) exit 8 ;;
 esac
@@ -315,6 +327,7 @@ esac
                 log = self.log.display(),
                 json = self.json.display(),
                 asset = asset_name(),
+                darwin = darwin_asset_name(),
                 tarball = self.tarball.display(),
                 stub = self.relay_stub.display(),
             ),
@@ -735,7 +748,7 @@ impl PwshDriver {
 function global:Invoke-WebRequest {{
   param([string]$Uri, $Headers, [string]$OutFile, [switch]$UseBasicParsing)
   Add-Content -LiteralPath '{log}' -Value "iwr $Uri"
-  if ($Uri.EndsWith('/{asset}')) {{ Copy-Item -LiteralPath '{tarball}' -Destination $OutFile; return }}
+  if ($Uri.EndsWith('/{asset}') -or $Uri.EndsWith('/{darwin}')) {{ Copy-Item -LiteralPath '{tarball}' -Destination $OutFile; return }}
   if ($Uri.EndsWith('/mesh-relay.sh') -and (Test-Path -LiteralPath '{stub}')) {{ Copy-Item -LiteralPath '{stub}' -Destination $OutFile; return }}
   throw "404 Not Found: $Uri"
 }}
@@ -745,6 +758,7 @@ exit $LASTEXITCODE
                 log = log.display(),
                 json = tools.json.display(),
                 asset = asset_name(),
+                darwin = darwin_asset_name(),
                 tarball = tools.tarball.display(),
                 stub = tools.relay_stub.display(),
                 installer = installer_copy.display(),
@@ -864,6 +878,20 @@ fn the_powershell_installer_points_fetches_and_exits_3_the_same_way_as_the_bash_
     assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
     assert!(out.contains("relay-stub-ran"), "{out}");
     assert!(err.is_empty(), "{err}");
+
+    // -WithMesh as root with the fetched relay failing: exit 3, and the retry hint names the normal user.
+    let home = Home::new("pwsh-fake-root-with-mesh");
+    let tools = Tools::new(&home);
+    tools.fake_root();
+    tools.serve_relay("exit 1\n");
+    let driver = PwshDriver::new(&home, &tools);
+    let (code, out, err) = driver.run(&pwsh, &home, &["-WithMesh"]);
+    assert_eq!(code, 3, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(err.contains("mesh setup exited with code 1"), "{err}");
+    assert!(
+        err.trim_end().ends_with("as your normal user"),
+        "the retry hint is addressed to the normal user:\n{err}"
+    );
 
     // An rnsd already in BinDir: an upgrade, so no pointer.
     let home = Home::new("pwsh-upgrade");

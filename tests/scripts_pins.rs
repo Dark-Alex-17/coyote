@@ -186,6 +186,7 @@ fn the_windows_script_carries_the_scheduled_task_and_readiness_contract() {
 /// heredoc bash 3.2 mis-scans when the prose holds an apostrophe.
 #[test]
 fn the_bash_scripts_stay_within_bash_3_2() {
+    let quoted_replacement = Regex::new(r#"\$\{[^}]*//[^}]*/""#).unwrap();
     for name in ["mesh-relay.sh", "install_coyote.sh"] {
         let script = read(scripts_dir().join(name));
         for (line_no, line) in script.lines().enumerate() {
@@ -239,6 +240,11 @@ fn the_bash_scripts_stay_within_bash_3_2() {
                     line_no + 1
                 );
             }
+            assert!(
+                !quoted_replacement.is_match(line).unwrap(),
+                "{name}:{} quotes the replacement of a pattern substitution; bash 3.2 keeps those quotes literally in the result: {line}",
+                line_no + 1
+            );
         }
         assert!(
             script.contains("set -euo pipefail"),
@@ -417,6 +423,13 @@ fn usage_probe_the_ci_scripts_job_lints_and_smokes_the_relay_on_every_runner_fam
             &["--no-service --dry-run", "'-NoService', '-DryRun'"][..],
         ),
         (
+            "dry run changes nothing",
+            &[
+                "[ ! -e \"$HOME/.reticulum\" ]",
+                "dry run created .reticulum",
+            ],
+        ),
+        (
             "install + rnsd --version",
             &["\"$BIN_DIR/rnsd\" --version", "'rnsd.cmd') --version"],
         ),
@@ -425,10 +438,21 @@ fn usage_probe_the_ci_scripts_job_lints_and_smokes_the_relay_on_every_runner_fam
             &["shasum -a 256", "Get-FileHash -Algorithm SHA256"],
         ),
         (
+            "re-run reports the existing config",
+            &["grep -q 'already exists'", "-notmatch 'already exists'"],
+        ),
+        (
             "pre-existing config byte-identical",
             &[
                 "cmp \"$RUNNER_TEMP/expected-config\"",
                 "an existing config was modified",
+            ],
+        ),
+        (
+            "stanzas printed",
+            &[
+                "grep -q '\\[\\[Team Relay\\]\\]'",
+                "stanzas lack [[Team Relay]]",
             ],
         ),
         (
@@ -723,6 +747,19 @@ fn relay_scripts_carry_the_strict_mode_scaffolding() {
         sh.lines().rev().find(|line| !line.trim().is_empty()),
         Some("main \"$@\""),
         "mesh-relay.sh must end with `main \"$@\"` so a truncated download executes nothing"
+    );
+    let xml_escape = sh
+        .split("xml_escape() {")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}").next())
+        .expect("mesh-relay.sh defines xml_escape");
+    assert!(
+        xml_escape.contains("| sed "),
+        "xml_escape must escape through sed: bash 3.2 keeps quotes inside a ${{text//x/y}} replacement literally and bash 5.2 reads an unquoted `&` there as the matched text:\n{xml_escape}"
+    );
+    assert!(
+        !sh.contains("# shellcheck"),
+        "mesh-relay.sh must lint clean without shellcheck directives; fix the finding instead of disabling it"
     );
     let ps1 = read(scripts_dir().join("mesh-relay.ps1"));
     assert!(

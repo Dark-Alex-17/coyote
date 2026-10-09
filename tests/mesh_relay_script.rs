@@ -47,15 +47,19 @@ fn on_path(name: &str) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-fn running_as_root() -> bool {
-    static ROOT: OnceLock<bool> = OnceLock::new();
-    *ROOT.get_or_init(|| {
+fn current_uid() -> &'static str {
+    static UID: OnceLock<String> = OnceLock::new();
+    UID.get_or_init(|| {
         Command::new("id")
             .arg("-u")
             .output()
-            .map(|out| String::from_utf8_lossy(&out.stdout).trim() == "0")
-            .unwrap_or(false)
+            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+            .unwrap_or_default()
     })
+}
+
+fn running_as_root() -> bool {
+    current_uid() == "0"
 }
 
 /// A throwaway HOME. `XDG_CONFIG_HOME` and `BIN_DIR` sit inside it so every path the
@@ -1431,6 +1435,102 @@ fn a_running_service_is_not_restarted_a_changed_unit_earns_a_note_and_a_squatter
         !recorded(&log).contains("restart"),
         "the restart is advice, never run:\n{}",
         recorded(&log)
+    );
+}
+
+/// A dry run against an active service with a stale unit on disk says what the real
+/// run would say: the restart note, with the unit text still printed and nothing
+/// written or run.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_linux_dry_run_over_a_stale_unit_and_an_active_service_prints_the_restart_note() {
+    let bash = bash_or_skip!();
+    let home = Home::new("stale-dry");
+    home.seed_rnsd();
+    let log = home.path().join("calls.log");
+    let tools = Tools::new(&home);
+    tools.fake("systemctl", &log, "exit 0");
+    let unit = home.config_home().join("systemd/user/coyote-rnsd.service");
+    fs::create_dir_all(unit.parent().unwrap()).unwrap();
+    fs::write(&unit, "[Unit]\nDescription=stale\n").unwrap();
+    fs::write(&log, "").unwrap();
+    let before = home.entries();
+
+    let (code, out, err) = run(home.relay(&bash, &["--dry-run"]).env("PATH", tools.path()));
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    for needle in [
+        &format!("Would write {}:", unit.display()),
+        "Description=Reticulum daemon for Coyote mesh",
+        "Note: the service definition changed; apply it with: systemctl --user restart coyote-rnsd",
+    ] {
+        assert!(out.contains(needle), "plan lacks {needle:?}:\n{out}");
+    }
+    assert!(
+        !out.contains("nothing to do") && !out.contains("not restarted"),
+        "{out}"
+    );
+    assert_eq!(home.entries(), before, "the dry run changed the home");
+    assert_eq!(
+        fs::read_to_string(&unit).unwrap(),
+        "[Unit]\nDescription=stale\n",
+        "the dry run rewrote the unit"
+    );
+    let calls = recorded(&log);
+    assert!(
+        !calls.contains("daemon-reload") && !calls.contains("enable") && !calls.contains("restart"),
+        "a dry run only probes systemctl:\n{calls}"
+    );
+}
+
+/// The Darwin twin: a loaded agent whose plist on disk is stale gets the bootout +
+/// bootstrap note instead of "nothing to do", and the plist is left as it was.
+#[test]
+fn a_darwin_dry_run_over_a_stale_plist_and_a_loaded_agent_prints_the_bootstrap_note() {
+    let bash = bash_or_skip!();
+    let home = Home::new("stale-launchd");
+    home.seed_rnsd();
+    let log = home.path().join("calls.log");
+    let tools = Tools::new(&home);
+    tools.uname_answering("Darwin").fake(
+        "launchctl",
+        &log,
+        "case \"$1\" in print) exit 0 ;; esac\nexit 1",
+    );
+    let plist = home
+        .path()
+        .join("Library/LaunchAgents/com.coyote.rnsd.plist");
+    fs::create_dir_all(plist.parent().unwrap()).unwrap();
+    fs::write(&plist, "<plist>stale</plist>\n").unwrap();
+    fs::write(&log, "").unwrap();
+    let before = home.entries();
+
+    let (code, out, err) = run(home.relay(&bash, &["--dry-run"]).env("PATH", tools.path()));
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    for needle in [
+        &format!("Would write {}:", plist.display()),
+        "<string>com.coyote.rnsd</string>",
+        &format!(
+            "Note: the service definition changed; apply it with: launchctl bootout gui/{uid}/com.coyote.rnsd && launchctl bootstrap gui/{uid} \"{}\"",
+            plist.display(),
+            uid = current_uid()
+        ),
+    ] {
+        assert!(out.contains(needle), "plan lacks {needle:?}:\n{out}");
+    }
+    assert!(
+        !out.contains("nothing to do") && !out.contains("not restarted"),
+        "{out}"
+    );
+    assert_eq!(home.entries(), before, "the dry run changed the home");
+    assert_eq!(
+        fs::read_to_string(&plist).unwrap(),
+        "<plist>stale</plist>\n",
+        "the dry run rewrote the plist"
+    );
+    let calls = recorded(&log);
+    assert!(
+        !calls.contains("bootstrap") && !calls.contains("bootout"),
+        "a dry run only probes launchctl:\n{calls}"
     );
 }
 
