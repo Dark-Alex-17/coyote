@@ -401,7 +401,9 @@ impl EnvoySessions {
     /// writers landing together (a run's exchange and the owner's late answer) both
     /// stay. With `create`, a thread the store does not hold becomes a record of
     /// `new_turns` alone; without it nothing is written for one. A record under the
-    /// key that this build cannot read, or that names another identity, is refused.
+    /// key that this build cannot read, or that names another identity, is refused. One
+    /// past `ttl_hours` since its last save is forgotten first and counts as not held:
+    /// a late turn never revives an expired thread.
     pub(crate) fn append(
         &self,
         identity: &str,
@@ -460,7 +462,22 @@ impl EnvoySessions {
         let _guard = self.write_lock.lock();
         let _file_lock = self.file_lock()?;
         let mut index = self.read_index()?;
-        let indexed = self.owned(&index, &key, &identity)?;
+        let indexed = match self.owned(&index, &key, &identity)? {
+            Some(indexed)
+                if matches!(mode, Write::Append { .. })
+                    && is_expired(
+                        &index.entries[indexed.position].last_used,
+                        now,
+                        self.limits.ttl,
+                    ) =>
+            {
+                index.entries.remove(indexed.position);
+                self.remove_record(&key)?;
+                self.write_index(&index)?;
+                None
+            }
+            indexed => indexed,
+        };
         let position = indexed.as_ref().map(|indexed| indexed.position);
         let mut turns = match mode {
             Write::Replace => turns,
@@ -1422,6 +1439,41 @@ mod tests {
             vec![user("may I?"), assistant("yes"), assistant("no")]
         );
         assert_eq!(held.last_used, rfc3339_utc(t(1_002)));
+    }
+
+    #[test]
+    fn an_append_never_revives_an_expired_thread() {
+        let tmp = TempDir::new("envoy-sessions-append-expired");
+        let config = EnvoyMemoryConfig {
+            ttl_hours: 1,
+            ..enabled()
+        };
+        let store = store(&tmp, &config);
+        store
+            .save(IDENTITY_A, "thread-one", exchange(1), t(1_000))
+            .unwrap();
+        let late = t(1_000 + 3_601);
+
+        store
+            .append_once(IDENTITY_A, "thread-one", assistant("late"), late)
+            .unwrap();
+        assert_eq!(store.load(IDENTITY_A, "thread-one", late).unwrap(), None);
+        assert!(!record_path(&store, IDENTITY_A, "thread-one").exists());
+        assert_eq!(store.stats().unwrap(), (0, 0));
+
+        store
+            .save(IDENTITY_A, "thread-one", exchange(1), t(1_000))
+            .unwrap();
+        store
+            .append(IDENTITY_A, "thread-one", exchange(2), late, true)
+            .unwrap();
+        let held = store.load(IDENTITY_A, "thread-one", late).unwrap().unwrap();
+        assert_eq!(
+            held.turns,
+            exchange(2),
+            "with create the expired turns go and only the new ones are the thread"
+        );
+        assert_eq!(held.last_used, rfc3339_utc(late));
     }
 
     #[test]
