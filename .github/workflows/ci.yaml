@@ -191,9 +191,9 @@ jobs:
     - name: Start The Clock
       run: echo "start=$(date +%s)" >> "$GITHUB_ENV"
 
-    # Both linters are version-pinned on purpose (shellcheck by the runner image,
-    # PSScriptAnalyzer below): a new rule arriving with an upgrade is a deliberate bump
-    # and a reviewed diff, not a red lane on an unrelated PR.
+    # shellcheck is whatever the runner image ships, so its version is printed for the
+    # log; PSScriptAnalyzer is pinned below so a new rule arriving with an upgrade is a
+    # deliberate bump and a reviewed diff, not a red lane on an unrelated PR.
     - name: ShellCheck
       if: runner.os == 'Linux'
       run: |
@@ -203,9 +203,11 @@ jobs:
     - name: PSScriptAnalyzer
       if: runner.os == 'Linux'
       shell: pwsh
+      env:
+        PSSA_VERSION: 1.25.0
       run: |
-        Install-Module PSScriptAnalyzer -RequiredVersion 1.25.0 -Repository PSGallery -Scope CurrentUser -Force
-        Import-Module PSScriptAnalyzer -RequiredVersion 1.25.0
+        Install-Module PSScriptAnalyzer -RequiredVersion $env:PSSA_VERSION -Repository PSGallery -Scope CurrentUser -Force
+        Import-Module PSScriptAnalyzer -RequiredVersion $env:PSSA_VERSION
         $r = Invoke-ScriptAnalyzer -Path scripts -Recurse -Severity Warning,Error
         $r | Format-Table -AutoSize | Out-String | Write-Output
         if ($r) { exit 1 }
@@ -219,7 +221,16 @@ jobs:
 
     - name: Installer Flags (bash)
       if: runner.os != 'Windows'
-      run: bash scripts/install_coyote.sh --help | grep -- --with-mesh
+      run: |
+        bash=bash
+        if [ "$RUNNER_OS" = macOS ]; then bash=/bin/bash; fi
+        "$bash" scripts/install_coyote.sh --help | grep -- --with-mesh
+
+    - name: The Bash Relay Refuses Git Bash With Exit 2
+      if: runner.os == 'Windows'
+      shell: bash
+      run: |
+        rc=0; bash scripts/mesh-relay.sh --no-service --dry-run || rc=$?; [ "$rc" -eq 2 ]
 
     # macOS runs the relay under the runner's /bin/bash 3.2, the bash the README
     # one-liner lands in on a Mac. `! cmd` is not an assertion under `set -e`, so
@@ -254,9 +265,9 @@ jobs:
         printf '%s\n' "$out"
         grep -q "BIN_DIR: $RUNNER_TEMP/rel-bin" <<<"$out"
         [ ! -e "$RUNNER_TEMP/rel-bin" ]
-        out=$("${relay[@]}" --version 1.5.2 --no-service --dry-run)
+        out=$("${relay[@]}" --version 1.5.1 --no-service --dry-run)
         printf '%s\n' "$out"
-        grep -q 'rns==1.5.2' <<<"$out"
+        grep -q 'rns==1.5.1' <<<"$out"
         echo "::endgroup::"
 
         echo "::group::the PowerShell relay refuses a non-Windows host with exit 2"
@@ -267,7 +278,7 @@ jobs:
           echo "::group::the systemd plan from the dry run names the absolute rnsd and writes nothing"
           plan=$("${relay[@]}" --dry-run)
           printf '%s\n' "$plan"
-          grep -q "ExecStart=$BIN_DIR/rnsd" <<<"$plan"
+          grep -q "ExecStart=\"$BIN_DIR/rnsd\"" <<<"$plan"
           grep -q 'Environment=PYTHONUNBUFFERED=1' <<<"$plan"
           grep -q 'WantedBy=default.target' <<<"$plan"
           grep -q 'enable-linger' <<<"$plan"
@@ -363,6 +374,15 @@ jobs:
         if (Test-Path (Join-Path $env:BIN_DIR 'rnsd.cmd')) { throw 'dry run created rnsd.cmd' }
         Write-Output '::endgroup::'
 
+        Write-Output '::group::the Scheduled Task plan from the dry run names the task, the log and the environment, and registers nothing'
+        $plan = (Invoke-Relay 0 @('-DryRun', '-AllowRoot')) -join "`n"
+        $plan | Write-Output
+        foreach ($needle in @('PYTHONUNBUFFERED=1', 'rnsd\.log', 'Coyote rnsd', 'Register-ScheduledTask')) {
+          if ($plan -notmatch $needle) { throw "the plan lacks $needle" }
+        }
+        if ($null -ne (Get-ScheduledTask -TaskName 'Coyote rnsd' -ErrorAction SilentlyContinue)) { throw 'the dry run registered the task' }
+        Write-Output '::endgroup::'
+
         Write-Output '::group::a relative -BinDir is rooted, -Version lands in the plan'
         $out = Invoke-Relay 0 @('-BinDir', '.\rel-bin', '-NoService', '-DryRun', '-AllowRoot')
         $out | Write-Output
@@ -371,8 +391,8 @@ jobs:
         $printed = ($binLine -replace '^.*BIN_DIR: ', '')
         if ($printed -ne (Join-Path (Get-Location).Path 'rel-bin')) { throw "BIN_DIR is not rooted at the cwd: $printed" }
         if (Test-Path '.\rel-bin') { throw 'dry run created rel-bin' }
-        $out = Invoke-Relay 0 @('-Version', '1.5.2', '-NoService', '-DryRun', '-AllowRoot')
-        if (($out -join "`n") -notmatch 'rns==1\.5\.2') { throw 'the plan lacks rns==1.5.2' }
+        $out = Invoke-Relay 0 @('-Version', '1.5.1', '-NoService', '-DryRun', '-AllowRoot')
+        if (($out -join "`n") -notmatch 'rns==1\.5\.1') { throw 'the plan lacks rns==1.5.1' }
         Write-Output '::endgroup::'
 
         Write-Output '::group::install rnsd and write the config'
@@ -432,7 +452,8 @@ jobs:
         BIN_DIR: ${{ runner.temp }}\mesh-home\bin
         COYOTE_CONFIG_DIR: ${{ runner.temp }}\mesh-home\coyote-config
       run: |
-        $ErrorActionPreference = 'Stop'
+        # A native command's stderr must not become a terminating error; $LASTEXITCODE is the oracle.
+        $ErrorActionPreference = 'Continue'
         powershell -NoProfile -ExecutionPolicy Bypass -File scripts/mesh-relay.ps1 -NoService -DryRun -AllowRoot
         if ($LASTEXITCODE -ne 0) { throw "mesh-relay.ps1 exited $LASTEXITCODE under Windows PowerShell 5.1" }
 
