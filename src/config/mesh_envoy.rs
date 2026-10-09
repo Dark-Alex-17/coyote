@@ -1218,12 +1218,12 @@ fn first_pending(queue: &EscalationQueue) -> Option<EscalationRequest> {
 
 /// Adds this exchange to what the envoy remembers of the sender's thread: the peer's
 /// fenced turn and the words the node said to the peer, nothing of the brief or the
-/// card. Written before the send and whether or not it then succeeds: the words are
-/// the node's own either way, and the peer may hear them on a retry. A follow-up's
-/// exchange goes after whatever the store holds by now, not after what the run was
-/// started with, so an answer the owner gave meanwhile stays; a root message's
-/// exchange is the whole of its thread. The store cuts and evicts; a record it
-/// refuses stays as it was.
+/// per-run peer section. Written before the send and whether or not it then succeeds:
+/// the words are the node's own either way, and the peer may hear them on a retry. A
+/// follow-up's exchange goes after whatever the store holds by now, not after what the
+/// run was started with, so an answer the owner gave meanwhile stays; a root message's
+/// exchange is the whole of its thread. The store cuts and evicts; a record it refuses
+/// stays as it was.
 fn remember_exchange(
     store: &EnvoySessions,
     message: &PeerMessage,
