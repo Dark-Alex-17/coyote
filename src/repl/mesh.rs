@@ -12227,6 +12227,129 @@ mod tests {
                 });
             }
 
+            /// Usage probe: trust is per config directory while the envoy's memory is
+            /// per instance, so `.mesh block` and `.mesh forget --identity` through the
+            /// REPL forget the identity's threads in a store this node does not serve
+            /// (a fork's, or one left by an earlier key) as well as in its own, leave
+            /// every other identity's threads in both, and a second revocation of the
+            /// same identity finds nothing to forget and refuses nothing. `.mesh untrust
+            /// <destination>` leaves both stores as they were.
+            #[test]
+            #[serial]
+            fn usage_probe_block_and_forget_identity_through_the_repl_sweep_a_store_this_node_does_not_serve()
+             {
+                use crate::config::mesh_config::EnvoyMemoryConfig;
+                use crate::mesh::envoy_sessions::{EnvoyRole, EnvoySessions, EnvoyTurn};
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-envoy-memory-sweep");
+                let _capture = capture::install();
+                let _script = prompt_script::install(&[]);
+                run_async(async {
+                    let config = EnvoyMemoryConfig {
+                        enabled: true,
+                        ..EnvoyMemoryConfig::default()
+                    };
+                    let started = started_runtime_with("repl-mesh-envoy-memory-sweep", {
+                        let config = config.clone();
+                        move |c| c.envoy_memory = config
+                    })
+                    .await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let trust = started.runtime.trust();
+                    let served = started
+                        .runtime
+                        .envoy_memory()
+                        .expect("an enabled store is opened at start");
+                    let other_instance = Session::default().ensure_mesh_instance_id().to_string();
+                    let unserved =
+                        EnvoySessions::open(started.runtime.cache_dir(), &other_instance, &config)
+                            .unwrap();
+                    assert_ne!(served.dir(), unserved.dir());
+                    let slot: &dyn LiveMesh = ctx.app.mesh.as_ref();
+                    let now = SystemTime::now();
+                    let turns = vec![
+                        EnvoyTurn {
+                            role: EnvoyRole::User,
+                            text: "where were we?".into(),
+                        },
+                        EnvoyTurn {
+                            role: EnvoyRole::Assistant,
+                            text: "the build".into(),
+                        },
+                    ];
+                    let dest_a = heard_trusted_peer(&started.runtime, slot);
+                    let id_a = identity_of(&trust, &dest_a);
+                    let (dest_b, id_b) = heard_peer(&started.runtime, "Bo", now);
+                    trust
+                        .trust_destination(slot, &dest_b, TrustOptions::default(), now)
+                        .unwrap();
+                    let (_dest_c, id_c) = heard_peer(&started.runtime, "Cy", now);
+                    for store in [served.as_ref(), &unserved] {
+                        for (identity, thread) in
+                            [(&id_a, "a-first"), (&id_b, "b-first"), (&id_c, "c-first")]
+                        {
+                            store.save(identity, thread, turns.clone(), now).unwrap();
+                        }
+                    }
+                    let held = |store: &EnvoySessions, identity: &str, thread: &str| {
+                        store.load(identity, thread, now).unwrap().is_some()
+                    };
+                    let both_hold = |identity: &str, thread: &str| {
+                        held(&served, identity, thread) && held(&unserved, identity, thread)
+                    };
+                    let neither_holds = |identity: &str, thread: &str| {
+                        !held(&served, identity, thread) && !held(&unserved, identity, thread)
+                    };
+
+                    let out = out_of(&mut ctx, &format!(".mesh untrust {dest_b} --yes"))
+                        .await
+                        .unwrap();
+                    assert!(out.contains("Untrusted"), "{out}");
+                    assert!(
+                        both_hold(&id_b, "b-first"),
+                        "a destination untrust sweeps no store"
+                    );
+
+                    let token = format!("untrust-{}", short(&id_a));
+                    let out = out_of(
+                        &mut ctx,
+                        &format!(".mesh forget --identity {id_a} --confirm {token}"),
+                    )
+                    .await
+                    .unwrap();
+                    assert!(out.contains("Untrusted identity"), "{out}");
+                    assert!(
+                        neither_holds(&id_a, "a-first"),
+                        "the unserved store kept the forgotten identity's thread"
+                    );
+                    assert!(both_hold(&id_b, "b-first") && both_hold(&id_c, "c-first"));
+
+                    let out = out_of(&mut ctx, &format!(".mesh block {id_c} --yes"))
+                        .await
+                        .unwrap();
+                    assert!(out.contains("Blocked"), "{out}");
+                    assert!(
+                        neither_holds(&id_c, "c-first"),
+                        "the unserved store kept the blocked identity's thread"
+                    );
+                    assert!(both_hold(&id_b, "b-first"));
+
+                    // Revoking again finds nothing to forget and is not an error.
+                    let out = out_of(&mut ctx, &format!(".mesh block {id_a} --yes"))
+                        .await
+                        .unwrap();
+                    assert!(out.contains("Blocked"), "{out}");
+                    assert!(neither_holds(&id_a, "a-first"));
+                    assert_eq!(served.stats().unwrap(), (1, 1));
+                    assert_eq!(unserved.stats().unwrap(), (1, 1));
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
             /// With no destination record to read the identity from, the untrust finds it
             /// in the peer table and still writes the deny.
             #[test]

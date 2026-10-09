@@ -8448,4 +8448,328 @@ mod tests {
         assert_eq!(turns[1].text, "answer 0");
         source.remove_dir();
     }
+
+    /// Usage probe: with the memory on, a thread the store holds nothing of is
+    /// prompted exactly as it is with the memory off, system and user turn byte for
+    /// byte, so turning the memory on changes nothing a peer's first message sees.
+    /// Only once the exchange is remembered is the next run any different.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn usage_probe_a_fresh_thread_is_prompted_byte_for_byte_as_with_the_memory_off() {
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-memory-fresh-identical");
+        let (source, _source) = stub_envoy_source();
+        let tmp = TempDir::new("mesh-envoy-memory-fresh-identical");
+        let app = test_app();
+        assert!(app.mesh.envoy_memory().is_none(), "the memory starts off");
+        let idle = RecordingIdleSink::attach(&app);
+
+        let (drive, seen_off) = prompt_recording_drive();
+        let runner = EnvoyRunner::start_with(Arc::clone(&app), drive);
+        assert!(
+            runner
+                .accept(threaded_job(&PEER_IDENTITY, "q-1", "t-9", "what is this?"))
+                .is_ok()
+        );
+        wait_until("the reply with the memory off", || {
+            idle.count("envoy replied:") == 1
+        })
+        .await;
+        runner.stop().await;
+
+        let store = memory_for(&app, &tmp);
+        let (drive, seen_on) = prompt_recording_drive();
+        let runner = EnvoyRunner::start_with(Arc::clone(&app), drive);
+        for (n, id) in ["q-1", "q-2"].into_iter().enumerate() {
+            assert!(
+                runner
+                    .accept(threaded_job(&PEER_IDENTITY, id, "t-9", "what is this?"))
+                    .is_ok()
+            );
+            wait_until("the reply with the memory on", || {
+                idle.count("envoy replied:") == n + 2
+            })
+            .await;
+        }
+        runner.stop().await;
+
+        let seen_off = seen_off.lock();
+        let seen_on = seen_on.lock();
+        assert_eq!(seen_off.len(), 1);
+        assert_eq!(seen_on.len(), 2);
+        assert_eq!(roles_of(&seen_off[0]), roles_of(&seen_on[0]));
+        for (off, on) in seen_off[0].iter().zip(seen_on[0].iter()) {
+            assert_eq!(
+                off.content.to_text(),
+                on.content.to_text(),
+                "a fresh thread's {:?} turn is the same with the memory on",
+                off.role
+            );
+        }
+        assert_eq!(
+            turns_of(&store, &PEER_IDENTITY, "t-9").len(),
+            4,
+            "the memory was on for both runs"
+        );
+        assert_ne!(
+            roles_of(&seen_on[1]),
+            roles_of(&seen_on[0]),
+            "only the resumed run is prompted differently"
+        );
+        source.remove_dir();
+    }
+
+    /// Usage probe: a run that timed out or was interrupted said nothing of its own.
+    /// The thread it was a follow-up in keeps exactly the turns it had, the next
+    /// message in that thread is driven with those turns alone, and a fresh thread
+    /// whose only run ended that way is not opened. Paused time so the ceiling passes.
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn usage_probe_a_timed_out_or_interrupted_run_leaves_the_thread_as_it_was() {
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-memory-cut-runs");
+        let (source, _source) = stub_envoy_source();
+        let tmp = TempDir::new("mesh-envoy-memory-cut-runs");
+        let app = test_app();
+        let store = memory_for(&app, &tmp);
+        let idle = RecordingIdleSink::attach(&app);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let runner = EnvoyRunner::start_with(Arc::clone(&app), {
+            let seen = Arc::clone(&seen);
+            drive_of(move |_, input, _| {
+                let seen = Arc::clone(&seen);
+                async move {
+                    let run = {
+                        let mut seen = seen.lock();
+                        seen.push(input.build_messages().unwrap());
+                        seen.len()
+                    };
+                    match run {
+                        // Runs 1 and 5 answer; 2, 3 and 4 never produce text.
+                        1 | 5 => Ok(format!("answer {}", run - 1)),
+                        _ => std::future::pending::<Result<String>>().await,
+                    }
+                }
+            })
+        });
+
+        assert!(
+            runner
+                .accept(threaded_job(&PEER_IDENTITY, "q-1", "t-9", "first"))
+                .is_ok()
+        );
+        wait_until("the first reply", || idle.count("envoy replied:") == 1).await;
+        let remembered = turns_of(&store, &PEER_IDENTITY, "t-9");
+        assert_eq!(remembered.len(), 2, "{remembered:?}");
+
+        // A follow-up whose run times out at the ceiling.
+        assert!(
+            runner
+                .accept(threaded_job(&PEER_IDENTITY, "q-2", "t-9", "slow one"))
+                .is_ok()
+        );
+        wait_until("the second run to time out", || {
+            idle.count("envoy timed out") == 1
+        })
+        .await;
+        assert_eq!(turns_of(&store, &PEER_IDENTITY, "t-9"), remembered);
+
+        // A follow-up whose run is interrupted.
+        assert!(
+            runner
+                .accept(threaded_job(&PEER_IDENTITY, "q-3", "t-9", "another"))
+                .is_ok()
+        );
+        wait_until("the third run to park", || seen.lock().len() == 3).await;
+        runner.interrupt();
+        wait_until("the third run to be interrupted", || {
+            idle.count("envoy interrupted") == 1
+        })
+        .await;
+        assert_eq!(turns_of(&store, &PEER_IDENTITY, "t-9"), remembered);
+
+        // A fresh thread whose only run times out is not opened.
+        assert!(
+            runner
+                .accept(threaded_job(&PEER_IDENTITY, "q-4", "t-fresh", "hello?"))
+                .is_ok()
+        );
+        wait_until("the fourth run to time out", || {
+            idle.count("envoy timed out") == 2
+        })
+        .await;
+        assert!(turns_of(&store, &PEER_IDENTITY, "t-fresh").is_empty());
+        assert!(
+            !store
+                .dir()
+                .join(format!(
+                    "{}.yaml",
+                    session_key(&hex_lower(&PEER_IDENTITY), "t-fresh").unwrap()
+                ))
+                .exists(),
+            "no record was written for a thread that was never answered"
+        );
+
+        // The next message in the held thread is driven with the one exchange alone.
+        assert!(
+            runner
+                .accept(threaded_job(&PEER_IDENTITY, "q-5", "t-9", "still there?"))
+                .is_ok()
+        );
+        wait_until("the fifth reply", || idle.count("envoy replied:") == 2).await;
+        runner.stop().await;
+
+        let seen = seen.lock();
+        assert_eq!(seen.len(), 5);
+        assert_eq!(
+            roles_of(&seen[4]),
+            vec![
+                MessageRole::System,
+                MessageRole::User,
+                MessageRole::Assistant,
+                MessageRole::User
+            ],
+            "the cut runs added no turn"
+        );
+        assert_eq!(seen[4][2].content.to_text(), "answer 0");
+        assert!(seen[4][3].content.to_text().contains("Message id: q-5"));
+        let turns = turns_of(&store, &PEER_IDENTITY, "t-9");
+        assert_eq!(turns.len(), 4, "{turns:?}");
+        assert!(turns[2].text.contains("Message id: q-5"));
+        assert_eq!(turns[3].text, "answer 4");
+        source.remove_dir();
+    }
+
+    /// Usage probe: with no envoy to run, a follow-up is refused as unavailable and the
+    /// thread keeps the turns it had; a fresh thread is not opened by it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn usage_probe_an_unavailable_envoy_adds_nothing_to_a_remembered_thread() {
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-memory-unavailable");
+        let tmp = TempDir::new("mesh-envoy-memory-unavailable");
+        let app = test_app();
+        let store = memory_for(&app, &tmp);
+        let held = vec![
+            EnvoyTurn {
+                role: EnvoyRole::User,
+                text: "where were we?".into(),
+            },
+            EnvoyTurn {
+                role: EnvoyRole::Assistant,
+                text: "the build".into(),
+            },
+        ];
+        store
+            .save(
+                &hex_lower(&PEER_IDENTITY),
+                "t-9",
+                held.clone(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        let idle = RecordingIdleSink::attach(&app);
+        let runs = Arc::new(AtomicUsize::new(0));
+        let runner = EnvoyRunner::start_with(Arc::clone(&app), {
+            let runs = Arc::clone(&runs);
+            drive_of(move |_, _, _| {
+                runs.fetch_add(1, Ordering::SeqCst);
+                async { Ok("never".into()) }
+            })
+        });
+        for (n, (id, thread)) in [("q-2", "t-9"), ("q-3", "t-fresh")].into_iter().enumerate() {
+            assert!(
+                runner
+                    .accept(threaded_job(&PEER_IDENTITY, id, thread, "and?"))
+                    .is_ok()
+            );
+            wait_until("the run to be refused as unavailable", || {
+                idle.count("envoy unavailable:") == n + 1
+            })
+            .await;
+        }
+        runner.stop().await;
+
+        assert_eq!(runs.load(Ordering::SeqCst), 0, "no drive ever ran");
+        assert_eq!(turns_of(&store, &PEER_IDENTITY, "t-9"), held);
+        assert!(turns_of(&store, &PEER_IDENTITY, "t-fresh").is_empty());
+        assert_eq!(store.stats().unwrap(), (1, 1));
+    }
+
+    /// Usage probe: a follow-up's exchange goes after what the store holds when the
+    /// run ends, so a thread forgotten while its follow-up was running holds that
+    /// follow-up's exchange alone afterwards, not the snapshot the run was prompted
+    /// with put back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn usage_probe_a_thread_forgotten_mid_run_holds_only_the_running_exchange_afterwards() {
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-memory-forgotten-mid-run");
+        let (source, _source) = stub_envoy_source();
+        let tmp = TempDir::new("mesh-envoy-memory-forgotten-mid-run");
+        let app = test_app();
+        let store = memory_for(&app, &tmp);
+        let idle = RecordingIdleSink::attach(&app);
+        let gate = Arc::new(Semaphore::new(0));
+        let held = Arc::new(AtomicBool::new(false));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let runner = EnvoyRunner::start_with(Arc::clone(&app), {
+            let gate = Arc::clone(&gate);
+            let held = Arc::clone(&held);
+            let seen = Arc::clone(&seen);
+            drive_of(move |_, input, _| {
+                let gate = Arc::clone(&gate);
+                let held = Arc::clone(&held);
+                let seen = Arc::clone(&seen);
+                async move {
+                    let run = {
+                        let mut seen = seen.lock();
+                        seen.push(input.build_messages().unwrap());
+                        seen.len()
+                    };
+                    if run == 2 {
+                        held.store(true, Ordering::SeqCst);
+                        gate.acquire().await.unwrap().forget();
+                    }
+                    Ok(format!("answer {}", run - 1))
+                }
+            })
+        });
+        assert!(
+            runner
+                .accept(threaded_job(&PEER_IDENTITY, "q-1", "t-9", "first"))
+                .is_ok()
+        );
+        wait_until("the first reply", || idle.count("envoy replied:") == 1).await;
+        assert!(
+            runner
+                .accept(threaded_job(&PEER_IDENTITY, "q-2", "t-9", "second"))
+                .is_ok()
+        );
+        wait_until("the second run to be held", || held.load(Ordering::SeqCst)).await;
+        assert!(
+            store.delete(&hex_lower(&PEER_IDENTITY), "t-9").unwrap(),
+            "the thread was held and is now forgotten"
+        );
+        gate.add_permits(1);
+        wait_until("the second reply", || idle.count("envoy replied:") == 2).await;
+        runner.stop().await;
+
+        let seen = seen.lock();
+        assert_eq!(
+            roles_of(&seen[1]),
+            vec![
+                MessageRole::System,
+                MessageRole::User,
+                MessageRole::Assistant,
+                MessageRole::User
+            ],
+            "the second run was prompted with the exchange that was held when it started"
+        );
+        let turns = turns_of(&store, &PEER_IDENTITY, "t-9");
+        assert_eq!(turns.len(), 2, "{turns:?}");
+        assert!(
+            turns[0].text.contains("Message id: q-2"),
+            "{}",
+            turns[0].text
+        );
+        assert_eq!(turns[1].text, "answer 1");
+        source.remove_dir();
+    }
 }
