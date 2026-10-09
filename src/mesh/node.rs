@@ -1,4 +1,4 @@
-use crate::config::mesh_config::{MeshConfig, MeshInterface};
+use crate::config::mesh_config::{EnvoyMemoryConfig, MeshConfig, MeshInterface};
 use crate::config::{ForkRekey, Session, paths};
 use crate::mesh::access::{AccessHandler, AccessRouting, AccessSurface, put_back};
 use crate::mesh::announce::{
@@ -302,8 +302,10 @@ pub(crate) struct MeshRuntime {
     cache_dir: PathBuf,
     serving: Arc<FetchServing>,
     /// What the envoy remembers of each peer thread; `None` while `mesh.envoy_memory`
-    /// is off. Bound to the instance the node started as, not rebound on a rekey.
-    envoy_memory: Option<Arc<EnvoySessions>>,
+    /// is off. Bound to the instance the node currently serves: `rebind_envoy_memory`
+    /// re-points it at the fork's store on a re-key.
+    envoy_memory: ArcSwapOption<EnvoySessions>,
+    envoy_memory_config: EnvoyMemoryConfig,
     memory: PeerMemory,
     interface_labels: Vec<String>,
     interface_kinds: Vec<&'static str>,
@@ -501,7 +503,8 @@ impl MeshRuntime {
             inbox_dir,
             cache_dir: paths.cache_dir,
             serving,
-            envoy_memory,
+            envoy_memory: ArcSwapOption::new(envoy_memory),
+            envoy_memory_config: config.envoy_memory.clone(),
             memory: PeerMemory::default(),
             interface_labels: plans.iter().map(InterfacePlan::label).collect(),
             interface_kinds: plans.iter().map(InterfacePlan::kind).collect(),
@@ -569,9 +572,10 @@ impl MeshRuntime {
             runtime.peers.clone(),
             runtime.cancellation_token(),
         )));
-        if let Some(store) = runtime.envoy_memory.clone() {
+        if config.envoy_memory.enabled {
+            let swept = Arc::downgrade(&runtime);
             runtime.register_task(tokio::spawn(sweep_envoy_memory(
-                store,
+                move || swept.upgrade().and_then(|runtime| runtime.envoy_memory()),
                 runtime.cancellation_token(),
             )));
         }
@@ -604,17 +608,29 @@ impl MeshRuntime {
         &self.cache_dir
     }
 
-    /// The envoy's conversation memory, `None` while `mesh.envoy_memory` is off. The
-    /// tests that read it drive a live node, which the loopback fixtures only do on unix.
-    #[cfg_attr(
-        not(all(test, unix)),
-        expect(
-            dead_code,
-            reason = "read by the envoy run flow once it retains conversation memory"
-        )
-    )]
+    /// The envoy's conversation memory for the instance the node currently serves —
+    /// re-pointed to the fork's store by a re-key, so a fork never reads the original's
+    /// conversations; `None` while `mesh.envoy_memory` is off.
     pub(crate) fn envoy_memory(&self) -> Option<Arc<EnvoySessions>> {
-        self.envoy_memory.clone()
+        self.envoy_memory.load_full()
+    }
+
+    /// Opens the envoy memory of `instance_id`, prunes it as `start` would, and remembers
+    /// into it, handing back the store it displaces so a caller that has to undo the
+    /// switch can put it back without touching the disk. The displaced store's directory
+    /// is left as it is: the fork never reads it. A no-op while `mesh.envoy_memory` is off.
+    pub(crate) fn rebind_envoy_memory(&self, instance_id: &str) -> Option<Arc<EnvoySessions>> {
+        let store = EnvoySessions::open(&self.cache_dir, instance_id, &self.envoy_memory_config)
+            .map(Arc::new);
+        if let Some(store) = &store {
+            prune_envoy_memory(store);
+        }
+        self.envoy_memory.swap(store)
+    }
+
+    /// Remembers into `store` again: the infallible half of `rebind_envoy_memory`.
+    pub(crate) fn restore_envoy_memory(&self, store: Option<Arc<EnvoySessions>>) {
+        self.envoy_memory.store(store);
     }
 
     /// The share root's serving state: the local size limit, the grant store and the
@@ -1863,14 +1879,21 @@ fn prune_envoy_memory(store: &EnvoySessions) {
     }
 }
 
-async fn sweep_envoy_memory(store: Arc<EnvoySessions>, cancel: CancellationToken) {
+/// Prunes whatever store `current` hands back on each heartbeat, so a re-key that
+/// re-points the node's memory moves the sweep with it.
+async fn sweep_envoy_memory(
+    current: impl Fn() -> Option<Arc<EnvoySessions>> + Send + 'static,
+    cancel: CancellationToken,
+) {
     let mut ticks = interval(Duration::from_secs(HEARTBEAT_SECS));
     // The first tick of an interval fires immediately; the store was already pruned at start.
     ticks.tick().await;
     loop {
         tokio::select! {
             () = cancel.cancelled() => break,
-            _ = ticks.tick() => prune_envoy_memory(&store),
+            _ = ticks.tick() => if let Some(store) = current() {
+                prune_envoy_memory(&store);
+            },
         }
     }
 }
@@ -2155,18 +2178,18 @@ impl MeshSlot {
         }
     }
 
-    /// Re-keys the running node for a forked session and binds the pending questions and
-    /// the grants to the fork's own files, since a fork asks its own questions and answers
-    /// its own access requests and must not collect or hand out the original's; a no-op
-    /// while the mesh is off. The fork's questions and grants are adopted before the node
-    /// re-keys so a reply or fetch the fork's destination serves at once finds them, and a
-    /// re-key that fails puts the original's back, since the original is what stays
-    /// served. Questions peers escalated before the fork are copied into the fork's
-    /// inbound file so `.mesh answer` still finds them after the switch. A fork pending
-    /// file this Coyote cannot read is logged and the fork starts with no questions
-    /// pending, as `install` does: the node must not be reported as failed for a cache
-    /// file. A fork grants file that cannot be opened refuses the re-key, as it would
-    /// refuse `start`.
+    /// Re-keys the running node for a forked session and binds the pending questions,
+    /// the grants and the envoy's memory to the fork's own files, since a fork asks its
+    /// own questions, answers its own access requests and remembers its own peer threads,
+    /// and must not collect, hand out or read the original's; a no-op while the mesh is
+    /// off. The fork's questions, grants and memory are adopted before the node re-keys
+    /// so a reply or fetch the fork's destination serves at once finds them, and a re-key
+    /// that fails puts the original's back, since the original is what stays served.
+    /// Questions peers escalated before the fork are copied into the fork's inbound file
+    /// so `.mesh answer` still finds them after the switch. A fork pending file this
+    /// Coyote cannot read is logged and the fork starts with no questions pending, as
+    /// `install` does: the node must not be reported as failed for a cache file. A fork
+    /// grants file that cannot be opened refuses the re-key, as it would refuse `start`.
     pub(crate) async fn rekey(&self, rekey: ForkRekey) -> Result<()> {
         let Some(runtime) = self.get() else {
             return Ok(());
@@ -2200,8 +2223,12 @@ impl MeshSlot {
             .context(
                 "The fork's grant store could not be opened, so the node still serves the original instance",
             );
-        let (rekeyed, displaced_grants) = match grants_rebound {
-            Ok(displaced) => (runtime.rekey(rekey).await, Some(displaced)),
+        let (rekeyed, displaced) = match grants_rebound {
+            Ok(displaced_grants) => {
+                let displaced_envoy_memory = runtime.rebind_envoy_memory(&rekey.fork_instance_id);
+                let rekeyed = runtime.rekey(rekey).await;
+                (rekeyed, Some((displaced_grants, displaced_envoy_memory)))
+            }
             Err(err) => (Err(err), None),
         };
         if rekeyed.is_err() {
@@ -2213,9 +2240,10 @@ impl MeshSlot {
                 runtime.cache_dir(),
                 &instance_id,
             )));
-            // The original's store was never closed, so putting it back cannot fail.
-            if let Some(original_grants) = displaced_grants {
+            // The original's stores were never closed, so putting them back cannot fail.
+            if let Some((original_grants, original_envoy_memory)) = displaced {
                 runtime.serving().restore_grants(original_grants);
+                runtime.restore_envoy_memory(original_envoy_memory);
             }
         }
         rekeyed
@@ -8569,7 +8597,8 @@ mod tests {
 
     /// The real sweep future under a paused clock: its first tick is the start's prune
     /// and does nothing; every heartbeat after it prunes, so a thread that expires while
-    /// the node runs goes without a load or save to notice it.
+    /// the node runs goes without a load or save to notice it. Once the store is swapped,
+    /// as a re-key does, the next tick prunes the new store and leaves the old one alone.
     #[tokio::test(start_paused = true)]
     async fn the_envoy_memory_sweep_prunes_on_each_tick() {
         let tmp = TempDir::new("node-envoy-memory-sweep");
@@ -8583,7 +8612,14 @@ mod tests {
             .save(REMEMBERED_PEER, "first", peer_turns(), two_hours_ago())
             .unwrap();
         let cancel = CancellationToken::new();
-        let sweep = tokio::spawn(sweep_envoy_memory(store.clone(), cancel.clone()));
+        let bound = Arc::new(ArcSwapOption::new(Some(store.clone())));
+        let sweep = tokio::spawn(sweep_envoy_memory(
+            {
+                let bound = bound.clone();
+                move || bound.load_full()
+            },
+            cancel.clone(),
+        ));
         let settle = || async {
             for _ in 0..8 {
                 tokio::task::yield_now().await;
@@ -8609,6 +8645,30 @@ mod tests {
             "the tick after prunes too"
         );
         assert_eq!(store.stats().unwrap(), (0, 0));
+
+        store
+            .save(
+                REMEMBERED_PEER,
+                "left-behind",
+                peer_turns(),
+                two_hours_ago(),
+            )
+            .unwrap();
+        let fork_store = Arc::new(EnvoySessions::open(&tmp.path, "fork", &config).unwrap());
+        fork_store
+            .save(REMEMBERED_PEER, "third", peer_turns(), two_hours_ago())
+            .unwrap();
+        bound.store(Some(fork_store.clone()));
+        tokio::time::advance(Duration::from_secs(HEARTBEAT_SECS)).await;
+        settle().await;
+        assert!(
+            !remembered_record(&fork_store, "third").exists(),
+            "the tick after the swap prunes the store now bound"
+        );
+        assert!(
+            remembered_record(&store, "left-behind").exists(),
+            "the displaced store is no longer swept"
+        );
 
         cancel.cancel();
         sweep.await.unwrap();
@@ -9322,6 +9382,117 @@ mod tests {
                 .is_granted(&peer, "docs/fork.md", now)
                 .unwrap(),
             "the refund landed in the fork's own file"
+        );
+        assert!(slot.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    /// A fork remembers into its own envoy memory: after the re-key the node's store is
+    /// the fork's, pruned on the way in, and a thread the original remembered is not
+    /// found there while its record stays on the original's disk.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rekey_rebinds_the_envoy_memory_to_the_fork_instance() {
+        let config = EnvoyMemoryConfig {
+            enabled: true,
+            ttl_hours: 1,
+            ..EnvoyMemoryConfig::default()
+        };
+        let started = started_runtime_with("node-rekey-envoy-memory", |c| {
+            c.envoy_memory = config.clone();
+        })
+        .await;
+        let cache_dir = started.runtime.cache_dir().to_path_buf();
+        let original_id = started.runtime.current_instance_id();
+        let fork_id = fresh_instance_id();
+        let now = SystemTime::now();
+        let original_store = started
+            .runtime
+            .envoy_memory()
+            .expect("an enabled store is opened at start");
+        original_store
+            .save(REMEMBERED_PEER, "original", peer_turns(), now)
+            .unwrap();
+        let fork_store = EnvoySessions::open(&cache_dir, &fork_id, &config).unwrap();
+        fork_store
+            .save(REMEMBERED_PEER, "fork", peer_turns(), now)
+            .unwrap();
+        fork_store
+            .save(REMEMBERED_PEER, "stale", peer_turns(), two_hours_ago())
+            .unwrap();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(started.runtime.clone()).unwrap();
+
+        slot.rekey(ForkRekey {
+            original_instance_id: Some(original_id),
+            fork_instance_id: fork_id,
+        })
+        .await
+        .unwrap();
+
+        let bound = started.runtime.envoy_memory().unwrap();
+        assert_eq!(bound.dir(), fork_store.dir());
+        assert!(bound.load(REMEMBERED_PEER, "fork", now).unwrap().is_some());
+        assert!(
+            bound
+                .load(REMEMBERED_PEER, "original", now)
+                .unwrap()
+                .is_none(),
+            "the fork does not read the original's conversations"
+        );
+        assert!(
+            !remembered_record(&fork_store, "stale").exists(),
+            "the fork's store was pruned on rebind"
+        );
+        assert!(
+            remembered_record(&original_store, "original").exists(),
+            "the original's record is left on its own disk"
+        );
+        assert!(slot.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    /// The envoy memory is rebound before the runtime re-keys; when the runtime then
+    /// refuses (here: the caller named the wrong original instance), the store rolls back
+    /// with the grants, so the node remembers into the original's store and never the
+    /// fork's.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_rekey_leaves_the_original_envoy_memory_bound() {
+        let config = EnvoyMemoryConfig {
+            enabled: true,
+            ttl_hours: 1,
+            ..EnvoyMemoryConfig::default()
+        };
+        let started = started_runtime_with("node-rekey-envoy-memory-refused", |c| {
+            c.envoy_memory = config.clone();
+        })
+        .await;
+        let fork_id = fresh_instance_id();
+        let now = SystemTime::now();
+        let original_store = started.runtime.envoy_memory().unwrap();
+        original_store
+            .save(REMEMBERED_PEER, "original", peer_turns(), now)
+            .unwrap();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(started.runtime.clone()).unwrap();
+
+        let refused = slot
+            .rekey(ForkRekey {
+                original_instance_id: Some(fresh_instance_id()),
+                fork_instance_id: fork_id,
+            })
+            .await;
+
+        assert!(refused.is_err());
+        let bound = started.runtime.envoy_memory().unwrap();
+        assert_eq!(bound.dir(), original_store.dir());
+        assert!(
+            bound
+                .load(REMEMBERED_PEER, "original", now)
+                .unwrap()
+                .is_some(),
+            "the original's memory is back in force"
         );
         assert!(slot.stop().await.unwrap());
         started.relay_handle.abort();
