@@ -899,9 +899,12 @@ impl EnvoyRunner {
     /// A run-time refusal of a stored message is replied to once per identity, per
     /// reason, per hour, on the claim the accept-time refusals spend; one withheld here
     /// is still filed and surfaced, but nothing is sent and nothing is reported unsent.
-    /// Whatever was said to the peer, sent or not, joins what the envoy remembers of
-    /// the thread when `memory` is on; a reply withheld adds nothing, and neither does
-    /// the interim escalated notice.
+    /// What the node itself said to the peer, sent or not, joins what the envoy
+    /// remembers of the thread when `memory` is on: the answer, the decline, the
+    /// hand-off line, the refusal line or the human's held answer. A run that timed
+    /// out, was interrupted, found the envoy unavailable or failed said nothing of its
+    /// own and adds nothing, and neither does a reply withheld or the interim escalated
+    /// notice.
     async fn deliver(
         &self,
         message: PeerMessage,
@@ -968,7 +971,15 @@ impl EnvoyRunner {
         let unsent = if !owed {
             None
         } else {
-            if let Some(memory) = memory {
+            let said_something = human_answer.is_some()
+                || matches!(
+                    outcome,
+                    EnvoyOutcome::Answered(_)
+                        | EnvoyOutcome::Declined(_)
+                        | EnvoyOutcome::Escalated { .. }
+                        | EnvoyOutcome::Refused(_)
+                );
+            if let Some(memory) = memory.filter(|_| said_something) {
                 // The sender's standing is judged again here, not at run start: an
                 // owner who blocked or untrusted it meanwhile had its threads forgotten,
                 // and this write must not bring one back. With no node attached there
@@ -1146,11 +1157,13 @@ fn first_pending(queue: &EscalationQueue) -> Option<EscalationRequest> {
 }
 
 /// Adds this exchange to what the envoy remembers of the sender's thread: the peer's
-/// fenced turn and the words the peer was sent, nothing of the brief or the card. A
-/// follow-up's exchange goes after whatever the store holds by now, not after what
-/// the run was started with, so an answer the owner gave meanwhile stays; a root
-/// message's exchange is the whole of its thread. The store cuts and evicts; a record
-/// it refuses stays as it was.
+/// fenced turn and the words the node said to the peer, nothing of the brief or the
+/// card. Written before the send and whether or not it then succeeds: the words are
+/// the node's own either way, and the peer may hear them on a retry. A follow-up's
+/// exchange goes after whatever the store holds by now, not after what the run was
+/// started with, so an answer the owner gave meanwhile stays; a root message's
+/// exchange is the whole of its thread. The store cuts and evicts; a record it
+/// refuses stays as it was.
 fn remember_exchange(
     store: &EnvoySessions,
     message: &PeerMessage,
@@ -7816,6 +7829,55 @@ mod tests {
             turns[1].text,
             "escalated to the human; no answer yet (ref q-esc)"
         );
+        source.remove_dir();
+    }
+
+    /// A run that failed said nothing of its own: the "cannot answer right now" line
+    /// is not a turn, so the thread is not opened for it, and a thread already held
+    /// gains nothing from it either.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn a_failed_run_is_not_remembered() {
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-memory-failed");
+        let (source, _source) = stub_envoy_source();
+        let tmp = TempDir::new("mesh-envoy-memory-failed");
+        let app = test_app();
+        let store = memory_for(&app, &tmp);
+        let idle = RecordingIdleSink::attach(&app);
+        let runs = Arc::new(AtomicUsize::new(0));
+        let runner = EnvoyRunner::start_with(Arc::clone(&app), {
+            let runs = Arc::clone(&runs);
+            drive_of(move |_, _, _| {
+                let runs = Arc::clone(&runs);
+                async move {
+                    if runs.fetch_add(1, Ordering::SeqCst) == 0 {
+                        Ok("answer".into())
+                    } else {
+                        Err(anyhow::anyhow!("the model went away"))
+                    }
+                }
+            })
+        });
+        for (n, (id, thread)) in [("q-1", "t-9"), ("q-2", "t-9"), ("q-3", "t-fresh")]
+            .into_iter()
+            .enumerate()
+        {
+            assert!(
+                runner
+                    .accept(threaded_job(&PEER_IDENTITY, id, thread, "and?"))
+                    .is_ok()
+            );
+            wait_until("the run to land", || {
+                idle.count("envoy replied:") == 1 && idle.count("envoy failed:") == n
+            })
+            .await;
+        }
+        runner.stop().await;
+
+        let turns = turns_of(&store, &PEER_IDENTITY, "t-9");
+        assert_eq!(turns.len(), 2, "{turns:?}");
+        assert_eq!(turns[1].text, "answer");
+        assert!(turns_of(&store, &PEER_IDENTITY, "t-fresh").is_empty());
         source.remove_dir();
     }
 

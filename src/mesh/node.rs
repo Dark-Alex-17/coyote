@@ -2990,9 +2990,11 @@ impl MeshSlot {
 
     /// The owner's late answer joins the thread the envoy remembers, as the turn after
     /// the hand-off line the run stored when it ended without one, and after whatever
-    /// a run in the thread wrote meanwhile. A thread the store does not hold gets no
-    /// record: an answer with no question before it is not a conversation. A record
-    /// that cannot be read or saved is left as it is.
+    /// a run in the thread wrote meanwhile. Written only once the send succeeded: a
+    /// send that fails puts the question back, and the answer is remembered when it
+    /// is next sent. A thread the store does not hold gets no record: an answer with
+    /// no question before it is not a conversation. A record that cannot be read or
+    /// saved is left as it is.
     fn remember_human_answer(&self, record: &InboundRecord, spoken: &str) {
         let Some(store) = self.envoy_memory() else {
             return;
