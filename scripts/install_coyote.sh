@@ -4,8 +4,8 @@ set -euo pipefail
 # coyote installer (Linux/macOS)
 #
 # Usage examples:
-#   curl -fsSL https://raw.githubusercontent.com/Dark-Alex-17/coyote/main/scripts/install_coyote.sh | bash
-#   curl -fsSL https://raw.githubusercontent.com/Dark-Alex-17/coyote/main/scripts/install_coyote.sh | bash -s -- --version vX.Y.Z
+#   curl -fsSL https://raw.githubusercontent.com/Dark-Alex-17/coyote/refs/heads/main/scripts/install_coyote.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/Dark-Alex-17/coyote/refs/heads/main/scripts/install_coyote.sh | bash -s -- --version vX.Y.Z
 #   BIN_DIR="$HOME/.local/bin" bash scripts/install_coyote.sh
 #
 # Flags / Env:
@@ -17,7 +17,7 @@ set -euo pipefail
 # still installed.
 
 REPO="Dark-Alex-17/coyote"
-MESH_RELAY_URL="https://raw.githubusercontent.com/${REPO}/main/scripts/mesh-relay.sh"
+MESH_RELAY_URL="https://raw.githubusercontent.com/${REPO}/refs/heads/main/scripts/mesh-relay.sh"
 
 usage() {
   echo "coyote installer (Linux/macOS)"
@@ -42,11 +42,28 @@ need_cmd() {
   fi
 }
 
+# The TLS flags this wget understands: busybox wget (Alpine) and old GNU wget lack
+# one or both, and refuse unknown options outright. Expanded as
+# ${WGET_TLS[@]+"${WGET_TLS[@]}"}: bash 3.2 treats an empty array as unset under -u.
+detect_wget_tls() {
+  local help flag
+  WGET_TLS=()
+  help="$(wget --help 2>&1 || true)"
+  for flag in --https-only --secure-protocol; do
+    if grep -q -- "$flag" <<<"$help"; then
+      if [[ "$flag" == "--secure-protocol" ]]; then flag="--secure-protocol=TLSv1_2"; fi
+      WGET_TLS+=("$flag")
+    else
+      log "This wget lacks $flag; downloading without it"
+    fi
+  done
+}
+
 http_get() {
   if [[ "$DL" == "curl" ]]; then
-    curl -fsSL --proto '=https' --tlsv1.2 -H 'User-Agent: coyote-installer' "$1"
+    curl -fsSL --proto '=https' --proto-redir '=https' --tlsv1.2 -H 'User-Agent: coyote-installer' "$1"
   else
-    wget -qO- --https-only --secure-protocol=TLSv1_2 --header='User-Agent: coyote-installer' "$1"
+    wget -qO- ${WGET_TLS[@]+"${WGET_TLS[@]}"} --header='User-Agent: coyote-installer' "$1"
   fi
 }
 
@@ -132,6 +149,7 @@ main() {
     DL=curl
   elif command -v wget >/dev/null 2>&1; then
     DL=wget
+    detect_wget_tls
   else
     echo "Error: need curl or wget" >&2
     exit 1
@@ -241,13 +259,13 @@ main() {
 
     ARCHIVE="$WORK/asset"
     if [[ "$DL" == "curl" ]]; then
-      if ! curl -fL --proto '=https' --tlsv1.2 -H 'User-Agent: coyote-installer' "$ASSET_URL" -o "$ARCHIVE"; then
+      if ! curl -fL --proto '=https' --proto-redir '=https' --tlsv1.2 -H 'User-Agent: coyote-installer' "$ASSET_URL" -o "$ARCHIVE"; then
         log "Failed to download $candidate; trying next candidate"
         TRIED+=("$candidate: download failed")
         continue
       fi
     else
-      if ! wget -q --https-only --secure-protocol=TLSv1_2 --header='User-Agent: coyote-installer' "$ASSET_URL" -O "$ARCHIVE"; then
+      if ! wget -q ${WGET_TLS[@]+"${WGET_TLS[@]}"} --header='User-Agent: coyote-installer' "$ASSET_URL" -O "$ARCHIVE"; then
         log "Failed to download $candidate; trying next candidate"
         TRIED+=("$candidate: download failed")
         continue
@@ -326,7 +344,9 @@ main() {
   if [[ -n "$WITH_MESH" ]]; then
     run_mesh_relay || MESH_RC=$?
     if [[ "$MESH_RC" -ne 0 ]]; then
-      echo "[coyote-install] Error: ${MESH_FAILURE}; coyote itself is installed. Retry with: curl -fsSL ${MESH_RELAY_URL} | bash" >&2
+      RETRY_AS=""
+      if [[ "$(id -u)" -eq 0 ]]; then RETRY_AS=" as your normal user"; fi
+      echo "[coyote-install] Error: ${MESH_FAILURE}; coyote itself is installed. Retry with: curl -fsSL ${MESH_RELAY_URL} | bash${RETRY_AS}" >&2
     fi
   elif [[ ! -e "${BIN_DIR}/rnsd" ]]; then
     if [[ "$(id -u)" -eq 0 ]]; then

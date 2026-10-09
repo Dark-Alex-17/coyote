@@ -2,8 +2,8 @@
 coyote installer (Windows/PowerShell 5+ and PowerShell 7)
 
 Examples:
-  powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr -useb https://raw.githubusercontent.com/Dark-Alex-17/coyote/main/scripts/install_coyote.ps1 | iex"
-  pwsh -c "irm https://raw.githubusercontent.com/Dark-Alex-17/coyote/main/scripts/install_coyote.ps1 | iex -Version vX.Y.Z"
+  powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr -useb https://raw.githubusercontent.com/Dark-Alex-17/coyote/refs/heads/main/scripts/install_coyote.ps1 | iex"
+  pwsh -c "irm https://raw.githubusercontent.com/Dark-Alex-17/coyote/refs/heads/main/scripts/install_coyote.ps1 | iex -Version vX.Y.Z"
 
 Parameters:
   -Version   <tag>         (default: latest)
@@ -26,7 +26,7 @@ if ($Version -and $Version -match '^[0-9]') { $Version = "v$Version" }
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
 $Repo = 'Dark-Alex-17/coyote'
-$MeshRelayBase = "https://raw.githubusercontent.com/$Repo/main/scripts"
+$MeshRelayBase = "https://raw.githubusercontent.com/$Repo/refs/heads/main/scripts"
 
 function Write-Info($msg) { Write-Information -MessageData "[coyote-install] $msg" -InformationAction Continue }
 function Fail($msg) { Write-Error $msg; exit 1 }
@@ -43,21 +43,27 @@ function Write-MeshPointer([string]$Suffix = '') {
   Write-Info "Coyote mesh needs a local Reticulum daemon; set it up any time with: $(Get-MeshCommand)   (or re-run this installer with -WithMesh)$Suffix"
 }
 
-# A checked-out installer's sibling relay script is used only when the invoking user
-# owns it; otherwise the relay is fetched from the pinned URL.
-function Find-SiblingRelay([string]$Name) {
-  if (-not $PSCommandPath) { return $null }
-  $sibling = Join-Path (Split-Path -Parent $PSCommandPath) $Name
-  if (-not (Test-Path -LiteralPath $sibling -PathType Leaf)) { return $null }
+function Test-OwnedByMe([string]$Path) {
+  if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
   if ($isWin) {
-    $acl = Get-Acl -LiteralPath $sibling -ErrorAction SilentlyContinue
+    $acl = Get-Acl -LiteralPath $Path -ErrorAction SilentlyContinue
     $owner = if ($acl) { $acl.Owner } else { $null }
     $me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
   } else {
-    $owner = (Get-Item -LiteralPath $sibling -ErrorAction SilentlyContinue).User
+    $owner = (Get-Item -LiteralPath $Path -ErrorAction SilentlyContinue).User
     $me = [Environment]::UserName
   }
-  if ($owner -and $owner -eq $me) { return $sibling }
+  return [bool]($owner -and $owner -eq $me)
+}
+
+# A checked-out installer's sibling relay script is used only when the invoking user
+# owns both the installer and the sibling; otherwise the relay is fetched from the
+# pinned URL.
+function Find-SiblingRelay([string]$Name) {
+  if (-not $PSCommandPath) { return $null }
+  if (-not (Test-OwnedByMe $PSCommandPath)) { return $null }
+  $sibling = Join-Path (Split-Path -Parent $PSCommandPath) $Name
+  if (Test-OwnedByMe $sibling) { return $sibling }
   return $null
 }
 
@@ -106,9 +112,12 @@ $isAdmin = $false
 if ($isWin) {
   $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
   $isAdmin = ([Security.Principal.WindowsPrincipal]$identity).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+} else {
+  $isAdmin = ((& id -u | Out-String).Trim() -eq '0')
 }
 $script:MeshFailure = ''
 $script:MeshRc = 0
+$script:MeshExplicitRc = 0
 
 if ($isWin) { $os = 'windows' }
 elseif ($isMac) { $os = 'darwin' }
@@ -193,6 +202,11 @@ try {
     Write-Info "Selected asset: $($asset.name)"
     Write-Info "Download URL:  $($asset.browser_download_url)"
 
+    if (-not ([string]$asset.browser_download_url).StartsWith('https://')) {
+      Write-Info "Refusing a non-HTTPS download URL for ${c}; trying next candidate"
+      $tried += "${c}: download URL is not https"
+      continue
+    }
     $archive = Join-Path $work.FullName 'asset'
     try {
       Invoke-WebRequest -UseBasicParsing -Headers @{ 'User-Agent' = 'coyote-installer' } -Uri $asset.browser_download_url -OutFile $archive
@@ -299,8 +313,10 @@ try {
   $rnsdName = if ($isWin) { 'rnsd.cmd' } else { 'rnsd' }
   if ($WithMesh) {
     Invoke-MeshRelay
-    if ($script:MeshRc -ne 0) {
-      [Console]::Error.WriteLine("[coyote-install] Error: $script:MeshFailure; coyote itself is installed. Retry with: $(Get-MeshCommand)")
+    $script:MeshExplicitRc = $script:MeshRc
+    if ($script:MeshExplicitRc -ne 0) {
+      $retryAs = if ($isAdmin) { ' as your normal user' } else { '' }
+      [Console]::Error.WriteLine("[coyote-install] Error: $script:MeshFailure; coyote itself is installed. Retry with: $(Get-MeshCommand)$retryAs")
     }
   } elseif (-not (Test-Path -LiteralPath (Join-Path $BinDir $rnsdName))) {
     if ($isAdmin) {
@@ -322,7 +338,7 @@ try {
   }
 
   Write-Info "Done. Try: coyote --help"
-  if ($script:MeshRc -ne 0) { exit 3 }
+  if ($script:MeshExplicitRc -ne 0) { exit 3 }
 } finally {
   Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $tmp
 }
