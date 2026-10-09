@@ -150,8 +150,26 @@ fn the_windows_script_carries_the_scheduled_task_and_readiness_contract() {
         );
     }
     assert!(
-        installer.contains("https://raw.githubusercontent.com/$Repo/main/scripts"),
+        installer.contains("https://raw.githubusercontent.com/$Repo/refs/heads/main/scripts"),
         "a piped installer must fetch the relay script from the README's ref"
+    );
+    // Only an explicit -WithMesh failure is exit 3; the prompt path records its failure
+    // in $script:MeshRc too, so the exit must key on a value set in the -WithMesh branch alone.
+    assert_eq!(
+        installer.matches("exit 3").count(),
+        1,
+        "install_coyote.ps1 has one exit 3"
+    );
+    assert!(
+        installer.contains("if ($script:MeshExplicitRc -ne 0) { exit 3 }"),
+        "exit 3 must key on the explicit-flag result, not the shared $script:MeshRc"
+    );
+    assert_eq!(
+        installer
+            .matches("$script:MeshExplicitRc = $script:MeshRc")
+            .count(),
+        1,
+        "the explicit-flag result is captured once, inside the -WithMesh branch"
     );
 }
 
@@ -167,7 +185,7 @@ fn the_bash_scripts_stay_within_bash_3_2() {
             if trimmed.starts_with('#') {
                 continue;
             }
-            for (needle, construct) in [
+            for (needle, construct, haystack) in [
                 ("mapfile", "mapfile (bash 4.0)"),
                 ("readarray", "readarray (bash 4.0)"),
                 ("declare -A", "associative arrays (bash 4.0)"),
@@ -175,13 +193,29 @@ fn the_bash_scripts_stay_within_bash_3_2() {
                 (";;&", ";;& case fall-through (bash 4.0)"),
                 ("[[ -v", "[[ -v (bash 4.2)"),
                 ("&>>", "&>> redirection (bash 4.0)"),
+                ("local -n", "local -n namerefs (bash 4.3)"),
+                ("declare -n", "declare -n namerefs (bash 4.3)"),
+                ("coproc", "coproc (bash 4.0)"),
+                ("EPOCHSECONDS", "EPOCHSECONDS (bash 5.0)"),
+                ("EPOCHREALTIME", "EPOCHREALTIME (bash 5.0)"),
+                ("@Q}", "${var@Q} parameter transformation (bash 4.4)"),
+                (";&", ";& case fall-through (bash 4.0)"),
                 (
                     "$(cat <<",
                     "$(cat <<EOF ...) with a heredoc (bash 3.2 mis-scans apostrophes inside it)",
                 ),
-            ] {
+            ]
+            .map(|(needle, construct)| {
+                // `;;&` is reported on its own; the `;&` needle must not fire on it too.
+                let haystack = if needle == ";&" {
+                    line.replace(";;&", "")
+                } else {
+                    line.to_string()
+                };
+                (needle, construct, haystack)
+            }) {
                 assert!(
-                    !line.contains(needle),
+                    !haystack.contains(needle),
                     "{name}:{} uses {construct}: {line}",
                     line_no + 1
                 );
@@ -207,6 +241,345 @@ fn the_bash_scripts_stay_within_bash_3_2() {
             "{name} must never escalate: everything it writes belongs to the user"
         );
     }
+}
+
+/// The text of the `scripts` job in ci.yaml: from its header to the next 2-space-indented
+/// key (the next job). Jobs are the only keys at that indent under `jobs:`.
+fn ci_scripts_job() -> String {
+    let workflow = read(
+        repo_root()
+            .join(".github")
+            .join("workflows")
+            .join("ci.yaml"),
+    )
+    .replace("\r\n", "\n");
+    let header = "\n  scripts:\n";
+    let start = workflow.find(header).expect("ci.yaml has a `scripts` job") + header.len();
+    let rest = &workflow[start..];
+    let end = rest
+        .match_indices("\n  ")
+        .map(|(at, _)| at)
+        .find(|&at| rest[at + 3..].starts_with(|c: char| c != ' ' && c != '\n'))
+        .unwrap_or(rest.len());
+    rest[..end].to_string()
+}
+
+/// The one lane that runs the scripts themselves: both linters pinned, then the relay
+/// smoke on all three runner families under a throwaway HOME with every tool directory
+/// pointed under it, macOS on its own /bin/bash 3.2 and Windows under both PowerShells.
+/// Service installation stays out of CI on purpose and the job says so.
+#[test]
+fn usage_probe_the_ci_scripts_job_lints_and_smokes_the_relay_on_every_runner_family() {
+    let job = ci_scripts_job();
+
+    for os in ["ubuntu-latest", "macos-latest", "windows-latest"] {
+        assert!(
+            job.contains(&format!("- {os}\n")),
+            "the scripts job matrix must include {os}:\n{job}"
+        );
+    }
+
+    let shellcheck = job
+        .lines()
+        .find(|line| line.trim_start().starts_with("shellcheck -S style"))
+        .expect("the job runs `shellcheck -S style` on the shell scripts");
+    for target in [
+        "scripts/*.sh",
+        "scripts/*/*.sh",
+        "deployment/propagation-node/entrypoint.sh",
+    ] {
+        assert!(
+            shellcheck.contains(target),
+            "shellcheck must cover {target}: {shellcheck}"
+        );
+    }
+
+    assert!(
+        job.contains("PSSA_VERSION: 1.25.0"),
+        "PSScriptAnalyzer is pinned at 1.25.0 in one step-level variable so a new rule is a reviewed bump, not a red PR"
+    );
+    assert!(
+        job.contains("Install-Module PSScriptAnalyzer -RequiredVersion $env:PSSA_VERSION"),
+        "PSScriptAnalyzer is installed at the pinned version"
+    );
+    assert!(
+        job.contains("Import-Module PSScriptAnalyzer -RequiredVersion $env:PSSA_VERSION"),
+        "the pinned PSScriptAnalyzer is the one imported (a newer module already on the image must not win)"
+    );
+    assert!(
+        job.contains("Invoke-ScriptAnalyzer -Path scripts -Recurse -Severity Warning,Error"),
+        "every .ps1 under scripts/ is analysed at Warning,Error"
+    );
+    assert!(
+        job.contains("if ($r) { exit 1 }"),
+        "a PSScriptAnalyzer finding must fail the lane, not scroll past"
+    );
+
+    // The throwaway HOME: every directory a rung may write to is under it, on both
+    // smoke steps, so an install never leaks into the runner image.
+    for key in [
+        "PIPX_HOME",
+        "PIPX_BIN_DIR",
+        "UV_TOOL_DIR",
+        "UV_TOOL_BIN_DIR",
+    ] {
+        let settings: Vec<&str> = job
+            .lines()
+            .filter(|line| line.trim_start().starts_with(&format!("{key}:")))
+            .collect();
+        assert_eq!(
+            settings.len(),
+            2,
+            "{key} must be set on the Unix and the Windows smoke step: {settings:?}"
+        );
+        for setting in settings {
+            assert!(
+                setting.contains("${{ runner.temp }}") && setting.contains("mesh-home"),
+                "{key} must live under the throwaway HOME: {setting}"
+            );
+        }
+    }
+    assert!(
+        job.contains("HOME: ${{ runner.temp }}/mesh-home")
+            && job.contains("USERPROFILE: ${{ runner.temp }}\\mesh-home"),
+        "the relay runs under a throwaway HOME / USERPROFILE on every runner family"
+    );
+
+    assert!(
+        job.contains("relay=(/bin/bash scripts/mesh-relay.sh)"),
+        "the macOS leg runs the relay under the runner's /bin/bash (3.2), the bash the README one-liner lands in"
+    );
+    assert!(
+        job.contains("shell: powershell") && job.contains("shell: pwsh"),
+        "the Windows leg runs the relay under pwsh AND Windows PowerShell 5.1"
+    );
+    assert!(
+        job.contains(
+            "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/mesh-relay.ps1 -NoService -DryRun -AllowRoot"
+        ),
+        "the 5.1 step must drive mesh-relay.ps1 itself, not just load the module"
+    );
+
+    // The smoke matrix the plan names, in both shells.
+    for (what, needles) in [
+        (
+            "dry run",
+            &["--no-service --dry-run", "'-NoService', '-DryRun'"][..],
+        ),
+        (
+            "install + rnsd --version",
+            &["\"$BIN_DIR/rnsd\" --version", "'rnsd.cmd') --version"],
+        ),
+        (
+            "re-run hash unchanged",
+            &["shasum -a 256", "Get-FileHash -Algorithm SHA256"],
+        ),
+        (
+            "pre-existing config byte-identical",
+            &[
+                "cmp \"$RUNNER_TEMP/expected-config\"",
+                "an existing config was modified",
+            ],
+        ),
+        (
+            "root refusal",
+            &[
+                "sudo -E env HOME=\"$HOME\"",
+                "Administrator is refused without -AllowRoot",
+            ],
+        ),
+    ] {
+        for needle in needles {
+            assert!(
+                job.contains(needle),
+                "the smoke matrix lacks the {what} check ({needle:?}):\n{job}"
+            );
+        }
+    }
+
+    let workflow = read(
+        repo_root()
+            .join(".github")
+            .join("workflows")
+            .join("ci.yaml"),
+    );
+    assert!(
+        workflow.contains("Service installation is NOT exercised here"),
+        "ci.yaml must say that the systemd/launchd/Scheduled-Task half is manual-VM acceptance, not CI"
+    );
+}
+
+/// The comment above `ingress_control = No` is copied from the propagation-node config,
+/// so the two files explain the same setting in the same words; and the two relay
+/// scripts write the same config body and print the same firewall sentence, so a
+/// Linux and a Windows host end up with daemons that behave alike.
+#[test]
+fn usage_probe_relay_scripts_are_config_twins_and_copy_the_propagation_node_comment() {
+    let pn_config = read(
+        repo_root()
+            .join("deployment")
+            .join("propagation-node")
+            .join("reticulum.config"),
+    );
+    let pn_lines: Vec<&str> = pn_config.lines().collect();
+    let ingress_at = pn_lines
+        .iter()
+        .position(|line| line.trim() == "ingress_control = No")
+        .expect("the propagation-node config turns ingress_control off");
+    let pn_comment: Vec<&str> = pn_lines[..ingress_at]
+        .iter()
+        .rev()
+        .take_while(|line| line.trim_start().starts_with('#'))
+        .map(|line| line.trim())
+        .collect();
+    assert!(
+        !pn_comment.is_empty(),
+        "the propagation-node config explains ingress_control in a comment above it"
+    );
+
+    let sh = read(scripts_dir().join("mesh-relay.sh"));
+    let ps1 = read(scripts_dir().join("mesh-relay.ps1"));
+    for (name, script) in [("mesh-relay.sh", &sh), ("mesh-relay.ps1", &ps1)] {
+        for line in &pn_comment {
+            assert!(
+                script.lines().any(|l| l.trim() == *line),
+                "{name} must carry the propagation-node's ingress_control comment verbatim: {line:?}"
+            );
+        }
+        // Both scripts emit the same stanzas and settings.
+        for needle in [
+            "enable_transport = True",
+            "forwards traffic for any other Reticulum peer it hears on its interfaces",
+            "[logging]",
+            "loglevel = 4",
+            "[[Coyote Local]]",
+            "type = AutoInterface",
+            "[[Coyote Sessions]]",
+            "type = TCPServerInterface",
+            "listen_ip = 127.0.0.1",
+            "listen_port = 4242",
+            "ingress_control = No",
+            "[[Team Relay]]",
+            "type = TCPClientInterface",
+        ] {
+            assert!(
+                script.contains(needle),
+                "{name} config text lacks {needle:?}"
+            );
+        }
+    }
+
+    // One firewall sentence, up to the per-OS tail.
+    let firewall = "Firewall: AutoInterface listens for LAN peers, and with enable_transport this rnsd forwards traffic for any Reticulum peer on the LAN (and on to the Team Relay when one is configured).";
+    for (name, script) in [("mesh-relay.sh", &sh), ("mesh-relay.ps1", &ps1)] {
+        assert!(
+            script.contains(firewall),
+            "{name} must print the shared firewall warning (a transport node forwards for the LAN and on to the relay): {firewall}"
+        );
+    }
+
+    // The scripts the Windows runner checks out must stay LF, and so must the workflow.
+    let attributes = read(repo_root().join(".gitattributes"));
+    for pattern in [
+        "scripts/*.sh",
+        "scripts/**/*.ps1",
+        ".github/workflows/*.yaml",
+    ] {
+        assert!(
+            attributes
+                .lines()
+                .any(|line| line.trim() == format!("{pattern} text eol=lf")),
+            ".gitattributes must pin `{pattern} text eol=lf`: a CRLF checkout breaks bash and the LF pins above"
+        );
+    }
+}
+
+/// Every download the installers make is HTTPS over TLS 1.2 or newer and stays HTTPS
+/// across redirects (curl refuses an https-to-http hop, the PowerShell installer refuses a
+/// non-https asset URL, wget gets whichever TLS flags it understands), and the relay
+/// script they fall back to is fetched from the repository over HTTPS. The bash prompt
+/// gate reads both a TTY stdin and stdout so `curl | bash` never blocks.
+#[test]
+fn usage_probe_installers_pin_https_tls12_and_gate_the_prompt_on_a_tty() {
+    let sh = read(scripts_dir().join("install_coyote.sh"));
+    for (line_no, line) in sh.lines().enumerate() {
+        // An invocation, not the one-liner quoted in comments and advice lines.
+        let invocation = line
+            .trim_start()
+            .trim_start_matches("if ")
+            .trim_start_matches("! ");
+        if invocation.starts_with("curl ") {
+            assert!(
+                invocation.contains("--proto '=https'")
+                    && invocation.contains("--proto-redir '=https'")
+                    && invocation.contains("--tlsv1.2"),
+                "install_coyote.sh:{} downloads with curl but not pinned to HTTPS (also across redirects) + TLS 1.2: {line}",
+                line_no + 1
+            );
+        }
+        if invocation.starts_with("wget ") {
+            assert!(
+                invocation.contains("${WGET_TLS[@]+\"${WGET_TLS[@]}\"}"),
+                "install_coyote.sh:{} downloads with wget without the feature-detected TLS flags: {line}",
+                line_no + 1
+            );
+        }
+    }
+    let detect = sh
+        .find("detect_wget_tls()")
+        .map(|at| &sh[at..])
+        .expect("install_coyote.sh feature-detects wget's TLS flags");
+    let detect = &detect[..detect.find("\n}\n").unwrap()];
+    for flag in ["--https-only", "--secure-protocol=TLSv1_2"] {
+        assert!(
+            detect.contains(flag),
+            "detect_wget_tls must offer {flag} when wget advertises it:\n{detect}"
+        );
+    }
+    assert!(
+        sh.contains(
+            "https://raw.githubusercontent.com/${REPO}/refs/heads/main/scripts/mesh-relay.sh"
+        ),
+        "the fallback relay script is fetched from the repository over HTTPS"
+    );
+    assert!(
+        sh.contains("-t 0 && -t 1") || sh.contains("[ -t 0 ] && [ -t 1 ]"),
+        "the bash prompt gate must require a TTY on both stdin and stdout so a piped install never waits on a question"
+    );
+
+    let ps1 = read(scripts_dir().join("install_coyote.ps1"));
+    let tls_at = ps1
+        .find("[Net.SecurityProtocolType]::Tls12")
+        .expect("install_coyote.ps1 enables TLS 1.2");
+    for call in ["Invoke-WebRequest", "Invoke-RestMethod"] {
+        for (at, _) in ps1.match_indices(call) {
+            assert!(
+                at > tls_at,
+                "install_coyote.ps1 calls {call} before TLS 1.2 is enabled"
+            );
+            let line_end = ps1[at..].find('\n').map(|n| at + n).unwrap_or(ps1.len());
+            let line = &ps1[at..line_end];
+            assert!(
+                line.contains("-UseBasicParsing"),
+                "install_coyote.ps1: {call} must pass -UseBasicParsing for Windows PowerShell 5.1 without IE: {line}"
+            );
+        }
+    }
+    let guard = ps1
+        .find(".StartsWith('https://')")
+        .expect("install_coyote.ps1 refuses a browser_download_url that is not https");
+    let download = ps1
+        .find("-Uri $asset.browser_download_url")
+        .expect("install_coyote.ps1 downloads the asset by its browser_download_url");
+    assert!(
+        guard < download,
+        "the https guard must run before the asset is downloaded"
+    );
+    assert!(
+        ps1.contains("https://raw.githubusercontent.com/$Repo/refs/heads/main/scripts")
+            && ps1.contains("mesh-relay.ps1"),
+        "the fallback relay script is fetched from the repository's scripts/ over HTTPS"
+    );
 }
 
 #[test]
@@ -244,13 +617,13 @@ fn relay_scripts_write_the_logging_section_and_unbuffered_service_environment() 
         "mesh-relay.sh must set PYTHONUNBUFFERED in the launchd plist's EnvironmentVariables, not only the systemd unit"
     );
     assert!(
-        sh.contains("READY_TIMEOUT=30"),
-        "mesh-relay.sh must wait 30 s for the listener: the documented exit 3 contract"
+        sh.contains("READY_TIMEOUT=\"${COYOTE_MESH_READY_TIMEOUT:-30}\""),
+        "mesh-relay.sh must wait 30 s for the listener (the documented exit 3 contract), with the override reserved for the test harness"
     );
     let ps1 = read(scripts_dir().join("mesh-relay.ps1"));
     assert!(
-        ps1.contains("$ReadyTimeoutSeconds = 30"),
-        "mesh-relay.ps1 must wait 30 s for the listener: the documented exit 3 contract"
+        ps1.contains("$ReadyTimeoutSeconds = if ($env:COYOTE_MESH_READY_TIMEOUT) { [int]$env:COYOTE_MESH_READY_TIMEOUT } else { 30 }"),
+        "mesh-relay.ps1 must wait 30 s for the listener (the documented exit 3 contract), with the override reserved for the test harness"
     );
 }
 

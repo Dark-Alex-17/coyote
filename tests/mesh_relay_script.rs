@@ -11,11 +11,12 @@
 
 use std::env;
 use std::fs;
+use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::OnceLock;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -180,6 +181,12 @@ impl Tools {
         self
     }
 
+    /// A `uname` whose `-s` answers `os`; every other call runs the real one.
+    fn uname_answering(&self, os: &str) -> &Self {
+        write_uname_shim(&self.dir.join("uname"), os);
+        self
+    }
+
     fn path(&self) -> &Path {
         &self.dir
     }
@@ -188,6 +195,53 @@ impl Tools {
 /// What the stand-ins recorded, one invocation per line.
 fn recorded(log: &Path) -> String {
     fs::read_to_string(log).unwrap_or_default()
+}
+
+/// Writes a `uname` at `path` whose `-s` answers `os`; every other call runs the real one.
+fn write_uname_shim(path: &Path, os: &str) {
+    let real = on_path("uname").expect("uname on PATH");
+    let _ = fs::remove_file(path);
+    fs::write(
+        path,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = -s ]; then echo {os}; else exec \"{}\" \"$@\"; fi\n",
+            real.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// A PATH that starts with a shim directory under the HOME holding a `uname` whose `-s`
+/// answers `os` and a `launchctl` that reports nothing loaded, so a developer Mac with
+/// a live agent plans the same way as a Linux runner. The rest of the real PATH follows.
+fn shimmed_path(home: &Home, os: &str) -> std::ffi::OsString {
+    let shim_dir = home.path().join("shim");
+    fs::create_dir_all(&shim_dir).unwrap();
+    write_uname_shim(&shim_dir.join("uname"), os);
+    let launchctl = shim_dir.join("launchctl");
+    fs::write(&launchctl, "#!/bin/sh\nexit 1\n").unwrap();
+    fs::set_permissions(&launchctl, fs::Permissions::from_mode(0o755)).unwrap();
+    env::join_paths(
+        std::iter::once(shim_dir).chain(env::split_paths(&env::var_os("PATH").unwrap())),
+    )
+    .unwrap()
+}
+
+const SHIM_ENTRIES: [&str; 3] = ["shim", "shim/launchctl", "shim/uname"];
+
+/// Tests that bind or probe 127.0.0.1:4242 run one at a time; the test threads are
+/// otherwise parallel and one test's listener would answer another's readiness probe.
+fn hold_loopback_4242() -> MutexGuard<'static, ()> {
+    static PORT: Mutex<()> = Mutex::new(());
+    PORT.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The script hard-codes 4242; a host that already has a listener there cannot run the
+/// readiness scenarios, and the test says so instead of failing.
+fn loopback_4242_in_use() -> bool {
+    let addr = "127.0.0.1:4242".parse().unwrap();
+    TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok()
 }
 
 /// Files directly under `dir`, sorted, so a "no temp file left behind" check can
@@ -585,18 +639,23 @@ fn without_uv_pipx_or_a_new_enough_python_it_exits_2_before_touching_the_home() 
 fn the_linux_dry_run_plans_a_user_unit_with_the_absolute_rnsd_and_writes_nothing() {
     let bash = bash_or_skip!();
     let home = Home::new("systemd");
+    home.seed_rnsd();
+    let log = home.path().join("calls.log");
+    let tools = Tools::new(&home);
+    tools.fake("systemctl", &log, "exit 0");
 
-    let (code, out, err) = run(&mut home.relay(&bash, &["--dry-run"]));
+    let (code, out, err) = run(home.relay(&bash, &["--dry-run"]).env("PATH", tools.path()));
     assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
     let unit = home.config_home().join("systemd/user/coyote-rnsd.service");
     for needle in [
-        &format!("ExecStart={}/rnsd", home.bin_dir().display()),
+        &format!("ExecStart=\"{}/rnsd\"", home.bin_dir().display()),
         "Environment=PYTHONUNBUFFERED=1",
         "Restart=on-failure",
         "RestartSec=5",
         "WantedBy=default.target",
         "enable-linger",
         "journalctl --user -u coyote-rnsd",
+        "Would run: systemctl --user daemon-reload && systemctl --user enable --now coyote-rnsd",
         &unit.display().to_string(),
     ] {
         assert!(out.contains(needle), "plan lacks {needle:?}:\n{out}");
@@ -605,10 +664,15 @@ fn the_linux_dry_run_plans_a_user_unit_with_the_absolute_rnsd_and_writes_nothing
         !out.contains("ExecStart=rnsd"),
         "the unit must not rely on systemd's fixed search path:\n{out}"
     );
-    assert_eq!(
-        home.entries(),
-        Vec::<String>::new(),
-        "the service dry run created files"
+    assert!(
+        !home.config_home().exists() && !home.path().join(".reticulum").exists(),
+        "the service dry run created files: {:?}",
+        home.entries()
+    );
+    let calls = recorded(&log);
+    assert!(
+        !calls.contains("daemon-reload") && !calls.contains("enable"),
+        "a dry run only probes systemctl:\n{calls}"
     );
 }
 
@@ -616,25 +680,7 @@ fn the_linux_dry_run_plans_a_user_unit_with_the_absolute_rnsd_and_writes_nothing
 fn a_darwin_dry_run_plans_a_launch_agent_logging_to_the_library_and_writes_nothing() {
     let bash = bash_or_skip!();
     let home = Home::new("launchd");
-
-    // `uname -s` answers Darwin; everything else runs the real uname.
-    let real_uname = on_path("uname").expect("uname on PATH");
-    let shim_dir = home.path().join("shim");
-    fs::create_dir_all(&shim_dir).unwrap();
-    let shim = shim_dir.join("uname");
-    fs::write(
-        &shim,
-        format!(
-            "#!/bin/sh\nif [ \"$1\" = -s ]; then echo Darwin; else exec \"{}\" \"$@\"; fi\n",
-            real_uname.display()
-        ),
-    )
-    .unwrap();
-    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
-    let path = env::join_paths(
-        std::iter::once(shim_dir.clone()).chain(env::split_paths(&env::var_os("PATH").unwrap())),
-    )
-    .unwrap();
+    let path = shimmed_path(&home, "Darwin");
 
     let (code, out, err) = run(home.relay(&bash, &["--dry-run"]).env("PATH", path));
     assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
@@ -669,10 +715,9 @@ fn a_darwin_dry_run_plans_a_launch_agent_logging_to_the_library_and_writes_nothi
         2,
         "stdout and stderr both go to the one log:\n{out}"
     );
-    let shim_entries = ["shim".to_string(), "shim/uname".to_string()];
     assert_eq!(
         home.entries(),
-        shim_entries,
+        SHIM_ENTRIES,
         "the launchd dry run created files"
     );
 }
@@ -929,7 +974,7 @@ fn without_a_user_bus_the_unit_is_written_the_enable_command_printed_and_nothing
 
     let unit = home.config_home().join("systemd/user/coyote-rnsd.service");
     let expected = format!(
-        "[Unit]\nDescription=Reticulum daemon for Coyote mesh\nAfter=network.target\n\n[Service]\nExecStart={}/rnsd\nEnvironment=PYTHONUNBUFFERED=1\nRestart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n",
+        "[Unit]\nDescription=Reticulum daemon for Coyote mesh\nAfter=network.target\n\n[Service]\nExecStart=\"{}/rnsd\"\nEnvironment=PYTHONUNBUFFERED=1\nRestart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n",
         home.bin_dir().display()
     );
     assert_eq!(fs::read_to_string(&unit).unwrap(), expected);
@@ -995,23 +1040,7 @@ fn the_darwin_plist_parses_and_carries_the_launch_agent_contract() {
         return;
     };
     let home = Home::new("plist");
-    let real_uname = on_path("uname").expect("uname on PATH");
-    let shim_dir = home.path().join("shim");
-    fs::create_dir_all(&shim_dir).unwrap();
-    let shim = shim_dir.join("uname");
-    fs::write(
-        &shim,
-        format!(
-            "#!/bin/sh\nif [ \"$1\" = -s ]; then echo Darwin; else exec \"{}\" \"$@\"; fi\n",
-            real_uname.display()
-        ),
-    )
-    .unwrap();
-    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
-    let path = env::join_paths(
-        std::iter::once(shim_dir).chain(env::split_paths(&env::var_os("PATH").unwrap())),
-    )
-    .unwrap();
+    let path = shimmed_path(&home, "Darwin");
 
     let (code, out, err) = run(home.relay(&bash, &["--dry-run"]).env("PATH", path));
     assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
@@ -1061,4 +1090,466 @@ print(json.dumps(d, sort_keys=True))"#,
         "{out}"
     );
     assert!(out.contains(&format!("Logs: {}", log.display())), "{out}");
+}
+
+/// A working `rnsd` anywhere on PATH is reused: it is linked into BIN_DIR, no
+/// installer runs even though `uv` is right there, and the plan line says so. The
+/// firewall warning follows the AutoInterface: an existing config without one is
+/// printed around in silence, one with it earns the warning.
+#[test]
+fn usage_probe_an_rnsd_on_path_is_linked_into_bin_dir_and_no_installer_runs() {
+    let bash = bash_or_skip!();
+    let home = Home::new("path-reuse");
+    let log = home.path().join("calls.log");
+    let tools = Tools::new(&home);
+    tools
+        .fake("uv", &log, "exit 0")
+        .fake("rnsd", &log, "echo 'rnsd 1.5.2'");
+    let real = tools.path().join("rnsd");
+
+    let (code, out, err) = run(home
+        .relay(&bash, &["--no-service", "--dry-run"])
+        .env("PATH", tools.path()));
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(
+        out.contains(&format!(
+            "Install: reuse {} (already works)",
+            real.display()
+        )),
+        "the plan names the rnsd found on PATH:\n{out}"
+    );
+    assert!(!home.bin_dir().exists(), "a dry run created BIN_DIR");
+
+    let (code, out, err) = run(home
+        .relay(&bash, &["--no-service"])
+        .env("PATH", tools.path()));
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    let shim = home.bin_dir().join("rnsd");
+    assert!(
+        shim.symlink_metadata().unwrap().file_type().is_symlink(),
+        "an rnsd that lives elsewhere is linked, not copied, into BIN_DIR"
+    );
+    assert_eq!(
+        fs::read_link(&shim).unwrap(),
+        real,
+        "the link must point at the PATH rnsd"
+    );
+    assert!(
+        out.contains(&format!("Linked {} -> {}", shim.display(), real.display())),
+        "{out}"
+    );
+    let calls = recorded(&log);
+    assert!(
+        !calls.contains("uv "),
+        "uv must not be invoked when a working rnsd is already on PATH:\n{calls}"
+    );
+    assert!(!out.contains("Installing"), "{out}");
+    assert!(
+        out.contains("Firewall: AutoInterface listens for LAN peers"),
+        "the freshly written config enables an AutoInterface, so the warning is due:\n{out}"
+    );
+
+    // An existing config without an AutoInterface: printed around, no firewall talk.
+    let config = home.reticulum_config();
+    fs::write(
+        &config,
+        "[reticulum]\nenable_transport = True\n[interfaces]\n  [[Loop]]\n    type = TCPServerInterface\n    listen_ip = 127.0.0.1\n    listen_port = 4242\n",
+    )
+    .unwrap();
+    let before = fs::read(&config).unwrap();
+    let (code, out, err) = run(home
+        .relay(&bash, &["--no-service"])
+        .env("PATH", tools.path()));
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(out.contains("already exists, not touched"), "{out}");
+    assert!(
+        !out.contains("Firewall:"),
+        "no AutoInterface in the existing config means no firewall warning:\n{out}"
+    );
+    assert_eq!(
+        fs::read(&config).unwrap(),
+        before,
+        "the existing config was rewritten"
+    );
+
+    // The same file with an AutoInterface: the warning comes back, the file still untouched.
+    fs::write(
+        &config,
+        "[reticulum]\nenable_transport = True\n[interfaces]\n  [[LAN]]\n    type = AutoInterface\n",
+    )
+    .unwrap();
+    let before = fs::read(&config).unwrap();
+    let (code, out, _) = run(home
+        .relay(&bash, &["--no-service"])
+        .env("PATH", tools.path()));
+    assert_eq!(code, 0);
+    assert!(
+        out.contains("Firewall: AutoInterface listens for LAN peers"),
+        "{out}"
+    );
+    assert_eq!(
+        fs::read(&config).unwrap(),
+        before,
+        "the existing config was rewritten"
+    );
+}
+
+#[test]
+fn an_unsupported_os_exits_2_on_stderr_and_writes_nothing() {
+    let bash = bash_or_skip!();
+    let home = Home::new("freebsd");
+    let path = shimmed_path(&home, "FreeBSD");
+
+    let (code, out, err) = run(home.relay(&bash, &["--no-service"]).env("PATH", path));
+    assert_eq!(code, 2, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(
+        err.contains("unsupported OS 'FreeBSD'") && err.contains("Linux and macOS"),
+        "{err}"
+    );
+    assert!(out.is_empty(), "{out}");
+    assert_eq!(
+        home.entries(),
+        SHIM_ENTRIES,
+        "an unsupported OS wrote files"
+    );
+}
+
+/// Where the venv rung puts its venv follows coyote's own config-directory rules:
+/// `COYOTE_CONFIG_DIR` beats `XDG_CONFIG_HOME`, and with neither set Linux uses
+/// `~/.config/coyote` while macOS uses `~/Library/Application Support/coyote`.
+#[test]
+fn the_venv_follows_coyote_config_dir_then_xdg_then_the_per_os_default() {
+    let bash = bash_or_skip!();
+    let home = Home::new("config-dir");
+    let log = home.path().join("calls.log");
+    let tools = Tools::new(&home);
+    tools.fake("python3", &log, "exit 0");
+    let plan_line = |venv: &Path| {
+        format!(
+            "Install: {}/python3 -m venv \"{}\" && pip install \"rns==1.5.2\"",
+            tools.path().display(),
+            venv.display()
+        )
+    };
+
+    let explicit = home.path().join("elsewhere/coyote-config");
+    let (code, out, err) = run(home
+        .relay(&bash, &["--no-service", "--dry-run"])
+        .env("PATH", tools.path())
+        .env("COYOTE_CONFIG_DIR", &explicit));
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(
+        out.contains(&plan_line(&explicit.join("mesh/rns-venv"))),
+        "COYOTE_CONFIG_DIR must win over XDG_CONFIG_HOME:\n{out}"
+    );
+
+    tools.uname_answering("Linux");
+    let (code, out, err) = run(home
+        .relay(&bash, &["--no-service", "--dry-run"])
+        .env("PATH", tools.path())
+        .env_remove("XDG_CONFIG_HOME"));
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(
+        out.contains(&plan_line(
+            &home.path().join(".config/coyote/mesh/rns-venv")
+        )),
+        "Linux without XDG_CONFIG_HOME defaults to ~/.config/coyote:\n{out}"
+    );
+
+    tools.uname_answering("Darwin");
+    let (code, out, err) = run(home
+        .relay(&bash, &["--no-service", "--dry-run"])
+        .env("PATH", tools.path())
+        .env_remove("XDG_CONFIG_HOME"));
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(
+        out.contains(&plan_line(
+            &home
+                .path()
+                .join("Library/Application Support/coyote/mesh/rns-venv")
+        )),
+        "macOS without XDG_CONFIG_HOME defaults to ~/Library/Application Support/coyote:\n{out}"
+    );
+    assert!(
+        !home.config_home().exists() && !home.path().join("Library").exists(),
+        "a dry run created a config directory: {:?}",
+        home.entries()
+    );
+}
+
+/// A user bus answers, the unit is enabled, and nothing ever listens on 4242: the
+/// script gives up after the (overridden) timeout with exit 3, names the port and the
+/// journal command, and leaves the unit it wrote in place.
+#[cfg(target_os = "linux")]
+#[test]
+fn exit_3_names_the_port_and_the_journal_when_the_listener_never_comes_up() {
+    let bash = bash_or_skip!();
+    let _port = hold_loopback_4242();
+    if loopback_4242_in_use() {
+        eprintln!("skipping: something already listens on 127.0.0.1:4242");
+        return;
+    }
+    let home = Home::new("timeout");
+    home.seed_rnsd();
+    let log = home.path().join("calls.log");
+    let tools = Tools::new(&home);
+    tools.fake(
+        "systemctl",
+        &log,
+        "case \"$*\" in *is-active*) exit 1 ;; esac\nexit 0",
+    );
+
+    let started = std::time::Instant::now();
+    let (code, out, err) = run(home
+        .relay(&bash, &[])
+        .env("PATH", tools.path())
+        .env("COYOTE_MESH_READY_TIMEOUT", "1"));
+    let elapsed = started.elapsed();
+    assert_eq!(code, 3, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "the overridden timeout must bound the wait (took {elapsed:?})"
+    );
+    assert!(
+        err.contains("did not open 127.0.0.1:4242 within 1s")
+            && err.contains("journalctl --user -u coyote-rnsd"),
+        "{err}"
+    );
+    assert!(out.contains("Enabled and started coyote-rnsd"), "{out}");
+    assert!(
+        home.config_home()
+            .join("systemd/user/coyote-rnsd.service")
+            .is_file(),
+        "the unit stays written for the operator to debug"
+    );
+    let calls = recorded(&log);
+    assert!(
+        calls.contains("systemctl --user daemon-reload")
+            && calls.contains("systemctl --user enable --now coyote-rnsd"),
+        "{calls}"
+    );
+    assert!(
+        !out.contains("Next: start coyote"),
+        "a failed readiness wait must not print the next steps:\n{out}"
+    );
+}
+
+/// With a listener on 4242: a service systemd calls inactive is enabled, and since the
+/// port is open anyway the operator is warned that something else holds it; on the
+/// next run the now-active service is left alone; an active service whose unit text
+/// just changed earns the restart note instead.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_running_service_is_not_restarted_a_changed_unit_earns_a_note_and_a_squatter_a_warning() {
+    let bash = bash_or_skip!();
+    let _port = hold_loopback_4242();
+    if loopback_4242_in_use() {
+        eprintln!("skipping: something already listens on 127.0.0.1:4242");
+        return;
+    }
+    let Ok(_listener) = TcpListener::bind("127.0.0.1:4242") else {
+        eprintln!("skipping: cannot bind 127.0.0.1:4242");
+        return;
+    };
+    let home = Home::new("running");
+    home.seed_rnsd();
+    let log = home.path().join("calls.log");
+    let tools = Tools::new(&home);
+    tools.fake(
+        "systemctl",
+        &log,
+        "case \"$*\" in *is-active*) exit 1 ;; esac\nexit 0",
+    );
+    let unit = home.config_home().join("systemd/user/coyote-rnsd.service");
+
+    let (code, out, err) = run(home.relay(&bash, &[]).env("PATH", tools.path()));
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(
+        out.contains(&format!("Wrote {}", unit.display()))
+            && out.contains("Enabled and started coyote-rnsd")
+            && out.contains("rnsd is listening on 127.0.0.1:4242"),
+        "{out}"
+    );
+    assert!(
+        out.contains(
+            "WARNING: 127.0.0.1:4242 is open but coyote-rnsd is not active; something else holds the port"
+        ),
+        "{out}"
+    );
+    assert!(out.contains("Next: start coyote"), "{out}");
+
+    // Now systemd reports the service active and the unit on disk is current.
+    tools.fake("systemctl", &log, "exit 0");
+    fs::write(&log, "").unwrap();
+    let (code, out, err) = run(home.relay(&bash, &[]).env("PATH", tools.path()));
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(
+        out.contains(&format!(
+            "{} already present with this content",
+            unit.display()
+        )) && out.contains("coyote-rnsd is already running; not restarted"),
+        "{out}"
+    );
+    assert!(
+        !out.contains("Note: the service definition changed"),
+        "{out}"
+    );
+    assert!(!out.contains("WARNING"), "{out}");
+    let calls = recorded(&log);
+    assert!(
+        !calls.contains("enable") && !calls.contains("restart") && !calls.contains("start"),
+        "a running service is never started or restarted:\n{calls}"
+    );
+
+    // A stale unit on disk: the new text is written and, since the service is active,
+    // the operator is told how to apply it rather than having it restarted underneath.
+    fs::write(&unit, "[Unit]\nDescription=stale\n").unwrap();
+    let (code, out, _) = run(home.relay(&bash, &[]).env("PATH", tools.path()));
+    assert_eq!(code, 0);
+    assert!(
+        out.contains(
+            "Note: the service definition changed; apply it with: systemctl --user restart coyote-rnsd"
+        ),
+        "{out}"
+    );
+    assert!(!out.contains("already running; not restarted"), "{out}");
+    assert!(
+        fs::read_to_string(&unit)
+            .unwrap()
+            .contains("Description=Reticulum daemon for Coyote mesh"),
+        "the changed unit was not rewritten"
+    );
+    assert!(
+        !recorded(&log).contains("restart"),
+        "the restart is advice, never run:\n{}",
+        recorded(&log)
+    );
+}
+
+/// The systemd unit quotes its ExecStart path and the launchd plist escapes XML, so a
+/// BIN_DIR with a space or an ampersand produces a definition each manager parses back
+/// to the same path.
+#[test]
+fn awkward_bin_dir_characters_survive_the_unit_and_the_plist() {
+    let bash = bash_or_skip!();
+    let home = Home::new("awkward");
+    let bin = home.path().join("odd & \"bin\" <dir>");
+    let bin_str = bin.to_str().unwrap();
+
+    let path = shimmed_path(&home, "Darwin");
+    let (code, out, err) = run(home
+        .relay(&bash, &["--dry-run", "--bin-dir", bin_str])
+        .env("PATH", path));
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    let escaped = format!(
+        "<string>{}/odd &amp; &quot;bin&quot; &lt;dir&gt;/rnsd</string>",
+        home.path().display()
+    );
+    assert!(
+        out.contains(&escaped),
+        "plist must XML-escape the path:\n{out}"
+    );
+    assert!(
+        !out.contains(&format!("<string>{bin_str}/rnsd</string>")),
+        "{out}"
+    );
+    if let Some(python3) = on_path("python3") {
+        let start = out.find("<?xml ").expect("plist start");
+        let end = out.find("</plist>").expect("plist end") + "</plist>".len();
+        let mut parse = Command::new(python3);
+        parse.arg("-c").arg(
+            r#"import plistlib, sys
+d = plistlib.loads(sys.stdin.buffer.read())
+print(d["ProgramArguments"][0])"#,
+        );
+        parse.stdin(std::process::Stdio::piped());
+        parse.stdout(std::process::Stdio::piped());
+        let mut child = parse.spawn().unwrap();
+        use std::io::Write;
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(&out.as_bytes()[start..end])
+            .unwrap();
+        let parsed = child.wait_with_output().unwrap();
+        assert!(parsed.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&parsed.stdout).trim(),
+            format!("{bin_str}/rnsd"),
+            "plistlib must read the original path back"
+        );
+    }
+
+    if cfg!(target_os = "linux") {
+        let log = home.path().join("calls.log");
+        let tools = Tools::new(&home);
+        tools
+            .fake("systemctl", &log, "exit 0")
+            .fake("python3", &log, "exit 0");
+        let (code, out, err) = run(home
+            .relay(&bash, &["--dry-run", "--bin-dir", bin_str])
+            .env("PATH", tools.path()));
+        assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+        assert!(
+            out.contains(&format!("ExecStart=\"{bin_str}/rnsd\"")),
+            "systemd needs the path quoted:\n{out}"
+        );
+    }
+}
+
+/// An existing config earns the firewall warning only for an AutoInterface that is
+/// switched on: `enabled = No` in that stanza silences it, and the Linux text never
+/// mentions a macOS prompt.
+#[test]
+fn the_firewall_warning_follows_an_enabled_autointerface_and_the_os() {
+    let bash = bash_or_skip!();
+    let home = Home::new("firewall");
+    home.seed_rnsd();
+    let tools = Tools::new(&home);
+    tools.uname_answering("Linux");
+    let config = home.reticulum_config();
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+
+    fs::write(
+        &config,
+        "[reticulum]\nenable_transport = True\n[interfaces]\n  [[LAN]]\n    type = AutoInterface\n    enabled = No\n  [[Loop]]\n    type = TCPServerInterface\n    enabled = Yes\n",
+    )
+    .unwrap();
+    let (code, out, err) = run(home
+        .relay(&bash, &["--no-service"])
+        .env("PATH", tools.path()));
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(
+        !out.contains("Firewall:"),
+        "a disabled AutoInterface opens no port:\n{out}"
+    );
+
+    fs::write(
+        &config,
+        "[reticulum]\nenable_transport = True\n[interfaces]\n  [[LAN]]\n    type = AutoInterface\n    enabled = Yes\n",
+    )
+    .unwrap();
+    let (code, out, _) = run(home
+        .relay(&bash, &["--no-service"])
+        .env("PATH", tools.path()));
+    assert_eq!(code, 0);
+    let firewall = out
+        .lines()
+        .find(|line| line.contains("Firewall:"))
+        .unwrap_or_else(|| panic!("no firewall line:\n{out}"));
+    assert!(
+        !firewall.contains("macOS") && !firewall.contains("Windows"),
+        "Linux gets no macOS/Windows prompt talk:\n{firewall}"
+    );
+
+    tools.uname_answering("Darwin");
+    let (code, out, _) = run(home
+        .relay(&bash, &["--no-service"])
+        .env("PATH", tools.path()));
+    assert_eq!(code, 0);
+    assert!(
+        out.contains("macOS will ask whether python/rnsd may accept incoming connections"),
+        "{out}"
+    );
 }
