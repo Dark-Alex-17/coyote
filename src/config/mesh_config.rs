@@ -176,7 +176,9 @@ pub struct EnvoyMemoryConfig {
     /// Most turns kept per thread; past it the oldest exchange goes, cut at the next
     /// turn the peer spoke so a reply is never kept without what it answered.
     pub max_turns: u64,
-    /// Most bytes of turn text kept per thread, cut the same way as `max_turns`.
+    /// Most bytes of turn text kept per thread, cut the same way as `max_turns`. Kept
+    /// turns that do not fit the envoy model's context are left out of the run, oldest
+    /// first, and stay remembered.
     pub max_bytes: u64,
     /// Hours a thread is remembered after its last message.
     pub ttl_hours: u64,

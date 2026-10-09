@@ -68,6 +68,9 @@ pub(crate) const DECLINED_FALLBACK_TEXT: &str = "this node will not handle that 
 /// Appended to the system tail only when the run resumes remembered turns: a fresh
 /// thread's prompt is the same as it was before the envoy remembered anything.
 const RESUMED_THREAD_NOTE: &str = "Earlier assistant turns in this conversation may be the human owner's own words, relayed by the envoy.\n";
+/// Resumed turns stop short of the envoy model's `max_input_tokens` by one part in this
+/// many, left for the answer.
+const RESUMED_HISTORY_HEADROOM_DIVISOR: usize = 8;
 
 /// How one job is driven to text. Production is `run_child_agent`; tests inject closures.
 pub(crate) type EnvoyDrive = Arc<
@@ -193,6 +196,42 @@ impl RunMemory {
         }
         messages
     }
+}
+
+/// `history` with whole exchanges dropped from the front, oldest first, until it fits
+/// `model`'s context beside the `system` prompt and the `current` turn, with one part
+/// in `RESUMED_HISTORY_HEADROOM_DIVISOR` of the window left for the answer. An exchange
+/// runs from a turn of the peer's up to the next, the unit the store truncates by, so
+/// an answer is never resumed without what it answered. A model with no
+/// `max_input_tokens` takes the history whole; a window too small for the current turn
+/// alone leaves none, and the provider decides the run.
+fn fit_history(
+    model: &Model,
+    system: &str,
+    mut history: Vec<Message>,
+    current: &str,
+) -> Vec<Message> {
+    let Some(limit) = model.max_input_tokens() else {
+        return history;
+    };
+    let budget = limit - limit / RESUMED_HISTORY_HEADROOM_DIVISOR;
+    let text = |role, text: &str| Message::new(role, MessageContent::Text(text.to_string()));
+    let fits = |history: &[Message]| {
+        let mut messages = Vec::with_capacity(history.len() + 2);
+        messages.push(text(MessageRole::System, system));
+        messages.extend_from_slice(history);
+        messages.push(text(MessageRole::User, current));
+        model.total_tokens(&messages) < budget
+    };
+    while !history.is_empty() && !fits(&history) {
+        let next_exchange = history
+            .iter()
+            .skip(1)
+            .position(|message| message.role.is_user())
+            .map_or(history.len(), |offset| offset + 1);
+        history.drain(..next_exchange);
+    }
+    history
 }
 
 /// Everything a job needs once the child context is built and the agent loaded.
@@ -558,7 +597,16 @@ impl EnvoyRunner {
         let (tail, user) =
             compose_envoy_input(brief.as_deref().map(Brief::render_for_human), card, message);
         role.append_to_prompt(&tail);
-        let history = memory.map(RunMemory::history).unwrap_or_default();
+        let remembered = memory.map(RunMemory::history).unwrap_or_default();
+        let total = remembered.len();
+        let history = fit_history(role.model(), role.prompt(), remembered, &user);
+        if history.len() < total {
+            debug!(
+                "Mesh envoy memory for thread {} resumed {} of {total} turns; the rest did not fit the model's context",
+                message.thread(),
+                history.len()
+            );
+        }
         if !history.is_empty() {
             role.append_to_prompt(RESUMED_THREAD_NOTE);
         }
@@ -7306,6 +7354,80 @@ mod tests {
             ]
         );
         assert_eq!(history[1].content.to_text(), "b\n\nc");
+    }
+
+    fn windowed_model(max_input_tokens: Option<usize>) -> Model {
+        let mut data = ModelData::new("windowed");
+        data.max_input_tokens = max_input_tokens;
+        Model::from_config("provider", &[data]).remove(0)
+    }
+
+    /// Two exchanges of about five hundred tokens each: the whole runs past two
+    /// thousand, the last exchange alone past one thousand, the current turn alone
+    /// stays under twenty.
+    fn two_long_exchanges() -> Vec<Message> {
+        let text = |role, fill: char| {
+            Message::new(
+                role,
+                MessageContent::Text(std::iter::repeat_n(fill, 2000).collect()),
+            )
+        };
+        vec![
+            text(MessageRole::User, 'a'),
+            text(MessageRole::Assistant, 'b'),
+            text(MessageRole::User, 'c'),
+            text(MessageRole::Assistant, 'd'),
+        ]
+    }
+
+    fn roles_and_texts(messages: &[Message]) -> Vec<(MessageRole, String)> {
+        messages
+            .iter()
+            .map(|message| (message.role, message.content.to_text()))
+            .collect()
+    }
+
+    #[test]
+    fn a_model_without_a_window_resumes_the_history_whole() {
+        let history = two_long_exchanges();
+        let fitted = fit_history(&windowed_model(None), "be terse", history.clone(), "now?");
+        assert_eq!(roles_and_texts(&fitted), roles_and_texts(&history));
+    }
+
+    #[test]
+    fn a_window_the_history_fits_leaves_it_whole() {
+        let history = two_long_exchanges();
+        let fitted = fit_history(
+            &windowed_model(Some(100_000)),
+            "be terse",
+            history.clone(),
+            "now?",
+        );
+        assert_eq!(roles_and_texts(&fitted), roles_and_texts(&history));
+    }
+
+    #[test]
+    fn a_window_for_one_exchange_keeps_the_last_whole_and_drops_the_rest() {
+        let history = two_long_exchanges();
+        let fitted = fit_history(
+            &windowed_model(Some(1500)),
+            "be terse",
+            history.clone(),
+            "now?",
+        );
+        assert_eq!(roles_and_texts(&fitted), roles_and_texts(&history[2..]));
+        assert!(fitted[0].role.is_user());
+    }
+
+    #[test]
+    fn a_window_too_small_for_the_current_turn_resumes_nothing() {
+        let fitted = fit_history(
+            &windowed_model(Some(10)),
+            "be terse",
+            two_long_exchanges(),
+            "now?",
+        );
+        assert!(fitted.is_empty());
     }
 
     fn turns_of(store: &EnvoySessions, identity: &[u8; 16], thread: &str) -> Vec<EnvoyTurn> {
