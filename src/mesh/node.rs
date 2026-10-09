@@ -2987,9 +2987,10 @@ impl MeshSlot {
     }
 
     /// The owner's late answer joins the thread the envoy remembers, as the turn after
-    /// the hand-off line the run stored when it ended without one. A thread the store
-    /// does not hold gets no record: an answer with no question before it is not a
-    /// conversation. A record that cannot be read or saved is left as it is.
+    /// the hand-off line the run stored when it ended without one, and after whatever
+    /// a run in the thread wrote meanwhile. A thread the store does not hold gets no
+    /// record: an answer with no question before it is not a conversation. A record
+    /// that cannot be read or saved is left as it is.
     fn remember_human_answer(&self, record: &InboundRecord, spoken: &str) {
         let Some(store) = self.envoy_memory() else {
             return;
@@ -2998,25 +2999,19 @@ impl MeshSlot {
         if !is_wire_id(thread) {
             return;
         }
-        let now = SystemTime::now();
-        let mut turns = match store.load(&record.peer_identity, thread, now) {
-            Ok(Some(file)) => file.turns,
-            Ok(None) => return,
-            Err(err) => {
-                warn!(
-                    "Mesh envoy memory for thread {thread} could not be read ({}); the owner's answer was not remembered",
-                    redact_hashes(&err.to_string())
-                );
-                return;
-            }
-        };
-        turns.push(EnvoyTurn {
+        let answer = vec![EnvoyTurn {
             role: EnvoyRole::Assistant,
             text: spoken.to_string(),
-        });
-        if let Err(err) = store.save(&record.peer_identity, thread, turns, now) {
+        }];
+        if let Err(err) = store.append(
+            &record.peer_identity,
+            thread,
+            answer,
+            SystemTime::now(),
+            false,
+        ) {
             warn!(
-                "Mesh envoy memory for thread {thread} could not be saved: {}",
+                "Mesh envoy memory for thread {thread} could not be saved; the owner's answer was not remembered: {}",
                 redact_hashes(&err.to_string())
             );
         }

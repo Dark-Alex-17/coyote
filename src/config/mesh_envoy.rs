@@ -161,7 +161,8 @@ struct TerminalHooks {
 }
 
 /// What the envoy remembers of the sender's thread, held for one run: the store it
-/// came from and the turns before this message, oldest first.
+/// came from and the turns before this message, oldest first. The turns are what the
+/// run is prompted with; what is written back goes after whatever the store holds then.
 struct RunMemory {
     store: Arc<EnvoySessions>,
     turns: Vec<EnvoyTurn>,
@@ -428,13 +429,21 @@ impl EnvoyRunner {
 
     /// The sender's thread as the envoy remembers it, when the memory is on and the
     /// thread id is one the store keys; `None` when nothing will be remembered. A
-    /// record that cannot be read, or that names another identity, is never used: the
-    /// thread starts over and the run goes on.
+    /// root message (one naming no `thread`) opens its thread and loads nothing,
+    /// whatever is under its id from before. A record that cannot be read, or that
+    /// names another identity, is never used: the thread starts over and the run goes
+    /// on.
     fn recall(&self, message: &PeerMessage) -> Option<RunMemory> {
         let store = self.app.load().mesh.envoy_memory()?;
         let thread = message.thread();
         if !is_wire_id(thread) {
             return None;
+        }
+        if message.thread.is_none() {
+            return Some(RunMemory {
+                store,
+                turns: Vec::new(),
+            });
         }
         let turns = match store.load(&message.source_identity, thread, SystemTime::now()) {
             Ok(record) => record.map(|record| record.turns).unwrap_or_default(),
@@ -961,7 +970,7 @@ impl EnvoyRunner {
         } else {
             if let Some(memory) = memory {
                 let spoken = human_answer.clone().unwrap_or_else(|| reply_text.clone());
-                remember_exchange(memory, &message, card, spoken);
+                remember_exchange(&memory.store, &message, card, spoken);
             }
             match (
                 app.mesh.get(),
@@ -1121,20 +1130,34 @@ fn first_pending(queue: &EscalationQueue) -> Option<EscalationRequest> {
 }
 
 /// Adds this exchange to what the envoy remembers of the sender's thread: the peer's
-/// fenced turn and the words the peer was sent, nothing of the brief or the card. The
-/// store cuts and evicts; a record it refuses stays as it was.
-fn remember_exchange(memory: RunMemory, message: &PeerMessage, card: &PeerCard, spoken: String) {
-    let RunMemory { store, mut turns } = memory;
-    turns.push(EnvoyTurn {
-        role: EnvoyRole::User,
-        text: peer_turn(card, message),
-    });
-    turns.push(EnvoyTurn {
-        role: EnvoyRole::Assistant,
-        text: spoken,
-    });
+/// fenced turn and the words the peer was sent, nothing of the brief or the card. A
+/// follow-up's exchange goes after whatever the store holds by now, not after what
+/// the run was started with, so an answer the owner gave meanwhile stays; a root
+/// message's exchange is the whole of its thread. The store cuts and evicts; a record
+/// it refuses stays as it was.
+fn remember_exchange(
+    store: &EnvoySessions,
+    message: &PeerMessage,
+    card: &PeerCard,
+    spoken: String,
+) {
+    let exchange = vec![
+        EnvoyTurn {
+            role: EnvoyRole::User,
+            text: peer_turn(card, message),
+        },
+        EnvoyTurn {
+            role: EnvoyRole::Assistant,
+            text: spoken,
+        },
+    ];
     let thread = message.thread();
-    if let Err(err) = store.save(&message.source_identity, thread, turns, SystemTime::now()) {
+    let now = SystemTime::now();
+    let written = match message.thread {
+        Some(_) => store.append(&message.source_identity, thread, exchange, now, true),
+        None => store.save(&message.source_identity, thread, exchange, now),
+    };
+    if let Err(err) = written {
         warn!(
             "Mesh envoy memory for thread {thread} could not be saved: {}",
             redact_hashes(&err.to_string())
@@ -7304,6 +7327,156 @@ mod tests {
         );
         assert_eq!(turns_of(&store, &PEER_IDENTITY, "t-9").len(), 2);
         assert_eq!(turns_of(&store, &OTHER_IDENTITY, "t-9").len(), 2);
+        source.remove_dir();
+    }
+
+    /// The owner's late answer to an earlier question lands while a follow-up in the
+    /// same thread is running. The run writes its exchange after what the store holds
+    /// by then, not after the snapshot it started from, so the answer is kept and the
+    /// next message is driven with every turn.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn a_late_answer_landing_during_a_follow_up_run_is_kept() {
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-memory-race");
+        let (source, _source) = stub_envoy_source();
+        let tmp = TempDir::new("mesh-envoy-memory-race");
+        let app = test_app();
+        let store = memory_for(&app, &tmp);
+        let idle = RecordingIdleSink::attach(&app);
+        let gate = Arc::new(Semaphore::new(0));
+        let held = Arc::new(AtomicBool::new(false));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let runner = EnvoyRunner::start_with(Arc::clone(&app), {
+            let gate = Arc::clone(&gate);
+            let held = Arc::clone(&held);
+            let seen = Arc::clone(&seen);
+            drive_of(move |_, input, _| {
+                let gate = Arc::clone(&gate);
+                let held = Arc::clone(&held);
+                let seen = Arc::clone(&seen);
+                async move {
+                    let run = {
+                        let mut seen = seen.lock();
+                        seen.push(input.build_messages().unwrap());
+                        seen.len()
+                    };
+                    if run == 2 {
+                        held.store(true, Ordering::SeqCst);
+                        gate.acquire().await.unwrap().forget();
+                    }
+                    Ok(format!("answer {}", run - 1))
+                }
+            })
+        });
+        assert!(
+            runner
+                .accept(threaded_job(&PEER_IDENTITY, "q-1", "t-9", "may I?"))
+                .is_ok()
+        );
+        wait_until("the first reply", || idle.count("envoy replied:") == 1).await;
+        assert!(
+            runner
+                .accept(threaded_job(&PEER_IDENTITY, "q-2", "t-9", "and then?"))
+                .is_ok()
+        );
+        wait_until("the second run to be held", || held.load(Ordering::SeqCst)).await;
+        store
+            .append(
+                &hex_lower(&PEER_IDENTITY),
+                "t-9",
+                vec![EnvoyTurn {
+                    role: EnvoyRole::Assistant,
+                    text: "the owner says yes".into(),
+                }],
+                SystemTime::now(),
+                false,
+            )
+            .unwrap();
+        gate.add_permits(1);
+        wait_until("the second reply", || idle.count("envoy replied:") == 2).await;
+        let turns = turns_of(&store, &PEER_IDENTITY, "t-9");
+        assert_eq!(turns.len(), 5, "{turns:?}");
+        assert_eq!(turns[1].text, "answer 0");
+        assert_eq!(turns[2].text, "the owner says yes");
+        assert!(turns[3].text.contains("Message id: q-2"));
+        assert_eq!(turns[4].text, "answer 1");
+
+        assert!(
+            runner
+                .accept(threaded_job(&PEER_IDENTITY, "q-3", "t-9", "so?"))
+                .is_ok()
+        );
+        wait_until("the third reply", || idle.count("envoy replied:") == 3).await;
+        runner.stop().await;
+
+        let seen = seen.lock();
+        assert_eq!(
+            roles_of(&seen[2]),
+            vec![
+                MessageRole::System,
+                MessageRole::User,
+                MessageRole::Assistant,
+                MessageRole::Assistant,
+                MessageRole::User,
+                MessageRole::Assistant,
+                MessageRole::User
+            ]
+        );
+        assert_eq!(seen[2][3].content.to_text(), "the owner says yes");
+        source.remove_dir();
+    }
+
+    /// A root message is the start of its thread whatever the store holds under its
+    /// id: nothing is loaded for it, and its exchange replaces what was there.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn a_root_message_starts_clean_and_replaces_what_was_under_its_id() {
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-memory-root-clean");
+        let (source, _source) = stub_envoy_source();
+        let tmp = TempDir::new("mesh-envoy-memory-root-clean");
+        let app = test_app();
+        let store = memory_for(&app, &tmp);
+        store
+            .save(
+                &hex_lower(&PEER_IDENTITY),
+                "q-9",
+                vec![
+                    EnvoyTurn {
+                        role: EnvoyRole::User,
+                        text: "an older conversation".into(),
+                    },
+                    EnvoyTurn {
+                        role: EnvoyRole::Assistant,
+                        text: "its answer".into(),
+                    },
+                ],
+                SystemTime::now(),
+            )
+            .unwrap();
+        let idle = RecordingIdleSink::attach(&app);
+        let (drive, seen) = prompt_recording_drive();
+        let runner = EnvoyRunner::start_with(Arc::clone(&app), drive);
+        assert!(
+            runner
+                .accept(job(PeerKind::Message, "q-9", "starting over"))
+                .is_ok()
+        );
+        wait_until("the reply", || idle.count("envoy replied:") == 1).await;
+        runner.stop().await;
+
+        let seen = seen.lock();
+        assert_eq!(
+            roles_of(&seen[0]),
+            vec![MessageRole::System, MessageRole::User]
+        );
+        let turns = turns_of(&store, &PEER_IDENTITY, "q-9");
+        assert_eq!(turns.len(), 2, "{turns:?}");
+        assert!(
+            turns[0].text.contains("Message id: q-9"),
+            "{}",
+            turns[0].text
+        );
+        assert_eq!(turns[1].text, "answer 0");
         source.remove_dir();
     }
 

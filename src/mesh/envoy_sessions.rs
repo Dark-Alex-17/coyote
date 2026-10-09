@@ -341,20 +341,64 @@ impl EnvoySessions {
         &self,
         identity: &str,
         thread: &str,
-        mut turns: Vec<EnvoyTurn>,
+        turns: Vec<EnvoyTurn>,
         now: SystemTime,
     ) -> Result<(), EnvoyMemoryError> {
+        self.write(identity, thread, turns, now, Write::Replace)
+    }
+
+    /// Adds `new_turns` after what the store holds of `identity`'s `thread`, then bounds
+    /// and evicts as `save` does. The read and the write are one locked step, so two
+    /// writers landing together (a run's exchange and the owner's late answer) both
+    /// stay. With `create`, a thread the store does not hold becomes a record of
+    /// `new_turns` alone; without it nothing is written for one. A record under the
+    /// key that this build cannot read, or that names another identity, is refused.
+    pub(crate) fn append(
+        &self,
+        identity: &str,
+        thread: &str,
+        new_turns: Vec<EnvoyTurn>,
+        now: SystemTime,
+        create: bool,
+    ) -> Result<(), EnvoyMemoryError> {
+        self.write(identity, thread, new_turns, now, Write::Append { create })
+    }
+
+    fn write(
+        &self,
+        identity: &str,
+        thread: &str,
+        mut turns: Vec<EnvoyTurn>,
+        now: SystemTime,
+        mode: Write,
+    ) -> Result<(), EnvoyMemoryError> {
         let (identity, key) = resolve(identity, thread)?;
-        truncate(&mut turns, &self.limits);
-        if turns.is_empty() && !self.dir.exists() {
-            return Ok(());
+        if !self.dir.exists() {
+            // Nothing is under any key yet, so the turns given are the whole record;
+            // one that comes to nothing creates no store.
+            truncate(&mut turns, &self.limits);
+            if turns.is_empty() || mode == (Write::Append { create: false }) {
+                return Ok(());
+            }
         }
         let _guard = self.write_lock.lock();
         let _file_lock = self.file_lock()?;
         let mut index = self.read_index()?;
-        let position = self
-            .owned(&index, &key, &identity)?
-            .map(|indexed| indexed.position);
+        let indexed = self.owned(&index, &key, &identity)?;
+        let position = indexed.as_ref().map(|indexed| indexed.position);
+        let mut turns = match mode {
+            Write::Replace => turns,
+            Write::Append { create } => match indexed.and_then(|indexed| indexed.record) {
+                Some(record) => {
+                    let mut held = record.turns;
+                    held.extend(turns);
+                    held
+                }
+                None if create => turns,
+                None => return Ok(()),
+            },
+        };
+        truncate(&mut turns, &self.limits);
         if turns.is_empty() {
             if let Some(position) = position {
                 index.entries.remove(position);
@@ -624,6 +668,16 @@ impl EnvoySessions {
 struct Indexed {
     position: usize,
     record: Option<EnvoySessionFile>,
+}
+
+/// What a write makes of the turns already under the key.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Write {
+    /// The turns given are the whole record.
+    Replace,
+    /// The turns given follow the ones held; `create` says whether a thread not held
+    /// becomes a record of them alone.
+    Append { create: bool },
 }
 
 /// The canonical identity and the key it and `thread` make, or the refusal for an
@@ -1100,6 +1154,92 @@ mod tests {
     }
 
     #[test]
+    fn append_adds_after_the_held_turns_and_creates_only_when_asked() {
+        let tmp = TempDir::new("envoy-sessions-append");
+        let store = store(&tmp, &enabled());
+        store
+            .append(IDENTITY_A, "thread-one", exchange(1), t(1_000), false)
+            .unwrap();
+        assert!(
+            !tmp.path.join("mesh").exists(),
+            "an append to a store that does not exist creates nothing"
+        );
+        store
+            .append(IDENTITY_A, "thread-one", exchange(1), t(1_000), true)
+            .unwrap();
+
+        store
+            .append(
+                IDENTITY_A,
+                "thread-one",
+                vec![assistant("late")],
+                t(1_001),
+                false,
+            )
+            .unwrap();
+        store
+            .append(IDENTITY_A, "thread-two", exchange(2), t(1_002), false)
+            .unwrap();
+        store
+            .append(IDENTITY_A, "thread-three", exchange(3), t(1_003), true)
+            .unwrap();
+
+        let loaded = store
+            .load(IDENTITY_A, "thread-one", t(1_001))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            loaded.turns,
+            [exchange(1), vec![assistant("late")]].concat()
+        );
+        assert_eq!(loaded.last_used, rfc3339_utc(t(1_001)));
+        assert_eq!(store.stats().unwrap(), (2, 1));
+        assert_eq!(
+            store.load(IDENTITY_A, "thread-two", t(1_002)).unwrap(),
+            None,
+            "an append without create to a thread not held writes nothing"
+        );
+        assert!(!record_path(&store, IDENTITY_A, "thread-two").exists());
+        assert_eq!(
+            store
+                .load(IDENTITY_A, "thread-three", t(1_003))
+                .unwrap()
+                .unwrap()
+                .turns,
+            exchange(3)
+        );
+    }
+
+    #[test]
+    fn append_is_bounded_like_save() {
+        let tmp = TempDir::new("envoy-sessions-append-bounded");
+        let store = store(
+            &tmp,
+            &EnvoyMemoryConfig {
+                max_turns: 4,
+                ..enabled()
+            },
+        );
+        for n in 1..=3 {
+            store
+                .append(
+                    IDENTITY_A,
+                    "thread-one",
+                    exchange(n),
+                    t(1_000 + n as u64),
+                    true,
+                )
+                .unwrap();
+        }
+
+        let loaded = store
+            .load(IDENTITY_A, "thread-one", t(1_003))
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.turns, [exchange(2), exchange(3)].concat());
+    }
+
+    #[test]
     fn stats_counts_conversations_and_distinct_identities() {
         let tmp = TempDir::new("envoy-sessions-stats");
         let store = store(&tmp, &enabled());
@@ -1545,6 +1685,11 @@ mod tests {
         assert!(
             store
                 .save(IDENTITY_A, "thread-one", exchange(2), t(1_001))
+                .is_err()
+        );
+        assert!(
+            store
+                .append(IDENTITY_A, "thread-one", exchange(2), t(1_001), false)
                 .is_err()
         );
         assert_eq!(
