@@ -1882,14 +1882,16 @@ fn prune_envoy_memory(store: &EnvoySessions) {
     }
 }
 
-/// A revoked identity's conversations go with its trust, out of whichever store the
-/// node currently serves; nothing to do while the memory is off.
+/// A revoked identity's conversations go with its trust, out of every instance's store
+/// under the cache directory and not only the one the node currently serves: trust is
+/// per config directory, the stores per instance. Nothing to do while the memory is off.
 impl EnvoyMemorySink for MeshRuntime {
     fn forget_identity(&self, identity: &str) {
-        let Some(store) = self.envoy_memory() else {
-            return;
-        };
-        match store.delete_identity(identity) {
+        match EnvoySessions::delete_identity_everywhere(
+            &self.cache_dir,
+            &self.envoy_memory_config,
+            identity,
+        ) {
             Ok(0) => {}
             Ok(removed) => debug!(
                 "Mesh forgot {removed} remembered envoy conversation(s) of {}",
@@ -9682,6 +9684,55 @@ mod tests {
         }
         assert!(store.load(&other, "theirs", now).unwrap().is_some());
         assert!(slot.stop().await.unwrap());
+        started.relay_handle.abort();
+    }
+
+    /// Trust is per config directory, the stores per instance: revoking an identity
+    /// forgets its threads in every instance's store under the cache directory, not only
+    /// the one the node serves, other identities' threads left in each.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn revoking_an_identity_forgets_its_threads_in_every_instance_store() {
+        let config = EnvoyMemoryConfig {
+            enabled: true,
+            ..EnvoyMemoryConfig::default()
+        };
+        let started = started_runtime_with("node-forget-every-instance", |c| {
+            c.envoy_memory = config.clone();
+        })
+        .await;
+        let runtime = started.runtime.clone();
+        let served = runtime
+            .envoy_memory()
+            .expect("an enabled store is opened at start");
+        let other_instance =
+            EnvoySessions::open(runtime.cache_dir(), &fresh_instance_id(), &config).unwrap();
+        let now = SystemTime::now();
+        let other = hex_lower(&[0x77; 16]);
+        for store in [served.as_ref(), &other_instance] {
+            store
+                .save(REMEMBERED_PEER, "first", peer_turns(), now)
+                .unwrap();
+            store.save(&other, "theirs", peer_turns(), now).unwrap();
+        }
+
+        runtime.forget_identity(REMEMBERED_PEER);
+
+        for store in [served.as_ref(), &other_instance] {
+            assert_eq!(
+                store.load(REMEMBERED_PEER, "first", now).unwrap(),
+                None,
+                "{}",
+                store.dir().display()
+            );
+            assert!(!remembered_record(store, "first").exists());
+            assert!(
+                store.load(&other, "theirs", now).unwrap().is_some(),
+                "{}",
+                store.dir().display()
+            );
+        }
+        runtime.shutdown().await.unwrap();
         started.relay_handle.abort();
     }
 

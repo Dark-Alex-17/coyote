@@ -12,9 +12,11 @@ use crate::config::mesh_config::EnvoyMemoryConfig;
 use crate::mesh::schema::{Remedy, VersionProbe, unversioned_refusal, version_refusal};
 use crate::mesh::trust::parse_hash;
 use crate::mesh::{
-    canonical_hash, mesh_cache_dir, parse_rfc3339, rfc3339_utc, write_atomically_owner_only,
+    canonical_hash, mesh_cache_dir, parse_rfc3339, redact_hashes, rfc3339_utc,
+    write_atomically_owner_only,
 };
 
+use log::warn;
 use parking_lot::Mutex;
 use rns_transport::hash::{AddressHash, Hash};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -221,6 +223,11 @@ pub(crate) fn session_key(identity: &str, thread: &str) -> Option<String> {
     )
 }
 
+/// Where every instance's store lives, one directory each.
+fn stores_dir(cache_dir: &Path) -> PathBuf {
+    mesh_cache_dir(cache_dir).join("envoy-sessions")
+}
+
 /// The conversations one instance's envoy remembers, keyed by instance because a fork
 /// answers its own peers and must not read the original's.
 pub(crate) struct EnvoySessions {
@@ -277,12 +284,53 @@ impl EnvoySessions {
         config: &EnvoyMemoryConfig,
     ) -> Option<Self> {
         config.enabled.then(|| Self {
-            dir: mesh_cache_dir(cache_dir)
-                .join("envoy-sessions")
-                .join(instance_id),
+            dir: stores_dir(cache_dir).join(instance_id),
             limits: EnvoyMemoryLimits::from(config),
             write_lock: Mutex::new(()),
         })
+    }
+
+    /// Forgets every thread of `identity` in every instance's store under `cache_dir`,
+    /// not only the one this node serves: trust is per config directory and the stores
+    /// are per instance, so a revoked identity's conversations with a fork, or with an
+    /// instance since re-keyed, go too. How many went in all. A store that refuses is
+    /// logged and skipped, the sweep going on to the next; `Ok(0)` while the memory is
+    /// off or no store exists.
+    pub(crate) fn delete_identity_everywhere(
+        cache_dir: &Path,
+        config: &EnvoyMemoryConfig,
+        identity: &str,
+    ) -> Result<usize, EnvoyMemoryError> {
+        let stores = stores_dir(cache_dir);
+        if !config.enabled || !stores.exists() {
+            return Ok(0);
+        }
+        let io_error = |source| EnvoyMemoryError::Io {
+            path: stores.clone(),
+            source,
+        };
+        let mut removed = 0;
+        for entry in fs::read_dir(&stores).map_err(io_error)? {
+            let path = entry.map_err(io_error)?.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let store = Self {
+                dir: path,
+                limits: EnvoyMemoryLimits::from(config),
+                write_lock: Mutex::new(()),
+            };
+            match store.delete_identity(identity) {
+                Ok(count) => removed += count,
+                Err(err @ EnvoyMemoryError::NotAnIdentity(_)) => return Err(err),
+                Err(err) => warn!(
+                    "Mesh envoy memory under '{}' could not be swept: {}",
+                    store.dir.display(),
+                    redact_hashes(&err.to_string())
+                ),
+            }
+        }
+        Ok(removed)
     }
 
     #[cfg(test)]
@@ -1151,6 +1199,72 @@ mod tests {
             exchange(3)
         );
         assert_eq!(store.stats().unwrap(), (1, 1));
+    }
+
+    #[test]
+    fn delete_identity_everywhere_sweeps_every_instance_store_and_skips_one_that_refuses() {
+        let tmp = TempDir::new("envoy-sessions-delete-everywhere");
+        let config = enabled();
+        assert_eq!(
+            EnvoySessions::delete_identity_everywhere(&tmp.path, &config, IDENTITY_A).unwrap(),
+            0
+        );
+        assert!(!tmp.path.join("mesh").exists());
+        let stores: Vec<EnvoySessions> = ["inst-a", "inst-b", "inst-c"]
+            .into_iter()
+            .map(|instance| EnvoySessions::open(&tmp.path, instance, &config).unwrap())
+            .collect();
+        for (n, store) in stores.iter().enumerate() {
+            store
+                .save(IDENTITY_A, "thread-one", exchange(n), t(1_000))
+                .unwrap();
+            store
+                .save(IDENTITY_B, "thread-one", exchange(n), t(1_000))
+                .unwrap();
+        }
+        stores[0]
+            .save(IDENTITY_A, "thread-two", exchange(9), t(1_001))
+            .unwrap();
+        let refused_index = stores[2].index_path();
+        let planted = fs::read_to_string(&refused_index)
+            .unwrap()
+            .replace("\"version\":1", "\"version\":2");
+        fs::write(&refused_index, &planted).unwrap();
+        fs::write(stores_dir(&tmp.path).join("notes.txt"), "not a store").unwrap();
+
+        assert_eq!(
+            EnvoySessions::delete_identity_everywhere(&tmp.path, &config, IDENTITY_A).unwrap(),
+            3
+        );
+
+        for store in &stores[..2] {
+            assert_eq!(
+                store.load(IDENTITY_A, "thread-one", t(1_001)).unwrap(),
+                None
+            );
+            assert!(
+                store
+                    .load(IDENTITY_B, "thread-one", t(1_001))
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        assert!(!record_path(&stores[0], IDENTITY_A, "thread-two").exists());
+        assert_eq!(
+            fs::read_to_string(&refused_index).unwrap(),
+            planted,
+            "the store that refuses is left as it is"
+        );
+        assert!(record_path(&stores[2], IDENTITY_A, "thread-one").exists());
+        assert!(
+            EnvoySessions::delete_identity_everywhere(&tmp.path, &config, "not-a-hash").is_err()
+        );
+        let off = EnvoyMemoryConfig::default();
+        assert_eq!(
+            EnvoySessions::delete_identity_everywhere(&tmp.path, &off, IDENTITY_B).unwrap(),
+            0,
+            "the memory off, nothing is swept"
+        );
     }
 
     #[test]
