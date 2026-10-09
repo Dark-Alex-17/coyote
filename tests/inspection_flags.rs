@@ -39,6 +39,12 @@ fn probe_inspection_flag(flag: &str, require_stdout: bool) {
     let output = Command::new(env!("CARGO_BIN_EXE_coyote"))
         .arg(flag)
         .env("COYOTE_CONFIG_DIR", &tmp_dir)
+        // Log file lives under the cache dir unless COYOTE_LOG_PATH overrides
+        // it; keep test children off the developer's real coyote.log (and its
+        // rotation). Info level pins that the redirect is honored.
+        .env("COYOTE_CACHE_DIR", &home_dir)
+        .env_remove("COYOTE_LOG_PATH")
+        .env("COYOTE_LOG_LEVEL", "info")
         // A fresh fake HOME hides any real ~/.coyote_password on the host;
         // USERPROFILE is the best-effort Windows equivalent (dirs resolves
         // home via the Known Folder API there). HOME is set, never removed:
@@ -64,6 +70,10 @@ fn probe_inspection_flag(flag: &str, require_stdout: bool) {
     assert!(
         !home_dir.join(".coyote_password").exists(),
         "{flag}: the lenient inspection path must never bootstrap a password file"
+    );
+    assert!(
+        home_dir.join("coyote.log").exists(),
+        "{flag}: the log file must land under the test's cache dir"
     );
     let _ = fs::remove_dir_all(&tmp_dir);
     let _ = fs::remove_dir_all(&home_dir);
@@ -121,6 +131,8 @@ fn agent_info_on_empty_config_dir_bootstraps_builtins() {
     let output = Command::new(env!("CARGO_BIN_EXE_coyote"))
         .args(["--agent", "adversary", "--info"])
         .env("COYOTE_CONFIG_DIR", &tmp_dir)
+        .env("COYOTE_CACHE_DIR", &home_dir)
+        .env_remove("COYOTE_LOG_PATH")
         .env("HOME", &home_dir)
         .env("USERPROFILE", &home_dir)
         .env_remove("IS_SANDBOX")
@@ -170,6 +182,8 @@ fn sandbox_list_secrets_prints_informational_message_and_writes_nothing() {
     let output = Command::new(env!("CARGO_BIN_EXE_coyote"))
         .arg("--list-secrets")
         .env("COYOTE_CONFIG_DIR", &tmp_dir)
+        .env("COYOTE_CACHE_DIR", &home_dir)
+        .env_remove("COYOTE_LOG_PATH")
         .env("IS_SANDBOX", "1")
         .env("HOME", &home_dir)
         .env("USERPROFILE", &home_dir)
@@ -235,6 +249,8 @@ fn sandbox_mutating_vault_flag_stays_strict() {
     let output = Command::new(env!("CARGO_BIN_EXE_coyote"))
         .args(["--delete-secret", "probe"])
         .env("COYOTE_CONFIG_DIR", &tmp_dir)
+        .env("COYOTE_CACHE_DIR", &home_dir)
+        .env_remove("COYOTE_LOG_PATH")
         .env("IS_SANDBOX", "1")
         .env("HOME", &home_dir)
         .env("USERPROFILE", &home_dir)
@@ -294,6 +310,8 @@ fn probe_strict_mcp_flag(label: &str, args: &[&str]) {
     let output = Command::new(env!("CARGO_BIN_EXE_coyote"))
         .args(args)
         .env("COYOTE_CONFIG_DIR", &tmp_dir)
+        .env("COYOTE_CACHE_DIR", &home_dir)
+        .env_remove("COYOTE_LOG_PATH")
         .env("HOME", &home_dir)
         .env("USERPROFILE", &home_dir)
         .env_remove("IS_SANDBOX")
@@ -363,6 +381,8 @@ fn mcp_list_lists_configured_server_without_vault() {
     let output = Command::new(env!("CARGO_BIN_EXE_coyote"))
         .arg("--mcp-list")
         .env("COYOTE_CONFIG_DIR", &tmp_dir)
+        .env("COYOTE_CACHE_DIR", &home_dir)
+        .env_remove("COYOTE_LOG_PATH")
         .env("HOME", &home_dir)
         .env("USERPROFILE", &home_dir)
         .env_remove("IS_SANDBOX")
@@ -412,6 +432,8 @@ fn sync_models_stays_on_bootstrap_path() {
     let output = Command::new(env!("CARGO_BIN_EXE_coyote"))
         .arg("--sync-models")
         .env("COYOTE_CONFIG_DIR", &tmp_dir)
+        .env("COYOTE_CACHE_DIR", &home_dir)
+        .env_remove("COYOTE_LOG_PATH")
         .env("HOME", &home_dir)
         .env("USERPROFILE", &home_dir)
         .env_remove("IS_SANDBOX")
@@ -448,6 +470,8 @@ fn run_list_sessions(
     Command::new(env!("CARGO_BIN_EXE_coyote"))
         .arg("--list-sessions")
         .env("COYOTE_CONFIG_DIR", config_dir)
+        .env("COYOTE_CACHE_DIR", home_dir)
+        .env_remove("COYOTE_LOG_PATH")
         .env("COYOTE_SESSIONS_DIR", global_sessions)
         .env("HOME", home_dir)
         .env("USERPROFILE", home_dir)

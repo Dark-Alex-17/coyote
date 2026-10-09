@@ -1148,6 +1148,12 @@ async fn run_process_job(
     let mut child = command
         .spawn()
         .map_err(|err| anyhow!("Unable to run {}, {err}", snapshot.display_name))?;
+    debug!(
+        "Spawned job process '{}' pid {:?}",
+        snapshot.display_name,
+        child.id()
+    );
+    let spawned = Instant::now();
 
     #[cfg(unix)]
     if let Some(pid) = child.id() {
@@ -1181,6 +1187,11 @@ async fn run_process_job(
         match time::timeout(Duration::from_secs(snapshot.timeout_secs), child.wait()).await {
             Ok(wait_result) => wait_result,
             Err(_) => {
+                debug!(
+                    "Job process '{}' killed after {:.1?} (timeout)",
+                    snapshot.display_name,
+                    spawned.elapsed()
+                );
                 kill_expired_job(&mut child, &state).await;
                 state.lock().pgid = None;
                 drain_pump(stdout_pump).await;
@@ -1211,6 +1222,11 @@ async fn run_process_job(
             bail!("Unable to run {}, {err}", snapshot.display_name);
         }
     };
+    debug!(
+        "Job process '{}' exited with {status} after {:.1?}",
+        snapshot.display_name,
+        spawned.elapsed()
+    );
     // pid-reuse guard: the child is reaped, so a later group kill against
     // this pgid could hit an innocent recycled pid.
     state.lock().pgid = None;

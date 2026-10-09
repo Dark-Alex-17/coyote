@@ -141,6 +141,11 @@ fn run_coyote(dir: &Path, args: &[&str]) -> Output {
         .args(args)
         .current_dir(dir)
         .env("COYOTE_CONFIG_DIR", dir)
+        // Log file lives under the cache dir unless COYOTE_LOG_PATH overrides
+        // it; keep test children off the developer's real coyote.log (and its
+        // rotation).
+        .env("COYOTE_CACHE_DIR", dir.join("cache"))
+        .env_remove("COYOTE_LOG_PATH")
         .env_remove("IS_SANDBOX")
         .stdin(Stdio::null())
         .output()

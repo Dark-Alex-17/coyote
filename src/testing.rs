@@ -11,31 +11,46 @@ struct TestLogCollector;
 
 static WARN_MESSAGES: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 static DEBUG_MESSAGES: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+static INFO_MESSAGES: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 
-/// Debug capture is restricted to the modules whose tests assert on debug
-/// output so the buffer is not flooded by the rest of the crate. Matching is
-/// module-boundary-aware: only these exact modules or their `::` submodules
-/// qualify, so a sibling like `hooks_registry` would not.
-const DEBUG_TARGET_PREFIXES: [&str; 2] = [
+/// Debug and info capture are restricted to the modules whose tests assert
+/// on that output so the buffers are not flooded by the rest of the crate.
+/// Matching is module-boundary-aware: only these exact modules or their `::`
+/// submodules qualify, so a sibling like `hooks_registry` would not.
+const DEBUG_TARGET_PREFIXES: [&str; 3] = [
     concat!(env!("CARGO_CRATE_NAME"), "::hooks"),
     concat!(env!("CARGO_CRATE_NAME"), "::config::agent"),
+    concat!(env!("CARGO_CRATE_NAME"), "::function"),
+];
+
+const INFO_TARGET_PREFIXES: [&str; 2] = [
+    concat!(env!("CARGO_CRATE_NAME"), "::graph::script"),
+    concat!(env!("CARGO_CRATE_NAME"), "::function"),
 ];
 
 fn captures_warn(metadata: &Metadata) -> bool {
     metadata.level() <= Level::Warn
 }
 
-fn captures_module_debug(metadata: &Metadata) -> bool {
-    if metadata.level() != Level::Debug {
+fn captures_module_level(metadata: &Metadata, level: Level, prefixes: &[&str]) -> bool {
+    if metadata.level() != level {
         return false;
     }
     let target = metadata.target();
-    DEBUG_TARGET_PREFIXES.iter().any(|prefix| {
+    prefixes.iter().any(|prefix| {
         target == *prefix
             || target
                 .strip_prefix(prefix)
                 .is_some_and(|rest| rest.starts_with("::"))
     })
+}
+
+fn captures_module_debug(metadata: &Metadata) -> bool {
+    captures_module_level(metadata, Level::Debug, &DEBUG_TARGET_PREFIXES)
+}
+
+fn captures_module_info(metadata: &Metadata) -> bool {
+    captures_module_level(metadata, Level::Info, &INFO_TARGET_PREFIXES)
 }
 
 /// Every warn- or error-level message captured since the collector was
@@ -53,6 +68,13 @@ pub(crate) fn debug_messages() -> &'static Mutex<Vec<String>> {
     DEBUG_MESSAGES.get_or_init(Mutex::default)
 }
 
+/// Every info-level message from the [`INFO_TARGET_PREFIXES`] modules
+/// captured since the collector was installed. Same marker-filtering
+/// discipline as [`warn_messages`].
+pub(crate) fn info_messages() -> &'static Mutex<Vec<String>> {
+    INFO_MESSAGES.get_or_init(Mutex::default)
+}
+
 /// A copy of everything in [`warn_messages`], recovering from poisoning the
 /// same way the collector itself does.
 pub(crate) fn warn_snapshot() -> Vec<String> {
@@ -65,6 +87,12 @@ pub(crate) fn debug_snapshot() -> Vec<String> {
     snapshot_of(debug_messages())
 }
 
+/// A copy of everything in [`info_messages`], recovering from poisoning the
+/// same way the collector itself does.
+pub(crate) fn info_snapshot() -> Vec<String> {
+    snapshot_of(info_messages())
+}
+
 fn snapshot_of(buffer: &Mutex<Vec<String>>) -> Vec<String> {
     buffer
         .lock()
@@ -74,7 +102,7 @@ fn snapshot_of(buffer: &Mutex<Vec<String>>) -> Vec<String> {
 
 impl Log for TestLogCollector {
     fn enabled(&self, metadata: &Metadata) -> bool {
-        captures_warn(metadata) || captures_module_debug(metadata)
+        captures_warn(metadata) || captures_module_debug(metadata) || captures_module_info(metadata)
     }
 
     // A test that panics while holding a buffer poisons its mutex; the logger
@@ -90,6 +118,11 @@ impl Log for TestLogCollector {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push(record.args().to_string());
+        } else if captures_module_info(record.metadata()) {
+            info_messages()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(record.args().to_string());
         }
     }
 
@@ -97,11 +130,11 @@ impl Log for TestLogCollector {
 }
 
 /// Installs the process-wide log collector capturing warn-level messages and
-/// debug messages from the [`DEBUG_TARGET_PREFIXES`] modules.
-/// `log::set_logger` accepts one logger per process, so every test that
-/// captures either stream must install through this shared entry point. The
-/// max level is Debug so the debug capture sees its records; warn capture is
-/// unaffected.
+/// debug/info messages from the [`DEBUG_TARGET_PREFIXES`] and
+/// [`INFO_TARGET_PREFIXES`] modules. `log::set_logger` accepts one logger per
+/// process, so every test that captures any stream must install through this
+/// shared entry point. The max level is Debug so the debug capture sees its
+/// records; warn capture is unaffected.
 pub(crate) fn install_log_collector() {
     static INSTALL: Once = Once::new();
     INSTALL.call_once(|| {

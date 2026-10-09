@@ -1542,6 +1542,10 @@ impl ToolCall {
     pub async fn eval(&self, ctx: &mut RequestContext) -> Result<Value> {
         let result = self.eval_inner(ctx).await;
         if let Err(err) = &result {
+            // A bail before the tool ran (unknown tool, bad arguments) never
+            // reaches eval_inner's start/finish lines. The error text can carry
+            // the raw argument payload, so only the name goes to the log.
+            info!("Tool call '{}' refused before running", self.name);
             hooks::fire(
                 HookEvent::ToolFailed,
                 ctx,
@@ -1599,6 +1603,7 @@ impl ToolCall {
             &[("COYOTE_TOOL_NAME", self.name.clone())],
             Some(args_json.clone()),
         );
+        info!("Tool call '{}' started", self.name);
         let tool_started_at = Instant::now();
 
         let output = match cmd_name.as_str() {
@@ -1731,6 +1736,11 @@ impl ToolCall {
                     .as_str()
                     .map(str::to_string)
                     .unwrap_or_else(|| error.to_string());
+                info!(
+                    "Tool call '{}' finished in {:.1?} (error)",
+                    self.name,
+                    tool_started_at.elapsed()
+                );
                 hooks::fire(
                     HookEvent::ToolFailed,
                     ctx,
@@ -1742,6 +1752,11 @@ impl ToolCall {
                 );
             }
             None => {
+                info!(
+                    "Tool call '{}' finished in {:.1?} (ok)",
+                    self.name,
+                    tool_started_at.elapsed()
+                );
                 hooks::fire(
                     HookEvent::ToolCompleted,
                     ctx,
@@ -2410,6 +2425,8 @@ pub fn run_llm_function(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|err| anyhow!("Unable to run {command_name}, {err}"))?;
+    debug!("Spawned tool process '{command_name}' pid {}", child.id());
+    let spawned = Instant::now();
 
     let stdout = child.stdout.take().expect("Failed to capture stdout");
     let stderr = child.stderr.take().expect("Failed to capture stderr");
@@ -2478,13 +2495,23 @@ pub fn run_llm_function(
     let deadline = (timeout_secs > 0).then(|| Instant::now() + Duration::from_secs(timeout_secs));
     let status = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break status,
+            Ok(Some(status)) => {
+                debug!(
+                    "Tool process '{command_name}' exited with {status} after {:.1?}",
+                    spawned.elapsed()
+                );
+                break status;
+            }
             Ok(None) => {}
             Err(err) => bail!("Unable to run {command_name}, {err}"),
         }
         if let Some(deadline) = deadline
             && Instant::now() >= deadline
         {
+            debug!(
+                "Tool process '{command_name}' killed after {:.1?} (timeout)",
+                spawned.elapsed()
+            );
             let _ = child.kill();
             let _ = child.wait();
             drop(stdout_thread);
@@ -2504,6 +2531,10 @@ pub fn run_llm_function(
             return Ok(Some(error_json.to_string()));
         }
         if abort.as_ref().is_some_and(|a| a.aborted()) {
+            debug!(
+                "Tool process '{command_name}' killed after {:.1?} (abort)",
+                spawned.elapsed()
+            );
             let _ = child.kill();
             let _ = child.wait();
             drop(stdout_thread);
@@ -5510,6 +5541,76 @@ mod tests {
                 .contains("exited with code 1")
         );
         assert!(!captures[1].envs.contains_key("COYOTE_TOOL_DURATION_MS"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn eval_logs_error_tag_for_nonzero_exit_returned_as_ok() {
+        crate::testing::install_log_collector();
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        ctx.tool_scope
+            .functions
+            .append_declaration(FunctionDeclaration {
+                name: "false".to_string(),
+                description: String::new(),
+                parameters: JsonSchema::default(),
+                agent: false,
+            });
+
+        let output = run_async(call_with_args("false", json!({})).eval(&mut ctx)).unwrap();
+
+        assert!(output["tool_call_error"].is_string());
+        let finished: Vec<String> = crate::testing::info_snapshot()
+            .into_iter()
+            .filter(|m| m.starts_with("Tool call 'false' finished in"))
+            .collect();
+        assert!(!finished.is_empty());
+        assert!(
+            finished.iter().all(|m| m.ends_with("(error)")),
+            "{finished:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn eval_logs_ok_tag_and_process_lifecycle_for_successful_tool() {
+        crate::testing::install_log_collector();
+        let mut ctx = RequestContext::new(Arc::new(AppState::test_default()), WorkingMode::Cmd);
+        ctx.tool_scope
+            .functions
+            .append_declaration(FunctionDeclaration {
+                name: "true".to_string(),
+                description: String::new(),
+                parameters: JsonSchema::default(),
+                agent: false,
+            });
+
+        let output = run_async(call_with_args("true", json!({})).eval(&mut ctx)).unwrap();
+
+        assert_eq!(output, Value::Null);
+        let infos = crate::testing::info_snapshot();
+        assert!(infos.iter().any(|m| m == "Tool call 'true' started"));
+        let finished: Vec<&String> = infos
+            .iter()
+            .filter(|m| m.starts_with("Tool call 'true' finished in"))
+            .collect();
+        assert!(!finished.is_empty());
+        assert!(finished.iter().all(|m| m.ends_with("(ok)")), "{finished:?}");
+        let debugs = crate::testing::debug_snapshot();
+        assert!(
+            debugs
+                .iter()
+                .any(|m| m.starts_with("Spawned tool process 'true' pid ")),
+            "{debugs:?}"
+        );
+        assert!(
+            debugs
+                .iter()
+                .any(|m| m.starts_with("Tool process 'true' exited with exit status: 0 after ")),
+            "{debugs:?}"
+        );
     }
 
     #[test]
