@@ -8058,7 +8058,8 @@ mod tests {
     }
 
     /// The remembered turns are part of the prompt, so an unpriced run that resumes a
-    /// thread is charged more than a fresh run over the same words.
+    /// thread is charged more than a fresh run over the same words, by about the
+    /// history's own token count and not merely the resumed-thread note's.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
     async fn a_resumed_thread_debits_more_than_a_fresh_run() {
@@ -8068,7 +8069,7 @@ mod tests {
         let app = test_app();
         let store = memory_for(&app, &tmp);
         let idle = RecordingIdleSink::attach(&app);
-        let earlier = (0..2)
+        let earlier: Vec<EnvoyTurn> = (0..2)
             .flat_map(|_| {
                 [
                     EnvoyTurn {
@@ -8082,6 +8083,23 @@ mod tests {
                 ]
             })
             .collect();
+        let model =
+            Model::retrieve_model(app.config.as_ref(), TEST_MODEL_ID, ModelType::Chat).unwrap();
+        let history: Vec<Message> = earlier
+            .iter()
+            .map(|turn| {
+                let role = match turn.role {
+                    EnvoyRole::User => MessageRole::User,
+                    EnvoyRole::Assistant => MessageRole::Assistant,
+                };
+                Message::new(role, MessageContent::Text(turn.text.clone()))
+            })
+            .collect();
+        let history_tokens = model.total_tokens(&history) as u64;
+        let note_tokens = model.total_tokens(&[Message::new(
+            MessageRole::System,
+            MessageContent::Text(RESUMED_THREAD_NOTE.into()),
+        )]) as u64;
         store
             .save(
                 &hex_lower(&PEER_IDENTITY),
@@ -8114,9 +8132,10 @@ mod tests {
                 .unwrap()
                 .tokens
         };
+        let extra = tokens(&PEER_IDENTITY).saturating_sub(tokens(&OTHER_IDENTITY));
         assert!(
-            tokens(&PEER_IDENTITY) > tokens(&OTHER_IDENTITY),
-            "resumed {} vs fresh {}",
+            extra >= history_tokens * 9 / 10 && extra >= 10 * note_tokens,
+            "resumed {} vs fresh {}: extra {extra}, history {history_tokens}, note {note_tokens}",
             tokens(&PEER_IDENTITY),
             tokens(&OTHER_IDENTITY)
         );
