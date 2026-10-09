@@ -72,7 +72,7 @@
 //! different identity.
 
 use crate::mesh::announce::is_control_or_invisible;
-use crate::mesh::envoy_sessions::EnvoyMemorySink;
+use crate::mesh::envoy_sessions::{EnvoyMemoryError, EnvoyMemorySink};
 use crate::mesh::idle::{IdleNotify, Origin};
 use crate::mesh::knock::KnockSurface;
 use crate::mesh::node::MeshSlot;
@@ -861,6 +861,16 @@ impl TrustStore {
             return;
         };
         sink.forget_identity(identity);
+    }
+
+    /// How many envoy conversations `untrust_identity` or `block_identity` would forget
+    /// of `identity`; `None` when no envoy memory is attached.
+    pub(crate) fn remembered_envoy_threads(
+        &self,
+        identity: &str,
+    ) -> Option<Result<usize, EnvoyMemoryError>> {
+        let sink = self.envoy_memory.lock().as_ref().and_then(Weak::upgrade)?;
+        Some(sink.remembered_of(identity))
     }
 
     /// `mesh.collision_protection`: on, the collision rung of `authorize_origin` precedes
@@ -2778,6 +2788,10 @@ mod tests {
     impl EnvoyMemorySink for RecordingMemory {
         fn forget_identity(&self, identity: &str) {
             self.0.lock().push(identity.to_string());
+        }
+
+        fn remembered_of(&self, _identity: &str) -> Result<usize, EnvoyMemoryError> {
+            Ok(0)
         }
     }
 

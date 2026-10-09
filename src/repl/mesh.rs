@@ -5,7 +5,7 @@ use crate::config::{MeshConfig, RequestContext, paths};
 use crate::function::mesh::trust_label;
 use crate::mesh::access::GrantKind;
 use crate::mesh::card::{CardSource, DISPLAY_NAME_MAX_CHARS, StatusHandler, render_for_human};
-use crate::mesh::envoy_sessions::EnvoySessions;
+use crate::mesh::envoy_sessions::{EnvoyMemoryError, EnvoySessions};
 use crate::mesh::fetch::{
     FILE_FETCH_REQUEST_TIMEOUT, FetchError as FileFetchError, Fetched, SINGLE_SEGMENT_FETCH_CEILING,
 };
@@ -2210,6 +2210,7 @@ fn untrust_identity(
         bail!("Identity {identity} is not in the trust list, so there is nothing to untrust.");
     }
     let expected = format!("untrust-{}", short(identity));
+    let memory = store.remembered_envoy_threads(identity);
     match confirm {
         None => {
             let mut lines = vec![format!("Untrusting identity {identity} forgets:")];
@@ -2240,8 +2241,32 @@ fn untrust_identity(
             } else {
                 String::new()
             };
+            let memory_clause = match &memory {
+                Some(Ok(count)) if *count > 0 => {
+                    lines.push(format!(
+                        "  {}  forgotten with it",
+                        plural(
+                            *count,
+                            "remembered envoy conversation",
+                            "remembered envoy conversations"
+                        )
+                    ));
+                    format!(
+                        " and the {} remembered of it",
+                        plural(*count, "envoy conversation", "envoy conversations")
+                    )
+                }
+                Some(Err(err)) => {
+                    lines.push(format!(
+                        "  remembered envoy conversations  could not be counted: {}; they are swept all the same",
+                        redact_hashes(&err.to_string())
+                    ));
+                    String::new()
+                }
+                _ => String::new(),
+            };
             lines.push(format!(
-                "{DRY_RUN_NOTHING_CHANGED} To forget this identity and its {} instance(s){refused_clause}, run: .mesh {verb} --identity {identity} --confirm {expected}",
+                "{DRY_RUN_NOTHING_CHANGED} To forget this identity and its {} instance(s){refused_clause}{memory_clause}, run: .mesh {verb} --identity {identity} --confirm {expected}",
                 bound.len()
             ));
             out_text(&lines.join("\n"));
@@ -2258,10 +2283,42 @@ fn untrust_identity(
                 removed.len()
             )];
             lines.extend(removed.iter().map(|hash| format!("  {hash}")));
+            lines.extend(envoy_memory_sweep_line(
+                identity,
+                memory,
+                store.remembered_envoy_threads(identity),
+            ));
             out_text(&lines.join("\n"));
         }
     }
     Ok(())
+}
+
+/// What a revocation says of the envoy memory once its sweep has run, from the count
+/// `before` the write and the one read `after` it; nothing when there was nothing to
+/// forget.
+fn envoy_memory_sweep_line(
+    identity: &str,
+    before: Option<Result<usize, EnvoyMemoryError>>,
+    after: Option<Result<usize, EnvoyMemoryError>>,
+) -> Option<String> {
+    match after {
+        Some(Ok(0)) | None => match before {
+            Some(Ok(count)) if count > 0 => Some(format!(
+                "Forgot the {} remembered of it.",
+                plural(count, "envoy conversation", "envoy conversations")
+            )),
+            _ => None,
+        },
+        Some(Ok(remaining)) => Some(format!(
+            "{} remembered of it could not be forgotten; run .mesh memory forget {identity}.",
+            plural(remaining, "envoy conversation", "envoy conversations")
+        )),
+        Some(Err(err)) => Some(format!(
+            "Its remembered envoy conversations could not be counted: {}; run .mesh memory forget {identity} to be sure.",
+            redact_hashes(&err.to_string())
+        )),
+    }
 }
 
 fn block(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
@@ -2276,8 +2333,21 @@ fn block(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     };
     let store = trust_store(ctx)?;
     let identity = identity_hash(target)?;
+    let memory = store.remembered_envoy_threads(&identity);
+    let memory_clause = match &memory {
+        Some(Ok(count)) if *count > 0 => format!(
+            ", and the {} remembered of it {} forgotten.",
+            plural(*count, "envoy conversation", "envoy conversations"),
+            if *count == 1 { "is" } else { "are" }
+        ),
+        Some(Err(err)) => format!(
+            ". Its remembered envoy conversations could not be counted: {}; they are swept all the same.",
+            redact_hashes(&err.to_string())
+        ),
+        _ => ".".to_string(),
+    };
     out_text(&format!(
-        "This blocks identity {}: its knocks are dropped without a word, and every trust record for it, identity and instances alike, is removed.",
+        "This blocks identity {}: its knocks are dropped without a word, and every trust record for it, identity and instances alike, is removed{memory_clause}",
         short(&identity)
     ));
     if !confirm_or_flag(&format!("Block {}?", short(&identity)), "--yes", args.yes)? {
@@ -2298,6 +2368,11 @@ fn block(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
         ));
         lines.extend(removed.iter().map(|hash| format!("  {hash}")));
     }
+    lines.extend(envoy_memory_sweep_line(
+        &identity,
+        memory,
+        store.remembered_envoy_threads(&identity),
+    ));
     out_text(&lines.join("\n"));
     Ok(())
 }
@@ -12820,6 +12895,189 @@ mod tests {
                         started.runtime.envoy_memory().is_none(),
                         "the sweep opened no store for the node"
                     );
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// The revocation verbs say how many envoy conversations go with the trust:
+            /// the untrust and forget dry runs list the count and name it in the sentence,
+            /// the write reports it forgotten, `.mesh block` carries the clause in its
+            /// intro and its report, and the count is the sweep's, across every instance
+            /// store and not only the one the node serves.
+            #[test]
+            #[serial]
+            fn revocation_verbs_disclose_the_envoy_conversations_they_forget() {
+                use crate::config::mesh_config::EnvoyMemoryConfig;
+                use crate::mesh::envoy_sessions::{EnvoyRole, EnvoySessions, EnvoyTurn};
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-envoy-memory-disclose");
+                let _capture = capture::install();
+                let _script = prompt_script::install(&[]);
+                run_async(async {
+                    let config = EnvoyMemoryConfig {
+                        enabled: true,
+                        ..EnvoyMemoryConfig::default()
+                    };
+                    let started = started_runtime_with("repl-mesh-envoy-memory-disclose", {
+                        let config = config.clone();
+                        move |c| c.envoy_memory = config
+                    })
+                    .await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let trust = started.runtime.trust();
+                    let served = started
+                        .runtime
+                        .envoy_memory()
+                        .expect("an enabled store is opened at start");
+                    let other_instance = Session::default().ensure_mesh_instance_id().to_string();
+                    let unserved =
+                        EnvoySessions::open(started.runtime.cache_dir(), &other_instance, &config)
+                            .unwrap();
+                    let slot: &dyn LiveMesh = ctx.app.mesh.as_ref();
+                    let now = SystemTime::now();
+                    let turns = vec![
+                        EnvoyTurn {
+                            role: EnvoyRole::User,
+                            text: "where were we?".into(),
+                        },
+                        EnvoyTurn {
+                            role: EnvoyRole::Assistant,
+                            text: "the build".into(),
+                        },
+                    ];
+                    let dest_a = heard_trusted_peer(&started.runtime, slot);
+                    let id_a = identity_of(&trust, &dest_a);
+                    let (dest_b, id_b) = heard_peer(&started.runtime, "Bo", now);
+                    trust
+                        .trust_destination(slot, &dest_b, TrustOptions::default(), now)
+                        .unwrap();
+                    // A's `a-first` sits in both stores and counts once; three threads in all.
+                    for (store, identity, thread) in [
+                        (served.as_ref(), &id_a, "a-first"),
+                        (served.as_ref(), &id_a, "a-second"),
+                        (&unserved, &id_a, "a-first"),
+                        (&unserved, &id_a, "a-third"),
+                        (&unserved, &id_b, "b-first"),
+                    ] {
+                        store.save(identity, thread, turns.clone(), now).unwrap();
+                    }
+                    let remembered_of = |identity: &str| {
+                        EnvoySessions::remembered_everywhere(started.runtime.cache_dir(), &config)
+                            .unwrap()
+                            .get(identity)
+                            .map_or(0, Vec::len)
+                    };
+                    assert_eq!(remembered_of(&id_a), 3);
+
+                    for line in [
+                        format!(".mesh untrust {dest_a} --dry-run"),
+                        format!(".mesh untrust {dest_a} --yes"),
+                    ] {
+                        let out = out_of(&mut ctx, &line).await.unwrap();
+                        assert!(!out.contains("envoy"), "{line}: {out}");
+                    }
+                    assert_eq!(
+                        remembered_of(&id_a),
+                        3,
+                        "a destination untrust sweeps nothing"
+                    );
+                    trust
+                        .trust_destination(
+                            ctx.app.mesh.as_ref(),
+                            &dest_a,
+                            TrustOptions::default(),
+                            now,
+                        )
+                        .unwrap();
+                    let before_dry_runs = trust_file(&trust);
+
+                    let token = format!("untrust-{}", short(&id_a));
+                    let untrust_dry_run =
+                        out_of(&mut ctx, &format!(".mesh untrust --identity {id_a}"))
+                            .await
+                            .unwrap();
+                    assert!(
+                        untrust_dry_run
+                            .lines()
+                            .any(|line| line
+                                == "  3 remembered envoy conversations  forgotten with it"),
+                        "{untrust_dry_run}"
+                    );
+                    assert!(
+                        untrust_dry_run.contains(&format!(
+                            "To forget this identity and its 1 instance(s) and the 3 envoy conversations remembered of it, run: .mesh untrust --identity {id_a} --confirm {token}"
+                        )),
+                        "{untrust_dry_run}"
+                    );
+                    assert_eq!(trust_file(&trust), before_dry_runs);
+                    assert_eq!(remembered_of(&id_a), 3, "the dry run forgets nothing");
+
+                    let forget_dry_run =
+                        out_of(&mut ctx, &format!(".mesh forget --identity {id_a}"))
+                            .await
+                            .unwrap();
+                    assert_eq!(
+                        forget_dry_run.replace(".mesh forget", ".mesh untrust"),
+                        untrust_dry_run,
+                        "{forget_dry_run}"
+                    );
+                    assert_eq!(trust_file(&trust), before_dry_runs);
+                    assert_eq!(remembered_of(&id_a), 3);
+
+                    let out = out_of(
+                        &mut ctx,
+                        &format!(".mesh untrust --identity {id_a} --confirm {token}"),
+                    )
+                    .await
+                    .unwrap();
+                    assert!(out.contains("Untrusted identity"), "{out}");
+                    assert_eq!(
+                        out.lines().last(),
+                        Some("Forgot the 3 envoy conversations remembered of it."),
+                        "{out}"
+                    );
+                    assert_eq!(remembered_of(&id_a), 0);
+                    assert_eq!(remembered_of(&id_b), 1, "another identity's thread stays");
+
+                    let out = out_of(&mut ctx, &format!(".mesh block {id_b} --yes"))
+                        .await
+                        .unwrap();
+                    assert!(
+                        out.lines().next().unwrap().ends_with(
+                            ", identity and instances alike, is removed, and the 1 envoy conversation remembered of it is forgotten."
+                        ),
+                        "{out}"
+                    );
+                    assert!(out.contains("Blocked"), "{out}");
+                    assert_eq!(
+                        out.lines().last(),
+                        Some("Forgot the 1 envoy conversation remembered of it."),
+                        "{out}"
+                    );
+                    assert_eq!(remembered_of(&id_b), 0);
+
+                    // With nothing remembered the verbs say nothing of the memory.
+                    let (dest_c, id_c) = heard_peer(&started.runtime, "Cy", now);
+                    trust
+                        .trust_destination(
+                            ctx.app.mesh.as_ref(),
+                            &dest_c,
+                            TrustOptions::default(),
+                            now,
+                        )
+                        .unwrap();
+                    for line in [
+                        format!(".mesh untrust --identity {id_c}"),
+                        format!(".mesh block {id_c} --yes"),
+                        format!(".mesh block {id_a} --yes"),
+                    ] {
+                        let out = out_of(&mut ctx, &line).await.unwrap();
+                        assert!(!out.contains("envoy"), "{line}: {out}");
+                    }
+                    assert_eq!(prompt_script::prompts_asked(), 0);
 
                     assert!(ctx.app.mesh.stop().await.unwrap());
                     started.relay_handle.abort();

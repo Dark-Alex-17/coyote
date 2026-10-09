@@ -7,7 +7,9 @@ use crate::mesh::announce::{
 use crate::mesh::brief::{Brief, Digest, assemble_brief, digest_objective_for};
 use crate::mesh::card::{CardSource, DISPLAY_NAME_MAX_CHARS, StatusHandler, build_card};
 use crate::mesh::envoy::{EnvoyJob, EnvoySink};
-use crate::mesh::envoy_sessions::{EnvoyMemorySink, EnvoyRole, EnvoySessions, EnvoyTurn};
+use crate::mesh::envoy_sessions::{
+    EnvoyMemoryError, EnvoyMemorySink, EnvoyRole, EnvoySessions, EnvoyTurn,
+};
 use crate::mesh::events::{
     BriefUpdateSource, MeshEvent, MeshHookSink, MeshHooks, NodeFacts, Routed, TrustHookObserver,
 };
@@ -1904,6 +1906,14 @@ impl EnvoyMemorySink for MeshRuntime {
                 redact_hashes(&err.to_string())
             ),
         }
+    }
+
+    fn remembered_of(&self, identity: &str) -> Result<usize, EnvoyMemoryError> {
+        Ok(
+            EnvoySessions::remembered_everywhere(&self.cache_dir, &self.envoy_memory_config)?
+                .get(identity)
+                .map_or(0, Vec::len),
+        )
     }
 }
 

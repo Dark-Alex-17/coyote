@@ -41,6 +41,10 @@ const RECORD_EXTENSION: &str = "yaml";
 pub(crate) trait EnvoyMemorySink: Send + Sync {
     /// Forgets every thread remembered of `identity` (lower-hex).
     fn forget_identity(&self, identity: &str);
+
+    /// How many threads are remembered of `identity` (lower-hex) across every instance
+    /// store; reads only.
+    fn remembered_of(&self, identity: &str) -> Result<usize, EnvoyMemoryError>;
 }
 
 /// One `<key>.yaml`: the retained turns of one peer thread. The shape is a stable on-disk
