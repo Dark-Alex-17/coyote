@@ -1021,9 +1021,11 @@ fn check_index_anchors(definitions: &[Definition], entries: &[IndexEntry]) -> Re
 mod tests {
     use super::*;
     use crate::config::mesh_config::{
-        DEFAULT_FETCH_MAX_BYTES, DEFAULT_INLINE_MAX_BYTES, DEFAULT_PEER_MAX_CONCURRENT,
-        DEFAULT_PEER_MAX_MESSAGES_PER_HOUR, DEFAULT_PEER_MAX_TOKENS_PER_HOUR, MAX_FETCH_FILE_BYTES,
-        MAX_INLINE_FILE_TOTAL,
+        DEFAULT_ENVOY_MEMORY_MAX_BYTES, DEFAULT_ENVOY_MEMORY_MAX_PER_IDENTITY,
+        DEFAULT_ENVOY_MEMORY_MAX_SESSIONS, DEFAULT_ENVOY_MEMORY_MAX_TURNS,
+        DEFAULT_ENVOY_MEMORY_TTL_HOURS, DEFAULT_FETCH_MAX_BYTES, DEFAULT_INLINE_MAX_BYTES,
+        DEFAULT_PEER_MAX_CONCURRENT, DEFAULT_PEER_MAX_MESSAGES_PER_HOUR,
+        DEFAULT_PEER_MAX_TOKENS_PER_HOUR, MAX_FETCH_FILE_BYTES, MAX_INLINE_FILE_TOTAL,
     };
     use crate::config::mesh_envoy::ENVOY_RUN_TIMEOUT_SECS;
     use crate::function::mesh::FETCH_INLINE_TEXT_MAX_BYTES;
@@ -1032,9 +1034,9 @@ mod tests {
         MAX_FETCH_RESPONSE_BYTES, RESPONSE_FRAME_PREFIX, RefusalCode, RequestId, ResponseFrame,
     };
     use crate::mesh::{
-        access, announce, card, events, fetch, grants, identity, knock, knocks, limits, message,
-        node, peers, pending, propagation, propagation_fetch, propagation_nodes, protocol, r3,
-        schema, shares, trust, wire_path,
+        access, announce, card, envoy_sessions, events, fetch, grants, identity, knock, knocks,
+        limits, message, node, peers, pending, propagation, propagation_fetch, propagation_nodes,
+        protocol, r3, schema, shares, trust, wire_path,
     };
     use lxmf_core::constants::{FIELD_CUSTOM_DATA, FIELD_CUSTOM_TYPE};
     use rmpv::Value;
@@ -1042,7 +1044,7 @@ mod tests {
     use rns_transport::resource::MAX_EFFICIENT_SIZE;
     use std::time::Duration;
 
-    const EXPECTED_LITERALS: &str = r#"1,1,10,16,262144,128,"/knock","/status","/message",30,10,10,2,20,16,0xf0,0xf1,0xf3,0xf4,0xf5,0xf6,0xfd,0xfe,"SCOPE",64,300,900,3,2700,1800,1024,"scope.knock/1",200,15,10,256,3,600,256,16,1,0,1,2,64,280,64,64,120,280,"scope.peer/1",1,120,4000,64,4096,8,15,10,604800,256,3600,120,256,1,60,100000,120,26,60,2,60,1024,64,240,131072,112,4096,15552000,4096,86400,3,900,256,0,32,0xfb,0xfc,8,64,256,64,8,2,2,2,2,1,2,1,8,106496,98304,65536,"/list","/fetch",1024,64,1000,100000,64,2048,120,128,1048447,4194304,4194304,4198400,92 c4 10,200,16,32,"/access","scope.access/1",16,500,5,900,1,1,1,16,32768,1048575,4096"#;
+    const EXPECTED_LITERALS: &str = r#"1,1,10,16,262144,128,"/knock","/status","/message",30,10,10,2,20,16,0xf0,0xf1,0xf3,0xf4,0xf5,0xf6,0xfd,0xfe,"SCOPE",64,300,900,3,2700,1800,1024,"scope.knock/1",200,15,10,256,3,600,256,16,1,0,1,2,64,280,64,64,120,280,"scope.peer/1",1,120,4000,64,4096,8,15,10,604800,256,3600,120,256,1,60,100000,120,26,60,2,60,1024,64,240,131072,112,4096,15552000,4096,86400,3,900,256,0,32,0xfb,0xfc,8,64,256,64,8,2,2,2,2,1,2,1,8,106496,98304,65536,"/list","/fetch",1024,64,1000,100000,64,2048,120,128,1048447,4194304,4194304,4198400,92 c4 10,200,16,32,"/access","scope.access/1",16,500,5,900,1,1,1,16,32768,1048575,4096,1,1,256,16,40,65536,168"#;
 
     fn expected_constants() -> Vec<(&'static str, String)> {
         let secs = |d: Duration| d.as_secs().to_string();
@@ -1386,6 +1388,34 @@ mod tests {
             (
                 "PRESENCE_SURFACED_CAP",
                 trust::PRESENCE_SURFACED_CAP.to_string(),
+            ),
+            (
+                "ENVOY_SESSION_VERSION",
+                envoy_sessions::ENVOY_SESSION_VERSION.to_string(),
+            ),
+            (
+                "ENVOY_SESSION_INDEX_VERSION",
+                envoy_sessions::ENVOY_SESSION_INDEX_VERSION.to_string(),
+            ),
+            (
+                "DEFAULT_ENVOY_MEMORY_MAX_SESSIONS",
+                DEFAULT_ENVOY_MEMORY_MAX_SESSIONS.to_string(),
+            ),
+            (
+                "DEFAULT_ENVOY_MEMORY_MAX_PER_IDENTITY",
+                DEFAULT_ENVOY_MEMORY_MAX_PER_IDENTITY.to_string(),
+            ),
+            (
+                "DEFAULT_ENVOY_MEMORY_MAX_TURNS",
+                DEFAULT_ENVOY_MEMORY_MAX_TURNS.to_string(),
+            ),
+            (
+                "DEFAULT_ENVOY_MEMORY_MAX_BYTES",
+                DEFAULT_ENVOY_MEMORY_MAX_BYTES.to_string(),
+            ),
+            (
+                "DEFAULT_ENVOY_MEMORY_TTL_HOURS",
+                DEFAULT_ENVOY_MEMORY_TTL_HOURS.to_string(),
             ),
         ]
     }
@@ -2815,6 +2845,14 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
             ),
             ("SHARES_FILE_VERSION", shares::SHARES_FILE_VERSION),
             ("GRANT_RECORD_VERSION", grants::GRANT_RECORD_VERSION),
+            (
+                "ENVOY_SESSION_VERSION",
+                envoy_sessions::ENVOY_SESSION_VERSION,
+            ),
+            (
+                "ENVOY_SESSION_INDEX_VERSION",
+                envoy_sessions::ENVOY_SESSION_INDEX_VERSION,
+            ),
         ];
         let registry = registry_rows();
         let rows: Vec<(u64, Vec<&str>)> = registry
@@ -2850,6 +2888,30 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
             let (_, want) = live.iter().find(|(live, _)| live == name).unwrap();
             assert_eq!(value, want, "`{name}`");
         }
+    }
+
+    /// The envoy memory file name for one (identity, thread) is fixed by this vector: a
+    /// change to the digest input would silently orphan every record on disk.
+    #[test]
+    fn envoy_session_key_is_the_truncated_sha256_of_identity_nul_thread() {
+        let identity = "0123456789abcdef0123456789abcdef";
+        let key = envoy_sessions::session_key(identity, "thread-one").unwrap();
+
+        assert_eq!(key, "8ebad0226f3717c3cebe929e4b7c49ca");
+        assert_eq!(key.len(), 32);
+        assert!(
+            key.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "{key}"
+        );
+        assert_ne!(
+            key,
+            envoy_sessions::session_key(identity, "thread-two").unwrap()
+        );
+        assert_ne!(
+            key,
+            envoy_sessions::session_key("fedcba9876543210fedcba9876543210", "thread-one").unwrap()
+        );
     }
 
     /// The registry rows for the code points the code spells as constants or wire names
