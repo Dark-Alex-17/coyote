@@ -264,18 +264,19 @@ _detect_with_llm() {
   local dir="$1"
   local evidence
   evidence=$(_gather_project_evidence "${dir}")
+  # Heredocs are read directly rather than through `$(cat <<EOF ...)`: bash 3.2
+  # (macOS /bin/bash) scans `$(...)` for quotes without understanding heredocs,
+  # so an apostrophe in the prose below makes the whole file unparseable there.
+  # `read -d ''` returns 1 at EOF, hence the `|| true` under `set -e`.
   local prompt
-  prompt=$(cat <<-EOF
-
+  IFS= read -r -d '' prompt <<-EOF || true
 		Analyze this project directory and determine the project type, primary language, and the correct shell commands to build, test, check (typecheck/vet), lint, and format it.
 
 		PRIORITY RULE: if the project declares its own task-runner interface (a Taskfile, justfile, Makefile, package.json scripts, or similar), those declared targets ARE the correct commands — prefer them over generic ecosystem defaults, and never invent a target the interface does not declare.
-
 		EOF
-	)
-  prompt+=$'\n'"${evidence}"$'\n'
-  prompt+=$(cat <<-EOF
-
+  prompt+=$'\n'"${evidence}"$'\n\n'
+  local rules
+  IFS= read -r -d '' rules <<-EOF || true
 		Respond with ONLY a valid JSON object. No markdown fences, no explanation, no extra text.
 		The JSON must have exactly these 6 keys:
 		{"type":"<language>","build":"<build command>","test":"<test command>","check":"<typecheck/vet command>","lint":"<lint command>","fmt":"<format command>"}
@@ -286,7 +287,7 @@ _detect_with_llm() {
 		- Use the most standard/common commands for the detected ecosystem
 		- If you detect a package manager lockfile, use that package manager (e.g. pnpm over npm)
 		EOF
-	)
+  prompt+="${rules}"
 
   local llm_response
   llm_response=$(coyote --no-stream "${prompt}" 2>/dev/null) || return 1
