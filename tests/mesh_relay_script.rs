@@ -11,12 +11,17 @@
 
 use std::env;
 use std::fs;
+#[cfg(target_os = "linux")]
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::{Mutex, MutexGuard, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::OnceLock;
+#[cfg(target_os = "linux")]
+use std::sync::{Mutex, MutexGuard};
+#[cfg(target_os = "linux")]
+use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -232,6 +237,8 @@ const SHIM_ENTRIES: [&str; 3] = ["shim", "shim/launchctl", "shim/uname"];
 
 /// Tests that bind or probe 127.0.0.1:4242 run one at a time; the test threads are
 /// otherwise parallel and one test's listener would answer another's readiness probe.
+/// Only the systemd scenarios (Linux) reach the readiness wait with fakes.
+#[cfg(target_os = "linux")]
 fn hold_loopback_4242() -> MutexGuard<'static, ()> {
     static PORT: Mutex<()> = Mutex::new(());
     PORT.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -239,6 +246,7 @@ fn hold_loopback_4242() -> MutexGuard<'static, ()> {
 
 /// The script hard-codes 4242; a host that already has a listener there cannot run the
 /// readiness scenarios, and the test says so instead of failing.
+#[cfg(target_os = "linux")]
 fn loopback_4242_in_use() -> bool {
     let addr = "127.0.0.1:4242".parse().unwrap();
     TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok()
