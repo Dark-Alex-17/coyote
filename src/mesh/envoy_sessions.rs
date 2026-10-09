@@ -294,15 +294,16 @@ impl EnvoySessions {
     /// not only the one this node serves: trust is per config directory and the stores
     /// are per instance, so a revoked identity's conversations with a fork, or with an
     /// instance since re-keyed, go too. How many went in all. A store that refuses is
-    /// logged and skipped, the sweep going on to the next; `Ok(0)` while the memory is
-    /// off or no store exists.
+    /// logged and skipped, the sweep going on to the next; `Ok(0)` when no store exists.
+    /// The sweep runs whether or not the memory is on: records may remain from a time
+    /// it was, and a revocation must reach them before the memory comes back.
     pub(crate) fn delete_identity_everywhere(
         cache_dir: &Path,
         config: &EnvoyMemoryConfig,
         identity: &str,
     ) -> Result<usize, EnvoyMemoryError> {
         let stores = stores_dir(cache_dir);
-        if !config.enabled || !stores.exists() {
+        if !stores.exists() {
             return Ok(0);
         }
         let io_error = |source| EnvoyMemoryError::Io {
@@ -1253,11 +1254,35 @@ mod tests {
         assert!(
             EnvoySessions::delete_identity_everywhere(&tmp.path, &config, "not-a-hash").is_err()
         );
+    }
+
+    #[test]
+    fn delete_identity_everywhere_sweeps_while_the_memory_is_off() {
+        let tmp = TempDir::new("envoy-sessions-delete-while-off");
+        let on = store(&tmp, &enabled());
+        on.save(IDENTITY_A, "thread-one", exchange(1), t(1_000))
+            .unwrap();
+        on.save(IDENTITY_B, "thread-one", exchange(2), t(1_000))
+            .unwrap();
+
         let off = EnvoyMemoryConfig::default();
+        assert!(!off.enabled);
         assert_eq!(
-            EnvoySessions::delete_identity_everywhere(&tmp.path, &off, IDENTITY_B).unwrap(),
-            0,
-            "the memory off, nothing is swept"
+            EnvoySessions::delete_identity_everywhere(&tmp.path, &off, IDENTITY_A).unwrap(),
+            1
+        );
+
+        let reopened = store(&tmp, &enabled());
+        assert_eq!(
+            reopened.load(IDENTITY_A, "thread-one", t(1_001)).unwrap(),
+            None
+        );
+        assert_eq!(
+            reopened
+                .load(IDENTITY_B, "thread-one", t(1_001))
+                .unwrap()
+                .map(|record| record.turns),
+            Some(exchange(2))
         );
     }
 

@@ -1884,7 +1884,8 @@ fn prune_envoy_memory(store: &EnvoySessions) {
 
 /// A revoked identity's conversations go with its trust, out of every instance's store
 /// under the cache directory and not only the one the node currently serves: trust is
-/// per config directory, the stores per instance. Nothing to do while the memory is off.
+/// per config directory, the stores per instance. The sweep runs whether or not the
+/// memory is on, since records may remain from a time it was.
 impl EnvoyMemorySink for MeshRuntime {
     fn forget_identity(&self, identity: &str) {
         match EnvoySessions::delete_identity_everywhere(
