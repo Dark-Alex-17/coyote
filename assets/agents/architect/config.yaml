@@ -6,7 +6,7 @@ description: |
   plan-conformance check (plus a black-box usage-pattern probe for consumer-facing surface), and
   finishes with ONE draft PR (CI checks watched to green) plus tracked follow-up tasks. Task state
   lives on disk in a plans directory, so runs survive context compression.
-version: 2.8.0
+version: 2.9.0
 agent_session: temp
 auto_continue: true
 max_auto_continues: 100
@@ -492,6 +492,22 @@ instructions: |
   - Run the adversary check (and, for consumer-facing tasks, the probe check) in the worktree:
     `get_diff --base <BASE SHA>` — identical semantics to sequential mode.
 
+  **Teamwork messaging (a parallel batch is a team; you are the hub and sole integrator):**
+  - After spawning a batch, send every task's Sisyphus its teammate roster
+    (`agent__send_message --id <agent id>`): each sibling's TASK-NNN, agent id, and declared file
+    scope, plus its own. The roster is what turns a scope breach into an early warning instead of
+    a merge-time surprise; without it the agents are mutually invisible.
+  - **Scope-breach early warning.** A Sisyphus reporting (message or escalation) that it must edit
+    files OUTSIDE its declared scope: respond before it edits — either RE-SCOPE (the overlapped
+    files belong to an unstarted/completed task: update the plan's disjointness note and re-send
+    the roster) or SERIALIZE (an in-flight sibling owns them: the breacher finishes the rest of
+    its task, its merge waits until the owner's lands, then it rebases and completes the breaching
+    edit). NEVER let two in-flight tasks knowingly edit the same file.
+  - **Merged-task broadcast.** After each integration lands (step 4 below), message every
+    remaining in-flight Sisyphus: TASK-NNN merged into the run branch @ <sha> + its scope — no
+    action required, but their eventual merge lands on the new tip. Check your own inbox
+    (`agent__check_inbox`) whenever you collect an agent or finish a merge.
+
   **Integration (architect is the integrator; merges are ALWAYS one at a time):**
   1. When a task's Sisyphus finishes AND its adversary check CONFORMS, merge in the PRIMARY checkout:
      `git checkout feat/PLAN-<slug> && git merge --no-ff feat/PLAN-<slug>-task-NNN`.
@@ -504,6 +520,15 @@ instructions: |
   4. Only after the merge lands AND the integration build+tests are green: push the run branch, close
      the task (step 5), and clean up — `git worktree remove .worktrees/task-NNN` and delete the task
      branch (local + remote).
+
+  **Worktree hygiene (a worktree lives EXACTLY as long as its task is in flight):**
+  - The clean-merge path (step 4) removes it. EVERY other exit removes it too: task failed
+    permanently, escalated to the user, re-scoped/serialized away, or its Sisyphus cancelled —
+    `git worktree remove --force .worktrees/task-NNN` as soon as the agent is done writing.
+    Keep the pushed task branch when real work exists (forensics/resume); delete it otherwise.
+  - Sweep `git worktree list` at the END OF EVERY BATCH, not just before Phase F — stray
+    worktrees accumulate silently and confuse later batches' claims. `git worktree prune`
+    after any manual directory removal.
 
   **Task-queue mirroring (optional).** For a parallel batch, the `agent__task_*` queue MAY mirror
   the disk `blocked_by` graph — one queue task per TASK-NNN with `agent: sisyphus`, the delegation
