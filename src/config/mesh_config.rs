@@ -165,8 +165,8 @@ impl Default for MeshFetch {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EnvoyMemoryConfig {
-    /// Off by default: nothing a peer says is kept once its run ends, and no store
-    /// directory is created.
+    /// Off by default: the envoy keeps no context across runs and no store directory is
+    /// created; messages are still filed in the inbox.
     pub enabled: bool,
     /// Most threads remembered across all peers; past it the least recently used go.
     pub max_sessions: u64,
@@ -681,6 +681,16 @@ mod tests {
         let cfg: Config =
             serde_yaml::from_str("mesh:\n  fetch:\n    inline_max_bytes: 1024\n").unwrap();
         assert_eq!(cfg.mesh.fetch.inline_max_bytes, 1024);
+    }
+
+    #[test]
+    fn mesh_envoy_memory_block_ignores_unknown_key_within_envoy_memory() {
+        let cfg: Config = serde_yaml::from_str("mesh:\n  envoy_memory: {bogus: 1}\n").unwrap();
+        assert_eq!(cfg.mesh, MeshConfig::default());
+        let cfg: Config =
+            serde_yaml::from_str("mesh:\n  envoy_memory:\n    max_turns: 12\n").unwrap();
+        assert_eq!(cfg.mesh.envoy_memory.max_turns, 12);
+        assert!(!cfg.mesh.envoy_memory.enabled);
     }
 
     /// `collision_protection` reads as a plain boolean, is absent-means-off beside other

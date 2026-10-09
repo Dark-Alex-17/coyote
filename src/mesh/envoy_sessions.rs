@@ -76,8 +76,9 @@ pub(crate) struct EnvoySessionIndex {
     pub entries: Vec<EnvoySessionEntry>,
 }
 
-/// One conversation as the index knows it: enough to judge every bound without opening
-/// the record.
+/// One conversation as the index knows it. Eviction reads `last_used` and `identity`
+/// alone and never opens the record; `turns` and `bytes` are informational, what the
+/// record held when it was last written.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct EnvoySessionEntry {
@@ -192,8 +193,9 @@ impl std::error::Error for EnvoyMemoryError {
 }
 
 /// The file name of one thread's record: the truncated SHA-256 of the identity's address
-/// bytes, a zero byte and the thread, as 32 lowercase hex. The zero byte keeps an
-/// identity whose thread name happens to extend another's from colliding with it; the
+/// bytes, a zero byte and the thread, as 32 lowercase hex. The identity is fixed-width,
+/// so the zero byte marks no boundary; it is a fixed separator that keeps this digest's
+/// input distinct from `destination_address`'s, which also chains an address hash. The
 /// identity bytes, not its hex, so the key is the same whatever case the caller spelt.
 /// `None` when `identity` is not a 32-hex address hash.
 pub(crate) fn session_key(identity: &str, thread: &str) -> Option<String> {
@@ -233,6 +235,19 @@ struct EnvoyMemoryLimits {
 
 impl From<&EnvoyMemoryConfig> for EnvoyMemoryLimits {
     fn from(config: &EnvoyMemoryConfig) -> Self {
+        // `MeshConfig::validate` is the gate: a zero bound never reaches the store.
+        for value in [
+            config.max_sessions,
+            config.max_per_identity,
+            config.max_turns,
+            config.max_bytes,
+            config.ttl_hours,
+        ] {
+            debug_assert!(
+                value >= 1,
+                "mesh.envoy_memory bounds are validated to 1 or more"
+            );
+        }
         let count = |value: u64| usize::try_from(value).unwrap_or(usize::MAX);
         Self {
             max_sessions: count(config.max_sessions),
@@ -315,11 +330,12 @@ impl EnvoySessions {
 
     /// Writes `turns`, cut to `max_turns` and `max_bytes` oldest exchange first, as the
     /// whole of `identity`'s `thread`, stamped `now`, creating the store on the first
-    /// save; then evicts what the save pushed over `max_per_identity` or `max_sessions`,
-    /// least recently used first and never the thread just saved. Turns that cut to
-    /// nothing delete the record instead of writing an empty one. A record already under
-    /// the key that this build cannot read, or that names another identity, is refused
-    /// rather than written over.
+    /// save; then drops every other conversation past `ttl_hours` and what the save
+    /// pushed over `max_per_identity` or `max_sessions`, least recently used first and
+    /// never the thread just saved. Turns that cut to nothing delete the record instead
+    /// of writing an empty one. On either branch a record already under the key that
+    /// this build cannot read, or that names another identity, is refused: neither
+    /// written over nor removed.
     #[cfg_attr(
         not(test),
         expect(
@@ -336,8 +352,7 @@ impl EnvoySessions {
     ) -> Result<(), EnvoyMemoryError> {
         let (identity, key) = resolve(identity, thread)?;
         truncate(&mut turns, &self.limits);
-        if turns.is_empty() {
-            self.delete_where(|entry| entry.key == key)?;
+        if turns.is_empty() && !self.dir.exists() {
             return Ok(());
         }
         let _guard = self.write_lock.lock();
@@ -346,6 +361,14 @@ impl EnvoySessions {
         let position = self
             .owned(&index, &key, &identity)?
             .map(|indexed| indexed.position);
+        if turns.is_empty() {
+            if let Some(position) = position {
+                index.entries.remove(position);
+                self.remove_record(&key)?;
+                self.write_index(&index)?;
+            }
+            return Ok(());
+        }
         let record = EnvoySessionFile {
             version: ENVOY_SESSION_VERSION,
             identity,
@@ -372,7 +395,8 @@ impl EnvoySessions {
         self.write_index(&index)
     }
 
-    /// `true` when `identity`'s `thread` was there to remove.
+    /// `true` when `identity`'s `thread` was there to remove. Removes the record by key
+    /// without reading it: the caller asked for it gone, whatever it holds.
     #[cfg_attr(
         not(test),
         expect(
@@ -385,7 +409,8 @@ impl EnvoySessions {
         Ok(self.delete_where(|entry| entry.key == key)? > 0)
     }
 
-    /// Forgets every thread of `identity`; how many went.
+    /// Forgets every thread of `identity`; how many went. Removes each record by key
+    /// without reading it.
     #[cfg_attr(
         not(test),
         expect(
@@ -401,7 +426,8 @@ impl EnvoySessions {
 
     /// Forgets every conversation past `ttl_hours`, then the least recently used past
     /// `max_per_identity` and `max_sessions`, and removes record files the index does
-    /// not name. `Ok(0)` without creating anything while the store does not exist; the
+    /// not name, each by key without reading it: the bound requires it gone, whatever
+    /// it holds. `Ok(0)` without creating anything while the store does not exist; the
     /// index is rewritten only when a conversation went. Returns how many did.
     pub(crate) fn prune(&self, now: SystemTime) -> Result<usize, EnvoyMemoryError> {
         if !self.dir.exists() {
@@ -1262,6 +1288,55 @@ mod tests {
         assert_eq!(store.read_index().unwrap().entries[0].bytes, 36);
     }
 
+    /// A cap that dropping one turn would satisfy still loses the whole exchange: the
+    /// byte bound cuts at the same boundary as the turn bound.
+    #[test]
+    fn byte_truncation_drops_the_whole_exchange_not_one_turn() {
+        let tmp = TempDir::new("envoy-sessions-max-bytes-unit");
+        let config = EnvoyMemoryConfig {
+            max_bytes: 45,
+            ..enabled()
+        };
+        let store = store(&tmp, &config);
+        let turns: Vec<EnvoyTurn> = (1..=3).flat_map(exchange).collect();
+        assert_eq!(text_bytes(&turns), 54);
+        assert_eq!(
+            text_bytes(&turns[1..]),
+            44,
+            "dropping the first question alone would fit the cap"
+        );
+
+        store
+            .save(IDENTITY_A, "thread-one", turns, t(1_000))
+            .unwrap();
+
+        let loaded = store
+            .load(IDENTITY_A, "thread-one", t(1_000))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            loaded.turns,
+            [exchange(2), exchange(3)].concat(),
+            "the first answer went with its question"
+        );
+        assert_eq!(text_bytes(&loaded.turns), 36);
+
+        let mut turns = vec![user("q1"), assistant("a1"), assistant("a1b"), user("q2")];
+        assert_eq!(text_bytes(&turns[1..]), 7);
+        truncate(
+            &mut turns,
+            &limits(&EnvoyMemoryConfig {
+                max_bytes: 7,
+                ..enabled()
+            }),
+        );
+        assert_eq!(
+            turns,
+            [user("q2")],
+            "both answers went with the question they answered"
+        );
+    }
+
     #[test]
     fn a_single_unit_over_max_bytes_leaves_nothing_and_deletes_the_record() {
         let tmp = TempDir::new("envoy-sessions-oversized-unit");
@@ -1660,6 +1735,48 @@ mod tests {
 
         assert_eq!(fs::read_to_string(&path).unwrap(), planted);
         assert_eq!(names_in(store.dir()), before, "no sibling appears");
+    }
+
+    #[test]
+    fn a_save_that_truncates_to_nothing_still_refuses_an_unreadable_record() {
+        let tmp = TempDir::new("envoy-sessions-empty-save-refuses");
+        let store = store(
+            &tmp,
+            &EnvoyMemoryConfig {
+                max_bytes: 20,
+                ..enabled()
+            },
+        );
+        store
+            .save(IDENTITY_A, "thread-one", exchange(1), t(1_000))
+            .unwrap();
+        let path = record_path(&store, IDENTITY_A, "thread-one");
+        let planted = fs::read_to_string(&path).unwrap().replace(
+            &format!("version: {ENVOY_SESSION_VERSION}\n"),
+            &format!("version: {}\n", ENVOY_SESSION_VERSION + 1),
+        );
+        fs::write(&path, &planted).unwrap();
+        let oversized = vec![user("q"), assistant(&"a".repeat(32))];
+
+        let err = store
+            .save(IDENTITY_A, "thread-one", oversized, t(1_001))
+            .unwrap_err();
+
+        assert!(
+            matches!(err, EnvoyMemoryError::Version { found, expected, .. }
+                if found == ENVOY_SESSION_VERSION + 1 && expected == ENVOY_SESSION_VERSION),
+            "{err:?}"
+        );
+        assert!(
+            path.exists(),
+            "the save that cut to nothing did not unlink it"
+        );
+        assert_eq!(
+            threads_of(&store, IDENTITY_A),
+            ["thread-one"],
+            "nor drop it from the index"
+        );
+        assert_refused_in_place(&store, &path, &planted);
     }
 
     #[test]

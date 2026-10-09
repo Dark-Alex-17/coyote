@@ -281,8 +281,8 @@ mesh:
     inline_max_bytes: 65536      # Largest file a peer may attach inline to a message; larger files are dropped by the receiver (default: 65536; must be 1 to 98304, the per-message total)
     max_bytes: 4194304           # Largest file this node serves to a peer that fetches it; a larger one is refused (default: 4194304; must be 1 to 4194304, 4 MiB; served limit is currently capped near 1 MiB by a transport workaround, see the README)
     inbox_dir: null              # Absolute directory where files peers send inline, and files this node fetches, are staged, under <inbox_dir>/<instance id>; keep it outside any workspace you share, or peers could fetch each other's staged files (default: null = <cache dir>/mesh/inbox/<instance id>)
-  envoy_memory:                  # What the envoy remembers of a trusted peer's thread between messages; off by default, so nothing a peer says is kept once its run ends
-    enabled: false               # Keep the peer's turns and the envoy's answers per (sender identity, thread) so a follow-up in the same thread is answered in context (default: false)
+  envoy_memory:                  # What the envoy remembers of a trusted peer's thread between messages; off by default, so the envoy carries nothing a peer said into its next run (the inbox still files every message and reply)
+    enabled: false               # Keep the peer's turns and the envoy's answers per (sender identity, thread) so a follow-up in the same thread is answered in context; kept under <cache dir>/mesh/envoy-sessions/<instance id>, owner-only (default: false)
     max_sessions: 256            # Most threads remembered across all peers; the least recently used go first (default: 256; must be 1 or more)
     max_per_identity: 16         # Most threads remembered for one peer identity; the least recently used go first (default: 16; must be 1 or more)
     max_turns: 40                # Most turns kept per thread; the oldest exchange goes first (default: 40; must be 1 or more)

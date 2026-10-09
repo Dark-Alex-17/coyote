@@ -604,10 +604,14 @@ impl MeshRuntime {
         &self.cache_dir
     }
 
-    /// The envoy's conversation memory, `None` while `mesh.envoy_memory` is off.
-    #[expect(
-        dead_code,
-        reason = "read by the envoy run flow once it retains conversation memory"
+    /// The envoy's conversation memory, `None` while `mesh.envoy_memory` is off. The
+    /// tests that read it drive a live node, which the loopback fixtures only do on unix.
+    #[cfg_attr(
+        not(all(test, unix)),
+        expect(
+            dead_code,
+            reason = "read by the envoy run flow once it retains conversation memory"
+        )
     )]
     pub(crate) fn envoy_memory(&self) -> Option<Arc<EnvoySessions>> {
         self.envoy_memory.clone()
@@ -1853,7 +1857,7 @@ fn prune_envoy_memory(store: &EnvoySessions) {
         Ok(0) => {}
         Ok(removed) => debug!("Forgot {removed} remembered envoy conversations"),
         Err(err) => warn!(
-            "The envoy's conversation memory could not be pruned: {}",
+            "Failed to prune the envoy's conversation memory: {}",
             redact_hashes(&err.to_string())
         ),
     }
@@ -3521,10 +3525,11 @@ impl EnvoySink for FullEnvoy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::mesh_config::{MAX_TIMEOUT_SECS, MeshBrief};
+    use crate::config::mesh_config::{EnvoyMemoryConfig, MAX_TIMEOUT_SECS, MeshBrief};
     use crate::hooks::HookEvent;
     use crate::mesh::access::{AccessOptions, access_message, validate_access};
     use crate::mesh::destination_address;
+    use crate::mesh::envoy_sessions::{EnvoyRole, EnvoyTurn, session_key};
     use crate::mesh::events::{RecordingHookSink, env_value, one_fire};
     use crate::mesh::limits::PEER_RETRY_AFTER_CAPACITY;
     use crate::mesh::message::{
@@ -8471,6 +8476,142 @@ mod tests {
         let _rotation = IdentityLock::exclusive(&identity_path)
             .expect("rotation is possible once every node has stopped");
         relay_handle.abort();
+    }
+
+    const REMEMBERED_PEER: &str = "0123456789abcdef0123456789abcdef";
+
+    fn peer_turns() -> Vec<EnvoyTurn> {
+        vec![
+            EnvoyTurn {
+                role: EnvoyRole::User,
+                text: "where were we?".to_string(),
+            },
+            EnvoyTurn {
+                role: EnvoyRole::Assistant,
+                text: "the build".to_string(),
+            },
+        ]
+    }
+
+    fn remembered_record(store: &EnvoySessions, thread: &str) -> PathBuf {
+        store.dir().join(format!(
+            "{}.yaml",
+            session_key(REMEMBERED_PEER, thread).unwrap()
+        ))
+    }
+
+    fn two_hours_ago() -> SystemTime {
+        SystemTime::now() - Duration::from_secs(2 * 3_600)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_prunes_the_envoy_memory_it_opens() {
+        let (addr, relay_handle, _) = loopback_relay().await;
+        let tmp = TempDir::new("node-envoy-memory-start");
+        let paths = mesh_paths(&tmp);
+        let config = MeshConfig {
+            envoy_memory: EnvoyMemoryConfig {
+                enabled: true,
+                ttl_hours: 1,
+                ..EnvoyMemoryConfig::default()
+            },
+            ..private_config(addr.port())
+        };
+        let mut session = Session::default();
+        let instance_id = session.ensure_mesh_instance_id().to_string();
+        let planted =
+            EnvoySessions::open(&paths.cache_dir, &instance_id, &config.envoy_memory).unwrap();
+        planted
+            .save(REMEMBERED_PEER, "fresh", peer_turns(), SystemTime::now())
+            .unwrap();
+        planted
+            .save(REMEMBERED_PEER, "stale", peer_turns(), two_hours_ago())
+            .unwrap();
+        assert!(
+            remembered_record(&planted, "stale").exists(),
+            "a save never evicts the thread it writes, so the stale one is planted"
+        );
+
+        let runtime =
+            MeshRuntime::start(&config, true, &mut session, paths, NodeOptions::default())
+                .await
+                .unwrap();
+
+        let store = runtime
+            .envoy_memory()
+            .expect("an enabled store is opened at start");
+        assert_eq!(store.dir(), planted.dir());
+        assert!(
+            !remembered_record(&planted, "stale").exists(),
+            "the thread past its ttl went on load"
+        );
+        assert!(remembered_record(&planted, "fresh").exists());
+        assert_eq!(store.stats().unwrap(), (1, 1));
+        runtime.shutdown().await.unwrap();
+        relay_handle.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_with_envoy_memory_off_creates_no_store_directory() {
+        let started = started_runtime("node-envoy-memory-off").await;
+
+        assert!(started.runtime.envoy_memory().is_none());
+        assert!(
+            !mesh_cache_dir(started.runtime.cache_dir())
+                .join("envoy-sessions")
+                .exists()
+        );
+        started.runtime.shutdown().await.unwrap();
+        started.relay_handle.abort();
+    }
+
+    /// The real sweep future under a paused clock: its first tick is the start's prune
+    /// and does nothing; every heartbeat after it prunes, so a thread that expires while
+    /// the node runs goes without a load or save to notice it.
+    #[tokio::test(start_paused = true)]
+    async fn the_envoy_memory_sweep_prunes_on_each_tick() {
+        let tmp = TempDir::new("node-envoy-memory-sweep");
+        let config = EnvoyMemoryConfig {
+            enabled: true,
+            ttl_hours: 1,
+            ..EnvoyMemoryConfig::default()
+        };
+        let store = Arc::new(EnvoySessions::open(&tmp.path, "inst", &config).unwrap());
+        store
+            .save(REMEMBERED_PEER, "first", peer_turns(), two_hours_ago())
+            .unwrap();
+        let cancel = CancellationToken::new();
+        let sweep = tokio::spawn(sweep_envoy_memory(store.clone(), cancel.clone()));
+        let settle = || async {
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+        };
+        settle().await;
+        assert!(
+            remembered_record(&store, "first").exists(),
+            "the immediate first tick is skipped"
+        );
+
+        tokio::time::advance(Duration::from_secs(HEARTBEAT_SECS)).await;
+        settle().await;
+        assert!(!remembered_record(&store, "first").exists());
+
+        store
+            .save(REMEMBERED_PEER, "second", peer_turns(), two_hours_ago())
+            .unwrap();
+        tokio::time::advance(Duration::from_secs(HEARTBEAT_SECS)).await;
+        settle().await;
+        assert!(
+            !remembered_record(&store, "second").exists(),
+            "the tick after prunes too"
+        );
+        assert_eq!(store.stats().unwrap(), (0, 0));
+
+        cancel.cancel();
+        sweep.await.unwrap();
     }
 
     #[cfg(unix)]
