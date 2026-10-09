@@ -1855,7 +1855,7 @@ async fn sweep_peers(peers: Arc<PeerTable>, cancel: CancellationToken) {
 fn prune_envoy_memory(store: &EnvoySessions) {
     match store.prune(SystemTime::now()) {
         Ok(0) => {}
-        Ok(removed) => debug!("Forgot {removed} remembered envoy conversations"),
+        Ok(removed) => debug!("Forgot {removed} remembered envoy conversation(s)"),
         Err(err) => warn!(
             "Failed to prune the envoy's conversation memory: {}",
             redact_hashes(&err.to_string())
