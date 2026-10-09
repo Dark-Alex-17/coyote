@@ -12091,6 +12091,142 @@ mod tests {
                 });
             }
 
+            /// The envoy's memory of an identity goes with the identity's trust through
+            /// the REPL verbs: `.mesh forget --identity` and `.mesh block` remove every
+            /// thread the identity had, the dry run and the refused `--yes` remove
+            /// nothing, and `.mesh untrust <destination>` leaves the identity's threads
+            /// in place, other identities untouched throughout.
+            #[test]
+            #[serial]
+            fn usage_probe_forget_identity_and_block_through_the_repl_forget_the_identitys_threads_while_a_destination_untrust_keeps_them()
+             {
+                use crate::mesh::envoy_sessions::{EnvoyRole, EnvoyTurn};
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-envoy-memory-revoke");
+                let _capture = capture::install();
+                let _script = prompt_script::install(&[]);
+                run_async(async {
+                    let started = started_runtime_with("repl-mesh-envoy-memory-revoke", |c| {
+                        c.envoy_memory.enabled = true;
+                    })
+                    .await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let trust = started.runtime.trust();
+                    let store = started
+                        .runtime
+                        .envoy_memory()
+                        .expect("an enabled store is opened at start");
+                    let slot: &dyn LiveMesh = ctx.app.mesh.as_ref();
+                    let now = SystemTime::now();
+                    let turns = vec![
+                        EnvoyTurn {
+                            role: EnvoyRole::User,
+                            text: "where were we?".into(),
+                        },
+                        EnvoyTurn {
+                            role: EnvoyRole::Assistant,
+                            text: "the build".into(),
+                        },
+                    ];
+                    let dest_a = heard_trusted_peer(&started.runtime, slot);
+                    let id_a = identity_of(&trust, &dest_a);
+                    let (dest_b, id_b) = heard_peer(&started.runtime, "Bo", now);
+                    trust
+                        .trust_destination(slot, &dest_b, TrustOptions::default(), now)
+                        .unwrap();
+                    let (_dest_c, id_c) = heard_peer(&started.runtime, "Cy", now);
+                    for (identity, thread) in [
+                        (&id_a, "a-first"),
+                        (&id_a, "a-second"),
+                        (&id_b, "b-first"),
+                        (&id_c, "c-first"),
+                    ] {
+                        store.save(identity, thread, turns.clone(), now).unwrap();
+                    }
+                    let held = |identity: &str, thread: &str| {
+                        store.load(identity, thread, now).unwrap().is_some()
+                    };
+
+                    let out = out_of(&mut ctx, &format!(".mesh untrust {dest_b} --yes"))
+                        .await
+                        .unwrap();
+                    assert!(
+                        out.contains(&format!("Untrusted {}.", short(&dest_b))),
+                        "{out}"
+                    );
+                    assert!(
+                        held(&id_b, "b-first"),
+                        "untrusting one destination leaves the identity's threads"
+                    );
+
+                    let token = format!("untrust-{}", short(&id_a));
+                    let out = out_of(
+                        &mut ctx,
+                        &format!(".mesh forget --identity {id_a} --dry-run"),
+                    )
+                    .await
+                    .unwrap();
+                    assert!(out.contains("This was a dry run"), "{out}");
+                    let err =
+                        refusal(&mut ctx, &format!(".mesh forget --identity {id_a} --yes")).await;
+                    assert!(err.contains("--confirm untrust-"), "{err}");
+                    assert!(held(&id_a, "a-first") && held(&id_a, "a-second"));
+
+                    let out = out_of(
+                        &mut ctx,
+                        &format!(".mesh forget --identity {id_a} --confirm {token}"),
+                    )
+                    .await
+                    .unwrap();
+                    assert!(out.contains("Untrusted identity"), "{out}");
+                    assert!(
+                        !held(&id_a, "a-first"),
+                        "a-first outlived the identity's trust"
+                    );
+                    assert!(
+                        !held(&id_a, "a-second"),
+                        "a-second outlived the identity's trust"
+                    );
+                    assert!(
+                        store.dir().read_dir().unwrap().all(|entry| {
+                            let name = entry.unwrap().file_name();
+                            let name = name.to_string_lossy();
+                            !name.ends_with(".yaml") || {
+                                let key = name.trim_end_matches(".yaml");
+                                ["b-first", "c-first"].iter().any(|thread| {
+                                    crate::mesh::envoy_sessions::session_key(
+                                        if *thread == "b-first" { &id_b } else { &id_c },
+                                        thread,
+                                    )
+                                    .as_deref()
+                                        == Some(key)
+                                })
+                            }
+                        }),
+                        "only the other identities' records remain on disk"
+                    );
+                    assert!(held(&id_b, "b-first") && held(&id_c, "c-first"));
+
+                    let out = out_of(&mut ctx, &format!(".mesh block {id_c} --yes"))
+                        .await
+                        .unwrap();
+                    assert!(out.contains(&format!("Blocked {}", short(&id_c))), "{out}");
+                    assert!(
+                        !held(&id_c, "c-first"),
+                        "blocking forgets a never-trusted identity's threads"
+                    );
+                    assert!(
+                        held(&id_b, "b-first"),
+                        "the identity whose destination was untrusted still has its thread"
+                    );
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
             /// With no destination record to read the identity from, the untrust finds it
             /// in the peer table and still writes the deny.
             #[test]

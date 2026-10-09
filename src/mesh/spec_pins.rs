@@ -3273,6 +3273,46 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
         }
     }
 
+    /// Every clause of the sender-facing contract the requirement was written to carry:
+    /// not keyed by destination or thread alone, never loaded for another identity,
+    /// bounded in count, size and age, the owner's transcript excluded, a receiver
+    /// retaining none conformant, a root or evicted thread starting clean, and the
+    /// revocation verbs that take the state with the trust.
+    #[test]
+    fn usage_probe_sec_024_carries_every_clause_of_the_senders_contract() {
+        let line = SPEC
+            .lines()
+            .find(|line| line.starts_with("**[MESH-SEC-024]**"))
+            .expect("MESH-SEC-024 is defined");
+        for clause in [
+            "MAY retain envoy conversation state",
+            "per (sending identity, thread)",
+            "never by the destination",
+            "nor by the thread alone",
+            "on behalf of another identity",
+            "names another identity being refused",
+            "bounded in count, size and age",
+            "MUST NOT assume retained state",
+            "retains none being conformant",
+            "a root message, or one naming a thread the receiver no longer holds, starting clean",
+            "never the brief, the peer card, a system prompt or the owner's own transcript",
+            "`.mesh untrust --identity` and `.mesh block` forgetting every thread",
+            "untrust of one destination leaves them in place",
+            "charged to the sending identity's token budget",
+        ] {
+            assert!(line.contains(clause), "MESH-SEC-024 lacks {clause:?}");
+        }
+        let index_row = SPEC
+            .lines()
+            .find(|line| line.starts_with("- [MESH-SEC-024](#154-trust-boundary)"))
+            .expect("MESH-SEC-024 has a section 21 index row");
+        assert!(index_row.contains("envoy memory"), "{index_row}");
+        assert!(
+            SPEC.contains("| MESH-SEC-024 | `a_second_message_in_the_thread_is_driven_with_the_first_exchange`"),
+            "MESH-SEC-024 has a section 20 ENFORCED_BY row"
+        );
+    }
+
     #[test]
     fn wire_path_rule_table_names_the_rules_in_order() {
         const HEADER: &str = "| Rule | Condition | Receiver action |";
