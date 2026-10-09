@@ -10,6 +10,7 @@
 #![cfg(unix)]
 
 use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
@@ -320,6 +321,12 @@ esac
         );
     }
 
+    /// Swap the real `id` for one answering `0`, so the installers take their root branch.
+    fn fake_root(&self) {
+        fs::remove_file(self.dir.join("id")).unwrap();
+        write_script(&self.dir.join("id"), "echo 0\n");
+    }
+
     /// What the stand-in `curl` was asked for, one invocation per line.
     fn requests(&self) -> String {
         fs::read_to_string(&self.log).unwrap_or_default()
@@ -410,6 +417,59 @@ fn without_the_flag_or_a_tty_coyote_is_installed_and_the_mesh_is_only_pointed_at
     assert!(
         !requests.contains("mesh-relay.sh"),
         "the relay script was fetched without being asked:\n{requests}"
+    );
+}
+
+#[test]
+fn root_is_pointed_at_the_relay_as_its_normal_user_and_never_prompted() {
+    let bash = bash_or_skip!();
+    let home = Home::new("fake-root");
+    let tools = Tools::new(&home);
+    tools.fake_root();
+
+    let (code, out, err) = run(&mut home.install(&bash, &installer(), &[], &tools));
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    let pointers = pointer_lines(&out);
+    assert_eq!(pointers.len(), 1, "exactly one pointer line:\n{out}");
+    assert!(
+        pointers[0].contains("run it as your normal user"),
+        "root is told to run the relay unelevated:\n{}",
+        pointers[0]
+    );
+    assert!(!out.contains("[y/N]"), "root is never prompted:\n{out}");
+    assert!(
+        !tools.requests().contains("mesh-relay.sh"),
+        "{}",
+        tools.requests()
+    );
+
+    // An rnsd already in BIN_DIR is an upgrade for root too: neither pointer nor prompt.
+    let home = Home::new("fake-root-upgrade");
+    let tools = Tools::new(&home);
+    tools.fake_root();
+    home.seed_rnsd();
+    let (code, out, err) = run(&mut home.install(&bash, &installer(), &[], &tools));
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(
+        pointer_lines(&out).is_empty() && !out.contains("[y/N]"),
+        "{out}"
+    );
+
+    // --with-mesh with the fetched relay failing: exit 3, and the retry hint names the normal user.
+    let home = Home::new("fake-root-with-mesh");
+    let tools = Tools::new(&home);
+    tools.fake_root();
+    tools.serve_relay("exit 1\n");
+    let alone = home.path().join("alone");
+    fs::create_dir_all(&alone).unwrap();
+    let copy = alone.join("install_coyote.sh");
+    fs::copy(installer(), &copy).unwrap();
+    let (code, out, err) = run(&mut home.install(&bash, &copy, &["--with-mesh"], &tools));
+    assert_eq!(code, 3, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(err.contains("mesh setup exited with code 1"), "{err}");
+    assert!(
+        err.trim_end().ends_with("as your normal user"),
+        "the retry hint is addressed to the normal user:\n{err}"
     );
 }
 
@@ -644,10 +704,12 @@ fn an_unowned_sibling_relay_is_bypassed_and_a_piped_installer_always_fetches() {
 
 /// The PowerShell installer, driven on this host by `pwsh`: global functions defined
 /// before the installer runs shadow `Invoke-RestMethod` and `Invoke-WebRequest`, so the
-/// release and the relay come from disk and every request is recorded.
+/// release and the relay come from disk and every request is recorded. The harness
+/// tools sit ahead of the host's PATH, so a fake `id` is the one the installer asks.
 struct PwshDriver {
     script: PathBuf,
     log: PathBuf,
+    path: OsString,
 }
 
 impl PwshDriver {
@@ -689,7 +751,12 @@ exit $LASTEXITCODE
             ),
         )
         .unwrap();
-        PwshDriver { script, log }
+        let mut dirs = vec![tools.path().to_path_buf()];
+        if let Some(host) = env::var_os("PATH") {
+            dirs.extend(env::split_paths(&host));
+        }
+        let path = env::join_paths(dirs).unwrap();
+        PwshDriver { script, log, path }
     }
 
     fn run(&self, pwsh: &Path, home: &Home, args: &[&str]) -> (i32, String, String) {
@@ -703,6 +770,7 @@ exit $LASTEXITCODE
             .env("HOME", home.path())
             .env("XDG_CONFIG_HOME", home.config_home())
             .env("BIN_DIR", home.bin_dir())
+            .env("PATH", &self.path)
             .env("CI", "1")
             .env_remove("COYOTE_CONFIG_DIR")
             .env_remove("COYOTE_VERSION");
@@ -746,6 +814,26 @@ fn the_powershell_installer_points_fetches_and_exits_3_the_same_way_as_the_bash_
         !driver.requests().contains("mesh-relay.sh"),
         "{}",
         driver.requests()
+    );
+
+    // No flag as root (a fake `id` answering 0): the pointer says to run the relay as
+    // the normal user, and there is no prompt.
+    let home = Home::new("pwsh-fake-root");
+    let tools = Tools::new(&home);
+    tools.fake_root();
+    let driver = PwshDriver::new(&home, &tools);
+    let (code, out, err) = driver.run(&pwsh, &home, &[]);
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    let pointers = pointer_lines(&out);
+    assert_eq!(pointers.len(), 1, "exactly one pointer line:\n{out}");
+    assert!(
+        pointers[0].contains("run it as your normal user"),
+        "{}",
+        pointers[0]
+    );
+    assert!(
+        !out.contains("Set up the local Reticulum daemon for Coyote mesh now?"),
+        "root is never prompted:\n{out}"
     );
 
     // -WithMesh with the relay fetch failing: an error on stderr, exit 3, coyote installed.

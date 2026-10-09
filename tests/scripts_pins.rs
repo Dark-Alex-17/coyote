@@ -103,6 +103,14 @@ fn the_windows_script_carries_the_scheduled_task_and_readiness_contract() {
         ),
         ("'Running'", "an already running task must not be restarted"),
         (
+            "$existing.Actions",
+            "a registered task's action is compared with the one this run would write",
+        ),
+        (
+            "Set-ScheduledTask",
+            "a changed definition is applied, or planned under -DryRun, with Set-ScheduledTask",
+        ),
+        (
             "rnsd.cmd",
             "the shim is a .cmd because symlinks need developer mode",
         ),
@@ -359,6 +367,48 @@ fn usage_probe_the_ci_scripts_job_lints_and_smokes_the_relay_on_every_runner_fam
         ),
         "the 5.1 step must drive mesh-relay.ps1 itself, not just load the module"
     );
+    assert!(
+        job.contains("$ErrorActionPreference = 'Continue'"),
+        "the 5.1 step must not turn the relay's stderr into a terminating error; $LASTEXITCODE is the oracle"
+    );
+    assert!(
+        job.contains("shell: bash\n")
+            && job.contains(
+                "bash scripts/mesh-relay.sh --no-service --dry-run || rc=$?; [ \"$rc\" -eq 2 ]"
+            ),
+        "the Windows leg must prove the bash relay refuses Git Bash with exit 2"
+    );
+    assert!(
+        job.contains(
+            "Get-ScheduledTask -TaskName 'Coyote rnsd' -ErrorAction SilentlyContinue)) { throw"
+        ),
+        "the pwsh dry run must be proven to register no Scheduled Task"
+    );
+    assert!(
+        job.contains("bash=/bin/bash")
+            && job.contains("\"$bash\" scripts/install_coyote.sh --help"),
+        "the macOS installer --help probe must run under the runner's /bin/bash"
+    );
+    assert!(
+        job.contains("--version 1.5.1 --no-service --dry-run")
+            && job.contains("'-Version', '1.5.1', '-NoService', '-DryRun'"),
+        "a non-default version must land in the dry-run plan on both shells"
+    );
+    // GitHub's pwsh wrapper ends a step with `exit $LASTEXITCODE`, and the pwsh smoke
+    // step's last relay call is the expected refusal; both Windows steps end with exit 0.
+    for name in [
+        "Mesh Relay Smoke (Windows)",
+        "Mesh Relay Under Windows PowerShell 5.1",
+    ] {
+        let step = job
+            .split("    - name: ")
+            .find(|step| step.starts_with(name))
+            .unwrap_or_else(|| panic!("ci.yaml has a `{name}` step"));
+        assert!(
+            step.trim_end().ends_with("\n        exit 0"),
+            "the `{name}` step must end with `exit 0` so a relay's last exit code cannot fail it:\n{step}"
+        );
+    }
 
     // The smoke matrix the plan names, in both shells.
     for (what, needles) in [
@@ -638,6 +688,22 @@ fn installers_offer_the_mesh_relay_hand_off() {
     assert!(
         ps1.contains("-WithMesh"),
         "install_coyote.ps1 must accept `-WithMesh` so the docs can cite it as the one-command mesh setup"
+    );
+    for (name, text) in [("install_coyote.sh", &sh), ("install_coyote.ps1", &ps1)] {
+        assert!(
+            text.contains("run it as your normal user"),
+            "{name} must tell root/Administrator to run the relay unelevated instead of prompting"
+        );
+    }
+    let root_check = sh
+        .find("if [[ \"$(id -u)\" -eq 0 ]]; then\n      mesh_pointer")
+        .expect("install_coyote.sh points root at the relay without a prompt");
+    let tty_check = sh
+        .find("elif [[ -t 0 && -t 1 ]]; then")
+        .expect("install_coyote.sh gates the prompt on a TTY");
+    assert!(
+        root_check < tty_check,
+        "root must be checked before the TTY, so root at a terminal is never prompted"
     );
 }
 
