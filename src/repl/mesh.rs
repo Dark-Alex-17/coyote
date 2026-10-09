@@ -12350,6 +12350,131 @@ mod tests {
                 });
             }
 
+            /// Usage probe: a revoked identity's threads go with its trust even while
+            /// the envoy's memory is off. The node opens no store of its own, yet
+            /// `.mesh untrust --identity` and `.mesh block` through the REPL still reach
+            /// the records left under the cache directory from when the memory was on,
+            /// in every instance's store, while `.mesh untrust <destination>` and the
+            /// other identities' threads are left as they were, so nothing of a revoked
+            /// peer waits there for the memory to come back.
+            #[test]
+            #[serial]
+            fn usage_probe_revoking_an_identity_through_the_repl_sweeps_the_memory_left_from_when_it_was_on()
+             {
+                use crate::config::mesh_config::EnvoyMemoryConfig;
+                use crate::mesh::envoy_sessions::{EnvoyRole, EnvoySessions, EnvoyTurn};
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-envoy-memory-sweep-off");
+                let _capture = capture::install();
+                let _script = prompt_script::install(&[]);
+                run_async(async {
+                    let started = started_runtime_with("repl-mesh-envoy-memory-sweep-off", |c| {
+                        assert!(!c.envoy_memory.enabled, "the memory is off by default");
+                    })
+                    .await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    assert!(
+                        started.runtime.envoy_memory().is_none(),
+                        "with the memory off the node serves no store"
+                    );
+                    let trust = started.runtime.trust();
+                    // What an earlier, enabled run left behind: two instances' stores.
+                    let was_on = EnvoyMemoryConfig {
+                        enabled: true,
+                        ..EnvoyMemoryConfig::default()
+                    };
+                    let stores: Vec<EnvoySessions> = (0..2)
+                        .map(|_| {
+                            let instance = Session::default().ensure_mesh_instance_id().to_string();
+                            EnvoySessions::open(started.runtime.cache_dir(), &instance, &was_on)
+                                .unwrap()
+                        })
+                        .collect();
+                    assert_ne!(stores[0].dir(), stores[1].dir());
+                    let slot: &dyn LiveMesh = ctx.app.mesh.as_ref();
+                    let now = SystemTime::now();
+                    let turns = vec![
+                        EnvoyTurn {
+                            role: EnvoyRole::User,
+                            text: "where were we?".into(),
+                        },
+                        EnvoyTurn {
+                            role: EnvoyRole::Assistant,
+                            text: "the build".into(),
+                        },
+                    ];
+                    let dest_a = heard_trusted_peer(&started.runtime, slot);
+                    let id_a = identity_of(&trust, &dest_a);
+                    let (dest_b, id_b) = heard_peer(&started.runtime, "Bo", now);
+                    trust
+                        .trust_destination(slot, &dest_b, TrustOptions::default(), now)
+                        .unwrap();
+                    let (_dest_c, id_c) = heard_peer(&started.runtime, "Cy", now);
+                    for store in &stores {
+                        for (identity, thread) in
+                            [(&id_a, "a-first"), (&id_b, "b-first"), (&id_c, "c-first")]
+                        {
+                            store.save(identity, thread, turns.clone(), now).unwrap();
+                        }
+                    }
+                    let holders = |identity: &str, thread: &str| {
+                        stores
+                            .iter()
+                            .filter(|store| store.load(identity, thread, now).unwrap().is_some())
+                            .count()
+                    };
+
+                    let out = out_of(&mut ctx, &format!(".mesh untrust {dest_b} --yes"))
+                        .await
+                        .unwrap();
+                    assert!(out.contains("Untrusted"), "{out}");
+                    assert_eq!(
+                        holders(&id_b, "b-first"),
+                        2,
+                        "a destination untrust sweeps no store"
+                    );
+
+                    let token = format!("untrust-{}", short(&id_a));
+                    let out = out_of(
+                        &mut ctx,
+                        &format!(".mesh untrust --identity {id_a} --confirm {token}"),
+                    )
+                    .await
+                    .unwrap();
+                    assert!(out.contains("Untrusted identity"), "{out}");
+                    assert_eq!(
+                        holders(&id_a, "a-first"),
+                        0,
+                        "a store kept the untrusted identity's thread while the memory was off"
+                    );
+                    assert_eq!(holders(&id_b, "b-first"), 2);
+                    assert_eq!(holders(&id_c, "c-first"), 2);
+
+                    let out = out_of(&mut ctx, &format!(".mesh block {id_c} --yes"))
+                        .await
+                        .unwrap();
+                    assert!(out.contains("Blocked"), "{out}");
+                    assert_eq!(
+                        holders(&id_c, "c-first"),
+                        0,
+                        "a store kept the blocked identity's thread while the memory was off"
+                    );
+                    assert_eq!(holders(&id_b, "b-first"), 2);
+                    for store in &stores {
+                        assert_eq!(store.stats().unwrap(), (1, 1));
+                    }
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+                    assert!(
+                        started.runtime.envoy_memory().is_none(),
+                        "the sweep opened no store for the node"
+                    );
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
             /// With no destination record to read the identity from, the untrust finds it
             /// in the peer table and still writes the deny.
             #[test]

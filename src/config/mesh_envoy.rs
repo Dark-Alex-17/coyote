@@ -8120,6 +8120,196 @@ mod tests {
         source.remove_dir();
     }
 
+    /// Usage probe: only a refusal the peer was told joins the thread. A stored
+    /// message's run-time refusal is replied to once per identity, per reason, per
+    /// hour; the first one in the hour is heard and remembered as the refusal line,
+    /// the second of the same reason is withheld, still filed for the owner, and
+    /// leaves no turn: the thread reads exactly as it did before that message came.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn usage_probe_a_stored_refusal_withheld_under_the_hourly_claim_leaves_no_turn() {
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-memory-withheld");
+        let (source, _source) = stub_envoy_source();
+        let tmp = TempDir::new("mesh-envoy-memory-withheld");
+        let app = test_app();
+        let store = memory_for(&app, &tmp);
+        let idle = RecordingIdleSink::attach(&app);
+        app.mesh.limits().configure(PeerLimitConfig {
+            concurrency: 64,
+            tokens_per_hour: 100,
+            ..PeerLimitConfig::default()
+        });
+        let gate = Arc::new(Semaphore::new(0));
+        let started = Arc::new(AtomicBool::new(false));
+        let runner = EnvoyRunner::start_with(Arc::clone(&app), {
+            let gate = Arc::clone(&gate);
+            let started = Arc::clone(&started);
+            drive_of(move |_, _, _| {
+                let gate = Arc::clone(&gate);
+                let started = Arc::clone(&started);
+                async move {
+                    started.store(true, Ordering::SeqCst);
+                    gate.acquire().await.unwrap().forget();
+                    Ok("answer".into())
+                }
+            })
+        });
+        let stored = |id: &str, content: &str| {
+            let mut job = threaded_job(&PEER_IDENTITY, id, "t-9", content);
+            job.message.via = PeerVia::StoreAndForward;
+            job
+        };
+        assert!(runner.accept(stored("q-1", "first")).is_ok());
+        wait_until("the first run to start", || started.load(Ordering::SeqCst)).await;
+        // Both queue behind the run that spends the window; both are refused at run
+        // time for the same reason, the first told, the second withheld.
+        assert!(runner.accept(stored("q-2", "second")).is_ok());
+        assert!(runner.accept(stored("q-3", "third")).is_ok());
+        app.mesh
+            .limits()
+            .debit(&hex_lower(&PEER_IDENTITY), 400, None, Instant::now());
+        gate.add_permits(1);
+        // The answered exchange files two, each refused original one.
+        wait_until("the answer and both refused originals to be filed", || {
+            app.mesh.peer_inbox().len() >= 4
+        })
+        .await;
+        runner.stop().await;
+
+        assert_eq!(idle.count("envoy replied:"), 1);
+        assert!(idle.has("token_ceiling"));
+        let turns = turns_of(&store, &PEER_IDENTITY, "t-9");
+        assert_eq!(turns.len(), 4, "{turns:?}");
+        assert!(turns[0].text.contains("Message id: q-1"), "{turns:?}");
+        assert_eq!(turns[1].text, "answer");
+        assert!(turns[2].text.contains("Message id: q-2"), "{turns:?}");
+        assert_eq!(turns[3].role, EnvoyRole::Assistant);
+        assert_eq!(turns[3].text, RefusalReason::TokenCeiling.peer_text());
+        assert!(
+            !turns
+                .iter()
+                .any(|turn| turn.text.contains("Message id: q-3")),
+            "the withheld refusal left a turn: {turns:?}"
+        );
+        source.remove_dir();
+    }
+
+    /// Usage probe: a record on disk from before the turns were folded, or one a late
+    /// answer left ending in two assistant turns, is prompted alternating all the same,
+    /// since the fold happens as the turns are read and not as they are written; and
+    /// the turn bound, cutting the oldest exchange at the next turn the peer spoke,
+    /// never leaves the prompt opening on the envoy's own words. The stored record
+    /// keeps the two turns apart.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn usage_probe_a_record_ending_in_two_assistant_turns_is_prompted_alternating_through_the_turn_bound()
+     {
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-memory-fold-bound");
+        let (source, _source) = stub_envoy_source();
+        let tmp = TempDir::new("mesh-envoy-memory-fold-bound");
+        let app = test_app();
+        let config = EnvoyMemoryConfig {
+            enabled: true,
+            max_turns: 4,
+            ..Default::default()
+        };
+        let store = Arc::new(EnvoySessions::open(&tmp.path, "inst-a", &config).unwrap());
+        app.mesh.set_envoy_memory_for_tests(Arc::clone(&store));
+        let idle = RecordingIdleSink::attach(&app);
+        let turn = |role, text: &str| EnvoyTurn {
+            role,
+            text: text.into(),
+        };
+        let on_disk = vec![
+            turn(EnvoyRole::User, "where were we?"),
+            turn(
+                EnvoyRole::Assistant,
+                "escalated to the human; no answer yet (ref q-0)",
+            ),
+            turn(EnvoyRole::Assistant, "the owner says yes"),
+        ];
+        store
+            .save(
+                &hex_lower(&PEER_IDENTITY),
+                "t-9",
+                on_disk.clone(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        assert_eq!(
+            turns_of(&store, &PEER_IDENTITY, "t-9"),
+            on_disk,
+            "the record keeps the two assistant turns apart"
+        );
+        let (drive, seen) = prompt_recording_drive();
+        let runner = EnvoyRunner::start_with(Arc::clone(&app), drive);
+
+        assert!(
+            runner
+                .accept(threaded_job(&PEER_IDENTITY, "q-1", "t-9", "and then?"))
+                .is_ok()
+        );
+        wait_until("the first reply", || idle.count("envoy replied:") == 1).await;
+        assert!(
+            runner
+                .accept(threaded_job(&PEER_IDENTITY, "q-2", "t-9", "go on"))
+                .is_ok()
+        );
+        wait_until("the second reply", || idle.count("envoy replied:") == 2).await;
+        runner.stop().await;
+
+        let seen = seen.lock();
+        assert_eq!(seen.len(), 2);
+        let first = &seen[0];
+        assert_alternates_after_system(first);
+        assert_eq!(
+            roles_of(first),
+            vec![
+                MessageRole::System,
+                MessageRole::User,
+                MessageRole::Assistant,
+                MessageRole::User
+            ],
+            "{first:?}"
+        );
+        assert_eq!(first[1].content.to_text(), "where were we?");
+        assert_eq!(
+            first[2].content.to_text(),
+            "escalated to the human; no answer yet (ref q-0)\n\nthe owner says yes"
+        );
+        assert!(
+            first[3].content.to_text().contains("and then?"),
+            "{first:?}"
+        );
+        // Five turns held against a bound of four: the oldest exchange, all three of
+        // its turns, goes, and the second run opens on the peer's own words.
+        let second = &seen[1];
+        assert_alternates_after_system(second);
+        assert_eq!(
+            roles_of(second),
+            vec![
+                MessageRole::System,
+                MessageRole::User,
+                MessageRole::Assistant,
+                MessageRole::User
+            ],
+            "{second:?}"
+        );
+        assert!(
+            second[1].content.to_text().contains("and then?"),
+            "{second:?}"
+        );
+        assert_eq!(second[2].content.to_text(), "answer 0");
+        assert!(second[3].content.to_text().contains("go on"), "{second:?}");
+        let turns = turns_of(&store, &PEER_IDENTITY, "t-9");
+        assert_eq!(turns.len(), 4, "{turns:?}");
+        assert_eq!(turns[0].role, EnvoyRole::User);
+        assert!(turns[0].text.contains("and then?"), "{turns:?}");
+        assert_eq!(turns[1].text, "answer 0");
+        assert_eq!(turns[3].text, "answer 1");
+        source.remove_dir();
+    }
+
     /// The remembered turns are part of the prompt, so an unpriced run that resumes a
     /// thread is charged more than a fresh run over the same words, by about the
     /// history's own token count and not merely the resumed-thread note's.

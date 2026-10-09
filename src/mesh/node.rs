@@ -6296,6 +6296,121 @@ mod tests {
         stub.stop().await;
     }
 
+    /// Serves `/message` on a stub in the recorder's place: refuses every message
+    /// while `refusing` is set, acknowledges them as the recorder would once cleared.
+    #[cfg(unix)]
+    struct RefusingUntilCleared {
+        refusing: AtomicBool,
+        acknowledged: std::sync::atomic::AtomicUsize,
+    }
+
+    #[cfg(unix)]
+    #[async_trait]
+    impl Handler for RefusingUntilCleared {
+        async fn handle(&self, request: AdmittedRequest) -> Reply {
+            if self.refusing.load(Ordering::SeqCst) {
+                return Reply::Code(RefusalCode::Throttled);
+            }
+            match crate::mesh::message::from_r3_body(&request.body) {
+                Ok(body) => {
+                    self.acknowledged.fetch_add(1, Ordering::SeqCst);
+                    Reply::Value(crate::mesh::message::received_reply(&body.id))
+                }
+                Err(_) => Reply::Code(RefusalCode::InvalidData),
+            }
+        }
+    }
+
+    /// Usage probe: the owner's late answer is remembered only once the peer heard it.
+    /// A send the peer refuses puts the question back and leaves the thread as the
+    /// hand-off left it, nothing of the unheard words in it; the retry that lands,
+    /// with other words, is the one turn the thread gains, and no second copy of it.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_a_late_answer_the_peer_refused_is_not_remembered_until_the_retry_that_lands()
+     {
+        use crate::mesh::trust::TrustOptions;
+
+        let stub =
+            PeerStub::listen("node-late-answer-retry-stub", TcpServer::DEFAULT_CLIENT_MTU).await;
+        let peer = Arc::new(RefusingUntilCleared {
+            refusing: AtomicBool::new(true),
+            acknowledged: std::sync::atomic::AtomicUsize::new(0),
+        });
+        stub.serve(MESSAGE_PATH, Arc::clone(&peer) as Arc<dyn Handler>);
+        let started = started_runtime_on_with("node-late-answer-retry-memory", stub.port(), |c| {
+            c.envoy_memory.enabled = true;
+        })
+        .await;
+        let runtime = started.runtime.clone();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime.clone()).unwrap();
+        stub.trust(&runtime.current_destination_hash(), runtime.fingerprint());
+        stub.announce(Some("Stub")).await;
+        let to = stub.destination_hex();
+        let peers = runtime.peers();
+        stub.wait_to_be_filed(&peers, &to).await;
+        runtime
+            .trust()
+            .trust_destination(
+                slot.as_ref(),
+                &to,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        let identity = stub.identity_hex();
+        let memory = runtime
+            .envoy_memory()
+            .expect("an enabled store is opened at start");
+        let now = SystemTime::now();
+        memory.save(&identity, "a-1", peer_turns(), now).unwrap();
+        let store = slot.inbound_store().unwrap();
+        store
+            .upsert(
+                InboundRecord {
+                    peer_destination: to.clone(),
+                    peer_identity: identity.clone(),
+                    ..inbound_record("a-1")
+                },
+                now,
+            )
+            .unwrap();
+        let held = || memory.load(&identity, "a-1", now).unwrap().unwrap().turns;
+
+        let err = slot
+            .answer_inbound("a-1", "yes, go ahead")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("The peer refused the message"), "{err}");
+        assert!(
+            store.get("a-1").unwrap().is_some(),
+            "the question is put back"
+        );
+        assert_eq!(held(), peer_turns(), "an unheard answer is not remembered");
+
+        peer.refusing.store(false, Ordering::SeqCst);
+        slot.answer_inbound("a-1", "on second thought: not yet")
+            .await
+            .unwrap();
+        assert_eq!(peer.acknowledged.load(Ordering::SeqCst), 1);
+        assert!(
+            store.get("a-1").unwrap().is_none(),
+            "the answer settles the question"
+        );
+        let turns = held();
+        assert_eq!(turns.len(), peer_turns().len() + 1, "{turns:?}");
+        assert_eq!(turns.last().unwrap().role, EnvoyRole::Assistant);
+        assert_eq!(turns.last().unwrap().text, "on second thought: not yet");
+        assert!(
+            !turns.iter().any(|turn| turn.text == "yes, go ahead"),
+            "the refused words never joined the thread: {turns:?}"
+        );
+        assert!(slot.stop().await.unwrap());
+        stub.stop().await;
+    }
+
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn answer_inbound_with_file_sends_without_the_envoy_and_removes_the_record() {
