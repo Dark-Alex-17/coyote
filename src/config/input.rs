@@ -40,8 +40,10 @@ pub struct Input {
     rag_name: Option<String>,
     with_session: bool,
     with_agent: bool,
-    /// Earlier user and assistant turns, oldest first, placed before the current
-    /// text by `build_messages`; for a caller that keeps a conversation outside a session.
+    /// Earlier turns, oldest first, placed before the current text by `build_messages`;
+    /// for a caller that keeps a conversation outside a session. Honoured only on the
+    /// role branch (`with_session` false), and callers keep it to user and assistant
+    /// turns.
     history: Vec<Message>,
 }
 
@@ -72,8 +74,8 @@ impl Input {
         })
     }
 
-    /// `from_str` with an explicit role and `history` ahead of `text`: no session
-    /// history or agent of the context's rides along, only the turns given.
+    /// `from_str` with an explicit role and `history` ahead of `text`: the context's
+    /// session and agent do not ride along, only the turns given.
     pub fn with_history(
         ctx: &RequestContext,
         text: &str,
@@ -338,6 +340,7 @@ impl Input {
     }
 
     pub fn build_messages(&self) -> Result<Vec<Message>> {
+        debug_assert!(self.history.is_empty() || !self.with_session);
         let mut messages = if let Some(session) = self.session(&self.session) {
             session.build_messages(self)
         } else {
@@ -1283,6 +1286,26 @@ mod tests {
         );
         assert!(!input.with_session());
         assert!(!input.with_agent());
+    }
+
+    #[test]
+    fn with_history_under_an_empty_prompt_leads_with_the_turns() {
+        let ctx = create_test_ctx();
+        let history = vec![
+            turn(MessageRole::User, "first question"),
+            turn(MessageRole::Assistant, "first answer"),
+        ];
+        let input =
+            Input::with_history(&ctx, "second question", Role::new("r", ""), history).unwrap();
+
+        assert_eq!(
+            roles_and_texts(&input.build_messages().unwrap()),
+            vec![
+                (MessageRole::User, "first question".to_string()),
+                (MessageRole::Assistant, "first answer".to_string()),
+                (MessageRole::User, "second question".to_string()),
+            ]
+        );
     }
 
     #[test]

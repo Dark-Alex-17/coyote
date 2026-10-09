@@ -233,8 +233,8 @@ fn stores_dir(cache_dir: &Path) -> PathBuf {
 pub(crate) struct EnvoySessions {
     dir: PathBuf,
     limits: EnvoyMemoryLimits,
-    /// Orders the read-modify-write of every mutation within this process; `file_lock`
-    /// does the same across processes.
+    /// Orders every mutation through this handle; `file_lock` is the exclusion between
+    /// handles and processes.
     write_lock: Mutex<()>,
 }
 
@@ -296,12 +296,15 @@ impl EnvoySessions {
     /// instance since re-keyed, go too. How many went in all. A store that refuses is
     /// logged and skipped, the sweep going on to the next; `Ok(0)` when no store exists.
     /// The sweep runs whether or not the memory is on: records may remain from a time
-    /// it was, and a revocation must reach them before the memory comes back.
+    /// it was, and a revocation must reach them before the memory comes back. A
+    /// non-hash `identity` is `NotAnIdentity` whatever is on disk.
     pub(crate) fn delete_identity_everywhere(
         cache_dir: &Path,
         config: &EnvoyMemoryConfig,
         identity: &str,
     ) -> Result<usize, EnvoyMemoryError> {
+        let identity = canonical_hash(identity)
+            .ok_or_else(|| EnvoyMemoryError::NotAnIdentity(identity.to_string()))?;
         let stores = stores_dir(cache_dir);
         if !stores.exists() {
             return Ok(0);
@@ -321,9 +324,8 @@ impl EnvoySessions {
                 limits: EnvoyMemoryLimits::from(config),
                 write_lock: Mutex::new(()),
             };
-            match store.delete_identity(identity) {
+            match store.delete_identity(&identity) {
                 Ok(count) => removed += count,
-                Err(err @ EnvoyMemoryError::NotAnIdentity(_)) => return Err(err),
                 Err(err) => warn!(
                     "Mesh envoy memory under '{}' could not be swept: {}",
                     store.dir.display(),
@@ -1258,6 +1260,10 @@ mod tests {
             EnvoySessions::delete_identity_everywhere(&tmp.path, &config, IDENTITY_A).unwrap(),
             0
         );
+        assert!(matches!(
+            EnvoySessions::delete_identity_everywhere(&tmp.path, &config, "not-a-hash"),
+            Err(EnvoyMemoryError::NotAnIdentity(_))
+        ));
         assert!(!tmp.path.join("mesh").exists());
         let stores: Vec<EnvoySessions> = ["inst-a", "inst-b", "inst-c"]
             .into_iter()
@@ -1305,9 +1311,10 @@ mod tests {
             "the store that refuses is left as it is"
         );
         assert!(record_path(&stores[2], IDENTITY_A, "thread-one").exists());
-        assert!(
-            EnvoySessions::delete_identity_everywhere(&tmp.path, &config, "not-a-hash").is_err()
-        );
+        assert!(matches!(
+            EnvoySessions::delete_identity_everywhere(&tmp.path, &config, "not-a-hash"),
+            Err(EnvoyMemoryError::NotAnIdentity(_))
+        ));
     }
 
     #[test]

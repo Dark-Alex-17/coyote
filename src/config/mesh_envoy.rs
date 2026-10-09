@@ -1248,8 +1248,9 @@ fn remember_exchange(
     };
     match written {
         Ok(()) => {}
-        // Recall already warned the owner about a record naming another identity.
-        Err(err @ EnvoyMemoryError::WrongIdentity { .. }) => debug!(
+        // Recall loaded the follow-up's thread and already warned the owner about a
+        // record naming another identity; a root's thread was never loaded.
+        Err(err @ EnvoyMemoryError::WrongIdentity { .. }) if message.thread.is_some() => debug!(
             "Mesh envoy memory for thread {thread} could not be saved: {}",
             redact_hashes(&err.to_string())
         ),
@@ -7362,7 +7363,7 @@ mod tests {
         Model::from_config("provider", &[data]).remove(0)
     }
 
-    /// Two exchanges of about five hundred tokens each: the whole runs past two
+    /// Two exchanges, each message about five hundred tokens: the whole runs past two
     /// thousand, the last exchange alone past one thousand, the current turn alone
     /// stays under twenty.
     fn two_long_exchanges() -> Vec<Message> {
@@ -8566,7 +8567,7 @@ mod tests {
             let system = messages[0].content.to_text();
             assert!(system.ends_with(&tail), "{system}");
             assert!(
-                !system.contains("Earlier assistant turns"),
+                !system.contains(RESUMED_THREAD_NOTE),
                 "a run with nothing to resume gets the prompt it always got: {system}"
             );
         }
