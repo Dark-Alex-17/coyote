@@ -28,7 +28,7 @@ use crate::mesh::message::{
     CHECK_INBOX_NEXT_ACTION, Disposition, ModelNotes, OutboundPeer, PEER_LINE_MAX_CHARS,
     PartLimits, PeerAdmission, PeerInbox, PeerKind, PeerMessage, PeerMessageHandler, PeerRouting,
     PeerSurface, PeerVia, RawPart, RawPeerMessage, SendError, SendOutcome, collect_next_action,
-    unix_now,
+    is_wire_id, unix_now,
 };
 use crate::mesh::notify::{Notification, NotificationSink, Source};
 use crate::mesh::peers::{PEER_TABLE_MAX_ENTRIES, PeerChange, PeerSighting, PeerTable};
@@ -2995,6 +2995,9 @@ impl MeshSlot {
             return;
         };
         let thread = record.thread.as_str();
+        if !is_wire_id(thread) {
+            return;
+        }
         let now = SystemTime::now();
         let mut turns = match store.load(&record.peer_identity, thread, now) {
             Ok(Some(file)) => file.turns,
@@ -8684,6 +8687,41 @@ mod tests {
 
     fn two_hours_ago() -> SystemTime {
         SystemTime::now() - Duration::from_secs(2 * 3_600)
+    }
+
+    /// The record's thread comes off disk, so the late answer gates it like every
+    /// other path to the store: a thread that is not a wire id touches nothing, even
+    /// when a record was planted under it.
+    #[test]
+    fn a_late_answer_to_a_thread_that_is_not_a_wire_id_remembers_nothing() {
+        let tmp = TempDir::new("node-late-answer-thread-gate");
+        let config = EnvoyMemoryConfig {
+            enabled: true,
+            ..EnvoyMemoryConfig::default()
+        };
+        let store = Arc::new(EnvoySessions::open(&tmp.path, "inst", &config).unwrap());
+        let now = SystemTime::now();
+        store
+            .save(REMEMBERED_PEER, "not a wire id!", peer_turns(), now)
+            .unwrap();
+        let slot = MeshSlot::default();
+        slot.set_envoy_memory_for_tests(store.clone());
+
+        slot.remember_human_answer(
+            &InboundRecord {
+                peer_identity: REMEMBERED_PEER.to_string(),
+                thread: "not a wire id!".to_string(),
+                ..inbound_record("a-1")
+            },
+            "the owner says yes",
+        );
+
+        let turns = store
+            .load(REMEMBERED_PEER, "not a wire id!", now)
+            .unwrap()
+            .expect("the planted record is left as it was")
+            .turns;
+        assert_eq!(turns, peer_turns());
     }
 
     #[cfg(unix)]
