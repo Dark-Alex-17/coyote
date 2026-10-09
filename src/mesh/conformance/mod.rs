@@ -380,6 +380,7 @@ const ENFORCED_BY: &[(&str, &[&str])] = &[
             "forget_one_thread_then_one_identity_reaches_every_store_and_leaves_the_rest",
             "forget_all_without_a_terminal_refuses_naming_the_flag_and_with_it_wipes_every_store",
             "forget_all_dry_run_lists_every_identity_in_full_with_its_count_and_changes_nothing",
+            "delete_identity_everywhere_leaves_a_store_whose_index_cannot_be_read_and_counts_it",
         ],
     ),
     ("MESH-INV-001", &["mesh_module_never_names_the_request_ctx"]),

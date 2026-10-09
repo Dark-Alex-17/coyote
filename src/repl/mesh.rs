@@ -13538,6 +13538,198 @@ mod tests {
                 });
             }
 
+            /// Usage probe: a store whose index cannot be read (one directory under the
+            /// stores, not the whole tree) is told of by every identity-level revocation.
+            /// The dry runs of `untrust --identity` and its `forget` alias add a row
+            /// saying the store may hold more of the identity and that only `.mesh
+            /// memory forget all` empties it; `block` says it in its intro; after the
+            /// write each appends the same clause to its memory line — the sweep leaves
+            /// that store as it is. A wrong token is refused on its own, naming no memory
+            /// at all, and the destination-level verbs never mention it.
+            #[test]
+            #[serial]
+            fn usage_probe_revocation_verbs_name_the_store_whose_index_cannot_be_read_and_leave_it()
+            {
+                use crate::config::mesh_config::EnvoyMemoryConfig;
+                use crate::mesh::envoy_sessions::{EnvoyRole, EnvoyTurn};
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-envoy-memory-unreadable-store");
+                let _capture = capture::install();
+                let _script = prompt_script::install(&[]);
+                run_async(async {
+                    let started =
+                        started_runtime_with("repl-mesh-envoy-memory-unreadable-store", |c| {
+                            c.envoy_memory = EnvoyMemoryConfig {
+                                enabled: true,
+                                ..EnvoyMemoryConfig::default()
+                            }
+                        })
+                        .await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let trust = started.runtime.trust();
+                    let served = started
+                        .runtime
+                        .envoy_memory()
+                        .expect("an enabled store is opened at start");
+                    let slot: &dyn LiveMesh = ctx.app.mesh.as_ref();
+                    let now = SystemTime::now();
+                    let stores = started
+                        .runtime
+                        .cache_dir()
+                        .join("mesh")
+                        .join("envoy-sessions");
+                    let broken = stores.join("inst-broken");
+                    fs::create_dir_all(&broken).unwrap();
+                    let index = broken.join("index.json");
+                    fs::write(&index, "{not json").unwrap();
+                    let record = broken.join(format!("{}.yaml", "ad".repeat(16)));
+                    fs::write(&record, "version: 1\n").unwrap();
+                    let untouched = |why: &str| {
+                        assert_eq!(fs::read_to_string(&index).unwrap(), "{not json", "{why}");
+                        assert!(record.exists(), "{why}");
+                    };
+                    let clause = "1 envoy memory store whose index cannot be read may hold more of it; run .mesh memory forget all to empty it";
+
+                    let dest_a = heard_trusted_peer(&started.runtime, slot);
+                    let id_a = identity_of(&trust, &dest_a);
+                    served
+                        .save(
+                            &id_a,
+                            "a-served",
+                            vec![
+                                EnvoyTurn {
+                                    role: EnvoyRole::User,
+                                    text: "where were we?".into(),
+                                },
+                                EnvoyTurn {
+                                    role: EnvoyRole::Assistant,
+                                    text: "the build".into(),
+                                },
+                            ],
+                            now,
+                        )
+                        .unwrap();
+                    let (dest_b, id_b) = heard_peer(&started.runtime, "Bo", now);
+                    trust
+                        .trust_destination(slot, &dest_b, TrustOptions::default(), now)
+                        .unwrap();
+
+                    // Destination-level verbs: no memory read, so no mention.
+                    for line in [
+                        format!(".mesh untrust {dest_b} --dry-run"),
+                        format!(".mesh forget {dest_b} --dry-run"),
+                    ] {
+                        let out = out_of(&mut ctx, &line).await.unwrap();
+                        assert!(!out.contains("envoy"), "{line}: {out}");
+                        assert!(!out.contains("cannot be read"), "{line}: {out}");
+                    }
+
+                    // A wrong token is refused before the memory is read: the refusal
+                    // is the token sentence alone.
+                    let token = format!("untrust-{}", short(&id_a));
+                    let err = refusal(
+                        &mut ctx,
+                        &format!(".mesh untrust --identity {id_a} --confirm nope"),
+                    )
+                    .await;
+                    assert!(
+                        err.starts_with("'nope' is not the token for identity"),
+                        "{err}"
+                    );
+                    assert!(err.contains(&format!("--confirm {token}")), "{err}");
+                    assert!(!err.contains("envoy"), "{err}");
+                    assert!(!err.contains("cannot be read"), "{err}");
+
+                    // Identity-level dry runs: the count that could be read, then the store
+                    // that could not, each on its own row; the closing sentence counts
+                    // only what was read.
+                    for verb in ["untrust", "forget"] {
+                        let out = out_of(&mut ctx, &format!(".mesh {verb} --identity {id_a}"))
+                            .await
+                            .unwrap();
+                        let lines: Vec<&str> = out.lines().collect();
+                        assert!(
+                            lines.contains(&"  1 remembered envoy conversation  forgotten with it"),
+                            "{verb}: {out}"
+                        );
+                        assert!(
+                            lines.contains(&format!("  {clause}").as_str()),
+                            "{verb}: the unreadable store has its own row: {out}"
+                        );
+                        let last = lines.last().unwrap_or(&"");
+                        assert!(last.starts_with(DRY_RUN_NOTHING_CHANGED), "{verb}: {out}");
+                        assert!(
+                            last.contains("and the 1 envoy conversation remembered of it, run:"),
+                            "{verb}: {out}"
+                        );
+                        assert!(
+                            last.contains(&format!("--confirm {token}")),
+                            "{verb}: {out}"
+                        );
+                        untouched("a dry run reads only");
+                    }
+
+                    // The write: the served thread goes; the unreadable store is named on
+                    // the same line, after what was forgotten.
+                    let out = out_of(
+                        &mut ctx,
+                        &format!(".mesh untrust --identity {id_a} --confirm {token}"),
+                    )
+                    .await
+                    .unwrap();
+                    assert!(out.contains("Untrusted identity"), "{out}");
+                    assert_eq!(
+                        out.lines().last(),
+                        Some(
+                            format!("Forgot the 1 envoy conversation remembered of it. {clause}.")
+                                .as_str()
+                        ),
+                        "{out}"
+                    );
+                    assert_eq!(
+                        served.stats().unwrap(),
+                        (0, 0),
+                        "the served store gave its thread up"
+                    );
+                    untouched("untrust --identity leaves a store it cannot read");
+
+                    // `block` of an identity nothing is remembered of: the intro still
+                    // names the store, and so does the line after the write, on its own.
+                    let out = out_of(&mut ctx, &format!(".mesh block {id_b} --yes"))
+                        .await
+                        .unwrap();
+                    let intro = out.lines().next().unwrap_or_default();
+                    assert!(intro.starts_with("This blocks identity"), "{out}");
+                    assert!(intro.ends_with(&format!("is removed. {clause}.")), "{out}");
+                    assert!(
+                        !intro.contains("remembered of it"),
+                        "no conversation count is claimed for an identity with none: {out}"
+                    );
+                    assert!(out.contains("Blocked"), "{out}");
+                    assert_eq!(
+                        out.lines().last(),
+                        Some(format!("{clause}.").as_str()),
+                        "{out}"
+                    );
+                    untouched("block leaves a store it cannot read");
+
+                    // The remedy the verbs named is the one that reaches it.
+                    let out = out_of(&mut ctx, ".mesh memory forget all --yes")
+                        .await
+                        .unwrap();
+                    assert!(
+                        out.starts_with("Forgot 1 store whose index cannot be read"),
+                        "{out}"
+                    );
+                    assert!(!index.exists() && !record.exists(), "{out}");
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
             /// With no destination record to read the identity from, the untrust finds it
             /// in the peer table and still writes the deny.
             #[test]
@@ -28461,6 +28653,285 @@ mod tests {
                 );
                 assert_eq!(fs::read_to_string(&index).unwrap(), "{not json");
                 assert_eq!(prompt_script::prompts_asked(), 0);
+            }
+
+            /// Usage probe: when every store that exists is one whose index cannot be
+            /// read, `forget all` still has work — the stores are emptied unread and are
+            /// what the listing and the result name, with or without record files behind
+            /// the broken index. Only once they are gone does the verb say it remembers
+            /// nothing. With conversations, an unindexed record file and an unreadable
+            /// store all present, the subject joins its three parts with commas and `and`.
+            #[test]
+            #[serial]
+            fn usage_probe_forget_all_empties_stores_that_are_only_unreadable_and_joins_three_subjects()
+             {
+                let guard = TestConfigDirGuard::new(TAG);
+                let _cache = EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
+                let _capture = capture::install();
+                let _script = prompt_script::install(&[]);
+                let cache_dir = MeshPaths::from_env().cache_dir;
+                let stores = cache_dir.join("mesh").join("envoy-sessions");
+                let with_record = stores.join("inst-c");
+                let index_only = stores.join("inst-d");
+                fs::create_dir_all(&with_record).unwrap();
+                fs::create_dir_all(&index_only).unwrap();
+                fs::write(with_record.join("index.json"), "{not json").unwrap();
+                let record = with_record.join(format!("{}.yaml", "ad".repeat(16)));
+                fs::write(&record, "version: 1\n").unwrap();
+                fs::write(index_only.join("index.json"), "").unwrap();
+                let mut ctx = ctx_with(MeshConfig::default(), true);
+
+                let out = run_async(out_of(&mut ctx, ".mesh memory forget all --dry-run")).unwrap();
+                assert_eq!(
+                    out.lines().collect::<Vec<_>>(),
+                    [
+                        "Would forget 2 stores whose index cannot be read.",
+                        DRY_RUN_NOTHING_CHANGED,
+                    ],
+                    "stores nobody can read are still something to forget: {out}"
+                );
+                assert!(record.exists());
+                assert_eq!(
+                    fs::read_to_string(with_record.join("index.json")).unwrap(),
+                    "{not json"
+                );
+
+                let out = run_async(out_of(&mut ctx, ".mesh memory forget all --yes")).unwrap();
+                assert!(
+                    out.starts_with("Forgot 2 stores whose index cannot be read"),
+                    "the result names the emptied stores, not `remembers nothing`: {out}"
+                );
+                assert!(!out.contains("could not be forgotten"), "{out}");
+                assert!(
+                    !record.exists(),
+                    "the record behind the broken index went unread"
+                );
+                assert!(!with_record.join("index.json").exists());
+                assert!(!index_only.join("index.json").exists());
+                assert!(
+                    with_record.exists() && index_only.exists(),
+                    "the store directories themselves stay for the next write"
+                );
+
+                let out = run_async(out_of(&mut ctx, ".mesh memory forget all --yes")).unwrap();
+                assert_eq!(
+                    out, "The envoy remembers nothing.",
+                    "an emptied directory is no longer a store"
+                );
+
+                // Three kinds of subject at once: conversations, an orphan, an unreadable store.
+                seed(&cache_dir);
+                let orphan = stores
+                    .join("inst-a")
+                    .join(format!("{}.yaml", "de".repeat(16)));
+                fs::write(&orphan, "version: 1\n").unwrap();
+                fs::write(with_record.join("index.json"), "{not json").unwrap();
+                let out = run_async(out_of(&mut ctx, ".mesh memory forget all --dry-run")).unwrap();
+                let [row_a, row_b] = all_rows();
+                assert_eq!(
+                    out.lines().collect::<Vec<_>>(),
+                    [
+                        "Would forget 3 remembered conversations of 2 identities, 1 record file that no index names and 1 store whose index cannot be read:",
+                        row_a.as_str(),
+                        row_b.as_str(),
+                        DRY_RUN_NOTHING_CHANGED,
+                    ],
+                    "{out}"
+                );
+                let out = run_async(out_of(&mut ctx, ".mesh memory forget all --yes")).unwrap();
+                let last = out.lines().last().unwrap_or_default();
+                assert!(
+                    last.starts_with(
+                        "Forgot 3 remembered conversations of 2 identities, 1 record file that no index names and 1 store whose index cannot be read"
+                    ),
+                    "{out}"
+                );
+                assert!(!orphan.exists());
+                assert!(!with_record.join("index.json").exists());
+                assert!(remembered(&cache_dir).is_empty());
+                assert_eq!(prompt_script::prompts_asked(), 0);
+            }
+
+            /// Usage probe: the thread scope, like the identity scope, leaves a store
+            /// whose index cannot be read as it is — even when the thread it is asked to
+            /// forget does exist in the readable stores and goes — and says so after the
+            /// `Forgot` line, naming `forget all` as the way to empty that store.
+            #[test]
+            #[serial]
+            fn usage_probe_forgetting_one_thread_leaves_an_unreadable_store_and_says_so_after_the_forgot_line()
+             {
+                let guard = TestConfigDirGuard::new(TAG);
+                let _cache = EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
+                let _capture = capture::install();
+                let _script = prompt_script::install(&[]);
+                let cache_dir = MeshPaths::from_env().cache_dir;
+                seed(&cache_dir);
+                let third = cache_dir.join("mesh").join("envoy-sessions").join("inst-c");
+                fs::create_dir_all(&third).unwrap();
+                let index = third.join("index.json");
+                fs::write(&index, "{not json").unwrap();
+                let record = third.join(format!("{}.yaml", "ad".repeat(16)));
+                fs::write(&record, "version: 1\n").unwrap();
+                let mut ctx = ctx_with(MeshConfig::default(), true);
+                let short_a = short(ID_A);
+                let note = "1 store whose index cannot be read is left as it is and may hold more; run .mesh memory forget all to empty it.";
+
+                let out = run_async(out_of(
+                    &mut ctx,
+                    &format!(".mesh memory forget {ID_A} a-first --dry-run"),
+                ))
+                .unwrap();
+                assert_eq!(
+                    out.lines().collect::<Vec<_>>(),
+                    [
+                        format!(
+                            "Would forget the remembered thread 'a-first' of identity {short_a}."
+                        )
+                        .as_str(),
+                        note,
+                        DRY_RUN_NOTHING_CHANGED,
+                    ],
+                    "{out}"
+                );
+
+                let out = run_async(out_of(
+                    &mut ctx,
+                    &format!(".mesh memory forget {ID_A} a-first --yes"),
+                ))
+                .unwrap();
+                assert_eq!(
+                    out.lines().collect::<Vec<_>>(),
+                    [
+                        format!(
+                            "Forgot the remembered thread 'a-first' of identity {short_a} (2 records across the instance stores)."
+                        )
+                        .as_str(),
+                        note,
+                    ],
+                    "the thread both readable stores held is gone, the unreadable store is named, not emptied: {out}"
+                );
+                assert_eq!(
+                    remembered(&cache_dir),
+                    BTreeMap::from([
+                        (ID_A.to_string(), vec!["a-second".to_string()]),
+                        (ID_B.to_string(), vec!["b-first".to_string()]),
+                    ])
+                );
+                assert_eq!(fs::read_to_string(&index).unwrap(), "{not json");
+                assert!(record.exists());
+                assert_eq!(prompt_script::prompts_asked(), 0);
+            }
+
+            #[cfg(unix)]
+            mod symlinked_store {
+                use super::*;
+
+                /// Usage probe: the sweep never follows a symlink under the stores
+                /// directory. A link to a real store elsewhere is not listed, not counted
+                /// among the conversations, not counted as a store whose index cannot be
+                /// read even when its target's index is garbage, and `forget all` leaves
+                /// everything behind the link exactly as it was.
+                #[test]
+                #[serial]
+                fn usage_probe_forget_all_neither_lists_nor_empties_a_store_behind_a_symlink() {
+                    let guard = TestConfigDirGuard::new(TAG);
+                    let _cache =
+                        EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    let cache_dir = MeshPaths::from_env().cache_dir;
+                    seed(&cache_dir);
+                    let stores = cache_dir.join("mesh").join("envoy-sessions");
+
+                    // A real store outside the stores directory, reached only through a link.
+                    let elsewhere = guard.path.join("elsewhere");
+                    let linked = EnvoySessions::open(&elsewhere, "linked", &enabled()).unwrap();
+                    let now = SystemTime::now();
+                    linked
+                        .save(
+                            ID_B,
+                            "b-linked",
+                            vec![EnvoyTurn {
+                                role: EnvoyRole::User,
+                                text: "behind the link".into(),
+                            }],
+                            now,
+                        )
+                        .unwrap();
+                    let target = elsewhere.join("mesh").join("envoy-sessions").join("linked");
+                    assert!(target.join("index.json").is_file());
+                    std::os::unix::fs::symlink(&target, stores.join("inst-link")).unwrap();
+                    // And a link to a directory whose index is garbage.
+                    let broken = guard.path.join("broken");
+                    fs::create_dir_all(&broken).unwrap();
+                    fs::write(broken.join("index.json"), "{not json").unwrap();
+                    let broken_record = broken.join(format!("{}.yaml", "ad".repeat(16)));
+                    fs::write(&broken_record, "version: 1\n").unwrap();
+                    std::os::unix::fs::symlink(&broken, stores.join("inst-broken-link")).unwrap();
+                    let before = |dir: &Path| -> Vec<String> {
+                        let mut names: Vec<String> = fs::read_dir(dir)
+                            .unwrap()
+                            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                            .collect();
+                        names.sort();
+                        names
+                    };
+                    let target_before = before(&target);
+                    let broken_before = before(&broken);
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+
+                    let out =
+                        run_async(out_of(&mut ctx, ".mesh memory forget all --dry-run")).unwrap();
+                    let [row_a, row_b] = all_rows();
+                    assert_eq!(
+                        out.lines().collect::<Vec<_>>(),
+                        [
+                            "Would forget 3 remembered conversations of 2 identities:",
+                            row_a.as_str(),
+                            row_b.as_str(),
+                            DRY_RUN_NOTHING_CHANGED,
+                        ],
+                        "nothing behind a link is listed, as a conversation or as an unreadable store: {out}"
+                    );
+
+                    let out = run_async(out_of(&mut ctx, ".mesh memory forget all --yes")).unwrap();
+                    assert_eq!(
+                        out.lines().last(),
+                        Some(
+                            "Forgot 3 remembered conversations of 2 identities (4 records across the instance stores)."
+                        ),
+                        "{out}"
+                    );
+                    assert!(remembered(&cache_dir).is_empty());
+                    assert_eq!(
+                        before(&target),
+                        target_before,
+                        "the linked store is untouched"
+                    );
+                    assert_eq!(before(&broken), broken_before, "and so is the broken one");
+                    assert_eq!(
+                        linked.stats().unwrap(),
+                        (1, 1),
+                        "the thread behind the link is still remembered there"
+                    );
+                    assert!(
+                        stores
+                            .join("inst-link")
+                            .symlink_metadata()
+                            .unwrap()
+                            .file_type()
+                            .is_symlink()
+                    );
+                    assert!(
+                        stores
+                            .join("inst-broken-link")
+                            .symlink_metadata()
+                            .unwrap()
+                            .file_type()
+                            .is_symlink()
+                    );
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+                }
             }
         }
     }

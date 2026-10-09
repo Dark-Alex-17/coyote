@@ -913,6 +913,137 @@ fn the_collision_protection_prose_in_the_wiki_matches_the_template_and_names_the
     }
 }
 
+/// The `### Conversation memory` section on `Mesh.md` names the wipe verb, says the
+/// memory is kept per identity and thread, and states every bound; the bounds are
+/// spelt as their default values, not as the `mesh.envoy_memory.*` key names.
+#[test]
+fn the_conversation_memory_section_names_the_wipe_verb_the_isolation_and_every_bound() {
+    let Some(wiki) = wiki_dir() else { return };
+    let mesh = read(wiki.join("Mesh.md"));
+    let heading = "\n### Conversation memory\n";
+    let section_at = mesh
+        .find(heading)
+        .expect("Mesh.md has a `### Conversation memory` section");
+    let section = mesh[section_at + 1..]
+        .split("\n## ")
+        .next()
+        .unwrap()
+        .split("\n### ")
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    for phrase in [
+        ".mesh memory forget",
+        "identity",
+        "thread",
+        "`mesh.envoy_memory.*`",
+        "256 threads across all peers",
+        "16 per identity",
+        "40 turns",
+        "65536 bytes",
+        "168 hours",
+    ] {
+        assert!(
+            section.contains(phrase),
+            "Mesh.md's `### Conversation memory` section does not say {phrase:?}:\n{section}"
+        );
+    }
+}
+
+/// Usage probe: `ttl_hours` counts from the thread's last *written* exchange — a load
+/// that finds a thread does not renew it. Every surface an operator reads the key on says
+/// so in the same words: the template and example comments, the README and Configuration
+/// table rows, the Configuration page's yaml line and the field's own rustdoc; none of them
+/// still says "after its last message".
+#[test]
+fn usage_probe_every_ttl_hours_twin_counts_from_the_last_written_exchange() {
+    let Some(wiki) = wiki_dir() else { return };
+    const WORDING: &str = "after its last written exchange";
+    const STALE: &str = "after its last message";
+
+    let yaml_line = |label: &str, text: &str| -> String {
+        text.lines()
+            .find(|line| line.trim_start().starts_with("ttl_hours:") && line.contains('#'))
+            .unwrap_or_else(|| panic!("{label} has no commented `ttl_hours:` line"))
+            .to_string()
+    };
+    let table_row = |label: &str, text: &str, head: &str| -> String {
+        text.lines()
+            .find(|line| line.starts_with(head))
+            .unwrap_or_else(|| panic!("{label} has no `{head}` row"))
+            .to_string()
+    };
+    let config_source = read(repo_root().join("src/config/mesh_config.rs"));
+    let rustdoc = {
+        let lines: Vec<&str> = config_source.lines().collect();
+        let field = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("pub ttl_hours:"))
+            .expect("EnvoyMemoryConfig has a `pub ttl_hours` field");
+        lines[..field]
+            .iter()
+            .rev()
+            .take_while(|line| line.trim_start().starts_with("///"))
+            .map(|line| line.trim())
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+
+    let twins = [
+        (
+            "assets/config-template.yaml",
+            yaml_line(
+                "assets/config-template.yaml",
+                &read(repo_root().join("assets/config-template.yaml")),
+            ),
+        ),
+        (
+            "config.example.yaml",
+            yaml_line(
+                "config.example.yaml",
+                &read(repo_root().join("config.example.yaml")),
+            ),
+        ),
+        (
+            "Mesh-Configuration.md yaml",
+            yaml_line(
+                "Mesh-Configuration.md",
+                &read(wiki.join("Mesh-Configuration.md")),
+            ),
+        ),
+        (
+            "Mesh-Configuration.md table",
+            table_row(
+                "Mesh-Configuration.md",
+                &read(wiki.join("Mesh-Configuration.md")),
+                "| `envoy_memory.ttl_hours`",
+            ),
+        ),
+        (
+            "README.md table",
+            table_row(
+                "README.md",
+                &read(repo_root().join("README.md")),
+                "| `mesh.envoy_memory.ttl_hours`",
+            ),
+        ),
+        ("EnvoyMemoryConfig::ttl_hours rustdoc", rustdoc),
+    ];
+    for (label, text) in &twins {
+        assert!(
+            text.contains(WORDING),
+            "{label} does not say `{WORDING}`: {text}"
+        );
+        assert!(
+            !text.contains(STALE),
+            "{label} still says `{STALE}`: {text}"
+        );
+    }
+}
+
 /// Usage probe: the identity-tier Note on `Mesh-Trust-Model.md` quotes the two presence
 /// lines with the instance as `<dest8>` — `presence_collision_text` shortens the old
 /// destination and has no label to print — while the record-collision lines quoted above

@@ -800,7 +800,7 @@ impl EnvoySessions {
             Ok(index) => index,
             Err(err) => {
                 warn!(
-                    "Mesh envoy memory under '{}' is emptied unread; its index could not be read: {}",
+                    "Mesh envoy memory under '{}' is being emptied unread; its index could not be read: {}",
                     self.dir.display(),
                     redact_hashes(&err.to_string())
                 );

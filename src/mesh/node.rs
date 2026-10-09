@@ -1903,7 +1903,7 @@ impl EnvoyMemorySink for MeshRuntime {
                 removed,
                 unreadable_stores,
             }) => debug!(
-                "Mesh forgot {removed} remembered envoy conversation(s) of {}; {unreadable_stores} store(s) could not be read",
+                "Mesh forgot {removed} remembered envoy conversation(s) of {}; {unreadable_stores} store(s) could not be swept",
                 short(identity)
             ),
             Err(err) => warn!(
