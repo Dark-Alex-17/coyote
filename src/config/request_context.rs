@@ -11424,6 +11424,68 @@ mod tests {
         assert!(ctx.session_file_for("both", SessionScope::Global).exists());
     }
 
+    /// What the envoy remembers of a peer's thread lives under the cache dir, keyed by
+    /// a digest, and is not a session of the owner's: no REPL session verb lists it,
+    /// offers it for deletion or resolves its key to a file that exists.
+    #[test]
+    #[serial]
+    fn an_envoy_sessions_record_is_never_a_repl_session() {
+        use crate::config::mesh_config::EnvoyMemoryConfig;
+        use crate::mesh::envoy_sessions::{EnvoyRole, EnvoySessions, EnvoyTurn, session_key};
+
+        let _config = TestConfigDirGuard::new();
+        let cache = _config.path.join("cache");
+        let _cache = EnvVarGuard::set(get_env_name("cache_dir"), &cache);
+        let ctx = create_test_ctx();
+        write_session_file(&ctx, "mine", SessionScope::Global, "messages: []\n");
+        let identity = "0123456789abcdef0123456789abcdef";
+        let store = EnvoySessions::open(
+            &paths::cache_dir(),
+            "inst",
+            &EnvoyMemoryConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        store
+            .save(
+                identity,
+                "t-1",
+                vec![
+                    EnvoyTurn {
+                        role: EnvoyRole::User,
+                        text: "where were we?".into(),
+                    },
+                    EnvoyTurn {
+                        role: EnvoyRole::Assistant,
+                        text: "the build".into(),
+                    },
+                ],
+                SystemTime::now(),
+            )
+            .unwrap();
+        let key = session_key(identity, "t-1").unwrap();
+        assert!(
+            cache
+                .join("mesh")
+                .join("envoy-sessions")
+                .join("inst")
+                .join(format!("{key}.yaml"))
+                .exists()
+        );
+
+        assert_eq!(ctx.list_sessions(), vec!["mine"]);
+        assert_eq!(
+            ctx.session_delete_entries(),
+            vec![("mine".to_string(), SessionScope::Global)]
+        );
+        let (path, scope) = ctx.resolve_session_file(&key);
+        assert_eq!(scope, SessionScope::Global);
+        assert!(path.starts_with(ctx.sessions_dir_for(SessionScope::Global)));
+        assert!(!path.exists());
+    }
+
     #[test]
     #[serial]
     fn session_list_rows_show_both_twins_and_mark_the_shadowed_global() {
