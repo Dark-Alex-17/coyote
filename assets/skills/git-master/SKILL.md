@@ -46,6 +46,21 @@ Before running anything that rewrites history or deletes refs:
 - `git branch --show-current` — confirm which branch you're on.
 - `git log -3 --oneline` — confirm what's about to be moved.
 
+## Worktrees
+
+A worktree is an ephemeral workspace: it lives exactly as long as the work that needed it.
+
+- Create under one dedicated directory (e.g. `.worktrees/<name>`), never nested inside another
+  worktree.
+- Remove it the moment the work lands or is abandoned — `git worktree remove <path>` (`--force`
+  when it holds discarded changes). Stale worktrees accumulate silently, hold branch checkouts
+  hostage (a branch checked out in any worktree can't be checked out or deleted elsewhere), and
+  confuse later automation.
+- `git worktree list` before creating one (collisions) and after finishing a batch of work (no
+  strays). `git worktree prune` after any manual directory deletion.
+- Removing a worktree never deletes its branch — decide branch retention separately, on purpose.
+- Never remove the worktree you are standing in; step out (or have the parent checkout do it).
+
 ## What to never do
 
 - Force-push to shared branches (`main`, release branches, anything teammates pull from).
