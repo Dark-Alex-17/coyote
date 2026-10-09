@@ -100,8 +100,25 @@ fn detect_line_kind(line: &str) -> LineKind {
 }
 
 fn parse_table_row(line: &str) -> Vec<String> {
-    let inner = line.trim().trim_start_matches('|').trim_end_matches('|');
-    inner.split('|').map(|c| c.trim().to_string()).collect()
+    let mut cells = Vec::new();
+    let mut current = String::new();
+    let mut chars = line.trim().trim_start_matches('|').chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' if chars.peek() == Some(&'|') => {
+                chars.next();
+                current.push('|');
+            }
+            '|' => cells.push(std::mem::take(&mut current)),
+            _ => current.push(ch),
+        }
+    }
+    // A trailing unescaped `|` closes the last cell rather than opening an
+    // empty one; anything else after the last delimiter is a real cell.
+    if !current.is_empty() || cells.is_empty() {
+        cells.push(current);
+    }
+    cells.into_iter().map(|c| c.trim().to_string()).collect()
 }
 
 fn parse_alignments(separator_row: &str) -> Vec<CellAlignment> {
@@ -1581,6 +1598,38 @@ std::error::Error>> {
             parse_table_row("  |   foo   |   bar   |  "),
             vec!["foo", "bar"],
         );
+    }
+
+    #[test]
+    fn parse_table_row_keeps_escaped_pipes_inside_cells() {
+        assert_eq!(
+            parse_table_row(r"| `.mesh memory forget <identity\|all>` | [--yes\|--dry-run] | x |"),
+            vec![
+                "`.mesh memory forget <identity|all>`",
+                "[--yes|--dry-run]",
+                "x",
+            ],
+        );
+    }
+
+    #[test]
+    fn parse_table_row_escaped_pipe_at_cell_edges() {
+        assert_eq!(parse_table_row(r"| a | b\| |"), vec!["a", "b|"]);
+        assert_eq!(parse_table_row(r"| a | b\||"), vec!["a", "b|"]);
+        assert_eq!(parse_table_row(r"| \|a | b |"), vec!["|a", "b"]);
+    }
+
+    #[test]
+    fn parse_table_row_leaves_other_backslashes_alone() {
+        assert_eq!(
+            parse_table_row(r"| C:\path | a\b |"),
+            vec![r"C:\path", r"a\b"]
+        );
+    }
+
+    #[test]
+    fn parse_table_row_without_trailing_pipe() {
+        assert_eq!(parse_table_row("| a | b"), vec!["a", "b"]);
     }
 
     #[test]
