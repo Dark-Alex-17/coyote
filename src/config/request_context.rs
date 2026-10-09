@@ -42,6 +42,7 @@ use crate::mcp::{
     is_mcp_meta_function, mcp_meta_function_names,
 };
 use crate::mesh::card::DISPLAY_NAME_MAX_CHARS;
+use crate::mesh::envoy_sessions::EnvoySessions;
 use crate::mesh::idle::plural;
 use crate::mesh::knocks::KnockRecord;
 use crate::mesh::pending::{InboundKind, InboundRecord, PENDING_QUESTION_MAX_CHARS};
@@ -49,7 +50,8 @@ use crate::mesh::shares::GLOB_METACHARACTERS;
 use crate::mesh::trust::{Tier, TrustRecord};
 use crate::mesh::wire_path::WIRE_PATH_MAX_BYTES;
 use crate::mesh::{
-    MeshRuntime, MeshSlot, PeerRecord, age_text, display_text, parse_rfc3339, redact_hashes, short,
+    MeshPaths, MeshRuntime, MeshSlot, PeerRecord, age_text, display_text, parse_rfc3339,
+    redact_hashes, short,
 };
 use crate::rag::Rag;
 use crate::supervisor::Supervisor;
@@ -81,7 +83,7 @@ use log::warn;
 use parking_lot::RwLock;
 use prompts::DEFAULT_SKILL_INSTRUCTIONS;
 use rand::distr::{Alphanumeric, SampleString};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{File, OpenOptions, read_dir, read_to_string, remove_dir_all, remove_file};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -4545,6 +4547,10 @@ impl RequestContext {
             values = self.mesh_completion_fetch(&args[1..]);
         } else if cmd == ".mesh" && args.len() >= 2 && args[0] == "inbox" {
             values = mesh_completion_inbox(&args[1..]);
+        } else if cmd == ".mesh" && args.len() == 2 && args[0] == "memory" {
+            values = super::map_completion_values(vec!["forget "]);
+        } else if cmd == ".mesh" && args.len() >= 3 && args[0] == "memory" && args[1] == "forget" {
+            values = self.mesh_completion_memory_forget(&args[2..]);
         } else if cmd == ".mesh" && args.len() == 2 && args[0] == "trust" {
             values = self.mesh_completion_trustable_destinations();
             values.push(("--identity ".to_string(), None));
@@ -5264,6 +5270,120 @@ impl RequestContext {
                 )
             })
             .collect()
+    }
+
+    /// What the envoy remembers, every instance's store merged, under the running node's
+    /// cache directory or, with the mesh off, the configured one: the records outlive
+    /// the node and `mesh.envoy_memory.enabled` alike. An unreadable store completes to
+    /// nothing rather than failing the key press.
+    fn remembered_everywhere(&self) -> BTreeMap<String, Vec<String>> {
+        let cache_dir = self
+            .app
+            .mesh
+            .get()
+            .map(|runtime| runtime.cache_dir().to_path_buf())
+            .unwrap_or_else(|| MeshPaths::from_env().cache_dir);
+        EnvoySessions::remembered_everywhere(&cache_dir, &self.app.config.mesh.envoy_memory)
+            .unwrap_or_else(|err| {
+                debug!(
+                    "envoy memory unreadable while completing `.mesh memory`: {}",
+                    redact_hashes(&err.to_string())
+                );
+                BTreeMap::new()
+            })
+    }
+
+    /// `.mesh memory forget <TAB>` and what follows, `rest` being everything after
+    /// `forget`. The first position is every identity the envoy remembers, each as
+    /// `{peer name or short hash} . {n} conversations`, then with the mesh on the trust
+    /// list's identities it remembers nothing of, less the blocked, and `all` last. The
+    /// second position, for an identity, is its remembered threads. `--yes` and
+    /// `--dry-run` go anywhere, each dropping once its partner is present, and do not
+    /// take up a position. Unlike the other `.mesh` completions this one is not empty
+    /// while the mesh is off: the verb works off, on what is on disk.
+    fn mesh_completion_memory_forget(&self, rest: &[&str]) -> Vec<(String, Option<String>)> {
+        let Some((_, prior)) = rest.split_last() else {
+            return Vec::new();
+        };
+        let positional: Vec<&str> = prior
+            .iter()
+            .copied()
+            .filter(|token| !matches!(*token, "--yes" | "--dry-run"))
+            .collect();
+        let Some(target) = positional.first() else {
+            return self.mesh_completion_remembered_identities();
+        };
+        let mut values = Vec::new();
+        if positional.len() == 1 && *target != "all" {
+            let threads = self
+                .remembered_everywhere()
+                .remove(&target.to_ascii_lowercase())
+                .unwrap_or_default();
+            values.extend(threads.into_iter().map(|thread| (thread, None)));
+        }
+        for (flag, partner) in [("--yes", "--dry-run"), ("--dry-run", "--yes")] {
+            if prior.contains(&flag) || prior.contains(&partner) {
+                continue;
+            }
+            values.push((flag.to_string(), None));
+        }
+        values
+    }
+
+    fn mesh_completion_remembered_identities(&self) -> Vec<(String, Option<String>)> {
+        let runtime = self.app.mesh.get();
+        let mut names: HashMap<String, String> = HashMap::new();
+        if let Some(runtime) = &runtime {
+            for peer in heard_peers(runtime) {
+                let Some(name) = peer
+                    .display_name
+                    .as_deref()
+                    .and_then(|name| display_text(name, DISPLAY_NAME_MAX_CHARS))
+                else {
+                    continue;
+                };
+                names.entry(peer.identity_hash).or_insert(name);
+            }
+        }
+        let mut values: Vec<(String, Option<String>)> = self
+            .remembered_everywhere()
+            .into_iter()
+            .map(|(identity, threads)| {
+                let who = names
+                    .get(&identity)
+                    .cloned()
+                    .unwrap_or_else(|| short(&identity).to_string());
+                let description = format!(
+                    "{who} . {}",
+                    plural(threads.len(), "conversation", "conversations")
+                );
+                (identity, Some(description))
+            })
+            .collect();
+        if let Some(runtime) = &runtime {
+            let blocked = blocked_identities(runtime);
+            let known = runtime
+                .trust()
+                .records()
+                .into_iter()
+                .filter_map(|record| {
+                    let identity = match record.tier {
+                        Tier::Identity => record.hash.clone(),
+                        Tier::Destination => record.identity.clone()?,
+                    };
+                    (!blocked.contains(&identity)).then(|| {
+                        let label = trust_record_label(&record);
+                        (identity, Some(format!("{label} . nothing remembered")))
+                    })
+                })
+                .collect();
+            push_missing(&mut values, known);
+        }
+        values.push((
+            "all".to_string(),
+            Some("every remembered conversation".to_string()),
+        ));
+        values
     }
 
     /// What peers escalated and this node has not yet decided; empty, with a debug line,
@@ -24596,6 +24716,260 @@ mod tests {
         );
         assert!(complete(&["inbox", "--purge-files", "--dry-run", ""]).is_empty());
         assert!(complete(&["inbox", "--purge-files", "--yes", ""]).is_empty());
+    }
+
+    const REMEMBERED_IDENTITY_A: &str = "0123456789abcdef0123456789abcdef";
+    const REMEMBERED_IDENTITY_B: &str = "fedcba9876543210fedcba9876543210";
+
+    /// Two instance stores under `cache_dir`: A with a thread in each, B with one.
+    fn seed_envoy_memory(cache_dir: &Path) {
+        use crate::mesh::envoy_sessions::{EnvoyRole, EnvoySessions, EnvoyTurn};
+
+        let config = crate::config::mesh_config::EnvoyMemoryConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let now = SystemTime::now();
+        let turns = vec![
+            EnvoyTurn {
+                role: EnvoyRole::User,
+                text: "where were we?".into(),
+            },
+            EnvoyTurn {
+                role: EnvoyRole::Assistant,
+                text: "the build".into(),
+            },
+        ];
+        let own = EnvoySessions::open(cache_dir, "inst", &config).unwrap();
+        let fork = EnvoySessions::open(cache_dir, "fork", &config).unwrap();
+        for (store, identity, thread) in [
+            (&own, REMEMBERED_IDENTITY_A, "a-first"),
+            (&fork, REMEMBERED_IDENTITY_A, "a-second"),
+            (&fork, REMEMBERED_IDENTITY_B, "b-first"),
+        ] {
+            store.save(identity, thread, turns.clone(), now).unwrap();
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn repl_complete_mesh_memory_offers_forget_then_the_remembered_identities_from_disk_while_off()
+    {
+        let guard = TestConfigDirGuard::new();
+        let _cache = EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
+        let ctx = create_test_ctx();
+        assert!(ctx.app.mesh.get().is_none());
+        let complete = |args: &[&str]| ctx.repl_complete(".mesh", args, "");
+
+        assert_eq!(complete(&["memory", ""]), [("forget ".to_string(), None)]);
+        assert_eq!(
+            complete(&["memory", "forget", ""]),
+            [(
+                "all".to_string(),
+                Some("every remembered conversation".to_string())
+            )],
+            "nothing on disk yet"
+        );
+
+        seed_envoy_memory(&MeshPaths::from_env().cache_dir);
+
+        assert_eq!(
+            complete(&["memory", "forget", ""]),
+            [
+                (
+                    REMEMBERED_IDENTITY_A.to_string(),
+                    Some(format!(
+                        "{} . 2 conversations",
+                        short(REMEMBERED_IDENTITY_A)
+                    ))
+                ),
+                (
+                    REMEMBERED_IDENTITY_B.to_string(),
+                    Some(format!("{} . 1 conversation", short(REMEMBERED_IDENTITY_B)))
+                ),
+                (
+                    "all".to_string(),
+                    Some("every remembered conversation".to_string())
+                ),
+            ],
+            "the records outlive the node, so the verb and its completion work with the mesh off"
+        );
+        assert_eq!(
+            complete(&["memory", "forget", REMEMBERED_IDENTITY_A, ""]),
+            [
+                ("a-first".to_string(), None),
+                ("a-second".to_string(), None),
+                ("--yes".to_string(), None),
+                ("--dry-run".to_string(), None),
+            ]
+        );
+        assert_eq!(
+            complete(&[
+                "memory",
+                "forget",
+                &REMEMBERED_IDENTITY_B.to_uppercase(),
+                ""
+            ]),
+            [
+                ("b-first".to_string(), None),
+                ("--yes".to_string(), None),
+                ("--dry-run".to_string(), None),
+            ],
+            "the identity is matched in either case"
+        );
+        assert_eq!(
+            complete(&["memory", "forget", "all", ""]),
+            [("--yes".to_string(), None), ("--dry-run".to_string(), None)]
+        );
+        assert!(
+            complete(&["memory", "forget", "all", "--yes", ""]).is_empty(),
+            "either flag rules the other out"
+        );
+        assert_eq!(
+            complete(&["memory", "forget", REMEMBERED_IDENTITY_A, "--dry-run", ""]),
+            [
+                ("a-first".to_string(), None),
+                ("a-second".to_string(), None)
+            ],
+            "a flag takes no position: the thread is still accepted after it"
+        );
+        assert_eq!(
+            complete(&["memory", "forget", "--yes", ""]),
+            [
+                (
+                    REMEMBERED_IDENTITY_A.to_string(),
+                    Some(format!(
+                        "{} . 2 conversations",
+                        short(REMEMBERED_IDENTITY_A)
+                    ))
+                ),
+                (
+                    REMEMBERED_IDENTITY_B.to_string(),
+                    Some(format!("{} . 1 conversation", short(REMEMBERED_IDENTITY_B)))
+                ),
+                (
+                    "all".to_string(),
+                    Some("every remembered conversation".to_string())
+                ),
+            ],
+            "the target is still wanted after a leading flag"
+        );
+        assert!(
+            complete(&[
+                "memory",
+                "forget",
+                REMEMBERED_IDENTITY_A,
+                "--dry-run",
+                "a-first",
+                ""
+            ])
+            .is_empty()
+        );
+        assert!(complete(&["memory", "list", ""]).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn repl_complete_mesh_memory_forget_offers_remembered_identities_by_peer_name_then_trusted_ones_with_nothing_remembered()
+     {
+        let _guard = TestConfigDirGuard::new();
+        let fixture = seed_mesh_completion_fixture_with("rc-mesh-complete-memory", |c| {
+            c.envoy_memory.enabled = true;
+        })
+        .await;
+        let runtime = &fixture.started.runtime;
+        let store = runtime
+            .envoy_memory()
+            .expect("an enabled store is opened at start");
+        let now = SystemTime::now();
+        let turns = vec![crate::mesh::envoy_sessions::EnvoyTurn {
+            role: crate::mesh::envoy_sessions::EnvoyRole::User,
+            text: "where were we?".into(),
+        }];
+        store
+            .save(
+                &fixture.trusted_peer_identity,
+                "bea-first",
+                turns.clone(),
+                now,
+            )
+            .unwrap();
+        store
+            .save(
+                &fixture.trusted_peer_identity,
+                "bea-second",
+                turns.clone(),
+                now,
+            )
+            .unwrap();
+        store
+            .save(REMEMBERED_IDENTITY_A, "stranger-first", turns, now)
+            .unwrap();
+
+        let values = fixture.complete(&["memory", "forget", ""]);
+
+        let (remembered, rest) = values.split_at(2);
+        let mut remembered = remembered.to_vec();
+        remembered.sort_unstable();
+        let mut expected = vec![
+            (
+                fixture.trusted_peer_identity.clone(),
+                Some("Bea . 2 conversations".to_string()),
+            ),
+            (
+                REMEMBERED_IDENTITY_A.to_string(),
+                Some(format!("{} . 1 conversation", short(REMEMBERED_IDENTITY_A))),
+            ),
+        ];
+        expected.sort_unstable();
+        assert_eq!(
+            remembered, expected,
+            "a remembered identity is named by its peer when the node knows one, else by its short hash: {values:?}"
+        );
+        let (all, trusted) = rest.split_last().expect("`all` closes the list");
+        assert_eq!(
+            *all,
+            (
+                "all".to_string(),
+                Some("every remembered conversation".to_string())
+            )
+        );
+        let mut trusted_values = completion_values(trusted);
+        trusted_values.sort_unstable();
+        let mut expected_trusted = [
+            fixture.trusted_identity.as_str(),
+            fixture.refused_peer_identity.as_str(),
+        ];
+        expected_trusted.sort_unstable();
+        assert_eq!(
+            trusted_values, expected_trusted,
+            "every trust-known identity not already listed, less the blocked: {values:?}"
+        );
+        for identity in expected_trusted {
+            assert_eq!(
+                completion_description(&values, identity),
+                format!("{} . nothing remembered", short(identity))
+            );
+        }
+        assert!(
+            !values
+                .iter()
+                .any(|(value, _)| *value == fixture.blocked_identity),
+            "a blocked identity is not offered: {values:?}"
+        );
+
+        assert_eq!(
+            fixture.complete(&["memory", "forget", &fixture.trusted_peer_identity, ""]),
+            [
+                ("bea-first".to_string(), None),
+                ("bea-second".to_string(), None),
+                ("--yes".to_string(), None),
+                ("--dry-run".to_string(), None),
+            ]
+        );
+
+        fixture.stop().await;
     }
 
     #[test]

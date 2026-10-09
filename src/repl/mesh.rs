@@ -5,6 +5,7 @@ use crate::config::{MeshConfig, RequestContext, paths};
 use crate::function::mesh::trust_label;
 use crate::mesh::access::GrantKind;
 use crate::mesh::card::{CardSource, DISPLAY_NAME_MAX_CHARS, StatusHandler, render_for_human};
+use crate::mesh::envoy_sessions::EnvoySessions;
 use crate::mesh::fetch::{
     FILE_FETCH_REQUEST_TIMEOUT, FetchError as FileFetchError, Fetched, SINGLE_SEGMENT_FETCH_CEILING,
 };
@@ -14,8 +15,8 @@ use crate::mesh::idle::plural;
 use crate::mesh::knock::{KnockIntro, KnockOutcome, KnockVia};
 use crate::mesh::knocks::KnockRecord;
 use crate::mesh::message::{
-    BroadcastOutcome, Disposition, OutboundPeer, PEER_CONTENT_MAX_CHARS, Part, PartLimits,
-    PeerKind, PeerMessage, PeerVia, RawPart, RecipientOutcome,
+    BroadcastOutcome, Disposition, OutboundPeer, PEER_CONTENT_MAX_CHARS, PEER_ID_MAX_CHARS, Part,
+    PartLimits, PeerKind, PeerMessage, PeerVia, RawPart, RecipientOutcome, is_wire_id,
 };
 use crate::mesh::pending::{
     Correlation, InboundKind, InboundRecord, PendingState, access_not_a_question,
@@ -46,6 +47,7 @@ use chrono::{DateTime, Utc};
 use inquire::Confirm;
 use log::debug;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::io::{IsTerminal, Read};
@@ -186,6 +188,11 @@ pub(super) const VERBS: &[(&str, &str, &str)] = &[
         "Fetch one file a trusted peer shares into this node's staging inbox",
         ".mesh fetch <destination> <path> [--if-sha256 <hex>]",
     ),
+    (
+        "memory",
+        "Forget what the envoy remembers of a peer's threads: one identity, one of its threads, or everything",
+        ".mesh memory forget <identity|all> [thread] [--yes|--dry-run]",
+    ),
 ];
 
 pub(crate) const MESH_OFF: &str = "Mesh is off. Run `.mesh on` first.";
@@ -245,6 +252,7 @@ pub(crate) async fn run(
         "grant" => grant(ctx, rest).await,
         "refuse" => refuse(ctx, rest).await,
         "fetch" => fetch(ctx, &abort_signal, rest).await,
+        "memory" => memory(ctx, rest),
         other => bail!("Unknown .mesh command '{other}'. Type `.mesh` for the list."),
     }
 }
@@ -1569,6 +1577,225 @@ fn parse_fetch_args(rest: &str) -> Result<Option<FetchArgs>> {
         path,
         if_sha256,
     }))
+}
+
+/// `.mesh memory forget <identity|all> [thread]`: forgets what the envoy remembers of a
+/// peer's threads in every instance's store, the one this node serves and any fork's or
+/// re-keyed predecessor's alike. What would go is listed first; nothing is asked or
+/// written when the scope names nothing remembered. A conversation is counted once however
+/// many instance stores hold a record of it; the record count is added when it differs.
+/// Runs with the mesh off and with `mesh.envoy_memory.enabled` false: the records may be
+/// on disk from when it was on.
+fn memory(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
+    let Some((sub_verb, rest)) = split_verb(rest) else {
+        out_text(&render_verb_help("memory"));
+        return Ok(());
+    };
+    if sub_verb != "forget" {
+        bail!(
+            "'{sub_verb}' is not a `.mesh memory` command; `forget` is the one it takes. {}",
+            render_verb_help("memory")
+        );
+    }
+    let Some(args) = parse_memory_forget_args(rest)? else {
+        out_text(&render_verb_help("memory"));
+        return Ok(());
+    };
+    let cache_dir = ctx
+        .app
+        .mesh
+        .get()
+        .map(|runtime| runtime.cache_dir().to_path_buf())
+        .unwrap_or_else(|| MeshPaths::from_env().cache_dir);
+    let config = &ctx.app.config.mesh.envoy_memory;
+    let remembered = EnvoySessions::remembered_everywhere(&cache_dir, config)?;
+    let preview = forget_preview(&args.scope, &remembered);
+    if preview.count == 0 {
+        out_text(&match &args.scope {
+            ForgetScope::All => "The envoy remembers nothing.".to_string(),
+            ForgetScope::Identity(identity) => format!(
+                "The envoy remembers nothing of identity {}.",
+                short(identity)
+            ),
+            ForgetScope::Thread { identity, thread } => format!(
+                "The envoy remembers no thread '{thread}' of identity {}.",
+                short(identity)
+            ),
+        });
+        return Ok(());
+    }
+    let conversations =
+        |count| plural(count, "remembered conversation", "remembered conversations");
+    let subject = match &args.scope {
+        ForgetScope::All => format!(
+            "{} of {}",
+            conversations(preview.count),
+            plural(remembered.len(), "identity", "identities")
+        ),
+        ForgetScope::Identity(identity) => {
+            format!(
+                "{} of identity {}",
+                conversations(preview.count),
+                short(identity)
+            )
+        }
+        ForgetScope::Thread { identity, thread } => {
+            format!(
+                "the remembered thread '{thread}' of identity {}",
+                short(identity)
+            )
+        }
+    };
+    if args.dry_run {
+        let mut lines = vec![if preview.rows.is_empty() {
+            format!("Would forget {subject}.")
+        } else {
+            format!("Would forget {subject}:")
+        }];
+        lines.extend(preview.rows);
+        lines.push(DRY_RUN_NOTHING_CHANGED.to_string());
+        out_text(&lines.join("\n"));
+        return Ok(());
+    }
+    if !preview.rows.is_empty() {
+        let mut lines = vec![format!("Forgetting {subject}:")];
+        lines.extend(preview.rows);
+        out_text(&lines.join("\n"));
+    }
+    let question = format!("Forget {subject}? This cannot be undone.");
+    if !confirm_or_flag(&question, "--yes", args.yes)? {
+        out_text(NOTHING_CHANGED);
+        return Ok(());
+    }
+    let removed = match &args.scope {
+        ForgetScope::All => EnvoySessions::delete_all_everywhere(&cache_dir, config)?,
+        ForgetScope::Identity(identity) => {
+            EnvoySessions::delete_identity_everywhere(&cache_dir, config, identity)?
+        }
+        ForgetScope::Thread { identity, thread } => {
+            EnvoySessions::delete_thread_everywhere(&cache_dir, config, identity, thread)?
+        }
+    };
+    let records = if removed == preview.count {
+        String::new()
+    } else {
+        format!(
+            " ({} across the instance stores)",
+            plural(removed, "record", "records")
+        )
+    };
+    out_text(&format!("Forgot {subject}{records}."));
+    Ok(())
+}
+
+enum ForgetScope {
+    All,
+    Identity(String),
+    Thread { identity: String, thread: String },
+}
+
+struct ForgetArgs {
+    scope: ForgetScope,
+    yes: bool,
+    dry_run: bool,
+}
+
+/// `<identity|all>` then an optional `[thread]`, with `--yes` or `--dry-run` anywhere but
+/// not both; `None` when the first positional is missing, which the caller answers with
+/// the usage line. `all` takes no thread, an identity is a 32-hex hash and a thread a
+/// wire id, each refused with what was expected.
+fn parse_memory_forget_args(rest: Option<&str>) -> Result<Option<ForgetArgs>> {
+    let Some(rest) = rest else {
+        return Ok(None);
+    };
+    let mut positional = Vec::new();
+    let mut yes = false;
+    let mut dry_run = false;
+    for token in split_tokens(rest) {
+        match token.as_str() {
+            "--yes" => yes = true,
+            "--dry-run" => dry_run = true,
+            _ if token.starts_with("--") || positional.len() == 2 => {
+                return Err(unexpected(&token, "memory"));
+            }
+            _ => positional.push(token),
+        }
+    }
+    if yes && dry_run {
+        return Err(unexpected("--yes", "memory"));
+    }
+    let mut positional = positional.into_iter();
+    let Some(target) = positional.next() else {
+        return Ok(None);
+    };
+    let thread = positional.next();
+    let scope = if target == "all" {
+        if let Some(thread) = thread {
+            return Err(unexpected(&thread, "memory"));
+        }
+        ForgetScope::All
+    } else {
+        let identity = identity_hash(&target)?;
+        match thread {
+            Some(thread) if !is_wire_id(&thread) => bail!(
+                "'{thread}' is not a thread id: expected 1 to {PEER_ID_MAX_CHARS} characters from `[0-9A-Za-z_.:-]`, as `.mesh memory forget <identity> --dry-run` lists them. {}",
+                render_verb_help("memory")
+            ),
+            Some(thread) => ForgetScope::Thread { identity, thread },
+            None => ForgetScope::Identity(identity),
+        }
+    };
+    Ok(Some(ForgetArgs {
+        scope,
+        yes,
+        dry_run,
+    }))
+}
+
+/// What `scope` names of `remembered`: how many conversations go and the listing rows
+/// shown before anything is asked. Rows name every identity in full so one can be pasted
+/// back into `.mesh memory forget <identity>`; a single thread needs no rows.
+struct ForgetPreview {
+    count: usize,
+    rows: Vec<String>,
+}
+
+fn forget_preview(
+    scope: &ForgetScope,
+    remembered: &BTreeMap<String, Vec<String>>,
+) -> ForgetPreview {
+    match scope {
+        ForgetScope::All => ForgetPreview {
+            count: remembered.values().map(Vec::len).sum(),
+            rows: remembered
+                .iter()
+                .map(|(identity, threads)| {
+                    format!(
+                        "  {identity}  {}",
+                        plural(threads.len(), "conversation", "conversations")
+                    )
+                })
+                .collect(),
+        },
+        ForgetScope::Identity(identity) => {
+            let threads = remembered
+                .get(identity)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            ForgetPreview {
+                count: threads.len(),
+                rows: threads.iter().map(|thread| format!("  {thread}")).collect(),
+            }
+        }
+        ForgetScope::Thread { identity, thread } => ForgetPreview {
+            count: usize::from(
+                remembered
+                    .get(identity)
+                    .is_some_and(|threads| threads.contains(thread)),
+            ),
+            rows: Vec::new(),
+        },
+    }
 }
 
 fn render_sync(report: &FetchReport) -> String {
@@ -15069,14 +15296,14 @@ mod tests {
                 });
             }
 
-            /// Usage probe: bare `.mesh` lists exactly the 27 verbs, one row each in table
+            /// Usage probe: bare `.mesh` lists exactly the 28 verbs, one row each in table
             /// order, `sync` and `forget` among them and none of the withdrawn spellings;
             /// the old `.mesh help` is an unknown verb whose single-sentence error points
             /// at `.mesh` for the list (it does not name `sync`), and under the node it
             /// touches nothing.
             #[test]
             #[serial]
-            fn usage_probe_bare_mesh_lists_the_twenty_seven_verbs_and_the_old_help_spelling_points_at_it()
+            fn usage_probe_bare_mesh_lists_the_twenty_eight_verbs_and_the_old_help_spelling_points_at_it()
              {
                 let _guard = TestConfigDirGuard::new("repl-mesh-usage-probe-verb-list");
                 let _capture = capture::install();
@@ -15100,10 +15327,10 @@ mod tests {
                         .collect();
                     let expected: Vec<&str> = VERBS.iter().map(|(name, _, _)| *name).collect();
                     assert_eq!(listed, expected, "{out}");
-                    assert_eq!(listed.len(), 27, "{out}");
+                    assert_eq!(listed.len(), 28, "{out}");
                     for present in [
                         "sync", "forget", "untrust", "trust", "block", "unblock", "allow", "deny",
-                        "unshare", "shares", "grant", "refuse",
+                        "unshare", "shares", "grant", "refuse", "memory",
                     ] {
                         assert!(listed.contains(&present), "{present}: {out}");
                     }
@@ -26432,6 +26659,411 @@ mod tests {
                         assert!(ctx.app.mesh.stop().await.unwrap());
                         started.relay_handle.abort();
                     });
+                }
+            }
+
+            mod memory_verb {
+                use super::*;
+                use crate::config::mesh_config::EnvoyMemoryConfig;
+                use crate::mesh::envoy_sessions::{EnvoyRole, EnvoySessions, EnvoyTurn};
+                use std::collections::BTreeMap;
+
+                const TAG: &str = "repl-mesh-memory-forget";
+                const ID_A: &str = "0123456789abcdef0123456789abcdef";
+                const ID_B: &str = "fedcba9876543210fedcba9876543210";
+
+                fn enabled() -> EnvoyMemoryConfig {
+                    EnvoyMemoryConfig {
+                        enabled: true,
+                        ..Default::default()
+                    }
+                }
+
+                /// Two instance stores under `cache_dir`: the first holds A's `a-first`
+                /// and `a-second`, the second A's `a-first` again and B's `b-first`, so
+                /// three threads are remembered across four records.
+                fn seed(cache_dir: &Path) {
+                    let now = SystemTime::now();
+                    let turns = vec![
+                        EnvoyTurn {
+                            role: EnvoyRole::User,
+                            text: "where were we?".into(),
+                        },
+                        EnvoyTurn {
+                            role: EnvoyRole::Assistant,
+                            text: "the build".into(),
+                        },
+                    ];
+                    let first = EnvoySessions::open(cache_dir, "inst-a", &enabled()).unwrap();
+                    let second = EnvoySessions::open(cache_dir, "inst-b", &enabled()).unwrap();
+                    for (store, identity, thread) in [
+                        (&first, ID_A, "a-first"),
+                        (&first, ID_A, "a-second"),
+                        (&second, ID_A, "a-first"),
+                        (&second, ID_B, "b-first"),
+                    ] {
+                        store.save(identity, thread, turns.clone(), now).unwrap();
+                    }
+                }
+
+                fn remembered(cache_dir: &Path) -> BTreeMap<String, Vec<String>> {
+                    EnvoySessions::remembered_everywhere(cache_dir, &EnvoyMemoryConfig::default())
+                        .unwrap()
+                }
+
+                fn seeded() -> BTreeMap<String, Vec<String>> {
+                    BTreeMap::from([
+                        (
+                            ID_A.to_string(),
+                            vec!["a-first".to_string(), "a-second".to_string()],
+                        ),
+                        (ID_B.to_string(), vec!["b-first".to_string()]),
+                    ])
+                }
+
+                fn all_question() -> String {
+                    "Forget 3 remembered conversations of 2 identities? This cannot be undone."
+                        .to_string()
+                }
+
+                fn all_rows() -> [String; 2] {
+                    [
+                        format!("  {ID_A}  2 conversations"),
+                        format!("  {ID_B}  1 conversation"),
+                    ]
+                }
+
+                #[test]
+                #[serial]
+                fn bare_memory_prints_the_usage_and_any_other_sub_command_is_refused_naming_forget()
+                {
+                    let _capture = capture::install();
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+
+                    run_async(run(&mut ctx, ".mesh memory")).unwrap();
+                    assert_eq!(
+                        stdout_lines().join("\n"),
+                        render_verb_help("memory"),
+                        "the bare verb is its usage"
+                    );
+                    assert_eq!(
+                        err_of(&mut ctx, ".mesh memory list"),
+                        format!(
+                            "'list' is not a `.mesh memory` command; `forget` is the one it takes. {}",
+                            render_verb_help("memory")
+                        )
+                    );
+                }
+
+                #[test]
+                #[serial]
+                fn forget_all_dry_run_lists_every_identity_in_full_with_its_count_and_changes_nothing()
+                 {
+                    let _guard = TestConfigDirGuard::new(TAG);
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let started = started_runtime(TAG).await;
+                        let mut ctx = ctx_with(MeshConfig::default(), true);
+                        ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                        let cache_dir = started.runtime.cache_dir().to_path_buf();
+                        seed(&cache_dir);
+
+                        let out = out_of(&mut ctx, ".mesh memory forget all --dry-run")
+                            .await
+                            .unwrap();
+
+                        let [row_a, row_b] = all_rows();
+                        assert_eq!(
+                            out.lines().collect::<Vec<_>>(),
+                            [
+                                "Would forget 3 remembered conversations of 2 identities:",
+                                row_a.as_str(),
+                                row_b.as_str(),
+                                DRY_RUN_NOTHING_CHANGED,
+                            ],
+                            "{out}"
+                        );
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+                        assert_eq!(remembered(&cache_dir), seeded());
+
+                        assert!(ctx.app.mesh.stop().await.unwrap());
+                        started.relay_handle.abort();
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn forget_all_without_a_terminal_refuses_naming_the_flag_and_with_it_wipes_every_store()
+                 {
+                    let _guard = TestConfigDirGuard::new(TAG);
+                    let _capture = capture::install();
+                    let _script = prompt_script::install_non_interactive();
+                    run_async(async {
+                        let started = started_runtime(TAG).await;
+                        let mut ctx = ctx_with(MeshConfig::default(), true);
+                        ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                        let cache_dir = started.runtime.cache_dir().to_path_buf();
+                        seed(&cache_dir);
+
+                        let err = refusal(&mut ctx, ".mesh memory forget all").await;
+                        assert_eq!(
+                            err,
+                            format!(
+                                "{} Standard input is not a terminal, so there is no prompt to answer; pass --yes to confirm.",
+                                all_question()
+                            )
+                        );
+                        assert_eq!(remembered(&cache_dir), seeded());
+
+                        let out = out_of(&mut ctx, ".mesh memory forget all --yes")
+                            .await
+                            .unwrap();
+
+                        let [row_a, row_b] = all_rows();
+                        assert_eq!(
+                            out.lines().collect::<Vec<_>>(),
+                            [
+                                "Forgetting 3 remembered conversations of 2 identities:",
+                                row_a.as_str(),
+                                row_b.as_str(),
+                                "Forgot 3 remembered conversations of 2 identities (4 records across the instance stores).",
+                            ],
+                            "the count the operator confirmed is the one reported; a thread two instances remember is one conversation held in two records: {out}"
+                        );
+                        assert!(remembered(&cache_dir).is_empty());
+                        for instance in ["inst-a", "inst-b"] {
+                            let store =
+                                EnvoySessions::open(&cache_dir, instance, &enabled()).unwrap();
+                            assert_eq!(store.stats().unwrap(), (0, 0), "{instance}");
+                        }
+
+                        assert!(ctx.app.mesh.stop().await.unwrap());
+                        started.relay_handle.abort();
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn forget_all_declined_at_the_prompt_changes_nothing() {
+                    let _guard = TestConfigDirGuard::new(TAG);
+                    let _capture = capture::install();
+                    let asked: Arc<Mutex<Vec<String>>> = Arc::default();
+                    let recorder = asked.clone();
+                    let _script = prompt_script::install_answering(move |question| {
+                        recorder.lock().push(question.to_string());
+                        false
+                    });
+                    run_async(async {
+                        let started = started_runtime(TAG).await;
+                        let mut ctx = ctx_with(MeshConfig::default(), true);
+                        ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                        let cache_dir = started.runtime.cache_dir().to_path_buf();
+                        seed(&cache_dir);
+
+                        let out = out_of(&mut ctx, ".mesh memory forget all").await.unwrap();
+
+                        assert_eq!(*asked.lock(), [all_question()]);
+                        assert_eq!(out.lines().last(), Some(NOTHING_CHANGED), "{out}");
+                        assert_eq!(remembered(&cache_dir), seeded());
+
+                        assert!(ctx.app.mesh.stop().await.unwrap());
+                        started.relay_handle.abort();
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn forget_one_thread_then_one_identity_reaches_every_store_and_leaves_the_rest() {
+                    let _guard = TestConfigDirGuard::new(TAG);
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    run_async(async {
+                        let started = started_runtime(TAG).await;
+                        let mut ctx = ctx_with(MeshConfig::default(), true);
+                        ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                        let cache_dir = started.runtime.cache_dir().to_path_buf();
+                        seed(&cache_dir);
+                        let short_a = short(ID_A);
+
+                        let out = out_of(
+                            &mut ctx,
+                            &format!(".mesh memory forget {ID_A} a-first --dry-run"),
+                        )
+                        .await
+                        .unwrap();
+                        assert_eq!(
+                            out,
+                            format!(
+                                "Would forget the remembered thread 'a-first' of identity {short_a}.\n{DRY_RUN_NOTHING_CHANGED}"
+                            )
+                        );
+                        let out =
+                            out_of(&mut ctx, &format!(".mesh memory forget {ID_A} --dry-run"))
+                                .await
+                                .unwrap();
+                        assert_eq!(
+                            out,
+                            format!(
+                                "Would forget 2 remembered conversations of identity {short_a}:\n  a-first\n  a-second\n{DRY_RUN_NOTHING_CHANGED}"
+                            )
+                        );
+                        assert_eq!(remembered(&cache_dir), seeded());
+
+                        let out = out_of(
+                            &mut ctx,
+                            &format!(".mesh memory forget {} a-second --yes", ID_A.to_uppercase()),
+                        )
+                        .await
+                        .unwrap();
+                        assert_eq!(
+                            out,
+                            format!(
+                                "Forgot the remembered thread 'a-second' of identity {short_a}."
+                            ),
+                            "the identity is taken in either case"
+                        );
+                        assert_eq!(
+                            remembered(&cache_dir),
+                            BTreeMap::from([
+                                (ID_A.to_string(), vec!["a-first".to_string()]),
+                                (ID_B.to_string(), vec!["b-first".to_string()]),
+                            ])
+                        );
+
+                        let out = out_of(&mut ctx, &format!(".mesh memory forget {ID_A} --yes"))
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            out,
+                            format!(
+                                "Forgetting 1 remembered conversation of identity {short_a}:\n  a-first\nForgot 1 remembered conversation of identity {short_a} (2 records across the instance stores)."
+                            ),
+                            "a-first was in both stores, which is still the one conversation that was confirmed"
+                        );
+                        assert_eq!(
+                            remembered(&cache_dir),
+                            BTreeMap::from([(ID_B.to_string(), vec!["b-first".to_string()])])
+                        );
+                        assert_eq!(prompt_script::prompts_asked(), 0);
+
+                        assert!(ctx.app.mesh.stop().await.unwrap());
+                        started.relay_handle.abort();
+                    });
+                }
+
+                #[test]
+                #[serial]
+                fn forget_reaches_the_records_on_disk_while_the_mesh_and_the_memory_are_off() {
+                    let guard = TestConfigDirGuard::new(TAG);
+                    let _cache =
+                        EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    let cache_dir = MeshPaths::from_env().cache_dir;
+                    seed(&cache_dir);
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    assert!(ctx.app.mesh.get().is_none());
+                    assert!(!ctx.app.config.mesh.envoy_memory.enabled);
+
+                    let out = run_async(out_of(
+                        &mut ctx,
+                        &format!(".mesh memory forget {ID_A} --yes"),
+                    ))
+                    .unwrap();
+
+                    assert_eq!(
+                        out.lines().last(),
+                        Some(
+                            format!(
+                                "Forgot 2 remembered conversations of identity {} (3 records across the instance stores).",
+                                short(ID_A)
+                            )
+                            .as_str()
+                        ),
+                        "{out}"
+                    );
+                    assert_eq!(
+                        remembered(&cache_dir),
+                        BTreeMap::from([(ID_B.to_string(), vec!["b-first".to_string()])])
+                    );
+                }
+
+                #[test]
+                #[serial]
+                fn forget_with_nothing_remembered_says_so_and_asks_nothing() {
+                    let guard = TestConfigDirGuard::new(TAG);
+                    let _cache =
+                        EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
+                    let _capture = capture::install();
+                    let _script = prompt_script::install(&[]);
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    let short_a = short(ID_A);
+
+                    for (line, expected) in [
+                        (
+                            ".mesh memory forget all".to_string(),
+                            "The envoy remembers nothing.".to_string(),
+                        ),
+                        (
+                            format!(".mesh memory forget {ID_A}"),
+                            format!("The envoy remembers nothing of identity {short_a}."),
+                        ),
+                        (
+                            format!(".mesh memory forget {ID_A} a-first"),
+                            format!(
+                                "The envoy remembers no thread 'a-first' of identity {short_a}."
+                            ),
+                        ),
+                    ] {
+                        let out = run_async(out_of(&mut ctx, &line)).unwrap();
+                        assert_eq!(out, expected, "{line}");
+                    }
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+                    assert!(!guard.path.join("cache").exists(), "nothing is created");
+                }
+
+                #[test]
+                #[serial]
+                fn forget_refuses_a_bad_identity_a_bad_thread_a_thread_with_all_and_both_flags() {
+                    let _capture = capture::install();
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    let usage = render_verb_help("memory");
+
+                    assert_eq!(
+                        err_of(&mut ctx, ".mesh memory forget all --yes --dry-run"),
+                        format!("Unexpected '--yes'. {usage}")
+                    );
+                    assert_eq!(
+                        err_of(&mut ctx, ".mesh memory forget all some-thread"),
+                        format!("Unexpected 'some-thread'. {usage}")
+                    );
+                    assert_eq!(
+                        err_of(
+                            &mut ctx,
+                            &format!(".mesh memory forget {ID_A} a-first extra")
+                        ),
+                        format!("Unexpected 'extra'. {usage}")
+                    );
+                    assert_eq!(
+                        err_of(&mut ctx, &format!(".mesh memory forget {ID_A} --prune")),
+                        format!("Unexpected '--prune'. {usage}")
+                    );
+                    assert_eq!(
+                        err_of(&mut ctx, ".mesh memory forget nope"),
+                        "'nope' is not an identity hash: expected 32 hex characters, as `.mesh knocks` and `.mesh peers` list them."
+                    );
+                    assert_eq!(
+                        err_of(
+                            &mut ctx,
+                            &format!(".mesh memory forget {ID_A} \"bad thread!\"")
+                        ),
+                        format!(
+                            "'bad thread!' is not a thread id: expected 1 to {PEER_ID_MAX_CHARS} characters from `[0-9A-Za-z_.:-]`, as `.mesh memory forget <identity> --dry-run` lists them. {usage}"
+                        )
+                    );
+                    run_async(run(&mut ctx, ".mesh memory forget")).unwrap();
+                    assert_eq!(stdout_lines().join("\n"), usage, "no target is the usage");
                 }
             }
         }

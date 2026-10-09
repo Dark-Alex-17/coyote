@@ -317,10 +317,6 @@ impl EnvoySessions {
     /// many stores held it. Same sweep as `delete_identity_everywhere`: every instance,
     /// on or off, a refusing store logged and skipped, a non-hash `identity`
     /// `NotAnIdentity`.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the `.mesh memory forget` command's verb")
-    )]
     pub(crate) fn delete_thread_everywhere(
         cache_dir: &Path,
         config: &EnvoyMemoryConfig,
@@ -338,10 +334,6 @@ impl EnvoySessions {
 
     /// Forgets every conversation in every instance's store under `cache_dir`; how
     /// many went in all. Same sweep as `delete_identity_everywhere`.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the `.mesh memory forget` command's verb")
-    )]
     pub(crate) fn delete_all_everywhere(
         cache_dir: &Path,
         config: &EnvoyMemoryConfig,
@@ -358,10 +350,6 @@ impl EnvoySessions {
     /// with the threads remembered of it, sorted and each named once however many
     /// instances hold it. Same sweep as `delete_identity_everywhere`: every instance,
     /// on or off, a refusing store logged and skipped; empty when no store exists.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the `.mesh memory forget` command's verb")
-    )]
     pub(crate) fn remembered_everywhere(
         cache_dir: &Path,
         config: &EnvoyMemoryConfig,
