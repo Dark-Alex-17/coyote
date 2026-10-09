@@ -128,6 +128,15 @@ pub(crate) const ON_DISK_STRUCTS: &[(&str, &[&str])] = &[
         &["SharesFile", "AllowEntry", "DenyEntry", "OverrideEntry"],
     ),
     ("grants.rs", &["GrantRecord", "GrantedPath"]),
+    (
+        "envoy_sessions.rs",
+        &[
+            "EnvoySessionFile",
+            "EnvoyTurn",
+            "EnvoySessionIndex",
+            "EnvoySessionEntry",
+        ],
+    ),
 ];
 
 #[cfg(test)]
@@ -147,6 +156,7 @@ mod tests {
         ("message.rs", "PeerKind"),
         ("message.rs", "PeerVia"),
         ("message.rs", "Disposition"),
+        ("envoy_sessions.rs", "EnvoyRole"),
     ];
 
     /// The name a `struct`/`enum` line declares, with any generics, tuple body or brace
@@ -424,6 +434,16 @@ mod tests {
             (
                 "GRANT_RECORD_VERSION",
                 crate::mesh::grants::GRANT_RECORD_VERSION,
+                1,
+            ),
+            (
+                "ENVOY_SESSION_VERSION",
+                crate::mesh::envoy_sessions::ENVOY_SESSION_VERSION,
+                1,
+            ),
+            (
+                "ENVOY_SESSION_INDEX_VERSION",
+                crate::mesh::envoy_sessions::ENVOY_SESSION_INDEX_VERSION,
                 1,
             ),
         ];

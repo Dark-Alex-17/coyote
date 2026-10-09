@@ -7,6 +7,7 @@ use crate::mesh::announce::{
 use crate::mesh::brief::{Brief, Digest, assemble_brief, digest_objective_for};
 use crate::mesh::card::{CardSource, DISPLAY_NAME_MAX_CHARS, StatusHandler, build_card};
 use crate::mesh::envoy::{EnvoyJob, EnvoySink};
+use crate::mesh::envoy_sessions::EnvoySessions;
 use crate::mesh::events::{
     BriefUpdateSource, MeshEvent, MeshHookSink, MeshHooks, NodeFacts, Routed, TrustHookObserver,
 };
@@ -300,6 +301,9 @@ pub(crate) struct MeshRuntime {
     inbox_dir: Option<PathBuf>,
     cache_dir: PathBuf,
     serving: Arc<FetchServing>,
+    /// What the envoy remembers of each peer thread; `None` while `mesh.envoy_memory`
+    /// is off. Bound to the instance the node started as, not rebound on a rekey.
+    envoy_memory: Option<Arc<EnvoySessions>>,
     memory: PeerMemory,
     interface_labels: Vec<String>,
     interface_kinds: Vec<&'static str>,
@@ -376,6 +380,11 @@ impl MeshRuntime {
             SystemTime::now(),
         )?);
         let grants = GrantStore::open(&paths.cache_dir, &instance_id, SystemTime::now())?;
+        let envoy_memory =
+            EnvoySessions::open(&paths.cache_dir, &instance_id, &config.envoy_memory).map(Arc::new);
+        if let Some(store) = &envoy_memory {
+            prune_envoy_memory(store);
+        }
         let inbox_dir = config
             .fetch
             .inbox_dir_with(|configured| (options.translate_inbox_dir)(configured));
@@ -492,6 +501,7 @@ impl MeshRuntime {
             inbox_dir,
             cache_dir: paths.cache_dir,
             serving,
+            envoy_memory,
             memory: PeerMemory::default(),
             interface_labels: plans.iter().map(InterfacePlan::label).collect(),
             interface_kinds: plans.iter().map(InterfacePlan::kind).collect(),
@@ -559,6 +569,12 @@ impl MeshRuntime {
             runtime.peers.clone(),
             runtime.cancellation_token(),
         )));
+        if let Some(store) = runtime.envoy_memory.clone() {
+            runtime.register_task(tokio::spawn(sweep_envoy_memory(
+                store,
+                runtime.cancellation_token(),
+            )));
+        }
         if config.announce {
             runtime.register_task(tokio::spawn(announce_periodically(
                 runtime.clone(),
@@ -586,6 +602,15 @@ impl MeshRuntime {
 
     pub(crate) fn cache_dir(&self) -> &Path {
         &self.cache_dir
+    }
+
+    /// The envoy's conversation memory, `None` while `mesh.envoy_memory` is off.
+    #[expect(
+        dead_code,
+        reason = "read by the envoy run flow once it retains conversation memory"
+    )]
+    pub(crate) fn envoy_memory(&self) -> Option<Arc<EnvoySessions>> {
+        self.envoy_memory.clone()
     }
 
     /// The share root's serving state: the local size limit, the grant store and the
@@ -1817,6 +1842,31 @@ async fn sweep_peers(peers: Arc<PeerTable>, cancel: CancellationToken) {
             _ = ticks.tick() => {
                 log_aged_out_peers(&peers.sweep(SystemTime::now()));
             }
+        }
+    }
+}
+
+/// One sweep of the envoy's memory. Memory is best-effort: a store that cannot be pruned
+/// is logged and the node serves on without it being swept.
+fn prune_envoy_memory(store: &EnvoySessions) {
+    match store.prune(SystemTime::now()) {
+        Ok(0) => {}
+        Ok(removed) => debug!("Forgot {removed} remembered envoy conversations"),
+        Err(err) => warn!(
+            "The envoy's conversation memory could not be pruned: {}",
+            redact_hashes(&err.to_string())
+        ),
+    }
+}
+
+async fn sweep_envoy_memory(store: Arc<EnvoySessions>, cancel: CancellationToken) {
+    let mut ticks = interval(Duration::from_secs(HEARTBEAT_SECS));
+    // The first tick of an interval fires immediately; the store was already pruned at start.
+    ticks.tick().await;
+    loop {
+        tokio::select! {
+            () = cancel.cancelled() => break,
+            _ = ticks.tick() => prune_envoy_memory(&store),
         }
     }
 }

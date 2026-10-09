@@ -7,6 +7,7 @@ pub(crate) mod card;
 #[cfg(test)]
 pub(crate) mod conformance;
 pub(crate) mod envoy;
+pub(crate) mod envoy_sessions;
 pub(crate) mod events;
 pub(crate) mod fetch;
 #[cfg(test)]
@@ -183,6 +184,17 @@ pub(crate) fn display_text(text: &str, max_chars: usize) -> Option<String> {
 /// it points. The workspace share list lives in the repository, so a clone chooses what
 /// is at these names.
 pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_atomically_with(path, bytes, false)
+}
+
+/// `write_atomically` for a file only its owner may read: the temp file is created
+/// `0o600` on unix, so the bytes are never readable by others, not even between the
+/// write and the rename. Elsewhere the mode is the platform's.
+pub(crate) fn write_atomically_owner_only(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_atomically_with(path, bytes, true)
+}
+
+fn write_atomically_with(path: &Path, bytes: &[u8], owner_only: bool) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create directory '{}'", parent.display()))?;
@@ -193,9 +205,18 @@ pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
         .unwrap_or_default()
         .as_nanos();
     let tmp = path.with_added_extension(format!("{}-{nanos}.tmp", std::process::id()));
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
+    let mut open = fs::OpenOptions::new();
+    open.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        if owner_only {
+            open.mode(0o600);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = owner_only;
+    let mut file = open
         .open(&tmp)
         .with_context(|| format!("Failed to write '{}'", path.display()))?;
     let flushed = file.write_all(bytes).and_then(|()| file.sync_all());
@@ -1303,6 +1324,38 @@ mod tests {
         let err = write_atomically(&blocked.join("x.yaml"), b"x").unwrap_err();
         let text = format!("{err:#}");
         assert!(text.contains(&blocked.display().to_string()), "{text}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(umask)]
+    fn the_owner_only_write_yields_a_0600_file_and_the_plain_write_the_platform_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let _umask = crate::testing::UmaskGuard::zero();
+        let tmp = TempDir::new("write-atomically-owner-only");
+        let mode_of = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+
+        let private = tmp.path.join("private.yaml");
+        write_atomically_owner_only(&private, b"first").unwrap();
+        assert_eq!(fs::read(&private).unwrap(), b"first");
+        assert_eq!(mode_of(&private), 0o600);
+        write_atomically_owner_only(&private, b"second").unwrap();
+        assert_eq!(fs::read(&private).unwrap(), b"second");
+        assert_eq!(mode_of(&private), 0o600);
+
+        let shared = tmp.path.join("shared.yaml");
+        write_atomically(&shared, b"open").unwrap();
+        assert_eq!(fs::read(&shared).unwrap(), b"open");
+        assert_eq!(
+            mode_of(&shared),
+            0o666,
+            "the plain write is left to the umask"
+        );
+        assert_eq!(
+            fs::read_dir(&tmp.path).unwrap().count(),
+            2,
+            "no temp is left"
+        );
     }
 
     /// A clone can plant whatever it likes beside the workspace share list, so a link at
