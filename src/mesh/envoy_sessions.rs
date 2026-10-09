@@ -410,7 +410,34 @@ impl EnvoySessions {
         now: SystemTime,
         create: bool,
     ) -> Result<(), EnvoyMemoryError> {
-        self.write(identity, thread, new_turns, now, Write::Append { create })
+        self.write(
+            identity,
+            thread,
+            new_turns,
+            now,
+            Write::Append {
+                create,
+                skip_if_last_equal: false,
+            },
+        )
+    }
+
+    /// `append` of one turn to a thread the store holds, written nothing when the
+    /// held record already ends with that same turn: the one send retried by the owner
+    /// is remembered once. Decided under the write lock, so a turn landing in between
+    /// is seen.
+    pub(crate) fn append_once(
+        &self,
+        identity: &str,
+        thread: &str,
+        turn: EnvoyTurn,
+        now: SystemTime,
+    ) -> Result<(), EnvoyMemoryError> {
+        let mode = Write::Append {
+            create: false,
+            skip_if_last_equal: true,
+        };
+        self.write(identity, thread, vec![turn], now, mode)
     }
 
     fn write(
@@ -426,7 +453,7 @@ impl EnvoySessions {
             // Nothing is under any key yet, so the turns given are the whole record;
             // one that comes to nothing creates no store.
             truncate(&mut turns, &self.limits);
-            if turns.is_empty() || mode == (Write::Append { create: false }) {
+            if turns.is_empty() || matches!(mode, Write::Append { create: false, .. }) {
                 return Ok(());
             }
         }
@@ -437,8 +464,14 @@ impl EnvoySessions {
         let position = indexed.as_ref().map(|indexed| indexed.position);
         let mut turns = match mode {
             Write::Replace => turns,
-            Write::Append { create } => match indexed.and_then(|indexed| indexed.record) {
+            Write::Append {
+                create,
+                skip_if_last_equal,
+            } => match indexed.and_then(|indexed| indexed.record) {
                 Some(record) => {
+                    if skip_if_last_equal && record.turns.ends_with(&turns) {
+                        return Ok(());
+                    }
                     let mut held = record.turns;
                     held.extend(turns);
                     held
@@ -719,8 +752,12 @@ enum Write {
     /// The turns given are the whole record.
     Replace,
     /// The turns given follow the ones held; `create` says whether a thread not held
-    /// becomes a record of them alone.
-    Append { create: bool },
+    /// becomes a record of them alone, `skip_if_last_equal` whether a record that
+    /// already ends with them is left as it is.
+    Append {
+        create: bool,
+        skip_if_last_equal: bool,
+    },
 }
 
 /// The canonical identity and the key it and `thread` make, or the refusal for an
@@ -1341,6 +1378,50 @@ mod tests {
                 .turns,
             exchange(3)
         );
+    }
+
+    #[test]
+    fn append_once_skips_a_turn_the_record_already_ends_with() {
+        let tmp = TempDir::new("envoy-sessions-append-once");
+        let store = store(&tmp, &enabled());
+        store
+            .append_once(IDENTITY_A, "thread-one", assistant("yes"), t(1_000))
+            .unwrap();
+        assert!(
+            !tmp.path.join("mesh").exists(),
+            "an append-once never creates a thread"
+        );
+        store
+            .save(
+                IDENTITY_A,
+                "thread-one",
+                vec![user("may I?"), assistant("yes")],
+                t(1_000),
+            )
+            .unwrap();
+
+        store
+            .append_once(IDENTITY_A, "thread-one", assistant("yes"), t(1_001))
+            .unwrap();
+        let held = store
+            .load(IDENTITY_A, "thread-one", t(1_001))
+            .unwrap()
+            .unwrap();
+        assert_eq!(held.turns, vec![user("may I?"), assistant("yes")]);
+        assert_eq!(held.last_used, rfc3339_utc(t(1_000)));
+
+        store
+            .append_once(IDENTITY_A, "thread-one", assistant("no"), t(1_002))
+            .unwrap();
+        let held = store
+            .load(IDENTITY_A, "thread-one", t(1_002))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            held.turns,
+            vec![user("may I?"), assistant("yes"), assistant("no")]
+        );
+        assert_eq!(held.last_used, rfc3339_utc(t(1_002)));
     }
 
     #[test]

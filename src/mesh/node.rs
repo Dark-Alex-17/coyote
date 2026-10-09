@@ -2993,9 +2993,11 @@ impl MeshSlot {
     /// the hand-off line the run stored when it ended without one, and after whatever
     /// a run in the thread wrote meanwhile. Written only once the send succeeded: a
     /// send that fails puts the question back, and the answer is remembered when it
-    /// is next sent. A thread the store does not hold gets no record: an answer with
-    /// no question before it is not a conversation. A record that cannot be read or
-    /// saved is left as it is.
+    /// is next sent. An answer the run itself held and wrote before a send that then
+    /// failed is already the thread's last turn, so a retry of it adds nothing. A
+    /// thread the store does not hold gets no record: an answer with no question before
+    /// it is not a conversation. A record that cannot be read or saved is left as it
+    /// is.
     fn remember_human_answer(&self, record: &InboundRecord, spoken: &str) {
         let Some(store) = self.envoy_memory() else {
             return;
@@ -3004,17 +3006,13 @@ impl MeshSlot {
         if !is_wire_id(thread) {
             return;
         }
-        let answer = vec![EnvoyTurn {
+        let answer = EnvoyTurn {
             role: EnvoyRole::Assistant,
             text: spoken.to_string(),
-        }];
-        if let Err(err) = store.append(
-            &record.peer_identity,
-            thread,
-            answer,
-            SystemTime::now(),
-            false,
-        ) {
+        };
+        if let Err(err) =
+            store.append_once(&record.peer_identity, thread, answer, SystemTime::now())
+        {
             warn!(
                 "Mesh envoy memory for thread {thread} could not be saved; the owner's answer was not remembered: {}",
                 redact_hashes(&err.to_string())
@@ -8722,6 +8720,40 @@ mod tests {
             .expect("the planted record is left as it was")
             .turns;
         assert_eq!(turns, peer_turns());
+    }
+
+    /// A held answer the run wrote before a send that failed is the thread's last turn
+    /// already; the owner's retry of the same words adds no second copy.
+    #[test]
+    fn a_late_answer_sent_again_is_remembered_once() {
+        let tmp = TempDir::new("node-late-answer-retry");
+        let config = EnvoyMemoryConfig {
+            enabled: true,
+            ..EnvoyMemoryConfig::default()
+        };
+        let store = Arc::new(EnvoySessions::open(&tmp.path, "inst", &config).unwrap());
+        let now = SystemTime::now();
+        store
+            .save(REMEMBERED_PEER, "t-9", peer_turns(), now)
+            .unwrap();
+        let slot = MeshSlot::default();
+        slot.set_envoy_memory_for_tests(store.clone());
+        let record = InboundRecord {
+            peer_identity: REMEMBERED_PEER.to_string(),
+            thread: "t-9".to_string(),
+            ..inbound_record("a-1")
+        };
+
+        slot.remember_human_answer(&record, "the owner says yes");
+        slot.remember_human_answer(&record, "the owner says yes");
+
+        let turns = store
+            .load(REMEMBERED_PEER, "t-9", now)
+            .unwrap()
+            .unwrap()
+            .turns;
+        assert_eq!(turns.len(), peer_turns().len() + 1, "{turns:?}");
+        assert_eq!(turns.last().unwrap().text, "the owner says yes");
     }
 
     /// A record under the asked key that names another identity is the store's
