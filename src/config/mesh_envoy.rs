@@ -7502,6 +7502,121 @@ mod tests {
         source.remove_dir();
     }
 
+    /// Over two real nodes, the owner's answer given after the hand-off is the turn
+    /// after the hand-off line in the thread the envoy remembers, and the asker's next
+    /// message in that thread is driven with the question, the hand-off and the answer.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn the_owners_late_answer_joins_the_remembered_thread_over_two_real_nodes() {
+        let _cfg = TestConfigDirGuard::new("mesh-envoy-memory-late-answer");
+        let (source, _source) = stub_envoy_source();
+        let tmp = TempDir::new("mesh-envoy-memory-late-answer");
+        let app_b = test_app();
+        let store = memory_for(&app_b, &tmp);
+        let mut peer = AskingPeer::start("memory-late-answer", Arc::clone(&app_b)).await;
+        let idle_b = RecordingIdleSink::attach(&app_b);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let runner = EnvoyRunner::start_with(Arc::clone(&app_b), {
+            let seen = Arc::clone(&seen);
+            drive_of(move |ctx, input, _| {
+                let seen = Arc::clone(&seen);
+                async move {
+                    let first = {
+                        let mut seen = seen.lock();
+                        seen.push(input.build_messages().unwrap());
+                        seen.len() == 1
+                    };
+                    if !first {
+                        return Ok("the tests pass too".into());
+                    }
+                    let mut ctx = ctx;
+                    handle_user_tool(
+                        &mut ctx,
+                        "user__ask",
+                        &json!({"question": "Should we merge?"}),
+                    )
+                    .await?;
+                    Ok("never sent".into())
+                }
+            })
+        });
+        runner.attach();
+        let asker = peer.a.runtime.fingerprint().to_string();
+        let to_b = peer.to_b.clone();
+
+        let id = peer.ask("merge the branch").await;
+        wait_until("the hand-off to be recorded on B", || {
+            idle_b.has("envoy escalated to the human")
+        })
+        .await;
+        let remembered = || {
+            store
+                .load(&asker, &id, SystemTime::now())
+                .unwrap()
+                .map(|record| record.turns)
+                .unwrap_or_default()
+        };
+        assert_eq!(remembered().len(), 2, "{:?}", remembered());
+
+        app_b
+            .mesh
+            .answer_inbound(&id, "the owner says yes")
+            .await
+            .unwrap();
+        let replied = peer.collect(&id, 20).await;
+        assert_collected(&replied, &id, &to_b, "answered", "the owner says yes");
+        let turns = remembered();
+        assert_eq!(turns.len(), 3, "{turns:?}");
+        assert_eq!(
+            turns[1].text,
+            format!("escalated to the human; no answer yet (ref {id})")
+        );
+        assert_eq!(turns[2].role, EnvoyRole::Assistant);
+        assert_eq!(turns[2].text, "the owner says yes");
+
+        let asked = peer
+            .tool(
+                "ask",
+                json!({"to": to_b, "message": "and the tests?", "thread": id}),
+            )
+            .await;
+        assert_eq!(asked["status"], "asked", "{asked}");
+        let follow_up = asked["id"].as_str().unwrap().to_string();
+        let replied = peer.collect(&follow_up, 20).await;
+        assert_eq!(replied["status"], "replied", "{replied}");
+        assert_eq!(replied["thread"], id, "{replied}");
+        runner.stop().await;
+
+        assert_eq!(seen.lock().len(), 2);
+        let second = seen.lock()[1].clone();
+        assert_eq!(
+            roles_of(&second),
+            vec![
+                MessageRole::System,
+                MessageRole::User,
+                MessageRole::Assistant,
+                MessageRole::Assistant,
+                MessageRole::User
+            ]
+        );
+        assert_eq!(
+            second[2].content.to_text(),
+            format!("escalated to the human; no answer yet (ref {id})")
+        );
+        assert_eq!(second[3].content.to_text(), "the owner says yes");
+        assert!(
+            second[4]
+                .content
+                .to_text()
+                .contains(&format!("Message id: {follow_up}")),
+            "{}",
+            second[4].content.to_text()
+        );
+        peer.stop().await;
+        source.remove_dir();
+    }
+
     /// A job refused at run time, once the runs ahead of it spent the window, is
     /// remembered with the refusal the peer was sent as its one envoy turn.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

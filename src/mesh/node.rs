@@ -7,7 +7,7 @@ use crate::mesh::announce::{
 use crate::mesh::brief::{Brief, Digest, assemble_brief, digest_objective_for};
 use crate::mesh::card::{CardSource, DISPLAY_NAME_MAX_CHARS, StatusHandler, build_card};
 use crate::mesh::envoy::{EnvoyJob, EnvoySink};
-use crate::mesh::envoy_sessions::EnvoySessions;
+use crate::mesh::envoy_sessions::{EnvoyRole, EnvoySessions, EnvoyTurn};
 use crate::mesh::events::{
     BriefUpdateSource, MeshEvent, MeshHookSink, MeshHooks, NodeFacts, Routed, TrustHookObserver,
 };
@@ -2957,7 +2957,41 @@ impl MeshSlot {
             Err(err) => return Err(put_back(store, record, err)),
         };
         self.record_human_answer(record, text);
+        self.remember_human_answer(record, &reply.content);
         Ok(outcome)
+    }
+
+    /// The owner's late answer joins the thread the envoy remembers, as the turn after
+    /// the hand-off line the run stored when it ended without one. A thread the store
+    /// does not hold gets no record: an answer with no question before it is not a
+    /// conversation. A record that cannot be read or saved is left as it is.
+    fn remember_human_answer(&self, record: &InboundRecord, spoken: &str) {
+        let Some(store) = self.envoy_memory() else {
+            return;
+        };
+        let thread = record.thread.as_str();
+        let now = SystemTime::now();
+        let mut turns = match store.load(&record.peer_identity, thread, now) {
+            Ok(Some(file)) => file.turns,
+            Ok(None) => return,
+            Err(err) => {
+                warn!(
+                    "Mesh envoy memory for thread {thread} could not be read ({}); the owner's answer was not remembered",
+                    redact_hashes(&err.to_string())
+                );
+                return;
+            }
+        };
+        turns.push(EnvoyTurn {
+            role: EnvoyRole::Assistant,
+            text: spoken.to_string(),
+        });
+        if let Err(err) = store.save(&record.peer_identity, thread, turns, now) {
+            warn!(
+                "Mesh envoy memory for thread {thread} could not be saved: {}",
+                redact_hashes(&err.to_string())
+            );
+        }
     }
 
     /// The human's `.mesh answer` to `record` went to the peer with no live run. The
@@ -3577,7 +3611,7 @@ mod tests {
     use crate::hooks::HookEvent;
     use crate::mesh::access::{AccessOptions, access_message, validate_access};
     use crate::mesh::destination_address;
-    use crate::mesh::envoy_sessions::{EnvoyRole, EnvoyTurn, session_key};
+    use crate::mesh::envoy_sessions::session_key;
     use crate::mesh::events::{RecordingHookSink, env_value, one_fire};
     use crate::mesh::limits::PEER_RETRY_AFTER_CAPACITY;
     use crate::mesh::message::{
@@ -6157,6 +6191,81 @@ mod tests {
             slot.inbound_store().is_none(),
             "stopping lets go of the store"
         );
+        stub.stop().await;
+    }
+
+    /// An answer sent once the run has ended joins the thread the envoy remembers, as
+    /// its own turn after the hand-off line; one for a thread the store does not hold
+    /// writes nothing, since an answer with no question before it is not a conversation.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_late_answer_joins_the_remembered_thread_and_never_starts_one() {
+        use crate::mesh::trust::TrustOptions;
+
+        let stub = PeerStub::listen("node-late-answer-stub", TcpServer::DEFAULT_CLIENT_MTU).await;
+        let started = started_runtime_on_with("node-late-answer-memory", stub.port(), |c| {
+            c.envoy_memory.enabled = true;
+        })
+        .await;
+        let runtime = started.runtime.clone();
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime.clone()).unwrap();
+        stub.trust(&runtime.current_destination_hash(), runtime.fingerprint());
+        stub.announce(Some("Stub")).await;
+        let to = stub.destination_hex();
+        let peers = runtime.peers();
+        stub.wait_to_be_filed(&peers, &to).await;
+        runtime
+            .trust()
+            .trust_destination(
+                slot.as_ref(),
+                &to,
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .unwrap();
+        let identity = stub.identity_hex();
+        let memory = runtime
+            .envoy_memory()
+            .expect("an enabled store is opened at start");
+        let now = SystemTime::now();
+        memory.save(&identity, "a-1", peer_turns(), now).unwrap();
+        let store = slot.inbound_store().unwrap();
+        for id in ["a-1", "a-2"] {
+            store
+                .upsert(
+                    InboundRecord {
+                        peer_destination: to.clone(),
+                        peer_identity: identity.clone(),
+                        ..inbound_record(id)
+                    },
+                    now,
+                )
+                .unwrap();
+        }
+
+        slot.answer_inbound("a-1", "the owner says yes")
+            .await
+            .unwrap();
+        slot.answer_inbound("a-2", "and no to that").await.unwrap();
+
+        let turns = memory
+            .load(&identity, "a-1", now)
+            .unwrap()
+            .expect("the thread stays remembered")
+            .turns;
+        assert_eq!(turns.len(), 3, "{turns:?}");
+        assert_eq!(turns[2].role, EnvoyRole::Assistant);
+        assert_eq!(turns[2].text, "the owner says yes");
+        assert!(memory.load(&identity, "a-2", now).unwrap().is_none());
+        assert!(
+            !memory
+                .dir()
+                .join(format!("{}.yaml", session_key(&identity, "a-2").unwrap()))
+                .exists(),
+            "an answer alone starts no conversation"
+        );
+        assert!(slot.stop().await.unwrap());
         stub.stop().await;
     }
 
