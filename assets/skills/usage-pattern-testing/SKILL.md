@@ -174,3 +174,6 @@ would hunt a nonexistent bug).
 - Reporting an environment failure as a behavioral FAIL (or burying it in a PASS).
 - Throwaway tests in /tmp — tests that don't land in the repo's suite location die with the run.
 - Asserting only status codes — shape and content are where the quirks live.
+- Hiding pure tests behind infra build tags — a test function that exercises only pure
+  inputs/outputs tagged `//go:build integration` (or an infra marker) never runs in unit CI; it
+  belongs in an untagged file beside the source. Flag any you find in the diff's suites.

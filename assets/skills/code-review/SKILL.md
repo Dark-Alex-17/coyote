@@ -146,11 +146,19 @@ These are review findings that only surface in a diff context, not in a whole-fi
   flag-off-exempt"), report it as a 🟢 note so the reviewer of record sees it was weighed, not
   missed. No convention found ⇒ stay silent; this rule never invents a rollout policy the repo
   does not have.
-- **Chatty DB access — minimize round trips** — when one logical operation in the diff issues
-  multiple sequential queries (read-then-read to assemble one result, read-modify-write pairs,
-  any query inside a loop), ask whether a single query could do the job. Tiered:
-  - **Query in a loop over a previous query's rows (N+1)** — 🟡 by default; batch it (JOIN,
-    `IN (...)`, a window function, or a bulk write).
+- **Chatty data access — minimize round trips (DB queries AND remote calls)** — when one logical
+  operation in the diff issues multiple sequential queries or remote calls (read-then-read to
+  assemble one result, read-modify-write pairs, any query/HTTP/gRPC/SDK call inside a loop), ask
+  whether a single round trip could do the job. Tiered:
+  - **Call in a loop over a previous result's items (N+1)** — name the loop cardinality (per
+    customer? per item? per page?), then open the callee's signature/filter type and check
+    whether it accepts a SET: a slice/array param, SQL `IN (...)`/`= ANY($ids)`, an `ids[]`
+    filter, a batch endpoint. Set accepted → 🔴, citing the callee at file:line — one batched
+    call per run replaces N. A plan/spec/criterion that states a "1 + N" call budget does NOT
+    exempt it: report "spec endorses N calls but the callee accepts a set" as a question for
+    the owner. No set form → 🟡 only when the cardinality is unbounded (no cap or page limit);
+    otherwise note the bound. Report even when clean: `Remote-call scaling: <k> loops
+    inspected, 0 N+1.`
   - **Sole caller** — the function is the only consumer of every templated query it strings
     together: nothing else constrains their shape, so they can collapse into one dedicated
     query for free. 🟡, naming the queries that merge.
@@ -162,6 +170,39 @@ These are review findings that only surface in a diff context, not in a whole-fi
   - **Consistency escalation** — multiple reads composing one result OUTSIDE a transaction see
     a torn snapshot; when the pieces must be mutually consistent, that is a correctness finding
     (🟡, 🔴 when money or auth decisions read the torn state), independent of performance.
+- **Stated-but-unenforced coupling** — the diff states a relation between two or more values —
+  in README/doc comments, a Helm/config/deploy-time test, or as a literal constant whose value
+  must track another site (the max of an enum's ranks, a switch arm count). `fs_grep` for the
+  runtime enforcement point (a `Validate()`, constructor check, startup assertion) or the
+  derived expression (`slices.Max(...)`, `len(...)`). Relation stated (e.g. `A ≥ B + C`,
+  `X < RetentionPeriod`) but pinned only in a deploy-time test or prose → 🟡 "documented
+  invariant not enforced at runtime", naming the `Validate()` it belongs in. A literal
+  duplicating a value derivable from another site → 🟢 derive it.
+- **Admitted gaps must be observable** — an added comment or doc contains an admission:
+  `silently`, `never scanned`, `cannot distinguish`, `best-effort`, `not detected`, `may miss`,
+  `undetected`. Check whether the admitted condition is surfaced by a metric, a WARN+ log line,
+  an output/result field, or a Known Issues/runbook entry — cite it. None → 🟡 "known gap with
+  no signal": propose the smallest signal (a counter or WARN) and a Known Issues bullet.
+- **Dependency-behaviour claims in comments** — an added comment asserts how a third-party
+  library or service behaves ("X always/never sets Y", "the API returns Z when …"). Open the
+  PINNED dependency (module cache, vendor dir, lockfile version) and cite the line that proves
+  or contradicts the claim. Contradicted → the code guards a condition that cannot occur or
+  misses one that can: 🟡 by default, 🔴 when the false claim guards money, auth, or data
+  integrity. Unverifiable (remote service only) → 🟢 "unverified claim", ask for a reference.
+- **Reader-less defensive code** — the diff adds a backfill, default-fill, or normalisation of
+  a field/value. `fs_grep` for readers of that field/value outside tests. None, and the PR body
+  does not name the follow-up consumer → 🟡 dead defensive code: remove it, or name the
+  consumer. Exempt: a seam the PR explicitly declares for a named follow-up PR/task. A comment
+  JUSTIFYING the dead code with a dependency-behaviour claim gets the pinned-source check above
+  — the two failures travel together.
+- **Alert-rule thresholds** (Prometheus/Cortex/Mimir rule files and their unit tests) —
+  `increase(`/`rate(`/`sum(increase(` compared against an integer boundary (`< 1`, `<= 0`,
+  `== 0`, `>= 1`) is a knife-edge under range-vector extrapolation → 🟡; use a fractional
+  midpoint (e.g. `< 0.5`) and state which side a single event falls on. Every numeric
+  threshold needs unit-test cases exactly at the boundary on BOTH sides ("exactly one
+  completion in the window stays silent" AND "zero completions fires"); missing → 🟡 naming
+  the two series to add. Report even when clean: `Alert thresholds: <n> rules, <m>
+  boundary-tested.`
 
 ### Scope discipline
 
@@ -173,6 +214,28 @@ A diff review is a review of THE CHANGE, not the whole file:
 - Don't suggest refactors outside the scope of the change. ("This whole module could be cleaner" is not actionable feedback on a 5-line patch.)
 - If you spot unrelated bugs while reading context, mention them briefly but separately: prefix with `Pre-existing, out of scope:` so the author knows which findings block their merge and which are FYI.
 - The author's job is to ship THIS change. Your job is to catch what's wrong with THIS change.
+
+### Repo-convention conformance (MANDATORY when convention docs exist)
+
+Trigger: the repo root or a touched package directory carries convention docs — `CLAUDE.md`,
+`AGENTS.md`, `CONTRIBUTING.md`, `ARCHITECTURE.md`, a `docs/` style guide. Silent otherwise.
+
+Extract every MECHANICAL rule — one decidable without judgment: file/function size limits, test
+placement (beside source, in a named dir), build-tag policy, a package-role or layer table
+("package X is registration-only"), comment policy, constant/duplication rules, data-access
+rules (no N+1). Then run the corresponding check over the diff, not the whole repo:
+
+- size limits → `wc -l` every added/modified file against the limit;
+- test placement → each new test file sits where the rule says it must;
+- layer/package-role table → each new function landing in a listed package is permitted by that
+  package's declared role — new branching/validation in a "registration-only"/"wiring-only"
+  package is 🟡 by default, 🔴 when the table marks the rule load-bearing;
+- comment policy → classify each added comment block against the rule;
+- anything else exactly as the doc states it.
+
+Severity: as the repo doc assigns; else 🟡. Cite the doc at `path:line` beside every finding —
+the convention is the repo's own rule, not yours. Report even when clean: `Repo conventions:
+<n> rules checked, 0 violations.`
 
 ## 1. Correctness
 
@@ -228,6 +291,11 @@ Named adequacy anti-patterns — each is a finding even when coverage looks gree
   🟡 when no test passes an out-of-range value; stay silent when the diff adds no clamp. Unlike a
   guard, a clamp coerces instead of rejecting, so the "missing negative case" rule does not catch
   it — an untested clamp is how a bypass of the bound ships unnoticed.
+- **Pure test behind an infra tag** — a test file carries an infra build tag (`//go:build
+  integration`/`e2e`, a pytest infra marker) but contains test functions that exercise only pure
+  inputs/outputs — no harness, DB, network, or external client. Those tests never run in unit
+  CI → 🟡; move them to an untagged file in the same package. Check per FUNCTION, not per file:
+  one genuinely infra-bound test does not excuse pure siblings hiding behind the same tag.
 
 ## 3. Clarity
 
