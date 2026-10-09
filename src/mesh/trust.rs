@@ -1048,7 +1048,8 @@ impl TrustStore {
     /// identity tier, or (a trust file edited by hand) bound to a destination record
     /// alone, on disk or for the session, and not blocked. What the envoy asks before
     /// writing a thread back for an identity whose standing may have changed while its
-    /// run was going.
+    /// run was going. An identity trusted for the session alone lapses with the process
+    /// and no sweep runs for it, so its remembered threads are left to the age bound.
     pub(crate) fn knows_identity(&self, identity_hash: &str) -> bool {
         let identity = identity_hash.to_ascii_lowercase();
         let state = self.inner.lock();

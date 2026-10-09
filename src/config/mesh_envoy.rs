@@ -1198,11 +1198,17 @@ fn remember_exchange(
         Some(_) => store.append(&message.source_identity, thread, exchange, now, true),
         None => store.save(&message.source_identity, thread, exchange, now),
     };
-    if let Err(err) = written {
-        warn!(
+    match written {
+        Ok(()) => {}
+        // Recall already warned the owner about a record naming another identity.
+        Err(err @ EnvoyMemoryError::WrongIdentity { .. }) => debug!(
             "Mesh envoy memory for thread {thread} could not be saved: {}",
             redact_hashes(&err.to_string())
-        );
+        ),
+        Err(err) => warn!(
+            "Mesh envoy memory for thread {thread} could not be saved: {}",
+            redact_hashes(&err.to_string())
+        ),
     }
 }
 

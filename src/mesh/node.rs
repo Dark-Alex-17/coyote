@@ -2996,8 +2996,9 @@ impl MeshSlot {
     /// is next sent. An answer the run itself held and wrote before a send that then
     /// failed is already the thread's last turn, so a retry of it adds nothing. A
     /// thread the store does not hold gets no record: an answer with no question before
-    /// it is not a conversation. A record that cannot be read or saved is left as it
-    /// is.
+    /// it is not a conversation. No standing is re-checked here: the send that just
+    /// succeeded was authorized, and an append that never creates a thread cannot undo
+    /// a sweep. A record that cannot be read or saved is left as it is.
     fn remember_human_answer(&self, record: &InboundRecord, spoken: &str) {
         let Some(store) = self.envoy_memory() else {
             return;
