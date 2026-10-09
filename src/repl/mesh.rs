@@ -528,10 +528,11 @@ async fn status(
 ) -> Result<()> {
     match classify_status(rest) {
         StatusArg::Own => {
-            live(ctx)?;
+            let runtime = live(ctx)?;
             let source: Arc<dyn CardSource> = ctx.app.mesh.clone();
             let card = StatusHandler::new(Arc::downgrade(&source)).card(SystemTime::now());
             out_text(&render_for_human(&card, SystemTime::now()));
+            out_text(&format!("envoy memory: {}", envoy_memory_text(&runtime)));
         }
         StatusArg::Set(objective) => {
             ctx.app
@@ -4880,11 +4881,28 @@ fn render_node_facts(
             }
         },
     );
+    row("envoy memory", envoy_memory_text(runtime));
     output.push_str(&render_propagation_nodes(
         runtime.propagation_nodes().snapshot(),
         now,
     ));
     output
+}
+
+/// `off` while `mesh.envoy_memory` is off, else how many conversations of how many
+/// identities the store the node serves holds.
+fn envoy_memory_text(runtime: &MeshRuntime) -> String {
+    let Some(store) = runtime.envoy_memory() else {
+        return "off".to_string();
+    };
+    match store.stats() {
+        Ok((conversations, identities)) => format!(
+            "{}, {}",
+            plural(conversations, "conversation", "conversations"),
+            plural(identities, "identity", "identities")
+        ),
+        Err(err) => format!("unreadable: {}", redact_hashes(&err.to_string())),
+    }
 }
 
 fn predecessors_text(
@@ -8729,6 +8747,112 @@ mod tests {
                         row.contains(&crate::mesh::schema::unversioned_cause(
                             identity::PREDECESSOR_RECORD_VERSION
                         )),
+                        "{out}"
+                    );
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// The `envoy memory` line of the last `.mesh status` printed.
+            fn status_envoy_memory(out: &str) -> String {
+                out.lines()
+                    .rev()
+                    .find_map(|line| line.strip_prefix("envoy memory: "))
+                    .unwrap_or_else(|| panic!("no envoy memory line in {out}"))
+                    .to_string()
+            }
+
+            #[test]
+            #[serial]
+            fn status_and_info_say_the_envoy_memory_is_off() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-envoy-memory-off-line");
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-envoy-memory-off-line").await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    assert!(started.runtime.envoy_memory().is_none());
+
+                    let out = out_of(&mut ctx, ".mesh status").await.unwrap();
+                    assert_eq!(status_envoy_memory(&out), "off", "{out}");
+                    let out = out_of(&mut ctx, ".mesh info").await.unwrap();
+                    assert_eq!(info_row(&out, "envoy memory"), "off", "{out}");
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
+            /// With the memory on, `.mesh status` and `.mesh info` count the conversations
+            /// and identities of the store the node serves, the count moving as the store
+            /// fills.
+            #[test]
+            #[serial]
+            fn status_and_info_count_the_remembered_envoy_conversations() {
+                use crate::mesh::envoy_sessions::{EnvoyRole, EnvoyTurn};
+
+                let _guard = TestConfigDirGuard::new("repl-mesh-envoy-memory-line");
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime_with("repl-mesh-envoy-memory-line", |c| {
+                        c.envoy_memory.enabled = true;
+                    })
+                    .await;
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let store = started
+                        .runtime
+                        .envoy_memory()
+                        .expect("an enabled store is opened at start");
+                    let now = SystemTime::now();
+                    let turns = vec![
+                        EnvoyTurn {
+                            role: EnvoyRole::User,
+                            text: "where were we?".into(),
+                        },
+                        EnvoyTurn {
+                            role: EnvoyRole::Assistant,
+                            text: "the build".into(),
+                        },
+                    ];
+                    let (_, id_a) = heard_peer(&started.runtime, "Ann", now);
+                    let (_, id_b) = heard_peer(&started.runtime, "Bo", now);
+
+                    let out = out_of(&mut ctx, ".mesh status").await.unwrap();
+                    assert_eq!(
+                        status_envoy_memory(&out),
+                        "0 conversations, 0 identities",
+                        "{out}"
+                    );
+                    let out = out_of(&mut ctx, ".mesh info").await.unwrap();
+                    assert_eq!(
+                        info_row(&out, "envoy memory"),
+                        "0 conversations, 0 identities",
+                        "{out}"
+                    );
+
+                    store.save(&id_a, "a-first", turns.clone(), now).unwrap();
+                    let out = out_of(&mut ctx, ".mesh status").await.unwrap();
+                    assert_eq!(
+                        status_envoy_memory(&out),
+                        "1 conversation, 1 identity",
+                        "{out}"
+                    );
+
+                    store.save(&id_a, "a-second", turns.clone(), now).unwrap();
+                    store.save(&id_b, "b-first", turns, now).unwrap();
+                    let out = out_of(&mut ctx, ".mesh status").await.unwrap();
+                    assert_eq!(
+                        status_envoy_memory(&out),
+                        "3 conversations, 2 identities",
+                        "{out}"
+                    );
+                    let out = out_of(&mut ctx, ".mesh info").await.unwrap();
+                    assert_eq!(
+                        info_row(&out, "envoy memory"),
+                        "3 conversations, 2 identities",
                         "{out}"
                     );
 

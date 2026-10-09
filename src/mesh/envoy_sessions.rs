@@ -646,10 +646,6 @@ impl EnvoySessions {
     }
 
     /// `(conversations, distinct identities)`; `(0, 0)` while the store does not exist.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the status line's memory count")
-    )]
     pub(crate) fn stats(&self) -> Result<(usize, usize), EnvoyMemoryError> {
         if !self.dir.exists() {
             return Ok((0, 0));
