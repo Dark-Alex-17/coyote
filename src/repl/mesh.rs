@@ -34,10 +34,11 @@ use crate::mesh::trust::{
 };
 use crate::mesh::wire_path::{WIRE_PATH_MAX_BYTES, WirePath};
 use crate::mesh::{
-    FetchError, FetchReport, InterfaceState, LoggingInboundSink, MAX_WANTS_PER_FETCH,
-    MESH_ALREADY_ON, MeshPaths, MeshRuntime, NodeOptions, PeerRecord, PropagationNodeRecord,
-    age_text, canonical_hash, canonicalize, decode_hex, destination_address, display_text,
-    hex_lower, human_size, parse_rfc3339, redact_hashes, refuse_symlink, rfc3339_utc, short,
+    FetchError, FetchReport, InterfaceState, InterfaceStatus, LoggingInboundSink,
+    MAX_WANTS_PER_FETCH, MESH_ALREADY_ON, MeshPaths, MeshRuntime, NodeOptions, PeerRecord,
+    PropagationNodeRecord, age_text, canonical_hash, canonicalize, decode_hex, destination_address,
+    display_text, hex_lower, human_size, parse_rfc3339, redact_hashes, refuse_symlink, rfc3339_utc,
+    short,
 };
 use crate::supervisor::mailbox::EnvelopePayload;
 use crate::utils::{AbortSignal, drain_stale_tty_input, wait_user_interrupt};
@@ -352,7 +353,7 @@ async fn join(ctx: &mut RequestContext, options: JoinOptions) -> Result<()> {
     let app = Arc::clone(&ctx.app.config);
     ctx.refresh_mesh_tools(&app);
     out_text(&render_on_summary(&runtime, fresh));
-    for warning in interface_warnings(&runtime) {
+    for warning in interface_warnings(&runtime.interface_states()) {
         err_text(&warning);
     }
     Ok(())
@@ -4865,10 +4866,9 @@ fn render_on_summary(runtime: &MeshRuntime, fresh: bool) -> String {
 
 /// One line per interface the node came up without, in config order; `.mesh on` and
 /// autostart print them on stderr after the summary, `MeshRuntime::start` never does.
-fn interface_warnings(runtime: &MeshRuntime) -> Vec<String> {
-    runtime
-        .interface_states()
-        .into_iter()
+fn interface_warnings(states: &[InterfaceStatus]) -> Vec<String> {
+    states
+        .iter()
         .filter_map(|status| {
             let InterfaceState::Unreachable { reason, .. } = &status.state else {
                 return None;
@@ -5148,10 +5148,8 @@ fn render_node_facts(
     row("destination", runtime.current_destination_hash());
     row("instance", runtime.current_instance_id());
     for (i, status) in runtime.interface_states().iter().enumerate() {
-        row(
-            &format!("interfaces[{i}]"),
-            format!("{}  {}", status.label, status.state),
-        );
+        let (name, value) = interface_row(i, status);
+        row(&name, value);
     }
     let key_changes = runtime
         .trust()
@@ -5174,6 +5172,13 @@ fn render_node_facts(
         now,
     ));
     output
+}
+
+fn interface_row(i: usize, status: &InterfaceStatus) -> (String, String) {
+    (
+        format!("interfaces[{i}]"),
+        format!("{}  {}", status.label, status.state),
+    )
 }
 
 /// `off` while `mesh.envoy_memory` is off, else how many conversations of how many
@@ -6015,6 +6020,104 @@ mod tests {
         assert!(
             both.contains("the configured relay and the peers it reaches"),
             "{both}"
+        );
+    }
+
+    #[test]
+    fn interface_warnings_name_the_tail_for_lan_a_remote_relay_and_a_loopback_relay() {
+        let states = [
+            InterfaceStatus {
+                label: "lan".into(),
+                kind: "lan",
+                endpoint: None,
+                state: InterfaceState::Unreachable {
+                    reason: "address in use".into(),
+                    retrying: false,
+                },
+            },
+            InterfaceStatus {
+                label: "private relay.example:4965".into(),
+                kind: "private",
+                endpoint: Some("relay.example:4965".into()),
+                state: InterfaceState::Unreachable {
+                    reason: "tcp connect failed endpoint=relay.example:4965".into(),
+                    retrying: true,
+                },
+            },
+            InterfaceStatus {
+                label: "public 127.0.0.1:4242".into(),
+                kind: "public",
+                endpoint: Some("127.0.0.1:4242".into()),
+                state: InterfaceState::Connected,
+            },
+            InterfaceStatus {
+                label: "private 127.0.0.1:4242".into(),
+                kind: "private",
+                endpoint: Some("127.0.0.1:4242".into()),
+                state: InterfaceState::Unreachable {
+                    reason: "tcp connect failed endpoint=127.0.0.1:4242".into(),
+                    retrying: true,
+                },
+            },
+        ];
+
+        assert_eq!(
+            interface_warnings(&states),
+            vec![
+                "WARNING: lan is unreachable (address in use); peers on this link-local segment are out of reach.".to_string(),
+                "WARNING: private relay.example:4965 is unreachable (tcp connect failed endpoint=relay.example:4965); peers behind that relay are out of reach.".to_string(),
+                "WARNING: private 127.0.0.1:4242 is unreachable (tcp connect failed endpoint=127.0.0.1:4242); sessions on this machine cannot reach each other until a local Reticulum daemon (rnsd) is listening there.".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn interface_rows_show_a_failed_lan_as_unreachable_and_a_relay_as_connected() {
+        let lan_failed = InterfaceStatus {
+            label: "lan".into(),
+            kind: "lan",
+            endpoint: None,
+            state: InterfaceState::Unreachable {
+                reason: "address in use".into(),
+                retrying: false,
+            },
+        };
+        let retrying_relay = InterfaceStatus {
+            label: "private 127.0.0.1:4242".into(),
+            kind: "private",
+            endpoint: Some("127.0.0.1:4242".into()),
+            state: InterfaceState::Unreachable {
+                reason: "tcp connect failed endpoint=127.0.0.1:4242".into(),
+                retrying: true,
+            },
+        };
+        let connected_relay = InterfaceStatus {
+            label: "public relay.example:4965".into(),
+            kind: "public",
+            endpoint: Some("relay.example:4965".into()),
+            state: InterfaceState::Connected,
+        };
+
+        assert_eq!(
+            interface_row(0, &lan_failed),
+            (
+                "interfaces[0]".to_string(),
+                "lan  unreachable: address in use".to_string()
+            )
+        );
+        assert_eq!(
+            interface_row(1, &retrying_relay),
+            (
+                "interfaces[1]".into(),
+                "private 127.0.0.1:4242  unreachable, retrying: tcp connect failed endpoint=127.0.0.1:4242".into()
+            )
+        );
+        assert_eq!(
+            interface_row(2, &connected_relay),
+            (
+                "interfaces[2]".into(),
+                "public relay.example:4965  connected".into()
+            )
         );
     }
 
@@ -9041,7 +9144,8 @@ mod tests {
                     .await
                     .unwrap();
                     let mut ctx = ctx_with(MeshConfig::default(), true);
-                    ctx.app.mesh.install(runtime).unwrap();
+                    ctx.app.mesh.install(Arc::clone(&runtime)).unwrap();
+                    let label = format!("private 127.0.0.1:{closed}");
 
                     let out = out_of(&mut ctx, ".mesh info").await.unwrap();
 
@@ -9050,11 +9154,10 @@ mod tests {
                         format!("private 127.0.0.1:{}  connected", addr.port()),
                         "{out}"
                     );
+                    let reason = recorded_reason(&runtime, &label);
                     assert_eq!(
                         info_row(&out, "interfaces[1]"),
-                        format!(
-                            "private 127.0.0.1:{closed}  unreachable, retrying: tcp connect failed endpoint=127.0.0.1:{closed}"
-                        ),
+                        format!("{label}  unreachable, retrying: {reason}"),
                         "{out}"
                     );
 
@@ -10421,9 +10524,25 @@ mod tests {
                 });
             }
 
-            fn loopback_warning(port: u16) -> String {
+            /// The reason the node recorded for the unreachable interface `label`; the
+            /// wording is the transport's, so tests read it back rather than spell it.
+            fn recorded_reason(runtime: &MeshRuntime, label: &str) -> String {
+                let states = runtime.interface_states();
+                let status = states
+                    .iter()
+                    .find(|status| status.label == label)
+                    .unwrap_or_else(|| panic!("no {label} in {states:?}"));
+                let InterfaceState::Unreachable { reason, .. } = &status.state else {
+                    panic!("{label} is {}, not unreachable", status.state);
+                };
+                assert!(!reason.is_empty(), "{status:?}");
+                reason.clone()
+            }
+
+            fn loopback_warning(port: u16, reason: &str) -> String {
+                assert!(reason.contains(&format!("127.0.0.1:{port}")), "{reason}");
                 format!(
-                    "WARNING: private 127.0.0.1:{port} is unreachable (tcp connect failed endpoint=127.0.0.1:{port}); sessions on this machine cannot reach each other until a local Reticulum daemon (rnsd) is listening there."
+                    "WARNING: private 127.0.0.1:{port} is unreachable ({reason}); sessions on this machine cannot reach each other until a local Reticulum daemon (rnsd) is listening there."
                 )
             }
 
@@ -10476,9 +10595,11 @@ mod tests {
                         format!("  interfaces: private 127.0.0.1:{}", relay.port),
                         "{summary}"
                     );
+                    let runtime = ctx.app.mesh.get().unwrap();
+                    let reason = recorded_reason(&runtime, &format!("private 127.0.0.1:{closed}"));
                     assert_eq!(
                         warnings(),
-                        vec![loopback_warning(closed)],
+                        vec![loopback_warning(closed, &reason)],
                         "{:?}",
                         stderr_lines()
                     );
@@ -10542,9 +10663,11 @@ mod tests {
                     assert_eq!(prompt_script::prompts_asked(), 0);
                     let out = stdout_lines();
                     index_of(&out, "Mesh is on for this session");
+                    let runtime = ctx.app.mesh.get().unwrap();
+                    let reason = recorded_reason(&runtime, &format!("private 127.0.0.1:{closed}"));
                     assert_eq!(
                         warnings(),
-                        vec![loopback_warning(closed)],
+                        vec![loopback_warning(closed, &reason)],
                         "{:?}",
                         stderr_lines()
                     );
@@ -10706,13 +10829,15 @@ mod tests {
                     ctx.session = Some(Session::default());
 
                     run(&mut ctx, ".mesh on").await.unwrap();
-                    assert_eq!(warnings(), vec![loopback_warning(closed)]);
+                    let runtime = ctx.app.mesh.get().unwrap();
+                    let reason = recorded_reason(&runtime, &format!("private 127.0.0.1:{closed}"));
+                    assert_eq!(warnings(), vec![loopback_warning(closed, &reason)]);
                     let err = refusal(&mut ctx, ".mesh on").await;
 
                     assert_eq!(err, MESH_ALREADY_ON);
                     assert_eq!(
                         warnings(),
-                        vec![loopback_warning(closed)],
+                        vec![loopback_warning(closed, &reason)],
                         "{:?}",
                         stderr_lines()
                     );

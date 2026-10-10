@@ -42,7 +42,8 @@ pub(crate) mod wire_path;
 #[cfg(test)]
 pub(crate) use node::session_destination_name;
 pub(crate) use node::{
-    InterfaceState, MESH_ALREADY_ON, MeshPaths, MeshRuntime, MeshSlot, NodeOptions, refusal_reply,
+    InterfaceState, InterfaceStatus, MESH_ALREADY_ON, MeshPaths, MeshRuntime, MeshSlot,
+    NodeOptions, refusal_reply,
 };
 pub(crate) use peers::PeerRecord;
 pub(crate) use propagation_fetch::{

@@ -294,7 +294,10 @@ impl InterfaceStatus {
             .and_then(|endpoint| endpoint.rsplit_once(':'))
             .is_some_and(|(host, _)| {
                 let host = host.trim_start_matches('[').trim_end_matches(']');
-                host == "127.0.0.1" || host == "::1" || host.eq_ignore_ascii_case("localhost")
+                host.parse::<std::net::IpAddr>().map_or_else(
+                    |_| host.eq_ignore_ascii_case("localhost"),
+                    |ip| ip.is_loopback(),
+                )
             })
     }
 }
@@ -545,9 +548,8 @@ impl MeshRuntime {
             // failure is the first plan.
             let mut text = failures[0].clone();
             if states.iter().all(InterfaceStatus::is_loopback) {
-                text.push_str(&format!(
-                    " Nothing is listening on {endpoint}. The default configuration expects a local Reticulum daemon (rnsd) there — run scripts/mesh-relay.sh, or use type: lan to join the LAN without one; see Mesh-Deployment.",
-                    endpoint = states[0].endpoint.as_deref().unwrap_or_default()
+                text.push_str(&loopback_hint(
+                    states[0].endpoint.as_deref().unwrap_or_default(),
                 ));
             }
             bail!(text);
@@ -1557,15 +1559,22 @@ async fn join_interface(
     };
     match &joined {
         Joined::Connected(_) => debug!("Joined mesh interface {}", plan.label()),
-        Joined::Pending { reason, .. } => debug!(
+        Joined::Pending { reason, .. } => warn!(
             "Mesh interface {} is unreachable and keeps reconnecting: {reason}",
             plan.label()
         ),
         Joined::Failed { reason, .. } => {
-            debug!("Mesh interface {} was not attached: {reason}", plan.label());
+            warn!("Mesh interface {} was not attached: {reason}", plan.label());
         }
     }
     joined
+}
+
+/// Appended to the refusal when every configured relay is on loopback and none answered.
+fn loopback_hint(endpoint: &str) -> String {
+    format!(
+        " Nothing is listening on {endpoint}. The default configuration expects a local Reticulum daemon (rnsd) there — run scripts/mesh-relay.sh, or use type: lan to join the LAN without one; see Mesh-Deployment."
+    )
 }
 
 async fn join_lan(transport: &Transport) -> Joined {
@@ -1609,12 +1618,16 @@ async fn join_lan(transport: &Transport) -> Joined {
             .await;
             Joined::Failed {
                 reason: err.to_string(),
-                message: format!(
-                    "Failed to bind the mesh lan interface: {err}. Another process may hold the discovery port; remove the lan entry from mesh.interfaces or stop that process. Two Coyote sessions on one host need a local relay; see Mesh-Deployment."
-                ),
+                message: lan_bind_failure_message(&err),
             }
         }
     }
+}
+
+fn lan_bind_failure_message(err: &dyn fmt::Display) -> String {
+    format!(
+        "Failed to bind the mesh lan interface: {err}. Another process may hold the discovery port; remove the lan entry from mesh.interfaces or stop that process. Two Coyote sessions on one host need a local relay; see Mesh-Deployment."
+    )
 }
 
 async fn join_tcp(
@@ -2090,11 +2103,14 @@ async fn poll_pending_interfaces(
             }
             if let Some(label) = runtime.mark_interface_connected(index) {
                 debug!("Mesh interface {label} connected");
-                if let Err(err) = runtime.announce_on_connect().await {
-                    warn!(
-                        "Failed to announce the mesh node over {label}; the heartbeat will announce it: {}",
-                        redact_hashes(&format!("{err:#}"))
-                    );
+                tokio::select! {
+                    () = cancel.cancelled() => return,
+                    outcome = runtime.announce_on_connect() => if let Err(err) = outcome {
+                        warn!(
+                            "Failed to announce the mesh node over {label}; the heartbeat will announce it: {}",
+                            redact_hashes(&format!("{err:#}"))
+                        );
+                    }
                 }
                 slot.push_idle(IdleNotify {
                     source: Source::Mesh,
@@ -8765,6 +8781,78 @@ mod tests {
             ]
         );
         assert_eq!(plan_interfaces(&[]), Vec::<InterfacePlan>::new());
+    }
+
+    #[test]
+    fn lan_bind_failure_message_keeps_its_prefix_and_names_the_local_relay() {
+        let message = lan_bind_failure_message(&"boom");
+        assert_eq!(
+            message,
+            "Failed to bind the mesh lan interface: boom. Another process may hold the discovery port; remove the lan entry from mesh.interfaces or stop that process. Two Coyote sessions on one host need a local relay; see Mesh-Deployment."
+        );
+        assert!(message.starts_with("Failed to bind the mesh lan interface"));
+    }
+
+    #[test]
+    fn loopback_hint_names_the_endpoint() {
+        assert_eq!(
+            loopback_hint("127.0.0.1:4242"),
+            " Nothing is listening on 127.0.0.1:4242. The default configuration expects a local Reticulum daemon (rnsd) there — run scripts/mesh-relay.sh, or use type: lan to join the LAN without one; see Mesh-Deployment."
+        );
+    }
+
+    #[test]
+    fn interface_state_display_distinguishes_retrying_from_given_up() {
+        assert_eq!(InterfaceState::Connected.to_string(), "connected");
+        assert_eq!(
+            InterfaceState::Unreachable {
+                reason: "x".to_string(),
+                retrying: true,
+            }
+            .to_string(),
+            "unreachable, retrying: x"
+        );
+        assert_eq!(
+            InterfaceState::Unreachable {
+                reason: "x".to_string(),
+                retrying: false,
+            }
+            .to_string(),
+            "unreachable: x"
+        );
+    }
+
+    #[test]
+    fn is_loopback_covers_the_loopback_block_and_localhost() {
+        fn relay(endpoint: &str) -> InterfaceStatus {
+            InterfaceStatus {
+                label: format!("private {endpoint}"),
+                kind: "private",
+                endpoint: Some(endpoint.to_string()),
+                state: InterfaceState::Connected,
+            }
+        }
+
+        for endpoint in [
+            "127.0.0.1:4242",
+            "127.0.0.2:4242",
+            "[::1]:4242",
+            "LOCALHOST:4242",
+        ] {
+            assert!(relay(endpoint).is_loopback(), "{endpoint}");
+        }
+        for endpoint in ["10.0.0.1:4242", "relay.example:4965"] {
+            assert!(!relay(endpoint).is_loopback(), "{endpoint}");
+        }
+        assert!(
+            !InterfaceStatus {
+                label: "lan".to_string(),
+                kind: "lan",
+                endpoint: None,
+                state: InterfaceState::Connected,
+            }
+            .is_loopback()
+        );
     }
 
     #[tokio::test]
