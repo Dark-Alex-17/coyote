@@ -2081,8 +2081,9 @@ async fn sweep_peers(peers: Arc<PeerTable>, cancel: CancellationToken) {
 }
 
 /// Watches the TCP clients that were unreachable at start until each reports its first
-/// `connected`, recording it on the node, announcing over it and telling the user. Ends with
-/// the last one, or when the node or its slot is gone.
+/// `connected`, recording it on the node, telling the user and then announcing over it, so
+/// the line never waits on the announce. Ends with the last one, or when the node or its
+/// slot is gone.
 async fn poll_pending_interfaces(
     slot: Weak<MeshSlot>,
     runtime: Weak<MeshRuntime>,
@@ -2102,7 +2103,13 @@ async fn poll_pending_interfaces(
                 continue;
             }
             if let Some(label) = runtime.mark_interface_connected(index) {
-                debug!("Mesh interface {label} connected");
+                info!("Mesh interface {label} connected");
+                slot.push_idle(IdleNotify {
+                    source: Source::Mesh,
+                    text: format!("{label} connected"),
+                    origin: Origin::Local,
+                    model_note: None,
+                });
                 tokio::select! {
                     () = cancel.cancelled() => return,
                     outcome = runtime.announce_on_connect() => if let Err(err) = outcome {
@@ -2112,12 +2119,6 @@ async fn poll_pending_interfaces(
                         );
                     }
                 }
-                slot.push_idle(IdleNotify {
-                    source: Source::Mesh,
-                    text: format!("{label} connected"),
-                    origin: Origin::Local,
-                    model_note: None,
-                });
             }
         }
         if runtime.pending_interfaces().is_empty() {
@@ -9422,6 +9423,120 @@ mod tests {
         assert!(slot.stop().await.unwrap());
         relay_handle.abort();
         sink_handle.abort();
+    }
+
+    /// The only plan a relay on a loopback address other than `127.0.0.1`, refused: the
+    /// refusal still carries the local-daemon hint and names the endpoint as written,
+    /// because the whole 127/8 block is this machine.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_hint_covers_a_relay_anywhere_in_the_loopback_block() {
+        let closed = closed_port().await;
+        let tmp = TempDir::new("node-loopback-block-hint");
+        let mut session = Session::default();
+
+        let err = MeshRuntime::start(
+            &MeshConfig {
+                interfaces: vec![MeshInterface::Private {
+                    host: "127.0.0.2".to_string(),
+                    port: closed,
+                }],
+                ..MeshConfig::default()
+            },
+            true,
+            &mut session,
+            mesh_paths(&tmp),
+            short_connect(),
+        )
+        .await
+        .err()
+        .expect("a refused relay on 127.0.0.2 must be refused")
+        .to_string();
+
+        assert!(err.contains(&format!("127.0.0.2:{closed}")), "{err}");
+        assert!(err.contains("private"), "{err}");
+        assert!(
+            err.ends_with(&format!(
+                " Nothing is listening on 127.0.0.2:{closed}. The default configuration expects a local Reticulum daemon (rnsd) there — run scripts/mesh-relay.sh, or use type: lan to join the LAN without one; see Mesh-Deployment."
+            )),
+            "{err}"
+        );
+        assert!(
+            !err.contains("127.0.0.1"),
+            "the hint must name the endpoint as the operator wrote it: {err}"
+        );
+        let metrics = tokio::runtime::Handle::current().metrics();
+        wait_until("the transport's tasks to exit", || {
+            metrics.num_alive_tasks() == 0
+        })
+        .await;
+    }
+
+    /// A node that comes up degraded says so once in the log, at warn, per unreachable
+    /// interface and by its label — where `--tail-logs` shows it — and says nothing of the
+    /// interfaces that connected. The refused relay sits on `127.0.0.3`, a host no other
+    /// test dials, and only the lines appended during this start are read: the warn buffer
+    /// is process-global and ephemeral ports recur across the suite.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_a_degraded_start_warns_once_per_unreachable_interface_in_the_log() {
+        install_log_collector();
+        let (relay, relay_handle, _) = loopback_relay().await;
+        let closed = closed_port().await;
+        let refused_label = format!("private 127.0.0.3:{closed}");
+        let tmp = TempDir::new("node-degraded-warn");
+        let mut session = Session::default();
+        let before = warn_snapshot().len();
+        let runtime = MeshRuntime::start(
+            &MeshConfig {
+                interfaces: vec![
+                    MeshInterface::Private {
+                        host: "127.0.0.1".to_string(),
+                        port: relay.port(),
+                    },
+                    MeshInterface::Private {
+                        host: "127.0.0.3".to_string(),
+                        port: closed,
+                    },
+                ],
+                ..MeshConfig::default()
+            },
+            true,
+            &mut session,
+            mesh_paths(&tmp),
+            short_connect(),
+        )
+        .await
+        .unwrap();
+        let during: Vec<String> = warn_snapshot().into_iter().skip(before).collect();
+
+        let states = states_of(&runtime);
+        let InterfaceState::Unreachable { reason, .. } = &states[1].1 else {
+            panic!("{states:?}");
+        };
+        let about_refused: Vec<String> = during
+            .iter()
+            .filter(|line| line.contains(&refused_label))
+            .cloned()
+            .collect();
+        assert_eq!(
+            about_refused,
+            vec![format!(
+                "Mesh interface {refused_label} is unreachable and keeps reconnecting: {reason}"
+            )],
+            "{during:?}"
+        );
+        assert!(
+            !during
+                .iter()
+                .any(|line| line.contains(&private_label(relay.port()))),
+            "a connected interface is not warned about: {during:?}"
+        );
+        assert!(!about_refused[0].contains('\n'), "{about_refused:?}");
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime).unwrap();
+        assert!(slot.stop().await.unwrap());
+        relay_handle.abort();
     }
 
     #[cfg(unix)]

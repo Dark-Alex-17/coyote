@@ -8577,9 +8577,9 @@ mod tests {
             use crate::mesh::rfc3339_utc;
             use crate::mesh::test_support::{
                 FakeNode, PEER_TTL, PeerSighting, PeerStub, StartedRuntime, TempDir,
-                TransportRelay, closed_port, loopback_relay, mesh_paths, private_config,
-                snapshot_fixture, started_runtime, started_runtime_on, started_runtime_on_with,
-                started_runtime_with, status_round_trip, wait_until,
+                TransportRelay, closed_port, held_port, loopback_relay, mesh_paths, private_config,
+                serve_as_sink, snapshot_fixture, started_runtime, started_runtime_on,
+                started_runtime_on_with, started_runtime_with, status_round_trip, wait_until,
             };
             use crate::mesh::trust::{KeyChangeOutcome, LiveMesh, TrustOptions};
             use crate::testing::EnvVarGuard;
@@ -10844,6 +10844,180 @@ mod tests {
                     assert_eq!(prompt_script::prompts_asked(), 1);
 
                     run(&mut ctx, ".mesh off --yes").await.unwrap();
+                    relay_handle.abort();
+                });
+            }
+
+            /// The operator sees the whole story through the REPL: `.mesh on` warns about
+            /// the relay that refused, `.mesh info` lists it as retrying, and once something
+            /// listens there the idle line `<label> connected` arrives and the same row reads
+            /// `connected` — with no second `.mesh on` and no second WARNING.
+            #[test]
+            #[serial]
+            fn usage_probe_info_flips_the_retrying_row_to_connected_after_a_late_connect() {
+                let guard = TestConfigDirGuard::new("repl-mesh-info-late-connect");
+                let _cache = EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
+                let _script = prompt_script::install(&[true]);
+                let _capture = capture::install();
+                run_async(async {
+                    let (held, socket) = held_port().await;
+                    let (addr, relay_handle, _) = loopback_relay().await;
+                    let mut ctx = ctx_with(
+                        MeshConfig {
+                            interfaces: vec![
+                                MeshInterface::Private {
+                                    host: "127.0.0.1".to_string(),
+                                    port: addr.port(),
+                                },
+                                MeshInterface::Private {
+                                    host: "127.0.0.1".to_string(),
+                                    port: held,
+                                },
+                            ],
+                            ..MeshConfig::default()
+                        },
+                        true,
+                    );
+                    ctx.session = Some(Session::default());
+                    let idle = Arc::new(Recording::default());
+                    ctx.app.mesh.set_idle(idle.clone());
+                    let label = format!("private 127.0.0.1:{held}");
+
+                    run(&mut ctx, ".mesh on").await.unwrap();
+
+                    let runtime = ctx.app.mesh.get().unwrap();
+                    let reason = recorded_reason(&runtime, &label);
+                    assert_eq!(warnings(), vec![loopback_warning(held, &reason)]);
+                    let before = out_of(&mut ctx, ".mesh info").await.unwrap();
+                    assert_eq!(
+                        info_row(&before, "interfaces[1]"),
+                        format!("{label}  unreachable, retrying: {reason}"),
+                        "{before}"
+                    );
+                    assert!(
+                        idle.0.lock().is_empty(),
+                        "nothing connected yet: {:?}",
+                        idle.0.lock()
+                    );
+
+                    // Something starts listening on the held port.
+                    let listener = socket.listen(16).unwrap();
+                    let (sink_handle, _) = serve_as_sink(listener).await;
+                    wait_until("the idle line for the late connect", || {
+                        idle.0
+                            .lock()
+                            .iter()
+                            .any(|text| *text == format!("{label} connected"))
+                    })
+                    .await;
+
+                    let after = out_of(&mut ctx, ".mesh info").await.unwrap();
+                    assert_eq!(
+                        info_row(&after, "interfaces[0]"),
+                        format!("private 127.0.0.1:{}  connected", addr.port()),
+                        "{after}"
+                    );
+                    assert_eq!(
+                        info_row(&after, "interfaces[1]"),
+                        format!("{label}  connected"),
+                        "{after}"
+                    );
+                    assert!(!after.contains("unreachable"), "{after}");
+                    assert_eq!(
+                        runtime.interfaces(),
+                        vec![format!("private 127.0.0.1:{}", addr.port()), label.clone()],
+                        "the late interface now counts among the connected ones"
+                    );
+                    assert_eq!(
+                        idle.0
+                            .lock()
+                            .iter()
+                            .filter(|text| **text == format!("{label} connected"))
+                            .count(),
+                        1,
+                        "{:?}",
+                        idle.0.lock()
+                    );
+                    assert_eq!(
+                        warnings(),
+                        vec![loopback_warning(held, &reason)],
+                        "a connect is told on the idle channel, never as a second WARNING"
+                    );
+
+                    run(&mut ctx, ".mesh off --yes").await.unwrap();
+                    assert!(ctx.app.mesh.get().is_none());
+                    relay_handle.abort();
+                    sink_handle.abort();
+                });
+            }
+
+            /// A relay on `127.0.0.2` is this machine as much as `127.0.0.1` is: refused
+            /// beside a working relay it gets the local-daemon WARNING tail, and its
+            /// `.mesh info` row names the endpoint as the operator wrote it.
+            #[test]
+            #[serial]
+            fn usage_probe_mesh_on_warns_with_the_local_daemon_tail_for_any_loopback_address() {
+                let guard = TestConfigDirGuard::new("repl-mesh-on-partial-loopback-block");
+                let _cache = EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
+                let _script = prompt_script::install(&[true]);
+                let _capture = capture::install();
+                run_async(async {
+                    let closed = closed_port().await;
+                    let (addr, relay_handle, _) = loopback_relay().await;
+                    let mut ctx = ctx_with(
+                        MeshConfig {
+                            interfaces: vec![
+                                MeshInterface::Private {
+                                    host: "127.0.0.2".to_string(),
+                                    port: closed,
+                                },
+                                MeshInterface::Private {
+                                    host: "127.0.0.1".to_string(),
+                                    port: addr.port(),
+                                },
+                            ],
+                            ..MeshConfig::default()
+                        },
+                        true,
+                    );
+                    ctx.session = Some(Session::default());
+                    let label = format!("private 127.0.0.2:{closed}");
+
+                    run(&mut ctx, ".mesh on").await.unwrap();
+
+                    assert!(ctx.app.mesh.get().is_some());
+                    let runtime = ctx.app.mesh.get().unwrap();
+                    let reason = recorded_reason(&runtime, &label);
+                    assert_eq!(
+                        warnings(),
+                        vec![format!(
+                            "WARNING: {label} is unreachable ({reason}); sessions on this machine cannot reach each other until a local Reticulum daemon (rnsd) is listening there."
+                        )],
+                        "{:?}",
+                        stderr_lines()
+                    );
+                    let out = stdout_lines();
+                    let summary = &out[index_of(&out, "Mesh is on for this session")];
+                    assert!(
+                        summary
+                            .contains(&format!("  interfaces: private 127.0.0.1:{}", addr.port())),
+                        "{summary}"
+                    );
+                    assert!(!summary.contains("127.0.0.2"), "{summary}");
+                    let info = out_of(&mut ctx, ".mesh info").await.unwrap();
+                    assert_eq!(
+                        info_row(&info, "interfaces[0]"),
+                        format!("{label}  unreachable, retrying: {reason}"),
+                        "{info}"
+                    );
+                    assert_eq!(
+                        info_row(&info, "interfaces[1]"),
+                        format!("private 127.0.0.1:{}  connected", addr.port()),
+                        "{info}"
+                    );
+
+                    run(&mut ctx, ".mesh off --yes").await.unwrap();
+                    assert!(ctx.app.mesh.get().is_none());
                     relay_handle.abort();
                 });
             }
