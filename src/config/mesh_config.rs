@@ -501,6 +501,13 @@ impl From<MeshInterface> for RawMeshInterface {
 
 /// The `mesh:` section of `.info`, one row per setting. The digest prompt body is never printed.
 pub fn render_mesh_info(mesh: &MeshConfig) -> String {
+    render_mesh_settings(mesh, true)
+}
+
+/// `render_mesh_info` with the configured `interfaces[i]` rows optional: `.mesh info` leaves
+/// them out while a node is on, since the node's own rows then list every interface under
+/// the same names with its state.
+pub fn render_mesh_settings(mesh: &MeshConfig, with_interfaces: bool) -> String {
     let digest_prompt = if mesh.digest_prompt() == MESH_DIGEST_PROMPT {
         "default"
     } else {
@@ -521,8 +528,10 @@ pub fn render_mesh_info(mesh: &MeshConfig) -> String {
         mesh.display_name_on_public.to_string(),
     );
     row("about", super::format_option_value(&mesh.about));
-    for (i, interface) in mesh.interfaces.iter().enumerate() {
-        row(&format!("interfaces[{i}]"), interface.to_string());
+    if with_interfaces {
+        for (i, interface) in mesh.interfaces.iter().enumerate() {
+            row(&format!("interfaces[{i}]"), interface.to_string());
+        }
     }
     row("brief", mesh.brief.to_string());
     row("digest_prompt", digest_prompt.to_string());

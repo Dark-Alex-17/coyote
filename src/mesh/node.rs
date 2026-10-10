@@ -9539,6 +9539,152 @@ mod tests {
         relay_handle.abort();
     }
 
+    /// The user is told of a late connect before the node announces over it, so the line
+    /// never waits on the announce. The announce takes the destination lock first; the test
+    /// holds that lock while the held port starts listening, which stalls the announce for
+    /// as long as the test likes — the line, the state flip and the single info log line
+    /// must all land regardless. Released, the announce completes and the node stops clean.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_the_connected_line_does_not_wait_on_the_announce() {
+        install_log_collector();
+        let (held, socket) = held_port().await;
+        let (relay, relay_handle, _) = loopback_relay().await;
+        let held_label = private_label(held);
+        let tmp = TempDir::new("node-line-before-announce");
+        let mut session = Session::default();
+        let runtime = MeshRuntime::start(
+            &private_relays(&[relay.port(), held]),
+            true,
+            &mut session,
+            mesh_paths(&tmp),
+            short_connect(),
+        )
+        .await
+        .unwrap();
+        assert!(is_retrying(&states_of(&runtime)[1].1));
+        let slot = Arc::new(MeshSlot::default());
+        let notifier = Arc::new(RecordingSink::default());
+        slot.set_notifier(Arc::clone(&notifier) as Arc<dyn NotificationSink>);
+        slot.install(runtime.clone()).unwrap();
+        let info_before = crate::testing::info_snapshot().len();
+        let warn_before = warn_snapshot().len();
+
+        let busy_destination = runtime.destination.lock().await;
+        let listener = socket.listen(16).unwrap();
+        let (sink_handle, _) = serve_as_sink(listener).await;
+        wait_for_mesh_line(&notifier, &format!("{held_label} connected")).await;
+
+        assert_eq!(
+            states_of(&runtime)[1],
+            (held_label.clone(), InterfaceState::Connected),
+            "the state flips before the user is told"
+        );
+        assert!(runtime.pending_interfaces().is_empty());
+        let about_held: Vec<String> = crate::testing::info_snapshot()
+            .into_iter()
+            .skip(info_before)
+            .filter(|line| line.contains(&held_label))
+            .collect();
+        assert_eq!(
+            about_held,
+            vec![format!("Mesh interface {held_label} connected")],
+            "the connect is logged once, at info"
+        );
+        let expected_line =
+            Notification::new(Source::Mesh, format!("{held_label} connected")).render();
+        let lines_told = notifier
+            .0
+            .lock()
+            .iter()
+            .filter(|line| **line == expected_line)
+            .count();
+        assert_eq!(lines_told, 1, "{:?}", notifier.0.lock());
+        assert!(
+            !warn_snapshot()
+                .into_iter()
+                .skip(warn_before)
+                .any(|line| line.contains("announce")),
+            "a stalled announce is not a failed one"
+        );
+        drop(busy_destination);
+
+        assert!(slot.stop().await.unwrap());
+        relay_handle.abort();
+        sink_handle.abort();
+        let metrics = tokio::runtime::Handle::current().metrics();
+        wait_until("the node's tasks to exit", || {
+            metrics.num_alive_tasks() == 0
+        })
+        .await;
+    }
+
+    /// `.mesh off` while the connect announce is still in flight: the poller yields to the
+    /// stop at once rather than being aborted after the grace window, so the stop reports
+    /// no task it had to kill. The announce is stalled the same way — the destination lock
+    /// held by the test — and released only once the stop has waited longer than the grace
+    /// window, which is when a poller that did not yield would have been aborted.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_stop_during_the_connect_announce_aborts_no_task() {
+        install_log_collector();
+        let (held, socket) = held_port().await;
+        let (relay, relay_handle, _) = loopback_relay().await;
+        let held_label = private_label(held);
+        let tmp = TempDir::new("node-stop-mid-announce");
+        let mut session = Session::default();
+        let runtime = MeshRuntime::start(
+            &private_relays(&[relay.port(), held]),
+            true,
+            &mut session,
+            mesh_paths(&tmp),
+            short_connect(),
+        )
+        .await
+        .unwrap();
+        let slot = Arc::new(MeshSlot::default());
+        let notifier = Arc::new(RecordingSink::default());
+        slot.set_notifier(Arc::clone(&notifier) as Arc<dyn NotificationSink>);
+        slot.install(runtime.clone()).unwrap();
+        let warn_before = warn_snapshot().len();
+
+        let busy_destination = runtime.destination.lock().await;
+        let listener = socket.listen(16).unwrap();
+        let (sink_handle, _) = serve_as_sink(listener).await;
+        wait_for_mesh_line(&notifier, &format!("{held_label} connected")).await;
+
+        let stopping = tokio::spawn({
+            let slot = Arc::clone(&slot);
+            async move { slot.stop().await }
+        });
+        // The stop cannot finish while the destination is busy; hold it past the grace
+        // window so a poller still inside its announce would have been aborted by now.
+        sleep(SHUTDOWN_GRACE + Duration::from_secs(1)).await;
+        assert!(!stopping.is_finished(), "stop needs the destination");
+        drop(busy_destination);
+        let stopped = tokio::time::timeout(SHUTDOWN_GRACE, stopping)
+            .await
+            .expect("stop must not wait out the grace window once the destination is free")
+            .unwrap()
+            .unwrap();
+        assert!(stopped);
+
+        let during: Vec<String> = warn_snapshot().into_iter().skip(warn_before).collect();
+        assert!(
+            !during
+                .iter()
+                .any(|line| line.contains("did not stop within")),
+            "{during:?}"
+        );
+        relay_handle.abort();
+        sink_handle.abort();
+        let metrics = tokio::runtime::Handle::current().metrics();
+        wait_until("the node's tasks to exit", || {
+            metrics.num_alive_tasks() == 0
+        })
+        .await;
+    }
+
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn start_joins_only_the_configured_relay() {

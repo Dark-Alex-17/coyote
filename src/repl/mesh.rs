@@ -1,5 +1,5 @@
 use crate::config::mesh_config::{
-    MESH_INFO_LABEL_WIDTH, MeshBrief, MeshInterface, render_mesh_info,
+    MESH_INFO_LABEL_WIDTH, MeshBrief, MeshInterface, render_mesh_settings,
 };
 use crate::config::{MeshConfig, RequestContext, paths};
 use crate::function::mesh::trust_label;
@@ -456,13 +456,16 @@ fn knocks(ctx: &RequestContext) -> Result<()> {
 
 fn info(ctx: &RequestContext, rest: Option<&str>) -> Result<()> {
     let Some(rest) = rest else {
-        let mut text = render_mesh_info(&ctx.app.config.mesh);
+        let node = ctx.app.mesh.get();
+        // A running node lists every interface itself, with its state, under the same
+        // row names the settings would use.
+        let mut text = render_mesh_settings(&ctx.app.config.mesh, node.is_none());
         text.push_str(&format!(
             "  {:<MESH_INFO_LABEL_WIDTH$}{}\n",
             "reach",
             reach_line(&ctx.app.config.mesh)
         ));
-        match ctx.app.mesh.get() {
+        match node {
             Some(runtime) => {
                 let predecessors = identity::predecessors(&MeshPaths::from_env().identity_path);
                 text.push_str(&render_node_facts(
@@ -9093,9 +9096,20 @@ mod tests {
                         runtime.current_destination_hash(),
                         "{out}"
                     );
-                    for (i, status) in runtime.interface_states().iter().enumerate() {
+                    let states = runtime.interface_states();
+                    assert!(!states.is_empty());
+                    for (i, status) in states.iter().enumerate() {
+                        let head =
+                            format!("  {:<MESH_INFO_LABEL_WIDTH$}", format!("interfaces[{i}]"));
+                        // The node's row is the only one of that name: the settings'
+                        // `interfaces[i]` rows are left out while the node is on.
                         assert_eq!(
-                            info_row(&out, &format!("interfaces[{i}]")),
+                            out.lines().filter(|line| line.starts_with(&head)).count(),
+                            1,
+                            "{out}"
+                        );
+                        assert_eq!(
+                            row(&format!("interfaces[{i}]")),
                             format!("{}  {}", status.label, status.state),
                             "{out}"
                         );
