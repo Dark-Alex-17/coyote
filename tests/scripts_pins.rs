@@ -213,6 +213,92 @@ fn the_windows_script_carries_the_scheduled_task_and_readiness_contract() {
     );
 }
 
+/// The install ladder of the Windows script: present → uv → pipx → `py -3` → `python`,
+/// each python probed against the 3.9 floor, exit 2 when every rung is missing; and the
+/// venv lands under COYOTE_CONFIG_DIR, else XDG_CONFIG_HOME, else %APPDATA%\coyote. CI
+/// strips uv and pipx to reach `py -3`; the `python` rung and the exit 2 behind it are
+/// held here by position.
+#[test]
+fn the_windows_script_tries_py_3_before_python_enforces_the_3_9_floor_and_falls_back_to_appdata() {
+    let ps1 = read(scripts_dir().join("mesh-relay.ps1"));
+    let index_of = |token: &str, why: &str| {
+        ps1.find(token)
+            .unwrap_or_else(|| panic!("mesh-relay.ps1 lacks {token:?}: {why}"))
+    };
+
+    let uv = index_of(
+        "Get-Command uv -CommandType Application",
+        "uv is the first install rung after an existing rnsd",
+    );
+    let pipx = index_of(
+        "Get-Command pipx -CommandType Application",
+        "pipx is the rung after uv",
+    );
+    let py = index_of(
+        "Test-PythonOk -File 'py' -Prefix @('-3')",
+        "the py launcher is asked for a Python 3 explicitly",
+    );
+    let python = index_of(
+        "Test-PythonOk -File 'python' -Prefix @()",
+        "a bare python on PATH is the last rung",
+    );
+    assert!(
+        uv < pipx,
+        "uv must be probed before pipx: the ladder is uv → pipx → py -3 → python"
+    );
+    assert!(
+        pipx < py,
+        "pipx must be probed before `py -3`: a venv is the rung of last resort"
+    );
+    assert!(
+        py < python,
+        "`py -3` must be tried before `python`: on Windows `python` may be the Store alias or a Python 2"
+    );
+
+    assert!(
+        ps1.contains("sys.exit(0 if sys.version_info >= (3, 9) else 1)"),
+        "mesh-relay.ps1 must probe each python against the 3.9 floor before building the venv"
+    );
+    let failure = index_of(
+        "no way to install rnsd",
+        "every missing rung must be reported as one failure",
+    );
+    let next_exit = ps1[failure..]
+        .lines()
+        .map(str::trim_start)
+        .find(|line| line.starts_with("exit "))
+        .expect("mesh-relay.ps1 exits after the `no way to install rnsd` failure");
+    assert_eq!(
+        next_exit, "exit 2",
+        "the `no way to install rnsd` failure must be exit 2, the documented missing-prerequisite code"
+    );
+
+    let coyote_config_dir = index_of(
+        "$env:COYOTE_CONFIG_DIR",
+        "an explicit COYOTE_CONFIG_DIR must win",
+    );
+    let xdg = index_of(
+        "Join-Path $env:XDG_CONFIG_HOME 'coyote'",
+        "XDG_CONFIG_HOME is honoured when set, as the bash twin does",
+    );
+    let appdata = index_of(
+        "Join-Path $env:APPDATA 'coyote'",
+        "with neither variable the config dir is %APPDATA%\\coyote",
+    );
+    let venv = index_of(
+        "Join-Path $coyoteConfig 'mesh\\rns-venv'",
+        "the venv lives under the resolved config dir",
+    );
+    assert!(
+        coyote_config_dir < xdg && xdg < appdata,
+        "the config dir precedence must be COYOTE_CONFIG_DIR → XDG_CONFIG_HOME → APPDATA"
+    );
+    assert!(
+        appdata < venv,
+        "the venv path must be derived from the config dir after it is resolved"
+    );
+}
+
 /// launchd has no `daemon-reload`: a loaded agent only picks up a rewritten plist after
 /// `bootout` + `bootstrap`, so the script says so in its Note and prints that pair,
 /// never running it against a loaded agent.
@@ -461,18 +547,55 @@ fn usage_probe_the_ci_scripts_job_lints_and_smokes_the_relay_on_every_runner_fam
         "a non-default version must land in the dry-run plan on both shells"
     );
     // GitHub's pwsh wrapper ends a step with `exit $LASTEXITCODE`, and the pwsh smoke
-    // step's last relay call is the expected refusal; both Windows steps end with exit 0.
+    // step's last relay call is the expected refusal; every Windows step ends with exit 0.
     for name in [
         "Mesh Relay Smoke (Windows)",
+        "Mesh Relay Venv Plan Under The Roaming Profile (Windows)",
         "Mesh Relay Under Windows PowerShell 5.1",
     ] {
         let step = job
             .split("    - name: ")
             .find(|step| step.starts_with(name))
             .unwrap_or_else(|| panic!("ci.yaml has a `{name}` step"));
-        assert!(
-            step.trim_end().ends_with("\n        exit 0"),
+        // The slice runs up to the next `- name:`, so it carries that step's leading comment.
+        let last_code_line = step
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'));
+        assert_eq!(
+            last_code_line,
+            Some("        exit 0"),
             "the `{name}` step must end with `exit 0` so a relay's last exit code cannot fail it:\n{step}"
+        );
+    }
+
+    // The venv fallback is proven on a PATH without uv or pipx and with neither config
+    // variable set, under a profile the smoke step has not already installed into.
+    for (needle, why) in [
+        (
+            "Remove-Item Env:COYOTE_CONFIG_DIR, Env:XDG_CONFIG_HOME",
+            "the venv plan must be made with both config variables unset so APPDATA is the one left",
+        ),
+        (
+            "APPDATA: ${{ runner.temp }}\\mesh-venv-home\\AppData\\Roaming",
+            "APPDATA must be a throwaway under its own profile, not the smoke step's (that one already holds a working rnsd.cmd)",
+        ),
+        (
+            "Join-Path $_ 'uv.exe')) -and -not (Test-Path (Join-Path $_ 'pipx.exe'))",
+            "every PATH entry holding uv or pipx must be stripped so the venv rung is reached",
+        ),
+        (
+            "Install: py -3 -m venv",
+            "the plan must pick `py -3`, the rung before `python`",
+        ),
+        (
+            "\\\\AppData\\\\Roaming\\\\coyote\\\\mesh\\\\rns-venv",
+            "the plan must place the venv under %APPDATA%\\coyote\\mesh\\rns-venv",
+        ),
+    ] {
+        assert!(
+            job.contains(needle),
+            "the Roaming-profile venv step lacks {needle:?}: {why}"
         );
     }
 

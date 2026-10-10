@@ -446,6 +446,39 @@ jobs:
         # The runner's pwsh wrapper exits with the last native exit code, which the refusal just set to 1.
         exit 0
 
+    # With no COYOTE_CONFIG_DIR / XDG_CONFIG_HOME and neither uv nor pipx on PATH the
+    # venv rung plans under the Roaming profile, and `py -3` is tried before `python`.
+    # A fresh profile, not the smoke step's: that one already holds a working rnsd.cmd,
+    # which would win as the `present` rung. APPDATA is a throwaway so even a bug could
+    # not write into the runner's profile.
+    - name: Mesh Relay Venv Plan Under The Roaming Profile (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      env:
+        USERPROFILE: ${{ runner.temp }}\mesh-venv-home
+        APPDATA: ${{ runner.temp }}\mesh-venv-home\AppData\Roaming
+        BIN_DIR: ${{ runner.temp }}\mesh-venv-home\bin
+      run: |
+        $ErrorActionPreference = 'Stop'
+        Remove-Item Env:COYOTE_CONFIG_DIR, Env:XDG_CONFIG_HOME -ErrorAction SilentlyContinue
+        $env:Path = (($env:Path -split ';') | Where-Object {
+          $_ -and -not (Test-Path (Join-Path $_ 'uv.exe')) -and -not (Test-Path (Join-Path $_ 'pipx.exe')) -and -not (Test-Path (Join-Path $_ 'pipx.cmd'))
+        }) -join ';'
+        $left = @(Get-Command uv, pipx -CommandType Application -ErrorAction SilentlyContinue)
+        if ($left.Count -gt 0) { throw "uv/pipx still on PATH: $($left.Source -join ', ')" }
+        if (-not (Get-Command py -CommandType Application -ErrorAction SilentlyContinue)) { throw 'the runner has no py launcher; the rung-order check needs one' }
+        New-Item -ItemType Directory -Force -Path $env:USERPROFILE | Out-Null
+        $plan = @(& pwsh -NoProfile -File scripts/mesh-relay.ps1 -NoService -DryRun -AllowRoot)
+        if ($LASTEXITCODE -ne 0) { $plan | Write-Output; throw "expected exit 0, got $LASTEXITCODE" }
+        $text = $plan -join "`n"
+        $text | Write-Output
+        $venv = Join-Path $env:APPDATA 'coyote\mesh\rns-venv'
+        if ($text -notmatch [regex]::Escape("Install: py -3 -m venv `"$venv`"")) { throw "the plan does not pick py -3 with the venv under $venv" }
+        if ($text -notmatch '\\AppData\\Roaming\\coyote\\mesh\\rns-venv') { throw 'the plan does not place the venv under the Roaming profile' }
+        if (Test-Path $env:APPDATA) { throw 'the dry run created something under APPDATA' }
+        if (Test-Path (Join-Path $env:USERPROFILE '.reticulum')) { throw 'the dry run created .reticulum' }
+        exit 0
+
     - name: Mesh Relay Under Windows PowerShell 5.1
       if: runner.os == 'Windows'
       shell: powershell
