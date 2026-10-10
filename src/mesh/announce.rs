@@ -12,8 +12,8 @@ pub(crate) const MAX_DISPLAY_NAME_BYTES: usize = 64;
 /// `HEARTBEAT_SECS` apart, and a manual announce is never sent sooner than this after the
 /// previous one. A newly registered destination, at start or after a re-key, announces at
 /// once, and a pending interface's first connect announces once; the transport sends on every
-/// interface, so a relay that already heard the start announce sees the repeat and dedups it
-/// by announce hash.
+/// interface, so a relay that already heard the start announce hears a fresh announce for a
+/// path it already holds and forwards it like any other; nothing dedups it.
 pub(crate) const REANNOUNCE_FLOOR_SECS: u64 = 300;
 /// How often a running node re-announces so peers can tell it is still there.
 pub(crate) const HEARTBEAT_SECS: u64 = 900;
