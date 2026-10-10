@@ -51,7 +51,9 @@
 //! `/status` request returns the other's card with its display name and published state.
 //! Every byte of that crosses the relay. A second test starts two `lan` nodes in one
 //! namespace and asserts the second refuses to bind with the message the product prints,
-//! without touching the host's discovery port.
+//! without touching the host's discovery port; the same child then starts a node on
+//! `lan` plus a loopback relay and asserts it comes up with `lan` reported unreachable
+//! and the relay connected.
 
 use super::interop::{interop_enabled, off_switch_skip_line, require_reference};
 use crate::config::Session;
@@ -60,7 +62,8 @@ use crate::mesh::card::STATE_IDLE;
 use crate::mesh::node::{MeshRuntime, MeshSlot, NodeOptions};
 use crate::mesh::protocol::MESH_PROTOCOL_VERSION;
 use crate::mesh::test_support::{
-    TempDir, TrustList, disable_ingress_control, mesh_paths, snapshot_fixture, started_runtime,
+    TempDir, TrustList, disable_ingress_control, loopback_relay, mesh_paths, snapshot_fixture,
+    started_runtime,
 };
 use crate::mesh::trust::TrustOptions;
 
@@ -726,6 +729,35 @@ async fn two_lan_nodes_in_one_namespace_cannot_both_bind() {
         "{refusal}"
     );
     assert!(
+        refusal
+            .ends_with("Two Coyote sessions on one host need a local relay; see Mesh-Deployment."),
+        "{refusal}"
+    );
+    let interfaces = reply["interfaces"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{reply}"));
+    assert_eq!(interfaces.len(), 2, "{reply}");
+    assert_eq!(interfaces[0]["label"], "lan", "{reply}");
+    let lan_state = interfaces[0]["state"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{reply}"));
+    let lan_reason = lan_state
+        .strip_prefix("unreachable: ")
+        .unwrap_or_else(|| panic!("lan is not reported as given up: {reply}"));
+    assert!(
+        refusal.contains(lan_reason),
+        "the lan state does not carry the bind error the refusal names: {reply}"
+    );
+    let sink_port = reply["sink_port"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("{reply}"));
+    assert_eq!(
+        interfaces[1]["label"],
+        format!("private 127.0.0.1:{sink_port}"),
+        "{reply}"
+    );
+    assert_eq!(interfaces[1]["state"], "connected", "{reply}");
+    assert!(
         child.exited_within(EXIT_GRACE * 2),
         "the child did not exit"
     );
@@ -1094,7 +1126,9 @@ async fn connect(addr: &str) -> Result<Value, String> {
     })
 }
 
-/// `lan-collision` mode: the second `lan` node in one namespace must refuse to bind.
+/// `lan-collision` mode: the second `lan` node in one namespace must refuse to bind, and
+/// a third on `lan` plus a loopback relay must come up with `lan` reported unreachable
+/// and the relay connected. Both go out in one `OK`.
 async fn lan_collision() {
     let config = MeshConfig {
         interfaces: vec![MeshInterface::Lan],
@@ -1124,7 +1158,7 @@ async fn lan_collision() {
     first_slot.install(first).unwrap();
     let second_tmp = TempDir::new("netns-lan-second");
     let mut second_session = Session::default();
-    match MeshRuntime::start(
+    let refusal = match MeshRuntime::start(
         &config,
         true,
         &mut second_session,
@@ -1141,9 +1175,56 @@ async fn lan_collision() {
                 "ERR",
                 json!({ "error": "the second lan node started alongside the first" }),
             );
+            assert!(first_slot.stop().await.unwrap());
+            return;
         }
-        Err(err) => emit("OK", json!({ "refusal": format!("{err:#}") })),
+        Err(err) => format!("{err:#}"),
+    };
+    let (sink_addr, sink_handle, _) = loopback_relay().await;
+    let partial_tmp = TempDir::new("netns-lan-partial");
+    let mut partial_session = Session::default();
+    match MeshRuntime::start(
+        &MeshConfig {
+            interfaces: vec![
+                MeshInterface::Lan,
+                MeshInterface::Private {
+                    host: "127.0.0.1".to_string(),
+                    port: sink_addr.port(),
+                },
+            ],
+            ..MeshConfig::default()
+        },
+        true,
+        &mut partial_session,
+        mesh_paths(&partial_tmp),
+        NodeOptions::default(),
+    )
+    .await
+    {
+        Ok(partial) => {
+            let interfaces: Vec<Value> = partial
+                .interface_states()
+                .iter()
+                .map(|status| json!({ "label": status.label, "state": status.state.to_string() }))
+                .collect();
+            let partial_slot = Arc::new(MeshSlot::default());
+            partial_slot.install(partial).unwrap();
+            emit(
+                "OK",
+                json!({
+                    "refusal": refusal,
+                    "sink_port": sink_addr.port(),
+                    "interfaces": interfaces,
+                }),
+            );
+            assert!(partial_slot.stop().await.unwrap());
+        }
+        Err(err) => emit(
+            "ERR",
+            json!({ "error": format!("the lan+relay node did not start alongside the first: {err:#}") }),
+        ),
     }
+    sink_handle.abort();
     assert!(first_slot.stop().await.unwrap());
 }
 

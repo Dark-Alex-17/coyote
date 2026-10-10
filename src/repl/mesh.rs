@@ -34,10 +34,10 @@ use crate::mesh::trust::{
 };
 use crate::mesh::wire_path::{WIRE_PATH_MAX_BYTES, WirePath};
 use crate::mesh::{
-    FetchError, FetchReport, LoggingInboundSink, MAX_WANTS_PER_FETCH, MESH_ALREADY_ON, MeshPaths,
-    MeshRuntime, NodeOptions, PeerRecord, PropagationNodeRecord, age_text, canonical_hash,
-    canonicalize, decode_hex, destination_address, display_text, hex_lower, human_size,
-    parse_rfc3339, redact_hashes, refuse_symlink, rfc3339_utc, short,
+    FetchError, FetchReport, InterfaceState, LoggingInboundSink, MAX_WANTS_PER_FETCH,
+    MESH_ALREADY_ON, MeshPaths, MeshRuntime, NodeOptions, PeerRecord, PropagationNodeRecord,
+    age_text, canonical_hash, canonicalize, decode_hex, destination_address, display_text,
+    hex_lower, human_size, parse_rfc3339, redact_hashes, refuse_symlink, rfc3339_utc, short,
 };
 use crate::supervisor::mailbox::EnvelopePayload;
 use crate::utils::{AbortSignal, drain_stale_tty_input, wait_user_interrupt};
@@ -352,6 +352,9 @@ async fn join(ctx: &mut RequestContext, options: JoinOptions) -> Result<()> {
     let app = Arc::clone(&ctx.app.config);
     ctx.refresh_mesh_tools(&app);
     out_text(&render_on_summary(&runtime, fresh));
+    for warning in interface_warnings(&runtime) {
+        err_text(&warning);
+    }
     Ok(())
 }
 
@@ -4860,6 +4863,34 @@ fn render_on_summary(runtime: &MeshRuntime, fresh: bool) -> String {
     )
 }
 
+/// One line per interface the node came up without, in config order; `.mesh on` and
+/// autostart print them on stderr after the summary, `MeshRuntime::start` never does.
+fn interface_warnings(runtime: &MeshRuntime) -> Vec<String> {
+    runtime
+        .interface_states()
+        .into_iter()
+        .filter_map(|status| {
+            let InterfaceState::Unreachable { reason, .. } = &status.state else {
+                return None;
+            };
+            let label = &status.label;
+            Some(if status.is_loopback() {
+                format!(
+                    "WARNING: {label} is unreachable ({reason}); sessions on this machine cannot reach each other until a local Reticulum daemon (rnsd) is listening there."
+                )
+            } else if status.kind == "lan" {
+                format!(
+                    "WARNING: lan is unreachable ({reason}); peers on this link-local segment are out of reach."
+                )
+            } else {
+                format!(
+                    "WARNING: {label} is unreachable ({reason}); peers behind that relay are out of reach."
+                )
+            })
+        })
+        .collect()
+}
+
 fn name_label(name: Option<&str>) -> String {
     name.and_then(|name| display_text(name, DISPLAY_NAME_MAX_CHARS))
         .unwrap_or_else(|| "(no name)".to_string())
@@ -5116,7 +5147,12 @@ fn render_node_facts(
     );
     row("destination", runtime.current_destination_hash());
     row("instance", runtime.current_instance_id());
-    row("joined", runtime.interfaces().join(", "));
+    for (i, status) in runtime.interface_states().iter().enumerate() {
+        row(
+            &format!("interfaces[{i}]"),
+            format!("{}  {}", status.label, status.state),
+        );
+    }
     let key_changes = runtime
         .trust()
         .records()
@@ -8424,6 +8460,7 @@ mod tests {
         #[cfg(unix)]
         mod with_a_node {
             use super::*;
+            use crate::mesh::MeshSlot;
             use crate::mesh::brief::Digest;
             use crate::mesh::envoy::{EnvoyJob, EnvoySink};
             use crate::mesh::grants::GrantRecord;
@@ -8437,8 +8474,9 @@ mod tests {
             use crate::mesh::rfc3339_utc;
             use crate::mesh::test_support::{
                 FakeNode, PEER_TTL, PeerSighting, PeerStub, StartedRuntime, TempDir,
-                loopback_relay, private_config, snapshot_fixture, started_runtime,
-                started_runtime_on, started_runtime_on_with, started_runtime_with, wait_until,
+                TransportRelay, closed_port, loopback_relay, mesh_paths, private_config,
+                snapshot_fixture, started_runtime, started_runtime_on, started_runtime_on_with,
+                started_runtime_with, status_round_trip, wait_until,
             };
             use crate::mesh::trust::{KeyChangeOutcome, LiveMesh, TrustOptions};
             use crate::testing::EnvVarGuard;
@@ -8952,15 +8990,76 @@ mod tests {
                         runtime.current_destination_hash(),
                         "{out}"
                     );
-                    let joined = row("joined");
-                    for interface in runtime.interfaces() {
-                        assert!(joined.contains(&interface), "{interface} missing: {out}");
+                    for (i, status) in runtime.interface_states().iter().enumerate() {
+                        assert_eq!(
+                            info_row(&out, &format!("interfaces[{i}]")),
+                            format!("{}  {}", status.label, status.state),
+                            "{out}"
+                        );
                     }
+                    assert!(!out.contains("  joined"), "{out}");
                     assert_eq!(row("reach"), reach_line(&ctx.app.config.mesh), "{out}");
                     assert!(out.contains("selection: nearest by hops"), "{out}");
 
                     assert!(ctx.app.mesh.stop().await.unwrap());
                     started.relay_handle.abort();
+                });
+            }
+
+            #[test]
+            #[serial]
+            fn info_lists_an_unreachable_interface_as_retrying() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-info-retrying");
+                let _capture = capture::install();
+                run_async(async {
+                    let (addr, relay_handle, _) = loopback_relay().await;
+                    let closed = closed_port().await;
+                    let tmp = TempDir::new("repl-mesh-info-retrying");
+                    let mut session = Session::default();
+                    let runtime = MeshRuntime::start(
+                        &MeshConfig {
+                            interfaces: vec![
+                                MeshInterface::Private {
+                                    host: "127.0.0.1".to_string(),
+                                    port: addr.port(),
+                                },
+                                MeshInterface::Private {
+                                    host: "127.0.0.1".to_string(),
+                                    port: closed,
+                                },
+                            ],
+                            ..MeshConfig::default()
+                        },
+                        true,
+                        &mut session,
+                        mesh_paths(&tmp),
+                        NodeOptions {
+                            connect_timeout: Duration::from_millis(300),
+                            ..NodeOptions::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    let mut ctx = ctx_with(MeshConfig::default(), true);
+                    ctx.app.mesh.install(runtime).unwrap();
+
+                    let out = out_of(&mut ctx, ".mesh info").await.unwrap();
+
+                    assert_eq!(
+                        info_row(&out, "interfaces[0]"),
+                        format!("private 127.0.0.1:{}  connected", addr.port()),
+                        "{out}"
+                    );
+                    assert_eq!(
+                        info_row(&out, "interfaces[1]"),
+                        format!(
+                            "private 127.0.0.1:{closed}  unreachable, retrying: tcp connect failed endpoint=127.0.0.1:{closed}"
+                        ),
+                        "{out}"
+                    );
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    relay_handle.abort();
                 });
             }
 
@@ -10315,6 +10414,140 @@ mod tests {
                     let preview = index_of(&out, "What leaves this machine");
                     let summary = index_of(&out, "Mesh is on for this session");
                     assert!(preview < summary, "{out:?}");
+
+                    run(&mut ctx, ".mesh off --yes").await.unwrap();
+                    assert!(ctx.app.mesh.get().is_none());
+                    relay_handle.abort();
+                });
+            }
+
+            fn loopback_warning(port: u16) -> String {
+                format!(
+                    "WARNING: private 127.0.0.1:{port} is unreachable (tcp connect failed endpoint=127.0.0.1:{port}); sessions on this machine cannot reach each other until a local Reticulum daemon (rnsd) is listening there."
+                )
+            }
+
+            fn warnings() -> Vec<String> {
+                stderr_lines()
+                    .into_iter()
+                    .filter(|line| line.starts_with("WARNING:"))
+                    .collect()
+            }
+
+            #[test]
+            #[serial]
+            fn mesh_on_prints_one_warning_per_unreachable_interface_and_the_node_serves() {
+                let guard = TestConfigDirGuard::new("repl-mesh-on-partial");
+                let _cache = EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
+                let _script = prompt_script::install(&[true]);
+                let _capture = capture::install();
+                run_async(async {
+                    let closed = closed_port().await;
+                    let relay = TransportRelay::start().await;
+                    let mut ctx = ctx_with(
+                        MeshConfig {
+                            interfaces: vec![
+                                MeshInterface::Private {
+                                    host: "127.0.0.1".to_string(),
+                                    port: closed,
+                                },
+                                MeshInterface::Private {
+                                    host: "127.0.0.1".to_string(),
+                                    port: relay.port,
+                                },
+                            ],
+                            ..MeshConfig::default()
+                        },
+                        true,
+                    );
+                    ctx.session = Some(Session::default());
+
+                    run(&mut ctx, ".mesh on").await.unwrap();
+
+                    assert!(ctx.app.mesh.get().is_some());
+                    let out = stdout_lines();
+                    let summary = &out[index_of(&out, "Mesh is on for this session")];
+                    let interfaces = summary
+                        .lines()
+                        .find(|line| line.starts_with("  interfaces: "))
+                        .unwrap_or_else(|| panic!("no interfaces line in {summary}"));
+                    assert_eq!(
+                        interfaces,
+                        format!("  interfaces: private 127.0.0.1:{}", relay.port),
+                        "{summary}"
+                    );
+                    assert_eq!(
+                        warnings(),
+                        vec![loopback_warning(closed)],
+                        "{:?}",
+                        stderr_lines()
+                    );
+
+                    let peer_tmp = TempDir::new("repl-mesh-on-partial-peer");
+                    let mut peer_session = Session::default();
+                    let peer = MeshRuntime::start(
+                        &private_config(relay.port),
+                        true,
+                        &mut peer_session,
+                        mesh_paths(&peer_tmp),
+                        NodeOptions::default(),
+                    )
+                    .await
+                    .unwrap();
+                    let peer_slot = Arc::new(MeshSlot::default());
+                    peer_slot.install(peer).unwrap();
+
+                    let card = status_round_trip(&ctx.app.mesh, &peer_slot).await;
+                    assert!(card.served_at_secs > 0);
+
+                    run(&mut ctx, ".mesh off --yes").await.unwrap();
+                    assert!(ctx.app.mesh.get().is_none());
+                    assert!(peer_slot.stop().await.unwrap());
+                    relay.stop().await;
+                });
+            }
+
+            #[test]
+            #[serial]
+            fn autostart_prints_the_warning_for_an_unreachable_interface() {
+                let guard = TestConfigDirGuard::new("repl-mesh-autostart-partial");
+                let _cache = EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
+                let _script = prompt_script::install_non_interactive();
+                let _capture = capture::install();
+                run_async(async {
+                    let closed = closed_port().await;
+                    let (addr, relay_handle, _) = loopback_relay().await;
+                    let mut ctx = ctx_with(
+                        MeshConfig {
+                            enabled: true,
+                            interfaces: vec![
+                                MeshInterface::Private {
+                                    host: "127.0.0.1".to_string(),
+                                    port: addr.port(),
+                                },
+                                MeshInterface::Private {
+                                    host: "127.0.0.1".to_string(),
+                                    port: closed,
+                                },
+                            ],
+                            ..MeshConfig::default()
+                        },
+                        true,
+                    );
+                    ctx.session = Some(Session::default());
+
+                    autostart(&mut ctx).await.unwrap();
+
+                    assert!(ctx.app.mesh.get().is_some());
+                    assert_eq!(prompt_script::prompts_asked(), 0);
+                    let out = stdout_lines();
+                    index_of(&out, "Mesh is on for this session");
+                    assert_eq!(
+                        warnings(),
+                        vec![loopback_warning(closed)],
+                        "{:?}",
+                        stderr_lines()
+                    );
 
                     run(&mut ctx, ".mesh off --yes").await.unwrap();
                     assert!(ctx.app.mesh.get().is_none());
