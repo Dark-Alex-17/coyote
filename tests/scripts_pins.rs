@@ -410,18 +410,19 @@ fn the_bash_scripts_stay_within_bash_3_2() {
     }
 }
 
-/// The text of the `scripts` job in ci.yaml: from its header to the next 2-space-indented
-/// key (the next job). Jobs are the only keys at that indent under `jobs:`.
-fn ci_scripts_job() -> String {
-    let workflow = read(
-        repo_root()
-            .join(".github")
-            .join("workflows")
-            .join("ci.yaml"),
-    )
-    .replace("\r\n", "\n");
-    let header = "\n  scripts:\n";
-    let start = workflow.find(header).expect("ci.yaml has a `scripts` job") + header.len();
+fn workflow(file: &str) -> String {
+    read(repo_root().join(".github").join("workflows").join(file)).replace("\r\n", "\n")
+}
+
+/// The text of the job `name` in the workflow `file`: from its header to the next
+/// 2-space-indented key (the next job). Jobs are the only keys at that indent under `jobs:`.
+fn workflow_job(file: &str, name: &str) -> String {
+    let workflow = workflow(file);
+    let header = format!("\n  {name}:\n");
+    let start = workflow
+        .find(&header)
+        .unwrap_or_else(|| panic!("{file} has a `{name}` job"))
+        + header.len();
     let rest = &workflow[start..];
     let end = rest
         .match_indices("\n  ")
@@ -429,6 +430,28 @@ fn ci_scripts_job() -> String {
         .find(|&at| rest[at + 3..].starts_with(|c: char| c != ' ' && c != '\n'))
         .unwrap_or(rest.len());
     rest[..end].to_string()
+}
+
+fn ci_scripts_job() -> String {
+    workflow_job("ci.yaml", "scripts")
+}
+
+/// The `#` comment block directly above the header of job `name`: the last paragraph
+/// before it, which must consist of comment lines only.
+fn job_lead_comment(file: &str, name: &str) -> String {
+    let workflow = workflow(file);
+    let header = format!("\n  {name}:\n");
+    let before = &workflow[..workflow
+        .find(&header)
+        .unwrap_or_else(|| panic!("{file} has a `{name}` job"))];
+    let comment = before.rsplit_once("\n\n").map_or(before, |(_, last)| last);
+    for line in comment.lines().filter(|line| !line.trim().is_empty()) {
+        assert!(
+            line.starts_with("  #"),
+            "the `{name}` job in {file} must sit directly under its explanatory comment block, not under: {line}"
+        );
+    }
+    comment.to_string()
 }
 
 /// The one lane that runs the scripts themselves: both linters pinned, then the relay
@@ -685,6 +708,109 @@ fn usage_probe_the_ci_scripts_job_lints_and_smokes_the_relay_on_every_runner_fam
         workflow.contains("Service installation is NOT exercised here"),
         "ci.yaml must say that the systemd/launchd/Scheduled-Task half is manual-VM acceptance, not CI"
     );
+}
+
+/// The image smoke runs in two places: informationally on every PR around the latest
+/// released coyote (the only binary the Dockerfile can download for a PR), and as a gate
+/// in the release workflow, where a host-arch build is smoked before the multi-platform
+/// push so a broken rnsd layer or entrypoint never reaches Docker Hub.
+#[test]
+fn both_workflows_run_the_image_smoke_and_the_release_gates_the_push_on_it() {
+    let ci = workflow_job("ci.yaml", "image-smoke");
+    let ci_comment = job_lead_comment("ci.yaml", "image-smoke");
+    for needle in [
+        "runs-on: ubuntu-latest",
+        "timeout-minutes:",
+        "scripts/image-smoke.sh coyote-smoke:ci --pn coyote-pn:ci",
+        "docker build -t coyote-pn:ci deployment/propagation-node",
+        "gh release view --json tagName -q .tagName",
+        "sed 's/^v//'",
+        "GH_TOKEN: ${{ github.token }}",
+        "--build-arg COYOTE_VERSION=",
+    ] {
+        assert!(
+            ci.contains(needle),
+            "the ci.yaml image-smoke job must contain `{needle}`: it builds the Dockerfile around the latest release resolved through `gh`, builds the propagation node on its own so a failure there is attributable, and runs the smoke against both:\n{ci}"
+        );
+    }
+    assert!(
+        !ci.contains("continue-on-error"),
+        "a red smoke must show as a red job, not vanish into a green run"
+    );
+    assert!(
+        !ci.contains("cache-to"),
+        "a GHA layer cache of the ~5.7 GB image would evict the rust-cache entries the `All` matrix depends on"
+    );
+    assert!(
+        !ci.contains("needs:"),
+        "the image smoke is informational and runs beside the other jobs, not after them"
+    );
+    for phrase in ["latest released coyote", "not the PR's Rust"] {
+        assert!(
+            ci_comment.contains(phrase),
+            "the comment above the image-smoke job must say `{phrase}`, so nobody reads a green run as coverage of the PR's own binary:\n{ci_comment}"
+        );
+    }
+
+    let release = workflow_job("release.yaml", "publish-sandbox-image");
+    let smoke_at = release
+        .find("scripts/image-smoke.sh coyote-smoke:release")
+        .expect("publish-sandbox-image smokes `coyote-smoke:release`");
+    let push_at = release
+        .find("platforms: linux/amd64,linux/arm64")
+        .expect("publish-sandbox-image still has the multi-platform push");
+    assert!(
+        smoke_at < push_at,
+        "the smoke must precede the multi-platform push: it is the gate, and a smoke after the push guards nothing"
+    );
+    let before_smoke = &release[..smoke_at];
+    for needle in ["load: true", "push: false", "tags: coyote-smoke:release"] {
+        assert!(
+            before_smoke.contains(needle),
+            "the smoked image is built with `{needle}` before the smoke: loaded into the daemon, never pushed:\n{before_smoke}"
+        );
+    }
+    assert!(
+        before_smoke
+            .lines()
+            .any(|line| line.trim() == "platforms: linux/amd64"),
+        "the smoke build is host-arch only (`platforms: linux/amd64`), so the smoke never executes under QEMU:\n{before_smoke}"
+    );
+    let from_push = &release[push_at..];
+    for needle in [
+        "push: ${{ env.ACT != 'true' }}",
+        "tags: darkalex17/coyote:latest, darkalex17/coyote:v${{ env.version }}",
+    ] {
+        assert!(
+            from_push.contains(needle),
+            "the push step must stay as it was, with `{needle}`:\n{from_push}"
+        );
+    }
+    assert_eq!(
+        release
+            .matches("build-args: COYOTE_VERSION=${{ env.version }}")
+            .count(),
+        2,
+        "the smoke build and the push take the same `COYOTE_VERSION`, so the smoked image is the pushed image:\n{release}"
+    );
+    assert!(
+        !release.contains("continue-on-error"),
+        "a failed smoke must fail the release, not be noted and pushed anyway"
+    );
+
+    let tracking_id = Regex::new(r"(?i)\b(task|plan|scope)-[0-9A-Z]").unwrap();
+    for (what, text) in [
+        ("ci.yaml image-smoke", ci.as_str()),
+        ("ci.yaml image-smoke comment", ci_comment.as_str()),
+        ("release.yaml publish-sandbox-image", release.as_str()),
+    ] {
+        for line in text.lines() {
+            assert!(
+                !tracking_id.is_match(line).unwrap(),
+                "{what} references plan/task tracking; that belongs in commit messages: {line}"
+            );
+        }
+    }
 }
 
 /// The comment above `ingress_control = No` is copied from the propagation-node config,
