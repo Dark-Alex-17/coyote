@@ -727,6 +727,7 @@ fn both_workflows_run_the_image_smoke_and_the_release_gates_the_push_on_it() {
         "sed 's/^v//'",
         "GH_TOKEN: ${{ github.token }}",
         "--build-arg COYOTE_VERSION=",
+        "permissions:\n      contents: read\n",
     ] {
         assert!(
             ci.contains(needle),
@@ -739,7 +740,7 @@ fn both_workflows_run_the_image_smoke_and_the_release_gates_the_push_on_it() {
     );
     assert!(
         !ci.contains("cache-to"),
-        "a GHA layer cache of the ~5.7 GB image would evict the rust-cache entries the `All` matrix depends on"
+        "a GHA layer cache of the multi-gigabyte image would evict the rust-cache entries the `All` matrix depends on"
     );
     assert!(
         !ci.contains("needs:"),
@@ -754,7 +755,7 @@ fn both_workflows_run_the_image_smoke_and_the_release_gates_the_push_on_it() {
 
     let release = workflow_job("release.yaml", "publish-sandbox-image");
     let smoke_at = release
-        .find("scripts/image-smoke.sh coyote-smoke:release")
+        .find("scripts/image-smoke.sh coyote-smoke:release --pn coyote-pn:release")
         .expect("publish-sandbox-image smokes `coyote-smoke:release`");
     let push_at = release
         .find("platforms: linux/amd64,linux/arm64")
@@ -764,10 +765,15 @@ fn both_workflows_run_the_image_smoke_and_the_release_gates_the_push_on_it() {
         "the smoke must precede the multi-platform push: it is the gate, and a smoke after the push guards nothing"
     );
     let before_smoke = &release[..smoke_at];
-    for needle in ["load: true", "push: false", "tags: coyote-smoke:release"] {
+    for needle in [
+        "load: true",
+        "push: false",
+        "tags: coyote-smoke:release",
+        "docker build -t coyote-pn:release deployment/propagation-node",
+    ] {
         assert!(
             before_smoke.contains(needle),
-            "the smoked image is built with `{needle}` before the smoke: loaded into the daemon, never pushed:\n{before_smoke}"
+            "`{needle}` must come before the smoke: the host-arch image is loaded into the daemon and never pushed, and the propagation node is built in its own attributable step:\n{before_smoke}"
         );
     }
     assert!(
@@ -796,6 +802,10 @@ fn both_workflows_run_the_image_smoke_and_the_release_gates_the_push_on_it() {
     assert!(
         !release.contains("continue-on-error"),
         "a failed smoke must fail the release, not be noted and pushed anyway"
+    );
+    assert!(
+        !release.contains("cache-to"),
+        "the GHA cache is repository-scoped: a layer cache of the image here would evict the same rust-cache entries the `All` matrix depends on"
     );
 
     let tracking_id = Regex::new(r"(?i)\b(task|plan|scope)-[0-9A-Z]").unwrap();

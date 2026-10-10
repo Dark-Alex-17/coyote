@@ -514,31 +514,27 @@ jobs:
   # the entrypoint contract around the latest released coyote, not the PR's Rust (that is
   # `All`'s job). Host arch only, no QEMU. Informational like `mesh-interop`: not in
   # branch protection, and deliberately NOT `continue-on-error`, so a red smoke shows as
-  # a red job. This is the slow lane: the uncached build stage installs a Rust toolchain
-  # and `cargo install`s two tools. No `cache-from`/`cache-to`: the image is ~5.7 GB and
-  # a GHA layer cache of it would evict the rust-cache entries the `All` matrix depends
-  # on. The runner's disk is freed first because the build stage plus the flattened
-  # final image need ~12 GB.
+  # a red job. The build runs uncached every time, about 6.5 minutes of which 5 are the
+  # build stage's rustup and two `cargo install`s. No `cache-from`/`cache-to`: the image
+  # is over 4 GB and a GHA layer cache of it would evict the rust-cache entries the `All`
+  # matrix depends on. The runner's 86 GB of free disk covers the build stage and the
+  # flattened image without any clean-up step.
   image-smoke:
     name: Image Smoke
 
     runs-on: ubuntu-latest
 
-    timeout-minutes: 90
+    # `gh release view` is the only token use; the other jobs keep the default scope.
+    permissions:
+      contents: read
+
+    timeout-minutes: 30
 
     steps:
     - uses: actions/checkout@v4
 
     - name: Start The Clock
       run: echo "start=$(date +%s)" >> "$GITHUB_ENV"
-
-    # The build stage and the flattened image together need ~12 GB that a stock runner
-    # does not have free.
-    - name: Free Runner Disk
-      run: |
-        df -h /
-        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
-        df -h /
 
     # The Dockerfile prefixes the `v` itself at the release-download URL, so the
     # build-arg is the bare version.
@@ -554,7 +550,7 @@ jobs:
 
     # Plain `docker build` on the daemon's default builder, not a buildx container
     # driver: the daemon already builds for the host arch and sets TARGETARCH, and a
-    # container-driver builder would keep a second 5.7 GB copy of every layer that
+    # container-driver builder would keep a second multi-gigabyte copy of every layer that
     # `--load` then copies into the daemon.
     - name: Build The Image
       run: |
