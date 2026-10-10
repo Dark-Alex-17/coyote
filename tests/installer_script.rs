@@ -9,15 +9,19 @@
 //! Unix only, like the script. Without `bash` on PATH the tests print `skipping:`.
 #![cfg(unix)]
 
+use expectrl::process::unix::WaitStatus;
+use expectrl::session::{OsProcess, OsStream};
+use expectrl::{Expect, Session};
 use std::env;
 use std::ffi::OsString;
 use std::fs;
-use std::io::Write;
+use std::io::{self, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::OnceLock;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -135,11 +139,19 @@ impl Home {
 
     /// `script` run by `bash` with stdin closed, as a piped or scripted install has it.
     fn install(&self, bash: &Path, script: &Path, args: &[&str], tools: &Tools) -> Command {
+        let mut cmd = self.install_at_tty(bash, script, args, tools);
+        cmd.stdin(Stdio::null());
+        cmd
+    }
+
+    /// `script` run by `bash` with its stdio untouched, for `Session::spawn` to wire to
+    /// a pseudo-terminal: `PtyProcess` dup2s the slave onto 0/1/2 before `exec`, so any
+    /// `Stdio` set on the command here would win over the tty.
+    fn install_at_tty(&self, bash: &Path, script: &Path, args: &[&str], tools: &Tools) -> Command {
         let mut cmd = Command::new(bash);
         cmd.arg(script)
             .args(args)
             .current_dir(repo_root())
-            .stdin(Stdio::null())
             .env("HOME", &self.root)
             .env("XDG_CONFIG_HOME", self.config_home())
             .env("BIN_DIR", self.bin_dir())
@@ -905,4 +917,218 @@ fn the_powershell_installer_points_fetches_and_exits_3_the_same_way_as_the_bash_
         "{out}"
     );
     assert!(!driver.requests().contains("mesh-relay.sh"));
+}
+
+/// At a tty the installer asks once, and Enter takes the default `N`: only the
+/// pointer follows, and the relay is neither run nor fetched.
+#[test]
+fn at_a_tty_enter_declines_the_prompt_once_and_only_the_pointer_follows() {
+    let bash = bash_or_skip!();
+    if running_as_root() {
+        eprintln!("skipping: root is never prompted");
+        return;
+    }
+    let home = Home::new("tty-decline");
+    let tools = Tools::new(&home);
+    let copy = checkout_with_sibling(&home, "exit 0\n");
+
+    let (code, out) = install_answering(home.install_at_tty(&bash, &copy, &[], &tools), "\r");
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out.matches("[y/N]").count(), 1, "asked once:\n{out}");
+    let pointers = pointer_lines(&out);
+    assert_eq!(pointers.len(), 1, "exactly one pointer line:\n{out}");
+    assert!(pointers[0].contains("--with-mesh"), "{}", pointers[0]);
+    assert!(
+        !home.path().join("relay.log").exists(),
+        "the relay ran after a declined prompt:\n{out}"
+    );
+    let requests = tools.requests();
+    assert!(
+        !requests.contains("mesh-relay.sh"),
+        "the relay was fetched after a declined prompt:\n{requests}"
+    );
+    let coyote = home.bin_dir().join("coyote");
+    assert!(coyote.is_file(), "no coyote in BIN_DIR:\n{out}");
+    assert_eq!(
+        fs::metadata(&coyote).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+    assert!(!home.path().join(".reticulum").exists(), "{out}");
+}
+
+/// Answering `y` runs the checkout's own relay once, with the installer's `BIN_DIR`,
+/// fetching nothing; a relay that succeeds leaves no pointer behind.
+#[test]
+fn at_a_tty_y_runs_the_sibling_relay_exactly_once_and_nothing_is_fetched() {
+    let bash = bash_or_skip!();
+    if running_as_root() {
+        eprintln!("skipping: root is never prompted");
+        return;
+    }
+    let home = Home::new("tty-accept");
+    let tools = Tools::new(&home);
+    let copy = checkout_with_sibling(&home, "exit 0\n");
+
+    let (code, out) = install_answering(home.install_at_tty(&bash, &copy, &[], &tools), "y\r");
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out.matches("[y/N]").count(), 1, "asked once:\n{out}");
+    assert_eq!(
+        fs::read_to_string(home.path().join("relay.log")).unwrap_or_default(),
+        format!("BIN_DIR={}\n", home.bin_dir().display()),
+        "the sibling relay runs exactly once with the installer's BIN_DIR:\n{out}"
+    );
+    let requests = tools.requests();
+    assert!(
+        !requests.contains("mesh-relay.sh"),
+        "a checked-out installer uses its sibling, it does not fetch:\n{requests}"
+    );
+    assert!(
+        pointer_lines(&out).is_empty(),
+        "a relay that succeeded is not pointed at again:\n{out}"
+    );
+}
+
+/// On the prompt path the mesh is optional, so a relay that fails is a note with its
+/// exit code plus the pointer, and the installer still exits 0 (exit 3 is reserved
+/// for an explicit `--with-mesh`).
+#[test]
+fn at_a_tty_y_with_a_failing_relay_is_a_note_and_the_pointer_not_exit_3() {
+    let bash = bash_or_skip!();
+    if running_as_root() {
+        eprintln!("skipping: root is never prompted");
+        return;
+    }
+    let home = Home::new("tty-relay-fails");
+    let tools = Tools::new(&home);
+    let copy = checkout_with_sibling(&home, "exit 2\n");
+
+    let (code, out) = install_answering(home.install_at_tty(&bash, &copy, &[], &tools), "y\r");
+    assert_eq!(code, 0, "{out}");
+    assert_eq!(out.matches("[y/N]").count(), 1, "asked once:\n{out}");
+    assert!(
+        out.contains("mesh setup exited with code 2; coyote itself is installed."),
+        "the relay's exit code is named:\n{out}"
+    );
+    assert_eq!(
+        pointer_lines(&out).len(),
+        1,
+        "exactly one pointer line:\n{out}"
+    );
+    assert_eq!(
+        fs::read_to_string(home.path().join("relay.log"))
+            .unwrap_or_default()
+            .lines()
+            .count(),
+        1,
+        "{out}"
+    );
+}
+
+/// Copies the installer into `<HOME>/checkout/` beside a stand-in `mesh-relay.sh` that
+/// appends `BIN_DIR=<value>` to `<HOME>/relay.log` and then runs `tail`. Both files are
+/// owned by the test uid, so `run_mesh_relay` trusts the sibling over a fetch.
+fn checkout_with_sibling(home: &Home, tail: &str) -> PathBuf {
+    let checkout = home.path().join("checkout");
+    fs::create_dir_all(&checkout).unwrap();
+    let copy = checkout.join("install_coyote.sh");
+    fs::copy(installer(), &copy).unwrap();
+    write_script(
+        &checkout.join("mesh-relay.sh"),
+        &format!(
+            "printf '%s\\n' \"BIN_DIR=$BIN_DIR\" >> \"{}\"\n{tail}",
+            home.path().join("relay.log").display()
+        ),
+    );
+    copy
+}
+
+type Pty = Session<OsProcess, OsStream>;
+
+const PTY_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Runs `cmd` under a pseudo-terminal, types `answer` at the mesh prompt and returns
+/// the exit code with the whole transcript, its `\r\n` line ends normalised.
+fn install_answering(cmd: Command, answer: &str) -> (i32, String) {
+    let mut session = spawn_pty(cmd);
+    let mut transcript = Vec::new();
+    expect_or_dump(
+        &mut session,
+        &mut transcript,
+        "Set up the local Reticulum daemon for Coyote mesh now? [y/N] ",
+    );
+    session.send(answer).expect("answer the prompt");
+    expect_or_dump(&mut session, &mut transcript, "Done. Try: coyote --help");
+    drain_to_eof(&mut session, &mut transcript);
+    let code = wait_exit(&mut session);
+    (
+        code,
+        String::from_utf8_lossy(&transcript).replace("\r\n", "\n"),
+    )
+}
+
+fn spawn_pty(command: Command) -> Pty {
+    let mut session = Session::spawn(command).expect("spawn the installer under a pty");
+    session
+        .get_process_mut()
+        .set_window_size(120, 40)
+        .expect("set pty window size");
+    session.set_expect_timeout(Some(PTY_TIMEOUT));
+    session
+}
+
+/// Waits for `needle`, appending everything up to and including it to `transcript`.
+/// On timeout or EOF the panic carries the transcript plus whatever else has arrived.
+fn expect_or_dump(session: &mut Pty, transcript: &mut Vec<u8>, needle: &str) {
+    match session.expect(needle) {
+        Ok(captures) => {
+            transcript.extend_from_slice(captures.before());
+            transcript.extend_from_slice(captures.get(0).unwrap_or_default());
+        }
+        Err(err) => {
+            let mut chunk = [0u8; 4096];
+            while let Ok(n) = session.try_read(&mut chunk) {
+                if n == 0 {
+                    break;
+                }
+                transcript.extend_from_slice(&chunk[..n]);
+            }
+            panic!(
+                "waiting for {needle:?}: {err}\ntranscript:\n{}",
+                String::from_utf8_lossy(transcript)
+            );
+        }
+    }
+}
+
+/// Reads the rest of the output into `transcript` until the pty hangs up, which Linux
+/// reports as `EIO` rather than a zero-length read.
+fn drain_to_eof(session: &mut Pty, transcript: &mut Vec<u8>) {
+    let deadline = Instant::now() + PTY_TIMEOUT;
+    let mut chunk = [0u8; 4096];
+    loop {
+        match session.try_read(&mut chunk) {
+            Ok(0) => return,
+            Ok(n) => transcript.extend_from_slice(&chunk[..n]),
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                assert!(
+                    Instant::now() < deadline,
+                    "the installer kept the pty open:\n{}",
+                    String::from_utf8_lossy(transcript)
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => return,
+        }
+    }
+}
+
+fn wait_exit(session: &mut Pty) -> i32 {
+    match session
+        .get_process_mut()
+        .wait()
+        .expect("wait for the installer")
+    {
+        WaitStatus::Exited(_, code) => code,
+        other => panic!("the installer did not exit normally: {other:?}"),
+    }
 }
