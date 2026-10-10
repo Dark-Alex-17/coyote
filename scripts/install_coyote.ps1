@@ -249,7 +249,7 @@ try {
       continue
     }
 
-    if (-not $isWin) { try { & chmod +x -- $bin } catch { $null = $_ } }
+    if (-not $isWin) { try { & chmod +x $bin } catch { $null = $_ } }
 
     $works = $false
     try { & $bin --version *> $null; if ($LASTEXITCODE -eq 0) { $works = $true } } catch { $null = $_ }
@@ -259,7 +259,7 @@ try {
       $probe = Join-Path $BinDir ".coyote-install-probe-$PID"
       try {
         Copy-Item -Force $bin $probe
-        & chmod +x -- $probe
+        & chmod +x $probe
         & $probe --version *> $null
         if ($LASTEXITCODE -eq 0) { $works = $true }
       } catch { $null = $_ } finally {
