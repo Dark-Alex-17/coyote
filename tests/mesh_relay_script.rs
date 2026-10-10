@@ -11,17 +11,12 @@
 
 use std::env;
 use std::fs;
-#[cfg(target_os = "linux")]
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::OnceLock;
-#[cfg(target_os = "linux")]
-use std::sync::{Mutex, MutexGuard};
-#[cfg(target_os = "linux")]
-use std::time::Duration;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -158,10 +153,10 @@ struct Tools {
 
 impl Tools {
     /// The coreutils every run of the script reaches for, so a scenario only adds
-    /// the installers it wants the ladder to see.
-    const BASE: [&'static str; 17] = [
+    /// the installers it wants the ladder to see (`sed` escapes the plist's XML).
+    const BASE: [&'static str; 18] = [
         "sh", "uname", "id", "mktemp", "mkdir", "rm", "rmdir", "dirname", "basename", "chmod",
-        "mv", "cp", "ln", "cat", "head", "grep", "sleep",
+        "mv", "cp", "ln", "cat", "head", "grep", "sleep", "sed",
     ];
 
     fn new(home: &Home) -> Self {
@@ -241,8 +236,8 @@ const SHIM_ENTRIES: [&str; 3] = ["shim", "shim/launchctl", "shim/uname"];
 
 /// Tests that bind or probe 127.0.0.1:4242 run one at a time; the test threads are
 /// otherwise parallel and one test's listener would answer another's readiness probe.
-/// Only the systemd scenarios (Linux) reach the readiness wait with fakes.
-#[cfg(target_os = "linux")]
+/// The systemd scenarios (Linux) and the launchd real run reach the readiness wait
+/// with fakes.
 fn hold_loopback_4242() -> MutexGuard<'static, ()> {
     static PORT: Mutex<()> = Mutex::new(());
     PORT.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -250,7 +245,6 @@ fn hold_loopback_4242() -> MutexGuard<'static, ()> {
 
 /// The script hard-codes 4242; a host that already has a listener there cannot run the
 /// readiness scenarios, and the test says so instead of failing.
-#[cfg(target_os = "linux")]
 fn loopback_4242_in_use() -> bool {
     let addr = "127.0.0.1:4242".parse().unwrap();
     TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok()
@@ -1510,7 +1504,7 @@ fn a_darwin_dry_run_over_a_stale_plist_and_a_loaded_agent_prints_the_bootstrap_n
         &format!("Would write {}:", plist.display()),
         "<string>com.coyote.rnsd</string>",
         &format!(
-            "Note: the service definition changed; apply it with: launchctl bootout gui/{uid}/com.coyote.rnsd && launchctl bootstrap gui/{uid} \"{}\"",
+            "Note: the service definition changed and the plist would be rewritten; launchd cannot reload a loaded agent in place, so apply it with: launchctl bootout gui/{uid}/com.coyote.rnsd && launchctl bootstrap gui/{uid} \"{}\"",
             plist.display(),
             uid = current_uid()
         ),
@@ -1531,6 +1525,129 @@ fn a_darwin_dry_run_over_a_stale_plist_and_a_loaded_agent_prints_the_bootstrap_n
     assert!(
         !calls.contains("bootstrap") && !calls.contains("bootout"),
         "a dry run only probes launchctl:\n{calls}"
+    );
+}
+
+/// The launchd real run, with a `launchctl` that remembers what `bootstrap` loaded:
+/// an unloaded agent is bootstrapped once; the next run leaves the loaded agent and
+/// the unchanged plist alone; a plist whose program path changed is rewritten on disk
+/// and, since launchd cannot reload it in place, the bootout + bootstrap pair is
+/// printed and never run.
+#[test]
+fn a_darwin_real_run_bootstraps_once_rewrites_a_changed_plist_and_only_prints_the_reload_pair() {
+    let bash = bash_or_skip!();
+    let _port = hold_loopback_4242();
+    if loopback_4242_in_use() {
+        eprintln!("skipping: something already listens on 127.0.0.1:4242");
+        return;
+    }
+    let Ok(_listener) = TcpListener::bind("127.0.0.1:4242") else {
+        eprintln!("skipping: cannot bind 127.0.0.1:4242");
+        return;
+    };
+    let home = Home::new("launchd-real");
+    let rnsd = home.seed_rnsd();
+    let log = home.path().join("calls.log");
+    let tools = Tools::new(&home);
+    tools.uname_answering("Darwin").fake(
+        "launchctl",
+        &log,
+        "case \"$1\" in\n  print) [ -f \"$HOME/launchd.loaded\" ] && exit 0; exit 1 ;;\n  bootstrap) : > \"$HOME/launchd.loaded\"; exit 0 ;;\nesac\nexit 1",
+    );
+    let agents = home.path().join("Library/LaunchAgents");
+    let plist = agents.join("com.coyote.rnsd.plist");
+    let uid = current_uid();
+
+    let (code, out, err) = run(home.relay(&bash, &[]).env("PATH", tools.path()));
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    for needle in [
+        &format!("Wrote {}", plist.display()),
+        "Bootstrapped com.coyote.rnsd",
+        "Logs:",
+        "rnsd is listening on 127.0.0.1:4242",
+    ] {
+        assert!(out.contains(needle), "{needle:?} missing:\n{out}");
+    }
+    assert!(!out.contains("WARNING"), "{out}");
+    assert_eq!(mode_of(&plist), 0o644);
+    assert_eq!(
+        names_in(&agents),
+        vec!["com.coyote.rnsd.plist".to_string()],
+        "a temp file was left behind"
+    );
+    let written = fs::read_to_string(&plist).unwrap();
+    assert!(
+        written.contains(&format!("<string>{}</string>", rnsd.display())),
+        "{written}"
+    );
+    let calls = recorded(&log);
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|line| {
+                *line == format!("launchctl bootstrap gui/{uid} {}", plist.display())
+            })
+            .count(),
+        1,
+        "{calls}"
+    );
+    assert!(!calls.contains("bootout"), "{calls}");
+    let modified = fs::metadata(&plist).unwrap().modified().unwrap();
+
+    // Loaded, and the plist on disk is current: nothing is written or run.
+    fs::write(&log, "").unwrap();
+    let (code, out, err) = run(home.relay(&bash, &[]).env("PATH", tools.path()));
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(
+        out.contains(&format!(
+            "{} already present with this content",
+            plist.display()
+        )) && out.contains("com.coyote.rnsd is already loaded; not restarted"),
+        "{out}"
+    );
+    assert!(
+        !out.contains("Note: the service definition changed"),
+        "{out}"
+    );
+    assert_eq!(fs::read_to_string(&plist).unwrap(), written);
+    assert_eq!(fs::metadata(&plist).unwrap().modified().unwrap(), modified);
+    let calls = recorded(&log);
+    assert!(
+        !calls.contains("bootstrap") && !calls.contains("bootout"),
+        "a loaded agent is left alone:\n{calls}"
+    );
+
+    // Another rnsd path changes ProgramArguments: the plist is rewritten, the loaded
+    // agent is not touched, and the operator is told the pair that would apply it.
+    let bin2 = home.path().join("bin2");
+    fs::create_dir_all(&bin2).unwrap();
+    let rnsd2 = bin2.join("rnsd");
+    fs::write(&rnsd2, "#!/bin/sh\necho 'rnsd 1.5.2'\n").unwrap();
+    fs::set_permissions(&rnsd2, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(&log, "").unwrap();
+    let (code, out, err) = run(home
+        .relay(&bash, &["--bin-dir", bin2.to_str().unwrap()])
+        .env("PATH", tools.path()));
+    assert_eq!(code, 0, "stdout:\n{out}\nstderr:\n{err}");
+    assert!(
+        out.contains(&format!(
+            "Note: the service definition changed and the plist was rewritten; launchd cannot reload a loaded agent in place, so apply it with: launchctl bootout gui/{uid}/com.coyote.rnsd && launchctl bootstrap gui/{uid} \"{}\"",
+            plist.display()
+        )),
+        "{out}"
+    );
+    assert!(!out.contains("not restarted"), "{out}");
+    let rewritten = fs::read_to_string(&plist).unwrap();
+    assert!(
+        rewritten.contains(&format!("<string>{}</string>", rnsd2.display())),
+        "the changed plist was not rewritten:\n{rewritten}"
+    );
+    assert_eq!(mode_of(&plist), 0o644);
+    assert_eq!(names_in(&agents), vec!["com.coyote.rnsd.plist".to_string()]);
+    let calls = recorded(&log);
+    assert!(
+        !calls.contains("bootstrap") && !calls.contains("bootout"),
+        "the reload pair is advice, never run:\n{calls}"
     );
 }
 

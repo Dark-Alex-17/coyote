@@ -104,11 +104,15 @@ fn the_windows_script_carries_the_scheduled_task_and_readiness_contract() {
         ("'Running'", "an already running task must not be restarted"),
         (
             "$existing.Actions",
-            "a registered task's action is compared with the one this run would write",
+            "a registered task's definition is compared with the one this run would write",
         ),
         (
-            "    Set-ScheduledTask -TaskName $TaskName -Action $action | Out-Null",
-            "a changed definition is stored with an executed Set-ScheduledTask, not only described",
+            "    Set-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings | Out-Null",
+            "a changed definition is stored in full with an executed Set-ScheduledTask, not only described",
+        ),
+        (
+            "function Get-CurrentUserName",
+            "the WindowsIdentity lookup sits behind a function so the task harness can stand in for it off-Windows",
         ),
         (
             "rnsd.cmd",
@@ -135,6 +139,28 @@ fn the_windows_script_carries_the_scheduled_task_and_readiness_contract() {
             .count()
             == 2,
         "mesh-relay.ps1 must print the changed-definition Note on both the dry run and the real run"
+    );
+    let shape = ps1
+        .split("function Get-TaskShape")
+        .nth(1)
+        .and_then(|rest| rest.split("\nfunction ").next())
+        .expect("mesh-relay.ps1 defines Get-TaskShape");
+    for token in ["CimClassName", "LogonType", "Hidden", "ExecutionTimeLimit"] {
+        assert!(
+            shape.contains(token),
+            "Get-TaskShape must compare {token}: a registered task is matched on its whole shape, not only the action arguments"
+        );
+    }
+    let stop_lines: Vec<&str> = ps1
+        .lines()
+        .filter(|line| line.contains("Stop-ScheduledTask"))
+        .collect();
+    assert!(
+        !stop_lines.is_empty()
+            && stop_lines
+                .iter()
+                .all(|line| line.contains("Note:") || line.contains("Would run:")),
+        "Stop-ScheduledTask is advice only; a running task is never restarted by the script: {stop_lines:?}"
     );
     assert!(
         !ps1.contains("Test-NetConnection"),
@@ -184,6 +210,34 @@ fn the_windows_script_carries_the_scheduled_task_and_readiness_contract() {
             .count(),
         1,
         "the explicit-flag result is captured once, inside the -WithMesh branch"
+    );
+}
+
+/// launchd has no `daemon-reload`: a loaded agent only picks up a rewritten plist after
+/// `bootout` + `bootstrap`, so the script says so in its Note and prints that pair,
+/// never running it against a loaded agent.
+#[test]
+fn the_bash_script_prints_the_launchd_reload_pair_and_never_runs_it() {
+    let sh = read(scripts_dir().join("mesh-relay.sh"));
+    for needle in [
+        "Note: the service definition changed and the plist was rewritten; launchd cannot reload a loaded agent in place, so apply it with: launchctl bootout",
+        "Note: the service definition changed and the plist would be rewritten; launchd cannot reload a loaded agent in place, so apply it with: launchctl bootout",
+    ] {
+        assert!(
+            sh.contains(needle),
+            "mesh-relay.sh macOS Note must state why the pair is needed: {needle:?}"
+        );
+    }
+    let bootout_lines: Vec<&str> = sh
+        .lines()
+        .filter(|line| line.contains("launchctl bootout"))
+        .collect();
+    assert!(
+        !bootout_lines.is_empty()
+            && bootout_lines
+                .iter()
+                .all(|line| line.trim_start().starts_with("log \"Note:")),
+        "launchctl bootout is advice only; a loaded agent is never torn down by the script: {bootout_lines:?}"
     );
 }
 

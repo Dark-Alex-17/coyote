@@ -607,7 +607,7 @@ service_darwin() {
     echo
     if launchd_loaded; then
       if [[ "$differs" -eq 1 ]]; then
-        log "Note: the service definition changed; apply it with: launchctl bootout gui/$(id -u)/$LAUNCHD_LABEL && launchctl bootstrap gui/$(id -u) \"$LAUNCHD_PLIST\""
+        log "Note: the service definition changed and the plist would be rewritten; launchd cannot reload a loaded agent in place, so apply it with: launchctl bootout gui/$(id -u)/$LAUNCHD_LABEL && launchctl bootstrap gui/$(id -u) \"$LAUNCHD_PLIST\""
       else
         log "$LAUNCHD_LABEL is already loaded; nothing to do"
       fi
@@ -630,7 +630,7 @@ service_darwin() {
 
   if launchd_loaded; then
     if [[ "$changed" -eq 1 ]]; then
-      log "Note: the service definition changed; apply it with: launchctl bootout gui/$(id -u)/$LAUNCHD_LABEL && launchctl bootstrap gui/$(id -u) \"$LAUNCHD_PLIST\""
+      log "Note: the service definition changed and the plist was rewritten; launchd cannot reload a loaded agent in place, so apply it with: launchctl bootout gui/$(id -u)/$LAUNCHD_LABEL && launchctl bootstrap gui/$(id -u) \"$LAUNCHD_PLIST\""
     else
       log "$LAUNCHD_LABEL is already loaded; not restarted"
     fi

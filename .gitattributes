@@ -16,6 +16,7 @@ assets/functions/scripts/* text eol=lf
 assets/functions/utils/*.sh text eol=lf
 scripts/*.sh text eol=lf
 scripts/**/*.ps1 text eol=lf
+tests/**/*.ps1 text eol=lf
 deployment/propagation-node/** text eol=lf
 .github/workflows/*.yaml text eol=lf
 src/mesh/fuzz/corpus/**/*.bin binary

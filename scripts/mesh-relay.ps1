@@ -424,25 +424,50 @@ function Wait-Ready {
   exit 3
 }
 
+# A function so the harness can stand in for it: the static throws off-Windows.
+function Get-CurrentUserName {
+  return [Security.Principal.WindowsIdentity]::GetCurrent().Name
+}
+
+# The whole shape a task is registered with; a stored task is compared on all of it,
+# so a trigger or principal that drifted is caught, not only a changed action.
+function Get-TaskShape($Action, $Trigger, $Principal, $Settings) {
+  return @(
+    "execute=$($Action.Execute)", "arguments=$($Action.Arguments)",
+    "trigger=$($Trigger.CimClass.CimClassName)", "logon-user=$($Trigger.UserId)",
+    "logon-type=$($Principal.LogonType)", "hidden=$($Settings.Hidden)",
+    "time-limit=$($Settings.ExecutionTimeLimit)"
+  ) -join "`n"
+}
+
 function Install-Service {
-  $user = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+  $user = Get-CurrentUserName
   $actionArgument = Get-TaskActionArgument
+  $action = New-ScheduledTaskAction -Execute 'cmd.exe' -Argument $actionArgument
+  $trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
+  $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive
+  $settings = New-ScheduledTaskSettingsSet -Hidden -ExecutionTimeLimit ([TimeSpan]::Zero) -StartWhenAvailable
+  $desired = Get-TaskShape $action $trigger $principal $settings
   $existing = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-  $registeredArgument = $null
+  $registered = $null
   if ($existing) {
     $actions = @($existing.Actions)
-    if ($actions.Count -gt 0) { $registeredArgument = $actions[0].Arguments }
+    $triggers = @($existing.Triggers)
+    if ($actions.Count -gt 0 -and $triggers.Count -gt 0) {
+      $registered = Get-TaskShape $actions[0] $triggers[0] $existing.Principal $existing.Settings
+    }
   }
+  $unchanged = ($registered -eq $desired)
 
   if ($DryRun) {
     if ($existing) {
-      if ($registeredArgument -eq $actionArgument) {
+      if ($unchanged) {
         Write-Info "Service: Scheduled Task '$TaskName' already registered with this action; nothing to do"
       } else {
-        Write-Info "Note: the service definition changed; apply it with: Set-ScheduledTask -TaskName '$TaskName' -Action (New-ScheduledTaskAction -Execute 'cmd.exe' -Argument '$actionArgument')"
+        Write-Info "Note: the service definition changed; apply it with: Set-ScheduledTask -TaskName '$TaskName' -Action (New-ScheduledTaskAction -Execute 'cmd.exe' -Argument '$actionArgument') -Trigger (New-ScheduledTaskTrigger -AtLogOn -User '$user') -Principal (New-ScheduledTaskPrincipal -UserId '$user' -LogonType Interactive) -Settings (New-ScheduledTaskSettingsSet -Hidden -ExecutionTimeLimit ([TimeSpan]::Zero) -StartWhenAvailable)"
         Write-Info "Would update Scheduled Task '$TaskName' for ${user}:"
         Write-TaskPlan $actionArgument
-        Write-Output "  Would run: Set-ScheduledTask -TaskName '$TaskName' -Action ...; Stop-ScheduledTask and Start-ScheduledTask only when it is not running"
+        Write-Output "  Would run: Set-ScheduledTask -TaskName '$TaskName' -Action ... -Trigger ... -Principal ... -Settings ...; Stop-ScheduledTask and Start-ScheduledTask only when it is not running"
       }
     } else {
       Write-Info "Would register Scheduled Task '$TaskName' for ${user}:"
@@ -456,21 +481,16 @@ function Install-Service {
   New-Item -ItemType Directory -Force -Path (Split-Path -Parent $script:LogFile) | Out-Null
   $changed = $false
   if ($existing) {
-    if ($registeredArgument -eq $actionArgument) {
+    if ($unchanged) {
       Write-Info "Scheduled Task '$TaskName' already registered"
     } else {
       # The stored definition is updated like the unit/plist on the other platforms; a
-      # running task keeps the old action until it is restarted, which stays the user's call.
+      # running task keeps the old definition until it is restarted, which stays the user's call.
       $changed = $true
-      $action = New-ScheduledTaskAction -Execute 'cmd.exe' -Argument $actionArgument
-      Set-ScheduledTask -TaskName $TaskName -Action $action | Out-Null
+      Set-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings | Out-Null
       Write-Info "Updated Scheduled Task '$TaskName'"
     }
   } else {
-    $action = New-ScheduledTaskAction -Execute 'cmd.exe' -Argument $actionArgument
-    $trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
-    $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive
-    $settings = New-ScheduledTaskSettingsSet -Hidden -ExecutionTimeLimit ([TimeSpan]::Zero) -StartWhenAvailable
     Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings | Out-Null
     Write-Info "Registered Scheduled Task '$TaskName'"
     $existing = Get-ScheduledTask -TaskName $TaskName
