@@ -71,7 +71,7 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
 # Dockerfile declares the same value and tests/scripts_pins.rs holds the two together.
 ARG RNS_VERSION=1.5.2
 
-# rnsd for the entrypoint. A uv-managed CPython 3.12 (rns 1.5.2 is interop-verified on 3.12)
+# rnsd for the entrypoint. A uv-managed CPython 3.12 (the pinned rns is interop-verified on 3.12)
 # lands under ~/.local/share/uv/python and rides the flatten below with the tool venv;
 # --no-build makes a missing wheel fail the build instead of compiling under QEMU on arm64.
 RUN UV_NO_CACHE=1 uv tool install --no-build --python 3.12 "rns==${RNS_VERSION}"

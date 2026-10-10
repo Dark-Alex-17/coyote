@@ -12,10 +12,13 @@
 #   fd 0 at /dev/null (jobs.c forkchild()), which made `docker run -it <img>
 #   sh -c ...` impossible to interrupt.
 #   tini -g delivers TERM (docker stop) and INT (docker kill -s INT) to the whole
-#   process group, i.e. to the main command directly; this script traps them only
-#   to stay alive until the main command returns and then exits with its status
-#   (143 for a command killed by the TERM, coyote's own code otherwise). tini -s
-#   makes PID 1 a subreaper for the grandchildren a dying main command leaves.
+#   process group, i.e. to the main command directly, as long as it stays in this
+#   script's process group (coyote and `sh -c` do; an interactive shell with job
+#   control moves itself out and must be stopped on its own terms); this script
+#   traps them only to stay alive until the main command returns and then exits
+#   with its status (143 for a command killed by the TERM, coyote's own code
+#   otherwise). tini -s makes PID 1 a subreaper for the grandchildren a dying main
+#   command leaves.
 # The main command is `coyote "$@"`, or "$@" itself when the first arg is sh, bash
 # or a path (the Docker Sandboxes keep-alive; `coyote --sandbox` reaches coyote via
 # `sbx exec` and never passes through here). rnsd starts on both paths.
@@ -36,7 +39,11 @@ case "$1" in
 esac
 
 warn() {
-  echo "coyote-entrypoint: WARNING: $*" >&2
+  printf 'coyote-entrypoint: WARNING: %s\n' "$*" >&2
+}
+
+note() {
+  printf 'coyote-entrypoint: %s\n' "$*" >&2
 }
 
 # Sets relay_host/relay_port from COYOTE_MESH_RELAY, or leaves them empty with a
@@ -77,9 +84,14 @@ render_config() {
   fi
   parse_relay
   lan=0
-  if [ "${COYOTE_MESH_LAN:-}" = 1 ]; then
-    lan=1
-  fi
+  case "${COYOTE_MESH_LAN:-}" in
+    "") ;;
+    1)
+      lan=1
+      note "COYOTE_MESH_LAN=1: with --network host this rnsd listens for LAN peers and, with enable_transport, forwards traffic for any Reticulum peer on the LAN (and on to the Team Relay when one is configured)"
+      ;;
+    *) warn "COYOTE_MESH_LAN=$COYOTE_MESH_LAN is not 1; AutoInterface not added" ;;
+  esac
   relay=0
   if [ -n "$relay_host" ]; then
     relay=1
@@ -95,7 +107,11 @@ render_config() {
     skip { next }
     { gsub(/@RELAY_HOST@/, host); gsub(/@RELAY_PORT@/, port); print }
   ' "$template" > "$tmp"; then
-    mv "$tmp" "$config_dir/config"
+    mv "$tmp" "$config_dir/config" || {
+      rm -f "$tmp"
+      warn "cannot write $config_dir/config; rnsd not started"
+      return 1
+    }
   else
     rm -f "$tmp"
     warn "rendering $template failed; rnsd not started"
@@ -103,40 +119,67 @@ render_config() {
   fi
 }
 
+# Names the opt-in variables that are set but have no effect on an existing config.
+note_existing_config() {
+  unapplied=
+  if [ -n "${COYOTE_MESH_RELAY:-}" ]; then
+    unapplied=COYOTE_MESH_RELAY
+  fi
+  if [ -n "${COYOTE_MESH_LAN:-}" ]; then
+    unapplied="${unapplied:+$unapplied/}COYOTE_MESH_LAN"
+  fi
+  if [ -n "$unapplied" ]; then
+    note "$config_dir/config exists; $unapplied not applied (edit the file or remove it)"
+  fi
+}
+
 start_rnsd() {
-  config_dir="${HOME:-/home/agent}/.reticulum"
+  home="${HOME:-/home/agent}"
+  config_dir="$home/.reticulum"
   if ! mkdir -p "$config_dir"; then
     warn "cannot create $config_dir; rnsd not started"
     return 1
   fi
   if [ ! -e "$config_dir/config" ]; then
     render_config || return 1
+  else
+    note_existing_config
   fi
   # rnsd reads ~/.reticulum by default, so no --config. `-vv` only takes effect
   # because the template has a [logging] section (Reticulum.py:459-467), and
   # RNS.log is a bare print() (RNS/__init__.py:129-134): without PYTHONUNBUFFERED=1
   # the lines sit in CPython's block buffer while fd 2 is a pipe and `docker logs`
   # never shows them. Output stays raw on the container's stderr; a prefixing pipe
-  # would hide the pid needed to stop it. The `setsid` process of this `&` job
-  # shares this script's process group and so is not a group leader; util-linux
-  # setsid therefore calls setsid() without forking and $! is rnsd's own pid.
-  PYTHONUNBUFFERED=1 setsid rnsd -vv </dev/null >&2 &
+  # would hide the pid needed to stop it. `env -i` keeps the container's
+  # environment (LLM provider keys among it) away from the one network-facing
+  # process. `env` and `setsid` both exec in place: the `&` child shares this
+  # script's process group and so is not a group leader, util-linux setsid
+  # therefore calls setsid() without forking, and $! is rnsd's own pid.
+  env -i HOME="$home" PATH="$PATH" PYTHONUNBUFFERED=1 setsid rnsd -vv </dev/null >&2 &
   rnsd_pid=$!
 }
 
-if [ "${COYOTE_MESH_RNSD:-}" = 0 ]; then
-  echo "coyote-entrypoint: COYOTE_MESH_RNSD=0, rnsd not started" >&2
-else
-  start_rnsd
-fi
+case "${COYOTE_MESH_RNSD:-}" in
+  0) note "COYOTE_MESH_RNSD=0, rnsd not started" ;;
+  "" | 1) start_rnsd ;;
+  *)
+    warn "COYOTE_MESH_RNSD=$COYOTE_MESH_RNSD is not 0; rnsd started"
+    start_rnsd
+    ;;
+esac
 
-# The main command gets the group signal from tini at the same moment this script
-# does and decides for itself; the trap keeps this script alive until the command
-# returns. A trap with a command (unlike `trap ''`) leaves the main command's
+# tini -g forwards every signal it receives to the group, so the main command gets
+# each one at the same moment this script does and decides for itself; the trap
+# keeps this script alive until the command returns. With only TERM and INT
+# trapped, a HUP (or a Ctrl-\ QUIT under -it) would kill this script, tini would
+# exit, and the container would be torn down around a live main command with rnsd
+# never stopped. A trap with a command (unlike `trap ''`) leaves the main command's
 # disposition at the default. Forwarding INT here would be wrong twice over: the
 # command already has it, and rnsd installs a SIGINT handler that exits
 # (Reticulum.py:375), so a Ctrl-C that coyote survives would take the daemon down.
-trap ':' TERM INT
+# rnsd handles INT and TERM itself and sits in its own session, so widening the
+# trap changes nothing for it.
+trap ':' HUP INT QUIT TERM USR1 USR2
 
 if [ "$passthrough" = 1 ]; then
   "$@"
@@ -147,6 +190,9 @@ rc=$?
 
 if [ -n "$rnsd_pid" ]; then
   kill -s TERM "$rnsd_pid" 2>/dev/null
+  # kill -0 succeeds on an exited-but-unreaped child; the loop ends early only
+  # because the shell reaps the background rnsd while waiting on the foreground
+  # sleep (dash, bash and ash all do). Do not replace it with a fixed sleep.
   polls=0
   while [ "$polls" -lt 25 ] && kill -0 "$rnsd_pid" 2>/dev/null; do
     sleep 0.2

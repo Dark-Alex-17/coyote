@@ -976,13 +976,16 @@ fn relay_scripts_carry_the_strict_mode_scaffolding() {
 #[test]
 fn scripts_are_ascii_lf_and_free_of_plan_labels() {
     let tracking_id = Regex::new(r"(?i)\b(task|plan|scope)-[0-9A-Z]").unwrap();
-    for name in RELAY_SCRIPTS
+    let paths: Vec<PathBuf> = RELAY_SCRIPTS
         .iter()
         .chain(INSTALLERS.iter())
         .chain(IMAGE_SCRIPTS.iter())
-    {
-        let path = scripts_dir().join(name);
-        let bytes = fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        .map(|name| scripts_dir().join(name))
+        .chain([repo_root().join("Dockerfile")])
+        .collect();
+    for path in &paths {
+        let name = path.file_name().unwrap().to_string_lossy();
+        let bytes = fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
         assert!(
             bytes.is_ascii(),
             "{name} must be plain ASCII so PowerShell 5.1 reads it without a BOM and curl | bash never meets an encoding surprise"
@@ -1062,16 +1065,29 @@ fn the_image_dockerfile_installs_the_dockerfile_rns_version() {
         dockerfile.contains("scripts/reticulum.config.tmpl /opt/coyote/reticulum.config.tmpl"),
         "Dockerfile must bake the Reticulum template at /opt/coyote/reticulum.config.tmpl, the path the entrypoint renders from"
     );
+    assert!(
+        dockerfile.contains("install -d -m 0755 /opt/coyote"),
+        "Dockerfile must create /opt/coyote with install -d: left to COPY it takes the file mode and uid 1000 cannot traverse it"
+    );
+    assert!(
+        !dockerfile.contains("PYTHONUNBUFFERED"),
+        "PYTHONUNBUFFERED stays scoped to the rnsd child in the entrypoint, never an image-wide ENV"
+    );
+    assert!(
+        !dockerfile.contains("HEALTHCHECK"),
+        "Dockerfile must declare no HEALTHCHECK: the image runs as a sandbox and a CLI, not a service"
+    );
 }
 
 /// The entrypoint's first write of `~/.reticulum/config` is permanent for that
 /// container's volume, so the template must carry the `[logging]` section without
 /// which `rnsd -v` is ignored, and the entrypoint must start rnsd unbuffered
-/// (`RNS.log` is a bare `print()`) in its own session (neither a TTY SIGINT nor
-/// tini's group signal may reach it: rnsd exits on SIGINT, `Reticulum.py:375`),
-/// run the main command in its foreground (a dash `&` child inherits SIGINT ignored
-/// and `/dev/null` on fd 0) without ever `exec`ing it, and trap TERM/INT with a
-/// command rather than `''` (an ignored signal would be inherited by the main command).
+/// (`RNS.log` is a bare `print()`) under `env -i` in its own session (neither a TTY
+/// SIGINT nor tini's group signal may reach it: rnsd exits on SIGINT,
+/// `Reticulum.py:375`), run the main command in its foreground (a dash `&` child
+/// inherits SIGINT ignored and `/dev/null` on fd 0) without ever `exec`ing it, and
+/// trap every signal tini -g forwards with a command rather than `''` (an ignored
+/// signal would be inherited by the main command).
 #[test]
 fn the_image_template_and_entrypoint_carry_the_rnsd_logging_contract() {
     let template = read(scripts_dir().join("reticulum.config.tmpl"));
@@ -1101,32 +1117,34 @@ fn the_image_template_and_entrypoint_carry_the_rnsd_logging_contract() {
         "docker-entrypoint.sh must be POSIX sh: the image's /bin/sh is dash and shellcheck infers the dialect from the shebang"
     );
     for needle in [
-        "PYTHONUNBUFFERED=1",
-        "rnsd -vv",
+        "PYTHONUNBUFFERED=1 setsid rnsd -vv",
+        "env -i HOME=",
         "COYOTE_MESH_RNSD",
         "COYOTE_MESH_RELAY",
         "COYOTE_MESH_LAN",
-        "setsid",
-        "trap ':' TERM INT",
+        "trap ':' HUP INT QUIT TERM USR1 USR2",
+        "[ ! -e \"$config_dir/config\" ]",
         "Reticulum.py:459-467",
         "RNS/__init__.py:129-134",
         "Reticulum.py:375",
     ] {
         assert!(
             entrypoint.contains(needle),
-            "docker-entrypoint.sh must contain `{needle}`: the smoke's log assertions, the env contract and the signal model depend on it"
+            "docker-entrypoint.sh must contain `{needle}`: the smoke's log assertions, the env contract (PYTHONUNBUFFERED scoped to the rnsd child under env -i), the never-overwrite guard and the signal model depend on it"
         );
     }
     assert!(
         !entrypoint.contains("exec coyote"),
         "docker-entrypoint.sh must run coyote as a child, not exec it: the script has to outlive it to stop rnsd and return its exit code"
     );
-    for forbidden in ["coyote \"$@\" &", "\"$@\" &", "wait \"$main_pid\""] {
-        assert!(
-            !entrypoint.contains(forbidden),
-            "docker-entrypoint.sh must run the main command in the foreground, not as a background job (`{forbidden}`): dash hard-ignores SIGINT in an `&` child and gives it /dev/null as stdin"
-        );
-    }
+    assert!(
+        entrypoint.contains("  \"$@\"\nelse\n  coyote \"$@\"\nfi\nrc=$?"),
+        "docker-entrypoint.sh must dispatch the main command in the foreground and read its status straight from $?: dash hard-ignores SIGINT in an `&` child and gives it /dev/null as stdin, so a background job plus `wait` would make `docker run -it` uninterruptible and starve the command of the container's stdin"
+    );
+    assert!(
+        !entrypoint.contains("sed -i"),
+        "docker-entrypoint.sh must never edit a config in place: the rendered file is written once through mktemp + mv and an existing one is never touched"
+    );
     assert!(
         !entrypoint.contains("# shellcheck"),
         "docker-entrypoint.sh must lint clean without shellcheck directives; fix the finding instead of disabling it"
