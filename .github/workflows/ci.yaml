@@ -514,11 +514,11 @@ jobs:
   # the entrypoint contract around the latest released coyote, not the PR's Rust (that is
   # `All`'s job). Host arch only, no QEMU. Informational like `mesh-interop`: not in
   # branch protection, and deliberately NOT `continue-on-error`, so a red smoke shows as
-  # a red job. The build runs uncached every time, about 6.5 minutes of which 5 are the
-  # build stage's rustup and two `cargo install`s. No `cache-from`/`cache-to`: the image
-  # is over 4 GB and a GHA layer cache of it would evict the rust-cache entries the `All`
-  # matrix depends on. The runner's 86 GB of free disk covers the build stage and the
-  # flattened image without any clean-up step.
+  # a red job. The build runs uncached every time: measured in October 2026 at about 6.5
+  # minutes, 5 of them the build stage's rustup and two `cargo install`s. No
+  # `cache-from`/`cache-to`: the image is over 4 GB and a GHA layer cache of it would
+  # evict the rust-cache entries the `All` matrix depends on. The runner's free disk
+  # (86 GB then) covers the build stage and the flattened image without a clean-up step.
   image-smoke:
     name: Image Smoke
 

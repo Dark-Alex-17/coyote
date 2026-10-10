@@ -769,11 +769,11 @@ fn both_workflows_run_the_image_smoke_and_the_release_gates_the_push_on_it() {
         "load: true",
         "push: false",
         "tags: coyote-smoke:release",
-        "docker build -t coyote-pn:release deployment/propagation-node",
+        "docker build --load -t coyote-pn:release deployment/propagation-node",
     ] {
         assert!(
             before_smoke.contains(needle),
-            "`{needle}` must come before the smoke: the host-arch image is loaded into the daemon and never pushed, and the propagation node is built in its own attributable step:\n{before_smoke}"
+            "`{needle}` must come before the smoke: both images are loaded into the daemon (the job's buildx container builder keeps a plain build in its own cache) and never pushed:\n{before_smoke}"
         );
     }
     assert!(
