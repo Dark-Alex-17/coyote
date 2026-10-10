@@ -1383,7 +1383,8 @@ impl TrustStore {
                     .map(|row| (row.destination_hash, row.identity_hash))?
             }
         };
-        (holder != seen_identity && state.trusted_for_all(&holder)).then_some((destination, holder))
+        (!same_hash(&holder, seen_identity) && state.trusted_for_all(&holder))
+            .then_some((destination, holder))
     }
 
     /// `heard_under_trusted_for_all` as the line it earns, deduped while the node runs. A
@@ -2157,8 +2158,9 @@ impl State {
     /// Clears every memo `identity` is the holder of or was refused by: the human blocked
     /// it, which answers every one of them.
     fn forget_presence_memos_naming(&mut self, identity: &str) {
-        self.presence_memos
-            .retain(|_, memo| memo.holder != identity && !memo.refused.contains(identity));
+        self.presence_memos.retain(|_, memo| {
+            !same_hash(&memo.holder, identity) && !memo.refused.contains(identity)
+        });
         let memos = &self.presence_memos;
         self.presence_memo_order
             .retain(|instance| memos.contains_key(instance));
@@ -2857,10 +2859,16 @@ mod tests {
         assert!(same_hash("", ""));
     }
 
-    /// Every production compare of a typed address hash, or of a destination against the
-    /// one an identity derives, here and in message.rs, goes through `same_hash` or
-    /// `ct_eq`, never through `==` or `!=`. Keyed lookups of a hash the peer already knows
-    /// (the knock cache, the peer table) are not a timing boundary and stay ordinary compares.
+    /// Every production compare of a typed address hash, of a destination against the one
+    /// an identity derives, or of a presence holder or a `*_identity` hex string against
+    /// another identity, here and in message.rs, goes through `same_hash` or `ct_eq`, never
+    /// through `==` or `!=`. The holder of an instance is an identity hash wherever it is
+    /// compared, on the verdict rung that refuses a presenter and in the sweep a block runs
+    /// over the memos, so `holder` is a subject on its own. Keyed lookups of a hash the peer
+    /// already knows (the knock cache, the peer table) and the membership scans over the
+    /// user's own records bound to an identity (`knows_identity`, the sweeps an untrust or a
+    /// block runs) are not a timing boundary and stay ordinary compares, which is why the
+    /// bare `identity` operand of `entry.identity == identity` is not a subject.
     #[test]
     fn production_code_never_compares_hashes_with_the_equality_operators() {
         let sources = [
@@ -2873,6 +2881,8 @@ mod tests {
             ["parse_", "hash("].concat(),
             ["destination_", "address("].concat(),
             ["address", "_hash"].concat(),
+            ["hol", "der"].concat(),
+            ["_ide", "ntity"].concat(),
         ];
         let operators = [[" =", "= "].concat(), [" !", "= "].concat()];
         let shapes = [
