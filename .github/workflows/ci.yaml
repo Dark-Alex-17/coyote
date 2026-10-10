@@ -193,7 +193,9 @@ jobs:
 
     # shellcheck is whatever the runner image ships, so its version is printed for the
     # log; PSScriptAnalyzer is pinned below so a new rule arriving with an upgrade is a
-    # deliberate bump and a reviewed diff, not a red lane on an unrelated PR.
+    # deliberate bump and a reviewed diff, not a red lane on an unrelated PR. The
+    # PowerShell files are enumerated from the index rather than a directory list so a
+    # .ps1 added anywhere in the tree (tests/fixtures/ already has one) is analysed too.
     - name: ShellCheck
       if: runner.os == 'Linux'
       run: |
@@ -208,7 +210,10 @@ jobs:
       run: |
         Install-Module PSScriptAnalyzer -RequiredVersion $env:PSSA_VERSION -Repository PSGallery -Scope CurrentUser -Force
         Import-Module PSScriptAnalyzer -RequiredVersion $env:PSSA_VERSION
-        $r = Invoke-ScriptAnalyzer -Path scripts -Recurse -Severity Warning,Error
+        $files = @(git ls-files '*.ps1')
+        if (-not $files) { throw 'git ls-files found no tracked .ps1 files' }
+        Write-Output "Analysing $($files.Count) PowerShell file(s): $files"
+        $r = @($files | ForEach-Object { Invoke-ScriptAnalyzer -Path $_ -Severity Warning,Error })
         $r | Format-Table -AutoSize | Out-String | Write-Output
         if ($r) { exit 1 }
 

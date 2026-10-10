@@ -467,8 +467,22 @@ fn usage_probe_the_ci_scripts_job_lints_and_smokes_the_relay_on_every_runner_fam
         "the pinned PSScriptAnalyzer is the one imported (a newer module already on the image must not win)"
     );
     assert!(
-        job.contains("Invoke-ScriptAnalyzer -Path scripts -Recurse -Severity Warning,Error"),
-        "every .ps1 under scripts/ is analysed at Warning,Error"
+        job.contains("$files = @(git ls-files '*.ps1')"),
+        "the PowerShell files are enumerated from the git index, so a .ps1 anywhere in the tree (tests/fixtures/ has one) is analysed, not just scripts/"
+    );
+    assert!(
+        job.contains("if (-not $files) { throw"),
+        "an empty enumeration must fail the step, not analyse nothing and pass"
+    );
+    assert!(
+        job.contains(
+            "$files | ForEach-Object { Invoke-ScriptAnalyzer -Path $_ -Severity Warning,Error }"
+        ),
+        "every enumerated .ps1 is analysed at Warning,Error"
+    );
+    assert!(
+        !job.contains("Invoke-ScriptAnalyzer -Path scripts"),
+        "the analyser must not be narrowed back to a fixed directory"
     );
     assert!(
         job.contains("if ($r) { exit 1 }"),
@@ -740,6 +754,7 @@ fn usage_probe_relay_scripts_are_config_twins_and_copy_the_propagation_node_comm
     for pattern in [
         "scripts/*.sh",
         "scripts/**/*.ps1",
+        "tests/**/*.ps1",
         ".github/workflows/*.yaml",
     ] {
         assert!(
