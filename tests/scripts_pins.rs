@@ -1,5 +1,7 @@
 //! Static pins for the mesh relay setup scripts (`scripts/mesh-relay.sh`,
-//! `scripts/mesh-relay.ps1`) and the installer hooks that hand off to them.
+//! `scripts/mesh-relay.ps1`), the installer hooks that hand off to them, and the
+//! Docker image's rnsd bundle (`Dockerfile`, `scripts/docker-entrypoint.sh`,
+//! `scripts/reticulum.config.tmpl`, `scripts/image-smoke.sh`).
 //!
 //! The scripts write a Reticulum config once and never overwrite it, so a wrong
 //! first write is permanent for that host; these tests hold the tokens that make
@@ -29,6 +31,11 @@ fn read(path: impl AsRef<Path>) -> String {
 
 const RELAY_SCRIPTS: [&str; 2] = ["mesh-relay.sh", "mesh-relay.ps1"];
 const INSTALLERS: [&str; 2] = ["install_coyote.sh", "install_coyote.ps1"];
+const IMAGE_SCRIPTS: [&str; 3] = [
+    "docker-entrypoint.sh",
+    "image-smoke.sh",
+    "reticulum.config.tmpl",
+];
 
 /// The value of `ARG RNS_VERSION=` in the propagation-node Dockerfile, the
 /// single place the interop-verified rns version is declared.
@@ -969,7 +976,11 @@ fn relay_scripts_carry_the_strict_mode_scaffolding() {
 #[test]
 fn scripts_are_ascii_lf_and_free_of_plan_labels() {
     let tracking_id = Regex::new(r"(?i)\b(task|plan|scope)-[0-9A-Z]").unwrap();
-    for name in RELAY_SCRIPTS.iter().chain(INSTALLERS.iter()) {
+    for name in RELAY_SCRIPTS
+        .iter()
+        .chain(INSTALLERS.iter())
+        .chain(IMAGE_SCRIPTS.iter())
+    {
         let path = scripts_dir().join(name);
         let bytes = fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
         assert!(
@@ -992,10 +1003,165 @@ fn scripts_are_ascii_lf_and_free_of_plan_labels() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let metadata = fs::metadata(scripts_dir().join("mesh-relay.sh")).unwrap();
+        for name in ["mesh-relay.sh", "docker-entrypoint.sh", "image-smoke.sh"] {
+            let metadata = fs::metadata(scripts_dir().join(name)).unwrap();
+            assert!(
+                metadata.permissions().mode() & 0o111 != 0,
+                "{name} should be executable in the tree so `./scripts/{name}` works from a checkout"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_image_dockerfile_installs_the_dockerfile_rns_version() {
+    let version = dockerfile_rns_version();
+    let dockerfile = read(repo_root().join("Dockerfile"));
+    let mut lines = dockerfile.lines();
+    assert_eq!(
+        lines.next(),
+        Some("# syntax=docker/dockerfile:1"),
+        "Dockerfile must start with the syntax directive; the check directive below is ignored without it"
+    );
+    assert_eq!(
+        lines.next(),
+        Some("# check=error=true"),
+        "Dockerfile must fail the build on BuildKit check warnings instead of printing them"
+    );
+    assert!(
+        dockerfile.contains(&format!("ARG RNS_VERSION={version}")),
+        "Dockerfile must declare `ARG RNS_VERSION={version}`: deployment/propagation-node/Dockerfile says so and that is the version the interop harness verified; bump both together"
+    );
+    assert!(
+        dockerfile.contains("\"rns==${RNS_VERSION}\""),
+        "Dockerfile must install rns pinned to RNS_VERSION rather than the latest release"
+    );
+    assert!(
+        dockerfile.contains("uv tool install"),
+        "Dockerfile must install rns as a uv tool so rnsd lands in /home/agent/.local/bin, already on PATH"
+    );
+    assert!(
+        dockerfile.contains("--no-build"),
+        "Dockerfile must pass --no-build so a missing wheel fails the build instead of compiling under QEMU on arm64"
+    );
+    assert!(
+        dockerfile.contains("--python 3.12"),
+        "Dockerfile must install rns under a uv-managed CPython 3.12, the interpreter the interop harness verified rns on"
+    );
+    assert!(
+        dockerfile.contains("UV_NO_CACHE=1"),
+        "Dockerfile must disable the uv cache for the rns install so no cache directory rides into the flattened image"
+    );
+    assert!(
+        dockerfile.contains(
+            "ENTRYPOINT [\"/usr/bin/tini\", \"-s\", \"-g\", \"--\", \"/usr/local/bin/coyote-entrypoint\"]"
+        ),
+        "Dockerfile must run tini with -s and -g: -s reaps the grandchildren a dying main command leaves (sh -c 'sleep infinity' on TERM); -g delivers TERM/INT to the process group, which is how the foreground main command receives them"
+    );
+    assert!(
+        dockerfile.contains("scripts/reticulum.config.tmpl /opt/coyote/reticulum.config.tmpl"),
+        "Dockerfile must bake the Reticulum template at /opt/coyote/reticulum.config.tmpl, the path the entrypoint renders from"
+    );
+}
+
+/// The entrypoint's first write of `~/.reticulum/config` is permanent for that
+/// container's volume, so the template must carry the `[logging]` section without
+/// which `rnsd -v` is ignored, and the entrypoint must start rnsd unbuffered
+/// (`RNS.log` is a bare `print()`) in its own session (neither a TTY SIGINT nor
+/// tini's group signal may reach it: rnsd exits on SIGINT, `Reticulum.py:375`),
+/// run the main command in its foreground (a dash `&` child inherits SIGINT ignored
+/// and `/dev/null` on fd 0) without ever `exec`ing it, and trap TERM/INT with a
+/// command rather than `''` (an ignored signal would be inherited by the main command).
+#[test]
+fn the_image_template_and_entrypoint_carry_the_rnsd_logging_contract() {
+    let template = read(scripts_dir().join("reticulum.config.tmpl"));
+    for needle in [
+        "[logging]",
+        "loglevel = 4",
+        "ingress_control = No",
+        "listen_ip = 127.0.0.1",
+        "enable_transport = True",
+        "#@if lan",
+        "#@if relay",
+    ] {
         assert!(
-            metadata.permissions().mode() & 0o111 != 0,
-            "mesh-relay.sh should be executable in the tree so `./scripts/mesh-relay.sh` works from a checkout"
+            template.contains(needle),
+            "reticulum.config.tmpl must contain `{needle}`: the rendered config is written once and never overwritten"
         );
     }
+    assert!(
+        !template.contains("share_instance = No"),
+        "reticulum.config.tmpl must not write `share_instance = No`: rnstatus and rnpath inside the container attach to the shared instance"
+    );
+
+    let entrypoint = read(scripts_dir().join("docker-entrypoint.sh"));
+    assert_eq!(
+        entrypoint.lines().next(),
+        Some("#!/bin/sh"),
+        "docker-entrypoint.sh must be POSIX sh: the image's /bin/sh is dash and shellcheck infers the dialect from the shebang"
+    );
+    for needle in [
+        "PYTHONUNBUFFERED=1",
+        "rnsd -vv",
+        "COYOTE_MESH_RNSD",
+        "COYOTE_MESH_RELAY",
+        "COYOTE_MESH_LAN",
+        "setsid",
+        "trap ':' TERM INT",
+        "Reticulum.py:459-467",
+        "RNS/__init__.py:129-134",
+        "Reticulum.py:375",
+    ] {
+        assert!(
+            entrypoint.contains(needle),
+            "docker-entrypoint.sh must contain `{needle}`: the smoke's log assertions, the env contract and the signal model depend on it"
+        );
+    }
+    assert!(
+        !entrypoint.contains("exec coyote"),
+        "docker-entrypoint.sh must run coyote as a child, not exec it: the script has to outlive it to stop rnsd and return its exit code"
+    );
+    for forbidden in ["coyote \"$@\" &", "\"$@\" &", "wait \"$main_pid\""] {
+        assert!(
+            !entrypoint.contains(forbidden),
+            "docker-entrypoint.sh must run the main command in the foreground, not as a background job (`{forbidden}`): dash hard-ignores SIGINT in an `&` child and gives it /dev/null as stdin"
+        );
+    }
+    assert!(
+        !entrypoint.contains("# shellcheck"),
+        "docker-entrypoint.sh must lint clean without shellcheck directives; fix the finding instead of disabling it"
+    );
+}
+
+#[test]
+fn the_image_smoke_asserts_the_post_connect_relay_line() {
+    let smoke = read(scripts_dir().join("image-smoke.sh"));
+    assert_eq!(
+        smoke.lines().next(),
+        Some("#!/usr/bin/env bash"),
+        "image-smoke.sh is bash (/dev/tcp, [[ ]], here-strings)"
+    );
+    assert!(
+        smoke.contains(
+            "TCP connection for TCPInterface\\[Team Relay/[^]]*\\] established|Reconnected socket for TCPInterface\\[Team Relay/"
+        ),
+        "image-smoke.sh must match the post-connect line (`] established`) or the reconnect line: a bare `TCP connection for TCPInterface[Team Relay` matches the pre-connect line and could never fail"
+    );
+    for needle in [
+        "TCPInterface.py:233",
+        ":247",
+        ":290",
+        "rnstatus",
+        "COYOTE_MESH_RNSD=0",
+        "/dev/tcp/127.0.0.1/4242",
+    ] {
+        assert!(
+            smoke.contains(needle),
+            "image-smoke.sh must contain `{needle}`: the regex citations, the in-container diagnostic on failure, and the rnsd-less prober"
+        );
+    }
+    assert!(
+        !smoke.contains("# shellcheck"),
+        "image-smoke.sh must lint clean without shellcheck directives; fix the finding instead of disabling it"
+    );
 }
