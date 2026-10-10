@@ -168,12 +168,17 @@ start_rnsd() {
 # early-dead rnsd while waiting on the foreground main command, after which the
 # pid is free, and a reused pid has another parent. Without /proc, kill -0 is all
 # there is. The stat line is `pid (comm) S ppid ...` and comm may itself contain
-# spaces or `)`, hence the strip through the last `) `.
+# spaces or `)`, hence the strip through the last `) `. No subshell: a group
+# signal landing on an `$(awk ...)` child, whose traps are back to default, would
+# kill it mid-read and report a live rnsd as dead.
 rnsd_alive() {
   [ -n "$rnsd_pid" ] || return 1
   kill -0 "$rnsd_pid" 2>/dev/null || return 1
   [ -r /proc/"$rnsd_pid"/stat ] || return 0
-  ppid=$(awk '{ s = $0; sub(/^.*\) /, "", s); split(s, f, " "); print f[2] }' /proc/"$rnsd_pid"/stat 2>/dev/null)
+  { IFS= read -r stat < /proc/"$rnsd_pid"/stat; } 2>/dev/null || return 1
+  fields=${stat##*) }
+  ppid=${fields#* }
+  ppid=${ppid%% *}
   [ "$ppid" = "$$" ]
 }
 
@@ -222,6 +227,7 @@ if rnsd_alive; then
     polls=$((polls + 1))
   done
   if rnsd_alive; then
+    warn "rnsd (pid $rnsd_pid) did not exit within 5 s after TERM; sending KILL"
     kill -s KILL "$rnsd_pid" 2>/dev/null
   fi
   wait "$rnsd_pid"

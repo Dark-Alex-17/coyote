@@ -1157,6 +1157,14 @@ fn the_image_template_and_entrypoint_carry_the_rnsd_logging_contract() {
         );
     }
     assert!(
+        entrypoint.contains("${stat##*) }"),
+        "docker-entrypoint.sh must strip the stat line through its LAST `) ` with parameter expansion: comm may hold spaces or `)`, and a `$(awk ...)` subshell (traps reset to default) hit by a group signal mid-stop would report a live rnsd as dead"
+    );
+    assert!(
+        entrypoint.contains("did not exit within 5 s after TERM; sending KILL"),
+        "docker-entrypoint.sh must say so on stderr before the KILL escalation: a daemon that ignored TERM is otherwise indistinguishable from one that exited in time"
+    );
+    assert!(
         !entrypoint.contains(r#"/proc/"$rnsd_pid"/comm"#),
         "docker-entrypoint.sh must not decide `ours` by /proc/<pid>/comm: see the ppid pin above"
     );

@@ -36,8 +36,12 @@ pn="coyote-smoke-pn-$suffix"
 c="coyote-smoke-relay-$suffix"
 net="coyote-smoke-$suffix"
 scratch="$(mktemp -d)"
+label="coyote-smoke=$suffix"
 
+# A `timeout`-killed docker client leaves its container behind (`--rm` fires only
+# when the client sees the exit), so the sweep goes by label before the names.
 cleanup() {
+  docker ps -aq --filter "label=$label" | xargs -r docker rm -f >/dev/null 2>&1 || true
   docker rm -f "$t" "$i" "$pn" "$c" >/dev/null 2>&1 || true
   docker network rm "$net" >/dev/null 2>&1 || true
   rm -rf "$scratch"
@@ -93,7 +97,7 @@ if [[ -z "$pn_image" ]]; then
 fi
 
 # 1. The passthrough branch: the Docker Sandboxes keep-alive shape, where rnsd must start too.
-docker run -d --name "$t" "$image" sh -c 'sleep infinity' >/dev/null
+docker run -d --name "$t" --label "$label" "$image" sh -c 'sleep infinity' >/dev/null
 ok "started $t"
 
 # 2. The coyote binary is on PATH and runs as uid 1000.
@@ -153,7 +157,7 @@ ok "docker stop took ${elapsed}s and exited 143"
 #    INT keeps running with its daemon, one that does not dies of it as under plain docker.
 #    `docker logs` is captured before grep: under pipefail a `grep -q` that exits on its
 #    first match would leave `docker logs` dead of SIGPIPE and the pipeline failed.
-docker run -d --name "$i" "$image" bash -c 'trap "echo main-got-INT" INT; while :; do sleep 1; done' >/dev/null
+docker run -d --name "$i" --label "$label" "$image" bash -c 'trap "echo main-got-INT" INT; while :; do sleep 1; done' >/dev/null
 wait_exec "$i" 'exec 3<>/dev/tcp/127.0.0.1/4242' \
   || fail_with_logs "$i" "127.0.0.1:4242 did not answer within 30 s in the INT container"
 docker kill -s INT "$i" >/dev/null
@@ -172,7 +176,7 @@ comms="$(docker exec "$i" ps -eo comm=)"
 grep -qx rnsd <<<"$comms" || fail_with_logs "$i" "rnsd did not survive an INT the main command handled"
 ok "INT reaches the main command and leaves rnsd running"
 docker rm -f "$i" >/dev/null
-docker run -d --name "$i" "$image" sh -c 'sleep 999' >/dev/null
+docker run -d --name "$i" --label "$label" "$image" sh -c 'sleep 999' >/dev/null
 wait_exec "$i" 'exec 3<>/dev/tcp/127.0.0.1/4242' \
   || fail_with_logs "$i" "127.0.0.1:4242 did not answer within 30 s in the unhandled-INT container"
 docker kill -s INT "$i" >/dev/null
@@ -190,16 +194,16 @@ docker rm -f "$i" >/dev/null
 
 # 9. The main child's exit status is the container's exit status.
 set +e
-bounded docker run --rm "$image" sh -c 'exit 7' 2>/dev/null
+bounded docker run --rm --label "$label" "$image" sh -c 'exit 7' 2>"$scratch/exit7.stderr"
 rc=$?
 set -e
-[[ "$rc" != "124" ]] || fail "the exit-code passthrough container did not exit within 90 s"
-[[ "$rc" == "7" ]] || fail "exit code passthrough gave $rc, not 7"
+[[ "$rc" != "124" ]] || fail "the exit-code passthrough container did not exit within 90 s:"$'\n'"$(cat "$scratch/exit7.stderr")"
+[[ "$rc" == "7" ]] || fail "exit code passthrough gave $rc, not 7:"$'\n'"$(cat "$scratch/exit7.stderr")"
 ok "exit code 7 passes through"
 
 # 10. The opt-out leaves no rnsd behind.
 set +e
-bounded docker run --rm -e COYOTE_MESH_RNSD=0 "$image" bash -c 'sleep 1; ! pgrep -x rnsd' 2>/dev/null
+bounded docker run --rm --label "$label" -e COYOTE_MESH_RNSD=0 "$image" bash -c 'sleep 1; ! pgrep -x rnsd' 2>/dev/null
 rc=$?
 set -e
 [[ "$rc" != "124" ]] || fail "the COYOTE_MESH_RNSD=0 container did not exit within 90 s"
@@ -208,7 +212,7 @@ ok "COYOTE_MESH_RNSD=0 starts no rnsd"
 
 # 11. Only ~/.reticulum and /tmp need to be writable for rnsd to start.
 set +e
-read_only_err="$(bounded docker run --rm --read-only --tmpfs /home/agent/.reticulum --tmpfs /tmp "$image" \
+read_only_err="$(bounded docker run --rm --label "$label" --read-only --tmpfs /home/agent/.reticulum --tmpfs /tmp "$image" \
   bash -c 'for _ in {1..60}; do exec 3<>/dev/tcp/127.0.0.1/4242 && exit 0; sleep 0.5; done; exit 1' 2>&1 >/dev/null)"
 rc=$?
 set -e
@@ -219,7 +223,7 @@ ok "rnsd comes up on a read-only root"
 # 12. A malformed relay value warns and is dropped from the config; the main child is unaffected.
 #     stdout is the `cat` of the rendered config, stderr the entrypoint's own lines.
 set +e
-bad_relay_config="$(bounded docker run --rm -e COYOTE_MESH_RELAY=bad "$image" sh -c 'cat ~/.reticulum/config' 2>"$scratch/bad-relay.stderr")"
+bad_relay_config="$(bounded docker run --rm --label "$label" -e COYOTE_MESH_RELAY=bad "$image" sh -c 'cat ~/.reticulum/config' 2>"$scratch/bad-relay.stderr")"
 rc=$?
 set -e
 [[ "$rc" != "124" ]] || fail "the COYOTE_MESH_RELAY=bad container did not exit within 90 s:"$'\n'"$(cat "$scratch/bad-relay.stderr")"
@@ -231,7 +235,7 @@ ok "a malformed COYOTE_MESH_RELAY warns, writes no relay stanza and never blocks
 
 # 13. COYOTE_MESH_LAN=1 adds the AutoInterface and says what a transport node on the LAN does.
 set +e
-lan_config="$(bounded docker run --rm -e COYOTE_MESH_LAN=1 "$image" sh -c 'cat ~/.reticulum/config' 2>"$scratch/lan.stderr")"
+lan_config="$(bounded docker run --rm --label "$label" -e COYOTE_MESH_LAN=1 "$image" sh -c 'cat ~/.reticulum/config' 2>"$scratch/lan.stderr")"
 rc=$?
 set -e
 [[ "$rc" != "124" ]] || fail "the COYOTE_MESH_LAN=1 container did not exit within 90 s:"$'\n'"$(cat "$scratch/lan.stderr")"
@@ -244,7 +248,7 @@ ok "COYOTE_MESH_LAN=1 renders the AutoInterface and prints the LAN note"
 #     left unapplied. The outer run (RNSD=0) renders nothing; the nested entrypoint is the
 #     real one meeting a pre-existing file.
 set +e
-existing_stdout="$(bounded docker run --rm -e COYOTE_MESH_RNSD=0 "$image" sh -c 'mkdir -p ~/.reticulum; printf "# mine\n" > ~/.reticulum/config; env -u COYOTE_MESH_RNSD COYOTE_MESH_LAN=1 /usr/local/bin/coyote-entrypoint sh -c "cat ~/.reticulum/config"' 2>"$scratch/existing.stderr")"
+existing_stdout="$(bounded docker run --rm --label "$label" -e COYOTE_MESH_RNSD=0 "$image" sh -c 'mkdir -p ~/.reticulum; printf "# mine\n" > ~/.reticulum/config; env -u COYOTE_MESH_RNSD COYOTE_MESH_LAN=1 /usr/local/bin/coyote-entrypoint sh -c "cat ~/.reticulum/config"' 2>"$scratch/existing.stderr")"
 rc=$?
 set -e
 [[ "$rc" != "124" ]] || fail "the existing-config container did not exit within 90 s:"$'\n'"$(cat "$scratch/existing.stderr")"
@@ -256,7 +260,7 @@ ok "an existing config is kept and the unapplied variable is named"
 
 # 15. A missing template warns and skips rnsd; the main child still runs with its own status.
 set +e
-no_template_err="$(bounded docker run --rm --tmpfs /opt/coyote "$image" sh -c 'exit 0' 2>&1 >/dev/null)"
+no_template_err="$(bounded docker run --rm --label "$label" --tmpfs /opt/coyote "$image" sh -c 'exit 0' 2>&1 >/dev/null)"
 rc=$?
 set -e
 [[ "$rc" != "124" ]] || fail "the missing-template container did not exit within 90 s:"$'\n'"$no_template_err"
@@ -267,11 +271,11 @@ ok "a missing template warns, skips rnsd and never blocks the main child"
 
 # 16. Two containers on one network: a propagation node and a coyote image dialing it.
 docker network create "$net" >/dev/null
-docker run -d --name "$pn" --network "$net" "$pn_image" >/dev/null
+docker run -d --name "$pn" --label "$label" --network "$net" "$pn_image" >/dev/null
 pn_up=0
 deadline=$(( $(date +%s) + 30 ))
 while (( $(date +%s) < deadline )); do
-  if bounded docker run --rm --network "$net" -e COYOTE_MESH_RNSD=0 "$image" bash -c "exec 3<>/dev/tcp/$pn/4242" >/dev/null 2>&1; then
+  if bounded docker run --rm --label "$label" --network "$net" -e COYOTE_MESH_RNSD=0 "$image" bash -c "exec 3<>/dev/tcp/$pn/4242" >/dev/null 2>&1; then
     pn_up=1
     break
   fi
@@ -280,7 +284,7 @@ done
 [[ "$pn_up" == "1" ]] || fail_with_logs "$pn" "propagation node $pn:4242 did not answer within 30 s"
 ok "propagation node answers on $pn:4242"
 
-docker run -d --name "$c" --network "$net" -e COYOTE_MESH_RELAY="$pn:4242" "$image" sh -c 'sleep infinity' >/dev/null
+docker run -d --name "$c" --label "$label" --network "$net" -e COYOTE_MESH_RELAY="$pn:4242" "$image" sh -c 'sleep infinity' >/dev/null
 # The first alternative is the post-connect line: RNS 1.5.2 TCPInterface.py:233 logs
 # `Establishing TCP connection for ...` before connecting and :247 logs
 # `TCP connection for ... established` after, hence the `] established` suffix anchor;
