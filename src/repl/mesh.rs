@@ -11036,6 +11036,187 @@ mod tests {
                 });
             }
 
+            /// Spec: "While a node is on these are the ONLY `interfaces[i]` rows." Walk the
+            /// listing through off → on (degraded) → off: while off, bare `.mesh info` lists
+            /// the configured interfaces as settings (`public … (world-visible)`, `private …`);
+            /// while on, every `interfaces[i]` head appears exactly once and carries the
+            /// node's `<label>  <state>` value — no settings row survives beside it, not even
+            /// for the interface that is still retrying; after `.mesh off` the settings rows
+            /// are back. Bare `.info` keeps its own settings rows throughout.
+            #[test]
+            #[serial]
+            fn usage_probe_info_lists_each_interface_exactly_once_across_off_on_and_off_again() {
+                let guard = TestConfigDirGuard::new("repl-mesh-info-rows-once");
+                let _cache = EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
+                let _script = prompt_script::install(&[true]);
+                let _capture = capture::install();
+                run_async(async {
+                    let closed = closed_port().await;
+                    let (addr, relay_handle, _) = loopback_relay().await;
+                    let interfaces = vec![
+                        MeshInterface::Public {
+                            host: "127.0.0.1".to_string(),
+                            port: addr.port(),
+                        },
+                        MeshInterface::Private {
+                            host: "127.0.0.1".to_string(),
+                            port: closed,
+                        },
+                    ];
+                    let settings: Vec<String> =
+                        interfaces.iter().map(ToString::to_string).collect();
+                    assert_eq!(
+                        settings,
+                        vec![
+                            format!("public 127.0.0.1:{} (world-visible)", addr.port()),
+                            format!("private 127.0.0.1:{closed}"),
+                        ]
+                    );
+                    let mut ctx = ctx_with(
+                        MeshConfig {
+                            interfaces,
+                            ..MeshConfig::default()
+                        },
+                        true,
+                    );
+                    ctx.session = Some(Session::default());
+
+                    let heads = |out: &str| -> Vec<String> {
+                        out.lines()
+                            .filter(|line| line.starts_with("  interfaces["))
+                            .map(ToString::to_string)
+                            .collect()
+                    };
+                    let rows_of = |out: &str| -> Vec<String> {
+                        (0..2)
+                            .map(|i| info_row(out, &format!("interfaces[{i}]")))
+                            .collect()
+                    };
+
+                    // Off: the settings rows, one per configured interface, nothing else.
+                    let off = out_of(&mut ctx, ".mesh info").await.unwrap();
+                    assert_eq!(info_row(&off, "node"), "off", "{off}");
+                    assert_eq!(heads(&off).len(), 2, "{off}");
+                    assert_eq!(rows_of(&off), settings, "{off}");
+                    assert!(!off.contains("connected"), "{off}");
+                    assert!(!off.contains("unreachable"), "{off}");
+
+                    run(&mut ctx, ".mesh on").await.unwrap();
+                    let runtime = ctx.app.mesh.get().unwrap();
+                    let label = format!("private 127.0.0.1:{closed}");
+                    let reason = recorded_reason(&runtime, &label);
+                    assert_eq!(warnings().len(), 1, "{:?}", stderr_lines());
+
+                    // On, degraded: exactly one row per head, each the node's label + state.
+                    let on = out_of(&mut ctx, ".mesh info").await.unwrap();
+                    assert_eq!(info_row(&on, "node"), "on", "{on}");
+                    assert_eq!(
+                        heads(&on).len(),
+                        2,
+                        "one row per configured interface while on:\n{on}"
+                    );
+                    assert_eq!(
+                        rows_of(&on),
+                        vec![
+                            format!("public 127.0.0.1:{}  connected", addr.port()),
+                            format!("{label}  unreachable, retrying: {reason}"),
+                        ],
+                        "{on}"
+                    );
+                    for setting in &settings {
+                        assert!(
+                            !heads(&on)
+                                .iter()
+                                .any(|line| line.trim_start().ends_with(setting.as_str())),
+                            "a settings-shaped interfaces row survives while the node is on:\n{on}"
+                        );
+                    }
+                    assert!(!on.contains("(world-visible)"), "{on}");
+                    assert!(!on.contains("  joined"), "{on}");
+
+                    // Bare `.info` is the settings view and keeps the configured rows (it
+                    // prints through `print!`, which the capture does not record, so the text
+                    // is taken from the function `.info` prints).
+                    let sys = ctx.sysinfo(ctx.app.config.as_ref()).unwrap();
+                    assert_eq!(heads(&sys).len(), 2, "{sys}");
+                    assert_eq!(rows_of(&sys), settings, "{sys}");
+                    assert!(!sys.contains("connected"), "{sys}");
+
+                    run(&mut ctx, ".mesh off --yes").await.unwrap();
+                    assert!(ctx.app.mesh.get().is_none());
+
+                    // Off again: the settings rows are back, the node's rows are gone.
+                    let off_again = out_of(&mut ctx, ".mesh info").await.unwrap();
+                    assert_eq!(info_row(&off_again, "node"), "off", "{off_again}");
+                    assert_eq!(heads(&off_again).len(), 2, "{off_again}");
+                    assert_eq!(rows_of(&off_again), settings, "{off_again}");
+                    assert!(!off_again.contains("connected"), "{off_again}");
+                    assert!(!off_again.contains("unreachable"), "{off_again}");
+                    relay_handle.abort();
+                });
+            }
+
+            /// Spec: the per-interface rows are the node's and replace the `joined` row —
+            /// they must follow the node's interface order and count even when the settings
+            /// the REPL holds disagree with what the node was started on (an installed node
+            /// from another config, or a config edited after `.mesh on`): bare `.mesh info`
+            /// lists the NODE's interfaces, never a mixture of the two lists.
+            #[test]
+            #[serial]
+            fn usage_probe_info_rows_follow_the_running_node_not_the_held_settings() {
+                let _guard = TestConfigDirGuard::new("repl-mesh-info-rows-node-wins");
+                let _capture = capture::install();
+                run_async(async {
+                    let started = started_runtime("repl-mesh-info-rows-node-wins").await;
+                    // Settings the REPL holds name three interfaces the node never joined.
+                    let mut ctx = ctx_with(
+                        MeshConfig {
+                            interfaces: vec![
+                                MeshInterface::Lan,
+                                MeshInterface::Private {
+                                    host: "relay.example".to_string(),
+                                    port: 4242,
+                                },
+                                MeshInterface::Public {
+                                    host: "relay.example".to_string(),
+                                    port: 4965,
+                                },
+                            ],
+                            ..MeshConfig::default()
+                        },
+                        true,
+                    );
+                    ctx.app.mesh.install(started.runtime.clone()).unwrap();
+                    let states = started.runtime.interface_states();
+
+                    let out = out_of(&mut ctx, ".mesh info").await.unwrap();
+
+                    let rows: Vec<String> = out
+                        .lines()
+                        .filter(|line| line.starts_with("  interfaces["))
+                        .map(|line| line.trim_start().to_string())
+                        .collect();
+                    let expected: Vec<String> = states
+                        .iter()
+                        .enumerate()
+                        .map(|(i, status)| {
+                            format!(
+                                "{:<MESH_INFO_LABEL_WIDTH$}{}  {}",
+                                format!("interfaces[{i}]"),
+                                status.label,
+                                status.state
+                            )
+                        })
+                        .collect();
+                    assert_eq!(rows, expected, "{out}");
+                    assert!(!out.contains("relay.example"), "{out}");
+                    assert!(!out.contains("  joined"), "{out}");
+
+                    assert!(ctx.app.mesh.stop().await.unwrap());
+                    started.relay_handle.abort();
+                });
+            }
+
             #[test]
             #[serial]
             fn mesh_off_declined_keeps_the_node() {

@@ -1855,6 +1855,33 @@ mod tests {
     }
 
     #[test]
+    fn render_mesh_settings_without_interfaces_drops_only_the_interface_rows() {
+        let mesh = MeshConfig {
+            interfaces: vec![
+                MeshInterface::Lan,
+                MeshInterface::Private {
+                    host: "relay.example.com".into(),
+                    port: 4242,
+                },
+                MeshInterface::Public {
+                    host: "node.example.com".into(),
+                    port: 4242,
+                },
+            ],
+            ..Default::default()
+        };
+        let with_interfaces = render_mesh_info(&mesh);
+        let without: String = with_interfaces
+            .lines()
+            .filter(|line| !line.starts_with("  interfaces["))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        assert_eq!(with_interfaces.lines().count(), without.lines().count() + 3);
+        assert_eq!(render_mesh_settings(&mesh, false), without);
+        assert_eq!(render_mesh_settings(&mesh, true), with_interfaces);
+    }
+
+    #[test]
     fn render_mesh_info_shows_a_configured_inbox_dir() {
         let mesh = MeshConfig {
             fetch: MeshFetch {
