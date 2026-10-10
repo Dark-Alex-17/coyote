@@ -2679,19 +2679,6 @@ fn the_containers_page_names_the_entrypoint_variables() {
             "Sandboxes.md's mesh section does not say {needle:?}"
         );
     }
-    for (label, text) in [
-        ("Mesh-Containers.md", &page),
-        ("Sandboxes.md's mesh section", &sandbox),
-    ] {
-        let stale: Vec<String> = release_tokens(text)
-            .into_iter()
-            .filter(|token| token != release)
-            .collect();
-        assert!(
-            stale.is_empty(),
-            "{label} names releases other than {release}: {stale:?}; the image's rnsd qualifier is spelled from {IMAGE_RNSD_SINCE:?}"
-        );
-    }
     let docker = section(
         "Installation.md",
         &read(wiki.join("Installation.md")),
@@ -2707,13 +2694,27 @@ fn the_containers_page_names_the_entrypoint_variables() {
             "Installation.md's Docker section does not say {needle:?}"
         );
     }
+    for (label, text) in [
+        ("Mesh-Containers.md", &page),
+        ("Sandboxes.md's mesh section", &sandbox),
+        ("Installation.md's Docker section", &docker),
+    ] {
+        let stale: Vec<String> = release_tokens(text)
+            .into_iter()
+            .filter(|token| token != release)
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "{label} names releases other than {release}: {stale:?}; the image's rnsd qualifier is spelled from {IMAGE_RNSD_SINCE:?}"
+        );
+    }
 }
 
-/// The README's `### Docker` section names the image's rnsd twice over (the prerequisite
-/// line under `### Mesh` is the one the `from v0.10.4` needle finds; the Docker section's
-/// own "From v0.10.4 the image also starts..." sentence is a second site) and the
-/// propagation node's README once: every `vX.Y.Z` token in those two bodies is that one
-/// release, so neither site can drift away from the other. Repo-side; runs without the wiki.
+/// The README names the image's rnsd twice (the `## Prerequisites` line, which the
+/// `from v0.10.4` needle finds, and the `### Docker` paragraph) and the propagation node's
+/// README once; this sweeps the `### Docker` section and the node README so every `vX.Y.Z`
+/// token there is that one release and neither site drifts from the other. Repo-side; runs
+/// without the wiki.
 #[test]
 fn usage_probe_the_readme_docker_section_and_the_node_readme_name_only_the_image_rnsd_release() {
     let release = image_rnsd_release();
