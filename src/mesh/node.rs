@@ -1274,24 +1274,34 @@ impl MeshRuntime {
         Ok(true)
     }
 
-    /// Announces the current destination regardless of `REANNOUNCE_FLOOR_SECS`: a relay that
-    /// has just become reachable never heard the start announce, and the next heartbeat is up
-    /// to `HEARTBEAT_SECS` away. Sends nothing when the node is configured not to announce.
+    /// Announces the current destination over a pending interface that has just connected.
+    /// This is the third start-like exception to the floor described on
+    /// `REANNOUNCE_FLOOR_SECS`: the peers behind that relay have never heard this
+    /// destination, and the next heartbeat is up to `HEARTBEAT_SECS` away. It fires once per
+    /// pending interface, on its first connect, and sends nothing when the node is
+    /// configured not to announce. It deliberately leaves `last_announce` untouched: the
+    /// heartbeat clock and the floor that `announce_now` applies to a user's `.mesh announce`
+    /// keep the reference they had, so a connect neither delays the heartbeat nor opens a
+    /// fresh manual-announce window.
     pub(crate) async fn announce_on_connect(&self) -> Result<()> {
         if !self.announce {
             return Ok(());
         }
-        let mut state = self.destination.lock().await;
+        let state = self.destination.lock().await;
         let transport = self.running_transport().await?;
-        timeout(REKEY_GRACE, self.send_announce(&mut state, &transport))
-            .await
-            .map_err(|_| {
-                anyhow!(
-                    "The mesh transport did not send the announce for destination {} within {}s",
-                    state.hash.to_hex_string(),
-                    REKEY_GRACE.as_secs()
-                )
-            })?
+        timeout(
+            REKEY_GRACE,
+            announce_destination(&transport, &state.dest, &state.hash, &self.app_data),
+        )
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "The mesh transport did not send the announce for destination {} within {}s",
+                state.hash.to_hex_string(),
+                REKEY_GRACE.as_secs()
+            )
+        })??;
+        Ok(())
     }
 
     /// A handle on the transport, taken so the `transport` guard is not held across the
@@ -2110,6 +2120,9 @@ async fn poll_pending_interfaces(
                     origin: Origin::Local,
                     model_note: None,
                 });
+                // Awaiting the announce here can hold back a second pending interface's
+                // `connected` line by up to `REKEY_GRACE`; accepted, as the next tick
+                // picks it up.
                 tokio::select! {
                     () = cancel.cancelled() => return,
                     outcome = runtime.announce_on_connect() => if let Err(err) = outcome {
@@ -9610,6 +9623,191 @@ mod tests {
             "a stalled announce is not a failed one"
         );
         drop(busy_destination);
+
+        assert!(slot.stop().await.unwrap());
+        relay_handle.abort();
+        sink_handle.abort();
+        let metrics = tokio::runtime::Handle::current().metrics();
+        wait_until("the node's tasks to exit", || {
+            metrics.num_alive_tasks() == 0
+        })
+        .await;
+    }
+
+    /// The "Sent mesh announce" debug lines for `hash8` logged since `before`; the debug
+    /// buffer is shared by every node in the suite, so the count is scoped to one node.
+    #[cfg(unix)]
+    fn announces_since(before: usize, hash8: &str) -> usize {
+        let needle = format!("Sent mesh announce for destination {hash8}");
+        crate::testing::debug_snapshot()
+            .into_iter()
+            .skip(before)
+            .filter(|line| *line == needle)
+            .count()
+    }
+
+    /// The connect announce is a floor exception, not a floor reset: `last_announce` still
+    /// holds the start announce's instant afterwards, so a manual announce right after the
+    /// connect is still inside the original window and sends nothing.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_connect_announce_leaves_last_announce_unchanged() {
+        install_log_collector();
+        let (held, socket) = held_port().await;
+        let (relay, relay_handle, _) = loopback_relay().await;
+        let held_label = private_label(held);
+        let tmp = TempDir::new("node-connect-keeps-floor");
+        let mut session = Session::default();
+        let runtime = MeshRuntime::start(
+            &private_relays(&[relay.port(), held]),
+            true,
+            &mut session,
+            mesh_paths(&tmp),
+            short_connect(),
+        )
+        .await
+        .unwrap();
+        let (started_at, hash8) = {
+            let state = runtime.destination.lock().await;
+            (
+                state.last_announce,
+                short(&state.hash.to_hex_string()).to_string(),
+            )
+        };
+        assert!(started_at.is_some(), "the start announce sets the floor");
+        let slot = Arc::new(MeshSlot::default());
+        let notifier = Arc::new(RecordingSink::default());
+        slot.set_notifier(Arc::clone(&notifier) as Arc<dyn NotificationSink>);
+        slot.install(runtime.clone()).unwrap();
+        let before = crate::testing::debug_snapshot().len();
+
+        let listener = socket.listen(16).unwrap();
+        let (sink_handle, _) = serve_as_sink(listener).await;
+        wait_for_mesh_line(&notifier, &format!("{held_label} connected")).await;
+        wait_until("the connect announce to be sent", || {
+            announces_since(before, &hash8) == 1
+        })
+        .await;
+
+        assert_eq!(
+            runtime.destination.lock().await.last_announce,
+            started_at,
+            "the connect announce must not move the floor"
+        );
+        assert!(
+            !runtime.announce_now().await.unwrap(),
+            "a manual announce is still inside the start announce's floor"
+        );
+
+        assert!(slot.stop().await.unwrap());
+        relay_handle.abort();
+        sink_handle.abort();
+        let metrics = tokio::runtime::Handle::current().metrics();
+        wait_until("the node's tasks to exit", || {
+            metrics.num_alive_tasks() == 0
+        })
+        .await;
+    }
+
+    /// One connect announce per pending interface: the connect is recorded one-way, which
+    /// empties the pending list and ends the poller, so ticks that would have run again
+    /// find nothing to announce over.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_second_connected_poll_never_reannounces() {
+        install_log_collector();
+        let (held, socket) = held_port().await;
+        let (relay, relay_handle, _) = loopback_relay().await;
+        let held_label = private_label(held);
+        let tmp = TempDir::new("node-connect-announces-once");
+        let mut session = Session::default();
+        let runtime = MeshRuntime::start(
+            &private_relays(&[relay.port(), held]),
+            true,
+            &mut session,
+            mesh_paths(&tmp),
+            short_connect(),
+        )
+        .await
+        .unwrap();
+        let hash8 = short(&runtime.destination_hash().await).to_string();
+        let slot = Arc::new(MeshSlot::default());
+        let notifier = Arc::new(RecordingSink::default());
+        slot.set_notifier(Arc::clone(&notifier) as Arc<dyn NotificationSink>);
+        slot.install(runtime.clone()).unwrap();
+        let before = crate::testing::debug_snapshot().len();
+
+        let listener = socket.listen(16).unwrap();
+        let (sink_handle, _) = serve_as_sink(listener).await;
+        wait_for_mesh_line(&notifier, &format!("{held_label} connected")).await;
+        wait_until("the connect announce to be sent", || {
+            announces_since(before, &hash8) == 1
+        })
+        .await;
+
+        sleep(CONNECT_WATCH_TICK * 3).await;
+        assert!(runtime.pending_interfaces().is_empty());
+        assert_eq!(
+            announces_since(before, &hash8),
+            1,
+            "later ticks announce nothing"
+        );
+        assert!(
+            runtime.mark_interface_connected(1).is_none(),
+            "a connect is recorded once"
+        );
+
+        assert!(slot.stop().await.unwrap());
+        relay_handle.abort();
+        sink_handle.abort();
+        let metrics = tokio::runtime::Handle::current().metrics();
+        wait_until("the node's tasks to exit", || {
+            metrics.num_alive_tasks() == 0
+        })
+        .await;
+    }
+
+    /// A node configured not to announce stays silent on a late connect too, and its
+    /// floor stays unset.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn no_connect_announce_when_the_node_does_not_announce() {
+        install_log_collector();
+        let (held, socket) = held_port().await;
+        let (relay, relay_handle, _) = loopback_relay().await;
+        let held_label = private_label(held);
+        let tmp = TempDir::new("node-connect-silent");
+        let mut session = Session::default();
+        let runtime = MeshRuntime::start(
+            &MeshConfig {
+                announce: false,
+                ..private_relays(&[relay.port(), held])
+            },
+            true,
+            &mut session,
+            mesh_paths(&tmp),
+            short_connect(),
+        )
+        .await
+        .unwrap();
+        let hash8 = {
+            let state = runtime.destination.lock().await;
+            assert!(state.last_announce.is_none());
+            short(&state.hash.to_hex_string()).to_string()
+        };
+        let slot = Arc::new(MeshSlot::default());
+        let notifier = Arc::new(RecordingSink::default());
+        slot.set_notifier(Arc::clone(&notifier) as Arc<dyn NotificationSink>);
+        slot.install(runtime.clone()).unwrap();
+        let before = crate::testing::debug_snapshot().len();
+
+        let listener = socket.listen(16).unwrap();
+        let (sink_handle, _) = serve_as_sink(listener).await;
+        wait_for_mesh_line(&notifier, &format!("{held_label} connected")).await;
+        sleep(CONNECT_WATCH_TICK * 2).await;
+
+        assert_eq!(announces_since(before, &hash8), 0);
+        assert!(runtime.destination.lock().await.last_announce.is_none());
 
         assert!(slot.stop().await.unwrap());
         relay_handle.abort();
