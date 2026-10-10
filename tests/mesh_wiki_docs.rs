@@ -41,6 +41,32 @@ const TRUST_FILE_TWIN: &str = "`mesh/trust.yaml` is shared the same way: a trust
 /// differently.
 const IMAGE_RNSD_SINCE: &str = "from v0.10.4";
 
+/// The bare release out of [`IMAGE_RNSD_SINCE`].
+fn image_rnsd_release() -> &'static str {
+    IMAGE_RNSD_SINCE
+        .rsplit(' ')
+        .next()
+        .expect("IMAGE_RNSD_SINCE ends with the release")
+}
+
+/// Every `vX.Y.Z` token in `text`, a sentence-final `.` stripped, so a page that names a
+/// release names it in every spelling the sweep compares against the one in
+/// [`IMAGE_RNSD_SINCE`].
+fn release_tokens(text: &str) -> Vec<String> {
+    text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '.'))
+        .map(|word| word.trim_end_matches('.'))
+        .filter(|word| {
+            word.strip_prefix('v').is_some_and(|rest| {
+                rest.split('.').count() == 3
+                    && rest
+                        .split('.')
+                        .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+            })
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
@@ -2600,23 +2626,18 @@ fn the_containers_page_names_the_entrypoint_variables() {
             "{label} does not say {IMAGE_RNSD_SINCE:?} about the image's rnsd"
         );
     }
-    let release = IMAGE_RNSD_SINCE
-        .rsplit(' ')
-        .next()
-        .expect("IMAGE_RNSD_SINCE ends with the release");
-    let version_tokens = |text: &str| -> Vec<String> {
-        text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '.'))
-            .filter(|word| {
-                word.strip_prefix('v').is_some_and(|rest| {
-                    rest.split('.').count() == 3
-                        && rest.split('.').all(|part| {
-                            !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit())
-                        })
-                })
-            })
-            .map(str::to_owned)
-            .collect()
-    };
+    let release = image_rnsd_release();
+    let docker_readme = section(
+        "README.md",
+        &read(repo_root().join("README.md")),
+        "### Docker",
+    );
+    for variable in &variables {
+        assert!(
+            docker_readme.contains(variable),
+            "README.md's `### Docker` section does not name `{variable}`"
+        );
+    }
 
     let Some(wiki) = wiki_dir() else { return };
     let page = read(wiki.join("Mesh-Containers.md"));
@@ -2662,7 +2683,7 @@ fn the_containers_page_names_the_entrypoint_variables() {
         ("Mesh-Containers.md", &page),
         ("Sandboxes.md's mesh section", &sandbox),
     ] {
-        let stale: Vec<String> = version_tokens(text)
+        let stale: Vec<String> = release_tokens(text)
             .into_iter()
             .filter(|token| token != release)
             .collect();
@@ -2684,6 +2705,37 @@ fn the_containers_page_names_the_entrypoint_variables() {
         assert!(
             flat(&docker).contains(needle),
             "Installation.md's Docker section does not say {needle:?}"
+        );
+    }
+}
+
+/// The README's `### Docker` section names the image's rnsd twice over (the prerequisite
+/// line under `### Mesh` is the one the `from v0.10.4` needle finds; the Docker section's
+/// own "From v0.10.4 the image also starts..." sentence is a second site) and the
+/// propagation node's README once: every `vX.Y.Z` token in those two bodies is that one
+/// release, so neither site can drift away from the other. Repo-side; runs without the wiki.
+#[test]
+fn usage_probe_the_readme_docker_section_and_the_node_readme_name_only_the_image_rnsd_release() {
+    let release = image_rnsd_release();
+    let readme = read(repo_root().join("README.md"));
+    let docker = section("README.md", &readme, "### Docker");
+    let node_readme = read(repo_root().join("deployment/propagation-node/README.md"));
+    for (label, text) in [
+        ("README.md's `### Docker` section", docker.as_str()),
+        (
+            "deployment/propagation-node/README.md",
+            node_readme.as_str(),
+        ),
+    ] {
+        let tokens = release_tokens(text);
+        assert!(
+            !tokens.is_empty(),
+            "{label} no longer qualifies the image's rnsd with a release"
+        );
+        let stale: Vec<&String> = tokens.iter().filter(|token| *token != release).collect();
+        assert!(
+            stale.is_empty(),
+            "{label} names releases other than {release}: {stale:?}; the image's rnsd qualifier is spelled from {IMAGE_RNSD_SINCE:?}"
         );
     }
 }
