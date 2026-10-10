@@ -512,6 +512,36 @@ jobs:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
+      # The host-arch smoke image is loaded into the daemon beside buildx's own cache.
+      - name: Free runner disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      # The gate: the same Dockerfile and build-arg the push step uses, built for the
+      # runner's own arch only and loaded into the daemon so the smoke can run it. The
+      # multi-platform push below stays unchanged and the smoke never executes under
+      # QEMU; the buildx builder shares its layer cache, so the amd64 half of the push
+      # is largely a cache hit.
+      - name: Build host-arch image for the smoke
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: coyote-smoke:release
+          build-args: COYOTE_VERSION=${{ env.version }}
+
+      - name: Smoke the image
+        run: scripts/image-smoke.sh coyote-smoke:release
+
+      # Reclaim the daemon copy before the multi-platform build.
+      - name: Remove the smoke image
+        run: docker rmi coyote-smoke:release
+
       - name: Push to Docker Hub
         uses: docker/build-push-action@v5
         with:

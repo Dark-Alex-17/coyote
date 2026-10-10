@@ -506,3 +506,82 @@ jobs:
           echo "### Scripts wall-clock (${{ matrix.os }}): $((end - ${start:-$end})) s"
           echo "Outcome: ${{ job.status }}"
         } >> "$GITHUB_STEP_SUMMARY"
+
+  # The Dockerfile built around the latest released coyote and run through
+  # scripts/image-smoke.sh. The Dockerfile downloads
+  # `releases/download/v${COYOTE_VERSION}/coyote-<musl>.tar.gz`, and the latest release
+  # is the only binary a PR build can download, so a green run proves the rnsd layer and
+  # the entrypoint contract around the latest released coyote, not the PR's Rust (that is
+  # `All`'s job). Host arch only, no QEMU. Informational like `mesh-interop`: not in
+  # branch protection, and deliberately NOT `continue-on-error`, so a red smoke shows as
+  # a red job. This is the slow lane: the uncached build stage installs a Rust toolchain
+  # and `cargo install`s two tools. No `cache-from`/`cache-to`: the image is ~5.7 GB and
+  # a GHA layer cache of it would evict the rust-cache entries the `All` matrix depends
+  # on. The runner's disk is freed first because the build stage plus the flattened
+  # final image need ~12 GB.
+  image-smoke:
+    name: Image Smoke
+
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 90
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Start The Clock
+      run: echo "start=$(date +%s)" >> "$GITHUB_ENV"
+
+    # The build stage and the flattened image together need ~12 GB that a stock runner
+    # does not have free.
+    - name: Free Runner Disk
+      run: |
+        df -h /
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+        df -h /
+
+    # The Dockerfile prefixes the `v` itself at the release-download URL, so the
+    # build-arg is the bare version.
+    - name: Resolve The Latest Release
+      env:
+        GH_TOKEN: ${{ github.token }}
+        GH_REPO: ${{ github.repository }}
+      run: |
+        version="$(gh release view --json tagName -q .tagName | sed 's/^v//')"
+        [ -n "$version" ] || { echo "::error::gh release view returned no tag"; exit 1; }
+        echo "coyote_version=$version" >> "$GITHUB_ENV"
+        echo "latest release: v$version"
+
+    # Plain `docker build` on the daemon's default builder, not a buildx container
+    # driver: the daemon already builds for the host arch and sets TARGETARCH, and a
+    # container-driver builder would keep a second 5.7 GB copy of every layer that
+    # `--load` then copies into the daemon.
+    - name: Build The Image
+      run: |
+        build_start=$(date +%s)
+        docker build --build-arg COYOTE_VERSION="$coyote_version" -t coyote-smoke:ci .
+        echo "build_seconds=$(( $(date +%s) - build_start ))" >> "$GITHUB_ENV"
+        docker image ls coyote-smoke:ci
+
+    # Its own step so a propagation-node build failure is attributable in the log; the
+    # smoke script would otherwise build it quietly with `-q`.
+    - name: Build The Propagation Node
+      run: docker build -t coyote-pn:ci deployment/propagation-node
+
+    - name: Smoke
+      run: |
+        smoke_start=$(date +%s)
+        scripts/image-smoke.sh coyote-smoke:ci --pn coyote-pn:ci
+        echo "smoke_seconds=$(( $(date +%s) - smoke_start ))" >> "$GITHUB_ENV"
+
+    - name: Record Wall-Clock
+      if: always()
+      run: |
+        end=$(date +%s)
+        {
+          echo "### Image smoke wall-clock: $((end - ${start:-$end})) s"
+          echo "Image build: ${build_seconds:-n/a} s"
+          echo "Smoke: ${smoke_seconds:-n/a} s"
+          echo "coyote: v${coyote_version:-unresolved}"
+          echo "Outcome: ${{ job.status }}"
+        } >> "$GITHUB_STEP_SUMMARY"
