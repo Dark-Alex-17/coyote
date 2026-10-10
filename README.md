@@ -85,6 +85,12 @@ Coyote requires the following tools to be installed on your system:
     * Optional: if `ast-grep` is not installed, the `ast_grep` tool reports it and agents fall back to `fs_grep`
 * [duckdb](https://duckdb.org/) (for fast, local RAGs)
     * `curl https://install.duckdb.org | bash`
+* Coyote mesh (`.mesh`) needs a local Reticulum daemon. `cargo install`, Homebrew and the Docker image install only the
+  Coyote binary; set `rnsd` up separately with one command —
+  `curl -fsSL https://raw.githubusercontent.com/Dark-Alex-17/coyote/refs/heads/main/scripts/mesh-relay.sh | bash` or
+  `powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr -useb https://raw.githubusercontent.com/Dark-Alex-17/coyote/refs/heads/main/scripts/mesh-relay.ps1 | iex"`
+  — or pass `--with-mesh` / `-WithMesh` to the installer.
+  See [Mesh Deployment](https://github.com/Dark-Alex-17/coyote/wiki/Mesh-Deployment).
 
 These tools are used to provide various functionalities within Coyote, such as document processing, JSON manipulation,
 etc., and they are used within agents and tools.
@@ -360,9 +366,10 @@ Interoperability is exercised against the reference Reticulum/LXMF implementatio
 [mesh interop harness](https://github.com/Dark-Alex-17/coyote/blob/main/scripts/mesh-interop/README.md),
 run in the informational `Mesh Interop` CI job.
 The [propagation node image](https://github.com/Dark-Alex-17/coyote/blob/main/deployment/propagation-node/README.md)
-guide covers a ready-to-run LXMF propagation node for store-and-forward between your instances
+guide covers a ready-to-run LXMF propagation node: store-and-forward across devices for a team
 (held messages are fetched automatically every `mesh.propagation_sync_interval_secs` seconds and on demand with
-`.mesh sync`).
+`.mesh sync`). It is not how sessions on one host reach each other; those dial the local `rnsd` named under
+[Prerequisites](#prerequisites).
 The envoy that answers trusted peers for you starts every run with no memory of the peer: a follow-up in the same
 thread is answered as if it were the first message. `mesh.envoy_memory.enabled: true` changes that, keeping the
 peer's turns and what the node sent back per (sender identity, thread) so a follow-up is answered in context; the
