@@ -8,13 +8,20 @@
 //! COYOTE_WIKI_DIR=../coyote.wiki cargo test --test mesh_wiki_docs
 //! ```
 //!
-//! Without the variable every test prints `skipping:` and passes, so a plain
-//! `cargo test` is unaffected. With it set to a directory that has no `Mesh.md`
-//! the tests fail rather than pass against nothing.
+//! Without the variable the wiki half of every test is skipped (printed as
+//! `skipping:`) and the repo-only assertions still run, so a plain `cargo test`
+//! is unaffected. With it set to a directory that has no `Mesh.md` the tests
+//! fail rather than pass against nothing.
 //!
-//! There is no lib target, so the code side of each pin is read from the repo's
-//! text: the REPL `VERBS` table, the hook counts and the `mesh__*` tool names under
-//! `src/`, the spec's H1 in `docs/mesh/PROTOCOL.md`, and the README.
+//! There is no lib target, so the code side of each pin is read from the repo's text:
+//! the REPL `VERBS` table, `interface_warnings` and `interface_row` in `src/repl/mesh.rs`,
+//! the failure texts and `InterfaceState` rows in `src/mesh/node.rs`, the hook counts and
+//! the `mesh__*` tool names under `src/`, the limits and the empty-`interfaces` bail in
+//! `src/config/mesh_config.rs`, the yaml twins (`assets/config-template.yaml`,
+//! `config.example.yaml`), `scripts/mesh-relay.{sh,ps1}`, the `Dockerfile`, the spec's
+//! H1 in `docs/mesh/PROTOCOL.md`, the README and the propagation node's README. The
+//! assertions that read only the repo run on every `cargo test`, ahead of each test's
+//! wiki gate.
 
 use std::env;
 use std::fs;
@@ -23,6 +30,12 @@ use std::path::{Path, PathBuf};
 const WIKI_DIR: &str = "COYOTE_WIKI_DIR";
 const RECIPE: &str = "`COYOTE_WIKI_DIR=../coyote.wiki cargo test --test mesh_wiki_docs`";
 const PROTOCOL_PATH: &str = "docs/mesh/PROTOCOL.md";
+/// The shipped `mesh.interfaces` default as the README's and the Configuration page's
+/// Default cells spell it.
+const INTERFACES_DEFAULT: &str = "`[{type: private, host: 127.0.0.1, port: 4242}]`";
+/// The trust-file caveat the two-sessions prose carries on the Deployment and
+/// Configuration pages alike, whitespace flattened.
+const TRUST_FILE_TWIN: &str = "`mesh/trust.yaml` is shared the same way: a trust, untrust or block made in one REPL reaches the other only after its `.mesh off` and `.mesh on`, and the REPL that writes last wins the file. Split the config dirs when a block has to hold.";
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1557,5 +1570,1195 @@ fn every_envoy_memory_key_is_documented_on_every_surface_with_the_default_the_co
                 wiki_row(key)
             );
         }
+    }
+}
+
+/// The Mesh page's lead, the text before its first section, names the local daemon and
+/// the loopback endpoint the shipped default dials.
+#[test]
+fn the_mesh_page_names_the_local_daemon_and_its_loopback_endpoint_before_the_first_section() {
+    let Some(wiki) = wiki_dir() else { return };
+    let page = read(wiki.join("Mesh.md"));
+    let lead = lead(&page);
+    for needle in ["rnsd", "127.0.0.1:4242"] {
+        assert!(
+            lead.contains(needle),
+            "Mesh.md does not name {needle} before its first `## ` heading:\n{lead}"
+        );
+    }
+}
+
+/// The `interfaces:` line of `text` and every line indented deeper than it.
+fn interfaces_block(label: &str, text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with("interfaces:"))
+        .unwrap_or_else(|| panic!("{label} has no `interfaces:` block"));
+    let indent = |line: &str| line.len() - line.trim_start().len();
+    let head = indent(lines[start]);
+    let body = lines[start + 1..]
+        .iter()
+        .take_while(|line| indent(line) > head)
+        .copied();
+    std::iter::once(lines[start])
+        .chain(body)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The `interfaces:` block is one text on every surface: the example and the
+/// Configuration page's yaml carry the template's lines byte for byte, and the template's
+/// default is the private loopback entry, which the page's Keys table spells as the README does.
+/// The template/example comparison runs on every run.
+#[test]
+fn the_interfaces_block_is_byte_identical_across_the_template_the_example_and_the_configuration_page()
+ {
+    let template = interfaces_block(
+        "assets/config-template.yaml",
+        &read(repo_root().join("assets/config-template.yaml")),
+    );
+    let example = interfaces_block(
+        "config.example.yaml",
+        &read(repo_root().join("config.example.yaml")),
+    );
+    assert_eq!(
+        example, template,
+        "config.example.yaml's `interfaces:` block differs from the template"
+    );
+    for needle in ["type: private", "127.0.0.1"] {
+        assert!(
+            template.contains(needle),
+            "the template's `interfaces:` block does not say {needle}:\n{template}"
+        );
+    }
+
+    let Some(wiki) = wiki_dir() else { return };
+    let configuration = read(wiki.join("Mesh-Configuration.md"));
+    let page = interfaces_block("Mesh-Configuration.md", &configuration);
+    assert_eq!(
+        page, template,
+        "Mesh-Configuration.md's `interfaces:` block differs from the template"
+    );
+    let row = configuration
+        .lines()
+        .find(|line| line.starts_with("| `interfaces`"))
+        .expect("Mesh-Configuration.md's Keys table has an `interfaces` row");
+    assert_eq!(
+        table_cells(row)[2],
+        INTERFACES_DEFAULT,
+        "Mesh-Configuration.md's `interfaces` Default cell is not the shipped loopback entry: {row}"
+    );
+}
+
+/// `label: spells <needle>` for every needle `text` spells, whitespace runs collapsed to
+/// one space and case ignored, so a phrase wrapped across lines is caught.
+fn local_routing_hits(label: &str, text: &str, needles: &[&str]) -> Vec<String> {
+    let flat = text
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    needles
+        .iter()
+        .filter(|needle| flat.contains(&needle.to_lowercase()))
+        .map(|needle| format!("{label}: spells {needle}"))
+        .collect()
+}
+
+/// Sessions on one host reach each other through the host's rnsd; neither a Mesh page nor
+/// the in-repo READMEs route them through a relay or point at the retired two-instance
+/// recipe. The READMEs are scanned on every run; the wiki pages only when `COYOTE_WIKI_DIR`
+/// is set.
+#[test]
+fn no_mesh_page_or_the_propagation_node_readme_routes_local_sessions_through_the_relay() {
+    let needles = [
+        "second instance on the same machine reaches the mesh through this relay",
+        "doubles as the `private` relay",
+        "two instances on one machine therefore go through a relay",
+        "two-instance recipe",
+    ];
+    let wrapped = "so a second instance on the same machine reaches the mesh\n  through this relay with `type: private`.\n";
+    let control = local_routing_hits("fixture", wrapped, &needles);
+    assert_eq!(
+        control.len(),
+        1,
+        "the scan does not go red on a phrase wrapped across lines: {control:?}"
+    );
+    let control = local_routing_hits("fixture", "a team relay in rnsd's config\n", &needles);
+    assert!(
+        control.is_empty(),
+        "the team relay in rnsd's config is not local routing: {control:?}"
+    );
+
+    let mut pages = vec![
+        repo_root().join("README.md"),
+        repo_root().join("deployment/propagation-node/README.md"),
+    ];
+    if let Some(wiki) = wiki_dir() {
+        pages.extend(mesh_pages(&wiki));
+    }
+    let hits: Vec<String> = pages
+        .iter()
+        .flat_map(|path| local_routing_hits(&path.display().to_string(), &read(path), &needles))
+        .collect();
+    assert!(hits.is_empty(), "{}", hits.join("\n"));
+}
+
+/// The text of a `format!` literal outside its `{...}` placeholders, each piece trimmed;
+/// pieces shorter than 12 characters are dropped as too common to pin, except the first,
+/// which anchors the line. A literal with an escaped brace must be unescaped first, as the
+/// empty-interfaces pin does.
+fn format_fragments(literal: &str) -> Vec<String> {
+    assert!(
+        !literal.contains("{{"),
+        "{literal:?} escapes a brace; unescape its doubled braces first, as the empty-interfaces pin does"
+    );
+    let mut pieces = Vec::new();
+    let mut rest = literal;
+    while let Some(open) = rest.find('{') {
+        pieces.push(&rest[..open]);
+        let close = rest[open..]
+            .find('}')
+            .map(|offset| open + offset)
+            .unwrap_or_else(|| panic!("unclosed placeholder in {literal:?}"));
+        rest = &rest[close + 1..];
+    }
+    pieces.push(rest);
+    pieces
+        .into_iter()
+        .enumerate()
+        .map(|(index, piece)| (index, piece.trim()))
+        .filter(|(index, piece)| !piece.is_empty() && (*index == 0 || piece.chars().count() >= 12))
+        .map(|(_, piece)| piece.to_string())
+        .collect()
+}
+
+/// The source of `name` in `path`: from its `fn` line to the first `\n}\n` after it.
+fn fn_body(path: &str, name: &str) -> String {
+    let source = read(repo_root().join(path));
+    let start = source
+        .find(&format!("fn {name}("))
+        .unwrap_or_else(|| panic!("{path} declares fn {name}"));
+    let end = source[start..]
+        .find("\n}\n")
+        .map(|offset| start + offset)
+        .unwrap_or_else(|| panic!("{path}'s fn {name} does not end with `}}` on its own line"));
+    source[start..end].to_string()
+}
+
+/// The Commands and Deployment pages quote what `.mesh on` prints for an interface that
+/// did not come up as the code formats it: the three `WARNING:` lines, the `Mesh relay`
+/// failure text, the hint appended when every configured interface is a loopback relay,
+/// the `lan` bind failure and the three `InterfaceState` rows of `.mesh info`. Every piece
+/// of text around a placeholder is on both pages byte for byte. The code side is checked
+/// on every run.
+#[test]
+fn the_commands_and_deployment_pages_quote_the_interface_warnings_and_states_as_the_code_prints_them()
+ {
+    assert_eq!(
+        format_fragments("WARNING: {label} is unreachable ({reason}); tail here."),
+        ["WARNING:", "is unreachable (", "); tail here."],
+        "format_fragments does not split a literal on its placeholders"
+    );
+
+    let warnings: Vec<String> = string_literals(&fn_body("src/repl/mesh.rs", "interface_warnings"))
+        .into_iter()
+        .filter(|literal| literal.starts_with("WARNING: "))
+        .collect();
+    assert_eq!(
+        warnings.len(),
+        3,
+        "interface_warnings in src/repl/mesh.rs does not format exactly three WARNING lines: {warnings:?}"
+    );
+    let failures: Vec<String> = string_literals(&fn_body("src/mesh/node.rs", "join_tcp"))
+        .into_iter()
+        .filter(|literal| literal.starts_with("Mesh relay "))
+        .collect();
+    assert_eq!(
+        failures.len(),
+        1,
+        "join_tcp in src/mesh/node.rs does not format exactly one `Mesh relay` failure: {failures:?}"
+    );
+    let hints = string_literals(&fn_body("src/mesh/node.rs", "loopback_hint"));
+    assert_eq!(
+        hints.len(),
+        1,
+        "loopback_hint in src/mesh/node.rs does not format exactly one literal: {hints:?}"
+    );
+    let lan_failures = string_literals(&fn_body("src/mesh/node.rs", "lan_bind_failure_message"));
+    assert_eq!(
+        lan_failures.len(),
+        1,
+        "lan_bind_failure_message in src/mesh/node.rs does not format exactly one literal: {lan_failures:?}"
+    );
+    let node_source = read(repo_root().join("src/mesh/node.rs"));
+    let display = node_source
+        .split("\nimpl fmt::Display for InterfaceState {")
+        .nth(1)
+        .expect("src/mesh/node.rs implements Display for InterfaceState")
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    let states = string_literals(display);
+    assert_eq!(
+        states,
+        [
+            "connected",
+            "unreachable, retrying: {reason}",
+            "unreachable: {reason}"
+        ],
+        "InterfaceState's Display pieces moved; update the wiki and this test"
+    );
+
+    let Some(wiki) = wiki_dir() else { return };
+    for page_name in ["Mesh-Commands.md", "Mesh-Deployment.md"] {
+        let page = read(wiki.join(page_name));
+        for literal in warnings
+            .iter()
+            .chain(&failures)
+            .chain(&hints)
+            .chain(&lan_failures)
+            .chain(&states)
+        {
+            for fragment in format_fragments(literal) {
+                assert!(
+                    page.contains(&fragment),
+                    "{page_name} does not quote {fragment:?} from {literal:?}"
+                );
+            }
+        }
+        for needle in ["unreachable, retrying: <reason>", "connected"] {
+            assert!(
+                page.contains(needle),
+                "{page_name} does not show the `.mesh info` interface state {needle:?}"
+            );
+        }
+    }
+}
+
+/// The Configuration page's validation table quotes the empty-`interfaces` error as the
+/// code bails, braces unescaped. The bail's shape is checked on every run.
+#[test]
+fn the_configuration_page_quotes_the_empty_interfaces_sentence_as_the_code_bails() {
+    let source = read(repo_root().join("src/config/mesh_config.rs"));
+    let start = source
+        .find("\"mesh.interfaces is empty;")
+        .expect("src/config/mesh_config.rs formats the empty-interfaces error");
+    let bail = source[..start]
+        .rfind("bail!(")
+        .expect("the empty-interfaces error is raised with bail!");
+    assert!(
+        source[bail + "bail!(".len()..start].trim().is_empty(),
+        "the empty-interfaces literal is not the bail!'s first argument"
+    );
+    let end = source[start..]
+        .find("\"\n")
+        .map(|offset| start + offset)
+        .expect("the empty-interfaces literal ends its line");
+    let literals = string_literals(&source[bail..=end]);
+    assert_eq!(
+        literals.len(),
+        1,
+        "the empty-interfaces bail! does not carry exactly one literal: {literals:?}"
+    );
+    let sentence = literals[0].replace("{{", "{").replace("}}", "}");
+
+    let Some(wiki) = wiki_dir() else { return };
+    let page = read(wiki.join("Mesh-Configuration.md"));
+    assert!(
+        page.contains(&sentence),
+        "Mesh-Configuration.md does not quote the empty-interfaces error as the code bails:\n{sentence}"
+    );
+}
+
+/// The text of `page` before its first `## ` heading.
+fn lead(page: &str) -> String {
+    page.lines()
+        .take_while(|line| !line.starts_with("## "))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The text under `heading`, an `## ` or `### ` line of `page`, up to the next heading of
+/// the same or a higher level.
+fn section(label: &str, page: &str, heading: &str) -> String {
+    let marker = format!("\n{heading}\n");
+    let at = page
+        .find(&marker)
+        .unwrap_or_else(|| panic!("{label} has no `{heading}` heading"));
+    let body = &page[at + marker.len()..];
+    let level = heading.bytes().take_while(|b| *b == b'#').count();
+    let end = (2..=level)
+        .filter_map(|depth| body.find(&format!("\n{} ", "#".repeat(depth))))
+        .min()
+        .unwrap_or(body.len());
+    body[..end].to_string()
+}
+
+/// `text` with every whitespace run collapsed to one space, so a sentence the page wraps is
+/// matched as prose.
+fn flat(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The source of the bash function `name` in `path`: from its `name() {` line to the next
+/// `}` on its own line.
+fn bash_fn_body(path: &str, name: &str) -> String {
+    let source = read(repo_root().join(path));
+    let head = format!("{name}() {{");
+    let start = source
+        .find(&head)
+        .unwrap_or_else(|| panic!("{path} defines {name}()"));
+    let end = source[start..]
+        .find("\n}\n")
+        .map(|offset| start + offset)
+        .unwrap_or_else(|| panic!("{path}'s {name}() does not end with `}}` on its own line"));
+    source[start..end].to_string()
+}
+
+/// The lines between each `cat <<'EOF'` or `cat <<EOF` line of `body` and its closing `EOF`.
+fn heredoc_bodies(body: &str) -> Vec<String> {
+    let mut bodies = Vec::new();
+    let mut lines = body.lines();
+    while let Some(line) = lines.next() {
+        if !(line.contains("cat <<'EOF'") || line.contains("cat <<EOF")) {
+            continue;
+        }
+        let mut heredoc = Vec::new();
+        loop {
+            match lines.next() {
+                Some("EOF") => break,
+                Some(line) => heredoc.push(line),
+                None => panic!("unterminated heredoc in:\n{body}"),
+            }
+        }
+        bodies.push(heredoc.join("\n"));
+    }
+    bodies
+}
+
+/// The anchor GitHub gives a markdown heading: the `#`s stripped, lowercased, every
+/// character that is not a letter, digit, space, hyphen or underscore dropped (which takes
+/// backticks and the `.` of `.mesh on` with it), spaces to hyphens.
+fn github_slug(heading: &str) -> String {
+    heading
+        .trim_start_matches('#')
+        .trim()
+        .to_lowercase()
+        .chars()
+        .filter(|c| c.is_alphanumeric() || matches!(c, ' ' | '-' | '_'))
+        .map(|c| if c == ' ' { '-' } else { c })
+        .collect()
+}
+
+/// Every heading line of `page` outside its fenced code blocks.
+fn headings(page: &str) -> Vec<&str> {
+    let mut fenced = false;
+    page.lines()
+        .filter(|line| {
+            if line.trim_start().starts_with("```") {
+                fenced = !fenced;
+                return false;
+            }
+            !fenced && line.starts_with('#')
+        })
+        .collect()
+}
+
+/// The slug of every heading of `page` outside its fenced code blocks.
+fn heading_slugs(page: &str) -> Vec<String> {
+    headings(page).into_iter().map(github_slug).collect()
+}
+
+/// `label:line → Page#anchor` for every `](Page#anchor)` link in `text` whose `Page` is
+/// in `anchors` and whose `anchor` is none of that page's heading slugs.
+fn dangling_section_links(label: &str, text: &str, anchors: &[(&str, Vec<String>)]) -> Vec<String> {
+    let mut dangling = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        for (at, _) in line.match_indices("](") {
+            let target = &line[at + 2..];
+            let Some(close) = target.find(')') else {
+                continue;
+            };
+            let Some((page, anchor)) = target[..close].split_once('#') else {
+                continue;
+            };
+            let Some((_, slugs)) = anchors.iter().find(|(name, _)| *name == page) else {
+                continue;
+            };
+            if !slugs.iter().any(|slug| slug == anchor) {
+                dangling.push(format!("{label}:{} → {page}#{anchor}", index + 1));
+            }
+        }
+    }
+    dangling
+}
+
+/// The block from the line starting `**Which setup?**` through the first following line
+/// ending `the loopback hop.`, inclusive.
+fn decision_tree(label: &str, page: &str) -> String {
+    let lines: Vec<&str> = page.lines().collect();
+    let start = lines
+        .iter()
+        .position(|line| line.starts_with("**Which setup?**"))
+        .unwrap_or_else(|| panic!("{label} has no `**Which setup?**` line"));
+    let end = lines[start..]
+        .iter()
+        .position(|line| line.ends_with("the loopback hop."))
+        .map(|offset| start + offset)
+        .unwrap_or_else(|| panic!("{label}'s decision tree does not end with `the loopback hop.`"));
+    lines[start..=end].join("\n")
+}
+
+/// The Mesh page's lead carries the three setups of the decision tree, the trust sentence
+/// and the one-command daemon setup; its Pages row for Mesh Deployment names the daemon;
+/// the interfaces list spells `private` as the loopback default ahead of `lan`; the Quick
+/// start points at the daemon setup; and the inbox section quotes the idle line a late
+/// relay prints.
+#[test]
+fn the_mesh_page_lead_carries_the_three_setups_and_the_pages_row_names_the_daemon() {
+    let Some(wiki) = wiki_dir() else { return };
+    let page = read(wiki.join("Mesh.md"));
+    let intro = flat(&lead(&page));
+    for needle in [
+        "Running without rnsd",
+        "lxmd",
+        "mutually trusted",
+        "interface-level switch",
+        "--with-mesh",
+        "-WithMesh",
+        "scripts/mesh-relay.sh",
+    ] {
+        assert!(
+            intro.contains(needle),
+            "Mesh.md does not say {needle:?} before its first `## ` heading:\n{intro}"
+        );
+    }
+    let pages = section("Mesh.md", &page, "## Pages");
+    let deployment_row = pages
+        .lines()
+        .find(|line| line.contains("[Mesh Deployment](Mesh-Deployment)"))
+        .unwrap_or_else(|| {
+            panic!("Mesh.md's Pages section has no Mesh Deployment bullet:\n{pages}")
+        });
+    assert!(
+        deployment_row.contains("rnsd"),
+        "the Mesh Deployment bullet does not name rnsd: {deployment_row}"
+    );
+    let how = section("Mesh.md", &page, "## How it works");
+    let bullets: Vec<&str> = how.lines().filter(|line| line.starts_with("- `")).collect();
+    let bullet = |kind: &str| {
+        bullets
+            .iter()
+            .position(|line| line.starts_with(&format!("- `{kind}`")))
+            .unwrap_or_else(|| panic!("Mesh.md's interfaces list has no `{kind}` bullet:\n{how}"))
+    };
+    let private_at = bullet("private");
+    let lan_at = bullet("lan");
+    assert_eq!(
+        bullets[private_at],
+        "- `private`: TCP client to a relay; the default dials the local rnsd on `127.0.0.1:4242`.",
+        "Mesh.md's `private` bullet changed"
+    );
+    assert_eq!(
+        bullets[lan_at],
+        "- `lan`: Reticulum AutoInterface, link-local only; the no-daemon fallback.",
+        "Mesh.md's `lan` bullet changed"
+    );
+    assert!(
+        private_at < lan_at,
+        "Mesh.md lists `lan` before the `private` default:\n{how}"
+    );
+    let quick_start = flat(&section("Mesh.md", &page, "## Quick start"));
+    assert!(
+        quick_start.contains("the per-host daemon setup is on"),
+        "Mesh.md's Quick start does not point at the daemon setup:\n{quick_start}"
+    );
+    let inbox = section("Mesh.md", &page, "## Notifications and the inbox");
+    assert!(
+        inbox.contains("[mesh] <label> connected"),
+        "Mesh.md's inbox section does not quote the `[mesh] <label> connected` idle line:\n{inbox}"
+    );
+}
+
+/// The decision tree, from `**Which setup?**` through `the loopback hop.`, is one text on
+/// the Mesh and Deployment pages.
+#[test]
+fn the_decision_tree_is_byte_identical_on_the_mesh_and_deployment_pages() {
+    let Some(wiki) = wiki_dir() else { return };
+    let fixture = "intro\n**Which setup?** lead\n1. one\n\nreached through\nthe loopback hop.\nAll of it is elsewhere.\n";
+    assert_eq!(
+        decision_tree("fixture", fixture),
+        "**Which setup?** lead\n1. one\n\nreached through\nthe loopback hop.",
+        "decision_tree does not stop at the first `the loopback hop.` line"
+    );
+    let mesh = decision_tree("Mesh.md", &read(wiki.join("Mesh.md")));
+    let deployment = decision_tree("Mesh-Deployment.md", &read(wiki.join("Mesh-Deployment.md")));
+    assert_eq!(
+        mesh, deployment,
+        "the decision tree differs between Mesh.md and Mesh-Deployment.md"
+    );
+    assert!(
+        !mesh.contains("All of it is on"),
+        "the Mesh.md pointer sentence leaked into the twin block:\n{mesh}"
+    );
+}
+
+/// The Deployment page keeps its section order, leads with the one-liner and the loopback
+/// default, climbs the ladder loopback → team relay → `type: public`, and quotes the relay
+/// script: every line of the rnsd config it writes, its firewall sentence (on the Platform
+/// page too), its usage lines, its exit codes, both root refusals and the enable command it
+/// prints when no user session bus answers. The script-side shape checks run on every run.
+#[test]
+fn the_deployment_page_keeps_its_section_order_and_quotes_the_relay_script() {
+    const SH: &str = "scripts/mesh-relay.sh";
+    const PS1: &str = "scripts/mesh-relay.ps1";
+    let config_lines: Vec<String> = ["settings_text", "interfaces_text", "config_text"]
+        .iter()
+        .flat_map(|name| heredoc_bodies(&bash_fn_body(SH, name)))
+        .flat_map(|body| {
+            body.lines()
+                .map(|line| {
+                    line.trim()
+                        .replace("$RELAY_HOST", "HOST")
+                        .replace("$RELAY_PORT", "PORT")
+                })
+                .filter(|line| !line.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert!(
+        config_lines.iter().any(|line| line == "target_host = HOST")
+            && config_lines
+                .iter()
+                .any(|line| line == "enable_transport = True"),
+        "the heredocs of {SH} no longer carry the relay stanza and the transport flag: {config_lines:?}"
+    );
+
+    let firewall = bash_fn_body(SH, "firewall_warning");
+    let sentence_at = firewall
+        .find("local sentence=\"")
+        .expect("firewall_warning declares `local sentence`")
+        + "local sentence=\"".len();
+    let sentence = &firewall[sentence_at..sentence_at + firewall[sentence_at..].find('"').unwrap()];
+    assert!(
+        sentence.starts_with("Firewall: "),
+        "firewall_warning's sentence moved: {sentence:?}"
+    );
+
+    let usage: Vec<String> = string_literals(&bash_fn_body(SH, "usage"))
+        .into_iter()
+        .filter(|literal| literal.starts_with("  -"))
+        .collect();
+    assert_eq!(usage.len(), 7, "usage() lists seven options: {usage:?}");
+
+    let header = read(repo_root().join(SH));
+    let exit_codes = flat(
+        &header
+            .lines()
+            .skip_while(|line| !line.starts_with("# Exit codes:"))
+            .map_while(|line| line.strip_prefix("# "))
+            .collect::<Vec<_>>()
+            .join(" "),
+    );
+    assert!(
+        exit_codes.starts_with("Exit codes: 0 ") && exit_codes.contains("; 3 "),
+        "{SH}'s `# Exit codes:` header lines moved: {exit_codes:?}"
+    );
+
+    let root_refusal = string_literals(&bash_fn_body(SH, "refuse_root"))
+        .into_iter()
+        .find(|literal| literal.starts_with("running as root"))
+        .expect("refuse_root errs with `running as root`");
+    let ps1 = read(repo_root().join(PS1));
+    let admin_lead = "Write-Failure 'running as Administrator";
+    let admin_at = ps1
+        .find(admin_lead)
+        .expect("mesh-relay.ps1 refuses Administrator")
+        + "Write-Failure '".len();
+    let admin_refusal = &ps1[admin_at..admin_at + ps1[admin_at..].find('\'').unwrap()];
+
+    let no_bus_enable = string_literals(&bash_fn_body(SH, "service_linux"))
+        .into_iter()
+        .find(|literal| {
+            literal
+                .trim_start()
+                .starts_with("systemctl --user daemon-reload && ")
+        })
+        .expect("service_linux prints the enable command when no user bus answers")
+        .trim()
+        .replace("$SERVICE_NAME", "coyote-rnsd");
+    assert!(
+        no_bus_enable.ends_with("enable --now coyote-rnsd"),
+        "service_linux's no-bus enable command moved: {no_bus_enable:?}"
+    );
+
+    let Some(wiki) = wiki_dir() else { return };
+    let page = read(wiki.join("Mesh-Deployment.md"));
+    let platform = read(wiki.join("Mesh-Platform-Support.md"));
+
+    let sections: Vec<&str> = headings(&page)
+        .into_iter()
+        .filter_map(|line| line.strip_prefix("## "))
+        .collect();
+    assert_eq!(
+        sections,
+        [
+            "The ladder",
+            "Setting up rnsd",
+            "Joining with some interfaces down",
+            "Running without rnsd",
+            "Two sessions on one host",
+            "Relay gotchas",
+            "Propagation nodes",
+            "Identity portability",
+            "Success looks like",
+        ],
+        "Mesh-Deployment.md's `## ` headings moved"
+    );
+    for heading in headings(&page) {
+        assert!(
+            !heading.contains("Two instances on one machine"),
+            "Mesh-Deployment.md keeps the retired heading: {heading}"
+        );
+    }
+
+    let intro = flat(&lead(&page));
+    for needle in [
+        "private 127.0.0.1:4242",
+        "rnsd",
+        "scripts/mesh-relay.sh | bash",
+    ] {
+        assert!(
+            intro.contains(needle),
+            "Mesh-Deployment.md does not say {needle:?} before its first `## ` heading:\n{intro}"
+        );
+    }
+
+    let ladder = section("Mesh-Deployment.md", &page, "## The ladder");
+    let rungs: Vec<&str> = ladder
+        .lines()
+        .filter(|line| line.starts_with("### "))
+        .collect();
+    assert_eq!(rungs.len(), 3, "the ladder has three rungs: {rungs:?}");
+    for (rung, needle) in rungs.iter().zip(["rnsd", "relay", "type: public"]) {
+        assert!(
+            rung.contains(needle),
+            "ladder rung {rung:?} does not name {needle:?}; the order is loopback, team relay, public"
+        );
+    }
+    assert!(
+        page.contains("\"Private\" means network reachability, not access control."),
+        "Mesh-Deployment.md no longer says what \"private\" means"
+    );
+
+    let setup = section("Mesh-Deployment.md", &page, "## Setting up rnsd");
+    let setup_lines: Vec<&str> = setup.lines().map(str::trim).collect();
+    for line in &config_lines {
+        assert!(
+            setup_lines.contains(&line.as_str()),
+            "Mesh-Deployment.md's `## Setting up rnsd` does not quote the config line {line:?}"
+        );
+    }
+    assert!(
+        flat(&setup).contains(&no_bus_enable),
+        "Mesh-Deployment.md's `## Setting up rnsd` does not quote the no-bus enable command {no_bus_enable:?}"
+    );
+
+    for (label, text) in [
+        ("Mesh-Deployment.md", &page),
+        ("Mesh-Platform-Support.md", &platform),
+    ] {
+        assert!(
+            text.contains(sentence),
+            "{label} does not quote the firewall sentence verbatim:\n{sentence}"
+        );
+    }
+
+    for line in &usage {
+        let (flag, effect) = line
+            .trim()
+            .split_once("  ")
+            .unwrap_or_else(|| panic!("usage line {line:?} has no two-space gap"));
+        assert!(
+            page.contains(&format!("`{flag}`")),
+            "Mesh-Deployment.md's flag table has no `{flag}`"
+        );
+        if effect.contains("${") {
+            continue;
+        }
+        assert!(
+            page.contains(effect.trim()),
+            "Mesh-Deployment.md's flag table does not say {:?} for `{flag}`",
+            effect.trim()
+        );
+    }
+
+    let prose = flat(&page).replace('`', "");
+    assert!(
+        prose.contains(&exit_codes),
+        "Mesh-Deployment.md does not spell the exit codes as {SH}'s header does:\n{exit_codes}"
+    );
+
+    for refusal in [root_refusal.as_str(), admin_refusal] {
+        assert!(
+            page.contains(refusal),
+            "Mesh-Deployment.md does not quote the refusal {refusal:?}"
+        );
+    }
+}
+
+/// The Platform page's rnsd section names the three services the scripts register and the
+/// linger hint, quotes the macOS and Windows firewall prompts as the scripts word them, and
+/// links the Deployment sections that replaced the two-instance recipe. The script-side
+/// shape checks run on every run.
+#[test]
+fn the_platform_page_names_the_services_and_quotes_the_firewall_prompts() {
+    let firewall = bash_fn_body("scripts/mesh-relay.sh", "firewall_warning");
+    let macos_at = firewall
+        .find("\"$sentence ")
+        .expect("firewall_warning appends the macOS prompt to the sentence")
+        + "\"$sentence ".len();
+    let macos = &firewall[macos_at..macos_at + firewall[macos_at..].find('"').unwrap()];
+    let ps1 = read(repo_root().join("scripts/mesh-relay.ps1"));
+    let windows_lead = "when one is configured). ";
+    let windows_at = ps1
+        .find(windows_lead)
+        .expect("mesh-relay.ps1 appends the Windows prompt to the sentence")
+        + windows_lead.len();
+    let windows = &ps1[windows_at..windows_at + ps1[windows_at..].find('\'').unwrap()];
+    let prompts = [("macOS", macos), ("Windows", windows)];
+    for (platform, prompt) in prompts {
+        assert!(
+            prompt.starts_with(&format!("{platform} will ask")),
+            "the {platform} prompt moved: {prompt:?}"
+        );
+    }
+
+    let Some(wiki) = wiki_dir() else { return };
+    let page = read(wiki.join("Mesh-Platform-Support.md"));
+    let rnsd = section(
+        "Mesh-Platform-Support.md",
+        &page,
+        "## Running rnsd per platform",
+    );
+    for needle in [
+        "coyote-rnsd",
+        "com.coyote.rnsd",
+        "Coyote rnsd",
+        "loginctl enable-linger",
+    ] {
+        assert!(
+            rnsd.contains(needle),
+            "Mesh-Platform-Support.md's rnsd section does not name {needle:?}:\n{rnsd}"
+        );
+    }
+
+    for (platform, prompt) in prompts {
+        assert!(
+            rnsd.contains(prompt),
+            "Mesh-Platform-Support.md does not quote the {platform} prompt verbatim:\n{prompt}"
+        );
+    }
+
+    for anchor in [
+        "Mesh-Deployment#setting-up-rnsd",
+        "Mesh-Deployment#running-without-rnsd",
+    ] {
+        assert!(
+            page.contains(&format!("]({anchor})")),
+            "Mesh-Platform-Support.md does not link {anchor}"
+        );
+    }
+    assert!(
+        !page.contains("two-instances-on-one-machine"),
+        "Mesh-Platform-Support.md still links the retired two-instance recipe"
+    );
+}
+
+/// Every `](Page#anchor)` link from a Mesh page into one of the restructured pages names a
+/// heading that page has, by its GitHub slug.
+#[test]
+fn every_section_link_into_the_restructured_pages_resolves_to_a_heading() {
+    let Some(wiki) = wiki_dir() else { return };
+    assert_eq!(github_slug("### `.mesh info`"), "mesh-info");
+    assert_eq!(
+        github_slug("## Talking to peers (tools)"),
+        "talking-to-peers-tools"
+    );
+    assert_eq!(
+        github_slug("## `collision_protection`"),
+        "collision_protection"
+    );
+    let fixture_anchors = [("Mesh", vec!["the-brief".to_string()])];
+    let fixture =
+        "see [x](Mesh#the-brief) and [y](Mesh#no-such-heading)\nand [z](Other#whatever)\n";
+    assert_eq!(
+        dangling_section_links("fixture", fixture, &fixture_anchors),
+        ["fixture:1 → Mesh#no-such-heading"],
+        "the scan does not flag exactly the dangling link into a watched page"
+    );
+    assert_eq!(
+        heading_slugs("# Top\n```text\n# not a heading\n```\n## Real\n"),
+        ["top", "real"],
+        "heading_slugs does not skip fenced code"
+    );
+
+    let anchors: Vec<(&str, Vec<String>)> = [
+        "Mesh",
+        "Mesh-Deployment",
+        "Mesh-Platform-Support",
+        "Mesh-Commands",
+        "Mesh-Configuration",
+    ]
+    .into_iter()
+    .map(|page| (page, heading_slugs(&read(wiki.join(format!("{page}.md"))))))
+    .collect();
+    let dangling: Vec<String> = mesh_pages(&wiki)
+        .iter()
+        .flat_map(|path| {
+            let label = path.file_name().unwrap().to_string_lossy().to_string();
+            dangling_section_links(&label, &read(path), &anchors)
+        })
+        .collect();
+    assert!(
+        dangling.is_empty(),
+        "section links that resolve to no heading:\n{}",
+        dangling.join("\n")
+    );
+}
+
+/// The `.mesh info` sample on the Commands page pads its labels to `MESH_INFO_LABEL_WIDTH`
+/// and shows an `interfaces[0]` row as `interface_row` formats it: label, two spaces, state.
+/// The width and the row's shape are read on every run.
+#[test]
+fn the_commands_page_info_sample_pads_labels_to_the_code_width_and_shows_the_interface_row() {
+    let source = read(repo_root().join("src/config/mesh_config.rs"));
+    let marker = "pub const MESH_INFO_LABEL_WIDTH: usize = ";
+    let at = source
+        .find(marker)
+        .expect("src/config/mesh_config.rs declares MESH_INFO_LABEL_WIDTH")
+        + marker.len();
+    let width: usize = source[at..]
+        .split(';')
+        .next()
+        .unwrap()
+        .parse()
+        .expect("MESH_INFO_LABEL_WIDTH is a literal");
+    assert!(
+        string_literals(&fn_body("src/repl/mesh.rs", "interface_row"))
+            .contains(&"{}  {}".to_string()),
+        "interface_row no longer joins the label and state with two spaces; update the sample and this test"
+    );
+
+    let Some(wiki) = wiki_dir() else { return };
+    let page = read(wiki.join("Mesh-Commands.md"));
+    let info = section("Mesh-Commands.md", &page, "### `.mesh info`");
+    let sample = info
+        .split("```text\n")
+        .skip(1)
+        .map(|block| block.split("\n```").next().unwrap())
+        .find(|block| block.starts_with("  node"))
+        .expect("the `.mesh info` section has a text block starting with `  node`");
+    let mut interface_rows = 0;
+    for row in sample.lines() {
+        let body = row
+            .strip_prefix("  ")
+            .unwrap_or_else(|| panic!("sample row is not indented by two: {row:?}"));
+        if body.starts_with("selection:") {
+            continue;
+        }
+        let gap = body
+            .find("  ")
+            .unwrap_or_else(|| panic!("sample row has no value: {row:?}"));
+        let name = &body[..gap];
+        let value_at = 2 + gap + body[gap..].len() - body[gap..].trim_start().len();
+        assert_eq!(
+            value_at,
+            2 + width,
+            "the value of `{name}` starts at byte {value_at}, not {} as MESH_INFO_LABEL_WIDTH pads it: {row:?}",
+            2 + width
+        );
+        if name == "interfaces[0]" {
+            interface_rows += 1;
+            assert_eq!(
+                &row[value_at..],
+                "private 127.0.0.1:4242  connected",
+                "the interfaces[0] row is not what interface_row formats for the default"
+            );
+        }
+    }
+    assert_eq!(
+        interface_rows, 1,
+        "the `.mesh info` sample shows one interfaces[0] row:\n{sample}"
+    );
+}
+
+/// The `.mesh on` section's samples follow the shipped default: the preview's `To whom:`
+/// line names the private audience as `audience` words it, the summary's `interfaces:`
+/// row names the loopback relay, and the idle line a late relay prints is quoted.
+#[test]
+fn the_commands_page_on_samples_name_the_private_default_and_the_connect_idle_line() {
+    let audiences = string_literals(&fn_body("src/repl/mesh.rs", "audience"));
+    let private = audiences
+        .iter()
+        .find(|literal| literal.contains("relay") && !literal.contains("internet"))
+        .unwrap_or_else(|| {
+            panic!("audience in src/repl/mesh.rs has no private-relay literal: {audiences:?}")
+        });
+
+    let Some(wiki) = wiki_dir() else { return };
+    let page = read(wiki.join("Mesh-Commands.md"));
+    let on = section("Mesh-Commands.md", &page, "### `.mesh on`");
+    for needle in [
+        format!("  private 127.0.0.1:4242: {private}"),
+        "  interfaces: private 127.0.0.1:4242".to_string(),
+        "`[mesh] <label> connected`".to_string(),
+    ] {
+        assert!(
+            on.contains(&needle),
+            "Mesh-Commands.md's `.mesh on` section does not carry {needle:?}"
+        );
+    }
+}
+
+/// The Containers page quotes the image's `ENTRYPOINT` line as the Dockerfile has it; the
+/// Dockerfile-side check runs on every run.
+#[test]
+fn the_containers_page_quotes_the_image_entrypoint() {
+    let dockerfile = read(repo_root().join("Dockerfile"));
+    let entrypoint = dockerfile
+        .lines()
+        .find(|line| line.starts_with("ENTRYPOINT "))
+        .expect("Dockerfile has an ENTRYPOINT line");
+    assert!(
+        entrypoint.contains("coyote-entrypoint"),
+        "the Dockerfile's ENTRYPOINT moved: {entrypoint}"
+    );
+
+    let Some(wiki) = wiki_dir() else { return };
+    let page = read(wiki.join("Mesh-Containers.md"));
+    assert!(
+        page.contains(entrypoint),
+        "Mesh-Containers.md does not quote {entrypoint:?}"
+    );
+}
+
+/// The Hooks page scopes `COYOTE_MESH_INTERFACES` to the interfaces connected when
+/// `mesh.started` fired and at the ones connected when the node left; no page names the
+/// retired `COYOTE_LOG_FILE`, the current `COYOTE_LOG_PATH` is the variable the code reads
+/// and Unattended-Mode points at it; `src/mesh/announce.rs` says an announce is forwarded
+/// undeduplicated. The code-side checks run on every run.
+#[test]
+fn the_hooks_page_scopes_mesh_interfaces_to_the_start_event_and_the_log_path_variable_is_current() {
+    assert!(
+        read(repo_root().join("src/config/paths.rs")).contains("get_env_name(\"log_path\")"),
+        "src/config/paths.rs no longer reads the log_path variable; update the wiki and this test"
+    );
+    let announce = flat(&read(repo_root().join("src/mesh/announce.rs")));
+    assert!(
+        announce.contains("forwards it like any other; nothing dedups it."),
+        "src/mesh/announce.rs no longer says the relay forwards an announce undeduplicated"
+    );
+    assert!(
+        !announce.contains("dedups it by announce hash"),
+        "src/mesh/announce.rs claims the relay dedups by announce hash again"
+    );
+
+    let Some(wiki) = wiki_dir() else { return };
+    let hooks = read(wiki.join("Hooks.md"));
+    let lines: Vec<&str> = hooks.lines().collect();
+    let at = lines
+        .iter()
+        .position(|line| line.starts_with("- `COYOTE_MESH_INTERFACES`"))
+        .expect("Hooks.md has a `COYOTE_MESH_INTERFACES` bullet");
+    let bullet = std::iter::once(lines[at])
+        .chain(
+            lines[at + 1..]
+                .iter()
+                .copied()
+                .take_while(|line| line.starts_with("  ")),
+        )
+        .collect::<Vec<_>>()
+        .join(" ");
+    for needle in [
+        "when `mesh.started` fired",
+        "refires nothing",
+        "when the node left",
+    ] {
+        assert!(
+            bullet.contains(needle),
+            "Hooks.md's COYOTE_MESH_INTERFACES bullet does not say {needle:?}: {bullet}"
+        );
+    }
+
+    let stale: Vec<String> = fs::read_dir(&wiki)
+        .unwrap_or_else(|e| panic!("read {}: {e}", wiki.display()))
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "md"))
+        .filter(|path| read(path).contains("COYOTE_LOG_FILE"))
+        .map(|path| path.file_name().unwrap().to_string_lossy().to_string())
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "these pages still name COYOTE_LOG_FILE: {stale:?}"
+    );
+    assert!(
+        read(wiki.join("Environment-Variables.md"))
+            .lines()
+            .any(|line| line.starts_with("| `COYOTE_LOG_PATH`")),
+        "Environment-Variables.md has no `COYOTE_LOG_PATH` row"
+    );
+    let unattended = flat(&read(wiki.join("Unattended-Mode.md")));
+    assert!(
+        unattended.contains("`COYOTE_LOG_PATH` points"),
+        "Unattended-Mode.md does not point at `COYOTE_LOG_PATH`"
+    );
+}
+
+/// The README names the daemon prerequisite with both one-liners and the installer flags,
+/// shows the shipped `mesh.interfaces` default, and says what the propagation node is and
+/// is not for; the node's own README points hosts at `--relay` with all four recipes, keeps
+/// the loopback default and describes the existing-config path as `write_config` in
+/// `scripts/mesh-relay.sh` takes it. Reads only the repo, so it runs without the wiki.
+#[test]
+fn the_readme_names_the_daemon_prerequisite_and_the_private_default() {
+    let readme = read(repo_root().join("README.md"));
+    let prose = flat(&readme);
+    for needle in [
+        "Coyote mesh (`.mesh`) needs a local Reticulum daemon",
+        "curl -fsSL https://raw.githubusercontent.com/Dark-Alex-17/coyote/refs/heads/main/scripts/mesh-relay.sh | bash",
+        "iwr -useb https://raw.githubusercontent.com/Dark-Alex-17/coyote/refs/heads/main/scripts/mesh-relay.ps1 | iex",
+        "--with-mesh",
+        "-WithMesh",
+    ] {
+        assert!(prose.contains(needle), "README.md does not say {needle:?}");
+    }
+    let row = readme
+        .lines()
+        .find(|line| line.starts_with("| `mesh.interfaces`"))
+        .expect("README.md has a `mesh.interfaces` table row");
+    assert_eq!(
+        table_cells(row)[1],
+        INTERFACES_DEFAULT,
+        "README.md's `mesh.interfaces` default is not the shipped loopback entry: {row}"
+    );
+    let mesh = section("README.md", &readme, "### Mesh");
+    for needle in [
+        "store-and-forward across devices for a team",
+        "not how sessions on one host reach each other",
+    ] {
+        assert!(
+            mesh.contains(needle),
+            "README.md's `### Mesh` section does not say {needle:?}:\n{mesh}"
+        );
+    }
+    let node_readme = read(repo_root().join("deployment/propagation-node/README.md"));
+    for needle in ["scripts/mesh-relay.sh --relay", "host: 127.0.0.1"] {
+        assert!(
+            node_readme.contains(needle),
+            "deployment/propagation-node/README.md does not say {needle:?}"
+        );
+    }
+    let write_config = bash_fn_body("scripts/mesh-relay.sh", "write_config");
+    for needle in ["-f \"$RNS_CONFIG\"", "already exists, not touched"] {
+        assert!(
+            write_config.contains(needle),
+            "scripts/mesh-relay.sh's write_config no longer carries {needle:?}; update the propagation node README and this test"
+        );
+    }
+    let coyote_side = flat(&section(
+        "deployment/propagation-node/README.md",
+        &node_readme,
+        "## Coyote side",
+    ));
+    for needle in [
+        "no `~/.reticulum/config` yet",
+        "prints the stanza to add by hand",
+        "systemctl --user restart coyote-rnsd",
+        "launchctl bootout",
+        "Start-ScheduledTask 'Coyote rnsd'",
+        "--relay <node host>:4242",
+        "bash -s -- --relay",
+        "-ExecutionPolicy Bypass -File .\\mesh-relay.ps1",
+        "host: <node host>",
+    ] {
+        assert!(
+            coyote_side.contains(needle),
+            "deployment/propagation-node/README.md's `## Coyote side` does not say {needle:?}:\n{coyote_side}"
+        );
+    }
+}
+
+/// `path:line: spells <needle>` for every line of `text` that carries one of `needles`,
+/// matched case-insensitively.
+fn label_hits(path: &str, text: &str, needles: &[String]) -> Vec<String> {
+    let mut hits = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        let lower = line.to_lowercase();
+        for needle in needles {
+            if lower.contains(&needle.to_lowercase()) {
+                hits.push(format!("{path}:{}: spells {needle}", index + 1));
+            }
+        }
+    }
+    hits
+}
+
+/// No README, this lint or Mesh page carries a planning label; the needles are assembled
+/// at runtime so this test's own text cannot trip it.
+#[test]
+fn no_doc_or_lint_carries_a_plan_or_task_label() {
+    let needles = [
+        ["PLAN", "-"].concat(),
+        ["TASK", "-"].concat(),
+        ["rul", "ing "].concat(),
+    ];
+    let mut files = vec![
+        repo_root().join("README.md"),
+        repo_root().join("deployment/propagation-node/README.md"),
+        repo_root().join("tests/mesh_wiki_docs.rs"),
+    ];
+    if let Some(wiki) = wiki_dir() {
+        files.extend(mesh_pages(&wiki));
+    }
+    let mut hits = Vec::new();
+    for path in &files {
+        hits.extend(label_hits(
+            &path.display().to_string(),
+            &read(path),
+            &needles,
+        ));
+    }
+    assert!(hits.is_empty(), "{}", hits.join("\n"));
+}
+
+/// The two-sessions prose on the Deployment and Configuration pages carries the same
+/// `mesh/trust.yaml` caveat, and the Directories section keeps the split rule: nothing
+/// split to run, both directories split for two identities.
+#[test]
+fn the_two_sessions_prose_carries_the_trust_file_caveat_on_both_pages() {
+    let Some(wiki) = wiki_dir() else { return };
+    let configuration = read(wiki.join("Mesh-Configuration.md"));
+    for (label, text) in [
+        ("Mesh-Deployment.md", read(wiki.join("Mesh-Deployment.md"))),
+        ("Mesh-Configuration.md", configuration.clone()),
+    ] {
+        assert!(
+            flat(&text).contains(TRUST_FILE_TWIN),
+            "{label} does not carry the trust-file caveat verbatim:\n{TRUST_FILE_TWIN}"
+        );
+    }
+    let directories = flat(&section(
+        "Mesh-Configuration.md",
+        &configuration,
+        "## Directories",
+    ));
+    for needle in ["need nothing split", "need both directories split"] {
+        assert!(
+            directories.contains(needle),
+            "Mesh-Configuration.md's Directories section does not say {needle:?}:\n{directories}"
+        );
     }
 }
