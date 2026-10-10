@@ -1611,7 +1611,10 @@ clients:
         assert!(!example.mesh.enabled);
         assert_eq!(
             example.mesh.interfaces,
-            vec![mesh_config::MeshInterface::Lan]
+            vec![mesh_config::MeshInterface::Private {
+                host: "127.0.0.1".into(),
+                port: 4242
+            }]
         );
     }
 

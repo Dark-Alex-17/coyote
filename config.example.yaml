@@ -328,14 +328,18 @@ mesh:
   display_name: coyote-laptop    # Opt-in plaintext label carried in the announce (default: null = nothing but the protocol version is announced)
   display_name_on_public: false  # Also carry display_name when any interface is type public (default: false; public presence is world-visible)
   about: null                    # One human-written line (up to 200 characters) on what this node's envoy can help with; carried on the status card to trusted peers only, never in the announce (default: null = nothing)
-  interfaces:                    # Interfaces the node joins. Exactly what is listed here and nothing else; there is no auto-detection and no fallback between types (default: a single lan entry)
-    - type: lan                  # lan = link-local only (Reticulum AutoInterface). Does not cross sbx, WireGuard, Tailscale or OpenVPN; only one process per host can bind it
+  interfaces:                    # Interfaces the node joins. Exactly what is listed here and nothing else; there is no auto-detection and no fallback between types (default: a single private entry pointing at the local rnsd on 127.0.0.1:4242)
+    - type: private              # private = TCP client to a relay. The default dials the local Reticulum daemon (rnsd) on loopback — run scripts/mesh-relay.sh once per host
+      host: 127.0.0.1
+      port: 4242
+    # - type: lan                # lan = link-local only (Reticulum AutoInterface), the no-daemon fallback. Does not cross sbx, WireGuard, Tailscale or OpenVPN; only one process per host can bind it
     # - type: private            # private = TCP client to a relay your team runs; requires host + port
     #   host: relay.example.com
     #   port: 4242
     # - type: public             # public = same wire shape as private, but the relay is a community node so your presence is world-visible; requires host + port
     #   host: node.example.com
     #   port: 4242
+    # Other transports (LoRa/RNode, I2P, UDP, serial) are configured in rnsd and reached through the loopback hop above.
   brief: auto                    # What the envoy serves to trusted peers (default: auto): auto = status card + session digest + user brief; manual = card + user brief only, no model spend; off = card only
   digest_prompt: null            # Prompt used to build the shareable session digest. If null or blank, uses built-in default
   brief_model: openai:gpt-4o-mini # Model used to build the digest (default: null = the session's current model)

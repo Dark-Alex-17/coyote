@@ -7147,7 +7147,7 @@ mod tests {
             "{mesh}"
         );
         assert!(
-            mesh.contains("  interfaces[0]                   lan\n"),
+            mesh.contains("  interfaces[0]                   private 127.0.0.1:4242\n"),
             "{mesh}"
         );
     }

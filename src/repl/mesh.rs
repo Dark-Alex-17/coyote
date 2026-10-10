@@ -5947,7 +5947,13 @@ mod tests {
 
     #[test]
     fn reach_line_follows_the_configured_interfaces() {
-        let lan_only = reach_line(&MeshConfig::default());
+        let default = reach_line(&MeshConfig::default());
+        assert_eq!(default, "the configured relay and the peers it reaches");
+
+        let lan_only = reach_line(&MeshConfig {
+            interfaces: vec![MeshInterface::Lan],
+            ..Default::default()
+        });
         assert_eq!(lan_only, "this link-local segment only");
 
         let private = reach_line(&private_config(4242));

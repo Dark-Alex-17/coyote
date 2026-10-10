@@ -243,7 +243,10 @@ impl Default for MeshConfig {
             display_name: None,
             display_name_on_public: false,
             about: None,
-            interfaces: vec![MeshInterface::Lan],
+            interfaces: vec![MeshInterface::Private {
+                host: "127.0.0.1".into(),
+                port: 4242,
+            }],
             brief: MeshBrief::default(),
             digest_prompt: None,
             brief_model: None,
@@ -290,7 +293,7 @@ impl MeshConfig {
         }
         if self.interfaces.is_empty() {
             bail!(
-                "mesh.interfaces is empty; list at least one interface (the default is a single {{type: lan}} entry)"
+                "mesh.interfaces is empty; list at least one interface (the default is a single {{type: private, host: 127.0.0.1, port: 4242}} entry, the local rnsd)"
             );
         }
         let lan_count = self
@@ -628,7 +631,13 @@ mod tests {
         assert_eq!(mesh.display_name, None);
         assert!(!mesh.display_name_on_public);
         assert_eq!(mesh.about, None);
-        assert_eq!(mesh.interfaces, vec![MeshInterface::Lan]);
+        assert_eq!(
+            mesh.interfaces,
+            vec![MeshInterface::Private {
+                host: "127.0.0.1".into(),
+                port: 4242
+            }]
+        );
         assert_eq!(mesh.brief, MeshBrief::Auto);
         assert_eq!(mesh.digest_prompt, None);
         assert_eq!(mesh.brief_model, None);
@@ -961,7 +970,10 @@ mod tests {
         };
         let err = mesh.validate(true).unwrap_err().to_string();
         assert!(err.contains("mesh.interfaces is empty"), "{err}");
-        assert!(err.contains("{type: lan}"), "{err}");
+        assert!(
+            err.contains("{type: private, host: 127.0.0.1, port: 4242}"),
+            "{err}"
+        );
     }
 
     #[test]
