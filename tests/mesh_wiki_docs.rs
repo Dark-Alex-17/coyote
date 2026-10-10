@@ -2550,22 +2550,29 @@ fn the_containers_page_quotes_the_image_entrypoint() {
 }
 
 /// The Containers page names every `COYOTE_MESH_*` variable the image entrypoint reads
-/// (the set is scraped from the script, so a fourth variable fails this until the page
-/// names it), says the AutoInterface needs `--network host`, never to publish `4242`,
-/// and quotes the Dockerfile's `rns==<RNS_VERSION>`; the Sandboxes page's mesh section
-/// names the opt-out and the relay variable; the "from v0.10.4" qualifier is spelled the
-/// same on the page and in both READMEs. The repo-side checks run on every run.
+/// (the set is scraped from the script's `${…}` and bare `$…` references, so a fourth
+/// variable fails this until the page names it), says the AutoInterface needs
+/// `--network host`, never to publish `4242`, and quotes the Dockerfile's
+/// `rns==<RNS_VERSION>`; the Sandboxes and Installation pages name the opt-out and the
+/// relay variable; the "from v0.10.4" qualifier is spelled the same in both READMEs and
+/// every `vX.Y.Z` token on the Containers page and in the Sandboxes mesh section is that
+/// release. The repo-side checks run on every run.
 #[test]
 fn the_containers_page_names_the_entrypoint_variables() {
     let entrypoint = read(repo_root().join("scripts/docker-entrypoint.sh"));
+    let name_end = |rest: &str| {
+        rest.find(|c: char| !(c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'))
+            .unwrap_or(rest.len())
+    };
     let mut variables: Vec<&str> = entrypoint
-        .match_indices("${COYOTE_MESH_")
-        .map(|(at, _)| {
-            let name = &entrypoint[at + 2..];
-            &name[..name
-                .find([':', '}', '%', '#'])
-                .expect("a closed ${...} expansion")]
-        })
+        .match_indices("$COYOTE_MESH_")
+        .map(|(at, _)| &entrypoint[at + 1..])
+        .chain(
+            entrypoint
+                .match_indices("${COYOTE_MESH_")
+                .map(|(at, _)| &entrypoint[at + 2..]),
+        )
+        .map(|rest| &rest[..name_end(rest)])
         .collect();
     variables.sort_unstable();
     variables.dedup();
@@ -2593,6 +2600,23 @@ fn the_containers_page_names_the_entrypoint_variables() {
             "{label} does not say {IMAGE_RNSD_SINCE:?} about the image's rnsd"
         );
     }
+    let release = IMAGE_RNSD_SINCE
+        .rsplit(' ')
+        .next()
+        .expect("IMAGE_RNSD_SINCE ends with the release");
+    let version_tokens = |text: &str| -> Vec<String> {
+        text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '.'))
+            .filter(|word| {
+                word.strip_prefix('v').is_some_and(|rest| {
+                    rest.split('.').count() == 3
+                        && rest.split('.').all(|part| {
+                            !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit())
+                        })
+                })
+            })
+            .map(str::to_owned)
+            .collect()
+    };
 
     let Some(wiki) = wiki_dir() else { return };
     let page = read(wiki.join("Mesh-Containers.md"));
@@ -2632,6 +2656,34 @@ fn the_containers_page_names_the_entrypoint_variables() {
         assert!(
             flat(&sandbox).contains(needle),
             "Sandboxes.md's mesh section does not say {needle:?}"
+        );
+    }
+    for (label, text) in [
+        ("Mesh-Containers.md", &page),
+        ("Sandboxes.md's mesh section", &sandbox),
+    ] {
+        let stale: Vec<String> = version_tokens(text)
+            .into_iter()
+            .filter(|token| token != release)
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "{label} names releases other than {release}: {stale:?}; the image's rnsd qualifier is spelled from {IMAGE_RNSD_SINCE:?}"
+        );
+    }
+    let docker = section(
+        "Installation.md",
+        &read(wiki.join("Installation.md")),
+        "## Docker",
+    );
+    for needle in [
+        "COYOTE_MESH_RNSD=0`",
+        "COYOTE_MESH_RELAY=host:port`",
+        IMAGE_RNSD_SINCE,
+    ] {
+        assert!(
+            flat(&docker).contains(needle),
+            "Installation.md's Docker section does not say {needle:?}"
         );
     }
 }
