@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1
+# check=error=true
 ARG COYOTE_VERSION
 FROM docker/sandbox-templates:shell-docker AS build
 
@@ -65,6 +67,15 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
     cargo install --locked iwec && \
     cargo install --locked ast-grep
 
+# The rns version the mesh interop harness is verified against; the propagation-node
+# Dockerfile declares the same value and tests/scripts_pins.rs holds the two together.
+ARG RNS_VERSION=1.5.2
+
+# rnsd for the entrypoint. A uv-managed CPython 3.12 (rns 1.5.2 is interop-verified on 3.12)
+# lands under ~/.local/share/uv/python and rides the flatten below with the tool venv;
+# --no-build makes a missing wheel fail the build instead of compiling under QEMU on arm64.
+RUN UV_NO_CACHE=1 uv tool install --no-build --python 3.12 "rns==${RNS_VERSION}"
+
 USER root
 
 RUN set -euo pipefail; \
@@ -83,6 +94,9 @@ RUN set -euo pipefail; \
     rm -rf "$TMPDIR"
 
 COPY --chmod=0755 scripts/docker-entrypoint.sh /usr/local/bin/coyote-entrypoint
+# Left to COPY, /opt/coyote would be created with the file mode and uid 1000 could not traverse it.
+RUN install -d -m 0755 /opt/coyote
+COPY --chmod=0644 scripts/reticulum.config.tmpl /opt/coyote/reticulum.config.tmpl
 
 FROM scratch
 
@@ -109,7 +123,10 @@ WORKDIR /home/agent/workspace
 
 USER 1000
 
-# tini as PID 1 (as in the sandbox-templates base) reaps orphans and forwards
-# signals; coyote-entrypoint runs coyote by default, or the given command
-# (e.g. the Docker Sandboxes keep-alive) when the first arg is sh/bash/a path.
-ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/coyote-entrypoint"]
+# tini as PID 1: -s (subreaper) reaps the orphans a dying main command leaves behind,
+# -g delivers TERM/INT to the whole process group so the main command receives them
+# directly. coyote-entrypoint starts rnsd in its own session (opt out with
+# COYOTE_MESH_RNSD=0), runs coyote, or the given command (e.g. the Docker Sandboxes
+# keep-alive) when the first arg is sh/bash/a path, in its foreground, then stops rnsd
+# and exits with the main command's code.
+ENTRYPOINT ["/usr/bin/tini", "-s", "-g", "--", "/usr/local/bin/coyote-entrypoint"]
