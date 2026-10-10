@@ -2545,6 +2545,41 @@ fn the_containers_page_quotes_the_image_entrypoint() {
     );
 }
 
+/// The Containers page names the three variables the image entrypoint reads, says the
+/// AutoInterface needs `--network host`, and never to publish `4242`; the entrypoint-side
+/// check runs on every run.
+#[test]
+fn the_containers_page_names_the_entrypoint_variables() {
+    const VARIABLES: [&str; 3] = ["COYOTE_MESH_RELAY", "COYOTE_MESH_LAN", "COYOTE_MESH_RNSD"];
+    let entrypoint = read(repo_root().join("scripts/docker-entrypoint.sh"));
+    for variable in VARIABLES {
+        assert!(
+            entrypoint.contains(variable),
+            "scripts/docker-entrypoint.sh no longer reads {variable}; update the wiki and this test"
+        );
+    }
+
+    let Some(wiki) = wiki_dir() else { return };
+    let page = read(wiki.join("Mesh-Containers.md"));
+    let private = section(
+        "Mesh-Containers.md",
+        &page,
+        "## Running with `type: private`",
+    );
+    for variable in VARIABLES {
+        assert!(
+            private.contains(&format!("`{variable}")),
+            "Mesh-Containers.md's `type: private` section does not name `{variable}`"
+        );
+    }
+    for needle in ["`--network host`", "never publish `4242`", "from v0.10.4"] {
+        assert!(
+            flat(&page).contains(needle),
+            "Mesh-Containers.md does not say {needle:?}"
+        );
+    }
+}
+
 /// The Hooks page scopes `COYOTE_MESH_INTERFACES` to the interfaces connected when
 /// `mesh.started` fired and at the ones connected when the node left; no page names the
 /// retired `COYOTE_LOG_FILE`, the current `COYOTE_LOG_PATH` is the variable the code reads

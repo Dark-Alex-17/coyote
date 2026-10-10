@@ -168,7 +168,8 @@ mesh:
       port: 4242
 ```
 
-Only a session running without `rnsd` dials the node directly, with `host: <node host>` in place of `127.0.0.1`.
+Only a session running without `rnsd` dials the node directly, with `host: <node host>` in place of `127.0.0.1`; the
+Docker image (from v0.10.4) has its own `rnsd` and reaches the node through `COYOTE_MESH_RELAY=<node host>:4242` instead.
 
 Once the node's announce is heard, `.mesh info` shows it under `propagation_nodes`. Selection is nearest by hops;
 pinning a specific node is not supported yet, and `.mesh info` prints that line itself.

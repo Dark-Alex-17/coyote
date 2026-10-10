@@ -85,8 +85,9 @@ Coyote requires the following tools to be installed on your system:
     * Optional: if `ast-grep` is not installed, the `ast_grep` tool reports it and agents fall back to `fs_grep`
 * [duckdb](https://duckdb.org/) (for fast, local RAGs)
     * `curl https://install.duckdb.org | bash`
-* Coyote mesh (`.mesh`) needs a local Reticulum daemon. `cargo install`, Homebrew and the Docker image install only the
-  Coyote binary; set `rnsd` up separately with one command —
+* Coyote mesh (`.mesh`) needs a local Reticulum daemon. `cargo install` and Homebrew install only the Coyote binary;
+  the Docker image runs `rnsd` for you from v0.10.4 (before that it too shipped only the binary); set `rnsd` up
+  separately with one command —
   `curl -fsSL https://raw.githubusercontent.com/Dark-Alex-17/coyote/refs/heads/main/scripts/mesh-relay.sh | bash` or
   `powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr -useb https://raw.githubusercontent.com/Dark-Alex-17/coyote/refs/heads/main/scripts/mesh-relay.ps1 | iex"`
   — or pass `--with-mesh` / `-WithMesh` to the installer.
