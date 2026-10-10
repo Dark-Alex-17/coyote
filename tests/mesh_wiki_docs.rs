@@ -36,6 +36,10 @@ const INTERFACES_DEFAULT: &str = "`[{type: private, host: 127.0.0.1, port: 4242}
 /// The trust-file caveat the two-sessions prose carries on the Deployment and
 /// Configuration pages alike, whitespace flattened.
 const TRUST_FILE_TWIN: &str = "`mesh/trust.yaml` is shared the same way: a trust, untrust or block made in one REPL reaches the other only after its `.mesh off` and `.mesh on`, and the REPL that writes last wins the file. Split the config dirs when a block has to hold.";
+/// The release from which the image runs rnsd, as the README, the propagation node's
+/// README and the Containers page qualify it; one edit site when the cut is numbered
+/// differently.
+const IMAGE_RNSD_SINCE: &str = "from v0.10.4";
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -2545,17 +2549,48 @@ fn the_containers_page_quotes_the_image_entrypoint() {
     );
 }
 
-/// The Containers page names the three variables the image entrypoint reads, says the
-/// AutoInterface needs `--network host`, and never to publish `4242`; the entrypoint-side
-/// check runs on every run.
+/// The Containers page names every `COYOTE_MESH_*` variable the image entrypoint reads
+/// (the set is scraped from the script, so a fourth variable fails this until the page
+/// names it), says the AutoInterface needs `--network host`, never to publish `4242`,
+/// and quotes the Dockerfile's `rns==<RNS_VERSION>`; the Sandboxes page's mesh section
+/// names the opt-out and the relay variable; the "from v0.10.4" qualifier is spelled the
+/// same on the page and in both READMEs. The repo-side checks run on every run.
 #[test]
 fn the_containers_page_names_the_entrypoint_variables() {
-    const VARIABLES: [&str; 3] = ["COYOTE_MESH_RELAY", "COYOTE_MESH_LAN", "COYOTE_MESH_RNSD"];
     let entrypoint = read(repo_root().join("scripts/docker-entrypoint.sh"));
-    for variable in VARIABLES {
+    let mut variables: Vec<&str> = entrypoint
+        .match_indices("${COYOTE_MESH_")
+        .map(|(at, _)| {
+            let name = &entrypoint[at + 2..];
+            &name[..name
+                .find([':', '}', '%', '#'])
+                .expect("a closed ${...} expansion")]
+        })
+        .collect();
+    variables.sort_unstable();
+    variables.dedup();
+    assert_eq!(
+        variables,
+        ["COYOTE_MESH_LAN", "COYOTE_MESH_RELAY", "COYOTE_MESH_RNSD"],
+        "scripts/docker-entrypoint.sh reads a different COYOTE_MESH_* set; update the wiki and this test"
+    );
+    let dockerfile = read(repo_root().join("Dockerfile"));
+    let rns_version = dockerfile
+        .lines()
+        .find_map(|line| line.strip_prefix("ARG RNS_VERSION="))
+        .expect("Dockerfile declares ARG RNS_VERSION=")
+        .trim();
+    let readme = flat(&read(repo_root().join("README.md")));
+    let node_readme = flat(&read(
+        repo_root().join("deployment/propagation-node/README.md"),
+    ));
+    for (label, prose) in [
+        ("README.md", &readme),
+        ("deployment/propagation-node/README.md", &node_readme),
+    ] {
         assert!(
-            entrypoint.contains(variable),
-            "scripts/docker-entrypoint.sh no longer reads {variable}; update the wiki and this test"
+            prose.contains(IMAGE_RNSD_SINCE),
+            "{label} does not say {IMAGE_RNSD_SINCE:?} about the image's rnsd"
         );
     }
 
@@ -2566,16 +2601,37 @@ fn the_containers_page_names_the_entrypoint_variables() {
         &page,
         "## Running with `type: private`",
     );
-    for variable in VARIABLES {
+    for variable in &variables {
         assert!(
             private.contains(&format!("`{variable}")),
             "Mesh-Containers.md's `type: private` section does not name `{variable}`"
         );
     }
-    for needle in ["`--network host`", "never publish `4242`", "from v0.10.4"] {
+    let rns_spec = format!("rns=={rns_version}");
+    for needle in [
+        "`--network host`",
+        "never publish `4242`",
+        IMAGE_RNSD_SINCE,
+        rns_spec.as_str(),
+    ] {
         assert!(
             flat(&page).contains(needle),
             "Mesh-Containers.md does not say {needle:?}"
+        );
+    }
+    let sandbox = section(
+        "Sandboxes.md",
+        &read(wiki.join("Sandboxes.md")),
+        "## Mesh inside a sandbox",
+    );
+    for needle in [
+        "`COYOTE_MESH_RNSD=0`",
+        "`COYOTE_MESH_RELAY=host:port`",
+        IMAGE_RNSD_SINCE,
+    ] {
+        assert!(
+            flat(&sandbox).contains(needle),
+            "Sandboxes.md's mesh section does not say {needle:?}"
         );
     }
 }

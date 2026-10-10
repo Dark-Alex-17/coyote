@@ -85,8 +85,8 @@ Coyote requires the following tools to be installed on your system:
     * Optional: if `ast-grep` is not installed, the `ast_grep` tool reports it and agents fall back to `fs_grep`
 * [duckdb](https://duckdb.org/) (for fast, local RAGs)
     * `curl https://install.duckdb.org | bash`
-* Coyote mesh (`.mesh`) needs a local Reticulum daemon. `cargo install` and Homebrew install only the Coyote binary;
-  the Docker image runs `rnsd` for you from v0.10.4 (before that it too shipped only the binary); set `rnsd` up
+* Coyote mesh (`.mesh`) needs a local Reticulum daemon. The Docker image runs `rnsd` for you from v0.10.4 (before that
+  it too shipped only the binary); `cargo install` and Homebrew install only the Coyote binary, so set `rnsd` up
   separately with one command —
   `curl -fsSL https://raw.githubusercontent.com/Dark-Alex-17/coyote/refs/heads/main/scripts/mesh-relay.sh | bash` or
   `powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr -useb https://raw.githubusercontent.com/Dark-Alex-17/coyote/refs/heads/main/scripts/mesh-relay.ps1 | iex"`
@@ -157,6 +157,11 @@ e.g. to get a shell inside the image:
 ```bash
 docker run --rm -it darkalex17/coyote bash
 ```
+
+From v0.10.4 the image also starts a Reticulum daemon (`rnsd`, listening on the container's loopback only) beside the
+main command, so the shipped mesh default works inside the container; `-e COYOTE_MESH_RNSD=0` leaves it off and
+`-e COYOTE_MESH_RELAY=host:port` points it at your relay. Details are on the
+[Mesh Containers](https://github.com/Dark-Alex-17/coyote/wiki/Mesh-Containers) page.
 
 ### Scripts
 #### Linux/MacOS (`bash`)
