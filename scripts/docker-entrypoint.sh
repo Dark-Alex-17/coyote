@@ -17,8 +17,9 @@
 #   control moves itself out and must be stopped on its own terms); this script
 #   traps them only to stay alive until the main command returns and then exits
 #   with its status (143 for a command killed by the TERM, coyote's own code
-#   otherwise). tini -s makes PID 1 a subreaper for the grandchildren a dying main
-#   command leaves.
+#   otherwise). PID 1 reaps the orphans a dying main command leaves regardless;
+#   tini -s keeps it reaping (and quiet) when it is not PID 1, e.g. under
+#   `docker run --init`.
 # The main command is `coyote "$@"`, or "$@" itself when the first arg is sh, bash
 # or a path (the Docker Sandboxes keep-alive; `coyote --sandbox` reaches coyote via
 # `sbx exec` and never passes through here). rnsd starts on both paths.
@@ -100,7 +101,9 @@ render_config() {
     warn "cannot write to $config_dir; rnsd not started"
     return 1
   }
+  # A CRLF checkout of the template would otherwise defeat the marker lines.
   if awk -v lan="$lan" -v relay="$relay" -v host="$relay_host" -v port="$relay_port" '
+    { sub(/\r$/, "") }
     /^#@if lan$/ { skip = !lan; next }
     /^#@if relay$/ { skip = !relay; next }
     /^#@end$/ { skip = 0; next }
@@ -159,6 +162,30 @@ start_rnsd() {
   rnsd_pid=$!
 }
 
+# dash reaps an early-dead rnsd while waiting on the foreground main command,
+# after which the pid is free; a long coyote session spawns many tool children
+# and the pid counter wraps. Where /proc exists, the pid must still be rnsd.
+rnsd_alive() {
+  [ -n "$rnsd_pid" ] && kill -0 "$rnsd_pid" 2>/dev/null && {
+    [ ! -r /proc/"$rnsd_pid"/comm ] || [ "$(cat /proc/"$rnsd_pid"/comm 2>/dev/null)" = rnsd ]
+  }
+}
+
+# tini -g forwards every signal it receives to the group, so the main command gets
+# each one at the same moment this script does and decides for itself; the trap
+# keeps this script alive until the command returns. With only TERM and INT
+# trapped, a HUP (or a Ctrl-\ QUIT under -it) would kill this script, tini would
+# exit, and the container would be torn down around a live main command with rnsd
+# never stopped. A trap with a command (unlike `trap ''`) is reset to the default
+# in every child, so neither rnsd nor the main command inherits it. It is set
+# before rnsd is spawned: a TERM landing between the spawn and the trap would kill
+# this script and leave rnsd running. Forwarding INT here would be wrong twice
+# over: the command already has it, and rnsd installs a SIGINT handler that exits
+# (Reticulum.py:375), so a Ctrl-C that coyote survives would take the daemon down.
+# rnsd handles INT and TERM itself and sits in its own session, so widening the
+# trap changes nothing for it.
+trap ':' HUP INT QUIT TERM USR1 USR2
+
 case "${COYOTE_MESH_RNSD:-}" in
   0) note "COYOTE_MESH_RNSD=0, rnsd not started" ;;
   "" | 1) start_rnsd ;;
@@ -168,19 +195,6 @@ case "${COYOTE_MESH_RNSD:-}" in
     ;;
 esac
 
-# tini -g forwards every signal it receives to the group, so the main command gets
-# each one at the same moment this script does and decides for itself; the trap
-# keeps this script alive until the command returns. With only TERM and INT
-# trapped, a HUP (or a Ctrl-\ QUIT under -it) would kill this script, tini would
-# exit, and the container would be torn down around a live main command with rnsd
-# never stopped. A trap with a command (unlike `trap ''`) leaves the main command's
-# disposition at the default. Forwarding INT here would be wrong twice over: the
-# command already has it, and rnsd installs a SIGINT handler that exits
-# (Reticulum.py:375), so a Ctrl-C that coyote survives would take the daemon down.
-# rnsd handles INT and TERM itself and sits in its own session, so widening the
-# trap changes nothing for it.
-trap ':' HUP INT QUIT TERM USR1 USR2
-
 if [ "$passthrough" = 1 ]; then
   "$@"
 else
@@ -189,16 +203,18 @@ fi
 rc=$?
 
 if [ -n "$rnsd_pid" ]; then
-  kill -s TERM "$rnsd_pid" 2>/dev/null
+  if rnsd_alive; then
+    kill -s TERM "$rnsd_pid" 2>/dev/null
+  fi
   # kill -0 succeeds on an exited-but-unreaped child; the loop ends early only
   # because the shell reaps the background rnsd while waiting on the foreground
   # sleep (dash, bash and ash all do). Do not replace it with a fixed sleep.
   polls=0
-  while [ "$polls" -lt 25 ] && kill -0 "$rnsd_pid" 2>/dev/null; do
+  while [ "$polls" -lt 25 ] && rnsd_alive; do
     sleep 0.2
     polls=$((polls + 1))
   done
-  if kill -0 "$rnsd_pid" 2>/dev/null; then
+  if rnsd_alive; then
     kill -s KILL "$rnsd_pid" 2>/dev/null
   fi
   wait "$rnsd_pid"

@@ -18,6 +18,7 @@ use std::ffi::OsStr;
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::thread;
@@ -82,7 +83,8 @@ impl Home {
 
     /// `setsid` runs its command in place; `rnsd` records its argv, the environment
     /// the contract hands it (HOME, PYTHONUNBUFFERED) and whether a canary from the
-    /// script's own environment leaked through `env -i`, then idles until TERM.
+    /// script's own environment leaked through `env -i`, writes `ready` once its TERM
+    /// trap is in place, then idles until TERM.
     fn write_shims(&self) {
         self.write_executable("setsid", "#!/bin/sh\nexec \"$@\"\n");
         let log = self.rnsd_log();
@@ -99,11 +101,22 @@ impl Home {
                  printf 'stdin=%s\\n' \"$(readlink /proc/$$/fd/0 2>/dev/null || echo unknown)\" >> \"$log\"\n\
                  echo 'rnsd-stub: [Notice] up' >&2\n\
                  trap 'printf \"signal=TERM\\n\" >> \"$log\"; exit 0' TERM\n\
-                 trap 'printf \"signal=INT\\n\" >> \"$log\"; exit 0' INT\n\
+                 printf 'ready\\n' >> \"$log\"\n\
                  while :; do sleep 0.1; done\n",
                 log = log.display()
             ),
         );
+    }
+
+    /// A main-command body that waits (up to 5 s) for the stand-in rnsd's `ready` line
+    /// and then runs `then`: the script TERMs rnsd as soon as the main command returns,
+    /// so a command that exits at once races the stub's own startup.
+    fn after_rnsd_ready(&self, then: &str) -> String {
+        format!(
+            "polls=0; until grep -q '^ready$' {log} 2>/dev/null || [ \"$polls\" -ge 100 ]; do \
+             sleep 0.05; polls=$((polls + 1)); done; {then}",
+            log = self.rnsd_log().display()
+        )
     }
 
     /// A copy of the script whose only difference is the template path.
@@ -326,6 +339,35 @@ fn the_lan_and_relay_variables_add_their_stanzas_and_only_those() {
     );
 }
 
+/// A template checked out with CRLF line endings renders the same default config: the
+/// awk program strips the CR before it matches the `#@if` / `#@end` markers, so the
+/// optional stanzas stay out and no CR reaches the file.
+#[test]
+fn a_crlf_template_renders_the_default_config_without_the_optional_stanzas() {
+    let home = Home::new("crlf-template");
+    let template = read(home.template());
+    assert!(
+        !template.contains('\r'),
+        "the checked-in template is LF; this test makes the CRLF copy itself"
+    );
+    fs::write(home.template(), template.replace('\n', "\r\n")).unwrap();
+    let (code, _, stderr) = run(home.command(&[], &["sh", "-c", "exit 0"]));
+    assert_eq!(code, 0, "{stderr}");
+    assert!(!stderr.contains("WARNING"), "{stderr}");
+    let config = read(home.config());
+    assert!(
+        config.contains("[[Coyote Sessions]]") && config.contains("listen_ip = 127.0.0.1"),
+        "the loopback listener is rendered from a CRLF template:\n{config}"
+    );
+    for absent in ["AutoInterface", "Team Relay", "#@", "\r"] {
+        assert!(
+            !config.contains(absent),
+            "a CRLF template must not leak `{}` into the rendered config:\n{config}",
+            absent.escape_debug()
+        );
+    }
+}
+
 /// Values that are not `host:port` (or carry characters the awk replacement cannot take
 /// safely) warn, write no relay stanza, and never change the main command's status.
 #[test]
@@ -344,7 +386,7 @@ fn a_malformed_relay_warns_writes_no_stanza_and_never_blocks_the_main_command() 
         let home = Home::new("bad-relay");
         let (code, stdout, stderr) = run(home.command(
             &[("COYOTE_MESH_RELAY", bad)],
-            &["sh", "-c", "sleep 0.5; echo ran; exit 4"],
+            &["sh", "-c", &home.after_rnsd_ready("echo ran; exit 4")],
         ));
         assert_eq!(code, 4, "COYOTE_MESH_RELAY={bad:?}: {stderr}");
         assert_eq!(stdout, "ran\n");
@@ -377,7 +419,7 @@ fn an_existing_config_is_never_overwritten() {
             ("COYOTE_MESH_LAN", "1"),
             ("COYOTE_MESH_RELAY", "relay.example:4242"),
         ],
-        &["sh", "-c", "sleep 0.5; exit 0"],
+        &["sh", "-c", &home.after_rnsd_ready("exit 0")],
     ));
     assert_eq!(code, 0, "{stderr}");
     assert_eq!(
@@ -407,7 +449,8 @@ fn an_existing_config_is_never_overwritten() {
     let quiet = Home::new("existing-quiet");
     fs::create_dir_all(quiet.config().parent().unwrap()).unwrap();
     fs::write(quiet.config(), sentinel).unwrap();
-    let (code, _, stderr) = run(quiet.command(&[], &["sh", "-c", "sleep 0.5; exit 0"]));
+    let (code, _, stderr) =
+        run(quiet.command(&[], &["sh", "-c", &quiet.after_rnsd_ready("exit 0")]));
     assert_eq!(code, 0, "{stderr}");
     assert!(
         !stderr.contains("not applied"),
@@ -440,7 +483,7 @@ fn rnsd_is_skipped_on_request_and_its_failure_never_blocks_the_main_command() {
     let other = Home::new("rnsd-other-value");
     let (code, _, stderr) = run(other.command(
         &[("COYOTE_MESH_RNSD", "false")],
-        &["sh", "-c", "sleep 0.5; exit 0"],
+        &["sh", "-c", &other.after_rnsd_ready("exit 0")],
     ));
     assert_eq!(code, 0);
     assert!(
@@ -479,13 +522,16 @@ fn rnsd_is_skipped_on_request_and_its_failure_never_blocks_the_main_command() {
 }
 
 /// rnsd runs as `rnsd -vv` under `env -i` with HOME, PATH and `PYTHONUNBUFFERED=1` and
-/// nothing else of the script's environment, `/dev/null` on fd 0, is TERMed (not INTed)
-/// once the main command returns, and its own stderr lines reach the script's stderr
-/// raw; the main command keeps the real stdin.
+/// nothing else of the script's environment, `/dev/null` on fd 0, is TERMed once the
+/// main command returns, and its own stderr lines reach the script's stderr raw; the
+/// main command keeps the real stdin. (That INT never reaches rnsd is a property of
+/// the real `setsid`, which the stand-in does not have; `scripts/image-smoke.sh`
+/// proves it against the image.)
 ///
 /// stderr goes to a file rather than a pipe: were the script to `exec` the main command
 /// (or forget to stop rnsd), the orphaned daemon would hold a pipe open and this test
-/// would hang instead of failing. The stub's pid is recorded so an orphan is reaped.
+/// would hang instead of failing. The stub's pid is recorded so an orphan the script
+/// never TERMed is reaped.
 #[test]
 fn rnsd_gets_its_scoped_environment_and_a_term_after_the_main_command_returns() {
     let home = Home::new("rnsd-env");
@@ -494,7 +540,7 @@ fn rnsd_gets_its_scoped_environment_and_a_term_after_the_main_command_returns() 
     let mut child = home
         .command(
             &[("COYOTE_TEST_CANARY", "leaked")],
-            &["sh", "-c", "sleep 0.5; cat; exit 0"],
+            &["sh", "-c", &home.after_rnsd_ready("cat; exit 0")],
         )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -510,16 +556,20 @@ fn rnsd_gets_its_scoped_environment_and_a_term_after_the_main_command_returns() 
     let started = Instant::now();
     let out = child.wait_with_output().unwrap();
     let elapsed = started.elapsed();
-    // Give a daemon the script failed to stop a moment, then reap it so nothing leaks.
     thread::sleep(Duration::from_millis(300));
     let recorded = home.rnsd_recorded();
-    let orphan = recorded
-        .lines()
-        .find_map(|line| line.strip_prefix("pid="))
-        .filter(|pid| Path::new(&format!("/proc/{pid}")).exists() || cfg!(not(target_os = "linux")))
-        .map(str::to_owned);
-    if let Some(pid) = &orphan {
-        let _ = Command::new("kill").args(["-9", pid]).output();
+    if !recorded.contains("signal=TERM\n") {
+        let orphan = recorded
+            .lines()
+            .find_map(|line| line.strip_prefix("pid="))
+            .filter(|pid| {
+                let probe = Command::new("kill").args(["-0", pid]).output();
+                probe.is_ok_and(|out| out.status.success())
+            })
+            .map(str::to_owned);
+        if let Some(pid) = &orphan {
+            let _ = Command::new("kill").args(["-9", pid]).output();
+        }
     }
     let stderr = read(&stderr_path);
     assert_eq!(out.status.code(), Some(0));
@@ -558,10 +608,6 @@ fn rnsd_gets_its_scoped_environment_and_a_term_after_the_main_command_returns() 
         recorded.contains("signal=TERM\n"),
         "rnsd must be TERMed after the main command:\n{recorded}"
     );
-    assert!(
-        !recorded.contains("signal=INT"),
-        "INT must never reach rnsd:\n{recorded}"
-    );
 }
 
 /// A daemon that ignores TERM is KILLed after the bounded wait and the script still
@@ -587,9 +633,182 @@ fn a_daemon_that_ignores_term_is_killed_after_the_bounded_wait() {
     );
 }
 
+/// Kills a whole process group on drop, so a wrapper that died early (the RED shape of
+/// the signal test) cannot leave its main command looping after the test.
+struct Group(u32);
+
+impl Group {
+    fn signal(&self, signal: &str) {
+        let status = Command::new("sh")
+            .args([
+                "-c",
+                r#"kill -s "$1" -- "-$2""#,
+                "_",
+                signal,
+                &self.0.to_string(),
+            ])
+            .status()
+            .expect("spawn sh kill");
+        assert!(
+            status.success(),
+            "kill -s {signal} to process group {}",
+            self.0
+        );
+    }
+}
+
+impl Drop for Group {
+    fn drop(&mut self) {
+        let _ = Command::new("sh")
+            .args([
+                "-c",
+                r#"kill -s KILL -- "-$1" 2>/dev/null"#,
+                "_",
+                &self.0.to_string(),
+            ])
+            .status();
+    }
+}
+
+fn wait_for(path: &Path, what: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "{what} did not appear within 10 s"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The container's `tini -s -g` delivers every forwarded signal to the whole process
+/// group, so the wrapper receives HUP, QUIT, USR1 and USR2 alongside the main command and
+/// must outlive them: a main command that handles them keeps running and its own exit
+/// status (here from USR2) is the script's; a main command with default dispositions dies
+/// of HUP and the script reports that death verbatim (129). rnsd is TERMed by the script
+/// after the main command either way.
+///
+/// The script runs in a fresh process group (what tini -g signals) and the stand-in rnsd
+/// ignores these signals, standing in for the real daemon's own session.
+#[test]
+fn usage_probe_the_wrapper_outlives_every_signal_tini_forwards_to_the_group() {
+    let home = Home::new("group-signals");
+    let log = home.rnsd_log();
+    home.write_executable(
+        "rnsd",
+        &format!(
+            "#!/bin/sh\ntrap '' HUP QUIT USR1 USR2\ntrap 'printf \"signal=TERM\\\\n\" >> {log}; exit 0' TERM\n\
+             printf 'started\\\\n' >> {log}\nwhile :; do sleep 0.1; done\n",
+            log = log.display()
+        ),
+    );
+
+    // First, a main command that handles the four signals and exits 9 on USR2.
+    let ready = home.path().join("handled.ready");
+    let stdout_path = home.path().join("handled.stdout");
+    let stderr_path = home.path().join("handled.stderr");
+    let mut child = home
+        .command(
+            &[],
+            &[
+                "sh",
+                "-c",
+                "trap 'echo got-HUP' HUP; trap 'echo got-QUIT' QUIT; trap 'echo got-USR1' USR1; \
+                 trap 'exit 9' USR2; : > \"$0\"; while :; do sleep 0.1; done",
+                ready.to_str().unwrap(),
+            ],
+        )
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(fs::File::create(&stdout_path).unwrap())
+        .stderr(fs::File::create(&stderr_path).unwrap())
+        .spawn()
+        .expect("spawn sh");
+    let group = Group(child.id());
+    wait_for(&ready, "the handled main command's ready marker");
+    wait_for(&log, "the stand-in rnsd's start line");
+    for signal in ["HUP", "QUIT", "USR1"] {
+        group.signal(signal);
+        thread::sleep(Duration::from_millis(400));
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "the wrapper died of {signal} while its main command was still running:\n{}",
+            read(&stderr_path)
+        );
+    }
+    group.signal("USR2");
+    let status = child.wait().unwrap();
+    drop(group);
+    let stdout = read(&stdout_path);
+    assert_eq!(
+        status.code(),
+        Some(9),
+        "the main command's exit status after USR2 is the script's:\n{}",
+        read(&stderr_path)
+    );
+    for line in ["got-HUP", "got-QUIT", "got-USR1"] {
+        assert_eq!(
+            stdout.matches(line).count(),
+            1,
+            "the main command handled each signal exactly once:\n{stdout}"
+        );
+    }
+    assert!(
+        home.rnsd_recorded().contains("signal=TERM\n"),
+        "rnsd is TERMed once the main command returns:\n{}",
+        home.rnsd_recorded()
+    );
+
+    // Then a main command with default dispositions: HUP kills it, the script reports 129.
+    let _ = fs::remove_file(&log);
+    let ready = home.path().join("unhandled.ready");
+    let stderr_path = home.path().join("unhandled.stderr");
+    let mut child = home
+        .command(
+            &[],
+            &[
+                "sh",
+                "-c",
+                ": > \"$0\"; exec sleep 30",
+                ready.to_str().unwrap(),
+            ],
+        )
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(fs::File::create(&stderr_path).unwrap())
+        .spawn()
+        .expect("spawn sh");
+    let group = Group(child.id());
+    wait_for(&ready, "the unhandled main command's ready marker");
+    wait_for(&log, "the stand-in rnsd's start line");
+    thread::sleep(Duration::from_millis(200));
+    let started = Instant::now();
+    group.signal("HUP");
+    let status = child.wait().unwrap();
+    let elapsed = started.elapsed();
+    drop(group);
+    assert_eq!(
+        status.code(),
+        Some(129),
+        "an unhandled HUP on the main command is reported verbatim (128 + 1):\n{}",
+        read(&stderr_path)
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "the script returned {elapsed:?} after the main command died"
+    );
+    assert!(
+        home.rnsd_recorded().contains("signal=TERM\n"),
+        "rnsd is TERMed after the main command's death too:\n{}",
+        home.rnsd_recorded()
+    );
+}
+
 /// Passthrough: `sh`, `bash` and an absolute path run as given; anything else is a
-/// `coyote` argument. The script's own helpers are not on PATH here, so the coyote branch
-/// is observed through a stand-in `coyote`.
+/// `coyote` argument, and rnsd starts ahead of that branch as it does ahead of
+/// passthrough. The script's own helpers are not on PATH here, so the coyote branch is
+/// observed through a stand-in `coyote`.
 #[test]
 fn the_first_argument_selects_passthrough_or_the_coyote_binary() {
     let home = Home::new("dispatch");
@@ -615,6 +834,23 @@ fn the_first_argument_selects_passthrough_or_the_coyote_binary() {
     assert_eq!(
         stdout, "coyote-stub:\n",
         "no arguments runs coyote with none"
+    );
+
+    let with_rnsd = Home::new("dispatch-rnsd");
+    with_rnsd.write_executable(
+        "coyote",
+        &format!(
+            "#!/bin/sh\n{}\n",
+            with_rnsd.after_rnsd_ready("echo \"coyote-stub:$*\"; exit 0")
+        ),
+    );
+    let (code, stdout, stderr) = run(with_rnsd.command(&[], &["--version"]));
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(stdout, "coyote-stub:--version\n");
+    assert!(
+        with_rnsd.rnsd_recorded().contains("argv=-vv"),
+        "rnsd starts before the coyote branch too:\n{}",
+        with_rnsd.rnsd_recorded()
     );
 }
 
@@ -683,11 +919,11 @@ struct Container {
 
 impl Container {
     fn detached(image: &str, extra: &[&str], command: &[&str]) -> Self {
-        let name = format!(
-            "coyote-image-test-{}-{}",
-            std::process::id(),
-            extra.len() + command.len()
-        );
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let name = format!("coyote-image-test-{}-{unique}", std::process::id());
         let lbl = label();
         let mut args = vec!["run", "-d", "--name", &name, "--label", &lbl];
         args.extend_from_slice(extra);
@@ -953,4 +1189,169 @@ fn rnsd_failure_in_the_image_never_blocks_the_main_command() {
         "a read-only root without tmpfs still runs the main command"
     );
     assert!(String::from_utf8_lossy(&out.stderr).contains("rnsd not started"));
+}
+
+/// Polls `docker exec` for the loopback listener for up to 30 s.
+fn wait_for_4242(container: &str) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let probe = docker(&[
+            "exec",
+            container,
+            "bash",
+            "-c",
+            "exec 3<>/dev/tcp/127.0.0.1/4242",
+        ]);
+        if probe.status.success() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "rnsd did not listen on 127.0.0.1:4242 within 30 s in {container}"
+        );
+        thread::sleep(Duration::from_millis(500));
+    }
+}
+
+fn wait_for_exit(container: &Container) -> String {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let running = docker_ok(&["inspect", "--format", "{{.State.Running}}", &container.name]);
+        if running.trim() == "false" {
+            return container.exit_code();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{} still running 10 s after the signal:\n{}",
+            container.name,
+            container.logs()
+        );
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// Under `tini -s -g` every signal docker forwards reaches the main command directly
+/// and the wrapper outlives it: a main command handling HUP, QUIT and USR1 keeps the
+/// container up (and rnsd, in its own session, keeps listening), its own exit status
+/// on USR2 is the container's; a main command with default dispositions dies of HUP or
+/// USR1 and the container exits 128 + n verbatim.
+#[test]
+#[ignore = "needs docker, COYOTE_IMAGE_TESTS=1 and COYOTE_IMAGE=<tag>"]
+fn usage_probe_forwarded_signals_reach_the_main_command_and_the_wrapper_outlives_them() {
+    let Some(image) = live_image() else { return };
+    {
+        let handled = Container::detached(
+            &image,
+            &[],
+            &[
+                "bash",
+                "-c",
+                "trap 'echo got-HUP' HUP; trap 'echo got-QUIT' QUIT; trap 'echo got-USR1' USR1; \
+                 trap 'exit 9' USR2; while :; do sleep 1; done",
+            ],
+        );
+        wait_for_4242(&handled.name);
+        for signal in ["HUP", "QUIT", "USR1"] {
+            docker_ok(&["kill", "-s", signal, &handled.name]);
+            thread::sleep(Duration::from_millis(1500));
+            let running = docker_ok(&["inspect", "--format", "{{.State.Running}}", &handled.name]);
+            assert_eq!(
+                running.trim(),
+                "true",
+                "the container died of {signal} while its main command was handling it:\n{}",
+                handled.logs()
+            );
+        }
+        let logs = handled.logs();
+        for line in ["got-HUP", "got-QUIT", "got-USR1"] {
+            assert_eq!(
+                logs.matches(line).count(),
+                1,
+                "the main command handled each forwarded signal exactly once:\n{logs}"
+            );
+        }
+        wait_for_4242(&handled.name);
+        docker_ok(&["kill", "-s", "USR2", &handled.name]);
+        assert_eq!(
+            wait_for_exit(&handled),
+            "9",
+            "the main command's own status after USR2 is the container's:\n{}",
+            handled.logs()
+        );
+    }
+    for (signal, code) in [("HUP", "129"), ("USR1", "138")] {
+        let unhandled =
+            Container::detached(&image, &["--label", signal], &["sh", "-c", "sleep 999"]);
+        wait_for_4242(&unhandled.name);
+        docker_ok(&["kill", "-s", signal, &unhandled.name]);
+        assert_eq!(
+            wait_for_exit(&unhandled),
+            code,
+            "an unhandled {signal} on the main command exits 128 + n verbatim:\n{}",
+            unhandled.logs()
+        );
+    }
+}
+
+/// The real rnsd never inherits the container's environment: its `/proc/<pid>/environ`
+/// holds HOME, PATH and `PYTHONUNBUFFERED=1` and nothing else, so a provider key handed
+/// to the container reaches the main command only.
+#[test]
+#[ignore = "needs docker, COYOTE_IMAGE_TESTS=1 and COYOTE_IMAGE=<tag>"]
+fn usage_probe_the_real_rnsd_sees_home_path_and_unbuffered_only() {
+    let Some(image) = live_image() else { return };
+    let lbl = label();
+    let secret = "probe-not-a-real-key";
+    let out = docker(&[
+        "run",
+        "--rm",
+        "--label",
+        &lbl,
+        "-e",
+        &format!("ANTHROPIC_API_KEY={secret}"),
+        &image,
+        "bash",
+        "-c",
+        "for _ in $(seq 1 60); do (exec 3<>/dev/tcp/127.0.0.1/4242) 2>/dev/null && break; sleep 0.5; done; \
+         p=$(pgrep -x rnsd | head -1); [ -n \"$p\" ] || { echo no-rnsd; exit 1; }; \
+         echo environ-begin; tr '\\0' '\\n' < /proc/$p/environ | sort; echo environ-end; \
+         echo \"main-sees=${ANTHROPIC_API_KEY:-unset}\"",
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let environ: Vec<&str> = stdout
+        .lines()
+        .skip_while(|l| *l != "environ-begin")
+        .skip(1)
+        .take_while(|l| *l != "environ-end")
+        .collect();
+    let keys: Vec<&str> = environ
+        .iter()
+        .map(|l| l.split_once('=').map(|(k, _)| k).unwrap_or(l))
+        .collect();
+    assert_eq!(
+        keys,
+        ["HOME", "PATH", "PYTHONUNBUFFERED"],
+        "rnsd's environment is exactly HOME, PATH, PYTHONUNBUFFERED:\n{stdout}"
+    );
+    assert!(
+        environ.contains(&"HOME=/home/agent") && environ.contains(&"PYTHONUNBUFFERED=1"),
+        "{stdout}"
+    );
+    assert!(
+        !stdout
+            .lines()
+            .take_while(|l| *l != "environ-end")
+            .any(|l| l.contains(secret)),
+        "the provider key reached rnsd:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("main-sees={secret}\n")),
+        "the main command keeps the container's environment:\n{stdout}"
+    );
 }

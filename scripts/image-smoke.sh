@@ -157,7 +157,8 @@ while (( $(date +%s) < deadline )); do
   sleep 1
 done
 [[ "$trapped" == "1" ]] || fail_with_logs "$i" "the main command's INT trap did not fire within 10 s"
-docker exec "$i" ps -eo comm= | grep -qx rnsd || fail_with_logs "$i" "rnsd did not survive an INT the main command handled"
+comms="$(docker exec "$i" ps -eo comm=)"
+grep -qx rnsd <<<"$comms" || fail_with_logs "$i" "rnsd did not survive an INT the main command handled"
 ok "INT reaches the main command and leaves rnsd running"
 docker rm -f "$i" >/dev/null
 docker run -d --name "$i" "$image" sh -c 'sleep 999' >/dev/null

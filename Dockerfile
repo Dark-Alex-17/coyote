@@ -123,9 +123,10 @@ WORKDIR /home/agent/workspace
 
 USER 1000
 
-# tini as PID 1: -s (subreaper) reaps the orphans a dying main command leaves behind,
-# -g delivers TERM/INT to the whole process group so the main command receives them
-# directly. coyote-entrypoint starts rnsd in its own session (opt out with
+# tini as PID 1 reaps the orphans a dying main command leaves behind; -s (subreaper)
+# keeps it reaping, and quiet about it, when it is not PID 1, e.g. under `docker run
+# --init`. -g delivers TERM/INT to the whole process group so the main command
+# receives them directly. coyote-entrypoint starts rnsd in its own session (opt out with
 # COYOTE_MESH_RNSD=0), runs coyote, or the given command (e.g. the Docker Sandboxes
 # keep-alive) when the first arg is sh/bash/a path, in its foreground, then stops rnsd
 # and exits with the main command's code.

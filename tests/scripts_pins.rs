@@ -976,6 +976,15 @@ fn relay_scripts_carry_the_strict_mode_scaffolding() {
 #[test]
 fn scripts_are_ascii_lf_and_free_of_plan_labels() {
     let tracking_id = Regex::new(r"(?i)\b(task|plan|scope)-[0-9A-Z]").unwrap();
+    let attributes = read(repo_root().join(".gitattributes"));
+    for pattern in ["Dockerfile", "scripts/*.tmpl"] {
+        assert!(
+            attributes
+                .lines()
+                .any(|line| line.trim() == format!("{pattern} text eol=lf")),
+            ".gitattributes must pin `{pattern} text eol=lf`: the LF sweep below and the entrypoint's `#@if` markers both need an LF checkout on the Windows runners"
+        );
+    }
     let paths: Vec<PathBuf> = RELAY_SCRIPTS
         .iter()
         .chain(INSTALLERS.iter())
@@ -1017,7 +1026,7 @@ fn scripts_are_ascii_lf_and_free_of_plan_labels() {
 }
 
 #[test]
-fn the_image_dockerfile_installs_the_dockerfile_rns_version() {
+fn the_image_dockerfile_installs_the_propagation_node_rns_version() {
     let version = dockerfile_rns_version();
     let dockerfile = read(repo_root().join("Dockerfile"));
     let mut lines = dockerfile.lines();
@@ -1059,7 +1068,7 @@ fn the_image_dockerfile_installs_the_dockerfile_rns_version() {
         dockerfile.contains(
             "ENTRYPOINT [\"/usr/bin/tini\", \"-s\", \"-g\", \"--\", \"/usr/local/bin/coyote-entrypoint\"]"
         ),
-        "Dockerfile must run tini with -s and -g: -s reaps the grandchildren a dying main command leaves (sh -c 'sleep infinity' on TERM); -g delivers TERM/INT to the process group, which is how the foreground main command receives them"
+        "Dockerfile must run tini with -s and -g: -s keeps tini reaping (and quiet) when it is not PID 1, e.g. under `docker run --init` (PID 1 reaps orphans regardless); -g delivers TERM/INT to the process group, which is how the foreground main command receives them"
     );
     assert!(
         dockerfile.contains("scripts/reticulum.config.tmpl /opt/coyote/reticulum.config.tmpl"),
@@ -1133,6 +1142,10 @@ fn the_image_template_and_entrypoint_carry_the_rnsd_logging_contract() {
             "docker-entrypoint.sh must contain `{needle}`: the smoke's log assertions, the env contract (PYTHONUNBUFFERED scoped to the rnsd child under env -i), the never-overwrite guard and the signal model depend on it"
         );
     }
+    assert!(
+        entrypoint.contains(r#"{ sub(/\r$/, "") }"#),
+        "docker-entrypoint.sh's awk program must strip a trailing CR from every line before the `#@if` markers are matched: a CRLF template would otherwise render every optional stanza unconditionally"
+    );
     assert!(
         !entrypoint.contains("exec coyote"),
         "docker-entrypoint.sh must run coyote as a child, not exec it: the script has to outlive it to stop rnsd and return its exit code"
