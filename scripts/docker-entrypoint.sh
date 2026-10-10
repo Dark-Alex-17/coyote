@@ -213,16 +213,22 @@ else
 fi
 rc=$?
 
-# A TERM that lands before the exec chain reaches rnsd kills the `env`/`setsid`
-# stage with its default disposition: after an instant-exit main command the
-# daemon simply never starts. Only a child we signalled is waited on.
+# A TERM that lands on the `env`/`setsid` stage kills it with its default
+# disposition: after an instant-exit main command the daemon simply never starts.
+# One TERM can still be lost: between fork and exec the child is a copy of this
+# shell, carrying this shell's trap handler until it resets its traps, and a
+# signal swallowed there never reaches rnsd. So TERM is re-sent once a second
+# while the child lives (rnsd exits on the first one it receives, so a running
+# daemon sees only one). Only a child we signalled is waited on.
 if rnsd_alive; then
-  kill -s TERM "$rnsd_pid" 2>/dev/null
   # kill -0 succeeds on an exited-but-unreaped child; the loop ends early only
   # because the shell reaps the background rnsd while waiting on the foreground
   # sleep (dash, bash and ash all do). Do not replace it with a fixed sleep.
   polls=0
   while [ "$polls" -lt 25 ] && rnsd_alive; do
+    if [ $((polls % 5)) -eq 0 ]; then
+      kill -s TERM "$rnsd_pid" 2>/dev/null
+    fi
     sleep 0.2
     polls=$((polls + 1))
   done

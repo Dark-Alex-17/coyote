@@ -807,13 +807,69 @@ fn a_main_command_that_returns_before_setsid_execs_rnsd_still_stops_the_child() 
     drop(group);
     let recorded = home.rnsd_recorded();
     // A TERM that lands in the `&` child's first instants, before the forked shell has
-    // reset the trap handler it inherited, is swallowed there; the bounded wait then
-    // KILLs the stub and says so.
+    // reset the trap handler it inherited, is swallowed there; the script re-sends TERM
+    // once a second, so a stub that got as far as arming its trap was TERMed, never
+    // KILLed.
     assert!(
-        !recorded.contains("ready\n")
-            || recorded.contains("signal=TERM\n")
-            || stderr.contains("did not exit within 5 s after TERM; sending KILL"),
-        "a stub that armed its trap must have been TERMed or KILLed:\n{recorded}\nstderr:\n{stderr}"
+        !recorded.contains("ready\n") || recorded.contains("signal=TERM\n"),
+        "a stub that armed its trap must have been TERMed:\n{recorded}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("sending KILL"),
+        "the stop phase escalated to KILL:\n{stderr}"
+    );
+}
+
+/// A TERM swallowed by the child before it became rnsd (the forked shell still carries
+/// this shell's trap handler for an instant) must not cost the 5 s KILL escalation: the
+/// stop phase re-sends TERM once a second. The shim arms a one-shot trap at once and
+/// sleeps past the main command's exit, so the first TERM is absorbed; it then exec's the
+/// stub, which arms its own trap; without the re-send the stub idles until the KILL and
+/// the entrypoint warns.
+#[test]
+fn a_term_swallowed_before_the_child_became_rnsd_is_sent_again() {
+    let home = Home::new("absorbed-term");
+    home.write_executable(
+        "setsid",
+        "#!/bin/sh\ntrap 'trap - TERM' TERM\nsleep 0.5\nexec \"$@\"\n",
+    );
+    let mut child = home
+        .command(&[], &["sh", "-c", "sleep 0.2; exit 4"])
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn sh");
+    let pgid = child.id();
+    let group = Group(pgid);
+    let stdout = Capture::start(child.stdout.take().unwrap());
+    let stderr = Capture::start(child.stderr.take().unwrap());
+    let started = Instant::now();
+    let status = wait_bounded(&mut child, || {
+        format!("stdout:\n{}\nstderr:\n{}", stdout.so_far(), stderr.so_far())
+    });
+    let elapsed = started.elapsed();
+    let stdout = stdout.finish(pgid);
+    let stderr = stderr.finish(pgid);
+    drop(group);
+    assert_eq!(
+        status.code(),
+        Some(4),
+        "stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let recorded = home.rnsd_recorded();
+    assert!(
+        recorded.contains("signal=TERM\n"),
+        "the stub never saw the re-sent TERM:\n{recorded}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("sending KILL"),
+        "the stop phase escalated to KILL instead of re-sending TERM:\n{stderr}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "the re-sent TERM must end the child well inside the 5 s KILL bound; took {elapsed:?}"
     );
 }
 
