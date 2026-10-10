@@ -73,10 +73,11 @@ use rns_transport::iface::auto::{AutoInterfaceConfig, AutoInterfaceDeviceFilter}
 use rns_transport::iface::auto_runtime::{
     AutoDiscoveryRuntime, AutoInterfaceTransportRuntime, AutoRuntimePlan,
 };
-use rns_transport::iface::tcp_client::TcpClient;
+use rns_transport::iface::tcp_client::{TcpClient, TcpRuntimeStatusHandle};
 use rns_transport::iface::{IfaceRole, InterfaceMode};
 use rns_transport::transport::{AnnounceEvent, Transport, TransportConfig};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -89,7 +90,7 @@ use tokio_util::sync::CancellationToken;
 /// One grace window on the transport. `stop` spends at most one on registered tasks and one
 /// on transport teardown, plus any `REKEY_GRACE` a concurrent rekey is spending; `start`
 /// spends one on registering and first announcing the destination, and `abandon_start` and
-/// the `join_lan`/`join_tcp` failure cleanup spend one unwinding. The r3 tests bound their
+/// the `join_lan` failure cleanup spend one unwinding. The r3 tests bound their
 /// own teardown with it too.
 pub(crate) const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// How long `rekey` and `announce_now` wait on the transport for each of their steps. The
@@ -98,6 +99,8 @@ pub(crate) const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 pub(crate) const REKEY_GRACE: Duration = Duration::from_secs(5);
 /// Poll interval while waiting for a TCP relay to report itself connected.
 const CONNECT_POLL: Duration = Duration::from_millis(50);
+/// How often the connect-poller samples the TCP clients still reconnecting after start.
+const CONNECT_WATCH_TICK: Duration = Duration::from_secs(1);
 /// Depth of the host channel a LAN interface feeds the transport through.
 const LAN_CHANNEL_CAPACITY: usize = 128;
 /// How often the peer table is written back if it changed; `stop` writes it regardless.
@@ -235,6 +238,65 @@ impl InterfacePlan {
             Self::Tcp { kind, .. } => kind,
         }
     }
+
+    fn status(&self, state: InterfaceState) -> InterfaceStatus {
+        InterfaceStatus {
+            label: self.label(),
+            kind: self.kind(),
+            endpoint: match self {
+                Self::Lan => None,
+                Self::Tcp { endpoint, .. } => Some(endpoint.clone()),
+            },
+            state,
+        }
+    }
+}
+
+/// What one configured interface is doing. `Unreachable` with `retrying` is a TCP client
+/// the transport keeps reconnecting; without it, a `lan` bind that failed and will not be
+/// tried again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum InterfaceState {
+    Connected,
+    Unreachable { reason: String, retrying: bool },
+}
+
+impl fmt::Display for InterfaceState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Connected => f.write_str("connected"),
+            Self::Unreachable {
+                reason,
+                retrying: true,
+            } => write!(f, "unreachable, retrying: {reason}"),
+            Self::Unreachable {
+                reason,
+                retrying: false,
+            } => write!(f, "unreachable: {reason}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InterfaceStatus {
+    pub label: String,
+    pub kind: &'static str,
+    /// `host:port` for a relay; `None` for `lan`.
+    pub endpoint: Option<String>,
+    pub state: InterfaceState,
+}
+
+impl InterfaceStatus {
+    /// A relay on this host's loopback, where nothing listening means no local daemon.
+    pub(crate) fn is_loopback(&self) -> bool {
+        self.endpoint
+            .as_deref()
+            .and_then(|endpoint| endpoint.rsplit_once(':'))
+            .is_some_and(|(host, _)| {
+                let host = host.trim_start_matches('[').trim_end_matches(']');
+                host == "127.0.0.1" || host == "::1" || host.eq_ignore_ascii_case("localhost")
+            })
+    }
 }
 
 /// Maps the configured list 1:1; nothing is detected, defaulted, or substituted.
@@ -264,6 +326,22 @@ enum JoinedInterface {
         hash: AddressHash,
         handle: JoinHandle<()>,
         label: String,
+    },
+}
+
+enum Joined {
+    Connected(JoinedInterface),
+    /// A TCP client whose first connect failed; it stays attached and keeps reconnecting.
+    Pending {
+        iface: JoinedInterface,
+        status: TcpRuntimeStatusHandle,
+        reason: String,
+        message: String,
+    },
+    /// Nothing was attached; `lan` only.
+    Failed {
+        reason: String,
+        message: String,
     },
 }
 
@@ -309,8 +387,11 @@ pub(crate) struct MeshRuntime {
     envoy_memory: ArcSwapOption<EnvoySessions>,
     envoy_memory_config: EnvoyMemoryConfig,
     memory: PeerMemory,
-    interface_labels: Vec<String>,
-    interface_kinds: Vec<&'static str>,
+    /// Every configured interface with what it is doing, in config order.
+    interface_states: RwLock<Vec<InterfaceStatus>>,
+    /// The TCP clients still reconnecting, by index into `interface_states`, with the
+    /// status handle the connect-poller watches for their first `connected`.
+    pending_interfaces: parking_lot::Mutex<Vec<(usize, TcpRuntimeStatusHandle)>>,
     hooks: MeshHooks,
     /// `None` once `shutdown` has released this owner. Requests and the server loop hold
     /// clones, so the upstream `Drop` that cancels the transport's tasks runs when the last
@@ -423,14 +504,53 @@ impl MeshRuntime {
         let client_resource_events = transport.resource_events();
         let server_resource_events = transport.resource_events();
         let mut joined = Vec::with_capacity(plans.len());
-        for plan in &plans {
+        let mut states = Vec::with_capacity(plans.len());
+        let mut pending = Vec::new();
+        let mut failures = Vec::new();
+        for (index, plan) in plans.iter().enumerate() {
             match join_interface(&transport, plan, &options).await {
-                Ok(iface) => joined.push(iface),
-                Err(err) => {
-                    abandon_start(transport, joined).await;
-                    return Err(err);
+                Joined::Connected(iface) => {
+                    joined.push(iface);
+                    states.push(plan.status(InterfaceState::Connected));
+                }
+                Joined::Pending {
+                    iface,
+                    status,
+                    reason,
+                    message,
+                } => {
+                    joined.push(iface);
+                    pending.push((index, status));
+                    states.push(plan.status(InterfaceState::Unreachable {
+                        reason,
+                        retrying: true,
+                    }));
+                    failures.push(message);
+                }
+                Joined::Failed { reason, message } => {
+                    states.push(plan.status(InterfaceState::Unreachable {
+                        reason,
+                        retrying: false,
+                    }));
+                    failures.push(message);
                 }
             }
+        }
+        if !states
+            .iter()
+            .any(|status| status.state == InterfaceState::Connected)
+        {
+            abandon_start(transport, joined).await;
+            // `validate` refused an empty list above, so every plan failed and the first
+            // failure is the first plan.
+            let mut text = failures[0].clone();
+            if states.iter().all(InterfaceStatus::is_loopback) {
+                text.push_str(&format!(
+                    " Nothing is listening on {endpoint}. The default configuration expects a local Reticulum daemon (rnsd) there — run scripts/mesh-relay.sh, or use type: lan to join the LAN without one; see Mesh-Deployment.",
+                    endpoint = states[0].endpoint.as_deref().unwrap_or_default()
+                ));
+            }
+            bail!(text);
         }
         let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
         let (dest, hash, origin) = match register_destination(
@@ -508,8 +628,8 @@ impl MeshRuntime {
             envoy_memory: ArcSwapOption::new(envoy_memory),
             envoy_memory_config: config.envoy_memory.clone(),
             memory: PeerMemory::default(),
-            interface_labels: plans.iter().map(InterfacePlan::label).collect(),
-            interface_kinds: plans.iter().map(InterfacePlan::kind).collect(),
+            interface_states: RwLock::new(states),
+            pending_interfaces: parking_lot::Mutex::new(pending),
             hooks: options.hooks,
             transport: Mutex::new(Some(transport.clone())),
             interfaces: Mutex::new(joined),
@@ -751,14 +871,53 @@ impl MeshRuntime {
         self.destination.lock().await.hash.to_hex_string()
     }
 
-    /// Human labels of the joined interfaces, in config order.
+    /// Human labels of the connected interfaces, in config order. A pending interface
+    /// joins the list when the connect-poller sees it come up; `mesh.started` fired once
+    /// at install with the kinds connected then and nothing refires on a later connect,
+    /// so a hook consumer learns of it only through `.mesh info`.
     pub(crate) fn interfaces(&self) -> Vec<String> {
-        self.interface_labels.clone()
+        self.connected_interfaces()
+            .map(|status| status.label)
+            .collect()
     }
 
-    /// The joined interfaces by kind only (`lan`, `private`, `public`), in config order.
+    /// The connected interfaces by kind only (`lan`, `private`, `public`), in config
+    /// order; a later connect updates it the same way as `interfaces`.
     pub(crate) fn interface_kinds(&self) -> Vec<&'static str> {
-        self.interface_kinds.clone()
+        self.connected_interfaces()
+            .map(|status| status.kind)
+            .collect()
+    }
+
+    fn connected_interfaces(&self) -> impl Iterator<Item = InterfaceStatus> {
+        self.interface_states()
+            .into_iter()
+            .filter(|status| status.state == InterfaceState::Connected)
+    }
+
+    /// Every configured interface with its current state, in config order.
+    pub(crate) fn interface_states(&self) -> Vec<InterfaceStatus> {
+        self.interface_states.read().clone()
+    }
+
+    /// The interfaces still reconnecting, by index into `interface_states`.
+    pub(crate) fn pending_interfaces(&self) -> Vec<(usize, TcpRuntimeStatusHandle)> {
+        self.pending_interfaces.lock().clone()
+    }
+
+    /// Records that the interface at `index` came up and returns its label; `None` when
+    /// it was already connected or there is no such interface.
+    pub(crate) fn mark_interface_connected(&self, index: usize) -> Option<String> {
+        let mut states = self.interface_states.write();
+        let status = states.get_mut(index)?;
+        if status.state == InterfaceState::Connected {
+            return None;
+        }
+        status.state = InterfaceState::Connected;
+        self.pending_interfaces
+            .lock()
+            .retain(|(pending, _)| *pending != index);
+        Some(status.label.clone())
     }
 
     pub(crate) fn hooks(&self) -> &MeshHooks {
@@ -1113,6 +1272,26 @@ impl MeshRuntime {
         Ok(true)
     }
 
+    /// Announces the current destination regardless of `REANNOUNCE_FLOOR_SECS`: a relay that
+    /// has just become reachable never heard the start announce, and the next heartbeat is up
+    /// to `HEARTBEAT_SECS` away. Sends nothing when the node is configured not to announce.
+    pub(crate) async fn announce_on_connect(&self) -> Result<()> {
+        if !self.announce {
+            return Ok(());
+        }
+        let mut state = self.destination.lock().await;
+        let transport = self.running_transport().await?;
+        timeout(REKEY_GRACE, self.send_announce(&mut state, &transport))
+            .await
+            .map_err(|_| {
+                anyhow!(
+                    "The mesh transport did not send the announce for destination {} within {}s",
+                    state.hash.to_hex_string(),
+                    REKEY_GRACE.as_secs()
+                )
+            })?
+    }
+
     /// A handle on the transport, taken so the `transport` guard is not held across the
     /// caller's waits and a concurrent `request` or `shutdown` does not queue behind them.
     async fn running_transport(&self) -> Result<Arc<Transport>> {
@@ -1369,27 +1548,41 @@ async fn join_interface(
     transport: &Transport,
     plan: &InterfacePlan,
     options: &NodeOptions,
-) -> Result<JoinedInterface> {
+) -> Joined {
     let joined = match plan {
-        InterfacePlan::Lan => join_lan(transport).await?,
+        InterfacePlan::Lan => join_lan(transport).await,
         InterfacePlan::Tcp { kind, endpoint } => {
-            join_tcp(transport, kind, endpoint, options.connect_timeout).await?
+            join_tcp(transport, kind, endpoint, options.connect_timeout).await
         }
     };
-    debug!("Joined mesh interface {}", plan.label());
-    Ok(joined)
+    match &joined {
+        Joined::Connected(_) => debug!("Joined mesh interface {}", plan.label()),
+        Joined::Pending { reason, .. } => debug!(
+            "Mesh interface {} is unreachable and keeps reconnecting: {reason}",
+            plan.label()
+        ),
+        Joined::Failed { reason, .. } => {
+            debug!("Mesh interface {} was not attached: {reason}", plan.label());
+        }
+    }
+    joined
 }
 
-async fn join_lan(transport: &Transport) -> Result<JoinedInterface> {
-    let plan = AutoRuntimePlan::from_system(
+async fn join_lan(transport: &Transport) -> Joined {
+    let plan = match AutoRuntimePlan::from_system(
         AutoInterfaceConfig::default(),
         AutoInterfaceDeviceFilter::default(),
-    )
-    .map_err(|err| {
-        anyhow!(
-            "Failed to enumerate network interfaces for the mesh lan interface: {err}. Remove the lan entry from mesh.interfaces or fix the host's networking."
-        )
-    })?;
+    ) {
+        Ok(plan) => plan,
+        Err(err) => {
+            return Joined::Failed {
+                reason: err.to_string(),
+                message: format!(
+                    "Failed to enumerate network interfaces for the mesh lan interface: {err}. Remove the lan entry from mesh.interfaces or fix the host's networking."
+                ),
+            };
+        }
+    };
     let manager = transport.iface_manager();
     let channel = manager.lock().await.new_channel_with_role_and_mode(
         LAN_CHANNEL_CAPACITY,
@@ -1402,7 +1595,7 @@ async fn join_lan(transport: &Transport) -> Result<JoinedInterface> {
         .spawn_discovery_runtime_with_native_scope_ids_and_transport(Some(bridge), None)
         .await
     {
-        Ok(runtime) => Ok(JoinedInterface::Lan {
+        Ok(runtime) => Joined::Connected(JoinedInterface::Lan {
             host_iface,
             runtime,
         }),
@@ -1414,9 +1607,12 @@ async fn join_lan(transport: &Transport) -> Result<JoinedInterface> {
                 tokio::time::Instant::now() + SHUTDOWN_GRACE,
             )
             .await;
-            bail!(
-                "Failed to bind the mesh lan interface: {err}. Another process may hold the discovery port; remove the lan entry from mesh.interfaces or stop that process."
-            )
+            Joined::Failed {
+                reason: err.to_string(),
+                message: format!(
+                    "Failed to bind the mesh lan interface: {err}. Another process may hold the discovery port; remove the lan entry from mesh.interfaces or stop that process. Two Coyote sessions on one host need a local relay; see Mesh-Deployment."
+                ),
+            }
         }
     }
 }
@@ -1426,7 +1622,7 @@ async fn join_tcp(
     kind: &'static str,
     endpoint: &str,
     connect_timeout: Duration,
-) -> Result<JoinedInterface> {
+) -> Joined {
     let client = TcpClient::new(endpoint).with_connect_timeout(connect_timeout);
     let status = client.runtime_status_handle();
     let context = transport.iface_manager().lock().await.new_context(client);
@@ -1435,17 +1631,17 @@ async fn join_tcp(
     let label = format!("{kind} {endpoint}");
 
     let deadline = Instant::now() + connect_timeout + Duration::from_secs(1);
-    let failure = loop {
+    let reason = loop {
         let snapshot = status.to_json();
         match snapshot["stream_state"].as_str() {
             Some("connected") => {
-                return Ok(JoinedInterface::Tcp {
+                return Joined::Connected(JoinedInterface::Tcp {
                     hash,
                     handle,
                     label,
                 });
             }
-            // The client's first connect failed; it would now retry forever on its own.
+            // The client's first connect failed; it now retries forever on its own.
             Some("reconnecting" | "closed") => {
                 break snapshot["last_error"]
                     .as_str()
@@ -1456,19 +1652,19 @@ async fn join_tcp(
             _ => sleep(CONNECT_POLL).await,
         }
     };
-    stop_interface(
-        transport,
-        JoinedInterface::Tcp {
+    let message = format!(
+        "Mesh relay {endpoint} (type: {kind}) is unreachable: {reason}. The node cannot join the mesh until that relay is reachable; fix mesh.interfaces or the relay."
+    );
+    Joined::Pending {
+        iface: JoinedInterface::Tcp {
             hash,
             handle,
             label,
         },
-        tokio::time::Instant::now() + SHUTDOWN_GRACE,
-    )
-    .await;
-    bail!(
-        "Mesh relay {endpoint} (type: {kind}) is unreachable: {failure}. The node cannot join the mesh until that relay is reachable; fix mesh.interfaces or the relay."
-    )
+        status,
+        reason,
+        message,
+    }
 }
 
 /// Detaches the interface at `iface` from the transport, giving up at `deadline`; `false`
@@ -1871,6 +2067,49 @@ async fn sweep_peers(peers: Arc<PeerTable>, cancel: CancellationToken) {
     }
 }
 
+/// Watches the TCP clients that were unreachable at start until each reports its first
+/// `connected`, recording it on the node, announcing over it and telling the user. Ends with
+/// the last one, or when the node or its slot is gone.
+async fn poll_pending_interfaces(
+    slot: Weak<MeshSlot>,
+    runtime: Weak<MeshRuntime>,
+    cancel: CancellationToken,
+) {
+    let mut ticks = interval(CONNECT_WATCH_TICK);
+    loop {
+        tokio::select! {
+            () = cancel.cancelled() => return,
+            _ = ticks.tick() => {}
+        }
+        let (Some(slot), Some(runtime)) = (slot.upgrade(), runtime.upgrade()) else {
+            return;
+        };
+        for (index, status) in runtime.pending_interfaces() {
+            if status.to_json()["stream_state"].as_str() != Some("connected") {
+                continue;
+            }
+            if let Some(label) = runtime.mark_interface_connected(index) {
+                debug!("Mesh interface {label} connected");
+                if let Err(err) = runtime.announce_on_connect().await {
+                    warn!(
+                        "Failed to announce the mesh node over {label}; the heartbeat will announce it: {}",
+                        redact_hashes(&format!("{err:#}"))
+                    );
+                }
+                slot.push_idle(IdleNotify {
+                    source: Source::Mesh,
+                    text: format!("{label} connected"),
+                    origin: Origin::Local,
+                    model_note: None,
+                });
+            }
+        }
+        if runtime.pending_interfaces().is_empty() {
+            return;
+        }
+    }
+}
+
 /// One sweep of the envoy's memory. Memory is best-effort: a store that cannot be pruned
 /// is logged and the node serves on without it being swept.
 fn prune_envoy_memory(store: &EnvoySessions) {
@@ -2154,6 +2393,9 @@ impl MeshSlot {
     /// not surfaced, and not marked as surfaced either, so a repeat from that identity
     /// still earns its one line. The caller refreshes the session's tool catalog once
     /// this returns, since the `mesh__*` tools are declared only while a node is on.
+    /// The connect-poller for interfaces still reconnecting is spawned here, so this must
+    /// be called from inside a tokio runtime (every caller is); a connect that landed
+    /// between `MeshRuntime::start` and this call is seen on the poller's first tick.
     pub(crate) fn install(self: &Arc<Self>, runtime: Arc<MeshRuntime>) -> Result<()> {
         if self.get().is_some() {
             bail!(MESH_ALREADY_ON);
@@ -2209,10 +2451,17 @@ impl MeshSlot {
             runtime.hooks().set(sink);
         }
         let facts = node_facts(&runtime);
-        *slot = Some(runtime);
+        *slot = Some(runtime.clone());
         // Fired outside the lock: the sink is not the slot's to trust with it.
         drop(slot);
         self.hooks.fire(MeshEvent::Started(facts));
+        if !runtime.pending_interfaces().is_empty() {
+            runtime.register_task(tokio::spawn(poll_pending_interfaces(
+                Arc::downgrade(self),
+                Arc::downgrade(&runtime),
+                runtime.cancellation_token(),
+            )));
+        }
         self.request_sync();
         Ok(())
     }
@@ -3679,8 +3928,9 @@ mod tests {
     use crate::mesh::rfc3339_utc;
     #[cfg(unix)]
     use crate::mesh::test_support::{
-        PeerStub, loopback_relay, started_runtime, started_runtime_on, started_runtime_on_with,
-        started_runtime_with, started_runtime_with_options,
+        PeerStub, TransportRelay, held_port, loopback_relay, serve_as_sink, started_runtime,
+        started_runtime_on, started_runtime_on_with, started_runtime_with,
+        started_runtime_with_options, status_round_trip,
     };
     use crate::mesh::test_support::{
         TempDir, TrustList, mesh_paths, private_config, snapshot_fixture,
@@ -3704,6 +3954,9 @@ mod tests {
     const POLL: Duration = Duration::from_millis(100);
     #[cfg(unix)]
     const INTEROP_TIMEOUT: Duration = Duration::from_secs(15);
+    /// Covers the transport's fixed 5 s reconnect sleep plus one connect and one poller tick.
+    #[cfg(unix)]
+    const CONNECT_LATER_TIMEOUT: Duration = Duration::from_secs(12);
 
     /// Unset timers leave every path's deadlines as they are; set ones apply only where
     /// they are the longer, so a configured value can never shorten a deadline: the one
@@ -8610,6 +8863,12 @@ mod tests {
 
         assert!(err.contains(&format!("127.0.0.1:{port}")), "{err}");
         assert!(err.contains("private"), "{err}");
+        assert!(
+            err.contains(&format!(
+                "Nothing is listening on 127.0.0.1:{port}. The default configuration expects a local Reticulum daemon (rnsd) there — run scripts/mesh-relay.sh, or use type: lan to join the LAN without one; see Mesh-Deployment."
+            )),
+            "{err}"
+        );
         let instance_id = session.mesh_instance_id().unwrap();
         assert!(lock_path(&cache_dir, instance_id).exists());
         let _reacquired = InstanceLock::acquire(&cache_dir, instance_id)
@@ -8619,6 +8878,293 @@ mod tests {
             metrics.num_alive_tasks() == 0
         })
         .await;
+    }
+
+    /// A node configured on every port in `ports`, each a private relay on loopback.
+    #[cfg(unix)]
+    fn private_relays(ports: &[u16]) -> MeshConfig {
+        MeshConfig {
+            interfaces: ports
+                .iter()
+                .map(|port| MeshInterface::Private {
+                    host: "127.0.0.1".to_string(),
+                    port: *port,
+                })
+                .collect(),
+            ..MeshConfig::default()
+        }
+    }
+
+    /// Keeps the sequential join quick when a plan in the list is refused or unroutable.
+    #[cfg(unix)]
+    fn short_connect() -> NodeOptions {
+        NodeOptions {
+            connect_timeout: Duration::from_millis(300),
+            ..NodeOptions::default()
+        }
+    }
+
+    #[cfg(unix)]
+    fn private_label(port: u16) -> String {
+        format!("private 127.0.0.1:{port}")
+    }
+
+    #[cfg(unix)]
+    fn states_of(runtime: &MeshRuntime) -> Vec<(String, InterfaceState)> {
+        runtime
+            .interface_states()
+            .into_iter()
+            .map(|status| (status.label, status.state))
+            .collect()
+    }
+
+    #[cfg(unix)]
+    fn is_retrying(state: &InterfaceState) -> bool {
+        matches!(state, InterfaceState::Unreachable { retrying: true, .. })
+    }
+
+    /// Waits up to `CONNECT_LATER_TIMEOUT` for the slot's notifier to have been handed the
+    /// `[mesh]` line for `text`.
+    #[cfg(unix)]
+    async fn wait_for_mesh_line(sink: &RecordingSink, text: &str) {
+        let expected = Notification::new(Source::Mesh, text).render();
+        let deadline = tokio::time::Instant::now() + CONNECT_LATER_TIMEOUT;
+        while !sink.0.lock().contains(&expected) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for the line {text:?}; saw {:?}",
+                sink.0.lock()
+            );
+            sleep(POLL).await;
+        }
+    }
+
+    /// The relay is named by a `.invalid` host, which no resolver answers, rather than an
+    /// unroutable address: a sandbox whose egress proxy accepts every connect would make
+    /// an address reachable.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_fails_without_the_loopback_hint_for_a_non_loopback_relay() {
+        let tmp = TempDir::new("node-unresolvable");
+        let mut session = Session::default();
+        let config = MeshConfig {
+            interfaces: vec![MeshInterface::Private {
+                host: "relay.invalid".to_string(),
+                port: 4242,
+            }],
+            ..MeshConfig::default()
+        };
+
+        let err = MeshRuntime::start(
+            &config,
+            true,
+            &mut session,
+            mesh_paths(&tmp),
+            short_connect(),
+        )
+        .await
+        .err()
+        .expect("a relay that cannot be reached must be refused")
+        .to_string();
+
+        assert!(err.contains("relay.invalid:4242"), "{err}");
+        assert!(err.contains("is unreachable"), "{err}");
+        assert!(!err.contains("Nothing is listening on"), "{err}");
+        let metrics = tokio::runtime::Handle::current().metrics();
+        wait_until("the transport's tasks to exit", || {
+            metrics.num_alive_tasks() == 0
+        })
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_comes_up_on_the_reachable_relay_and_keeps_the_refused_one_pending() {
+        let closed = closed_port().await;
+        let relay = TransportRelay::start().await;
+        let tmp = TempDir::new("node-partial");
+        let mut session = Session::default();
+
+        let runtime = MeshRuntime::start(
+            &private_relays(&[closed, relay.port]),
+            true,
+            &mut session,
+            mesh_paths(&tmp),
+            short_connect(),
+        )
+        .await
+        .expect("one reachable relay is enough to come up");
+
+        let states = states_of(&runtime);
+        assert_eq!(states.len(), 2, "{states:?}");
+        assert_eq!(states[0].0, private_label(closed));
+        assert!(is_retrying(&states[0].1), "{states:?}");
+        assert_eq!(
+            states[1],
+            (private_label(relay.port), InterfaceState::Connected)
+        );
+        assert_eq!(runtime.interfaces(), vec![private_label(relay.port)]);
+        assert_eq!(runtime.interface_kinds(), vec!["private"]);
+
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime).unwrap();
+        let peer_tmp = TempDir::new("node-partial-peer");
+        let mut peer_session = Session::default();
+        let peer = MeshRuntime::start(
+            &private_config(relay.port),
+            true,
+            &mut peer_session,
+            mesh_paths(&peer_tmp),
+            NodeOptions::default(),
+        )
+        .await
+        .unwrap();
+        let peer_slot = Arc::new(MeshSlot::default());
+        peer_slot.install(peer).unwrap();
+
+        let card = status_round_trip(&slot, &peer_slot).await;
+
+        assert!(card.served_at_secs > 0);
+        assert!(slot.stop().await.unwrap());
+        assert!(peer_slot.stop().await.unwrap());
+        relay.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pending_interface_connects_later_and_pushes_the_idle_line() {
+        let (held, socket) = held_port().await;
+        let (relay, relay_handle, _) = loopback_relay().await;
+        let tmp = TempDir::new("node-connect-later");
+        let mut session = Session::default();
+        let runtime = MeshRuntime::start(
+            &private_relays(&[relay.port(), held]),
+            true,
+            &mut session,
+            mesh_paths(&tmp),
+            short_connect(),
+        )
+        .await
+        .unwrap();
+        let states = states_of(&runtime);
+        assert_eq!(
+            states[0],
+            (private_label(relay.port()), InterfaceState::Connected)
+        );
+        assert_eq!(states[1].0, private_label(held));
+        assert!(is_retrying(&states[1].1), "{states:?}");
+        let slot = Arc::new(MeshSlot::default());
+        let notifier = Arc::new(RecordingSink::default());
+        slot.set_notifier(Arc::clone(&notifier) as Arc<dyn NotificationSink>);
+        slot.install(runtime.clone()).unwrap();
+
+        let listener = socket.listen(16).unwrap();
+        let (sink_handle, _) = serve_as_sink(listener).await;
+        wait_for_mesh_line(&notifier, &format!("{} connected", private_label(held))).await;
+
+        assert_eq!(
+            states_of(&runtime),
+            vec![
+                (private_label(relay.port()), InterfaceState::Connected),
+                (private_label(held), InterfaceState::Connected),
+            ]
+        );
+        assert_eq!(
+            runtime.interfaces(),
+            vec![private_label(relay.port()), private_label(held)]
+        );
+        assert!(runtime.pending_interfaces().is_empty());
+        assert!(slot.stop().await.unwrap());
+        relay_handle.abort();
+        sink_handle.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn traffic_flows_over_an_interface_that_connected_after_start() {
+        let late_port = closed_port().await;
+        let relay_a = TransportRelay::start().await;
+        let tmp = TempDir::new("node-late-traffic");
+        let mut session = Session::default();
+        let runtime = MeshRuntime::start(
+            &private_relays(&[relay_a.port, late_port]),
+            true,
+            &mut session,
+            mesh_paths(&tmp),
+            short_connect(),
+        )
+        .await
+        .unwrap();
+        let states = states_of(&runtime);
+        assert_eq!(
+            states[0],
+            (private_label(relay_a.port), InterfaceState::Connected)
+        );
+        assert!(is_retrying(&states[1].1), "{states:?}");
+        let slot = Arc::new(MeshSlot::default());
+        let notifier = Arc::new(RecordingSink::default());
+        slot.set_notifier(Arc::clone(&notifier) as Arc<dyn NotificationSink>);
+        slot.install(runtime).unwrap();
+
+        let relay_b = TransportRelay::start_on(late_port).await;
+        wait_for_mesh_line(
+            &notifier,
+            &format!("{} connected", private_label(late_port)),
+        )
+        .await;
+        let peer_tmp = TempDir::new("node-late-traffic-peer");
+        let mut peer_session = Session::default();
+        let peer = MeshRuntime::start(
+            &private_config(late_port),
+            true,
+            &mut peer_session,
+            mesh_paths(&peer_tmp),
+            NodeOptions::default(),
+        )
+        .await
+        .unwrap();
+        let peer_slot = Arc::new(MeshSlot::default());
+        peer_slot.install(peer).unwrap();
+
+        let card = status_round_trip(&slot, &peer_slot).await;
+
+        assert!(card.served_at_secs > 0);
+        assert!(slot.stop().await.unwrap());
+        assert!(peer_slot.stop().await.unwrap());
+        relay_a.stop().await;
+        relay_b.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_aborts_the_connect_poller() {
+        let (relay, relay_handle, _) = loopback_relay().await;
+        let closed = closed_port().await;
+        let metrics = tokio::runtime::Handle::current().metrics();
+        let baseline = metrics.num_alive_tasks();
+        let tmp = TempDir::new("node-poller-stop");
+        let mut session = Session::default();
+        let runtime = MeshRuntime::start(
+            &private_relays(&[relay.port(), closed]),
+            true,
+            &mut session,
+            mesh_paths(&tmp),
+            short_connect(),
+        )
+        .await
+        .unwrap();
+        assert!(!runtime.pending_interfaces().is_empty());
+        let slot = Arc::new(MeshSlot::default());
+        slot.install(runtime).unwrap();
+
+        assert!(slot.stop().await.unwrap());
+
+        wait_until(
+            "the node's tasks, the connect-poller among them, to exit",
+            || metrics.num_alive_tasks() == baseline,
+        )
+        .await;
+        relay_handle.abort();
     }
 
     #[cfg(unix)]

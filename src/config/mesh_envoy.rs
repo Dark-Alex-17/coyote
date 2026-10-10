@@ -1431,7 +1431,7 @@ mod tests {
     };
     #[cfg(unix)]
     use crate::mesh::test_support::{
-        PeerStub, StartedRuntime, started_runtime_on, started_runtime_on_with,
+        PeerStub, StartedRuntime, TransportRelay, started_runtime_on, started_runtime_on_with,
     };
     use crate::mesh::{destination_address, hex_lower};
     use crate::supervisor::mailbox::EnvelopePayload;
@@ -6721,58 +6721,6 @@ mod tests {
     }
 
     // ---- the asking peer's own tools over two real nodes ---------------------------------
-
-    /// A Reticulum transport node in-process: a `TcpServer` on a transport with transport
-    /// mode on. Two `MeshRuntime`s that both join it hear each other's announces through
-    /// its rebroadcasts and link to each other through it, so neither side is a stub.
-    #[cfg(unix)]
-    struct TransportRelay {
-        transport: Arc<rns_transport::transport::Transport>,
-        iface: AddressHash,
-        port: u16,
-    }
-
-    #[cfg(unix)]
-    impl TransportRelay {
-        async fn start() -> Self {
-            use rns_transport::iface::tcp_server::TcpServer;
-            use rns_transport::transport::{Transport, TransportConfig};
-
-            let port = crate::mesh::test_support::closed_port().await;
-            let mut config =
-                TransportConfig::new("relay", &PrivateIdentity::new_from_rand(OsRng), false);
-            config.set_transport_enabled(true);
-            // Rebroadcast every announce a few times, ~5 s apart, so a node that joins
-            // after the other one announced still hears it.
-            config.set_announce_retry_limit(4);
-            let transport = Arc::new(Transport::new(config));
-            let tcp = TcpServer::new(format!("127.0.0.1:{port}"), transport.iface_manager())
-                .with_client_mtu(TcpServer::DEFAULT_CLIENT_MTU);
-            let status = tcp.runtime_status_handle();
-            let iface = transport
-                .iface_manager()
-                .lock()
-                .await
-                .spawn(tcp, TcpServer::spawn);
-            wait_until("the relay to listen", || {
-                status.to_json()["listener_state"].as_str() == Some("listening")
-            })
-            .await;
-            Self {
-                transport,
-                iface,
-                port,
-            }
-        }
-
-        async fn stop(self) {
-            let _ = tokio::time::timeout(
-                Duration::from_secs(5),
-                self.transport.stop_interface(self.iface),
-            )
-            .await;
-        }
-    }
 
     #[cfg(unix)]
     async fn wait_up_to(what: &str, bound: Duration, f: impl Fn() -> bool) {

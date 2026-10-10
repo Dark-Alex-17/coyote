@@ -68,6 +68,7 @@ pub(crate) struct NodeFacts {
     pub instance_id: String,
     pub destination: String,
     pub identity: String,
+    /// Kinds of the interfaces connected when the event fired; a later connect refires nothing.
     pub interfaces: Vec<&'static str>,
 }
 

@@ -42,7 +42,7 @@ pub(crate) mod wire_path;
 #[cfg(test)]
 pub(crate) use node::session_destination_name;
 pub(crate) use node::{
-    MESH_ALREADY_ON, MeshPaths, MeshRuntime, MeshSlot, NodeOptions, refusal_reply,
+    InterfaceState, MESH_ALREADY_ON, MeshPaths, MeshRuntime, MeshSlot, NodeOptions, refusal_reply,
 };
 pub(crate) use peers::PeerRecord;
 pub(crate) use propagation_fetch::{
@@ -302,7 +302,7 @@ pub(crate) mod test_support {
     #[cfg(all(test, unix))]
     pub(crate) use super::node::RecordingEnvoy;
     #[cfg(unix)]
-    use super::node::{MeshRuntime, NodeOptions};
+    use super::node::{MeshRuntime, MeshSlot, NodeOptions};
     #[cfg(unix)]
     pub(crate) use super::peers::{PEER_TTL, PeerSighting};
     pub(crate) use super::propagation::PropagationNode;
@@ -330,6 +330,8 @@ pub(crate) mod test_support {
     #[cfg(unix)]
     use super::session_destination_name;
     use super::snapshot::{BriefState, MeshSnapshot, SessionInfo, TurnState};
+    #[cfg(unix)]
+    use super::trust::TrustOptions;
     use super::trust::TrustStore;
     use super::{mesh_config_dir, rfc3339_utc};
     use crate::config::MeshConfig;
@@ -376,7 +378,7 @@ pub(crate) mod test_support {
     #[cfg(unix)]
     use tokio::io::AsyncReadExt;
     #[cfg(unix)]
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, TcpSocket};
     #[cfg(unix)]
     use tokio::sync::broadcast;
     #[cfg(unix)]
@@ -451,6 +453,14 @@ pub(crate) mod test_support {
     pub(crate) async fn loopback_relay() -> (SocketAddr, JoinHandle<()>, Arc<AtomicUsize>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let (handle, closed) = serve_as_sink(listener).await;
+        (addr, handle, closed)
+    }
+
+    /// Serves `listener` the way `loopback_relay` does: every connection is accepted and
+    /// drained until the peer hangs up, and the counter is the number of streams closed.
+    #[cfg(unix)]
+    pub(crate) async fn serve_as_sink(listener: TcpListener) -> (JoinHandle<()>, Arc<AtomicUsize>) {
         let closed = Arc::new(AtomicUsize::new(0));
         let counter = closed.clone();
         let handle = tokio::spawn(async move {
@@ -466,7 +476,154 @@ pub(crate) mod test_support {
                 });
             }
         });
-        (addr, handle, closed)
+        (handle, closed)
+    }
+
+    /// A loopback port that refuses connections until the test calls `.listen(backlog)`
+    /// on the returned socket, which turns it into the same byte sink `loopback_relay`
+    /// is once handed to `serve_as_sink`. A bound socket that is not listening answers
+    /// every SYN with a reset; `TcpListener::bind` would listen at once.
+    #[cfg(unix)]
+    pub(crate) async fn held_port() -> (u16, TcpSocket) {
+        let socket = TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        (socket.local_addr().unwrap().port(), socket)
+    }
+
+    /// A Reticulum transport node in-process: a `TcpServer` on a transport with transport
+    /// mode on. Two `MeshRuntime`s that both join it hear each other's announces through
+    /// its rebroadcasts and link to each other through it, so neither side is a stub.
+    #[cfg(unix)]
+    pub(crate) struct TransportRelay {
+        transport: Arc<Transport>,
+        iface: AddressHash,
+        pub(crate) port: u16,
+    }
+
+    #[cfg(unix)]
+    impl TransportRelay {
+        pub(crate) async fn start() -> Self {
+            Self::start_on(closed_port().await).await
+        }
+
+        /// Listens on `port`, which must be free: the upstream server retries a failed
+        /// bind every 5 s without a word, so the first bind is required to succeed here
+        /// rather than letting a held port hang the test.
+        pub(crate) async fn start_on(port: u16) -> Self {
+            let mut config =
+                TransportConfig::new("relay", &TransportIdentity::new_from_rand(OsRng), false);
+            config.set_transport_enabled(true);
+            // Rebroadcast every announce a few times, ~5 s apart, so a node that joins
+            // after the other one announced still hears it.
+            config.set_announce_retry_limit(4);
+            let transport = Arc::new(Transport::new(config));
+            let (tcp, first_bind) =
+                TcpServer::new(format!("127.0.0.1:{port}"), transport.iface_manager())
+                    .with_client_mtu(TcpServer::DEFAULT_CLIENT_MTU)
+                    .with_startup_result();
+            let status = tcp.runtime_status_handle();
+            let iface = transport
+                .iface_manager()
+                .lock()
+                .await
+                .spawn(tcp, TcpServer::spawn);
+            first_bind
+                .await
+                .expect("the relay reports its first bind")
+                .unwrap_or_else(|err| {
+                    panic!("the relay's first bind of 127.0.0.1:{port} failed: {err}")
+                });
+            wait_until("the relay to listen", || {
+                status.to_json()["listener_state"].as_str() == Some("listening")
+            })
+            .await;
+            Self {
+                transport,
+                iface,
+                port,
+            }
+        }
+
+        pub(crate) async fn stop(self) {
+            let _ = timeout(
+                Duration::from_secs(5),
+                self.transport.stop_interface(self.iface),
+            )
+            .await;
+        }
+    }
+
+    /// How long two nodes on a `TransportRelay` get to file each other.
+    #[cfg(unix)]
+    const PEER_FILING_TIMEOUT: Duration = Duration::from_secs(30);
+    /// How often the asker re-requests the answerer's path while waiting to file it.
+    #[cfg(unix)]
+    const PATH_REQUEST_INTERVAL: Duration = Duration::from_secs(5);
+
+    /// A `/status` round trip from the node in `asker` to the node in `answerer` over
+    /// whatever relay joins them, each trusting the other's destination the way
+    /// `.mesh trust` does. Panics with the step that did not happen.
+    #[cfg(unix)]
+    pub(crate) async fn status_round_trip(
+        asker: &Arc<MeshSlot>,
+        answerer: &Arc<MeshSlot>,
+    ) -> super::card::StatusCard {
+        let asking = asker.get().expect("the asking slot holds a node");
+        let answering = answerer.get().expect("the answering slot holds a node");
+        wait_for_peer(&asking, &answering.current_destination_hash()).await;
+        wait_for_peer(&answering, &asking.current_destination_hash()).await;
+        asking
+            .trust()
+            .trust_destination(
+                asker.as_ref(),
+                &answering.current_destination_hash(),
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .expect("the asker trusts the answerer");
+        answering
+            .trust()
+            .trust_destination(
+                answerer.as_ref(),
+                &asking.current_destination_hash(),
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .expect("the answerer trusts the asker");
+        let desc = asking
+            .resolve_destination(&answering.current_destination_hash())
+            .await
+            .expect("the answerer's destination resolves from its announce");
+        asking
+            .request_status(&desc)
+            .await
+            .unwrap_or_else(|err| panic!("the status request failed: {err:?}"))
+    }
+
+    /// Waits for `runtime` to file `destination`. An announce the relay heard before this
+    /// node joined is not replayed on its own; the relay answers a path request with the
+    /// announce it cached, so one goes out every `PATH_REQUEST_INTERVAL`.
+    #[cfg(unix)]
+    async fn wait_for_peer(runtime: &MeshRuntime, destination: &str) {
+        let peers = runtime.peers();
+        let hash = AddressHash::new_from_hex_string(destination).unwrap();
+        let transport = runtime
+            .transport_handle()
+            .await
+            .expect("the node is running");
+        let deadline = tokio::time::Instant::now() + PEER_FILING_TIMEOUT;
+        let mut next_request = tokio::time::Instant::now();
+        while peers.get(destination).is_none() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for {destination} to be filed"
+            );
+            if tokio::time::Instant::now() >= next_request {
+                transport.request_path(&hash, None, None).await;
+                next_request = tokio::time::Instant::now() + PATH_REQUEST_INTERVAL;
+            }
+            sleep(POLL).await;
+        }
     }
 
     pub(crate) fn private_config(port: u16) -> MeshConfig {
