@@ -9600,11 +9600,13 @@ mod tests {
             .filter(|line| **line == expected_line)
             .count();
         assert_eq!(lines_told, 1, "{:?}", notifier.0.lock());
+        // Other nodes in the suite warn about announces of their own, so only this
+        // interface's announce failure would count.
         assert!(
             !warn_snapshot()
                 .into_iter()
                 .skip(warn_before)
-                .any(|line| line.contains("announce")),
+                .any(|line| line.contains("announce") && line.contains(&held_label)),
             "a stalled announce is not a failed one"
         );
         drop(busy_destination);
@@ -9670,10 +9672,12 @@ mod tests {
         assert!(stopped);
 
         let during: Vec<String> = warn_snapshot().into_iter().skip(warn_before).collect();
+        // The aborted-task line names no node; an interface that did not stop is another
+        // node's business and reads differently.
         assert!(
             !during
                 .iter()
-                .any(|line| line.contains("did not stop within")),
+                .any(|line| line.starts_with("Mesh task did not stop within")),
             "{during:?}"
         );
         relay_handle.abort();
