@@ -10555,6 +10555,174 @@ mod tests {
                 });
             }
 
+            /// A relay off this host that cannot be reached beside one that can: the
+            /// WARNING takes the relay tail, not the local-daemon one, and the summary's
+            /// `interfaces:` line names the connected relay alone.
+            #[test]
+            #[serial]
+            fn usage_probe_mesh_on_warns_with_the_relay_tail_for_a_non_loopback_interface() {
+                let guard = TestConfigDirGuard::new("repl-mesh-on-partial-remote");
+                let _cache = EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
+                let _script = prompt_script::install(&[true]);
+                let _capture = capture::install();
+                run_async(async {
+                    let (addr, relay_handle, _) = loopback_relay().await;
+                    let mut ctx = ctx_with(
+                        MeshConfig {
+                            interfaces: vec![
+                                MeshInterface::Public {
+                                    host: "relay.invalid".to_string(),
+                                    port: 4242,
+                                },
+                                MeshInterface::Private {
+                                    host: "127.0.0.1".to_string(),
+                                    port: addr.port(),
+                                },
+                            ],
+                            ..MeshConfig::default()
+                        },
+                        true,
+                    );
+                    ctx.session = Some(Session::default());
+
+                    run(&mut ctx, ".mesh on").await.unwrap();
+
+                    assert!(ctx.app.mesh.get().is_some());
+                    let out = stdout_lines();
+                    let summary = &out[index_of(&out, "Mesh is on for this session")];
+                    let interfaces = summary
+                        .lines()
+                        .find(|line| line.starts_with("  interfaces: "))
+                        .unwrap_or_else(|| panic!("no interfaces line in {summary}"));
+                    assert_eq!(
+                        interfaces,
+                        format!("  interfaces: private 127.0.0.1:{}", addr.port()),
+                        "{summary}"
+                    );
+                    let warnings = warnings();
+                    assert_eq!(warnings.len(), 1, "{:?}", stderr_lines());
+                    assert!(
+                        warnings[0]
+                            .starts_with("WARNING: public relay.invalid:4242 is unreachable ("),
+                        "{}",
+                        warnings[0]
+                    );
+                    assert!(
+                        warnings[0].ends_with("); peers behind that relay are out of reach."),
+                        "{}",
+                        warnings[0]
+                    );
+                    assert!(!warnings[0].contains("rnsd"), "{}", warnings[0]);
+                    let info = out_of(&mut ctx, ".mesh info").await.unwrap();
+                    assert!(
+                        info_row(&info, "interfaces[0]")
+                            .starts_with("public relay.invalid:4242  unreachable, retrying: "),
+                        "{info}"
+                    );
+                    assert_eq!(
+                        info_row(&info, "interfaces[1]"),
+                        format!("private 127.0.0.1:{}  connected", addr.port()),
+                        "{info}"
+                    );
+
+                    run(&mut ctx, ".mesh off --yes").await.unwrap();
+                    assert!(ctx.app.mesh.get().is_none());
+                    relay_handle.abort();
+                });
+            }
+
+            /// Nothing connected is a refusal, not a warning: `.mesh on` fails with the
+            /// local-daemon hint in the error itself, prints no WARNING line, and leaves
+            /// the mesh off.
+            #[test]
+            #[serial]
+            fn usage_probe_mesh_on_with_every_relay_refused_fails_with_the_hint_and_no_warning() {
+                let guard = TestConfigDirGuard::new("repl-mesh-on-all-refused");
+                let _cache = EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
+                let _script = prompt_script::install(&[true]);
+                let _capture = capture::install();
+                run_async(async {
+                    let closed = closed_port().await;
+                    let mut ctx = ctx_with(
+                        MeshConfig {
+                            interfaces: vec![MeshInterface::Private {
+                                host: "127.0.0.1".to_string(),
+                                port: closed,
+                            }],
+                            ..MeshConfig::default()
+                        },
+                        true,
+                    );
+                    ctx.session = Some(Session::default());
+
+                    let err = refusal(&mut ctx, ".mesh on").await;
+
+                    assert!(ctx.app.mesh.get().is_none());
+                    assert!(
+                        err.ends_with(&format!(
+                            "Nothing is listening on 127.0.0.1:{closed}. The default configuration expects a local Reticulum daemon (rnsd) there — run scripts/mesh-relay.sh, or use type: lan to join the LAN without one; see Mesh-Deployment."
+                        )),
+                        "{err}"
+                    );
+                    assert!(warnings().is_empty(), "{:?}", stderr_lines());
+                    assert!(
+                        !stdout_lines()
+                            .iter()
+                            .any(|line| line.contains("Mesh is on for this session")),
+                        "{:?}",
+                        stdout_lines()
+                    );
+                });
+            }
+
+            /// `.mesh on` while on is refused before the node is touched: the one WARNING
+            /// from the first `.mesh on` is not printed a second time.
+            #[test]
+            #[serial]
+            fn usage_probe_second_mesh_on_repeats_no_warning() {
+                let guard = TestConfigDirGuard::new("repl-mesh-on-twice-partial");
+                let _cache = EnvVarGuard::set(get_env_name("cache_dir"), guard.path.join("cache"));
+                let _script = prompt_script::install(&[true, true]);
+                let _capture = capture::install();
+                run_async(async {
+                    let closed = closed_port().await;
+                    let (addr, relay_handle, _) = loopback_relay().await;
+                    let mut ctx = ctx_with(
+                        MeshConfig {
+                            interfaces: vec![
+                                MeshInterface::Private {
+                                    host: "127.0.0.1".to_string(),
+                                    port: closed,
+                                },
+                                MeshInterface::Private {
+                                    host: "127.0.0.1".to_string(),
+                                    port: addr.port(),
+                                },
+                            ],
+                            ..MeshConfig::default()
+                        },
+                        true,
+                    );
+                    ctx.session = Some(Session::default());
+
+                    run(&mut ctx, ".mesh on").await.unwrap();
+                    assert_eq!(warnings(), vec![loopback_warning(closed)]);
+                    let err = refusal(&mut ctx, ".mesh on").await;
+
+                    assert_eq!(err, MESH_ALREADY_ON);
+                    assert_eq!(
+                        warnings(),
+                        vec![loopback_warning(closed)],
+                        "{:?}",
+                        stderr_lines()
+                    );
+                    assert_eq!(prompt_script::prompts_asked(), 1);
+
+                    run(&mut ctx, ".mesh off --yes").await.unwrap();
+                    relay_handle.abort();
+                });
+            }
+
             #[test]
             #[serial]
             fn mesh_off_declined_keeps_the_node() {

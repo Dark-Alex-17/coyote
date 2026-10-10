@@ -9167,6 +9167,175 @@ mod tests {
         relay_handle.abort();
     }
 
+    /// Every plan a loopback relay by a different spelling of the loopback host, every one
+    /// refused: the hint is appended and names the first plan's endpoint as written.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_hint_names_the_first_endpoint_when_every_refused_plan_is_loopback() {
+        let first = closed_port().await;
+        let second = closed_port().await;
+        let tmp = TempDir::new("node-all-loopback-refused");
+        let mut session = Session::default();
+        let config = MeshConfig {
+            interfaces: vec![
+                MeshInterface::Private {
+                    host: "localhost".to_string(),
+                    port: first,
+                },
+                MeshInterface::Public {
+                    host: "::1".to_string(),
+                    port: second,
+                },
+            ],
+            ..MeshConfig::default()
+        };
+
+        let err = MeshRuntime::start(
+            &config,
+            true,
+            &mut session,
+            mesh_paths(&tmp),
+            short_connect(),
+        )
+        .await
+        .err()
+        .expect("two refused relays leave nothing to come up on")
+        .to_string();
+
+        assert!(
+            err.starts_with(&format!(
+                "Mesh relay localhost:{first} (type: private) is unreachable: "
+            )),
+            "{err}"
+        );
+        assert!(
+            err.ends_with(&format!(
+                " Nothing is listening on localhost:{first}. The default configuration expects a local Reticulum daemon (rnsd) there — run scripts/mesh-relay.sh, or use type: lan to join the LAN without one; see Mesh-Deployment."
+            )),
+            "{err}"
+        );
+        assert_eq!(err.matches("Nothing is listening on").count(), 1, "{err}");
+        assert!(!err.contains(&format!("::1:{second}")), "{err}");
+        let metrics = tokio::runtime::Handle::current().metrics();
+        wait_until("the transport's tasks to exit", || {
+            metrics.num_alive_tasks() == 0
+        })
+        .await;
+    }
+
+    /// A loopback relay and a non-loopback one both refused: the hint is for the case
+    /// where EVERY failed plan is loopback, so it stays off even though the first is.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_no_hint_when_a_refused_plan_is_not_loopback() {
+        let closed = closed_port().await;
+        let tmp = TempDir::new("node-mixed-refused");
+        let mut session = Session::default();
+        let config = MeshConfig {
+            interfaces: vec![
+                MeshInterface::Private {
+                    host: "127.0.0.1".to_string(),
+                    port: closed,
+                },
+                MeshInterface::Private {
+                    host: "relay.invalid".to_string(),
+                    port: 4242,
+                },
+            ],
+            ..MeshConfig::default()
+        };
+
+        let err = MeshRuntime::start(
+            &config,
+            true,
+            &mut session,
+            mesh_paths(&tmp),
+            short_connect(),
+        )
+        .await
+        .err()
+        .expect("no relay connected, so the node must not come up")
+        .to_string();
+
+        assert!(
+            err.starts_with(&format!(
+                "Mesh relay 127.0.0.1:{closed} (type: private) is unreachable: "
+            )),
+            "{err}"
+        );
+        assert!(!err.contains("Nothing is listening on"), "{err}");
+        assert!(
+            !err.contains("relay.invalid"),
+            "only the first failure is named: {err}"
+        );
+        let metrics = tokio::runtime::Handle::current().metrics();
+        wait_until("the transport's tasks to exit", || {
+            metrics.num_alive_tasks() == 0
+        })
+        .await;
+    }
+
+    /// `mesh.started` names the kinds connected at install, not the configured list, and
+    /// a pending interface connecting later refires nothing: the hook consumer saw one
+    /// `private`, not `private,private`, and sees no second fire.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn usage_probe_mesh_started_names_connected_kinds_only_and_a_late_connect_refires_nothing()
+     {
+        let (held, socket) = held_port().await;
+        let (relay, relay_handle, _) = loopback_relay().await;
+        let tmp = TempDir::new("node-started-connected-only");
+        let mut session = Session::default();
+        let runtime = MeshRuntime::start(
+            &private_relays(&[relay.port(), held]),
+            true,
+            &mut session,
+            mesh_paths(&tmp),
+            short_connect(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(runtime.interface_kinds(), vec!["private"]);
+        let slot = Arc::new(MeshSlot::default());
+        let hooks = RecordingHookSink::attach(&slot.hooks());
+        let notifier = Arc::new(RecordingSink::default());
+        slot.set_notifier(Arc::clone(&notifier) as Arc<dyn NotificationSink>);
+        slot.install(runtime.clone()).unwrap();
+
+        let envs = one_fire(&hooks, HookEvent::MeshStarted);
+        assert_eq!(env_value(&envs, "COYOTE_MESH_INTERFACES"), Some("private"));
+
+        let listener = socket.listen(16).unwrap();
+        let (sink_handle, _) = serve_as_sink(listener).await;
+        wait_for_mesh_line(&notifier, &format!("{} connected", private_label(held))).await;
+
+        assert_eq!(runtime.interface_kinds(), vec!["private", "private"]);
+        let refired = hooks.snapshot();
+        assert!(
+            !refired
+                .iter()
+                .any(|(event, _)| *event == HookEvent::MeshStarted),
+            "a later connect must not refire mesh.started: {refired:?}"
+        );
+        // The idle line is the one announcement of the connect, and only one.
+        let line =
+            Notification::new(Source::Mesh, format!("{} connected", private_label(held))).render();
+        assert_eq!(
+            notifier
+                .0
+                .lock()
+                .iter()
+                .filter(|seen| **seen == line)
+                .count(),
+            1,
+            "{:?}",
+            notifier.0.lock()
+        );
+        assert!(slot.stop().await.unwrap());
+        relay_handle.abort();
+        sink_handle.abort();
+    }
+
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn start_joins_only_the_configured_relay() {
