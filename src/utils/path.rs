@@ -34,6 +34,33 @@ pub fn safe_join_path<T1: AsRef<Path>, T2: AsRef<Path>>(
     }
 }
 
+/// Whether `name` is a device name Windows reserves in every directory: `CON`, `PRN`,
+/// `AUX`, `NUL`, `COM0`–`COM9`, `LPT0`–`LPT9` and the same with a superscript `¹ ² ³`
+/// as the digit — case-insensitively, with any extension, and after the trailing dots
+/// and spaces Win32 silently drops from a name before matching. Only the stem (the text
+/// before the first `.`) is compared, so `NUL.txt` and `con .txt` are reserved too.
+///
+/// Bundle installs (`install_remote::is_safe_component`) and mesh wire paths share this
+/// one predicate on purpose: both guard filenames that must be creatable on Windows.
+pub fn is_windows_reserved_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or("").trim_end_matches(' ');
+    let lower = stem.to_ascii_lowercase();
+    if matches!(lower.as_str(), "con" | "prn" | "aux" | "nul") {
+        return true;
+    }
+    let Some(port) = lower
+        .strip_prefix("com")
+        .or_else(|| lower.strip_prefix("lpt"))
+    else {
+        return false;
+    };
+    let mut digits = port.chars();
+    matches!(
+        (digits.next(), digits.next()),
+        (Some('0'..='9' | '\u{B9}' | '\u{B2}' | '\u{B3}'), None)
+    )
+}
+
 pub async fn expand_glob_paths<T: AsRef<str>>(
     paths: &[T],
     bail_non_exist: bool,
@@ -168,7 +195,6 @@ fn parse_glob(path_str: &str) -> Result<ParseGlobResult> {
     }
 }
 
-#[async_recursion::async_recursion]
 async fn list_files(
     files: &mut IndexSet<String>,
     entry_path: &Path,
@@ -192,19 +218,26 @@ async fn list_files(
                 if !current_only {
                     if let Some(remaining_depth) = depth {
                         if remaining_depth > 0 {
-                            list_files(
+                            Box::pin(list_files(
                                 files,
                                 &path,
                                 suffixes,
                                 current_only,
                                 bail_non_exist,
                                 Some(remaining_depth - 1),
-                            )
+                            ))
                             .await?;
                         }
                     } else {
-                        list_files(files, &path, suffixes, current_only, bail_non_exist, None)
-                            .await?;
+                        Box::pin(list_files(
+                            files,
+                            &path,
+                            suffixes,
+                            current_only,
+                            bail_non_exist,
+                            None,
+                        ))
+                        .await?;
                     }
                 }
             } else {

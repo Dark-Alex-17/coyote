@@ -1520,14 +1520,26 @@ clients:
     const CONFIG_EXAMPLE: &str =
         include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/config.example.yaml"));
 
+    /// The keys of a `mesh:` mapping, a nested block's own keys included as `outer.inner`.
+    fn mesh_keys_in(mesh: &serde_yaml::Value) -> HashSet<String> {
+        let mut keys = HashSet::new();
+        for (key, value) in mesh.as_mapping().expect("mesh: must be a nested mapping") {
+            let key = key.as_str().unwrap();
+            keys.insert(key.to_string());
+            if let Some(nested) = value.as_mapping() {
+                keys.extend(
+                    nested
+                        .keys()
+                        .map(|inner| format!("{key}.{}", inner.as_str().unwrap())),
+                );
+            }
+        }
+        keys
+    }
+
     fn mesh_keys_of(yaml: &str) -> HashSet<String> {
         let root: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
-        root["mesh"]
-            .as_mapping()
-            .expect("mesh: must be a nested mapping")
-            .keys()
-            .map(|k| k.as_str().unwrap().to_string())
-            .collect()
+        mesh_keys_in(&root["mesh"])
     }
 
     #[test]
@@ -1536,13 +1548,9 @@ clients:
         let rendered = render_config_template("openai:gpt-4o", None, &clients).unwrap();
 
         let serialized = serde_yaml::to_value(MeshConfig::default()).unwrap();
-        let struct_keys: HashSet<String> = serialized
-            .as_mapping()
-            .unwrap()
-            .keys()
-            .map(|k| k.as_str().unwrap().to_string())
-            .collect();
-        assert!(!struct_keys.is_empty());
+        let struct_keys = mesh_keys_in(&serialized);
+        assert!(struct_keys.contains("fetch.max_bytes"));
+        assert!(struct_keys.contains("envoy_memory.max_turns"));
 
         let template_keys = mesh_keys_of(&rendered);
         let example_keys = mesh_keys_of(CONFIG_EXAMPLE);
@@ -1563,13 +1571,50 @@ clients:
         assert_eq!(cfg.mesh, MeshConfig::default());
     }
 
+    /// The `collision_protection` comment is one text in the template and the example,
+    /// and the README row says the same: the setting refuses over a record under another
+    /// identity or a peer-table row under one trusted for all destinations, and the three
+    /// places a user reads that cannot drift apart.
+    #[test]
+    fn the_collision_protection_comment_is_one_text_across_readme_template_and_example() {
+        const README: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"));
+        fn comment_of(yaml: &str) -> &str {
+            let line = yaml
+                .lines()
+                .find(|line| line.trim_start().starts_with("collision_protection:"))
+                .expect("a collision_protection key");
+            let (_, comment) = line.split_once('#').expect("a comment on the key's line");
+            comment.trim()
+        }
+        let template = comment_of(CONFIG_TEMPLATE);
+        let example = comment_of(CONFIG_EXAMPLE);
+        assert_eq!(template, example, "the template and the example disagree");
+        let clause = "recorded under another identity, or heard in the peer table under one \
+                      trusted for all destinations";
+        assert!(
+            template.contains(clause),
+            "the comment lacks {clause:?}: {template:?}"
+        );
+        let row = README
+            .lines()
+            .find(|line| line.starts_with("| `mesh.collision_protection`"))
+            .expect("the README has a mesh.collision_protection row");
+        assert!(
+            row.contains(clause),
+            "the README row lacks {clause:?}: {row:?}"
+        );
+    }
+
     #[test]
     fn config_example_loads_with_the_config_loader() {
         let example = Config::load_from_str(CONFIG_EXAMPLE).unwrap();
         assert!(!example.mesh.enabled);
         assert_eq!(
             example.mesh.interfaces,
-            vec![mesh_config::MeshInterface::Lan]
+            vec![mesh_config::MeshInterface::Private {
+                host: "127.0.0.1".into(),
+                port: 4242
+            }]
         );
     }
 

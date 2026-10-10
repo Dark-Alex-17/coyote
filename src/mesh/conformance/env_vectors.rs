@@ -8,29 +8,33 @@
 //! instead of asserting it, and fails when the flag goes stale.
 
 use super::{Kind, Listed};
+use crate::mesh::knock::{KnockSurface, RecordingSurface};
+use crate::mesh::peers::{PEER_TTL, PeerSighting, PeerTable};
 use crate::mesh::protocol::{
     MESH_PROTOCOL_MIN_SUPPORTED, MESH_PROTOCOL_VERSION, VersionRefusal, protocol_supported,
 };
 use crate::mesh::r3::{
-    Admission, DispatchError, Dispatcher, Envelope, EnvelopeError, HANDLER_TIMEOUT, Handler,
-    InboundRequest, KNOCK_PATH, KnockEvent, KnockSink, MAX_CONCURRENT_INBOUND_REQUESTS,
-    MAX_R3_PAYLOAD_BYTES, MESSAGE_PATH, NAME_HASH_LEN, OriginName, PathHash, R3Error, RefusalCode,
-    Reply, RequestFrame, RequestHandler, RequestId, ResponseFrame, STATUS_PATH, SizeBranch,
+    ACCESS_PATH, Admission, DispatchError, Dispatcher, Envelope, EnvelopeError, FETCH_PATH,
+    HANDLER_TIMEOUT, Handler, InboundRequest, KNOCK_PATH, KnockEvent, KnockSink, LIST_PATH,
+    MAX_CONCURRENT_INBOUND_REQUESTS, MAX_R3_PAYLOAD_BYTES, MESSAGE_PATH, NAME_HASH_LEN, OriginName,
+    PathHash, R3Error, RefusalCode, Reply, RequestFrame, RequestHandler, RequestId, ResponseFrame,
+    STATUS_PATH, SizeBranch,
 };
-use crate::mesh::test_support::TrustList;
-use crate::mesh::trust::{Decision, Rule, Verdict};
+use crate::mesh::test_support::{TempDir, TrustList};
+use crate::mesh::trust::{Decision, InstancePresence, KeyChangeOutcome, Rule, TrustStore, Verdict};
 use crate::mesh::{destination_address, hex_lower};
 
 use async_trait::async_trait;
 use rand_core::OsRng;
 use rmpv::Value;
 use rns_transport::destination::link::LinkId;
+use rns_transport::hash::AddressHash;
 use rns_transport::identity::PrivateIdentity;
 use std::fmt::Debug;
 use std::future::Future;
 use std::io::Cursor;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// One requirement id, one input, one mandated receiver action.
 struct Vector {
@@ -337,7 +341,7 @@ async fn run_dispatch(
         branch: SizeBranch::Packet,
     };
     let observed = match RequestHandler::handle(&dispatcher, request).await {
-        Reply::Value(value) => Answer::Value(value),
+        Reply::Value(value) | Reply::Settled { value, .. } => Answer::Value(value),
         Reply::Code(code) => Answer::Code(code.to_wire()),
         Reply::Silent => Answer::Silent,
     };
@@ -2001,6 +2005,33 @@ fn dispatch_vectors() -> Vec<Vector> {
             Knock::None,
         ),
         dispatch(
+            "MESH-ENV-035",
+            Kind::Valid,
+            LIST_PATH,
+            trusted,
+            envelope_value(),
+            no_provider_answer(LIST_PATH),
+            Knock::None,
+        ),
+        dispatch(
+            "MESH-ENV-035",
+            Kind::Valid,
+            FETCH_PATH,
+            trusted,
+            envelope_value(),
+            no_provider_answer(FETCH_PATH),
+            Knock::None,
+        ),
+        dispatch(
+            "MESH-ENV-035",
+            Kind::Valid,
+            ACCESS_PATH,
+            trusted,
+            envelope_value(),
+            no_provider_answer(ACCESS_PATH),
+            Knock::None,
+        ),
+        dispatch(
             "MESH-ENV-036",
             Kind::Valid,
             KNOCK_PATH,
@@ -2067,6 +2098,42 @@ fn dispatch_vectors() -> Vec<Vector> {
                 envelope_value(),
                 no_access_answer(),
                 knocked(),
+            ),
+        ),
+        served(
+            Provider::Echo(LIST_PATH),
+            dispatch(
+                "MESH-ENV-036",
+                Kind::Valid,
+                LIST_PATH,
+                trusted,
+                envelope_value(),
+                Answer::Value(body.clone()),
+                Knock::None,
+            ),
+        ),
+        served(
+            Provider::Echo(FETCH_PATH),
+            dispatch(
+                "MESH-ENV-036",
+                Kind::Valid,
+                FETCH_PATH,
+                trusted,
+                envelope_value(),
+                Answer::Value(body.clone()),
+                Knock::None,
+            ),
+        ),
+        served(
+            Provider::Echo(ACCESS_PATH),
+            dispatch(
+                "MESH-ENV-036",
+                Kind::Valid,
+                ACCESS_PATH,
+                trusted,
+                envelope_value(),
+                Answer::Value(body.clone()),
+                Knock::None,
             ),
         ),
         dispatch(
@@ -2166,8 +2233,16 @@ fn authorize(list: TrustList) -> Verdict {
 /// `TrustStore::authorize_origin` for a fresh identity naming `ORIGIN` while a second fresh
 /// identity holds the destination `ORIGIN` derives under it. `list` receives the requester's
 /// identity and the destination `ORIGIN` derives under it, then the holder's identity and
-/// destination.
+/// destination. Collision protection is off.
 fn authorize_rotated_origin(list: fn(&str, &str, &str, &str) -> TrustList) -> Verdict {
+    authorize_rotated_origin_with(false, list)
+}
+
+/// `authorize_rotated_origin` with `mesh.collision_protection` set to `protection`.
+fn authorize_rotated_origin_with(
+    protection: bool,
+    list: fn(&str, &str, &str, &str) -> TrustList,
+) -> Verdict {
     let identity = PrivateIdentity::new_from_rand(OsRng)
         .as_identity()
         .address_hash;
@@ -2183,7 +2258,81 @@ fn authorize_rotated_origin(list: fn(&str, &str, &str, &str) -> TrustList) -> Ve
         &held,
     )
     .open("conformance-env");
-    store.authorize_origin(&identity, &ORIGIN).0
+    store.set_collision_protection(protection);
+    store.authorize_origin(&identity, &ORIGIN).verdict
+}
+
+/// `authorize_rotated_origin_with` for the presence rung: no record carries `ORIGIN`, the
+/// peer table has heard it under the holder's identity instead. `list` receives the same
+/// four arguments. The requester is judged at the instant the holder's row was heard.
+fn authorize_presence_origin_with(
+    protection: bool,
+    list: fn(&str, &str, &str, &str) -> TrustList,
+) -> Verdict {
+    judge_presence_origin(protection, list, |store, identity, _, heard| {
+        store.authorize_origin_at(identity, &ORIGIN, heard).verdict
+    })
+}
+
+/// `authorize_presence_origin_with` with the judging left to `judge`, which receives the
+/// store, the requester's identity, the holder's identity and the instant the holder's row
+/// was heard. A surface is attached, so an owner line the judge earns arms the memory.
+fn judge_presence_origin(
+    protection: bool,
+    list: fn(&str, &str, &str, &str) -> TrustList,
+    judge: fn(&TrustStore, &AddressHash, &AddressHash, SystemTime) -> Verdict,
+) -> Verdict {
+    let identity = PrivateIdentity::new_from_rand(OsRng)
+        .as_identity()
+        .address_hash;
+    let derived = destination_address(&ORIGIN, &identity).to_hex_string();
+    let holder = PrivateIdentity::new_from_rand(OsRng)
+        .as_identity()
+        .address_hash;
+    let held = destination_address(&ORIGIN, &holder).to_hex_string();
+    let (store, _tmp) = list(
+        &identity.to_hex_string(),
+        &derived,
+        &holder.to_hex_string(),
+        &held,
+    )
+    .open("conformance-env");
+    store.set_collision_protection(protection);
+    let heard = UNIX_EPOCH + Duration::from_secs(2_000);
+    let peers = TempDir::new("conformance-env-peers");
+    let table = Arc::new(PeerTable::load(peers.path.join("peers.json"), heard).unwrap());
+    store.attach_presence(Arc::downgrade(&table) as Weak<dyn InstancePresence>);
+    let surface = Arc::new(RecordingSurface::default());
+    store.attach_surface(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
+    table.observe(
+        PeerSighting {
+            destination_hash: held,
+            identity_hash: holder.to_hex_string(),
+            name_hash: hex_lower(&ORIGIN),
+            display_name: None,
+            protocol_version: MESH_PROTOCOL_VERSION,
+            hops: 1,
+        },
+        heard,
+    );
+    judge(&store, &identity, &holder, heard)
+}
+
+/// Judges the requester at `heard` and tells the owner as every ingress does; the verdict
+/// arms the instance's presence memo when it is a presence refusal, the line only spends
+/// its dedupe.
+fn surface_presence_line(store: &TrustStore, identity: &AddressHash, heard: SystemTime) {
+    let verdict = store.authorize_origin_at(identity, &ORIGIN, heard).verdict;
+    let outcome = match verdict.decision {
+        Decision::Allow => KeyChangeOutcome::Served,
+        Decision::Refuse => KeyChangeOutcome::Refused,
+    };
+    store.note_key_change(
+        &identity.to_hex_string(),
+        &hex_lower(&ORIGIN),
+        outcome,
+        heard,
+    );
 }
 
 const IDENTITY: &str = "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a";
@@ -2418,16 +2567,118 @@ fn custom_vectors() -> Vec<Vector> {
                 verdict(Decision::Refuse, Rule::IdentityChanged),
             )
         }),
-        custom("MESH-ENV-039", Kind::Invalid, || {
+        custom("MESH-ENV-039", Kind::Valid, || {
             same(
-                "denied held record is default closed",
+                "denied held record is identity changed",
                 authorize_rotated_origin(|identity, _, holder, held| {
                     TrustList::default()
                         .identity(identity, false)
                         .deny(held)
                         .destination(held, holder)
                 }),
+                verdict(Decision::Refuse, Rule::IdentityChanged),
+            )
+        }),
+        custom("MESH-ENV-039", Kind::Valid, || {
+            same(
+                "identity changed over identity allow under collision protection",
+                authorize_rotated_origin_with(true, |identity, _, holder, held| {
+                    TrustList::default()
+                        .identity(identity, true)
+                        .destination(held, holder)
+                }),
+                verdict(Decision::Refuse, Rule::IdentityChanged),
+            )
+        }),
+        custom("MESH-ENV-039", Kind::Valid, || {
+            same(
+                "destination allow over identity changed under collision protection",
+                authorize_rotated_origin_with(true, |identity, derived, holder, held| {
+                    TrustList::default()
+                        .destination(derived, identity)
+                        .destination(held, holder)
+                }),
+                verdict(Decision::Allow, Rule::DestinationTrusted),
+            )
+        }),
+        custom("MESH-ENV-039", Kind::Valid, || {
+            same(
+                "presence under identity allow under collision protection",
+                authorize_presence_origin_with(true, |identity, _, holder, _| {
+                    TrustList::default()
+                        .identity(identity, true)
+                        .identity(holder, true)
+                }),
+                verdict(Decision::Refuse, Rule::IdentityChanged),
+            )
+        }),
+        custom("MESH-ENV-039", Kind::Valid, || {
+            same(
+                "presence under identity allow with collision protection off",
+                authorize_presence_origin_with(false, |identity, _, holder, _| {
+                    TrustList::default()
+                        .identity(identity, true)
+                        .identity(holder, true)
+                }),
+                verdict(Decision::Allow, Rule::IdentityTrusted),
+            )
+        }),
+        custom("MESH-ENV-039", Kind::Valid, || {
+            same(
+                "presence with no allow is default closed under collision protection",
+                authorize_presence_origin_with(true, |_, _, holder, _| {
+                    TrustList::default().identity(holder, true)
+                }),
                 verdict(Decision::Refuse, Rule::DefaultClosed),
+            )
+        }),
+        custom("MESH-ENV-039", Kind::Valid, || {
+            same(
+                "destination allow over presence under collision protection",
+                authorize_presence_origin_with(true, |identity, derived, holder, _| {
+                    TrustList::default()
+                        .destination(derived, identity)
+                        .identity(holder, true)
+                }),
+                verdict(Decision::Allow, Rule::DestinationTrusted),
+            )
+        }),
+        custom("MESH-ENV-039", Kind::Valid, || {
+            same(
+                "remembered presence outlives the holder's row under collision protection",
+                judge_presence_origin(
+                    true,
+                    |identity, _, holder, _| {
+                        TrustList::default()
+                            .identity(identity, true)
+                            .identity(holder, true)
+                    },
+                    |store, identity, _, heard| {
+                        surface_presence_line(store, identity, heard);
+                        store
+                            .authorize_origin_at(identity, &ORIGIN, heard + PEER_TTL)
+                            .verdict
+                    },
+                ),
+                verdict(Decision::Refuse, Rule::IdentityChanged),
+            )
+        }),
+        custom("MESH-ENV-039", Kind::Valid, || {
+            same(
+                "remembered presence never refuses the holder it names",
+                judge_presence_origin(
+                    true,
+                    |identity, _, holder, _| {
+                        TrustList::default()
+                            .identity(identity, true)
+                            .identity(holder, true)
+                    },
+                    |store, identity, holder, heard| {
+                        surface_presence_line(store, identity, heard);
+                        store.authorize_origin_at(holder, &ORIGIN, heard).verdict
+                    },
+                ),
+                verdict(Decision::Allow, Rule::IdentityTrusted),
             )
         }),
         custom("MESH-ENV-044", Kind::Valid, || {
@@ -3028,6 +3279,24 @@ fn dispatch_error_vectors() -> Vec<Vector> {
             Kind::Valid,
             no_provider_value(Value::from(MESSAGE_PATH)),
             no_provider(MESSAGE_PATH),
+        ),
+        dispatch_error(
+            "MESH-ENV-042",
+            Kind::Valid,
+            no_provider_value(Value::from(LIST_PATH)),
+            no_provider(LIST_PATH),
+        ),
+        dispatch_error(
+            "MESH-ENV-042",
+            Kind::Valid,
+            no_provider_value(Value::from(FETCH_PATH)),
+            no_provider(FETCH_PATH),
+        ),
+        dispatch_error(
+            "MESH-ENV-042",
+            Kind::Valid,
+            no_provider_value(Value::from(ACCESS_PATH)),
+            no_provider(ACCESS_PATH),
         ),
         dispatch_error(
             "MESH-ENV-042",

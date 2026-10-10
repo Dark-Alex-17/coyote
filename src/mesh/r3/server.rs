@@ -1,8 +1,10 @@
 use crate::mesh::hex_lower;
 use crate::mesh::r3::client::SizeBranch;
+use crate::mesh::r3::dispatch::FETCH_PATH;
 use crate::mesh::r3::error::{R3Error, RefusalCode};
 use crate::mesh::r3::frame::{
-    MAX_R3_PAYLOAD_BYTES, PathHash, RequestFrame, RequestId, ResponseFrame,
+    MAX_FETCH_RESPONSE_BYTES, MAX_R3_PAYLOAD_BYTES, PathHash, RequestFrame, RequestId,
+    ResponseFrame,
 };
 use crate::mesh::r3::{redact_hashes, short};
 
@@ -51,11 +53,30 @@ pub(crate) struct InboundRequest {
 }
 
 /// What the handler answers with. `Silent` sends nothing, the way a `None` response does
-/// in RNS `Link.handle_request`.
+/// in RNS `Link.handle_request`. `Settled` is a value whose producer must hear whether it
+/// went out: `settlement.sent()` is called once the transport reports the reply
+/// dispatched, and the settlement is dropped unsent on every other outcome.
 pub(crate) enum Reply {
     Value(Value),
     Code(RefusalCode),
     Silent,
+    Settled {
+        value: Value,
+        settlement: Box<dyn Settlement>,
+    },
+}
+
+/// The producer's side of a `Reply::Settled`. `sent` is called once the transport reports
+/// the reply dispatched: a packet put on its interface, or a resource whose advertisement
+/// was dispatched, since `send_response_resource` returns once that is done and a transfer
+/// that fails mid-flight is not observable here. Dropping the settlement unsent means
+/// failure, whatever the cause: a send error or send timeout, or a handler that was
+/// cancelled or timed out while it still held the reply. `sent` runs on the server's
+/// async task and must not block; an unsent settlement is dropped on a blocking thread
+/// where the server can arrange it, and wherever the dropped handler future happens to be
+/// otherwise, so a `Drop` that writes to disk should stay small.
+pub(crate) trait Settlement: Send {
+    fn sent(self: Box<Self>);
 }
 
 /// Whether a request's bytes may be decoded at all.
@@ -339,14 +360,23 @@ impl R3Server {
                 let frame = match RequestFrame::decode(&packed) {
                     Ok(frame) => frame,
                     Err(err) => {
+                        let id8 = identity.as_ref().map_or_else(
+                            || "anonymous".to_string(),
+                            |identity| short(&identity.address_hash.to_hex_string()).to_string(),
+                        );
                         debug!(
-                            "Dropped an undecodable mesh request {} on link {}: {}",
+                            "Dropped an undecodable mesh request {} from {id8} on link {}: {}",
                             request_id.to_hex_string(),
                             link_id.to_hex_string(),
                             redact_hashes(&err.to_string())
                         );
                         return;
                     }
+                };
+                let max = if frame.path_hash == PathHash::of(FETCH_PATH) {
+                    MAX_FETCH_RESPONSE_BYTES
+                } else {
+                    MAX_R3_PAYLOAD_BYTES
                 };
                 let request = InboundRequest {
                     link_id,
@@ -367,30 +397,47 @@ impl R3Server {
                     );
                     return;
                 };
-                let value = match reply {
-                    Reply::Value(value) => value,
-                    Reply::Code(code) => code.to_wire(),
+                let (value, settlement): (Value, Option<Box<dyn Settlement>>) = match reply {
+                    Reply::Value(value) => (value, None),
+                    Reply::Code(code) => (code.to_wire(), None),
                     Reply::Silent => return,
+                    Reply::Settled { value, settlement } => (value, Some(settlement)),
                 };
                 match timeout(
                     DEFAULT_RESPONSE_SEND_TIMEOUT,
-                    respond(&transport, link_id, request_id, value),
+                    respond(&transport, link_id, request_id, value, max),
                 )
                 .await
                 {
-                    Ok(Ok(())) => {}
-                    Ok(Err(err)) => warn!(
-                        "Failed to send mesh response {} on link {}: {}",
-                        request_id.to_hex_string(),
-                        link_id.to_hex_string(),
-                        redact_hashes(&err.to_string())
-                    ),
-                    Err(_) => warn!(
-                        "Mesh response {} on link {} was not sent within {}s; gave up on it",
-                        request_id.to_hex_string(),
-                        link_id.to_hex_string(),
-                        DEFAULT_RESPONSE_SEND_TIMEOUT.as_secs()
-                    ),
+                    Ok(Ok(())) => {
+                        if let Some(settlement) = settlement {
+                            settlement.sent();
+                        }
+                    }
+                    // The settlement is dropped unsent off this task: an implementor may
+                    // settle its accounts on disk, and that must not stall the link loop.
+                    Ok(Err(err)) => {
+                        warn!(
+                            "Failed to send mesh response {} on link {}: {}",
+                            request_id.to_hex_string(),
+                            link_id.to_hex_string(),
+                            redact_hashes(&err.to_string())
+                        );
+                        if let Some(settlement) = settlement {
+                            tokio::task::spawn_blocking(move || drop(settlement));
+                        }
+                    }
+                    Err(_) => {
+                        warn!(
+                            "Mesh response {} on link {} was not sent within {}s; gave up on it",
+                            request_id.to_hex_string(),
+                            link_id.to_hex_string(),
+                            DEFAULT_RESPONSE_SEND_TIMEOUT.as_secs()
+                        );
+                        if let Some(settlement) = settlement {
+                            tokio::task::spawn_blocking(move || drop(settlement));
+                        }
+                    }
                 }
             };
             tokio::select! {
@@ -443,23 +490,24 @@ fn resource_request_id(complete: &ResourceComplete) -> RequestId {
     request_id
 }
 
-/// Encodes and sends one response, as a packet when it fits the link MDU and as a resource
-/// otherwise, the decision RNS `Link.handle_request` makes.
+/// Encodes and sends one response no larger than `max`, as a packet when it fits the link
+/// MDU and as a resource otherwise, the decision RNS `Link.handle_request` makes.
 async fn respond(
     transport: &Transport,
     link_id: LinkId,
     request_id: RequestId,
     value: Value,
+    max: usize,
 ) -> Result<(), R3Error> {
     let bytes = ResponseFrame {
         request_id,
         data: value,
     }
     .encode();
-    if bytes.len() > MAX_R3_PAYLOAD_BYTES {
+    if bytes.len() > max {
         return Err(R3Error::Oversize {
             len: bytes.len(),
-            max: MAX_R3_PAYLOAD_BYTES,
+            max,
         });
     }
     let link = transport

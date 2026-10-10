@@ -1,6 +1,11 @@
+use super::paths;
+use crate::mesh::card::ABOUT_MAX_CHARS;
+use crate::mesh::message::PEER_REQUEST_TIMEOUT;
+use crate::mesh::r3::DEFAULT_LINK_TIMEOUT;
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::path::{Path, PathBuf};
 
 pub const DEFAULT_KNOCK_RETENTION_HOURS: u64 = 24;
 pub const DEFAULT_PEER_MAX_CONCURRENT: u32 = 1;
@@ -10,6 +15,20 @@ pub const DEFAULT_PEER_MAX_COST_USD_PER_HOUR: f64 = 0.0;
 pub const DEFAULT_PROPAGATION_SYNC_INTERVAL_SECS: u64 = 300;
 /// One year: the longest automatic sync interval `validate` accepts.
 pub const MAX_PROPAGATION_SYNC_INTERVAL_SECS: u64 = 31_536_000;
+/// The longest request or link timer `validate` accepts; `Instant` cannot hold a deadline
+/// anywhere near `u64::MAX` seconds away.
+pub const MAX_TIMEOUT_SECS: u64 = MAX_PROPAGATION_SYNC_INTERVAL_SECS;
+pub const DEFAULT_INLINE_MAX_BYTES: u64 = 64 * 1024;
+/// Σ inline file bytes one message may carry; `inline_max_bytes` cannot exceed it.
+pub const MAX_INLINE_FILE_TOTAL: u64 = 96 * 1024;
+pub const DEFAULT_FETCH_MAX_BYTES: u64 = 4 * 1024 * 1024;
+/// Largest file a fetch may serve; `max_bytes` cannot exceed it.
+pub const MAX_FETCH_FILE_BYTES: u64 = 4 * 1024 * 1024;
+pub const DEFAULT_ENVOY_MEMORY_MAX_SESSIONS: u64 = 256;
+pub const DEFAULT_ENVOY_MEMORY_MAX_PER_IDENTITY: u64 = 16;
+pub const DEFAULT_ENVOY_MEMORY_MAX_TURNS: u64 = 40;
+pub const DEFAULT_ENVOY_MEMORY_MAX_BYTES: u64 = 65536;
+pub const DEFAULT_ENVOY_MEMORY_TTL_HOURS: u64 = 168;
 /// Width of the label column in `.mesh info`, shared by every row so the values line up
 /// whichever module renders them.
 pub const MESH_INFO_LABEL_WIDTH: usize = 32;
@@ -27,6 +46,8 @@ Omit secrets, credentials, tokens, API keys, file contents, and anything the use
 Be dense and factual; prefer bullet points; no preamble or commentary before or after the digest. Keep it under roughly 200 words."#;
 
 /// The `mesh:` block of config.yaml: how this Coyote joins and behaves on the Coyote Mesh.
+/// `envoy_memory` governs what the envoy retains of each trusted peer's thread between
+/// messages.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MeshConfig {
@@ -34,6 +55,9 @@ pub struct MeshConfig {
     pub announce: bool,
     pub display_name: Option<String>,
     pub display_name_on_public: bool,
+    /// One human-written line on what this node's envoy can help with; carried on the
+    /// status card to trusted peers, never in the announce.
+    pub about: Option<String>,
     pub interfaces: Vec<MeshInterface>,
     pub brief: MeshBrief,
     pub digest_prompt: Option<String>,
@@ -43,35 +67,172 @@ pub struct MeshConfig {
     /// off; 0 = hand off at once, the question stays open for `.mesh answer`.
     pub envoy_escalation_timeout: u64,
     pub knock_retention_hours: u64,
-    /// Envoy runs one sending identity may have queued or running at once; further
-    /// messages are refused with a typed reason until one finishes; the message is
-    /// still filed in the inbox for the human.
+    /// Whether a name-hash collision refuses an identity trusted for all destinations: off,
+    /// the collision rung is judged after identity allow and such an identity is served
+    /// with a warning to the human; on, it is judged before and the identity is refused
+    /// with an error until the human trusts its new destination, whether the instance is
+    /// recorded under another identity or only heard in the peer table under one trusted
+    /// for all destinations; a refusal from the peer table is remembered while the node
+    /// runs from the refusal itself, the instance's first-heard holder never refused. A
+    /// destination allow admits in either mode. The rung judges what the node serves, the
+    /// requests, knocks, stored messages and stored access requests it receives; what it
+    /// sends or broadcasts is unchanged.
+    pub collision_protection: bool,
+    /// Envoy runs one sending identity may have queued or running at once; on a live
+    /// link a message that would start a run while the sender already has that many
+    /// queued or running is refused before it is acknowledged with the bare throttled
+    /// code, which names no reason, and is not filed; by store-and-forward it is filed
+    /// in the inbox for the human without an envoy run and the peer gets one typed
+    /// reply per identity, per reason, per hour. 0 = unlimited.
     pub peer_max_concurrent: u32,
     /// Messages accepted from one sending identity per hour. Windows are fixed hours
-    /// kept in memory, so a restart opens a fresh window; further messages are refused
-    /// with a typed reason: on a live link in the reply itself, on store-and-forward
-    /// with one reply per identity per reason per hour, and on store-and-forward the
-    /// message is still filed in the inbox for the human, without an envoy run; plus
-    /// one folded REPL line per identity, per reason, per hour, with the folded count
-    /// reported the next time that peer is heard from after the hour rolls over; on a
-    /// live link the refused message is not filed; the peer is told to retry.
+    /// kept in memory, so a restart opens a fresh window; further messages are
+    /// refused: on a live link with the bare throttled code before acknowledgement,
+    /// not filed; by store-and-forward with one typed reply per identity, per reason,
+    /// per hour, the message filed in the inbox for the human without an envoy run;
+    /// plus one folded REPL line per identity, per reason, per hour, with the folded
+    /// count reported the next time that peer is heard from after the hour rolls over.
+    /// 0 = unlimited.
     pub peer_max_messages_per_hour: u32,
     /// Model tokens one sending identity may cost per hour, counted after each envoy
     /// run, so the runs in flight may overshoot the ceiling by at most
-    /// `peer_max_concurrent` runs before the next is refused; the message is still
-    /// filed in the inbox for the human.
+    /// `peer_max_concurrent` runs; on a live link a message that would start a run
+    /// after the hour's token ceiling is already spent is refused before it is
+    /// acknowledged with the bare throttled code, which names no reason, and is not
+    /// filed; one acknowledged before the ceiling was reached and refused when its
+    /// turn comes is filed in the inbox and answered with the typed `budget_exhausted`
+    /// reply; by store-and-forward it is filed in the inbox for the human without an
+    /// envoy run and the peer gets one typed reply per identity, per reason, per hour.
+    /// 0 = unlimited.
     pub peer_max_tokens_per_hour: u64,
     /// USD one sending identity may cost per hour, counted like the token ceiling; 0 =
-    /// no cost ceiling. Enforced only when the envoy model's prices are known; the
-    /// message is still filed in the inbox for the human.
+    /// no cost ceiling. Enforced only when the envoy model's prices are known; on a
+    /// live link a message that would start a run after the hour's cost ceiling is
+    /// already spent is refused before it is acknowledged with the bare throttled
+    /// code, which names no reason, and is not filed; one acknowledged before the
+    /// ceiling was reached and refused when its turn comes is filed in the inbox and
+    /// answered with the typed `budget_exhausted` reply; by store-and-forward it is
+    /// filed in the inbox for the human without an envoy run and the peer gets one
+    /// typed reply per identity, per reason, per hour.
     pub peer_max_cost_usd_per_hour: f64,
+    /// Seconds to wait for a peer's answer on `/message`, `/knock`, `/list`, `/access`
+    /// and `/status`; unset keeps each path's built-in deadline (15 s, 30 s for
+    /// `/status`). Set, it raises a path's deadline to this and never lowers one, so a
+    /// value under the shortest built-in deadline is out of range. `/fetch` keeps its
+    /// own 120 s.
+    pub request_timeout_secs: Option<u64>,
+    /// Seconds to wait for the link to open and identify before a request on the same
+    /// five paths; unset keeps the built-in 10 s. Set, it raises the deadline and never
+    /// lowers it, so a value under 10 is out of range.
+    pub link_timeout_secs: Option<u64>,
     /// Seconds between automatic fetches of the messages a propagation node holds for
     /// this node, the first running once a propagation node is heard after the node
-    /// joins; 0 = fetch only on `.mesh fetch`; off while `announce` is false, since a
+    /// joins; 0 = fetch only on `.mesh sync`; off while `announce` is false, since a
     /// fetch identifies this node to the propagation node.
     /// Sideband's `lxmf_sync_interval` defaults to 43200 s with periodic sync off and
     /// NomadNet's to 21600 s; neither fits an interactive REPL, so 300 s is used.
     pub propagation_sync_interval_secs: u64,
+    pub fetch: MeshFetch,
+    pub envoy_memory: EnvoyMemoryConfig,
+}
+
+/// File-sharing knobs; later work adds the rest of the block, the name is fixed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MeshFetch {
+    /// Largest file a peer may attach inline to a message; the receiver drops larger ones.
+    pub inline_max_bytes: u64,
+    /// Largest file this node serves to a peer that fetches it; a larger one is refused.
+    pub max_bytes: u64,
+    /// Where fetched files are staged, under `<inbox_dir>/<instance id>`; unset stages them
+    /// under the cache dir.
+    pub inbox_dir: Option<PathBuf>,
+}
+
+impl Default for MeshFetch {
+    fn default() -> Self {
+        Self {
+            inline_max_bytes: DEFAULT_INLINE_MAX_BYTES,
+            max_bytes: DEFAULT_FETCH_MAX_BYTES,
+            inbox_dir: None,
+        }
+    }
+}
+
+/// What the envoy remembers of a trusted peer's thread between messages: the peer's turns
+/// and the envoy's answers, keyed by the proved sender identity and the thread, never the
+/// owner's own transcript.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EnvoyMemoryConfig {
+    /// Off by default: the envoy keeps no context across runs and no store directory is
+    /// created; messages are still filed in the inbox.
+    pub enabled: bool,
+    /// Most threads remembered across all peers; past it the least recently used go.
+    pub max_sessions: u64,
+    /// Most threads remembered for one peer identity; past it that identity's least
+    /// recently used go, other identities' threads untouched.
+    pub max_per_identity: u64,
+    /// Most turns kept per thread; past it the oldest exchange goes, cut at the next
+    /// turn the peer spoke so a reply is never kept without what it answered.
+    pub max_turns: u64,
+    /// Most bytes of turn text kept per thread, cut the same way as `max_turns`. Kept
+    /// turns that do not fit the envoy model's context are left out of the run, oldest
+    /// first, and stay remembered.
+    pub max_bytes: u64,
+    /// Hours a thread is remembered after its last written exchange.
+    pub ttl_hours: u64,
+}
+
+impl Default for EnvoyMemoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_sessions: DEFAULT_ENVOY_MEMORY_MAX_SESSIONS,
+            max_per_identity: DEFAULT_ENVOY_MEMORY_MAX_PER_IDENTITY,
+            max_turns: DEFAULT_ENVOY_MEMORY_MAX_TURNS,
+            max_bytes: DEFAULT_ENVOY_MEMORY_MAX_BYTES,
+            ttl_hours: DEFAULT_ENVOY_MEMORY_TTL_HOURS,
+        }
+    }
+}
+
+impl MeshFetch {
+    /// `inbox_dir` as configured, or its sandboxed-home translation when the configured
+    /// directory does not exist and the translation does; `None` when unset. Resolving
+    /// emits no info-level line and is repeatable, so callers may resolve as often as
+    /// they like; the node announces the translation once, when it starts.
+    pub fn inbox_dir(&self) -> Option<PathBuf> {
+        self.inbox_dir_with(paths::translate_sandboxed_home_dir)
+    }
+
+    /// `inbox_dir` with `translate` standing in for the sandboxed-home translation, so a
+    /// node start can be exercised against a translation of the caller's choosing.
+    pub(crate) fn inbox_dir_with(
+        &self,
+        translate: impl Fn(&Path) -> Option<PathBuf>,
+    ) -> Option<PathBuf> {
+        self.inbox_dir
+            .as_deref()
+            .map(|configured| resolve_inbox_dir(configured, translate))
+    }
+}
+
+fn resolve_inbox_dir(configured: &Path, translate: impl Fn(&Path) -> Option<PathBuf>) -> PathBuf {
+    if configured.exists() {
+        return configured.to_path_buf();
+    }
+    if let Some(translated) = translate(configured)
+        && translated.exists()
+    {
+        debug!(
+            "mesh.fetch.inbox_dir '{}' not found; resolved to sandboxed path '{}'",
+            configured.display(),
+            translated.display()
+        );
+        return translated;
+    }
+    configured.to_path_buf()
 }
 
 impl Default for MeshConfig {
@@ -81,18 +242,27 @@ impl Default for MeshConfig {
             announce: true,
             display_name: None,
             display_name_on_public: false,
-            interfaces: vec![MeshInterface::Lan],
+            about: None,
+            interfaces: vec![MeshInterface::Private {
+                host: "127.0.0.1".into(),
+                port: 4242,
+            }],
             brief: MeshBrief::default(),
             digest_prompt: None,
             brief_model: None,
             envoy_model: None,
             envoy_escalation_timeout: 0,
             knock_retention_hours: DEFAULT_KNOCK_RETENTION_HOURS,
+            collision_protection: false,
             peer_max_concurrent: DEFAULT_PEER_MAX_CONCURRENT,
             peer_max_messages_per_hour: DEFAULT_PEER_MAX_MESSAGES_PER_HOUR,
             peer_max_tokens_per_hour: DEFAULT_PEER_MAX_TOKENS_PER_HOUR,
             peer_max_cost_usd_per_hour: DEFAULT_PEER_MAX_COST_USD_PER_HOUR,
+            request_timeout_secs: None,
+            link_timeout_secs: None,
             propagation_sync_interval_secs: DEFAULT_PROPAGATION_SYNC_INTERVAL_SECS,
+            fetch: MeshFetch::default(),
+            envoy_memory: EnvoyMemoryConfig::default(),
         }
     }
 }
@@ -123,7 +293,7 @@ impl MeshConfig {
         }
         if self.interfaces.is_empty() {
             bail!(
-                "mesh.interfaces is empty; list at least one interface (the default is a single {{type: lan}} entry)"
+                "mesh.interfaces is empty; list at least one interface (the default is a single {{type: private, host: 127.0.0.1, port: 4242}} entry, the local rnsd)"
             );
         }
         let lan_count = self
@@ -136,18 +306,16 @@ impl MeshConfig {
                 "mesh.interfaces lists lan more than once; only one lan interface can be bound per process"
             );
         }
-        for (name, value) in [
-            ("knock_retention_hours", self.knock_retention_hours),
-            ("peer_max_concurrent", u64::from(self.peer_max_concurrent)),
-            (
-                "peer_max_messages_per_hour",
-                u64::from(self.peer_max_messages_per_hour),
-            ),
-            ("peer_max_tokens_per_hour", self.peer_max_tokens_per_hour),
-        ] {
-            if value == 0 {
-                bail!("mesh.{name} is 0, which is out of range; use 1 or more");
+        if let Some(about) = &self.about {
+            let n = about.chars().count();
+            if n > ABOUT_MAX_CHARS {
+                bail!(
+                    "mesh.about is {n} characters, which is over the cap; use {ABOUT_MAX_CHARS} or fewer"
+                );
             }
+        }
+        if self.knock_retention_hours == 0 {
+            bail!("mesh.knock_retention_hours is 0, which is out of range; use 1 or more");
         }
         let cost = self.peer_max_cost_usd_per_hour;
         if !cost.is_finite() || cost < 0.0 {
@@ -155,11 +323,64 @@ impl MeshConfig {
                 "mesh.peer_max_cost_usd_per_hour is {cost}, which is out of range; use 0 (no ceiling) or a positive amount"
             );
         }
+        for (name, value, floor) in [
+            (
+                "request_timeout_secs",
+                self.request_timeout_secs,
+                PEER_REQUEST_TIMEOUT,
+            ),
+            (
+                "link_timeout_secs",
+                self.link_timeout_secs,
+                DEFAULT_LINK_TIMEOUT,
+            ),
+        ] {
+            let floor = floor.as_secs();
+            if let Some(value) = value
+                && !(floor..=MAX_TIMEOUT_SECS).contains(&value)
+            {
+                bail!(
+                    "mesh.{name} is {value}, which is out of range; use {floor} (the shortest built-in deadline, which this key raises but never lowers) to {MAX_TIMEOUT_SECS} (one year), or null to keep each path's built-in deadline"
+                );
+            }
+        }
         let sync = self.propagation_sync_interval_secs;
         if sync > MAX_PROPAGATION_SYNC_INTERVAL_SECS {
             bail!(
                 "mesh.propagation_sync_interval_secs is {sync}, which is out of range; use 0 (manual) or up to {MAX_PROPAGATION_SYNC_INTERVAL_SECS} (one year)"
             );
+        }
+        let inline = self.fetch.inline_max_bytes;
+        if !(1..=MAX_INLINE_FILE_TOTAL).contains(&inline) {
+            bail!(
+                "mesh.fetch.inline_max_bytes is {inline}, which is out of range; use 1 to {MAX_INLINE_FILE_TOTAL}"
+            );
+        }
+        let max = self.fetch.max_bytes;
+        if !(1..=MAX_FETCH_FILE_BYTES).contains(&max) {
+            bail!(
+                "mesh.fetch.max_bytes is {max}, which is out of range; use 1 to {MAX_FETCH_FILE_BYTES}"
+            );
+        }
+        if let Some(dir) = &self.fetch.inbox_dir
+            && !dir.is_absolute()
+        {
+            bail!(
+                "mesh.fetch.inbox_dir is '{}', which is not absolute; use an absolute path",
+                dir.display()
+            );
+        }
+        let memory = &self.envoy_memory;
+        for (name, value) in [
+            ("max_sessions", memory.max_sessions),
+            ("max_per_identity", memory.max_per_identity),
+            ("max_turns", memory.max_turns),
+            ("max_bytes", memory.max_bytes),
+            ("ttl_hours", memory.ttl_hours),
+        ] {
+            if value == 0 {
+                bail!("mesh.envoy_memory.{name} is 0, which is out of range; use 1 or more");
+            }
         }
         Ok(())
     }
@@ -280,6 +501,13 @@ impl From<MeshInterface> for RawMeshInterface {
 
 /// The `mesh:` section of `.info`, one row per setting. The digest prompt body is never printed.
 pub fn render_mesh_info(mesh: &MeshConfig) -> String {
+    render_mesh_settings(mesh, true)
+}
+
+/// `render_mesh_info` with the configured `interfaces[i]` rows optional: `.mesh info` leaves
+/// them out while a node is on, since the node's own rows then list every interface under
+/// the same names with its state.
+pub fn render_mesh_settings(mesh: &MeshConfig, with_interfaces: bool) -> String {
     let digest_prompt = if mesh.digest_prompt() == MESH_DIGEST_PROMPT {
         "default"
     } else {
@@ -299,8 +527,11 @@ pub fn render_mesh_info(mesh: &MeshConfig) -> String {
         "display_name_on_public",
         mesh.display_name_on_public.to_string(),
     );
-    for (i, interface) in mesh.interfaces.iter().enumerate() {
-        row(&format!("interfaces[{i}]"), interface.to_string());
+    row("about", super::format_option_value(&mesh.about));
+    if with_interfaces {
+        for (i, interface) in mesh.interfaces.iter().enumerate() {
+            row(&format!("interfaces[{i}]"), interface.to_string());
+        }
     }
     row("brief", mesh.brief.to_string());
     row("digest_prompt", digest_prompt.to_string());
@@ -314,14 +545,28 @@ pub fn render_mesh_info(mesh: &MeshConfig) -> String {
         "knock_retention_hours",
         mesh.knock_retention_hours.to_string(),
     );
-    row("peer_max_concurrent", mesh.peer_max_concurrent.to_string());
+    row(
+        "collision_protection",
+        mesh.collision_protection.to_string(),
+    );
+    let budget = |value: u64| {
+        if value == 0 {
+            "0 (unlimited)".to_string()
+        } else {
+            value.to_string()
+        }
+    };
+    row(
+        "peer_max_concurrent",
+        budget(u64::from(mesh.peer_max_concurrent)),
+    );
     row(
         "peer_max_messages_per_hour",
-        mesh.peer_max_messages_per_hour.to_string(),
+        budget(u64::from(mesh.peer_max_messages_per_hour)),
     );
     row(
         "peer_max_tokens_per_hour",
-        mesh.peer_max_tokens_per_hour.to_string(),
+        budget(mesh.peer_max_tokens_per_hour),
     );
     let cost = mesh.peer_max_cost_usd_per_hour;
     row(
@@ -331,6 +576,14 @@ pub fn render_mesh_info(mesh: &MeshConfig) -> String {
         } else {
             cost.to_string()
         },
+    );
+    row(
+        "request_timeout_secs",
+        super::format_option_value(&mesh.request_timeout_secs),
+    );
+    row(
+        "link_timeout_secs",
+        super::format_option_value(&mesh.link_timeout_secs),
     );
     let sync = mesh.propagation_sync_interval_secs;
     row(
@@ -343,6 +596,25 @@ pub fn render_mesh_info(mesh: &MeshConfig) -> String {
             sync.to_string()
         },
     );
+    row(
+        "fetch.inline_max_bytes",
+        mesh.fetch.inline_max_bytes.to_string(),
+    );
+    row("fetch.max_bytes", mesh.fetch.max_bytes.to_string());
+    row(
+        "fetch.inbox_dir",
+        super::format_option_value(&mesh.fetch.inbox_dir.as_ref().map(|dir| dir.display())),
+    );
+    let memory = &mesh.envoy_memory;
+    row("envoy_memory.enabled", memory.enabled.to_string());
+    row("envoy_memory.max_sessions", memory.max_sessions.to_string());
+    row(
+        "envoy_memory.max_per_identity",
+        memory.max_per_identity.to_string(),
+    );
+    row("envoy_memory.max_turns", memory.max_turns.to_string());
+    row("envoy_memory.max_bytes", memory.max_bytes.to_string());
+    row("envoy_memory.ttl_hours", memory.ttl_hours.to_string());
     output
 }
 
@@ -350,6 +622,9 @@ pub fn render_mesh_info(mesh: &MeshConfig) -> String {
 mod tests {
     use super::*;
     use crate::config::Config;
+    use crate::mesh::test_support::TempDir;
+    use crate::testing::EnvVarGuard;
+    use serial_test::serial;
 
     fn interface_error(yaml: &str) -> String {
         serde_yaml::from_str::<Config>(yaml)
@@ -364,18 +639,44 @@ mod tests {
         assert!(mesh.announce);
         assert_eq!(mesh.display_name, None);
         assert!(!mesh.display_name_on_public);
-        assert_eq!(mesh.interfaces, vec![MeshInterface::Lan]);
+        assert_eq!(mesh.about, None);
+        assert_eq!(
+            mesh.interfaces,
+            vec![MeshInterface::Private {
+                host: "127.0.0.1".into(),
+                port: 4242
+            }]
+        );
         assert_eq!(mesh.brief, MeshBrief::Auto);
         assert_eq!(mesh.digest_prompt, None);
         assert_eq!(mesh.brief_model, None);
         assert_eq!(mesh.envoy_model, None);
         assert_eq!(mesh.envoy_escalation_timeout, 0);
         assert_eq!(mesh.knock_retention_hours, 24);
+        assert!(!mesh.collision_protection);
         assert_eq!(mesh.peer_max_concurrent, 1);
         assert_eq!(mesh.peer_max_messages_per_hour, 60);
         assert_eq!(mesh.peer_max_tokens_per_hour, 100_000);
         assert_eq!(mesh.peer_max_cost_usd_per_hour, 0.0);
         assert_eq!(mesh.propagation_sync_interval_secs, 300);
+        assert_eq!(mesh.fetch.inline_max_bytes, 65_536);
+        assert_eq!(mesh.fetch.max_bytes, 4_194_304);
+        assert_eq!(mesh.fetch.inbox_dir, None);
+        assert!(!mesh.envoy_memory.enabled);
+        assert_eq!(mesh.envoy_memory.max_sessions, 256);
+        assert_eq!(mesh.envoy_memory.max_per_identity, 16);
+        assert_eq!(mesh.envoy_memory.max_turns, 40);
+        assert_eq!(mesh.envoy_memory.max_bytes, 65_536);
+        assert_eq!(mesh.envoy_memory.ttl_hours, 168);
+        assert_eq!(DEFAULT_INLINE_MAX_BYTES, 65_536);
+        assert_eq!(MAX_INLINE_FILE_TOTAL, 98_304);
+        assert_eq!(DEFAULT_FETCH_MAX_BYTES, 4_194_304);
+        assert_eq!(MAX_FETCH_FILE_BYTES, 4_194_304);
+        assert_eq!(DEFAULT_ENVOY_MEMORY_MAX_SESSIONS, 256);
+        assert_eq!(DEFAULT_ENVOY_MEMORY_MAX_PER_IDENTITY, 16);
+        assert_eq!(DEFAULT_ENVOY_MEMORY_MAX_TURNS, 40);
+        assert_eq!(DEFAULT_ENVOY_MEMORY_MAX_BYTES, 65_536);
+        assert_eq!(DEFAULT_ENVOY_MEMORY_TTL_HOURS, 168);
     }
 
     #[test]
@@ -391,6 +692,54 @@ mod tests {
     fn mesh_block_ignores_unknown_key_within_mesh() {
         let cfg: Config = serde_yaml::from_str("mesh: {bogus: 1}\n").unwrap();
         assert_eq!(cfg.mesh, MeshConfig::default());
+    }
+
+    #[test]
+    fn mesh_fetch_block_ignores_unknown_key_within_fetch() {
+        let cfg: Config = serde_yaml::from_str("mesh:\n  fetch: {bogus: 1}\n").unwrap();
+        assert_eq!(cfg.mesh, MeshConfig::default());
+        let cfg: Config =
+            serde_yaml::from_str("mesh:\n  fetch:\n    inline_max_bytes: 1024\n").unwrap();
+        assert_eq!(cfg.mesh.fetch.inline_max_bytes, 1024);
+    }
+
+    #[test]
+    fn mesh_envoy_memory_block_ignores_unknown_key_within_envoy_memory() {
+        let cfg: Config = serde_yaml::from_str("mesh:\n  envoy_memory: {bogus: 1}\n").unwrap();
+        assert_eq!(cfg.mesh, MeshConfig::default());
+        let cfg: Config =
+            serde_yaml::from_str("mesh:\n  envoy_memory:\n    max_turns: 12\n").unwrap();
+        assert_eq!(cfg.mesh.envoy_memory.max_turns, 12);
+        assert!(!cfg.mesh.envoy_memory.enabled);
+    }
+
+    /// `collision_protection` reads as a plain boolean, is absent-means-off beside other
+    /// mesh keys, rejects a non-boolean, and shows in `.mesh info`.
+    #[test]
+    fn usage_probe_collision_protection_parses_as_a_bool_and_defaults_off() {
+        let cfg: Config = serde_yaml::from_str("mesh:\n  knock_retention_hours: 5\n").unwrap();
+        assert!(!cfg.mesh.collision_protection);
+        let cfg: Config = serde_yaml::from_str("mesh:\n  collision_protection: true\n").unwrap();
+        assert!(cfg.mesh.collision_protection);
+        assert!(
+            serde_yaml::from_str::<Config>("mesh:\n  collision_protection: sometimes\n").is_err()
+        );
+        let on = MeshConfig {
+            collision_protection: true,
+            ..MeshConfig::default()
+        };
+        let on_row = render_mesh_info(&on)
+            .lines()
+            .find(|line| line.contains("collision_protection"))
+            .map(str::to_string)
+            .expect("a collision_protection row");
+        assert!(on_row.trim_end().ends_with("true"), "{on_row}");
+        let default_row = render_mesh_info(&MeshConfig::default())
+            .lines()
+            .find(|line| line.contains("collision_protection"))
+            .map(str::to_string)
+            .expect("a collision_protection row");
+        assert!(default_row.trim_end().ends_with("false"), "{default_row}");
     }
 
     #[test]
@@ -466,11 +815,11 @@ mod tests {
     #[test]
     fn disabled_block_with_out_of_range_rate_limit_parses_and_validates() {
         let cfg: Config = serde_yaml::from_str(
-            "mesh:\n  enabled: false\n  interfaces: []\n  peer_max_concurrent: 0\n  knock_retention_hours: 0\n",
+            "mesh:\n  enabled: false\n  interfaces: []\n  request_timeout_secs: 1\n  knock_retention_hours: 0\n",
         )
         .unwrap();
         assert!(!cfg.mesh.enabled);
-        assert_eq!(cfg.mesh.peer_max_concurrent, 0);
+        assert_eq!(cfg.mesh.request_timeout_secs, Some(1));
         cfg.mesh.validate(false).unwrap();
     }
 
@@ -615,7 +964,7 @@ mod tests {
         let mesh = MeshConfig {
             enabled: false,
             interfaces: vec![],
-            peer_max_concurrent: 0,
+            request_timeout_secs: Some(1),
             ..Default::default()
         };
         mesh.validate(false).unwrap();
@@ -630,7 +979,10 @@ mod tests {
         };
         let err = mesh.validate(true).unwrap_err().to_string();
         assert!(err.contains("mesh.interfaces is empty"), "{err}");
-        assert!(err.contains("{type: lan}"), "{err}");
+        assert!(
+            err.contains("{type: private, host: 127.0.0.1, port: 4242}"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -652,33 +1004,31 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_zero_peer_max_concurrent() {
+    fn validate_accepts_zero_peer_max_concurrent_as_unlimited() {
         let mesh = MeshConfig {
             enabled: true,
             peer_max_concurrent: 0,
             ..Default::default()
         };
-        let err = mesh.validate(true).unwrap_err().to_string();
-        assert!(
-            err.contains("mesh.peer_max_concurrent is 0, which is out of range"),
-            "{err}"
-        );
+        mesh.validate(true).unwrap();
     }
 
     #[test]
-    fn validate_rejects_zero_for_every_rate_and_retention_key() {
+    fn validate_rejects_zero_retention_and_accepts_zero_on_every_peer_budget() {
         let enabled = MeshConfig {
             enabled: true,
             ..Default::default()
         };
-        let cases = [
-            (
-                "knock_retention_hours",
-                MeshConfig {
-                    knock_retention_hours: 0,
-                    ..enabled.clone()
-                },
-            ),
+        let retention = MeshConfig {
+            knock_retention_hours: 0,
+            ..enabled.clone()
+        };
+        let err = retention.validate(true).unwrap_err().to_string();
+        assert!(
+            err.contains("mesh.knock_retention_hours is 0, which is out of range; use 1 or more"),
+            "{err}"
+        );
+        let unlimited = [
             (
                 "peer_max_concurrent",
                 MeshConfig {
@@ -701,17 +1051,212 @@ mod tests {
                 },
             ),
         ];
-        for (key, mesh) in cases {
-            let err = mesh.validate(true).unwrap_err().to_string();
-            let expected = format!("mesh.{key} is 0, which is out of range; use 1 or more");
-            assert!(err.contains(&expected), "{key}: {err}");
+        for (key, mesh) in unlimited {
+            mesh.validate(true)
+                .unwrap_or_else(|err| panic!("{key}: {err}"));
         }
     }
 
-    /// Usage probe (TASK-100 (b)/(f)): the documented `0 = fetch only on .mesh fetch` is a
-    /// VALID setting for an enabled mesh, unlike the rate and retention keys where 0 is out
-    /// of range; an absent key reads as the documented 300; a negative or fractional value
-    /// is refused at parse time naming the key rather than silently clamped.
+    /// Both timers default to unset, which serialises as `null` and reads back as unset;
+    /// set, each is accepted from its floor to the one-year cap and refused outside that
+    /// with a message naming the key, the value, the floor, the cap and `null`. The floors
+    /// are the shortest built-in deadlines on the paths the timers govern, so a value valid
+    /// for one path is valid for all; the cap is the sync interval's.
+    #[test]
+    fn validate_accepts_timers_from_their_floors_and_refuses_lower_ones_naming_the_floor() {
+        assert_eq!(MeshConfig::default().request_timeout_secs, None);
+        assert_eq!(MeshConfig::default().link_timeout_secs, None);
+        assert_eq!(PEER_REQUEST_TIMEOUT.as_secs(), 15);
+        assert_eq!(DEFAULT_LINK_TIMEOUT.as_secs(), 10);
+        assert_eq!(MAX_TIMEOUT_SECS, MAX_PROPAGATION_SYNC_INTERVAL_SECS);
+        let serialized = serde_yaml::to_string(&MeshConfig::default()).unwrap();
+        assert!(
+            serialized.contains("request_timeout_secs: null\n"),
+            "{serialized}"
+        );
+        assert!(
+            serialized.contains("link_timeout_secs: null\n"),
+            "{serialized}"
+        );
+        let null: Config = serde_yaml::from_str(
+            "mesh:\n  request_timeout_secs: null\n  link_timeout_secs: null\n",
+        )
+        .unwrap();
+        assert_eq!(null.mesh, MeshConfig::default());
+
+        let enabled = MeshConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let with = |request: Option<u64>, link: Option<u64>| MeshConfig {
+            request_timeout_secs: request,
+            link_timeout_secs: link,
+            ..enabled.clone()
+        };
+        for (request, link) in [
+            (None, None),
+            (Some(15), Some(10)),
+            (Some(90), Some(45)),
+            (Some(MAX_TIMEOUT_SECS), Some(MAX_TIMEOUT_SECS)),
+        ] {
+            with(request, link)
+                .validate(true)
+                .unwrap_or_else(|err| panic!("{request:?}/{link:?}: {err}"));
+        }
+        let err = with(Some(14), None).validate(true).unwrap_err().to_string();
+        assert!(
+            err.contains("mesh.request_timeout_secs is 14, which is out of range; use 15 ("),
+            "{err}"
+        );
+        assert!(
+            err.contains(") to 31536000 (one year), or null to keep each path's built-in deadline"),
+            "{err}"
+        );
+        let err = with(None, Some(9)).validate(true).unwrap_err().to_string();
+        assert!(
+            err.contains("mesh.link_timeout_secs is 9, which is out of range; use 10 ("),
+            "{err}"
+        );
+        let err = with(Some(1), Some(1))
+            .validate(true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("mesh.request_timeout_secs is 1"), "{err}");
+        for (request, link, key) in [
+            (Some(MAX_TIMEOUT_SECS + 1), None, "request_timeout_secs"),
+            (None, Some(MAX_TIMEOUT_SECS + 1), "link_timeout_secs"),
+            (Some(u64::MAX), Some(u64::MAX), "request_timeout_secs"),
+        ] {
+            let err = with(request, link).validate(true).unwrap_err().to_string();
+            assert!(
+                err.starts_with(&format!(
+                    "mesh.{key} is {}, which is out of range; use ",
+                    request.or(link).unwrap()
+                )),
+                "{request:?}/{link:?}: {err}"
+            );
+            assert!(
+                err.contains("to 31536000 (one year), or null"),
+                "{request:?}/{link:?}: {err}"
+            );
+        }
+
+        let disabled = MeshConfig {
+            request_timeout_secs: Some(1),
+            link_timeout_secs: Some(1),
+            ..Default::default()
+        };
+        disabled.validate(false).unwrap();
+    }
+
+    /// Usage probe: the refusal for a timer under its floor or over the cap is the whole
+    /// sentence the Mesh-Configuration page quotes, for both keys; `0` on a timer is NOT
+    /// the "unlimited" its budget neighbours mean, it is a value under the floor and
+    /// refused as one; and a timer written in YAML as a number reads back as that number,
+    /// as `null` reads back unset.
+    #[test]
+    fn usage_probe_timer_refusals_spell_the_documented_sentence_and_zero_is_not_unlimited() {
+        let enabled = MeshConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let with = |request: Option<u64>, link: Option<u64>| MeshConfig {
+            request_timeout_secs: request,
+            link_timeout_secs: link,
+            ..enabled.clone()
+        };
+        let sentence = |key: &str, value: u64, floor: u64| {
+            format!(
+                "mesh.{key} is {value}, which is out of range; use {floor} (the shortest built-in deadline, which this key raises but never lowers) to {MAX_TIMEOUT_SECS} (one year), or null to keep each path's built-in deadline"
+            )
+        };
+        for (request, link, key, value, floor) in [
+            (Some(14), None, "request_timeout_secs", 14, 15),
+            (Some(0), None, "request_timeout_secs", 0, 15),
+            (None, Some(9), "link_timeout_secs", 9, 10),
+            (None, Some(0), "link_timeout_secs", 0, 10),
+            (None, Some(31_536_001), "link_timeout_secs", 31_536_001, 10),
+            // a valid request timer does not excuse a bad link timer
+            (Some(600), Some(9), "link_timeout_secs", 9, 10),
+        ] {
+            let err = with(request, link).validate(true).unwrap_err().to_string();
+            assert_eq!(err, sentence(key, value, floor), "{request:?}/{link:?}");
+            assert!(!err.contains("invalid"), "{err}");
+        }
+
+        let parsed: Config = serde_yaml::from_str(
+            "mesh:\n  enabled: false\n  request_timeout_secs: 20\n  link_timeout_secs: 12\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.mesh.request_timeout_secs, Some(20));
+        assert_eq!(parsed.mesh.link_timeout_secs, Some(12));
+        let absent: Config = serde_yaml::from_str("mesh:\n  enabled: false\n").unwrap();
+        assert_eq!(absent.mesh.request_timeout_secs, None);
+        assert_eq!(absent.mesh.link_timeout_secs, None);
+        let round_trip: MeshConfig =
+            serde_yaml::from_str(&serde_yaml::to_string(&with(Some(20), Some(12))).unwrap())
+                .unwrap();
+        assert_eq!(round_trip.request_timeout_secs, Some(20));
+        assert_eq!(round_trip.link_timeout_secs, Some(12));
+        // a negative number is not a u64: refused at parse time, before validate
+        serde_yaml::from_str::<Config>("mesh:\n  request_timeout_secs: -5\n").unwrap_err();
+    }
+
+    /// Usage probe: every peer budget at `0` at once, alongside timers at their floors,
+    /// validates; the cost ceiling keeps its own `0 = no ceiling` rule and wording, and
+    /// the retention key keeps refusing `0` with the sentence the docs still carry, so a
+    /// config that lifts every peer budget is only one key away from a refusal.
+    #[test]
+    fn usage_probe_every_peer_budget_at_zero_at_once_validates_and_the_other_keys_keep_their_rules()
+    {
+        let lifted = MeshConfig {
+            enabled: true,
+            peer_max_concurrent: 0,
+            peer_max_messages_per_hour: 0,
+            peer_max_tokens_per_hour: 0,
+            peer_max_cost_usd_per_hour: 0.0,
+            request_timeout_secs: Some(15),
+            link_timeout_secs: Some(10),
+            ..Default::default()
+        };
+        lifted.validate(true).unwrap();
+        let parsed: Config = serde_yaml::from_str(
+            "mesh:\n  enabled: true\n  peer_max_concurrent: 0\n  peer_max_messages_per_hour: 0\n  peer_max_tokens_per_hour: 0\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.mesh.peer_max_concurrent, 0);
+        assert_eq!(parsed.mesh.peer_max_messages_per_hour, 0);
+        assert_eq!(parsed.mesh.peer_max_tokens_per_hour, 0);
+        parsed.mesh.validate(true).unwrap();
+
+        let err = MeshConfig {
+            knock_retention_hours: 0,
+            ..lifted.clone()
+        }
+        .validate(true)
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            err,
+            "mesh.knock_retention_hours is 0, which is out of range; use 1 or more"
+        );
+        let err = MeshConfig {
+            peer_max_cost_usd_per_hour: -1.0,
+            ..lifted.clone()
+        }
+        .validate(true)
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            err,
+            "mesh.peer_max_cost_usd_per_hour is -1, which is out of range; use 0 (no ceiling) or a positive amount"
+        );
+    }
+
+    /// Usage probe: the documented `0 = fetch only on .mesh sync` is a VALID setting for an
+    /// enabled mesh, unlike `knock_retention_hours`, where 0 is out of range; an absent
+    /// key reads as the documented 300; a negative or fractional value is refused at parse
+    /// time naming the key rather than silently clamped.
     #[test]
     fn propagation_sync_interval_zero_is_manual_and_valid_while_negatives_fail_to_parse() {
         let enabled = "mesh:\n  enabled: true\n  interfaces:\n    - {type: private, host: relay, port: 4242}\n";
@@ -799,6 +1344,333 @@ mod tests {
     }
 
     #[test]
+    fn validate_caps_about_at_the_card_limit_counting_characters() {
+        let enabled = MeshConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        for accepted in [
+            String::new(),
+            "\u{e9}".repeat(ABOUT_MAX_CHARS),
+            "a".repeat(ABOUT_MAX_CHARS),
+        ] {
+            let mesh = MeshConfig {
+                about: Some(accepted),
+                ..enabled.clone()
+            };
+            mesh.validate(true).unwrap();
+        }
+        let mesh = MeshConfig {
+            about: Some("\u{e9}".repeat(ABOUT_MAX_CHARS + 1)),
+            ..enabled
+        };
+        let err = mesh.validate(true).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "mesh.about is 201 characters, which is over the cap; use 200 or fewer"
+        );
+    }
+
+    #[test]
+    fn validate_keeps_inline_max_bytes_between_one_and_the_per_message_total() {
+        let enabled = MeshConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        for accepted in [1, DEFAULT_INLINE_MAX_BYTES, MAX_INLINE_FILE_TOTAL] {
+            let mesh = MeshConfig {
+                fetch: MeshFetch {
+                    inline_max_bytes: accepted,
+                    ..Default::default()
+                },
+                ..enabled.clone()
+            };
+            mesh.validate(true).unwrap();
+        }
+        for refused in [0, MAX_INLINE_FILE_TOTAL + 1, u64::MAX] {
+            let mesh = MeshConfig {
+                fetch: MeshFetch {
+                    inline_max_bytes: refused,
+                    ..Default::default()
+                },
+                ..enabled.clone()
+            };
+            let err = mesh.validate(true).unwrap_err().to_string();
+            assert_eq!(
+                err,
+                format!(
+                    "mesh.fetch.inline_max_bytes is {refused}, which is out of range; use 1 to 98304"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn validate_keeps_fetch_max_bytes_between_one_and_the_file_ceiling() {
+        let enabled = MeshConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        for accepted in [1, DEFAULT_FETCH_MAX_BYTES, MAX_FETCH_FILE_BYTES] {
+            let mesh = MeshConfig {
+                fetch: MeshFetch {
+                    max_bytes: accepted,
+                    ..Default::default()
+                },
+                ..enabled.clone()
+            };
+            mesh.validate(true).unwrap();
+        }
+        for refused in [0, MAX_FETCH_FILE_BYTES + 1, u64::MAX] {
+            let mesh = MeshConfig {
+                fetch: MeshFetch {
+                    max_bytes: refused,
+                    ..Default::default()
+                },
+                ..enabled.clone()
+            };
+            let err = mesh.validate(true).unwrap_err().to_string();
+            assert_eq!(
+                err,
+                format!(
+                    "mesh.fetch.max_bytes is {refused}, which is out of range; use 1 to 4194304"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn validate_requires_an_absolute_inbox_dir_when_one_is_set() {
+        let enabled = MeshConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let absolute = std::env::temp_dir();
+        let mesh = MeshConfig {
+            fetch: MeshFetch {
+                inbox_dir: Some(absolute.clone()),
+                ..Default::default()
+            },
+            ..enabled.clone()
+        };
+        mesh.validate(true).unwrap();
+
+        let relative = MeshConfig {
+            fetch: MeshFetch {
+                inbox_dir: Some(PathBuf::from("relative/inbox")),
+                ..Default::default()
+            },
+            ..enabled
+        };
+        let err = relative.validate(true).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "mesh.fetch.inbox_dir is 'relative/inbox', which is not absolute; use an absolute path"
+        );
+    }
+
+    fn envoy_memory_error(memory: EnvoyMemoryConfig) -> String {
+        let mesh = MeshConfig {
+            enabled: true,
+            envoy_memory: memory,
+            ..Default::default()
+        };
+        mesh.validate(true).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn mesh_envoy_memory_max_sessions_zero_is_out_of_range() {
+        let err = envoy_memory_error(EnvoyMemoryConfig {
+            max_sessions: 0,
+            ..Default::default()
+        });
+        assert_eq!(
+            err,
+            "mesh.envoy_memory.max_sessions is 0, which is out of range; use 1 or more"
+        );
+    }
+
+    #[test]
+    fn mesh_envoy_memory_max_per_identity_zero_is_out_of_range() {
+        let err = envoy_memory_error(EnvoyMemoryConfig {
+            max_per_identity: 0,
+            ..Default::default()
+        });
+        assert_eq!(
+            err,
+            "mesh.envoy_memory.max_per_identity is 0, which is out of range; use 1 or more"
+        );
+    }
+
+    #[test]
+    fn mesh_envoy_memory_max_turns_zero_is_out_of_range() {
+        let err = envoy_memory_error(EnvoyMemoryConfig {
+            max_turns: 0,
+            ..Default::default()
+        });
+        assert_eq!(
+            err,
+            "mesh.envoy_memory.max_turns is 0, which is out of range; use 1 or more"
+        );
+    }
+
+    #[test]
+    fn mesh_envoy_memory_max_bytes_zero_is_out_of_range() {
+        let err = envoy_memory_error(EnvoyMemoryConfig {
+            max_bytes: 0,
+            ..Default::default()
+        });
+        assert_eq!(
+            err,
+            "mesh.envoy_memory.max_bytes is 0, which is out of range; use 1 or more"
+        );
+    }
+
+    #[test]
+    fn mesh_envoy_memory_ttl_hours_zero_is_out_of_range() {
+        let err = envoy_memory_error(EnvoyMemoryConfig {
+            ttl_hours: 0,
+            ..Default::default()
+        });
+        assert_eq!(
+            err,
+            "mesh.envoy_memory.ttl_hours is 0, which is out of range; use 1 or more"
+        );
+    }
+
+    #[test]
+    fn mesh_envoy_memory_accepts_the_floor() {
+        for enabled in [false, true] {
+            let mesh = MeshConfig {
+                enabled: true,
+                envoy_memory: EnvoyMemoryConfig {
+                    enabled,
+                    max_sessions: 1,
+                    max_per_identity: 1,
+                    max_turns: 1,
+                    max_bytes: 1,
+                    ttl_hours: 1,
+                },
+                ..Default::default()
+            };
+            mesh.validate(true).unwrap();
+        }
+    }
+
+    #[test]
+    fn an_existing_inbox_dir_is_used_as_configured_without_translating() {
+        let tmp = TempDir::new("mesh-config-inbox-exists");
+
+        let resolved = resolve_inbox_dir(&tmp.path, |_| {
+            panic!("an inbox_dir that exists is not translated")
+        });
+
+        assert_eq!(resolved, tmp.path);
+    }
+
+    #[test]
+    fn a_missing_inbox_dir_whose_translation_exists_resolves_to_the_translation() {
+        let tmp = TempDir::new("mesh-config-inbox-translated");
+        let configured = tmp.path.join("missing");
+        let translated = tmp.path.join("inbox");
+        std::fs::create_dir_all(&translated).unwrap();
+
+        let resolved = resolve_inbox_dir(&configured, |path| {
+            assert_eq!(path, configured);
+            Some(translated.clone())
+        });
+
+        assert_eq!(resolved, translated);
+    }
+
+    #[test]
+    fn resolving_the_same_missing_inbox_dir_twice_translates_it_the_same_way_both_times() {
+        let tmp = TempDir::new("mesh-config-inbox-twice");
+        let configured = tmp.path.join("missing");
+        let translated = tmp.path.join("inbox");
+        std::fs::create_dir_all(&translated).unwrap();
+        let translate = |_: &Path| Some(translated.clone());
+
+        let first = resolve_inbox_dir(&configured, translate);
+        let second = resolve_inbox_dir(&configured, translate);
+
+        assert_eq!(first, translated);
+        assert_eq!(second, first);
+    }
+
+    #[test]
+    fn a_missing_inbox_dir_with_no_usable_translation_is_returned_as_configured() {
+        let tmp = TempDir::new("mesh-config-inbox-untranslated");
+        let configured = tmp.path.join("missing");
+        let also_missing = tmp.path.join("also-missing");
+
+        assert_eq!(resolve_inbox_dir(&configured, |_| None), configured);
+        assert_eq!(
+            resolve_inbox_dir(&configured, |_| Some(also_missing.clone())),
+            configured
+        );
+        assert!(!configured.exists(), "resolving creates nothing");
+        assert!(!also_missing.exists());
+    }
+
+    /// The real translator is wired in: under `IS_SANDBOX` a `/home/<user>` path maps to
+    /// `/home/agent`, and when nothing is there either the configured path comes back.
+    #[test]
+    #[serial]
+    fn inbox_dir_falls_through_to_the_configured_path_when_the_sandbox_translation_is_missing() {
+        let _sandbox = EnvVarGuard::set("IS_SANDBOX", "1");
+        let unique = format!("coyote-inbox-{}", uuid::Uuid::new_v4().simple());
+        let configured = PathBuf::from(format!("/home/someone/{unique}"));
+        assert_eq!(
+            paths::translate_sandboxed_home_dir(&configured),
+            Some(PathBuf::from(format!("/home/agent/{unique}")))
+        );
+        assert!(!Path::new(&format!("/home/agent/{unique}")).exists());
+        let fetch = MeshFetch {
+            inbox_dir: Some(configured.clone()),
+            ..Default::default()
+        };
+
+        assert_eq!(fetch.inbox_dir(), Some(configured));
+        assert_eq!(MeshFetch::default().inbox_dir(), None);
+    }
+
+    /// The public method, not just the seam: an `inbox_dir` that exists comes back exactly
+    /// as configured even under `IS_SANDBOX`, with nothing created and the stored field
+    /// untouched (the field and the method share a name, as `vault_password_file` does).
+    #[test]
+    #[serial]
+    fn usage_probe_an_existing_inbox_dir_is_returned_as_configured_by_the_method() {
+        let _sandbox = EnvVarGuard::set("IS_SANDBOX", "1");
+        let tmp = TempDir::new("mesh-config-inbox-method-exists");
+        let fetch = MeshFetch {
+            inbox_dir: Some(tmp.path.clone()),
+            ..Default::default()
+        };
+
+        assert_eq!(fetch.inbox_dir(), Some(tmp.path.clone()));
+        assert_eq!(fetch.inbox_dir.as_deref(), Some(tmp.path.as_path()));
+        assert_eq!(std::fs::read_dir(&tmp.path).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn fetch_block_reads_max_bytes_and_inbox_dir_and_serialises_an_unset_inbox_dir_as_null() {
+        let cfg: Config = serde_yaml::from_str(
+            "mesh:\n  fetch:\n    max_bytes: 1024\n    inbox_dir: /srv/inbox\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.mesh.fetch.max_bytes, 1024);
+        assert_eq!(cfg.mesh.fetch.inbox_dir, Some(PathBuf::from("/srv/inbox")));
+        assert_eq!(cfg.mesh.fetch.inline_max_bytes, DEFAULT_INLINE_MAX_BYTES);
+
+        let serialized = serde_yaml::to_string(&MeshFetch::default()).unwrap();
+        assert!(serialized.contains("inbox_dir: null"), "{serialized}");
+        assert!(serialized.contains("max_bytes: 4194304\n"), "{serialized}");
+        let null: Config = serde_yaml::from_str("mesh:\n  fetch:\n    inbox_dir: null\n").unwrap();
+        assert_eq!(null.mesh.fetch, MeshFetch::default());
+    }
+
+    #[test]
     fn render_mesh_info_marks_a_zero_cost_ceiling_as_off() {
         let info = render_mesh_info(&MeshConfig::default());
         assert!(
@@ -817,6 +1689,38 @@ mod tests {
     }
 
     #[test]
+    fn render_mesh_info_marks_a_zero_peer_budget_as_unlimited() {
+        let info = render_mesh_info(&MeshConfig::default());
+        assert!(
+            info.contains("  peer_max_concurrent             1\n"),
+            "{info}"
+        );
+        assert!(
+            info.contains("  peer_max_messages_per_hour      60\n"),
+            "{info}"
+        );
+        assert!(
+            info.contains("  peer_max_tokens_per_hour        100000\n"),
+            "{info}"
+        );
+        let unlimited = MeshConfig {
+            peer_max_concurrent: 0,
+            peer_max_messages_per_hour: 0,
+            peer_max_tokens_per_hour: 0,
+            ..Default::default()
+        };
+        let info = render_mesh_info(&unlimited);
+        for key in [
+            "peer_max_concurrent",
+            "peer_max_messages_per_hour",
+            "peer_max_tokens_per_hour",
+        ] {
+            let row = format!("  {key:<MESH_INFO_LABEL_WIDTH$}0 (unlimited)\n");
+            assert!(info.contains(&row), "{key}: {info}");
+        }
+    }
+
+    #[test]
     fn render_mesh_info_marks_a_zero_sync_interval_as_manual() {
         let info = render_mesh_info(&MeshConfig::default());
         assert!(
@@ -830,6 +1734,33 @@ mod tests {
         let info = render_mesh_info(&manual);
         assert!(
             info.contains("  propagation_sync_interval_secs  0 (manual)\n"),
+            "{info}"
+        );
+    }
+
+    #[test]
+    fn render_mesh_info_shows_unset_timers_as_null_and_set_ones_in_seconds() {
+        let info = render_mesh_info(&MeshConfig::default());
+        assert!(
+            info.contains("  request_timeout_secs            null\n"),
+            "{info}"
+        );
+        assert!(
+            info.contains("  link_timeout_secs               null\n"),
+            "{info}"
+        );
+        let raised = MeshConfig {
+            request_timeout_secs: Some(90),
+            link_timeout_secs: Some(45),
+            ..Default::default()
+        };
+        let info = render_mesh_info(&raised);
+        assert!(
+            info.contains("  request_timeout_secs            90\n"),
+            "{info}"
+        );
+        assert!(
+            info.contains("  link_timeout_secs               45\n"),
             "{info}"
         );
     }
@@ -893,11 +1824,81 @@ mod tests {
             "{info}"
         );
         assert!(
+            info.contains("  about                           null\n"),
+            "{info}"
+        );
+        assert!(
             info.contains("  brief                           manual\n"),
             "{info}"
         );
         assert!(
             info.contains("  peer_max_tokens_per_hour        100000\n"),
+            "{info}"
+        );
+        assert!(
+            info.contains("  fetch.inline_max_bytes          65536\n"),
+            "{info}"
+        );
+        assert!(
+            info.ends_with(concat!(
+                "  fetch.max_bytes                 4194304\n",
+                "  fetch.inbox_dir                 null\n",
+                "  envoy_memory.enabled            false\n",
+                "  envoy_memory.max_sessions       256\n",
+                "  envoy_memory.max_per_identity   16\n",
+                "  envoy_memory.max_turns          40\n",
+                "  envoy_memory.max_bytes          65536\n",
+                "  envoy_memory.ttl_hours          168\n",
+            )),
+            "{info}"
+        );
+    }
+
+    #[test]
+    fn render_mesh_settings_without_interfaces_drops_only_the_interface_rows() {
+        let mesh = MeshConfig {
+            interfaces: vec![
+                MeshInterface::Lan,
+                MeshInterface::Private {
+                    host: "relay.example.com".into(),
+                    port: 4242,
+                },
+                MeshInterface::Public {
+                    host: "node.example.com".into(),
+                    port: 4242,
+                },
+            ],
+            ..Default::default()
+        };
+        let with_interfaces = render_mesh_info(&mesh);
+        let without: String = with_interfaces
+            .lines()
+            .filter(|line| !line.starts_with("  interfaces["))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        assert_eq!(with_interfaces.lines().count(), without.lines().count() + 3);
+        assert_eq!(render_mesh_settings(&mesh, false), without);
+        assert_eq!(render_mesh_settings(&mesh, true), with_interfaces);
+    }
+
+    #[test]
+    fn render_mesh_info_shows_a_configured_inbox_dir() {
+        let mesh = MeshConfig {
+            fetch: MeshFetch {
+                inbox_dir: Some(PathBuf::from("/srv/inbox")),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let info = render_mesh_info(&mesh);
+
+        assert!(
+            info.contains("  fetch.inbox_dir                 /srv/inbox\n"),
+            "{info}"
+        );
+        assert!(
+            info.ends_with("  envoy_memory.ttl_hours          168\n"),
             "{info}"
         );
     }

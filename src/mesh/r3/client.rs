@@ -1,7 +1,9 @@
 use crate::mesh::protocol::VersionRefusal;
+use crate::mesh::r3::dispatch::FETCH_PATH;
 use crate::mesh::r3::error::{R3Error, RefusalCode};
 use crate::mesh::r3::frame::{
-    Envelope, MAX_R3_PAYLOAD_BYTES, RequestFrame, RequestId, ResponseFrame,
+    Envelope, MAX_FETCH_RESPONSE_BYTES, MAX_R3_PAYLOAD_BYTES, RESPONSE_FRAME_PREFIX, RequestFrame,
+    RequestId, ResponseFrame,
 };
 #[cfg(all(test, unix))]
 use crate::mesh::r3::receipt::RequestReceipt;
@@ -33,7 +35,7 @@ pub(crate) const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Ceiling on link establishment, before the request itself is sent.
 pub(crate) const DEFAULT_LINK_TIMEOUT: Duration = Duration::from_secs(10);
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RequestOptions {
     pub request_timeout: Duration,
     pub link_timeout: Duration,
@@ -112,6 +114,8 @@ type Correlated = Result<(Value, SizeBranch), R3Error>;
 
 struct PendingRequest {
     link_id: LinkId,
+    /// The path requested, which decides the size bound its response is held to.
+    path: String,
     reply: oneshot::Sender<Correlated>,
     /// Fires when the far end proves it holds the request; only a resource gets that proof.
     delivered: Option<oneshot::Sender<()>>,
@@ -353,7 +357,7 @@ impl R3Client {
                 request_id.to_hex_string(),
                 packed.len()
             );
-            let receiver = self.insert_pending(request_id, link_id, None)?;
+            let receiver = self.insert_pending(request_id, link_id, path, None)?;
             let guard = PendingGuard {
                 client: self,
                 request_id,
@@ -380,7 +384,7 @@ impl R3Client {
                 request_id.to_hex_string(),
                 packed.len()
             );
-            let receiver = self.insert_pending(request_id, link_id, delivered)?;
+            let receiver = self.insert_pending(request_id, link_id, path, delivered)?;
             let guard = PendingGuard {
                 client: self,
                 request_id,
@@ -453,10 +457,11 @@ impl R3Client {
 
     /// `Shutdown` once `run` has exited: a link may outlive the client loop, and a request
     /// filed after the drain would otherwise wait out its full timeout.
-    fn insert_pending(
+    pub(crate) fn insert_pending(
         &self,
         request_id: RequestId,
         link_id: LinkId,
+        path: &str,
         delivered: Option<oneshot::Sender<()>>,
     ) -> Result<oneshot::Receiver<Correlated>, R3Error> {
         let (reply, receiver) = oneshot::channel();
@@ -468,6 +473,7 @@ impl R3Client {
             request_id,
             PendingRequest {
                 link_id,
+                path: path.to_string(),
                 reply,
                 delivered,
                 resource_hash: None,
@@ -567,7 +573,7 @@ impl R3Client {
             }
             // Deliberately not fast-failed yet: a peer that rejects the advertisement waits
             // out the request deadline. Changing that alters the wedge-test expectations and
-            // is tracked as a TASK-063 follow-up; the arm is named so it cannot hide in `_`.
+            // is tracked as a follow-up; the arm is named so it cannot hide in `_`.
             ResourceEventKind::OutboundRejected => {}
             _ => {}
         }
@@ -575,13 +581,27 @@ impl R3Client {
 
     /// Resolves the pending request a response answers, provided it arrived on the link the
     /// request went out on. This is where the payload cap is enforced: after assembly, on
-    /// our side. The only bound before assembly is the upstream 64 MiB advertisement cap
-    /// (`advertisement_limits.rs`), because the upstream reject path deadlocks the transport
-    /// (rev 3ed5932 and release 0.12.0).
-    fn deliver(&self, link_id: LinkId, bytes: &[u8], branch: SizeBranch) {
-        if bytes.len() > MAX_R3_PAYLOAD_BYTES {
+    /// our side, and per path: a `/fetch` response may run to `MAX_FETCH_RESPONSE_BYTES`,
+    /// every other to `MAX_R3_PAYLOAD_BYTES`. The request id is read off the frame's fixed
+    /// prefix before the frame is decoded so the bound is known before the bytes are
+    /// parsed; bytes that do not start as a frame, or answer nothing pending, get the
+    /// coarse bound and then the per-path one once decoded. The only bound before assembly
+    /// is the upstream 64 MiB advertisement cap (`advertisement_limits.rs`), because the
+    /// upstream reject path deadlocks the transport (rev 3ed5932 and release 0.12.0).
+    pub(crate) fn deliver(&self, link_id: LinkId, bytes: &[u8], branch: SizeBranch) {
+        let path_bound = |path: &str| {
+            if path == FETCH_PATH {
+                MAX_FETCH_RESPONSE_BYTES
+            } else {
+                MAX_R3_PAYLOAD_BYTES
+            }
+        };
+        let max = self
+            .pending_path(bytes)
+            .map_or(MAX_FETCH_RESPONSE_BYTES, |path| path_bound(&path));
+        if bytes.len() > max {
             debug!(
-                "Dropped an oversize mesh response on link {} ({} bytes, max {MAX_R3_PAYLOAD_BYTES})",
+                "Dropped an oversize mesh response on link {} ({} bytes, max {max})",
                 link_id.to_hex_string(),
                 bytes.len()
             );
@@ -615,6 +635,15 @@ impl R3Client {
                 );
                 return;
             }
+            let max = path_bound(&entry.path);
+            if bytes.len() > max {
+                debug!(
+                    "Dropped an oversize mesh response on link {} ({} bytes, max {max})",
+                    link_id.to_hex_string(),
+                    bytes.len()
+                );
+                return;
+            }
             pending.remove(&frame.request_id)
         };
         let Some(pending) = pending else {
@@ -630,6 +659,19 @@ impl R3Client {
             let _ = delivered.send(());
         }
         let _ = pending.reply.send(Ok((frame.data, branch)));
+    }
+
+    /// The path of the pending request `bytes` answers, read from the frame's fixed prefix
+    /// (`RESPONSE_FRAME_PREFIX` then the 16-byte request id); `None` when the bytes do not
+    /// start that way or nothing pending has that id.
+    fn pending_path(&self, bytes: &[u8]) -> Option<String> {
+        let id_bytes = bytes.strip_prefix(&RESPONSE_FRAME_PREFIX)?.get(..16)?;
+        let request_id = RequestId::from(<[u8; 16]>::try_from(id_bytes).ok()?);
+        self.pending
+            .lock()
+            .by_request
+            .get(&request_id)
+            .map(|entry| entry.path.clone())
     }
 }
 

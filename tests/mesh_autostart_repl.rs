@@ -1,9 +1,9 @@
-//! Black-box coverage of the mesh autostart through the interactive REPL
-//! (TASK-100 criterion (e)), spec-first: `mesh.enabled: true` joins the mesh
-//! when the REPL starts, before the first prompt, without asking; a failed
-//! `.mesh on` precondition prints that refusal and leaves the mesh off with a
-//! usable prompt; `mesh.enabled: false` never mentions joining. The one-shot
-//! side of (e) (`--macro` never autostarts) lives in `macro_bracketing.rs`.
+//! Black-box coverage of the mesh autostart through the interactive REPL:
+//! `mesh.enabled: true` joins the mesh when the REPL starts, before the first
+//! prompt, without asking; a failed `.mesh on` precondition prints that refusal
+//! and leaves the mesh off with a usable prompt; `mesh.enabled: false` never
+//! mentions joining. The one-shot side (`--macro` never autostarts) lives in
+//! `macro_bracketing.rs`.
 //!
 //! Drives the real `coyote` binary through a pty like `envoy_repl.rs`, against
 //! a private-relay interface pointing at a loopback listener this test owns
@@ -293,7 +293,7 @@ fn exit_clean(session: &mut Target) -> WaitStatus {
         .expect("collect the REPL exit status")
 }
 
-/// (e) positive: with a session held, `mesh.enabled: true` joins before the
+/// Positive: with a session held, `mesh.enabled: true` joins before the
 /// first prompt with the autostart notice and the `.mesh on` summary, asks
 /// nothing, fires `mesh.started`, and a node verb works at the first prompt.
 /// `.exit` stops the node (`mesh.stopped`) and exits clean.
@@ -349,7 +349,7 @@ fn repl_with_mesh_enabled_joins_before_the_first_prompt_without_asking() {
     assert_eq!(stopped, 1, "exactly one stop at exit");
 }
 
-/// (e) failed precondition: `mesh.enabled: true` with no session prints the
+/// Failed precondition: `mesh.enabled: true` with no session prints the
 /// autostart notice and the very `.mesh on` refusal, then goes on to a usable
 /// prompt with the mesh off; no node is started (no `mesh.started`).
 #[test]
@@ -385,7 +385,7 @@ fn repl_with_mesh_enabled_but_no_session_prints_the_mesh_on_refusal_and_stays_of
     assert_eq!(started, 0, "no node was started");
 }
 
-/// (e) unchanged: `mesh.enabled: false` with a session held never mentions
+/// Unchanged: `mesh.enabled: false` with a session held never mentions
 /// joining and the mesh is off at the first prompt.
 #[test]
 fn repl_with_mesh_disabled_never_mentions_joining() {

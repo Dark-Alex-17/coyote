@@ -2,6 +2,8 @@ mod completer;
 mod highlighter;
 pub(crate) mod idle;
 pub(crate) mod mesh;
+#[cfg(test)]
+pub(crate) mod mesh_share_vectors;
 mod printer;
 mod prompt;
 mod replay;
@@ -124,7 +126,7 @@ pub const DEFAULT_CONTINUATION_PROMPT: &str = indoc! {"
     5. Otherwise, continue with the next pending item now. Call tools immediately."
 };
 
-static REPL_COMMANDS: LazyLock<[ReplCommand; 84]> = LazyLock::new(|| {
+static REPL_COMMANDS: LazyLock<[ReplCommand; 91]> = LazyLock::new(|| {
     [
         ReplCommand::new(".help", "Show this help guide", AssertState::pass()),
         ReplCommand::new(".info", "Show system info", AssertState::pass()),
@@ -225,12 +227,17 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 84]> = LazyLock::new(|| {
         ),
         ReplCommand::new(
             ".mesh untrust",
-            "Forget a trusted instance, or an identity together with every instance bound to it",
+            "Forget a trusted instance, or an identity with every instance bound to it; `untrust` forgets (an instance of an identity trusted for all is refused instead), `block` remembers and refuses",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh forget",
+            "alias of `untrust`: forget this peer",
             AssertState::pass(),
         ),
         ReplCommand::new(
             ".mesh block",
-            "Silence a whole identity: its knocks are dropped and its trust removed",
+            "Refuse every instance of an identity, including ones you trusted, and drop its knocks; `block` remembers where `untrust` only forgets",
             AssertState::pass(),
         ),
         ReplCommand::new(
@@ -239,28 +246,58 @@ static REPL_COMMANDS: LazyLock<[ReplCommand; 84]> = LazyLock::new(|| {
             AssertState::pass(),
         ),
         ReplCommand::new(
-            ".mesh deny",
-            "Refuse one instance: deny stops one destination being contacted, where block silences a whole identity",
-            AssertState::pass(),
-        ),
-        ReplCommand::new(
-            ".mesh undeny",
-            "Lift a deny on one instance (the identity-level counterpart is unblock)",
-            AssertState::pass(),
-        ),
-        ReplCommand::new(
             ".mesh rotate",
             "Mint a new mesh identity while the node is off; peers must re-trust the new one",
             AssertState::pass(),
         ),
         ReplCommand::new(
-            ".mesh fetch",
-            "Fetch the messages a propagation node holds for this node now",
+            ".mesh sync",
+            "Sync the messages a propagation node holds for this node now",
             AssertState::pass(),
         ),
         ReplCommand::new(
             ".mesh knock",
             "Ask an untrusted peer to trust this instance, with an optional intro",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh allow",
+            "Share files matching a pattern with every trusted peer, or with one peer",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh deny",
+            "Never share files matching a pattern, whatever `allow` says; a share rule, not a peer refusal (that is `untrust`)",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh unshare",
+            "Remove the allow or deny share rule that holds a pattern",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh shares",
+            "List the share rules and the file each came from, or the files a peer can fetch",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh grant",
+            "Grant a peer's access request: once for a while, or standing in the share list",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh refuse",
+            "Refuse a peer's access request",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh fetch",
+            "Fetch one file a trusted peer shares into this node's staging inbox",
+            AssertState::pass(),
+        ),
+        ReplCommand::new(
+            ".mesh memory",
+            "Forget what the envoy remembers of a peer's threads: one identity, one of its threads, or everything",
             AssertState::pass(),
         ),
         ReplCommand::new(
@@ -1425,7 +1462,7 @@ pub async fn run_repl_command(
                     let policy = ctx.macro_policy();
                     match policy.find(name).map(|row| &row.state) {
                         Some(state) if state.is_invocable() => {
-                            macro_execute(ctx, name, extra, abort_signal.clone()).await?;
+                            Box::pin(macro_execute(ctx, name, extra, abort_signal.clone())).await?;
                         }
                         Some(MacroState::DisabledRuntime) => bail!(
                             r#"Macro '{name}' is disabled. Re-enable it with ".macro enable {name}""#
@@ -1442,7 +1479,8 @@ pub async fn run_repl_command(
                                 let app = Arc::clone(&ctx.app.config);
                                 ctx.new_macro(app.as_ref(), name)?;
                             } else {
-                                macro_execute(ctx, name, extra, abort_signal.clone()).await?;
+                                Box::pin(macro_execute(ctx, name, extra, abort_signal.clone()))
+                                    .await?;
                             }
                         }
                     }
@@ -1683,7 +1721,7 @@ pub async fn run_repl_command(
                 let policy = ctx.macro_policy();
                 match policy.find(name).map(|row| &row.state) {
                     Some(MacroState::Enabled) => {
-                        macro_execute(ctx, name, args, abort_signal.clone()).await?;
+                        Box::pin(macro_execute(ctx, name, args, abort_signal.clone())).await?;
                     }
                     Some(MacroState::DisabledRuntime) => bail!(
                         r#"Macro '{name}' is disabled. Re-enable it with ".macro enable {name}""#
@@ -2157,18 +2195,20 @@ fn parse_repl_uninstall(args: Option<&str>) -> ReplUninstallDispatch {
 }
 
 fn repl_save_session_help() -> String {
-    r#"Save the current session to a file.
+    format!(
+        r#"Save the current session to a file.
 
 Usage:
   .save session [name] [--workspace|--global]
 
 Flags:
-  --workspace   Save under .coyote/ in the current workspace
+  --workspace   Save under {}/ in the current workspace
   --global      Save under the global config dir
 
 Without a flag the session is re-saved wherever it currently lives; a brand-new
-session lives in the global scope. Re-homing a session never deletes the old file."#
-        .to_string()
+session lives in the global scope. Re-homing a session never deletes the old file."#,
+        paths::workspace_config_dir_name()
+    )
 }
 
 #[derive(Debug, PartialEq)]
@@ -3382,8 +3422,8 @@ mod tests {
     }
 
     #[test]
-    fn repl_commands_has_84_entries() {
-        assert_eq!(REPL_COMMANDS.len(), 84);
+    fn repl_commands_has_91_entries() {
+        assert_eq!(REPL_COMMANDS.len(), 91);
     }
 
     #[test]
@@ -3400,7 +3440,7 @@ mod tests {
             .iter()
             .map(|(verb, description, _)| (*verb, *description))
             .collect();
-        assert_eq!(commands.len(), 21);
+        assert_eq!(commands.len(), 28);
         assert_eq!(commands, verbs);
     }
 
@@ -3729,7 +3769,20 @@ mod tests {
         }
     }
 
-    // Usage probe (spec-first, criterion 5): `-h/--help` wins from ANY
+    #[test]
+    #[serial]
+    fn repl_save_session_help_names_the_workspace_config_dir_the_process_runs_with() {
+        let _override = EnvVarGuard::set(get_env_name("workspace_config_dir"), ".cfg-help");
+
+        let help = repl_save_session_help();
+
+        assert!(
+            help.contains("  --workspace   Save under .cfg-help/ in the current workspace\n"),
+            "{help}"
+        );
+    }
+
+    // `-h/--help` wins from ANY
     // position — including when it is preceded by a token that would
     // otherwise route to Usage (unknown `-` flag) or Conflict (both scope
     // flags) — while, absent help, an unknown `-` token still routes to

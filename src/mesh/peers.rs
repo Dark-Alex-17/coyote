@@ -1,6 +1,7 @@
 use crate::mesh::announce::{HEARTBEAT_SECS, PEER_MISSED_HEARTBEATS_BEFORE_AGE_OUT};
 use crate::mesh::protocol::Compatibility;
 use crate::mesh::schema::{Remedy, VersionProbe, unversioned_cause, version_refusal};
+use crate::mesh::trust::{InstancePresence, PresenceRow};
 use crate::mesh::{redact_hashes, short, write_atomically};
 
 use anyhow::{Context, Result, bail};
@@ -24,7 +25,7 @@ pub(crate) const PEER_TTL: Duration =
 /// before `PEER_TTL` removes it.
 pub(crate) const PEER_STALE_AFTER: Duration = Duration::from_secs(2 * HEARTBEAT_SECS);
 
-pub(crate) const PEER_TABLE_VERSION: u64 = 1;
+pub(crate) const PEER_TABLE_VERSION: u64 = 2;
 
 /// `peers.json` whole: the version first, then the peers. Rejects unknown fields, as does
 /// each `PeerRecord`, so any change to the layout bumps `PEER_TABLE_VERSION`.
@@ -37,7 +38,7 @@ pub(crate) struct PeerTableFile {
 
 /// One remembered peer. A field with a default is one the table did not always keep; a
 /// record without it still loads, but a field this build does not know refuses the record.
-/// The defaults are a tolerance for hand-edited tables inside version 1, not a migration:
+/// The defaults are a tolerance for hand-edited tables inside one version, not a migration:
 /// a layout change still bumps `PEER_TABLE_VERSION`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -45,14 +46,14 @@ pub(crate) struct PeerRecord {
     pub destination_hash: String,
     pub identity_hash: String,
     /// Lower-hex of the announce's 10-byte name hash; it is what lets the trust store prove
-    /// the destination belongs to the identity. Empty when the table predates the field.
+    /// the destination belongs to the identity. Empty when a current-version table omits it.
     #[serde(default)]
     pub name_hash: String,
     pub display_name: Option<String>,
     pub protocol_version: u16,
     /// Whether this Coyote speaks `protocol_version`, kept so the outbound gate reads a
-    /// verdict. A table written before the field was kept loads it as compatible and
-    /// `load` reconciles it against `protocol_version`.
+    /// verdict. A current-version table that omits it loads it as compatible and `load`
+    /// reconciles it against `protocol_version`.
     #[serde(default)]
     pub compatibility: Compatibility,
     pub hops: u8,
@@ -127,10 +128,10 @@ impl PeerTable {
             .into_iter()
             .filter(|record| !is_expired(record, now))
             .map(|mut record| {
-                // A record written before the field existed loads as compatible and is
-                // judged from its announced version here. An `Incompatible` written by a
-                // previous run is kept as written until the peer's next announce
-                // re-judges it.
+                // A record inside the current version that lacks the field loads as
+                // compatible and is judged from its announced version here (older versions
+                // are refused by the version gate). An `Incompatible` written by a previous
+                // run is kept as written until the peer's next announce re-judges it.
                 if record.compatibility == Compatibility::Compatible {
                     record.compatibility = Compatibility::of(record.protocol_version);
                 }
@@ -309,9 +310,30 @@ fn is_expired(record: &PeerRecord, now: SystemTime) -> bool {
     now.duration_since(record.last_seen).unwrap_or_default() >= PEER_TTL
 }
 
+impl InstancePresence for PeerTable {
+    fn heard_rows(&self, name_hash: &str, now: SystemTime) -> Vec<PresenceRow> {
+        let inner = self.inner.lock();
+        let mut rows: Vec<PresenceRow> = inner
+            .values()
+            .filter(|peer| peer.name_hash == name_hash && !is_expired(peer, now))
+            .map(|peer| PresenceRow {
+                destination_hash: peer.destination_hash.clone(),
+                identity_hash: peer.identity_hash.clone(),
+                first_seen: peer.first_seen,
+            })
+            .collect();
+        rows.sort_by(|a, b| {
+            a.first_seen
+                .cmp(&b.first_seen)
+                .then_with(|| a.destination_hash.cmp(&b.destination_hash))
+        });
+        rows
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::TempDir;
+    use super::super::test_support::{TempDir, siblings_of};
     use super::*;
     use crate::mesh::protocol::MESH_PROTOCOL_VERSION;
     use crate::testing::{install_log_collector, warn_snapshot};
@@ -501,7 +523,11 @@ mod tests {
         );
         table.persist().unwrap();
         assert!(path.exists());
-        assert!(!path.with_extension("json.tmp").exists());
+        assert_eq!(
+            siblings_of(&path),
+            ["peers.json"],
+            "the atomic write leaves no temp file behind"
+        );
 
         let reloaded = PeerTable::load(path, t0 + PEER_TTL).unwrap();
 
@@ -755,19 +781,20 @@ mod tests {
     #[test]
     fn load_sets_aside_a_current_table_with_an_unknown_field() {
         let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let cause = format!("is not a version-{PEER_TABLE_VERSION} peer table");
         let mut file = file_of(vec![record("aa", 1, t0)]);
         file["peers"][0]["later"] = serde_json::json!(true);
         assert_corrupt_file_is_set_aside(
             "peers-corrupt-unknown-field",
             &serde_json::to_vec(&file).unwrap(),
-            "is not a version-1 peer table",
+            &cause,
         );
         let mut file = file_of(vec![record("aa", 1, t0)]);
         file["later"] = serde_json::json!(true);
         assert_corrupt_file_is_set_aside(
             "peers-corrupt-unknown-envelope-field",
             &serde_json::to_vec(&file).unwrap(),
-            "is not a version-1 peer table",
+            &cause,
         );
         let mut file = file_of(vec![record("aa", 1, t0)]);
         file["peers"][0]["compatibility"] =
@@ -775,7 +802,7 @@ mod tests {
         assert_corrupt_file_is_set_aside(
             "peers-corrupt-unknown-compatibility-field",
             &serde_json::to_vec(&file).unwrap(),
-            "is not a version-1 peer table",
+            &cause,
         );
     }
 
@@ -810,7 +837,10 @@ mod tests {
 
         assert!(err.contains(&path.display().to_string()), "{err}");
         assert!(err.contains(&format!("version {found}")), "{err}");
-        assert!(err.contains("version 1"), "{err}");
+        assert!(
+            err.contains(&format!("version {PEER_TABLE_VERSION}")),
+            "{err}"
+        );
         assert!(err.contains(cause), "{err}");
         assert!(err.contains("move the file aside"), "{err}");
         assert_eq!(
@@ -829,5 +859,85 @@ mod tests {
     #[test]
     fn load_refuses_a_pre_baseline_table_version_as_having_no_migration() {
         assert_version_is_refused("peers-older", 0, "no migration");
+    }
+
+    /// Usage probe: the `peers.json` a pre-SCOPE build wrote is a well-formed
+    /// version-1 table whose destination hashes derive from the old application name. It
+    /// must be refused with a clear message, not loaded as an empty table.
+    #[test]
+    fn usage_probe_load_refuses_a_well_formed_version_1_table_written_before_scope() {
+        assert_eq!(
+            PEER_TABLE_VERSION, 2,
+            "the SCOPE wire rename bumps the peer table 1 -> 2"
+        );
+        assert_version_is_refused("peers-pre-scope-v1", 1, "no migration");
+    }
+
+    /// Usage probe: the presence query the trust store asks for identity-tier rotation
+    /// returns only rows that ARE a presence at `now` — the same instance id, not expired —
+    /// with the row first heard earliest first, so the store's first-heard holder is the
+    /// head whatever order the rows were refreshed in; a refresh keeps `first_seen`, so a
+    /// row heard again does not move. Another instance's rows are never returned. An
+    /// expired row is not a presence (the cache would sweep it), so a rotation older than
+    /// the TTL surfaces nothing.
+    #[test]
+    fn usage_probe_presence_query_orders_live_rows_by_first_seen_and_skips_expired_rows_and_other_instances()
+     {
+        let (table, _tmp) = table("peers-presence-query");
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(100_000);
+        let same_instance = |destination: &str, identity: &str| PeerSighting {
+            destination_hash: destination.to_string(),
+            identity_hash: identity.to_string(),
+            name_hash: "name-shared".to_string(),
+            display_name: None,
+            protocol_version: MESH_PROTOCOL_VERSION,
+            hops: 1,
+        };
+        let row = |destination: &str, identity: &str, first_seen: SystemTime| PresenceRow {
+            destination_hash: destination.to_string(),
+            identity_hash: identity.to_string(),
+            first_seen,
+        };
+        table.observe(same_instance("dest-old", "id-old"), t0);
+        table.observe(
+            same_instance("dest-older", "id-older"),
+            t0 - Duration::from_secs(60),
+        );
+        table.observe(
+            same_instance("dest-new", "id-new"),
+            t0 + Duration::from_secs(5),
+        );
+        table.observe(sighting("unrelated", None), t0 + Duration::from_secs(5));
+        // Heard again: `last_seen` moves, `first_seen` and the order do not.
+        table.observe(
+            same_instance("dest-older", "id-older"),
+            t0 + Duration::from_secs(8),
+        );
+
+        assert_eq!(
+            table.heard_rows("name-shared", t0 + Duration::from_secs(10)),
+            vec![
+                row("dest-older", "id-older", t0 - Duration::from_secs(60)),
+                row("dest-old", "id-old", t0),
+                row("dest-new", "id-new", t0 + Duration::from_secs(5)),
+            ],
+            "first heard first, other instances excluded"
+        );
+
+        // At the TTL the old row is no longer a presence; the refreshed older row still is.
+        assert_eq!(
+            table.heard_rows("name-shared", t0 + PEER_TTL),
+            vec![
+                row("dest-older", "id-older", t0 - Duration::from_secs(60)),
+                row("dest-new", "id-new", t0 + Duration::from_secs(5)),
+            ]
+        );
+        assert!(
+            table
+                .heard_rows("name-shared", t0 + Duration::from_secs(8) + PEER_TTL)
+                .is_empty(),
+            "an expired row is not a presence"
+        );
+        assert!(table.heard_rows("name-nobody", t0).is_empty());
     }
 }

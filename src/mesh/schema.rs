@@ -44,8 +44,9 @@ fn subject(store: &str, path: &Path, line: Option<usize>) -> String {
 }
 
 /// The refusal for a store whose version is not `expected`. A newer version means a newer
-/// Coyote wrote it; an older one has no migration, since the first version is the
-/// baseline and every later layout ships its own or refuses.
+/// Coyote wrote it; an older one has no migration. The baseline is the version this build
+/// writes (2 for the trust file, knock records, peer table and the pending and inbound
+/// records, 1 elsewhere).
 pub(crate) fn version_refusal(
     store: &str,
     path: &Path,
@@ -92,42 +93,57 @@ pub(crate) fn unversioned_refusal(
     )
 }
 
+/// Every type serde reads from a mesh store, by file. A type missing here is one the
+/// version discipline does not cover, so the list is the contract, not a mirror.
+#[cfg(test)]
+pub(crate) const ON_DISK_STRUCTS: &[(&str, &[&str])] = &[
+    (
+        "trust.rs",
+        &[
+            "TrustFile",
+            "IdentityEntry",
+            "DestinationEntry",
+            "KeyChanged",
+            "OverlayEntry",
+        ],
+    ),
+    ("knocks.rs", &["KnockRecord"]),
+    ("pending.rs", &["PendingRecord", "InboundRecord"]),
+    ("message.rs", &["PeerMessage", "Part"]),
+    ("identity.rs", &["Predecessor"]),
+    ("peers.rs", &["PeerTableFile", "PeerRecord"]),
+    ("protocol.rs", &["Compatibility"]),
+    (
+        "propagation_fetch.rs",
+        &[
+            "StoreFile",
+            "SeenRecord",
+            "DeliveredRecord",
+            "DeferredRecord",
+            "CursorRecord",
+        ],
+    ),
+    (
+        "shares.rs",
+        &["SharesFile", "AllowEntry", "DenyEntry", "OverrideEntry"],
+    ),
+    ("grants.rs", &["GrantRecord", "GrantedPath"]),
+    (
+        "envoy_sessions.rs",
+        &[
+            "EnvoySessionFile",
+            "EnvoyTurn",
+            "EnvoySessionIndex",
+            "EnvoySessionEntry",
+        ],
+    ),
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
     use std::path::PathBuf;
-
-    /// Every type serde reads from a mesh store, by file. A type missing here is one the
-    /// version discipline does not cover, so the list is the contract, not a mirror.
-    const ON_DISK_STRUCTS: &[(&str, &[&str])] = &[
-        (
-            "trust.rs",
-            &[
-                "TrustFile",
-                "IdentityEntry",
-                "DestinationEntry",
-                "KeyChanged",
-                "OverlayEntry",
-            ],
-        ),
-        ("knocks.rs", &["KnockRecord"]),
-        ("pending.rs", &["PendingRecord", "InboundRecord"]),
-        ("message.rs", &["PeerMessage"]),
-        ("identity.rs", &["Predecessor"]),
-        ("peers.rs", &["PeerTableFile", "PeerRecord"]),
-        ("protocol.rs", &["Compatibility"]),
-        (
-            "propagation_fetch.rs",
-            &[
-                "StoreFile",
-                "SeenRecord",
-                "DeliveredRecord",
-                "DeferredRecord",
-                "CursorRecord",
-            ],
-        ),
-    ];
 
     /// Types that derive `Deserialize` but need no `deny_unknown_fields`: a fieldless enum
     /// has no field map for an unknown key to hide in, and the probe is lenient by design.
@@ -136,8 +152,11 @@ mod tests {
         ("schema.rs", "VersionProbe"),
         // Fieldless enums, serialized as bare strings.
         ("pending.rs", "PendingState"),
+        ("pending.rs", "InboundKind"),
         ("message.rs", "PeerKind"),
         ("message.rs", "PeerVia"),
+        ("message.rs", "Disposition"),
+        ("envoy_sessions.rs", "EnvoyRole"),
     ];
 
     /// The name a `struct`/`enum` line declares, with any generics, tuple body or brace
@@ -370,35 +389,68 @@ mod tests {
     }
 
     #[test]
-    fn every_on_disk_store_version_is_the_baseline() {
+    fn every_on_disk_store_version_is_pinned() {
         let versions = [
-            ("TRUST_FILE_VERSION", crate::mesh::trust::TRUST_FILE_VERSION),
+            (
+                "TRUST_FILE_VERSION",
+                crate::mesh::trust::TRUST_FILE_VERSION,
+                2,
+            ),
             (
                 "KNOCK_RECORD_VERSION",
                 crate::mesh::knocks::KNOCK_RECORD_VERSION,
+                2,
             ),
             (
                 "PENDING_RECORD_VERSION",
                 crate::mesh::pending::PENDING_RECORD_VERSION,
+                2,
             ),
             (
                 "INBOUND_RECORD_VERSION",
                 crate::mesh::pending::INBOUND_RECORD_VERSION,
+                2,
             ),
             (
                 "PREDECESSOR_RECORD_VERSION",
                 crate::mesh::identity::PREDECESSOR_RECORD_VERSION,
+                1,
             ),
-            ("PEER_TABLE_VERSION", crate::mesh::peers::PEER_TABLE_VERSION),
+            (
+                "PEER_TABLE_VERSION",
+                crate::mesh::peers::PEER_TABLE_VERSION,
+                2,
+            ),
             (
                 "PROPAGATION_STORE_VERSION",
                 crate::mesh::propagation_fetch::PROPAGATION_STORE_VERSION,
+                1,
+            ),
+            (
+                "SHARES_FILE_VERSION",
+                crate::mesh::shares::SHARES_FILE_VERSION,
+                1,
+            ),
+            (
+                "GRANT_RECORD_VERSION",
+                crate::mesh::grants::GRANT_RECORD_VERSION,
+                1,
+            ),
+            (
+                "ENVOY_SESSION_VERSION",
+                crate::mesh::envoy_sessions::ENVOY_SESSION_VERSION,
+                1,
+            ),
+            (
+                "ENVOY_SESSION_INDEX_VERSION",
+                crate::mesh::envoy_sessions::ENVOY_SESSION_INDEX_VERSION,
+                1,
             ),
         ];
-        for (name, version) in versions {
+        for (name, version, pinned) in versions {
             assert_eq!(
-                version, 1,
-                "{name} left the baseline: a bump ships a migration or a refusal, and its section 19 row moves with it"
+                version, pinned,
+                "{name} moved: a bump ships a migration or a refusal, and its section 19 row moves with it"
             );
         }
     }

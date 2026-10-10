@@ -160,3 +160,424 @@ jobs:
           echo "### Mesh interop wall-clock: $((end - ${start:-$end})) s"
           echo "Outcome: ${{ job.status }}"
         } >> "$GITHUB_STEP_SUMMARY"
+
+  # The shell and PowerShell scripts under scripts/: shellcheck and PSScriptAnalyzer on
+  # the ubuntu leg, then the mesh relay script's install, config and idempotency paths
+  # under a throwaway HOME on all three OSes — a dry run writes nothing, a real run
+  # installs rnsd and writes the Reticulum config, a second run changes nothing, an
+  # existing config is printed around and never touched, usage errors and a root run
+  # without --allow-root exit 1. Service installation is NOT exercised here: GitHub
+  # runners have no user session manager (no `systemctl --user` bus, no logged-in
+  # launchd GUI domain, no interactive logon for a Scheduled Task), so that path is the
+  # manual-VM acceptance.
+  scripts:
+    name: Scripts
+
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+        - ubuntu-latest
+        - macos-latest
+        - windows-latest
+
+    runs-on: ${{matrix.os}}
+
+    timeout-minutes: 20
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Start The Clock
+      run: echo "start=$(date +%s)" >> "$GITHUB_ENV"
+
+    # shellcheck is whatever the runner image ships, so its version is printed for the
+    # log; PSScriptAnalyzer is pinned below so a new rule arriving with an upgrade is a
+    # deliberate bump and a reviewed diff, not a red lane on an unrelated PR. The
+    # PowerShell files are enumerated from the index rather than a directory list so a
+    # .ps1 added anywhere in the tree (tests/fixtures/ already has one) is analysed too.
+    - name: ShellCheck
+      if: runner.os == 'Linux'
+      run: |
+        shellcheck --version
+        shellcheck -S style scripts/*.sh scripts/*/*.sh deployment/propagation-node/entrypoint.sh
+
+    - name: PSScriptAnalyzer
+      if: runner.os == 'Linux'
+      shell: pwsh
+      env:
+        PSSA_VERSION: 1.25.0
+      run: |
+        Install-Module PSScriptAnalyzer -RequiredVersion $env:PSSA_VERSION -Repository PSGallery -Scope CurrentUser -Force
+        Import-Module PSScriptAnalyzer -RequiredVersion $env:PSSA_VERSION
+        $files = @(git ls-files '*.ps1')
+        if (-not $files) { throw 'git ls-files found no tracked .ps1 files' }
+        Write-Output "Analysing $($files.Count) PowerShell file(s): $files"
+        $r = @($files | ForEach-Object { Invoke-ScriptAnalyzer -Path $_ -Severity Warning,Error })
+        $r | Format-Table -AutoSize | Out-String | Write-Output
+        if ($r) { exit 1 }
+
+    - name: Installer Flags
+      shell: pwsh
+      run: |
+        if (-not (Get-Command ./scripts/install_coyote.ps1).Parameters.ContainsKey('WithMesh')) {
+          throw 'install_coyote.ps1 has no -WithMesh parameter'
+        }
+
+    - name: Installer Flags (bash)
+      if: runner.os != 'Windows'
+      run: |
+        bash=bash
+        if [ "$RUNNER_OS" = macOS ]; then bash=/bin/bash; fi
+        "$bash" scripts/install_coyote.sh --help | grep -- --with-mesh
+
+    - name: The Bash Relay Refuses Git Bash With Exit 2
+      if: runner.os == 'Windows'
+      shell: bash
+      run: |
+        rc=0; bash scripts/mesh-relay.sh --no-service --dry-run || rc=$?; [ "$rc" -eq 2 ]
+
+    # macOS runs the relay under the runner's /bin/bash 3.2, the bash the README
+    # one-liner lands in on a Mac. `! cmd` is not an assertion under `set -e`, so
+    # expected failures are checked through an explicit exit-code capture. The pipx
+    # and uv tool directories are pointed under the throwaway HOME because the ubuntu
+    # image exports PIPX_HOME=/opt/pipx image-wide, which would leak the install.
+    - name: Mesh Relay Smoke
+      if: runner.os != 'Windows'
+      env:
+        HOME: ${{ runner.temp }}/mesh-home
+        XDG_CONFIG_HOME: ${{ runner.temp }}/mesh-home/.config
+        BIN_DIR: ${{ runner.temp }}/mesh-home/bin
+        PIPX_HOME: ${{ runner.temp }}/mesh-home/pipx
+        PIPX_BIN_DIR: ${{ runner.temp }}/mesh-home/.local/bin
+        UV_TOOL_DIR: ${{ runner.temp }}/mesh-home/uv-tools
+        UV_TOOL_BIN_DIR: ${{ runner.temp }}/mesh-home/.local/bin
+      run: |
+        set -euo pipefail
+        relay=(bash scripts/mesh-relay.sh)
+        if [ "$RUNNER_OS" = macOS ]; then relay=(/bin/bash scripts/mesh-relay.sh); fi
+        mkdir -p "$HOME"
+        cfg="$HOME/.reticulum/config"
+
+        echo "::group::dry run writes nothing"
+        "${relay[@]}" --no-service --dry-run
+        [ ! -e "$HOME/.reticulum" ]
+        [ ! -e "$BIN_DIR/rnsd" ]
+        echo "::endgroup::"
+
+        echo "::group::a relative --bin-dir resolves against the cwd, --version lands in the plan"
+        out=$(cd "$RUNNER_TEMP" && "${relay[0]}" "$GITHUB_WORKSPACE/scripts/mesh-relay.sh" --bin-dir ./rel-bin --no-service --dry-run)
+        printf '%s\n' "$out"
+        grep -q "BIN_DIR: $RUNNER_TEMP/rel-bin" <<<"$out"
+        [ ! -e "$RUNNER_TEMP/rel-bin" ]
+        out=$("${relay[@]}" --version 1.5.1 --no-service --dry-run)
+        printf '%s\n' "$out"
+        grep -q 'rns==1.5.1' <<<"$out"
+        echo "::endgroup::"
+
+        echo "::group::the PowerShell relay refuses a non-Windows host with exit 2"
+        rc=0; pwsh -NoProfile -File scripts/mesh-relay.ps1 -NoService -DryRun || rc=$?; [ "$rc" -eq 2 ]
+        echo "::endgroup::"
+
+        if [ "$RUNNER_OS" = Linux ]; then
+          echo "::group::the systemd plan from the dry run names the absolute rnsd and writes nothing"
+          plan=$("${relay[@]}" --dry-run)
+          printf '%s\n' "$plan"
+          grep -q "ExecStart=\"$BIN_DIR/rnsd\"" <<<"$plan"
+          grep -q 'Environment=PYTHONUNBUFFERED=1' <<<"$plan"
+          grep -q 'WantedBy=default.target' <<<"$plan"
+          grep -q 'enable-linger' <<<"$plan"
+          [ ! -e "$XDG_CONFIG_HOME/systemd" ]
+          echo "::endgroup::"
+        fi
+
+        echo "::group::install rnsd and write the config"
+        "${relay[@]}" --no-service
+        "$BIN_DIR/rnsd" --version
+        test -f "$cfg"
+        grep -q '^loglevel = 4' "$cfg"
+        if grep -q share_instance "$cfg"; then
+          echo "::error::the written config sets share_instance"
+          exit 1
+        fi
+        before=$(shasum -a 256 "$cfg")
+        echo "::endgroup::"
+
+        echo "::group::second run changes nothing"
+        out=$("${relay[@]}" --no-service)
+        printf '%s\n' "$out"
+        grep -q 'already exists' <<<"$out"
+        [ "$(shasum -a 256 "$cfg")" = "$before" ]
+        echo "::endgroup::"
+
+        echo "::group::existing config is printed around, never touched"
+        home2="$RUNNER_TEMP/mesh-home-existing"
+        mkdir -p "$home2/.reticulum"
+        printf 'custom\n' > "$home2/.reticulum/config"
+        printf 'custom\n' > "$RUNNER_TEMP/expected-config"
+        out=$(HOME="$home2" "${relay[@]}" --no-service --relay relay.example:4242)
+        printf '%s\n' "$out"
+        cmp "$RUNNER_TEMP/expected-config" "$home2/.reticulum/config"
+        grep -q '\[\[Team Relay\]\]' <<<"$out"
+        grep -q 'target_host = relay.example' <<<"$out"
+        echo "::endgroup::"
+
+        echo "::group::usage errors exit 1, --help exits 0"
+        rc=0; "${relay[@]}" --bogus || rc=$?; [ "$rc" -eq 1 ]
+        rc=0; "${relay[@]}" --no-service --relay nonsense || rc=$?; [ "$rc" -eq 1 ]
+        "${relay[@]}" --help
+        echo "::endgroup::"
+
+        echo "::group::root is refused without --allow-root"
+        rc=0; sudo -E env HOME="$HOME" "${relay[@]}" --no-service --dry-run || rc=$?; [ "$rc" -eq 1 ]
+        sudo -E env HOME="$HOME" "${relay[@]}" --no-service --dry-run --allow-root
+        echo "::endgroup::"
+
+        if [ "$RUNNER_OS" = macOS ]; then
+          echo "::group::the launchd plist from the dry run is valid"
+          plan=$("${relay[@]}" --dry-run)
+          printf '%s\n' "$plan"
+          plist="$RUNNER_TEMP/com.coyote.rnsd.plist"
+          sed -n '/^<?xml /,/^<\/plist>$/p' <<<"$plan" > "$plist"
+          test -s "$plist"
+          plutil -lint "$plist"
+          echo "::endgroup::"
+        fi
+
+    # The runner is Administrator, so every ordinary invocation passes -AllowRoot and the
+    # root-refusal check is the one without it. The relay runs as a child `pwsh -File` so
+    # $LASTEXITCODE is the script's real exit code every time. The pipx and uv tool
+    # directories sit under the throwaway profile so nothing leaks into the image.
+    - name: Mesh Relay Smoke (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      env:
+        USERPROFILE: ${{ runner.temp }}\mesh-home
+        BIN_DIR: ${{ runner.temp }}\mesh-home\bin
+        COYOTE_CONFIG_DIR: ${{ runner.temp }}\mesh-home\coyote-config
+        PIPX_HOME: ${{ runner.temp }}\mesh-home\pipx
+        PIPX_BIN_DIR: ${{ runner.temp }}\mesh-home\.local\bin
+        UV_TOOL_DIR: ${{ runner.temp }}\mesh-home\uv-tools
+        UV_TOOL_BIN_DIR: ${{ runner.temp }}\mesh-home\.local\bin
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $relay = 'scripts/mesh-relay.ps1'
+        function Invoke-Relay([int]$Expect, [string[]]$Flags) {
+          $out = @(& pwsh -NoProfile -File $relay @Flags)
+          if ($LASTEXITCODE -ne $Expect) {
+            $out | Write-Output
+            throw "expected exit $Expect, got $LASTEXITCODE for: $($Flags -join ' ')"
+          }
+          return $out
+        }
+        New-Item -ItemType Directory -Force -Path $env:USERPROFILE | Out-Null
+        $cfg = Join-Path $env:USERPROFILE '.reticulum\config'
+
+        Write-Output '::group::dry run writes nothing'
+        Invoke-Relay 0 @('-NoService', '-DryRun', '-AllowRoot')
+        if (Test-Path (Join-Path $env:USERPROFILE '.reticulum')) { throw 'dry run created .reticulum' }
+        if (Test-Path (Join-Path $env:BIN_DIR 'rnsd.cmd')) { throw 'dry run created rnsd.cmd' }
+        Write-Output '::endgroup::'
+
+        Write-Output '::group::the Scheduled Task plan from the dry run names the task, the log and the environment, and registers nothing'
+        $plan = (Invoke-Relay 0 @('-DryRun', '-AllowRoot')) -join "`n"
+        $plan | Write-Output
+        foreach ($needle in @('PYTHONUNBUFFERED=1', 'rnsd\.log', 'Coyote rnsd', 'Register-ScheduledTask')) {
+          if ($plan -notmatch $needle) { throw "the plan lacks $needle" }
+        }
+        if ($null -ne (Get-ScheduledTask -TaskName 'Coyote rnsd' -ErrorAction SilentlyContinue)) { throw 'the dry run registered the task' }
+        Write-Output '::endgroup::'
+
+        Write-Output '::group::a relative -BinDir is rooted, -Version lands in the plan'
+        $out = Invoke-Relay 0 @('-BinDir', '.\rel-bin', '-NoService', '-DryRun', '-AllowRoot')
+        $out | Write-Output
+        $binLine = $out | Where-Object { $_ -match 'BIN_DIR: ' } | Select-Object -First 1
+        if (-not $binLine) { throw 'the plan has no BIN_DIR line' }
+        $printed = ($binLine -replace '^.*BIN_DIR: ', '')
+        if ($printed -ne (Join-Path (Get-Location).Path 'rel-bin')) { throw "BIN_DIR is not rooted at the cwd: $printed" }
+        if (Test-Path '.\rel-bin') { throw 'dry run created rel-bin' }
+        $out = Invoke-Relay 0 @('-Version', '1.5.1', '-NoService', '-DryRun', '-AllowRoot')
+        if (($out -join "`n") -notmatch 'rns==1\.5\.1') { throw 'the plan lacks rns==1.5.1' }
+        Write-Output '::endgroup::'
+
+        Write-Output '::group::install rnsd and write the config'
+        Invoke-Relay 0 @('-NoService', '-AllowRoot')
+        & (Join-Path $env:BIN_DIR 'rnsd.cmd') --version
+        if ($LASTEXITCODE -ne 0) { throw "rnsd --version exited $LASTEXITCODE" }
+        if (-not (Test-Path $cfg)) { throw "no config at $cfg" }
+        $text = Get-Content -Raw $cfg
+        if ($text -notmatch '(?m)^loglevel = 4') { throw 'config lacks loglevel = 4' }
+        if ($text -match 'share_instance') { throw 'the written config sets share_instance' }
+        $before = (Get-FileHash -Algorithm SHA256 $cfg).Hash
+        Write-Output '::endgroup::'
+
+        Write-Output '::group::second run changes nothing'
+        $out = Invoke-Relay 0 @('-NoService', '-AllowRoot')
+        $out | Write-Output
+        if (($out -join "`n") -notmatch 'already exists') { throw 'second run did not report the existing config' }
+        if ((Get-FileHash -Algorithm SHA256 $cfg).Hash -ne $before) { throw 'second run changed the config' }
+        Write-Output '::endgroup::'
+
+        Write-Output '::group::existing config is printed around, never touched'
+        $home2 = Join-Path $env:RUNNER_TEMP 'mesh-home-existing'
+        New-Item -ItemType Directory -Force -Path (Join-Path $home2 '.reticulum') | Out-Null
+        $cfg2 = Join-Path $home2 '.reticulum\config'
+        Set-Content -Path $cfg2 -Value 'custom'
+        $before2 = (Get-FileHash -Algorithm SHA256 $cfg2).Hash
+        $mainHome = $env:USERPROFILE
+        $env:USERPROFILE = $home2
+        try {
+          $out = Invoke-Relay 0 @('-NoService', '-AllowRoot', '-Relay', 'relay.example:4242')
+        } finally {
+          $env:USERPROFILE = $mainHome
+        }
+        $out | Write-Output
+        if ((Get-FileHash -Algorithm SHA256 $cfg2).Hash -ne $before2) { throw 'an existing config was modified' }
+        $joined = $out -join "`n"
+        if ($joined -notmatch '\[\[Team Relay\]\]') { throw 'stanzas lack [[Team Relay]]' }
+        if ($joined -notmatch 'target_host = relay\.example') { throw 'stanzas lack target_host = relay.example' }
+        Write-Output '::endgroup::'
+
+        Write-Output '::group::usage errors exit 1, -Help exits 0'
+        # An unknown switch is refused by the parameter binder, so exit 1 here is pwsh's own.
+        Invoke-Relay 1 @('-Bogus')
+        Invoke-Relay 1 @('-NoService', '-AllowRoot', '-Relay', 'nonsense')
+        Invoke-Relay 0 @('-Help')
+        Write-Output '::endgroup::'
+
+        Write-Output '::group::Administrator is refused without -AllowRoot'
+        Invoke-Relay 1 @('-NoService', '-DryRun')
+        Write-Output '::endgroup::'
+        # The runner's pwsh wrapper exits with the last native exit code, which the refusal just set to 1.
+        exit 0
+
+    # With no COYOTE_CONFIG_DIR / XDG_CONFIG_HOME and neither uv nor pipx on PATH the
+    # venv rung plans under the Roaming profile, and `py -3` is tried before `python`.
+    # A fresh profile, not the smoke step's: that one already holds a working rnsd.cmd,
+    # which would win as the `present` rung. APPDATA is a throwaway so even a bug could
+    # not write into the runner's profile.
+    - name: Mesh Relay Venv Plan Under The Roaming Profile (Windows)
+      if: runner.os == 'Windows'
+      shell: pwsh
+      env:
+        USERPROFILE: ${{ runner.temp }}\mesh-venv-home
+        APPDATA: ${{ runner.temp }}\mesh-venv-home\AppData\Roaming
+        BIN_DIR: ${{ runner.temp }}\mesh-venv-home\bin
+      run: |
+        $ErrorActionPreference = 'Stop'
+        Remove-Item Env:COYOTE_CONFIG_DIR, Env:XDG_CONFIG_HOME -ErrorAction SilentlyContinue
+        $env:Path = (($env:Path -split ';') | Where-Object {
+          $_ -and -not (Test-Path (Join-Path $_ 'uv.exe')) -and -not (Test-Path (Join-Path $_ 'pipx.exe')) -and -not (Test-Path (Join-Path $_ 'pipx.cmd'))
+        }) -join ';'
+        $left = @(Get-Command uv, pipx -CommandType Application -ErrorAction SilentlyContinue)
+        if ($left.Count -gt 0) { throw "uv/pipx still on PATH: $($left.Source -join ', ')" }
+        if (-not (Get-Command py -CommandType Application -ErrorAction SilentlyContinue)) { throw 'the runner has no py launcher; the rung-order check needs one' }
+        New-Item -ItemType Directory -Force -Path $env:USERPROFILE | Out-Null
+        $plan = @(& pwsh -NoProfile -File scripts/mesh-relay.ps1 -NoService -DryRun -AllowRoot)
+        if ($LASTEXITCODE -ne 0) { $plan | Write-Output; throw "expected exit 0, got $LASTEXITCODE" }
+        $text = $plan -join "`n"
+        $text | Write-Output
+        $venv = Join-Path $env:APPDATA 'coyote\mesh\rns-venv'
+        if ($text -notmatch [regex]::Escape("Install: py -3 -m venv `"$venv`"")) { throw "the plan does not pick py -3 with the venv under $venv" }
+        if ($text -notmatch '\\AppData\\Roaming\\coyote\\mesh\\rns-venv') { throw 'the plan does not place the venv under the Roaming profile' }
+        if (Test-Path $env:APPDATA) { throw 'the dry run created something under APPDATA' }
+        if (Test-Path (Join-Path $env:USERPROFILE '.reticulum')) { throw 'the dry run created .reticulum' }
+        exit 0
+
+    - name: Mesh Relay Under Windows PowerShell 5.1
+      if: runner.os == 'Windows'
+      shell: powershell
+      env:
+        USERPROFILE: ${{ runner.temp }}\mesh-home
+        BIN_DIR: ${{ runner.temp }}\mesh-home\bin
+        COYOTE_CONFIG_DIR: ${{ runner.temp }}\mesh-home\coyote-config
+      run: |
+        # A native command's stderr must not become a terminating error; $LASTEXITCODE is the oracle.
+        $ErrorActionPreference = 'Continue'
+        powershell -NoProfile -ExecutionPolicy Bypass -File scripts/mesh-relay.ps1 -NoService -DryRun -AllowRoot
+        if ($LASTEXITCODE -ne 0) { throw "mesh-relay.ps1 exited $LASTEXITCODE under Windows PowerShell 5.1" }
+        exit 0
+
+    - name: Record Wall-Clock
+      if: always()
+      run: |
+        end=$(date +%s)
+        {
+          echo "### Scripts wall-clock (${{ matrix.os }}): $((end - ${start:-$end})) s"
+          echo "Outcome: ${{ job.status }}"
+        } >> "$GITHUB_STEP_SUMMARY"
+
+  # The Dockerfile built around the latest released coyote and run through
+  # scripts/image-smoke.sh. The Dockerfile downloads
+  # `releases/download/v${COYOTE_VERSION}/coyote-<musl>.tar.gz`, and the latest release
+  # is the only binary a PR build can download, so a green run proves the rnsd layer and
+  # the entrypoint contract around the latest released coyote, not the PR's Rust (that is
+  # `All`'s job). Host arch only, no QEMU. Informational like `mesh-interop`: not in
+  # branch protection, and deliberately NOT `continue-on-error`, so a red smoke shows as
+  # a red job. The build runs uncached every time: measured in October 2026 at about 6.5
+  # minutes, 5 of them the build stage's rustup and two `cargo install`s. No
+  # `cache-from`/`cache-to`: the image is over 4 GB and a GHA layer cache of it would
+  # evict the rust-cache entries the `All` matrix depends on. The runner's free disk
+  # (86 GB then) covers the build stage and the flattened image without a clean-up step.
+  image-smoke:
+    name: Image Smoke
+
+    runs-on: ubuntu-latest
+
+    # `gh release view` is the only token use; the other jobs keep the default scope.
+    permissions:
+      contents: read
+
+    timeout-minutes: 30
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Start The Clock
+      run: echo "start=$(date +%s)" >> "$GITHUB_ENV"
+
+    # The Dockerfile prefixes the `v` itself at the release-download URL, so the
+    # build-arg is the bare version.
+    - name: Resolve The Latest Release
+      env:
+        GH_TOKEN: ${{ github.token }}
+        GH_REPO: ${{ github.repository }}
+      run: |
+        version="$(gh release view --json tagName -q .tagName | sed 's/^v//')"
+        [ -n "$version" ] || { echo "::error::gh release view returned no tag"; exit 1; }
+        echo "coyote_version=$version" >> "$GITHUB_ENV"
+        echo "latest release: v$version"
+
+    # Plain `docker build` on the daemon's default builder, not a buildx container
+    # driver: the daemon already builds for the host arch and sets TARGETARCH, and a
+    # container-driver builder would keep a second multi-gigabyte copy of every layer that
+    # `--load` then copies into the daemon.
+    - name: Build The Image
+      run: |
+        build_start=$(date +%s)
+        docker build --build-arg COYOTE_VERSION="$coyote_version" -t coyote-smoke:ci .
+        echo "build_seconds=$(( $(date +%s) - build_start ))" >> "$GITHUB_ENV"
+        docker image ls coyote-smoke:ci
+
+    # Its own step so a propagation-node build failure is attributable in the log; the
+    # smoke script would otherwise build it quietly with `-q`.
+    - name: Build The Propagation Node
+      run: docker build -t coyote-pn:ci deployment/propagation-node
+
+    - name: Smoke
+      run: |
+        smoke_start=$(date +%s)
+        scripts/image-smoke.sh coyote-smoke:ci --pn coyote-pn:ci
+        echo "smoke_seconds=$(( $(date +%s) - smoke_start ))" >> "$GITHUB_ENV"
+
+    - name: Record Wall-Clock
+      if: always()
+      run: |
+        end=$(date +%s)
+        {
+          echo "### Image smoke wall-clock: $((end - ${start:-$end})) s"
+          echo "Image build: ${build_seconds:-n/a} s"
+          echo "Smoke: ${smoke_seconds:-n/a} s"
+          echo "coyote: v${coyote_version:-unresolved}"
+          echo "Outcome: ${{ job.status }}"
+        } >> "$GITHUB_STEP_SUMMARY"

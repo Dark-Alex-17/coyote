@@ -56,7 +56,7 @@ Coming from [AIChat](https://github.com/sigoden/aichat)? Follow the [migration g
 * [Agents](https://github.com/Dark-Alex-17/coyote/wiki/Agents): Leverage AI agents to perform complex tasks and workflows, including sub-agent spawning, teammate messaging, and user interaction tools.
     * [Graph Agents](https://github.com/Dark-Alex-17/coyote/wiki/Graph-Agents): Define an agent as a declarative, YAML-driven workflow. A directed graph of typed nodes (LLM calls, scripts, approvals, user input, RAG retrieval, sub-agent spawns).
 * [Background Jobs](https://github.com/Dark-Alex-17/coyote/wiki/Background-Jobs): Run long tool calls (builds, test suites, slow MCP calls) in the background with the `job__*` tools while the model keeps working, and completion arrives as a push notification.
-* [Hooks](https://github.com/Dark-Alex-17/coyote/wiki/Hooks): Run your own fire-and-forget commands when lifecycle events fire. Turns, tools, LLM requests, agents, sub-agent escalations, mesh peers, and more (43 events). Perfect for desktop notifications, activity logging, and downstream automation; hooks never block Coyote or change its behavior.
+* [Hooks](https://github.com/Dark-Alex-17/coyote/wiki/Hooks): Run your own fire-and-forget commands when lifecycle events fire. Turns, tools, LLM requests, agents, sub-agent escalations, mesh peers, and more (46 events). Perfect for desktop notifications, activity logging, and downstream automation; hooks never block Coyote or change its behavior.
 * [Todo System](https://github.com/Dark-Alex-17/coyote/wiki/TODO-System): Built-in task tracking for improved LLM reliability with smaller models.
 * [Environment Variables](https://github.com/Dark-Alex-17/coyote/wiki/Environment-Variables): Override and customize your Coyote configuration at runtime with environment variables.
 * [Client Configurations](https://github.com/Dark-Alex-17/coyote/wiki/Clients): Configuration instructions for various LLM providers.
@@ -85,6 +85,13 @@ Coyote requires the following tools to be installed on your system:
     * Optional: if `ast-grep` is not installed, the `ast_grep` tool reports it and agents fall back to `fs_grep`
 * [duckdb](https://duckdb.org/) (for fast, local RAGs)
     * `curl https://install.duckdb.org | bash`
+* Coyote mesh (`.mesh`) needs a local Reticulum daemon. The Docker image runs `rnsd` for you from v0.10.4 (before that
+  it too shipped only the binary); `cargo install` and Homebrew install only the Coyote binary, so set `rnsd` up
+  separately with one command —
+  `curl -fsSL https://raw.githubusercontent.com/Dark-Alex-17/coyote/refs/heads/main/scripts/mesh-relay.sh | bash` or
+  `powershell -NoProfile -ExecutionPolicy Bypass -Command "iwr -useb https://raw.githubusercontent.com/Dark-Alex-17/coyote/refs/heads/main/scripts/mesh-relay.ps1 | iex"`
+  — or pass `--with-mesh` / `-WithMesh` to the installer.
+  See [Mesh Deployment](https://github.com/Dark-Alex-17/coyote/wiki/Mesh-Deployment).
 
 These tools are used to provide various functionalities within Coyote, such as document processing, JSON manipulation,
 etc., and they are used within agents and tools.
@@ -150,6 +157,11 @@ e.g. to get a shell inside the image:
 ```bash
 docker run --rm -it darkalex17/coyote bash
 ```
+
+From v0.10.4 the image also starts a Reticulum daemon (`rnsd`, listening on the container's loopback only unless you
+opt into `COYOTE_MESH_LAN=1`) beside the main command, so the shipped mesh default works inside the container;
+`-e COYOTE_MESH_RNSD=0` leaves it off and `-e COYOTE_MESH_RELAY=host:port` points it at your relay. Details are on the
+[Mesh Containers](https://github.com/Dark-Alex-17/coyote/wiki/Mesh-Containers) page.
 
 ### Scripts
 #### Linux/MacOS (`bash`)
@@ -343,6 +355,10 @@ The appearance of Coyote can be modified using the following settings:
 | `save_shell_history` | `true`        | Enables or disables REPL command history                                                                         |
 
 ### Mesh
+SCOPE — Session Coordination & Presence Exchange. SCOPE is a peer protocol by which running LLM sessions announce
+presence, share status, and exchange messages on their owners' behalf, over Reticulum, without a broker. Coyote is
+the reference implementation of SCOPE, and "mesh" is Coyote's name for its SCOPE feature.
+
 The `mesh` block controls the [Coyote Mesh](https://github.com/Dark-Alex-17/coyote/wiki/Mesh), which lets Coyote
 instances discover and message each other. It is off by default, and setting `mesh.enabled: true` requires
 `function_calling_support: true`; config loading is refused otherwise. Interface entries under `mesh.interfaces` are
@@ -350,32 +366,55 @@ always checked when config is parsed; the remaining `mesh` keys (rate limits, re
 requirement) are only checked when `mesh.enabled` is `true`.
 The wire format Coyote instances speak to each other is specified normatively in
 [docs/mesh/PROTOCOL.md](https://github.com/Dark-Alex-17/coyote/blob/main/docs/mesh/PROTOCOL.md).
+Trusted peers can also fetch the files you share and ask for others; see
+[Mesh File Sharing](https://github.com/Dark-Alex-17/coyote/wiki/Mesh-File-Sharing).
 Interoperability is exercised against the reference Reticulum/LXMF implementation by the
 [mesh interop harness](https://github.com/Dark-Alex-17/coyote/blob/main/scripts/mesh-interop/README.md),
 run in the informational `Mesh Interop` CI job.
 The [propagation node image](https://github.com/Dark-Alex-17/coyote/blob/main/deployment/propagation-node/README.md)
-guide covers a ready-to-run LXMF propagation node for store-and-forward between your instances
+guide covers a ready-to-run LXMF propagation node: store-and-forward across devices for a team
 (held messages are fetched automatically every `mesh.propagation_sync_interval_secs` seconds and on demand with
-`.mesh fetch`).
+`.mesh sync`). It is not how sessions on one host reach each other; those dial the local `rnsd` named under
+[Prerequisites](#prerequisites).
+The envoy that answers trusted peers for you starts every run with no memory of the peer: a follow-up in the same
+thread is answered as if it were the first message. `mesh.envoy_memory.enabled: true` changes that, keeping the
+peer's turns and what the node sent back per (sender identity, thread) so a follow-up is answered in context; the
+record never holds your own transcript, is bounded by the five `mesh.envoy_memory.*` limits, goes with the identity's
+trust when you `.mesh untrust --identity` or `.mesh block` it (untrusting one of its destinations leaves it), and
+`.mesh memory forget <identity|all> [thread]` wipes it at will. See
+[Conversation memory](https://github.com/Dark-Alex-17/coyote/wiki/Mesh#conversation-memory).
 
 | Setting                           | Default Value   | Description                                                                                                                                                                  |
 |-----------------------------------|-----------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `mesh.enabled`                    | `false`         | Join the mesh when the REPL starts (one-shot runs never join); nothing leaves the machine while this is `false`                                                              |
-| `mesh.announce`                   | `true`          | Announce this node so peers can see it; `false` is outbound-only (see peers without being seen); also turns the automatic propagation sync off (`.mesh fetch` still works) |
+| `mesh.announce`                   | `true`          | Announce this node so peers can see it; `false` is outbound-only (see peers without being seen); also turns the automatic propagation sync off (`.mesh sync` still works) |
 | `mesh.display_name`               | `null`          | Opt-in plaintext label carried in the announce                                                                                                                               |
 | `mesh.display_name_on_public`     | `false`         | Also carry `display_name` when any interface is `type: public`, where presence is world-visible                                                                              |
-| `mesh.interfaces`                 | `[{type: lan}]` | Interfaces the node joins: `lan` (link-local only; takes no `host`/`port`, at most once), or `private`/`public` with `host` and `port` for a relay. No auto-detection, no fallback |
+| `mesh.about`                      | `null`          | One human-written line on what this node's envoy can help with, at most 200 characters; shown on the status card to trusted peers, never in the announce                   |
+| `mesh.interfaces`                 | `[{type: private, host: 127.0.0.1, port: 4242}]` | Interfaces the node joins: `private`/`public` with `host` and `port` for a relay (the default is the local rnsd on loopback), or `lan` (link-local only; the no-daemon fallback; takes no `host`/`port`, at most once). No auto-detection, no fallback |
 | `mesh.brief`                      | `auto`          | `auto` (status card + session digest + user brief), `manual` (card + user brief; no digest, so no model spend), or `off` (status card only)                                  |
 | `mesh.digest_prompt`              | `null`          | Prompt used to build the shareable session digest; `null` or blank uses the built-in default                                                                                 |
 | `mesh.brief_model`                | `null`          | Model used to build the digest; `null` uses the session's current model                                                                                                      |
 | `mesh.envoy_model`                | `null`          | Model the envoy answers peers with; `null` uses the configured `model_id` (the envoy never follows a `.model` switch)                                                          |
 | `mesh.envoy_escalation_timeout`   | `0`             | Seconds the envoy holds a peer's question open for the human before handing it off; `0` hands off at once (the question stays open for `.mesh answer`); a hold longer than the 120 s run ceiling is cut to it |
 | `mesh.knock_retention_hours`      | `24`            | How long unanswered knocks from known identities are kept; must be `1` or more                                                                                               |
-| `mesh.peer_max_concurrent`        | `1`             | Envoy runs one sending identity may have queued or running at once; must be `1` or more. Further messages are refused with a typed reason until one finishes; the message is still filed in the inbox for the human |
-| `mesh.peer_max_messages_per_hour` | `60`            | Messages accepted from one sending identity per hour, in fixed hourly windows kept in memory (a restart opens a fresh window); must be `1` or more. Further messages are refused with a typed reason: on a live link in the reply itself, on store-and-forward with one reply per identity per reason per hour, and on store-and-forward the message is still filed in the inbox for the human, without an envoy run; plus one folded REPL line per identity, per reason, per hour, with the folded count reported the next time that peer is heard from after the hour rolls over; on a live link the refused message is not filed; the peer is told to retry |
-| `mesh.peer_max_tokens_per_hour`   | `100000`        | Model tokens one sending identity may cost per hour, counted after each envoy run, so the runs in flight may overshoot the ceiling by at most `peer_max_concurrent` runs before the next is refused; must be `1` or more. The message is still filed in the inbox for the human |
-| `mesh.peer_max_cost_usd_per_hour` | `0`             | USD one sending identity may cost per hour, counted like the token ceiling and enforced only when the envoy model's prices are known; `0` = no cost ceiling, otherwise a positive amount. The message is still filed in the inbox for the human |
-| `mesh.propagation_sync_interval_secs` | `300`       | Seconds between automatic fetches of the messages a propagation node holds for this node; the first fetch runs once a propagation node is heard after the node joins; `0` = fetch only on `.mesh fetch`; at most `31536000`; off while `announce` is false |
+| `mesh.collision_protection`       | `false`         | Whether an identity trusted for all destinations is refused when it announces or claims an instance id recorded under another identity, or heard in the peer table under one trusted for all destinations; `false` serves it with a warning to you, `true` refuses it with an error until you trust its new destination with `.mesh trust`; a destination you trusted explicitly is served either way |
+| `mesh.peer_max_concurrent`        | `1`             | Envoy runs one sending identity may have queued or running at once; `0` = unlimited. On a live link a message that would start a run while the sender already has that many queued or running is refused before it is acknowledged with the bare throttled code, which names no reason, and is not filed; by store-and-forward it is filed in the inbox for the human without an envoy run and the peer gets one typed reply per identity, per reason, per hour |
+| `mesh.peer_max_messages_per_hour` | `60`            | Messages accepted from one sending identity per hour, in fixed hourly windows kept in memory (a restart opens a fresh window); `0` = unlimited. Further messages are refused: on a live link with the bare throttled code before acknowledgement, not filed; by store-and-forward with one typed reply per identity, per reason, per hour, the message filed in the inbox for the human without an envoy run; plus one folded REPL line per identity, per reason, per hour, with the folded count reported the next time that peer is heard from after the hour rolls over |
+| `mesh.peer_max_tokens_per_hour`   | `100000`        | Model tokens one sending identity may cost per hour, counted after each envoy run, so the runs in flight may overshoot the ceiling by at most `peer_max_concurrent` runs; `0` = unlimited. On a live link a message that would start a run after the hour's token ceiling is already spent is refused before it is acknowledged with the bare throttled code, which names no reason, and is not filed; one acknowledged before the ceiling was reached and refused when its turn comes is filed in the inbox and answered with the typed `budget_exhausted` reply; by store-and-forward it is filed in the inbox for the human without an envoy run and the peer gets one typed reply per identity, per reason, per hour |
+| `mesh.peer_max_cost_usd_per_hour` | `0`             | USD one sending identity may cost per hour, counted like the token ceiling and enforced only when the envoy model's prices are known; `0` = no cost ceiling, otherwise a positive amount. On a live link a message that would start a run after the hour's cost ceiling is already spent is refused before it is acknowledged with the bare throttled code, which names no reason, and is not filed; one acknowledged before the ceiling was reached and refused when its turn comes is filed in the inbox and answered with the typed `budget_exhausted` reply; by store-and-forward it is filed in the inbox for the human without an envoy run and the peer gets one typed reply per identity, per reason, per hour |
+| `mesh.request_timeout_secs`       | `null`          | Seconds to wait for a peer's answer on `/message`, `/knock`, `/list`, `/access` and `/status`; raises a path's built-in deadline (15 s; 30 s for `/status`) and never lowers one, so a value under `15` or over `31536000` (one year) is refused; `null` keeps each path's built-in deadline; `/fetch` keeps its own 120 s and the `mesh__peers` status sweep its 5 s |
+| `mesh.link_timeout_secs`          | `null`          | Seconds to wait for the link to open and identify before a request on the same five paths; raises the built-in 10 s and never lowers it, so a value under `10` or over `31536000` (one year) is refused; `null` keeps the 10 s |
+| `mesh.propagation_sync_interval_secs` | `300`       | Seconds between automatic fetches of the messages a propagation node holds for this node; the first fetch runs once a propagation node is heard after the node joins; `0` = fetch only on `.mesh sync`; at most `31536000`; off while `announce` is false |
+| `mesh.fetch.inline_max_bytes`     | `65536`         | Largest file a peer may attach inline to one message; larger ones are dropped from the message and counted; `1` to `98304`, the per-message inline total                      |
+| `mesh.fetch.max_bytes`            | `4194304`       | Largest file this node serves to a peer that fetches it; a larger one is refused; `1` to `4194304` (4 MiB); until the upstream multi-segment transfer fix lands the served limit is `min(max_bytes, 1048447)` (about 1 MiB) and a `too_large` refusal's `limit` reports the limit applied |
+| `mesh.fetch.inbox_dir`            | `null`          | Absolute directory where files peers send inline, and files this node fetches, are staged, under `<inbox_dir>/<instance id>`; `null` stages them under `<cache dir>/mesh/inbox/<instance id>`; keep it outside any workspace you share, or peers could fetch each other's staged files |
+| `mesh.envoy_memory.enabled`       | `false`         | Remember a trusted peer's thread between messages, so the envoy answers a follow-up in context: the peer's turns and what the node said, keyed by the proved identity and thread, kept owner-only under `<cache dir>/mesh/envoy-sessions/<instance id>`; off by default, so nothing a peer says is carried into its next run (the inbox still files every message) |
+| `mesh.envoy_memory.max_sessions`  | `256`           | Most threads remembered across all peers; the least recently used go first; must be `1` or more                                                                              |
+| `mesh.envoy_memory.max_per_identity` | `16`         | Most threads remembered for one peer identity; the least recently used go first; must be `1` or more                                                                         |
+| `mesh.envoy_memory.max_turns`     | `40`            | Most turns kept per thread; the oldest exchange goes first; must be `1` or more                                                                                              |
+| `mesh.envoy_memory.max_bytes`     | `65536`         | Most bytes of turn text kept per thread; the oldest exchange goes first, and kept turns that do not fit the envoy model's context are left out of the run, oldest first, and stay remembered; must be `1` or more |
+| `mesh.envoy_memory.ttl_hours`     | `168`           | Hours a thread is remembered after its last written exchange; must be `1` or more                                                                                            |
 
 ---
 

@@ -19,9 +19,9 @@ pub(crate) const STATUS_CARD_VERSION: u64 = 1;
 
 /// `state.code` values. A code point is never renumbered or reused; new ones are only
 /// appended, and a reader keeps a code it does not know rather than refusing the card.
-pub(crate) const STATE_UNKNOWN: u8 = 0;
-pub(crate) const STATE_IDLE: u8 = 1;
-pub(crate) const STATE_WORKING: u8 = 2;
+pub(crate) const STATE_UNKNOWN: u64 = 0;
+pub(crate) const STATE_IDLE: u64 = 1;
+pub(crate) const STATE_WORKING: u64 = 2;
 
 /// Caps on the text the card carries, in characters, applied on the serving side.
 /// `DISPLAY_NAME_MAX_CHARS` is the peer-facing cap; announces enforce a separate 64-byte
@@ -32,19 +32,24 @@ pub(crate) const REPO_NAME_MAX_CHARS: usize = 64;
 pub(crate) const BRANCH_MAX_CHARS: usize = 64;
 pub(crate) const PLAN_TITLE_MAX_CHARS: usize = 120;
 pub(crate) const TODO_GOAL_MAX_CHARS: usize = 280;
+pub(crate) const ABOUT_MAX_CHARS: usize = 200;
+pub(crate) const CAPS_MAX_ENTRIES: usize = 16;
+pub(crate) const CAP_MAX_CHARS: usize = 32;
 
 /// What a trusted peer learns about this session when it asks `/status`.
 ///
 /// Wire form: a msgpack map with string keys. `v` (integer) and `served_at_secs` (integer)
 /// are required, as is `state` (a map whose `code` is required and `since_secs` optional).
 /// `display_name`, `objective`, `repo` (`name` required, `branch` optional), `plan`
-/// (`title`), `todo` (`goal` optional, `done`, `total`) and `snapshot_age_secs` are
-/// optional and left out when absent; a reader treats a missing key and nil alike.
+/// (`title`), `todo` (`goal` optional, `done`, `total`), `about`, `caps` and
+/// `snapshot_age_secs` are optional and left out when absent; a reader treats a missing
+/// key and nil alike, and an empty `caps` list is never emitted.
 ///
 /// Two rules keep a card readable across versions. Keys a reader does not know are
 /// ignored, so a same-version peer may add fields without breaking older readers. State
 /// code points are immutable: never renumbered, only appended, and an unknown code is kept
-/// as it came rather than refused. A `v` above `STATUS_CARD_VERSION` is refused with an
+/// as it came rather than refused. `caps` entries this Coyote does not define are kept as
+/// they came for the same reason. A `v` above `STATUS_CARD_VERSION` is refused with an
 /// error that names the upgrade.
 ///
 /// The card never carries a path, the working directory, the session name, the model, the
@@ -52,9 +57,12 @@ pub(crate) const TODO_GOAL_MAX_CHARS: usize = 280;
 /// repository root and nothing more.
 ///
 /// A decoded card is peer-supplied data. Its text has been through `display_text`, so it is
-/// clean and within the caps, but `since_secs`, `snapshot_age_secs` and `served_at_secs` are
-/// kept as sent: clock skew between peers is normal, so no value is refused as too large,
-/// and a consumer turning them into ages or instants must use saturating arithmetic.
+/// clean and within the caps, but the numbers are not clamped. `state.code` is kept as
+/// sent, and a code this reader does not know is rendered as unknown. `since_secs`,
+/// `snapshot_age_secs` and `served_at_secs` are kept as sent too: clock skew between peers
+/// is normal, so no value is refused as too large, and a consumer turning them into ages or
+/// instants must use saturating arithmetic. `todo.done` and `todo.total` are the exception
+/// and saturate to `u32::MAX` on read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StatusCard {
     pub display_name: Option<String>,
@@ -63,13 +71,15 @@ pub(crate) struct StatusCard {
     pub repo: Option<CardRepo>,
     pub plan: Option<CardPlan>,
     pub todo: Option<CardTodo>,
+    pub about: Option<String>,
+    pub caps: Vec<String>,
     pub snapshot_age_secs: Option<u64>,
     pub served_at_secs: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CardState {
-    pub code: u8,
+    pub code: u64,
     pub since_secs: Option<u64>,
 }
 
@@ -115,6 +125,11 @@ impl StatusCard {
             map.push((Value::from("total"), Value::from(todo.total)));
             entries.push((Value::from("todo"), Value::Map(map)));
         }
+        push_text(&mut entries, "about", self.about.as_deref());
+        if !self.caps.is_empty() {
+            let caps = self.caps.iter().map(|cap| Value::from(cap.as_str()));
+            entries.push((Value::from("caps"), Value::Array(caps.collect())));
+        }
         push_u64(&mut entries, "snapshot_age_secs", self.snapshot_age_secs);
         entries.push((
             Value::from("served_at_secs"),
@@ -144,8 +159,7 @@ impl StatusCard {
             .ok_or_else(|| malformed("`state` is missing"))?;
         let code = state
             .u64("code")?
-            .and_then(|code| u8::try_from(code).ok())
-            .ok_or_else(|| malformed("`state.code` is missing or not a byte"))?;
+            .ok_or_else(|| malformed("`state.code` is missing"))?;
         let repo = match card.map("repo")? {
             Some(repo) => Some(CardRepo {
                 name: repo
@@ -181,6 +195,8 @@ impl StatusCard {
             repo,
             plan,
             todo,
+            about: card.text_or_absent("about", ABOUT_MAX_CHARS),
+            caps: card.text_list_or_empty("caps", CAPS_MAX_ENTRIES, CAP_MAX_CHARS),
             snapshot_age_secs: card.u64("snapshot_age_secs")?,
             served_at_secs: card
                 .u64("served_at_secs")?
@@ -206,7 +222,8 @@ fn malformed(reason: &str) -> StatusError {
 }
 
 /// One msgpack map being read as a card or one of its sub-maps. A missing key and a nil
-/// value both read as absent; a present value of the wrong type is malformed.
+/// value both read as absent; a present value of the wrong type is malformed, except
+/// under the `_or_absent` and `_or_empty` readers, which keep the rest of the card.
 struct Fields<'a>(&'a [(Value, Value)]);
 
 impl<'a> Fields<'a> {
@@ -233,6 +250,44 @@ impl<'a> Fields<'a> {
         }
     }
 
+    /// `text` for a key added after `v: 1` shipped: a value that is not a string reads as
+    /// absent, since a reader from before the key would have accepted the card.
+    fn text_or_absent(&self, key: &str, max_chars: usize) -> Option<String> {
+        let value = self.get(key)?;
+        match value.as_str() {
+            Some(text) => display_text(text, max_chars),
+            None => {
+                debug!("Mesh status card `{key}` is not a string; read as absent");
+                None
+            }
+        }
+    }
+
+    /// The strings in the list at `key`, each as `display_text` leaves it, for a key added
+    /// after `v: 1` shipped. A value that is not a list reads as no entries, an entry that
+    /// is not a string or comes out blank is skipped, and entries past `max_entries` are
+    /// dropped; nothing here refuses the card.
+    fn text_list_or_empty(&self, key: &str, max_entries: usize, max_chars: usize) -> Vec<String> {
+        let Some(value) = self.get(key) else {
+            return Vec::new();
+        };
+        let Some(entries) = value.as_array() else {
+            debug!("Mesh status card `{key}` is not a list; read as empty");
+            return Vec::new();
+        };
+        entries
+            .iter()
+            .take(max_entries)
+            .filter_map(|entry| match entry.as_str() {
+                Some(text) => display_text(text, max_chars),
+                None => {
+                    debug!("Mesh status card `{key}` entry is not a string; skipped");
+                    None
+                }
+            })
+            .collect()
+    }
+
     fn u64(&self, key: &str) -> Result<Option<u64>, StatusError> {
         self.get(key)
             .map(|value| {
@@ -243,10 +298,12 @@ impl<'a> Fields<'a> {
             .transpose()
     }
 
+    /// The uint at `key`, saturated to `u32::MAX`; missing or nil is malformed.
     fn u32(&self, key: &str) -> Result<u32, StatusError> {
-        self.u64(key)?
-            .and_then(|number| u32::try_from(number).ok())
-            .ok_or_else(|| malformed(&format!("`{key}` is missing or not a 32-bit count")))
+        let number = self
+            .u64(key)?
+            .ok_or_else(|| malformed(&format!("`{key}` is missing")))?;
+        Ok(u32::try_from(number).unwrap_or(u32::MAX))
     }
 
     fn map(&self, key: &str) -> Result<Option<Fields<'a>>, StatusError> {
@@ -285,6 +342,12 @@ pub(crate) fn render_for_human(card: &StatusCard, now: SystemTime) -> String {
             card.objective.as_deref().unwrap_or("(none)")
         ),
     ];
+    if let Some(about) = &card.about {
+        lines.push(format!("about: {about}"));
+    }
+    if !card.caps.is_empty() {
+        lines.push(format!("caps: {}", card.caps.join(", ")));
+    }
     let state = match card.state.code {
         STATE_IDLE => "idle".to_string(),
         STATE_WORKING => "working".to_string(),
@@ -326,6 +389,8 @@ pub(crate) fn build_card(
     objective_override: Option<&str>,
     digest_objective: Option<&str>,
     display_name: Option<&str>,
+    about: Option<&str>,
+    caps: &[String],
     now: SystemTime,
 ) -> StatusCard {
     let objective = [
@@ -385,6 +450,8 @@ pub(crate) fn build_card(
         repo,
         plan,
         todo,
+        about: about.and_then(|about| display_text(about, ABOUT_MAX_CHARS)),
+        caps: caps.to_vec(),
         snapshot_age_secs: snapshot.map(|snapshot| snapshot.age(now).as_secs()),
         served_at_secs: unix_secs(now),
     }
@@ -397,6 +464,8 @@ pub(crate) trait CardSource: Send + Sync {
     fn objective_override(&self) -> Option<Arc<String>>;
     fn digest(&self) -> Option<Arc<Digest>>;
     fn display_name(&self) -> Option<String>;
+    fn about(&self) -> Option<String>;
+    fn caps(&self) -> Vec<String>;
 }
 
 impl CardSource for MeshSlot {
@@ -415,6 +484,15 @@ impl CardSource for MeshSlot {
     fn display_name(&self) -> Option<String> {
         self.get()
             .and_then(|runtime| runtime.display_name().map(str::to_string))
+    }
+
+    fn about(&self) -> Option<String> {
+        self.get()
+            .and_then(|runtime| runtime.about().map(str::to_string))
+    }
+
+    fn caps(&self) -> Vec<String> {
+        vec!["fetch".to_string()]
     }
 }
 
@@ -438,7 +516,7 @@ impl StatusHandler {
             debug!(
                 "Mesh /status served the minimal card: the session slot behind the provider is gone"
             );
-            return build_card(None, None, None, None, now);
+            return build_card(None, None, None, None, None, &[], now);
         };
         let snapshot = source.snapshot();
         let objective_override = source.objective_override();
@@ -447,11 +525,14 @@ impl StatusHandler {
             .as_deref()
             .and_then(|snapshot| digest_objective_for(snapshot, digest.as_deref()));
         let display_name = source.display_name();
+        let about = source.about();
         build_card(
             snapshot.as_deref(),
             objective_override.as_deref().map(String::as_str),
             digest_objective.as_deref(),
             display_name.as_deref(),
+            about.as_deref(),
+            &source.caps(),
             now,
         )
     }
@@ -509,17 +590,19 @@ impl fmt::Display for StatusError {
 impl std::error::Error for StatusError {}
 
 impl MeshRuntime {
-    /// Asks `destination` for its status card over a live link with the default timeouts.
+    /// Asks `destination` for its status card over a live link with the default timeouts,
+    /// raised by the configured ones.
     pub(crate) async fn request_status(
         &self,
         destination: &DestinationDesc,
     ) -> Result<StatusCard, StatusError> {
-        self.request_status_with(destination, RequestOptions::default())
-            .await
+        let options = self.request_timeouts().raise(RequestOptions::default());
+        self.request_status_with(destination, options).await
     }
 
     /// `request_status` with the caller's timeouts. The request goes to the peer directly
-    /// and fails typed when it cannot be answered now; it is never held for later.
+    /// and fails typed when it cannot be answered now; it is never held for later. A card
+    /// that was read is remembered for `last_card`.
     pub(crate) async fn request_status_with(
         &self,
         destination: &DestinationDesc,
@@ -532,7 +615,10 @@ impl MeshRuntime {
         if let Some(error) = DispatchError::from_value(&outcome.value) {
             return Err(StatusError::NotServed(error));
         }
-        StatusCard::from_value(&outcome.value)
+        let card = StatusCard::from_value(&outcome.value)?;
+        self.memory()
+            .remember_card(&destination.address_hash.to_hex_string(), card.clone());
+        Ok(card)
     }
 }
 
@@ -567,9 +653,11 @@ mod tests {
             card.repo.as_ref().and_then(|repo| repo.branch.as_deref()),
             card.plan.as_ref().map(|plan| plan.title.as_str()),
             card.todo.as_ref().and_then(|todo| todo.goal.as_deref()),
+            card.about.as_deref(),
         ]
         .into_iter()
         .flatten()
+        .chain(card.caps.iter().map(String::as_str))
         .collect()
     }
 
@@ -620,7 +708,7 @@ mod tests {
     fn a_session_without_repo_plan_or_todo_still_yields_a_card_that_round_trips() {
         let mut snapshot = snapshot_fixture();
         snapshot.captured_at = now();
-        let card = build_card(Some(&snapshot), None, None, Some("Alex"), now());
+        let card = build_card(Some(&snapshot), None, None, Some("Alex"), None, &[], now());
         assert_eq!(card.display_name.as_deref(), Some("Alex"));
         assert_eq!(card.objective.as_deref(), Some("ship it"));
         assert_eq!(card.state.code, STATE_IDLE);
@@ -628,11 +716,13 @@ mod tests {
         assert_eq!(card.repo, None);
         assert_eq!(card.plan, None);
         assert_eq!(card.todo, None);
+        assert_eq!(card.about, None);
+        assert!(card.caps.is_empty());
         assert_eq!(card.snapshot_age_secs, Some(0));
         assert_eq!(card.served_at_secs, unix_secs(now()));
         assert_eq!(StatusCard::from_value(&card.to_value()), Ok(card));
 
-        let minimal = build_card(None, None, None, None, now());
+        let minimal = build_card(None, None, None, None, None, &[], now());
         assert_eq!(
             minimal,
             StatusCard {
@@ -645,6 +735,8 @@ mod tests {
                 repo: None,
                 plan: None,
                 todo: None,
+                about: None,
+                caps: Vec::new(),
                 snapshot_age_secs: None,
                 served_at_secs: unix_secs(now()),
             }
@@ -664,7 +756,7 @@ mod tests {
         drop(source);
         assert_eq!(
             handler.card(now()),
-            build_card(None, None, None, None, now())
+            build_card(None, None, None, None, None, &[], now())
         );
     }
 
@@ -689,6 +781,36 @@ mod tests {
         fn display_name(&self) -> Option<String> {
             None
         }
+
+        fn about(&self) -> Option<String> {
+            None
+        }
+
+        fn caps(&self) -> Vec<String> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn a_slot_without_a_runtime_has_no_about() {
+        let slot = Arc::new(MeshSlot::default());
+        slot.publish(snapshot_fixture());
+        assert_eq!(CardSource::about(slot.as_ref()), None);
+        let handler = StatusHandler::new(Arc::downgrade(&slot) as Weak<dyn CardSource>);
+        let card = handler.card(now());
+        assert_eq!(card.objective.as_deref(), Some("ship it"));
+        assert_eq!(card.about, None);
+    }
+
+    #[test]
+    fn the_status_card_always_advertises_the_fetch_capability() {
+        let slot = Arc::new(MeshSlot::default());
+        assert_eq!(CardSource::caps(slot.as_ref()), ["fetch"]);
+        let handler = StatusHandler::new(Arc::downgrade(&slot) as Weak<dyn CardSource>);
+        assert_eq!(handler.card(now()).caps, ["fetch"]);
+
+        slot.publish(snapshot_fixture());
+        assert_eq!(handler.card(now()).caps, ["fetch"]);
     }
 
     #[test]
@@ -748,18 +870,36 @@ mod tests {
             Some("from the override"),
             Some("from the digest"),
             None,
+            None,
+            &[],
             now(),
         );
         assert_eq!(card.objective.as_deref(), Some("from the override"));
 
-        let card = build_card(Some(&snapshot), None, Some("from the digest"), None, now());
+        let card = build_card(
+            Some(&snapshot),
+            None,
+            Some("from the digest"),
+            None,
+            None,
+            &[],
+            now(),
+        );
         assert_eq!(card.objective.as_deref(), Some("from the todo goal"));
 
         snapshot.objective = None;
-        let card = build_card(Some(&snapshot), None, Some("from the digest"), None, now());
+        let card = build_card(
+            Some(&snapshot),
+            None,
+            Some("from the digest"),
+            None,
+            None,
+            &[],
+            now(),
+        );
         assert_eq!(card.objective.as_deref(), Some("from the digest"));
 
-        let card = build_card(Some(&snapshot), Some("  "), None, None, now());
+        let card = build_card(Some(&snapshot), Some("  "), None, None, None, &[], now());
         assert_eq!(card.objective, None);
     }
 
@@ -783,7 +923,7 @@ mod tests {
 
     #[test]
     fn version_is_one_and_newer_or_missing_versions_are_refused_by_name() {
-        let card = build_card(None, None, None, None, now());
+        let card = build_card(None, None, None, None, None, &[], now());
         let Value::Map(entries) = card.to_value() else {
             unreachable!("a card encodes as a map");
         };
@@ -842,6 +982,469 @@ mod tests {
         assert_eq!(card.state.since_secs, None);
         assert_eq!(card.objective, None);
         assert_eq!(card.served_at_secs, 5);
+        assert_eq!(card.about, None, "a card from before `about` reads as none");
+        assert!(
+            card.caps.is_empty(),
+            "a card from before `caps` reads as none"
+        );
+    }
+
+    fn card_with(key: &str, value: Value) -> Value {
+        Value::Map(vec![
+            (Value::from("v"), Value::from(1u64)),
+            (
+                Value::from("state"),
+                Value::Map(vec![(Value::from("code"), Value::from(STATE_IDLE))]),
+            ),
+            (Value::from(key), value),
+            (Value::from("served_at_secs"), Value::from(5u64)),
+        ])
+    }
+
+    fn card_with_state(state: Vec<(Value, Value)>) -> Value {
+        Value::Map(vec![
+            (Value::from("v"), Value::from(1u64)),
+            (Value::from("state"), Value::Map(state)),
+            (Value::from("served_at_secs"), Value::from(5u64)),
+        ])
+    }
+
+    #[test]
+    fn state_codes_above_a_byte_are_kept_and_rendered_as_unknown() {
+        for code in [256u64, 1u64 << 40, u64::MAX] {
+            let value = card_with_state(vec![(Value::from("code"), Value::from(code))]);
+            let card = StatusCard::from_value(&value).unwrap();
+            assert_eq!(card.state.code, code);
+            let text = render_for_human(&card, now());
+            assert!(text.contains(&format!("state: unknown ({code})")), "{text}");
+        }
+        assert!(matches!(
+            StatusCard::from_value(&card_with_state(vec![(
+                Value::from("code"),
+                Value::from("x")
+            )])),
+            Err(StatusError::Malformed(_))
+        ));
+        assert!(matches!(
+            StatusCard::from_value(&card_with_state(vec![(Value::from("code"), Value::Nil)])),
+            Err(StatusError::Malformed(_))
+        ));
+        assert!(matches!(
+            StatusCard::from_value(&card_with_state(Vec::new())),
+            Err(StatusError::Malformed(_))
+        ));
+    }
+
+    fn todo_map(done: Value, total: Value) -> Value {
+        Value::Map(vec![
+            (Value::from("done"), done),
+            (Value::from("total"), total),
+        ])
+    }
+
+    #[test]
+    fn todo_counts_above_u32_saturate_on_read() {
+        let card = StatusCard::from_value(&card_with(
+            "todo",
+            todo_map(Value::from(1u64 << 33), Value::from(u64::MAX)),
+        ))
+        .unwrap();
+        let todo = card.todo.unwrap();
+        assert_eq!(todo.done, u32::MAX);
+        assert_eq!(todo.total, u32::MAX);
+
+        let card = StatusCard::from_value(&card_with(
+            "todo",
+            todo_map(Value::from(u64::from(u32::MAX)), Value::from(3u64)),
+        ))
+        .unwrap();
+        assert_eq!(card.todo.unwrap().done, u32::MAX);
+
+        assert!(matches!(
+            StatusCard::from_value(&card_with(
+                "todo",
+                todo_map(Value::from("1"), Value::from(2u64))
+            )),
+            Err(StatusError::Malformed(_))
+        ));
+        assert!(matches!(
+            StatusCard::from_value(&card_with("todo", todo_map(Value::Nil, Value::from(2u64)))),
+            Err(StatusError::Malformed(_))
+        ));
+    }
+
+    /// A hand-packed card so the test controls the msgpack *format family* of each
+    /// number, which `Value::from` would normalise away.
+    fn packed_card(code: &[u8], done: &[u8], total: &[u8]) -> Vec<u8> {
+        fn fixstr(text: &str) -> Vec<u8> {
+            let mut out = vec![0xa0 | u8::try_from(text.len()).unwrap()];
+            out.extend_from_slice(text.as_bytes());
+            out
+        }
+        let mut bytes = vec![0x84];
+        bytes.extend(fixstr("v"));
+        bytes.push(0x01);
+        bytes.extend(fixstr("state"));
+        bytes.push(0x82);
+        bytes.extend(fixstr("code"));
+        bytes.extend_from_slice(code);
+        bytes.extend(fixstr("extra"));
+        bytes.push(0xc0);
+        bytes.extend(fixstr("todo"));
+        bytes.push(0x82);
+        bytes.extend(fixstr("done"));
+        bytes.extend_from_slice(done);
+        bytes.extend(fixstr("total"));
+        bytes.extend_from_slice(total);
+        bytes.extend(fixstr("served_at_secs"));
+        bytes.push(0x05);
+        bytes
+    }
+
+    fn read_packed(bytes: &[u8]) -> Result<StatusCard, StatusError> {
+        let value = rmpv::decode::read_value(&mut &bytes[..]).unwrap();
+        StatusCard::from_value(&value)
+    }
+
+    #[test]
+    fn usage_probe_a_uint_is_accepted_from_every_non_negative_msgpack_int_format() {
+        // `uint` means a non-negative integer, whichever int format family the encoder
+        // picked: positive values in the signed formats are kept, negatives and floats are
+        // not, and an unknown `state` sub-key alongside is ignored.
+        let int16_256 = [0xd1, 0x01, 0x00];
+        let int64_2_pow_33 = {
+            let mut out = vec![0xd3];
+            out.extend_from_slice(&(1i64 << 33).to_be_bytes());
+            out
+        };
+        let uint64_2_pow_40 = {
+            let mut out = vec![0xcf];
+            out.extend_from_slice(&(1u64 << 40).to_be_bytes());
+            out
+        };
+        let card = read_packed(&packed_card(&int16_256, &int64_2_pow_33, &uint64_2_pow_40))
+            .expect("positive signed-format ints are uints");
+        assert_eq!(card.state.code, 256);
+        let todo = card.todo.clone().unwrap();
+        assert_eq!((todo.done, todo.total), (u32::MAX, u32::MAX));
+        assert!(
+            render_for_human(&card, now()).contains("state: unknown (256)"),
+            "{}",
+            render_for_human(&card, now())
+        );
+
+        let card = read_packed(&packed_card(&uint64_2_pow_40, &[0x01], &[0x02])).unwrap();
+        assert_eq!(card.state.code, 1 << 40);
+        assert_eq!(card.todo.map(|todo| (todo.done, todo.total)), Some((1, 2)));
+
+        let int8_1 = [0xd0, 0x01];
+        let card = read_packed(&packed_card(&int8_1, &int8_1, &int8_1)).unwrap();
+        assert_eq!(card.state.code, STATE_IDLE);
+        assert!(render_for_human(&card, now()).contains("state: idle"));
+
+        let negative_fixint = [0xff];
+        let float64_one = {
+            let mut out = vec![0xcb];
+            out.extend_from_slice(&1.0f64.to_be_bytes());
+            out
+        };
+        for wrong in [&negative_fixint[..], &float64_one[..]] {
+            for (label, bytes) in [
+                ("code", packed_card(wrong, &[0x01], &[0x02])),
+                ("done", packed_card(&[0x01], wrong, &[0x02])),
+                ("total", packed_card(&[0x01], &[0x01], wrong)),
+            ] {
+                match read_packed(&bytes) {
+                    Err(StatusError::Malformed(message)) => assert!(
+                        message.contains(label) && message.contains("non-negative integer"),
+                        "{label}: {message}"
+                    ),
+                    other => panic!("{label} = {wrong:?} must be Malformed, got {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn usage_probe_saturated_counts_and_wide_codes_are_a_decode_encode_fixed_point() {
+        // Reading saturates `todo.*`; what a consumer then re-emits is the saturated
+        // count, and reading that back changes nothing. The code is re-emitted verbatim.
+        let value = Value::Map(vec![
+            (Value::from("v"), Value::from(1u64)),
+            (
+                Value::from("state"),
+                Value::Map(vec![
+                    (Value::from("code"), Value::from(u64::MAX)),
+                    (Value::from("since_secs"), Value::from(7u64)),
+                ]),
+            ),
+            (
+                Value::from("todo"),
+                todo_map(Value::from(1u64 << 33), Value::from(u64::MAX)),
+            ),
+            (Value::from("served_at_secs"), Value::from(5u64)),
+        ]);
+        let card = StatusCard::from_value(&value).unwrap();
+        assert_eq!(card.state.since_secs, Some(7));
+
+        let reencoded = card.to_value();
+        let fields = Fields::of(&reencoded).unwrap();
+        let state = fields.map("state").unwrap().unwrap();
+        assert_eq!(state.u64("code").unwrap(), Some(u64::MAX));
+        let todo = fields.map("todo").unwrap().unwrap();
+        assert_eq!(todo.u64("done").unwrap(), Some(u64::from(u32::MAX)));
+        assert_eq!(todo.u64("total").unwrap(), Some(u64::from(u32::MAX)));
+
+        assert_eq!(StatusCard::from_value(&reencoded), Ok(card.clone()));
+        let twice = StatusCard::from_value(&reencoded).unwrap().to_value();
+        assert_eq!(encoded(&card), {
+            let mut bytes = Vec::new();
+            rmpv::encode::write_value(&mut bytes, &twice).unwrap();
+            bytes
+        });
+    }
+
+    #[test]
+    fn usage_probe_a_wire_card_at_every_numeric_extreme_renders_both_counts_verbatim() {
+        // Saturation can leave `done` past `total`; the human rendering prints the two
+        // counts as read and computes nothing from them, an unknown code is named with its
+        // value, and the ages at `u64::MAX` are kept as sent and rendered at either end of
+        // the clock without arithmetic overflow.
+        let value = Value::Map(vec![
+            (Value::from("v"), Value::from(1u64)),
+            (
+                Value::from("state"),
+                Value::Map(vec![
+                    (Value::from("code"), Value::from(1u64 << 40)),
+                    (Value::from("since_secs"), Value::from(u64::MAX)),
+                ]),
+            ),
+            (
+                Value::from("todo"),
+                todo_map(Value::from(1u64 << 33), Value::from(5u64)),
+            ),
+            (Value::from("snapshot_age_secs"), Value::from(u64::MAX)),
+            (Value::from("served_at_secs"), Value::from(u64::MAX)),
+        ]);
+        let card = StatusCard::from_value(&value).expect("every number is a uint");
+        assert_eq!(card.state.since_secs, Some(u64::MAX));
+        assert_eq!(card.snapshot_age_secs, Some(u64::MAX));
+        assert_eq!(card.served_at_secs, u64::MAX);
+        let (done, total) = card.todo.as_ref().map(|t| (t.done, t.total)).unwrap();
+        assert_eq!((done, total), (u32::MAX, 5));
+
+        // The far end is the last second RFC 3339 can spell (9999-12-31T23:59:59Z): a
+        // `SystemTime` on every platform, where Windows' clock, i64 100-ns ticks ending in
+        // the year 30828, cannot hold `UNIX_EPOCH + u64::MAX / 2` seconds.
+        for at in [
+            UNIX_EPOCH,
+            now(),
+            UNIX_EPOCH + Duration::from_secs(253_402_300_799),
+        ] {
+            let text = render_for_human(&card, at);
+            assert!(
+                text.contains("\nstate: unknown (1099511627776)\n"),
+                "{text}"
+            );
+            assert!(text.contains("\ntodo: 4294967295/5\n"), "{text}");
+            assert!(text.contains("\nsince: "), "{text}");
+            assert!(
+                text.contains(&format!("\nsnapshot: {}s old when served\n", u64::MAX)),
+                "{text}"
+            );
+            assert!(
+                text.lines().last().unwrap().starts_with("served: "),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn about_is_sanitised_and_cut_on_a_character_boundary() {
+        let about = format!("\u{1b}[31m{}\u{202E}", "\u{e9}".repeat(ABOUT_MAX_CHARS + 5));
+        let card = StatusCard::from_value(&card_with("about", Value::from(about))).unwrap();
+        let about = card.about.as_deref().unwrap();
+        assert_eq!(about.chars().count(), ABOUT_MAX_CHARS);
+        assert_eq!(about.len(), ABOUT_MAX_CHARS * 2);
+        assert!(about.chars().all(|c| c == '\u{e9}'), "{about:?}");
+
+        let numeric = StatusCard::from_value(&card_with("about", Value::from(7u64))).unwrap();
+        assert_eq!(
+            numeric.about, None,
+            "an `about` that is not a string reads as absent, not as a malformed card"
+        );
+        let blank = StatusCard::from_value(&card_with("about", Value::from(" \u{200B} "))).unwrap();
+        assert_eq!(blank.about, None);
+    }
+
+    #[test]
+    fn caps_skips_entries_that_are_not_text_and_drops_those_past_the_cap() {
+        let mut entries: Vec<Value> = (0..20).map(|i| Value::from(format!("cap-{i}"))).collect();
+        entries[3] = Value::from(3u64);
+        entries[5] = Value::from("\u{1b}[2J");
+        entries[7] = Value::from(format!("fetch{}", "x".repeat(CAP_MAX_CHARS)));
+        let card = StatusCard::from_value(&card_with("caps", Value::Array(entries))).unwrap();
+        assert_eq!(card.caps.len(), CAPS_MAX_ENTRIES - 2);
+        assert!(
+            card.caps
+                .iter()
+                .all(|cap| cap.chars().count() <= CAP_MAX_CHARS)
+        );
+        assert_eq!(card.caps[0], "cap-0");
+        assert_eq!(card.caps[3], "cap-4");
+        assert_eq!(card.caps[4], "cap-6");
+        assert_eq!(
+            card.caps[5],
+            format!("fetch{}", "x".repeat(CAP_MAX_CHARS - 5)),
+            "an over-long entry is cut, not dropped"
+        );
+        assert_eq!(card.caps[6], "cap-8");
+        assert_eq!(card.caps.last().map(String::as_str), Some("cap-15"));
+        assert!(!card.caps.iter().any(|cap| cap.contains("cap-16")));
+
+        let empty = StatusCard::from_value(&card_with("caps", Value::Array(vec![]))).unwrap();
+        assert!(empty.caps.is_empty());
+        let nil = StatusCard::from_value(&card_with("caps", Value::Nil)).unwrap();
+        assert!(nil.caps.is_empty());
+    }
+
+    #[test]
+    fn caps_that_are_not_a_list_read_as_no_caps() {
+        for wrong in [
+            Value::Map(vec![(Value::from("fetch"), Value::Boolean(true))]),
+            Value::from("fetch"),
+            Value::from(1u64),
+        ] {
+            let card = StatusCard::from_value(&card_with("caps", wrong)).unwrap();
+            assert!(card.caps.is_empty(), "{:?}", card.caps);
+        }
+    }
+
+    /// The keys a `v: 1` reader from before `about` and `caps` would have ignored may
+    /// not refuse the card now; the rest of the card reads as if they were absent.
+    #[test]
+    fn a_card_with_a_malformed_about_and_caps_still_reads_the_rest_intact() {
+        let value = Value::Map(vec![
+            (Value::from("v"), Value::from(1u64)),
+            (Value::from("display_name"), Value::from("Alex")),
+            (
+                Value::from("state"),
+                Value::Map(vec![(Value::from("code"), Value::from(STATE_IDLE))]),
+            ),
+            (Value::from("about"), Value::Array(vec![Value::from("x")])),
+            (Value::from("caps"), Value::from("fetch")),
+            (Value::from("served_at_secs"), Value::from(5u64)),
+        ]);
+
+        let card = StatusCard::from_value(&value).unwrap();
+
+        assert_eq!(card.display_name.as_deref(), Some("Alex"));
+        assert_eq!(card.state.code, STATE_IDLE);
+        assert_eq!(card.served_at_secs, 5);
+        assert_eq!(card.about, None);
+        assert!(card.caps.is_empty());
+        assert_eq!(StatusCard::from_value(&card.to_value()), Ok(card));
+    }
+
+    /// Ignore-on-receipt for the card: the lenient readers must hold
+    /// for the shapes a non-Rust peer can put on the wire that are not `rmpv` strings —
+    /// msgpack `bin` and a `str` holding bytes that are not UTF-8 — and must hold after a
+    /// real encode→decode, not only on a hand-built `Value`. A wrong-typed `about` is
+    /// absent, every non-text `caps` entry is skipped, and the card's required keys read
+    /// as served.
+    #[test]
+    fn usage_probe_binary_and_invalid_utf8_about_and_caps_read_as_absent_through_msgpack_bytes() {
+        // `rmpv` only builds a `Utf8String` from valid text, so the invalid `str` is made
+        // the way a peer would make it: a 3-byte fixstr whose bytes are not UTF-8,
+        // patched over a 3-byte marker after encoding.
+        const MARKER: &str = "QQQ";
+        fn patch_marker(bytes: &mut [u8]) {
+            let needle = [0xa3, b'Q', b'Q', b'Q'];
+            let at = bytes.windows(4).position(|w| w == needle).unwrap();
+            bytes[at + 1..at + 4].copy_from_slice(&[0xff, 0xfe, 0x41]);
+            assert!(!bytes.windows(4).any(|w| w == needle));
+        }
+        let value = Value::Map(vec![
+            (Value::from("v"), Value::from(1u64)),
+            (Value::from("display_name"), Value::from("Alex")),
+            (
+                Value::from("state"),
+                Value::Map(vec![(Value::from("code"), Value::from(STATE_IDLE))]),
+            ),
+            (
+                Value::from("about"),
+                Value::Binary(b"about as bytes".to_vec()),
+            ),
+            (
+                Value::from("caps"),
+                Value::Array(vec![
+                    Value::Binary(b"fetch".to_vec()),
+                    Value::from(MARKER),
+                    Value::Boolean(true),
+                    Value::from("fetch"),
+                    Value::Nil,
+                    Value::Array(vec![Value::from("nested")]),
+                    Value::from("sync"),
+                ]),
+            ),
+            (Value::from("served_at_secs"), Value::from(5u64)),
+        ]);
+        let mut bytes = Vec::new();
+        rmpv::encode::write_value(&mut bytes, &value).unwrap();
+        patch_marker(&mut bytes);
+        let decoded = rmpv::decode::read_value(&mut bytes.as_slice()).unwrap();
+
+        let card = StatusCard::from_value(&decoded).unwrap();
+
+        assert_eq!(card.about, None, "msgpack bin is not a string");
+        assert_eq!(card.caps, vec!["fetch".to_string(), "sync".to_string()]);
+        assert_eq!(card.display_name.as_deref(), Some("Alex"));
+        assert_eq!(card.state.code, STATE_IDLE);
+        assert_eq!(card.served_at_secs, 5);
+        assert_eq!(StatusCard::from_value(&card.to_value()), Ok(card));
+
+        let mut bytes = Vec::new();
+        rmpv::encode::write_value(&mut bytes, &card_with("about", Value::from(MARKER))).unwrap();
+        patch_marker(&mut bytes);
+        let decoded = rmpv::decode::read_value(&mut bytes.as_slice()).unwrap();
+        let card = StatusCard::from_value(&decoded).unwrap();
+        assert_eq!(card.about, None, "a str that is not UTF-8 reads as absent");
+    }
+
+    #[test]
+    fn unknown_caps_are_kept_and_the_maximal_card_round_trips_about_and_caps() {
+        let card = StatusCard::from_value(&card_with(
+            "caps",
+            Value::Array(vec![Value::from("fetch"), Value::from("teleport")]),
+        ))
+        .unwrap();
+        assert_eq!(card.caps, vec!["fetch".to_string(), "teleport".to_string()]);
+
+        let card = maximal_card();
+        let decoded = StatusCard::from_value(&card.to_value()).unwrap();
+        assert_eq!(decoded.about, card.about);
+        assert_eq!(decoded.caps, card.caps);
+        assert_eq!(decoded, card);
+    }
+
+    #[test]
+    fn build_card_sanitises_about_and_copies_caps_as_given() {
+        let caps = vec!["fetch".to_string()];
+        let card = build_card(
+            None,
+            None,
+            None,
+            None,
+            Some("  Ask me about the \u{1b}[31mmesh\u{1b}[0m  "),
+            &caps,
+            now(),
+        );
+        assert_eq!(card.about.as_deref(), Some("Ask me about the mesh"));
+        assert_eq!(card.caps, caps);
+
+        let blank = build_card(None, None, None, None, Some(" \t "), &[], now());
+        assert_eq!(blank.about, None);
+        assert!(blank.caps.is_empty());
     }
 
     #[test]
@@ -879,7 +1482,17 @@ mod tests {
     fn card_text_goes_through_display_text_and_never_leaks_paths_or_session_data() {
         let snapshot = adversarial_snapshot();
         let display_name = format!("Zed\u{1b}[2J Quill{}", "\u{1f600}".repeat(70));
-        let card = build_card(Some(&snapshot), None, None, Some(&display_name), now());
+        let about = format!("help\u{1b}[31m with\u{200B} the mesh {}", "a".repeat(300));
+        let caps = vec!["fetch".to_string()];
+        let card = build_card(
+            Some(&snapshot),
+            None,
+            None,
+            Some(&display_name),
+            Some(&about),
+            &caps,
+            now(),
+        );
 
         let objective = card.objective.as_deref().unwrap();
         assert_eq!(objective.chars().count(), OBJECTIVE_MAX_CHARS);
@@ -889,6 +1502,11 @@ mod tests {
         assert_eq!(name.chars().count(), DISPLAY_NAME_MAX_CHARS);
         assert!(name.starts_with("Zed Quill"), "{name:?}");
         assert!(name.ends_with('\u{1f600}'), "{name:?}");
+
+        let about = card.about.as_deref().unwrap();
+        assert_eq!(about.chars().count(), ABOUT_MAX_CHARS);
+        assert!(about.starts_with("help with the mesh aaa"), "{about:?}");
+        assert_eq!(card.caps, caps);
 
         let repo = card.repo.as_ref().unwrap();
         assert_eq!(repo.name, "proj");
@@ -960,7 +1578,7 @@ mod tests {
             root: PathBuf::from("/home/u/proj"),
             branch: None,
         });
-        let card = build_card(Some(&snapshot), None, None, None, now());
+        let card = build_card(Some(&snapshot), None, None, None, None, &[], now());
         assert_eq!(
             card.repo,
             Some(CardRepo {
@@ -973,7 +1591,7 @@ mod tests {
             root: PathBuf::from("/"),
             branch: Some("main".into()),
         });
-        let card = build_card(Some(&snapshot), None, None, None, now());
+        let card = build_card(Some(&snapshot), None, None, None, None, &[], now());
         assert_eq!(card.repo, None);
     }
 
@@ -982,12 +1600,12 @@ mod tests {
         let mut snapshot = snapshot_fixture();
         snapshot.todo = TodoList::default();
         assert_eq!(
-            build_card(Some(&snapshot), None, None, None, now()).todo,
+            build_card(Some(&snapshot), None, None, None, None, &[], now()).todo,
             None
         );
 
         snapshot.todo.goal = "  finish  ".into();
-        let card = build_card(Some(&snapshot), None, None, None, now());
+        let card = build_card(Some(&snapshot), None, None, None, None, &[], now());
         assert_eq!(
             card.todo,
             Some(CardTodo {
@@ -1033,6 +1651,10 @@ mod tests {
                 done: u32::MAX,
                 total: u32::MAX,
             }),
+            about: Some("a".repeat(ABOUT_MAX_CHARS)),
+            caps: (0..CAPS_MAX_ENTRIES)
+                .map(|_| "c".repeat(CAP_MAX_CHARS))
+                .collect(),
             snapshot_age_secs: Some(u64::MAX),
             served_at_secs: u64::MAX,
         }
@@ -1052,6 +1674,8 @@ mod tests {
             "repo",
             "plan",
             "todo",
+            "about",
+            "caps",
             "snapshot_age_secs",
             "served_at_secs",
         ];
@@ -1069,17 +1693,19 @@ mod tests {
     #[test]
     fn maximal_card_exceeds_the_link_mdu_and_the_minimal_card_is_small() {
         assert!(encoded(&maximal_card()).len() > LINK_PACKET_MDU);
-        assert!(encoded(&build_card(None, None, None, None, now())).len() < 100);
+        assert!(encoded(&build_card(None, None, None, None, None, &[], now())).len() < 100);
     }
 
     #[test]
     fn human_rendering_keeps_unknown_state_codes() {
-        let mut card = build_card(None, None, None, None, now());
+        let mut card = build_card(None, None, None, None, None, &[], now());
         card.state.code = 7;
         let text = render_for_human(&card, now());
         assert!(text.contains("state: unknown (7)"), "{text}");
         assert!(text.contains("name: (none)"), "{text}");
         assert!(text.contains("objective: (none)"), "{text}");
+        assert!(!text.contains("about:"), "{text}");
+        assert!(!text.contains("caps:"), "{text}");
         assert!(!text.contains("since:"), "{text}");
         assert!(!text.contains("repo:"), "{text}");
         assert!(text.contains("served: 0s ago"), "{text}");
@@ -1100,7 +1726,15 @@ mod tests {
         );
         let early = render_for_human(&maximal_card(), UNIX_EPOCH);
         assert!(early.contains("since: 0s ago"), "{early}");
-        let mut aged = build_card(Some(&snapshot_fixture()), None, None, None, now());
+        let mut aged = build_card(
+            Some(&snapshot_fixture()),
+            None,
+            None,
+            None,
+            None,
+            &[],
+            now(),
+        );
         aged.state.since_secs = Some(unix_secs(now()) - 3 * 3600);
         let text = render_for_human(&aged, now() + Duration::from_secs(90));
         assert!(text.contains("since: 3h ago"), "{text}");
@@ -1134,8 +1768,25 @@ mod tests {
             text.contains(&format!("\nsnapshot: {}s old when served\n", u64::MAX)),
             "{text}"
         );
+        assert!(
+            text.contains(&format!(
+                "\nobjective: {}\nabout: {}\ncaps: {}\nstate: working\n",
+                "o".repeat(OBJECTIVE_MAX_CHARS),
+                "a".repeat(ABOUT_MAX_CHARS),
+                vec!["c".repeat(CAP_MAX_CHARS); CAPS_MAX_ENTRIES].join(", ")
+            )),
+            "{text}"
+        );
 
-        let card = build_card(Some(&snapshot_fixture()), None, None, Some("Ann"), now());
+        let card = build_card(
+            Some(&snapshot_fixture()),
+            None,
+            None,
+            Some("Ann"),
+            None,
+            &[],
+            now(),
+        );
         let text = render_for_human(&card, now() + Duration::from_secs(5));
         assert!(
             text.starts_with("name: Ann\nobjective: ship it\nstate: idle\n"),
@@ -1143,14 +1794,14 @@ mod tests {
         );
         assert!(text.contains("served: 5s ago"), "{text}");
 
-        let text = render_for_human(&build_card(None, None, None, None, now()), now());
+        let text = render_for_human(&build_card(None, None, None, None, None, &[], now()), now());
         assert!(text.contains("\nstate: unknown\n"), "{text}");
         let odd = StatusCard {
             state: CardState {
                 code: 7,
                 since_secs: None,
             },
-            ..build_card(None, None, None, None, now())
+            ..build_card(None, None, None, None, None, &[], now())
         };
         assert!(
             render_for_human(&odd, now()).contains("\nstate: unknown (7)\n"),
@@ -1179,7 +1830,7 @@ mod tests {
         assert!(malformed.contains("status card"), "{malformed}");
     }
 
-    /// Spec-first usage probe: `.mesh status <dest>` surfaces `StatusError` through `?`, so
+    /// `.mesh status <dest>` surfaces `StatusError` through `?`, so
     /// the four causes (transport, not served, unsupported card version, malformed) must
     /// read as four DISTINCT texts, each naming its own cause and remedy.
     #[test]

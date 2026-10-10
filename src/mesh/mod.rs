@@ -1,16 +1,21 @@
 #![deny(unsafe_code)]
 
+pub(crate) mod access;
 mod announce;
 pub(crate) mod brief;
 pub(crate) mod card;
 #[cfg(test)]
-mod conformance;
+pub(crate) mod conformance;
 pub(crate) mod envoy;
+pub(crate) mod envoy_sessions;
 pub(crate) mod events;
+pub(crate) mod fetch;
 #[cfg(test)]
 mod fuzz;
+pub(crate) mod grants;
 pub(crate) mod identity;
 pub(crate) mod idle;
+pub(crate) mod inbox;
 pub(crate) mod knock;
 pub(crate) mod knocks;
 pub(crate) mod limits;
@@ -24,15 +29,22 @@ mod propagation;
 mod propagation_fetch;
 mod propagation_nodes;
 mod protocol;
-mod r3;
+pub(crate) mod r3;
 // pub(crate): the REPL pins the shared refusal wording in its tests.
 pub(crate) mod schema;
+pub(crate) mod shares;
 pub(crate) mod snapshot;
 #[cfg(test)]
 mod spec_pins;
 pub(crate) mod trust;
+pub(crate) mod wire_path;
 
-pub(crate) use node::{MESH_ALREADY_ON, MeshPaths, MeshRuntime, MeshSlot, NodeOptions};
+#[cfg(test)]
+pub(crate) use node::session_destination_name;
+pub(crate) use node::{
+    InterfaceState, InterfaceStatus, MESH_ALREADY_ON, MeshPaths, MeshRuntime, MeshSlot,
+    NodeOptions, refusal_reply,
+};
 pub(crate) use peers::PeerRecord;
 pub(crate) use propagation_fetch::{
     FetchError, FetchReport, LoggingInboundSink, MAX_WANTS_PER_FETCH,
@@ -41,10 +53,10 @@ pub(crate) use propagation_nodes::PropagationNodeRecord;
 pub(crate) use r3::{RequestOptions, redact_hashes, short};
 
 use crate::config::sanitize_display_text;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use rns_transport::hash::{AddressHash, Hash};
 use sha2::Digest;
-use std::fs::{self, File};
+use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -80,6 +92,26 @@ pub(crate) fn age_text(now: SystemTime, then: SystemTime) -> String {
         s if s < 3600 => format!("{}m ago", s / 60),
         s if s < 86_400 => format!("{}h ago", s / 3600),
         s => format!("{}d ago", s / 86_400),
+    }
+}
+
+/// `0 bytes`, `1 byte`, `512 bytes`, then decimal units: one decimal below ten of a unit
+/// (`1.2 KB`), whole above (`16 KB`, `3 MB`), with a `.0` dropped (`2 KB`).
+pub(crate) fn human_size(bytes: u64) -> String {
+    const UNITS: [(&str, f64); 3] = [("GB", 1e9), ("MB", 1e6), ("KB", 1e3)];
+    let size = bytes as f64;
+    match UNITS.iter().find(|(_, unit)| size >= *unit) {
+        None if bytes == 1 => "1 byte".to_string(),
+        None => format!("{bytes} bytes"),
+        Some((name, unit)) => {
+            let scaled = size / unit;
+            let shown = if scaled < 10.0 {
+                format!("{scaled:.1}")
+            } else {
+                format!("{scaled:.0}")
+            };
+            format!("{} {name}", shown.strip_suffix(".0").unwrap_or(&shown))
+        }
     }
 }
 
@@ -145,21 +177,118 @@ pub(crate) fn display_text(text: &str, max_chars: usize) -> Option<String> {
     Some(capped.trim_end().to_string())
 }
 
-/// Writes `bytes` to `<path>.tmp` beside `path`, syncs it, then renames it into place, so a
-/// crash mid-write cannot leave a half-written file for the next load to refuse.
+/// Writes `bytes` to a fresh temp file beside `path`, syncs it, then renames it into
+/// place, so a crash mid-write cannot leave a half-written file for the next load to
+/// refuse. The temp name is unique per write and opened `create_new`, so a planted link
+/// under a guessable name is never followed; a symlink at `path` itself is refused, since
+/// renaming over it would replace the link while a write through it would land wherever
+/// it points. The workspace share list lives in the repository, so a clone chooses what
+/// is at these names.
 pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_atomically_with(path, bytes, false)
+}
+
+/// `write_atomically` for a file only its owner may read: the temp file is created
+/// `0o600` on unix, so the bytes are never readable by others, not even between the
+/// write and the rename. Elsewhere the mode is the platform's.
+pub(crate) fn write_atomically_owner_only(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_atomically_with(path, bytes, true)
+}
+
+fn write_atomically_with(path: &Path, bytes: &[u8], owner_only: bool) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create directory '{}'", parent.display()))?;
     }
-    let tmp = path.with_added_extension("tmp");
-    File::create(&tmp)
-        .and_then(|mut file| {
-            file.write_all(bytes)?;
-            file.sync_all()
-        })
-        .and_then(|()| fs::rename(&tmp, path))
-        .with_context(|| format!("Failed to write '{}'", path.display()))
+    refuse_symlink(path)?;
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let tmp = path.with_added_extension(format!("{}-{nanos}.tmp", std::process::id()));
+    let mut open = fs::OpenOptions::new();
+    open.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        if owner_only {
+            open.mode(0o600);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = owner_only;
+    let mut file = open
+        .open(&tmp)
+        .with_context(|| format!("Failed to write '{}'", path.display()))?;
+    let flushed = file.write_all(bytes).and_then(|()| file.sync_all());
+    drop(file);
+    let written = flushed.and_then(|()| fs::rename(&tmp, path));
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    written.with_context(|| format!("Failed to write '{}'", path.display()))
+}
+
+/// Mesh state is written only to regular files: a symlink at `path` is refused rather
+/// than replaced or written through. A missing file passes.
+pub(crate) fn refuse_symlink(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => bail!(
+            "'{}' is a symlink; mesh state is written only to regular files. Replace the link with the file it points to and try again.",
+            path.display()
+        ),
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => {
+            Err(err).with_context(|| format!("Failed to read metadata of '{}'", path.display()))
+        }
+    }
+}
+
+/// `dunce::canonicalize`, with the `\\?\` prefix that dunce keeps on a Windows path
+/// longer than MAX_PATH dropped as well. A share root and a file deep beneath it must
+/// resolve to the same spelling or no prefix check between them can hold, and the
+/// standard library re-applies the prefix itself whenever a path needs it, so nothing
+/// below is lost. The prefix is kept whenever dunce would keep it for another reason:
+/// a reserved device name or a name the legacy form would trim. One edge stays closed:
+/// a single name of 254 or 255 characters is too long for the probe below on its own,
+/// so a path holding one keeps the prefix and fails the root check as before.
+pub(crate) fn canonicalize(path: &Path) -> std::io::Result<PathBuf> {
+    let resolved = dunce::canonicalize(path)?;
+    #[cfg(windows)]
+    let resolved = without_verbatim_disk(resolved);
+    Ok(resolved)
+}
+
+#[cfg(windows)]
+fn without_verbatim_disk(path: PathBuf) -> PathBuf {
+    use std::path::{Component, Prefix};
+
+    let mut components = path.components();
+    if !matches!(
+        components.next(),
+        Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::VerbatimDisk(_))
+    ) {
+        return path;
+    }
+    // dunce's per-name rules are reused by asking it about each name alone, where length
+    // cannot be the reason it keeps the prefix.
+    let names_are_plain = components.all(|component| match component {
+        Component::RootDir => true,
+        Component::Normal(name) => !dunce::simplified(&Path::new(r"\\?\C:\").join(name))
+            .as_os_str()
+            .as_encoded_bytes()
+            .starts_with(br"\\?\"),
+        _ => false,
+    });
+    if !names_are_plain {
+        return path;
+    }
+    let plain = path
+        .to_str()
+        .and_then(|text| text.strip_prefix(r"\\?\"))
+        .map(PathBuf::from);
+    plain.unwrap_or(path)
 }
 
 #[cfg(test)]
@@ -171,10 +300,12 @@ pub(crate) mod test_support {
     #[cfg(unix)]
     use super::message::{PeerBody, from_r3_body, received_reply};
     use super::node::MeshPaths;
+    #[cfg(all(test, unix))]
+    pub(crate) use super::node::RecordingEnvoy;
     #[cfg(unix)]
-    use super::node::{MeshRuntime, NodeOptions};
+    use super::node::{MeshRuntime, MeshSlot, NodeOptions};
     #[cfg(unix)]
-    pub(crate) use super::peers::PeerSighting;
+    pub(crate) use super::peers::{PEER_TTL, PeerSighting};
     pub(crate) use super::propagation::PropagationNode;
     #[cfg(unix)]
     use super::propagation::pn_announce_app_data;
@@ -182,6 +313,13 @@ pub(crate) mod test_support {
     use super::propagation_fetch::FETCH_TRANSFER_LIMIT_KB;
     pub(crate) use super::propagation_fetch::{InboundMessage, InboundSink};
     pub(crate) use super::protocol::Compatibility;
+    #[cfg(all(test, unix))]
+    pub(crate) use super::r3::network::{
+        NodePair, Script as ResponderScript, access_body, fetch_body, hook_sink_for,
+        installed_slot, share_docs_from_a, short_options, trusting_b, wire_field, wire_status,
+    };
+    #[cfg(unix)]
+    pub(crate) use super::r3::{ACCESS_PATH, FETCH_PATH, LIST_PATH};
     #[cfg(unix)]
     use super::r3::{
         Admission, Dispatcher, InboundRequest, LoggingKnockSink, R3Client, R3Server, RequestHandler,
@@ -190,7 +328,11 @@ pub(crate) mod test_support {
         AdmittedRequest, Handler, MESSAGE_PATH, NAME_HASH_LEN, OriginName, PathHash, RefusalCode,
         Reply, RequestId, SizeBranch,
     };
+    #[cfg(unix)]
+    use super::session_destination_name;
     use super::snapshot::{BriefState, MeshSnapshot, SessionInfo, TurnState};
+    #[cfg(unix)]
+    use super::trust::TrustOptions;
     use super::trust::TrustStore;
     use super::{mesh_config_dir, rfc3339_utc};
     use crate::config::MeshConfig;
@@ -237,7 +379,7 @@ pub(crate) mod test_support {
     #[cfg(unix)]
     use tokio::io::AsyncReadExt;
     #[cfg(unix)]
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, TcpSocket};
     #[cfg(unix)]
     use tokio::sync::broadcast;
     #[cfg(unix)]
@@ -276,6 +418,12 @@ pub(crate) mod test_support {
             let seq = SEQ.fetch_add(1, Ordering::Relaxed);
             let path = env::temp_dir().join(format!("coyote-mesh-{tag}-{nanos}-{seq}"));
             fs::create_dir_all(&path).unwrap();
+            // The temp root is handed out resolved, since what the code under test hands
+            // back is resolved too: macOS reaches /var through a link and Windows may name
+            // the profile by its short form, and a fixture joined on the raw root would
+            // never equal either. It goes through the same helper production uses, so a
+            // temp root deeper than MAX_PATH is spelled the same way on both sides too.
+            let path = super::canonicalize(&path).unwrap();
             Self { path }
         }
     }
@@ -284,6 +432,17 @@ pub(crate) mod test_support {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
         }
+    }
+
+    /// The names in `path`'s directory, sorted, so a test can pin that an atomic write
+    /// left nothing beside the file it replaced.
+    pub(crate) fn siblings_of(path: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
     }
 
     /// A TCP listener that accepts every connection and holds it open until the peer hangs
@@ -295,6 +454,14 @@ pub(crate) mod test_support {
     pub(crate) async fn loopback_relay() -> (SocketAddr, JoinHandle<()>, Arc<AtomicUsize>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let (handle, closed) = serve_as_sink(listener).await;
+        (addr, handle, closed)
+    }
+
+    /// Serves `listener` the way `loopback_relay` does: every connection is accepted and
+    /// drained until the peer hangs up, and the counter is the number of streams closed.
+    #[cfg(unix)]
+    pub(crate) async fn serve_as_sink(listener: TcpListener) -> (JoinHandle<()>, Arc<AtomicUsize>) {
         let closed = Arc::new(AtomicUsize::new(0));
         let counter = closed.clone();
         let handle = tokio::spawn(async move {
@@ -310,7 +477,154 @@ pub(crate) mod test_support {
                 });
             }
         });
-        (addr, handle, closed)
+        (handle, closed)
+    }
+
+    /// A loopback port that refuses connections until the test calls `.listen(backlog)`
+    /// on the returned socket, which turns it into the same byte sink `loopback_relay`
+    /// is once handed to `serve_as_sink`. A bound socket that is not listening answers
+    /// every SYN with a reset; `TcpListener::bind` would listen at once.
+    #[cfg(unix)]
+    pub(crate) async fn held_port() -> (u16, TcpSocket) {
+        let socket = TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        (socket.local_addr().unwrap().port(), socket)
+    }
+
+    /// A Reticulum transport node in-process: a `TcpServer` on a transport with transport
+    /// mode on. Two `MeshRuntime`s that both join it hear each other's announces through
+    /// its rebroadcasts and link to each other through it, so neither side is a stub.
+    #[cfg(unix)]
+    pub(crate) struct TransportRelay {
+        transport: Arc<Transport>,
+        iface: AddressHash,
+        pub(crate) port: u16,
+    }
+
+    #[cfg(unix)]
+    impl TransportRelay {
+        pub(crate) async fn start() -> Self {
+            Self::start_on(closed_port().await).await
+        }
+
+        /// Listens on `port`, which must be free: the upstream server retries a failed
+        /// bind every 5 s without a word, so the first bind is required to succeed here
+        /// rather than letting a held port hang the test.
+        pub(crate) async fn start_on(port: u16) -> Self {
+            let mut config =
+                TransportConfig::new("relay", &TransportIdentity::new_from_rand(OsRng), false);
+            config.set_transport_enabled(true);
+            // Rebroadcast every announce a few times, ~5 s apart, so a node that joins
+            // after the other one announced still hears it.
+            config.set_announce_retry_limit(4);
+            let transport = Arc::new(Transport::new(config));
+            let (tcp, first_bind) =
+                TcpServer::new(format!("127.0.0.1:{port}"), transport.iface_manager())
+                    .with_client_mtu(TcpServer::DEFAULT_CLIENT_MTU)
+                    .with_startup_result();
+            let status = tcp.runtime_status_handle();
+            let iface = transport
+                .iface_manager()
+                .lock()
+                .await
+                .spawn(tcp, TcpServer::spawn);
+            first_bind
+                .await
+                .expect("the relay reports its first bind")
+                .unwrap_or_else(|err| {
+                    panic!("the relay's first bind of 127.0.0.1:{port} failed: {err}")
+                });
+            wait_until("the relay to listen", || {
+                status.to_json()["listener_state"].as_str() == Some("listening")
+            })
+            .await;
+            Self {
+                transport,
+                iface,
+                port,
+            }
+        }
+
+        pub(crate) async fn stop(self) {
+            let _ = timeout(
+                Duration::from_secs(5),
+                self.transport.stop_interface(self.iface),
+            )
+            .await;
+        }
+    }
+
+    /// How long two nodes on a `TransportRelay` get to file each other.
+    #[cfg(unix)]
+    const PEER_FILING_TIMEOUT: Duration = Duration::from_secs(30);
+    /// How often the asker re-requests the answerer's path while waiting to file it.
+    #[cfg(unix)]
+    const PATH_REQUEST_INTERVAL: Duration = Duration::from_secs(5);
+
+    /// A `/status` round trip from the node in `asker` to the node in `answerer` over
+    /// whatever relay joins them, each trusting the other's destination the way
+    /// `.mesh trust` does. Panics with the step that did not happen.
+    #[cfg(unix)]
+    pub(crate) async fn status_round_trip(
+        asker: &Arc<MeshSlot>,
+        answerer: &Arc<MeshSlot>,
+    ) -> super::card::StatusCard {
+        let asking = asker.get().expect("the asking slot holds a node");
+        let answering = answerer.get().expect("the answering slot holds a node");
+        wait_for_peer(&asking, &answering.current_destination_hash()).await;
+        wait_for_peer(&answering, &asking.current_destination_hash()).await;
+        asking
+            .trust()
+            .trust_destination(
+                asker.as_ref(),
+                &answering.current_destination_hash(),
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .expect("the asker trusts the answerer");
+        answering
+            .trust()
+            .trust_destination(
+                answerer.as_ref(),
+                &asking.current_destination_hash(),
+                TrustOptions::default(),
+                SystemTime::now(),
+            )
+            .expect("the answerer trusts the asker");
+        let desc = asking
+            .resolve_destination(&answering.current_destination_hash())
+            .await
+            .expect("the answerer's destination resolves from its announce");
+        asking
+            .request_status(&desc)
+            .await
+            .unwrap_or_else(|err| panic!("the status request failed: {err:?}"))
+    }
+
+    /// Waits for `runtime` to file `destination`. An announce the relay heard before this
+    /// node joined is not replayed on its own; the relay answers a path request with the
+    /// announce it cached, so one goes out every `PATH_REQUEST_INTERVAL`.
+    #[cfg(unix)]
+    async fn wait_for_peer(runtime: &MeshRuntime, destination: &str) {
+        let peers = runtime.peers();
+        let hash = AddressHash::new_from_hex_string(destination).unwrap();
+        let transport = runtime
+            .transport_handle()
+            .await
+            .expect("the node is running");
+        let deadline = tokio::time::Instant::now() + PEER_FILING_TIMEOUT;
+        let mut next_request = tokio::time::Instant::now();
+        while peers.get(destination).is_none() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for {destination} to be filed"
+            );
+            if tokio::time::Instant::now() >= next_request {
+                transport.request_path(&hash, None, None).await;
+                next_request = tokio::time::Instant::now() + PATH_REQUEST_INTERVAL;
+            }
+            sleep(POLL).await;
+        }
     }
 
     pub(crate) fn private_config(port: u16) -> MeshConfig {
@@ -670,7 +984,14 @@ pub(crate) mod test_support {
         listener: Listener,
         identity: TransportIdentity,
         recorder: Arc<MessageRecorder>,
+        /// The trust list in force and the handlers beside the recorder; the dispatcher
+        /// is rebuilt from both whenever either changes.
+        list: Mutex<TrustList>,
+        extra: Mutex<Vec<(&'static str, Arc<dyn Handler>)>>,
         trust_dir: TempDir,
+        /// What the last `announce` carried, so a wait on the node filing this stub can
+        /// announce it again unchanged.
+        last_announce: Mutex<Option<Vec<u8>>>,
     }
 
     #[cfg(unix)]
@@ -679,20 +1000,23 @@ pub(crate) mod test_support {
             let identity = TransportIdentity::new_from_rand(OsRng);
             let recorder = Arc::new(MessageRecorder::default());
             let trust_dir = TempDir::new(tag);
-            let handler = Self::gate(&TrustList::default(), &trust_dir, recorder.clone());
+            let handler = Self::gate(&TrustList::default(), &trust_dir, recorder.clone(), &[]);
             let listener = Listener::listen(
                 Arc::new(R3Server::new()),
                 handler,
                 client_mtu,
                 identity.clone(),
-                DestinationName::new("coyote", &format!("mesh.{tag}")),
+                session_destination_name(tag),
             )
             .await;
             Self {
                 listener,
                 identity,
                 recorder,
+                list: Mutex::new(TrustList::default()),
+                extra: Mutex::new(Vec::new()),
                 trust_dir,
+                last_announce: Mutex::new(None),
             }
         }
 
@@ -700,34 +1024,45 @@ pub(crate) mod test_support {
             list: &TrustList,
             trust_dir: &TempDir,
             recorder: Arc<MessageRecorder>,
+            extra: &[(&'static str, Arc<dyn Handler>)],
         ) -> Arc<dyn RequestHandler> {
             list.write(&trust_dir.path);
             let trust = Arc::new(TrustStore::open(&trust_dir.path).unwrap());
             let dispatcher = Dispatcher::new(trust, Arc::new(LoggingKnockSink));
             dispatcher.register(MESSAGE_PATH, recorder).unwrap();
+            for (path, handler) in extra {
+                dispatcher.register(path, handler.clone()).unwrap();
+            }
             Arc::new(dispatcher)
+        }
+
+        fn regate(&self) {
+            self.listener.server.set_handler(Self::gate(
+                &self.list.lock(),
+                &self.trust_dir,
+                self.recorder.clone(),
+                &self.extra.lock(),
+            ));
+        }
+
+        /// Serves `path` with `handler` beside the recorder.
+        pub(crate) fn serve(&self, path: &'static str, handler: Arc<dyn Handler>) {
+            self.extra.lock().push((path, handler));
+            self.regate();
         }
 
         /// Trusts the instance at `destination_hex` bound to `identity_hex`, so its requests
         /// reach the recorder instead of knocking.
         pub(crate) fn trust(&self, destination_hex: &str, identity_hex: &str) {
-            let list = TrustList::default().destination(destination_hex, identity_hex);
-            self.listener.server.set_handler(Self::gate(
-                &list,
-                &self.trust_dir,
-                self.recorder.clone(),
-            ));
+            *self.list.lock() = TrustList::default().destination(destination_hex, identity_hex);
+            self.regate();
         }
 
         /// Knows `identity_hex` without trusting any of its instances: a knock from one
         /// of them is admitted and refused `NoAccess`, which is the knock landing.
         pub(crate) fn know_identity(&self, identity_hex: &str) {
-            let list = TrustList::default().identity(identity_hex, false);
-            self.listener.server.set_handler(Self::gate(
-                &list,
-                &self.trust_dir,
-                self.recorder.clone(),
-            ));
+            *self.list.lock() = TrustList::default().identity(identity_hex, false);
+            self.regate();
         }
 
         /// Announces as a Coyote node, which is what gets this stub into a runtime's peer
@@ -739,7 +1074,38 @@ pub(crate) mod test_support {
             }
             .encode()
             .unwrap();
+            *self.last_announce.lock() = Some(app_data.clone());
             self.listener.announce(Some(&app_data)).await;
+        }
+
+        /// Waits for `peers` to hold this stub under `to`, announcing again every
+        /// `REANNOUNCE` until it does. An announce is one packet with no retry of its own,
+        /// and the node reports its relay connected as soon as the socket is while the stub
+        /// registers the accepted client a task later, so the first packet can leave with
+        /// nobody to receive it. A node that heard it files the stub within one poll and
+        /// never hears a second; the cadence stays far below the announce burst rate that
+        /// trips ingress control.
+        pub(crate) async fn wait_to_be_filed(
+            &self,
+            peers: &crate::mesh::peers::PeerTable,
+            to: &str,
+        ) {
+            const REANNOUNCE: Duration = Duration::from_secs(1);
+            let deadline = tokio::time::Instant::now() + INTEROP_TIMEOUT;
+            let mut next_announce = tokio::time::Instant::now() + REANNOUNCE;
+            while peers.get(to).is_none() {
+                let now = tokio::time::Instant::now();
+                assert!(
+                    now < deadline,
+                    "timed out waiting for the node to file the stub"
+                );
+                if now >= next_announce {
+                    let app_data = self.last_announce.lock().clone();
+                    self.listener.announce(app_data.as_deref()).await;
+                    next_announce = now + REANNOUNCE;
+                }
+                sleep(POLL).await;
+            }
         }
 
         pub(crate) fn port(&self) -> u16 {
@@ -752,6 +1118,11 @@ pub(crate) mod test_support {
 
         pub(crate) fn identity_hex(&self) -> String {
             self.identity.address_hash().to_hex_string()
+        }
+
+        /// The name this stub's instance is derived from, as a stored message names it.
+        pub(crate) fn origin(&self) -> OriginName {
+            OriginName::of(&self.listener.desc.name)
         }
 
         /// Every well-formed `/message` body received so far, in arrival order.
@@ -769,7 +1140,7 @@ pub(crate) mod test_support {
     #[cfg(unix)]
     pub(crate) fn derived_sighting(aspect: &str, display_name: Option<&str>) -> PeerSighting {
         let identity = TransportIdentity::new_from_rand(OsRng);
-        let name = DestinationName::new("coyote", &format!("mesh.{aspect}"));
+        let name = session_destination_name(aspect);
         let desc = SingleInputDestination::new(identity, name).desc;
         PeerSighting {
             destination_hash: desc.address_hash.to_hex_string(),
@@ -929,14 +1300,36 @@ pub(crate) mod test_support {
         pub(crate) runtime: Arc<MeshRuntime>,
         pub(crate) session: Session,
         pub(crate) relay_handle: JoinHandle<()>,
-        _tmp: TempDir,
+        pub(crate) tmp: TempDir,
     }
 
     /// A runtime joined to a loopback relay, with its identity and cache under a temp dir.
     #[cfg(unix)]
     pub(crate) async fn started_runtime(tag: &str) -> StartedRuntime {
+        started_runtime_with(tag, |_| {}).await
+    }
+
+    /// `started_runtime` with the node's config adjusted first, for a test whose node
+    /// must stage or protect a directory of the test's choosing.
+    #[cfg(unix)]
+    pub(crate) async fn started_runtime_with(
+        tag: &str,
+        adjust: impl FnOnce(&mut MeshConfig),
+    ) -> StartedRuntime {
+        started_runtime_with_options(tag, NodeOptions::default(), adjust).await
+    }
+
+    /// `started_runtime_with` starting the node with `options` instead of the defaults.
+    #[cfg(unix)]
+    pub(crate) async fn started_runtime_with_options(
+        tag: &str,
+        options: NodeOptions,
+        adjust: impl FnOnce(&mut MeshConfig),
+    ) -> StartedRuntime {
         let (addr, relay_handle, _) = loopback_relay().await;
-        started_runtime_at(tag, addr.port(), relay_handle).await
+        let mut config = private_config(addr.port());
+        adjust(&mut config);
+        started_runtime_at(tag, config, options, relay_handle).await
     }
 
     /// A runtime joined to whatever listens on `port`, such as a `PeerStub`. There is no
@@ -944,38 +1337,51 @@ pub(crate) mod test_support {
     /// nothing.
     #[cfg(unix)]
     pub(crate) async fn started_runtime_on(tag: &str, port: u16) -> StartedRuntime {
-        started_runtime_at(tag, port, tokio::spawn(std::future::ready(()))).await
+        started_runtime_on_with(tag, port, |_| {}).await
+    }
+
+    /// `started_runtime_on` with the node's config adjusted first.
+    #[cfg(unix)]
+    pub(crate) async fn started_runtime_on_with(
+        tag: &str,
+        port: u16,
+        adjust: impl FnOnce(&mut MeshConfig),
+    ) -> StartedRuntime {
+        let mut config = private_config(port);
+        adjust(&mut config);
+        started_runtime_at(
+            tag,
+            config,
+            NodeOptions::default(),
+            tokio::spawn(std::future::ready(())),
+        )
+        .await
     }
 
     #[cfg(unix)]
     async fn started_runtime_at(
         tag: &str,
-        port: u16,
+        config: MeshConfig,
+        options: NodeOptions,
         relay_handle: JoinHandle<()>,
     ) -> StartedRuntime {
         let tmp = TempDir::new(tag);
         let mut session = Session::default();
-        let runtime = MeshRuntime::start(
-            &private_config(port),
-            true,
-            &mut session,
-            mesh_paths(&tmp),
-            NodeOptions::default(),
-        )
-        .await
-        .unwrap();
+        let runtime = MeshRuntime::start(&config, true, &mut session, mesh_paths(&tmp), options)
+            .await
+            .unwrap();
         StartedRuntime {
             runtime,
             session,
             relay_handle,
-            _tmp: tmp,
+            tmp,
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::{TempDir, rust_sources};
+    use super::test_support::{TempDir, read_source, rust_sources};
     use super::*;
 
     #[test]
@@ -995,11 +1401,44 @@ mod tests {
     }
 
     #[test]
+    fn sizes_read_in_bytes_then_decimal_units() {
+        assert_eq!(human_size(0), "0 bytes");
+        assert_eq!(human_size(1), "1 byte");
+        assert_eq!(human_size(512), "512 bytes");
+        assert_eq!(human_size(999), "999 bytes");
+        assert_eq!(human_size(1_200), "1.2 KB");
+        assert_eq!(human_size(2_048), "2 KB");
+        assert_eq!(human_size(16_384), "16 KB");
+        assert_eq!(human_size(3_000_000), "3 MB");
+        assert_eq!(human_size(2_500_000_000), "2.5 GB");
+    }
+
+    #[test]
     fn display_text_drops_the_unicode_line_and_paragraph_separators() {
         assert_eq!(
             display_text("one\u{2028}two\u{2029}three", 100).as_deref(),
             Some("one two three")
         );
+    }
+
+    /// `untrusted_content::wrap` keeps its own invisible-character list rather than
+    /// importing this module's; this pins the two together so a character
+    /// `display_text` drops can never lead a marker line past the fence's quote.
+    #[test]
+    fn every_invisible_character_display_text_drops_cannot_lead_a_marker_past_the_fence() {
+        let dropped = ('\0'..=char::MAX).filter(|c| {
+            !c.is_control()
+                && !matches!(c, '\u{2028}' | '\u{2029}')
+                && (announce::is_control_or_invisible(*c) || announce::is_variation_selector(*c))
+        });
+        for c in dropped {
+            let fenced = crate::utils::untrusted_content::wrap("peer ab12", &format!("{c}=== x"));
+            assert!(
+                fenced.contains(&format!("\n> {c}=== x\n")),
+                "U+{:04X} led an unquoted marker line: {fenced}",
+                c as u32
+            );
+        }
     }
 
     #[test]
@@ -1036,7 +1475,6 @@ mod tests {
 
         write_atomically(&path, b"second").unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"second");
-        assert!(!path.with_extension("json.tmp").exists());
         assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
 
         let blocked = tmp.path.join("file-not-dir");
@@ -1044,6 +1482,191 @@ mod tests {
         let err = write_atomically(&blocked.join("x.yaml"), b"x").unwrap_err();
         let text = format!("{err:#}");
         assert!(text.contains(&blocked.display().to_string()), "{text}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial(umask)]
+    fn the_owner_only_write_yields_a_0600_file_and_the_plain_write_the_platform_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let _umask = crate::testing::UmaskGuard::zero();
+        let tmp = TempDir::new("write-atomically-owner-only");
+        let mode_of = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+
+        let private = tmp.path.join("private.yaml");
+        write_atomically_owner_only(&private, b"first").unwrap();
+        assert_eq!(fs::read(&private).unwrap(), b"first");
+        assert_eq!(mode_of(&private), 0o600);
+        write_atomically_owner_only(&private, b"second").unwrap();
+        assert_eq!(fs::read(&private).unwrap(), b"second");
+        assert_eq!(mode_of(&private), 0o600);
+
+        let shared = tmp.path.join("shared.yaml");
+        write_atomically(&shared, b"open").unwrap();
+        assert_eq!(fs::read(&shared).unwrap(), b"open");
+        assert_eq!(
+            mode_of(&shared),
+            0o666,
+            "the plain write is left to the umask"
+        );
+        assert_eq!(
+            fs::read_dir(&tmp.path).unwrap().count(),
+            2,
+            "no temp is left"
+        );
+    }
+
+    /// A clone can plant whatever it likes beside the workspace share list, so a link at
+    /// the old temp name must not be written through and a link at the destination must
+    /// not be replaced.
+    #[cfg(unix)]
+    #[test]
+    fn write_atomically_never_follows_a_planted_symlink_at_the_temp_or_the_destination() {
+        let tmp = TempDir::new("write-atomically-symlink");
+        let sentinel = tmp.path.join("sentinel");
+        fs::write(&sentinel, b"untouched").unwrap();
+        let dir = tmp.path.join("state");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("shares.yaml");
+        std::os::unix::fs::symlink(&sentinel, path.with_added_extension("tmp")).unwrap();
+
+        write_atomically(&path, b"written").unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"written");
+        assert_eq!(fs::read(&sentinel).unwrap(), b"untouched");
+        let mut left: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            ["shares.yaml", "shares.yaml.tmp"],
+            "the planted link stays as found and no temp of ours is left"
+        );
+
+        let linked = dir.join("linked.yaml");
+        std::os::unix::fs::symlink(&sentinel, &linked).unwrap();
+        let err = write_atomically(&linked, b"written")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            format!(
+                "'{}' is a symlink; mesh state is written only to regular files. Replace the link with the file it points to and try again.",
+                linked.display()
+            )
+        );
+        assert_eq!(fs::read(&sentinel).unwrap(), b"untouched");
+        assert!(
+            fs::symlink_metadata(&linked)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 3, "no temp is left");
+    }
+
+    #[test]
+    fn canonicalize_agrees_with_dunce_on_a_short_path() {
+        let tmp = TempDir::new("canonicalize-short");
+        let file = tmp.path.join("a.md");
+        fs::write(&file, b"a").unwrap();
+
+        assert_eq!(
+            canonicalize(&file).unwrap(),
+            dunce::canonicalize(&file).unwrap()
+        );
+        assert!(canonicalize(&tmp.path.join("missing")).is_err());
+    }
+
+    /// The verbatim prefix dunce keeps for length alone goes; the one it keeps for a
+    /// name goes nowhere, and a path without one is untouched.
+    #[cfg(windows)]
+    #[test]
+    fn without_verbatim_disk_drops_the_prefix_only_when_length_was_the_reason() {
+        let deep = format!(r"\\?\C:\{}\{}\a.md", "a".repeat(200), "b".repeat(200));
+        assert!(deep.len() > 260);
+        assert_eq!(
+            without_verbatim_disk(PathBuf::from(&deep)),
+            PathBuf::from(&deep[4..])
+        );
+        assert_eq!(
+            without_verbatim_disk(PathBuf::from(r"\\?\C:\x\a.md")),
+            PathBuf::from(r"C:\x\a.md")
+        );
+
+        for kept in [r"\\?\C:\x\CON\y", r"\\?\C:\x\name.\y", r"\\?\C:\x\name \y"] {
+            assert_eq!(
+                without_verbatim_disk(PathBuf::from(kept)),
+                PathBuf::from(kept)
+            );
+        }
+
+        for plain in [
+            r"C:\x\a.md",
+            r"\\server\share\a.md",
+            r"\\?\UNC\server\share\a.md",
+        ] {
+            assert_eq!(
+                without_verbatim_disk(PathBuf::from(plain)),
+                PathBuf::from(plain)
+            );
+        }
+    }
+
+    /// A single name of 254 or 255 characters pushes the per-name probe itself past
+    /// MAX_PATH, so dunce keeps the prefix for the name alone and the path keeps its
+    /// prefix here: the edge fails closed rather than resolving to a second spelling.
+    #[cfg(windows)]
+    #[test]
+    fn without_verbatim_disk_keeps_the_prefix_for_a_name_the_probe_cannot_measure() {
+        for len in [254, 255] {
+            let kept = format!(r"\\?\C:\x\{}\a.md", "n".repeat(len));
+            assert_eq!(
+                without_verbatim_disk(PathBuf::from(&kept)),
+                PathBuf::from(&kept),
+                "{len}"
+            );
+        }
+        let stripped = format!(r"\\?\C:\x\{}\a.md", "n".repeat(253));
+        assert_eq!(
+            without_verbatim_disk(PathBuf::from(&stripped)),
+            PathBuf::from(&stripped[4..])
+        );
+    }
+
+    /// A verbatim path takes `.` and `..` literally, so one holding either keeps its
+    /// prefix: stripping it would let the plain form resolve them away.
+    #[cfg(windows)]
+    #[test]
+    fn without_verbatim_disk_keeps_the_prefix_around_dot_components() {
+        let deep = "d".repeat(300);
+        for kept in [
+            format!(r"\\?\C:\x\..\{deep}\a.md"),
+            format!(r"\\?\C:\x\.\{deep}\a.md"),
+            r"\\?\C:\x\..\a.md".to_string(),
+            r"\\?\C:\x\.\a.md".to_string(),
+        ] {
+            assert_eq!(
+                without_verbatim_disk(PathBuf::from(&kept)),
+                PathBuf::from(&kept),
+                "{kept}"
+            );
+        }
+    }
+
+    /// A deep candidate on another drive comes out plain and is still no descendant of a
+    /// root on this one: the prefix check stays a prefix check on the drive letter too.
+    #[cfg(windows)]
+    #[test]
+    fn without_verbatim_disk_keeps_another_drive_outside_the_root() {
+        let deep = format!(r"{}\{}", "a".repeat(200), "b".repeat(200));
+        let candidate = without_verbatim_disk(PathBuf::from(format!(r"\\?\D:\{deep}\a.md")));
+        let root = PathBuf::from(format!(r"C:\{deep}"));
+        assert_eq!(candidate, PathBuf::from(format!(r"D:\{deep}\a.md")));
+        assert_ne!(candidate, root);
+        assert!(!candidate.starts_with(&root));
     }
 
     #[test]
@@ -1077,6 +1700,128 @@ mod tests {
                     .any(|path| path.file_name().is_some_and(|file| file == name)),
                 "{name} must be among the scanned mesh sources"
             );
+        }
+    }
+
+    /// The wire identifiers before the SCOPE rename (announce magic, destination
+    /// application and aspect, LXMF type tags) must not survive anywhere under `src/mesh`
+    /// nor in the mesh-facing files outside it that the redaction scan covers, the one
+    /// permitted form being the foreign-magic decode vector that asserts they are refused.
+    /// A status-card repo named after this program is not a wire identifier.
+    #[test]
+    fn no_source_under_mesh_spells_the_pre_scope_wire_identifiers() {
+        let mut sources = rust_sources();
+        let mesh = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("mesh");
+        sources.extend(
+            redaction_scan_sources()
+                .into_iter()
+                .filter(|path| !path.starts_with(&mesh)),
+        );
+        /// Whether a line spelling the needle is one of the permitted forms.
+        type Allowed = fn(&str) -> bool;
+        fn never(_: &str) -> bool {
+            false
+        }
+        fn refused_foreign_magic(line: &str) -> bool {
+            line.contains("::decode(") && line.contains("), None)")
+        }
+        fn card_repo_name(line: &str) -> bool {
+            line.contains("\"repo\"") || line.contains("repo(") || line.contains("(\"name\"")
+        }
+        // Needles assembled at runtime so this test's own text does not match them.
+        let needles: [(String, Allowed); 5] = [
+            (["COY", "M"].concat(), refused_foreign_magic),
+            (["\"coy", "ote\""].concat(), card_repo_name),
+            (["coy", "ote.mesh"].concat(), never),
+            (["coy", "ote.peer/"].concat(), never),
+            (["coy", "ote.knock/"].concat(), never),
+        ];
+        let mut hits = Vec::new();
+        for path in &sources {
+            for (index, line) in fs::read_to_string(path).unwrap().lines().enumerate() {
+                for (needle, allowed) in &needles {
+                    if line.contains(needle.as_str()) && !allowed(line) {
+                        hits.push(format!(
+                            "{}:{}: spells {needle:?}",
+                            path.display(),
+                            index + 1
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(hits.is_empty(), "{}", hits.join("\n"));
+        for expected in ["announce.rs", "conformance/interop.rs", "repl/mesh.rs"] {
+            assert!(
+                sources.iter().any(|path| path.ends_with(expected)),
+                "{expected} must be among the scanned sources"
+            );
+        }
+    }
+
+    /// A staged file is the peer's and stays until a person removes it: no production line
+    /// under `src/mesh`, nor in the mesh-facing tool and REPL files, removes a file or
+    /// directory it names through the inbox. The inbox's own removal is of its temp file,
+    /// and the REPL's one removal is the human's `.mesh inbox --purge-files`, of exactly
+    /// this instance's directory after a confirm.
+    #[test]
+    fn no_mesh_source_removes_an_inbox_path() {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut sources: Vec<PathBuf> = rust_sources()
+            .into_iter()
+            .filter(|path| {
+                !path.components().any(|c| c.as_os_str() == "conformance")
+                    && path.file_name().is_some_and(|name| name != "tests.rs")
+            })
+            .collect();
+        sources.push(src.join("function").join("mesh.rs"));
+        sources.push(src.join("repl").join("mesh.rs"));
+        let removals = ["remove_file(", "remove_dir_all(", "remove_dir("];
+        let inbox_tokens = ["inbox", "Inbox", ".staged", "Part::File"];
+        let mut hits = Vec::new();
+        let mut inbox_removals = Vec::new();
+        let mut repl_removals = Vec::new();
+        for path in &sources {
+            for (index, line) in production_code(&read_source(path)).iter().enumerate() {
+                if !removals.iter().any(|call| line.contains(call)) {
+                    continue;
+                }
+                if path.ends_with("inbox.rs") {
+                    inbox_removals.push(line.trim().to_string());
+                } else if path.ends_with("repl/mesh.rs") {
+                    repl_removals.push(line.trim().to_string());
+                } else if inbox_tokens.iter().any(|token| line.contains(token)) {
+                    hits.push(format!("{}:{}: {}", path.display(), index + 1, line.trim()));
+                }
+            }
+        }
+        assert_eq!(hits, Vec::<String>::new());
+        assert_eq!(
+            inbox_removals,
+            ["let _ = fs::remove_file(&tmp);"],
+            "inbox.rs removes only its own temp file"
+        );
+        assert_eq!(
+            repl_removals,
+            ["fs::remove_dir_all(inbox_root)"],
+            "the REPL removes only the purge's inbox root"
+        );
+    }
+
+    #[test]
+    fn announce_doc_comments_name_the_scope_node() {
+        let announce = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("mesh")
+            .join("announce.rs");
+        let text = fs::read_to_string(&announce).unwrap();
+        for expected in ["SCOPE node", "SCOPE announce"] {
+            assert!(text.contains(expected), "announce.rs must say {expected:?}");
+        }
+        for stale in ["Coyote node", "Coyote announce"] {
+            assert!(!text.contains(stale), "announce.rs still says {stale:?}");
         }
     }
 

@@ -5,7 +5,8 @@ test spawns the pinned Python Reticulum/LXMF reference as a subprocess, joins th
 node to it as a TCP client (the production `rnsd` relay topology) and proves the two agree
 on the wire: announce filing, request replies, message delivery and store-and-forward
 through a real LXMF propagation node. The vectors half, which needs nothing but Rust, lives
-next to it in `vectors.rs`.
+next to it in the `*_vectors.rs` modules of that directory (and, for the REPL's attachment
+rules, in `src/repl/mesh_share_vectors.rs`).
 
 ## Pins
 
@@ -16,15 +17,15 @@ next to it in `vectors.rs`.
 
 ### Verification record
 
-Last verified 2026-09-29, on Linux, with the Rust side at the crates.io `0.12.0` release of
+Last verified 2026-10-06, on Linux, with the Rust side at the crates.io `0.12.0` release of
 `lxmf-wire`, `reticulum-rs-transport` and `reticulum-rs-core`, and the Python side at RNS
 `1.5.2` / LXMF `0.9.6` (the two commits pinned above):
 
 | Invocation | Result |
 |---|---|
-| `COYOTE_MESH_INTEROP=1 cargo test --all mesh::conformance -- --include-ignored` (interop + netns) | 72 passed, 0 ignored |
-| `cargo test --all mesh::fuzz` | 14 passed |
-| `cargo test --all` | 4700 passed, 0 failed |
+| `COYOTE_MESH_INTEROP=1 cargo test --all mesh::conformance -- --include-ignored` (vectors + interop + netns) | 96 passed, 0 ignored |
+| `cargo test --all mesh::fuzz` | 20 passed |
+| `cargo test --all` | 5622 passed, 0 failed in the unit binary; 99 passed across the integration binaries |
 
 The macOS and Windows legs are proven by the PR's CI matrix rather than by this record.
 Re-run the three commands and refresh this table whenever either side's pin moves.
@@ -44,6 +45,9 @@ source "${COYOTE_MESH_INTEROP_DIR:-$HOME/.cache/coyote/mesh-interop}/env.sh"
 COYOTE_MESH_INTEROP=1 cargo test --all mesh::conformance -- --include-ignored
 ```
 
+Independently of the interop setup, the wiki lint runs with
+`COYOTE_WIKI_DIR=../coyote.wiki cargo test --test mesh_wiki_docs`.
+
 `setup.sh` is idempotent: a second run verifies the pins and the imports and does nothing
 else. The interop tests are `#[ignore]`d, so a plain `cargo test` never spawns Python; without
 `COYOTE_MESH_INTEROP=1` they print `skipping: ...` and pass. With it set, every missing
@@ -58,6 +62,7 @@ Reticulum's interfaces and LXMF's router on first import starts late enough to m
 | `COYOTE_MESH_INTEROP_DIR` | Where the clones and venv live (default `~/.cache/coyote/mesh-interop`). |
 | `COYOTE_MESH_INTEROP_PYTHON` | The interpreter to spawn (default `<dir>/venv/bin/python`, else `python3`). |
 | `COYOTE_MESH_INTEROP_DEBUG` | Set to have the reference log at `RNS.LOG_DEBUG` on stderr, and to print this crate's captured `mesh` debug log to stderr when each reference shuts down. |
+| `COYOTE_WIKI_DIR` | A checkout of the project wiki (relative paths resolve against the crate root). Switches on `tests/mesh_wiki_docs.rs`, which pins the `Mesh*`, `Hooks` and `Home` wiki pages and the README to the REPL verb table, hook events, `mesh__*` tools and staging-inbox layout in the source; unset or blank, those tests print `skipping: ...` and pass. |
 
 ## `reference_peer.py`
 
@@ -66,16 +71,22 @@ One Python process, driven over stdin/stdout with one JSON object per line. Comm
 `{"id": N, "ok": false, "error": "..."}`; what the reference observes on its own arrives as
 `{"event": "...", ...}`. Bytes are lowercase hex. On start it writes a Reticulum config
 (transport enabled, one `TCPServerInterface` on a free loopback port, no shared instance),
-creates a Coyote-shaped destination `coyote.mesh.<instance_id>` serving `/status` and
+creates a Coyote-shaped destination `scope.session.<instance_id>` serving `/status` and
 `/message` to anyone, and prints `READY {json}` with `relay_port`, `identity_hash`,
-`destination_hash`, `name_hash` and `instance_id`.
+`destination_hash`, `name_hash` and `instance_id`. The reference peer does not implement
+`/knock`, `/list`, `/fetch` or `/access`; the file-sharing paths are covered by Rust-only
+in-process conformance vectors in `src/mesh/conformance/share_vectors.rs`,
+`access_vectors.rs` and `live_vectors.rs` (the last runs its node-pair rows over the
+loopback pair of `src/mesh/r3/tests.rs` and its symlink rows on unix only), so the Python
+reference still serves only `/status` and `/message`, and the interop matrix exercises only
+those two paths.
 
 | Command | Arguments | Reply / effect |
 |---|---|---|
-| `announce` | `display_name: str \| null` | Announces the peer destination with `COYM`, version `1` and the name. |
-| `watch` | `instance_id` | Registers an announce handler for `coyote.mesh.<instance_id>`; each hit is an `announce` event with `destination_hash`, `identity_hash`, `app_data`, `derived_destination_hash` (the reference's own derivation from the announced identity) and `decoded` (`magic_ok`, `version`, `display_name`). |
+| `announce` | `display_name: str \| null` | Announces the peer destination with `SCOPE`, version `1` and the name. |
+| `watch` | `instance_id` | Registers an announce handler for `scope.session.<instance_id>`; each hit is an `announce` event with `destination_hash`, `identity_hash`, `app_data`, `derived_destination_hash` (the reference's own derivation from the announced identity) and `decoded` (`magic_ok`, `version`, `display_name`). |
 | `wait_path` | `destination_hash`, `timeout_secs` | Requests a path once and waits until the transport has one and the identity is known; replies with `hops`. |
-| `request` | `destination_hash`, `instance_id`, `path`, `envelope` or `raw_envelope`, `timeout_secs` | Opens a link to `coyote.mesh.<instance_id>`, identifies as the peer identity, sends the request and replies with `status` (`ready`/`failed`), `response` (an integer for a refusal code, a map otherwise) and `response_type`. In `envelope`, a string `name_hash` is hex; keys are emitted in the given order. |
+| `request` | `destination_hash`, `instance_id`, `path`, `envelope` or `raw_envelope`, `timeout_secs` | Opens a link to `scope.session.<instance_id>`, identifies as the peer identity, sends the request and replies with `status` (`ready`/`failed`), `response` (an integer for a refusal code, a map otherwise) and `response_type`. In `envelope`, a string `name_hash` is hex; keys are emitted in the given order. |
 | `silence` | `path` | Deregisters that request handler on the peer destination, so a request to it goes unanswered. Fails when nothing is registered at `path`. |
 | `pn_start` | `cost` | Starts an `LXMRouter` propagation node at that stamp cost and announces it at once; replies with `destination_hash`, `stamp_cost`, `stamp_cost_flexibility`. |
 | `pn_announce` | | Announces the running propagation node again, so a peer that restarted after `pn_start` files it; replies with `destination_hash`. |

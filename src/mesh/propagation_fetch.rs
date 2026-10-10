@@ -1505,23 +1505,30 @@ async fn process_bodies(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mesh::access::{AccessRouting, AccessSurface, access_message, validate_access};
     use crate::mesh::destination_address;
     use crate::mesh::events::MeshHooks;
     use crate::mesh::knock::{
         KnockGate, KnockIntro, KnockRouting, KnockSurface, RecordingSurface, knock_message,
     };
     use crate::mesh::knocks::KnockCache;
+    use crate::mesh::message::{
+        OutboundPeer, PeerKind, PeerRouting, PeerSurface, peer_lxmf_message,
+    };
+    use crate::mesh::node::MeshSlot;
     use crate::mesh::peers::PeerSighting;
-    use crate::mesh::propagation::build_signed_message;
+    use crate::mesh::pending::{InboundKind, InboundStore};
+    use crate::mesh::propagation::{OutboundMessage, build_signed_message};
     use crate::mesh::r3::{OriginName, RequestFrame};
-    use crate::mesh::test_support::{TempDir, TrustList, read_source, rust_sources};
+    use crate::mesh::session_destination_name;
+    use crate::mesh::test_support::{TempDir, TrustList, read_source, rust_sources, siblings_of};
+    use crate::supervisor::mailbox::EnvelopePayload;
     use crate::testing::{debug_snapshot, install_log_collector, warn_snapshot};
 
     use lxmf_core::message::Payload;
     use lxmf_core::stamp::generate_stamp;
     use parking_lot::Mutex;
     use rand_core::OsRng;
-    use rns_transport::destination::DestinationName;
     use rns_transport::identity_bridge::to_transport_identity;
     use rns_transport::transport::TransportConfig;
     use std::sync::{Arc, Weak};
@@ -2346,9 +2353,11 @@ mod tests {
         assert_eq!(delivered[0].stamp_value, None);
     }
 
-    /// The runtime's sink as `fetch_propagated` builds it: a knock from a known identity
-    /// stops at the gate, which surfaces and files it under the instance recomputed from
-    /// the origin and the signer; a message from the same identity passes through.
+    /// The knock stage alone of the chain `fetch_propagated` builds: a knock from a known
+    /// identity stops at the gate, which surfaces and files it under the instance
+    /// recomputed from the origin and the signer; a message from the same identity
+    /// passes through. The whole chain is driven in
+    /// `sealed_bodies_reach_the_stage_of_the_full_chain_the_runtime_builds`.
     #[tokio::test]
     async fn a_fetched_knock_stops_at_the_gate_and_a_message_passes_through() {
         let knocker = CorePrivateIdentity::new_from_rand(OsRng);
@@ -2375,7 +2384,7 @@ mod tests {
             gate: &gate,
             inner: &inner,
         };
-        let origin = OriginName::of(&DestinationName::new("coyote", "mesh.knocker"));
+        let origin = OriginName::of(&session_destination_name("knocker"));
 
         let knock = knock_body(&knocker, &me, "let me in", &origin);
         assert_eq!(
@@ -2405,6 +2414,132 @@ mod tests {
         );
         assert_eq!(surface.texts().len(), 1);
         assert_eq!(gate.cache().list(SystemTime::now()).unwrap().len(), 1);
+    }
+
+    /// The full chain `fetch_propagated` builds, fed sealed bodies through the pipeline:
+    /// a knock is filed by the gate, an access request by the access surface, a peer
+    /// message by the peer surface, and only a plain message reaches the inbox sink.
+    /// The same knock body fetched again is a duplicate before any stage sees it.
+    #[tokio::test]
+    async fn sealed_bodies_reach_the_stage_of_the_full_chain_the_runtime_builds() {
+        let knocker = CorePrivateIdentity::new_from_rand(OsRng);
+        let knocker_id = transport_identity_of(&knocker);
+        let peer = CorePrivateIdentity::new_from_rand(OsRng);
+        let peer_id = transport_identity_of(&peer);
+        let origin = OriginName::of(&session_destination_name("peer"));
+        let knock_origin = OriginName::of(&session_destination_name("knocker"));
+        let peer_destination =
+            destination_address(&origin.0, &peer_id.address_hash).to_hex_string();
+        let mut bench = Bench::new(
+            "fetch-full-chain",
+            TrustList::default()
+                .destination(&peer_destination, &identity_hex(&peer_id))
+                .identity(&identity_hex(&knocker_id), false),
+        );
+        bench.keys.know(&knocker_id);
+        bench.keys.know(&peer_id);
+        let me = bench.me();
+        let trust = bench.trust.clone();
+        let slot = Arc::new(MeshSlot::default());
+        slot.set_inbound_store_for_tests(Arc::new(InboundStore::new(&bench._tmp.path, "inst")));
+        let peers = Arc::new(
+            PeerTable::load(bench._tmp.path.join("peers.json"), SystemTime::now()).unwrap(),
+        );
+        let gate = KnockGate::new(
+            trust.clone(),
+            peers,
+            KnockCache::new(&bench._tmp.path, 24),
+            MeshHooks::default(),
+        );
+        let inbox = CountingSink::default();
+        let peer_stage = PeerRouting {
+            trust: &trust,
+            surface: Some(slot.clone() as Arc<dyn PeerSurface>),
+            inner: &inbox,
+        };
+        let access_stage = AccessRouting {
+            trust: &trust,
+            surface: Some(slot.clone() as Arc<dyn AccessSurface>),
+            inner: &peer_stage,
+        };
+        let chain = KnockRouting {
+            gate: &gate,
+            inner: &access_stage,
+        };
+        let sealed = |signer: &CorePrivateIdentity, message: &OutboundMessage| {
+            build_signed_message(signer, &lxmf_delivery_hash(&me), message, 1_700_000_000.5)
+                .unwrap()
+                .pack_propagation_transient_with_rng(&to_core_identity(&me), OsRng)
+                .unwrap()
+                .0
+        };
+
+        let knock = knock_body(&knocker, &me, "let me in", &knock_origin);
+        assert_eq!(
+            bench.process_into(&knock, &chain).await,
+            BodyOutcome::Delivered
+        );
+        let request = validate_access("acc-1", vec!["docs/a.md".to_string()], "why").unwrap();
+        let access = sealed(&peer, &access_message(&request, &origin));
+        assert_eq!(
+            bench.process_into(&access, &chain).await,
+            BodyOutcome::Delivered
+        );
+        let stored =
+            OutboundPeer::new(PeerKind::Message, "from the node", None, None, None).unwrap();
+        let peer_message = sealed(&peer, &peer_lxmf_message(&stored, &origin));
+        assert_eq!(
+            bench.process_into(&peer_message, &chain).await,
+            BodyOutcome::Delivered
+        );
+        let plain = honest_body(&peer, &me, b"hello");
+        assert_eq!(
+            bench.process_into(&plain, &chain).await,
+            BodyOutcome::Delivered
+        );
+
+        let knocks = gate.cache().list(SystemTime::now()).unwrap();
+        assert_eq!(knocks.len(), 1, "the gate saw the knock and nothing else");
+        assert_eq!(knocks[0].identity_hash, identity_hex(&knocker_id));
+        assert_eq!(knocks[0].intro.as_deref(), Some("let me in"));
+
+        let filed = slot
+            .inbound_store()
+            .unwrap()
+            .list(SystemTime::now())
+            .unwrap();
+        assert_eq!(
+            filed.len(),
+            1,
+            "the access surface saw the request and nothing else"
+        );
+        assert_eq!(filed[0].id, "acc-1");
+        assert_eq!(filed[0].kind, InboundKind::Access);
+        assert_eq!(filed[0].peer_identity, identity_hex(&peer_id));
+        assert_eq!(filed[0].peer_destination, peer_destination);
+
+        let (delivered, dropped) = slot.peer_inbox().drain();
+        assert_eq!(
+            delivered.len(),
+            1,
+            "the peer surface saw the message and nothing else"
+        );
+        match &delivered[0].payload {
+            EnvelopePayload::Peer(message) => assert_eq!(message.message_id, stored.id),
+            other => panic!("not a peer envelope: {other:?}"),
+        }
+        assert_eq!(dropped, 0);
+
+        let message = inbox.only();
+        assert_eq!(message.content.as_deref(), Some(&b"hello"[..]));
+        assert_eq!(message.source_identity_hash, identity_hex(&peer_id));
+
+        assert_eq!(
+            discarded(bench.process_into(&knock, &chain).await),
+            Discard::Duplicate
+        );
+        assert_eq!(gate.cache().list(SystemTime::now()).unwrap().len(), 1);
+        assert_eq!(inbox.count(), 1);
     }
 
     fn store_at(tmp: &TempDir, now: SystemTime) -> FetchStore {
@@ -2528,7 +2663,11 @@ mod tests {
         );
         store.record_sync("cafe", t(5_001), 3);
         store.persist().unwrap();
-        assert!(!path.with_extension("json.tmp").exists());
+        assert_eq!(
+            siblings_of(&path),
+            ["propagation.json"],
+            "the atomic write leaves no temp file behind"
+        );
 
         let json: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(json["version"], 1);
@@ -2693,6 +2832,46 @@ mod tests {
             "fetch-store-unknown-field",
             br#"{"version": 1, "seen": [], "delivered": [], "deferred": [], "cursor": null, "later": true}"#,
             "is not a version-1 propagation fetch state",
+        );
+    }
+
+    #[test]
+    fn usage_probe_a_version_1_propagation_store_written_before_scope_still_loads() {
+        // The SCOPE wire rename bumps trust/peers/knocks 1 -> 2 and MUST NOT bump
+        // `PROPAGATION_STORE_VERSION`: a fetch state a user's node wrote on the build
+        // before the rename, spelled with a literal `"version": 1`, still loads in place,
+        // is not set aside, and keeps its dedup memory.
+        install_log_collector();
+        let tmp = TempDir::new("fetch-store-v1-before-scope");
+        let path = tmp.path.join("propagation.json");
+        let aside = tmp.path.join("propagation.json.corrupt");
+        let seen_hex = "1".repeat(64);
+        let delivered_hex = "2".repeat(64);
+        let bytes = format!(
+            concat!(
+                r#"{{"version": 1, "seen": [{{"transient_id": "{seen}", "seen_at": "1970-01-01T00:00:01Z"}}],"#,
+                r#" "delivered": [{{"message_id": "{delivered}", "delivered_at": "1970-01-01T00:00:01Z"}}],"#,
+                r#" "deferred": [], "cursor": null}}"#
+            ),
+            seen = seen_hex,
+            delivered = delivered_hex,
+        );
+        fs::write(&path, bytes.as_bytes()).unwrap();
+
+        let store = FetchStore::load(path.clone(), t(10))
+            .expect("a version-1 propagation store still loads");
+
+        assert_eq!(store.len(), 1, "the seen id survives the load");
+        assert!(store.contains(&[0x11; 32]));
+        assert!(store.was_delivered(&[0x22; 32]));
+        assert_eq!(store.cursor(), None);
+        assert!(path.exists(), "a loadable file is left where it is");
+        assert!(!aside.exists(), "a loadable file is not set aside");
+        assert!(
+            !warn_snapshot()
+                .iter()
+                .any(|line| line.contains(&path.display().to_string())),
+            "no warning names a file that loaded cleanly"
         );
     }
 
@@ -3288,7 +3467,7 @@ mod tests {
             )
             .await;
             // A Coyote peer announces its own destination, never `lxmf.delivery`.
-            let name = DestinationName::new("coyote", "mesh.test");
+            let name = session_destination_name("test");
             let coyote_hash = fetcher.learn_announce(&fake, sender, name).await;
             let me = fetcher.identity();
             let body = honest_body(&sender_core, &me, b"from a coyote");

@@ -18,24 +18,27 @@ pub(crate) use client::{
     DEFAULT_LINK_TIMEOUT, Deadline, R3Client, RequestOptions, RequestOutcome, SizeBranch, link_to,
     open_link,
 };
+#[cfg(test)]
+pub(crate) use dispatch::KNOWN_PATHS;
 #[cfg(all(test, unix))]
 pub(crate) use dispatch::LoggingKnockSink;
 pub(crate) use dispatch::{
-    AdmittedRequest, DispatchError, Dispatcher, Handler, KNOCK_PATH, KnockEvent, KnockSink,
-    MESSAGE_PATH, STATUS_PATH, describe_path,
+    ACCESS_PATH, AdmittedRequest, DispatchError, Dispatcher, FETCH_PATH, Handler, KNOCK_PATH,
+    KnockEvent, KnockSink, LIST_PATH, MESSAGE_PATH, STATUS_PATH, describe_path,
 };
 pub(crate) use error::{R3Error, RefusalCode};
 pub(crate) use frame::{Envelope, MAX_R3_PAYLOAD_BYTES, NAME_HASH_LEN, OriginName};
 #[cfg(test)]
 pub(crate) use frame::{
-    EnvelopeError, MAX_R3_NESTING_DEPTH, PathHash, RequestFrame, RequestId, ResponseFrame,
+    EnvelopeError, MAX_FETCH_RESPONSE_BYTES, MAX_R3_NESTING_DEPTH, PathHash, RESPONSE_FRAME_PREFIX,
+    RequestFrame, RequestId, ResponseFrame,
 };
 #[cfg(test)]
 pub(crate) use server::{
     Admission, DEFAULT_RESPONSE_SEND_TIMEOUT, HANDLER_TIMEOUT, InboundRequest,
     MAX_CONCURRENT_INBOUND_REQUESTS, PEER_RESOLVE_TIMEOUT, RequestHandler,
 };
-pub(crate) use server::{R3Server, Reply};
+pub(crate) use server::{R3Server, Reply, Settlement};
 #[cfg(all(test, unix))]
 pub(crate) use tests::network;
 

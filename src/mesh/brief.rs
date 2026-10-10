@@ -133,6 +133,12 @@ fn render_card(card: &StatusCard) -> Option<String> {
     if let Some(objective) = &card.objective {
         lines.push(format!("Objective: {objective}"));
     }
+    if let Some(about) = &card.about {
+        lines.push(format!("About: {about}"));
+    }
+    if !card.caps.is_empty() {
+        lines.push(format!("Caps: {}", card.caps.join(", ")));
+    }
     // These labels mirror the STATE_* codes in card.rs; a new code needs a label here.
     let state = match card.state.code {
         STATE_IDLE => Some("idle"),
@@ -290,6 +296,8 @@ mod tests {
                 done: 1,
                 total: 2,
             }),
+            about: None,
+            caps: Vec::new(),
             snapshot_age_secs: Some(0),
             served_at_secs: 1,
         }
@@ -389,6 +397,30 @@ mod tests {
     }
 
     #[test]
+    fn the_card_section_names_about_and_caps_after_the_objective_when_the_card_has_them() {
+        let mut described = card();
+        described.about = Some("reviews Rust and writes docs".into());
+        described.caps = vec!["review".into(), "docs".into()];
+        let text = assemble_brief(MeshBrief::Manual, Some(&described), None, None, &todo())
+            .unwrap()
+            .text;
+        assert!(
+            text.contains(
+                "Objective: ship it\nAbout: reviews Rust and writes docs\nCaps: review, docs\nState: working"
+            ),
+            "{text}"
+        );
+
+        let bare = assemble_brief(MeshBrief::Manual, Some(&card()), None, None, &todo())
+            .unwrap()
+            .text;
+        assert!(
+            !bare.contains("About:") && !bare.contains("Caps:"),
+            "{bare}"
+        );
+    }
+
+    #[test]
     fn a_digest_is_served_with_its_age_visible() {
         let brief = assemble_brief(
             MeshBrief::Auto,
@@ -460,6 +492,8 @@ mod tests {
             repo: None,
             plan: None,
             todo: None,
+            about: None,
+            caps: Vec::new(),
             snapshot_age_secs: None,
             served_at_secs: 1,
         };
@@ -474,6 +508,51 @@ mod tests {
             None,
             "a card with nothing to say and a blank note are not sources"
         );
+    }
+
+    #[test]
+    fn usage_probe_brief_treats_a_code_above_a_byte_exactly_like_unknown() {
+        // The brief is the envoy's view of a card: a state code it does not know adds no
+        // line (as code 0 does), is never an error, and the saturated todo counts render.
+        let empty = TodoList::default();
+        let with_code = |code: u64| StatusCard {
+            display_name: Some("Alex".into()),
+            objective: None,
+            state: CardState {
+                code,
+                since_secs: Some(1),
+            },
+            repo: None,
+            plan: None,
+            todo: Some(CardTodo {
+                goal: None,
+                done: u32::MAX,
+                total: u32::MAX,
+            }),
+            about: None,
+            caps: Vec::new(),
+            snapshot_age_secs: None,
+            served_at_secs: 1,
+        };
+        let unknown = assemble_brief(
+            MeshBrief::Auto,
+            Some(&with_code(STATE_UNKNOWN)),
+            None,
+            None,
+            &empty,
+        )
+        .unwrap();
+        for code in [256u64, 1 << 40, u64::MAX] {
+            let wide = assemble_brief(MeshBrief::Auto, Some(&with_code(code)), None, None, &empty)
+                .unwrap();
+            assert_eq!(wide.text, unknown.text, "code {code}");
+            assert!(!wide.text.contains("State:"), "{}", wide.text);
+            assert!(
+                wide.text.contains("Todo: 4294967295/4294967295 done"),
+                "{}",
+                wide.text
+            );
+        }
     }
 
     #[test]

@@ -17,35 +17,62 @@
 //! `I1 != I2`.
 //!
 //! Instance ids are public, so anyone who has heard the peer can announce
-//! `coyote.mesh.<instance_id>` under their own identity: the signal is forgeable by any
+//! `scope.session.<instance_id>` under their own identity: the signal is forgeable by any
 //! stranger. Hence the mark never alters the existing grant (`I1` still proves its own key
-//! and stays trusted for `D`); the new identity is a stranger and stays fail-closed; the
-//! human is told once per record while the mark stands; the first conflicting identity is
-//! what the mark records, and later conflicts against an already-marked record write
-//! nothing, so an attacker cannot drive disk churn; the wording says "announced under
-//! another identity", never "rotated"; and nothing is ever re-bound or re-trusted on its
-//! own. While the record stands, only the human clears a mark: by trusting either
-//! destination again, by trusting the identity seen for all destinations, or by blocking
-//! the identity seen. A confirmed `.mesh trust --prune` removes a stale marked record with
-//! the rest, and the dry run shows the mark. Once the new destination is trusted that
-//! identity holds its own record for the instance and marks the old one no more, since both
-//! bindings are the human's; an identity trusted for all destinations marks nothing either,
-//! the human having answered for every instance of it; and a denied record is never marked,
-//! the human having answered it already. The converse holds too: an identity-tier grant has
-//! no instance binding, so a rotation of that identity is fail-closed (the new key is a
-//! stranger) but is neither marked nor surfaced; only a destination record can carry a
-//! key-change notice.
+//! and stays trusted for `D`); the new identity stands on its own record, a stranger when
+//! it has none; the human is told once per record while the mark stands; the first
+//! conflicting identity is what the mark records, and later conflicts against an
+//! already-marked record write nothing, so an attacker cannot drive disk churn; the wording
+//! says "presented under another identity", never "rotated"; and nothing is ever re-bound
+//! or re-trusted on its own. Every colliding record is marked, a denied one and one whose
+//! seen identity is trusted for all destinations included; only a blocked identity seen, or
+//! one that already holds its own record for the instance (both bindings then being the
+//! human's), marks nothing. While the record stands, the mark is cleared only by the human
+//! trusting the new destination, which is the one answer that confirms the new key; a
+//! confirmed `.mesh trust --prune` removes a stale marked record with the rest, and the dry
+//! run shows the mark.
 //!
-//! The store-and-forward peer-MESSAGE path (`src/mesh/message.rs`) authorizes through plain
-//! `authorize`, so a rotated peer fails closed there but is neither marked nor notified;
-//! the announce path is the detector, and detection on the message path is a follow-up.
+//! Whether the colliding identity is served depends on its own standing and on
+//! `mesh.collision_protection`: off, an identity trusted for all destinations is served
+//! and the human gets a warning; on, the collision rung is judged before identity allow
+//! and it is refused with an error until the human trusts its new destination. A
+//! destination allow admits in either mode, and a collision no allow admits is refused by
+//! rule identity changed rather than default closed, so no knock invites the human to
+//! trust the new key as a stranger. An identity trusted for all destinations carries no
+//! per-instance record of its own, so a rotation of it is detected only against the peer
+//! table: when a row holds the instance under such an identity the human is told once,
+//! best effort, and nothing is marked. With protection off the presenting identity is
+//! served and the line is a warning; on, the verdict itself reads the table, for an
+//! identity-allow verdict alone, takes the instance's first-heard live row under such an
+//! identity for its holder, the presenter's own row counted, and refuses any other such
+//! identity by rule identity changed with an error until the human trusts its new
+//! destination; the holder is never refused, whichever presented first. The refusal arms
+//! a memo for the instance for the node's lifetime (bounded by the surfacing cap), whether
+//! or not its line was shown, so the holder's row ageing out of the table does not lift
+//! it; the memo refuses only while the holder it names is trusted for all destinations,
+//! so untrusting the holder admits the new key and re-trusting it refuses again, while
+//! trusting the new destination or blocking the holder or a refused key clears the memo.
+//! Every identity trusted for all destinations that the rung refuses is told once per
+//! instance; strangers presenting the instance share one line per instance and key it was
+//! heard under.
+//! The listings label a refused identity by its grant. The collision rung judges what
+//! this node serves: the requests, knocks, stored messages and stored access requests it
+//! receives. What it sends or broadcasts is gated by plain `authorize` and does not change
+//! with the setting.
 //!
-//! On the R3 path a freshly rotated peer has no standing and is silenced before its frame
-//! is decoded, so its name hash is never seen there. `Rule::IdentityChanged` fires at the
-//! verdict stage only when a proven identity that has standing (for another instance, say)
-//! names an instance whose destination is bound to a different identity.
+//! The store-and-forward peer-MESSAGE path (`src/mesh/message.rs`) and ACCESS path
+//! (`src/mesh/access.rs`) judge through `authorize_origin` and mark like the link, knock
+//! and announce paths: a rotated peer's stored message or access request is served or
+//! dropped by the same verdict and earns the same line.
+//!
+//! On the R3 and store-and-forward paths a freshly rotated peer has no standing and is
+//! silenced before any verdict, so its name hash is never seen there.
+//! `Rule::IdentityChanged` fires at the verdict stage only when a proven identity that has
+//! standing (for another instance, say) names an instance whose destination is bound to a
+//! different identity.
 
 use crate::mesh::announce::is_control_or_invisible;
+use crate::mesh::envoy_sessions::{EnvoyMemoryError, EnvoyMemorySink, RememberedOf};
 use crate::mesh::idle::{IdleNotify, Origin};
 use crate::mesh::knock::KnockSurface;
 use crate::mesh::node::MeshSlot;
@@ -54,8 +81,8 @@ use crate::mesh::peers::{PeerRecord, PeerTable};
 use crate::mesh::r3::NAME_HASH_LEN;
 use crate::mesh::schema::{Remedy, VersionProbe, unversioned_refusal, version_refusal};
 use crate::mesh::{
-    canonical_hash, decode_hex, destination_address, mesh_config_dir, parse_rfc3339, redact_hashes,
-    rfc3339_utc, short, write_atomically,
+    canonical_hash, decode_hex, destination_address, hex_lower, mesh_config_dir, parse_rfc3339,
+    redact_hashes, rfc3339_utc, short, write_atomically,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -63,15 +90,16 @@ use arc_swap::ArcSwapOption;
 use parking_lot::Mutex;
 use rns_transport::hash::AddressHash;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 
-pub(crate) const TRUST_FILE_VERSION: u64 = 1;
+pub(crate) const TRUST_FILE_VERSION: u64 = 2;
 /// The trust list is the human's own decisions, so a refusal says what starting fresh costs.
 const TRUST_FILE_REMEDY: Remedy =
     Remedy::UserFile("is the trust list, and a fresh one trusts nobody");
@@ -205,9 +233,9 @@ struct DestinationEntry {
     label: Option<String>,
     note: Option<String>,
     /// Set once this destination's name hash was seen under an identity other than
-    /// `identity`. Added inside version 1 before MESH-CODE-005 made every new field bump
-    /// `TRUST_FILE_VERSION`, so a file written before it existed loads with it absent; the
-    /// default is grandfathered in the baseline and is not a precedent for the next field.
+    /// `identity`. Added before MESH-CODE-005 made every new field bump `TRUST_FILE_VERSION`,
+    /// so a current-version file written without it loads with it absent; the default is a
+    /// tolerance inside one version and is not a precedent for the next field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     key_changed: Option<KeyChanged>,
 }
@@ -301,6 +329,11 @@ enum TrustMutation {
         destination: String,
         identity: String,
     },
+    /// The identity is trusted for all, so untrusting one destination writes a deny
+    /// instead; nothing is removed, so it is not a revocation.
+    RefuseDestination {
+        destination: String,
+    },
     /// `was_granting` is whether the removed identity record carried `all_destinations`;
     /// a binding-only record held no identity-tier trust to revoke.
     UntrustIdentity {
@@ -308,20 +341,20 @@ enum TrustMutation {
         was_granting: bool,
         removed: Vec<String>,
     },
-    /// `marks_cleared` counts the key-change marks that named this identity as the one
-    /// seen, resolved by the block.
     BlockIdentity {
         identity: String,
         was_granting: bool,
         removed: Vec<String>,
-        marks_cleared: usize,
     },
     UnblockIdentity {
         identity: String,
     },
+    /// Tests seed the deny overlay directly; the REPL writes it through `RefuseDestination`.
+    #[cfg(test)]
     Deny {
         destination: String,
     },
+    #[cfg(test)]
     Undeny {
         destination: String,
     },
@@ -329,7 +362,7 @@ enum TrustMutation {
     Prune {
         stale: Vec<(String, String)>,
     },
-    /// The destinations whose name hash was announced under `seen_identity`, an identity
+    /// The destinations whose name hash was presented under `seen_identity`, an identity
     /// other than the one each is bound to.
     KeyChanged {
         destinations: Vec<String>,
@@ -351,6 +384,9 @@ impl fmt::Display for TrustMutation {
             Self::UntrustDestination { destination, .. } => {
                 write!(f, "untrust destination {}", short(destination))
             }
+            Self::RefuseDestination { destination } => {
+                write!(f, "refuse destination {}", short(destination))
+            }
             Self::UntrustIdentity {
                 identity, removed, ..
             } => write!(
@@ -360,21 +396,19 @@ impl fmt::Display for TrustMutation {
                 removed.len()
             ),
             Self::BlockIdentity {
-                identity,
-                removed,
-                marks_cleared,
-                ..
+                identity, removed, ..
             } => write!(
                 f,
-                "block identity {} (+{} destinations, {} key-change marks cleared)",
+                "block identity {} (+{} destinations)",
                 short(identity),
-                removed.len(),
-                marks_cleared
+                removed.len()
             ),
             Self::UnblockIdentity { identity } => {
                 write!(f, "unblock identity {}", short(identity))
             }
+            #[cfg(test)]
             Self::Deny { destination } => write!(f, "deny {}", short(destination)),
+            #[cfg(test)]
             Self::Undeny { destination } => write!(f, "undeny {}", short(destination)),
             Self::Prune { stale } => write!(f, "prune {} destinations", stale.len()),
             Self::KeyChanged {
@@ -382,7 +416,7 @@ impl fmt::Display for TrustMutation {
                 seen_identity,
             } => write!(
                 f,
-                "key change marked on {} destinations announced under identity {}",
+                "key change marked on {} destinations presented under identity {}",
                 destinations.len(),
                 short(seen_identity)
             ),
@@ -452,7 +486,6 @@ impl TrustMutation {
                 identity,
                 was_granting,
                 removed,
-                ..
             } => {
                 if was_granting {
                     observer.revoked(revoked(
@@ -481,14 +514,15 @@ impl TrustMutation {
                     ));
                 }
             }
+            #[cfg(test)]
+            Self::Deny { .. } | Self::Undeny { .. } => {}
             Self::TrustDestination {
                 change: TrustChange::Updated,
                 ..
             }
             | Self::TrustIdentity { granted: false, .. }
+            | Self::RefuseDestination { .. }
             | Self::UnblockIdentity { .. }
-            | Self::Deny { .. }
-            | Self::Undeny { .. }
             | Self::KeyChanged { .. } => {}
         }
     }
@@ -544,19 +578,39 @@ pub(crate) struct TrustOutcome {
     pub identity_hash: String,
     pub destination_hash: String,
     pub change: TrustChange,
-    /// Destinations of other records the trusted instance's name hash re-derives under
-    /// their bound identities: the instance was trusted under another key before. Their
-    /// key-change marks are cleared; the records themselves stay until untrusted.
-    pub superseded: Vec<String>,
+    /// The other records the trusted instance's name hash re-derives under their bound
+    /// identities: the instance was trusted under another key before. Their key-change
+    /// marks are cleared; the records themselves, a deny on them included, stay.
+    pub superseded: Vec<BindingConflict>,
+    /// Whether a deny record on the destination went with the same write.
+    pub deny_lifted: bool,
+}
+
+/// What `untrust_destination` did, or with `dry_run` would do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UntrustOutcome {
+    /// The destination record was removed; the record for its identity stays.
+    Forgotten { identity: String },
+    /// The identity is trusted for every destination, so forgetting this one means
+    /// refusing it: a deny record is written and its record (if any) stays.
+    Refused {
+        identity: String,
+        already_refused: bool,
+        /// No record and no session twin held the destination when the call was made,
+        /// so the write pass back-fills one bound to the resolved identity.
+        record_missing: bool,
+    },
 }
 
 /// A trusted destination record whose name hash `binding_conflicts` was asked about
-/// re-derives under its bound identity, which is not the identity asked about.
+/// re-derives under its bound identity, which is not the identity asked about. `denied`
+/// when a deny record stands on the destination.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BindingConflict {
     pub destination_hash: String,
     pub bound_identity: String,
     pub label: Option<String>,
+    pub denied: bool,
     pub already_marked: bool,
 }
 
@@ -568,6 +622,71 @@ pub(crate) struct MarkedKeyChange {
     pub bound_identity: String,
     pub seen_identity: String,
     pub label: Option<String>,
+    pub denied: bool,
+}
+
+/// How the identity that presented a collision was answered; picks the line the human
+/// gets. `Served` is the warning, `Refused` the error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeyChangeOutcome {
+    Served,
+    Refused,
+}
+
+/// `authorize_origin`'s answer: the verdict, the destination it judged, and the records
+/// the origin's name hash collides with, so the caller marks only when there is something
+/// to mark. `collisions` is empty whenever the verdict is a destination allow or a block:
+/// the identity then holds the instance itself, or the human has already answered it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OriginVerdict {
+    pub verdict: Verdict,
+    pub destination: AddressHash,
+    pub collisions: Vec<BindingConflict>,
+}
+
+/// The peer table as the trust list sees it: a presence cache that may hold an instance
+/// under an identity other than the one now presenting it. An identity trusted for all
+/// destinations has no per-instance record, so this is the only place its rotation shows.
+pub(crate) trait InstancePresence: Send + Sync {
+    /// Every cached row announcing the instance `name_hash` (lower hex), the earliest
+    /// first heard first and ties broken by destination hash; a row expired at `now` is
+    /// not a presence.
+    fn heard_rows(&self, name_hash: &str, now: SystemTime) -> Vec<PresenceRow>;
+}
+
+/// One peer table row holding an instance: the destination it was heard on, the identity
+/// it holds the instance under and when that row was first heard, which decides who the
+/// presence rung takes for the instance's holder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PresenceRow {
+    pub destination_hash: String,
+    pub identity_hash: String,
+    pub first_seen: SystemTime,
+}
+
+/// Bound on the presence rung's memos and, separately, on the (name hash, holder) pairs
+/// whose shared line has been told; the oldest is forgotten when either outgrows this, so a
+/// long run stays bounded. Every memo stands for a refusal, so there is nothing cheaper to
+/// evict first: a memo forgotten lifts the refusal it remembers until the rung refuses
+/// again.
+pub(crate) const PRESENCE_SURFACED_CAP: usize = 4096;
+
+/// A presence collision whose owner line is due: the holder's destination and identity,
+/// and which dedupe entries this detection recorded, so a dropped line rolls back exactly
+/// the dedupe it spent and nothing of the refusal.
+struct PresenceLine {
+    old_destination: String,
+    old_identity: String,
+    remembered: bool,
+    told: bool,
+}
+
+/// What became of a key-change line offered to the surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Offered {
+    Shown,
+    Dropped,
+    NoSurface,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -582,8 +701,10 @@ pub(crate) enum Rule {
     IdentityBlocked,
     DestinationTrusted,
     IdentityTrusted,
-    /// The origin name hash re-derives a trusted destination under a different identity;
-    /// always a refusal.
+    /// The origin name hash re-derives a trusted destination under a different identity,
+    /// or, under collision protection, has a first-heard holder in the peer table (or the
+    /// presence rung's memo) under another identity trusted for all destinations; always a
+    /// refusal.
     IdentityChanged,
     DefaultClosed,
 }
@@ -610,12 +731,33 @@ struct State {
     session_identities: BTreeMap<String, IdentityEntry>,
     session_destinations: BTreeMap<String, DestinationEntry>,
     seen: BTreeMap<String, SystemTime>,
+    /// Per instance the presence rung has refused someone for, its memo, with insertion
+    /// order for eviction; and `(name hash, holder)` for every presence collision whose
+    /// shared line was told, with its own insertion order. `remember_refusal` and
+    /// `remember_shared_line` keep each pair in step.
+    presence_memos: HashMap<String, PresenceMemo>,
+    presence_memo_order: VecDeque<String>,
+    presence_surfaced: HashSet<(String, String)>,
+    presence_surfaced_order: VecDeque<(String, String)>,
+}
+
+/// What the presence rung remembers of one instance for the node's lifetime, from the
+/// first time it refused a presenter: the first-heard holder, the one identity trusted
+/// for all destinations the rung never refuses the instance to; every other such identity
+/// it has refused, which `.mesh block` of any of them clears along with the holder; and,
+/// of those, the ones told their own line, so a dropped line can be offered again without
+/// touching the refusal. Never written to disk.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct PresenceMemo {
+    holder: String,
+    refused: BTreeSet<String>,
+    told: BTreeSet<String>,
 }
 
 /// Equality of two hashes that takes the same time whether they differ in the first byte
 /// or the last. The length check folds into the same `Choice` rather than short-circuiting;
 /// both sides are canonical 32-hex in practice, so it only ever guards a malformed input.
-fn same_hash(left: &str, right: &str) -> bool {
+pub(crate) fn same_hash(left: &str, right: &str) -> bool {
     let (left, right) = (left.as_bytes(), right.as_bytes());
     let same_len = left.len().ct_eq(&right.len());
     let shorter = left.len().min(right.len());
@@ -643,6 +785,12 @@ pub(crate) struct TrustStore {
     /// Where a key-change line goes; held weakly because the slot owns the runtime that
     /// owns this store.
     surface: Mutex<Option<Weak<dyn KnockSurface>>>,
+    /// The peer table, held weakly for the same reason.
+    presence: Mutex<Option<Weak<dyn InstancePresence>>>,
+    /// Where a revoked identity's remembered conversations go, held weakly for the same
+    /// reason.
+    envoy_memory: Mutex<Option<Weak<dyn EnvoyMemorySink>>>,
+    collision_protection: AtomicBool,
 }
 
 impl fmt::Debug for TrustStore {
@@ -677,6 +825,9 @@ impl TrustStore {
             }),
             observer: ArcSwapOption::empty(),
             surface: Mutex::new(None),
+            presence: Mutex::new(None),
+            envoy_memory: Mutex::new(None),
+            collision_protection: AtomicBool::new(false),
         })
     }
 
@@ -691,6 +842,48 @@ impl TrustStore {
         *self.surface.lock() = Some(surface);
     }
 
+    /// Installs the presence cache `note_key_change` consults when no record collides, so
+    /// the rotation of an identity trusted for all destinations is surfaced best effort.
+    pub(crate) fn attach_presence(&self, presence: Weak<dyn InstancePresence>) {
+        *self.presence.lock() = Some(presence);
+    }
+
+    /// Installs the envoy memory that `untrust_identity` and `block_identity` tell to
+    /// forget the identity's conversations.
+    pub(crate) fn attach_envoy_memory(&self, sink: Weak<dyn EnvoyMemorySink>) {
+        *self.envoy_memory.lock() = Some(sink);
+    }
+
+    /// Called with the state lock released: the memory store takes its own locks and
+    /// touches the disk.
+    fn forget_envoy_memory(&self, identity: &str) {
+        let Some(sink) = self.envoy_memory.lock().as_ref().and_then(Weak::upgrade) else {
+            return;
+        };
+        sink.forget_identity(identity);
+    }
+
+    /// How many envoy conversations `untrust_identity` or `block_identity` would forget
+    /// of `identity`, and how many stores could not be read to tell; `None` when no
+    /// envoy memory is attached.
+    pub(crate) fn remembered_envoy_threads(
+        &self,
+        identity: &str,
+    ) -> Option<Result<RememberedOf, EnvoyMemoryError>> {
+        let sink = self.envoy_memory.lock().as_ref().and_then(Weak::upgrade)?;
+        Some(sink.remembered_of(identity))
+    }
+
+    /// `mesh.collision_protection`: on, the collision rung of `authorize_origin` precedes
+    /// identity allow.
+    pub(crate) fn set_collision_protection(&self, on: bool) {
+        self.collision_protection.store(on, Ordering::Relaxed);
+    }
+
+    fn collision_protection(&self) -> bool {
+        self.collision_protection.load(Ordering::Relaxed)
+    }
+
     #[cfg(test)]
     pub(crate) fn path(&self) -> &Path {
         &self.path
@@ -700,87 +893,118 @@ impl TrustStore {
     /// identity allow, then default-closed. A blocked identity is refused before either
     /// allow and reported under its own rule. A destination record only allows the identity
     /// it was proven to belong to. `authorize_origin` layers the one rule that needs the
-    /// name hash, identity changed, between identity allow and default-closed.
+    /// name hash, identity changed, between identity allow and default-closed, or before
+    /// identity allow under collision protection.
     ///
     /// The map lookups are keyed on values the peer already knows and are not treated as a
     /// timing boundary. The destination binding is the one direct equality against a
     /// caller-supplied identity, and it runs in constant time (`same_hash`). Callers
     /// consume the verdict; none of them compares identities again.
     pub(crate) fn authorize(&self, identity_hash: &str, destination_hash: &str) -> Verdict {
-        let identity = identity_hash.to_ascii_lowercase();
-        let destination = destination_hash.to_ascii_lowercase();
-        let state = self.inner.lock();
-        if state.file.denied_destinations.contains_key(&destination) {
-            return Verdict {
-                decision: Decision::Refuse,
-                rule: Rule::DestinationDenied,
-            };
-        }
-        if state.file.blocked_identities.contains_key(&identity) {
-            return Verdict {
-                decision: Decision::Refuse,
-                rule: Rule::IdentityBlocked,
-            };
-        }
-        let bound_to_identity = state
-            .file
-            .destinations
-            .get(&destination)
-            .or_else(|| state.session_destinations.get(&destination))
-            .is_some_and(|entry| same_hash(&entry.identity, &identity));
-        if bound_to_identity {
-            return Verdict {
-                decision: Decision::Allow,
-                rule: Rule::DestinationTrusted,
-            };
-        }
-        if state
-            .file
-            .identities
-            .get(&identity)
-            .is_some_and(|entry| entry.all_destinations)
-        {
-            return Verdict {
-                decision: Decision::Allow,
-                rule: Rule::IdentityTrusted,
-            };
-        }
-        Verdict {
-            decision: Decision::Refuse,
-            rule: Rule::DefaultClosed,
-        }
+        self.inner.lock().authorize(
+            &identity_hash.to_ascii_lowercase(),
+            &destination_hash.to_ascii_lowercase(),
+        )
     }
 
     /// `authorize` for a request whose origin is known by name hash: the destination judged
-    /// is the one `name_hash` and `identity` derive, and a default-closed verdict becomes
-    /// `IdentityChanged` when that name hash re-derives a trusted destination under another
-    /// identity. That is the only difference: a refusal stays a refusal, only its rule
-    /// changes, and the conflicting record's grant stays with the identity it is bound to.
+    /// is the one `name_hash` and `identity` derive, and the records that name hash
+    /// re-derives under another identity come back with the verdict. A default-closed
+    /// verdict becomes `IdentityChanged` when there are any; so does an identity-allow
+    /// verdict under collision protection; a destination deny stands, its collisions
+    /// reported for marking. A destination allow is never asked, the identity then holding
+    /// the instance itself, so its collisions are empty without a scan, and a blocked
+    /// identity's are empty too. The conflicting records' grants stay with the identities
+    /// they are bound to. An identity-allow verdict under collision protection that no
+    /// record collides with is judged once more against the peer table: the instance heard
+    /// there under another identity trusted for all destinations is a rotation with no
+    /// record to mark, and it is refused by rule identity changed with empty collisions.
+    /// The instance's holder is the identity its earliest-heard live row is under, the
+    /// presenter's own row counted, among rows under identities trusted for all
+    /// destinations (`heard_under_trusted_for_all`); the holder itself is never refused by
+    /// this rung. The refusal arms a memo for the instance here and now, whatever becomes of
+    /// the owner line `note_key_change` offers: from then on the memo's holder is the
+    /// instance's holder without another look at the table, and the presenter stays refused
+    /// while that holder is trusted for all destinations, whether or not its row is still
+    /// in the table, until `.mesh trust` of a destination of the instance or `.mesh block`
+    /// of the holder or a refused presenter clears the memo, `PRESENCE_SURFACED_CAP`
+    /// evicts it, or the node restarts. No other rule and no unprotected store reads either
+    /// here. `now` decides which peer table rows have expired; every ingress hands the same
+    /// instant to `note_key_change`, so the rows the verdict sees are the rows the owner
+    /// line sees.
+    pub(crate) fn authorize_origin_at(
+        &self,
+        identity: &AddressHash,
+        name_hash: &[u8; NAME_HASH_LEN],
+        now: SystemTime,
+    ) -> OriginVerdict {
+        let destination = destination_address(name_hash, identity);
+        let identity_hex = identity.to_hex_string();
+        let mut state = self.inner.lock();
+        let mut verdict = state.authorize(&identity_hex, &destination.to_hex_string());
+        let collisions = match verdict.rule {
+            Rule::IdentityTrusted | Rule::DefaultClosed | Rule::DestinationDenied => {
+                state.binding_conflicts(&identity_hex, name_hash)
+            }
+            _ => Vec::new(),
+        };
+        let presence_refuses = verdict.rule == Rule::IdentityTrusted
+            && self.collision_protection()
+            && collisions.is_empty()
+            && {
+                let name_hash_hex = hex_lower(name_hash);
+                match self.heard_under_trusted_for_all(
+                    &state,
+                    &name_hash_hex,
+                    name_hash,
+                    &identity_hex,
+                    now,
+                ) {
+                    Some((_, holder)) => {
+                        state.remember_refusal(&name_hash_hex, &holder, &identity_hex);
+                        true
+                    }
+                    None => false,
+                }
+            };
+        if self.collision_refuses(verdict.rule, &collisions) || presence_refuses {
+            verdict = Verdict {
+                decision: Decision::Refuse,
+                rule: Rule::IdentityChanged,
+            };
+        }
+        OriginVerdict {
+            verdict,
+            destination,
+            collisions,
+        }
+    }
+
+    /// `authorize_origin_at` judged now.
+    #[cfg(test)]
     pub(crate) fn authorize_origin(
         &self,
         identity: &AddressHash,
         name_hash: &[u8; NAME_HASH_LEN],
-    ) -> (Verdict, AddressHash) {
-        let destination = destination_address(name_hash, identity);
-        let identity_hex = identity.to_hex_string();
-        let verdict = self.authorize(&identity_hex, &destination.to_hex_string());
-        if verdict.rule == Rule::DefaultClosed
-            && !self.binding_conflicts(&identity_hex, name_hash).is_empty()
-        {
-            return (
-                Verdict {
-                    decision: Decision::Refuse,
-                    rule: Rule::IdentityChanged,
-                },
-                destination,
-            );
-        }
-        (verdict, destination)
+    ) -> OriginVerdict {
+        self.authorize_origin_at(identity, name_hash, SystemTime::now())
     }
 
-    /// The trusted destination records, on disk then session, that `name_hash` re-derives
-    /// under their bound identity when that identity is not `identity_hash`: the instance
-    /// they belong to has been seen under another key.
+    /// The verdict half of a collision: whether `collisions`, found for a verdict under
+    /// `rule`, refuse the identity. An identity with no grant of its own is refused by them
+    /// outright; one trusted for all destinations only under collision protection.
+    fn collision_refuses(&self, rule: Rule, collisions: &[BindingConflict]) -> bool {
+        !collisions.is_empty()
+            && match rule {
+                Rule::DefaultClosed => true,
+                Rule::IdentityTrusted => self.collision_protection(),
+                _ => false,
+            }
+    }
+
+    /// The detection half: the trusted destination records, on disk then session, that
+    /// `name_hash` re-derives under their bound identity when that identity is not
+    /// `identity_hash`. The instance they belong to has been seen under another key.
     pub(crate) fn binding_conflicts(
         &self,
         identity_hash: &str,
@@ -831,6 +1055,28 @@ impl TrustStore {
         IdentityStanding::Unknown
     }
 
+    /// Whether the trust list still has any record of `identity_hash`: trusted at the
+    /// identity tier, or (a trust file edited by hand) bound to a destination record
+    /// alone, on disk or for the session, and not blocked. What the envoy asks before
+    /// writing a thread back for an identity whose standing may have changed while its
+    /// run was going. An identity trusted for the session alone lapses with the process
+    /// and no sweep runs for it, so its remembered threads are left to the age bound.
+    pub(crate) fn knows_identity(&self, identity_hash: &str) -> bool {
+        let identity = identity_hash.to_ascii_lowercase();
+        let state = self.inner.lock();
+        if state.file.blocked_identities.contains_key(&identity) {
+            return false;
+        }
+        state.file.identities.contains_key(&identity)
+            || state.session_identities.contains_key(&identity)
+            || state
+                .file
+                .destinations
+                .values()
+                .chain(state.session_destinations.values())
+                .any(|entry| entry.identity == identity)
+    }
+
     pub(crate) fn is_blocked_identity(&self, identity_hash: &str) -> bool {
         self.inner
             .lock()
@@ -841,7 +1087,7 @@ impl TrustStore {
 
     /// Every identity and destination record, disk first then session, each section in key
     /// order. A denied destination is still listed, flagged, so the user can see what a
-    /// `deny` is holding back; a deny with no record of its own is listed too, so the
+    /// refusal is holding back; a deny with no record of its own is listed too, so the
     /// enumeration is the whole picture.
     pub(crate) fn records(&self) -> Vec<TrustRecord> {
         let state = self.inner.lock();
@@ -918,6 +1164,8 @@ impl TrustStore {
         overlay_records(&self.inner.lock().file.blocked_identities)
     }
 
+    /// The deny overlay on its own; `records()` carries it as the `denied` flag.
+    #[cfg(test)]
     pub(crate) fn denied(&self) -> Vec<OverlayRecord> {
         overlay_records(&self.inner.lock().file.denied_destinations)
     }
@@ -959,34 +1207,80 @@ impl TrustStore {
             .or_insert(at);
     }
 
-    /// Marks every trusted destination record whose instance `name_hash` names when it is
-    /// seen under `identity_hash` rather than the identity the record is bound to, and
-    /// surfaces one line per record newly marked. A record already marked keeps its first
-    /// sighting and is neither written nor reported again, so a repeated or forged announce
-    /// costs nothing; session records are marked in memory only. The grant is untouched:
-    /// the bound identity still proves its own key. An unreadable hash marks nothing, and
-    /// neither does a blocked `identity_hash`: the human has already answered it. The same
-    /// goes for a denied record and for an `identity_hash` the human has already trusted,
-    /// for the instance or for all destinations (`State::binding_conflicts`).
+    /// Marks every destination record whose instance `name_hash` names when it is seen
+    /// under `identity_hash` rather than the identity the record is bound to, a denied
+    /// record and one whose seen identity is trusted for all destinations included, and
+    /// surfaces one line per record newly marked, a warning or an error by `outcome`. A
+    /// record already marked keeps its first sighting and is neither written nor reported
+    /// again, so a repeated or forged announce costs nothing; session records are marked in
+    /// memory only. The grant is untouched: the bound identity still proves its own key.
+    /// An unreadable hash marks nothing, and neither does a blocked `identity_hash` (the
+    /// human has already answered it) or one that already holds the instance
+    /// (`State::binding_conflicts`). When no record collides the peer table is asked
+    /// instead: an identity trusted for all destinations has no record to mark, so a row
+    /// holding the instance under such an identity is surfaced once per (instance, identity
+    /// the row holds it under) while the node runs, whatever identity presents it, and once
+    /// more to each identity trusted for all destinations that presents it and is refused;
+    /// nothing is written. A line no surface shows, dropped or with nothing attached, is
+    /// offered again at the next presentation; the refusal it reports stands either way,
+    /// armed by the verdict and by the detection here, not by the line.
     pub(crate) fn note_key_change(
         &self,
         identity_hash: &str,
         name_hash: &str,
+        outcome: KeyChangeOutcome,
         now: SystemTime,
     ) -> Vec<MarkedKeyChange> {
-        let (Some(seen), Some(name_hash)) =
+        let (Some(seen), Some(name_hash_bytes)) =
             (parse_hash(identity_hash), decode_name_hash(name_hash))
         else {
             return Vec::new();
         };
+        let name_hash = hex_lower(&name_hash_bytes);
         let seen_identity = seen.to_hex_string();
+        let new_destination = destination_address(&name_hash_bytes, &seen).to_hex_string();
         let marked = {
             let mut state = self.inner.lock();
             if state.file.blocked_identities.contains_key(&seen_identity) {
                 return Vec::new();
             }
-            let fresh: Vec<BindingConflict> = state
-                .binding_conflicts(&seen_identity, &name_hash)
+            let conflicts = state.binding_conflicts(&seen_identity, &name_hash_bytes);
+            if conflicts.is_empty() {
+                let heard = self.presence_collision(
+                    &mut state,
+                    &name_hash,
+                    &name_hash_bytes,
+                    &seen_identity,
+                    now,
+                );
+                drop(state);
+                if let Some(line) = heard {
+                    let offered = self.offer_line(
+                        &seen_identity,
+                        &line.old_destination,
+                        presence_collision_text(
+                            &line.old_destination,
+                            &line.old_identity,
+                            &seen_identity,
+                            &new_destination,
+                            outcome,
+                        ),
+                    );
+                    if offered != Offered::Shown {
+                        self.inner
+                            .lock()
+                            .forget_presence(&name_hash, &seen_identity, &line);
+                    }
+                    if offered == Offered::Dropped {
+                        warn!(
+                            "Mesh key-change notice for {} was dropped; nothing is marked, the refusal stands and the notice is offered again when the instance is next presented",
+                            short(&line.old_destination)
+                        );
+                    }
+                }
+                return Vec::new();
+            }
+            let fresh: Vec<BindingConflict> = conflicts
                 .into_iter()
                 .filter(|conflict| !conflict.already_marked)
                 .collect();
@@ -1036,35 +1330,127 @@ impl TrustStore {
                     bound_identity: conflict.bound_identity,
                     seen_identity: seen_identity.clone(),
                     label: conflict.label,
+                    denied: conflict.denied,
                 })
                 .collect::<Vec<_>>()
         };
-        let new_destination = destination_address(&name_hash, &seen).to_hex_string();
-        self.surface_key_changes(&marked, &new_destination);
+        self.surface_key_changes(&marked, &new_destination, outcome);
         marked
+    }
+
+    /// The holder the presence rung refuses `seen_identity` the instance `name_hash` for,
+    /// as `(destination, identity)`, for an identity no record collides with. The holder is
+    /// the memo's when the instance has one; otherwise it is the identity under the
+    /// earliest-heard live peer table row for the instance, `seen_identity`'s own row
+    /// counted, among rows under identities trusted for all destinations, the rung guarding
+    /// the rotation of an identity-tier grant and no other. None when that holder is
+    /// `seen_identity` itself, is no longer trusted for all destinations, or `seen_identity`
+    /// holds the instance by a record of its own; the memo's holder has its destination
+    /// derived again, since its row may be gone. Reads nothing but the table and the store,
+    /// and the table not at all while no identity is trusted for all destinations or a memo
+    /// stands. A memo is only ever armed over a live foreign row, so there is no first
+    /// refusal with no row to name a holder from.
+    fn heard_under_trusted_for_all(
+        &self,
+        state: &State,
+        name_hash: &str,
+        name_hash_bytes: &[u8; NAME_HASH_LEN],
+        seen_identity: &str,
+        now: SystemTime,
+    ) -> Option<(String, String)> {
+        if !state
+            .file
+            .identities
+            .values()
+            .any(|entry| entry.all_destinations)
+        {
+            return None;
+        }
+        if state.holds_instance(seen_identity, name_hash_bytes) {
+            return None;
+        }
+        let (destination, holder) = match state.presence_memos.get(name_hash) {
+            Some(memo) => {
+                let destination = destination_address(name_hash_bytes, &parse_hash(&memo.holder)?);
+                (destination.to_hex_string(), memo.holder.clone())
+            }
+            None => {
+                let presence = self.presence.lock().as_ref().and_then(Weak::upgrade)?;
+                presence
+                    .heard_rows(name_hash, now)
+                    .into_iter()
+                    .find(|row| state.trusted_for_all(&row.identity_hash))
+                    .map(|row| (row.destination_hash, row.identity_hash))?
+            }
+        };
+        (!same_hash(&holder, seen_identity) && state.trusted_for_all(&holder))
+            .then_some((destination, holder))
+    }
+
+    /// `heard_under_trusted_for_all` as the line it earns, deduped while the node runs. A
+    /// presenter trusted for all destinations under collision protection is the one the
+    /// rung refuses: the memo is armed for it here, as the verdict armed it, and it earns
+    /// its own line once per instance, since the line names its remedies. Every other
+    /// presenter shares one line per (instance, identity the row holds it under), since
+    /// only the holder's own signed announces make such rows and any number of strangers
+    /// may present the instance; a served presentation is no refusal and arms no memo. A
+    /// refused presenter's line spends the shared line too. Nothing on disk changes.
+    fn presence_collision(
+        &self,
+        state: &mut State,
+        name_hash: &str,
+        name_hash_bytes: &[u8; NAME_HASH_LEN],
+        seen_identity: &str,
+        now: SystemTime,
+    ) -> Option<PresenceLine> {
+        let (old_destination, old_identity) = self.heard_under_trusted_for_all(
+            state,
+            name_hash,
+            name_hash_bytes,
+            seen_identity,
+            now,
+        )?;
+        let refused = self.collision_protection() && state.trusted_for_all(seen_identity);
+        if refused {
+            state.remember_refusal(name_hash, &old_identity, seen_identity);
+        }
+        let remembered = state.remember_shared_line((name_hash.to_string(), old_identity.clone()));
+        let told = refused && state.tell_presence_line(name_hash, seen_identity);
+        let due = if refused { told } else { remembered };
+        if !due {
+            return None;
+        }
+        debug!(
+            "Mesh instance {} heard under identity {} is presented by identity {}; no record carries it",
+            short(&old_destination),
+            short(&old_identity),
+            short(seen_identity)
+        );
+        Some(PresenceLine {
+            old_destination,
+            old_identity,
+            remembered,
+            told,
+        })
     }
 
     /// One line per newly marked record, offered after the store lock is released. Nothing
     /// in the line comes from the peer: the label is the human's own, admitted by
     /// `check_text`, and the rest is hashes. A dropped line is not offered again; the mark
     /// stands and `.mesh peers` shows it.
-    fn surface_key_changes(&self, marked: &[MarkedKeyChange], new_destination: &str) {
-        let surface = self.surface.lock().as_ref().and_then(Weak::upgrade);
+    fn surface_key_changes(
+        &self,
+        marked: &[MarkedKeyChange],
+        new_destination: &str,
+        outcome: KeyChangeOutcome,
+    ) {
         for change in marked {
-            let Some(surface) = &surface else {
-                debug!(
-                    "Mesh key change on destination {} was not surfaced: nothing is attached",
-                    short(&change.destination_hash)
-                );
-                continue;
-            };
-            let shown = surface.surface(IdleNotify {
-                source: Source::Mesh,
-                origin: Origin::Peer(short(&change.seen_identity).to_string()),
-                text: key_change_text(change, new_destination),
-                model_note: None,
-            });
-            if !shown {
+            let offered = self.offer_line(
+                &change.seen_identity,
+                &change.destination_hash,
+                key_change_text(change, new_destination, outcome),
+            );
+            if offered == Offered::Dropped {
                 warn!(
                     "Mesh key-change notice for {} was dropped; the mark stands and .mesh peers shows it",
                     short(&change.destination_hash)
@@ -1073,12 +1459,37 @@ impl TrustStore {
         }
     }
 
+    /// Offers one key-change line about `destination_hash`, seen under `seen_identity`, to
+    /// whatever is attached.
+    fn offer_line(&self, seen_identity: &str, destination_hash: &str, text: String) -> Offered {
+        let Some(surface) = self.surface.lock().as_ref().and_then(Weak::upgrade) else {
+            debug!(
+                "Mesh key change on destination {} was not surfaced: nothing is attached",
+                short(destination_hash)
+            );
+            return Offered::NoSurface;
+        };
+        let shown = surface.surface(IdleNotify {
+            source: Source::Mesh,
+            origin: Origin::Peer(short(seen_identity).to_string()),
+            text,
+            model_note: None,
+        });
+        if shown {
+            Offered::Shown
+        } else {
+            Offered::Dropped
+        }
+    }
+
     /// Trusts one destination by proving which identity announced it, and makes sure that
     /// identity has a record (without `all_destinations`, which only `trust_identity` sets).
     /// The identity comes from the announce's or the knock's own hashes, never from the
-    /// caller. Re-trusting a destination clears its key-change mark, as does trusting the
-    /// new destination of an instance whose old records carry one: the human has affirmed
-    /// the binding.
+    /// caller. Trusting the new destination of an instance whose old records carry a
+    /// key-change mark clears those marks: the human has confirmed the new key. Re-trusting
+    /// a marked destination itself leaves its mark, since that answers nothing about the
+    /// key it was seen under. The presence rung's memo for the instance, if one stands, is
+    /// cleared for the same reason as the marks.
     pub(crate) fn trust_destination(
         &self,
         mesh: &dyn LiveMesh,
@@ -1096,7 +1507,6 @@ impl TrustStore {
             Some(entry) => {
                 entry.identity = peer.identity_hash.clone();
                 entry.last_seen_at = Stamp::new(peer.last_seen);
-                entry.key_changed = None;
                 apply_options(&mut entry.label, &mut entry.note, opts);
                 TrustChange::Updated
             }
@@ -1115,20 +1525,21 @@ impl TrustStore {
                 TrustChange::Added
             }
         };
-        let superseded: Vec<String> = decode_name_hash(&peer.name_hash)
+        let superseded = decode_name_hash(&peer.name_hash)
             .map(|name_hash| state.binding_conflicts(&peer.identity_hash, &name_hash))
-            .unwrap_or_default()
-            .into_iter()
-            .map(|conflict| conflict.destination_hash)
-            .collect();
-        for destination in &superseded {
-            if let Some(entry) = file.destinations.get_mut(destination) {
+            .unwrap_or_default();
+        for conflict in &superseded {
+            if let Some(entry) = file.destinations.get_mut(&conflict.destination_hash) {
                 entry.key_changed = None;
             }
         }
         file.identities
             .entry(peer.identity_hash.clone())
             .or_insert_with(|| identity_entry(now, peer.last_seen, false));
+        let deny_lifted = file
+            .denied_destinations
+            .remove(&peer.destination_hash)
+            .is_some();
         self.commit(
             &mut state,
             file,
@@ -1138,11 +1549,15 @@ impl TrustStore {
                 change,
             },
         )?;
-        for destination in &superseded {
-            if let Some(entry) = state.session_destinations.get_mut(destination) {
+        for conflict in &superseded {
+            if let Some(entry) = state
+                .session_destinations
+                .get_mut(&conflict.destination_hash)
+            {
                 entry.key_changed = None;
             }
         }
+        state.forget_presence_memo(&peer.name_hash);
         // Both now live on disk, so a session twin would list the same hash twice.
         state.session_destinations.remove(&peer.destination_hash);
         state.session_identities.remove(&peer.identity_hash);
@@ -1151,6 +1566,7 @@ impl TrustStore {
             destination_hash: peer.destination_hash,
             change,
             superseded,
+            deny_lifted,
         })
     }
 
@@ -1174,13 +1590,13 @@ impl TrustStore {
                 destination_hash: peer.destination_hash,
                 change: TrustChange::Updated,
                 superseded: Vec::new(),
+                deny_lifted: false,
             });
         }
         let change = match state.session_destinations.get_mut(&peer.destination_hash) {
             Some(entry) => {
                 entry.identity = peer.identity_hash.clone();
                 entry.last_seen_at = Stamp::new(peer.last_seen);
-                entry.key_changed = None;
                 TrustChange::Updated
             }
             None => {
@@ -1204,20 +1620,23 @@ impl TrustStore {
                 .entry(peer.identity_hash.clone())
                 .or_insert_with(|| identity_entry(now, peer.last_seen, false));
         }
+        state.forget_presence_memo(&peer.name_hash);
         Ok(TrustOutcome {
             identity_hash: peer.identity_hash,
             destination_hash: peer.destination_hash,
             change,
             superseded: Vec::new(),
+            deny_lifted: false,
         })
     }
 
     /// Trusts every destination of an identity (`--identity`): the record's
     /// `all_destinations` flag is set, or the record is created with it set. Only peer rows
     /// whose destination the identity provably derives count towards `last_seen_at`; the
-    /// identity column alone is a claim. Every key-change mark that named this identity as
-    /// the one seen is cleared: the human has answered for every instance of it, and
-    /// `binding_conflicts` would never re-evaluate the mark for an identity trusted for all.
+    /// identity column alone is a claim. Key-change marks naming this identity as the one
+    /// seen stand: only trusting the new destination clears one. The grant carries no
+    /// per-instance record, so a rotation of this identity is surfaced from the peer table
+    /// when heard and never marked.
     pub(crate) fn trust_identity(
         &self,
         mesh: &dyn LiveMesh,
@@ -1231,7 +1650,9 @@ impl TrustStore {
         let last_seen = peers
             .snapshot()
             .iter()
-            .filter(|peer| peer.identity_hash == identity && verified_identity(peer).is_ok())
+            .filter(|peer| {
+                same_hash(&peer.identity_hash, &identity) && verified_identity(peer).is_ok()
+            })
             .map(|peer| peer.last_seen)
             .max();
         let mut state = self.inner.lock();
@@ -1255,7 +1676,6 @@ impl TrustStore {
                 (TrustChange::Added, true)
             }
         };
-        clear_marks_seen_under(file.destinations.values_mut(), &identity);
         self.commit(
             &mut state,
             file,
@@ -1266,43 +1686,117 @@ impl TrustStore {
         )?;
         // The identity now lives on disk, so a session twin would list the same hash twice.
         state.session_identities.remove(&identity);
-        clear_marks_seen_under(state.session_destinations.values_mut(), &identity);
         Ok(change)
     }
 
-    /// Removes one destination record; the identity record stays.
+    /// Removes one destination record; the identity record stays. When that identity is
+    /// trusted for every destination, removing the record alone would change nothing, so
+    /// the destination is denied instead and nothing is removed: the identity record keeps
+    /// its standing, the destination record (if any) keeps its label and binding, and
+    /// `trust_destination` lifts the deny on the intact record. The identity is read from
+    /// the destination's record, its session twin, or a peer table row whose binding
+    /// verifies, so a destination never trusted on its own can still be refused; it gets a
+    /// record bound to the identity the peer table proves, written with the deny, so
+    /// forgetting the identity forgets the refusal too. A knocker that never announced has
+    /// no row to resolve through and cannot be refused until it is heard. `dry_run` reports
+    /// the outcome and writes nothing. Forgetting a record under a plain identity drops any
+    /// deny left on it, so no orphan deny survives the record.
     pub(crate) fn untrust_destination(
         &self,
         mesh: &dyn LiveMesh,
         destination_hash: &str,
-    ) -> Result<()> {
-        live(mesh)?;
+        now: SystemTime,
+        dry_run: bool,
+    ) -> Result<UntrustOutcome> {
+        let peers = live(mesh)?;
         let destination = normalize_hash(destination_hash);
         let mut state = self.inner.lock();
         let mut file = state.file.clone();
-        let on_disk = file.destinations.remove(&destination);
-        let in_session = state.session_destinations.contains_key(&destination);
-        if on_disk.is_none() && !in_session {
-            bail!(
-                "Destination {destination} is not in the trust list, so there is nothing to untrust."
+        let resolved = file
+            .destinations
+            .get(&destination)
+            .or_else(|| state.session_destinations.get(&destination))
+            .map(|entry| (entry.identity.clone(), entry.last_seen_at.0))
+            .or_else(|| {
+                peers.get(&destination).and_then(|peer| {
+                    verified_identity(&peer)
+                        .ok()
+                        .map(|identity| (identity.to_hex_string(), peer.last_seen))
+                })
+            });
+        let Some((identity, last_seen)) = resolved else {
+            return Err(nothing_to_untrust(&file, &destination));
+        };
+        let trusted_all = file
+            .identities
+            .get(&identity)
+            .is_some_and(|entry| entry.all_destinations);
+        if trusted_all {
+            let already_refused = file.denied_destinations.contains_key(&destination);
+            let has_record = file.destinations.contains_key(&destination)
+                || state.session_destinations.contains_key(&destination);
+            let record_missing = !has_record;
+            if dry_run || (already_refused && !record_missing) {
+                return Ok(UntrustOutcome::Refused {
+                    identity,
+                    already_refused,
+                    record_missing,
+                });
+            }
+            file.destinations
+                .entry(destination.clone())
+                .or_insert_with(|| DestinationEntry {
+                    identity: identity.clone(),
+                    added_at: Stamp::new(now),
+                    last_seen_at: Stamp::new(last_seen),
+                    label: None,
+                    note: None,
+                    key_changed: None,
+                });
+            upsert_overlay(
+                &mut file.denied_destinations,
+                destination.clone(),
+                None,
+                now,
             );
-        }
-        if let Some(entry) = on_disk {
             self.commit(
                 &mut state,
                 file,
-                TrustMutation::UntrustDestination {
+                TrustMutation::RefuseDestination {
                     destination: destination.clone(),
-                    identity: entry.identity,
                 },
             )?;
+            // The record now lives on disk, so a session twin would list the same hash twice.
+            state.session_destinations.remove(&destination);
+            return Ok(UntrustOutcome::Refused {
+                identity,
+                already_refused,
+                record_missing,
+            });
+        }
+        let on_disk = file.destinations.remove(&destination);
+        let in_session = state.session_destinations.contains_key(&destination);
+        if on_disk.is_none() && !in_session {
+            return Err(nothing_to_untrust(&file, &destination));
+        }
+        if dry_run {
+            return Ok(UntrustOutcome::Forgotten { identity });
+        }
+        let deny_dropped = file.denied_destinations.remove(&destination).is_some();
+        if on_disk.is_some() || deny_dropped {
+            let mutation = TrustMutation::UntrustDestination {
+                destination: destination.clone(),
+                identity: identity.clone(),
+            };
+            self.commit(&mut state, file, mutation)?;
         }
         state.forget_destination(&destination);
-        Ok(())
+        Ok(UntrustOutcome::Forgotten { identity })
     }
 
-    /// Removes an identity record and every destination bound to it; returns the removed
-    /// destination hashes.
+    /// Removes an identity record and every destination bound to it, denies included;
+    /// returns the removed destination hashes. Whatever the envoy remembered of the
+    /// identity's conversations goes with the trust.
     pub(crate) fn untrust_identity(
         &self,
         mesh: &dyn LiveMesh,
@@ -1310,34 +1804,45 @@ impl TrustStore {
     ) -> Result<Vec<String>> {
         live(mesh)?;
         let identity = normalize_hash(identity_hash);
-        let mut state = self.inner.lock();
-        let mut file = state.file.clone();
-        let on_disk = file.identities.remove(&identity);
-        let in_session = state.session_identities.contains_key(&identity);
-        if on_disk.is_none() && !in_session {
-            bail!("Identity {identity} is not in the trust list, so there is nothing to untrust.");
-        }
-        let removed = remove_destinations_of(&mut file, &identity);
-        if on_disk.is_some() || !removed.is_empty() {
-            self.commit(
-                &mut state,
-                file,
-                TrustMutation::UntrustIdentity {
-                    identity: identity.clone(),
-                    was_granting: on_disk.is_some_and(|entry| entry.all_destinations),
-                    removed: removed.clone(),
-                },
-            )?;
-        }
-        state.forget_identity(&identity, &removed);
+        let removed = {
+            let mut state = self.inner.lock();
+            let mut file = state.file.clone();
+            let on_disk = file.identities.remove(&identity);
+            let in_session = state.session_identities.contains_key(&identity);
+            if on_disk.is_none() && !in_session {
+                bail!(
+                    "Identity {identity} is not in the trust list, so there is nothing to untrust."
+                );
+            }
+            let removed = remove_destinations_of(&mut file, &identity);
+            for hash in &removed {
+                file.denied_destinations.remove(hash);
+            }
+            if on_disk.is_some() || !removed.is_empty() {
+                self.commit(
+                    &mut state,
+                    file,
+                    TrustMutation::UntrustIdentity {
+                        identity: identity.clone(),
+                        was_granting: on_disk.is_some_and(|entry| entry.all_destinations),
+                        removed: removed.clone(),
+                    },
+                )?;
+            }
+            state.forget_identity(&identity, &removed);
+            removed
+        };
+        self.forget_envoy_memory(&identity);
         Ok(removed)
     }
 
     /// Suppresses an identity's knocks and drops its trust records, on disk and for the
     /// session; returns the removed destination hashes. Blocking is the one mutation that
-    /// works on an identity the trust list has never seen. It also clears every key-change
-    /// mark that named this identity as the one seen: the block is the notice's own remedy,
-    /// and a later sighting under yet another identity can mark the record again.
+    /// works on an identity the trust list has never seen. The block silences the identity;
+    /// a key-change mark naming it as the one seen stands until the new destination is
+    /// trusted. Every presence memo naming it, as holder or as a refused presenter, is
+    /// cleared: the human has answered the collision it stood for. Whatever the envoy
+    /// remembered of the identity's conversations goes too.
     pub(crate) fn block_identity(
         &self,
         mesh: &dyn LiveMesh,
@@ -1348,27 +1853,29 @@ impl TrustStore {
         live(mesh)?;
         let identity = valid_hash("identity", identity_hash)?;
         check_text("note", note.as_deref())?;
-        let mut state = self.inner.lock();
-        let mut file = state.file.clone();
-        let was_granting = file
-            .identities
-            .remove(&identity)
-            .is_some_and(|entry| entry.all_destinations);
-        let removed = remove_destinations_of(&mut file, &identity);
-        let marks_cleared = clear_marks_seen_under(file.destinations.values_mut(), &identity);
-        upsert_overlay(&mut file.blocked_identities, identity.clone(), note, now);
-        self.commit(
-            &mut state,
-            file,
-            TrustMutation::BlockIdentity {
-                identity: identity.clone(),
-                was_granting,
-                removed: removed.clone(),
-                marks_cleared,
-            },
-        )?;
-        state.forget_identity(&identity, &removed);
-        clear_marks_seen_under(state.session_destinations.values_mut(), &identity);
+        let removed = {
+            let mut state = self.inner.lock();
+            let mut file = state.file.clone();
+            let was_granting = file
+                .identities
+                .remove(&identity)
+                .is_some_and(|entry| entry.all_destinations);
+            let removed = remove_destinations_of(&mut file, &identity);
+            upsert_overlay(&mut file.blocked_identities, identity.clone(), note, now);
+            self.commit(
+                &mut state,
+                file,
+                TrustMutation::BlockIdentity {
+                    identity: identity.clone(),
+                    was_granting,
+                    removed: removed.clone(),
+                },
+            )?;
+            state.forget_identity(&identity, &removed);
+            state.forget_presence_memos_naming(&identity);
+            removed
+        };
+        self.forget_envoy_memory(&identity);
         Ok(removed)
     }
 
@@ -1388,8 +1895,10 @@ impl TrustStore {
         )
     }
 
-    /// Refuses one destination even when its identity is trusted. The destination's own
-    /// trust record, if any, is kept so the user sees what the deny overrides.
+    /// Seeds the deny overlay for a destination regardless of its identity's standing; the
+    /// destination's own trust record, if any, is kept. The REPL has no verb for this:
+    /// `untrust_destination` writes the overlay when the identity is trusted for all.
+    #[cfg(test)]
     pub(crate) fn deny_destination(
         &self,
         mesh: &dyn LiveMesh,
@@ -1411,6 +1920,7 @@ impl TrustStore {
         self.commit(&mut state, file, TrustMutation::Deny { destination })
     }
 
+    #[cfg(test)]
     pub(crate) fn undeny_destination(
         &self,
         mesh: &dyn LiveMesh,
@@ -1428,8 +1938,10 @@ impl TrustStore {
 
     /// Destination records not seen for `older_than`, judged on the freshest of the disk
     /// `last_seen_at`, the in-memory sighting and a peer-table announce whose identity is
-    /// verified to be the record's; removed unless `dry_run`. Identities are never pruned:
-    /// they are the user's statement about a person, not about an instance that may be gone.
+    /// verified to be the record's; removed unless `dry_run`. A refused record is the
+    /// operator's answer about that instance and is never pruned. Identities are never
+    /// pruned: they are the user's statement about a person, not about an instance that
+    /// may be gone.
     pub(crate) fn prune_destinations(
         &self,
         mesh: &dyn LiveMesh,
@@ -1443,6 +1955,7 @@ impl TrustStore {
             .file
             .destinations
             .iter()
+            .filter(|(hash, _)| !state.file.denied_destinations.contains_key(*hash))
             .filter(|(hash, entry)| {
                 let on_record = state.effective_last_seen(hash, entry);
                 let last_seen = verified_announce(&peers, hash, entry)
@@ -1525,40 +2038,166 @@ impl State {
         }
     }
 
+    /// `identity` and `destination` are canonical lower hex; see `TrustStore::authorize`.
+    fn authorize(&self, identity: &str, destination: &str) -> Verdict {
+        if self.file.denied_destinations.contains_key(destination) {
+            return Verdict {
+                decision: Decision::Refuse,
+                rule: Rule::DestinationDenied,
+            };
+        }
+        if self.file.blocked_identities.contains_key(identity) {
+            return Verdict {
+                decision: Decision::Refuse,
+                rule: Rule::IdentityBlocked,
+            };
+        }
+        let bound_to_identity = self
+            .file
+            .destinations
+            .get(destination)
+            .or_else(|| self.session_destinations.get(destination))
+            .is_some_and(|entry| same_hash(&entry.identity, identity));
+        if bound_to_identity {
+            return Verdict {
+                decision: Decision::Allow,
+                rule: Rule::DestinationTrusted,
+            };
+        }
+        if self.trusted_for_all(identity) {
+            return Verdict {
+                decision: Decision::Allow,
+                rule: Rule::IdentityTrusted,
+            };
+        }
+        Verdict {
+            decision: Decision::Refuse,
+            rule: Rule::DefaultClosed,
+        }
+    }
+
+    fn trusted_for_all(&self, identity: &str) -> bool {
+        self.file
+            .identities
+            .get(identity)
+            .is_some_and(|entry| entry.all_destinations)
+    }
+
+    /// Records that the presence rung refused `presenter` the instance `name_hash` held by
+    /// `holder`: arms the instance's memo if none stands, evicting the oldest memo past
+    /// `PRESENCE_SURFACED_CAP`, and adds the presenter to the refused. A standing memo keeps
+    /// its holder.
+    fn remember_refusal(&mut self, name_hash: &str, holder: &str, presenter: &str) {
+        if !self.presence_memos.contains_key(name_hash) {
+            self.presence_memo_order.push_back(name_hash.to_string());
+            if self.presence_memo_order.len() > PRESENCE_SURFACED_CAP
+                && let Some(oldest) = self.presence_memo_order.pop_front()
+            {
+                self.presence_memos.remove(&oldest);
+            }
+        }
+        self.presence_memos
+            .entry(name_hash.to_string())
+            .or_insert_with(|| PresenceMemo {
+                holder: holder.to_string(),
+                ..PresenceMemo::default()
+            })
+            .refused
+            .insert(presenter.to_string());
+    }
+
+    /// Records `(name hash, holder)` as having had its shared line told, evicting the oldest
+    /// pair past `PRESENCE_SURFACED_CAP`; false when the pair was told already.
+    fn remember_shared_line(&mut self, key: (String, String)) -> bool {
+        if !self.presence_surfaced.insert(key.clone()) {
+            return false;
+        }
+        self.presence_surfaced_order.push_back(key);
+        if self.presence_surfaced_order.len() > PRESENCE_SURFACED_CAP
+            && let Some(oldest) = self.presence_surfaced_order.pop_front()
+        {
+            self.presence_surfaced.remove(&oldest);
+        }
+        true
+    }
+
+    /// Records that `presenter` was told the instance's memo refuses it; false when it had
+    /// been told already, or when no memo stands to refuse it.
+    fn tell_presence_line(&mut self, name_hash: &str, presenter: &str) -> bool {
+        self.presence_memos
+            .get_mut(name_hash)
+            .is_some_and(|memo| memo.told.insert(presenter.to_string()))
+    }
+
+    /// Rolls back the dedupe one detection spent when its line was dropped: the shared
+    /// line, if this detection told it, and the presenter's own, if this detection told
+    /// it, so the next presentation offers the line again. The memo the detection armed
+    /// stands: the refusal was never the line's.
+    fn forget_presence(&mut self, name_hash: &str, presenter: &str, line: &PresenceLine) {
+        if line.remembered {
+            let key = (name_hash.to_string(), line.old_identity.clone());
+            self.presence_surfaced.remove(&key);
+            self.presence_surfaced_order.retain(|pair| pair != &key);
+        }
+        if line.told
+            && let Some(memo) = self.presence_memos.get_mut(name_hash)
+        {
+            memo.told.remove(presenter);
+        }
+    }
+
+    /// Clears the instance's memo: the human trusted a destination of it, which answers
+    /// what the memo was waiting on.
+    fn forget_presence_memo(&mut self, name_hash: &str) {
+        if self.presence_memos.remove(name_hash).is_some() {
+            self.presence_memo_order
+                .retain(|instance| instance != name_hash);
+        }
+    }
+
+    /// Clears every memo `identity` is the holder of or was refused by: the human blocked
+    /// it, which answers every one of them.
+    fn forget_presence_memos_naming(&mut self, identity: &str) {
+        self.presence_memos.retain(|_, memo| {
+            !same_hash(&memo.holder, identity) && !memo.refused.contains(identity)
+        });
+        let memos = &self.presence_memos;
+        self.presence_memo_order
+            .retain(|instance| memos.contains_key(instance));
+    }
+
     /// `identity` is canonical lower hex. An entry whose bound identity does not parse is
     /// skipped: `open` refuses such a file, so none exists, but nothing here panics. Nothing
     /// conflicts once `identity` holds its own trusted record for the instance, both
-    /// bindings then being the human's, nor once `identity` is trusted for all
-    /// destinations, the human having answered for every instance of it; a denied record
-    /// is left out, the human having answered it.
+    /// bindings then being the human's. A denied record conflicts like any other, and so
+    /// does one whose `identity` is trusted for all destinations: the verdict decides what
+    /// a conflict means, detection only reports it.
     fn binding_conflicts(
         &self,
         identity: &str,
         name_hash: &[u8; NAME_HASH_LEN],
     ) -> Vec<BindingConflict> {
-        let trusted_for_all = self
-            .file
-            .identities
-            .get(identity)
-            .is_some_and(|entry| entry.all_destinations);
-        if trusted_for_all || self.holds_instance(identity, name_hash) {
+        if self.holds_instance(identity, name_hash) {
             return Vec::new();
         }
         self.file
             .destinations
             .iter()
             .chain(&self.session_destinations)
-            .filter(|(hash, _)| !self.file.denied_destinations.contains_key(*hash))
             .filter(|(_, entry)| !same_hash(&entry.identity, identity))
             .filter(|(hash, entry)| {
                 parse_hash(&entry.identity).is_some_and(|bound| {
-                    parse_hash(hash) == Some(destination_address(name_hash, &bound))
+                    same_hash(
+                        hash,
+                        &destination_address(name_hash, &bound).to_hex_string(),
+                    )
                 })
             })
             .map(|(hash, entry)| BindingConflict {
                 destination_hash: hash.clone(),
                 bound_identity: entry.identity.clone(),
                 label: entry.label.clone(),
+                denied: self.file.denied_destinations.contains_key(hash),
                 already_marked: entry.key_changed.is_some(),
             })
             .collect()
@@ -1732,6 +2371,15 @@ fn refuse_if_blocked(file: &TrustFile, identity: &str) -> Result<()> {
     Ok(())
 }
 
+fn nothing_to_untrust(file: &TrustFile, destination: &str) -> anyhow::Error {
+    if file.denied_destinations.contains_key(destination) {
+        return anyhow!(
+            "Destination {destination} is refused and its identity is not trusted; `.mesh trust {destination}` lifts that once the peer is heard."
+        );
+    }
+    anyhow!("Destination {destination} is not in the trust list, so there is nothing to untrust.")
+}
+
 fn identity_entry(now: SystemTime, last_seen: SystemTime, all_destinations: bool) -> IdentityEntry {
     IdentityEntry {
         added_at: Stamp::new(now),
@@ -1786,25 +2434,6 @@ fn remove_destinations_of(file: &mut TrustFile, identity: &str) -> Vec<String> {
         file.destinations.remove(hash);
     }
     bound
-}
-
-/// Clears the key-change marks that name `identity` as the one seen; returns how many.
-fn clear_marks_seen_under<'a>(
-    entries: impl Iterator<Item = &'a mut DestinationEntry>,
-    identity: &str,
-) -> usize {
-    let mut cleared = 0;
-    for entry in entries {
-        if entry
-            .key_changed
-            .as_ref()
-            .is_some_and(|mark| mark.seen_identity == identity)
-        {
-            entry.key_changed = None;
-            cleared += 1;
-        }
-    }
-    cleared
 }
 
 fn overlay_records(overlay: &BTreeMap<String, OverlayEntry>) -> Vec<OverlayRecord> {
@@ -1902,7 +2531,7 @@ fn verify_binding(
         anyhow!("'{destination}' is not a destination hash: expected 32 hex characters.")
     })?;
     let expected = destination_address(&name_hash, &identity);
-    if expected != claimed {
+    if !bool::from(expected.as_slice().ct_eq(claimed.as_slice())) {
         bail!(
             "Destination {destination} does not match identity {} in {source} (that identity would announce {}); nothing was trusted.",
             identity.to_hex_string(),
@@ -1916,41 +2545,96 @@ pub(crate) fn decode_name_hash(hex: &str) -> Option<[u8; NAME_HASH_LEN]> {
     decode_hex(hex)?.try_into().ok()
 }
 
-/// The one line a key change earns. It says "announced under", not "rotated": anyone who
-/// has heard the instance id can announce it under their own key, so the human verifies
-/// out of band before trusting the new destination, or blocks the new identity. Full
-/// hashes, because the human pastes them.
-fn key_change_text(change: &MarkedKeyChange, new_destination: &str) -> String {
+/// The one line a key change earns, opening with a literal `warning: ` or `error: ` so
+/// the severity reads without colour. It says "presented under", not "rotated": anyone
+/// who has heard the instance id can present it under their own key, so the human
+/// confirms with the identity's holder out of band before trusting the new destination,
+/// which clears the mark, or blocks the new identity, which silences it. The same line
+/// serves a mark raised by an announce and one raised by a link, knock or stored request,
+/// so it names no path and speaks of what the identity gets when it asks, not of what it
+/// got. Full hashes, because the human pastes them.
+fn key_change_text(
+    change: &MarkedKeyChange,
+    new_destination: &str,
+    outcome: KeyChangeOutcome,
+) -> String {
     let instance = change
         .label
         .clone()
         .unwrap_or_else(|| short(&change.destination_hash).to_string());
-    format!(
-        "instance {instance} is bound to identity {bound} but was announced under identity {seen}; \
-         its grant stays with the old key and the new key is a stranger. If the peer rotated, \
-         verify the new identity out of band and run .mesh trust {new_destination} ; \
-         otherwise .mesh block {seen}",
-        bound = change.bound_identity,
-        seen = change.seen_identity,
-    )
+    let bound = &change.bound_identity;
+    let seen = &change.seen_identity;
+    let standing = if change.denied {
+        "the old key stays refused"
+    } else {
+        "its grant stays with the old key"
+    };
+    match outcome {
+        KeyChangeOutcome::Served => format!(
+            "warning: instance {instance} is bound to identity {bound} but was presented under \
+             identity {seen}, which is trusted for all destinations and is served while it \
+             asks; the record is marked and {standing}. If the peer rotated, confirm with its \
+             holder out of band and run .mesh trust {new_destination} to clear the mark; \
+             otherwise .mesh block {seen}"
+        ),
+        KeyChangeOutcome::Refused => format!(
+            "error: instance {instance} is bound to identity {bound} but was presented under \
+             identity {seen} and is refused when it asks; {standing} and the new key is a \
+             stranger. Confirm with the identity's holder out of band before granting anything: \
+             if the peer rotated, run .mesh trust {new_destination} to trust the new key and \
+             clear the mark; otherwise .mesh block {seen} silences it"
+        ),
+    }
+}
+
+/// The line a collision found only in the peer table earns: the instance was heard under
+/// `old_identity`, trusted for all destinations, and is now presented by `seen_identity`.
+/// No record carries the instance, so nothing is marked and the line says so. It is served
+/// only while `mesh.collision_protection` is off, and the warning names the setting.
+fn presence_collision_text(
+    old_destination: &str,
+    old_identity: &str,
+    seen_identity: &str,
+    new_destination: &str,
+    outcome: KeyChangeOutcome,
+) -> String {
+    let instance = short(old_destination);
+    match outcome {
+        KeyChangeOutcome::Served => format!(
+            "warning: instance {instance} was heard under identity {old_identity}, trusted for all \
+             destinations, and is now presented under identity {seen_identity}, which is also \
+             trusted for all destinations and is served while it asks because \
+             collision_protection is off; no record carries the instance, so nothing is marked. \
+             If the peer rotated, confirm with its holder out of band; otherwise \
+             .mesh block {seen_identity}"
+        ),
+        KeyChangeOutcome::Refused => format!(
+            "error: instance {instance} was heard under identity {old_identity}, trusted for all \
+             destinations, and is now presented under identity {seen_identity}, which is \
+             refused when it asks; no record carries the instance, so nothing is marked. Confirm \
+             with the identity's holder out of band before granting anything: if the peer rotated, run \
+             .mesh trust {new_destination}; otherwise .mesh block {seen_identity}"
+        ),
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_support::TempDir;
+    use super::super::test_support::{TempDir, siblings_of};
     use super::*;
     use crate::hooks::HookEvent;
     use crate::mesh::events::{
         MeshHooks, RecordingHookSink, TrustHookObserver, env_value, one_fire,
     };
-    use crate::mesh::hex_lower;
     use crate::mesh::knock::RecordingSurface;
     use crate::mesh::peers::{PEER_TTL, PeerSighting};
+    use crate::mesh::session_destination_name;
     use crate::testing::{install_log_collector, warn_snapshot};
 
     use rand_core::OsRng;
-    use rns_transport::destination::{DestinationName, SingleInputDestination};
+    use rns_transport::destination::SingleInputDestination;
     use rns_transport::identity::PrivateIdentity;
+    use std::sync::atomic::AtomicUsize;
 
     struct MeshOff;
 
@@ -1990,7 +2674,7 @@ mod tests {
     }
 
     fn announced_as(identity: PrivateIdentity, aspect: &str) -> Announced {
-        let name = DestinationName::new("coyote", &format!("mesh.{aspect}"));
+        let name = session_destination_name(aspect);
         let destination = SingleInputDestination::new(identity, name);
         Announced {
             destination_hash: destination.desc.address_hash.to_hex_string(),
@@ -2064,6 +2748,14 @@ mod tests {
             sink
         }
 
+        /// Attaches an envoy memory that records which identities it was told to forget.
+        fn remembering(&self) -> Arc<RecordingMemory> {
+            let memory = Arc::new(RecordingMemory::default());
+            self.store
+                .attach_envoy_memory(Arc::downgrade(&memory) as Weak<dyn EnvoyMemorySink>);
+            memory
+        }
+
         fn trust_identity(&self, identity_hash: &str, at: SystemTime) -> TrustChange {
             self.store
                 .trust_identity(&self.mesh, identity_hash, TrustOptions::default(), at)
@@ -2087,6 +2779,25 @@ mod tests {
         hex_lower(&[fill; 16])
     }
 
+    #[derive(Default)]
+    struct RecordingMemory(Mutex<Vec<String>>);
+
+    impl RecordingMemory {
+        fn forgotten(&self) -> Vec<String> {
+            self.0.lock().clone()
+        }
+    }
+
+    impl EnvoyMemorySink for RecordingMemory {
+        fn forget_identity(&self, identity: &str) {
+            self.0.lock().push(identity.to_string());
+        }
+
+        fn remembered_of(&self, _identity: &str) -> Result<RememberedOf, EnvoyMemoryError> {
+            Ok(RememberedOf::default())
+        }
+    }
+
     fn verdict(decision: Decision, rule: Rule) -> Verdict {
         Verdict { decision, rule }
     }
@@ -2098,7 +2809,16 @@ mod tests {
                 &parse_hash(&peer.identity_hash).unwrap(),
                 &decode_name_hash(&peer.name_hash).unwrap(),
             )
-            .0
+            .verdict
+    }
+
+    /// The outcome the announce path hands `note_key_change`: `peer`'s identity judged as
+    /// its request would be.
+    fn announce_outcome(store: &TrustStore, peer: &Announced) -> KeyChangeOutcome {
+        match origin_verdict(store, peer).decision {
+            Decision::Allow => KeyChangeOutcome::Served,
+            Decision::Refuse => KeyChangeOutcome::Refused,
+        }
     }
 
     fn record(store: &TrustStore, hash: &str) -> TrustRecord {
@@ -2107,6 +2827,14 @@ mod tests {
             .into_iter()
             .find(|record| record.hash == hash)
             .unwrap_or_else(|| panic!("no record for {hash}"))
+    }
+
+    fn superseded_destinations(outcome: &TrustOutcome) -> Vec<String> {
+        outcome
+            .superseded
+            .iter()
+            .map(|conflict| conflict.destination_hash.clone())
+            .collect()
     }
 
     /// A trusted instance and the same instance announced under a fresh identity.
@@ -2129,6 +2857,71 @@ mod tests {
         assert!(!same_hash(&hash, &last_byte_differs));
         assert!(!same_hash("ab", "abc"));
         assert!(same_hash("", ""));
+    }
+
+    /// Every production compare of a typed address hash, of a destination against the one
+    /// an identity derives, or of a presence holder or a `*_identity` hex string against
+    /// another identity, here and in message.rs, goes through `same_hash` or `ct_eq`, never
+    /// through `==` or `!=`. The holder of an instance is an identity hash wherever it is
+    /// compared, on the verdict rung that refuses a presenter and in the sweep a block runs
+    /// over the memos, so `holder` is a subject on its own. Keyed lookups of a hash the peer
+    /// already knows (the knock cache, the peer table) and the membership scans over the
+    /// user's own records bound to an identity (`knows_identity`, the sweeps an untrust or a
+    /// block runs) are not a timing boundary and stay ordinary compares, which is why the
+    /// bare `identity` operand of `entry.identity == identity` is not a subject.
+    #[test]
+    fn production_code_never_compares_hashes_with_the_equality_operators() {
+        let sources = [
+            ("trust.rs", include_str!("trust.rs")),
+            ("message.rs", include_str!("message.rs")),
+        ];
+        let test_module = ["\n#[cfg(test)]\n", "mod tests {"].concat();
+        // Assembled at runtime so this test's own text does not match the probes.
+        let subjects = [
+            ["parse_", "hash("].concat(),
+            ["destination_", "address("].concat(),
+            ["address", "_hash"].concat(),
+            ["hol", "der"].concat(),
+            ["_ide", "ntity"].concat(),
+        ];
+        let operators = [[" =", "= "].concat(), [" !", "= "].concat()];
+        let shapes = [
+            ["expected !", "= claimed"].concat(),
+            ["expected =", "= claimed"].concat(),
+            ["claimed !", "= expected"].concat(),
+            ["claimed =", "= expected"].concat(),
+            ["== Some(destination_", "address("].concat(),
+        ];
+        let mut hits = Vec::new();
+        for (file, source) in sources {
+            let production = &source[..source.find(&test_module).expect("the test module opens")];
+            let lines: Vec<&str> = production.lines().map(str::trim).collect();
+            for (index, line) in lines.iter().enumerate() {
+                if line.starts_with("//") {
+                    continue;
+                }
+                // A compare rustfmt split leaves its operator at one line's edge; probe it
+                // joined with its other half.
+                let neighbour = |offset: usize| lines.get(offset).copied().unwrap_or("");
+                let joined = if operators.iter().any(|op| line.ends_with(op.trim())) {
+                    [line, " ", neighbour(index + 1)].concat()
+                } else if operators.iter().any(|op| line.starts_with(op.trim())) {
+                    [neighbour(index.wrapping_sub(1)), " ", line].concat()
+                } else {
+                    line.to_string()
+                };
+                let compares = subjects.iter().any(|s| joined.contains(s.as_str()))
+                    && operators.iter().any(|op| joined.contains(op.as_str()));
+                if compares || shapes.iter().any(|shape| joined.contains(shape.as_str())) {
+                    hits.push(format!("{file}:{}: {line}", index + 1));
+                }
+            }
+        }
+        assert!(
+            hits.is_empty(),
+            "compare hashes with same_hash or ct_eq, not == or !=:\n{}",
+            hits.join("\n")
+        );
     }
 
     #[test]
@@ -2277,11 +3070,13 @@ mod tests {
                 was_granting: true,
                 removed: vec![destination.clone()],
             },
+            TrustMutation::RefuseDestination {
+                destination: destination.clone(),
+            },
             TrustMutation::BlockIdentity {
                 identity: identity.clone(),
                 was_granting: false,
                 removed: vec![destination.clone()],
-                marks_cleared: 1,
             },
             TrustMutation::UnblockIdentity {
                 identity: identity.clone(),
@@ -2949,7 +3744,7 @@ mod tests {
         let text = String::from_utf8(fx.file_bytes().unwrap()).unwrap();
 
         let expected = format!(
-            "version: 1\n\
+            "version: {TRUST_FILE_VERSION}\n\
              identities:\n  {id}:\n    added_at: {ts}\n    last_seen_at: {ts}\n    label: null\n    note: null\n    all_destinations: false\n\
              destinations:\n  {dest}:\n    identity: {id}\n    added_at: {ts}\n    last_seen_at: {ts}\n    label: Bob\n    note: null\n\
              denied_destinations:\n  {denied}:\n    added_at: {ts}\n    note: noisy\n\
@@ -2961,7 +3756,11 @@ mod tests {
             ts = rfc3339_utc(t(1_790_000_000)),
         );
         assert_eq!(text, expected);
-        assert!(!fx.store.path().with_extension("yaml.tmp").exists());
+        assert_eq!(
+            siblings_of(fx.store.path()),
+            ["trust.yaml"],
+            "the atomic write leaves no temp file behind"
+        );
     }
 
     #[test]
@@ -2969,12 +3768,17 @@ mod tests {
         let tmp = TempDir::new("trust-newer");
         let path = mesh_config_dir(&tmp.path).join("trust.yaml");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, "version: 2\nidentities: {}\nfuture_section: {}\n").unwrap();
+        let newer = TRUST_FILE_VERSION + 1;
+        fs::write(
+            &path,
+            format!("version: {newer}\nidentities: {{}}\nfuture_section: {{}}\n"),
+        )
+        .unwrap();
 
         let err = TrustStore::open(&tmp.path).unwrap_err().to_string();
 
         assert!(err.contains(&path.display().to_string()), "{err}");
-        assert!(err.contains("version 2"), "{err}");
+        assert!(err.contains(&format!("version {newer}")), "{err}");
         assert!(err.contains("upgrade Coyote"), "{err}");
         assert!(err.contains("move the file aside"), "{err}");
     }
@@ -2990,10 +3794,55 @@ mod tests {
 
         assert!(err.contains(&path.display().to_string()), "{err}");
         assert!(err.contains("version 0"), "{err}");
-        assert!(err.contains("version 1"), "{err}");
+        assert!(
+            err.contains(&format!("version {TRUST_FILE_VERSION}")),
+            "{err}"
+        );
         assert!(err.contains("no migration"), "{err}");
         assert!(err.contains("move the file aside"), "{err}");
         assert!(!err.contains("upgrade Coyote"), "{err}");
+    }
+
+    /// Usage probe: a `trust.yaml` the pre-SCOPE build wrote (a well-formed
+    /// version-1 file whose destination hashes derive from the old application name) is
+    /// refused with a clear message, never opened as an empty trust list.
+    #[test]
+    fn usage_probe_open_refuses_a_well_formed_version_1_trust_file_written_before_scope() {
+        assert_eq!(
+            TRUST_FILE_VERSION, 2,
+            "the SCOPE wire rename bumps the trust file 1 -> 2"
+        );
+        let tmp = TempDir::new("trust-pre-scope-v1");
+        let path = mesh_config_dir(&tmp.path).join("trust.yaml");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let (identity, destination) = (fake_hash(0x1a), fake_hash(0x2b));
+        let ts = "2026-01-01T00:00:00Z";
+        let old = format!(
+            "version: 1\n\
+             identities:\n  {identity}:\n    added_at: {ts}\n    last_seen_at: {ts}\n    label: null\n    note: null\n    all_destinations: false\n\
+             destinations:\n  {destination}:\n    identity: {identity}\n    added_at: {ts}\n    last_seen_at: {ts}\n    label: Bob\n    note: null\n"
+        );
+        fs::write(&path, &old).unwrap();
+
+        let err = match TrustStore::open(&tmp.path) {
+            Ok(store) => panic!(
+                "a version-1 trust file must be refused, not opened with {} records",
+                store.records().len()
+            ),
+            Err(err) => err.to_string(),
+        };
+
+        assert!(err.contains(&path.display().to_string()), "{err}");
+        assert!(err.contains("version 1"), "{err}");
+        assert!(err.contains("version 2"), "{err}");
+        assert!(err.contains("no migration"), "{err}");
+        assert!(err.contains("move the file aside"), "{err}");
+        assert!(!err.contains("upgrade Coyote"), "{err}");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            old,
+            "a refused trust file is left as it was"
+        );
     }
 
     #[test]
@@ -3018,14 +3867,19 @@ mod tests {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         let identity = fake_hash(0x1a);
         let good = format!(
-            "version: 1\nidentities:\n  {identity}:\n    added_at: 2026-01-01T00:00:00Z\n    last_seen_at: 2026-01-01T00:00:00Z\n    label: null\n    note: null\n    all_destinations: true\n"
+            "version: {TRUST_FILE_VERSION}\nidentities:\n  {identity}:\n    added_at: 2026-01-01T00:00:00Z\n    last_seen_at: 2026-01-01T00:00:00Z\n    label: null\n    note: null\n    all_destinations: true\n"
         );
         fs::write(&path, &good).unwrap();
         assert_eq!(TrustStore::open(&tmp.path).unwrap().records().len(), 1);
 
         fs::write(&path, format!("{good}    tier: identity\n")).unwrap();
         let err = format!("{:#}", TrustStore::open(&tmp.path).unwrap_err());
-        assert!(err.contains("could not be parsed as version 1"), "{err}");
+        assert!(
+            err.contains(&format!(
+                "could not be parsed as version {TRUST_FILE_VERSION}"
+            )),
+            "{err}"
+        );
         assert!(err.contains("trusts nobody"), "{err}");
         assert!(err.contains("tier"), "{err}");
 
@@ -3049,7 +3903,7 @@ mod tests {
         fs::write(
             &path,
             format!(
-                "version: 1\ndenied_destinations:\n  {upper}:\n    added_at: 2026-01-01T00:00:00Z\n    note: null\n"
+                "version: {TRUST_FILE_VERSION}\ndenied_destinations:\n  {upper}:\n    added_at: 2026-01-01T00:00:00Z\n    note: null\n"
             ),
         )
         .unwrap();
@@ -3066,7 +3920,7 @@ mod tests {
         fs::write(
             &path,
             format!(
-                "version: 1\ndestinations:\n  {}:\n    identity: {}\n    added_at: 2026-01-01T00:00:00Z\n    last_seen_at: 2026-01-01T00:00:00Z\n    label: null\n    note: null\n",
+                "version: {TRUST_FILE_VERSION}\ndestinations:\n  {}:\n    identity: {}\n    added_at: 2026-01-01T00:00:00Z\n    last_seen_at: 2026-01-01T00:00:00Z\n    label: null\n    note: null\n",
                 fake_hash(0x2b),
                 identity.to_ascii_uppercase()
             ),
@@ -3087,7 +3941,7 @@ mod tests {
         fs::write(
             &path,
             format!(
-                "version: 1\ndestinations:\n  {destination}:\n    identity: {missing}\n    added_at: 2026-01-01T00:00:00Z\n    last_seen_at: 2026-01-01T00:00:00Z\n    label: null\n    note: null\n"
+                "version: {TRUST_FILE_VERSION}\ndestinations:\n  {destination}:\n    identity: {missing}\n    added_at: 2026-01-01T00:00:00Z\n    last_seen_at: 2026-01-01T00:00:00Z\n    label: null\n    note: null\n"
             ),
         )
         .unwrap();
@@ -3342,7 +4196,7 @@ mod tests {
         fs::write(
             fx.store.path(),
             format!(
-                "version: 1\n\
+                "version: {TRUST_FILE_VERSION}\n\
                  identities:\n  {identity}:\n    added_at: {ts}\n    last_seen_at: {ts}\n    label: null\n    note: null\n    all_destinations: true\n\
                  destinations:\n  {destination}:\n    identity: {identity}\n    added_at: {ts}\n    last_seen_at: {ts}\n    label: null\n    note: null\n\
                  denied_destinations:\n  {destination}:\n    added_at: {ts}\n    note: null\n\
@@ -3490,6 +4344,62 @@ mod tests {
     }
 
     #[test]
+    fn trust_destination_lifts_a_deny_in_the_same_write() {
+        let fx = Fixture::new("trust-deny-lifted");
+        let peer = announced("alpha");
+        fx.announce(&peer, t(2_000));
+        fx.store
+            .deny_destination(&fx.mesh, &peer.destination_hash, None, t(2_000))
+            .unwrap();
+        let plain = announced("beta");
+        fx.announce(&plain, t(2_000));
+
+        let outcome = fx
+            .store
+            .trust_destination(
+                &fx.mesh,
+                &peer.destination_hash,
+                TrustOptions::default(),
+                t(3_000),
+            )
+            .unwrap();
+
+        assert_eq!(outcome.change, TrustChange::Added);
+        assert!(outcome.deny_lifted);
+        assert!(fx.store.denied().is_empty());
+        assert_eq!(
+            fx.store
+                .authorize(&peer.identity_hash, &peer.destination_hash),
+            verdict(Decision::Allow, Rule::DestinationTrusted)
+        );
+        assert_eq!(fx.reopen().denied(), fx.store.denied());
+
+        let again = fx
+            .store
+            .trust_destination(
+                &fx.mesh,
+                &peer.destination_hash,
+                TrustOptions::default(),
+                t(4_000),
+            )
+            .unwrap();
+        assert_eq!(again.change, TrustChange::Updated);
+        assert!(!again.deny_lifted);
+
+        let never_denied = fx
+            .store
+            .trust_destination(
+                &fx.mesh,
+                &plain.destination_hash,
+                TrustOptions::default(),
+                t(4_000),
+            )
+            .unwrap();
+        assert_eq!(never_denied.change, TrustChange::Added);
+        assert!(!never_denied.deny_lifted);
+    }
+
+    #[test]
     fn block_identity_removes_its_records_and_suppresses_it() {
         let fx = Fixture::new("trust-block");
         let peer = announced("alpha");
@@ -3631,10 +4541,15 @@ mod tests {
         );
 
         fx.store
-            .untrust_destination(&fx.mesh, &format!(" {}", first.destination_hash))
+            .untrust_destination(
+                &fx.mesh,
+                &format!(" {}", first.destination_hash),
+                t(9_000),
+                false,
+            )
             .unwrap();
         fx.store
-            .untrust_destination(&fx.mesh, &session.destination_hash)
+            .untrust_destination(&fx.mesh, &session.destination_hash, t(9_000), false)
             .unwrap();
 
         let mut hashes: Vec<String> = fx.store.records().into_iter().map(|r| r.hash).collect();
@@ -3653,7 +4568,7 @@ mod tests {
         );
         assert!(
             fx.store
-                .untrust_destination(&fx.mesh, &first.destination_hash)
+                .untrust_destination(&fx.mesh, &first.destination_hash, t(9_000), false)
                 .is_err()
         );
 
@@ -3723,6 +4638,138 @@ mod tests {
             .find(|record| record.hash == first.destination_hash)
             .unwrap();
         assert_eq!(retrusted.last_seen_at, t(4_000));
+    }
+
+    /// Untrusting an identity tells the envoy memory to forget it once, by the lower-hex
+    /// identity, however many destinations the cascade removed and however it was spelt.
+    #[test]
+    fn untrust_identity_forgets_the_identitys_envoy_memory_once() {
+        let fx = Fixture::new("trust-untrust-memory");
+        let memory = fx.remembering();
+        let peer = announced("alpha");
+        fx.announce(&peer, t(2_000));
+        fx.trust_destination(&peer, t(3_000));
+        fx.trust_identity(&peer.identity_hash, t(3_000));
+
+        let removed = fx
+            .store
+            .untrust_identity(&fx.mesh, &peer.identity_hash.to_uppercase())
+            .unwrap();
+
+        assert_eq!(removed, std::slice::from_ref(&peer.destination_hash));
+        assert_eq!(
+            memory.forgotten(),
+            std::slice::from_ref(&peer.identity_hash)
+        );
+    }
+
+    /// Blocking forgets the identity's envoy memory even when the trust list never held
+    /// it: a blocked peer's conversations do not outlive the block.
+    #[test]
+    fn block_identity_forgets_the_envoy_memory_of_an_identity_never_trusted() {
+        let fx = Fixture::new("trust-block-memory");
+        let memory = fx.remembering();
+        let identity = fake_hash(0xbb);
+
+        fx.store
+            .block_identity(&fx.mesh, &identity, None, t(3_000))
+            .unwrap();
+
+        assert_eq!(memory.forgotten(), [identity]);
+    }
+
+    /// Revoking a destination says nothing about the person: neither `untrust_destination`
+    /// nor `prune_destinations` touches the envoy memory.
+    #[test]
+    fn revoking_a_destination_leaves_the_envoy_memory_alone() {
+        let fx = Fixture::new("trust-destination-memory");
+        let memory = fx.remembering();
+        let untrusted = announced("alpha");
+        fx.announce(&untrusted, t(2_000));
+        fx.trust_destination(&untrusted, t(3_000));
+        let stale = announced("beta");
+        fx.announce(&stale, t(2_000));
+        fx.trust_destination(&stale, t(3_000));
+
+        fx.store
+            .untrust_destination(&fx.mesh, &untrusted.destination_hash, t(9_000), false)
+            .unwrap();
+        let pruned = fx
+            .store
+            .prune_destinations(&fx.mesh, Duration::from_secs(3_600), t(10_200), false)
+            .unwrap();
+
+        assert_eq!(pruned, std::slice::from_ref(&stale.destination_hash));
+        assert!(memory.forgotten().is_empty());
+    }
+
+    /// An envoy memory that has gone away is no error: the revocation stands on its own.
+    #[test]
+    fn untrust_identity_survives_a_dropped_envoy_memory() {
+        let fx = Fixture::new("trust-dropped-memory");
+        let identity = fake_hash(0xcc);
+        fx.trust_identity(&identity, t(3_000));
+        drop(fx.remembering());
+
+        fx.store.untrust_identity(&fx.mesh, &identity).unwrap();
+
+        assert!(fx.store.records().is_empty());
+    }
+
+    /// The identity the envoy writes a thread back for is known while a record names
+    /// it, on disk or for the session, and unknown once blocked or untrusted as an
+    /// identity; the untrust of one destination says nothing about the person.
+    #[test]
+    fn knows_identity_follows_every_record_and_never_a_block() {
+        let fx = Fixture::new("trust-knows-identity");
+        let by_destination = announced("alpha");
+        fx.announce(&by_destination, t(2_000));
+        let for_session = announced("beta");
+        fx.announce(&for_session, t(2_000));
+        let by_identity = fake_hash(0xcc);
+        let stranger = fake_hash(0xdd);
+        assert!(!fx.store.knows_identity(&by_destination.identity_hash));
+
+        fx.trust_destination(&by_destination, t(3_000));
+        fx.store
+            .trust_destination_for_session(&fx.mesh, &for_session.destination_hash, t(3_000))
+            .unwrap();
+        fx.trust_identity(&by_identity, t(3_000));
+
+        assert!(
+            fx.store
+                .knows_identity(&by_destination.identity_hash.to_uppercase()),
+            "bound to a destination record on disk"
+        );
+        assert!(
+            fx.store.knows_identity(&for_session.identity_hash),
+            "bound to a destination record for the session"
+        );
+        assert!(fx.store.knows_identity(&by_identity));
+        assert!(!fx.store.knows_identity(&stranger));
+
+        fx.store
+            .untrust_destination(&fx.mesh, &by_destination.destination_hash, t(4_000), false)
+            .unwrap();
+        assert!(
+            fx.store.knows_identity(&by_destination.identity_hash),
+            "the identity record the destination's trust made stays"
+        );
+        fx.store
+            .untrust_identity(&fx.mesh, &by_destination.identity_hash)
+            .unwrap();
+        assert!(
+            !fx.store.knows_identity(&by_destination.identity_hash),
+            "untrusted as an identity, it is a stranger again"
+        );
+        fx.store
+            .block_identity(&fx.mesh, &by_identity, None, t(4_000))
+            .unwrap();
+        assert!(!fx.store.knows_identity(&by_identity));
+        assert_eq!(
+            fx.store.identity_standing(&by_identity),
+            IdentityStanding::Blocked
+        );
     }
 
     #[test]
@@ -4039,7 +5086,9 @@ mod tests {
             ),
             (
                 "untrust_destination",
-                store.untrust_destination(&mesh, &dest),
+                store
+                    .untrust_destination(&mesh, &dest, now, false)
+                    .map(drop),
             ),
             (
                 "untrust_identity",
@@ -4342,7 +5391,7 @@ mod tests {
         let sink = fx.observed();
 
         fx.store
-            .untrust_destination(&fx.mesh, &peer.destination_hash)
+            .untrust_destination(&fx.mesh, &peer.destination_hash, t(4_000), false)
             .unwrap();
 
         let envs = one_fire(&sink, HookEvent::MeshTrustRevoked);
@@ -4361,6 +5410,807 @@ mod tests {
         assert_eq!(
             env_value(&envs, "COYOTE_MESH_PEER_IDENTITY"),
             Some(peer.identity_hash.as_str())
+        );
+    }
+
+    #[test]
+    fn untrust_destination_dry_run_reports_a_refusal_for_a_trusted_all_identity_and_writes_nothing()
+    {
+        let fx = Fixture::new("trust-untrust-refuse-dry-run");
+        let peer = announced("alpha");
+        let sibling = fake_hash(0xcc);
+        fx.announce(&peer, t(2_000));
+        fx.trust_identity(&peer.identity_hash, t(2_000));
+        let sink = fx.observed();
+        let before = fx.file_bytes();
+        let refused = UntrustOutcome::Refused {
+            identity: peer.identity_hash.clone(),
+            already_refused: false,
+            record_missing: true,
+        };
+
+        let outcome = fx
+            .store
+            .untrust_destination(&fx.mesh, &peer.destination_hash, t(3_000), true)
+            .unwrap();
+
+        assert_eq!(outcome, refused);
+        assert_eq!(fx.file_bytes(), before);
+        assert!(fx.store.denied().is_empty());
+        assert_eq!(
+            fx.store
+                .authorize(&peer.identity_hash, &peer.destination_hash),
+            verdict(Decision::Allow, Rule::IdentityTrusted)
+        );
+        assert!(sink.drain().is_empty(), "a dry run fires nothing");
+
+        let outcome = fx
+            .store
+            .untrust_destination(&fx.mesh, &peer.destination_hash, t(3_000), false)
+            .unwrap();
+
+        assert_eq!(outcome, refused);
+        assert_eq!(fx.store.denied().len(), 1);
+        assert_eq!(fx.store.denied()[0].hash, peer.destination_hash);
+        assert_eq!(
+            fx.store
+                .authorize(&peer.identity_hash, &peer.destination_hash),
+            verdict(Decision::Refuse, Rule::DestinationDenied)
+        );
+        assert_eq!(
+            fx.store.authorize(&peer.identity_hash, &sibling),
+            verdict(Decision::Allow, Rule::IdentityTrusted)
+        );
+        assert!(
+            sink.drain().is_empty(),
+            "a refusal removes nothing, so it revokes nothing"
+        );
+
+        let outcome = fx
+            .store
+            .untrust_destination(&fx.mesh, &peer.destination_hash, t(4_000), false)
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            UntrustOutcome::Refused {
+                identity: peer.identity_hash.clone(),
+                already_refused: true,
+                record_missing: false,
+            }
+        );
+    }
+
+    #[test]
+    fn untrust_destination_of_a_bound_record_under_a_trusted_all_identity_refuses_it_and_keeps_the_record()
+     {
+        let fx = Fixture::new("trust-untrust-refuse-bound");
+        let peer = announced("alpha");
+        fx.announce(&peer, t(2_000));
+        fx.trust_identity(&peer.identity_hash, t(3_000));
+        fx.store
+            .trust_destination(
+                &fx.mesh,
+                &peer.destination_hash,
+                TrustOptions {
+                    label: Some("Bob".to_string()),
+                    note: None,
+                },
+                t(3_000),
+            )
+            .unwrap();
+        let sink = fx.observed();
+
+        let outcome = fx
+            .store
+            .untrust_destination(&fx.mesh, &peer.destination_hash, t(4_000), false)
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            UntrustOutcome::Refused {
+                identity: peer.identity_hash.clone(),
+                already_refused: false,
+                record_missing: false,
+            }
+        );
+        let listed = record(&fx.store, &peer.destination_hash);
+        assert_eq!(listed.tier, Tier::Destination);
+        assert!(listed.denied);
+        assert_eq!(
+            listed.identity.as_deref(),
+            Some(peer.identity_hash.as_str())
+        );
+        assert_eq!(listed.label.as_deref(), Some("Bob"));
+        assert!(
+            !fx.store
+                .is_trusted_destination(&peer.identity_hash, &peer.destination_hash)
+        );
+        assert_eq!(
+            fx.store
+                .authorize(&peer.identity_hash, &peer.destination_hash),
+            verdict(Decision::Refuse, Rule::DestinationDenied)
+        );
+        assert_eq!(fx.store.denied().len(), 1);
+        assert_eq!(fx.store.denied()[0].hash, peer.destination_hash);
+        assert!(
+            sink.drain().is_empty(),
+            "the record stays, so there is nothing to revoke"
+        );
+        assert_eq!(fx.reopen().records(), fx.store.records());
+    }
+
+    #[test]
+    fn untrust_destination_ignores_a_peer_row_whose_identity_column_does_not_derive_the_destination()
+     {
+        let fx = Fixture::new("trust-untrust-tampered-row");
+        let peer = announced("alpha");
+        let impostor = announced("beta");
+        fx.announce(&impostor, t(2_000));
+        fx.trust_identity(&impostor.identity_hash, t(2_000));
+        fx.mesh.0.observe(
+            PeerSighting {
+                identity_hash: impostor.identity_hash.clone(),
+                ..sighting(&peer)
+            },
+            t(2_000),
+        );
+        let before = fx.file_bytes();
+
+        let err = fx
+            .store
+            .untrust_destination(&fx.mesh, &peer.destination_hash, t(3_000), false)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("not in the trust list"), "{err}");
+        assert_eq!(fx.file_bytes(), before);
+        assert!(fx.store.denied().is_empty());
+    }
+
+    #[test]
+    fn untrust_destination_of_a_peer_table_only_instance_writes_a_bound_record_with_the_deny() {
+        let fx = Fixture::new("trust-untrust-refuse-peer-table-only");
+        let peer = announced("alpha");
+        fx.announce(&peer, t(2_000));
+        fx.trust_identity(&peer.identity_hash, t(3_000));
+        let sink = fx.observed();
+
+        let outcome = fx
+            .store
+            .untrust_destination(&fx.mesh, &peer.destination_hash, t(4_000), false)
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            UntrustOutcome::Refused {
+                identity: peer.identity_hash.clone(),
+                already_refused: false,
+                record_missing: true,
+            }
+        );
+        let listed = record(&fx.store, &peer.destination_hash);
+        assert_eq!(listed.tier, Tier::Destination);
+        assert_eq!(
+            listed.identity.as_deref(),
+            Some(peer.identity_hash.as_str())
+        );
+        assert_eq!(listed.label, None);
+        assert!(listed.denied);
+        assert!(!listed.session);
+        assert_eq!(listed.added_at, t(4_000));
+        assert_eq!(listed.last_seen_at, t(2_000));
+        assert_eq!(fx.store.denied().len(), 1);
+        assert_eq!(fx.store.denied()[0].hash, peer.destination_hash);
+        assert_eq!(
+            fx.store
+                .authorize(&peer.identity_hash, &peer.destination_hash),
+            verdict(Decision::Refuse, Rule::DestinationDenied)
+        );
+        assert!(
+            sink.drain().is_empty(),
+            "a refusal grants nothing, so it fires nothing"
+        );
+        assert_eq!(fx.reopen().records(), fx.store.records());
+    }
+
+    #[test]
+    fn untrust_identity_drops_the_denies_of_the_instances_it_forgets() {
+        let fx = Fixture::new("trust-untrust-identity-sweeps-denies");
+        let peer = announced("alpha");
+        fx.announce(&peer, t(2_000));
+        fx.trust_identity(&peer.identity_hash, t(2_000));
+        fx.trust_destination(&peer, t(2_000));
+        fx.store
+            .untrust_destination(&fx.mesh, &peer.destination_hash, t(3_000), false)
+            .unwrap();
+        assert_eq!(fx.store.denied().len(), 1);
+
+        let removed = fx
+            .store
+            .untrust_identity(&fx.mesh, &peer.identity_hash)
+            .unwrap();
+
+        assert_eq!(removed, vec![peer.destination_hash.clone()]);
+        assert!(fx.store.denied().is_empty());
+        assert!(fx.store.records().is_empty());
+        assert_eq!(fx.reopen().denied(), fx.store.denied());
+    }
+
+    #[test]
+    fn untrust_identity_drops_the_deny_of_a_peer_table_only_instance_it_forgets() {
+        let fx = Fixture::new("trust-untrust-identity-sweeps-peer-table-deny");
+        let identity = PrivateIdentity::new_from_rand(OsRng);
+        let bound = announced_as(identity.clone(), "alpha");
+        let heard = announced_as(identity, "beta");
+        fx.announce(&bound, t(2_000));
+        fx.announce(&heard, t(2_000));
+        fx.trust_identity(&bound.identity_hash, t(2_000));
+        fx.trust_destination(&bound, t(2_000));
+        fx.store
+            .untrust_destination(&fx.mesh, &bound.destination_hash, t(3_000), false)
+            .unwrap();
+        fx.store
+            .untrust_destination(&fx.mesh, &heard.destination_hash, t(3_000), false)
+            .unwrap();
+        assert_eq!(fx.store.denied().len(), 2);
+
+        let mut removed = fx
+            .store
+            .untrust_identity(&fx.mesh, &bound.identity_hash)
+            .unwrap();
+        removed.sort();
+
+        let mut expected = vec![
+            bound.destination_hash.clone(),
+            heard.destination_hash.clone(),
+        ];
+        expected.sort();
+        assert_eq!(removed, expected);
+        assert!(fx.store.denied().is_empty());
+        assert!(fx.store.records().is_empty());
+        assert_eq!(
+            fx.store
+                .authorize(&bound.identity_hash, &heard.destination_hash),
+            verdict(Decision::Refuse, Rule::DefaultClosed)
+        );
+        assert_eq!(fx.reopen().denied(), fx.store.denied());
+    }
+
+    #[test]
+    fn untrust_destination_dry_run_on_a_bound_record_writes_nothing() {
+        let fx = Fixture::new("trust-untrust-forget-dry-run");
+        let peer = announced("alpha");
+        fx.announce(&peer, t(2_000));
+        fx.trust_destination(&peer, t(2_000));
+        let sink = fx.observed();
+        let before = fx.file_bytes();
+
+        let outcome = fx
+            .store
+            .untrust_destination(&fx.mesh, &peer.destination_hash, t(3_000), true)
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            UntrustOutcome::Forgotten {
+                identity: peer.identity_hash.clone()
+            }
+        );
+        assert_eq!(fx.file_bytes(), before);
+        assert_eq!(
+            record(&fx.store, &peer.destination_hash).tier,
+            Tier::Destination
+        );
+        assert!(
+            fx.store
+                .is_trusted_destination(&peer.identity_hash, &peer.destination_hash)
+        );
+        assert!(sink.drain().is_empty());
+    }
+
+    #[test]
+    fn a_second_refusal_is_a_no_op_that_does_not_rewrite_the_file() {
+        let fx = Fixture::new("trust-untrust-refuse-twice");
+        let peer = announced("alpha");
+        fx.announce(&peer, t(2_000));
+        fx.trust_identity(&peer.identity_hash, t(2_000));
+        fx.store
+            .untrust_destination(&fx.mesh, &peer.destination_hash, t(3_000), false)
+            .unwrap();
+        let before = fx.file_bytes();
+        assert!(before.is_some());
+
+        let outcome = fx
+            .store
+            .untrust_destination(&fx.mesh, &peer.destination_hash, t(4_000), false)
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            UntrustOutcome::Refused {
+                identity: peer.identity_hash.clone(),
+                already_refused: true,
+                record_missing: false,
+            }
+        );
+        assert_eq!(fx.file_bytes(), before);
+        assert_eq!(fx.store.denied().len(), 1);
+    }
+
+    #[test]
+    fn a_repeat_refusal_backfills_the_record_of_a_legacy_deny_only_row() {
+        let fx = Fixture::new("trust-untrust-refuse-backfill");
+        let peer = announced("alpha");
+        fx.announce(&peer, t(2_000));
+        fx.trust_identity(&peer.identity_hash, t(3_000));
+        fx.store
+            .deny_destination(&fx.mesh, &peer.destination_hash, None, t(3_500))
+            .unwrap();
+        assert_eq!(
+            record(&fx.store, &peer.destination_hash).identity,
+            None,
+            "a deny-only row is listed unbound"
+        );
+        let sink = fx.observed();
+
+        let outcome = fx
+            .store
+            .untrust_destination(&fx.mesh, &peer.destination_hash, t(4_000), false)
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            UntrustOutcome::Refused {
+                identity: peer.identity_hash.clone(),
+                already_refused: true,
+                record_missing: true,
+            }
+        );
+        let backfilled = record(&fx.store, &peer.destination_hash);
+        assert!(backfilled.denied);
+        assert_eq!(
+            backfilled.identity.as_deref(),
+            Some(peer.identity_hash.as_str())
+        );
+        assert_eq!(backfilled.added_at, t(4_000));
+        assert_eq!(backfilled.last_seen_at, t(2_000));
+        assert_eq!(fx.store.denied().len(), 1);
+        assert_eq!(fx.store.denied()[0].added_at, t(3_500));
+        assert!(sink.drain().is_empty(), "a back-fill fires nothing");
+        assert_eq!(fx.reopen().records(), fx.store.records());
+    }
+
+    #[test]
+    fn untrust_of_a_deny_only_row_names_the_refusal_not_a_missing_record() {
+        let fx = Fixture::new("trust-untrust-deny-only");
+        let unheard = fake_hash(0xcc);
+        fx.store
+            .deny_destination(&fx.mesh, &unheard, None, t(2_000))
+            .unwrap();
+        let heard = announced("alpha");
+        fx.announce(&heard, t(2_000));
+        fx.store
+            .deny_destination(&fx.mesh, &heard.destination_hash, None, t(2_000))
+            .unwrap();
+        let before = fx.file_bytes();
+
+        for destination in [&unheard, &heard.destination_hash] {
+            let err = fx
+                .store
+                .untrust_destination(&fx.mesh, destination, t(3_000), false)
+                .unwrap_err()
+                .to_string();
+            assert_eq!(
+                err,
+                format!(
+                    "Destination {destination} is refused and its identity is not trusted; `.mesh trust {destination}` lifts that once the peer is heard."
+                )
+            );
+        }
+        assert_eq!(fx.file_bytes(), before);
+        assert_eq!(fx.store.denied().len(), 2);
+    }
+
+    #[test]
+    fn untrust_of_a_denied_record_under_a_plain_identity_forgets_the_deny_too() {
+        let fx = Fixture::new("trust-untrust-denied-record-plain-identity");
+        let peer = announced("alpha");
+        fx.announce(&peer, t(2_000));
+        fx.trust_destination(&peer, t(2_000));
+        fx.store
+            .deny_destination(&fx.mesh, &peer.destination_hash, None, t(2_500))
+            .unwrap();
+        assert!(record(&fx.store, &peer.destination_hash).denied);
+        let sink = fx.observed();
+
+        let outcome = fx
+            .store
+            .untrust_destination(&fx.mesh, &peer.destination_hash, t(3_000), false)
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            UntrustOutcome::Forgotten {
+                identity: peer.identity_hash.clone()
+            }
+        );
+        assert!(
+            fx.store
+                .records()
+                .iter()
+                .all(|record| record.hash != peer.destination_hash),
+            "no orphan deny row survives the record"
+        );
+        assert!(fx.store.denied().is_empty());
+        assert_eq!(
+            fx.store
+                .authorize(&peer.identity_hash, &peer.destination_hash),
+            verdict(Decision::Refuse, Rule::DefaultClosed)
+        );
+        let envs = one_fire(&sink, HookEvent::MeshTrustRevoked);
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_TRUST_TIER"),
+            Some("destination")
+        );
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_PEER_DESTINATION"),
+            Some(peer.destination_hash.as_str())
+        );
+    }
+
+    #[test]
+    fn untrust_dry_run_of_a_denied_record_under_a_plain_identity_writes_nothing() {
+        let fx = Fixture::new("trust-untrust-denied-record-plain-identity-dry-run");
+        let peer = announced("alpha");
+        fx.announce(&peer, t(2_000));
+        fx.trust_destination(&peer, t(2_000));
+        fx.store
+            .deny_destination(&fx.mesh, &peer.destination_hash, None, t(2_500))
+            .unwrap();
+        let sink = fx.observed();
+        let before = fx.file_bytes();
+
+        let outcome = fx
+            .store
+            .untrust_destination(&fx.mesh, &peer.destination_hash, t(3_000), true)
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            UntrustOutcome::Forgotten {
+                identity: peer.identity_hash.clone()
+            }
+        );
+        assert_eq!(fx.file_bytes(), before);
+        assert!(record(&fx.store, &peer.destination_hash).denied);
+        assert_eq!(fx.store.denied().len(), 1);
+        assert!(sink.drain().is_empty());
+    }
+
+    #[test]
+    fn prune_never_prunes_a_refused_instance() {
+        let fx = Fixture::new("trust-prune-refused");
+        let refused = announced("alpha");
+        let sibling = announced("beta");
+        fx.announce(&refused, t(1_000));
+        fx.announce(&sibling, t(1_000));
+        fx.trust_identity(&refused.identity_hash, t(1_000));
+        fx.trust_destination(&sibling, t(1_000));
+        fx.store
+            .untrust_destination(&fx.mesh, &refused.destination_hash, t(1_500), false)
+            .unwrap();
+        assert!(record(&fx.store, &refused.destination_hash).denied);
+        let sink = fx.observed();
+        let now = t(1_000 + 3_600);
+        let horizon = Duration::from_secs(3_600);
+
+        let dry = fx
+            .store
+            .prune_destinations(&fx.mesh, horizon, now, true)
+            .unwrap();
+        assert_eq!(dry, vec![sibling.destination_hash.clone()]);
+
+        let pruned = fx
+            .store
+            .prune_destinations(&fx.mesh, horizon, now, false)
+            .unwrap();
+        assert_eq!(pruned, vec![sibling.destination_hash.clone()]);
+        assert!(record(&fx.store, &refused.destination_hash).denied);
+        assert_eq!(fx.store.denied().len(), 1);
+        assert!(
+            !fx.store
+                .records()
+                .iter()
+                .any(|record| record.hash == sibling.destination_hash)
+        );
+        let fired = sink.drain();
+        assert_eq!(fired.len(), 1, "{fired:?}");
+        assert_eq!(
+            env_value(&fired[0].1, "COYOTE_MESH_PEER_DESTINATION"),
+            Some(sibling.destination_hash.as_str())
+        );
+    }
+
+    /// Usage probe: the whole refuse-then-lift cycle on a trusted-all identity's
+    /// instance is silent to hooks. The refusal removes nothing (no `revoked`), the
+    /// second refusal changes nothing, and the lift is an `Updated` on the intact
+    /// record (no `granted`, like every other update). Only forgetting the identity
+    /// afterwards speaks, and then once per record. A hook author therefore learns of
+    /// a refusal only from `.mesh` output, never from `mesh.trust.*`.
+    #[test]
+    fn usage_probe_refuse_lift_and_refuse_again_fire_no_trust_hooks() {
+        let fx = Fixture::new("trust-usage-probe-refuse-lift-silent");
+        let peer = announced("alpha");
+        fx.announce(&peer, t(2_000));
+        fx.trust_identity(&peer.identity_hash, t(2_000));
+        fx.store
+            .trust_destination(
+                &fx.mesh,
+                &peer.destination_hash,
+                TrustOptions {
+                    label: Some("Bob".to_string()),
+                    note: None,
+                },
+                t(2_000),
+            )
+            .unwrap();
+        let sink = fx.observed();
+
+        fx.store
+            .untrust_destination(&fx.mesh, &peer.destination_hash, t(3_000), false)
+            .unwrap();
+        assert!(sink.drain().is_empty(), "a refusal removes nothing");
+
+        fx.store
+            .untrust_destination(&fx.mesh, &peer.destination_hash, t(3_500), false)
+            .unwrap();
+        assert!(sink.drain().is_empty(), "a second refusal is a no-op");
+
+        let lifted = fx
+            .store
+            .trust_destination(
+                &fx.mesh,
+                &peer.destination_hash,
+                TrustOptions::default(),
+                t(4_000),
+            )
+            .unwrap();
+        assert_eq!(lifted.change, TrustChange::Updated);
+        assert!(lifted.deny_lifted);
+        assert_eq!(
+            record(&fx.store, &peer.destination_hash).label.as_deref(),
+            Some("Bob"),
+            "the lift keeps the label the record had before the refusal"
+        );
+        assert!(
+            sink.drain().is_empty(),
+            "lifting a refusal on an intact record is an update, not a grant"
+        );
+
+        let removed = fx
+            .store
+            .untrust_identity(&fx.mesh, &peer.identity_hash)
+            .unwrap();
+        assert_eq!(removed, vec![peer.destination_hash.clone()]);
+        let fired = sink.drain();
+        assert_eq!(fired.len(), 2, "{fired:?}");
+        assert!(
+            fired
+                .iter()
+                .all(|(event, _)| *event == HookEvent::MeshTrustRevoked),
+            "{fired:?}"
+        );
+    }
+
+    /// Usage probe: lifting a deny that has no record under it (a seeded overlay; a
+    /// refusal always writes a record) is a fresh grant and fires `granted` with both
+    /// hashes, so the two shapes of lift differ only in whether a hook speaks.
+    #[test]
+    fn usage_probe_lifting_a_record_less_deny_is_a_grant_that_fires_granted() {
+        let fx = Fixture::new("trust-usage-probe-lift-orphan-grants");
+        let peer = announced("alpha");
+        fx.announce(&peer, t(2_000));
+        fx.trust_identity(&peer.identity_hash, t(2_000));
+        fx.store
+            .deny_destination(&fx.mesh, &peer.destination_hash, None, t(3_000))
+            .unwrap();
+        assert!(
+            !fx.store
+                .records()
+                .iter()
+                .any(|record| record.hash == peer.destination_hash && !record.denied),
+            "no trusted record sits under the deny"
+        );
+        let sink = fx.observed();
+
+        let lifted = fx
+            .store
+            .trust_destination(
+                &fx.mesh,
+                &peer.destination_hash,
+                TrustOptions::default(),
+                t(4_000),
+            )
+            .unwrap();
+
+        assert_eq!(lifted.change, TrustChange::Added);
+        assert!(lifted.deny_lifted);
+        let envs = one_fire(&sink, HookEvent::MeshTrustGranted);
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_PEER_DESTINATION"),
+            Some(peer.destination_hash.as_str())
+        );
+        assert_eq!(
+            env_value(&envs, "COYOTE_MESH_PEER_IDENTITY"),
+            Some(peer.identity_hash.as_str())
+        );
+    }
+
+    /// Usage probe: the record a refusal writes for a peer-table-only instance is a
+    /// real binding. A second refusal is a no-op that rewrites nothing; `trust <dest>`
+    /// then lifts the deny on that intact record (`Updated`, `deny_lifted`), keeps the
+    /// identity it was bound to, takes the label the lift carries, fires no trust hook
+    /// (nothing new is granted), and the lifted record survives a reopen.
+    #[test]
+    fn usage_probe_refusal_of_a_record_less_instance_is_a_binding_trust_lifts_in_place() {
+        let fx = Fixture::new("trust-usage-probe-record-less-refusal-lift");
+        let peer = announced("alpha");
+        fx.announce(&peer, t(2_000));
+        fx.trust_identity(&peer.identity_hash, t(3_000));
+        let sink = fx.observed();
+
+        fx.store
+            .untrust_destination(&fx.mesh, &peer.destination_hash, t(4_000), false)
+            .unwrap();
+        let after_refusal = fx.file_bytes();
+        assert!(after_refusal.is_some());
+
+        let again = fx
+            .store
+            .untrust_destination(&fx.mesh, &peer.destination_hash, t(5_000), false)
+            .unwrap();
+        assert_eq!(
+            again,
+            UntrustOutcome::Refused {
+                identity: peer.identity_hash.clone(),
+                already_refused: true,
+                record_missing: false,
+            }
+        );
+        assert_eq!(
+            fx.file_bytes(),
+            after_refusal,
+            "a second refusal rewrites nothing"
+        );
+        assert_eq!(
+            record(&fx.store, &peer.destination_hash).added_at,
+            t(4_000),
+            "the binding keeps the stamp of the refusal that wrote it"
+        );
+
+        let lifted = fx
+            .store
+            .trust_destination(
+                &fx.mesh,
+                &peer.destination_hash,
+                TrustOptions {
+                    label: Some("Alpha desk".to_string()),
+                    note: None,
+                },
+                t(6_000),
+            )
+            .unwrap();
+        assert_eq!(lifted.change, TrustChange::Updated);
+        assert!(lifted.deny_lifted);
+        assert_eq!(lifted.identity_hash, peer.identity_hash);
+        assert!(fx.store.denied().is_empty());
+        let listed = record(&fx.store, &peer.destination_hash);
+        assert!(!listed.denied);
+        assert_eq!(
+            listed.identity.as_deref(),
+            Some(peer.identity_hash.as_str())
+        );
+        assert_eq!(listed.label.as_deref(), Some("Alpha desk"));
+        assert_eq!(
+            fx.store
+                .authorize(&peer.identity_hash, &peer.destination_hash),
+            verdict(Decision::Allow, Rule::DestinationTrusted)
+        );
+        assert!(
+            sink.drain().is_empty(),
+            "refuse, refuse again and lift on the intact record fire nothing"
+        );
+        assert_eq!(fx.reopen().records(), fx.store.records());
+    }
+
+    /// Usage probe: an instance trusted for the session only, under an identity trusted
+    /// for all on disk, is refused through its session twin: the refusal writes a disk
+    /// record bound to the twin's identity with the twin's sighting, the session entry is
+    /// folded into it (the hash is listed once, not as a session row), the verdict is the
+    /// deny, and `untrust_identity` sweeps record and deny together.
+    #[test]
+    fn usage_probe_refusal_through_a_session_twin_persists_the_binding_once() {
+        let fx = Fixture::new("trust-usage-probe-session-twin-refusal");
+        let peer = announced("alpha");
+        fx.announce(&peer, t(2_000));
+        fx.store
+            .trust_destination_for_session(&fx.mesh, &peer.destination_hash, t(2_500))
+            .unwrap();
+        fx.trust_identity(&peer.identity_hash, t(3_000));
+        assert!(record(&fx.store, &peer.destination_hash).session);
+        let before = fx.file_bytes();
+        let sink = fx.observed();
+
+        let dry = fx
+            .store
+            .untrust_destination(&fx.mesh, &peer.destination_hash, t(4_000), true)
+            .unwrap();
+        assert_eq!(
+            dry,
+            UntrustOutcome::Refused {
+                identity: peer.identity_hash.clone(),
+                already_refused: false,
+                record_missing: false,
+            }
+        );
+        assert_eq!(fx.file_bytes(), before, "a dry run writes nothing");
+        assert!(record(&fx.store, &peer.destination_hash).session);
+        assert!(fx.store.denied().is_empty());
+
+        let outcome = fx
+            .store
+            .untrust_destination(&fx.mesh, &peer.destination_hash, t(4_000), false)
+            .unwrap();
+        assert_eq!(outcome, dry);
+        let rows: Vec<TrustRecord> = fx
+            .store
+            .records()
+            .into_iter()
+            .filter(|record| record.hash == peer.destination_hash)
+            .collect();
+        assert_eq!(
+            rows.len(),
+            1,
+            "one row, not a disk record plus a session twin: {rows:?}"
+        );
+        let listed = &rows[0];
+        assert!(!listed.session);
+        assert!(listed.denied);
+        assert_eq!(
+            listed.identity.as_deref(),
+            Some(peer.identity_hash.as_str())
+        );
+        assert_eq!(listed.last_seen_at, t(2_000));
+        assert_eq!(
+            fx.store
+                .authorize(&peer.identity_hash, &peer.destination_hash),
+            verdict(Decision::Refuse, Rule::DestinationDenied)
+        );
+        assert_eq!(
+            fx.reopen()
+                .authorize(&peer.identity_hash, &peer.destination_hash),
+            verdict(Decision::Refuse, Rule::DestinationDenied),
+            "the refusal outlives the session"
+        );
+        assert!(sink.drain().is_empty(), "a refusal fires nothing");
+
+        let removed = fx
+            .store
+            .untrust_identity(&fx.mesh, &peer.identity_hash)
+            .unwrap();
+        assert_eq!(removed, vec![peer.destination_hash.clone()]);
+        assert!(fx.store.denied().is_empty());
+        assert!(
+            !fx.store
+                .records()
+                .iter()
+                .any(|record| record.hash == peer.destination_hash)
+        );
+        assert_eq!(
+            fx.store
+                .authorize(&peer.identity_hash, &peer.destination_hash),
+            verdict(Decision::Refuse, Rule::DefaultClosed)
         );
     }
 
@@ -4416,16 +6266,22 @@ mod tests {
         fx.trust_destination(&new_key_elsewhere, t(4_500));
         assert!(fx.store.is_trusted_identity(&new.identity_hash));
 
-        let (before, destination) = fx.store.authorize_origin(
+        let before = fx.store.authorize_origin(
             &parse_hash(&new.identity_hash).unwrap(),
             &decode_name_hash(&new.name_hash).unwrap(),
         );
-        assert_eq!(before, verdict(Decision::Refuse, Rule::IdentityChanged));
-        assert_eq!(destination.to_hex_string(), new.destination_hash);
+        assert_eq!(
+            before.verdict,
+            verdict(Decision::Refuse, Rule::IdentityChanged)
+        );
+        assert_eq!(before.destination.to_hex_string(), new.destination_hash);
 
-        let marked = fx
-            .store
-            .note_key_change(&new.identity_hash, &new.name_hash, t(5_000));
+        let marked = fx.store.note_key_change(
+            &new.identity_hash,
+            &new.name_hash,
+            KeyChangeOutcome::Refused,
+            t(5_000),
+        );
         assert_eq!(marked.len(), 1);
 
         assert_eq!(
@@ -4466,9 +6322,12 @@ mod tests {
         let (old, new) = trusted_then_rotated(&fx);
         let hooks = fx.observed();
 
-        let marked = fx
-            .store
-            .note_key_change(&new.identity_hash, &new.name_hash, t(5_000));
+        let marked = fx.store.note_key_change(
+            &new.identity_hash,
+            &new.name_hash,
+            KeyChangeOutcome::Refused,
+            t(5_000),
+        );
 
         assert_eq!(
             marked,
@@ -4477,6 +6336,7 @@ mod tests {
                 bound_identity: old.identity_hash.clone(),
                 seen_identity: new.identity_hash.clone(),
                 label: None,
+                denied: false,
             }]
         );
         assert_eq!(
@@ -4500,7 +6360,7 @@ mod tests {
             text.contains(&format!(".mesh block {}", new.identity_hash)),
             "{text}"
         );
-        assert!(text.contains("announced under"), "{text}");
+        assert!(text.contains("presented under"), "{text}");
         let after_first = fx.file_bytes().unwrap();
         assert!(
             String::from_utf8(after_first.clone())
@@ -4508,16 +6368,22 @@ mod tests {
                 .contains("key_changed:")
         );
 
-        let again = fx
-            .store
-            .note_key_change(&new.identity_hash, &new.name_hash, t(6_000));
+        let again = fx.store.note_key_change(
+            &new.identity_hash,
+            &new.name_hash,
+            KeyChangeOutcome::Refused,
+            t(6_000),
+        );
         assert!(again.is_empty(), "{again:?}");
         assert_eq!(fx.file_bytes().unwrap(), after_first);
 
         let third = announced("alpha");
-        let other = fx
-            .store
-            .note_key_change(&third.identity_hash, &third.name_hash, t(7_000));
+        let other = fx.store.note_key_change(
+            &third.identity_hash,
+            &third.name_hash,
+            KeyChangeOutcome::Refused,
+            t(7_000),
+        );
         assert!(other.is_empty(), "{other:?}");
         assert_eq!(fx.file_bytes().unwrap(), after_first);
         assert_eq!(
@@ -4535,8 +6401,12 @@ mod tests {
     fn key_change_mark_survives_restart() {
         let fx = Fixture::new("trust-key-change-restart");
         let (old, new) = trusted_then_rotated(&fx);
-        fx.store
-            .note_key_change(&new.identity_hash, &new.name_hash, t(5_000));
+        fx.store.note_key_change(
+            &new.identity_hash,
+            &new.name_hash,
+            KeyChangeOutcome::Refused,
+            t(5_000),
+        );
 
         let reopened = fx.reopen();
 
@@ -4553,7 +6423,12 @@ mod tests {
         );
         assert!(
             reopened
-                .note_key_change(&new.identity_hash, &new.name_hash, t(6_000))
+                .note_key_change(
+                    &new.identity_hash,
+                    &new.name_hash,
+                    KeyChangeOutcome::Refused,
+                    t(6_000)
+                )
                 .is_empty(),
             "a mark loaded from disk is not written again"
         );
@@ -4567,7 +6442,7 @@ mod tests {
         let (identity, destination, seen) = (fake_hash(0x1a), fake_hash(0x2b), fake_hash(0x3c));
         let ts = "2026-01-01T00:00:00Z";
         let without_mark = format!(
-            "version: 1\nidentities:\n  {identity}:\n    added_at: {ts}\n    last_seen_at: {ts}\n    label: null\n    note: null\n    all_destinations: false\ndestinations:\n  {destination}:\n    identity: {identity}\n    added_at: {ts}\n    last_seen_at: {ts}\n    label: null\n    note: null\n"
+            "version: {TRUST_FILE_VERSION}\nidentities:\n  {identity}:\n    added_at: {ts}\n    last_seen_at: {ts}\n    label: null\n    note: null\n    all_destinations: false\ndestinations:\n  {destination}:\n    identity: {identity}\n    added_at: {ts}\n    last_seen_at: {ts}\n    label: null\n    note: null\n"
         );
         fs::write(&path, &without_mark).unwrap();
         let store = TrustStore::open(&tmp.path).unwrap();
@@ -4598,49 +6473,54 @@ mod tests {
     }
 
     #[test]
-    fn explicit_re_trust_clears_the_key_change_mark() {
+    fn re_trusting_the_marked_destination_keeps_its_mark() {
         let fx = Fixture::new("trust-key-change-retrust");
         let (old, new) = trusted_then_rotated(&fx);
-        fx.store
-            .note_key_change(&new.identity_hash, &new.name_hash, t(5_000));
-        assert!(
-            record(&fx.store, &old.destination_hash)
-                .key_changed
-                .is_some()
+        fx.store.note_key_change(
+            &new.identity_hash,
+            &new.name_hash,
+            KeyChangeOutcome::Refused,
+            t(5_000),
         );
+        let mark = record(&fx.store, &old.destination_hash).key_changed;
+        assert!(mark.is_some());
 
         assert_eq!(fx.trust_destination(&old, t(7_000)), TrustChange::Updated);
 
-        assert_eq!(record(&fx.store, &old.destination_hash).key_changed, None);
+        assert_eq!(record(&fx.store, &old.destination_hash).key_changed, mark);
         assert_eq!(
             record(&fx.reopen(), &old.destination_hash).key_changed,
-            None
+            mark
         );
         assert!(
-            !String::from_utf8(fx.file_bytes().unwrap())
-                .unwrap()
-                .contains("key_changed")
+            fx.store
+                .note_key_change(
+                    &new.identity_hash,
+                    &new.name_hash,
+                    KeyChangeOutcome::Refused,
+                    t(8_000)
+                )
+                .is_empty(),
+            "the mark stands, so the next conflicting sighting writes nothing"
         );
         assert_eq!(
-            fx.store
-                .note_key_change(&new.identity_hash, &new.name_hash, t(8_000))
-                .len(),
-            1,
-            "once cleared, the next conflicting sighting marks again"
+            origin_verdict(&fx.store, &new),
+            verdict(Decision::Refuse, Rule::IdentityChanged)
         );
     }
 
     #[test]
-    fn blocking_the_seen_identity_clears_its_marks() {
+    fn blocking_the_seen_identity_keeps_the_mark() {
         let fx = Fixture::new("trust-key-change-block-seen");
         let (old, new) = trusted_then_rotated(&fx);
-        fx.store
-            .note_key_change(&new.identity_hash, &new.name_hash, t(5_000));
-        assert!(
-            record(&fx.store, &old.destination_hash)
-                .key_changed
-                .is_some()
+        fx.store.note_key_change(
+            &new.identity_hash,
+            &new.name_hash,
+            KeyChangeOutcome::Refused,
+            t(5_000),
         );
+        let mark = record(&fx.store, &old.destination_hash).key_changed;
+        assert!(mark.is_some());
 
         let removed = fx
             .store
@@ -4648,10 +6528,10 @@ mod tests {
             .unwrap();
 
         assert!(removed.is_empty(), "the new identity held no records");
-        assert_eq!(record(&fx.store, &old.destination_hash).key_changed, None);
+        assert_eq!(record(&fx.store, &old.destination_hash).key_changed, mark);
         assert_eq!(
             record(&fx.reopen(), &old.destination_hash).key_changed,
-            None
+            mark
         );
         assert_eq!(
             fx.store
@@ -4660,39 +6540,45 @@ mod tests {
             "the bound identity's grant is untouched"
         );
         let third = announced("alpha");
-        assert_eq!(
+        assert!(
             fx.store
-                .note_key_change(&third.identity_hash, &third.name_hash, t(7_000))
-                .len(),
-            1,
-            "a later sighting under yet another identity marks again"
+                .note_key_change(
+                    &third.identity_hash,
+                    &third.name_hash,
+                    KeyChangeOutcome::Refused,
+                    t(7_000)
+                )
+                .is_empty(),
+            "the mark keeps its first sighting"
         );
+        assert_eq!(record(&fx.store, &old.destination_hash).key_changed, mark);
     }
 
     #[test]
-    fn trusting_the_seen_identity_for_all_destinations_clears_its_marks() {
+    fn trusting_the_seen_identity_for_all_destinations_keeps_the_mark() {
         let fx = Fixture::new("trust-key-change-trust-seen");
         let (old, new) = trusted_then_rotated(&fx);
-        fx.store
-            .note_key_change(&new.identity_hash, &new.name_hash, t(5_000));
-        assert!(
-            record(&fx.store, &old.destination_hash)
-                .key_changed
-                .is_some()
+        fx.store.note_key_change(
+            &new.identity_hash,
+            &new.name_hash,
+            KeyChangeOutcome::Refused,
+            t(5_000),
         );
+        let mark = record(&fx.store, &old.destination_hash).key_changed;
+        assert!(mark.is_some());
 
         assert_eq!(
             fx.trust_identity(&new.identity_hash, t(6_000)),
             TrustChange::Added
         );
 
-        assert_eq!(record(&fx.store, &old.destination_hash).key_changed, None);
+        assert_eq!(record(&fx.store, &old.destination_hash).key_changed, mark);
         assert_eq!(
             record(&fx.reopen(), &old.destination_hash).key_changed,
-            None
+            mark
         );
         assert!(
-            !String::from_utf8(fx.file_bytes().unwrap())
+            String::from_utf8(fx.file_bytes().unwrap())
                 .unwrap()
                 .contains("key_changed")
         );
@@ -4702,11 +6588,21 @@ mod tests {
             verdict(Decision::Allow, Rule::DestinationTrusted),
             "the bound identity's grant is untouched"
         );
+        assert_eq!(
+            origin_verdict(&fx.store, &new),
+            verdict(Decision::Allow, Rule::IdentityTrusted),
+            "the grant admits the identity; the mark stands as the human's reminder"
+        );
         assert!(
             fx.store
-                .note_key_change(&new.identity_hash, &new.name_hash, t(7_000))
+                .note_key_change(
+                    &new.identity_hash,
+                    &new.name_hash,
+                    KeyChangeOutcome::Served,
+                    t(7_000)
+                )
                 .is_empty(),
-            "an identity trusted for all destinations marks nothing"
+            "a record already marked is not written again"
         );
     }
 
@@ -4719,9 +6615,12 @@ mod tests {
             .unwrap();
         let before = fx.file_bytes().unwrap();
 
-        let marked = fx
-            .store
-            .note_key_change(&new.identity_hash, &new.name_hash, t(5_000));
+        let marked = fx.store.note_key_change(
+            &new.identity_hash,
+            &new.name_hash,
+            KeyChangeOutcome::Refused,
+            t(5_000),
+        );
 
         assert!(marked.is_empty(), "{marked:?}");
         assert_eq!(record(&fx.store, &old.destination_hash).key_changed, None);
@@ -4729,7 +6628,7 @@ mod tests {
     }
 
     #[test]
-    fn a_denied_record_marks_nothing() {
+    fn a_denied_record_is_marked_too() {
         let fx = Fixture::new("trust-key-change-denied-record");
         let (old, new) = trusted_then_rotated(&fx);
         fx.store
@@ -4737,17 +6636,32 @@ mod tests {
             .unwrap();
         let before = fx.file_bytes().unwrap();
 
-        let marked = fx
-            .store
-            .note_key_change(&new.identity_hash, &new.name_hash, t(5_000));
+        let marked = fx.store.note_key_change(
+            &new.identity_hash,
+            &new.name_hash,
+            KeyChangeOutcome::Refused,
+            t(5_000),
+        );
 
-        assert!(marked.is_empty(), "{marked:?}");
-        assert_eq!(record(&fx.store, &old.destination_hash).key_changed, None);
-        assert_eq!(fx.file_bytes().unwrap(), before);
+        assert_eq!(marked.len(), 1, "{marked:?}");
+        let listed = record(&fx.store, &old.destination_hash);
+        assert!(listed.denied, "the deny stands");
+        assert_eq!(
+            listed.key_changed,
+            Some(KeyChange {
+                seen_identity: new.identity_hash.clone(),
+                at: t(5_000),
+            })
+        );
+        assert_ne!(fx.file_bytes().unwrap(), before);
+        assert_eq!(
+            origin_verdict(&fx.store, &new),
+            verdict(Decision::Refuse, Rule::IdentityChanged)
+        );
     }
 
     #[test]
-    fn an_all_destinations_identity_marks_nothing() {
+    fn an_all_destinations_identity_is_served_and_marks_with_a_warning() {
         let fx = Fixture::new("trust-key-change-all-destinations-seen");
         let surface = Arc::new(RecordingSurface::default());
         fx.store
@@ -4758,15 +6672,31 @@ mod tests {
             TrustChange::Added
         );
         let before = fx.file_bytes().unwrap();
+        let outcome = announce_outcome(&fx.store, &new);
+        assert_eq!(outcome, KeyChangeOutcome::Served);
 
-        let marked = fx
-            .store
-            .note_key_change(&new.identity_hash, &new.name_hash, t(5_000));
+        let marked =
+            fx.store
+                .note_key_change(&new.identity_hash, &new.name_hash, outcome, t(5_000));
 
-        assert!(marked.is_empty(), "{marked:?}");
-        assert_eq!(record(&fx.store, &old.destination_hash).key_changed, None);
-        assert_eq!(fx.file_bytes().unwrap(), before);
-        assert!(surface.texts().is_empty(), "{:#?}", surface.texts());
+        assert_eq!(marked.len(), 1, "{marked:?}");
+        assert_eq!(
+            record(&fx.store, &old.destination_hash).key_changed,
+            Some(KeyChange {
+                seen_identity: new.identity_hash.clone(),
+                at: t(5_000),
+            })
+        );
+        assert_ne!(fx.file_bytes().unwrap(), before);
+        let texts = surface.texts();
+        assert_eq!(texts.len(), 1, "{texts:#?}");
+        let text = &texts[0];
+        assert!(text.starts_with("warning: "), "{text}");
+        assert!(text.contains("is served"), "{text}");
+        assert!(
+            text.contains(&format!(".mesh trust {}", new.destination_hash)),
+            "{text}"
+        );
         assert_eq!(
             origin_verdict(&fx.store, &new),
             verdict(Decision::Allow, Rule::IdentityTrusted)
@@ -4774,11 +6704,13 @@ mod tests {
     }
 
     #[test]
-    fn an_identity_tier_grants_rotation_is_fail_closed_but_unmarked() {
+    fn an_identity_tier_grants_rotation_is_surfaced_from_the_peer_table_but_unmarked() {
         let fx = Fixture::new("trust-key-change-identity-tier-grant");
         let surface = Arc::new(RecordingSurface::default());
         fx.store
             .attach_surface(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
+        fx.store
+            .attach_presence(Arc::downgrade(&fx.mesh.0) as Weak<dyn InstancePresence>);
         let old = announced("alpha");
         fx.announce(&old, t(2_000));
         assert_eq!(
@@ -4794,9 +6726,12 @@ mod tests {
         fx.announce(&new, t(4_000));
         let before = fx.file_bytes().unwrap();
 
-        let marked = fx
-            .store
-            .note_key_change(&new.identity_hash, &new.name_hash, t(5_000));
+        let marked = fx.store.note_key_change(
+            &new.identity_hash,
+            &new.name_hash,
+            KeyChangeOutcome::Refused,
+            t(4_500),
+        );
 
         assert!(marked.is_empty(), "{marked:?}");
         assert_eq!(
@@ -4806,7 +6741,7 @@ mod tests {
         assert_eq!(
             origin_verdict(&fx.store, &new),
             verdict(Decision::Refuse, Rule::DefaultClosed),
-            "with no destination record there is no binding to conflict with"
+            "with no destination record there is no binding to conflict with; the stranger knocks"
         );
         assert!(
             fx.store
@@ -4817,7 +6752,86 @@ mod tests {
             fx.store.records()
         );
         assert_eq!(fx.file_bytes().unwrap(), before);
-        assert!(surface.texts().is_empty(), "{:#?}", surface.texts());
+        let texts = surface.texts();
+        assert_eq!(texts.len(), 1, "{texts:#?}");
+        let text = &texts[0];
+        assert!(text.starts_with("error: "), "{text}");
+        assert!(text.contains(&old.identity_hash), "{text}");
+        assert!(text.contains(&new.identity_hash), "{text}");
+        assert!(text.contains("nothing is marked"), "{text}");
+        assert!(
+            text.contains(&format!(".mesh trust {}", new.destination_hash)),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(".mesh block {}", new.identity_hash)),
+            "{text}"
+        );
+    }
+
+    /// Usage probe: the presence-cache dedupe is keyed on the canonical lower-hex name
+    /// hash. A knock or envelope may spell the instance id in upper case; the peer table
+    /// row is still found, the one line is still earned, and a later lower-case (or
+    /// upper-case again) presentation of the same instance under the same key earns none.
+    #[test]
+    fn usage_probe_an_identity_tier_rotation_spelled_in_upper_case_hex_is_surfaced_once_under_the_canonical_key()
+     {
+        let fx = Fixture::new("trust-key-change-identity-tier-upper-hex");
+        let surface = Arc::new(RecordingSurface::default());
+        fx.store
+            .attach_surface(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
+        fx.store
+            .attach_presence(Arc::downgrade(&fx.mesh.0) as Weak<dyn InstancePresence>);
+        let old = announced("alpha");
+        fx.announce(&old, t(2_000));
+        assert_eq!(
+            fx.trust_identity(&old.identity_hash, t(3_000)),
+            TrustChange::Added
+        );
+        let new = announced("alpha");
+        assert_eq!(new.name_hash, old.name_hash);
+        fx.announce(&new, t(4_000));
+        let before = fx.file_bytes().unwrap();
+        let upper = new.name_hash.to_ascii_uppercase();
+        assert_ne!(upper, new.name_hash, "the fixture's name hash has letters");
+
+        let marked = fx.store.note_key_change(
+            &new.identity_hash,
+            &upper,
+            KeyChangeOutcome::Refused,
+            t(4_500),
+        );
+
+        assert!(marked.is_empty(), "{marked:?}");
+        let texts = surface.texts();
+        assert_eq!(texts.len(), 1, "{texts:#?}");
+        assert!(texts[0].starts_with("error: "), "{}", texts[0]);
+        assert!(texts[0].contains(&old.identity_hash), "{}", texts[0]);
+        assert!(texts[0].contains(&new.identity_hash), "{}", texts[0]);
+        assert!(
+            texts[0].contains(&format!(".mesh trust {}", new.destination_hash)),
+            "the new destination is derived from the canonical hash: {}",
+            texts[0]
+        );
+
+        for spelling in [new.name_hash.clone(), upper] {
+            assert!(
+                fx.store
+                    .note_key_change(
+                        &new.identity_hash,
+                        &spelling,
+                        KeyChangeOutcome::Refused,
+                        t(5_000),
+                    )
+                    .is_empty()
+            );
+            assert_eq!(
+                surface.texts().len(),
+                1,
+                "{spelling} is the same instance: not told again"
+            );
+        }
+        assert_eq!(fx.file_bytes().unwrap(), before, "nothing is written");
     }
 
     struct DroppingSurface;
@@ -4837,9 +6851,12 @@ mod tests {
             .attach_surface(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
         let (old, new) = trusted_then_rotated(&fx);
 
-        let marked = fx
-            .store
-            .note_key_change(&new.identity_hash, &new.name_hash, t(5_000));
+        let marked = fx.store.note_key_change(
+            &new.identity_hash,
+            &new.name_hash,
+            KeyChangeOutcome::Refused,
+            t(5_000),
+        );
 
         assert_eq!(marked.len(), 1);
         assert!(
@@ -4854,7 +6871,12 @@ mod tests {
         assert!(warn_snapshot().contains(&line), "{line}");
         assert!(
             fx.store
-                .note_key_change(&new.identity_hash, &new.name_hash, t(6_000))
+                .note_key_change(
+                    &new.identity_hash,
+                    &new.name_hash,
+                    KeyChangeOutcome::Refused,
+                    t(6_000)
+                )
                 .is_empty(),
             "a dropped line is not offered again"
         );
@@ -4867,8 +6889,12 @@ mod tests {
         fx.store
             .attach_surface(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
         let (old, new) = trusted_then_rotated(&fx);
-        fx.store
-            .note_key_change(&new.identity_hash, &new.name_hash, t(5_000));
+        fx.store.note_key_change(
+            &new.identity_hash,
+            &new.name_hash,
+            KeyChangeOutcome::Refused,
+            t(5_000),
+        );
         assert_eq!(surface.texts().len(), 1);
         fx.announce(&new, t(6_000));
 
@@ -4884,7 +6910,11 @@ mod tests {
 
         assert_eq!(outcome.change, TrustChange::Added);
         assert_eq!(outcome.identity_hash, new.identity_hash);
-        assert_eq!(outcome.superseded, vec![old.destination_hash.clone()]);
+        assert_eq!(
+            superseded_destinations(&outcome),
+            vec![old.destination_hash.clone()]
+        );
+        assert!(!outcome.superseded[0].denied);
         assert_eq!(record(&fx.store, &old.destination_hash).key_changed, None);
         assert_eq!(
             record(&fx.reopen(), &old.destination_hash).key_changed,
@@ -4912,9 +6942,12 @@ mod tests {
 
         let after_trust = fx.file_bytes().unwrap();
         fx.announce(&new, t(8_000));
-        let again = fx
-            .store
-            .note_key_change(&new.identity_hash, &new.name_hash, t(8_000));
+        let again = fx.store.note_key_change(
+            &new.identity_hash,
+            &new.name_hash,
+            KeyChangeOutcome::Refused,
+            t(8_000),
+        );
 
         assert!(again.is_empty(), "{again:?}");
         assert_eq!(fx.file_bytes().unwrap(), after_trust);
@@ -4928,5 +6961,2721 @@ mod tests {
             origin_verdict(&fx.store, &new),
             verdict(Decision::Allow, Rule::DestinationTrusted)
         );
+    }
+
+    fn origin_of(store: &TrustStore, peer: &Announced) -> OriginVerdict {
+        store.authorize_origin(
+            &parse_hash(&peer.identity_hash).unwrap(),
+            &decode_name_hash(&peer.name_hash).unwrap(),
+        )
+    }
+
+    #[test]
+    fn authorize_origin_returns_the_collisions_its_verdict_was_judged_on() {
+        let fx = Fixture::new("trust-origin-verdict-collisions");
+        let (old, new) = trusted_then_rotated(&fx);
+
+        let stranger = origin_of(&fx.store, &new);
+        assert_eq!(
+            stranger.verdict,
+            verdict(Decision::Refuse, Rule::IdentityChanged)
+        );
+        assert_eq!(stranger.destination.to_hex_string(), new.destination_hash);
+        assert_eq!(
+            stranger.collisions,
+            vec![BindingConflict {
+                destination_hash: old.destination_hash.clone(),
+                bound_identity: old.identity_hash.clone(),
+                label: None,
+                denied: false,
+                already_marked: false,
+            }]
+        );
+
+        let bound = origin_of(&fx.store, &old);
+        assert_eq!(
+            bound.verdict,
+            verdict(Decision::Allow, Rule::DestinationTrusted)
+        );
+        assert!(bound.collisions.is_empty(), "{:?}", bound.collisions);
+
+        fx.trust_identity(&new.identity_hash, t(4_000));
+        let served = origin_of(&fx.store, &new);
+        assert_eq!(
+            served.verdict,
+            verdict(Decision::Allow, Rule::IdentityTrusted)
+        );
+        assert_eq!(served.collisions.len(), 1, "{:?}", served.collisions);
+
+        fx.store
+            .deny_destination(&fx.mesh, &new.destination_hash, None, t(5_000))
+            .unwrap();
+        let denied = origin_of(&fx.store, &new);
+        assert_eq!(
+            denied.verdict,
+            verdict(Decision::Refuse, Rule::DestinationDenied)
+        );
+        assert_eq!(
+            denied.collisions.len(),
+            1,
+            "a deny on the requester still reports what it collides with: {:?}",
+            denied.collisions
+        );
+        fx.store
+            .undeny_destination(&fx.mesh, &new.destination_hash)
+            .unwrap();
+
+        fx.store
+            .block_identity(&fx.mesh, &new.identity_hash, None, t(6_000))
+            .unwrap();
+        let blocked = origin_of(&fx.store, &new);
+        assert_eq!(
+            blocked.verdict,
+            verdict(Decision::Refuse, Rule::IdentityBlocked)
+        );
+        assert!(blocked.collisions.is_empty(), "{:?}", blocked.collisions);
+    }
+
+    /// A known identity whose own destination is denied names an instance bound to another
+    /// identity: the deny is the verdict, and the colliding record rides along for marking,
+    /// `denied` telling the bound record's standing apart from the requester's.
+    #[test]
+    fn a_denied_requester_over_a_colliding_record_gets_the_collisions_with_its_verdict() {
+        let fx = Fixture::new("trust-origin-verdict-denied-requester");
+        let (old, new) = trusted_then_rotated(&fx);
+        fx.announce(&new, t(3_500));
+        fx.trust_identity(&new.identity_hash, t(4_000));
+        fx.store
+            .deny_destination(&fx.mesh, &new.destination_hash, None, t(5_000))
+            .unwrap();
+
+        let denied = origin_of(&fx.store, &new);
+
+        assert_eq!(
+            denied.verdict,
+            verdict(Decision::Refuse, Rule::DestinationDenied)
+        );
+        assert_eq!(
+            denied.collisions,
+            vec![BindingConflict {
+                destination_hash: old.destination_hash.clone(),
+                bound_identity: old.identity_hash.clone(),
+                label: None,
+                denied: false,
+                already_marked: false,
+            }]
+        );
+
+        fx.store
+            .deny_destination(&fx.mesh, &old.destination_hash, None, t(6_000))
+            .unwrap();
+        let both_denied = origin_of(&fx.store, &new);
+        assert_eq!(
+            both_denied.verdict,
+            verdict(Decision::Refuse, Rule::DestinationDenied)
+        );
+        assert_eq!(
+            both_denied
+                .collisions
+                .iter()
+                .map(|conflict| conflict.denied)
+                .collect::<Vec<_>>(),
+            vec![true]
+        );
+    }
+
+    #[test]
+    fn binding_conflicts_reports_a_denied_record_and_an_all_destinations_identity() {
+        let fx = Fixture::new("trust-binding-conflicts-detection");
+        let (old, new) = trusted_then_rotated(&fx);
+        let name_hash = decode_name_hash(&new.name_hash).unwrap();
+        let conflicting = |store: &TrustStore| -> Vec<String> {
+            store
+                .binding_conflicts(&new.identity_hash, &name_hash)
+                .into_iter()
+                .map(|conflict| conflict.destination_hash)
+                .collect()
+        };
+
+        assert_eq!(conflicting(&fx.store), vec![old.destination_hash.clone()]);
+        assert!(
+            fx.store
+                .binding_conflicts(&old.identity_hash, &name_hash)
+                .is_empty(),
+            "the bound identity conflicts with nothing"
+        );
+
+        fx.store
+            .deny_destination(&fx.mesh, &old.destination_hash, None, t(4_000))
+            .unwrap();
+        assert_eq!(
+            conflicting(&fx.store),
+            vec![old.destination_hash.clone()],
+            "a denied record still collides"
+        );
+
+        fx.trust_identity(&new.identity_hash, t(5_000));
+        assert_eq!(
+            conflicting(&fx.store),
+            vec![old.destination_hash.clone()],
+            "an identity trusted for all destinations still collides"
+        );
+
+        fx.announce(&new, t(6_000));
+        fx.trust_destination(&new, t(7_000));
+        assert!(
+            conflicting(&fx.store).is_empty(),
+            "an identity holding its own record for the instance conflicts with nothing"
+        );
+    }
+
+    #[test]
+    fn note_key_change_marks_every_record_binding_conflicts_reports() {
+        let fx = Fixture::new("trust-key-change-marks-all");
+        let (first, second) = trusted_then_rotated(&fx);
+        fx.announce(&second, t(3_500));
+        fx.store
+            .trust_destination_for_session(&fx.mesh, &second.destination_hash, t(4_000))
+            .unwrap();
+        let third = announced("alpha");
+        let name_hash = decode_name_hash(&third.name_hash).unwrap();
+        let mut expected: Vec<String> = fx
+            .store
+            .binding_conflicts(&third.identity_hash, &name_hash)
+            .into_iter()
+            .map(|conflict| conflict.destination_hash)
+            .collect();
+        expected.sort();
+        assert_eq!(expected.len(), 2, "{expected:?}");
+
+        let mut marked: Vec<String> = fx
+            .store
+            .note_key_change(
+                &third.identity_hash,
+                &third.name_hash,
+                KeyChangeOutcome::Refused,
+                t(5_000),
+            )
+            .into_iter()
+            .map(|change| change.destination_hash)
+            .collect();
+        marked.sort();
+
+        assert_eq!(marked, expected);
+        for destination in [&first.destination_hash, &second.destination_hash] {
+            assert_eq!(
+                record(&fx.store, destination).key_changed,
+                Some(KeyChange {
+                    seen_identity: third.identity_hash.clone(),
+                    at: t(5_000),
+                })
+            );
+        }
+        let on_disk = String::from_utf8(fx.file_bytes().unwrap()).unwrap();
+        assert_eq!(
+            on_disk.matches("key_changed:").count(),
+            1,
+            "the session record is marked in memory only"
+        );
+        assert!(
+            fx.store
+                .binding_conflicts(&third.identity_hash, &name_hash)
+                .iter()
+                .all(|conflict| conflict.already_marked)
+        );
+    }
+
+    #[test]
+    fn trusting_the_new_destination_clears_the_old_record_even_when_its_identity_is_trusted_for_all()
+     {
+        let fx = Fixture::new("trust-key-change-superseded-all-destinations");
+        let (old, new) = trusted_then_rotated(&fx);
+        fx.trust_identity(&new.identity_hash, t(4_000));
+        fx.store.note_key_change(
+            &new.identity_hash,
+            &new.name_hash,
+            KeyChangeOutcome::Served,
+            t(5_000),
+        );
+        assert!(
+            record(&fx.store, &old.destination_hash)
+                .key_changed
+                .is_some()
+        );
+        fx.announce(&new, t(6_000));
+
+        let outcome = fx
+            .store
+            .trust_destination(
+                &fx.mesh,
+                &new.destination_hash,
+                TrustOptions::default(),
+                t(7_000),
+            )
+            .unwrap();
+
+        assert_eq!(outcome.change, TrustChange::Added);
+        assert_eq!(
+            superseded_destinations(&outcome),
+            vec![old.destination_hash.clone()]
+        );
+        assert_eq!(record(&fx.store, &old.destination_hash).key_changed, None);
+        assert_eq!(
+            record(&fx.reopen(), &old.destination_hash).key_changed,
+            None
+        );
+        assert!(fx.store.is_trusted_identity(&new.identity_hash));
+        assert_eq!(
+            origin_verdict(&fx.store, &new),
+            verdict(Decision::Allow, Rule::DestinationTrusted),
+            "the destination record outranks the identity grant"
+        );
+        assert!(
+            fx.store
+                .note_key_change(
+                    &new.identity_hash,
+                    &new.name_hash,
+                    KeyChangeOutcome::Served,
+                    t(8_000)
+                )
+                .is_empty()
+        );
+    }
+
+    /// The superseded record is a denied one: trusting the new destination clears its
+    /// mark and names it with its deny, which stands as before.
+    #[test]
+    fn trusting_the_new_destination_clears_a_denied_old_records_mark_and_keeps_its_deny() {
+        let fx = Fixture::new("trust-key-change-superseded-denied");
+        let (old, new) = trusted_then_rotated(&fx);
+        fx.store
+            .deny_destination(&fx.mesh, &old.destination_hash, None, t(3_500))
+            .unwrap();
+        fx.store.note_key_change(
+            &new.identity_hash,
+            &new.name_hash,
+            KeyChangeOutcome::Refused,
+            t(5_000),
+        );
+        let old_record = record(&fx.store, &old.destination_hash);
+        assert!(old_record.denied);
+        assert!(old_record.key_changed.is_some());
+        fx.announce(&new, t(6_000));
+
+        let outcome = fx
+            .store
+            .trust_destination(
+                &fx.mesh,
+                &new.destination_hash,
+                TrustOptions::default(),
+                t(7_000),
+            )
+            .unwrap();
+
+        assert_eq!(
+            outcome.superseded,
+            vec![BindingConflict {
+                destination_hash: old.destination_hash.clone(),
+                bound_identity: old.identity_hash.clone(),
+                label: None,
+                denied: true,
+                already_marked: true,
+            }]
+        );
+        let reopened = record(&fx.reopen(), &old.destination_hash);
+        assert_eq!(reopened.key_changed, None);
+        assert!(reopened.denied, "the deny on the old key stands");
+        assert_eq!(
+            origin_verdict(&fx.store, &old),
+            verdict(Decision::Refuse, Rule::DestinationDenied)
+        );
+        assert_eq!(
+            origin_verdict(&fx.store, &new),
+            verdict(Decision::Allow, Rule::DestinationTrusted)
+        );
+    }
+
+    #[test]
+    fn collision_protection_refuses_an_all_destinations_identity_over_a_colliding_record() {
+        let fx = Fixture::new("trust-collision-protection-on");
+        let (old, new) = trusted_then_rotated(&fx);
+        fx.trust_identity(&new.identity_hash, t(4_000));
+        assert_eq!(
+            origin_verdict(&fx.store, &new),
+            verdict(Decision::Allow, Rule::IdentityTrusted)
+        );
+        assert_eq!(announce_outcome(&fx.store, &new), KeyChangeOutcome::Served);
+
+        fx.store.set_collision_protection(true);
+
+        let refused = origin_of(&fx.store, &new);
+        assert_eq!(
+            refused.verdict,
+            verdict(Decision::Refuse, Rule::IdentityChanged)
+        );
+        assert_eq!(refused.collisions.len(), 1, "{:?}", refused.collisions);
+        assert_eq!(announce_outcome(&fx.store, &new), KeyChangeOutcome::Refused);
+        assert_eq!(
+            fx.store
+                .authorize(&new.identity_hash, &new.destination_hash),
+            verdict(Decision::Allow, Rule::IdentityTrusted),
+            "only the origin-aware rung knows the name hash"
+        );
+        assert_eq!(
+            origin_verdict(&fx.store, &old),
+            verdict(Decision::Allow, Rule::DestinationTrusted),
+            "the bound identity's grant is untouched"
+        );
+
+        fx.store.set_collision_protection(false);
+        assert_eq!(
+            origin_verdict(&fx.store, &new),
+            verdict(Decision::Allow, Rule::IdentityTrusted)
+        );
+    }
+
+    /// An identity trusted for all destinations whose own derived destination is denied is
+    /// refused when it asks, so its announce over a colliding record marks with the error
+    /// line, whatever the protection setting.
+    #[test]
+    fn an_all_destinations_identity_with_a_denied_destination_marks_with_an_error() {
+        let fx = Fixture::new("trust-key-change-all-destinations-denied");
+        let surface = Arc::new(RecordingSurface::default());
+        fx.store
+            .attach_surface(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
+        let (old, new) = trusted_then_rotated(&fx);
+        fx.trust_identity(&new.identity_hash, t(4_000));
+        fx.store
+            .deny_destination(&fx.mesh, &new.destination_hash, None, t(4_500))
+            .unwrap();
+        let refused = origin_of(&fx.store, &new);
+        assert_eq!(
+            refused.verdict,
+            verdict(Decision::Refuse, Rule::DestinationDenied)
+        );
+        assert_eq!(refused.collisions.len(), 1, "{:?}", refused.collisions);
+        let outcome = announce_outcome(&fx.store, &new);
+        assert_eq!(outcome, KeyChangeOutcome::Refused);
+
+        let marked =
+            fx.store
+                .note_key_change(&new.identity_hash, &new.name_hash, outcome, t(5_000));
+
+        assert_eq!(marked.len(), 1, "{marked:?}");
+        assert_eq!(
+            record(&fx.store, &old.destination_hash)
+                .key_changed
+                .map(|mark| mark.seen_identity),
+            Some(new.identity_hash.clone())
+        );
+        let texts = surface.texts();
+        assert_eq!(texts.len(), 1, "{texts:#?}");
+        assert!(texts[0].starts_with("error: "), "{}", texts[0]);
+        assert!(texts[0].contains("is refused when it asks"), "{}", texts[0]);
+    }
+
+    #[test]
+    fn a_destination_allow_admits_in_either_collision_protection_mode() {
+        let fx = Fixture::new("trust-collision-protection-destination-allow");
+        let (old, new) = trusted_then_rotated(&fx);
+        fx.announce(&new, t(4_000));
+        fx.trust_destination(&new, t(5_000));
+
+        for protection in [false, true] {
+            fx.store.set_collision_protection(protection);
+            for peer in [&old, &new] {
+                let origin = origin_of(&fx.store, peer);
+                assert_eq!(
+                    origin.verdict,
+                    verdict(Decision::Allow, Rule::DestinationTrusted),
+                    "protection {protection}"
+                );
+                assert!(origin.collisions.is_empty(), "{:?}", origin.collisions);
+            }
+        }
+    }
+
+    #[test]
+    fn a_presence_collision_writes_nothing_and_is_surfaced_once_per_pair() {
+        let fx = Fixture::new("trust-presence-collision-no-write");
+        let surface = Arc::new(RecordingSurface::default());
+        fx.store
+            .attach_surface(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
+        fx.store
+            .attach_presence(Arc::downgrade(&fx.mesh.0) as Weak<dyn InstancePresence>);
+        let old = announced("alpha");
+        fx.announce(&old, t(2_000));
+        fx.trust_identity(&old.identity_hash, t(3_000));
+        let new = announced("alpha");
+        fx.announce(&new, t(4_000));
+        let before = fx.file_bytes().unwrap();
+
+        for at in [4_100, 4_200] {
+            let marked = fx.store.note_key_change(
+                &new.identity_hash,
+                &new.name_hash,
+                KeyChangeOutcome::Refused,
+                t(at),
+            );
+            assert!(marked.is_empty(), "{marked:?}");
+        }
+
+        assert_eq!(fx.file_bytes().unwrap(), before);
+        assert_eq!(surface.texts().len(), 1, "{:#?}", surface.texts());
+
+        let stranger_instance = announced("beta");
+        fx.announce(&stranger_instance, t(9_000));
+        let other_stranger = announced("beta");
+        fx.announce(&other_stranger, t(10_000));
+        fx.store.note_key_change(
+            &other_stranger.identity_hash,
+            &other_stranger.name_hash,
+            KeyChangeOutcome::Refused,
+            t(11_000),
+        );
+        assert_eq!(
+            surface.texts().len(),
+            1,
+            "two strangers sharing an instance id are the human's business only once one is trusted"
+        );
+    }
+
+    /// The dedupe is keyed on the identity the peer row holds the instance under, not on
+    /// the one presenting it: only that identity's own signed announces make such rows, so
+    /// however many keys announce the instance the human hears of it once. A row that has
+    /// aged out of the peer table is no presence at all.
+    #[test]
+    fn two_fresh_identities_presenting_the_same_instance_earn_one_presence_line() {
+        let fx = Fixture::new("trust-presence-collision-one-line");
+        let surface = Arc::new(RecordingSurface::default());
+        fx.store
+            .attach_surface(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
+        fx.store
+            .attach_presence(Arc::downgrade(&fx.mesh.0) as Weak<dyn InstancePresence>);
+        let rotating = PrivateIdentity::new_from_rand(OsRng);
+        let old = announced_as(rotating.clone(), "alpha");
+        fx.announce(&old, t(2_000));
+        fx.trust_identity(&old.identity_hash, t(3_000));
+        let before = fx.file_bytes().unwrap();
+
+        for (n, at) in [3_100, 3_200, 3_300].into_iter().enumerate() {
+            let fresh = announced("alpha");
+            fx.announce(&fresh, t(at));
+            let marked = fx.store.note_key_change(
+                &fresh.identity_hash,
+                &fresh.name_hash,
+                KeyChangeOutcome::Refused,
+                t(at + 50),
+            );
+            assert!(marked.is_empty(), "{marked:?}");
+            assert_eq!(
+                surface.texts().len(),
+                1,
+                "after {} keys: {:#?}",
+                n + 1,
+                surface.texts()
+            );
+        }
+        assert!(surface.texts()[0].contains(&old.identity_hash));
+        assert_eq!(fx.file_bytes().unwrap(), before);
+
+        let old_gamma = announced_as(rotating, "gamma");
+        fx.announce(&old_gamma, t(2_000));
+        let late = announced("gamma");
+        let expired = t(2_000) + PEER_TTL;
+        fx.announce(&late, expired);
+        fx.store.note_key_change(
+            &late.identity_hash,
+            &late.name_hash,
+            KeyChangeOutcome::Refused,
+            expired,
+        );
+        assert_eq!(
+            surface.texts().len(),
+            1,
+            "a row that has aged out of the peer table is no presence"
+        );
+    }
+
+    /// After the line that names the old key as the recorded identity and the new one as
+    /// the presenter, the old key heard again is not a fresh collision with the roles
+    /// swapped: the pair has been told once.
+    #[test]
+    fn the_old_key_heard_again_after_a_rotation_line_earns_no_second_line() {
+        let fx = Fixture::new("trust-presence-collision-role-inverted");
+        let surface = Arc::new(RecordingSurface::default());
+        fx.store
+            .attach_surface(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
+        fx.store
+            .attach_presence(Arc::downgrade(&fx.mesh.0) as Weak<dyn InstancePresence>);
+        let old = announced("alpha");
+        fx.announce(&old, t(2_000));
+        fx.trust_identity(&old.identity_hash, t(3_000));
+        let new = announced("alpha");
+        fx.announce(&new, t(4_000));
+        fx.trust_identity(&new.identity_hash, t(4_200));
+        fx.store.note_key_change(
+            &new.identity_hash,
+            &new.name_hash,
+            KeyChangeOutcome::Served,
+            t(4_500),
+        );
+        assert_eq!(surface.texts().len(), 1, "{:#?}", surface.texts());
+
+        fx.announce(&old, t(5_000));
+        let marked = fx.store.note_key_change(
+            &old.identity_hash,
+            &old.name_hash,
+            KeyChangeOutcome::Served,
+            t(5_100),
+        );
+
+        assert!(marked.is_empty(), "{marked:?}");
+        let texts = surface.texts();
+        assert_eq!(texts.len(), 1, "{texts:#?}");
+        assert!(texts[0].contains(&old.identity_hash), "{}", texts[0]);
+        assert!(texts[0].contains(&new.identity_hash), "{}", texts[0]);
+    }
+
+    #[test]
+    fn a_denied_records_line_says_the_old_key_stays_refused() {
+        let fx = Fixture::new("trust-key-change-denied-record-text");
+        let surface = Arc::new(RecordingSurface::default());
+        fx.store
+            .attach_surface(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
+        let (old, new) = trusted_then_rotated(&fx);
+        fx.store
+            .deny_destination(&fx.mesh, &old.destination_hash, None, t(4_000))
+            .unwrap();
+
+        let marked = fx.store.note_key_change(
+            &new.identity_hash,
+            &new.name_hash,
+            KeyChangeOutcome::Refused,
+            t(5_000),
+        );
+
+        assert_eq!(marked.len(), 1, "{marked:?}");
+        assert!(marked[0].denied);
+        let texts = surface.texts();
+        assert_eq!(texts.len(), 1, "{texts:#?}");
+        let text = &texts[0];
+        assert!(text.starts_with("error: "), "{text}");
+        assert!(text.contains("the old key stays refused"), "{text}");
+        assert!(!text.contains("grant stays"), "{text}");
+        assert!(text.contains("presented under"), "{text}");
+        assert!(
+            text.contains(&format!(".mesh block {}", new.identity_hash)),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_presence_collision_between_two_all_destinations_identities_is_a_warning() {
+        let fx = Fixture::new("trust-presence-collision-warning");
+        let surface = Arc::new(RecordingSurface::default());
+        fx.store
+            .attach_surface(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
+        fx.store
+            .attach_presence(Arc::downgrade(&fx.mesh.0) as Weak<dyn InstancePresence>);
+        let rotating = PrivateIdentity::new_from_rand(OsRng);
+        let old = announced_as(rotating.clone(), "alpha");
+        fx.announce(&old, t(2_000));
+        fx.trust_identity(&old.identity_hash, t(3_000));
+        let new = announced("alpha");
+        fx.announce(&new, t(4_000));
+        fx.trust_identity(&new.identity_hash, t(5_000));
+        let outcome = announce_outcome(&fx.store, &new);
+        assert_eq!(outcome, KeyChangeOutcome::Served);
+
+        let marked =
+            fx.store
+                .note_key_change(&new.identity_hash, &new.name_hash, outcome, t(4_500));
+
+        assert!(marked.is_empty(), "{marked:?}");
+        let texts = surface.texts();
+        assert_eq!(texts.len(), 1, "{texts:#?}");
+        let text = &texts[0];
+        assert!(text.starts_with("warning: "), "{text}");
+        assert!(text.contains(&old.identity_hash), "{text}");
+        assert!(text.contains(&new.identity_hash), "{text}");
+        assert!(text.contains("nothing is marked"), "{text}");
+        assert!(
+            text.contains(&format!(".mesh block {}", new.identity_hash)),
+            "{text}"
+        );
+        assert_eq!(
+            origin_verdict(&fx.store, &new),
+            verdict(Decision::Allow, Rule::IdentityTrusted)
+        );
+
+        let old_beta = announced_as(rotating, "beta");
+        fx.announce(&old_beta, t(7_000));
+        let new_beta = announced("beta");
+        fx.announce(&new_beta, t(8_000));
+        fx.trust_destination(&new_beta, t(9_000));
+        assert!(
+            fx.store
+                .note_key_change(
+                    &new_beta.identity_hash,
+                    &new_beta.name_hash,
+                    KeyChangeOutcome::Refused,
+                    t(10_000)
+                )
+                .is_empty()
+        );
+        assert_eq!(
+            surface.texts().len(),
+            1,
+            "an identity holding its own record for the instance is not a presence collision"
+        );
+    }
+
+    /// The presence rung of `authorize_origin`: under collision protection an identity
+    /// trusted for all destinations that presents an instance the peer table holds under
+    /// another such identity is refused by identity changed, with no record collisions to
+    /// report. The grant alone still allows, the refusal earns one `error:` line naming
+    /// both identities and `.mesh trust <new destination>`, nothing is marked or written,
+    /// the destination allow then admits, and protection off serves as before. The old
+    /// key, first heard, is the instance's holder and is judged by its grant alone.
+    #[test]
+    fn collision_protection_refuses_a_presence_detected_rotation_of_an_identity_trusted_for_all() {
+        let fx = Fixture::new("trust-presence-collision-protected");
+        let surface = Arc::new(RecordingSurface::default());
+        fx.store
+            .attach_surface(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
+        fx.store
+            .attach_presence(Arc::downgrade(&fx.mesh.0) as Weak<dyn InstancePresence>);
+        fx.store.set_collision_protection(true);
+        let old = announced("alpha");
+        fx.announce(&old, t(2_000));
+        fx.trust_identity(&old.identity_hash, t(3_000));
+        let new = announced("alpha");
+        assert_eq!(new.name_hash, old.name_hash);
+        fx.announce(&new, t(4_000));
+        fx.trust_identity(&new.identity_hash, t(5_000));
+        let before = fx.file_bytes().unwrap();
+        let identity = parse_hash(&new.identity_hash).unwrap();
+        let name_hash = decode_name_hash(&new.name_hash).unwrap();
+
+        let origin = fx
+            .store
+            .authorize_origin_at(&identity, &name_hash, t(4_500));
+        assert_eq!(
+            origin.verdict,
+            verdict(Decision::Refuse, Rule::IdentityChanged)
+        );
+        assert!(origin.collisions.is_empty(), "{:?}", origin.collisions);
+        assert_eq!(
+            fx.store
+                .authorize(&new.identity_hash, &new.destination_hash),
+            verdict(Decision::Allow, Rule::IdentityTrusted),
+            "the grant alone still allows what the node sends"
+        );
+        assert_eq!(
+            fx.store
+                .authorize_origin_at(
+                    &parse_hash(&old.identity_hash).unwrap(),
+                    &name_hash,
+                    t(4_500)
+                )
+                .verdict,
+            verdict(Decision::Allow, Rule::IdentityTrusted),
+            "the old key's row was heard first, so it is the holder and never refused by this rung"
+        );
+
+        let marked = fx.store.note_key_change(
+            &new.identity_hash,
+            &new.name_hash,
+            KeyChangeOutcome::Refused,
+            t(4_500),
+        );
+        assert!(marked.is_empty(), "{marked:?}");
+        let texts = surface.texts();
+        assert_eq!(texts.len(), 1, "{texts:#?}");
+        let text = &texts[0];
+        assert!(text.starts_with("error: "), "{text}");
+        assert!(text.contains(&old.identity_hash), "{text}");
+        assert!(text.contains(&new.identity_hash), "{text}");
+        assert!(text.contains("is refused when it asks"), "{text}");
+        assert!(text.contains("nothing is marked"), "{text}");
+        assert!(text.contains("presented under"), "{text}");
+        assert!(!text.contains("announced under"), "{text}");
+        assert!(
+            text.contains(&format!(
+                ".mesh trust {}; otherwise .mesh block {}",
+                new.destination_hash, new.identity_hash
+            )),
+            "{text}"
+        );
+        assert_eq!(fx.file_bytes().unwrap(), before, "nothing is written");
+        assert!(
+            fx.store
+                .records()
+                .iter()
+                .all(|record| record.key_changed.is_none()),
+            "{:#?}",
+            fx.store.records()
+        );
+
+        fx.store.set_collision_protection(false);
+        assert_eq!(
+            fx.store
+                .authorize_origin_at(&identity, &name_hash, t(4_500))
+                .verdict,
+            verdict(Decision::Allow, Rule::IdentityTrusted),
+            "protection off serves the identity allow"
+        );
+        fx.store.set_collision_protection(true);
+
+        assert_eq!(fx.trust_destination(&new, t(6_000)), TrustChange::Added);
+        assert_eq!(
+            fx.store
+                .authorize_origin_at(&identity, &name_hash, t(6_500))
+                .verdict,
+            verdict(Decision::Allow, Rule::DestinationTrusted),
+            "the human trusting the new destination admits it under protection"
+        );
+        assert_eq!(surface.texts().len(), 1, "{:#?}", surface.texts());
+    }
+
+    /// `InstancePresence` that counts how often the store consults it.
+    struct CountingPresence(Arc<PeerTable>, AtomicUsize);
+
+    impl InstancePresence for CountingPresence {
+        fn heard_rows(&self, name_hash: &str, now: SystemTime) -> Vec<PresenceRow> {
+            self.1.fetch_add(1, Ordering::SeqCst);
+            self.0.heard_rows(name_hash, now)
+        }
+    }
+
+    /// The presence rung costs a peer table scan, so `authorize_origin` pays it only for
+    /// an identity-allow verdict under collision protection: a stranger (default closed),
+    /// a destination allow and a blocked identity never reach the table, and with
+    /// protection off neither does the identity allow.
+    #[test]
+    fn authorize_origin_consults_the_peer_table_only_for_an_identity_allow_under_protection() {
+        let fx = Fixture::new("trust-presence-rung-is-identity-allow-only");
+        let presence = Arc::new(CountingPresence(fx.mesh.0.clone(), AtomicUsize::new(0)));
+        fx.store
+            .attach_presence(Arc::downgrade(&presence) as Weak<dyn InstancePresence>);
+        let old = announced("alpha");
+        fx.announce(&old, t(4_000));
+        fx.trust_identity(&old.identity_hash, t(4_000));
+        let new = announced("alpha");
+        fx.announce(&new, t(4_100));
+        let identity = parse_hash(&new.identity_hash).unwrap();
+        let name_hash = decode_name_hash(&new.name_hash).unwrap();
+        let origin = |now| {
+            fx.store
+                .authorize_origin_at(&identity, &name_hash, now)
+                .verdict
+        };
+        let scans = || presence.1.load(Ordering::SeqCst);
+
+        fx.store.set_collision_protection(true);
+        assert_eq!(
+            origin(t(4_500)),
+            verdict(Decision::Refuse, Rule::DefaultClosed)
+        );
+        assert_eq!(scans(), 0, "a stranger is not judged against the table");
+
+        fx.trust_identity(&new.identity_hash, t(5_000));
+        fx.store.set_collision_protection(false);
+        assert_eq!(
+            origin(t(5_500)),
+            verdict(Decision::Allow, Rule::IdentityTrusted)
+        );
+        assert_eq!(scans(), 0, "protection off never reads the table");
+
+        fx.store.set_collision_protection(true);
+        assert_eq!(
+            origin(t(5_500)),
+            verdict(Decision::Refuse, Rule::IdentityChanged)
+        );
+        assert_eq!(
+            scans(),
+            1,
+            "the identity allow under protection is the one rung that scans"
+        );
+
+        assert_eq!(fx.trust_destination(&new, t(6_000)), TrustChange::Added);
+        assert_eq!(
+            origin(t(6_500)),
+            verdict(Decision::Allow, Rule::DestinationTrusted)
+        );
+        assert_eq!(
+            scans(),
+            1,
+            "a destination allow is not judged against the table"
+        );
+
+        fx.store
+            .block_identity(&fx.mesh, &new.identity_hash, None, t(7_000))
+            .unwrap();
+        assert_eq!(
+            origin(t(7_500)),
+            verdict(Decision::Refuse, Rule::IdentityBlocked)
+        );
+        assert_eq!(
+            scans(),
+            1,
+            "a blocked identity is not judged against the table"
+        );
+    }
+
+    /// The presence rung's memo is of a refusal, not a guess: before the rung has refused
+    /// anyone, with the old row aged past `PEER_TTL`, the presenter is admitted. The
+    /// verdict that refuses it over the live row arms the memo by itself, before any owner
+    /// line, so the refusal outlives the old row: still identity changed at `+PEER_TTL`.
+    /// The old key, first heard, is never refused. Untrusting the holder admits the
+    /// presenter while it lasts, since the memo refuses only for a holder still trusted for
+    /// all destinations, and re-trusting the holder refuses again from the same memo;
+    /// blocking the holder or the presenter clears the memo, so once unblocked and
+    /// re-trusted the presenter is admitted until the rung refuses it over a live row
+    /// again. Trusting the presenter's destination admits it regardless. Judging writes
+    /// nothing and marks nothing throughout.
+    #[test]
+    fn a_presence_refusal_outlives_the_old_row_from_the_refusal_itself() {
+        let fx = Fixture::new("trust-presence-refusal-outlives-row");
+        let surface = Arc::new(RecordingSurface::default());
+        fx.store
+            .attach_surface(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
+        fx.store.set_collision_protection(true);
+        let old = announced("alpha");
+        fx.announce(&old, t(2_000));
+        fx.trust_identity(&old.identity_hash, t(3_000));
+        let new = announced("alpha");
+        assert_eq!(new.name_hash, old.name_hash);
+        fx.announce(&new, t(4_000));
+        fx.trust_identity(&new.identity_hash, t(5_000));
+        let before = fx.file_bytes().unwrap();
+        let name_hash = decode_name_hash(&new.name_hash).unwrap();
+        let origin = |peer: &Announced, now| {
+            fx.store
+                .authorize_origin_at(&parse_hash(&peer.identity_hash).unwrap(), &name_hash, now)
+                .verdict
+        };
+        let aged_out = t(4_000) + PEER_TTL;
+
+        assert_eq!(
+            origin(&new, t(4_500)),
+            verdict(Decision::Allow, Rule::IdentityTrusted),
+            "no peer table attached: nothing to consult, the identity allow stands"
+        );
+
+        fx.store
+            .attach_presence(Arc::downgrade(&fx.mesh.0) as Weak<dyn InstancePresence>);
+        assert_eq!(
+            origin(&new, aged_out),
+            verdict(Decision::Allow, Rule::IdentityTrusted),
+            "nobody refused yet and both rows aged out: nothing is remembered"
+        );
+        assert_eq!(
+            origin(&new, t(4_500)),
+            verdict(Decision::Refuse, Rule::IdentityChanged),
+            "the old row is live at 4 500 s"
+        );
+        assert_eq!(
+            origin(&old, t(4_500)),
+            verdict(Decision::Allow, Rule::IdentityTrusted),
+            "the old key was heard first: the holder is never refused by this rung"
+        );
+        assert_eq!(
+            origin(&new, aged_out),
+            verdict(Decision::Refuse, Rule::IdentityChanged),
+            "the refusal armed the memo before any line was offered"
+        );
+        assert!(surface.texts().is_empty(), "{:#?}", surface.texts());
+
+        assert!(
+            fx.store
+                .note_key_change(
+                    &new.identity_hash,
+                    &new.name_hash,
+                    KeyChangeOutcome::Refused,
+                    t(4_500),
+                )
+                .is_empty(),
+            "nothing is marked"
+        );
+        assert_eq!(surface.texts().len(), 1, "{:#?}", surface.texts());
+        assert_eq!(
+            origin(&new, aged_out),
+            verdict(Decision::Refuse, Rule::IdentityChanged),
+            "the refusal outlives the old row"
+        );
+        assert_eq!(
+            origin(&old, aged_out),
+            verdict(Decision::Allow, Rule::IdentityTrusted),
+            "the memo never refuses the holder it names"
+        );
+        assert_eq!(fx.file_bytes().unwrap(), before, "judging writes nothing");
+
+        fx.store
+            .untrust_identity(&fx.mesh, &old.identity_hash)
+            .unwrap();
+        assert_eq!(
+            origin(&new, aged_out),
+            verdict(Decision::Allow, Rule::IdentityTrusted),
+            "the holder no longer trusted for all destinations: the memo refuses nobody"
+        );
+        fx.trust_identity(&old.identity_hash, t(5_200));
+        assert_eq!(
+            origin(&new, aged_out),
+            verdict(Decision::Refuse, Rule::IdentityChanged),
+            "untrusting cleared no memo; the holder trusted again, it refuses again"
+        );
+
+        fx.store
+            .block_identity(&fx.mesh, &old.identity_hash, None, t(5_300))
+            .unwrap();
+        assert_eq!(
+            origin(&new, aged_out),
+            verdict(Decision::Allow, Rule::IdentityTrusted),
+            "blocking the holder admits the presenter"
+        );
+        fx.store
+            .unblock_identity(&fx.mesh, &old.identity_hash)
+            .unwrap();
+        fx.trust_identity(&old.identity_hash, t(5_400));
+        assert_eq!(
+            origin(&new, aged_out),
+            verdict(Decision::Allow, Rule::IdentityTrusted),
+            "blocking the holder cleared the memo: trusted again, it refuses nothing until the \
+             rung refuses over a live row again"
+        );
+        assert_eq!(
+            origin(&new, t(4_500)),
+            verdict(Decision::Refuse, Rule::IdentityChanged),
+            "the live row refuses and arms the memo again"
+        );
+        assert_eq!(
+            origin(&new, aged_out),
+            verdict(Decision::Refuse, Rule::IdentityChanged)
+        );
+
+        fx.store
+            .block_identity(&fx.mesh, &new.identity_hash, None, t(5_500))
+            .unwrap();
+        assert_eq!(
+            origin(&new, t(4_500)),
+            verdict(Decision::Refuse, Rule::IdentityBlocked)
+        );
+        assert_eq!(
+            origin(&old, t(4_500)),
+            verdict(Decision::Allow, Rule::IdentityTrusted),
+            "the holder is admitted whatever becomes of the presenter"
+        );
+        fx.store
+            .unblock_identity(&fx.mesh, &new.identity_hash)
+            .unwrap();
+        fx.trust_identity(&new.identity_hash, t(5_600));
+        assert_eq!(
+            origin(&new, aged_out),
+            verdict(Decision::Allow, Rule::IdentityTrusted),
+            "blocking the presenter cleared the memo too: unblocked and trusted again, it is \
+             admitted with the old row gone"
+        );
+        assert_eq!(
+            origin(&new, t(4_500)),
+            verdict(Decision::Refuse, Rule::IdentityChanged),
+            "and refused over the live row again"
+        );
+
+        assert_eq!(fx.trust_destination(&new, t(6_000)), TrustChange::Added);
+        assert_eq!(
+            origin(&new, aged_out),
+            verdict(Decision::Allow, Rule::DestinationTrusted),
+            "the human trusting the new destination admits it under protection"
+        );
+        assert_eq!(surface.texts().len(), 1, "{:#?}", surface.texts());
+        assert!(
+            fx.store
+                .records()
+                .iter()
+                .all(|record| record.key_changed.is_none()),
+            "{:#?}",
+            fx.store.records()
+        );
+    }
+
+    /// The memos and their insertion order stay in step across the `PRESENCE_SURFACED_CAP`
+    /// eviction: a memo evicted from the oldest end is gone with who it had told, a
+    /// remembered one still names its holder, the order names no instance without a memo,
+    /// and the shared-line pairs are bounded the same way on their own.
+    #[test]
+    fn remembered_presence_pairs_and_their_index_evict_together_at_the_cap() {
+        let holder = fake_hash(0x11);
+        let presenter = fake_hash(0x22);
+        let mut state = State::default();
+        state
+            .file
+            .identities
+            .insert(holder.clone(), identity_entry(t(1_000), t(1_000), true));
+        let instance = |n: usize| format!("instance-{n}");
+
+        state.remember_refusal(&instance(0), &holder, &presenter);
+        state.remember_refusal(&instance(0), &presenter, &holder);
+        assert_eq!(
+            state.presence_memos.get(&instance(0)),
+            Some(&PresenceMemo {
+                holder: holder.clone(),
+                refused: BTreeSet::from([presenter.clone(), holder.clone()]),
+                told: BTreeSet::new(),
+            }),
+            "a standing memo keeps its holder, whoever is refused later"
+        );
+        assert_eq!(state.presence_memo_order.len(), 1);
+        assert!(state.tell_presence_line(&instance(0), &presenter));
+        assert!(
+            !state.tell_presence_line(&instance(0), &presenter),
+            "a presenter is told once per instance"
+        );
+        assert!(
+            !state.tell_presence_line(&instance(1), &presenter),
+            "no memo, nothing to be told of"
+        );
+
+        for n in 1..=PRESENCE_SURFACED_CAP {
+            state.remember_refusal(&instance(n), &holder, &presenter);
+        }
+        assert_eq!(state.presence_memos.len(), PRESENCE_SURFACED_CAP);
+        assert_eq!(state.presence_memo_order.len(), PRESENCE_SURFACED_CAP);
+        assert!(
+            !state.presence_memos.contains_key(&instance(0)),
+            "the oldest memo was evicted"
+        );
+        assert!(
+            !state.tell_presence_line(&instance(0), &presenter),
+            "the evicted memo took who it told with it"
+        );
+        assert_eq!(
+            state
+                .presence_memos
+                .get(&instance(1))
+                .map(|memo| &memo.holder),
+            Some(&holder),
+            "the next-oldest memo still names its holder"
+        );
+        assert_eq!(
+            state
+                .presence_memos
+                .get(&instance(PRESENCE_SURFACED_CAP))
+                .map(|memo| &memo.holder),
+            Some(&holder),
+            "and so does the newest"
+        );
+        assert!(
+            state
+                .presence_memo_order
+                .iter()
+                .all(|instance| state.presence_memos.contains_key(instance))
+        );
+        state.remember_refusal(&instance(0), &holder, &presenter);
+        assert!(
+            state.tell_presence_line(&instance(0), &presenter),
+            "an evicted instance armed again tells its line again"
+        );
+        assert!(!state.presence_memos.contains_key(&instance(1)));
+        assert_eq!(state.presence_memo_order.len(), PRESENCE_SURFACED_CAP);
+
+        assert!(state.remember_shared_line((instance(0), holder.clone())));
+        assert!(
+            !state.remember_shared_line((instance(0), holder.clone())),
+            "a shared line is told once per pair"
+        );
+        for n in 1..=PRESENCE_SURFACED_CAP {
+            assert!(state.remember_shared_line((instance(n), holder.clone())));
+        }
+        assert_eq!(state.presence_surfaced.len(), PRESENCE_SURFACED_CAP);
+        assert_eq!(state.presence_surfaced_order.len(), PRESENCE_SURFACED_CAP);
+        assert!(
+            state.remember_shared_line((instance(0), holder)),
+            "the oldest pair was evicted and can be told again"
+        );
+    }
+
+    /// Usage probe: a presence-only rotation is refused by the verdict alone; the line it
+    /// earns is deduped once per (instance, recorded identity) while the refusal itself
+    /// holds for every request, and the dedupe is shared with the protection-off warning,
+    /// so flipping the setting after the line was earned restates nothing.
+    #[test]
+    fn usage_probe_a_presence_refusal_holds_per_request_while_its_line_is_earned_once() {
+        let fx = Fixture::new("trust-probe-presence-refusal-holds");
+        let surface = Arc::new(RecordingSurface::default());
+        fx.store
+            .attach_surface(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
+        fx.store
+            .attach_presence(Arc::downgrade(&fx.mesh.0) as Weak<dyn InstancePresence>);
+        fx.store.set_collision_protection(true);
+        let old = announced("alpha");
+        fx.announce(&old, t(2_000));
+        fx.trust_identity(&old.identity_hash, t(3_000));
+        let new = announced("alpha");
+        fx.announce(&new, t(4_000));
+        fx.trust_identity(&new.identity_hash, t(5_000));
+        let identity = parse_hash(&new.identity_hash).unwrap();
+        let name_hash = decode_name_hash(&new.name_hash).unwrap();
+
+        for round in 0..3 {
+            let origin = fx
+                .store
+                .authorize_origin_at(&identity, &name_hash, t(4_500 + round));
+            assert_eq!(
+                origin.verdict,
+                verdict(Decision::Refuse, Rule::IdentityChanged),
+                "round {round}"
+            );
+            assert!(
+                fx.store
+                    .note_key_change(
+                        &new.identity_hash,
+                        &new.name_hash,
+                        KeyChangeOutcome::Refused,
+                        t(4_500 + round),
+                    )
+                    .is_empty(),
+                "round {round}: nothing is marked"
+            );
+        }
+        let texts = surface.texts();
+        assert_eq!(texts.len(), 1, "one line for three refusals: {texts:#?}");
+        assert!(texts[0].starts_with("error: "), "{}", texts[0]);
+
+        fx.store.set_collision_protection(false);
+        assert!(
+            fx.store
+                .note_key_change(
+                    &new.identity_hash,
+                    &new.name_hash,
+                    KeyChangeOutcome::Served,
+                    t(4_600),
+                )
+                .is_empty()
+        );
+        assert_eq!(
+            surface.texts().len(),
+            1,
+            "the served variant shares the dedupe: {:#?}",
+            surface.texts()
+        );
+    }
+
+    /// Usage probe: the served presence line, the one `mesh.collision_protection: false`
+    /// earns, names the setting that let the identity through and no longer promises that
+    /// "nothing is needed"; both variants say "presented under", never "announced under",
+    /// since the same line serves an announce, a link, a knock and a stored request.
+    #[test]
+    fn usage_probe_the_served_presence_line_names_the_setting_and_promises_nothing() {
+        let fx = Fixture::new("trust-probe-presence-served-line");
+        let surface = Arc::new(RecordingSurface::default());
+        fx.store
+            .attach_surface(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
+        fx.store
+            .attach_presence(Arc::downgrade(&fx.mesh.0) as Weak<dyn InstancePresence>);
+        let old = announced("alpha");
+        fx.announce(&old, t(2_000));
+        fx.trust_identity(&old.identity_hash, t(3_000));
+        let new = announced("alpha");
+        fx.announce(&new, t(4_000));
+        fx.trust_identity(&new.identity_hash, t(5_000));
+        assert_eq!(
+            origin_verdict(&fx.store, &new),
+            verdict(Decision::Allow, Rule::IdentityTrusted),
+            "protection off: served"
+        );
+
+        fx.store.note_key_change(
+            &new.identity_hash,
+            &new.name_hash,
+            KeyChangeOutcome::Served,
+            t(4_500),
+        );
+
+        let texts = surface.texts();
+        assert_eq!(texts.len(), 1, "{texts:#?}");
+        let text = &texts[0];
+        assert!(text.starts_with("warning: "), "{text}");
+        assert!(
+            text.contains("is served while it asks because collision_protection is off"),
+            "{text}"
+        );
+        assert!(!text.contains("nothing is needed"), "{text}");
+        assert!(text.contains("presented under"), "{text}");
+        assert!(!text.contains("announced under"), "{text}");
+        assert!(text.contains("nothing is marked"), "{text}");
+        assert!(
+            text.contains("confirm with its holder out of band"),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(".mesh block {}", new.identity_hash)),
+            "{text}"
+        );
+    }
+
+    /// Both rows live and the old key heard first: the new key presenting is refused, the
+    /// refusal arms the memo naming the old key as holder and the new key as refused, and
+    /// the one `error:` line is earned; the old key presenting at the same instant is
+    /// admitted by its grant and earns no line. Nothing is written.
+    #[test]
+    fn the_first_heard_holder_stays_allowed_while_the_new_keys_row_is_live() {
+        let fx = Fixture::new("trust-presence-first-heard-holder-allowed");
+        let surface = Arc::new(RecordingSurface::default());
+        fx.store
+            .attach_surface(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
+        fx.store
+            .attach_presence(Arc::downgrade(&fx.mesh.0) as Weak<dyn InstancePresence>);
+        fx.store.set_collision_protection(true);
+        let old = announced("alpha");
+        fx.announce(&old, t(2_000));
+        fx.trust_identity(&old.identity_hash, t(3_000));
+        let new = announced("alpha");
+        fx.announce(&new, t(4_000));
+        fx.trust_identity(&new.identity_hash, t(5_000));
+        let before = fx.file_bytes().unwrap();
+        let instance = new.name_hash.as_str();
+
+        assert_eq!(
+            present(&fx, &new, instance, t(4_500)),
+            verdict(Decision::Refuse, Rule::IdentityChanged)
+        );
+        let texts = surface.texts();
+        assert_eq!(texts.len(), 1, "{texts:#?}");
+        assert!(
+            texts[0].starts_with("error: ")
+                && texts[0].contains(&old.identity_hash)
+                && texts[0].contains(&new.identity_hash),
+            "{}",
+            texts[0]
+        );
+        {
+            let state = fx.store.inner.lock();
+            let memo = state
+                .presence_memos
+                .get(instance)
+                .expect("the refusal armed the memo");
+            assert_eq!(memo.holder, old.identity_hash);
+            assert_eq!(memo.refused, BTreeSet::from([new.identity_hash.clone()]));
+        }
+
+        assert_eq!(
+            present(&fx, &old, instance, t(4_500)),
+            verdict(Decision::Allow, Rule::IdentityTrusted),
+            "the first-heard holder is never refused by this rung"
+        );
+        assert_eq!(
+            surface.texts().len(),
+            1,
+            "the holder earns no line: {:#?}",
+            surface.texts()
+        );
+        assert_eq!(fx.file_bytes().unwrap(), before, "judging writes nothing");
+    }
+
+    /// Refused over the old key's live row, the new key stays refused from the memo once
+    /// that row has aged out, and the old key, with no row left, is still admitted: the
+    /// memo's holder is authoritative and the table is not asked again.
+    #[test]
+    fn a_new_key_stays_refused_after_the_holders_row_aged_out() {
+        let fx = Fixture::new("trust-presence-new-key-refused-after-row-gone");
+        let surface = Arc::new(RecordingSurface::default());
+        fx.store
+            .attach_surface(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
+        fx.store
+            .attach_presence(Arc::downgrade(&fx.mesh.0) as Weak<dyn InstancePresence>);
+        fx.store.set_collision_protection(true);
+        let old = announced("alpha");
+        fx.announce(&old, t(2_000));
+        fx.trust_identity(&old.identity_hash, t(3_000));
+        let new = announced("alpha");
+        fx.announce(&new, t(4_000));
+        fx.trust_identity(&new.identity_hash, t(5_000));
+        let instance = new.name_hash.as_str();
+        let old_row_gone = t(2_000) + PEER_TTL + Duration::from_secs(1);
+
+        assert_eq!(
+            present(&fx, &new, instance, t(4_500)),
+            verdict(Decision::Refuse, Rule::IdentityChanged)
+        );
+        assert!(
+            fx.mesh
+                .0
+                .heard_rows(instance, old_row_gone)
+                .iter()
+                .all(|row| row.identity_hash != old.identity_hash),
+            "the old key's row has aged out"
+        );
+        assert_eq!(
+            present(&fx, &new, instance, old_row_gone),
+            verdict(Decision::Refuse, Rule::IdentityChanged),
+            "the memo refuses with the holder's row gone"
+        );
+        assert_eq!(
+            present(&fx, &old, instance, old_row_gone),
+            verdict(Decision::Allow, Rule::IdentityTrusted),
+            "the holder is admitted with no row of its own"
+        );
+        assert_eq!(surface.texts().len(), 1, "{:#?}", surface.texts());
+    }
+
+    /// An insider trusted for all destinations that announces the victim's instance and
+    /// presents it first cannot make itself the holder: the peer table's first-heard row
+    /// decides, so the insider is refused and the memo names the victim, who is admitted
+    /// when it presents next and stays admitted once its own row has aged out, the insider
+    /// staying refused from the memo.
+    #[test]
+    fn an_insider_announcing_first_heard_instance_cannot_lock_out_its_first_heard_holder() {
+        let fx = Fixture::new("trust-presence-insider-presents-first");
+        let surface = Arc::new(RecordingSurface::default());
+        fx.store
+            .attach_surface(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
+        fx.store
+            .attach_presence(Arc::downgrade(&fx.mesh.0) as Weak<dyn InstancePresence>);
+        fx.store.set_collision_protection(true);
+        let victim = announced("alpha");
+        fx.announce(&victim, t(2_000));
+        fx.trust_identity(&victim.identity_hash, t(2_100));
+        let insider = announced("alpha");
+        fx.announce(&insider, t(3_000));
+        fx.trust_identity(&insider.identity_hash, t(3_100));
+        let instance = victim.name_hash.as_str();
+
+        assert_eq!(
+            present(&fx, &insider, instance, t(3_500)),
+            verdict(Decision::Refuse, Rule::IdentityChanged),
+            "presenting first makes nobody the holder"
+        );
+        {
+            let state = fx.store.inner.lock();
+            assert_eq!(
+                state.presence_memos.get(instance).map(|memo| &memo.holder),
+                Some(&victim.identity_hash),
+                "the memo names the first-heard key"
+            );
+        }
+        assert_eq!(
+            present(&fx, &victim, instance, t(3_600)),
+            verdict(Decision::Allow, Rule::IdentityTrusted)
+        );
+        assert_eq!(surface.texts().len(), 1, "{:#?}", surface.texts());
+
+        let victim_row_gone = t(2_000) + PEER_TTL + Duration::from_secs(1);
+        assert_eq!(
+            present(&fx, &victim, instance, victim_row_gone),
+            verdict(Decision::Allow, Rule::IdentityTrusted),
+            "the holder stays admitted with its row gone and the insider's live"
+        );
+        assert_eq!(
+            present(&fx, &insider, instance, victim_row_gone),
+            verdict(Decision::Refuse, Rule::IdentityChanged),
+            "the insider stays refused from the memo"
+        );
+        assert_eq!(surface.texts().len(), 1, "{:#?}", surface.texts());
+    }
+
+    /// The presentation-order twin: the victim presenting first is admitted and arms
+    /// nothing, since a served presentation is no refusal; the insider presenting after it
+    /// is refused and the memo armed then names the victim all the same.
+    #[test]
+    fn the_holder_presenting_first_arms_nothing_and_the_insider_is_refused_after_it() {
+        let fx = Fixture::new("trust-presence-holder-presents-first");
+        let surface = Arc::new(RecordingSurface::default());
+        fx.store
+            .attach_surface(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
+        fx.store
+            .attach_presence(Arc::downgrade(&fx.mesh.0) as Weak<dyn InstancePresence>);
+        fx.store.set_collision_protection(true);
+        let victim = announced("alpha");
+        fx.announce(&victim, t(2_000));
+        fx.trust_identity(&victim.identity_hash, t(2_100));
+        let insider = announced("alpha");
+        fx.announce(&insider, t(3_000));
+        fx.trust_identity(&insider.identity_hash, t(3_100));
+        let instance = victim.name_hash.as_str();
+
+        assert_eq!(
+            present(&fx, &victim, instance, t(3_500)),
+            verdict(Decision::Allow, Rule::IdentityTrusted)
+        );
+        {
+            let state = fx.store.inner.lock();
+            assert!(
+                state.presence_memos.is_empty(),
+                "{:#?}",
+                state.presence_memos
+            );
+            assert!(state.presence_memo_order.is_empty());
+        }
+        assert!(surface.texts().is_empty(), "{:#?}", surface.texts());
+
+        assert_eq!(
+            present(&fx, &insider, instance, t(3_600)),
+            verdict(Decision::Refuse, Rule::IdentityChanged)
+        );
+        {
+            let state = fx.store.inner.lock();
+            assert_eq!(
+                state.presence_memos.get(instance).map(|memo| &memo.holder),
+                Some(&victim.identity_hash)
+            );
+        }
+        assert_eq!(surface.texts().len(), 1, "{:#?}", surface.texts());
+    }
+
+    /// `.mesh trust <new destination>` clears the instance's memo along with admitting the
+    /// new key by its destination grant: with the holder's row gone, the memo alone refused
+    /// the new key, and once the destination grant is given and taken away again nothing
+    /// refuses it, where a memo left standing would have.
+    #[test]
+    fn trusting_the_new_destination_clears_the_instances_presence_memo() {
+        let fx = Fixture::new("trust-presence-trust-destination-clears-memo");
+        let surface = Arc::new(RecordingSurface::default());
+        fx.store
+            .attach_surface(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
+        fx.store
+            .attach_presence(Arc::downgrade(&fx.mesh.0) as Weak<dyn InstancePresence>);
+        fx.store.set_collision_protection(true);
+        let old = announced("alpha");
+        fx.announce(&old, t(2_000));
+        fx.trust_identity(&old.identity_hash, t(3_000));
+        let new = announced("alpha");
+        fx.announce(&new, t(4_000));
+        fx.trust_identity(&new.identity_hash, t(5_000));
+        let instance = new.name_hash.as_str();
+        let old_row_gone = t(2_000) + PEER_TTL + Duration::from_secs(1);
+
+        assert_eq!(
+            present(&fx, &new, instance, t(4_500)),
+            verdict(Decision::Refuse, Rule::IdentityChanged)
+        );
+        assert_eq!(
+            present(&fx, &new, instance, old_row_gone),
+            verdict(Decision::Refuse, Rule::IdentityChanged),
+            "the memo alone refuses"
+        );
+
+        assert_eq!(fx.trust_destination(&new, t(6_000)), TrustChange::Added);
+        {
+            let state = fx.store.inner.lock();
+            assert!(
+                state.presence_memos.is_empty(),
+                "{:#?}",
+                state.presence_memos
+            );
+            assert!(state.presence_memo_order.is_empty());
+        }
+        assert_eq!(
+            present(&fx, &new, instance, old_row_gone),
+            verdict(Decision::Allow, Rule::DestinationTrusted)
+        );
+
+        fx.store
+            .untrust_identity(&fx.mesh, &new.identity_hash)
+            .unwrap();
+        fx.trust_identity(&new.identity_hash, t(6_100));
+        assert_eq!(
+            present(&fx, &new, instance, old_row_gone),
+            verdict(Decision::Allow, Rule::IdentityTrusted),
+            "the destination grant gone again, no memo and no live row of the old key refuses"
+        );
+        assert_eq!(surface.texts().len(), 1, "{:#?}", surface.texts());
+    }
+
+    /// `.mesh block <presenting identity>` clears the memo that refused it: a third key
+    /// trusted for all destinations presenting the instance with the holder's row gone is
+    /// admitted, where the memo would have refused it, while the holder's live row still
+    /// refuses and arms a memo afresh.
+    #[test]
+    fn blocking_the_presenting_identity_clears_the_instances_presence_memo() {
+        let fx = Fixture::new("trust-presence-block-presenter-clears-memo");
+        let surface = Arc::new(RecordingSurface::default());
+        fx.store
+            .attach_surface(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
+        fx.store
+            .attach_presence(Arc::downgrade(&fx.mesh.0) as Weak<dyn InstancePresence>);
+        fx.store.set_collision_protection(true);
+        let holder = announced("alpha");
+        fx.announce(&holder, t(2_000));
+        fx.trust_identity(&holder.identity_hash, t(3_000));
+        let presenter = announced("alpha");
+        fx.announce(&presenter, t(4_000));
+        fx.trust_identity(&presenter.identity_hash, t(5_000));
+        let third = announced("beta");
+        fx.announce(&third, t(2_000));
+        fx.trust_identity(&third.identity_hash, t(3_000));
+        let instance = holder.name_hash.as_str();
+        let holder_row_gone = t(2_000) + PEER_TTL + Duration::from_secs(1);
+
+        assert_eq!(
+            present(&fx, &presenter, instance, t(4_500)),
+            verdict(Decision::Refuse, Rule::IdentityChanged)
+        );
+        assert_eq!(
+            present(&fx, &third, instance, holder_row_gone),
+            verdict(Decision::Refuse, Rule::IdentityChanged),
+            "the memo refuses every other key trusted for all destinations"
+        );
+        {
+            let state = fx.store.inner.lock();
+            assert_eq!(
+                state.presence_memos.get(instance).map(|memo| &memo.refused),
+                Some(&BTreeSet::from([
+                    presenter.identity_hash.clone(),
+                    third.identity_hash.clone()
+                ]))
+            );
+        }
+
+        fx.store
+            .block_identity(&fx.mesh, &presenter.identity_hash, None, t(6_000))
+            .unwrap();
+        {
+            let state = fx.store.inner.lock();
+            assert!(
+                state.presence_memos.is_empty(),
+                "{:#?}",
+                state.presence_memos
+            );
+            assert!(state.presence_memo_order.is_empty());
+        }
+        assert_eq!(
+            present(&fx, &third, instance, holder_row_gone),
+            verdict(Decision::Allow, Rule::IdentityTrusted),
+            "no memo and no live row under a key trusted for all destinations: admitted"
+        );
+        assert_eq!(
+            present(&fx, &third, instance, t(4_500)),
+            verdict(Decision::Refuse, Rule::IdentityChanged),
+            "the holder's live row refuses as before"
+        );
+        {
+            let state = fx.store.inner.lock();
+            assert_eq!(
+                state.presence_memos.get(instance),
+                Some(&PresenceMemo {
+                    holder: holder.identity_hash.clone(),
+                    refused: BTreeSet::from([third.identity_hash.clone()]),
+                    told: BTreeSet::from([third.identity_hash.clone()]),
+                }),
+                "and arms a memo afresh, the blocked key no part of it"
+            );
+        }
+    }
+
+    /// `.mesh block <holder>` clears the holder's memo rather than silencing it: unblocked
+    /// and trusted for all destinations again, the holder refuses nothing until the rung
+    /// refuses over its live row again, where an untrusted-then-retrusted holder's memo
+    /// refuses at once.
+    #[test]
+    fn blocking_the_holder_clears_its_memo_too() {
+        let fx = Fixture::new("trust-presence-block-holder-clears-memo");
+        let surface = Arc::new(RecordingSurface::default());
+        fx.store
+            .attach_surface(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
+        fx.store
+            .attach_presence(Arc::downgrade(&fx.mesh.0) as Weak<dyn InstancePresence>);
+        fx.store.set_collision_protection(true);
+        let holder = announced("alpha");
+        fx.announce(&holder, t(2_000));
+        fx.trust_identity(&holder.identity_hash, t(3_000));
+        let presenter = announced("alpha");
+        fx.announce(&presenter, t(4_000));
+        fx.trust_identity(&presenter.identity_hash, t(5_000));
+        let instance = holder.name_hash.as_str();
+        let holder_row_gone = t(2_000) + PEER_TTL + Duration::from_secs(1);
+
+        assert_eq!(
+            present(&fx, &presenter, instance, t(4_500)),
+            verdict(Decision::Refuse, Rule::IdentityChanged)
+        );
+        fx.store
+            .untrust_identity(&fx.mesh, &holder.identity_hash)
+            .unwrap();
+        fx.trust_identity(&holder.identity_hash, t(5_100));
+        assert_eq!(
+            present(&fx, &presenter, instance, holder_row_gone),
+            verdict(Decision::Refuse, Rule::IdentityChanged),
+            "untrusting the holder left its memo standing"
+        );
+
+        fx.store
+            .block_identity(&fx.mesh, &holder.identity_hash, None, t(6_000))
+            .unwrap();
+        {
+            let state = fx.store.inner.lock();
+            assert!(
+                state.presence_memos.is_empty(),
+                "{:#?}",
+                state.presence_memos
+            );
+            assert!(state.presence_memo_order.is_empty());
+        }
+        fx.store
+            .unblock_identity(&fx.mesh, &holder.identity_hash)
+            .unwrap();
+        fx.trust_identity(&holder.identity_hash, t(6_100));
+        assert_eq!(
+            present(&fx, &presenter, instance, holder_row_gone),
+            verdict(Decision::Allow, Rule::IdentityTrusted),
+            "blocking cleared the memo: trusted again, the holder refuses nothing by memory"
+        );
+        assert_eq!(
+            present(&fx, &presenter, instance, t(4_500)),
+            verdict(Decision::Refuse, Rule::IdentityChanged),
+            "its live row refuses again"
+        );
+        assert_eq!(
+            surface.texts().len(),
+            2,
+            "a fresh memo tells the refused key once more: {:#?}",
+            surface.texts()
+        );
+    }
+
+    /// `InstancePresence` that reports every instance as held by one identity, heard at
+    /// t(1 000), while `live`, and nothing once switched off, so the memos can be told from
+    /// the table.
+    struct SwitchablePresence {
+        holder: String,
+        live: AtomicBool,
+    }
+
+    impl InstancePresence for SwitchablePresence {
+        fn heard_rows(&self, name_hash: &str, _now: SystemTime) -> Vec<PresenceRow> {
+            if !self.live.load(Ordering::SeqCst) {
+                return Vec::new();
+            }
+            vec![PresenceRow {
+                destination_hash: format!("{name_hash}{}", &fake_hash(0x7d)[name_hash.len()..]),
+                identity_hash: self.holder.clone(),
+                first_seen: t(1_000),
+            }]
+        }
+    }
+
+    /// Usage probe: the memory's bound seen through the verdict rather than the `State`
+    /// internals. One presenter earns a line for `PRESENCE_SURFACED_CAP` + 1 instances all
+    /// held by one identity trusted for all destinations; the oldest pair is evicted, so with
+    /// the table silent that instance is admitted again while the next-oldest and the newest
+    /// stay refused, and the evicted instance's line can be earned a second time once the
+    /// table holds it again. The file never changes.
+    #[test]
+    fn usage_probe_an_evicted_presence_memory_lifts_its_refusal_and_its_line_can_be_earned_again() {
+        let fx = Fixture::new("trust-probe-presence-cap-through-the-verdict");
+        let surface = Arc::new(RecordingSurface::default());
+        fx.store
+            .attach_surface(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
+        fx.store.set_collision_protection(true);
+        let holder = announced("holder");
+        fx.announce(&holder, t(2_000));
+        fx.trust_identity(&holder.identity_hash, t(3_000));
+        let presenter = announced("presenter");
+        fx.announce(&presenter, t(2_000));
+        fx.trust_identity(&presenter.identity_hash, t(3_000));
+        let presence = Arc::new(SwitchablePresence {
+            holder: holder.identity_hash.clone(),
+            live: AtomicBool::new(true),
+        });
+        fx.store
+            .attach_presence(Arc::downgrade(&presence) as Weak<dyn InstancePresence>);
+        let before = fx.file_bytes().unwrap();
+        let identity = parse_hash(&presenter.identity_hash).unwrap();
+        let instance = |n: usize| {
+            let name = session_destination_name(&format!("cap-{n}"));
+            let bytes: [u8; NAME_HASH_LEN] = name.as_name_hash_slice().try_into().unwrap();
+            (bytes, hex_lower(&bytes))
+        };
+        let judge = |n: usize, now| {
+            let (bytes, hex) = instance(n);
+            let origin = fx.store.authorize_origin_at(&identity, &bytes, now);
+            let outcome = match origin.verdict.decision {
+                Decision::Allow => KeyChangeOutcome::Served,
+                Decision::Refuse => KeyChangeOutcome::Refused,
+            };
+            assert!(
+                fx.store
+                    .note_key_change(&presenter.identity_hash, &hex, outcome, now)
+                    .is_empty()
+            );
+            origin.verdict
+        };
+
+        for n in 0..=PRESENCE_SURFACED_CAP {
+            assert_eq!(
+                judge(n, t(4_000)),
+                verdict(Decision::Refuse, Rule::IdentityChanged),
+                "instance {n}"
+            );
+        }
+        assert_eq!(
+            surface.texts().len(),
+            PRESENCE_SURFACED_CAP + 1,
+            "one line per (instance, holder) pair"
+        );
+
+        presence.live.store(false, Ordering::SeqCst);
+        assert_eq!(
+            judge(0, t(4_100)),
+            verdict(Decision::Allow, Rule::IdentityTrusted),
+            "the oldest pair was evicted at the cap: with the table silent it refuses nobody"
+        );
+        assert_eq!(
+            judge(1, t(4_100)),
+            verdict(Decision::Refuse, Rule::IdentityChanged),
+            "the next-oldest pair is still remembered"
+        );
+        assert_eq!(
+            judge(PRESENCE_SURFACED_CAP, t(4_100)),
+            verdict(Decision::Refuse, Rule::IdentityChanged),
+            "and so is the newest"
+        );
+        assert_eq!(
+            surface.texts().len(),
+            PRESENCE_SURFACED_CAP + 1,
+            "remembered refusals restate nothing"
+        );
+
+        presence.live.store(true, Ordering::SeqCst);
+        assert_eq!(
+            judge(0, t(4_200)),
+            verdict(Decision::Refuse, Rule::IdentityChanged),
+            "heard again, the evicted instance is refused from the table"
+        );
+        assert_eq!(
+            surface.texts().len(),
+            PRESENCE_SURFACED_CAP + 2,
+            "and its line is earned a second time, the dedupe having forgotten it"
+        );
+        presence.live.store(false, Ordering::SeqCst);
+        assert_eq!(
+            judge(0, t(4_300)),
+            verdict(Decision::Refuse, Rule::IdentityChanged),
+            "the re-earned line remembers the pair again"
+        );
+        assert_eq!(
+            judge(1, t(4_300)),
+            verdict(Decision::Allow, Rule::IdentityTrusted),
+            "re-remembering instance 0 evicted the then-oldest pair, instance 1"
+        );
+        assert_eq!(fx.file_bytes().unwrap(), before, "judging writes nothing");
+    }
+
+    /// The owner line is deduped by who is refused, not only by the pair. A stranger
+    /// announcing an instance heard under an identity trusted for all destinations spends
+    /// the pair's one line and arms no memo; a successor trusted for all destinations that
+    /// then presents the instance is refused over the holder's live row, arms the memo and
+    /// still earns its own `error:` line, naming it and its destination's remedy, once:
+    /// presenting again earns nothing, and the holder presenting is admitted and earns
+    /// nothing. A stranger could otherwise spend the line the human needs to see.
+    #[test]
+    fn a_trusted_presenter_the_presence_rung_refuses_earns_its_own_line_after_a_strangers() {
+        let fx = Fixture::new("trust-presence-trusted-presenter-own-line");
+        let surface = Arc::new(RecordingSurface::default());
+        fx.store
+            .attach_surface(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
+        fx.store
+            .attach_presence(Arc::downgrade(&fx.mesh.0) as Weak<dyn InstancePresence>);
+        fx.store.set_collision_protection(true);
+        let holder = announced("alpha");
+        fx.announce(&holder, t(2_000));
+        fx.trust_identity(&holder.identity_hash, t(3_000));
+        let stranger = announced("alpha");
+        fx.announce(&stranger, t(4_000));
+        let name_hash = decode_name_hash(&holder.name_hash).unwrap();
+        let judge = |peer: &Announced, now| {
+            let origin = fx.store.authorize_origin_at(
+                &parse_hash(&peer.identity_hash).unwrap(),
+                &name_hash,
+                now,
+            );
+            let outcome = match origin.verdict.decision {
+                Decision::Allow => KeyChangeOutcome::Served,
+                Decision::Refuse => KeyChangeOutcome::Refused,
+            };
+            assert!(
+                fx.store
+                    .note_key_change(&peer.identity_hash, &peer.name_hash, outcome, now)
+                    .is_empty(),
+                "nothing is marked"
+            );
+            origin.verdict
+        };
+
+        assert_eq!(
+            judge(&stranger, t(4_500)),
+            verdict(Decision::Refuse, Rule::DefaultClosed)
+        );
+        let texts = surface.texts();
+        assert_eq!(texts.len(), 1, "{texts:#?}");
+        assert!(
+            texts[0].starts_with("error: ") && texts[0].contains(&stranger.identity_hash),
+            "{}",
+            texts[0]
+        );
+
+        let successor = announced("alpha");
+        fx.announce(&successor, t(4_550));
+        fx.trust_identity(&successor.identity_hash, t(4_550));
+        let before = fx.file_bytes().unwrap();
+        assert_eq!(
+            judge(&successor, t(4_600)),
+            verdict(Decision::Refuse, Rule::IdentityChanged)
+        );
+        let texts = surface.texts();
+        assert_eq!(texts.len(), 2, "{texts:#?}");
+        assert!(texts[1].starts_with("error: "), "{}", texts[1]);
+        assert!(
+            texts[1].contains(&format!(
+                "presented under identity {}",
+                successor.identity_hash
+            )),
+            "{}",
+            texts[1]
+        );
+        assert!(
+            texts[1].contains(&format!(".mesh trust {}", successor.destination_hash)),
+            "{}",
+            texts[1]
+        );
+        assert!(
+            texts[1].contains(&format!("heard under identity {}", holder.identity_hash)),
+            "{}",
+            texts[1]
+        );
+
+        assert_eq!(
+            judge(&successor, t(4_650)),
+            verdict(Decision::Refuse, Rule::IdentityChanged)
+        );
+        assert_eq!(
+            surface.texts().len(),
+            2,
+            "told once: {:#?}",
+            surface.texts()
+        );
+        assert_eq!(
+            judge(&holder, t(4_650)),
+            verdict(Decision::Allow, Rule::IdentityTrusted),
+            "the first-heard holder is admitted while the successor's row is live"
+        );
+        assert_eq!(
+            surface.texts().len(),
+            2,
+            "the holder earns no line: {:#?}",
+            surface.texts()
+        );
+        assert_eq!(
+            judge(&successor, t(4_550) + PEER_TTL),
+            verdict(Decision::Refuse, Rule::IdentityChanged),
+            "the successor's own refusal armed the memo; every row gone, it still refuses"
+        );
+        assert_eq!(fx.file_bytes().unwrap(), before, "judging writes nothing");
+        assert!(
+            fx.store
+                .records()
+                .iter()
+                .all(|record| record.key_changed.is_none()),
+            "{:#?}",
+            fx.store.records()
+        );
+    }
+
+    /// A presence line the surface drops leaves the refusal standing: the memo the verdict
+    /// armed refuses once the holder's row has aged out just the same, only the dedupe the
+    /// dropped line spent is rolled back, so the next presentation offers the line again.
+    /// Once a surface takes it, the line is surfaced once.
+    #[test]
+    fn a_dropped_presence_line_keeps_the_refusal_and_is_offered_again() {
+        install_log_collector();
+        let fx = Fixture::new("trust-presence-dropped-line-no-memory");
+        let dropping = Arc::new(DroppingSurface);
+        fx.store
+            .attach_surface(Arc::downgrade(&dropping) as Weak<dyn KnockSurface>);
+        fx.store
+            .attach_presence(Arc::downgrade(&fx.mesh.0) as Weak<dyn InstancePresence>);
+        fx.store.set_collision_protection(true);
+        let old = announced("alpha");
+        fx.announce(&old, t(2_000));
+        fx.trust_identity(&old.identity_hash, t(3_000));
+        let new = announced("alpha");
+        fx.announce(&new, t(4_000));
+        fx.trust_identity(&new.identity_hash, t(5_000));
+        let name_hash = decode_name_hash(&new.name_hash).unwrap();
+        let origin = |now| {
+            fx.store
+                .authorize_origin_at(&parse_hash(&new.identity_hash).unwrap(), &name_hash, now)
+                .verdict
+        };
+        let old_row_gone = t(2_000) + PEER_TTL;
+
+        assert_eq!(
+            origin(t(4_500)),
+            verdict(Decision::Refuse, Rule::IdentityChanged)
+        );
+        assert!(
+            fx.store
+                .note_key_change(
+                    &new.identity_hash,
+                    &new.name_hash,
+                    KeyChangeOutcome::Refused,
+                    t(4_500),
+                )
+                .is_empty()
+        );
+        assert!(
+            warn_snapshot().iter().any(|line| line.contains(
+                "was dropped; nothing is marked, the refusal stands and the notice is offered again"
+            )),
+            "{:#?}",
+            warn_snapshot()
+        );
+        assert_eq!(
+            origin(t(4_500)),
+            verdict(Decision::Refuse, Rule::IdentityChanged),
+            "the live row still refuses"
+        );
+        assert_eq!(
+            origin(old_row_gone),
+            verdict(Decision::Refuse, Rule::IdentityChanged),
+            "the dropped line took nothing from the refusal"
+        );
+        {
+            let state = fx.store.inner.lock();
+            assert_eq!(
+                state.presence_memos.get(new.name_hash.as_str()),
+                Some(&PresenceMemo {
+                    holder: old.identity_hash.clone(),
+                    refused: BTreeSet::from([new.identity_hash.clone()]),
+                    told: BTreeSet::new(),
+                }),
+                "the memo stands, its line untold"
+            );
+            assert!(state.presence_surfaced.is_empty());
+            assert!(state.presence_surfaced_order.is_empty());
+        }
+
+        let surface = Arc::new(RecordingSurface::default());
+        fx.store
+            .attach_surface(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
+        assert!(
+            fx.store
+                .note_key_change(
+                    &new.identity_hash,
+                    &new.name_hash,
+                    KeyChangeOutcome::Refused,
+                    t(4_600),
+                )
+                .is_empty()
+        );
+        let texts = surface.texts();
+        assert_eq!(texts.len(), 1, "{texts:#?}");
+        assert!(
+            texts[0].starts_with("error: ") && texts[0].contains(&new.identity_hash),
+            "{}",
+            texts[0]
+        );
+        assert_eq!(
+            origin(old_row_gone),
+            verdict(Decision::Refuse, Rule::IdentityChanged),
+            "surfaced or not, the refusal stands"
+        );
+        assert!(
+            fx.store
+                .note_key_change(
+                    &new.identity_hash,
+                    &new.name_hash,
+                    KeyChangeOutcome::Refused,
+                    t(4_700),
+                )
+                .is_empty()
+        );
+        assert_eq!(surface.texts().len(), 1, "{:#?}", surface.texts());
+    }
+
+    /// Judges `peer` presenting `name_hash` the way every ingress path does: the verdict,
+    /// then `note_key_change` with the outcome that verdict earns. A presence-only
+    /// collision marks nothing whichever way it goes.
+    fn present(fx: &Fixture, peer: &Announced, name_hash: &str, now: SystemTime) -> Verdict {
+        let bytes = decode_name_hash(name_hash).unwrap();
+        let origin =
+            fx.store
+                .authorize_origin_at(&parse_hash(&peer.identity_hash).unwrap(), &bytes, now);
+        let outcome = match origin.verdict.decision {
+            Decision::Allow => KeyChangeOutcome::Served,
+            Decision::Refuse => KeyChangeOutcome::Refused,
+        };
+        assert!(
+            fx.store
+                .note_key_change(&peer.identity_hash, name_hash, outcome, now)
+                .is_empty(),
+            "a presence-only collision marks nothing"
+        );
+        origin.verdict
+    }
+
+    /// The destination `peer`'s identity derives for `name_hash`: what the owner line's
+    /// `.mesh trust` remedy names.
+    fn destination_for(peer: &Announced, name_hash: &str) -> String {
+        destination_address(
+            &decode_name_hash(name_hash).unwrap(),
+            &parse_hash(&peer.identity_hash).unwrap(),
+        )
+        .to_hex_string()
+    }
+
+    /// The own-line dedupe is per refused presenter: two identities trusted for all
+    /// destinations that each present an instance held by a third are each told once,
+    /// naming themselves and their own destination's remedy, and presenting again earns
+    /// neither a second line. A stranger or a destination-tier identity presenting the
+    /// instance after them shares the pair's line, which the first detection already
+    /// spent, so they add nothing. The memory outlives the holder's row for both refused
+    /// keys and never refuses the holder; `trust.yaml` is left byte for byte.
+    #[test]
+    fn usage_probe_each_trusted_for_all_presenter_the_rung_refuses_is_told_once_and_later_presenters_add_nothing()
+     {
+        let fx = Fixture::new("trust-probe-presence-own-line-per-presenter");
+        let surface = Arc::new(RecordingSurface::default());
+        fx.store
+            .attach_surface(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
+        fx.store
+            .attach_presence(Arc::downgrade(&fx.mesh.0) as Weak<dyn InstancePresence>);
+        fx.store.set_collision_protection(true);
+        let holder = announced("alpha");
+        fx.announce(&holder, t(2_000));
+        fx.trust_identity(&holder.identity_hash, t(3_000));
+        // Two more identities trusted for all destinations, heard under their own
+        // instances, and one trusted for its own destination only.
+        let first = announced("beta");
+        fx.announce(&first, t(2_000));
+        fx.trust_identity(&first.identity_hash, t(3_000));
+        let second = announced("gamma");
+        fx.announce(&second, t(2_000));
+        fx.trust_identity(&second.identity_hash, t(3_000));
+        let destination_tier = announced("delta");
+        fx.announce(&destination_tier, t(2_000));
+        assert_eq!(
+            fx.trust_destination(&destination_tier, t(3_000)),
+            TrustChange::Added
+        );
+        let stranger = announced("alpha");
+        let before = fx.file_bytes().unwrap();
+        let instance = holder.name_hash.as_str();
+
+        assert_eq!(
+            present(&fx, &first, instance, t(4_500)),
+            verdict(Decision::Refuse, Rule::IdentityChanged)
+        );
+        let texts = surface.texts();
+        assert_eq!(texts.len(), 1, "{texts:#?}");
+        assert!(
+            texts[0].starts_with("error: ")
+                && texts[0].contains(&format!("presented under identity {}", first.identity_hash))
+                && texts[0].contains(&format!(
+                    ".mesh trust {}",
+                    destination_for(&first, instance)
+                )),
+            "{}",
+            texts[0]
+        );
+
+        assert_eq!(
+            present(&fx, &second, instance, t(4_600)),
+            verdict(Decision::Refuse, Rule::IdentityChanged)
+        );
+        let texts = surface.texts();
+        assert_eq!(
+            texts.len(),
+            2,
+            "the second refused key earns its own line: {texts:#?}"
+        );
+        assert!(
+            texts[1].starts_with("error: ")
+                && texts[1].contains(&format!(
+                    "presented under identity {}",
+                    second.identity_hash
+                ))
+                && texts[1].contains(&format!(
+                    ".mesh trust {}",
+                    destination_for(&second, instance)
+                ))
+                && !texts[1].contains(&first.identity_hash),
+            "{}",
+            texts[1]
+        );
+
+        assert_eq!(
+            present(&fx, &first, instance, t(4_650)),
+            verdict(Decision::Refuse, Rule::IdentityChanged)
+        );
+        assert_eq!(
+            present(&fx, &second, instance, t(4_650)),
+            verdict(Decision::Refuse, Rule::IdentityChanged)
+        );
+        assert_eq!(
+            surface.texts().len(),
+            2,
+            "each refused key is told once: {:#?}",
+            surface.texts()
+        );
+
+        assert_eq!(
+            present(&fx, &stranger, instance, t(4_680)),
+            verdict(Decision::Refuse, Rule::DefaultClosed)
+        );
+        assert_eq!(
+            present(&fx, &destination_tier, instance, t(4_680)),
+            verdict(Decision::Refuse, Rule::DefaultClosed),
+            "a known identity with no allow of its own still knocks for a presence-only instance"
+        );
+        assert_eq!(
+            surface.texts().len(),
+            2,
+            "a stranger and a destination-tier identity share the pair's spent line: {:#?}",
+            surface.texts()
+        );
+
+        let holder_row_gone = t(2_000) + PEER_TTL;
+        assert_eq!(
+            present(&fx, &first, instance, holder_row_gone),
+            verdict(Decision::Refuse, Rule::IdentityChanged),
+            "the first refused key stays refused from the memory"
+        );
+        assert_eq!(
+            present(&fx, &second, instance, holder_row_gone),
+            verdict(Decision::Refuse, Rule::IdentityChanged),
+            "and so does the second"
+        );
+        assert_eq!(
+            present(&fx, &holder, instance, holder_row_gone),
+            verdict(Decision::Allow, Rule::IdentityTrusted),
+            "the memory never refuses the holder it names"
+        );
+        assert_eq!(surface.texts().len(), 2, "{:#?}", surface.texts());
+        assert_eq!(fx.file_bytes().unwrap(), before, "judging writes nothing");
+        assert!(
+            fx.store
+                .records()
+                .iter()
+                .all(|record| record.key_changed.is_none()),
+            "{:#?}",
+            fx.store.records()
+        );
+    }
+
+    /// A refused key's own line that the surface drops is offered again, while the shared
+    /// line a stranger already spent and the memo the refusal armed both stand: the
+    /// roll-back undoes only the dedupe the dropped detection added. Once a surface takes
+    /// the line it is told once.
+    #[test]
+    fn usage_probe_a_dropped_own_line_after_a_strangers_keeps_the_refusal_and_is_offered_again() {
+        install_log_collector();
+        let fx = Fixture::new("trust-probe-presence-dropped-own-line");
+        let recording = Arc::new(RecordingSurface::default());
+        fx.store
+            .attach_surface(Arc::downgrade(&recording) as Weak<dyn KnockSurface>);
+        fx.store
+            .attach_presence(Arc::downgrade(&fx.mesh.0) as Weak<dyn InstancePresence>);
+        fx.store.set_collision_protection(true);
+        let holder = announced("alpha");
+        fx.announce(&holder, t(2_000));
+        fx.trust_identity(&holder.identity_hash, t(3_000));
+        let refused = announced("beta");
+        fx.announce(&refused, t(2_000));
+        fx.trust_identity(&refused.identity_hash, t(3_000));
+        let stranger = announced("alpha");
+        let before = fx.file_bytes().unwrap();
+        let instance = holder.name_hash.as_str();
+        let holder_row_gone = t(2_000) + PEER_TTL;
+
+        assert_eq!(
+            present(&fx, &stranger, instance, t(4_500)),
+            verdict(Decision::Refuse, Rule::DefaultClosed)
+        );
+        assert_eq!(recording.texts().len(), 1, "{:#?}", recording.texts());
+
+        let dropping = Arc::new(DroppingSurface);
+        fx.store
+            .attach_surface(Arc::downgrade(&dropping) as Weak<dyn KnockSurface>);
+        assert_eq!(
+            present(&fx, &refused, instance, t(4_600)),
+            verdict(Decision::Refuse, Rule::IdentityChanged)
+        );
+        assert!(
+            warn_snapshot().iter().any(|line| line.contains(
+                "was dropped; nothing is marked, the refusal stands and the notice is offered again"
+            )),
+            "{:#?}",
+            warn_snapshot()
+        );
+        assert_eq!(
+            present(&fx, &refused, instance, holder_row_gone),
+            verdict(Decision::Refuse, Rule::IdentityChanged),
+            "the refusal armed the memo; the dropped line did not disarm it"
+        );
+
+        fx.store
+            .attach_surface(Arc::downgrade(&recording) as Weak<dyn KnockSurface>);
+        assert_eq!(
+            present(&fx, &refused, instance, t(4_650)),
+            verdict(Decision::Refuse, Rule::IdentityChanged)
+        );
+        let texts = recording.texts();
+        assert_eq!(
+            texts.len(),
+            2,
+            "the dropped line is offered again: {texts:#?}"
+        );
+        assert!(
+            texts[1].starts_with("error: ")
+                && texts[1].contains(&format!(
+                    "presented under identity {}",
+                    refused.identity_hash
+                )),
+            "{}",
+            texts[1]
+        );
+        assert_eq!(
+            present(&fx, &refused, instance, t(4_680)),
+            verdict(Decision::Refuse, Rule::IdentityChanged)
+        );
+        assert_eq!(
+            recording.texts().len(),
+            2,
+            "told once: {:#?}",
+            recording.texts()
+        );
+        assert_eq!(fx.file_bytes().unwrap(), before, "judging writes nothing");
+    }
+
+    /// A presence line with no surface attached to take it leaves the refusal standing
+    /// too: the pair and the presenter's own line are rolled back as for a dropped line,
+    /// the memo stands, so the verdict refuses once the holder's row has aged out, and the
+    /// line is offered again, once, when a surface is attached.
+    #[test]
+    fn a_presence_line_with_nothing_attached_keeps_the_refusal_and_is_offered_again() {
+        let fx = Fixture::new("trust-presence-no-surface-no-memory");
+        fx.store
+            .attach_presence(Arc::downgrade(&fx.mesh.0) as Weak<dyn InstancePresence>);
+        fx.store.set_collision_protection(true);
+        let old = announced("alpha");
+        fx.announce(&old, t(2_000));
+        fx.trust_identity(&old.identity_hash, t(3_000));
+        let new = announced("alpha");
+        fx.announce(&new, t(4_000));
+        fx.trust_identity(&new.identity_hash, t(5_000));
+        let before = fx.file_bytes().unwrap();
+        let instance = new.name_hash.as_str();
+        let old_row_gone = t(2_000) + PEER_TTL;
+
+        assert_eq!(
+            present(&fx, &new, instance, t(4_500)),
+            verdict(Decision::Refuse, Rule::IdentityChanged),
+            "the live row refuses"
+        );
+        {
+            let state = fx.store.inner.lock();
+            assert!(state.presence_surfaced.is_empty());
+            assert!(state.presence_surfaced_order.is_empty());
+            assert_eq!(
+                state.presence_memos.get(instance),
+                Some(&PresenceMemo {
+                    holder: old.identity_hash.clone(),
+                    refused: BTreeSet::from([new.identity_hash.clone()]),
+                    told: BTreeSet::new(),
+                })
+            );
+        }
+        assert_eq!(
+            present(&fx, &new, instance, old_row_gone),
+            verdict(Decision::Refuse, Rule::IdentityChanged),
+            "a line nothing took changes nothing about the refusal"
+        );
+
+        let surface = Arc::new(RecordingSurface::default());
+        fx.store
+            .attach_surface(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
+        assert_eq!(
+            present(&fx, &new, instance, t(4_600)),
+            verdict(Decision::Refuse, Rule::IdentityChanged)
+        );
+        let texts = surface.texts();
+        assert_eq!(texts.len(), 1, "{texts:#?}");
+        assert!(
+            texts[0].starts_with("error: ") && texts[0].contains(&new.identity_hash),
+            "{}",
+            texts[0]
+        );
+        assert_eq!(
+            present(&fx, &new, instance, old_row_gone),
+            verdict(Decision::Refuse, Rule::IdentityChanged),
+            "the memo refuses as before"
+        );
+        assert_eq!(surface.texts().len(), 1, "{:#?}", surface.texts());
+        assert_eq!(fx.file_bytes().unwrap(), before, "judging writes nothing");
+    }
+
+    /// A presenter the memo alone refuses still earns its own line: a first key trusted
+    /// for all destinations was refused over the holder's live row and armed the memo, the
+    /// human then trusted a newcomer for all destinations after the row aged out, and the
+    /// newcomer's first refused presentation names it and `.mesh trust <its destination>`
+    /// with the holder's destination derived again, since no row remains. Presenting again
+    /// adds nothing.
+    #[test]
+    fn a_presenter_refused_by_memory_alone_still_earns_its_own_line() {
+        let fx = Fixture::new("trust-presence-memory-only-own-line");
+        let surface = Arc::new(RecordingSurface::default());
+        fx.store
+            .attach_surface(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
+        fx.store
+            .attach_presence(Arc::downgrade(&fx.mesh.0) as Weak<dyn InstancePresence>);
+        fx.store.set_collision_protection(true);
+        let holder = announced("alpha");
+        fx.announce(&holder, t(2_000));
+        fx.trust_identity(&holder.identity_hash, t(3_000));
+        let first = announced("beta");
+        fx.announce(&first, t(2_000));
+        fx.trust_identity(&first.identity_hash, t(3_000));
+        let newcomer = announced("alpha");
+        let instance = holder.name_hash.as_str();
+        let holder_row_gone = t(2_000) + PEER_TTL;
+
+        assert_eq!(
+            present(&fx, &first, instance, t(4_500)),
+            verdict(Decision::Refuse, Rule::IdentityChanged)
+        );
+        assert_eq!(surface.texts().len(), 1, "{:#?}", surface.texts());
+
+        fx.trust_identity(&newcomer.identity_hash, holder_row_gone);
+        let before = fx.file_bytes().unwrap();
+        assert_eq!(
+            present(&fx, &newcomer, instance, holder_row_gone),
+            verdict(Decision::Refuse, Rule::IdentityChanged),
+            "the memo refuses with the holder's row gone"
+        );
+        let texts = surface.texts();
+        assert_eq!(
+            texts.len(),
+            2,
+            "the refused key earns its own line from the memory: {texts:#?}"
+        );
+        assert!(
+            texts[1].starts_with("error: ")
+                && texts[1].contains(&format!(
+                    "presented under identity {}",
+                    newcomer.identity_hash
+                ))
+                && texts[1].contains(&holder.identity_hash)
+                && texts[1].contains(&format!(
+                    "instance {} was heard",
+                    short(&holder.destination_hash)
+                ))
+                && texts[1].contains(&format!(
+                    ".mesh trust {}",
+                    destination_for(&newcomer, instance)
+                )),
+            "{}",
+            texts[1]
+        );
+
+        assert_eq!(
+            present(&fx, &newcomer, instance, holder_row_gone + PEER_TTL),
+            verdict(Decision::Refuse, Rule::IdentityChanged)
+        );
+        assert_eq!(
+            surface.texts().len(),
+            2,
+            "told once: {:#?}",
+            surface.texts()
+        );
+        assert_eq!(fx.file_bytes().unwrap(), before, "judging writes nothing");
+        assert!(
+            fx.store
+                .records()
+                .iter()
+                .all(|record| record.key_changed.is_none()),
+            "{:#?}",
+            fx.store.records()
+        );
+    }
+
+    /// A line the memo alone earns, once the holder's row is gone, rolls back only what
+    /// its own detection recorded when the surface drops it: the memo a first refused key
+    /// armed stands, so the refusal holds, and the newcomer's own line is offered again
+    /// until a surface takes it, then told once, with the holder's destination derived
+    /// from the instance and the remembered identity. Nothing is re-seeded by that line:
+    /// the memo still names one holder in one order slot. The holder itself and a stranger
+    /// presenting the instance after the row is gone are judged by their grants and add
+    /// nothing.
+    #[test]
+    fn usage_probe_a_dropped_memory_only_own_line_keeps_the_memory_and_is_offered_again() {
+        install_log_collector();
+        let fx = Fixture::new("trust-probe-presence-memory-only-dropped-own-line");
+        let recording = Arc::new(RecordingSurface::default());
+        fx.store
+            .attach_surface(Arc::downgrade(&recording) as Weak<dyn KnockSurface>);
+        fx.store
+            .attach_presence(Arc::downgrade(&fx.mesh.0) as Weak<dyn InstancePresence>);
+        fx.store.set_collision_protection(true);
+        let holder = announced("alpha");
+        fx.announce(&holder, t(2_000));
+        fx.trust_identity(&holder.identity_hash, t(3_000));
+        let first = announced("beta");
+        fx.announce(&first, t(2_000));
+        fx.trust_identity(&first.identity_hash, t(3_000));
+        let newcomer = announced("alpha");
+        let instance = holder.name_hash.as_str();
+        let holder_row_gone = t(2_000) + PEER_TTL;
+
+        assert_eq!(
+            present(&fx, &first, instance, t(4_500)),
+            verdict(Decision::Refuse, Rule::IdentityChanged)
+        );
+        assert_eq!(recording.texts().len(), 1, "{:#?}", recording.texts());
+
+        fx.trust_identity(&newcomer.identity_hash, holder_row_gone);
+        let before = fx.file_bytes().unwrap();
+        let dropping = Arc::new(DroppingSurface);
+        fx.store
+            .attach_surface(Arc::downgrade(&dropping) as Weak<dyn KnockSurface>);
+        for at in [holder_row_gone, holder_row_gone + PEER_TTL] {
+            assert_eq!(
+                present(&fx, &newcomer, instance, at),
+                verdict(Decision::Refuse, Rule::IdentityChanged),
+                "the memo refuses with the holder's row gone"
+            );
+            let state = fx.store.inner.lock();
+            assert_eq!(
+                state.presence_memos.get(instance),
+                Some(&PresenceMemo {
+                    holder: holder.identity_hash.clone(),
+                    refused: BTreeSet::from([
+                        first.identity_hash.clone(),
+                        newcomer.identity_hash.clone()
+                    ]),
+                    told: BTreeSet::from([first.identity_hash.clone()]),
+                }),
+                "the memo stands and the dropped own line is not told"
+            );
+            assert_eq!(state.presence_memo_order.len(), 1);
+            assert_eq!(state.presence_surfaced_order.len(), 1);
+        }
+        assert!(
+            warn_snapshot().iter().any(|line| line.contains(
+                "was dropped; nothing is marked, the refusal stands and the notice is offered again"
+            )),
+            "{:#?}",
+            warn_snapshot()
+        );
+
+        fx.store
+            .attach_surface(Arc::downgrade(&recording) as Weak<dyn KnockSurface>);
+        assert_eq!(
+            present(&fx, &newcomer, instance, holder_row_gone + 2 * PEER_TTL),
+            verdict(Decision::Refuse, Rule::IdentityChanged)
+        );
+        let texts = recording.texts();
+        assert_eq!(texts.len(), 2, "offered again: {texts:#?}");
+        assert!(
+            texts[1].starts_with("error: ")
+                && texts[1].contains(&format!(
+                    "instance {} was heard under identity {}",
+                    short(&holder.destination_hash),
+                    holder.identity_hash
+                ))
+                && texts[1].contains(&format!(
+                    "presented under identity {}",
+                    newcomer.identity_hash
+                ))
+                && texts[1].contains(&format!(
+                    ".mesh trust {}",
+                    destination_for(&newcomer, instance)
+                ))
+                && texts[1].contains(&format!(".mesh block {}", newcomer.identity_hash)),
+            "{}",
+            texts[1]
+        );
+        {
+            let state = fx.store.inner.lock();
+            assert_eq!(
+                state.presence_memos.get(instance),
+                Some(&PresenceMemo {
+                    holder: holder.identity_hash.clone(),
+                    refused: BTreeSet::from([
+                        first.identity_hash.clone(),
+                        newcomer.identity_hash.clone()
+                    ]),
+                    told: BTreeSet::from([
+                        first.identity_hash.clone(),
+                        newcomer.identity_hash.clone()
+                    ]),
+                }),
+                "nothing is re-seeded"
+            );
+            assert_eq!(state.presence_memo_order.len(), 1);
+            assert_eq!(state.presence_surfaced_order.len(), 1);
+        }
+        assert_eq!(
+            present(&fx, &newcomer, instance, holder_row_gone + 3 * PEER_TTL),
+            verdict(Decision::Refuse, Rule::IdentityChanged)
+        );
+        assert_eq!(recording.texts().len(), 2, "told once");
+
+        assert_eq!(
+            present(&fx, &holder, instance, holder_row_gone + 3 * PEER_TTL),
+            verdict(Decision::Allow, Rule::IdentityTrusted),
+            "the memo never refuses the holder it names"
+        );
+        let late_stranger = announced("alpha");
+        assert_eq!(
+            present(
+                &fx,
+                &late_stranger,
+                instance,
+                holder_row_gone + 3 * PEER_TTL
+            ),
+            verdict(Decision::Refuse, Rule::DefaultClosed)
+        );
+        assert_eq!(
+            recording.texts().len(),
+            2,
+            "the holder and a late stranger add nothing: {:#?}",
+            recording.texts()
+        );
+        assert_eq!(fx.file_bytes().unwrap(), before, "judging writes nothing");
+    }
+
+    /// A surface that was attached and has since gone away is no surface: the line
+    /// reaches nobody, so the pair and the own line are rolled back as with nothing
+    /// attached, the memo stands and the verdict refuses once the row has aged out, and a
+    /// surface attached later is offered the line on the next presentation.
+    #[test]
+    fn usage_probe_a_surface_that_went_away_takes_no_line_and_keeps_the_refusal() {
+        install_log_collector();
+        let fx = Fixture::new("trust-probe-presence-surface-went-away");
+        fx.store
+            .attach_presence(Arc::downgrade(&fx.mesh.0) as Weak<dyn InstancePresence>);
+        fx.store.set_collision_protection(true);
+        let gone = Arc::new(RecordingSurface::default());
+        fx.store
+            .attach_surface(Arc::downgrade(&gone) as Weak<dyn KnockSurface>);
+        drop(gone);
+        let old = announced("alpha");
+        fx.announce(&old, t(2_000));
+        fx.trust_identity(&old.identity_hash, t(3_000));
+        let new = announced("alpha");
+        fx.announce(&new, t(4_000));
+        fx.trust_identity(&new.identity_hash, t(5_000));
+        let before = fx.file_bytes().unwrap();
+        let instance = new.name_hash.as_str();
+        let old_row_gone = t(2_000) + PEER_TTL;
+
+        assert_eq!(
+            present(&fx, &new, instance, t(4_500)),
+            verdict(Decision::Refuse, Rule::IdentityChanged),
+            "the live row refuses"
+        );
+        {
+            let state = fx.store.inner.lock();
+            assert!(state.presence_surfaced.is_empty());
+            assert!(state.presence_surfaced_order.is_empty());
+            assert_eq!(
+                state.presence_memos.get(instance),
+                Some(&PresenceMemo {
+                    holder: old.identity_hash.clone(),
+                    refused: BTreeSet::from([new.identity_hash.clone()]),
+                    told: BTreeSet::new(),
+                })
+            );
+        }
+        let dropped = format!("notice for {} was dropped", short(&old.destination_hash));
+        assert!(
+            !warn_snapshot().iter().any(|line| line.contains(&dropped)),
+            "nothing attached is not a drop: {:#?}",
+            warn_snapshot()
+        );
+        assert_eq!(
+            present(&fx, &new, instance, old_row_gone),
+            verdict(Decision::Refuse, Rule::IdentityChanged),
+            "a line nobody could see took nothing from the refusal"
+        );
+
+        let surface = Arc::new(RecordingSurface::default());
+        fx.store
+            .attach_surface(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
+        assert_eq!(
+            present(&fx, &new, instance, t(4_600)),
+            verdict(Decision::Refuse, Rule::IdentityChanged)
+        );
+        assert_eq!(surface.texts().len(), 1, "{:#?}", surface.texts());
+        assert_eq!(
+            present(&fx, &new, instance, old_row_gone),
+            verdict(Decision::Refuse, Rule::IdentityChanged),
+            "the memo refuses as before"
+        );
+        assert_eq!(fx.file_bytes().unwrap(), before, "judging writes nothing");
+    }
+
+    /// With `collision_protection` off the own-line rule is not applied: the pair's one
+    /// warning is all the human hears, so once a stranger has spent it an identity trusted
+    /// for all destinations presenting the same instance is served and told nothing, and
+    /// so is the next such identity; no memo is armed, a served presentation being no
+    /// refusal, and nothing is written.
+    #[test]
+    fn usage_probe_with_protection_off_a_trusted_for_all_presenter_after_a_stranger_adds_no_line() {
+        let fx = Fixture::new("trust-probe-presence-protection-off-no-own-line");
+        let surface = Arc::new(RecordingSurface::default());
+        fx.store
+            .attach_surface(Arc::downgrade(&surface) as Weak<dyn KnockSurface>);
+        fx.store
+            .attach_presence(Arc::downgrade(&fx.mesh.0) as Weak<dyn InstancePresence>);
+        let holder = announced("alpha");
+        fx.announce(&holder, t(2_000));
+        fx.trust_identity(&holder.identity_hash, t(3_000));
+        let first = announced("beta");
+        fx.announce(&first, t(2_000));
+        fx.trust_identity(&first.identity_hash, t(3_000));
+        let second = announced("gamma");
+        fx.announce(&second, t(2_000));
+        fx.trust_identity(&second.identity_hash, t(3_000));
+        let stranger = announced("alpha");
+        let before = fx.file_bytes().unwrap();
+        let instance = holder.name_hash.as_str();
+
+        assert_eq!(
+            present(&fx, &stranger, instance, t(4_500)),
+            verdict(Decision::Refuse, Rule::DefaultClosed)
+        );
+        assert_eq!(surface.texts().len(), 1, "{:#?}", surface.texts());
+
+        for (peer, at) in [(&first, t(4_600)), (&second, t(4_650)), (&first, t(4_690))] {
+            assert_eq!(
+                present(&fx, peer, instance, at),
+                verdict(Decision::Allow, Rule::IdentityTrusted),
+                "protection off serves"
+            );
+            assert_eq!(
+                surface.texts().len(),
+                1,
+                "one line per pair, no own line: {:#?}",
+                surface.texts()
+            );
+        }
+        {
+            let state = fx.store.inner.lock();
+            assert!(
+                state.presence_memos.is_empty(),
+                "{:#?}",
+                state.presence_memos
+            );
+            assert!(state.presence_memo_order.is_empty());
+            assert!(
+                state
+                    .presence_surfaced
+                    .contains(&(instance.to_string(), holder.identity_hash.clone()))
+            );
+        }
+        assert_eq!(fx.file_bytes().unwrap(), before, "judging writes nothing");
     }
 }

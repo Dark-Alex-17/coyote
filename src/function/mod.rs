@@ -88,13 +88,13 @@ impl BinaryType<'_> {
 /// `<NAME>_ROOT_DIR` is the canonical process cwd; when that cannot be
 /// resolved it is emitted empty so an inherited value is still overridden
 /// and `tools.py` refuses every path.
-/// `<NAME>_DENY_DIRS` names Coyote's own config, cache, workspace config,
-/// functions, rags, macros, roles, hooks, skills and sessions dirs plus the
-/// config, env, messages and log files and the log's rotated generations
-/// (each relocatable through its own env var, so it may sit inside the cwd
-/// outside every denied dir), joined with the platform path-list
-/// separator. An entry that cannot be canonicalized is passed as
-/// configured, so `tools.py` still sees it.
+/// `<NAME>_DENY_DIRS` names Coyote's own config, cache, workspace config
+/// (under every name it goes by), functions, rags, macros, roles, hooks,
+/// skills and sessions dirs plus the config, env, messages and log files
+/// and the log's rotated generations (each relocatable through its own env
+/// var, so it may sit inside the cwd outside every denied dir), joined with
+/// the platform path-list separator. An entry that cannot be canonicalized
+/// is passed as configured, so `tools.py` still sees it.
 pub(crate) fn builtin_agent_env(agent_name: Option<&str>) -> Vec<(String, String)> {
     let Some(canonical) = agent_name.and_then(crate::config::reserved_agent) else {
         return Vec::new();
@@ -108,10 +108,9 @@ pub(crate) fn builtin_agent_env(agent_name: Option<&str>) -> Vec<(String, String
         .map(|path| path.display().to_string())
         .unwrap_or_default();
     let log_path = paths::log_config().ok().and_then(|(_, path)| path);
-    let mut deny_paths = vec![
-        paths::config_dir(),
-        paths::cache_dir(),
-        paths::workspace_config_dir(),
+    let mut deny_paths = vec![paths::config_dir(), paths::cache_dir()];
+    deny_paths.extend(paths::workspace_config_dir_paths());
+    deny_paths.extend([
         paths::config_file(),
         paths::env_file(),
         paths::functions_dir(),
@@ -122,7 +121,7 @@ pub(crate) fn builtin_agent_env(agent_name: Option<&str>) -> Vec<(String, String
         paths::skills_dir(),
         crate::config::default_sessions_dir(),
         crate::config::default_messages_file(),
-    ];
+    ]);
     if let Some(log) = log_path {
         deny_paths.extend(paths::log_archive_files(&log));
         deny_paths.push(log);
@@ -3009,7 +3008,7 @@ fn polyfill_cmd_name<T: AsRef<Path>>(cmd_name: &str, bin_dir: &[T]) -> String {
 // Polling tools are expected to repeat with identical arguments (status probes,
 // list views, inbox checks); recording them would also let them break up
 // detection of a real loop in the calls they interleave with.
-const LOOP_TRACKER_EXEMPT_TOOLS: [&str; 9] = [
+const LOOP_TRACKER_EXEMPT_TOOLS: [&str; 10] = [
     "job__check",
     "job__list",
     "agent__check",
@@ -3019,6 +3018,7 @@ const LOOP_TRACKER_EXEMPT_TOOLS: [&str; 9] = [
     "mesh__check_inbox",
     "mesh__collect",
     "mesh__peers",
+    "mesh__list",
 ];
 
 fn is_loop_tracker_exempt(name: &str) -> bool {
@@ -3914,10 +3914,11 @@ mod tests {
             "mesh__check_inbox",
             "mesh__collect",
             "mesh__peers",
+            "mesh__list",
         ]
         .into_iter()
         .collect();
-        assert_eq!(LOOP_TRACKER_EXEMPT_TOOLS.len(), 9);
+        assert_eq!(LOOP_TRACKER_EXEMPT_TOOLS.len(), 10);
         assert_eq!(actual, expected);
     }
 
@@ -5650,10 +5651,19 @@ mod tests {
                 crate::testing::EnvVarGuard::set(get_env_name("messages_file"), &messages);
             let archives = paths::log_archive_files(&log_path);
             assert_eq!(paths::workspace_config_dir(), workspace);
+            let default_workspace = env::current_dir()
+                .unwrap()
+                .join(crate::config::WORKSPACE_COYOTE_DIR_NAME);
+            assert_eq!(
+                paths::workspace_config_dir_paths(),
+                [workspace.clone(), default_workspace.clone()],
+                "an overridden workspace config dir is denied under both its names"
+            );
             let mut deny_paths = vec![
                 &guard.path,
                 &cache,
                 &workspace,
+                &default_workspace,
                 &config_file,
                 &env_file,
                 &functions,
@@ -5705,6 +5715,8 @@ mod tests {
                         dunce::canonicalize(&guard.path).unwrap(),
                         paths::cache_dir(),
                         workspace,
+                        dunce::canonicalize(&default_workspace)
+                            .unwrap_or_else(|_| default_workspace.clone()),
                         config_file,
                         env_file,
                         functions,

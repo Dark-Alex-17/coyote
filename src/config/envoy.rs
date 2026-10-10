@@ -690,6 +690,62 @@ mod tests {
     }
 
     #[test]
+    fn embedded_instructions_tell_the_envoy_how_to_refuse_a_file_request() {
+        let instructions = &embedded_config()
+            .expect("embedded config parses")
+            .instructions;
+        for expected in [
+            crate::config::mesh_envoy::REFUSAL_MARKER,
+            "/access",
+            "mesh__request_access",
+            "never attempted and never escalated",
+        ] {
+            assert!(instructions.contains(expected), "{instructions}");
+        }
+        let marker_lines = instructions
+            .lines()
+            .filter(|line| line.contains(crate::config::mesh_envoy::REFUSAL_MARKER))
+            .count();
+        assert_eq!(marker_lines, 1, "{instructions}");
+    }
+
+    /// The shipped instructions keep the escalation rule but no longer ask the envoy to
+    /// tell the peer an answer will follow: the runner says that on the wire itself, and
+    /// an envoy writing the sentence as its final text would ship it as an answer. The
+    /// one "tell the peer" left is the `/access` redirect.
+    #[test]
+    fn usage_probe_embedded_instructions_leave_telling_the_peer_to_the_runner() {
+        let instructions = &embedded_config()
+            .expect("embedded config parses")
+            .instructions;
+        let escalation_line = instructions
+            .lines()
+            .find(|line| line.contains("escalate to the user"))
+            .unwrap_or_else(|| panic!("no escalation line in {instructions}"));
+        assert!(
+            escalation_line.contains("the peer is told automatically that an answer will follow"),
+            "{escalation_line}"
+        );
+        assert!(
+            escalation_line.contains("do not decide"),
+            "{escalation_line}"
+        );
+        assert!(
+            !instructions.contains("tell the peer an answer will follow"),
+            "{instructions}"
+        );
+        let tell_the_peer: Vec<&str> = instructions
+            .lines()
+            .filter(|line| line.contains("tell the peer"))
+            .collect();
+        assert_eq!(tell_the_peer.len(), 1, "{tell_the_peer:?}");
+        assert!(
+            tell_the_peer[0].contains("ask via /access"),
+            "{tell_the_peer:?}"
+        );
+    }
+
+    #[test]
     fn embedded_assets_ship_no_hooks_or_graph() {
         let mut files: Vec<String> = EnvoyAssets::iter()
             .map(|f| f.as_ref().to_string())

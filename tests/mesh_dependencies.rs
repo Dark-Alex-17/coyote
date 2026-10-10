@@ -615,11 +615,10 @@ fn the_release_gate_names_every_obligation_notice_records() {
 }
 
 // ---------------------------------------------------------------------------
-// Usage-probe tests for the crates.io pin (TASK-063). Each pins one promise the
-// task made about the tree as a consumer meets it: `cargo build --locked` pulls
-// nothing from git, the release is the one the stamp API needs, the guide no
-// longer describes a pin that is gone, and the merge gate's mechanism check can
-// actually go red.
+// Tests for the crates.io pin. Each holds one promise it makes about the tree
+// as a consumer meets it: `cargo build --locked` pulls nothing from git, the
+// release is the one the stamp API needs, the guide no longer describes a git
+// pin that is gone, and the merge gate's mechanism check can actually go red.
 // ---------------------------------------------------------------------------
 
 /// The version string both mesh crates are declared at under `[dependencies]`.
@@ -667,12 +666,12 @@ fn semver_triple(version: &str) -> (u64, u64, u64) {
     triple
 }
 
-/// Acceptance (a) and (b), as `cargo build --locked` sees them: the resolved graph the
-/// lockfile records carries no git source at all, and the three LXMF-rs crates it
-/// resolves (the two declared ones plus the `reticulum-rs-core` they share) all come
-/// from the registry at exactly the version the manifest declares. The CI merge gate
-/// asks `cargo metadata` the same question; this asks the tracked file, so the answer is
-/// available on every platform's test leg without a network.
+/// No git source and the registry release, as `cargo build --locked` sees them: the
+/// resolved graph the lockfile records carries no git source at all, and the three
+/// LXMF-rs crates it resolves (the two declared ones plus the `reticulum-rs-core` they
+/// share) all come from the registry at exactly the version the manifest declares. The
+/// CI merge gate asks `cargo metadata` the same question; this asks the tracked file, so
+/// the answer is available on every platform's test leg without a network.
 #[test]
 fn usage_probe_the_lockfile_resolves_the_mesh_crates_from_the_registry_with_no_git_source() {
     let lock = read_tracked("Cargo.lock");
@@ -709,7 +708,7 @@ fn usage_probe_the_lockfile_resolves_the_mesh_crates_from_the_registry_with_no_g
     }
 }
 
-/// Acceptance (b) plus the pin-form ruling: a release strictly newer than 0.11.0, because
+/// The release and the pin form: a release strictly newer than 0.11.0, because
 /// 0.11.0 is what the retired git revision also called itself and is the release that
 /// lacks the delivery-stamp calls; and a plain caret string, the repo convention, rather
 /// than an `=` requirement or an inline table. `the_mesh_crates_move_together` already
@@ -739,9 +738,9 @@ fn usage_probe_the_mesh_pin_is_a_plain_release_strictly_newer_than_0_11_0() {
     }
 }
 
-/// Acceptance (d) as amended: the subsection that described the interim git pin goes with
-/// the pin, and with it every mention of the retired revision in the guide, while the
-/// dependency policy and the two records the ruling kept stay where a contributor looks
+/// The guide drops the retired pin: the subsection that described the interim git pin
+/// goes with the pin, and with it every mention of the retired revision in the guide,
+/// while the dependency policy and the two kept records stay where a contributor looks
 /// for them, Windows row included.
 #[test]
 fn usage_probe_contributing_retired_the_interim_pin_prose_and_kept_the_records() {
@@ -773,7 +772,7 @@ fn usage_probe_contributing_retired_the_interim_pin_prose_and_kept_the_records()
     );
 }
 
-/// Acceptance (g), red-capability: the mechanism assertion in
+/// Red-capability: the mechanism assertion in
 /// `the_no_git_sources_gate_is_quoted_and_enforced` is only worth having if a neutered
 /// step fails it. Feed the same helpers the tracked workflow with its `exit 1` removed,
 /// and again with the exit moved outside the `if … fi`, and check that neither variant

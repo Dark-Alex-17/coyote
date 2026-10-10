@@ -116,6 +116,19 @@ mesh crates and BSD 3-Clause for the dalek crates and `subtle`, are not in this 
 them, or drop the dependencies, before cutting a release that contains them. The second, settling
 the license expression for the combined work, is the license owner's call and is tracked separately.
 
+### Small single-purpose dependencies
+
+`unicode-normalization` exists for one call: the `nfc` rule of `WirePath::parse` in
+`src/mesh/wire_path.rs`, which refuses a wire path that is not already NFC rather than
+normalising it. Any later dependency of this kind is added on the same terms: one caller,
+named here.
+
+`globset` exists for the share-set patterns in `src/mesh/shares.rs`: the allow, deny and
+built-in deny lists are compiled there with `literal_separator` so only `**` crosses a `/`.
+Deny and built-in deny are judged on both the name the peer sent, a parsed `WirePath`, and
+the path it resolved to under the share root; allow and override are judged on the resolved
+path alone. No other module uses `globset`.
+
 ### Dependency build-cost records
 
 A point-in-time record for the LXMF-rs and windows-sys dependency addition of 2026-09, not a
@@ -254,6 +267,13 @@ emulator, so those assertions would not transfer. `expectrl` therefore sits unde
 prompt-integrity assertions are not exercised on windows-latest. That lane still compiles
 `examples/pty-reedline-target.rs` and the printer wiring in `src/repl/printer.rs` under
 `-D warnings`.
+
+### Opt-in doc lint
+
+`tests/mesh_wiki_docs.rs` pins the wiki's mesh pages, `Hooks`, `Home` and the README to the verbs, hooks, tools and staging-inbox layout in the source.
+The wiki is a separate clone, so the lint runs only when pointed at one:
+`COYOTE_WIKI_DIR=../coyote.wiki cargo test --test mesh_wiki_docs`. Without the variable it prints
+`skipping:` and passes. `scripts/mesh-interop/README.md` documents the variable.
 
  ## Authorship Policy
 

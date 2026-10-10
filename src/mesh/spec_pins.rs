@@ -14,18 +14,25 @@ const UPSTREAM_ISSUES: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/docs/mesh/upstream-issues.md"
 ));
+#[cfg(test)]
+const README: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"));
 
-const EXPECTED_H1: &str = "# Coyote Mesh Protocol, version 1: wire format";
+const EXPECTED_H1: &str = "# SCOPE — Session Coordination & Presence Exchange";
+const EXPECTED_TAGLINE: &str = "\"SCOPE is a peer protocol by which running LLM sessions announce presence, share status, and exchange messages on their owners' behalf, over Reticulum, without a broker.\"";
+const INTRODUCTION_HEADING: &str = "## 1. Introduction and scope";
+const AREAS_SENTENCE_OPEN: &str = "Requirement ids have the form";
 const SECTION_COUNT: usize = 21;
+const CODE_POINT_HEADING: &str = "## 13. Code-point immutability";
+const ON_DISK_SCHEMA_KIND: &str = "on-disk schema version";
 const CONSTANTS_HEADING: &str = "## 19. Constants";
 const INDEX_HEADING: &str = "## 21. Requirements index";
 const BCP14: &str = "The key words \"MUST\", \"MUST NOT\", \"REQUIRED\", \"SHALL\", \"SHALL NOT\", \
     \"SHOULD\", \"SHOULD NOT\", \"RECOMMENDED\", \"NOT RECOMMENDED\", \"MAY\", and \"OPTIONAL\" in \
     this document are to be interpreted as described in BCP 14 [RFC2119] [RFC8174] when, and \
     only when, they appear in all capitals, as shown here.";
-const AREAS: [&str; 16] = [
+const AREAS: [&str; 23] = [
     "DEST", "ANN", "ENV", "KNOCK", "STATUS", "MSG", "PROP", "VER", "TIME", "CANON", "EXT", "CODE",
-    "SEC", "INV", "LOG", "LEN",
+    "SEC", "INV", "LOG", "LEN", "PART", "DISP", "LIST", "FETCH", "ACCESS", "SHARE", "SCHEMA",
 ];
 /// Every compound keyword (`MUST NOT`, `NOT RECOMMENDED`, ...) contains one of these.
 const KEYWORDS: [&str; 7] = [
@@ -623,7 +630,13 @@ pub(crate) fn rust_sources(dir: &Path) -> std::io::Result<String> {
 /// Each `.rs` file under `root/src` as its `/`-joined path relative to `root` and its
 /// contents, as `rust_files` walks it.
 fn rust_source_files(root: &Path) -> std::io::Result<Vec<(String, String)>> {
-    rust_files(&root.join("src"))?
+    rust_files_under(root, "src")
+}
+
+/// Each `.rs` file under `root/<dir>` as its `/`-joined path relative to `root` and its
+/// contents, as `rust_files` walks it.
+fn rust_files_under(root: &Path, dir: &str) -> std::io::Result<Vec<(String, String)>> {
+    rust_files(&root.join(dir))?
         .into_iter()
         .map(|path| {
             let relative = path
@@ -1008,26 +1021,43 @@ fn check_index_anchors(definitions: &[Definition], entries: &[IndexEntry]) -> Re
 mod tests {
     use super::*;
     use crate::config::mesh_config::{
+        DEFAULT_ENVOY_MEMORY_MAX_BYTES, DEFAULT_ENVOY_MEMORY_MAX_PER_IDENTITY,
+        DEFAULT_ENVOY_MEMORY_MAX_SESSIONS, DEFAULT_ENVOY_MEMORY_MAX_TURNS,
+        DEFAULT_ENVOY_MEMORY_TTL_HOURS, DEFAULT_FETCH_MAX_BYTES, DEFAULT_INLINE_MAX_BYTES,
         DEFAULT_PEER_MAX_CONCURRENT, DEFAULT_PEER_MAX_MESSAGES_PER_HOUR,
-        DEFAULT_PEER_MAX_TOKENS_PER_HOUR,
+        DEFAULT_PEER_MAX_TOKENS_PER_HOUR, MAX_FETCH_FILE_BYTES, MAX_INLINE_FILE_TOTAL,
     };
     use crate::config::mesh_envoy::ENVOY_RUN_TIMEOUT_SECS;
-    use crate::mesh::r3::RefusalCode;
+    use crate::function::mesh::FETCH_INLINE_TEXT_MAX_BYTES;
+    use crate::mesh::message::{MAX_PARTS, MAX_PARTS_BYTES};
+    use crate::mesh::r3::{
+        MAX_FETCH_RESPONSE_BYTES, RESPONSE_FRAME_PREFIX, RefusalCode, RequestId, ResponseFrame,
+    };
     use crate::mesh::{
-        announce, card, identity, knock, knocks, limits, message, peers, pending, propagation,
-        propagation_fetch, propagation_nodes, protocol, r3, trust,
+        access, announce, card, envoy_sessions, events, fetch, grants, identity, knock, knocks,
+        limits, message, node, peers, pending, propagation, propagation_fetch, propagation_nodes,
+        protocol, r3, schema, shares, trust, wire_path,
     };
     use lxmf_core::constants::{FIELD_CUSTOM_DATA, FIELD_CUSTOM_TYPE};
+    use rmpv::Value;
     use rns_transport::hash::ADDRESS_HASH_SIZE;
+    use rns_transport::resource::MAX_EFFICIENT_SIZE;
     use std::time::Duration;
 
-    const EXPECTED_LITERALS: &str = r#"1,1,10,16,262144,128,"/knock","/status","/message",30,10,10,2,20,16,0xf0,0xf1,0xf3,0xf4,0xf5,0xf6,0xfd,0xfe,"COYM",64,300,900,3,2700,1800,1024,"coyote.knock/1",200,15,10,256,3,600,256,16,1,0,1,2,64,280,64,64,120,280,"coyote.peer/1",1,120,4000,64,4096,8,15,10,604800,256,3600,120,256,1,60,100000,120,26,60,2,60,1024,64,240,131072,112,4096,15552000,3,900,256,0,32,0xfb,0xfc,8,64,256,64,8,1,1,1,1,1,1,1"#;
+    const EXPECTED_LITERALS: &str = r#"1,1,10,16,262144,128,"/knock","/status","/message",30,10,10,2,20,16,0xf0,0xf1,0xf3,0xf4,0xf5,0xf6,0xfd,0xfe,"SCOPE",64,300,900,3,2700,1800,1024,"scope.knock/1",200,15,10,256,3,600,256,16,1,0,1,2,64,280,64,64,120,280,"scope.peer/1",1,120,4000,64,4096,8,15,10,604800,256,3600,120,256,1,60,100000,120,26,60,2,60,1024,64,240,131072,112,4096,15552000,4096,86400,3,900,256,0,32,0xfb,0xfc,8,64,256,64,8,2,2,2,2,1,2,1,8,106496,98304,65536,"/list","/fetch",1024,64,1000,100000,64,2048,120,128,1048447,4194304,4194304,4198400,92 c4 10,200,16,32,"/access","scope.access/1",16,500,5,900,1,1,1,16,32768,1048575,4096,1,1,256,16,40,65536,168"#;
 
     fn expected_constants() -> Vec<(&'static str, String)> {
         let secs = |d: Duration| d.as_secs().to_string();
         let quoted = |s: &str| format!("{s:?}");
         let byte = |v: u8| format!("0x{v:02x}");
         let code = |c: RefusalCode| byte(c as u8);
+        let hex_bytes = |bytes: &[u8]| {
+            bytes
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
         vec![
             (
                 "MESH_PROTOCOL_VERSION",
@@ -1216,6 +1246,8 @@ mod tests {
                 propagation_fetch::DEDUP_CAPACITY.to_string(),
             ),
             ("DEDUP_HORIZON", secs(propagation_fetch::DEDUP_HORIZON)),
+            ("BODY_DEDUP_CAPACITY", node::BODY_DEDUP_CAPACITY.to_string()),
+            ("BODY_DEDUP_HORIZON", secs(node::BODY_DEDUP_HORIZON)),
             (
                 "MAX_UNKNOWN_SOURCE_DEFERRALS",
                 propagation_fetch::MAX_UNKNOWN_SOURCE_DEFERRALS.to_string(),
@@ -1277,11 +1309,119 @@ mod tests {
                 "PROPAGATION_STORE_VERSION",
                 propagation_fetch::PROPAGATION_STORE_VERSION.to_string(),
             ),
+            ("MAX_PARTS", MAX_PARTS.to_string()),
+            ("MAX_PARTS_BYTES", MAX_PARTS_BYTES.to_string()),
+            ("MAX_INLINE_FILE_TOTAL", MAX_INLINE_FILE_TOTAL.to_string()),
+            (
+                "DEFAULT_INLINE_MAX_BYTES",
+                DEFAULT_INLINE_MAX_BYTES.to_string(),
+            ),
+            ("LIST_PATH", quoted(r3::LIST_PATH)),
+            ("FETCH_PATH", quoted(r3::FETCH_PATH)),
+            (
+                "WIRE_PATH_MAX_BYTES",
+                wire_path::WIRE_PATH_MAX_BYTES.to_string(),
+            ),
+            (
+                "WIRE_PATH_MAX_SEGMENTS",
+                wire_path::WIRE_PATH_MAX_SEGMENTS.to_string(),
+            ),
+            ("LIST_PAGE_SIZE", shares::LIST_PAGE_SIZE.to_string()),
+            (
+                "DEFAULT_LIST_WALK_BOUND",
+                shares::DEFAULT_LIST_WALK_BOUND.to_string(),
+            ),
+            ("CURSOR_MAX_BYTES", fetch::CURSOR_MAX_BYTES.to_string()),
+            ("LIST_PAGE_HEADROOM", fetch::LIST_PAGE_HEADROOM.to_string()),
+            (
+                "FILE_FETCH_REQUEST_TIMEOUT",
+                secs(fetch::FILE_FETCH_REQUEST_TIMEOUT),
+            ),
+            (
+                "OK_REPLY_FRAMING_BYTES",
+                fetch::OK_REPLY_FRAMING_BYTES.to_string(),
+            ),
+            (
+                "SINGLE_SEGMENT_FETCH_CEILING",
+                fetch::SINGLE_SEGMENT_FETCH_CEILING.to_string(),
+            ),
+            (
+                "DEFAULT_FETCH_MAX_BYTES",
+                DEFAULT_FETCH_MAX_BYTES.to_string(),
+            ),
+            ("MAX_FETCH_FILE_BYTES", MAX_FETCH_FILE_BYTES.to_string()),
+            (
+                "MAX_FETCH_RESPONSE_BYTES",
+                MAX_FETCH_RESPONSE_BYTES.to_string(),
+            ),
+            ("RESPONSE_FRAME_PREFIX", hex_bytes(&RESPONSE_FRAME_PREFIX)),
+            ("ABOUT_MAX_CHARS", card::ABOUT_MAX_CHARS.to_string()),
+            ("CAPS_MAX_ENTRIES", card::CAPS_MAX_ENTRIES.to_string()),
+            ("CAP_MAX_CHARS", card::CAP_MAX_CHARS.to_string()),
+            ("ACCESS_PATH", quoted(r3::ACCESS_PATH)),
+            ("ACCESS_TYPE", quoted(access::ACCESS_TYPE)),
+            ("ACCESS_MAX_PATHS", access::ACCESS_MAX_PATHS.to_string()),
+            (
+                "ACCESS_REASON_MAX_CHARS",
+                access::ACCESS_REASON_MAX_CHARS.to_string(),
+            ),
+            (
+                "ACCESS_MAX_PENDING_PER_IDENTITY",
+                access::ACCESS_MAX_PENDING_PER_IDENTITY.to_string(),
+            ),
+            ("DEFAULT_GRANT_TTL", secs(grants::DEFAULT_GRANT_TTL)),
+            (
+                "SHARES_FILE_VERSION",
+                shares::SHARES_FILE_VERSION.to_string(),
+            ),
+            (
+                "GRANT_RECORD_VERSION",
+                grants::GRANT_RECORD_VERSION.to_string(),
+            ),
+            ("DEFAULT_GRANT_USES", grants::DEFAULT_GRANT_USES.to_string()),
+            ("GRANT_MAX_PATHS", grants::GRANT_MAX_PATHS.to_string()),
+            (
+                "FETCH_INLINE_TEXT_MAX_BYTES",
+                FETCH_INLINE_TEXT_MAX_BYTES.to_string(),
+            ),
+            ("MAX_EFFICIENT_SIZE", MAX_EFFICIENT_SIZE.to_string()),
+            (
+                "PRESENCE_SURFACED_CAP",
+                trust::PRESENCE_SURFACED_CAP.to_string(),
+            ),
+            (
+                "ENVOY_SESSION_VERSION",
+                envoy_sessions::ENVOY_SESSION_VERSION.to_string(),
+            ),
+            (
+                "ENVOY_SESSION_INDEX_VERSION",
+                envoy_sessions::ENVOY_SESSION_INDEX_VERSION.to_string(),
+            ),
+            (
+                "DEFAULT_ENVOY_MEMORY_MAX_SESSIONS",
+                DEFAULT_ENVOY_MEMORY_MAX_SESSIONS.to_string(),
+            ),
+            (
+                "DEFAULT_ENVOY_MEMORY_MAX_PER_IDENTITY",
+                DEFAULT_ENVOY_MEMORY_MAX_PER_IDENTITY.to_string(),
+            ),
+            (
+                "DEFAULT_ENVOY_MEMORY_MAX_TURNS",
+                DEFAULT_ENVOY_MEMORY_MAX_TURNS.to_string(),
+            ),
+            (
+                "DEFAULT_ENVOY_MEMORY_MAX_BYTES",
+                DEFAULT_ENVOY_MEMORY_MAX_BYTES.to_string(),
+            ),
+            (
+                "DEFAULT_ENVOY_MEMORY_TTL_HOURS",
+                DEFAULT_ENVOY_MEMORY_TTL_HOURS.to_string(),
+            ),
         ]
     }
 
     const VALID_SPEC: &str = "\
-# Coyote Mesh Protocol, version 1: wire format
+# SCOPE — Session Coordination & Presence Exchange
 
 ## 1. Introduction and scope
 
@@ -1474,7 +1614,7 @@ Fenced lines may say must and MUST without an id.
                 .unwrap_err()
                 .contains("exactly one H1")
         );
-        let wrong_h1 = sections(&(1..=21).collect::<Vec<_>>()).replace("version 1", "version 2");
+        let wrong_h1 = sections(&(1..=21).collect::<Vec<_>>()).replace("Presence", "Absence");
         assert!(check_headings(&wrong_h1).is_err());
         assert!(check_headings(&sections(&(1..=21).collect::<Vec<_>>())).is_ok());
         assert!(
@@ -2004,6 +2144,172 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
     }
 
     #[test]
+    fn spec_opens_with_the_tagline_and_defines_a_session() {
+        let mut lines = SPEC.lines();
+        assert_eq!(lines.next(), Some(EXPECTED_H1));
+        let opening = lines
+            .find(|line| !line.trim().is_empty())
+            .expect("a line after the H1");
+        assert!(
+            opening.starts_with(EXPECTED_TAGLINE),
+            "the spec no longer opens with the tagline: {opening:?}"
+        );
+        assert!(
+            opening.contains("A session is"),
+            "the opening line no longer defines a session: {opening:?}"
+        );
+    }
+
+    /// The reference implementation is named once, where section 1 says what it is;
+    /// everywhere else the text speaks of sessions, nodes, requesters and responders.
+    #[test]
+    fn coyote_is_named_once_in_the_introduction() {
+        // Assembled at runtime so the mesh source guard does not match this test's text.
+        let name = ["Coy", "ote"].concat();
+        let prose = strip_code(SPEC);
+        let everywhere = prose.matches(name.as_str()).count();
+        assert_eq!(
+            everywhere, 1,
+            "{name} is named {everywhere} times outside code"
+        );
+        let introduction = section(&prose, INTRODUCTION_HEADING).unwrap();
+        assert_eq!(
+            introduction.content.matches(name.as_str()).count(),
+            1,
+            "{name} is not named under {INTRODUCTION_HEADING:?}"
+        );
+    }
+
+    /// The README's mesh section opens with the protocol's name and tagline as the spec
+    /// states them, then says what the reference implementation is and what "mesh" names.
+    /// Both are derived from the spec's pinned strings so the two documents cannot drift.
+    #[test]
+    fn readme_mesh_section_leads_with_the_scope_name_tagline_and_reference_sentence() {
+        let lines: Vec<&str> = README.lines().collect();
+        let headings: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| **line == "### Mesh")
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(headings.len(), 1, "### Mesh headings at lines {headings:?}");
+        let paragraph = lines[headings[0] + 1..]
+            .iter()
+            .skip_while(|line| line.trim().is_empty())
+            .take_while(|line| !line.trim().is_empty())
+            .copied()
+            .collect::<Vec<&str>>()
+            .join(" ");
+        let protocol = EXPECTED_H1
+            .strip_prefix("# ")
+            .expect("the H1 carries a heading marker");
+        assert!(
+            paragraph.starts_with(protocol),
+            "the mesh section does not open with {protocol:?}: {paragraph:?}"
+        );
+        let tagline = EXPECTED_TAGLINE
+            .strip_prefix('"')
+            .and_then(|tagline| tagline.strip_suffix('"'))
+            .expect("the tagline is quoted");
+        assert!(
+            paragraph.contains(tagline),
+            "the mesh section lacks the tagline: {paragraph:?}"
+        );
+        // Assembled at runtime so the mesh source guard does not match this test's text.
+        let name = ["Coy", "ote"].concat();
+        let reference = format!(
+            "{name} is the reference implementation of SCOPE, and \"mesh\" is {name}'s name for its SCOPE feature."
+        );
+        assert!(
+            paragraph.contains(&reference),
+            "the mesh section lacks {reference:?}: {paragraph:?}"
+        );
+    }
+
+    /// The README speaks the SCOPE wire vocabulary only: the announce magic and the
+    /// backtick-wrapped destination prefixes from before the rename must not appear.
+    /// The needles carry their backtick so file names like the log and config do not trip.
+    #[test]
+    fn readme_never_spells_the_pre_scope_wire_vocabulary() {
+        // Assembled at runtime so the mesh source guard does not match this test's text.
+        let needles = [
+            ["COY", "M"].concat(),
+            ["`coy", "ote.mesh"].concat(),
+            ["`coy", "ote.peer/"].concat(),
+            ["`coy", "ote.knock/"].concat(),
+        ];
+        let scan = |text: &str| -> Vec<String> {
+            text.lines()
+                .enumerate()
+                .flat_map(|(index, line)| {
+                    needles
+                        .iter()
+                        .filter(move |needle| line.contains(needle.as_str()))
+                        .map(move |needle| format!("README.md:{}: spells {needle}", index + 1))
+                })
+                .collect()
+        };
+        let fixture = format!("fine line\nthe {} destination\n", needles[1]);
+        let control = scan(&fixture);
+        assert_eq!(
+            control.len(),
+            1,
+            "the scan does not go red on a fixture: {control:?}"
+        );
+        let hits = scan(README);
+        assert!(hits.is_empty(), "{}", hits.join("\n"));
+    }
+
+    /// The `mesh.fetch.max_bytes` row states the single-segment ceiling as the number a
+    /// user can compare against their setting; a Rust constant name does not belong in a
+    /// user-facing config table. The number is the code's, so the row cannot drift.
+    #[test]
+    fn readme_fetch_row_spells_the_single_segment_ceiling_as_a_number() {
+        let row = README
+            .lines()
+            .find(|line| line.starts_with("| `mesh.fetch.max_bytes`"))
+            .expect("the README has a mesh.fetch.max_bytes row");
+        let clause = format!(
+            "`min(max_bytes, {})` (about 1 MiB)",
+            fetch::SINGLE_SEGMENT_FETCH_CEILING
+        );
+        assert!(
+            row.contains(&clause),
+            "the fetch row lacks {clause:?}: {row:?}"
+        );
+        assert!(
+            !row.contains("SINGLE_SEGMENT_FETCH_CEILING"),
+            "the fetch row names the constant instead of its value: {row:?}"
+        );
+    }
+
+    #[test]
+    fn the_areas_sentence_names_every_area_token() {
+        let sentence = SPEC
+            .lines()
+            .find(|line| line.starts_with(AREAS_SENTENCE_OPEN))
+            .unwrap_or_else(|| panic!("no line starts with {AREAS_SENTENCE_OPEN:?}"));
+        let missing: Vec<&str> = AREAS
+            .into_iter()
+            .filter(|area| !sentence.contains(&format!("`{area}`")))
+            .collect();
+        assert!(missing.is_empty(), "the areas sentence omits {missing:?}");
+        let unknown: Vec<&str> = split_spans(sentence)
+            .into_iter()
+            .map(|(_, span)| span)
+            .filter(|span| {
+                !span.is_empty()
+                    && span.bytes().all(|b| b.is_ascii_uppercase())
+                    && !AREAS.contains(span)
+            })
+            .collect();
+        assert!(
+            unknown.is_empty(),
+            "the areas sentence names {unknown:?}, which are not areas"
+        );
+    }
+
+    #[test]
     fn spec_has_the_bcp14_boilerplate() {
         check_boilerplate(SPEC).unwrap();
     }
@@ -2061,6 +2367,270 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
         assert_eq!(
             check_cited_paths(SPEC, &files, &tests),
             Vec::<String>::new()
+        );
+    }
+
+    /// Usage probe: the protocol spec's definition and table rows spell
+    /// the SCOPE wire identifiers everywhere. Nothing is released, so there is no
+    /// "formerly" form to allow: the pre-SCOPE announce magic (as text or as its hex
+    /// bytes), the old `<app>.mesh` destination name in any spelling of application and
+    /// aspect, the old `<app>.<kind>/1` LXMF type tags and the bare `<app>.` prefix may
+    /// not appear on any line.
+    #[test]
+    fn usage_probe_spec_spells_no_pre_scope_wire_identifier() {
+        // Assembled at runtime so the mesh source guard does not match this test's text.
+        let old_app = ["coy", "ote"].concat();
+        let needles = [
+            ["COY", "M"].concat(),
+            "43 4f 59 4d".to_string(),
+            format!("{old_app}."),
+            format!("{old_app}.mesh"),
+            format!("{old_app}.peer/"),
+            format!("{old_app}.knock/"),
+            format!("application `{old_app}`"),
+            "aspect `mesh.".to_string(),
+            format!("DestinationName::new(\"{old_app}\""),
+            format!("`{old_app}`, `.`, `mesh."),
+        ];
+        let hits: Vec<String> = SPEC
+            .lines()
+            .enumerate()
+            .flat_map(|(index, line)| {
+                needles
+                    .iter()
+                    .filter(|needle| line.contains(needle.as_str()))
+                    .map(move |needle| {
+                        format!("docs/mesh/PROTOCOL.md:{}: spells {needle:?}", index + 1)
+                    })
+            })
+            .collect();
+        assert!(hits.is_empty(), "{}", hits.join("\n"));
+
+        // Positive control: the SCOPE forms are what the same rows spell now.
+        for present in [
+            "`\"SCOPE\"`",
+            "53 43 4f 50 45",
+            "scope.session.<instance_id>",
+            "DestinationName::new(\"scope\", \"session.<instance_id>\")",
+            "| `scope.session.<instance_id>` | destination name: application `scope`, aspect `session.<instance_id>` | `DestinationName::new(\"scope\", \"session.<instance_id>\")` | 4 |",
+            "\"scope.knock/1\"",
+            "\"scope.peer/1\"",
+        ] {
+            assert!(
+                SPEC.contains(present),
+                "the spec no longer spells {present:?}"
+            );
+        }
+    }
+
+    /// The sentences the withdrawn `.mesh fetch` spelling of the SYNC verb stood in.
+    /// `.mesh fetch` is now the file verb, so the pin below matches these sentences and
+    /// never the bare words; keep every needle a `.mesh fetch` sentence so the pin stays a
+    /// strict narrowing of the old bare-token tripwire.
+    const WITHDRAWN_SYNC_PHRASINGS: [&str; 5] = [
+        "`.mesh fetch` runs a fetch",
+        "on demand with `.mesh fetch`",
+        "from `.mesh fetch`;",
+        "only `.mesh fetch` runs",
+        "`.mesh fetch` is refused",
+    ];
+
+    fn names_fetch_as_the_sync_verb(line: &str) -> bool {
+        WITHDRAWN_SYNC_PHRASINGS
+            .iter()
+            .any(|phrase| line.contains(phrase))
+    }
+
+    /// The verb that pulls held messages is `.mesh sync`; the spec names it and never
+    /// its withdrawn name. `.mesh fetch` is the file verb, so the needle is the sync
+    /// sentences the old spelling stood in, not the bare words.
+    #[test]
+    fn usage_probe_spec_names_the_sync_verb_not_the_fetch_verb() {
+        let hits: Vec<String> = SPEC
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| names_fetch_as_the_sync_verb(line))
+            .map(|(index, _)| {
+                format!(
+                    "docs/mesh/PROTOCOL.md:{}: names .mesh fetch as the sync verb",
+                    index + 1
+                )
+            })
+            .collect();
+        assert!(hits.is_empty(), "{}", hits.join("\n"));
+        assert!(
+            SPEC.contains("`.mesh sync`"),
+            "the spec no longer names `.mesh sync`"
+        );
+    }
+
+    /// Usage probe: the narrowed needle is still red-capable for every withdrawn SYNC
+    /// sentence, is a strict narrowing of the old bare `.mesh fetch` pin, and spares the
+    /// sentences the FILE verb will carry in the spec.
+    #[test]
+    fn usage_probe_sync_needle_trips_the_withdrawn_sentences_and_spares_the_file_verb() {
+        for phrase in WITHDRAWN_SYNC_PHRASINGS {
+            assert!(
+                phrase.contains(".mesh fetch"),
+                "{phrase:?} would flag a line the old bare-token pin did not"
+            );
+            let line = format!("Some prose, {phrase} in the middle of a sentence.");
+            assert!(
+                names_fetch_as_the_sync_verb(&line),
+                "the withdrawn sentence {phrase:?} no longer trips the pin"
+            );
+        }
+        // The live spec line the sync sentences came from: with the sync verb swapped
+        // back to the old spelling it must trip, as written it must not.
+        let live = SPEC
+            .lines()
+            .find(|line| line.contains("only `.mesh sync` runs a fetch"))
+            .expect("the spec still carries the `.mesh sync` sentence");
+        assert!(!names_fetch_as_the_sync_verb(live));
+        assert!(names_fetch_as_the_sync_verb(
+            &live.replace("`.mesh sync`", "`.mesh fetch`")
+        ));
+        for file_verb in [
+            "`.mesh fetch <destination> <path> [--if-sha256 <hex>]` pulls one shared file into the staging inbox.",
+            "The operator pulls it with `.mesh fetch`; the staged path, size and sha256 are printed, never the bytes.",
+            "A `too_large` reply from `.mesh fetch` names the limit.",
+        ] {
+            assert!(
+                !names_fetch_as_the_sync_verb(file_verb),
+                "file-verb sentence {file_verb:?} trips the sync pin"
+            );
+        }
+        // Known collision the spec author must write around: the file verb also obeys
+        // the mesh gate, yet "`.mesh fetch` is refused" is one of the withdrawn sync
+        // sentences, so that exact spelling trips the pin whichever verb it describes.
+        assert!(names_fetch_as_the_sync_verb(
+            "`.mesh fetch` is refused while the node is off."
+        ));
+    }
+
+    /// Usage probe: section 5.1's layout line, every offset the field
+    /// table spells, and both worked hex examples are derived from the live five-byte
+    /// magic, not left at the old four-byte arithmetic. The examples must round-trip
+    /// through the live codec to exactly the version and name the prose gives them.
+    #[test]
+    fn usage_probe_spec_announce_layout_widths_and_examples_follow_the_live_magic() {
+        let magic_len = announce::ANNOUNCE_MAGIC.len();
+        let header_len = magic_len + 2;
+        let max_total = header_len + announce::MAX_DISPLAY_NAME_BYTES;
+        let magic_text = std::str::from_utf8(&announce::ANNOUNCE_MAGIC).unwrap();
+
+        let section = section(SPEC, "### 5.1 Application data").unwrap();
+        // `section` runs to the next `## ` heading; stop at 5.2.
+        let content = section.content.as_str();
+        let end = content.find("\n### ").unwrap_or(content.len());
+        let text = &content[..end];
+
+        let layout = text
+            .lines()
+            .find(|line| line.starts_with("Layout: "))
+            .expect("section 5.1 opens with a Layout line");
+        assert_eq!(
+            layout,
+            format!(
+                "Layout: `magic({magic_len}) || version(2) || display_name(0..={})`; total length {header_len} to {max_total} bytes. There is no length prefix.",
+                announce::MAX_DISPLAY_NAME_BYTES
+            )
+        );
+
+        let tables = tables(text);
+        let [table] = tables.as_slice() else {
+            panic!("section 5.1 holds one table");
+        };
+        let rows: Vec<Vec<&str>> = table.rows.iter().map(|row| cells(row)).collect();
+        let field = |name: &str| -> Vec<&str> {
+            rows.iter()
+                .find(|cells| cells[0].starts_with(name))
+                .unwrap_or_else(|| panic!("section 5.1 has no {name} row"))
+                .clone()
+        };
+        let magic_row = field("magic");
+        assert_eq!(magic_row[0], format!("magic, bytes 0..{magic_len}"));
+        assert_eq!(magic_row[1], format!("{magic_len} bytes"));
+        assert_eq!(magic_row[2], format!("`ANNOUNCE_MAGIC` = `{magic_text:?}`"));
+        assert!(
+            magic_row[3].contains(&format!("shorter than {header_len} bytes"))
+                && magic_row[3]
+                    .contains(&format!("first {magic_len} bytes are not `{magic_text:?}`")),
+            "MESH-ANN-001 row: {}",
+            magic_row[3]
+        );
+        assert_eq!(
+            field("version")[0],
+            format!("version, bytes {magic_len}..{header_len}")
+        );
+        assert_eq!(
+            field("display_name")[0],
+            format!("display_name, bytes {header_len}..end")
+        );
+        assert!(
+            field("any other byte")[3].contains(&format!("from offset {header_len} to the end")),
+            "MESH-ANN-005 row: {}",
+            field("any other byte")[3]
+        );
+
+        // The worked examples decode with the live codec to what the prose says, and the
+        // named one re-encodes to the very bytes printed.
+        let examples = text
+            .lines()
+            .find(|line| line.starts_with("Examples ("))
+            .expect("section 5.1 gives worked examples");
+        let hex_spans: Vec<Vec<u8>> = examples
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .filter(|span| {
+                span.split(' ')
+                    .all(|byte| byte.len() == 2 && u8::from_str_radix(byte, 16).is_ok())
+            })
+            .map(|span| {
+                span.split(' ')
+                    .map(|byte| u8::from_str_radix(byte, 16).unwrap())
+                    .collect()
+            })
+            .collect();
+        let [named, bare] = hex_spans.as_slice() else {
+            panic!("section 5.1 gives two hex examples, found {hex_spans:?}");
+        };
+        assert!(
+            examples.contains("is version 1, display name `Alex`"),
+            "{examples}"
+        );
+        assert!(
+            examples.contains("is version `0x0102`, no display name"),
+            "{examples}"
+        );
+        assert_eq!(named.len(), header_len + "Alex".len());
+        assert_eq!(
+            announce::AnnounceAppData::decode(named),
+            Some(announce::AnnounceAppData {
+                version: 1,
+                display_name: Some("Alex".to_string()),
+            }),
+            "{named:02x?}"
+        );
+        assert_eq!(
+            announce::AnnounceAppData {
+                version: 1,
+                display_name: Some("Alex".to_string()),
+            }
+            .encode()
+            .unwrap(),
+            *named,
+            "the printed example is not what the live encoder emits"
+        );
+        assert_eq!(bare.len(), header_len);
+        assert_eq!(
+            announce::AnnounceAppData::decode(bare),
+            Some(announce::AnnounceAppData {
+                version: 0x0102,
+                display_name: None,
+            }),
+            "{bare:02x?}"
         );
     }
 
@@ -2239,6 +2809,908 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
         check_constants(&actual, &expected_constants()).unwrap();
     }
 
+    /// The cells of every body row of the one table under `CODE_POINT_HEADING`.
+    fn registry_rows() -> Vec<Vec<String>> {
+        let section = section(SPEC, CODE_POINT_HEADING).unwrap();
+        let tables = tables(&section.content);
+        let [table] = tables.as_slice() else {
+            panic!(
+                "{CODE_POINT_HEADING:?} holds {} tables, expected exactly one",
+                tables.len()
+            );
+        };
+        table
+            .rows
+            .iter()
+            .skip(2)
+            .map(|row| cells(row).into_iter().map(str::to_string).collect())
+            .collect()
+    }
+
+    #[test]
+    fn registry_on_disk_schema_version_rows_match_the_live_constants() {
+        let live = [
+            ("TRUST_FILE_VERSION", trust::TRUST_FILE_VERSION),
+            ("KNOCK_RECORD_VERSION", knocks::KNOCK_RECORD_VERSION),
+            ("PENDING_RECORD_VERSION", pending::PENDING_RECORD_VERSION),
+            ("INBOUND_RECORD_VERSION", pending::INBOUND_RECORD_VERSION),
+            (
+                "PREDECESSOR_RECORD_VERSION",
+                identity::PREDECESSOR_RECORD_VERSION,
+            ),
+            ("PEER_TABLE_VERSION", peers::PEER_TABLE_VERSION),
+            (
+                "PROPAGATION_STORE_VERSION",
+                propagation_fetch::PROPAGATION_STORE_VERSION,
+            ),
+            ("SHARES_FILE_VERSION", shares::SHARES_FILE_VERSION),
+            ("GRANT_RECORD_VERSION", grants::GRANT_RECORD_VERSION),
+            (
+                "ENVOY_SESSION_VERSION",
+                envoy_sessions::ENVOY_SESSION_VERSION,
+            ),
+            (
+                "ENVOY_SESSION_INDEX_VERSION",
+                envoy_sessions::ENVOY_SESSION_INDEX_VERSION,
+            ),
+        ];
+        let registry = registry_rows();
+        let rows: Vec<(u64, Vec<&str>)> = registry
+            .iter()
+            .filter(|cells| cells.get(1).map(String::as_str) == Some(ON_DISK_SCHEMA_KIND))
+            .map(|cells| {
+                let [value, _, names, _] = cells.as_slice() else {
+                    panic!("registry row {cells:?} does not have four cells");
+                };
+                let value = backticked(value)
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or_else(|| panic!("registry row {cells:?} has no backticked version"));
+                let names = names
+                    .split(", ")
+                    .map(|name| {
+                        backticked(name)
+                            .unwrap_or_else(|| panic!("registry row {cells:?} names {name:?}"))
+                    })
+                    .collect();
+                (value, names)
+            })
+            .collect();
+        let listed: Vec<&str> = rows
+            .iter()
+            .flat_map(|(_, names)| names.iter().copied())
+            .collect();
+        let expected: Vec<&str> = live.iter().map(|(name, _)| *name).collect();
+        assert_eq!(listed, expected);
+        for (value, names) in &rows {
+            let [name] = names.as_slice() else {
+                panic!("registry row {names:?} must list one constant");
+            };
+            let (_, want) = live.iter().find(|(live, _)| live == name).unwrap();
+            assert_eq!(value, want, "`{name}`");
+        }
+    }
+
+    /// The envoy memory file name for one (identity, thread) is fixed by this vector: a
+    /// change to the digest input would silently orphan every record on disk.
+    #[test]
+    fn envoy_session_key_is_the_truncated_sha256_of_identity_nul_thread() {
+        let identity = "0123456789abcdef0123456789abcdef";
+        let key = envoy_sessions::session_key(identity, "thread-one").unwrap();
+
+        assert_eq!(key, "8ebad0226f3717c3cebe929e4b7c49ca");
+        assert_eq!(key.len(), 32);
+        assert!(
+            key.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "{key}"
+        );
+        assert_ne!(
+            key,
+            envoy_sessions::session_key(identity, "thread-two").unwrap()
+        );
+        assert_ne!(
+            key,
+            envoy_sessions::session_key("fedcba9876543210fedcba9876543210", "thread-one").unwrap()
+        );
+    }
+
+    /// The registry rows for the code points the code spells as constants or wire names
+    /// list exactly those values, so a value renamed or added in code shows up here.
+    #[test]
+    fn registry_rows_name_the_live_code_points() {
+        let paths = [
+            ("KNOCK_PATH", r3::KNOCK_PATH),
+            ("STATUS_PATH", r3::STATUS_PATH),
+            ("MESSAGE_PATH", r3::MESSAGE_PATH),
+            ("LIST_PATH", r3::LIST_PATH),
+            ("FETCH_PATH", r3::FETCH_PATH),
+            ("ACCESS_PATH", r3::ACCESS_PATH),
+        ];
+        assert_eq!(paths.map(|(_, path)| path), r3::KNOWN_PATHS);
+        let spans = |words: &[&str]| {
+            words
+                .iter()
+                .map(|word| format!("`{word}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let dispositions = [
+            message::Disposition::Answered,
+            message::Disposition::Escalated,
+            message::Disposition::Refused,
+            message::Disposition::BudgetExhausted,
+        ]
+        .map(message::Disposition::wire_name);
+        // String literals at the `status_reply` call sites of src/mesh/fetch.rs.
+        let fetch_statuses = [
+            "ok",
+            "not_modified",
+            "not_shared",
+            "invalid_path",
+            "too_large",
+        ];
+        let access_statuses = [
+            access::AccessOutcome::Pending.status(),
+            access::AccessOutcome::Granted { expires: 0.0 }.status(),
+            access::AccessOutcome::Refused(access::AccessRefusal::Duplicate).status(),
+        ];
+        let access_reasons = [
+            access::AccessRefusal::Duplicate,
+            access::AccessRefusal::TooManyPending,
+        ]
+        .map(access::AccessRefusal::wire_name);
+        let decisions = [
+            events::AccessDecision::Granted,
+            events::AccessDecision::Denied,
+        ]
+        .map(events::AccessDecision::wire_name);
+        let rules: Vec<&str> = wire_path::RULES.iter().map(|(name, _)| *name).collect();
+        let mut expected: Vec<(String, &str, Option<String>)> = paths
+            .iter()
+            .map(|(name, path)| {
+                (
+                    format!("`{path:?}`"),
+                    "request path",
+                    Some(format!("`{name}`")),
+                )
+            })
+            .collect();
+        expected.extend([
+            (spans(&["text", "data", "file"]), "`type` value", None),
+            (spans(&dispositions), "`disposition` value", None),
+            (spans(&fetch_statuses), "fetch `status` value", None),
+            (spans(&access_statuses), "access `status` value", None),
+            (spans(&access_reasons), "access `reason` value", None),
+            (spans(&decisions), "decision `status` value", None),
+            (spans(&rules), "`rule` value", None),
+            ("`\"fetch\"`".to_string(), "capability", None),
+            (
+                format!("`{:?}`", knock::KNOCK_TYPE),
+                "LXMF type tag",
+                Some("`KNOCK_TYPE`".to_string()),
+            ),
+            (
+                format!("`{:?}`", message::PEER_MESSAGE_TYPE),
+                "LXMF type tag",
+                Some("`PEER_MESSAGE_TYPE`".to_string()),
+            ),
+            (
+                format!("`{:?}`", access::ACCESS_TYPE),
+                "LXMF type tag",
+                Some("`ACCESS_TYPE`".to_string()),
+            ),
+        ]);
+        let rows = registry_rows();
+        let missing: Vec<String> = expected
+            .iter()
+            .filter(|(first, kind, value)| {
+                !rows.iter().any(|cells| {
+                    let [first_cell, kind_cell, value_cell, _] = cells.as_slice() else {
+                        panic!("registry row {cells:?} does not have four cells");
+                    };
+                    first_cell == first
+                        && kind_cell.contains(kind)
+                        && value.as_ref().is_none_or(|value| value_cell == value)
+                })
+            })
+            .map(|(first, kind, value)| {
+                format!("| {first} | {kind} | {} |", value.as_deref().unwrap_or(""))
+            })
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "the registry lacks rows for:\n{}",
+            missing.join("\n")
+        );
+    }
+
+    /// The `/fetch` worked example spells the protocol's file bound in its `too_large`
+    /// line, and the sentence under it names the limit the reference answers while the
+    /// single-segment ceiling stands, so dropping the ceiling or moving it moves the note.
+    #[test]
+    fn fetch_example_notes_the_live_ceiling_under_the_protocol_bound() {
+        let lines: Vec<&str> = SPEC.lines().collect();
+        let example = lines
+            .iter()
+            .position(|line| line.contains(r#""status": "too_large", "limit": "#))
+            .expect("the /fetch example has a too_large line");
+        assert!(
+            lines[example].ends_with(&format!(r#""limit": {MAX_FETCH_FILE_BYTES} }}"#)),
+            "{:?}",
+            lines[example]
+        );
+        assert_eq!(
+            lines[example + 1],
+            "```",
+            "the too_large line closes the example"
+        );
+        let note = lines[example + 3];
+        assert_eq!(lines[example + 2], "", "{note:?}");
+        for needle in [
+            "`SINGLE_SEGMENT_FETCH_CEILING`",
+            "MESH-LEN-007",
+            &format!("`limit: {}`", fetch::SINGLE_SEGMENT_FETCH_CEILING),
+        ] {
+            assert!(note.contains(needle), "{note:?} lacks {needle:?}");
+        }
+        assert!(
+            !note.contains(&MAX_FETCH_FILE_BYTES.to_string()),
+            "the note names the ceiling, not the bound the example already spells: {note:?}"
+        );
+    }
+
+    /// MESH-SEC-019 states why `/list` entries travel unfenced where fetched text does
+    /// not: the wire-path grammar of section 10.13 admits no character that could forge
+    /// a fence marker. Dropping the clause would leave the asymmetry unexplained, and
+    /// widening the grammar would make the clause false, so the paragraph is pinned to
+    /// both the clause and the section it leans on.
+    #[test]
+    fn sec_019_states_why_list_entries_are_returned_unfenced() {
+        let definition = SPEC
+            .lines()
+            .find(|line| line.starts_with("**[MESH-SEC-019]**"))
+            .expect("MESH-SEC-019 is defined");
+        for clause in [
+            "`/list` entries are returned unfenced",
+            "the wire-path grammar admitting no line terminator, control or invisible character",
+            "(section 10.13;",
+        ] {
+            assert!(
+                definition.contains(clause),
+                "{definition:?} lacks {clause:?}"
+            );
+        }
+        assert!(
+            SPEC.contains("### 10.13 Wire paths"),
+            "the clause names a section this document no longer has"
+        );
+    }
+
+    /// MESH-LEN-007 binds the reference on the pinned transport, not every responder:
+    /// the single-segment ceiling is a leniency the reference applies while that
+    /// transport's multi-segment defect stands, and the protocol's own serving limit
+    /// stays MESH-FETCH-026. Widening the subject back to "a responder MUST" would turn
+    /// the workaround into a protocol limit, so both the subject and the disclaimer are
+    /// pinned.
+    #[test]
+    fn len_007_binds_the_reference_on_the_pinned_transport_not_the_protocol() {
+        let definition = SPEC
+            .lines()
+            .find(|line| line.starts_with("**[MESH-LEN-007]**"))
+            .expect("MESH-LEN-007 is defined");
+        for clause in [
+            "a responder on the pinned rns-transport MUST cap its serving limit at `SINGLE_SEGMENT_FETCH_CEILING`",
+            "not a limit of this protocol, whose serving limit is MESH-FETCH-026 (MESH-FETCH-027",
+        ] {
+            assert!(
+                definition.contains(clause),
+                "{definition:?} lacks {clause:?}"
+            );
+        }
+    }
+
+    /// Every field a store file reads under a `#[serde(default)]` is named on the
+    /// MESH-CODE-005 line, by its on-disk key where the attribute renames it. The files
+    /// are those of `ON_DISK_STRUCTS` in `schema.rs`: the stores plus `message.rs`, whose
+    /// `PeerMessage` and `Part` ride inside a pending record; none of them holds a
+    /// wire-only struct with a default. The line also states the one exception to the
+    /// bump rule, an additive default that reads an older record as what it was, and
+    /// names MESH-SCHEMA-003 as its instance, so the two paragraphs cannot drift apart.
+    #[test]
+    fn code_005_names_every_on_disk_serde_default_field() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut fields = BTreeSet::new();
+        for (file, _) in schema::ON_DISK_STRUCTS {
+            let path = format!("src/mesh/{file}");
+            let source = std::fs::read_to_string(root.join(&path)).unwrap();
+            let lines: Vec<&str> = source.lines().map(str::trim).collect();
+            let mut index = 0;
+            while index < lines.len() {
+                let start = index;
+                index += 1;
+                let Some(opened) = lines[start].strip_prefix("#[serde(") else {
+                    continue;
+                };
+                let mut attribute = opened.to_string();
+                while !attribute.ends_with(")]") {
+                    let Some(next) = lines.get(index) else {
+                        panic!("unterminated serde attribute at {path}:{}", start + 1);
+                    };
+                    attribute.push(' ');
+                    attribute.push_str(next);
+                    index += 1;
+                }
+                let attribute = attribute.strip_suffix(")]").unwrap();
+                let arguments: Vec<&str> = attribute.split(',').map(str::trim).collect();
+                if !arguments
+                    .iter()
+                    .any(|argument| *argument == "default" || argument.starts_with("default ="))
+                {
+                    continue;
+                }
+                let field = lines[index..]
+                    .iter()
+                    .find(|next| !next.starts_with("#[") && !next.starts_with("///"))
+                    .unwrap_or_else(|| panic!("{path}:{}: no field below", start + 1));
+                let declaration = field
+                    .trim_start_matches("pub(crate) ")
+                    .trim_start_matches("pub ");
+                assert!(
+                    !declaration.starts_with("struct ") && !declaration.starts_with("enum "),
+                    "{path}:{}: struct-level #[serde(default)]; its fields cannot be enumerated here",
+                    start + 1
+                );
+                let declared = declaration.split(':').next().unwrap().trim();
+                let renamed = arguments
+                    .iter()
+                    .find_map(|argument| argument.strip_prefix("rename = \""))
+                    .and_then(|rest| rest.split('"').next());
+                fields.insert(renamed.unwrap_or(declared).to_string());
+            }
+        }
+        assert!(fields.len() > 10, "{fields:?}");
+        let definition = SPEC
+            .lines()
+            .find(|line| line.starts_with("**[MESH-CODE-005]**"))
+            .expect("MESH-CODE-005 is defined");
+        let missing: Vec<&String> = fields
+            .iter()
+            .filter(|field| !definition.contains(&format!("`{field}`")))
+            .collect();
+        assert_eq!(missing, Vec::<&String>::new());
+
+        for clause in [
+            "a field removed, renamed or retyped, or a field added without a default, MUST bump the store's constant",
+            "a field added with a `#[serde(default)]` whose default is the only value an older record could have held MAY land inside the version (MESH-SCHEMA-003 is the instance)",
+        ] {
+            assert!(
+                definition.contains(clause),
+                "{definition:?} lacks {clause:?}"
+            );
+        }
+        assert!(
+            !definition.contains("a field added included"),
+            "the unconditional bump rule is back: {definition:?}"
+        );
+        let instance = SPEC
+            .lines()
+            .find(|line| line.starts_with("**[MESH-SCHEMA-003]**"))
+            .expect("MESH-SCHEMA-003 is defined");
+        let additive = ["kind", "paths", "reason"];
+        for field in additive {
+            assert!(
+                fields.contains(field),
+                "pending.rs no longer defaults `{field}`"
+            );
+            assert!(instance.contains(&format!("`{field}`")), "{instance:?}");
+        }
+        assert!(
+            instance.contains("`INBOUND_RECORD_VERSION` = `2`")
+                && instance.contains("without `kind`, `paths` or `reason`"),
+            "{instance:?}"
+        );
+        assert!(
+            definition
+                .contains("on an inbound record `kind`, `paths` and `reason` (MESH-SCHEMA-003)"),
+            "{definition:?}"
+        );
+    }
+
+    #[test]
+    fn env_042_lists_exactly_the_known_paths_in_order() {
+        let line = SPEC
+            .lines()
+            .find(|line| line.contains("**[MESH-ENV-042]**"))
+            .expect("MESH-ENV-042 is defined");
+        let listed: Vec<&str> = split_spans(line)
+            .into_iter()
+            .map(|(_, span)| span)
+            .filter(|span| span.starts_with('/'))
+            .collect();
+        assert_eq!(listed, r3::KNOWN_PATHS);
+    }
+
+    #[test]
+    fn sec_024_pins_the_envoy_memory_contract() {
+        let line = SPEC
+            .lines()
+            .find(|line| line.starts_with("**[MESH-SEC-024]**"))
+            .expect("MESH-SEC-024 is defined");
+        let bounds: Vec<String> = expected_constants()
+            .into_iter()
+            .filter(|(name, _)| name.starts_with("DEFAULT_ENVOY_MEMORY_"))
+            .map(|(name, value)| format!("`{name}` = `{value}`"))
+            .collect();
+        assert_eq!(bounds.len(), 5, "{bounds:?}");
+        let clauses = [
+            "keyed by the proved sending identity",
+            "`session_key`",
+            "MUST never be loaded",
+            "MUST be bounded in count, size and age",
+            "MAY rely on retained state only within a thread",
+            "MUST NOT assume",
+            "SHOULD remain answerable",
+            "retains none",
+            "never the brief, the per-run peer section the node composes (the instance, kind and route of the message), a system prompt or the owner's own transcript",
+            "the peer-chosen name and message id travelling inside the fenced turn as data (MESH-SEC-009)",
+            "hours since it was last written",
+            "nor is such a record ever one of the owner's own sessions",
+            "goes with its trust",
+        ];
+        for clause in clauses
+            .iter()
+            .copied()
+            .chain(bounds.iter().map(String::as_str))
+        {
+            assert!(line.contains(clause), "{line:?} lacks {clause:?}");
+        }
+    }
+
+    /// Every clause of the sender-facing contract the requirement was written to carry:
+    /// not keyed by destination or thread alone, never loaded for another identity,
+    /// bounded in count, size and age, the owner's transcript excluded, a receiver
+    /// retaining none conformant, a root or evicted thread starting clean, and the
+    /// revocation verbs that take the state with the trust.
+    #[test]
+    fn usage_probe_sec_024_carries_every_clause_of_the_senders_contract() {
+        let line = SPEC
+            .lines()
+            .find(|line| line.starts_with("**[MESH-SEC-024]**"))
+            .expect("MESH-SEC-024 is defined");
+        for clause in [
+            "MAY retain envoy conversation state",
+            "per (sending identity, thread)",
+            "never by the destination",
+            "nor by the thread alone",
+            "on behalf of another identity",
+            "names another identity being refused",
+            "bounded in count, size and age",
+            "MUST NOT assume retained state",
+            "retains none being conformant",
+            "a root message, or one naming a thread the receiver no longer holds, starting clean",
+            "never the brief, the per-run peer section the node composes (the instance, kind and route of the message), a system prompt or the owner's own transcript",
+            "the peer-chosen name and message id travelling inside the fenced turn as data (MESH-SEC-009)",
+            "`.mesh untrust --identity` and `.mesh block` forgetting every thread",
+            "untrust of one destination leaves them in place",
+            "charged to the sending identity's token budget",
+        ] {
+            assert!(line.contains(clause), "MESH-SEC-024 lacks {clause:?}");
+        }
+        let index_row = SPEC
+            .lines()
+            .find(|line| line.starts_with("- [MESH-SEC-024](#154-trust-boundary)"))
+            .expect("MESH-SEC-024 has a section 21 index row");
+        assert!(index_row.contains("envoy memory"), "{index_row}");
+        assert!(
+            SPEC.contains("| MESH-SEC-024 | `a_second_message_in_the_thread_is_driven_with_the_first_exchange`"),
+            "MESH-SEC-024 has a section 20 ENFORCED_BY row"
+        );
+    }
+
+    #[test]
+    fn wire_path_rule_table_names_the_rules_in_order() {
+        const HEADER: &str = "| Rule | Condition | Receiver action |";
+        let section = section(SPEC, "### 10.13 Wire paths").unwrap();
+        let tables = tables(&section.content);
+        let table = tables
+            .iter()
+            .find(|table| table.rows[0].trim() == HEADER)
+            .unwrap_or_else(|| panic!("no {HEADER:?} table under 10.13"));
+        let listed: Vec<&str> = table.rows[2..]
+            .iter()
+            .map(|row| {
+                let first = cells(row)[0];
+                backticked(first)
+                    .unwrap_or_else(|| panic!("rule cell {first:?} is not a code span"))
+            })
+            .collect();
+        let live: Vec<&str> = wire_path::RULES.iter().map(|(name, _)| *name).collect();
+        assert_eq!(listed, live);
+    }
+
+    fn follows(line: &str, needle: &str, accept: impl Fn(&[u8]) -> bool) -> bool {
+        line.match_indices(needle)
+            .any(|(at, _)| accept(&line.as_bytes()[at + needle.len()..]))
+    }
+
+    /// `follows`, with the needle starting a word, so a `render_spec(s)` call is no citation.
+    fn follows_word(line: &str, needle: &str, accept: impl Fn(&[u8]) -> bool) -> bool {
+        let bytes = line.as_bytes();
+        line.match_indices(needle).any(|(at, _)| {
+            is_word_boundary(at.checked_sub(1).and_then(|before| bytes.get(before)))
+                && accept(&bytes[at + needle.len()..])
+        })
+    }
+
+    /// A line that cites a planning artefact (a task id, a lettered review criterion, a
+    /// review round, a ruling, a commit, a letter-dash-number plan label in a comment)
+    /// instead of the behaviour it tests, in any letter case. The needles are assembled at
+    /// runtime so this file does not spell them. A task id quoted inside a code span or a
+    /// string literal is fixture input, not a citation, and a line that names the
+    /// `ILLUSTRATIVE_IDS` list is the fixture that keeps one such id on purpose.
+    fn cites_a_plan_label(line: &str) -> bool {
+        if line.contains("ILLUSTRATIVE_IDS") {
+            return false;
+        }
+        let line = line.to_ascii_lowercase();
+        let task = ["task", "-"].concat();
+        let lettered = [
+            "criterion".to_string(),
+            "acceptance".to_string(),
+            "spec".to_string(),
+            ["usage", " probe"].concat(),
+            "amendment".to_string(),
+        ];
+        let lettered_numbered = [
+            ["b", "-"].concat(),
+            ["g", "-"].concat(),
+            ["t", "-"].concat(),
+        ];
+        let rounds = [
+            ["probe,", " round "].concat(),
+            ["review", " round "].concat(),
+            ["criteria", " "].concat(),
+        ];
+        let ruling = ["ruling", " "].concat();
+        let shorthand = "(r";
+        let round_dash = ["round", "-"].concat();
+        let plain = [
+            ["plan", " criterion"].concat(),
+            ["plan", " ruling"].concat(),
+            ["user", " ruling"].concat(),
+        ];
+        let commit = [" fix", " commit"];
+        let letter_in_parens = |rest: &[u8]| {
+            rest.first() == Some(&b'(')
+                && rest.get(1).is_some_and(u8::is_ascii_lowercase)
+                && rest.get(2) == Some(&b')')
+        };
+        let after_optional_round = |rest: &[u8]| {
+            let rest = match rest {
+                [b' ', b'r', digits @ ..] if digits.first().is_some_and(u8::is_ascii_digit) => {
+                    &digits[digits.iter().take_while(|b| b.is_ascii_digit()).count()..]
+                }
+                rest => rest,
+            };
+            letter_in_parens(rest.strip_prefix(b" ").unwrap_or(rest))
+        };
+        let after_a_short_hash = |before: &[u8]| {
+            let hex = before
+                .iter()
+                .rev()
+                .take_while(|b| b.is_ascii_hexdigit())
+                .count();
+            let token = &before[before.len() - hex..];
+            (7..=40).contains(&hex)
+                && token.iter().any(u8::is_ascii_digit)
+                && before[..before.len() - hex]
+                    .last()
+                    .is_none_or(|b| !b.is_ascii_alphanumeric() && *b != b'_')
+        };
+        let round_shorthand = |rest: &[u8]| {
+            let digits = rest.iter().take_while(|b| b.is_ascii_digit()).count();
+            let rest = &rest[digits..];
+            digits > 0
+                && (rest.first() == Some(&b')')
+                    || rest.strip_prefix(b" ").is_some_and(letter_in_parens))
+        };
+        let ruling_shorthand_at_start = |text: &str| {
+            let bytes = text.as_bytes();
+            bytes.first() == Some(&b'r') && bytes.get(1).is_some_and(u8::is_ascii_digit) && {
+                let digits = bytes[1..].iter().take_while(|b| b.is_ascii_digit()).count();
+                bytes.get(1 + digits) == Some(&b':')
+            }
+        };
+        let comment_text = line
+            .trim_start()
+            .strip_prefix("//")
+            .map(|text| text.trim_start_matches('/').trim_start());
+        let starts_with_digit = |rest: &[u8]| rest.first().is_some_and(u8::is_ascii_digit);
+        follows(&without_quoted(&line), &task, starts_with_digit)
+            || lettered
+                .iter()
+                .any(|needle| follows_word(&line, needle, after_optional_round))
+            || comment_text.is_some_and(|text| {
+                lettered_numbered
+                    .iter()
+                    .any(|needle| follows_word(&without_quoted(text), needle, starts_with_digit))
+            })
+            || comment_text.is_some_and(|text| letter_in_parens(text.as_bytes()))
+            || rounds
+                .iter()
+                .chain(std::iter::once(&ruling))
+                .any(|needle| follows(&line, needle, starts_with_digit))
+            || plain.iter().any(|needle| line.contains(needle.as_str()))
+            || comment_text.is_some_and(|text| follows(text, shorthand, round_shorthand))
+            || comment_text.is_some_and(ruling_shorthand_at_start)
+            || follows(&line, &round_dash, starts_with_digit)
+            || commit.iter().any(|needle| {
+                line.match_indices(needle)
+                    .any(|(at, _)| after_a_short_hash(&line.as_bytes()[..at]))
+            })
+    }
+
+    fn without_quoted(line: &str) -> String {
+        let mut out = String::with_capacity(line.len());
+        let mut rest = strip_spans(line);
+        while let Some(open) = rest.find('"') {
+            let Some(close) = rest[open + 1..].find('"') else {
+                break;
+            };
+            out.push_str(&rest[..open]);
+            out.push(' ');
+            rest = rest[open + close + 2..].to_string();
+        }
+        out.push_str(&rest);
+        out
+    }
+
+    #[test]
+    fn plan_label_scanner_trips_each_shape_and_spares_prose() {
+        for hit in [
+            ["// see TASK", "-118 for why"].concat(),
+            ["// see task", "-118 for why"].concat(),
+            ["/// Usage probe, criterion", " (b): the root"].concat(),
+            ["/// Criterion", " (b): the root"].concat(),
+            ["/// acceptance", " (c): the peer"].concat(),
+            ["// the spec", "(a) says"].concat(),
+            ["/// usage", " probe r2 (d): bare"].concat(),
+            ["/// amendment", " (b) covers"].concat(),
+            "/// (x) the second reply".to_string(),
+            "// (a) the second reply".to_string(),
+            ["// ruling", " 3 settled it"].concat(),
+            ["// per the user", " ruling"].concat(),
+            ["// ---- review", " round 2 ----"].concat(),
+            ["// ---- usage probe,", " round 2 ----"].concat(),
+            ["/// Plan", " criterion (f): at every cap"].concat(),
+            ["// the plan", " ruling was"].concat(),
+            ["/// usage", " probe r10 (b): the tenth"].concat(),
+            ["// settled (R", "3): the reply"].concat(),
+            ["// ---- usage probe (r", "4) ----"].concat(),
+            ["// settled (r", "2 (b)): the reply"].concat(),
+            ["// criteria", " 3+4 hold"].concat(),
+            ["// the 3a3d1d1", " fix narrowed it"].concat(),
+            [
+                "// after 0123456789abcdef0123456789abcdef01234567",
+                " commit",
+            ]
+            .concat(),
+            ["// the preview prints first (B", "-40)"].concat(),
+            ["/// g", "-12 covers the relay"].concat(),
+            ["// per t", "-3 the cap holds"].concat(),
+            ["// see B", "-7"].concat(),
+            ["// R", "8: judged before anything is printed"].concat(),
+            ["// r", "3: the peer refuses the reference"].concat(),
+            ["// The round", "-3 README claimed"].concat(),
+        ] {
+            assert!(cites_a_plan_label(&hit), "{hit:?}");
+        }
+        for miss in [
+            "// the TASK list is drained".to_string(),
+            "// a criterion (the first) applies".to_string(),
+            "// the rule (a) above".to_string(),
+            "// a spec (RFC) is cited".to_string(),
+            "// reviewed in round 2 of the audit".to_string(),
+            "// the ruling stands".to_string(),
+            "// a planned criterion is unmet".to_string(),
+            "// B6 and G8 are hex here".to_string(),
+            "// the R3 transport frames it".to_string(),
+            "// the R3 transport (r3 for short) frames it".to_string(),
+            "// r3 frames it".to_string(),
+            "// round trip".to_string(),
+            "// the transport (r3, lowercase on the wire) frames it".to_string(),
+            "// Err(R3Error::Shutdown) ends it".to_string(),
+            "assert_eq!(r1.len(), 2);".to_string(),
+            "// 9f1c3b0e6d8a4f2b9c7e1a5d3b8f6c04 is a wire id".to_string(),
+            "// a fix for the relay".to_string(),
+            "// the cache fix narrowed it".to_string(),
+            "// a defaced fix is reverted".to_string(),
+            "// the criteria differ".to_string(),
+            "// render_spec(s) builds the table".to_string(),
+            ["// the rule quotes `// TASK", "-002` as its example"].concat(),
+            ["let id = \"TASK", "-002\";"].concat(),
+            ["const ILLUSTRATIVE_IDS: [&str; 1] = [\"TASK", "-002\"];"].concat(),
+            "// the a1b2c3 hash names it".to_string(),
+            "// sub-1 is the first child".to_string(),
+            "// the b-tree is balanced".to_string(),
+            "// t-shirt sizing".to_string(),
+            ["let label = \"B", "-40\";"].concat(),
+            ["  models: [{name: g", "-1}]"].concat(),
+            ["/// Node A asks in thread `t", "-1`; node B answers"].concat(),
+        ] {
+            assert!(!cites_a_plan_label(&miss), "{miss:?}");
+        }
+    }
+
+    #[test]
+    fn source_comments_cite_behaviour_not_plan_labels() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files: Vec<(String, String)> = rust_source_files(root).unwrap();
+        files.extend(rust_files_under(root, "tests").unwrap());
+        files.push(("docs/mesh/PROTOCOL.md".to_string(), SPEC.to_string()));
+        let hits: Vec<String> = files
+            .iter()
+            .flat_map(|(path, source)| {
+                source
+                    .lines()
+                    .enumerate()
+                    .filter(|(_, line)| cites_a_plan_label(line))
+                    .map(move |(index, line)| format!("{path}:{}: {}", index + 1, line.trim()))
+            })
+            .collect();
+        assert!(
+            hits.is_empty(),
+            "code comments describe behaviour; cite a MESH- id or the behaviour instead of a \
+             plan label:\n{}",
+            hits.join("\n")
+        );
+    }
+
+    /// `source` line for line, so line numbers hold, with every `#[cfg(test)]`-attributed
+    /// inline module and every plain `//` comment line blanked. Doc comments (`///`,
+    /// `//!`) stay: they render as rustdoc and as `clap` help. A top-level module closes
+    /// at the first `}` on a line of its own, as rustfmt lays it out.
+    fn lines_outside_test_modules(source: &str) -> Vec<&str> {
+        let mut lines: Vec<&str> = source.lines().collect();
+        let mut at = 0;
+        while at < lines.len() {
+            let opens_test_module = lines[at] == "#[cfg(test)]"
+                && lines.get(at + 1).is_some_and(|opener| {
+                    opener.ends_with('{')
+                        && (opener.starts_with("mod ") || opener.starts_with("pub(crate) mod "))
+                });
+            if opens_test_module {
+                while at < lines.len() && lines[at] != "}" {
+                    lines[at] = "";
+                    at += 1;
+                }
+            } else if is_a_plain_comment(lines[at]) {
+                lines[at] = "";
+            }
+            at += 1;
+        }
+        lines
+    }
+
+    fn is_a_plain_comment(line: &str) -> bool {
+        let rest = line.trim_start().strip_prefix("//");
+        rest.is_some_and(|rest| !rest.starts_with('/') && !rest.starts_with('!'))
+    }
+
+    /// The workspace config directory's name reaches the code through
+    /// `paths::workspace_config_dir_name` and `paths::workspace_config_dirs`, so an
+    /// override renames it everywhere at once, help and display strings included. Only
+    /// `paths.rs` and the constant's own definition may spell it; test code may, since a
+    /// fixture lays out a directory by its default name. A file whose module is declared
+    /// under `#[cfg(test)]` is test code wholesale. A plain `//` comment may say what it
+    /// likes; a doc comment is held to the helper because it renders, as rustdoc or as
+    /// `clap` help. The name counts when it stands as a word: opened by a quote, a
+    /// backtick, a space, a slash, a brace or a parenthesis and not run on into a longer
+    /// identifier, so `.coyote_password` and `.coyote-case-probe` are other names.
+    #[test]
+    fn only_the_paths_helper_spells_the_workspace_config_dir_name() {
+        // Assembled at runtime so the scan does not match this test's own text.
+        let constant = ["WORKSPACE_", "COYOTE_DIR_NAME"].concat();
+        let name = [".coy", "ote"].concat();
+        let spells_the_name = |line: &str| {
+            line.match_indices(&name).any(|(at, _)| {
+                // The name is a whole word: whatever precedes it is not part of an
+                // identifier, and neither is whatever follows, so `.coyote_password` and
+                // `.coyote-case-probe` are other names while `\.coyote\` and `=.coyote` are
+                // hits. A string escape such as `\n` or `\t` ends in a letter but is not a
+                // word either.
+                let part_of_a_word = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
+                let before = &line[..at];
+                let after_an_escape = before.ends_with("\\n") || before.ends_with("\\t");
+                (after_an_escape || !before.chars().next_back().is_some_and(part_of_a_word))
+                    && !line[at + name.len()..]
+                        .chars()
+                        .next()
+                        .is_some_and(part_of_a_word)
+            })
+        };
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let files = rust_source_files(root).unwrap();
+        let test_modules: HashSet<String> = files
+            .iter()
+            .flat_map(|(_, source)| {
+                source
+                    .lines()
+                    .zip(source.lines().skip(1))
+                    .filter_map(|(attribute, item)| {
+                        (attribute.trim() == "#[cfg(test)]")
+                            .then(|| item.trim().trim_start_matches("pub(crate) "))
+                            .and_then(|item| item.strip_prefix("mod "))
+                            .and_then(|item| item.strip_suffix(';'))
+                            .map(str::to_string)
+                    })
+            })
+            .collect();
+        let is_test_file = |path: &str| {
+            path.split('/')
+                .any(|part| test_modules.contains(part.strip_suffix(".rs").unwrap_or(part)))
+        };
+        let scan = |path: &str, source: &str| -> Vec<String> {
+            if path == "src/config/paths.rs" || is_test_file(path) {
+                return Vec::new();
+            }
+            lines_outside_test_modules(source)
+                .iter()
+                .enumerate()
+                .filter(|(_, line)| {
+                    let defines_the_constant = path == "src/config/mod.rs"
+                        && line
+                            .trim_start()
+                            .starts_with(&format!("pub(crate) const {constant}"));
+                    !defines_the_constant && (line.contains(&constant) || spells_the_name(line))
+                })
+                .map(|(index, line)| format!("{path}:{}: {}", index + 1, line.trim()))
+                .collect()
+        };
+        for red in [
+            format!(
+                "fn help() -> &'static str {{\n    \"Save under {name}/ in the workspace\"\n}}\n"
+            ),
+            format!("/// Disable loading workspace macros from {name}/macros\n"),
+            format!("let dir = \"{name}\";\n"),
+            format!("let file = root.join(\"/{name}/mcp.json\");\n"),
+            format!("/// The `{name}` directory holds it.\n"),
+            format!("/// Saved under {name}, beside the sources.\n"),
+            format!("let name = {constant};\n"),
+            format!("let key = \"C:\\\\Users\\\\me\\\\{name}\\\\mesh\\\\identity.key\";\n"),
+            format!("let entry = \"target/\\n{name}/memory/\\n\";\n"),
+            format!("/// e.g. COYOTE_WORKSPACE_CONFIG_DIR={name}\n"),
+        ] {
+            let control = scan("src/fixture.rs", &red);
+            assert_eq!(
+                control.len(),
+                1,
+                "the scan does not go red on {red:?}: {control:?}"
+            );
+        }
+        for green in [
+            format!("let probe = \"{name}-case-probe\";\n"),
+            format!("let file = home.join(\"{name}_password\");\n"),
+            format!("// a {name} comment is not help\n"),
+        ] {
+            let control = scan("src/fixture.rs", &green);
+            assert!(
+                control.is_empty(),
+                "the scan goes red on {green:?}: {control:?}"
+            );
+        }
+        let hits: Vec<String> = files
+            .iter()
+            .flat_map(|(path, source)| scan(path, source))
+            .collect();
+        assert!(
+            hits.is_empty(),
+            "spell the workspace config directory through paths::workspace_config_dir_name \
+             or paths::workspace_config_dirs:\n{}",
+            hits.join("\n")
+        );
+    }
+
     #[test]
     fn spec_constants_are_pinned_by_tests_that_exist() {
         let sources = rust_sources(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src")).unwrap();
@@ -2263,6 +3735,43 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
     }
 
     #[test]
+    fn frozen_areas_define_no_id_past_their_published_maximum() {
+        let definitions = definitions(&body(SPEC).unwrap()).unwrap();
+        let frozen = [
+            ("DEST", 10),
+            ("ANN", 33),
+            ("ENV", 50),
+            ("VER", 14),
+            ("EXT", 8),
+            ("CODE", 5),
+            ("KNOCK", 29),
+            ("STATUS", 30),
+            ("MSG", 59),
+            ("PROP", 42),
+            ("TIME", 11),
+            ("CANON", 13),
+        ];
+        let highest: Vec<(&str, usize)> = frozen
+            .iter()
+            .map(|(area, _)| {
+                let prefix = format!("MESH-{area}-");
+                let max = definitions
+                    .iter()
+                    .filter_map(|d| d.id.strip_prefix(&prefix))
+                    .map(|digits| digits.parse::<usize>().expect("three digits"))
+                    .max()
+                    .unwrap_or_else(|| panic!("{area} defines no ids"));
+                (*area, max)
+            })
+            .collect();
+        assert_eq!(
+            highest,
+            frozen.to_vec(),
+            "a new requirement in a frozen area moves this pin deliberately"
+        );
+    }
+
+    #[test]
     fn spec_source_paths_exist() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let paths = source_paths(SPEC);
@@ -2272,5 +3781,34 @@ B (see `(` in a span) (`beta_test_two`, src/a.rs).
             .filter(|path| !root.join(path).is_file())
             .collect();
         assert_eq!(missing, Vec::<&String>::new());
+    }
+
+    /// The fetch response bound is the largest file plus framing, and a reply carrying
+    /// exactly the largest file fits under it.
+    #[test]
+    fn fetch_response_bound_is_the_file_bound_plus_framing() {
+        assert_eq!(
+            MAX_FETCH_RESPONSE_BYTES,
+            MAX_FETCH_FILE_BYTES as usize + 4096
+        );
+        let largest = ResponseFrame {
+            request_id: RequestId::from([0; 16]),
+            data: Value::Map(vec![
+                (Value::from("v"), Value::from(1)),
+                (Value::from("status"), Value::from("ok")),
+                (Value::from("size"), Value::from(MAX_FETCH_FILE_BYTES)),
+                (Value::from("sha256"), Value::Binary(vec![0; 32])),
+                (
+                    Value::from("bytes"),
+                    Value::Binary(vec![0; MAX_FETCH_FILE_BYTES as usize]),
+                ),
+            ]),
+        }
+        .encode();
+        assert!(
+            largest.len() <= MAX_FETCH_RESPONSE_BYTES,
+            "{} bytes, max {MAX_FETCH_RESPONSE_BYTES}",
+            largest.len()
+        );
     }
 }

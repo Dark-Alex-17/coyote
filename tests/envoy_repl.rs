@@ -150,13 +150,31 @@ fn spawn_repl(command: Command) -> Target {
 }
 
 /// Waits for the regex `pattern`, answering every cursor position query that
-/// arrives first, and returns the bytes that came before the match.
+/// arrives first, and returns the bytes that came before the match. A timeout
+/// panics with everything the REPL painted in the meantime and whether the
+/// REPL is still running, so a wait that never matched shows what arrived
+/// instead of just that nothing did.
 fn wait_for(session: &mut Target, pattern: &str) -> Vec<u8> {
     let mut before = Vec::new();
     loop {
-        let captures = session
-            .expect(Any([Regex(pattern), Regex(CURSOR_POSITION_QUERY)]))
-            .unwrap_or_else(|err| panic!("waiting for {pattern:?}: {err}"));
+        let captures = match session.expect(Any([Regex(pattern), Regex(CURSOR_POSITION_QUERY)])) {
+            Ok(captures) => captures,
+            Err(err) => {
+                let unmatched = session
+                    .check(Regex("(?s).*"))
+                    .map(|captures| captures.as_bytes().to_vec())
+                    .unwrap_or_default();
+                let status = session.get_process().status().map_or_else(
+                    |err| format!("unknown ({err})"),
+                    |status| format!("{status:?}"),
+                );
+                panic!(
+                    "waiting for {pattern:?}: {err}\nREPL process: {status}\nseen before the wait: {:?}\nunmatched output: {:?}",
+                    String::from_utf8_lossy(&before),
+                    String::from_utf8_lossy(&unmatched)
+                );
+            }
+        };
         before.extend_from_slice(captures.before());
         if captures.get(0) == Some(b"\x1b[6n".as_slice()) {
             session

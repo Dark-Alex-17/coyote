@@ -55,9 +55,12 @@ well-formed request on the same link and assert it is served.
 #### What this crate does meanwhile
 
 Production code sets no advertisement-time cap and no response size limit. Inbound requests and
-responses are bounded on this side after assembly instead, at `MAX_R3_PAYLOAD_BYTES`
-(`R3Server::dispatch`, `R3Client::deliver`), with the upstream 64 MiB advertisement cap as the
-only bound before that. The cap setter is reachable from tests only (`arm_request_cap_for_test`).
+responses are bounded on this side after assembly instead, per path: a request at
+`MAX_R3_PAYLOAD_BYTES` (`R3Server::dispatch`), a response at `MAX_FETCH_RESPONSE_BYTES` when it
+answers a `/fetch` and `MAX_R3_PAYLOAD_BYTES` otherwise, the path read off the pending request
+the frame's fixed prefix names before the frame is decoded (`R3Client::deliver`), with the
+upstream 64 MiB advertisement cap as the only bound before that. The cap setter is reachable
+from tests only (`arm_request_cap_for_test`).
 Removal condition: when the pinned transport sends the reject outside the lock, re-arm the cap
 and keep the post-assembly bound as the second line.
 
@@ -148,6 +151,63 @@ Every identity or destination hash given as text passes through `canonical_hash`
 which refuses anything that is not 32 ASCII hex digits, so the panicking path is unreachable
 from this crate. Removal condition: when the pinned parser validates its input, the guard
 becomes defence in depth and the leniency row is retired.
+
+### A4. rns-transport: follow-up Resource segments are dispatched through the path table and dropped on a non-broadcast link
+
+- Status: Drafted, not yet filed.
+- Repository / revision: FreeTAKTeam/LXMF-rs, crate `reticulum-rs-transport`, release 0.12.0
+  (crates.io), where found; `transport/resource_wire.rs` (`handle_resource_proof`) and the
+  `resource-retry` worker in `transport/jobs.rs`.
+- Severity: medium. A Resource longer than one segment (`MAX_EFFICIENT_SIZE`, one byte under
+  1 MiB) never completes between two nodes that keep `broadcast: false`: the first segment
+  transfers, the second segment's advertisement is dropped as unroutable, and the requester
+  waits out its deadline. The same transfer completes with `broadcast: true`.
+- Referenced by: `MESH-LEN-007` in `docs/mesh/PROTOCOL.md`.
+
+#### Root cause
+
+The first segment's advertisement leaves on the link's bound interface
+(`send_link_packet_on_bound_iface`, the `send_resource_*` family in
+`transport/links_parts/transport_sections/reset_out_link.rs`). When the proof for a completed
+segment arrives, `handle_resource_proof` (`transport/resource_wire.rs`) lets the resource
+manager build the next segment's advertisement and hands it to `handler.send_packet`; the
+`resource-retry` worker in `transport/jobs.rs` re-sends pending advertisements
+(`poll_outgoing`) the same way. `send_packet` routes through the path table
+(`route_outbound_packet` in `transport/path.rs`, called from `send_packet` in
+`transport/handler.rs`), and a link id is never a path-table key, so
+the lookup finds no next interface; only an announce is broadcast without a route, and a node
+with `broadcast: false` records `DroppedNoRoute` and sends nothing. The requester, which
+received segment one, waits for an advertisement that never leaves the responder.
+
+#### Reproduction
+
+1. Start two transports on a loopback `TcpServer` / `TcpClient` pair with `broadcast: false`
+   on both, open a link from B to A and register a request handler on A that answers with a
+   Resource of the requested size.
+2. Request a 300 KiB body. It travels as one segment and completes.
+3. Request a 1 MiB + 64 KiB body. A's side reports `OutboundFailed` after its retries, each
+   of them `DroppedNoRoute`; B's request times out.
+4. Repeat step 3 with `broadcast: true` on A. The two segments arrive and the request
+   completes.
+
+#### Suggested fix
+
+Dispatch the advertisement of every segment after the first, and each retry of it, on the
+link's bound interface as the first segment's is, instead of through `send_packet`. A
+regression test: a two-segment Resource over a `broadcast: false` pair completes.
+
+#### What this crate does meanwhile
+
+The responder caps its serving limit at `SINGLE_SEGMENT_FETCH_CEILING` = `MAX_EFFICIENT_SIZE`
+less `OK_REPLY_FRAMING_BYTES` (1 048 575 − 128 = 1 048 447 bytes; `serving_limit`,
+`src/mesh/fetch.rs`), so every `ok` reply fits one segment, and answers `too_large` with that
+limit for a larger file (`MESH-FETCH-027`, `MESH-LEN-007`;
+`a_file_above_the_single_segment_ceiling_is_too_large_with_that_limit`,
+`an_ok_reply_at_the_ceiling_fits_one_resource_segment`, `src/mesh/fetch.rs`). The ceiling only
+ever lowers `mesh.fetch.max_bytes`; a compile-time assertion keeps it under
+`MAX_FETCH_FILE_BYTES`. Removal condition: the upstream release that sends follow-up
+advertisements the way it sends the first; then the ceiling, its test and the README/config
+clauses go.
 
 ## Part B: inherited drafts against Reticulum implementations
 

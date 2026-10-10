@@ -14,6 +14,8 @@
 //! deliberate soak, so exactly that many iterations run and the cap is lifted.
 //! `COYOTE_MESH_FUZZ_SEED` (decimal or `0x` hex) replaces `DEFAULT_SEED`; the same seed
 //! yields the same inputs, so a run is reproducible on every platform.
+//! `COYOTE_MESH_FUZZ_WRITE_CORPUS=1` rewrites the codec corpus files that carry a wire
+//! identifier from the live constants instead of checking them.
 //!
 //! Reproducing a failure. A violation prints the target, the seed, the iteration (or corpus
 //! file), the oracle's text and the input as hex, and writes the input to
@@ -47,6 +49,7 @@ pub(super) const DEFAULT_ITERS: u64 = 2000;
 pub(super) const TARGET_WALL_CAP: Duration = Duration::from_secs(10);
 const ITERS_ENV: &str = "COYOTE_MESH_FUZZ_ITERS";
 const SEED_ENV: &str = "COYOTE_MESH_FUZZ_SEED";
+const WRITE_CORPUS_ENV: &str = "COYOTE_MESH_FUZZ_WRITE_CORPUS";
 const DEFAULT_SEED: u64 = 0xC07E_5EED_2026_0001;
 /// The splitmix64 increment, also the per-iteration seed spreader.
 const GOLDEN: u64 = 0x9E37_79B9_7F4A_7C15;
@@ -402,6 +405,7 @@ fn fuzz_budget_constants_are_pinned() {
     assert_eq!(TARGET_WALL_CAP, Duration::from_secs(10));
     assert_eq!(ITERS_ENV, "COYOTE_MESH_FUZZ_ITERS");
     assert_eq!(SEED_ENV, "COYOTE_MESH_FUZZ_SEED");
+    assert_eq!(WRITE_CORPUS_ENV, "COYOTE_MESH_FUZZ_WRITE_CORPUS");
     let ci = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/.github/workflows/ci.yaml"
@@ -505,11 +509,682 @@ fn fuzz_receipt_boundary_corpus_lengths_are_pinned() {
     );
 }
 
+/// The codec corpus files that spell a wire identifier or a store version are derived
+/// from the live constants, so a rename of the magic or a type tag, or a store bump,
+/// regenerates them instead of leaving the corpus replaying the old bytes.
+/// `WRITE_CORPUS_ENV=1` writes the derived bytes in place of checking them. Either way
+/// each file must still reach the decoder outcome its name describes, so a regenerated
+/// file cannot silently stop exercising it.
+#[test]
+fn fuzz_codec_corpus_files_carrying_wire_identifiers_are_built_from_the_live_constants() {
+    use super::announce::{ANNOUNCE_MAGIC, AnnounceAppData};
+    use super::knock::{KNOCK_TYPE, KnockMessage, decode_knock_message};
+    use super::message::{PEER_MESSAGE_TYPE, PeerLxmf, decode_peer_lxmf};
+    use super::pending::{PENDING_RECORD_VERSION, PendingRecord, PendingState};
+    use lxmf_core::constants::{FIELD_CUSTOM_DATA, FIELD_CUSTOM_TYPE};
+    use oracles::{
+        TAG_ANNOUNCE, TAG_KNOCK_FIELDS, TAG_PEER_FIELDS, TAG_PENDING, inbound_with, unpack_whole,
+    };
+    use rmpv::Value;
+
+    fn announce(version: [u8; 2], name: &[u8]) -> Vec<u8> {
+        [&[TAG_ANNOUNCE][..], &ANNOUNCE_MAGIC, &version, name].concat()
+    }
+    fn lxmf_fields(tag: u8, custom_type: &str, data: Vec<(Value, Value)>) -> Vec<u8> {
+        let fields = Value::Map(vec![
+            (Value::from(FIELD_CUSTOM_TYPE), Value::from(custom_type)),
+            (Value::from(FIELD_CUSTOM_DATA), Value::Map(data)),
+        ]);
+        let mut bytes = vec![tag];
+        rmpv::encode::write_value(&mut bytes, &fields).unwrap();
+        bytes
+    }
+    fn pending_line_with_unknown_field() -> Vec<u8> {
+        let record = PendingRecord {
+            version: PENDING_RECORD_VERSION,
+            id: "q1".to_string(),
+            peer_destination: "0b".repeat(16),
+            peer_identity: "0a".repeat(16),
+            thread: "q1".to_string(),
+            question: "what time is it".to_string(),
+            sent_at: "2027-01-15T05:13:20Z".to_string(),
+            timeout_at: "2027-01-15T05:23:20Z".to_string(),
+            state: PendingState::Open,
+            reply: None,
+        };
+        let mut object = serde_json::to_value(&record).unwrap();
+        object["later_field"] = serde_json::Value::from("refused");
+        let mut bytes = vec![TAG_PENDING];
+        bytes.extend(serde_json::to_string(&object).unwrap().into_bytes());
+        bytes.push(b'\n');
+        bytes
+    }
+
+    enum Outcome {
+        AnnounceVersion(u16),
+        NotAnAnnounce,
+        PeerNameHashLength,
+        KnockNameHashLength,
+        PendingUnknownField,
+    }
+    const NAME_HASH_LENGTH_REASON: &str = "name_hash is not 10 bytes";
+
+    let expected = [
+        (
+            "MESH-ANN-002-announce-version-ffff.bin",
+            announce([0xff, 0xff], b"Alex"),
+            Outcome::AnnounceVersion(0xffff),
+        ),
+        (
+            "MESH-ANN-003-announce-name-65-bytes.bin",
+            announce([0x00, 0x01], &[b'a'; 65]),
+            Outcome::NotAnAnnounce,
+        ),
+        (
+            "MESH-MSG-052-peer-name-hash-nine-bytes.bin",
+            lxmf_fields(
+                TAG_PEER_FIELDS,
+                PEER_MESSAGE_TYPE,
+                vec![
+                    (Value::from("name_hash"), Value::Binary(vec![0x09; 9])),
+                    (Value::from("kind"), Value::from("message")),
+                    (Value::from("id"), Value::from("m1")),
+                ],
+            ),
+            Outcome::PeerNameHashLength,
+        ),
+        (
+            "MESH-KNOCK-023-name-hash-nine-bytes.bin",
+            lxmf_fields(
+                TAG_KNOCK_FIELDS,
+                KNOCK_TYPE,
+                vec![(Value::from("name_hash"), Value::Binary(vec![0x07; 9]))],
+            ),
+            Outcome::KnockNameHashLength,
+        ),
+        (
+            "MESH-CODE-005-pending-unknown-field.bin",
+            pending_line_with_unknown_field(),
+            Outcome::PendingUnknownField,
+        ),
+    ];
+    let write = std::env::var_os(WRITE_CORPUS_ENV).is_some_and(|v| v == "1");
+    for (name, bytes, outcome) in expected {
+        let path = corpus_dir("codecs").join(name);
+        if write {
+            fs::write(&path, &bytes).unwrap();
+        }
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            bytes,
+            "codecs/{name} must be the bytes built from the live wire constants; regenerate with {WRITE_CORPUS_ENV}=1"
+        );
+        let payload = &bytes[1..];
+        match outcome {
+            Outcome::AnnounceVersion(version) => {
+                let decoded = AnnounceAppData::decode(payload)
+                    .unwrap_or_else(|| panic!("codecs/{name} must decode as an announce"));
+                assert_eq!(decoded.version, version, "codecs/{name}");
+            }
+            Outcome::NotAnAnnounce => {
+                assert!(
+                    AnnounceAppData::decode(payload).is_none(),
+                    "codecs/{name} must be refused by the announce decoder"
+                );
+            }
+            Outcome::PeerNameHashLength => {
+                let fields = unpack_whole(payload).unwrap();
+                let observed = decode_peer_lxmf(&inbound_with(fields));
+                assert!(
+                    matches!(observed, PeerLxmf::Malformed(NAME_HASH_LENGTH_REASON)),
+                    "codecs/{name}: decoded as {observed:?}"
+                );
+            }
+            Outcome::KnockNameHashLength => {
+                let fields = unpack_whole(payload).unwrap();
+                let observed = decode_knock_message(&inbound_with(fields));
+                assert!(
+                    matches!(observed, KnockMessage::Malformed(NAME_HASH_LENGTH_REASON)),
+                    "codecs/{name}: decoded as {observed:?}"
+                );
+            }
+            Outcome::PendingUnknownField => {
+                let line = std::str::from_utf8(payload).unwrap().trim_end();
+                let refusal = serde_json::from_str::<PendingRecord>(line)
+                    .err()
+                    .map(|error| error.to_string())
+                    .unwrap_or_else(|| panic!("codecs/{name} must be refused by PendingRecord"));
+                assert!(
+                    refusal.contains("later_field"),
+                    "codecs/{name}: refusal must name the unknown key, got {refusal}"
+                );
+            }
+        }
+    }
+}
+
+/// One codec seed per wire-path rule, each a path that breaks exactly the rule its name
+/// carries and none of the rules checked before it, so the replay exercises every
+/// `invalid_path` id the grammar can answer with. The texts are built from the live
+/// limits and `WRITE_CORPUS_ENV=1` rewrites the files, as for the wire-identifier seeds.
+#[test]
+fn fuzz_codec_corpus_wire_path_seeds_break_exactly_the_rule_their_name_claims() {
+    use super::wire_path::{RULES, WIRE_PATH_MAX_BYTES, WIRE_PATH_MAX_SEGMENTS, WirePath};
+    use oracles::TAG_WIRE_PATH;
+
+    fn text_for(rule: &str) -> String {
+        match rule {
+            "empty" => String::new(),
+            "length" => "a".repeat(WIRE_PATH_MAX_BYTES + 1),
+            "control" => "a\tb".to_string(),
+            "invisible" => "a\u{200b}b".to_string(),
+            "backslash" => "docs\\a.md".to_string(),
+            "leading_slash" => "/a".to_string(),
+            "drive_letter" => "C:x".to_string(),
+            "colon" => "ab:c".to_string(),
+            "nfc" => "e\u{301}".to_string(),
+            "segments" => "a/".repeat(WIRE_PATH_MAX_SEGMENTS) + "a",
+            "segment" => "docs//a.md".to_string(),
+            "trailing_dot" => "a.".to_string(),
+            "trailing_space" => "a ".to_string(),
+            "reserved_name" => "CON".to_string(),
+            other => panic!("no seed text for wire-path rule `{other}`"),
+        }
+    }
+
+    let fixture = oracles::CodecFixture::new();
+    let write = std::env::var_os(WRITE_CORPUS_ENV).is_some_and(|v| v == "1");
+    for (rule, _) in RULES {
+        let name = format!("MESH-FETCH-004-{rule}.bin");
+        let text = text_for(rule);
+        let bytes = [&[TAG_WIRE_PATH][..], text.as_bytes()].concat();
+        let path = corpus_dir("codecs").join(&name);
+        if write {
+            fs::write(&path, &bytes).unwrap();
+        }
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            bytes,
+            "codecs/{name} must be the bytes built from the live wire-path limits; regenerate with {WRITE_CORPUS_ENV}=1"
+        );
+        let Err(invalid) = WirePath::parse(&text) else {
+            panic!("codecs/{name}: {text:?} must be refused");
+        };
+        assert_eq!(
+            invalid.rule, rule,
+            "codecs/{name}: {text:?} must break `{rule}` first"
+        );
+        oracles::check_codec_bytes(&fixture, &bytes).unwrap_or_else(|what| {
+            panic!("codecs/{name} must satisfy the wire-path oracle: {what}")
+        });
+    }
+}
+
+/// Codec seeds for the `/list` page, `/fetch` reply and `/access` decoders, each built
+/// from the live page, cursor, path and reply constants and each reaching the outcome its
+/// name claims; `WRITE_CORPUS_ENV=1` rewrites the files, as for the wire-identifier seeds.
+#[test]
+fn fuzz_codec_corpus_share_and_access_seeds_reach_the_outcome_their_name_claims() {
+    use super::access::{
+        ACCESS_MAX_PATHS, ACCESS_TYPE, AccessError, AccessMessage, decode_access,
+        decode_access_message, read_access_reply,
+    };
+    use super::fetch::{CURSOR_MAX_BYTES, FetchError, FetchReply, SharesPage, read_fetch_reply};
+    use super::message::PEER_WIRE_VERSION;
+    use super::r3::NAME_HASH_LEN;
+    use lxmf_core::constants::{FIELD_CUSTOM_DATA, FIELD_CUSTOM_TYPE};
+    use oracles::{
+        SENT_ID, TAG_ACCESS_FIELDS, TAG_ACCESS_REPLY, TAG_ACCESS_REQUEST, TAG_FETCH_REPLY,
+        TAG_LIST_PAGE, inbound_with, unpack_whole,
+    };
+    use rmpv::Value;
+
+    fn tagged(tag: u8, value: &Value) -> Vec<u8> {
+        let mut bytes = vec![tag];
+        rmpv::encode::write_value(&mut bytes, value).unwrap();
+        bytes
+    }
+    fn versioned(tag: u8, rest: Vec<(&str, Value)>) -> Vec<u8> {
+        let mut entries = vec![("v", Value::from(PEER_WIRE_VERSION))];
+        entries.extend(rest);
+        let map = Value::Map(
+            entries
+                .into_iter()
+                .map(|(key, value)| (Value::from(key), value))
+                .collect(),
+        );
+        tagged(tag, &map)
+    }
+    fn paths(count: usize) -> Value {
+        Value::Array((0..count).map(|i| Value::from(format!("p{i}"))).collect())
+    }
+    let entry = Value::Map(vec![
+        (Value::from("path"), Value::from("docs/a.md")),
+        (Value::from("size"), Value::from(3u64)),
+        (Value::from("sha256"), Value::Binary(vec![0; 32])),
+        (Value::from("mtime"), Value::F64(0.0)),
+    ]);
+
+    enum Outcome {
+        ListMalformedNext,
+        ListOneEntryKept,
+        FetchUnknownStatus,
+        FetchCorrupt,
+        FetchUnknownRule,
+        AccessUnknownStatus,
+        AccessPathsOverCap,
+        AccessNameHashLength,
+    }
+
+    let expected = [
+        (
+            "MESH-LIST-009-next-65-bytes.bin",
+            versioned(
+                TAG_LIST_PAGE,
+                vec![
+                    ("entries", Value::Array(Vec::new())),
+                    ("next", Value::from("c".repeat(CURSOR_MAX_BYTES + 1))),
+                ],
+            ),
+            Outcome::ListMalformedNext,
+        ),
+        (
+            "MESH-LIST-008-entry-not-a-map-dropped.bin",
+            versioned(
+                TAG_LIST_PAGE,
+                vec![
+                    ("entries", Value::Array(vec![entry, Value::from(7u64)])),
+                    ("next", Value::Nil),
+                ],
+            ),
+            Outcome::ListOneEntryKept,
+        ),
+        (
+            "MESH-FETCH-015-unknown-status.bin",
+            versioned(TAG_FETCH_REPLY, vec![("status", Value::from("paused"))]),
+            Outcome::FetchUnknownStatus,
+        ),
+        (
+            "MESH-FETCH-018-corrupt-digest.bin",
+            versioned(
+                TAG_FETCH_REPLY,
+                vec![
+                    ("status", Value::from("ok")),
+                    ("bytes", Value::Binary(b"abc".to_vec())),
+                    ("size", Value::from(3u64)),
+                    ("sha256", Value::Binary(vec![0; 32])),
+                ],
+            ),
+            Outcome::FetchCorrupt,
+        ),
+        (
+            "MESH-FETCH-021-unknown-rule.bin",
+            versioned(
+                TAG_FETCH_REPLY,
+                vec![
+                    ("status", Value::from("invalid_path")),
+                    ("rule", Value::from("made_up")),
+                ],
+            ),
+            Outcome::FetchUnknownRule,
+        ),
+        (
+            "MESH-ACCESS-010-unknown-status.bin",
+            versioned(
+                TAG_ACCESS_REPLY,
+                vec![
+                    ("id", Value::from(SENT_ID)),
+                    ("status", Value::from("paused")),
+                ],
+            ),
+            Outcome::AccessUnknownStatus,
+        ),
+        (
+            "MESH-ACCESS-003-paths-over-cap.bin",
+            versioned(
+                TAG_ACCESS_REQUEST,
+                vec![
+                    ("id", Value::from("a-1")),
+                    ("paths", paths(ACCESS_MAX_PATHS + 1)),
+                ],
+            ),
+            Outcome::AccessPathsOverCap,
+        ),
+        (
+            "MESH-ACCESS-023-name-hash-nine-bytes.bin",
+            tagged(
+                TAG_ACCESS_FIELDS,
+                &Value::Map(vec![
+                    (Value::from(FIELD_CUSTOM_TYPE), Value::from(ACCESS_TYPE)),
+                    (
+                        Value::from(FIELD_CUSTOM_DATA),
+                        Value::Map(vec![
+                            (
+                                Value::from("name_hash"),
+                                Value::Binary(vec![0x07; NAME_HASH_LEN - 1]),
+                            ),
+                            (Value::from("id"), Value::from("a-1")),
+                            (Value::from("paths"), paths(1)),
+                        ]),
+                    ),
+                ]),
+            ),
+            Outcome::AccessNameHashLength,
+        ),
+    ];
+    let fixture = oracles::CodecFixture::new();
+    let write = std::env::var_os(WRITE_CORPUS_ENV).is_some_and(|v| v == "1");
+    for (name, bytes, outcome) in expected {
+        let path = corpus_dir("codecs").join(name);
+        if write {
+            fs::write(&path, &bytes).unwrap();
+        }
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            bytes,
+            "codecs/{name} must be the bytes built from the live constants; regenerate with {WRITE_CORPUS_ENV}=1"
+        );
+        let value = unpack_whole(&bytes[1..]).unwrap();
+        match outcome {
+            Outcome::ListMalformedNext => {
+                let observed = SharesPage::from_value(&value, "seed");
+                assert!(
+                    matches!(observed, Err(FetchError::Malformed("next"))),
+                    "codecs/{name}: read as {observed:?}"
+                );
+            }
+            Outcome::ListOneEntryKept => {
+                let page = SharesPage::from_value(&value, "seed")
+                    .unwrap_or_else(|err| panic!("codecs/{name} must read as a page: {err}"));
+                assert_eq!(page.entries.len(), 1, "codecs/{name}: {page:?}");
+            }
+            Outcome::FetchUnknownStatus => {
+                let observed = read_fetch_reply(&value);
+                assert!(
+                    matches!(observed, Err(FetchError::UnknownStatus)),
+                    "codecs/{name}: read as {observed:?}"
+                );
+            }
+            Outcome::FetchCorrupt => {
+                let observed = read_fetch_reply(&value);
+                assert!(
+                    matches!(observed, Err(FetchError::Corrupt)),
+                    "codecs/{name}: read as {observed:?}"
+                );
+            }
+            Outcome::FetchUnknownRule => {
+                let observed = read_fetch_reply(&value);
+                assert!(
+                    matches!(&observed, Ok(FetchReply::InvalidPath { rule }) if rule == "unknown"),
+                    "codecs/{name}: read as {observed:?}"
+                );
+            }
+            Outcome::AccessUnknownStatus => {
+                assert_eq!(
+                    read_access_reply(&value, SENT_ID),
+                    Err(AccessError::UnknownStatus),
+                    "codecs/{name}"
+                );
+            }
+            Outcome::AccessPathsOverCap => {
+                assert_eq!(
+                    decode_access(&value),
+                    Err("paths names more than the cap allows"),
+                    "codecs/{name}"
+                );
+            }
+            Outcome::AccessNameHashLength => {
+                assert_eq!(
+                    decode_access_message(&inbound_with(value)),
+                    AccessMessage::Malformed("name_hash is not 10 bytes"),
+                    "codecs/{name}"
+                );
+            }
+        }
+        oracles::check_codec_bytes(&fixture, &bytes).unwrap_or_else(|what| {
+            panic!("codecs/{name} must satisfy its decoder's oracle: {what}")
+        });
+    }
+}
+
+#[test]
+fn fuzz_wire_path_oracle_names_the_grammar_rules_in_the_order_they_are_checked() {
+    assert_eq!(
+        oracles::WIRE_PATH_RULES,
+        super::wire_path::RULES.map(|(id, _)| id)
+    );
+}
+
+/// Usage probe: the decoder and the fuzz oracle both read the version at a
+/// magic-length-relative offset. Every prefix of a valid announce, the exact one-short
+/// header (magic + 1 byte) and the exact header (magic + 2 bytes) must agree between the
+/// two, and the header-only announce must decode as its big-endian version with no name;
+/// an announce in the old four-byte-magic layout is another application for both.
+#[test]
+fn usage_probe_announce_decoder_and_oracle_agree_at_the_magic_relative_header_boundary() {
+    use super::announce::{ANNOUNCE_MAGIC, AnnounceAppData};
+    use oracles::TAG_ANNOUNCE;
+
+    let fixture = oracles::CodecFixture::new();
+    let agree = |bytes: &[u8]| {
+        let tagged = [&[TAG_ANNOUNCE][..], bytes].concat();
+        oracles::check_codec_bytes(&fixture, &tagged)
+            .unwrap_or_else(|what| panic!("decoder and oracle disagree on {bytes:?}: {what}"));
+    };
+
+    let full = [&ANNOUNCE_MAGIC[..], &[0x01, 0x02], b"Alex"].concat();
+    for len in 0..=full.len() {
+        agree(&full[..len]);
+    }
+
+    let one_short = &full[..ANNOUNCE_MAGIC.len() + 1];
+    assert_eq!(
+        AnnounceAppData::decode(one_short),
+        None,
+        "magic plus one byte is shorter than the header"
+    );
+    let header_only = &full[..ANNOUNCE_MAGIC.len() + 2];
+    let decoded = AnnounceAppData::decode(header_only).expect("magic plus two bytes is a header");
+    assert_eq!(
+        decoded.version, 0x0102,
+        "the version is the two bytes right after the magic, not bytes 4..6"
+    );
+    assert_eq!(decoded.display_name, None);
+    let decoded = AnnounceAppData::decode(&full).unwrap();
+    assert_eq!(decoded.version, 0x0102);
+    assert_eq!(
+        decoded.display_name.as_deref(),
+        Some("Alex"),
+        "the name starts right after the version, not at offset 6"
+    );
+
+    // A same-width magic one bit off is a foreign announce: neither the decoder nor the
+    // oracle reads it, and they agree on that at every prefix.
+    let mut foreign = ANNOUNCE_MAGIC;
+    foreign[ANNOUNCE_MAGIC.len() - 1] ^= 0x01;
+    let foreign_layout = [&foreign[..], &[0x00, 0x01], b"Alex"].concat();
+    assert_eq!(AnnounceAppData::decode(&foreign_layout), None);
+    agree(&foreign_layout);
+    for len in 0..=foreign_layout.len() {
+        agree(&foreign_layout[..len]);
+    }
+    // A SCOPE-prefixed announce padded to the old total header width still needs the full
+    // seven header bytes.
+    let mut padded = ANNOUNCE_MAGIC.to_vec();
+    padded.push(0x00);
+    assert_eq!(padded.len(), 6);
+    assert_eq!(AnnounceAppData::decode(&padded), None);
+    agree(&padded);
+}
+
+/// The card oracle cross-checks every decoded number against the generated input, so the
+/// decoder and the oracle must agree on each numeric edge the wire can carry: a code or a
+/// count sent twice (first wins, MESH-CANON-012), a count at and past `u32::MAX`
+/// (MESH-STATUS-026/027 saturate on read), a code or an age at `u64::MAX` kept as sent
+/// (MESH-STATUS-030), a positive value in a signed msgpack int format (still a uint), and the
+/// shapes the oracle leaves to the decoder (nil, negative, float, a scalar in place of a
+/// map). None of these may make the oracle report a false violation, and each decodes as
+/// the spec says.
+#[test]
+fn usage_probe_card_decoder_and_oracle_agree_on_every_numeric_edge() {
+    use super::card::{STATE_IDLE, StatusCard, StatusError};
+    use oracles::{TAG_CARD, packed};
+    use rmpv::Value;
+
+    let fixture = oracles::CodecFixture::new();
+    let agree_bytes = |payload: &[u8]| {
+        let tagged = [&[TAG_CARD][..], payload].concat();
+        oracles::check_codec_bytes(&fixture, &tagged).unwrap_or_else(|what| {
+            panic!("decoder and oracle disagree on card bytes {payload:02x?}: {what}")
+        });
+    };
+    let agree = |value: &Value| agree_bytes(&packed(value));
+    let key = |name: &str| Value::from(name);
+    let card = |state: Vec<(Value, Value)>, todo: Option<Value>, served_at: u64| {
+        let mut entries = vec![
+            (key("v"), Value::from(1u64)),
+            (key("state"), Value::Map(state)),
+        ];
+        if let Some(todo) = todo {
+            entries.push((key("todo"), todo));
+        }
+        entries.push((key("served_at_secs"), Value::from(served_at)));
+        Value::Map(entries)
+    };
+    let todo = |entries: Vec<(Value, Value)>| Some(Value::Map(entries));
+
+    // Duplicate keys: the first `code` and the first `done` win in both the decoder and
+    // the oracle; a different policy on either side would be reported.
+    let twice = card(
+        vec![
+            (key("code"), Value::from(STATE_IDLE)),
+            (key("code"), Value::from(256u64)),
+        ],
+        todo(vec![
+            (key("done"), Value::from(u64::MAX)),
+            (key("done"), Value::from(1u64)),
+            (key("total"), Value::from(2u64)),
+        ]),
+        5,
+    );
+    agree(&twice);
+    let decoded = StatusCard::from_value(&twice).expect("a card with repeated keys decodes");
+    assert_eq!(decoded.state.code, STATE_IDLE, "the first `code` wins");
+    assert_eq!(
+        decoded.todo.as_ref().map(|todo| (todo.done, todo.total)),
+        Some((u32::MAX, 2)),
+        "the first `done` wins and saturates"
+    );
+
+    // The saturation boundary: exact `u32::MAX` is kept, one past it and `u64::MAX` read as
+    // `u32::MAX`; the code and every age at `u64::MAX` are kept as sent.
+    for (done, total) in [
+        (u64::from(u32::MAX), 1u64),
+        (u64::from(u32::MAX) + 1, u64::from(u32::MAX)),
+        (u64::MAX, u64::MAX),
+        (1u64 << 33, 5),
+    ] {
+        let value = card(
+            vec![
+                (key("code"), Value::from(u64::MAX)),
+                (key("since_secs"), Value::from(u64::MAX)),
+            ],
+            todo(vec![
+                (key("done"), Value::from(done)),
+                (key("total"), Value::from(total)),
+            ]),
+            u64::MAX,
+        );
+        agree(&value);
+        let decoded = StatusCard::from_value(&value).unwrap();
+        assert_eq!(decoded.state.code, u64::MAX);
+        assert_eq!(decoded.state.since_secs, Some(u64::MAX));
+        assert_eq!(decoded.served_at_secs, u64::MAX);
+        let read = decoded.todo.map(|todo| (todo.done, todo.total)).unwrap();
+        let saturate = |sent: u64| u32::try_from(sent).unwrap_or(u32::MAX);
+        assert_eq!(
+            read,
+            (saturate(done), saturate(total)),
+            "done={done} total={total}"
+        );
+        // What the reader re-emits is itself a card the oracle agrees on.
+        agree(&StatusCard::from_value(&value).unwrap().to_value());
+    }
+
+    // A positive value in a signed msgpack format is a uint to both sides: `code` as int16
+    // 256, `done` as int64 2^33, `total` as int8 1; a `since_secs` as uint64 2^40.
+    let mut bytes = vec![0x84, 0xa1, b'v', 0x01, 0xa5];
+    bytes.extend_from_slice(b"state");
+    bytes.extend_from_slice(&[0x82, 0xa4]);
+    bytes.extend_from_slice(b"code");
+    bytes.extend_from_slice(&[0xd1, 0x01, 0x00, 0xaa]);
+    bytes.extend_from_slice(b"since_secs");
+    bytes.push(0xcf);
+    bytes.extend_from_slice(&(1u64 << 40).to_be_bytes());
+    bytes.push(0xa4);
+    bytes.extend_from_slice(b"todo");
+    bytes.extend_from_slice(&[0x82, 0xa4]);
+    bytes.extend_from_slice(b"done");
+    bytes.push(0xd3);
+    bytes.extend_from_slice(&(1i64 << 33).to_be_bytes());
+    bytes.push(0xa5);
+    bytes.extend_from_slice(b"total");
+    bytes.extend_from_slice(&[0xd0, 0x01, 0xae]);
+    bytes.extend_from_slice(b"served_at_secs");
+    bytes.push(0x05);
+    agree_bytes(&bytes);
+    let value = rmpv::decode::read_value(&mut &bytes[..]).unwrap();
+    let decoded = StatusCard::from_value(&value).expect("signed-format positives are uints");
+    assert_eq!(decoded.state.code, 256);
+    assert_eq!(decoded.state.since_secs, Some(1 << 40));
+    assert_eq!(
+        decoded.todo.map(|todo| (todo.done, todo.total)),
+        Some((u32::MAX, 1))
+    );
+
+    // Shapes the oracle leaves to the decoder: each is `Malformed` and no false violation.
+    let not_uints = [
+        Value::Nil,
+        Value::from(-1),
+        Value::F64(1.0),
+        Value::from("1"),
+    ];
+    for wrong in &not_uints {
+        for value in [
+            card(vec![(key("code"), wrong.clone())], None, 5),
+            card(
+                vec![(key("code"), Value::from(1u64))],
+                todo(vec![
+                    (key("done"), wrong.clone()),
+                    (key("total"), Value::from(2u64)),
+                ]),
+                5,
+            ),
+            card(
+                vec![(key("code"), Value::from(1u64))],
+                Some(Value::from(7u64)),
+                5,
+            ),
+            card(
+                vec![(key("code"), Value::from(1u64))],
+                todo(vec![]),
+                wrong.as_u64().unwrap_or(5),
+            ),
+        ] {
+            agree(&value);
+        }
+        assert!(matches!(
+            StatusCard::from_value(&card(vec![(key("code"), wrong.clone())], None, 5)),
+            Err(StatusError::Malformed(_))
+        ));
+    }
+}
+
 #[test]
 fn fuzz_corpus_files_belong_to_the_classes_their_names_claim() {
     use super::card::StatusCard;
     use super::message::PEER_FIELDS_MAX_DEPTH;
-    use super::pending::PendingRecord;
+    use super::pending::{PENDING_RECORD_VERSION, PendingRecord};
     use super::propagation_fetch::MAX_FETCHED_MESSAGE_BYTES;
     use super::r3::{MAX_R3_PAYLOAD_BYTES, R3Error, RefusalCode, RequestFrame};
     use oracles::{
@@ -753,8 +1428,8 @@ fn fuzz_corpus_files_belong_to_the_classes_their_names_claim() {
     );
     assert_eq!(
         object.get("version").and_then(serde_json::Value::as_u64),
-        Some(1),
-        "codecs/MESH-CODE-005-pending-unknown-field.bin claims MESH-CODE-005: a version-1 record"
+        Some(PENDING_RECORD_VERSION),
+        "codecs/MESH-CODE-005-pending-unknown-field.bin claims MESH-CODE-005: a current-version record"
     );
     assert!(
         object.contains_key("later_field"),
@@ -824,6 +1499,8 @@ fn fuzz_source_never_gates_on_platform_or_ignores() {
 
 #[test]
 fn fuzz_codec_tag_table_in_the_readme_matches_the_code() {
+    use super::announce::ANNOUNCE_MAGIC;
+
     let readme = include_str!("corpus/README.md");
     let table = &readme[readme.find("### Codec tag bytes").unwrap()..];
     let table = &table[..table.find("\n## ").unwrap_or(table.len())];
@@ -832,6 +1509,23 @@ fn fuzz_codec_tag_table_in_the_readme_matches_the_code() {
         assert!(table.contains(&row), "the README codec table lacks {row}");
     }
     assert_eq!(table.matches("\n| `0x").count(), oracles::CODEC_TAGS.len());
+    let announce_prefix = format!("| `{:#04x}` |", oracles::TAG_ANNOUNCE);
+    let announce_row = table
+        .lines()
+        .find(|line| line.starts_with(&announce_prefix))
+        .unwrap();
+    let magic = format!("`{}`", std::str::from_utf8(&ANNOUNCE_MAGIC).unwrap());
+    assert!(
+        announce_row.contains(&magic),
+        "the README announce row does not spell {magic}: {announce_row}"
+    );
+    for pin in [
+        WRITE_CORPUS_ENV,
+        "fuzz_codec_corpus_files_carrying_wire_identifiers_are_built_from_the_live_constants",
+        "fuzz_codec_corpus_wire_path_seeds_break_exactly_the_rule_their_name_claims",
+    ] {
+        assert!(readme.contains(pin), "the README does not name {pin}");
+    }
 }
 
 #[test]

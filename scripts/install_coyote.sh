@@ -4,15 +4,20 @@ set -euo pipefail
 # coyote installer (Linux/macOS)
 #
 # Usage examples:
-#   curl -fsSL https://raw.githubusercontent.com/Dark-Alex-17/coyote/main/scripts/install_coyote.sh | bash
-#   curl -fsSL https://raw.githubusercontent.com/Dark-Alex-17/coyote/main/scripts/install_coyote.sh | bash -s -- --version vX.Y.Z
+#   curl -fsSL https://raw.githubusercontent.com/Dark-Alex-17/coyote/refs/heads/main/scripts/install_coyote.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/Dark-Alex-17/coyote/refs/heads/main/scripts/install_coyote.sh | bash -s -- --version vX.Y.Z
 #   BIN_DIR="$HOME/.local/bin" bash scripts/install_coyote.sh
 #
 # Flags / Env:
 #   --version <tag>   Release tag (default: latest). Or set COYOTE_VERSION.
 #   --bin-dir <dir>   Install directory (default: /usr/local/bin or ~/.local/bin). Or set BIN_DIR.
+#   --with-mesh       Also set up the local Reticulum daemon (rnsd) for Coyote mesh.
+#
+# Exits 3 when --with-mesh was given and the mesh setup failed; coyote itself is
+# still installed.
 
 REPO="Dark-Alex-17/coyote"
+MESH_RELAY_URL="https://raw.githubusercontent.com/${REPO}/refs/heads/main/scripts/mesh-relay.sh"
 
 usage() {
   echo "coyote installer (Linux/macOS)"
@@ -20,7 +25,10 @@ usage() {
   echo "Options:"
   echo "  --version <tag>         Release tag (default: latest)"
   echo "  --bin-dir <dir>         Install directory (default: /usr/local/bin or ~/.local/bin)"
+  echo "  --with-mesh             Also set up the local Reticulum daemon (rnsd) for Coyote mesh"
   echo "  -h, --help              Show help"
+  echo
+  echo "Exits 3 when --with-mesh was given and the mesh setup failed; coyote itself is still installed."
 }
 
 log() {
@@ -34,11 +42,28 @@ need_cmd() {
   fi
 }
 
+# The TLS flags this wget understands: busybox wget (Alpine) and old GNU wget lack
+# one or both, and refuse unknown options outright. Expanded as
+# ${WGET_TLS[@]+"${WGET_TLS[@]}"}: bash 3.2 treats an empty array as unset under -u.
+detect_wget_tls() {
+  local help flag
+  WGET_TLS=()
+  help="$(wget --help 2>&1 || true)"
+  for flag in --https-only --secure-protocol; do
+    if grep -q -- "$flag" <<<"$help"; then
+      if [[ "$flag" == "--secure-protocol" ]]; then flag="--secure-protocol=TLSv1_2"; fi
+      WGET_TLS+=("$flag")
+    else
+      log "This wget lacks $flag; downloading without it"
+    fi
+  done
+}
+
 http_get() {
   if [[ "$DL" == "curl" ]]; then
-    curl -fsSL -H 'User-Agent: coyote-installer' "$1"
+    curl -fsSL --proto '=https' --proto-redir '=https' --tlsv1.2 -H 'User-Agent: coyote-installer' "$1"
   else
-    wget -qO- --header='User-Agent: coyote-installer' "$1"
+    wget -qO- ${WGET_TLS[@]+"${WGET_TLS[@]}"} --header='User-Agent: coyote-installer' "$1"
   fi
 }
 
@@ -56,14 +81,50 @@ smoke_test() {
   return "$ok"
 }
 
+mesh_pointer() {
+  log "Coyote mesh needs a local Reticulum daemon; set it up any time with: curl -fsSL ${MESH_RELAY_URL} | bash   (or re-run this installer with --with-mesh)${1:-}"
+}
+
+# Runs the relay script and returns its exit code (1 when it could not be fetched),
+# leaving the reason in MESH_FAILURE; the caller decides how loudly to report it.
+run_mesh_relay() {
+  # Prefer the sibling script of a checked-out installer, but only one the invoking
+  # user owns. Under `curl ... | bash` BASH_SOURCE is empty ($0 would be the literal
+  # `bash`, which a hostile CWD could satisfy), so a piped installer fetches the relay
+  # script from the same ref the README one-liners use.
+  local self="${BASH_SOURCE[0]:-}"
+  local sibling=""
+  local relay=""
+  if [[ -n "$self" && -f "$self" ]]; then sibling="$(dirname "$self")/mesh-relay.sh"; fi
+  if [[ -n "$sibling" && -O "$self" && -f "$sibling" && -O "$sibling" ]]; then
+    relay="$sibling"
+  else
+    relay="$WORKDIR/mesh-relay.sh"
+    log "Fetching $MESH_RELAY_URL"
+    if ! http_get "$MESH_RELAY_URL" > "$relay"; then
+      MESH_FAILURE="failed to download the mesh setup script"
+      return 1
+    fi
+  fi
+
+  local rc=0
+  BIN_DIR="$BIN_DIR" bash "$relay" || rc=$?
+  if [[ "$rc" -ne 0 ]]; then MESH_FAILURE="mesh setup exited with code ${rc}"; fi
+  return "$rc"
+}
+
 main() {
   VERSION="${COYOTE_VERSION:-}"
   BIN_DIR="${BIN_DIR:-}"
+  WITH_MESH=""
+  MESH_FAILURE=""
+  MESH_RC=0
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --version) VERSION="$2"; shift 2;;
       --bin-dir) BIN_DIR="$2"; shift 2;;
+      --with-mesh) WITH_MESH=1; shift;;
       -h|--help) usage; exit 0;;
       *) echo "Unknown argument: $1" >&2; usage; exit 2;;
     esac
@@ -88,6 +149,7 @@ main() {
     DL=curl
   elif command -v wget >/dev/null 2>&1; then
     DL=wget
+    detect_wget_tls
   else
     echo "Error: need curl or wget" >&2
     exit 1
@@ -197,13 +259,13 @@ main() {
 
     ARCHIVE="$WORK/asset"
     if [[ "$DL" == "curl" ]]; then
-      if ! curl -fL -H 'User-Agent: coyote-installer' "$ASSET_URL" -o "$ARCHIVE"; then
+      if ! curl -fL --proto '=https' --proto-redir '=https' --tlsv1.2 -H 'User-Agent: coyote-installer' "$ASSET_URL" -o "$ARCHIVE"; then
         log "Failed to download $candidate; trying next candidate"
         TRIED+=("$candidate: download failed")
         continue
       fi
     else
-      if ! wget -q --header='User-Agent: coyote-installer' "$ASSET_URL" -O "$ARCHIVE"; then
+      if ! wget -q ${WGET_TLS[@]+"${WGET_TLS[@]}"} --header='User-Agent: coyote-installer' "$ASSET_URL" -O "$ARCHIVE"; then
         log "Failed to download $candidate; trying next candidate"
         TRIED+=("$candidate: download failed")
         continue
@@ -275,7 +337,37 @@ main() {
       ;;
   esac
 
+  # Mesh is optional on the prompt path, so a failure there is a note and the pointer;
+  # an explicit --with-mesh that fails is an error. An rnsd already in BIN_DIR means a
+  # mesh set up earlier (an upgrade), so neither the prompt nor the pointer repeats.
+  # Root is never prompted: rnsd, its config and its service belong to the user.
+  if [[ -n "$WITH_MESH" ]]; then
+    run_mesh_relay || MESH_RC=$?
+    if [[ "$MESH_RC" -ne 0 ]]; then
+      RETRY_AS=""
+      if [[ "$(id -u)" -eq 0 ]]; then RETRY_AS=" as your normal user"; fi
+      echo "[coyote-install] Error: ${MESH_FAILURE}; coyote itself is installed. Retry with: curl -fsSL ${MESH_RELAY_URL} | bash${RETRY_AS}" >&2
+    fi
+  elif [[ ! -e "${BIN_DIR}/rnsd" ]]; then
+    if [[ "$(id -u)" -eq 0 ]]; then
+      mesh_pointer " - run it as your normal user, not with sudo"
+    elif [[ -t 0 && -t 1 ]]; then
+      read -r -p "Set up the local Reticulum daemon for Coyote mesh now? [y/N] " answer || answer=""
+      case "$answer" in
+        y|Y|yes|YES|Yes)
+          if ! run_mesh_relay; then
+            log "${MESH_FAILURE}; coyote itself is installed."
+            mesh_pointer
+          fi;;
+        *) mesh_pointer;;
+      esac
+    else
+      mesh_pointer
+    fi
+  fi
+
   log "Done. Try: coyote --help"
+  if [[ "$MESH_RC" -ne 0 ]]; then exit 3; fi
 }
 
 main "$@"

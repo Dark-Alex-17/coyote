@@ -16,6 +16,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// because the upstream reject path deadlocks the transport (rev 3ed5932 and release 0.12.0).
 pub(crate) const MAX_R3_PAYLOAD_BYTES: usize = 256 * 1024;
 
+/// The bound on a `/fetch` RESPONSE alone: the largest file a node serves plus room for the
+/// frame and the reply's other keys. Every other path, and every request, keeps
+/// `MAX_R3_PAYLOAD_BYTES`. Like that bound it is enforced after assembly: the requester
+/// discards an over-limit response once it has been put together, and the upstream 64 MiB
+/// advertisement cap is the only pre-assembly bound.
+pub(crate) const MAX_FETCH_RESPONSE_BYTES: usize =
+    (crate::config::mesh_config::MAX_FETCH_FILE_BYTES as usize) + 4096;
+
 /// The `rmpv` depth budget a frame may spend before it is refused as undecodable. Each
 /// container costs two, a `bin` leaf two and a `str` leaf three (`read_str_data` charges
 /// one before it reaches `read_bin_data`), so about 60 nested containers fit. `rmpv`'s own
@@ -26,6 +34,11 @@ pub(crate) const MAX_R3_NESTING_DEPTH: usize = 128;
 /// Bytes of a destination name hash, the prefix of the full name hash Reticulum uses to
 /// derive a destination address.
 pub(crate) const NAME_HASH_LEN: usize = NAME_HASH_LENGTH;
+
+/// The fixed opening of every encoded `ResponseFrame`: a 2-element array header and the
+/// `bin 8` header of its 16-byte request id. The requester reads a response's id straight
+/// off these bytes before it decodes anything.
+pub(crate) const RESPONSE_FRAME_PREFIX: [u8; 3] = [0x92, 0xc4, 0x10];
 
 const NAME_HASH_KEY: &str = "name_hash";
 const BODY_KEY: &str = "body";

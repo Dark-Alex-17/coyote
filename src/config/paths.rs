@@ -218,15 +218,45 @@ pub fn skill_file(name: &str) -> PathBuf {
     skill_dir(name).join("SKILL.md")
 }
 
-pub fn workspace_config_dir() -> PathBuf {
-    let workspace_dir_name = match env::var(get_env_name("workspace_config_dir")) {
+/// The name the workspace config directory goes by under a workspace root; the env
+/// override is returned as given, so it may be a relative or an absolute path. Sessions,
+/// agent sessions, skills, macros and the workspace mcp.json live under this name;
+/// workspace memory and the sbx mixin always use the literal `.coyote`.
+pub fn workspace_config_dir_name() -> String {
+    match env::var(get_env_name("workspace_config_dir")) {
         Ok(value) => value,
         Err(_) => WORKSPACE_COYOTE_DIR_NAME.to_string(),
-    };
+    }
+}
 
+/// Every name the workspace config directory goes by under a workspace root. The first
+/// is the runtime name: the env override as given, which may be a relative or an
+/// absolute path, and is where sessions, agent sessions, skills, macros and the
+/// workspace mcp.json live. The literal default follows when it differs: workspace
+/// memory and the sbx mixin always live under it, override or not. Everything that
+/// protects or denies the workspace config directory protects every name listed here.
+pub fn workspace_config_dirs() -> Vec<String> {
+    let mut names = vec![
+        workspace_config_dir_name(),
+        WORKSPACE_COYOTE_DIR_NAME.to_string(),
+    ];
+    names.dedup();
+    names
+}
+
+pub fn workspace_config_dir() -> PathBuf {
     env::current_dir()
         .unwrap_or_default()
-        .join(workspace_dir_name)
+        .join(workspace_config_dir_name())
+}
+
+/// `workspace_config_dirs` joined under the current directory, in the same order.
+pub fn workspace_config_dir_paths() -> Vec<PathBuf> {
+    let cwd = env::current_dir().unwrap_or_default();
+    workspace_config_dirs()
+        .iter()
+        .map(|name| cwd.join(name))
+        .collect()
 }
 
 pub fn workspace_skills_dir() -> PathBuf {
@@ -428,6 +458,13 @@ pub fn workspace_memory_dir_for(workspace_root: &Path) -> PathBuf {
 
 pub fn workspace_memory_index_file_for(workspace_root: &Path) -> PathBuf {
     workspace_memory_dir_for(workspace_root).join(MEMORY_INDEX_FILE_NAME)
+}
+
+/// The `.gitignore` line that keeps workspace memory out of the repository: a
+/// slash-separated, slash-terminated path relative to the repository root, not an OS
+/// path, since `.gitignore` reads it the same way on every platform.
+pub fn workspace_memory_gitignore_entry() -> String {
+    format!("{WORKSPACE_COYOTE_DIR_NAME}/{MEMORY_DIR_NAME}/")
 }
 
 pub fn repl_history_dir() -> PathBuf {
@@ -634,6 +671,109 @@ mod tests {
                 "has_skill({absent:?}) should be false for a missing skill"
             );
         }
+    }
+
+    #[test]
+    #[serial]
+    fn workspace_config_dir_name_is_the_env_override_or_the_default() {
+        let env_name = get_env_name("workspace_config_dir");
+        {
+            let _unset = EnvVarGuard::unset(&env_name);
+            assert_eq!(workspace_config_dir_name(), WORKSPACE_COYOTE_DIR_NAME);
+            assert_eq!(
+                workspace_config_dir(),
+                env::current_dir().unwrap().join(WORKSPACE_COYOTE_DIR_NAME)
+            );
+        }
+        let absolute = env::temp_dir().join("coyote-ws-name-override");
+        let _set = EnvVarGuard::set(&env_name, &absolute);
+        assert_eq!(workspace_config_dir_name(), absolute.to_str().unwrap());
+        assert_eq!(workspace_config_dir(), absolute);
+        let _relative = EnvVarGuard::set(&env_name, "conf/.hidden");
+        assert_eq!(workspace_config_dir_name(), "conf/.hidden");
+    }
+
+    #[test]
+    #[serial]
+    fn workspace_config_dirs_lists_the_override_first_and_the_default_once() {
+        let env_name = get_env_name("workspace_config_dir");
+        let cwd = env::current_dir().unwrap();
+        {
+            let _unset = EnvVarGuard::unset(&env_name);
+            assert_eq!(workspace_config_dirs(), [WORKSPACE_COYOTE_DIR_NAME]);
+            assert_eq!(
+                workspace_config_dir_paths(),
+                [cwd.join(WORKSPACE_COYOTE_DIR_NAME)]
+            );
+        }
+        {
+            let _same = EnvVarGuard::set(&env_name, WORKSPACE_COYOTE_DIR_NAME);
+            assert_eq!(workspace_config_dirs(), [WORKSPACE_COYOTE_DIR_NAME]);
+        }
+        let absolute = env::temp_dir().join("coyote-ws-dirs-override");
+        let _set = EnvVarGuard::set(&env_name, &absolute);
+        assert_eq!(
+            workspace_config_dirs(),
+            [absolute.to_str().unwrap(), WORKSPACE_COYOTE_DIR_NAME]
+        );
+        assert_eq!(
+            workspace_config_dir_paths(),
+            [absolute.clone(), cwd.join(WORKSPACE_COYOTE_DIR_NAME)]
+        );
+    }
+
+    /// A relative override is listed as given, ahead of the literal default, and joins
+    /// under the cwd segment by segment; the memory dir never follows it. An empty
+    /// override is passed through as the empty name, which joins to the cwd itself.
+    #[test]
+    #[serial]
+    fn usage_probe_a_relative_override_is_listed_as_given_and_memory_ignores_it() {
+        let env_name = get_env_name("workspace_config_dir");
+        let cwd = env::current_dir().unwrap();
+        let root = Path::new("/ws");
+        {
+            let _relative = EnvVarGuard::set(&env_name, "conf/.hidden");
+            assert_eq!(
+                workspace_config_dirs(),
+                ["conf/.hidden", WORKSPACE_COYOTE_DIR_NAME]
+            );
+            assert_eq!(
+                workspace_config_dir_paths(),
+                [
+                    cwd.join("conf").join(".hidden"),
+                    cwd.join(WORKSPACE_COYOTE_DIR_NAME)
+                ]
+            );
+            assert_eq!(workspace_memory_dir_for(root), root.join(".coyote/memory"));
+        }
+        let _empty = EnvVarGuard::set(&env_name, "");
+        assert_eq!(workspace_config_dirs(), ["", WORKSPACE_COYOTE_DIR_NAME]);
+        assert_eq!(workspace_config_dir_paths()[0], cwd);
+    }
+
+    #[test]
+    #[serial]
+    fn workspace_memory_stays_under_the_literal_name_when_the_config_dir_is_overridden() {
+        let env_name = get_env_name("workspace_config_dir");
+        let root = env::temp_dir().join("coyote-ws-memory-override-root");
+        let override_dir = env::temp_dir().join("coyote-ws-memory-override-cfg");
+        let _set = EnvVarGuard::set(&env_name, &override_dir);
+
+        assert_eq!(
+            workspace_config_dirs(),
+            [override_dir.to_str().unwrap(), WORKSPACE_COYOTE_DIR_NAME]
+        );
+        assert_eq!(
+            workspace_memory_dir_for(&root),
+            root.join(WORKSPACE_COYOTE_DIR_NAME).join(MEMORY_DIR_NAME)
+        );
+        assert_eq!(
+            workspace_memory_index_file_for(&root),
+            root.join(WORKSPACE_COYOTE_DIR_NAME)
+                .join(MEMORY_DIR_NAME)
+                .join(MEMORY_INDEX_FILE_NAME)
+        );
+        assert_eq!(workspace_memory_gitignore_entry(), ".coyote/memory/");
     }
 
     mod sandbox_home_translation {

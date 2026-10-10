@@ -5,15 +5,24 @@
 //! text; a check that could only fail on a panic is not an oracle and is not here.
 
 use super::SplitMix;
+use crate::config::mesh_config::{MAX_FETCH_FILE_BYTES, MAX_INLINE_FILE_TOTAL};
+use crate::mesh::access::{
+    ACCESS_MAX_PATHS, ACCESS_REASON_MAX_CHARS, ACCESS_TYPE, AccessError, AccessMessage,
+    AccessOutcome, AccessRefusal, ValidAccess, access_body, access_message, access_reply,
+    decode_access, decode_access_message, read_access_reply,
+};
 use crate::mesh::announce::{
     ANNOUNCE_MAGIC, AnnounceAppData, MAX_DISPLAY_NAME_BYTES, is_control_or_invisible,
 };
 use crate::mesh::card::{STATUS_CARD_VERSION, StatusCard, StatusError};
+use crate::mesh::fetch::{CURSOR_MAX_BYTES, FetchError, FetchReply, SharesPage, read_fetch_reply};
 use crate::mesh::knock::{KNOCK_TYPE, KnockMessage, decode_knock_message, intro_from_r3_body};
 use crate::mesh::knocks::KNOCK_INTRO_MAX_CHARS;
 use crate::mesh::message::{
-    OutboundPeer, PEER_MESSAGE_TYPE, PEER_WIRE_VERSION, PeerKind, PeerLxmf, PeerMessage, PeerVia,
-    decode_peer_lxmf, from_r3_body, to_r3_body,
+    Disposition, LxmfPeer, MAX_PARTS, MAX_PARTS_BYTES, OutboundPeer, PEER_MESSAGE_TYPE,
+    PEER_WIRE_VERSION, Part, PartLimits, PeerBody, PeerKind, PeerLxmf, PeerMessage, PeerVia,
+    RawPart, RawPeerMessage, admit_parts, decode_peer_lxmf, encode_parts, from_r3_body,
+    inline_size, is_wire_id, packed_len, to_r3_body,
 };
 use crate::mesh::pending::{
     PENDING_RECORD_VERSION, PENDING_TTL, PendingRecord, PendingState, PendingStore,
@@ -26,12 +35,15 @@ use crate::mesh::propagation_fetch::{
 };
 use crate::mesh::protocol::{MESH_PROTOCOL_MIN_SUPPORTED, MESH_PROTOCOL_VERSION, VersionRefusal};
 use crate::mesh::r3::{
-    AdmittedRequest, DispatchError, Dispatcher, Envelope, EnvelopeError, Handler, InboundRequest,
-    KNOCK_PATH, KnockEvent, KnockSink, MAX_R3_NESTING_DEPTH, MESSAGE_PATH, NAME_HASH_LEN, PathHash,
-    R3Error, RefusalCode, Reply, RequestFrame, RequestHandler, RequestId, STATUS_PATH, SizeBranch,
+    ACCESS_PATH, AdmittedRequest, DispatchError, Dispatcher, Envelope, EnvelopeError, FETCH_PATH,
+    Handler, InboundRequest, KNOCK_PATH, KNOWN_PATHS, KnockEvent, KnockSink, LIST_PATH,
+    MAX_R3_NESTING_DEPTH, MESSAGE_PATH, NAME_HASH_LEN, OriginName, PathHash, R3Error, RefusalCode,
+    Reply, RequestFrame, RequestHandler, RequestId, STATUS_PATH, SizeBranch,
 };
+use crate::mesh::shares::LIST_PAGE_SIZE;
 use crate::mesh::test_support::{TempDir, TrustList};
 use crate::mesh::trust::TrustStore;
+use crate::mesh::wire_path::{WIRE_PATH_MAX_BYTES, WIRE_PATH_MAX_SEGMENTS, WirePath};
 use crate::mesh::{destination_address, display_text, hex_lower, parse_rfc3339, rfc3339_utc};
 
 use arbitrary::{Arbitrary, Unstructured};
@@ -48,6 +60,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::Cursor;
+use std::path::Component;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -256,11 +269,14 @@ impl<T> Field<T> {
 
 type TextField = Field<String>;
 type UintField = Field<u64>;
-type U32Field = Field<u32>;
 type U16Field = Field<u16>;
-type ByteField = Field<u8>;
+type F64Field = Field<f64>;
+type Bin32Field = Field<[u8; 32]>;
 /// The schema version `1` most of the time.
 type Version1 = Field<()>;
+/// The one value the reader expects, fixed by its context (the id sent, the honest
+/// length or digest), most of the time.
+type Expected = Field<()>;
 
 fn text(field: TextField) -> Value {
     field.into_value(Value::from)
@@ -660,6 +676,9 @@ enum PathGen {
     Status,
     Message,
     Knock,
+    List,
+    Fetch,
+    Access,
     Other(String),
     RawHash([u8; ADDRESS_HASH_SIZE]),
 }
@@ -670,6 +689,9 @@ impl PathGen {
             Self::Status => PathHash::of(STATUS_PATH),
             Self::Message => PathHash::of(MESSAGE_PATH),
             Self::Knock => PathHash::of(KNOCK_PATH),
+            Self::List => PathHash::of(LIST_PATH),
+            Self::Fetch => PathHash::of(FETCH_PATH),
+            Self::Access => PathHash::of(ACCESS_PATH),
             Self::Other(path) => PathHash::of(&path),
             Self::RawHash(bytes) => PathHash::from(bytes),
         }
@@ -772,10 +794,11 @@ enum Verdict {
 }
 
 impl Gate {
-    /// MESH-ENV-039: destination deny, identity block, destination allow, identity allow,
-    /// identity changed, default closed. `FIXED_ORIGIN` is the one origin whose destination
-    /// the list binds to another identity (`bound`), so a default-closed instance from it is
-    /// refused as identity changed instead of knocking. `Silent` never gets here.
+    /// The MESH-ENV-039 order with `mesh.collision_protection` off, which is how the harness
+    /// runs: destination deny, identity block, destination allow, identity allow, identity
+    /// changed, default closed. `FIXED_ORIGIN` is the one origin whose destination the list
+    /// binds to another identity (`bound`), so a default-closed instance from it is refused
+    /// as identity changed instead of knocking. `Silent` never gets here.
     fn verdict(self, origin: &[u8; NAME_HASH_LEN], destination: &AddressHash) -> Verdict {
         let closed = if *origin == FIXED_ORIGIN {
             Verdict::IdentityChanged
@@ -892,6 +915,7 @@ impl DispatchFixture {
 fn describe_reply(reply: &Reply) -> String {
     match reply {
         Reply::Value(value) => format!("Value({value})"),
+        Reply::Settled { value, .. } => format!("Settled({value})"),
         Reply::Code(code) => format!("Code({code})"),
         Reply::Silent => "Silent".to_string(),
     }
@@ -1109,11 +1133,15 @@ fn check_tier(
                                 "MESH-ENV-036: the dispatcher's own /knock handler answers nil to a trusted instance, got {value}"
                             )
                         })
-                    } else if path_hash == PathHash::of(MESSAGE_PATH) {
+                    } else if let Some(unprovided) = KNOWN_PATHS
+                        .into_iter()
+                        .filter(|path| *path != KNOCK_PATH && *path != STATUS_PATH)
+                        .find(|path| PathHash::of(path) == path_hash)
+                    {
                         ensure(
                             DispatchError::from_value(value)
                                 == Some(DispatchError::NoProvider {
-                                    path: MESSAGE_PATH.to_string(),
+                                    path: unprovided.to_string(),
                                 }),
                             || {
                                 format!(
@@ -1873,15 +1901,21 @@ pub(super) fn check_receipt_deferral_budget(fx: &ReceiptFixture) -> Result<(), S
 pub(super) const TAG_CARD: u8 = 0x01;
 pub(super) const TAG_BODY: u8 = 0x02;
 const TAG_INTRO: u8 = 0x03;
-const TAG_ANNOUNCE: u8 = 0x04;
-const TAG_PEER_FIELDS: u8 = 0x05;
-const TAG_KNOCK_FIELDS: u8 = 0x06;
+pub(super) const TAG_ANNOUNCE: u8 = 0x04;
+pub(super) const TAG_PEER_FIELDS: u8 = 0x05;
+pub(super) const TAG_KNOCK_FIELDS: u8 = 0x06;
 pub(super) const TAG_REFUSAL_CODE: u8 = 0x07;
 const TAG_VERSION_REFUSAL: u8 = 0x08;
 const TAG_DISPATCH_ERROR: u8 = 0x09;
 pub(super) const TAG_PENDING: u8 = 0x0a;
+pub(super) const TAG_WIRE_PATH: u8 = 0x0b;
+pub(super) const TAG_LIST_PAGE: u8 = 0x0c;
+pub(super) const TAG_FETCH_REPLY: u8 = 0x0d;
+pub(super) const TAG_ACCESS_REPLY: u8 = 0x0e;
+pub(super) const TAG_ACCESS_FIELDS: u8 = 0x0f;
+pub(super) const TAG_ACCESS_REQUEST: u8 = 0x10;
 /// Every tag, for the README table check.
-pub(super) const CODEC_TAGS: [u8; 10] = [
+pub(super) const CODEC_TAGS: [u8; 16] = [
     TAG_CARD,
     TAG_BODY,
     TAG_INTRO,
@@ -1892,6 +1926,12 @@ pub(super) const CODEC_TAGS: [u8; 10] = [
     TAG_VERSION_REFUSAL,
     TAG_DISPATCH_ERROR,
     TAG_PENDING,
+    TAG_WIRE_PATH,
+    TAG_LIST_PAGE,
+    TAG_FETCH_REPLY,
+    TAG_ACCESS_REPLY,
+    TAG_ACCESS_FIELDS,
+    TAG_ACCESS_REQUEST,
 ];
 
 pub(super) struct CodecFixture {
@@ -1928,6 +1968,12 @@ pub(super) struct CodecBundle {
     version_refusal: VersionRefusalGen,
     dispatch_error: DispatchErrorGen,
     pending: Unlikely<JsonlGen>,
+    wire_path: WirePathGen,
+    list_page: ListPageGen,
+    fetch_reply: FetchReplyGen,
+    access_reply: AccessReplyGen,
+    access_fields: AccessFieldsGen,
+    access_request: AccessRequestGen,
 }
 
 impl CodecBundle {
@@ -1947,6 +1993,15 @@ impl CodecBundle {
             tagged(
                 TAG_DISPATCH_ERROR,
                 packed(&self.dispatch_error.into_value()),
+            ),
+            tagged(TAG_WIRE_PATH, self.wire_path.into_text().into_bytes()),
+            tagged(TAG_LIST_PAGE, packed(&self.list_page.into_value())),
+            tagged(TAG_FETCH_REPLY, packed(&self.fetch_reply.into_value())),
+            tagged(TAG_ACCESS_REPLY, packed(&self.access_reply.into_value())),
+            tagged(TAG_ACCESS_FIELDS, packed(&self.access_fields.into_value())),
+            tagged(
+                TAG_ACCESS_REQUEST,
+                packed(&self.access_request.into_value()),
             ),
         ];
         if let Some(pending) = self.pending.0 {
@@ -1984,6 +2039,12 @@ pub(super) fn check_codec_bytes(fx: &CodecFixture, bytes: &[u8]) -> Result<(), S
         TAG_VERSION_REFUSAL => with_value(payload, check_version_refusal),
         TAG_DISPATCH_ERROR => with_value(payload, check_dispatch_error),
         TAG_PENDING => check_pending(fx, payload),
+        TAG_WIRE_PATH => check_wire_path(payload),
+        TAG_LIST_PAGE => with_value(payload, check_list_page),
+        TAG_FETCH_REPLY => with_value(payload, check_fetch_reply),
+        TAG_ACCESS_REPLY => with_value(payload, check_access_reply),
+        TAG_ACCESS_FIELDS => with_value(payload, check_access_fields),
+        TAG_ACCESS_REQUEST => with_value(payload, check_access_request),
         other => Err(format!("unknown codec tag {other:#04x}")),
     }
 }
@@ -1992,7 +2053,7 @@ pub(super) fn check_codec_bytes(fx: &CodecFixture, bytes: &[u8]) -> Result<(), S
 
 #[derive(Debug, Arbitrary)]
 struct StateGen {
-    code: Likely<ByteField>,
+    code: Likely<UintField>,
     since_secs: Unlikely<UintField>,
     shape: Shape,
     replace: Unlikely<Scalar>,
@@ -2016,8 +2077,8 @@ struct PlanGen {
 #[derive(Debug, Arbitrary)]
 struct TodoGen {
     goal: Unlikely<TextField>,
-    done: Likely<U32Field>,
-    total: Likely<U32Field>,
+    done: Likely<UintField>,
+    total: Likely<UintField>,
     shape: Shape,
     replace: Unlikely<Scalar>,
 }
@@ -2045,10 +2106,7 @@ impl CardGen {
     fn into_value(self) -> Value {
         let state = |state: StateGen| {
             let map = state.shape.map(vec![
-                (
-                    key("code"),
-                    present(state.code, |code| code.into_value(Value::from)),
-                ),
+                (key("code"), present(state.code, uint)),
                 (key("since_secs"), rare(state.since_secs, uint)),
             ]);
             sub_map(map, state.replace)
@@ -2069,14 +2127,8 @@ impl CardGen {
         let todo = |todo: TodoGen| {
             let map = todo.shape.map(vec![
                 (key("goal"), rare(todo.goal, text)),
-                (
-                    key("done"),
-                    present(todo.done, |n| n.into_value(Value::from)),
-                ),
-                (
-                    key("total"),
-                    present(todo.total, |n| n.into_value(Value::from)),
-                ),
+                (key("done"), present(todo.done, uint)),
+                (key("total"), present(todo.total, uint)),
             ]);
             sub_map(map, todo.replace)
         };
@@ -2133,6 +2185,10 @@ fn check_card(value: &Value) -> Result<(), String> {
         }),
         (CardClass::Readable, Err(StatusError::Malformed(_))) => Ok(()),
         (CardClass::Readable, Ok(card)) => {
+            let entries = value
+                .as_map()
+                .ok_or_else(|| "MESH-STATUS: a Readable card is a map".to_string())?;
+            numbers_as_sent(entries, card)?;
             let reencoded = card.to_value();
             ensure(
                 StatusCard::from_value(&reencoded) == Ok(card.clone()),
@@ -2154,6 +2210,1061 @@ fn check_card(value: &Value) -> Result<(), String> {
     }
 }
 
+/// MESH-STATUS-030 against the generated input: `state.code`, `since_secs`,
+/// `snapshot_age_secs` and `served_at_secs` are kept verbatim, while `todo.done` and
+/// `todo.total` saturate to `u32::MAX` (MESH-STATUS-026, MESH-STATUS-027). A value that is
+/// nil or not a uint is the decoder's call and is not checked here.
+fn numbers_as_sent(entries: &[(Value, Value)], card: &StatusCard) -> Result<(), String> {
+    let sent_u64 = |map: &str, key: &str| {
+        first(entries, map)
+            .and_then(Value::as_map)
+            .and_then(|nested| first(nested, key))
+            .and_then(Value::as_u64)
+    };
+    let top_u64 = |key: &str| first(entries, key).and_then(Value::as_u64);
+    let kept = [
+        (
+            "state.code",
+            sent_u64("state", "code"),
+            Some(card.state.code),
+        ),
+        (
+            "state.since_secs",
+            sent_u64("state", "since_secs"),
+            card.state.since_secs,
+        ),
+        (
+            "snapshot_age_secs",
+            top_u64("snapshot_age_secs"),
+            card.snapshot_age_secs,
+        ),
+        (
+            "served_at_secs",
+            top_u64("served_at_secs"),
+            Some(card.served_at_secs),
+        ),
+    ];
+    for (field, sent, decoded) in kept {
+        let Some(sent) = sent else {
+            continue;
+        };
+        ensure(decoded == Some(sent), || {
+            format!("MESH-STATUS-030: `{field}` {sent} must be kept as sent, got {decoded:?}")
+        })?;
+    }
+    let todo = card.todo.as_ref();
+    let todo_fields = [
+        ("done", "MESH-STATUS-026", todo.map(|todo| todo.done)),
+        ("total", "MESH-STATUS-027", todo.map(|todo| todo.total)),
+    ];
+    for (key, rule, decoded) in todo_fields {
+        let Some(sent) = sent_u64("todo", key) else {
+            continue;
+        };
+        let saturated = u32::try_from(sent).unwrap_or(u32::MAX);
+        ensure(decoded == Some(saturated), || {
+            format!("{rule}: `todo.{key}` {sent} must read as {saturated}, got {decoded:?}")
+        })?;
+    }
+    Ok(())
+}
+
+// --- wire path (the file part name grammar) --------------------------------------------
+
+/// The rule ids `WirePath::parse` may refuse with, as the `invalid_path` reply carries
+/// them; a new rule is a wire vocabulary change and lands here deliberately.
+pub(super) const WIRE_PATH_RULES: [&str; 14] = [
+    "empty",
+    "length",
+    "control",
+    "invisible",
+    "backslash",
+    "leading_slash",
+    "drive_letter",
+    "colon",
+    "nfc",
+    "segments",
+    "segment",
+    "trailing_dot",
+    "trailing_space",
+    "reserved_name",
+];
+
+/// One run of a generated path: plain name characters, the separators and punctuation
+/// the rules look at, characters from the ranges that trip NFC, the invisible and the
+/// control checks, and the names Windows reserves.
+#[derive(Debug, Arbitrary)]
+enum PathPiece {
+    Word(u8, u8),
+    Slash,
+    Backslash,
+    Colon,
+    Dot,
+    DotDot,
+    Space,
+    Control(u8),
+    Latin(u8),
+    Combining(u8),
+    Cjk(u8),
+    Invisible(u8),
+    Reserved(u8),
+    Any(char),
+}
+
+impl PathPiece {
+    fn push_onto(self, text: &mut String) {
+        const WORD: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-";
+        const CONTROLS: [char; 4] = ['\0', '\u{7}', '\n', '\u{7f}'];
+        const LATIN: [char; 4] = ['\u{e9}', '\u{fc}', '\u{f1}', '\u{c5}'];
+        const COMBINING: [char; 3] = ['\u{301}', '\u{308}', '\u{30a}'];
+        const CJK: [char; 3] = ['\u{4e2d}', '\u{6587}', '\u{3042}'];
+        const INVISIBLE: [char; 5] = ['\u{200B}', '\u{200D}', '\u{202E}', '\u{2028}', '\u{FEFF}'];
+        const RESERVED: [&str; 6] = ["CON", "con", "NUL", "COM1", "lpt9", "AUX"];
+        match self {
+            Self::Word(start, len) => {
+                let start = usize::from(start) % WORD.len();
+                for i in 0..usize::from(len % 8) + 1 {
+                    text.push(char::from(WORD[(start + i) % WORD.len()]));
+                }
+            }
+            Self::Slash => text.push('/'),
+            Self::Backslash => text.push('\\'),
+            Self::Colon => text.push(':'),
+            Self::Dot => text.push('.'),
+            Self::DotDot => text.push_str(".."),
+            Self::Space => text.push(' '),
+            Self::Control(i) => text.push(CONTROLS[usize::from(i) % CONTROLS.len()]),
+            Self::Latin(i) => text.push(LATIN[usize::from(i) % LATIN.len()]),
+            Self::Combining(i) => text.push(COMBINING[usize::from(i) % COMBINING.len()]),
+            Self::Cjk(i) => text.push(CJK[usize::from(i) % CJK.len()]),
+            Self::Invisible(i) => text.push(INVISIBLE[usize::from(i) % INVISIBLE.len()]),
+            Self::Reserved(i) => text.push_str(RESERVED[usize::from(i) % RESERVED.len()]),
+            Self::Any(c) => text.push(c),
+        }
+    }
+}
+
+/// A path from pieces, or one built to straddle the byte or the segment cap.
+#[derive(Debug, Arbitrary)]
+enum WirePathGen {
+    Pieces(Vec<PathPiece>),
+    Long(u8),
+    ManySegments(u8),
+}
+
+impl WirePathGen {
+    fn into_text(self) -> String {
+        match self {
+            Self::Pieces(pieces) => {
+                let mut text = String::new();
+                for piece in pieces.into_iter().take(4 * MAX_CHILDREN) {
+                    piece.push_onto(&mut text);
+                }
+                text
+            }
+            Self::Long(n) => "a".repeat(WIRE_PATH_MAX_BYTES - 2 + usize::from(n) % 4),
+            Self::ManySegments(n) => {
+                vec!["a"; WIRE_PATH_MAX_SEGMENTS - 2 + usize::from(n) % 4].join("/")
+            }
+        }
+    }
+}
+
+/// Every refusal names a rule in `WIRE_PATH_RULES`; every accepted path is relative, has
+/// no empty, `.` or `..` segment, and maps to a path of plain components only, one per
+/// segment, so what the inbox joins under its root is what the peer named.
+fn check_wire_path(payload: &[u8]) -> Result<(), String> {
+    let Ok(text) = std::str::from_utf8(payload) else {
+        return Err("a wire path payload is UTF-8 text; this one did not decode".to_string());
+    };
+    match WirePath::parse(text) {
+        Err(invalid) => ensure(WIRE_PATH_RULES.contains(&invalid.rule), || {
+            format!(
+                "wire path: `{}` is not one of the {} rule ids the grammar names",
+                invalid.rule,
+                WIRE_PATH_RULES.len()
+            )
+        }),
+        Ok(path) => {
+            ensure(
+                path.segments()
+                    .all(|segment| !matches!(segment, "" | "." | "..")),
+                || {
+                    format!(
+                        "wire path: an accepted path has no empty, `.` or `..` segment, got {text:?}"
+                    )
+                },
+            )?;
+            let relative = path.to_relative_path();
+            ensure(relative.is_relative(), || {
+                format!("wire path: an accepted path is relative, got {relative:?}")
+            })?;
+            let components = relative.components().collect::<Vec<_>>();
+            ensure(
+                components.len() == path.segments().count()
+                    && components
+                        .iter()
+                        .all(|component| matches!(component, Component::Normal(_))),
+                || {
+                    format!(
+                        "wire path: one plain component per segment, got {components:?} for {text:?}"
+                    )
+                },
+            )
+        }
+    }
+}
+
+// --- /list page and /fetch reply (sections 10.14 and 10.15) ----------------------------
+
+const FETCH_STATUSES: [&str; 5] = [
+    "ok",
+    "not_modified",
+    "not_shared",
+    "invalid_path",
+    "too_large",
+];
+
+/// A word from a closed vocabulary, a word outside it, or no `str` at all.
+#[derive(Debug, Arbitrary)]
+enum WordGen {
+    Known(u8),
+    Unknown(String),
+    Odd(Scalar),
+}
+
+impl WordGen {
+    fn into_value(self, words: &[&str]) -> Value {
+        match self {
+            Self::Known(i) => Value::from(words[usize::from(i) % words.len()]),
+            Self::Unknown(word) => Value::from(word),
+            Self::Odd(odd) => odd.into_value(),
+        }
+    }
+}
+
+/// Text under a cap: any text, a run built to straddle the cap, or no `str` at all.
+#[derive(Debug, Arbitrary)]
+enum CappedTextGen {
+    Text(String),
+    Edge(u8),
+    Odd(Scalar),
+}
+
+impl CappedTextGen {
+    fn into_value(self, cap: usize) -> Value {
+        match self {
+            Self::Text(text) => Value::from(text),
+            Self::Edge(n) => Value::from("a".repeat(cap - 2 + usize::from(n) % 4)),
+            Self::Odd(odd) => odd.into_value(),
+        }
+    }
+}
+
+fn bin32(field: Bin32Field) -> Value {
+    field.into_value(|bytes| Value::Binary(bytes.to_vec()))
+}
+
+fn wire_path(path: WirePathGen) -> Value {
+    Value::from(path.into_text())
+}
+
+#[derive(Debug, Arbitrary)]
+struct EntryGen {
+    path: Likely<Field<WirePathGen>>,
+    size: Likely<UintField>,
+    sha256: Likely<Bin32Field>,
+    mtime: Likely<F64Field>,
+    shape: Shape,
+    replace: Unlikely<Scalar>,
+}
+
+impl EntryGen {
+    fn into_value(self) -> Value {
+        let map = self.shape.map(vec![
+            (
+                key("path"),
+                present(self.path, |path| path.into_value(wire_path)),
+            ),
+            (key("size"), present(self.size, uint)),
+            (key("sha256"), present(self.sha256, bin32)),
+            (
+                key("mtime"),
+                present(self.mtime, |mtime| mtime.into_value(Value::F64)),
+            ),
+        ]);
+        sub_map(map, self.replace)
+    }
+}
+
+/// The `entries` list: a few entries, one repeated to straddle `LIST_PAGE_SIZE`, or no
+/// list at all.
+#[derive(Debug, Arbitrary)]
+enum EntriesGen {
+    List(Vec<EntryGen>),
+    Repeated(u8, Box<EntryGen>),
+    NotAList(Scalar),
+}
+
+impl EntriesGen {
+    fn into_value(self) -> Value {
+        match self {
+            Self::List(entries) => Value::Array(
+                entries
+                    .into_iter()
+                    .take(MAX_CHILDREN)
+                    .map(EntryGen::into_value)
+                    .collect(),
+            ),
+            Self::Repeated(n, entry) => Value::Array(vec![
+                entry.into_value();
+                LIST_PAGE_SIZE - 2 + usize::from(n) % 4
+            ]),
+            Self::NotAList(odd) => odd.into_value(),
+        }
+    }
+}
+
+#[derive(Debug, Arbitrary)]
+struct ListPageGen {
+    v: Likely<Version1>,
+    entries: Likely<EntriesGen>,
+    next: Unlikely<CappedTextGen>,
+    shape: Shape,
+    replace: Unlikely<ArbValue>,
+}
+
+impl ListPageGen {
+    fn into_value(self) -> Value {
+        let map = self.shape.map(vec![
+            (key("v"), present(self.v, version1)),
+            (
+                key("entries"),
+                present(self.entries, EntriesGen::into_value),
+            ),
+            (
+                key("next"),
+                rare(self.next, |next| next.into_value(CURSOR_MAX_BYTES)),
+            ),
+        ]);
+        or_replaced(map, self.replace)
+    }
+}
+
+#[derive(Debug)]
+enum ListClass<'a> {
+    Malformed(&'static str),
+    /// A page: `kept` of the first `LIST_PAGE_SIZE` elements pass the entry table.
+    Readable {
+        kept: usize,
+        next: Option<&'a str>,
+    },
+}
+
+/// Section 10.14's reply table as a predicate: a map carrying `v` = 1 (MESH-LIST-006),
+/// `entries` an array (MESH-LIST-007), `next` absent, nil or a `str` within
+/// `CURSOR_MAX_BYTES` (MESH-LIST-009); then the first `LIST_PAGE_SIZE` elements held to
+/// the entry table, the rest of the page kept whatever they are (MESH-LIST-008).
+fn expect_list_page(value: &Value) -> ListClass<'_> {
+    let Some(entries) = value.as_map() else {
+        return ListClass::Malformed("map");
+    };
+    if first(entries, "v").and_then(Value::as_u64) != Some(PEER_WIRE_VERSION) {
+        return ListClass::Malformed("v");
+    }
+    let Some(listed) = first(entries, "entries").and_then(Value::as_array) else {
+        return ListClass::Malformed("entries");
+    };
+    let next = match first(entries, "next") {
+        None => None,
+        Some(cursor) => match cursor.as_str() {
+            Some(cursor) if cursor.len() <= CURSOR_MAX_BYTES => Some(cursor),
+            _ => return ListClass::Malformed("next"),
+        },
+    };
+    let kept = listed
+        .iter()
+        .take(LIST_PAGE_SIZE)
+        .filter(|entry| expect_entry(entry))
+        .count();
+    ListClass::Readable { kept, next }
+}
+
+/// MESH-LIST-011 to MESH-LIST-014: a map whose `path` is a `str` the wire path grammar
+/// accepts, `size` a `uint`, `sha256` a 32-byte `bin` and `mtime` a finite number.
+fn expect_entry(value: &Value) -> bool {
+    let Some(entries) = value.as_map() else {
+        return false;
+    };
+    first(entries, "path")
+        .and_then(Value::as_str)
+        .is_some_and(|path| WirePath::parse(path).is_ok())
+        && first(entries, "size").and_then(Value::as_u64).is_some()
+        && bin32_of(first(entries, "sha256")).is_some()
+        && first(entries, "mtime")
+            .and_then(Value::as_f64)
+            .is_some_and(f64::is_finite)
+}
+
+/// A 32-byte `bin` and nothing else; `Value::as_slice` would take a `str` as well.
+fn bin32_of(value: Option<&Value>) -> Option<[u8; 32]> {
+    match value? {
+        Value::Binary(bytes) => bytes.as_slice().try_into().ok(),
+        _ => None,
+    }
+}
+
+fn check_list_page(value: &Value) -> Result<(), String> {
+    let observed = SharesPage::from_value(value, "fuzz");
+    match (expect_list_page(value), &observed) {
+        (ListClass::Malformed(key), Err(FetchError::Malformed(got))) => ensure(*got == key, || {
+            format!("MESH-LIST-006..009: the refusal names `{key}`, the decoder said `{got}`")
+        }),
+        (ListClass::Readable { kept, next }, Ok(page)) => {
+            ensure(page.entries.len() == kept, || {
+                format!(
+                    "MESH-LIST-008: {kept} of the first {LIST_PAGE_SIZE} elements pass the entry table, the page kept {}",
+                    page.entries.len()
+                )
+            })?;
+            ensure(page.next.as_deref() == next, || {
+                format!(
+                    "MESH-LIST-009: next is the cursor sent, {next:?}, got {:?}",
+                    page.next
+                )
+            })?;
+            ensure(
+                page.entries
+                    .iter()
+                    .all(|entry| WirePath::parse(&entry.path).is_ok() && entry.mtime.is_finite()),
+                || {
+                    "MESH-LIST-011/014: every kept entry names a wire path and a finite mtime"
+                        .to_string()
+                },
+            )
+        }
+        (class, observed) => Err(format!(
+            "MESH-LIST-006..009: the predicate says {class:?}, the decoder says {observed:?}"
+        )),
+    }
+}
+
+#[derive(Debug, Arbitrary)]
+struct FetchReplyGen {
+    v: Likely<Version1>,
+    status: Likely<WordGen>,
+    payload: Vec<u8>,
+    bytes: Likely<Expected>,
+    size: Likely<Expected>,
+    sha256: Likely<Expected>,
+    rule: Likely<WordGen>,
+    limit: Likely<UintField>,
+    shape: Shape,
+    replace: Unlikely<ArbValue>,
+    dispatch: Unlikely<DispatchErrorGen>,
+}
+
+impl FetchReplyGen {
+    /// `bytes`, `size` and `sha256` are honest about `payload` unless a field goes odd,
+    /// so an `ok` reply is read to the end about as often as it is refused part-way.
+    fn into_value(self) -> Value {
+        if let Some(dispatch) = self.dispatch.0 {
+            return dispatch.into_value();
+        }
+        let digest = Sha256::digest(&self.payload).to_vec();
+        let len = self.payload.len() as u64;
+        let map = self.shape.map(vec![
+            (key("v"), present(self.v, version1)),
+            (
+                key("status"),
+                present(self.status, |status| status.into_value(&FETCH_STATUSES)),
+            ),
+            (
+                key("bytes"),
+                present(self.bytes, |bytes| {
+                    bytes.into_value(|()| Value::Binary(self.payload))
+                }),
+            ),
+            (
+                key("size"),
+                present(self.size, |size| size.into_value(|()| Value::from(len))),
+            ),
+            (
+                key("sha256"),
+                present(self.sha256, |sha256| {
+                    sha256.into_value(|()| Value::Binary(digest))
+                }),
+            ),
+            (
+                key("rule"),
+                present(self.rule, |rule| rule.into_value(&WIRE_PATH_RULES)),
+            ),
+            (key("limit"), present(self.limit, uint)),
+        ]);
+        or_replaced(map, self.replace)
+    }
+}
+
+#[derive(Debug)]
+enum FetchClass {
+    NotServed,
+    Malformed(&'static str),
+    Oversize(usize),
+    Corrupt,
+    UnknownStatus,
+    Readable(FetchReply),
+}
+
+/// Section 10.15's reply table as a predicate, in the requester's gate order: a dispatch
+/// error is `NotServed` (MESH-FETCH-013); then the map and `v` (MESH-FETCH-013), `status`
+/// a `str` (MESH-FETCH-014) naming one of the five (MESH-FETCH-015). An `ok` reply is
+/// judged `bytes` (MESH-FETCH-019), their count against `MAX_FETCH_FILE_BYTES`
+/// (MESH-FETCH-020), `size` (MESH-FETCH-016), `sha256` (MESH-FETCH-017), then the digest
+/// (MESH-FETCH-018); `invalid_path` keeps a rule the grammar names and reads any other
+/// `str` as `unknown` (MESH-FETCH-021); `too_large` carries a `uint` (MESH-FETCH-022).
+fn expect_fetch_reply(value: &Value) -> FetchClass {
+    if expect_dispatch_error(value).is_some() {
+        return FetchClass::NotServed;
+    }
+    let Some(entries) = value.as_map() else {
+        return FetchClass::Malformed("map");
+    };
+    if first(entries, "v").and_then(Value::as_u64) != Some(PEER_WIRE_VERSION) {
+        return FetchClass::Malformed("v");
+    }
+    let Some(status) = first(entries, "status").and_then(Value::as_str) else {
+        return FetchClass::Malformed("status");
+    };
+    match status {
+        "ok" => {
+            let Some(Value::Binary(bytes)) = first(entries, "bytes") else {
+                return FetchClass::Malformed("bytes");
+            };
+            if bytes.len() as u64 > MAX_FETCH_FILE_BYTES {
+                return FetchClass::Oversize(bytes.len());
+            }
+            if first(entries, "size").and_then(Value::as_u64) != Some(bytes.len() as u64) {
+                return FetchClass::Malformed("size");
+            }
+            let Some(sha256) = bin32_of(first(entries, "sha256")) else {
+                return FetchClass::Malformed("sha256");
+            };
+            if <[u8; 32]>::from(Sha256::digest(bytes)) != sha256 {
+                return FetchClass::Corrupt;
+            }
+            FetchClass::Readable(FetchReply::Ok {
+                bytes: bytes.clone(),
+                size: bytes.len() as u64,
+                sha256,
+            })
+        }
+        "not_modified" => match bin32_of(first(entries, "sha256")) {
+            Some(sha256) => FetchClass::Readable(FetchReply::NotModified { sha256 }),
+            None => FetchClass::Malformed("sha256"),
+        },
+        "not_shared" => FetchClass::Readable(FetchReply::NotShared),
+        "invalid_path" => match first(entries, "rule").and_then(Value::as_str) {
+            Some(rule) if WIRE_PATH_RULES.contains(&rule) => {
+                FetchClass::Readable(FetchReply::InvalidPath {
+                    rule: rule.to_string(),
+                })
+            }
+            Some(_) => FetchClass::Readable(FetchReply::InvalidPath {
+                rule: "unknown".to_string(),
+            }),
+            None => FetchClass::Malformed("rule"),
+        },
+        "too_large" => match first(entries, "limit").and_then(Value::as_u64) {
+            Some(limit) => FetchClass::Readable(FetchReply::TooLarge { limit }),
+            None => FetchClass::Malformed("limit"),
+        },
+        _ => FetchClass::UnknownStatus,
+    }
+}
+
+fn check_fetch_reply(value: &Value) -> Result<(), String> {
+    let observed = read_fetch_reply(value);
+    match (expect_fetch_reply(value), &observed) {
+        (FetchClass::NotServed, Err(FetchError::NotServed)) => Ok(()),
+        (FetchClass::Malformed(key), Err(FetchError::Malformed(got))) => {
+            ensure(*got == key, || {
+                format!("MESH-FETCH-013..022: the refusal names `{key}`, the decoder said `{got}`")
+            })
+        }
+        (FetchClass::Oversize(len), Err(FetchError::Oversize { len: got })) => {
+            ensure(*got == len, || {
+                format!("MESH-FETCH-020: the oversize refusal names {len} bytes, got {got}")
+            })
+        }
+        (FetchClass::Corrupt, Err(FetchError::Corrupt)) => Ok(()),
+        (FetchClass::UnknownStatus, Err(FetchError::UnknownStatus)) => Ok(()),
+        (FetchClass::Readable(expected), Ok(reply)) => ensure(*reply == expected, || {
+            format!(
+                "MESH-FETCH-016..022: the reply reads as {expected:?}, the decoder gave {reply:?}"
+            )
+        }),
+        (class, observed) => Err(format!(
+            "MESH-FETCH-013..022: the predicate says {class:?}, the decoder says {observed:?}"
+        )),
+    }
+}
+
+// --- /access reply, request body and LXMF fields (section 10.16) -----------------------
+
+/// The id every generated access reply is read against: a reply naming it is this
+/// request's, any other id is MESH-ACCESS-008's malformed reply.
+pub(super) const SENT_ID: &str = "acc-1";
+const ACCESS_STATUSES: [&str; 3] = ["pending", "granted", "refused"];
+const ACCESS_REFUSALS: [&str; 2] = ["duplicate", "too_many_pending"];
+
+/// The refusals `decode_access` can emit: the map and version gates, the key shapes, then
+/// `validate_access`'s rules (MESH-ACCESS-001 to MESH-ACCESS-004).
+const ACCESS_REQUEST_REASONS: [&str; 11] = [
+    "the body is not a map",
+    "v is missing or not the supported version",
+    "id is missing or not text",
+    "paths is missing or not a list",
+    "a path is not text",
+    "reason is not text",
+    "id is not a wire id",
+    "paths names more than the cap allows",
+    "a path is not a wire path",
+    "paths is empty",
+    "reason is longer than the cap allows",
+];
+
+/// The refusals `decode_access_message` can emit: the custom data and `name_hash` gates
+/// (MESH-ACCESS-021, MESH-ACCESS-023), the key shapes (MESH-ACCESS-024, MESH-ACCESS-025),
+/// then `validate_access`'s rules with the reason read from the content (MESH-ACCESS-027).
+const ACCESS_FIELDS_REASONS: [&str; 11] = [
+    "custom data is missing or not a map",
+    "name_hash is missing or not binary",
+    "name_hash is not 10 bytes",
+    "id is missing or not text",
+    "paths is missing or not a list",
+    "a path is not text",
+    "id is not a wire id",
+    "paths names more than the cap allows",
+    "a path is not a wire path",
+    "paths is empty",
+    "reason is longer than the cap allows",
+];
+
+#[derive(Debug, Arbitrary)]
+struct AccessReplyGen {
+    v: Likely<Version1>,
+    id: Likely<Expected>,
+    status: Likely<WordGen>,
+    expires: Likely<F64Field>,
+    reason: Likely<WordGen>,
+    shape: Shape,
+    replace: Unlikely<ArbValue>,
+    dispatch: Unlikely<DispatchErrorGen>,
+}
+
+impl AccessReplyGen {
+    fn into_value(self) -> Value {
+        if let Some(dispatch) = self.dispatch.0 {
+            return dispatch.into_value();
+        }
+        let map = self.shape.map(vec![
+            (key("v"), present(self.v, version1)),
+            (
+                key("id"),
+                present(self.id, |id| id.into_value(|()| Value::from(SENT_ID))),
+            ),
+            (
+                key("status"),
+                present(self.status, |status| status.into_value(&ACCESS_STATUSES)),
+            ),
+            (
+                key("expires"),
+                present(self.expires, |expires| expires.into_value(Value::F64)),
+            ),
+            (
+                key("reason"),
+                present(self.reason, |reason| reason.into_value(&ACCESS_REFUSALS)),
+            ),
+        ]);
+        or_replaced(map, self.replace)
+    }
+}
+
+#[derive(Debug)]
+enum AccessReplyClass {
+    NotServed,
+    Malformed(&'static str),
+    UnknownStatus,
+    Readable(AccessOutcome),
+}
+
+/// Section 10.16's reply table as a predicate, in the requester's gate order: a dispatch
+/// error is `NotServed`, then the map and `v` (MESH-ACCESS-007), the `id` sent
+/// (MESH-ACCESS-008), `status` a `str` (MESH-ACCESS-009) naming one of the three
+/// (MESH-ACCESS-010); `granted` carries a number (MESH-ACCESS-011), `refused` one of the
+/// two reasons or it is the unknown status (MESH-ACCESS-012).
+fn expect_access_reply(value: &Value) -> AccessReplyClass {
+    if expect_dispatch_error(value).is_some() {
+        return AccessReplyClass::NotServed;
+    }
+    let Some(entries) = value.as_map() else {
+        return AccessReplyClass::Malformed("the body is not a map");
+    };
+    if first(entries, "v").and_then(Value::as_u64) != Some(PEER_WIRE_VERSION) {
+        return AccessReplyClass::Malformed("v is missing or not the supported version");
+    }
+    if first(entries, "id").and_then(Value::as_str) != Some(SENT_ID) {
+        return AccessReplyClass::Malformed("id is missing or not the one sent");
+    }
+    let Some(status) = first(entries, "status").and_then(Value::as_str) else {
+        return AccessReplyClass::Malformed("status is missing or not text");
+    };
+    match status {
+        "pending" => AccessReplyClass::Readable(AccessOutcome::Pending),
+        "granted" => match first(entries, "expires").and_then(Value::as_f64) {
+            Some(expires) => AccessReplyClass::Readable(AccessOutcome::Granted { expires }),
+            None => AccessReplyClass::Malformed("expires is missing or not a number"),
+        },
+        "refused" => match first(entries, "reason").and_then(Value::as_str) {
+            Some("duplicate") => {
+                AccessReplyClass::Readable(AccessOutcome::Refused(AccessRefusal::Duplicate))
+            }
+            Some("too_many_pending") => {
+                AccessReplyClass::Readable(AccessOutcome::Refused(AccessRefusal::TooManyPending))
+            }
+            _ => AccessReplyClass::UnknownStatus,
+        },
+        _ => AccessReplyClass::UnknownStatus,
+    }
+}
+
+/// Equality on the wire, so a NaN `expires` compares equal to itself.
+fn same_outcome(a: &AccessOutcome, b: &AccessOutcome) -> bool {
+    match (a, b) {
+        (AccessOutcome::Granted { expires: x }, AccessOutcome::Granted { expires: y }) => {
+            x.to_bits() == y.to_bits()
+        }
+        _ => a == b,
+    }
+}
+
+fn check_access_reply(value: &Value) -> Result<(), String> {
+    let observed = read_access_reply(value, SENT_ID);
+    match (expect_access_reply(value), &observed) {
+        (AccessReplyClass::NotServed, Err(AccessError::NotServed(_))) => Ok(()),
+        (AccessReplyClass::Malformed(reason), Err(AccessError::Malformed(got))) => {
+            ensure(*got == reason, || {
+                format!("MESH-ACCESS-007..011: the refusal is `{reason}`, the decoder said `{got}`")
+            })
+        }
+        (AccessReplyClass::UnknownStatus, Err(AccessError::UnknownStatus)) => Ok(()),
+        (AccessReplyClass::Readable(expected), Ok(outcome)) => {
+            ensure(same_outcome(outcome, &expected), || {
+                format!(
+                    "MESH-ACCESS-010..012: the reply reads as {expected:?}, the decoder gave {outcome:?}"
+                )
+            })?;
+            let reencoded = access_reply(SENT_ID, outcome);
+            let back = read_access_reply(&reencoded, SENT_ID);
+            ensure(
+                back.as_ref().is_ok_and(|back| same_outcome(back, outcome)),
+                || {
+                    format!(
+                        "section 10.16 round trip: read(access_reply(o)) must equal o for {outcome:?}, re-read {back:?}"
+                    )
+                },
+            )?;
+            ensure(
+                packed(&reencoded) == packed(&access_reply(SENT_ID, outcome)),
+                || {
+                    "MESH-CANON: encoding an access reply twice must give the same bytes"
+                        .to_string()
+                },
+            )?;
+            no_duplicate_keys(&reencoded)
+        }
+        (class, observed) => Err(format!(
+            "MESH-ACCESS-007..012: the predicate says {class:?}, the decoder says {observed:?}"
+        )),
+    }
+}
+
+/// The `paths` list: wire paths, one repeated to straddle `ACCESS_MAX_PATHS`, or no list
+/// at all.
+#[derive(Debug, Arbitrary)]
+enum PathsGen {
+    List(Vec<Field<WirePathGen>>),
+    Repeated(u8, WirePathGen),
+    NotAList(Scalar),
+}
+
+impl PathsGen {
+    fn into_value(self) -> Value {
+        match self {
+            Self::List(paths) => Value::Array(
+                paths
+                    .into_iter()
+                    .take(MAX_CHILDREN)
+                    .map(|path| path.into_value(wire_path))
+                    .collect(),
+            ),
+            Self::Repeated(n, path) => Value::Array(vec![
+                wire_path(path);
+                ACCESS_MAX_PATHS - 2 + usize::from(n) % 4
+            ]),
+            Self::NotAList(odd) => odd.into_value(),
+        }
+    }
+}
+
+#[derive(Debug, Arbitrary)]
+struct AccessRequestGen {
+    v: Likely<Version1>,
+    id: Likely<IdGen>,
+    paths: Likely<PathsGen>,
+    reason: Unlikely<CappedTextGen>,
+    shape: Shape,
+    replace: Unlikely<ArbValue>,
+}
+
+impl AccessRequestGen {
+    fn into_value(self) -> Value {
+        let map = self.shape.map(vec![
+            (key("v"), present(self.v, version1)),
+            (key("id"), present(self.id, IdGen::into_value)),
+            (key("paths"), present(self.paths, PathsGen::into_value)),
+            (
+                key("reason"),
+                rare(self.reason, |reason| {
+                    reason.into_value(ACCESS_REASON_MAX_CHARS)
+                }),
+            ),
+        ]);
+        or_replaced(map, self.replace)
+    }
+}
+
+/// `ACCESS_TYPE` two times in three, as `str` or `bin`; otherwise any tag.
+#[derive(Debug, Arbitrary)]
+enum AccessTag {
+    Str,
+    Bin,
+    Any(TypeTag),
+}
+
+impl AccessTag {
+    fn into_value(self) -> Value {
+        match self {
+            Self::Str => TypeTag::AccessStr.into_value(),
+            Self::Bin => TypeTag::AccessBin.into_value(),
+            Self::Any(tag) => tag.into_value(),
+        }
+    }
+}
+
+#[derive(Debug, Arbitrary)]
+struct AccessDataGen {
+    name_hash: Likely<NameHashGen>,
+    id: Likely<IdGen>,
+    paths: Likely<PathsGen>,
+    shape: Shape,
+    replace: Unlikely<Scalar>,
+}
+
+/// An LXMF `fields` map: the custom type under `0xFB`, the access data under `0xFC`.
+#[derive(Debug, Arbitrary)]
+struct AccessFieldsGen {
+    tag: Likely<AccessTag>,
+    data: Likely<AccessDataGen>,
+    shape: Shape,
+    replace: Unlikely<ArbValue>,
+}
+
+impl AccessFieldsGen {
+    fn into_value(self) -> Value {
+        let data = |data: AccessDataGen| {
+            let map = data.shape.map(vec![
+                (
+                    key("name_hash"),
+                    present(data.name_hash, NameHashGen::into_value),
+                ),
+                (key("id"), present(data.id, IdGen::into_value)),
+                (key("paths"), present(data.paths, PathsGen::into_value)),
+            ]);
+            sub_map(map, data.replace)
+        };
+        let map = self.shape.map(vec![
+            (
+                Value::from(FIELD_CUSTOM_TYPE),
+                present(self.tag, AccessTag::into_value),
+            ),
+            (Value::from(FIELD_CUSTOM_DATA), present(self.data, data)),
+        ]);
+        or_replaced(map, self.replace)
+    }
+}
+
+/// The request table's `id`, `paths` and `reason` rows (MESH-ACCESS-002 to
+/// MESH-ACCESS-004) as both routes hold them: the wire id when every row passes. The
+/// path cap is judged on the list as sent, and a non-empty list of wire paths cannot
+/// lose every entry to repeat-dropping, so the floor is non-emptiness; the reason is
+/// cleaned as peer text before it is counted.
+fn expect_access_rows<'a>(entries: &'a [(Value, Value)], reason: &str) -> Option<&'a str> {
+    let id = first(entries, "id")
+        .and_then(Value::as_str)
+        .filter(|id| is_wire_id(id))?;
+    let paths = first(entries, "paths").and_then(Value::as_array)?;
+    let listed = !paths.is_empty()
+        && paths.len() <= ACCESS_MAX_PATHS
+        && paths.iter().all(|path| {
+            path.as_str()
+                .is_some_and(|path| WirePath::parse(path).is_ok())
+        });
+    let reasoned = display_text(reason, usize::MAX)
+        .is_none_or(|cleaned| cleaned.chars().count() <= ACCESS_REASON_MAX_CHARS);
+    (listed && reasoned).then_some(id)
+}
+
+/// Section 10.16's request table as a predicate: a map carrying `v` = 1 (MESH-ACCESS-001),
+/// `reason` absent, nil or a `str` (MESH-ACCESS-004), then the rows both routes share.
+fn expect_access_request(value: &Value) -> Option<&str> {
+    let entries = value.as_map()?;
+    if first(entries, "v").and_then(Value::as_u64) != Some(PEER_WIRE_VERSION) {
+        return None;
+    }
+    let reason = match first(entries, "reason") {
+        None => "",
+        Some(reason) => reason.as_str()?,
+    };
+    expect_access_rows(entries, reason)
+}
+
+/// What both routes promise of an admitted request (MESH-ACCESS-002 to MESH-ACCESS-004):
+/// a wire id, one to `ACCESS_MAX_PATHS` wire paths with no exact repeat, and a reason
+/// that is cleaned peer text within the cap.
+fn check_valid_access(request: &ValidAccess) -> Result<(), String> {
+    ensure(is_wire_id(&request.id), || {
+        format!("MESH-ACCESS-002: the id is a wire id, got {:?}", request.id)
+    })?;
+    ensure(
+        !request.paths.is_empty() && request.paths.len() <= ACCESS_MAX_PATHS,
+        || {
+            format!(
+                "MESH-ACCESS-003: one to {ACCESS_MAX_PATHS} paths, got {}",
+                request.paths.len()
+            )
+        },
+    )?;
+    ensure(
+        request
+            .paths
+            .iter()
+            .all(|path| WirePath::parse(path).is_ok()),
+        || {
+            format!(
+                "MESH-ACCESS-003: every path is a wire path, got {:?}",
+                request.paths
+            )
+        },
+    )?;
+    ensure(
+        request
+            .paths
+            .iter()
+            .enumerate()
+            .all(|(index, path)| !request.paths[..index].contains(path)),
+        || {
+            format!(
+                "MESH-ACCESS-003: exact repeats are dropped, got {:?}",
+                request.paths
+            )
+        },
+    )?;
+    ensure(
+        request.reason.chars().count() <= ACCESS_REASON_MAX_CHARS
+            && display_text(&request.reason, usize::MAX).unwrap_or_default() == request.reason,
+        || {
+            format!(
+                "MESH-ACCESS-004: the reason is cleaned peer text within {ACCESS_REASON_MAX_CHARS} characters, got {:?}",
+                request.reason
+            )
+        },
+    )
+}
+
+fn check_access_request(value: &Value) -> Result<(), String> {
+    let observed = decode_access(value);
+    match (expect_access_request(value), &observed) {
+        (None, Err(reason)) => ensure(ACCESS_REQUEST_REASONS.contains(reason), || {
+            format!("MESH-ACCESS-001..004: `{reason}` is not a refusal the request table names")
+        }),
+        (Some(id), Ok(request)) => {
+            ensure(request.id == id, || {
+                format!(
+                    "MESH-ACCESS-002: the id is the one sent, {id:?}, got {:?}",
+                    request.id
+                )
+            })?;
+            check_valid_access(request)?;
+            let reencoded = access_body(request);
+            let back = decode_access(&reencoded);
+            ensure(back.as_ref() == Ok(request), || {
+                format!(
+                    "section 10.16 round trip: decode(access_body(r)) must equal r for {request:?}, re-read {back:?}"
+                )
+            })?;
+            no_duplicate_keys(&reencoded)
+        }
+        (expected, observed) => Err(format!(
+            "MESH-ACCESS-001..004: the predicate reads {expected:?}, the decoder {observed:?}"
+        )),
+    }
+}
+
+fn check_access_fields(fields: &Value) -> Result<(), String> {
+    let observed = decode_access_message(&inbound_with(fields.clone()));
+    let rows = || custom_data(fields).and_then(|data| expect_access_rows(data, INBOUND_CONTENT));
+    match (expect_typed(fields, ACCESS_TYPE), &observed) {
+        (None, AccessMessage::NotAnAccess) => Ok(()),
+        (Some(name_hash), AccessMessage::Malformed(reason)) => {
+            ensure(ACCESS_FIELDS_REASONS.contains(reason), || {
+                format!("MESH-ACCESS-021..027: `{reason}` is not a refusal section 10.16 names")
+            })?;
+            ensure(name_hash.is_none() || rows().is_none(), || {
+                format!(
+                    "MESH-ACCESS-023..027: a typed message with a 10-byte name_hash whose rows pass is an access request, refused as `{reason}`"
+                )
+            })
+        }
+        (Some(Some(expected)), AccessMessage::Access { name_hash, request }) => {
+            ensure(*name_hash == expected, || {
+                "MESH-ACCESS-023: the request's name_hash is the 10-byte bin under the custom data"
+                    .to_string()
+            })?;
+            ensure(rows() == Some(request.id.as_str()), || {
+                format!(
+                    "MESH-ACCESS-024/025: an admitted request passes the rows under its own id, got {request:?}"
+                )
+            })?;
+            check_valid_access(request)?;
+            let message = access_message(request, &OriginName(expected));
+            let fields = message
+                .fields
+                .ok_or_else(|| "MESH-ACCESS-020: access_message types its fields".to_string())?;
+            let back = decode_access_message(&inbound_message(message.content, fields.clone()));
+            ensure(back == observed, || {
+                format!(
+                    "section 10.16 round trip: decode(access_message(r)) must equal r for {request:?}, re-read {back:?}"
+                )
+            })?;
+            no_duplicate_keys(&fields)
+        }
+        (expected, observed) => Err(format!(
+            "MESH-ACCESS-020..027: typed={expected:?} by the predicate, decoded as {observed:?}"
+        )),
+    }
+}
+
 // --- /message body (section 10) --------------------------------------------------------
 
 const BODY_REASONS: [&str; 9] = [
@@ -2162,10 +3273,10 @@ const BODY_REASONS: [&str; 9] = [
     "kind is missing or unknown",
     "id is missing, blank, too long or outside the id alphabet",
     "in_reply_to is not a message id",
+    "in_reply_to is missing on a reply",
     "title is not text or is too long",
     "content is missing, not text or too long",
     "fields is not a map",
-    "ts is missing or not a finite number",
 ];
 
 const KINDS: [&str; 4] = ["message", "ask", "reply", "bulletin"];
@@ -2266,6 +3377,237 @@ impl FieldsValue {
     }
 }
 
+const DISPOSITIONS: [&str; 4] = ["answered", "escalated", "refused", "budget_exhausted"];
+
+#[derive(Debug, Arbitrary)]
+enum DispositionGen {
+    Known(u8),
+    Unknown(String),
+    Odd(Scalar),
+}
+
+impl DispositionGen {
+    fn into_value(self) -> Value {
+        match self {
+            Self::Known(i) => Value::from(DISPOSITIONS[usize::from(i) % DISPOSITIONS.len()]),
+            Self::Unknown(name) => Value::from(name),
+            Self::Odd(odd) => odd.into_value(),
+        }
+    }
+}
+
+const PART_TYPES: [&str; 3] = ["text", "data", "file"];
+
+/// One `parts` element: a well-formed part of each shape, a known type missing its
+/// fields, a type this build does not know, or no map at all.
+#[derive(Debug, Arbitrary)]
+enum PartGen {
+    Text(TextField),
+    Data(ArbValue),
+    Inline {
+        name: TextField,
+        bytes: Vec<u8>,
+        honest_hash: bool,
+    },
+    Reference {
+        name: TextField,
+        path: TextField,
+        size: u64,
+    },
+    MissingFields(u8),
+    UnknownType(String, Vec<(String, Scalar)>),
+    NotAMap(Scalar),
+}
+
+impl PartGen {
+    fn into_value(self) -> Value {
+        let typed = |name: &str, mut rest: Vec<(Value, Value)>| {
+            rest.insert(0, (key("type"), Value::from(name)));
+            Value::Map(rest)
+        };
+        match self {
+            Self::Text(field) => typed("text", vec![(key("text"), text(field))]),
+            Self::Data(value) => typed("data", vec![(key("data"), value.into_value())]),
+            Self::Inline {
+                name,
+                bytes,
+                honest_hash,
+            } => {
+                let sha256 = if honest_hash {
+                    Sha256::digest(&bytes).to_vec()
+                } else {
+                    vec![0; 32]
+                };
+                typed(
+                    "file",
+                    vec![
+                        (key("name"), text(name)),
+                        (key("size"), Value::from(bytes.len() as u64)),
+                        (key("sha256"), Value::Binary(sha256)),
+                        (key("bytes"), Value::Binary(bytes)),
+                    ],
+                )
+            }
+            Self::Reference { name, path, size } => typed(
+                "file",
+                vec![
+                    (key("name"), text(name)),
+                    (key("size"), Value::from(size)),
+                    (key("sha256"), Value::Binary(vec![9; 32])),
+                    (key("ref"), Value::Map(vec![(key("path"), text(path))])),
+                ],
+            ),
+            Self::MissingFields(i) => {
+                typed(PART_TYPES[usize::from(i) % PART_TYPES.len()], Vec::new())
+            }
+            Self::UnknownType(name, entries) => typed(
+                &name,
+                entries
+                    .into_iter()
+                    .take(MAX_CHILDREN)
+                    .map(|(name, value)| (Value::from(name), value.into_value()))
+                    .collect(),
+            ),
+            Self::NotAMap(odd) => odd.into_value(),
+        }
+    }
+}
+
+/// The `parts` value: a list, one part repeated to past `MAX_PARTS`, or no list at all.
+#[derive(Debug, Arbitrary)]
+enum PartsGen {
+    List(Vec<PartGen>),
+    Repeated(u8, PartGen),
+    NotAList(Scalar),
+}
+
+impl PartsGen {
+    fn into_value(self) -> Value {
+        match self {
+            Self::List(parts) => Value::Array(
+                parts
+                    .into_iter()
+                    .take(MAX_CHILDREN)
+                    .map(PartGen::into_value)
+                    .collect(),
+            ),
+            Self::Repeated(n, part) => {
+                Value::Array(vec![part.into_value(); usize::from(n) % (3 * MAX_PARTS)])
+            }
+            Self::NotAList(odd) => odd.into_value(),
+        }
+    }
+}
+
+/// What a decoded body promises of its optional keys on either route: a `thread` is an id
+/// or absent, a disposition is carried by a reply and only a reply, `retry_after` only by
+/// a reply, and `parts` keeps at most what was listed, counting a non-list as one dropped
+/// and otherwise every element of a known `type` either read or dropped, an unknown one
+/// neither. Nothing in these keys refuses a body; that is the reason lists' job to pin.
+struct DecodedExtras<'a> {
+    kind: PeerKind,
+    thread: Option<&'a str>,
+    disposition: Option<Disposition>,
+    retry_after: Option<u32>,
+    parts: usize,
+    dropped_parts: u32,
+}
+
+impl<'a> DecodedExtras<'a> {
+    fn of_body(body: &'a PeerBody) -> Self {
+        Self {
+            kind: body.kind,
+            thread: body.thread.as_deref(),
+            disposition: body.disposition,
+            retry_after: body.retry_after,
+            parts: body.parts.len(),
+            dropped_parts: body.dropped_parts,
+        }
+    }
+
+    fn of_peer(peer: &'a LxmfPeer) -> Self {
+        Self {
+            kind: peer.kind,
+            thread: peer.thread.as_deref(),
+            disposition: peer.disposition,
+            retry_after: peer.retry_after,
+            parts: peer.parts.len(),
+            dropped_parts: peer.dropped_parts,
+        }
+    }
+}
+
+/// MESH-MSG-004/051: a decoded reply always names the message it answers and a decoded
+/// bulletin never names one.
+fn check_in_reply_to_per_kind(kind: PeerKind, in_reply_to: Option<&str>) -> Result<(), String> {
+    ensure(
+        kind != PeerKind::Reply || in_reply_to.is_some_and(is_wire_id),
+        || format!("MESH-MSG-004/051: a decoded reply carries in_reply_to, got {in_reply_to:?}"),
+    )?;
+    ensure(kind != PeerKind::Bulletin || in_reply_to.is_none(), || {
+        format!(
+            "MESH-MSG-004/051: a decoded bulletin reads in_reply_to as absent, got {in_reply_to:?}"
+        )
+    })
+}
+
+fn check_extras(entries: &[(Value, Value)], extras: &DecodedExtras<'_>) -> Result<(), String> {
+    ensure(extras.thread.is_none_or(is_wire_id), || {
+        format!(
+            "MESH-MSG: a thread that is not a message id reads as absent, got {:?}",
+            extras.thread
+        )
+    })?;
+    let is_reply = extras.kind == PeerKind::Reply;
+    ensure(extras.disposition.is_some() == is_reply, || {
+        format!(
+            "MESH-MSG: a reply always has a disposition and nothing else carries one, got {:?} on {:?}",
+            extras.disposition, extras.kind
+        )
+    })?;
+    ensure(extras.retry_after.is_none() || is_reply, || {
+        format!(
+            "MESH-MSG: only a reply carries retry_after, got {:?} on {:?}",
+            extras.retry_after, extras.kind
+        )
+    })?;
+    let parts = first(entries, "parts");
+    let known_typed = parts.and_then(Value::as_array).map_or(0, |items| {
+        items
+            .iter()
+            .filter(|item| {
+                item.as_map()
+                    .and_then(|entries| first(entries, "type"))
+                    .is_some_and(|kind| {
+                        let kind = match kind {
+                            Value::String(text) => text.as_bytes(),
+                            Value::Binary(bytes) => bytes.as_slice(),
+                            _ => return false,
+                        };
+                        PART_TYPES.iter().any(|known| known.as_bytes() == kind)
+                    })
+            })
+            .count()
+    });
+    ensure(extras.parts <= known_typed, || {
+        format!(
+            "MESH-MSG: {} parts decoded from a list naming {known_typed} known types",
+            extras.parts
+        )
+    })?;
+    let expected_dropped = if parts.is_some_and(|value| !value.is_array()) {
+        1
+    } else {
+        u32::try_from(known_typed - extras.parts).map_err(|err| err.to_string())?
+    };
+    ensure(extras.dropped_parts == expected_dropped, || {
+        format!(
+            "MESH-MSG: a parts that is not a list counts one dropped, else every known type not read; got {} for {parts:?}",
+            extras.dropped_parts
+        )
+    })
+}
+
 #[derive(Debug, Arbitrary)]
 struct BodyGen {
     v: Likely<Version1>,
@@ -2276,6 +3618,10 @@ struct BodyGen {
     content: Likely<TextField>,
     fields: Unlikely<FieldsValue>,
     ts: Likely<TsGen>,
+    thread: Unlikely<IdGen>,
+    disposition: Unlikely<DispositionGen>,
+    retry_after: Unlikely<UintField>,
+    parts: Unlikely<PartsGen>,
     shape: Shape,
     replace: Unlikely<ArbValue>,
 }
@@ -2294,6 +3640,13 @@ impl BodyGen {
             (key("content"), present(self.content, text)),
             (key("fields"), rare(self.fields, FieldsValue::into_value)),
             (key("ts"), present(self.ts, TsGen::into_value)),
+            (key("thread"), rare(self.thread, IdGen::into_value)),
+            (
+                key("disposition"),
+                rare(self.disposition, DispositionGen::into_value),
+            ),
+            (key("retry_after"), rare(self.retry_after, uint)),
+            (key("parts"), rare(self.parts, PartsGen::into_value)),
         ]);
         or_replaced(map, self.replace)
     }
@@ -2330,6 +3683,21 @@ fn check_body(value: &Value) -> Result<(), String> {
                     "MESH-MSG-012: a body that is not a map or not version 1 must be refused, got {body:?}"
                 )
             })?;
+            let entries = value
+                .as_map()
+                .ok_or_else(|| "MESH-MSG-012: a decoded body came from a map".to_string())?;
+            let sent_ts = first(entries, "ts")
+                .and_then(Value::as_f64)
+                .filter(|ts| ts.is_finite());
+            ensure(body.timestamp == sent_ts, || {
+                format!(
+                    "MESH-MSG-009: ts reads as the finite number sent or as absent; expected {sent_ts:?}, got {:?} for {:?}",
+                    body.timestamp,
+                    first(entries, "ts")
+                )
+            })?;
+            check_in_reply_to_per_kind(body.kind, body.in_reply_to.as_deref())?;
+            check_extras(entries, &DecodedExtras::of_body(&body))?;
             let peer = OutboundPeer {
                 kind: body.kind,
                 id: body.id.clone(),
@@ -2337,15 +3705,124 @@ fn check_body(value: &Value) -> Result<(), String> {
                 title: body.title.clone(),
                 content: body.content.clone(),
                 fields: body.fields.clone(),
+                parts: body.parts.clone(),
+                thread: body.thread.clone(),
+                disposition: body.disposition,
+                retry_after: body.retry_after,
             };
-            let again = from_r3_body(&to_r3_body(&peer, body.timestamp));
-            ensure(again.as_ref() == Ok(&body), || {
+            let ts = body.timestamp.unwrap_or(0.0);
+            let again = from_r3_body(&to_r3_body(&peer, ts));
+            let re_sent = PeerBody {
+                dropped_parts: 0,
+                timestamp: Some(ts),
+                ..body.clone()
+            };
+            ensure(again.as_ref() == Ok(&re_sent), || {
                 format!(
-                    "MESH-MSG round trip: from_r3_body(to_r3_body(body)) must equal body; got {again:?} for {body:?}"
+                    "MESH-MSG round trip: from_r3_body(to_r3_body(body)) must equal body with nothing dropped; got {again:?} for {body:?}"
                 )
-            })
+            })?;
+            check_admission(&body.parts, body.dropped_parts)
         }
     }
+}
+
+/// The receiver's part admission on what a codec read, with no inbox to stage into
+/// (section 10.7): what `admit_parts` keeps fits every cap and `PeerMessage::new_with`
+/// keeps only what passed, every file name and reference still a wire path, no inline
+/// file kept as a path, and every part the sender attached either kept or counted.
+fn check_admission(parts: &[RawPart], dropped_on_read: u32) -> Result<(), String> {
+    let source_destination = "0b".repeat(ADDRESS_HASH_SIZE);
+    let (admitted, dropped) =
+        admit_parts(parts.to_vec(), &PartLimits::default(), &source_destination);
+    ensure(admitted.len() <= MAX_PARTS, || {
+        format!(
+            "MESH-MSG parts: at most {MAX_PARTS} parts are admitted, got {}",
+            admitted.len()
+        )
+    })?;
+    let encoded = packed_len(&encode_parts(&admitted));
+    ensure(encoded <= MAX_PARTS_BYTES, || {
+        format!(
+            "MESH-MSG parts: the admitted parts encode to {encoded} bytes, over {MAX_PARTS_BYTES}"
+        )
+    })?;
+    let inline_total: u64 = admitted.iter().map(inline_size).sum();
+    ensure(inline_total <= MAX_INLINE_FILE_TOTAL, || {
+        format!(
+            "MESH-MSG parts: {inline_total} inline bytes admitted, over {MAX_INLINE_FILE_TOTAL}"
+        )
+    })?;
+    let listed = u32::try_from(parts.len()).map_err(|err| err.to_string())?;
+    let kept_by_admission = u32::try_from(admitted.len()).map_err(|err| err.to_string())?;
+    ensure(kept_by_admission + dropped == listed, || {
+        format!(
+            "MESH-MSG parts: {listed} parts read, {kept_by_admission} admitted and {dropped} dropped"
+        )
+    })?;
+
+    let message = PeerMessage::new_with(
+        RawPeerMessage {
+            source_identity: "0a".repeat(ADDRESS_HASH_SIZE),
+            source_destination,
+            destination: "0c".repeat(ADDRESS_HASH_SIZE),
+            title: None,
+            content: "hello".to_string(),
+            fields: None,
+            timestamp: FIXED_NOW_SECS as f64,
+            message_id: "m-1".to_string(),
+            in_reply_to: None,
+            kind: PeerKind::Message,
+            via: PeerVia::Direct,
+            thread: None,
+            disposition: None,
+            retry_after: None,
+            parts: parts.to_vec(),
+            dropped_parts: dropped_on_read,
+        },
+        &PartLimits::default(),
+        None,
+    );
+    ensure(message.parts.len() <= admitted.len(), || {
+        format!(
+            "MESH-MSG parts: the message keeps {} parts of {} admitted",
+            message.parts.len(),
+            admitted.len()
+        )
+    })?;
+    for part in &message.parts {
+        let Part::File {
+            name,
+            staged,
+            reference,
+            ..
+        } = part
+        else {
+            continue;
+        };
+        ensure(WirePath::parse(name).is_ok(), || {
+            format!("MESH-MSG parts: a kept file name is a wire path, got {name:?}")
+        })?;
+        ensure(
+            reference
+                .as_deref()
+                .is_none_or(|path| WirePath::parse(path).is_ok()),
+            || format!("MESH-MSG parts: a kept file reference is a wire path, got {reference:?}"),
+        )?;
+        ensure(staged.is_none(), || {
+            format!("MESH-MSG parts: nothing is staged without an inbox, got {staged:?}")
+        })?;
+    }
+    let kept = u32::try_from(message.parts.len()).map_err(|err| err.to_string())?;
+    ensure(
+        kept + message.dropped_parts == listed + dropped_on_read,
+        || {
+            format!(
+                "MESH-MSG parts: {listed} read and {dropped_on_read} unreadable, but {kept} kept and {} dropped",
+                message.dropped_parts
+            )
+        },
+    )
 }
 
 // --- /knock body (section 8) -----------------------------------------------------------
@@ -2419,7 +3896,11 @@ impl AnnounceGen {
         let mut out = Vec::new();
         match self.magic.0 {
             Some(()) => out.extend_from_slice(&ANNOUNCE_MAGIC),
-            None => out.extend_from_slice(b"COYX"),
+            None => {
+                let mut wrong = ANNOUNCE_MAGIC;
+                wrong[ANNOUNCE_MAGIC.len() - 1] ^= 0x01;
+                out.extend_from_slice(&wrong);
+            }
         }
         out.extend_from_slice(&self.version.to_be_bytes());
         match self.name {
@@ -2443,13 +3924,14 @@ impl AnnounceGen {
 
 /// MESH-ANN-001 (length and magic), MESH-ANN-002 (big-endian version), MESH-ANN-003
 /// (name at most 64 bytes, UTF-8, no control or invisible character), MESH-ANN-004 (empty
-/// name is no name), MESH-ANN-005 (every byte from 6 on is the name).
+/// name is no name), MESH-ANN-005 (every byte from 7 on is the name).
 fn expect_announce(bytes: &[u8]) -> Option<(u16, Option<&str>)> {
-    if bytes.len() < ANNOUNCE_MAGIC.len() + 2 || bytes[..ANNOUNCE_MAGIC.len()] != ANNOUNCE_MAGIC {
+    let (magic, rest) = bytes.split_at_checked(ANNOUNCE_MAGIC.len())?;
+    if magic != ANNOUNCE_MAGIC {
         return None;
     }
-    let version = u16::from_be_bytes([bytes[4], bytes[5]]);
-    let name = &bytes[6..];
+    let (version, name) = rest.split_at_checked(2)?;
+    let version = u16::from_be_bytes([version[0], version[1]]);
     if name.len() > MAX_DISPLAY_NAME_BYTES {
         return None;
     }
@@ -2489,7 +3971,7 @@ fn check_announce(bytes: &[u8]) -> Result<(), String> {
 
 // --- LXMF custom fields (sections 8.6 and 10.8) ----------------------------------------
 
-const PEER_REASONS: [&str; 7] = [
+const PEER_REASONS: [&str; 8] = [
     "custom data is missing or not a map",
     "name_hash is missing or not binary",
     "name_hash is not 10 bytes",
@@ -2497,6 +3979,7 @@ const PEER_REASONS: [&str; 7] = [
     "id is missing or blank",
     "id is too long or has characters outside the id alphabet",
     "in_reply_to is not a message id",
+    "in_reply_to is missing on a reply",
 ];
 
 const KNOCK_REASONS: [&str; 3] = [
@@ -2511,6 +3994,8 @@ enum TypeTag {
     PeerBin,
     KnockStr,
     KnockBin,
+    AccessStr,
+    AccessBin,
     Other(Scalar),
 }
 
@@ -2521,6 +4006,8 @@ impl TypeTag {
             Self::PeerBin => Value::Binary(PEER_MESSAGE_TYPE.as_bytes().to_vec()),
             Self::KnockStr => Value::from(KNOCK_TYPE),
             Self::KnockBin => Value::Binary(KNOCK_TYPE.as_bytes().to_vec()),
+            Self::AccessStr => Value::from(ACCESS_TYPE),
+            Self::AccessBin => Value::Binary(ACCESS_TYPE.as_bytes().to_vec()),
             Self::Other(odd) => odd.into_value(),
         }
     }
@@ -2533,6 +4020,10 @@ struct DataGen {
     id: Unlikely<IdGen>,
     in_reply_to: Unlikely<IdGen>,
     fields: Unlikely<FieldsValue>,
+    thread: Unlikely<IdGen>,
+    disposition: Unlikely<DispositionGen>,
+    retry_after: Unlikely<UintField>,
+    parts: Unlikely<PartsGen>,
     shape: Shape,
     replace: Unlikely<Scalar>,
 }
@@ -2561,6 +4052,13 @@ impl FieldsGen {
                     rare(data.in_reply_to, IdGen::into_value),
                 ),
                 (key("fields"), rare(data.fields, FieldsValue::into_value)),
+                (key("thread"), rare(data.thread, IdGen::into_value)),
+                (
+                    key("disposition"),
+                    rare(data.disposition, DispositionGen::into_value),
+                ),
+                (key("retry_after"), rare(data.retry_after, uint)),
+                (key("parts"), rare(data.parts, PartsGen::into_value)),
             ]);
             sub_map(map, data.replace)
         };
@@ -2608,7 +4106,24 @@ fn expect_typed(fields: &Value, tag: &str) -> Option<Option<[u8; NAME_HASH_LEN]>
     Some(name_hash)
 }
 
-fn inbound_with(fields: Value) -> InboundMessage {
+/// The first `0xFC` map's entries, when the fields carry one.
+fn custom_data(fields: &Value) -> Option<&[(Value, Value)]> {
+    fields
+        .as_map()?
+        .iter()
+        .find(|(name, _)| name.as_u64() == Some(u64::from(FIELD_CUSTOM_DATA)))
+        .and_then(|(_, value)| value.as_map())
+        .map(Vec::as_slice)
+}
+
+/// The content every generated LXMF message carries, the reason of an access request.
+const INBOUND_CONTENT: &str = "hello";
+
+pub(super) fn inbound_with(fields: Value) -> InboundMessage {
+    inbound_message(INBOUND_CONTENT.as_bytes().to_vec(), fields)
+}
+
+fn inbound_message(content: Vec<u8>, fields: Value) -> InboundMessage {
     InboundMessage {
         transient_id: [1u8; 32],
         message_id: [2u8; 32],
@@ -2616,7 +4131,7 @@ fn inbound_with(fields: Value) -> InboundMessage {
         source_delivery_hash: "0b".repeat(ADDRESS_HASH_SIZE),
         timestamp: 1_700_000_000.0,
         title: None,
-        content: Some(b"hello".to_vec()),
+        content: Some(content),
         fields: Some(fields),
         stamp_value: None,
     }
@@ -2629,11 +4144,16 @@ fn check_peer_fields(fields: &Value) -> Result<(), String> {
         (Some(_), PeerLxmf::Malformed(reason)) => ensure(PEER_REASONS.contains(reason), || {
             format!("MESH-MSG-049..052: `{reason}` is not a refusal section 10.8 names")
         }),
-        (Some(Some(expected)), PeerLxmf::Peer { name_hash, .. }) => {
-            ensure(*name_hash == expected, || {
+        (Some(Some(expected)), PeerLxmf::Peer(peer)) => {
+            ensure(peer.name_hash == expected, || {
                 "MESH-MSG-052: the peer's name_hash is the 10-byte bin under the custom data"
                     .to_string()
-            })
+            })?;
+            let data = custom_data(fields)
+                .ok_or_else(|| "MESH-MSG-052: a peer came from a custom data map".to_string())?;
+            check_in_reply_to_per_kind(peer.kind, peer.in_reply_to.as_deref())?;
+            check_extras(data, &DecodedExtras::of_peer(peer))?;
+            check_admission(&peer.parts, peer.dropped_parts)
         }
         (expected, observed) => Err(format!(
             "MESH-PROP-038/MESH-MSG-052: typed={expected:?} by the predicate, decoded as {observed:?}"
@@ -2822,6 +4342,9 @@ enum PathTextGen {
     Status,
     Message,
     Knock,
+    List,
+    Fetch,
+    Access,
     Other(String),
     Odd(Scalar),
 }
@@ -2864,6 +4387,9 @@ impl DispatchErrorGen {
                     PathTextGen::Status => Value::from(STATUS_PATH),
                     PathTextGen::Message => Value::from(MESSAGE_PATH),
                     PathTextGen::Knock => Value::from(KNOCK_PATH),
+                    PathTextGen::List => Value::from(LIST_PATH),
+                    PathTextGen::Fetch => Value::from(FETCH_PATH),
+                    PathTextGen::Access => Value::from(ACCESS_PATH),
                     PathTextGen::Other(path) => Value::from(path),
                     PathTextGen::Odd(odd) => odd.into_value(),
                 }),
@@ -2874,8 +4400,8 @@ impl DispatchErrorGen {
 }
 
 /// MESH-ENV-040 (`error` a `str` naming one of the two kinds), MESH-ENV-041 (`path_hash`
-/// exactly 32 hex digits), MESH-ENV-042 (`path` one of the three known paths); first
-/// occurrence wins (MESH-CANON-012).
+/// exactly 32 hex digits), MESH-ENV-042 (`path` one of the known paths, `KNOWN_PATHS`);
+/// first occurrence wins (MESH-CANON-012).
 fn expect_dispatch_error(value: &Value) -> Option<DispatchError> {
     let entries = value.as_map()?;
     let field = |name: &str| {
@@ -2895,7 +4421,7 @@ fn expect_dispatch_error(value: &Value) -> Option<DispatchError> {
         }
         "no_provider" => {
             let path = field("path")?;
-            [KNOCK_PATH, STATUS_PATH, MESSAGE_PATH]
+            KNOWN_PATHS
                 .contains(&path)
                 .then(|| DispatchError::NoProvider {
                     path: path.to_string(),
@@ -2956,12 +4482,18 @@ impl RecordGen {
             in_reply_to: Some(id.clone()),
             kind: PeerKind::Reply,
             via: PeerVia::Direct,
+            thread: None,
+            disposition: None,
+            retry_after: None,
+            parts: Vec::new(),
+            dropped_parts: 0,
         });
         PendingRecord {
             version: PENDING_RECORD_VERSION,
-            id,
+            id: id.clone(),
             peer_destination: "0b".repeat(ADDRESS_HASH_SIZE),
             peer_identity: "0a".repeat(ADDRESS_HASH_SIZE),
+            thread: id,
             question: self.question.chars().take(40).collect(),
             sent_at: rfc3339_utc(sent_at),
             timeout_at: rfc3339_utc(sent_at + Duration::from_secs(u64::from(self.timeout_secs))),
@@ -3039,8 +4571,8 @@ impl JsonlGen {
     }
 }
 
-/// The file rule of `read_jsonl`: every non-blank line is a version-1 pending record with
-/// an RFC 3339 `sent_at`, or the whole file is refused naming the first line that is not.
+/// The file rule of `read_jsonl`: every non-blank line is a current-version pending record
+/// with an RFC 3339 `sent_at`, or the whole file is refused naming the first line that is not.
 fn expect_pending(text: &str) -> Result<Vec<PendingRecord>, usize> {
     text.lines()
         .enumerate()
@@ -3072,19 +4604,19 @@ fn check_pending(fx: &CodecFixture, payload: &[u8]) -> Result<(), String> {
             loaded.len() <= records.len()
                 && loaded.iter().all(|record| {
                     record.version == PENDING_RECORD_VERSION
-                        && (record.state == PendingState::Open || record.reply.is_some())
+                        && (record.state != PendingState::Answered || record.reply.is_some())
                         && records.contains(record)
                 }),
             || {
                 format!(
-                    "load_pending returns a subset of the file's version-1 records, each open or carrying its reply; file {}, loaded {}",
+                    "load_pending returns a subset of the file's current-version records, each awaiting a reply or carrying its reply; file {}, loaded {}",
                     records.len(),
                     loaded.len()
                 )
             },
         ),
         (Err(line), Ok(loaded)) => Err(format!(
-            "the loader accepted a file whose line {line} is not a version-1 pending record with an RFC 3339 sent_at; loaded {}",
+            "the loader accepted a file whose line {line} is not a current-version pending record with an RFC 3339 sent_at; loaded {}",
             loaded.len()
         )),
         (Ok(records), Err(err)) => Err(format!(

@@ -17,7 +17,6 @@ use std::sync::Arc;
 #[folder = "assets/macros"]
 struct MacroAssets;
 
-#[async_recursion::async_recursion]
 pub async fn macro_execute(
     ctx: &mut RequestContext,
     name: &str,
@@ -1348,10 +1347,10 @@ variables:
         assert!(!ctx.macro_non_isolated);
     }
 
-    // ---- usage probe: spec-first tests for the .mesh-in-macros exclusion ----
+    // ---- the .mesh-in-macros exclusion ----
 
-    /// Spec (c) fixes the reason wording verbatim; pin the whole sentence so
-    /// the `.list macros` row and the load error cannot drift apart from it.
+    /// `forbidden_mesh_step` fixes the reason wording verbatim; pin the whole sentence
+    /// so the `.list macros` row and the load error cannot drift apart from it.
     #[test]
     fn usage_probe_reason_is_the_exact_spec_sentence() {
         let m = macro_with_steps(&[".model x", "  .mesh trust {{peer}}"]);
@@ -1364,7 +1363,7 @@ variables:
         );
     }
 
-    /// Spec (a)/(d): both REPL arms that reach a macro — `.macro <name> [args]`
+    /// Both REPL arms that reach a macro — `.macro <name> [args]`
     /// and the top-level `.<name> [args]` fallback — surface the load-time
     /// refusal (via `resolve_state` -> `Invalid`) and run no step, even when
     /// the macro is non-isolated and would otherwise mutate the live session.
@@ -1399,9 +1398,9 @@ variables:
         }
     }
 
-    /// Spec (d): enforcement lives in `Macro::load`, so it fires before
-    /// variable resolution — a mesh macro invoked WITHOUT its required
-    /// variable reports the refusal, not the usage error.
+    /// Enforcement lives in `Macro::load`, so it fires before variable resolution — a mesh
+    /// macro invoked without its required variable reports the refusal, not the usage
+    /// error.
     #[test]
     #[serial]
     fn usage_probe_load_refusal_precedes_variable_resolution() {
@@ -1426,7 +1425,7 @@ variables:
         assert!(!err.contains("Usage:"), "{err}");
     }
 
-    /// Spec (e): the exclusion is exactly one command family. A macro made of
+    /// The exclusion is exactly one command family. A macro made of
     /// every OTHER built-in REPL command still loads from disk, so the check
     /// cannot silently broaden to `.model`, `.session`, `.rag`, ...
     #[test]

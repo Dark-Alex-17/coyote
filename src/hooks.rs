@@ -149,6 +149,9 @@ pub enum HookEvent {
     MeshBulletinReceived,
     MeshBulletinSent,
     MeshBriefUpdated,
+    MeshFetchServed,
+    MeshAccessRequested,
+    MeshAccessDecided,
 }
 
 impl HookEvent {
@@ -197,10 +200,13 @@ impl HookEvent {
             HookEvent::MeshBulletinReceived => "mesh.bulletin.received",
             HookEvent::MeshBulletinSent => "mesh.bulletin.sent",
             HookEvent::MeshBriefUpdated => "mesh.brief.updated",
+            HookEvent::MeshFetchServed => "mesh.fetch.served",
+            HookEvent::MeshAccessRequested => "mesh.access.requested",
+            HookEvent::MeshAccessDecided => "mesh.access.decided",
         }
     }
 
-    pub(crate) const ALL: [HookEvent; 43] = [
+    pub(crate) const ALL: [HookEvent; 46] = [
         HookEvent::TurnStarted,
         HookEvent::TurnCompleted,
         HookEvent::TurnInterrupted,
@@ -244,6 +250,9 @@ impl HookEvent {
         HookEvent::MeshBulletinReceived,
         HookEvent::MeshBulletinSent,
         HookEvent::MeshBriefUpdated,
+        HookEvent::MeshFetchServed,
+        HookEvent::MeshAccessRequested,
+        HookEvent::MeshAccessDecided,
     ];
 }
 
@@ -1649,6 +1658,9 @@ mod tests {
             (HookEvent::MeshBulletinReceived, "mesh.bulletin.received"),
             (HookEvent::MeshBulletinSent, "mesh.bulletin.sent"),
             (HookEvent::MeshBriefUpdated, "mesh.brief.updated"),
+            (HookEvent::MeshFetchServed, "mesh.fetch.served"),
+            (HookEvent::MeshAccessRequested, "mesh.access.requested"),
+            (HookEvent::MeshAccessDecided, "mesh.access.decided"),
         ];
         for (event, name) in cases {
             assert_eq!(event.as_str(), name);
@@ -1658,6 +1670,25 @@ mod tests {
             );
         }
         assert_eq!(HookEvent::ALL.len(), cases.len());
+    }
+
+    #[test]
+    fn the_readme_counts_the_hook_events_the_registry_declares() {
+        const README: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"));
+        let n = HookEvent::ALL.len();
+        let counts: Vec<&str> = README
+            .match_indices('(')
+            .filter_map(|(start, _)| {
+                let rest = &README[start + 1..];
+                let digits = rest.find(|c: char| !c.is_ascii_digit())?;
+                (digits > 0 && rest[digits..].starts_with(" events)"))
+                    .then(|| &README[start..start + 1 + digits + " events)".len()])
+            })
+            .collect();
+        assert!(
+            counts == [format!("({n} events)")],
+            "README.md must say ({n} events) exactly once, where n = HookEvent::ALL.len(); found {counts:?}"
+        );
     }
 
     #[test]
@@ -1687,7 +1718,7 @@ mod tests {
             .map(|event| event.as_str())
             .filter(|name| name.starts_with("mesh."))
             .collect();
-        assert_eq!(mesh_events.len(), 12);
+        assert_eq!(mesh_events.len(), 15);
         for event in mesh_events {
             assert!(
                 entry_is_valid_wildcard(&format!("{event}.*")),
@@ -1717,7 +1748,7 @@ mod tests {
             .copied()
             .filter(|event| event.as_str().starts_with("mesh."))
             .collect();
-        assert_eq!(mesh_events.len(), 12);
+        assert_eq!(mesh_events.len(), 15);
         let mut global = HooksMap::default();
         for event in &mesh_events {
             global.extend(hooks_map(event.as_str(), &[("watch", "cmd-mesh")]));

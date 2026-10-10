@@ -1,6 +1,9 @@
 //! The `docs/mesh/PROTOCOL.md` ids the interop tests in `interop` exercise, kept apart from
 //! that `#[cfg(unix)]` module so the coverage report and the section 20 table count them on
-//! every platform.
+//! every platform. The Python reference serves only `/status` and `/message`, so the ids
+//! here cover the announce, status and message exchanges alone; the `/list`, `/fetch` and
+//! `/access` paths have no reference and are covered by the Rust-only vectors of
+//! `share_vectors`, `access_vectors` and `live_vectors`.
 
 use super::{Kind, Listed};
 
@@ -72,6 +75,12 @@ pub(super) const PROPAGATION_COST_IDS: &[&str] = &[
 /// A silent peer's message falls back to the propagation node and is stored there.
 pub(super) const PROPAGATION_IDS: &[&str] = &["MESH-PROP-015", "MESH-MSG-024"];
 
+/// The reference's message hears the bare `Throttled` code before any acknowledgement
+/// while the envoy queue is full and again while the reference already has a run in
+/// flight, and nothing is filed or counted either time; its bulletin is acknowledged as
+/// ever, and so is its message once the run has ended.
+pub(super) const THROTTLED_IDS: &[&str] = &["MESH-MSG-019", "MESH-MSG-041", "MESH-MSG-042"];
+
 pub(super) fn listed() -> Vec<Listed> {
     [
         (ANNOUNCE_IDS, Kind::Valid),
@@ -80,6 +89,7 @@ pub(super) fn listed() -> Vec<Listed> {
         (REQUEST_IDS, Kind::Valid),
         (PROPAGATION_COST_IDS, Kind::Boundary),
         (PROPAGATION_IDS, Kind::Valid),
+        (THROTTLED_IDS, Kind::Invalid),
     ]
     .into_iter()
     .flat_map(|(ids, kind)| {

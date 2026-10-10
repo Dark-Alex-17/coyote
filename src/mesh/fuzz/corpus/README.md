@@ -43,13 +43,19 @@ within the frame decoder's nesting budget is a violation, not a skip.
 | `0x01` | `StatusCard::from_value` (section 9.2) | msgpack card map |
 | `0x02` | `from_r3_body`, the `/message` body (section 10.1) | msgpack body map |
 | `0x03` | `intro_from_r3_body`, the `/knock` body (section 8) | msgpack map |
-| `0x04` | `AnnounceAppData::decode` (section 5.1) | raw bytes: `COYM`, u16 BE version, name |
+| `0x04` | `AnnounceAppData::decode` (section 5.1) | raw bytes: `SCOPE`, u16 BE version, name |
 | `0x05` | `decode_peer_lxmf`, LXMF peer custom fields (section 10.8) | msgpack fields map keyed `0xFB`, `0xFC` |
 | `0x06` | `decode_knock_message`, LXMF knock custom fields (section 8.6) | msgpack fields map keyed `0xFB`, `0xFC` |
 | `0x07` | `RefusalCode::from_wire` (section 6.7) | msgpack value |
 | `0x08` | `VersionRefusal::from_value` (section 7) | msgpack map |
 | `0x09` | `DispatchError::from_value` (section 6.7) | msgpack map |
 | `0x0a` | `PendingStore::load_pending` (section 10.5) | jsonl text |
+| `0x0b` | `WirePath::parse`, the file part name grammar (`wire_path.rs`) | UTF-8 text |
+| `0x0c` | `SharesPage::from_value`, the `/list` reply (section 10.14) | msgpack page map |
+| `0x0d` | `read_fetch_reply`, the `/fetch` reply (section 10.15) | msgpack reply map |
+| `0x0e` | `read_access_reply`, the `/access` reply (section 10.16) | msgpack reply map |
+| `0x0f` | `decode_access_message`, LXMF access custom fields (section 10.16) | msgpack fields map keyed `0xFB`, `0xFC` |
+| `0x10` | `decode_access`, the `/access` request body (section 10.16) | msgpack body map |
 
 ## Replay
 
@@ -73,6 +79,18 @@ with its tag byte. For `receipt/` it already starts with kind `0x01` and holds t
 `Unstructured` buffer, because the sealed bodies of a sequence depend on the bench they
 were built against and only the buffer reproduces them; a hand-made single body goes in
 under kind `0x00`.
+
+The four `codecs/` files that spell the announce magic or an LXMF type tag are pinned to
+the live constants by `fuzz_codec_corpus_files_carrying_wire_identifiers_are_built_from_the_live_constants`;
+after a rename, `COYOTE_MESH_FUZZ_WRITE_CORPUS=1 cargo test --all fuzz_codec_corpus_files_carrying` rewrites them.
+The `codecs/MESH-FETCH-004-<rule>.bin` files, one per wire-path rule, are pinned to the live
+path limits by `fuzz_codec_corpus_wire_path_seeds_break_exactly_the_rule_their_name_claims`;
+after a limit or rule change, `COYOTE_MESH_FUZZ_WRITE_CORPUS=1 cargo test --all fuzz_codec_corpus_wire_path`
+rewrites them.
+The `codecs/MESH-LIST-*`, `MESH-FETCH-015`, `MESH-FETCH-018`, `MESH-FETCH-021` and `MESH-ACCESS-*`
+files are pinned to the live page, cursor, path and reply constants by
+`fuzz_codec_corpus_share_and_access_seeds_reach_the_outcome_their_name_claims`;
+`COYOTE_MESH_FUZZ_WRITE_CORPUS=1 cargo test --all fuzz_codec_corpus_share_and_access` rewrites them.
 
 `.gitattributes` marks `src/mesh/fuzz/corpus/**/*.bin` as `binary`. Without it Git's text
 heuristic can take a small msgpack file for text and rewrite a `0x0a` byte (`c4 0a`, the

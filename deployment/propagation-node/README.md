@@ -10,12 +10,12 @@ Status in this build: Coyote discovers propagation nodes from their announces (`
 `propagation_nodes`) and posts to the nearest one when a direct link fails (`mesh__send` reports
 `via: store_and_forward`). Held messages are fetched back automatically every `mesh.propagation_sync_interval_secs`
 seconds (default 300; `0` turns the automatic path off, including the join-time fetch) and once a propagation node is
-heard after the node joins; `.mesh fetch` runs a fetch now. A `.mesh knock` to an unreachable peer is parked on the
+heard after the node joins; `.mesh sync` runs a fetch now. A `.mesh knock` to an unreachable peer is parked on the
 node the same way. Coyote's table of propagation nodes is not kept across a Coyote restart, so after a restart the
 first fetch waits for the node's next announce (up to `announce_interval`, 30 minutes with the shipped `lxmd.config`;
-`.mesh fetch` is refused until then too); a held message whose sender has not announced since the restart is kept on
+`.mesh sync` is refused until then too); a held message whose sender has not announced since the restart is kept on
 the node until it has been seen on three fetches and at least 15 minutes (one peer heartbeat) have passed; then it is
-dropped. A Coyote node with `announce: false` never fetches on its own; `.mesh fetch` does.
+dropped. A Coyote node with `announce: false` never fetches on its own; `.mesh sync` does.
 
 ## Build and run
 
@@ -132,16 +132,44 @@ Keep port 4242 behind a firewall or VPN, and set it back to `Yes` on a host that
 
 ## Coyote side
 
-Point each instance at the node:
+Each host runs the local daemon setup once, with this node as its relay. From a checkout:
+
+```sh
+scripts/mesh-relay.sh --relay <node host>:4242
+```
+
+```powershell
+pwsh -File scripts\mesh-relay.ps1 -Relay <node host>:4242
+```
+
+Without a checkout:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Dark-Alex-17/coyote/refs/heads/main/scripts/mesh-relay.sh | bash -s -- --relay <node host>:4242
+```
+
+```powershell
+iwr -useb https://raw.githubusercontent.com/Dark-Alex-17/coyote/refs/heads/main/scripts/mesh-relay.ps1 -OutFile mesh-relay.ps1
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\mesh-relay.ps1 -Relay <node host>:4242
+```
+
+On a host with no `~/.reticulum/config` yet the script writes the `[[Team Relay]]` stanza into it. A host that already
+ran the setup keeps its config: the script prints the stanza to add by hand, and the daemon then has to be restarted
+(`systemctl --user restart coyote-rnsd`, the `launchctl bootout`/`bootstrap` pair, or
+`Stop-ScheduledTask`/`Start-ScheduledTask 'Coyote rnsd'`). Coyote keeps the shipped default `mesh.interfaces`, which
+dials that daemon; there is nothing to change:
 
 ```yaml
 mesh:
   enabled: true
   interfaces:
     - type: private
-      host: <node host>
+      host: 127.0.0.1
       port: 4242
 ```
+
+Only a session running without `rnsd` dials the node directly, with `host: <node host>` in place of `127.0.0.1`; the
+Docker image (from v0.10.4) has its own `rnsd` and reaches the node through `COYOTE_MESH_RELAY=<node host>:4242` instead.
 
 Once the node's announce is heard, `.mesh info` shows it under `propagation_nodes`. Selection is nearest by hops;
 pinning a specific node is not supported yet, and `.mesh info` prints that line itself.
@@ -172,7 +200,8 @@ Deployment recipes and the trust model are in the wiki:
 - Upgrade by rebuilding with `--build-arg LXMF_VERSION=<version>` (and `RNS_VERSION` if needed) and starting the
   new image against the same volume; identity, config and held messages carry over.
 - `reticulum.config` sets `enable_transport = Yes`, so the container also relays announces and paths between
-  the Coyote nodes that dial it. Two Coyote processes on one host cannot both use `type: lan` (the AutoInterface
-  port `:42671` is bound exclusively), so a second instance on the same machine reaches the mesh through this
-  relay with `type: private`. The interface options are documented in the
+  the team's Coyote nodes that dial it; `enable_node = yes` is what makes it store and forward for them. Sessions
+  on one host reach each other through the host's local `rnsd` (`scripts/mesh-relay.sh --relay <node host>:4242`),
+  which dials this container as its `[[Team Relay]]`; this container is not that path. The interface options are
+  documented in the
   [Reticulum manual](https://markqvist.github.io/Reticulum/manual/interfaces.html#tcp-server-interface).

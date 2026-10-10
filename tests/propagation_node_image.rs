@@ -942,9 +942,8 @@ fn crlf_terminated_allowed_lines_are_accepted_by_lxmd() {
 }
 
 // ---------------------------------------------------------------------------
-// Usage probe (spec-first, written from the README's promises before the
-// entrypoint was read): the `lxmd` passthrough, the argument fallthrough, the
-// shutdown path and the identity-portability fine print.
+// README entrypoint promises: the `lxmd` passthrough, the argument fallthrough,
+// the shutdown path and the identity-portability fine print.
 // ---------------------------------------------------------------------------
 
 /// The interop harness checkout of `clone` (`lxmf` or `reticulum`, as
@@ -1402,9 +1401,9 @@ fn usage_probe_copying_only_the_lxmd_identity_moves_destinations_but_not_the_tra
 }
 
 // ---------------------------------------------------------------------------
-// Usage probe, round 3 (spec-first from the README as of 0097462): the
-// bind-mount recipe, the `lxmd --status` operating note against a LIVE daemon,
-// seeding on the non-daemon paths, and the store-and-forward wording.
+// README operating notes: the bind-mount recipe, the `lxmd --status` operating
+// note against a LIVE daemon, seeding on the non-daemon paths, and the
+// store-and-forward wording.
 // ---------------------------------------------------------------------------
 
 /// Collapse every whitespace run to one space so a re-wrapped sentence still matches.
@@ -1423,6 +1422,21 @@ fn usage_probe_docs_say_messages_are_posted_and_held_messages_are_fetched_back_a
         !root.contains("fetching held messages back is not yet"),
         "root README must not still say fetch-back is not yet wired up"
     );
+    assert!(
+        root.contains("`.mesh sync`"),
+        "root README must name `.mesh sync` as the manual fetch verb"
+    );
+    // A later file verb named `fetch` may appear here; only the sync sentence is pinned.
+    for withdrawn in [
+        "on demand with `.mesh fetch`",
+        "(`.mesh fetch` still works)",
+        "fetch only on `.mesh fetch`",
+    ] {
+        assert!(
+            !root.contains(withdrawn),
+            "root README must not name the withdrawn `.mesh fetch` verb as the manual fetch: {withdrawn}"
+        );
+    }
     let readme = one_line(&read(deployment_dir().join("README.md")));
     assert!(
         readme.contains("it posts the message to a propagation node"),
@@ -1442,7 +1456,7 @@ fn usage_probe_docs_say_messages_are_posted_and_held_messages_are_fetched_back_a
     );
     assert!(
         readme.contains(
-            "Coyote's table of propagation nodes is not kept across a Coyote restart, so after a restart the first fetch waits for the node's next announce (up to `announce_interval`, 30 minutes with the shipped `lxmd.config`; `.mesh fetch` is refused until then too)"
+            "Coyote's table of propagation nodes is not kept across a Coyote restart, so after a restart the first fetch waits for the node's next announce (up to `announce_interval`, 30 minutes with the shipped `lxmd.config`; `.mesh sync` is refused until then too)"
         ),
         "deployment README must say whose table is lost on restart and how long the first fetch can wait"
     );
@@ -1461,11 +1475,26 @@ fn usage_probe_docs_say_messages_are_posted_and_held_messages_are_fetched_back_a
         !readme.contains("Fetching held messages back is not yet triggered"),
         "deployment README must not still say fetch-back is not yet triggered"
     );
+    // A later file verb named `fetch` may appear here; only the sync sentences are pinned.
+    assert!(
+        readme.contains("`.mesh sync` runs a fetch now"),
+        "deployment README must name `.mesh sync` as the manual fetch verb"
+    );
+    for withdrawn in [
+        "`.mesh fetch` runs a fetch now",
+        "`.mesh fetch` is refused",
+        "`.mesh fetch` does",
+    ] {
+        assert!(
+            !readme.contains(withdrawn),
+            "deployment README must not name the withdrawn `.mesh fetch` verb as the manual fetch: {withdrawn}"
+        );
+    }
 }
 
 #[test]
 fn usage_probe_readme_status_note_matches_what_docker_exec_actually_does() {
-    // The round-3 README claimed that both `lxmd --status` forms write into the
+    // An earlier README draft claimed that both `lxmd --status` forms write into the
     // daemon's live `/data/reticulum/storage/` on exit. Live ground truth
     // (usage_probe_lxmd_status_against_a_live_daemon): inside the
     // daemon's network namespace the second instance never comes up. It dies while
@@ -1749,9 +1778,11 @@ fn usage_probe_bind_mount_recipe_runs_the_daemon_and_keeps_identities_private() 
 }
 
 // ---------------------------------------------------------------------------
-// Usage probe, round 4 (6bd1512): the corrected multi-node advice, the BuildKit
-// note, the .gitattributes widening, the load-bearing /opt/coyote-pn mkdir and the
-// exact exit codes / rewritten-file list the status note now promises.
+// README multi-node and status notes: the multi-node advice names `static_peers`
+// as the knob and warns off `from_static_only`, the BuildKit note and the
+// .gitattributes line-ending pins match the Dockerfile, the /opt/coyote-pn mkdir
+// is load-bearing, and the status note's exit codes and rewritten-file list are
+// exact.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -1771,7 +1802,7 @@ fn usage_probe_readme_multi_node_advice_names_the_knob_coyote_actually_honours()
     );
     assert!(
         !readme.contains("`from_static_only = yes` are the knobs"),
-        "the round-3 recommendation of from_static_only must be gone"
+        "the earlier recommendation of from_static_only must be gone"
     );
     assert!(
         readme.contains("`mesh__send` would answer `no_propagation_node`"),

@@ -215,10 +215,10 @@ pub(crate) struct MeshSnapshot {
     pub(crate) plan: Option<PlanRef>,
     pub(crate) todo: TodoList,
     pub(crate) brief: BriefState,
-    // `cwd` and `session` wait for the message provider.
-    #[allow(dead_code)]
+    /// The share root the `/list` and `/fetch` providers serve from.
     pub(crate) cwd: PathBuf,
     pub(crate) captured_at: SystemTime,
+    // `session` waits for the message provider.
     #[allow(dead_code)]
     pub(crate) session: SessionInfo,
 }
