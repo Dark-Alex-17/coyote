@@ -75,6 +75,17 @@ wait_exec() {
   return 1
 }
 
+# A 90 s ceiling on the `docker run --rm` steps where `timeout` exists (Linux CI;
+# macOS has none), so an entrypoint that never returns fails the smoke (exit 124)
+# instead of hanging it.
+bounded() {
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 90 "$@"
+  else
+    "$@"
+  fi
+}
+
 if [[ -z "$pn_image" ]]; then
   pn_image="coyote-pn:smoke"
   docker build -q -t "$pn_image" "$repo_root/deployment/propagation-node" >/dev/null
@@ -179,49 +190,65 @@ docker rm -f "$i" >/dev/null
 
 # 9. The main child's exit status is the container's exit status.
 set +e
-docker run --rm "$image" sh -c 'exit 7' 2>/dev/null
+bounded docker run --rm "$image" sh -c 'exit 7' 2>/dev/null
 rc=$?
 set -e
+[[ "$rc" != "124" ]] || fail "the exit-code passthrough container did not exit within 90 s"
 [[ "$rc" == "7" ]] || fail "exit code passthrough gave $rc, not 7"
 ok "exit code 7 passes through"
 
 # 10. The opt-out leaves no rnsd behind.
-docker run --rm -e COYOTE_MESH_RNSD=0 "$image" bash -c 'sleep 1; ! pgrep -x rnsd' 2>/dev/null \
-  || fail "rnsd ran despite COYOTE_MESH_RNSD=0"
+set +e
+bounded docker run --rm -e COYOTE_MESH_RNSD=0 "$image" bash -c 'sleep 1; ! pgrep -x rnsd' 2>/dev/null
+rc=$?
+set -e
+[[ "$rc" != "124" ]] || fail "the COYOTE_MESH_RNSD=0 container did not exit within 90 s"
+[[ "$rc" == "0" ]] || fail "rnsd ran despite COYOTE_MESH_RNSD=0"
 ok "COYOTE_MESH_RNSD=0 starts no rnsd"
 
 # 11. Only ~/.reticulum and /tmp need to be writable for rnsd to start.
 set +e
-read_only_err="$(docker run --rm --read-only --tmpfs /home/agent/.reticulum --tmpfs /tmp "$image" \
-  bash -c 'for _ in $(seq 1 60); do exec 3<>/dev/tcp/127.0.0.1/4242 && exit 0; sleep 0.5; done; exit 1' 2>&1 >/dev/null)"
+read_only_err="$(bounded docker run --rm --read-only --tmpfs /home/agent/.reticulum --tmpfs /tmp "$image" \
+  bash -c 'for _ in {1..60}; do exec 3<>/dev/tcp/127.0.0.1/4242 && exit 0; sleep 0.5; done; exit 1' 2>&1 >/dev/null)"
 rc=$?
 set -e
+[[ "$rc" != "124" ]] || fail "the read-only container did not exit within 90 s:"$'\n'"$read_only_err"
 [[ "$rc" == "0" ]] || fail "rnsd did not come up on a read-only root with tmpfs mounts:"$'\n'"$read_only_err"
 ok "rnsd comes up on a read-only root"
 
 # 12. A malformed relay value warns and is dropped from the config; the main child is unaffected.
+#     stdout is the `cat` of the rendered config, stderr the entrypoint's own lines.
 set +e
-bad_relay_out="$(docker run --rm -e COYOTE_MESH_RELAY=bad "$image" sh -c 'cat ~/.reticulum/config' 2>&1)"
+bad_relay_config="$(bounded docker run --rm -e COYOTE_MESH_RELAY=bad "$image" sh -c 'cat ~/.reticulum/config' 2>"$scratch/bad-relay.stderr")"
 rc=$?
 set -e
-[[ "$rc" == "0" ]] || fail "COYOTE_MESH_RELAY=bad changed the main child's exit code to $rc:"$'\n'"$bad_relay_out"
-grep -q 'WARNING:' <<<"$bad_relay_out" || fail "COYOTE_MESH_RELAY=bad produced no WARNING:"$'\n'"$bad_relay_out"
-grep -qF '[[Coyote Sessions]]' <<<"$bad_relay_out" || fail "COYOTE_MESH_RELAY=bad left no rendered config:"$'\n'"$bad_relay_out"
-! grep -qF 'Team Relay' <<<"$bad_relay_out" || fail "COYOTE_MESH_RELAY=bad still wrote a Team Relay stanza:"$'\n'"$bad_relay_out"
+[[ "$rc" != "124" ]] || fail "the COYOTE_MESH_RELAY=bad container did not exit within 90 s:"$'\n'"$(cat "$scratch/bad-relay.stderr")"
+[[ "$rc" == "0" ]] || fail "COYOTE_MESH_RELAY=bad changed the main child's exit code to $rc:"$'\n'"$(cat "$scratch/bad-relay.stderr")"
+grep -q 'WARNING:' "$scratch/bad-relay.stderr" || fail "COYOTE_MESH_RELAY=bad produced no WARNING:"$'\n'"$(cat "$scratch/bad-relay.stderr")"
+grep -qF '[[Coyote Sessions]]' <<<"$bad_relay_config" || fail "COYOTE_MESH_RELAY=bad left no rendered config:"$'\n'"$bad_relay_config"
+! grep -qF 'Team Relay' <<<"$bad_relay_config" || fail "COYOTE_MESH_RELAY=bad still wrote a Team Relay stanza:"$'\n'"$bad_relay_config"
 ok "a malformed COYOTE_MESH_RELAY warns, writes no relay stanza and never blocks the main child"
 
 # 13. COYOTE_MESH_LAN=1 adds the AutoInterface and says what a transport node on the LAN does.
-lan_out="$(docker run --rm -e COYOTE_MESH_LAN=1 "$image" sh -c 'cat ~/.reticulum/config' 2>&1)" \
-  || fail "COYOTE_MESH_LAN=1 run failed:"$'\n'"$lan_out"
-grep -qF 'type = AutoInterface' <<<"$lan_out" || fail "COYOTE_MESH_LAN=1 rendered no AutoInterface:"$'\n'"$lan_out"
-grep -qF 'COYOTE_MESH_LAN=1:' <<<"$lan_out" || fail "COYOTE_MESH_LAN=1 printed no LAN note:"$'\n'"$lan_out"
+set +e
+lan_config="$(bounded docker run --rm -e COYOTE_MESH_LAN=1 "$image" sh -c 'cat ~/.reticulum/config' 2>"$scratch/lan.stderr")"
+rc=$?
+set -e
+[[ "$rc" != "124" ]] || fail "the COYOTE_MESH_LAN=1 container did not exit within 90 s:"$'\n'"$(cat "$scratch/lan.stderr")"
+[[ "$rc" == "0" ]] || fail "COYOTE_MESH_LAN=1 run failed with $rc:"$'\n'"$(cat "$scratch/lan.stderr")"
+grep -qF 'type = AutoInterface' <<<"$lan_config" || fail "COYOTE_MESH_LAN=1 rendered no AutoInterface:"$'\n'"$lan_config"
+grep -qF 'COYOTE_MESH_LAN=1:' "$scratch/lan.stderr" || fail "COYOTE_MESH_LAN=1 printed no LAN note:"$'\n'"$(cat "$scratch/lan.stderr")"
 ok "COYOTE_MESH_LAN=1 renders the AutoInterface and prints the LAN note"
 
 # 14. An existing config is never overwritten and the entrypoint says which variables it
 #     left unapplied. The outer run (RNSD=0) renders nothing; the nested entrypoint is the
 #     real one meeting a pre-existing file.
-existing_stdout="$(docker run --rm -e COYOTE_MESH_RNSD=0 "$image" sh -c 'mkdir -p ~/.reticulum; printf "# mine\n" > ~/.reticulum/config; env -u COYOTE_MESH_RNSD COYOTE_MESH_LAN=1 /usr/local/bin/coyote-entrypoint sh -c "cat ~/.reticulum/config"' 2>"$scratch/existing.stderr")" \
-  || fail "the existing-config run failed:"$'\n'"$(cat "$scratch/existing.stderr")"
+set +e
+existing_stdout="$(bounded docker run --rm -e COYOTE_MESH_RNSD=0 "$image" sh -c 'mkdir -p ~/.reticulum; printf "# mine\n" > ~/.reticulum/config; env -u COYOTE_MESH_RNSD COYOTE_MESH_LAN=1 /usr/local/bin/coyote-entrypoint sh -c "cat ~/.reticulum/config"' 2>"$scratch/existing.stderr")"
+rc=$?
+set -e
+[[ "$rc" != "124" ]] || fail "the existing-config container did not exit within 90 s:"$'\n'"$(cat "$scratch/existing.stderr")"
+[[ "$rc" == "0" ]] || fail "the existing-config run failed with $rc:"$'\n'"$(cat "$scratch/existing.stderr")"
 [[ "$existing_stdout" == "# mine" ]] || fail "an existing config was rewritten; it now reads:"$'\n'"$existing_stdout"
 grep -qF 'config exists; COYOTE_MESH_LAN not applied' "$scratch/existing.stderr" \
   || fail "no note about the unapplied COYOTE_MESH_LAN on an existing config:"$'\n'"$(cat "$scratch/existing.stderr")"
@@ -229,9 +256,10 @@ ok "an existing config is kept and the unapplied variable is named"
 
 # 15. A missing template warns and skips rnsd; the main child still runs with its own status.
 set +e
-no_template_err="$(docker run --rm --tmpfs /opt/coyote "$image" sh -c 'exit 0' 2>&1 >/dev/null)"
+no_template_err="$(bounded docker run --rm --tmpfs /opt/coyote "$image" sh -c 'exit 0' 2>&1 >/dev/null)"
 rc=$?
 set -e
+[[ "$rc" != "124" ]] || fail "the missing-template container did not exit within 90 s:"$'\n'"$no_template_err"
 [[ "$rc" == "0" ]] || fail "a missing template changed the main child's exit code to $rc:"$'\n'"$no_template_err"
 grep -q 'WARNING:' <<<"$no_template_err" || fail "a missing template produced no WARNING:"$'\n'"$no_template_err"
 grep -q 'rnsd not started' <<<"$no_template_err" || fail "a missing template did not skip rnsd:"$'\n'"$no_template_err"
@@ -243,7 +271,7 @@ docker run -d --name "$pn" --network "$net" "$pn_image" >/dev/null
 pn_up=0
 deadline=$(( $(date +%s) + 30 ))
 while (( $(date +%s) < deadline )); do
-  if docker run --rm --network "$net" -e COYOTE_MESH_RNSD=0 "$image" bash -c "exec 3<>/dev/tcp/$pn/4242" >/dev/null 2>&1; then
+  if bounded docker run --rm --network "$net" -e COYOTE_MESH_RNSD=0 "$image" bash -c "exec 3<>/dev/tcp/$pn/4242" >/dev/null 2>&1; then
     pn_up=1
     break
   fi
@@ -257,8 +285,9 @@ docker run -d --name "$c" --network "$net" -e COYOTE_MESH_RELAY="$pn:4242" "$ima
 # `Establishing TCP connection for ...` before connecting and :247 logs
 # `TCP connection for ... established` after, hence the `] established` suffix anchor;
 # a bare `TCP connection for TCPInterface[Team Relay` would match the pre-connect line
-# and could never fail. The second alternative is :290, when the first attempt failed
-# and a retry connected. `[^]]` is a POSIX bracket expression matching anything but `]`.
+# and could never fail. The second alternative is the retry path, the gate at :290 and
+# its log at :291, when the first attempt failed and a retry connected. `[^]]` is a
+# POSIX bracket expression matching anything but `]`.
 relay_re='TCP connection for TCPInterface\[Team Relay/[^]]*\] established|Reconnected socket for TCPInterface\[Team Relay/'
 connected=0
 logs=

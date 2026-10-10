@@ -162,13 +162,19 @@ start_rnsd() {
   rnsd_pid=$!
 }
 
-# dash reaps an early-dead rnsd while waiting on the foreground main command,
-# after which the pid is free; a long coyote session spawns many tool children
-# and the pid counter wraps. Where /proc exists, the pid must still be rnsd.
+# "Ours" means still our child: the parent pid survives the env/setsid/rnsd execs
+# and setsid(), where comm only becomes rnsd after the last exec; a main command
+# that returns before then must still stop the daemon it started. dash reaps an
+# early-dead rnsd while waiting on the foreground main command, after which the
+# pid is free, and a reused pid has another parent. Without /proc, kill -0 is all
+# there is. The stat line is `pid (comm) S ppid ...` and comm may itself contain
+# spaces or `)`, hence the strip through the last `) `.
 rnsd_alive() {
-  [ -n "$rnsd_pid" ] && kill -0 "$rnsd_pid" 2>/dev/null && {
-    [ ! -r /proc/"$rnsd_pid"/comm ] || [ "$(cat /proc/"$rnsd_pid"/comm 2>/dev/null)" = rnsd ]
-  }
+  [ -n "$rnsd_pid" ] || return 1
+  kill -0 "$rnsd_pid" 2>/dev/null || return 1
+  [ -r /proc/"$rnsd_pid"/stat ] || return 0
+  ppid=$(awk '{ s = $0; sub(/^.*\) /, "", s); split(s, f, " "); print f[2] }' /proc/"$rnsd_pid"/stat 2>/dev/null)
+  [ "$ppid" = "$$" ]
 }
 
 # tini -g forwards every signal it receives to the group, so the main command gets
@@ -202,10 +208,11 @@ else
 fi
 rc=$?
 
-if [ -n "$rnsd_pid" ]; then
-  if rnsd_alive; then
-    kill -s TERM "$rnsd_pid" 2>/dev/null
-  fi
+# A TERM that lands before the exec chain reaches rnsd kills the `env`/`setsid`
+# stage with its default disposition: after an instant-exit main command the
+# daemon simply never starts. Only a child we signalled is waited on.
+if rnsd_alive; then
+  kill -s TERM "$rnsd_pid" 2>/dev/null
   # kill -0 succeeds on an exited-but-unreaped child; the loop ends early only
   # because the shell reaps the background rnsd while waiting on the foreground
   # sleep (dash, bash and ash all do). Do not replace it with a fixed sleep.

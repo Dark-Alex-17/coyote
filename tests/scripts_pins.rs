@@ -977,12 +977,12 @@ fn relay_scripts_carry_the_strict_mode_scaffolding() {
 fn scripts_are_ascii_lf_and_free_of_plan_labels() {
     let tracking_id = Regex::new(r"(?i)\b(task|plan|scope)-[0-9A-Z]").unwrap();
     let attributes = read(repo_root().join(".gitattributes"));
-    for pattern in ["Dockerfile", "scripts/*.tmpl"] {
+    for pattern in ["Dockerfile", "scripts/*.sh", "scripts/*.tmpl"] {
         assert!(
             attributes
                 .lines()
                 .any(|line| line.trim() == format!("{pattern} text eol=lf")),
-            ".gitattributes must pin `{pattern} text eol=lf`: the LF sweep below and the entrypoint's `#@if` markers both need an LF checkout on the Windows runners"
+            ".gitattributes must pin `{pattern} text eol=lf`: the LF sweep below, the two image scripts' shebang lines and the entrypoint's `#@if` markers all need an LF checkout on the Windows runners"
         );
     }
     let paths: Vec<PathBuf> = RELAY_SCRIPTS
@@ -1150,6 +1150,16 @@ fn the_image_template_and_entrypoint_carry_the_rnsd_logging_contract() {
         !entrypoint.contains("exec coyote"),
         "docker-entrypoint.sh must run coyote as a child, not exec it: the script has to outlive it to stop rnsd and return its exit code"
     );
+    for needle in [r#"/proc/"$rnsd_pid"/stat"#, r#"[ "$ppid" = "$$" ]"#] {
+        assert!(
+            entrypoint.contains(needle),
+            "docker-entrypoint.sh must identify its rnsd child by parent pid (`{needle}`): a comm-based check reads `env` or `setsid` on the not-yet-exec'd child and skips the TERM a main command that returns at once still owes it; the ppid survives every exec and setsid()"
+        );
+    }
+    assert!(
+        !entrypoint.contains(r#"/proc/"$rnsd_pid"/comm"#),
+        "docker-entrypoint.sh must not decide `ours` by /proc/<pid>/comm: see the ppid pin above"
+    );
     assert!(
         entrypoint.contains("  \"$@\"\nelse\n  coyote \"$@\"\nfi\nrc=$?"),
         "docker-entrypoint.sh must dispatch the main command in the foreground and read its status straight from $?: dash hard-ignores SIGINT in an `&` child and gives it /dev/null as stdin, so a background job plus `wait` would make `docker run -it` uninterruptible and starve the command of the container's stdin"
@@ -1180,8 +1190,9 @@ fn the_image_smoke_asserts_the_post_connect_relay_line() {
     );
     for needle in [
         "TCPInterface.py:233",
-        ":247",
-        ":290",
+        ":247 logs",
+        "gate at :290",
+        ":291",
         "rnstatus",
         "COYOTE_MESH_RNSD=0",
         "/dev/tcp/127.0.0.1/4242",
