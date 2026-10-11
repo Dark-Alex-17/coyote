@@ -72,7 +72,7 @@ struct Vector {
 type Check = fn() -> Result<(), String>;
 
 /// The input and expectation of a row, one variant per surface under test. The variant
-/// name is the family the coverage report groups rows by.
+/// name is the family label `all_listed` carries for the row.
 enum Case {
     /// `AccessHandler` over a bare `MeshSlot` with an inbound store and no share set,
     /// section 10.16: the request table and the rate rule.

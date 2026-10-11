@@ -1203,8 +1203,8 @@ pub(crate) mod network {
     /// `confirm_outbound_dispatch` moves it to `outgoing` once the write has returned),
     /// and a part request that arrives in between is dropped unanswered
     /// (`[resource-diag] request_received ... sender_present=false`); the receiver's
-    /// retries then leave through the path table and are dropped the way upstream issue
-    /// draft A4 describes for advertisements, so the transfer never completes. Both ends
+    /// retries then leave through the path table and are dropped the same way the transport
+    /// drops follow-up Resource advertisements, so the transfer never completes. Both ends
     /// of these tests live in one process on a loopback link, where a starved tokio worker
     /// lets the requester's first request overtake the responder's own continuation (macOS
     /// CI, run 37649401108). Holding the requester's interface manager, which its inbound

@@ -6,7 +6,7 @@
 //! The family lives beside the predicate rather than with the other share vectors
 //! because the mesh module may not name the request context, and these rows must build
 //! one. The conformance registry in `crate::mesh::conformance` still lists the rows and
-//! credits their executor, so the coverage report counts them with the rest.
+//! credits their executor, so `REQUIRED_IDS` is checked against them with the rest.
 //!
 //! Every row names the id it exercises and the receiver action the spec mandates for it.
 //! The rows read the config dir from the process env, so the executor serialises and holds

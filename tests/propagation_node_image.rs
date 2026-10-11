@@ -10,9 +10,9 @@
 //! * The always-on tests pin the shipped text: the pip pins match what the
 //!   interop harness is verified against, the shipped `lxmd.config` enables the
 //!   node and requires auth, the README documents the private-network contract
-//!   without citing upstream's build-only Dockerfile, the root README and the
-//!   protocol spec cross-link, and every shipped file is plain ASCII with LF
-//!   endings and no plan-tracker references. The `file:line` citations the README
+//!   without citing upstream's build-only Dockerfile, the root README points at
+//!   the operator docs, and every shipped file is plain ASCII with LF endings and
+//!   no plan-tracker references. The `file:line` citations the README
 //!   and entrypoint make into upstream are resolved against the interop harness
 //!   checkout that `scripts/mesh-interop/setup.sh` makes under
 //!   `${COYOTE_MESH_INTEROP_DIR:-$HOME/.cache/coyote/mesh-interop}` (the

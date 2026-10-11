@@ -1,12 +1,13 @@
 //! Pins the README's mesh section, the constants the code uses and the source-comment
-//! hygiene rules to the code. The scanners are line-oriented and std-only.
+//! hygiene rules to the code, plus the envoy session-key and fetch response-bound vectors.
+//! The scanners are line-oriented and std-only.
 
 use std::path::{Path, PathBuf};
 
 const README: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/README.md"));
 
-const EXPECTED_H1: &str = "# SCOPE — Session Coordination & Presence Exchange";
-const EXPECTED_TAGLINE: &str = "\"SCOPE is a peer protocol by which running LLM sessions announce presence, share status, and exchange messages on their owners' behalf, over Reticulum, without a broker.\"";
+const SCOPE_NAME: &str = "SCOPE — Session Coordination & Presence Exchange";
+const SCOPE_TAGLINE: &str = "SCOPE is a peer protocol by which running LLM sessions announce presence, share status, and exchange messages on their owners' behalf, over Reticulum, without a broker.";
 
 /// Splits `line` into (prose, code span) pairs; the last pair's span is empty.
 fn split_spans(line: &str) -> Vec<(&str, &str)> {
@@ -40,7 +41,7 @@ fn is_word_boundary(byte: Option<&u8>) -> bool {
 }
 
 /// Every `.rs` file under `dir`, this file excepted: its fixtures name identifiers that exist
-/// nowhere else, and a citation must not resolve against the guard that checks it.
+/// nowhere else, and the scanners below must not read this file's own fixtures.
 fn rust_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     let guard = Path::new(file!()).file_name();
     let mut files = Vec::new();
@@ -56,16 +57,6 @@ fn rust_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
         }
     }
     Ok(files)
-}
-
-/// The concatenated contents of every `.rs` file under `dir`, as `rust_files` walks it.
-fn rust_sources(dir: &Path) -> std::io::Result<String> {
-    let mut out = String::new();
-    for path in rust_files(dir)? {
-        out.push_str(&std::fs::read_to_string(path)?);
-        out.push('\n');
-    }
-    Ok(out)
 }
 
 /// Each `.rs` file under `root/src` as its `/`-joined path relative to `root` and its
@@ -509,13 +500,19 @@ mod tests {
 
     #[test]
     fn rust_source_walker_reads_nested_files() {
-        let sources =
-            rust_sources(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src/mesh")).unwrap();
-        assert!(sources.contains("fn destination_address"));
-        assert!(sources.contains("fn refusal_codes_round_trip_the_wire_and_reject_other_values"));
+        let files = rust_files_under(Path::new(env!("CARGO_MANIFEST_DIR")), "src/mesh").unwrap();
+        let nested = files
+            .iter()
+            .find(|(path, _)| path == "src/mesh/request/tests.rs")
+            .expect("src/mesh/request/tests.rs is listed");
         assert!(
-            !sources.contains("fn rust_source_walker_reads_nested_files"),
-            "the walk must skip this file so a citation cannot resolve against a fixture"
+            nested
+                .1
+                .contains("fn refusal_codes_round_trip_the_wire_and_reject_other_values")
+        );
+        assert!(
+            !files.iter().any(|(path, _)| path == "src/mesh/pins.rs"),
+            "the walk must skip this file so the scanners never read its fixtures"
         );
     }
 
@@ -560,19 +557,12 @@ mod tests {
             .copied()
             .collect::<Vec<&str>>()
             .join(" ");
-        let protocol = EXPECTED_H1
-            .strip_prefix("# ")
-            .expect("the H1 carries a heading marker");
         assert!(
-            paragraph.starts_with(protocol),
-            "the mesh section does not open with {protocol:?}: {paragraph:?}"
+            paragraph.starts_with(SCOPE_NAME),
+            "the mesh section does not open with {SCOPE_NAME:?}: {paragraph:?}"
         );
-        let tagline = EXPECTED_TAGLINE
-            .strip_prefix('"')
-            .and_then(|tagline| tagline.strip_suffix('"'))
-            .expect("the tagline is quoted");
         assert!(
-            paragraph.contains(tagline),
+            paragraph.contains(SCOPE_TAGLINE),
             "the mesh section lacks the tagline: {paragraph:?}"
         );
         // Assembled at runtime so the mesh source guard does not match this test's text.

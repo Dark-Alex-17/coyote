@@ -1,13 +1,13 @@
 //! Requirement-id keyed vectors for what only shows on a live link: size branches, the inbound
 //! caps, handler slots and timeouts, response correlation, version marks and the sender's
 //! outcome for a refused knock or an unacknowledged message. The table is declared on every
-//! platform so coverage counts it; the executor runs over the loopback fixtures of
+//! platform so `REQUIRED_IDS` is checked on each; the executor runs over the loopback fixtures of
 //! `request::tests::network`, which are `#[cfg(unix)]`.
 
 use super::{Kind, Listed};
 use crate::mesh::request::SizeBranch;
 
-// Read only by the unix executor below; the table itself is declared everywhere so coverage counts it.
+// Read only by the unix executor below; the table itself is declared everywhere so `REQUIRED_IDS` is checked on every platform.
 #[cfg_attr(not(unix), allow(dead_code))]
 struct Vector {
     id: &'static str,
@@ -56,7 +56,7 @@ enum OtherReply {
     OtherId,
 }
 
-// Read only by the unix executor below; the table itself is declared everywhere so coverage counts it.
+// Read only by the unix executor below; the table itself is declared everywhere so `REQUIRED_IDS` is checked on every platform.
 #[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Clone, Copy, Debug)]
 enum Case {
@@ -1333,9 +1333,9 @@ mod loopback {
     }
 
     /// Every group a row lands in has one of the `#[tokio::test]`s above driving it, and every
-    /// registered refusal code but `NoAccess` has a MESH-KNOCK-018 row: a row that counts for
-    /// coverage but is never driven, or an "any other code" row that only tries one code, would
-    /// let the table over-report what it asserts.
+    /// registered refusal code but `NoAccess` has a MESH-KNOCK-018 row: a row that is listed
+    /// but never driven, or an "any other code" row that only tries one code, would let the
+    /// table over-report what it asserts.
     #[test]
     fn every_row_is_driven_and_every_other_refusal_code_has_a_knock_row() {
         const DRIVEN: &[Group] = &[

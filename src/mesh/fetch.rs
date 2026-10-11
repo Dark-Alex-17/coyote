@@ -69,7 +69,8 @@ const UNKNOWN_RULE: &str = "unknown";
 /// row of README.md (pinned by `readme_fetch_row_spells_the_single_segment_ceiling_as_a_number`)
 /// and in the config template and example go with it, as do the ceiling clauses in
 /// MESH-FETCH-026, MESH-FETCH-027 and MESH-SEC-018, the leniency MESH-LEN-007, and both constants'
-/// `expected_constants` entries in src/mesh/pins.rs. Recorded as upstream issue draft A4.
+/// `expected_constants` entries in src/mesh/pins.rs. Reported upstream: follow-up Resource
+/// segments are dispatched through the path table and dropped on a non-broadcast link.
 pub(crate) const SINGLE_SEGMENT_FETCH_CEILING: u64 =
     (MAX_EFFICIENT_SIZE - OK_REPLY_FRAMING_BYTES) as u64;
 /// Room for the response frame (19 bytes), the map header and the `v`, `status`, `size`,

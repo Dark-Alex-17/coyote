@@ -80,7 +80,7 @@ struct Vector {
 type Check = fn() -> Result<(), String>;
 
 /// The input and expectation of a row, one variant per surface under test. The variant
-/// name is the family the coverage report groups rows by.
+/// name is the family label `all_listed` carries for the row.
 enum Case {
     /// `WirePath::parse` and the decoders that reuse it, section 10.13.
     WirePath(WireProbe),

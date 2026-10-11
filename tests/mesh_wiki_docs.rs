@@ -30,6 +30,7 @@ const WIKI_DIR: &str = "COYOTE_WIKI_DIR";
 const RECIPE: &str = "`COYOTE_WIKI_DIR=../coyote.wiki cargo test --test mesh_wiki_docs`";
 const SPEC_REPO: &str = "https://github.com/Dark-Alex-17/scope-protocol";
 /// The protocol's name as the wiki's Mesh page and the README's mesh section lead with it.
+/// Twin of SCOPE_NAME in src/mesh/pins.rs; both are checked against the README lead.
 const SCOPE_LEAD: &str = "SCOPE — Session Coordination & Presence Exchange";
 /// The shipped `mesh.interfaces` default as the README's and the Configuration page's
 /// Default cells spell it.
@@ -308,7 +309,8 @@ fn every_verb_row_in_the_wiki_table_matches_the_repl_verbs_table() {
 }
 
 #[test]
-fn the_spec_repository_link_appears_before_the_first_section_heading_on_every_mesh_page() {
+fn the_spec_repository_link_appears_before_the_first_section_heading_on_the_pages_that_describe_the_wire()
+ {
     let Some(wiki) = wiki_dir() else { return };
     for page in [
         "Mesh.md",
@@ -327,6 +329,7 @@ fn the_spec_repository_link_appears_before_the_first_section_heading_on_every_me
             !links.is_empty(),
             "{page} never links {SPEC_REPO}; the link belongs in the intro"
         );
+        // The verb and key pages keep one canonical pointer in their intro; the overview and file-sharing pages may cite the spec inline.
         if page == "Mesh-Commands.md" || page == "Mesh-Configuration.md" {
             assert_eq!(
                 links.len(),
@@ -657,14 +660,6 @@ fn usage_probe_the_peer_directory_scan_judges_each_literal_and_reads_crlf_alike(
 
 #[test]
 fn the_mesh_page_and_the_readme_mesh_section_lead_with_the_scope_expansion() {
-    let Some(wiki) = wiki_dir() else { return };
-    let page = read(wiki.join("Mesh.md"));
-    let first = page.lines().next().unwrap_or_default();
-    assert!(
-        first.starts_with(SCOPE_LEAD),
-        "Mesh.md line 1 does not open with {SCOPE_LEAD:?}: {first:?}"
-    );
-
     let readme = read(repo_root().join("README.md"));
     let mut after_heading = readme.lines().skip_while(|line| *line != "### Mesh");
     after_heading
@@ -676,6 +671,25 @@ fn the_mesh_page_and_the_readme_mesh_section_lead_with_the_scope_expansion() {
     assert!(
         lead.starts_with(SCOPE_LEAD),
         "README.md's `### Mesh` section does not open with {SCOPE_LEAD:?}: {lead:?}"
+    );
+    let section = readme
+        .lines()
+        .skip_while(|line| *line != "### Mesh")
+        .skip(1)
+        .take_while(|line| !line.starts_with("### ") && !line.starts_with("## "))
+        .collect::<Vec<&str>>()
+        .join("\n");
+    assert!(
+        section.contains(SPEC_REPO),
+        "README.md's `### Mesh` section never links {SPEC_REPO}"
+    );
+
+    let Some(wiki) = wiki_dir() else { return };
+    let page = read(wiki.join("Mesh.md"));
+    let first = page.lines().next().unwrap_or_default();
+    assert!(
+        first.starts_with(SCOPE_LEAD),
+        "Mesh.md line 1 does not open with {SCOPE_LEAD:?}: {first:?}"
     );
 }
 

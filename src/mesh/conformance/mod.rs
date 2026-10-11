@@ -40,7 +40,7 @@
 //!   creates the namespaces.
 //!
 //! Every table row names the id it exercises, so `grep MESH-ENV-030 src/mesh/conformance` lands
-//! on its vectors, and the test at the bottom of this file checks every required id has a
+//! on its vectors, and `every_required_id_has_a_vector` checks that every required id has a
 //! vector.
 //!
 //! Platform note: `interop`, `link_vectors::loopback` and `live_vectors::loopback` are
@@ -107,8 +107,9 @@ mod tests {
     use std::collections::BTreeSet;
     use std::path::Path;
 
-    /// The ids that must have at least one vector: every id of the areas whose receiver
-    /// actions are fully decidable from bytes, plus every catch-all row of the other areas.
+    /// A hand-maintained minimum: every platform must list a vector for each of these ids.
+    /// The requirement text behind each id lives in the SCOPE repository,
+    /// https://github.com/Dark-Alex-17/scope-protocol.
     const REQUIRED_IDS: &[&str] = &[
         "MESH-DEST-001",
         "MESH-DEST-002",
@@ -368,8 +369,13 @@ mod tests {
     fn every_required_id_has_a_vector() {
         let listed = all_listed();
         assert!(!listed.is_empty(), "no vectors are listed");
-        assert!(listed.iter().any(|row| row.kind == Kind::Invalid));
-        assert!(listed.iter().all(|row| !row.family.is_empty()));
+        assert!(
+            listed.iter().any(|row| row.kind == Kind::Invalid),
+            "no Invalid vector is listed"
+        );
+        if let Some(row) = listed.iter().find(|row| row.family.is_empty()) {
+            panic!("a vector row has an empty family: {}", row.id);
+        }
         let covered: BTreeSet<&str> = listed.iter().map(|listed| listed.id).collect();
         let missing: Vec<&&str> = REQUIRED_IDS
             .iter()

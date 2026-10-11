@@ -17,9 +17,9 @@ requirement behind it is named after the bug instead.
 
 | Directory | Bytes | Oracle |
 |---|---|---|
-| `dispatch/` | one request frame: msgpack `[f64 time, bin(16) path_hash, data]` | section 6.1 frame predicate, then the section 6.6 pipeline against every trust tier |
-| `envelope/` | one Envelope map: `v`, `name_hash`, `body` | section 6.5 predicate and the canonical re-encoding |
-| `receipt/` | a kind byte, then a body or a sequence buffer (below) | the section 11.4 stage order and the dedup model on a fresh store |
+| `dispatch/` | one request frame: msgpack `[f64 time, bin(16) path_hash, data]` | the frame predicate, then the dispatch pipeline against every trust tier |
+| `envelope/` | one Envelope map: `v`, `name_hash`, `body` | the Envelope predicate and the canonical re-encoding |
+| `receipt/` | a kind byte, then a body or a sequence buffer (below) | the receipt stage order and the dedup model on a fresh store |
 | `codecs/` | a tag byte, then that decoder's wire bytes | per-decoder predicate and round trip |
 
 ### Receipt kind bytes
@@ -40,22 +40,22 @@ within the frame decoder's nesting budget is a violation, not a skip.
 
 | Tag | Decoder | Payload |
 |---|---|---|
-| `0x01` | `StatusCard::from_value` (section 9.2) | msgpack card map |
-| `0x02` | `from_request_body`, the `/message` body (section 10.1) | msgpack body map |
-| `0x03` | `intro_from_request_body`, the `/knock` body (section 8) | msgpack map |
-| `0x04` | `AnnounceAppData::decode` (section 5.1) | raw bytes: `SCOPE`, u16 BE version, name |
-| `0x05` | `decode_peer_lxmf`, LXMF peer custom fields (section 10.8) | msgpack fields map keyed `0xFB`, `0xFC` |
-| `0x06` | `decode_knock_message`, LXMF knock custom fields (section 8.6) | msgpack fields map keyed `0xFB`, `0xFC` |
-| `0x07` | `RefusalCode::from_wire` (section 6.7) | msgpack value |
-| `0x08` | `VersionRefusal::from_value` (section 7) | msgpack map |
-| `0x09` | `DispatchError::from_value` (section 6.7) | msgpack map |
-| `0x0a` | `PendingStore::load_pending` (section 10.5) | jsonl text |
+| `0x01` | `StatusCard::from_value` | msgpack card map |
+| `0x02` | `from_request_body`, the `/message` body | msgpack body map |
+| `0x03` | `intro_from_request_body`, the `/knock` body | msgpack map |
+| `0x04` | `AnnounceAppData::decode` | raw bytes: `SCOPE`, u16 BE version, name |
+| `0x05` | `decode_peer_lxmf`, LXMF peer custom fields | msgpack fields map keyed `0xFB`, `0xFC` |
+| `0x06` | `decode_knock_message`, LXMF knock custom fields | msgpack fields map keyed `0xFB`, `0xFC` |
+| `0x07` | `RefusalCode::from_wire` | msgpack value |
+| `0x08` | `VersionRefusal::from_value` | msgpack map |
+| `0x09` | `DispatchError::from_value` | msgpack map |
+| `0x0a` | `PendingStore::load_pending` | jsonl text |
 | `0x0b` | `WirePath::parse`, the file part name grammar (`wire_path.rs`) | UTF-8 text |
-| `0x0c` | `SharesPage::from_value`, the `/list` reply (section 10.14) | msgpack page map |
-| `0x0d` | `read_fetch_reply`, the `/fetch` reply (section 10.15) | msgpack reply map |
-| `0x0e` | `read_access_reply`, the `/access` reply (section 10.16) | msgpack reply map |
-| `0x0f` | `decode_access_message`, LXMF access custom fields (section 10.16) | msgpack fields map keyed `0xFB`, `0xFC` |
-| `0x10` | `decode_access`, the `/access` request body (section 10.16) | msgpack body map |
+| `0x0c` | `SharesPage::from_value`, the `/list` reply | msgpack page map |
+| `0x0d` | `read_fetch_reply`, the `/fetch` reply | msgpack reply map |
+| `0x0e` | `read_access_reply`, the `/access` reply | msgpack reply map |
+| `0x0f` | `decode_access_message`, LXMF access custom fields | msgpack fields map keyed `0xFB`, `0xFC` |
+| `0x10` | `decode_access`, the `/access` request body | msgpack body map |
 
 ## Replay
 

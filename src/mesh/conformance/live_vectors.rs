@@ -1,14 +1,14 @@
 //! Requirement-id keyed vectors for the file-sharing surface as two nodes see it: the
 //! list, access, decision and fetch cycle, the admission of an access request, the
 //! requester's reading of a fetch reply, the share set's handling of symlinks and the
-//! grant a reference attachment lends. The table is declared on every platform so coverage
-//! counts it; the executor runs over the loopback node pair of `request::tests::network`, which
-//! is `#[cfg(unix)]`, and the symlink rows share that gate because their fixtures create
-//! symlinks.
+//! grant a reference attachment lends. The table is declared on every platform so
+//! `REQUIRED_IDS` is checked on each; the executor runs over the loopback node pair of
+//! `request::tests::network`, which is `#[cfg(unix)]`, and the symlink rows share that gate
+//! because their fixtures create symlinks.
 
 use super::{Kind, Listed};
 
-// Read only by the unix executor below; the table itself is declared everywhere so coverage counts it.
+// Read only by the unix executor below; the table itself is declared everywhere so `REQUIRED_IDS` is checked on every platform.
 #[cfg_attr(not(unix), allow(dead_code))]
 struct Vector {
     id: &'static str,
@@ -39,7 +39,7 @@ enum Status {
     InvalidPath,
 }
 
-// Read only by the unix executor below; the table itself is declared everywhere so coverage counts it.
+// Read only by the unix executor below; the table itself is declared everywhere so `REQUIRED_IDS` is checked on every platform.
 #[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Clone, Copy, Debug)]
 enum Answer {
@@ -67,7 +67,7 @@ enum Answer {
     Extras(Status),
 }
 
-// Read only by the unix executor below; the table itself is declared everywhere so coverage counts it.
+// Read only by the unix executor below; the table itself is declared everywhere so `REQUIRED_IDS` is checked on every platform.
 #[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Clone, Copy, Debug)]
 enum Expect {
@@ -80,7 +80,7 @@ enum Expect {
     InvalidPath(&'static str),
 }
 
-// Read only by the unix executor below; the table itself is declared everywhere so coverage counts it.
+// Read only by the unix executor below; the table itself is declared everywhere so `REQUIRED_IDS` is checked on every platform.
 #[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Clone, Copy, Debug)]
 enum Case {
@@ -1309,8 +1309,7 @@ mod loopback {
     }
 
     /// Every group a row lands in has one of the `#[tokio::test]`s above driving it: a row
-    /// that counts for coverage but is never driven would let the table over-report what
-    /// it asserts.
+    /// that is listed but never driven would let the table over-report what it asserts.
     #[test]
     fn every_row_is_driven() {
         const DRIVEN: &[Group] = &[

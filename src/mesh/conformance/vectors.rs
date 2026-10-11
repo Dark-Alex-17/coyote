@@ -115,7 +115,7 @@ struct Vector {
 }
 
 /// The input and expectation of a row, one variant per codec under test. The variant name
-/// is the family the coverage report groups rows by.
+/// is the family label `all_listed` carries for the row.
 enum Case {
     /// `AnnounceAppData::decode` over raw application data.
     Announce {
