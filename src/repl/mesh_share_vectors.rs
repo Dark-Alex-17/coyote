@@ -1,15 +1,13 @@
-//! Requirement-id keyed vectors for the REPL's `attachment` predicate: the file the human
-//! names held to the share rules of section 10.17, as MESH-SHARE-020 has it. Every row
-//! runs in-process on a share root the row builds in a temporary directory, through the
-//! request context the REPL hands the predicate.
+//! Named vectors for the REPL's `attachment` predicate: the file the human names held to
+//! the share rules. Every row runs in-process on a share root the row builds in a
+//! temporary directory, through the request context the REPL hands the predicate.
 //!
 //! The family lives beside the predicate rather than with the other share vectors
 //! because the mesh module may not name the request context, and these rows must build
-//! one. The conformance registry in `crate::mesh::conformance` still lists the rows, so
-//! `REQUIRED_IDS` is checked against them with the rest, and
+//! one. The conformance registry in `crate::mesh::conformance` still lists the rows, and
 //! `the_attachment_family_runs_with_the_conformance_slice` runs them with that slice.
 //!
-//! Every row names the id it exercises and the receiver action the spec mandates for it.
+//! Every row carries a descriptive name and the receiver action expected of it.
 //! The rows read the config dir from the process env, so the executor serialises and holds
 //! a config-dir guard.
 
@@ -31,9 +29,9 @@ const FAMILY: &str = "Attachment";
 /// A scenario that builds its own fixture and reports the first expectation it misses.
 type Check = fn() -> Result<(), String>;
 
-/// One requirement id, one input, one mandated receiver action.
+/// One named input and the receiver action expected of it.
 struct Vector {
-    id: &'static str,
+    name: &'static str,
     kind: Kind,
     check: Check,
 }
@@ -42,7 +40,7 @@ pub(crate) fn listed() -> Vec<Listed> {
     vectors()
         .iter()
         .map(|vector| Listed {
-            id: vector.id,
+            name: vector.name,
             kind: vector.kind,
             family: FAMILY,
         })
@@ -269,35 +267,35 @@ fn vectors() -> Vec<Vector> {
     use Kind::{Boundary, Invalid, Valid};
     vec![
         row(
-            "MESH-SHARE-020",
+            "inline-attachment-travels-whatever-the-lists-say",
             Valid,
             an_inline_attachment_travels_whatever_the_allow_and_deny_lists_say,
         ),
         row(
-            "MESH-SHARE-020",
+            "protected-attachment-is-refused-even-with-force",
             Invalid,
             an_attachment_under_the_protected_set_is_refused_with_or_without_force,
         ),
         row(
-            "MESH-SHARE-020",
+            "built-in-deny-refuses-until-force-lifts-it",
             Invalid,
             the_built_in_deny_refuses_an_attachment_until_force_lifts_it,
         ),
         row(
-            "MESH-SHARE-020",
+            "file-above-the-inline-limit-travels-by-reference",
             Boundary,
             a_file_above_the_inline_limit_travels_by_reference,
         ),
         row(
-            "MESH-SHARE-020",
+            "reference-the-serving-side-would-not-serve-is-refused",
             Invalid,
             a_reference_the_serving_side_would_not_serve_is_refused,
         ),
     ]
 }
 
-fn row(id: &'static str, kind: Kind, check: Check) -> Vector {
-    Vector { id, kind, check }
+fn row(name: &'static str, kind: Kind, check: Check) -> Vector {
+    Vector { name, kind, check }
 }
 
 /// Runs every row under a config-dir guard and panics on the first set of failures. Called
@@ -312,7 +310,7 @@ pub(crate) fn run_all() {
         .filter_map(|vector| {
             (vector.check)()
                 .err()
-                .map(|detail| format!("{} [{FAMILY}, {:?}]: {detail}", vector.id, vector.kind))
+                .map(|detail| format!("{} [{FAMILY}, {:?}]: {detail}", vector.name, vector.kind))
         })
         .collect();
     assert!(ran > 0, "no {FAMILY} vectors");
@@ -327,10 +325,23 @@ pub(crate) fn run_all() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
 
     #[test]
     #[serial_test::serial]
-    fn attachments_are_held_to_section_10_17_as_the_human_named_them() {
+    fn attachments_are_held_to_the_share_rules_as_the_human_named_them() {
         run_all();
+    }
+
+    #[test]
+    fn every_row_has_a_unique_name() {
+        let mut seen = BTreeSet::new();
+        for row in vectors() {
+            assert!(
+                seen.insert(row.name),
+                "duplicate vector name {:?}",
+                row.name
+            );
+        }
     }
 }

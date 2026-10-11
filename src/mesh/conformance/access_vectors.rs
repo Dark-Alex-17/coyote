@@ -58,7 +58,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// One requirement id, one input, one mandated receiver action.
 struct Vector {
-    id: &'static str,
+    name: &'static str,
     kind: Kind,
     case: Case,
     /// Set when the row is faithful to the spec and the code does not honour it; the
@@ -128,7 +128,7 @@ pub(super) fn listed() -> Vec<Listed> {
     vectors()
         .iter()
         .map(|vector| Listed {
-            id: vector.id,
+            name: vector.name,
             kind: vector.kind,
             family: vector.case.family(),
         })
@@ -704,51 +704,51 @@ fn answered(text: &str) -> Result<String, String> {
     }
 }
 
-fn row(id: &'static str, kind: Kind, case: Case) -> Vector {
+fn row(name: &'static str, kind: Kind, case: Case) -> Vector {
     Vector {
-        id,
+        name,
         kind,
         case,
         known_divergence: None,
     }
 }
 
-fn refused_body(id: &'static str, kind: Kind, body: Value) -> Vector {
-    row(id, kind, Case::AccessRequest(RequestProbe::Refused(body)))
+fn refused_body(name: &'static str, kind: Kind, body: Value) -> Vector {
+    row(name, kind, Case::AccessRequest(RequestProbe::Refused(body)))
 }
 
-fn request_check(id: &'static str, kind: Kind, check: Check) -> Vector {
-    row(id, kind, Case::AccessRequest(RequestProbe::Check(check)))
+fn request_check(name: &'static str, kind: Kind, check: Check) -> Vector {
+    row(name, kind, Case::AccessRequest(RequestProbe::Check(check)))
 }
 
 fn decode(
-    id: &'static str,
+    name: &'static str,
     kind: Kind,
     value: Value,
     expect: Result<AccessOutcome, AccessError>,
 ) -> Vector {
     row(
-        id,
+        name,
         kind,
         Case::AccessReply(ReplyProbe::Decode { value, expect }),
     )
 }
 
-fn malformed(id: &'static str, kind: Kind, value: Value, why: &'static str) -> Vector {
-    decode(id, kind, value, Err(AccessError::Malformed(why)))
+fn malformed(name: &'static str, kind: Kind, value: Value, why: &'static str) -> Vector {
+    decode(name, kind, value, Err(AccessError::Malformed(why)))
 }
 
-fn unknown_status(id: &'static str, kind: Kind, value: Value) -> Vector {
-    decode(id, kind, value, Err(AccessError::UnknownStatus))
+fn unknown_status(name: &'static str, kind: Kind, value: Value) -> Vector {
+    decode(name, kind, value, Err(AccessError::UnknownStatus))
 }
 
-fn reply_check(id: &'static str, kind: Kind, check: Check) -> Vector {
-    row(id, kind, Case::AccessReply(ReplyProbe::Check(check)))
+fn reply_check(name: &'static str, kind: Kind, check: Check) -> Vector {
+    row(name, kind, Case::AccessReply(ReplyProbe::Check(check)))
 }
 
-fn lxmf(id: &'static str, kind: Kind, message: InboundMessage, expect: AccessMessage) -> Vector {
+fn lxmf(name: &'static str, kind: Kind, message: InboundMessage, expect: AccessMessage) -> Vector {
     row(
-        id,
+        name,
         kind,
         Case::AccessLxmf(LxmfProbe::Decode {
             message: Box::new(message),
@@ -757,8 +757,8 @@ fn lxmf(id: &'static str, kind: Kind, message: InboundMessage, expect: AccessMes
     )
 }
 
-fn lxmf_check(id: &'static str, kind: Kind, check: Check) -> Vector {
-    row(id, kind, Case::AccessLxmf(LxmfProbe::Check(check)))
+fn lxmf_check(name: &'static str, kind: Kind, check: Check) -> Vector {
+    row(name, kind, Case::AccessLxmf(LxmfProbe::Check(check)))
 }
 
 // ---------------------------------------------------------------------------------------
@@ -2356,7 +2356,7 @@ mod tests {
             .filter(|vector| vector.case.family() == family)
         {
             ran += 1;
-            let tag = format!("{} [{family}, {:?}]", vector.id, vector.kind);
+            let tag = format!("{} [{family}, {:?}]", vector.name, vector.kind);
             match (run(&vector.case), vector.known_divergence) {
                 (Ok(()), None) => {}
                 (Err(detail), None) => failures.push(format!("{tag}: {detail}")),

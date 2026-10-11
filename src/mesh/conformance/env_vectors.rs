@@ -38,7 +38,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// One requirement id, one input, one mandated receiver action.
 struct Vector {
-    id: &'static str,
+    name: &'static str,
     kind: Kind,
     case: Case,
     /// Set when the row is faithful to the spec and the code does not honour it; the
@@ -167,7 +167,7 @@ pub(super) fn listed() -> Vec<Listed> {
     vectors()
         .iter()
         .map(|vector| Listed {
-            id: vector.id,
+            name: vector.name,
             kind: vector.kind,
             family: vector.case.family(),
         })
@@ -378,9 +378,9 @@ async fn run_dispatch(
 const ORIGIN: [u8; NAME_HASH_LEN] = [7; NAME_HASH_LEN];
 const UNKNOWN_PATH: &str = "/nowhere";
 
-fn row(id: &'static str, kind: Kind, case: Case) -> Vector {
+fn row(name: &'static str, kind: Kind, case: Case) -> Vector {
     Vector {
-        id,
+        name,
         kind,
         case,
         known_divergence: None,
@@ -539,12 +539,12 @@ fn path_bin(len: usize) -> Value {
 }
 
 fn request(
-    id: &'static str,
+    name: &'static str,
     kind: Kind,
     bytes: Vec<u8>,
     expect: FrameAction<RequestFrame>,
 ) -> Vector {
-    row(id, kind, Case::RequestFrameDecode { bytes, expect })
+    row(name, kind, Case::RequestFrameDecode { bytes, expect })
 }
 
 fn request_frame_vectors() -> Vec<Vector> {
@@ -768,12 +768,12 @@ fn response_value(request_id: Value, data: Value) -> Value {
 }
 
 fn response(
-    id: &'static str,
+    name: &'static str,
     kind: Kind,
     bytes: Vec<u8>,
     expect: FrameAction<ResponseFrame>,
 ) -> Vector {
-    row(id, kind, Case::ResponseFrameDecode { bytes, expect })
+    row(name, kind, Case::ResponseFrameDecode { bytes, expect })
 }
 
 fn response_frame_vectors() -> Vec<Vector> {
@@ -981,13 +981,13 @@ fn origin_bin(len: usize) -> Value {
     Value::Binary(vec![7; len])
 }
 
-fn envelope(id: &'static str, kind: Kind, value: Value, expect: EnvelopeAction) -> Vector {
-    row(id, kind, Case::EnvelopeDecode { value, expect })
+fn envelope(name: &'static str, kind: Kind, value: Value, expect: EnvelopeAction) -> Vector {
+    row(name, kind, Case::EnvelopeDecode { value, expect })
 }
 
-fn encode(id: &'static str, kind: Kind, body: Value, expect: Value) -> Vector {
+fn encode(name: &'static str, kind: Kind, body: Value, expect: Value) -> Vector {
     row(
-        id,
+        name,
         kind,
         Case::EnvelopeEncode {
             origin: OriginName(ORIGIN),
@@ -1470,7 +1470,7 @@ fn bad_version() -> Value {
 }
 
 fn dispatch(
-    id: &'static str,
+    name: &'static str,
     kind: Kind,
     path: &'static str,
     trust: TrustShape,
@@ -1479,7 +1479,7 @@ fn dispatch(
     knock: Knock,
 ) -> Vector {
     row(
-        id,
+        name,
         kind,
         Case::Dispatch {
             path,
@@ -1502,9 +1502,9 @@ fn served(provider: Provider, mut vector: Vector) -> Vector {
     vector
 }
 
-fn anonymous(id: &'static str, path: &'static str, trust: TrustShape, data: Value) -> Vector {
+fn anonymous(name: &'static str, path: &'static str, trust: TrustShape, data: Value) -> Vector {
     row(
-        id,
+        name,
         Kind::Invalid,
         Case::Dispatch {
             path,
@@ -2338,8 +2338,8 @@ fn surface_presence_line(store: &TrustStore, identity: &AddressHash, heard: Syst
 const IDENTITY: &str = "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a";
 const DESTINATION: &str = "d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1";
 
-fn custom(id: &'static str, kind: Kind, check: fn() -> Result<(), String>) -> Vector {
-    row(id, kind, Case::Custom(check))
+fn custom(name: &'static str, kind: Kind, check: fn() -> Result<(), String>) -> Vector {
+    row(name, kind, Case::Custom(check))
 }
 
 fn custom_vectors() -> Vec<Vector> {
@@ -2759,13 +2759,13 @@ fn refusal(found: Option<u16>) -> Option<VersionRefusal> {
     })
 }
 
-fn version(id: &'static str, kind: Kind, value: Value, expect: Option<VersionRefusal>) -> Vector {
-    row(id, kind, Case::VersionRefusalDecode { value, expect })
+fn version(name: &'static str, kind: Kind, value: Value, expect: Option<VersionRefusal>) -> Vector {
+    row(name, kind, Case::VersionRefusalDecode { value, expect })
 }
 
-fn version_encode(id: &'static str, found: Option<u16>, expect: Value) -> Vector {
+fn version_encode(name: &'static str, found: Option<u16>, expect: Value) -> Vector {
     row(
-        id,
+        name,
         Kind::Valid,
         Case::VersionRefusalEncode { found, expect },
     )
@@ -3096,12 +3096,12 @@ fn no_provider(path: &str) -> Option<DispatchError> {
 }
 
 fn dispatch_error(
-    id: &'static str,
+    name: &'static str,
     kind: Kind,
     value: Value,
     expect: Option<DispatchError>,
 ) -> Vector {
-    row(id, kind, Case::DispatchErrorDecode { value, expect })
+    row(name, kind, Case::DispatchErrorDecode { value, expect })
 }
 
 fn dispatch_error_vectors() -> Vec<Vector> {
@@ -3417,8 +3417,8 @@ fn dispatch_error_vectors() -> Vec<Vector> {
     ]
 }
 
-fn code(id: &'static str, kind: Kind, value: Value, expect: Option<Value>) -> Vector {
-    row(id, kind, Case::RefusalCodeDecode { value, expect })
+fn code(name: &'static str, kind: Kind, value: Value, expect: Option<Value>) -> Vector {
+    row(name, kind, Case::RefusalCodeDecode { value, expect })
 }
 
 fn wire(byte: u8) -> Option<Value> {
@@ -3525,7 +3525,7 @@ mod tests {
             .filter(|vector| vector.case.family() == family)
         {
             ran += 1;
-            let tag = format!("{} [{family}, {:?}]", vector.id, vector.kind);
+            let tag = format!("{} [{family}, {:?}]", vector.name, vector.kind);
             match (run(&vector.case), vector.known_divergence) {
                 (Ok(()), None) => {}
                 (Err(detail), None) => failures.push(format!("{tag}: {detail}")),

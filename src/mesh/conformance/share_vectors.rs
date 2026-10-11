@@ -66,7 +66,7 @@ use tokio::sync::oneshot::error::TryRecvError;
 
 /// One requirement id, one input, one mandated receiver action.
 struct Vector {
-    id: &'static str,
+    name: &'static str,
     kind: Kind,
     case: Case,
     /// Set when the row is faithful to the spec and the code does not honour it; the
@@ -308,7 +308,7 @@ pub(super) fn listed() -> Vec<Listed> {
     vectors()
         .iter()
         .map(|vector| Listed {
-            id: vector.id,
+            name: vector.name,
             kind: vector.kind,
             family: vector.case.family(),
         })
@@ -778,9 +778,9 @@ fn inbound_json(extra: &str) -> String {
     )
 }
 
-fn row(id: &'static str, kind: Kind, case: Case) -> Vector {
+fn row(name: &'static str, kind: Kind, case: Case) -> Vector {
     Vector {
-        id,
+        name,
         kind,
         case,
         known_divergence: None,
@@ -788,13 +788,13 @@ fn row(id: &'static str, kind: Kind, case: Case) -> Vector {
 }
 
 fn parse(
-    id: &'static str,
+    name: &'static str,
     kind: Kind,
     text: impl Into<String>,
     expect: Result<(), &'static str>,
 ) -> Vector {
     row(
-        id,
+        name,
         kind,
         Case::WirePath(WireProbe::Parse {
             text: text.into(),
@@ -805,7 +805,7 @@ fn parse(
 
 /// A verdict row on a root holding `files`, judged for the named peer with no case fold.
 fn verdict(
-    id: &'static str,
+    name: &'static str,
     kind: Kind,
     global: String,
     workspace: String,
@@ -814,7 +814,7 @@ fn verdict(
     expect: Option<Verdict>,
 ) -> Vector {
     verdict_as(
-        id,
+        name,
         kind,
         VerdictRow {
             global,
@@ -838,7 +838,7 @@ struct VerdictRow<'a> {
     expect: Option<Verdict>,
 }
 
-fn verdict_as(id: &'static str, kind: Kind, probe: VerdictRow<'_>) -> Vector {
+fn verdict_as(name: &'static str, kind: Kind, probe: VerdictRow<'_>) -> Vector {
     let VerdictRow {
         global,
         workspace,
@@ -849,7 +849,7 @@ fn verdict_as(id: &'static str, kind: Kind, probe: VerdictRow<'_>) -> Vector {
         expect,
     } = probe;
     row(
-        id,
+        name,
         kind,
         Case::ShareSet(ShareProbe::Verdict {
             global,
@@ -863,16 +863,16 @@ fn verdict_as(id: &'static str, kind: Kind, probe: VerdictRow<'_>) -> Vector {
     )
 }
 
-fn share_check(id: &'static str, kind: Kind, check: Check) -> Vector {
-    row(id, kind, Case::ShareSet(ShareProbe::Check(check)))
+fn share_check(name: &'static str, kind: Kind, check: Check) -> Vector {
+    row(name, kind, Case::ShareSet(ShareProbe::Check(check)))
 }
 
-fn grant_check(id: &'static str, kind: Kind, check: Check) -> Vector {
-    row(id, kind, Case::GrantStore(check))
+fn grant_check(name: &'static str, kind: Kind, check: Check) -> Vector {
+    row(name, kind, Case::GrantStore(check))
 }
 
-fn schema_check(id: &'static str, kind: Kind, check: Check) -> Vector {
-    row(id, kind, Case::StoreSchema(SchemaProbe::Check(check)))
+fn schema_check(name: &'static str, kind: Kind, check: Check) -> Vector {
+    row(name, kind, Case::StoreSchema(SchemaProbe::Check(check)))
 }
 
 // ---------------------------------------------------------------------------------------
@@ -2137,27 +2137,27 @@ fn pending_on(
         .map_err(|err| format!("insert_pending: {err:?}"))
 }
 
-fn list_check(id: &'static str, kind: Kind, check: Check) -> Vector {
-    row(id, kind, Case::ListServe(ListProbe::Check(check)))
+fn list_check(name: &'static str, kind: Kind, check: Check) -> Vector {
+    row(name, kind, Case::ListServe(ListProbe::Check(check)))
 }
 
-fn fetch_check(id: &'static str, kind: Kind, check: Check) -> Vector {
-    row(id, kind, Case::FetchServe(FetchProbe::Check(check)))
+fn fetch_check(name: &'static str, kind: Kind, check: Check) -> Vector {
+    row(name, kind, Case::FetchServe(FetchProbe::Check(check)))
 }
 
-fn client_check(id: &'static str, kind: Kind, check: Check) -> Vector {
-    row(id, kind, Case::FetchClient(ClientProbe::Check(check)))
+fn client_check(name: &'static str, kind: Kind, check: Check) -> Vector {
+    row(name, kind, Case::FetchClient(ClientProbe::Check(check)))
 }
 
 fn list_request(
-    id: &'static str,
+    name: &'static str,
     kind: Kind,
     files: &'static [&'static str],
     body: Value,
     expect: ListAnswer,
 ) -> Vector {
     row(
-        id,
+        name,
         kind,
         Case::ListServe(ListProbe::Request {
             files,
@@ -2175,14 +2175,14 @@ fn page_of(paths: &[&'static str], next: Option<String>) -> ListAnswer {
 }
 
 fn fetch_request(
-    id: &'static str,
+    name: &'static str,
     kind: Kind,
     files: &'static [&'static str],
     body: Value,
     expect: FetchAnswer,
 ) -> Vector {
     row(
-        id,
+        name,
         kind,
         Case::FetchServe(FetchProbe::Request {
             files,
@@ -2204,34 +2204,34 @@ fn invalid_path(rule: &'static str) -> FetchAnswer {
 }
 
 fn page_row(
-    id: &'static str,
+    name: &'static str,
     kind: Kind,
     value: Value,
     expect: Result<(usize, Option<String>), &'static str>,
 ) -> Vector {
     row(
-        id,
+        name,
         kind,
         Case::FetchClient(ClientProbe::Page { value, expect }),
     )
 }
 
-fn entry_row(id: &'static str, kind: Kind, value: Value, kept: bool) -> Vector {
+fn entry_row(name: &'static str, kind: Kind, value: Value, kept: bool) -> Vector {
     row(
-        id,
+        name,
         kind,
         Case::FetchClient(ClientProbe::Entry { value, kept }),
     )
 }
 
 fn reply_row(
-    id: &'static str,
+    name: &'static str,
     kind: Kind,
     value: Value,
     expect: Result<FetchReply, ReplyError>,
 ) -> Vector {
     row(
-        id,
+        name,
         kind,
         Case::FetchClient(ClientProbe::Reply { value, expect }),
     )
@@ -5350,7 +5350,7 @@ mod tests {
             .filter(|vector| vector.case.family() == family)
         {
             ran += 1;
-            let tag = format!("{} [{family}, {:?}]", vector.id, vector.kind);
+            let tag = format!("{} [{family}, {:?}]", vector.name, vector.kind);
             match (run(&vector.case), vector.known_divergence) {
                 (Ok(()), None) => {}
                 (Err(detail), None) => failures.push(format!("{tag}: {detail}")),

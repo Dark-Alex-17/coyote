@@ -1,17 +1,17 @@
-//! Requirement-id keyed vectors for the file-sharing surface as two nodes see it: the
-//! list, access, decision and fetch cycle, the admission of an access request, the
-//! requester's reading of a fetch reply, the share set's handling of symlinks and the
-//! grant a reference attachment lends. The table is declared on every platform so
-//! `REQUIRED_IDS` is checked on each; the executor runs over the loopback node pair of
-//! `request::tests::network`, which is `#[cfg(unix)]`, and the symlink rows share that gate
-//! because their fixtures create symlinks.
+//! Named vectors for the file-sharing surface as two nodes see it: the list, access,
+//! decision and fetch cycle, the admission of an access request, the requester's reading
+//! of a fetch reply, the share set's handling of symlinks and the grant a reference
+//! attachment lends. The table is declared on every platform so its rows are listed on
+//! each; the executor runs over the loopback node pair of `request::tests::network`, which
+//! is `#[cfg(unix)]`, and the symlink rows share that gate because their fixtures create
+//! symlinks.
 
 use super::{Kind, Listed};
 
-// Read only by the unix executor below; the table itself is declared everywhere so `REQUIRED_IDS` is checked on every platform.
+// Read only by the unix executor below; the table itself is declared everywhere so its rows are listed on every platform.
 #[cfg_attr(not(unix), allow(dead_code))]
 struct Vector {
-    id: &'static str,
+    name: &'static str,
     kind: Kind,
     case: Case,
 }
@@ -39,7 +39,7 @@ enum Status {
     InvalidPath,
 }
 
-// Read only by the unix executor below; the table itself is declared everywhere so `REQUIRED_IDS` is checked on every platform.
+// Read only by the unix executor below; the table itself is declared everywhere so its rows are listed on every platform.
 #[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Clone, Copy, Debug)]
 enum Answer {
@@ -67,7 +67,7 @@ enum Answer {
     Extras(Status),
 }
 
-// Read only by the unix executor below; the table itself is declared everywhere so `REQUIRED_IDS` is checked on every platform.
+// Read only by the unix executor below; the table itself is declared everywhere so its rows are listed on every platform.
 #[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Clone, Copy, Debug)]
 enum Expect {
@@ -80,7 +80,7 @@ enum Expect {
     InvalidPath(&'static str),
 }
 
-// Read only by the unix executor below; the table itself is declared everywhere so `REQUIRED_IDS` is checked on every platform.
+// Read only by the unix executor below; the table itself is declared everywhere so its rows are listed on every platform.
 #[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Clone, Copy, Debug)]
 enum Case {
@@ -147,9 +147,9 @@ const fn ok(size: Field, sha256: Field, bytes: Field) -> Answer {
     }
 }
 
-const fn reply(id: &'static str, kind: Kind, answer: Answer, expect: Expect) -> Vector {
+const fn reply(name: &'static str, kind: Kind, answer: Answer, expect: Expect) -> Vector {
     Vector {
-        id,
+        name,
         kind,
         case: Case::FetchReply { answer, expect },
     }
@@ -157,139 +157,139 @@ const fn reply(id: &'static str, kind: Kind, answer: Answer, expect: Expect) -> 
 
 const VECTORS: &[Vector] = &[
     Vector {
-        id: "MESH-LIST-016",
+        name: "list-shows-the-shared-files",
         kind: Kind::Valid,
         case: Case::Listing,
     },
     Vector {
-        id: "MESH-FETCH-024",
+        name: "fetch-of-an-allowed-file-serves-it-with-its-digest",
         kind: Kind::Valid,
         case: Case::ServedByAllow,
     },
     Vector {
-        id: "MESH-ACCESS-016",
+        name: "access-for-an-unserved-path-is-filed-pending",
         kind: Kind::Valid,
         case: Case::FiledPending,
     },
     Vector {
-        id: "MESH-ACCESS-019",
+        name: "grant-is-stored-before-the-decision-reply-is-sent",
         kind: Kind::Valid,
         case: Case::GrantBeforeReply,
     },
     Vector {
-        id: "MESH-ACCESS-018",
+        name: "decision-travels-as-one-reply-part-without-the-path",
         kind: Kind::Valid,
         case: Case::DecisionReply,
     },
     Vector {
-        id: "MESH-SHARE-014",
+        name: "grant-serves-the-file-once",
         kind: Kind::Valid,
         case: Case::GrantServes { spent: false },
     },
     Vector {
-        id: "MESH-SHARE-014",
+        name: "spent-grant-no-longer-serves",
         kind: Kind::Boundary,
         case: Case::GrantServes { spent: true },
     },
     Vector {
-        id: "MESH-LIST-016",
+        name: "granted-file-stays-out-of-the-listing",
         kind: Kind::Boundary,
         case: Case::GrantHiddenFromListing,
     },
     Vector {
-        id: "MESH-ACCESS-029",
+        name: "hook-environments-name-neither-the-path-nor-the-reason",
         kind: Kind::Valid,
         case: Case::NoSideChannel,
     },
     Vector {
-        id: "MESH-ACCESS-015",
+        name: "access-for-an-already-served-path-is-granted-at-once",
         kind: Kind::Valid,
         case: Case::GrantedAtOnce,
     },
     Vector {
-        id: "MESH-ACCESS-014",
+        name: "untrusted-requester-hears-silence-on-access",
         kind: Kind::Invalid,
         case: Case::UnknownRequester,
     },
     Vector {
-        id: "MESH-ACCESS-019",
+        name: "failed-decision-send-leaves-no-grant-and-the-request-pending",
         kind: Kind::Invalid,
         case: Case::DecisionSendFails,
     },
     reply(
-        "MESH-FETCH-013",
+        "fetch-reply-that-is-not-a-map-is-malformed",
         Kind::Invalid,
         Answer::NotAMap,
         Expect::Malformed("map"),
     ),
     reply(
-        "MESH-FETCH-013",
+        "fetch-reply-without-a-version-is-malformed",
         Kind::Invalid,
         Answer::Version(None),
         Expect::Malformed("v"),
     ),
     reply(
-        "MESH-FETCH-013",
+        "fetch-reply-with-another-version-is-malformed",
         Kind::Invalid,
         Answer::Version(Some(2)),
         Expect::Malformed("v"),
     ),
     reply(
-        "MESH-FETCH-014",
+        "fetch-reply-without-a-status-is-malformed",
         Kind::Invalid,
         Answer::NoStatus,
         Expect::Malformed("status"),
     ),
     reply(
-        "MESH-FETCH-014",
+        "fetch-reply-with-a-non-text-status-is-malformed",
         Kind::Invalid,
         Answer::StatusNotText,
         Expect::Malformed("status"),
     ),
     reply(
-        "MESH-FETCH-015",
+        "fetch-reply-with-an-unspelled-status-is-an-unknown-status",
         Kind::Invalid,
         Answer::OtherStatus,
         Expect::UnknownStatus,
     ),
     reply(
-        "MESH-FETCH-016",
+        "ok-reply-without-a-size-is-malformed",
         Kind::Invalid,
         ok(Field::Missing, Field::Right, Field::Right),
         Expect::Malformed("size"),
     ),
     reply(
-        "MESH-FETCH-016",
+        "ok-reply-with-a-size-of-the-wrong-type-is-malformed",
         Kind::Invalid,
         ok(Field::WrongType, Field::Right, Field::Right),
         Expect::Malformed("size"),
     ),
     reply(
-        "MESH-FETCH-016",
+        "ok-reply-whose-size-is-not-the-byte-count-is-malformed",
         Kind::Invalid,
         ok(Field::Other, Field::Right, Field::Right),
         Expect::Malformed("size"),
     ),
     reply(
-        "MESH-FETCH-017",
+        "ok-reply-without-a-sha256-is-malformed",
         Kind::Invalid,
         ok(Field::Right, Field::Missing, Field::Right),
         Expect::Malformed("sha256"),
     ),
     reply(
-        "MESH-FETCH-017",
+        "ok-reply-with-a-sha256-of-the-wrong-type-is-malformed",
         Kind::Invalid,
         ok(Field::Right, Field::WrongType, Field::Right),
         Expect::Malformed("sha256"),
     ),
     reply(
-        "MESH-FETCH-017",
+        "ok-reply-with-a-short-sha256-is-malformed",
         Kind::Invalid,
         ok(Field::Right, Field::Short, Field::Right),
         Expect::Malformed("sha256"),
     ),
     reply(
-        "MESH-FETCH-017",
+        "not-modified-reply-without-a-sha256-is-malformed",
         Kind::Invalid,
         Answer::NotModified {
             sha256: Field::Missing,
@@ -297,7 +297,7 @@ const VECTORS: &[Vector] = &[
         Expect::Malformed("sha256"),
     ),
     reply(
-        "MESH-FETCH-017",
+        "not-modified-reply-with-a-sha256-of-the-wrong-type-is-malformed",
         Kind::Invalid,
         Answer::NotModified {
             sha256: Field::WrongType,
@@ -305,7 +305,7 @@ const VECTORS: &[Vector] = &[
         Expect::Malformed("sha256"),
     ),
     reply(
-        "MESH-FETCH-017",
+        "not-modified-reply-with-a-short-sha256-is-malformed",
         Kind::Invalid,
         Answer::NotModified {
             sha256: Field::Short,
@@ -313,31 +313,31 @@ const VECTORS: &[Vector] = &[
         Expect::Malformed("sha256"),
     ),
     reply(
-        "MESH-FETCH-018",
+        "ok-reply-whose-sha256-does-not-match-the-bytes-is-corrupt",
         Kind::Invalid,
         ok(Field::Right, Field::Other, Field::Right),
         Expect::Corrupt,
     ),
     reply(
-        "MESH-FETCH-019",
+        "ok-reply-without-bytes-is-malformed",
         Kind::Invalid,
         ok(Field::Right, Field::Right, Field::Missing),
         Expect::Malformed("bytes"),
     ),
     reply(
-        "MESH-FETCH-019",
+        "ok-reply-with-bytes-of-the-wrong-type-is-malformed",
         Kind::Invalid,
         ok(Field::Right, Field::Right, Field::WrongType),
         Expect::Malformed("bytes"),
     ),
     reply(
-        "MESH-FETCH-007",
+        "invalid-path-reply-with-an-unnamed-rule-reads-as-unknown",
         Kind::Boundary,
         Answer::InvalidPath { rule: Field::Other },
         Expect::InvalidPath("unknown"),
     ),
     reply(
-        "MESH-FETCH-007",
+        "invalid-path-reply-without-a-rule-is-malformed",
         Kind::Invalid,
         Answer::InvalidPath {
             rule: Field::Missing,
@@ -345,7 +345,7 @@ const VECTORS: &[Vector] = &[
         Expect::Malformed("rule"),
     ),
     reply(
-        "MESH-FETCH-007",
+        "invalid-path-reply-with-a-rule-of-the-wrong-type-is-malformed",
         Kind::Invalid,
         Answer::InvalidPath {
             rule: Field::WrongType,
@@ -353,7 +353,7 @@ const VECTORS: &[Vector] = &[
         Expect::Malformed("rule"),
     ),
     reply(
-        "MESH-FETCH-022",
+        "too-large-reply-without-a-limit-is-malformed",
         Kind::Invalid,
         Answer::TooLarge {
             limit: Field::Missing,
@@ -361,7 +361,7 @@ const VECTORS: &[Vector] = &[
         Expect::Malformed("limit"),
     ),
     reply(
-        "MESH-FETCH-022",
+        "too-large-reply-with-a-limit-of-the-wrong-type-is-malformed",
         Kind::Invalid,
         Answer::TooLarge {
             limit: Field::WrongType,
@@ -369,51 +369,51 @@ const VECTORS: &[Vector] = &[
         Expect::Malformed("limit"),
     ),
     reply(
-        "MESH-FETCH-023",
+        "not-shared-reply-with-extra-keys-still-reads-as-not-shared",
         Kind::Valid,
         Answer::Extras(Status::NotShared),
         Expect::NotShared,
     ),
     reply(
-        "MESH-FETCH-023",
+        "too-large-reply-with-extra-keys-still-reads-as-too-large",
         Kind::Valid,
         Answer::Extras(Status::TooLarge),
         Expect::TooLarge,
     ),
     reply(
-        "MESH-FETCH-023",
+        "not-modified-reply-with-extra-keys-still-reads-as-not-modified",
         Kind::Valid,
         Answer::Extras(Status::NotModified),
         Expect::NotModified,
     ),
     reply(
-        "MESH-FETCH-023",
+        "invalid-path-reply-with-extra-keys-still-reads-as-invalid-path",
         Kind::Valid,
         Answer::Extras(Status::InvalidPath),
         Expect::InvalidPath("segment"),
     ),
     Vector {
-        id: "MESH-FETCH-006",
+        name: "symlink-escaping-the-root-is-not-shared",
         kind: Kind::Invalid,
         case: Case::EscapingLink,
     },
     Vector {
-        id: "MESH-SHARE-006",
+        name: "deny-on-the-target-holds-through-an-alias-symlink",
         kind: Kind::Valid,
         case: Case::DenyThroughAlias,
     },
     Vector {
-        id: "MESH-SHARE-012",
+        name: "mutation-through-a-planted-symlink-is-refused",
         kind: Kind::Invalid,
         case: Case::PlantedShareFile,
     },
     Vector {
-        id: "MESH-SHARE-019",
+        name: "reference-attachment-lends-a-grant-once-the-peer-heard-it",
         kind: Kind::Valid,
         case: Case::Lend { acknowledged: true },
     },
     Vector {
-        id: "MESH-SHARE-019",
+        name: "unheard-reference-attachment-takes-its-grant-back",
         kind: Kind::Invalid,
         case: Case::Lend {
             acknowledged: false,
@@ -425,11 +425,29 @@ pub(super) fn listed() -> Vec<Listed> {
     VECTORS
         .iter()
         .map(|row| Listed {
-            id: row.id,
+            name: row.name,
             kind: row.kind,
             family: row.case.family(),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::VECTORS;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn every_row_has_a_unique_name() {
+        let mut seen = BTreeSet::new();
+        for row in VECTORS {
+            assert!(
+                seen.insert(row.name),
+                "duplicate vector name {:?}",
+                row.name
+            );
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -1212,7 +1230,7 @@ mod loopback {
             if let Err(payload) = outcome {
                 failures.push(format!(
                     "{} [{}]: {}",
-                    row.id,
+                    row.name,
                     row.case.family(),
                     panic_message(payload)
                 ));
@@ -1324,7 +1342,7 @@ mod loopback {
             assert!(
                 DRIVEN.contains(&group),
                 "{} [{group:?}] has no test",
-                row.id
+                row.name
             );
         }
     }

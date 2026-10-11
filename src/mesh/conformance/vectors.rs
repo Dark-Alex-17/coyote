@@ -105,7 +105,7 @@ use tokio_util::sync::CancellationToken;
 
 /// One requirement id, one input, one mandated receiver action.
 struct Vector {
-    id: &'static str,
+    name: &'static str,
     kind: Kind,
     case: Case,
     /// Set when the row is faithful to the spec and the code does not honour it; the
@@ -301,7 +301,7 @@ pub(super) fn listed() -> Vec<Listed> {
     vectors()
         .iter()
         .map(|vector| Listed {
-            id: vector.id,
+            name: vector.name,
             kind: vector.kind,
             family: vector.case.family(),
         })
@@ -579,9 +579,9 @@ const IDENTITY_B: &str = "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b";
 const DESTINATION_A: &str = "d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1";
 const DESTINATION_B: &str = "d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2d2";
 
-fn row(id: &'static str, kind: Kind, case: Case) -> Vector {
+fn row(name: &'static str, kind: Kind, case: Case) -> Vector {
     Vector {
-        id,
+        name,
         kind,
         case,
         known_divergence: None,
@@ -1399,8 +1399,8 @@ fn dest_vectors() -> Vec<Vector> {
 // Section 5.1 and 5.2: the Coyote announce
 // ---------------------------------------------------------------------------------------
 
-fn announce(id: &'static str, kind: Kind, app_data: Vec<u8>, expect: AnnounceAction) -> Vector {
-    row(id, kind, Case::Announce { app_data, expect })
+fn announce(name: &'static str, kind: Kind, app_data: Vec<u8>, expect: AnnounceAction) -> Vector {
+    row(name, kind, Case::Announce { app_data, expect })
 }
 
 fn recorded(version: u16, display_name: Option<&str>) -> AnnounceAction {
@@ -1411,13 +1411,13 @@ fn recorded(version: u16, display_name: Option<&str>) -> AnnounceAction {
 }
 
 fn encode(
-    id: &'static str,
+    name: &'static str,
     kind: Kind,
     display_name: Option<&str>,
     expect: EncodeAction,
 ) -> Vector {
     row(
-        id,
+        name,
         kind,
         Case::AnnounceEncode {
             version: MESH_PROTOCOL_VERSION,
@@ -1442,7 +1442,7 @@ fn private() -> MeshInterface {
 }
 
 fn policy(
-    id: &'static str,
+    name: &'static str,
     kind: Kind,
     display_name: Option<&'static str>,
     interfaces: Vec<MeshInterface>,
@@ -1450,7 +1450,7 @@ fn policy(
     expect: Option<&'static str>,
 ) -> Vector {
     row(
-        id,
+        name,
         kind,
         Case::AnnouncePolicy {
             display_name,
@@ -1964,9 +1964,9 @@ fn announce_vectors() -> Vec<Vector> {
 // Section 5.4: propagation node announces
 // ---------------------------------------------------------------------------------------
 
-fn pn_row(id: &'static str, kind: Kind, app_data: Vec<u8>, expect: PnAction) -> Vector {
+fn pn_row(name: &'static str, kind: Kind, app_data: Vec<u8>, expect: PnAction) -> Vector {
     row(
-        id,
+        name,
         kind,
         Case::PnAnnounce {
             app_data,
@@ -2549,14 +2549,14 @@ fn pn_vectors() -> Vec<Vector> {
 // ---------------------------------------------------------------------------------------
 
 fn text_row(
-    id: &'static str,
+    name: &'static str,
     kind: Kind,
     input: &str,
     max_chars: usize,
     expect: Option<&str>,
 ) -> Vector {
     row(
-        id,
+        name,
         kind,
         Case::Text {
             input: input.to_string(),
@@ -2567,12 +2567,12 @@ fn text_row(
 }
 
 fn hash_row(
-    id: &'static str,
+    name: &'static str,
     kind: Kind,
     input: &'static str,
     expect: Option<&'static str>,
 ) -> Vector {
-    row(id, kind, Case::HashText { input, expect })
+    row(name, kind, Case::HashText { input, expect })
 }
 
 fn canon_vectors() -> Vec<Vector> {
@@ -4248,9 +4248,9 @@ fn time_vectors() -> Vec<Vector> {
 // Section 8.1 and 8.6: the knock body and the knock over LXMF
 // ---------------------------------------------------------------------------------------
 
-fn knock_body(id: &'static str, kind: Kind, body: Option<Value>, expect: Option<&str>) -> Vector {
+fn knock_body(name: &'static str, kind: Kind, body: Option<Value>, expect: Option<&str>) -> Vector {
     row(
-        id,
+        name,
         kind,
         Case::KnockBody {
             body,
@@ -4264,12 +4264,12 @@ fn intro(value: Value) -> Option<Value> {
 }
 
 fn lxmf_knock(
-    id: &'static str,
+    name: &'static str,
     kind: Kind,
     message: InboundMessage,
     expect: KnockMessage,
 ) -> Vector {
-    row(id, kind, Case::LxmfKnock { message, expect })
+    row(name, kind, Case::LxmfKnock { message, expect })
 }
 
 fn knock_vectors() -> Vec<Vector> {
@@ -4654,8 +4654,8 @@ fn knock_vectors() -> Vec<Vector> {
 // Section 9: the status card
 // ---------------------------------------------------------------------------------------
 
-fn card(id: &'static str, kind: Kind, value: Value, expect: CardAction) -> Vector {
-    row(id, kind, Case::Card { value, expect })
+fn card(name: &'static str, kind: Kind, value: Value, expect: CardAction) -> Vector {
+    row(name, kind, Case::Card { value, expect })
 }
 
 fn malformed(text: &'static str) -> CardAction {
@@ -5987,17 +5987,17 @@ fn status_vectors() -> Vec<Vector> {
 // Section 10: the message body, the acknowledgement, the typed refusal and the LXMF form
 // ---------------------------------------------------------------------------------------
 
-fn message(id: &'static str, kind: Kind, value: Value, expect: BodyAction) -> Vector {
-    row(id, kind, Case::MessageBody { value, expect })
+fn message(name: &'static str, kind: Kind, value: Value, expect: BodyAction) -> Vector {
+    row(name, kind, Case::MessageBody { value, expect })
 }
 
 fn refused(reason: &'static str) -> BodyAction {
     BodyAction::InvalidData(reason)
 }
 
-fn ack(id: &'static str, kind: Kind, value: Value, expect: bool) -> Vector {
+fn ack(name: &'static str, kind: Kind, value: Value, expect: bool) -> Vector {
     row(
-        id,
+        name,
         kind,
         Case::Ack {
             value,
@@ -6007,8 +6007,8 @@ fn ack(id: &'static str, kind: Kind, value: Value, expect: bool) -> Vector {
     )
 }
 
-fn lxmf_peer(id: &'static str, kind: Kind, message: InboundMessage, expect: PeerLxmf) -> Vector {
-    row(id, kind, Case::LxmfPeer { message, expect })
+fn lxmf_peer(name: &'static str, kind: Kind, message: InboundMessage, expect: PeerLxmf) -> Vector {
+    row(name, kind, Case::LxmfPeer { message, expect })
 }
 
 fn peer_malformed(reason: &'static str) -> PeerLxmf {
@@ -6016,7 +6016,7 @@ fn peer_malformed(reason: &'static str) -> PeerLxmf {
 }
 
 fn outbound_row(
-    id: &'static str,
+    name: &'static str,
     kind: Kind,
     content: &str,
     title: Option<&str>,
@@ -6025,7 +6025,7 @@ fn outbound_row(
     expect: OutboundAction,
 ) -> Vector {
     row(
-        id,
+        name,
         kind,
         Case::Outbound {
             kind: PeerKind::Message,
@@ -11152,7 +11152,7 @@ mod tests {
             .filter(|vector| vector.case.family() == family)
         {
             ran += 1;
-            let tag = format!("{} [{family}, {:?}]", vector.id, vector.kind);
+            let tag = format!("{} [{family}, {:?}]", vector.name, vector.kind);
             match (run(&vector.case), vector.known_divergence) {
                 (Ok(()), None) => {}
                 (Err(detail), None) => failures.push(format!("{tag}: {detail}")),
