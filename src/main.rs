@@ -5,6 +5,8 @@ mod config;
 mod function;
 mod graph;
 mod hooks;
+#[cfg(test)]
+mod hygiene_pins;
 mod rag;
 mod render;
 mod repl;
