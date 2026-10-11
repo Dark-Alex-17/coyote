@@ -1,12 +1,11 @@
-//! Requirement-id keyed vectors for the share side of the protocol: the wire-path grammar
-//! of section 10.13 and the three places that reuse it, the share set and the grant store
-//! of section 10.17, the `/list` and `/fetch` handlers and requesters of sections 10.14
-//! and 10.15, and the on-disk versioning of section 14.1 for the stores they read. Every
-//! row runs in-process against this crate's own `WirePath`, `ShareSet`, `GrantStore`,
-//! `ListHandler`, `FetchHandler`, `SharesPage`, `RequestClient` and record types, on a share
-//! root the row builds in a temporary directory.
+//! Vectors for the share side of the protocol: the wire-path grammar and the three places
+//! that reuse it, the share set and the grant store, the `/list` and `/fetch` handlers and
+//! requesters, and the on-disk versioning of the stores they read. Every row runs
+//! in-process against this crate's own `WirePath`, `ShareSet`, `GrantStore`, `ListHandler`,
+//! `FetchHandler`, `SharesPage`, `RequestClient` and record types, on a share root the row
+//! builds in a temporary directory.
 //!
-//! Every row names the id it exercises and the receiver action the spec mandates for it. A
+//! Every row carries a descriptive name and the receiver action expected of it. A
 //! row written faithfully from the spec that the code does not honour is kept as written
 //! and flagged with `known_divergence`; the executor prints such a row instead of asserting
 //! it, and fails when the flag goes stale.
@@ -64,7 +63,7 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime};
 use tokio::sync::oneshot::error::TryRecvError;
 
-/// One requirement id, one input, one mandated receiver action.
+/// One named input and the receiver action expected of it.
 struct Vector {
     name: &'static str,
     kind: Kind,
@@ -82,21 +81,21 @@ type Check = fn() -> Result<(), String>;
 /// The input and expectation of a row, one variant per surface under test. The variant
 /// name is the family label `all_listed` carries for the row.
 enum Case {
-    /// `WirePath::parse` and the decoders that reuse it, section 10.13.
+    /// `WirePath::parse` and the decoders that reuse it.
     WirePath(WireProbe),
-    /// `ShareSet` on a share root built for the row, section 10.17.
+    /// `ShareSet` on a share root built for the row.
     ShareSet(ShareProbe),
-    /// `GrantStore` in a cache directory built for the row, section 10.17.
+    /// `GrantStore` in a cache directory built for the row.
     GrantStore(Check),
     /// The version discipline of the share files, the grant store and the inbound
-    /// record, section 14.1.
+    /// record.
     StoreSchema(SchemaProbe),
-    /// `ListHandler` over a share root built for the row, section 10.14.
+    /// `ListHandler` over a share root built for the row.
     ListServe(ListProbe),
-    /// `FetchHandler` over a share root built for the row, section 10.15.
+    /// `FetchHandler` over a share root built for the row.
     FetchServe(FetchProbe),
     /// The requester's side of both paths: `SharesPage`, the inbox staging, the response
-    /// bound of `RequestClient` and the card keys of section 9 that announce the paths.
+    /// bound of `RequestClient` and the card keys that announce the paths.
     FetchClient(ClientProbe),
 }
 
@@ -3109,68 +3108,173 @@ fn wire_path_rows() -> Vec<Vector> {
     let sixty_five = vec!["a"; WIRE_PATH_MAX_SEGMENTS + 1].join("/");
     let mut rows = vec![
         // The fourteen rules, in `RULES` order.
-        parse("MESH-FETCH-003", Invalid, "", Err("empty")),
+        parse("wire-path-empty-is-refused", Invalid, "", Err("empty")),
         parse(
-            "MESH-FETCH-003",
+            "wire-path-one-over-the-byte-cap-is-refused-as-length",
             Invalid,
             "a".repeat(WIRE_PATH_MAX_BYTES + 1),
             Err("length"),
         ),
         parse(
-            "MESH-FETCH-003",
+            "wire-path-at-the-byte-cap-is-accepted",
             Boundary,
             "a".repeat(WIRE_PATH_MAX_BYTES),
             Ok(()),
         ),
-        parse("MESH-FETCH-003", Invalid, "a\tb", Err("control")),
-        parse("MESH-FETCH-003", Invalid, "a\u{200B}b", Err("invisible")),
-        parse("MESH-FETCH-003", Invalid, "docs\\a.md", Err("backslash")),
         parse(
-            "MESH-FETCH-003",
+            "wire-path-tab-is-refused-as-control",
+            Invalid,
+            "a\tb",
+            Err("control"),
+        ),
+        parse(
+            "wire-path-zero-width-space-is-refused-as-invisible",
+            Invalid,
+            "a\u{200B}b",
+            Err("invisible"),
+        ),
+        parse(
+            "wire-path-backslash-is-refused",
+            Invalid,
+            "docs\\a.md",
+            Err("backslash"),
+        ),
+        parse(
+            "wire-path-leading-slash-is-refused",
             Invalid,
             "/etc/passwd",
             Err("leading_slash"),
         ),
-        parse("MESH-FETCH-003", Invalid, "c:/x", Err("drive_letter")),
         parse(
-            "MESH-FETCH-003",
+            "wire-path-drive-letter-is-refused",
+            Invalid,
+            "c:/x",
+            Err("drive_letter"),
+        ),
+        parse(
+            "wire-path-colon-in-a-segment-is-refused",
             Invalid,
             "docs/x:Zone.Identifier",
             Err("colon"),
         ),
-        parse("MESH-FETCH-003", Invalid, "cafe\u{301}.md", Err("nfc")),
-        parse("MESH-FETCH-003", Valid, "caf\u{E9}.md", Ok(())),
-        parse("MESH-FETCH-003", Invalid, sixty_five, Err("segments")),
-        parse("MESH-FETCH-003", Boundary, sixty_four, Ok(())),
-        parse("MESH-FETCH-003", Invalid, "docs//a.md", Err("segment")),
-        parse("MESH-FETCH-003", Invalid, "docs/../a.md", Err("segment")),
-        parse("MESH-FETCH-003", Invalid, "docs./a.md", Err("trailing_dot")),
         parse(
-            "MESH-FETCH-003",
+            "wire-path-decomposed-accent-is-refused-as-nfc",
+            Invalid,
+            "cafe\u{301}.md",
+            Err("nfc"),
+        ),
+        parse(
+            "wire-path-nfc-normalised-form-is-kept",
+            Valid,
+            "caf\u{E9}.md",
+            Ok(()),
+        ),
+        parse(
+            "wire-path-one-over-the-segment-cap-is-refused",
+            Invalid,
+            sixty_five,
+            Err("segments"),
+        ),
+        parse(
+            "wire-path-at-the-segment-cap-is-accepted",
+            Boundary,
+            sixty_four,
+            Ok(()),
+        ),
+        parse(
+            "wire-path-empty-segment-is-refused",
+            Invalid,
+            "docs//a.md",
+            Err("segment"),
+        ),
+        parse(
+            "wire-path-dot-dot-segment-is-refused",
+            Invalid,
+            "docs/../a.md",
+            Err("segment"),
+        ),
+        parse(
+            "wire-path-trailing-dot-segment-is-refused",
+            Invalid,
+            "docs./a.md",
+            Err("trailing_dot"),
+        ),
+        parse(
+            "wire-path-trailing-space-segment-is-refused",
             Invalid,
             "docs /a.md",
             Err("trailing_space"),
         ),
         parse(
-            "MESH-FETCH-003",
+            "wire-path-reserved-device-name-with-extension-is-refused",
             Invalid,
             "docs/CON.txt",
             Err("reserved_name"),
         ),
-        parse("MESH-FETCH-003", Invalid, "com1.md", Err("reserved_name")),
-        parse("MESH-FETCH-003", Valid, "docs/a.md", Ok(())),
-        parse("MESH-FETCH-003", Valid, "src/mesh/peer.rs", Ok(())),
+        parse(
+            "wire-path-lowercase-reserved-device-name-is-refused",
+            Invalid,
+            "com1.md",
+            Err("reserved_name"),
+        ),
+        parse(
+            "wire-path-plain-two-segment-path-is-accepted",
+            Valid,
+            "docs/a.md",
+            Ok(()),
+        ),
+        parse(
+            "wire-path-plain-three-segment-path-is-accepted",
+            Valid,
+            "src/mesh/peer.rs",
+            Ok(()),
+        ),
         // Precedence: the first rule broken names the refusal.
-        parse("MESH-FETCH-003", Invalid, "a\0b", Err("control")),
-        parse("MESH-FETCH-003", Invalid, "C:\\x", Err("backslash")),
-        parse("MESH-FETCH-003", Invalid, "C:x", Err("drive_letter")),
-        parse("MESH-FETCH-003", Invalid, "cafe\u{301}/../x", Err("nfc")),
-        parse("MESH-FETCH-003", Invalid, ".", Err("segment")),
-        parse("MESH-FETCH-003", Invalid, "..", Err("segment")),
-        parse("MESH-FETCH-003", Invalid, "con.", Err("trailing_dot")),
+        parse(
+            "wire-path-nul-is-refused-as-control-before-invisible",
+            Invalid,
+            "a\0b",
+            Err("control"),
+        ),
+        parse(
+            "wire-path-backslash-is-refused-before-drive-letter",
+            Invalid,
+            "C:\\x",
+            Err("backslash"),
+        ),
+        parse(
+            "wire-path-drive-letter-is-refused-before-colon",
+            Invalid,
+            "C:x",
+            Err("drive_letter"),
+        ),
+        parse(
+            "wire-path-nfc-is-refused-before-segment",
+            Invalid,
+            "cafe\u{301}/../x",
+            Err("nfc"),
+        ),
+        parse(
+            "wire-path-single-dot-is-refused-as-a-segment-not-a-trailing-dot",
+            Invalid,
+            ".",
+            Err("segment"),
+        ),
+        parse(
+            "wire-path-double-dot-is-refused-as-a-segment-not-a-trailing-dot",
+            Invalid,
+            "..",
+            Err("segment"),
+        ),
+        parse(
+            "wire-path-con-dot-is-refused-as-trailing-dot-before-reserved-name",
+            Invalid,
+            "con.",
+            Err("trailing_dot"),
+        ),
         // The rule vocabulary.
         row(
-            "MESH-FETCH-003",
+            "unknown-rule-id-is-not-a-known-rule",
             Invalid,
             Case::WirePath(WireProbe::RuleId {
                 rule: "unknown",
@@ -3178,7 +3282,7 @@ fn wire_path_rows() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-FETCH-003",
+            "capitalised-rule-id-is-not-a-known-rule",
             Invalid,
             Case::WirePath(WireProbe::RuleId {
                 rule: "Segment",
@@ -3186,7 +3290,7 @@ fn wire_path_rows() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-FETCH-003",
+            "empty-rule-id-is-not-a-known-rule",
             Invalid,
             Case::WirePath(WireProbe::RuleId {
                 rule: "",
@@ -3195,7 +3299,7 @@ fn wire_path_rows() -> Vec<Vector> {
         ),
         // Every path on the wire passes the same gate.
         row(
-            "MESH-FETCH-005",
+            "access-paths-that-all-parse-are-accepted",
             Valid,
             Case::WirePath(WireProbe::AccessPaths {
                 paths: &["docs/a.md", "src/b.rs"],
@@ -3203,7 +3307,7 @@ fn wire_path_rows() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-FETCH-005",
+            "access-paths-with-a-traversal-are-not-accepted",
             Invalid,
             Case::WirePath(WireProbe::AccessPaths {
                 paths: &["docs/a.md", "../etc/passwd"],
@@ -3211,7 +3315,7 @@ fn wire_path_rows() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-FETCH-005",
+            "access-paths-with-a-leading-slash-are-not-accepted",
             Invalid,
             Case::WirePath(WireProbe::AccessPaths {
                 paths: &["/etc/passwd"],
@@ -3219,7 +3323,7 @@ fn wire_path_rows() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-FETCH-005",
+            "list-entry-with-a-plain-path-is-kept",
             Valid,
             Case::WirePath(WireProbe::ListEntry {
                 path: "docs/a.md",
@@ -3227,7 +3331,7 @@ fn wire_path_rows() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-FETCH-005",
+            "list-entry-with-a-backslash-path-is-dropped",
             Invalid,
             Case::WirePath(WireProbe::ListEntry {
                 path: "docs\\a.md",
@@ -3235,7 +3339,7 @@ fn wire_path_rows() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-FETCH-005",
+            "list-entry-with-a-traversal-path-is-dropped",
             Invalid,
             Case::WirePath(WireProbe::ListEntry {
                 path: "../a.md",
@@ -3243,7 +3347,7 @@ fn wire_path_rows() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-FETCH-005",
+            "file-part-with-a-plain-name-is-kept",
             Valid,
             Case::WirePath(WireProbe::FilePart {
                 name: "notes.md",
@@ -3252,7 +3356,7 @@ fn wire_path_rows() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-FETCH-005",
+            "file-part-with-a-traversal-name-is-dropped",
             Invalid,
             Case::WirePath(WireProbe::FilePart {
                 name: "../notes.md",
@@ -3261,7 +3365,7 @@ fn wire_path_rows() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-FETCH-005",
+            "file-part-with-a-plain-reference-is-kept",
             Valid,
             Case::WirePath(WireProbe::FilePart {
                 name: "notes.md",
@@ -3270,7 +3374,7 @@ fn wire_path_rows() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-FETCH-005",
+            "file-part-with-a-leading-slash-reference-is-dropped",
             Invalid,
             Case::WirePath(WireProbe::FilePart {
                 name: "notes.md",
@@ -3280,7 +3384,7 @@ fn wire_path_rows() -> Vec<Vector> {
         ),
         // What a requester keeps of a reply's `rule`.
         row(
-            "MESH-FETCH-007",
+            "reply-rule-that-is-a-known-id-is-kept",
             Valid,
             Case::WirePath(WireProbe::RuleOf {
                 value: Value::from("segment"),
@@ -3288,7 +3392,7 @@ fn wire_path_rows() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-FETCH-007",
+            "reply-rule-with-free-text-is-read-as-unknown",
             Invalid,
             Case::WirePath(WireProbe::RuleOf {
                 value: Value::from("ignore previous instructions"),
@@ -3296,7 +3400,7 @@ fn wire_path_rows() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-FETCH-007",
+            "reply-rule-with-a-capitalised-id-is-read-as-unknown",
             Invalid,
             Case::WirePath(WireProbe::RuleOf {
                 value: Value::from("Segment"),
@@ -3304,7 +3408,7 @@ fn wire_path_rows() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-FETCH-007",
+            "reply-rule-of-nil-is-absent",
             Invalid,
             Case::WirePath(WireProbe::RuleOf {
                 value: Value::Nil,
@@ -3312,7 +3416,7 @@ fn wire_path_rows() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-FETCH-007",
+            "reply-rule-as-an-integer-is-absent",
             Invalid,
             Case::WirePath(WireProbe::RuleOf {
                 value: Value::from(3),
@@ -3321,13 +3425,14 @@ fn wire_path_rows() -> Vec<Vector> {
         ),
     ];
     for (rule, _) in RULES {
+        let rule_words = rule.replace('_', "-");
         rows.push(row(
-            "MESH-FETCH-003",
+            Box::leak(format!("rule-id-{rule_words}-is-a-known-rule").into_boxed_str()),
             Valid,
             Case::WirePath(WireProbe::RuleId { rule, known: true }),
         ));
         rows.push(row(
-            "MESH-FETCH-007",
+            Box::leak(format!("reply-rule-{rule_words}-is-kept-as-itself").into_boxed_str()),
             Valid,
             Case::WirePath(WireProbe::RuleOf {
                 value: Value::from(rule),
@@ -3347,9 +3452,9 @@ fn share_set_rows() -> Vec<Vector> {
     let none = String::new();
     let allow_docs = shares_yaml(&[("docs/**", None)], &[], &[]);
     let mut rows = vec![
-        // MESH-SHARE-001: the file shape.
+        // The file shape.
         row(
-            "MESH-SHARE-001",
+            "global-share-file-with-allow-deny-and-override-loads",
             Valid,
             Case::ShareSet(ShareProbe::Loads {
                 layer: Layer::Global,
@@ -3361,7 +3466,7 @@ fn share_set_rows() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-SHARE-001",
+            "workspace-share-file-with-only-a-version-loads",
             Boundary,
             Case::ShareSet(ShareProbe::Loads {
                 layer: Layer::Workspace,
@@ -3369,7 +3474,7 @@ fn share_set_rows() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-SHARE-001",
+            "share-file-with-an-unknown-top-level-key-is-refused",
             Invalid,
             Case::ShareSet(ShareProbe::Poisoned {
                 layer: Layer::Global,
@@ -3377,7 +3482,7 @@ fn share_set_rows() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-SHARE-001",
+            "share-file-allow-entry-with-an-unknown-field-is-refused",
             Invalid,
             Case::ShareSet(ShareProbe::Poisoned {
                 layer: Layer::Global,
@@ -3387,13 +3492,13 @@ fn share_set_rows() -> Vec<Vector> {
             }),
         ),
         share_check(
-            "MESH-SHARE-001",
+            "non-canonical-peer-is-refused-at-write-and-matches-nobody-on-disk",
             Invalid,
             a_noncanonical_peer_is_refused_at_write_and_matches_nobody_on_disk,
         ),
-        // MESH-SHARE-002: patterns and overrides.
+        // Patterns and overrides.
         row(
-            "MESH-SHARE-002",
+            "pattern-with-a-double-star-is-valid",
             Valid,
             Case::ShareSet(ShareProbe::Pattern {
                 text: "docs/**",
@@ -3401,7 +3506,7 @@ fn share_set_rows() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-SHARE-002",
+            "pattern-with-a-single-star-in-the-file-name-is-valid",
             Valid,
             Case::ShareSet(ShareProbe::Pattern {
                 text: "src/*.rs",
@@ -3409,7 +3514,7 @@ fn share_set_rows() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-SHARE-002",
+            "pattern-of-a-bare-double-star-is-valid",
             Valid,
             Case::ShareSet(ShareProbe::Pattern {
                 text: "**",
@@ -3417,7 +3522,7 @@ fn share_set_rows() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-SHARE-002",
+            "pattern-with-a-backslash-is-invalid",
             Invalid,
             Case::ShareSet(ShareProbe::Pattern {
                 text: "docs\\**",
@@ -3425,7 +3530,7 @@ fn share_set_rows() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-SHARE-002",
+            "pattern-with-a-leading-slash-is-invalid",
             Invalid,
             Case::ShareSet(ShareProbe::Pattern {
                 text: "/docs/**",
@@ -3433,7 +3538,7 @@ fn share_set_rows() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-SHARE-002",
+            "pattern-with-a-drive-letter-is-invalid",
             Invalid,
             Case::ShareSet(ShareProbe::Pattern {
                 text: "C:/docs/**",
@@ -3441,7 +3546,7 @@ fn share_set_rows() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-SHARE-002",
+            "pattern-with-a-dot-dot-segment-is-invalid",
             Invalid,
             Case::ShareSet(ShareProbe::Pattern {
                 text: "docs/../**",
@@ -3449,7 +3554,7 @@ fn share_set_rows() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-SHARE-002",
+            "pattern-with-a-leading-dot-segment-is-invalid",
             Invalid,
             Case::ShareSet(ShareProbe::Pattern {
                 text: "./docs/**",
@@ -3457,7 +3562,7 @@ fn share_set_rows() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-SHARE-002",
+            "pattern-with-an-empty-segment-is-invalid",
             Invalid,
             Case::ShareSet(ShareProbe::Pattern {
                 text: "docs//**",
@@ -3465,7 +3570,7 @@ fn share_set_rows() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-SHARE-002",
+            "override-of-a-literal-path-is-valid",
             Valid,
             Case::ShareSet(ShareProbe::Override {
                 text: "docs/.env.example",
@@ -3473,7 +3578,7 @@ fn share_set_rows() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-SHARE-002",
+            "override-with-a-star-is-invalid",
             Invalid,
             Case::ShareSet(ShareProbe::Override {
                 text: "docs/*",
@@ -3481,7 +3586,7 @@ fn share_set_rows() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-SHARE-002",
+            "override-with-a-question-mark-is-invalid",
             Invalid,
             Case::ShareSet(ShareProbe::Override {
                 text: "docs/.env?",
@@ -3489,7 +3594,7 @@ fn share_set_rows() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-SHARE-002",
+            "override-with-a-leading-slash-is-invalid",
             Invalid,
             Case::ShareSet(ShareProbe::Override {
                 text: "/etc/.env",
@@ -3497,7 +3602,7 @@ fn share_set_rows() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-SHARE-002",
+            "override-with-a-dot-dot-segment-is-invalid",
             Invalid,
             Case::ShareSet(ShareProbe::Override {
                 text: "docs/../.env",
@@ -3505,7 +3610,7 @@ fn share_set_rows() -> Vec<Vector> {
             }),
         ),
         verdict(
-            "MESH-SHARE-002",
+            "single-star-matches-a-file-in-the-directory",
             Valid,
             shares_yaml(&[("docs/*", None)], &[], &[]),
             none.clone(),
@@ -3514,7 +3619,7 @@ fn share_set_rows() -> Vec<Vector> {
             Some(Shared),
         ),
         verdict(
-            "MESH-SHARE-002",
+            "single-star-does-not-cross-a-directory-boundary",
             Boundary,
             shares_yaml(&[("docs/*", None)], &[], &[]),
             none.clone(),
@@ -3523,7 +3628,7 @@ fn share_set_rows() -> Vec<Vector> {
             Some(NotAllowed),
         ),
         verdict(
-            "MESH-SHARE-002",
+            "double-star-crosses-directory-boundaries",
             Valid,
             shares_yaml(&[("docs/**", None)], &[], &[]),
             none.clone(),
@@ -3532,7 +3637,7 @@ fn share_set_rows() -> Vec<Vector> {
             Some(Shared),
         ),
         verdict(
-            "MESH-SHARE-002",
+            "question-mark-does-not-match-a-slash",
             Boundary,
             shares_yaml(&[("docs/a?.md", None)], &[], &[]),
             none.clone(),
@@ -3541,16 +3646,16 @@ fn share_set_rows() -> Vec<Vector> {
             Some(NotAllowed),
         ),
         row(
-            "MESH-SHARE-002",
+            "share-file-with-a-glob-in-an-override-is-refused",
             Invalid,
             Case::ShareSet(ShareProbe::Poisoned {
                 layer: Layer::Global,
                 text: shares_yaml(&[], &[], &["docs/*"]),
             }),
         ),
-        // MESH-SHARE-003: a refused file fails the set closed.
+        // A refused file fails the set closed.
         row(
-            "MESH-SHARE-003",
+            "share-file-with-an-absolute-deny-pattern-is-refused",
             Invalid,
             Case::ShareSet(ShareProbe::Poisoned {
                 layer: Layer::Global,
@@ -3558,7 +3663,7 @@ fn share_set_rows() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-SHARE-003",
+            "workspace-share-file-with-a-traversal-allow-pattern-is-refused",
             Invalid,
             Case::ShareSet(ShareProbe::Poisoned {
                 layer: Layer::Workspace,
@@ -3566,7 +3671,7 @@ fn share_set_rows() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-SHARE-003",
+            "share-file-with-malformed-yaml-is-refused",
             Invalid,
             Case::ShareSet(ShareProbe::Poisoned {
                 layer: Layer::Workspace,
@@ -3574,13 +3679,13 @@ fn share_set_rows() -> Vec<Vector> {
             }),
         ),
         share_check(
-            "MESH-SHARE-003",
+            "refused-file-serves-nothing-from-either-layer-and-takes-no-mutation",
             Invalid,
             a_refused_file_serves_nothing_from_either_layer_and_takes_no_mutation,
         ),
-        // MESH-SHARE-004: the order of judgement.
+        // The order of judgement.
         verdict(
-            "MESH-SHARE-004",
+            "protected-path-wins-over-allow-deny-and-override",
             Invalid,
             shares_yaml(&[("**", None)], &[".git/**"], &[".git/config"]),
             none.clone(),
@@ -3589,7 +3694,7 @@ fn share_set_rows() -> Vec<Vector> {
             Some(Protected),
         ),
         verdict(
-            "MESH-SHARE-004",
+            "user-deny-wins-over-an-override-of-a-built-in-deny",
             Invalid,
             shares_yaml(&[("**", None)], &[".env"], &[".env"]),
             none.clone(),
@@ -3598,7 +3703,7 @@ fn share_set_rows() -> Vec<Vector> {
             Some(Denied),
         ),
         verdict(
-            "MESH-SHARE-004",
+            "built-in-deny-wins-over-an-allow-all",
             Invalid,
             allow_all(),
             none.clone(),
@@ -3607,7 +3712,7 @@ fn share_set_rows() -> Vec<Vector> {
             Some(BuiltinDenied),
         ),
         verdict(
-            "MESH-SHARE-004",
+            "override-lifts-the-built-in-deny-under-an-allow",
             Valid,
             shares_yaml(&[("**", None)], &[], &[".env"]),
             none.clone(),
@@ -3616,7 +3721,7 @@ fn share_set_rows() -> Vec<Vector> {
             Some(Shared),
         ),
         verdict(
-            "MESH-SHARE-004",
+            "allowed-path-under-no-deny-is-shared",
             Valid,
             allow_docs.clone(),
             none.clone(),
@@ -3625,7 +3730,7 @@ fn share_set_rows() -> Vec<Vector> {
             Some(Shared),
         ),
         verdict(
-            "MESH-SHARE-004",
+            "path-outside-every-allow-is-not-allowed",
             Boundary,
             allow_docs.clone(),
             none.clone(),
@@ -3634,7 +3739,7 @@ fn share_set_rows() -> Vec<Vector> {
             Some(NotAllowed),
         ),
         verdict(
-            "MESH-SHARE-004",
+            "workspace-deny-beats-a-global-allow",
             Invalid,
             allow_all(),
             shares_yaml(&[], &["docs/**"], &[]),
@@ -3643,7 +3748,7 @@ fn share_set_rows() -> Vec<Vector> {
             Some(Denied),
         ),
         verdict(
-            "MESH-SHARE-004",
+            "global-deny-beats-a-workspace-allow",
             Invalid,
             shares_yaml(&[], &["docs/**"], &[]),
             allow_all(),
@@ -3652,7 +3757,7 @@ fn share_set_rows() -> Vec<Vector> {
             Some(Denied),
         ),
         verdict(
-            "MESH-SHARE-004",
+            "deny-in-the-other-layer-leaves-an-unmatched-path-shared",
             Valid,
             shares_yaml(&[], &["docs/**"], &[]),
             allow_all(),
@@ -3661,7 +3766,7 @@ fn share_set_rows() -> Vec<Vector> {
             Some(Shared),
         ),
         verdict(
-            "MESH-SHARE-004",
+            "missing-file-with-no-share-files-has-no-verdict",
             Boundary,
             none.clone(),
             none.clone(),
@@ -3669,9 +3774,9 @@ fn share_set_rows() -> Vec<Vector> {
             "docs/missing.md",
             None,
         ),
-        // MESH-SHARE-005: protected directories.
+        // Protected directories.
         verdict(
-            "MESH-SHARE-005",
+            "git-dir-stays-protected-despite-an-override",
             Invalid,
             shares_yaml(&[("**", None)], &[], &[".git/HEAD"]),
             none.clone(),
@@ -3680,7 +3785,7 @@ fn share_set_rows() -> Vec<Vector> {
             Some(Protected),
         ),
         verdict(
-            "MESH-SHARE-005",
+            "nested-git-dir-is-protected",
             Invalid,
             allow_all(),
             none.clone(),
@@ -3689,7 +3794,7 @@ fn share_set_rows() -> Vec<Vector> {
             Some(Protected),
         ),
         verdict(
-            "MESH-SHARE-005",
+            "workspace-config-dir-stays-protected-despite-an-override",
             Invalid,
             shares_yaml(&[("**", None)], &[], &[&in_config_dir]),
             none.clone(),
@@ -3698,7 +3803,7 @@ fn share_set_rows() -> Vec<Vector> {
             Some(Protected),
         ),
         verdict(
-            "MESH-SHARE-005",
+            "share-file-itself-in-the-config-dir-is-protected",
             Invalid,
             allow_all(),
             allow_all(),
@@ -3707,7 +3812,7 @@ fn share_set_rows() -> Vec<Vector> {
             Some(Protected),
         ),
         verdict(
-            "MESH-SHARE-005",
+            "directory-whose-name-merely-starts-with-git-is-shared",
             Valid,
             allow_all(),
             none.clone(),
@@ -3716,18 +3821,18 @@ fn share_set_rows() -> Vec<Vector> {
             Some(Shared),
         ),
         share_check(
-            "MESH-SHARE-005",
+            "global-config-dir-inside-the-root-is-protected",
             Invalid,
             the_global_config_dir_inside_the_root_is_protected,
         ),
         share_check(
-            "MESH-SHARE-005",
+            "cache-dir-and-a-configured-inbox-are-protected",
             Invalid,
             the_cache_dir_and_a_configured_inbox_are_protected,
         ),
-        // MESH-SHARE-006: a user deny from either layer, on the sent name.
+        // A user deny from either layer, on the sent name.
         verdict(
-            "MESH-SHARE-006",
+            "global-deny-covers-a-path-the-same-layer-allows",
             Invalid,
             shares_yaml(&[("**", None)], &["docs/**"], &[]),
             none.clone(),
@@ -3736,7 +3841,7 @@ fn share_set_rows() -> Vec<Vector> {
             Some(Denied),
         ),
         verdict(
-            "MESH-SHARE-006",
+            "workspace-deny-covers-a-path-the-same-layer-allows",
             Invalid,
             none.clone(),
             shares_yaml(&[("**", None)], &["docs/**"], &[]),
@@ -3745,7 +3850,7 @@ fn share_set_rows() -> Vec<Vector> {
             Some(Denied),
         ),
         verdict(
-            "MESH-SHARE-006",
+            "deny-glob-matches-a-deep-path-across-layers",
             Invalid,
             allow_all(),
             shares_yaml(&[], &["**/*.md"], &[]),
@@ -3754,7 +3859,7 @@ fn share_set_rows() -> Vec<Vector> {
             Some(Denied),
         ),
         verdict(
-            "MESH-SHARE-006",
+            "deny-leaves-a-path-outside-it-shared",
             Valid,
             shares_yaml(&[("**", None)], &["docs/**"], &[]),
             none.clone(),
@@ -3762,9 +3867,9 @@ fn share_set_rows() -> Vec<Vector> {
             "src/a.rs",
             Some(Shared),
         ),
-        // MESH-SHARE-007: the built-in deny.
+        // The built-in deny.
         verdict(
-            "MESH-SHARE-007",
+            "built-in-deny-hides-dot-env",
             Invalid,
             allow_all(),
             none.clone(),
@@ -3773,7 +3878,7 @@ fn share_set_rows() -> Vec<Vector> {
             Some(BuiltinDenied),
         ),
         verdict(
-            "MESH-SHARE-007",
+            "built-in-deny-hides-dot-env-variants",
             Invalid,
             allow_all(),
             none.clone(),
@@ -3782,7 +3887,7 @@ fn share_set_rows() -> Vec<Vector> {
             Some(BuiltinDenied),
         ),
         verdict(
-            "MESH-SHARE-007",
+            "built-in-deny-hides-pem-files",
             Invalid,
             allow_all(),
             none.clone(),
@@ -3791,7 +3896,7 @@ fn share_set_rows() -> Vec<Vector> {
             Some(BuiltinDenied),
         ),
         verdict(
-            "MESH-SHARE-007",
+            "built-in-deny-hides-key-files",
             Invalid,
             allow_all(),
             none.clone(),
@@ -3800,7 +3905,7 @@ fn share_set_rows() -> Vec<Vector> {
             Some(BuiltinDenied),
         ),
         verdict(
-            "MESH-SHARE-007",
+            "built-in-deny-hides-ssh-private-keys",
             Invalid,
             allow_all(),
             none.clone(),
@@ -3809,7 +3914,7 @@ fn share_set_rows() -> Vec<Vector> {
             Some(BuiltinDenied),
         ),
         verdict(
-            "MESH-SHARE-007",
+            "built-in-deny-hides-dot-env-at-any-depth",
             Invalid,
             allow_all(),
             none.clone(),
@@ -3818,7 +3923,7 @@ fn share_set_rows() -> Vec<Vector> {
             Some(BuiltinDenied),
         ),
         verdict(
-            "MESH-SHARE-007",
+            "built-in-deny-hides-the-git-dir-as-protected",
             Invalid,
             allow_all(),
             none.clone(),
@@ -3827,7 +3932,7 @@ fn share_set_rows() -> Vec<Vector> {
             Some(Protected),
         ),
         verdict(
-            "MESH-SHARE-007",
+            "built-in-deny-hides-the-config-dir",
             Invalid,
             allow_all(),
             none.clone(),
@@ -3836,7 +3941,7 @@ fn share_set_rows() -> Vec<Vector> {
             Some(Protected),
         ),
         verdict(
-            "MESH-SHARE-007",
+            "file-named-like-env-without-the-dot-is-shared",
             Valid,
             allow_all(),
             none.clone(),
@@ -3845,7 +3950,7 @@ fn share_set_rows() -> Vec<Vector> {
             Some(Shared),
         ),
         verdict(
-            "MESH-SHARE-007",
+            "file-named-keys-dot-md-is-shared",
             Valid,
             allow_all(),
             none.clone(),
@@ -3854,7 +3959,7 @@ fn share_set_rows() -> Vec<Vector> {
             Some(Shared),
         ),
         verdict(
-            "MESH-SHARE-007",
+            "file-named-environment-is-shared",
             Boundary,
             allow_all(),
             none.clone(),
@@ -3862,9 +3967,9 @@ fn share_set_rows() -> Vec<Vector> {
             "environment",
             Some(Shared),
         ),
-        // MESH-SHARE-008: the override.
+        // The override.
         verdict(
-            "MESH-SHARE-008",
+            "override-lifts-the-built-in-deny-on-an-example-env-file",
             Valid,
             shares_yaml(&[("**", None)], &[], &[".env.example"]),
             none.clone(),
@@ -3873,7 +3978,7 @@ fn share_set_rows() -> Vec<Vector> {
             Some(Shared),
         ),
         verdict(
-            "MESH-SHARE-008",
+            "override-of-one-file-does-not-lift-the-deny-on-another",
             Invalid,
             shares_yaml(&[("**", None)], &[], &[".env.example"]),
             none.clone(),
@@ -3882,7 +3987,7 @@ fn share_set_rows() -> Vec<Vector> {
             Some(BuiltinDenied),
         ),
         verdict(
-            "MESH-SHARE-008",
+            "override-without-an-allow-does-not-share",
             Invalid,
             shares_yaml(&[], &[], &[".env.example"]),
             none.clone(),
@@ -3891,7 +3996,7 @@ fn share_set_rows() -> Vec<Vector> {
             Some(NotAllowed),
         ),
         verdict(
-            "MESH-SHARE-008",
+            "user-deny-beats-an-override-of-the-same-file",
             Invalid,
             shares_yaml(&[("**", None)], &[".env.*"], &[".env.example"]),
             none.clone(),
@@ -3900,7 +4005,7 @@ fn share_set_rows() -> Vec<Vector> {
             Some(Denied),
         ),
         verdict(
-            "MESH-SHARE-008",
+            "workspace-override-does-not-lift-the-built-in-deny",
             Invalid,
             allow_all(),
             shares_yaml(&[], &[], &[".env.example"]),
@@ -3909,7 +4014,7 @@ fn share_set_rows() -> Vec<Vector> {
             Some(BuiltinDenied),
         ),
         verdict(
-            "MESH-SHARE-008",
+            "override-does-not-lift-a-protected-path",
             Invalid,
             shares_yaml(&[("**", None)], &[], &[".git/config"]),
             none.clone(),
@@ -3918,13 +4023,13 @@ fn share_set_rows() -> Vec<Vector> {
             Some(Protected),
         ),
         share_check(
-            "MESH-SHARE-008",
+            "workspace-override-is-read-and-shown-but-never-applied",
             Invalid,
             a_workspace_override_is_read_and_shown_but_never_applied,
         ),
-        // MESH-SHARE-009: an allow scoped to its peer.
+        // An allow scoped to its peer.
         verdict_as(
-            "MESH-SHARE-009",
+            "peer-scoped-allow-by-identity-hash-serves-that-peer",
             Valid,
             VerdictRow {
                 global: shares_yaml(&[("docs/**", Some(&identity))], &[], &[]),
@@ -3937,7 +4042,7 @@ fn share_set_rows() -> Vec<Vector> {
             },
         ),
         verdict_as(
-            "MESH-SHARE-009",
+            "peer-scoped-allow-by-destination-hash-serves-that-peer",
             Valid,
             VerdictRow {
                 global: shares_yaml(&[("docs/**", Some(&destination))], &[], &[]),
@@ -3950,7 +4055,7 @@ fn share_set_rows() -> Vec<Vector> {
             },
         ),
         verdict_as(
-            "MESH-SHARE-009",
+            "peer-scoped-allow-does-not-serve-another-peer",
             Invalid,
             VerdictRow {
                 global: shares_yaml(&[("docs/**", Some(&identity))], &[], &[]),
@@ -3963,7 +4068,7 @@ fn share_set_rows() -> Vec<Vector> {
             },
         ),
         verdict_as(
-            "MESH-SHARE-009",
+            "unscoped-allow-serves-any-peer",
             Valid,
             VerdictRow {
                 global: allow_docs.clone(),
@@ -3975,9 +4080,9 @@ fn share_set_rows() -> Vec<Vector> {
                 expect: Some(Shared),
             },
         ),
-        // MESH-SHARE-010: the case fold.
+        // The case fold.
         verdict_as(
-            "MESH-SHARE-010",
+            "case-fold-matches-a-deny-of-different-case",
             Invalid,
             VerdictRow {
                 global: shares_yaml(&[("**", None)], &["DOCS/**"], &[]),
@@ -3990,7 +4095,7 @@ fn share_set_rows() -> Vec<Vector> {
             },
         ),
         verdict_as(
-            "MESH-SHARE-010",
+            "without-case-fold-a-deny-of-different-case-does-not-match",
             Valid,
             VerdictRow {
                 global: shares_yaml(&[("**", None)], &["DOCS/**"], &[]),
@@ -4003,7 +4108,7 @@ fn share_set_rows() -> Vec<Vector> {
             },
         ),
         verdict_as(
-            "MESH-SHARE-010",
+            "case-fold-matches-an-allow-of-different-case",
             Valid,
             VerdictRow {
                 global: shares_yaml(&[("DOCS/**", None)], &[], &[]),
@@ -4016,7 +4121,7 @@ fn share_set_rows() -> Vec<Vector> {
             },
         ),
         verdict_as(
-            "MESH-SHARE-010",
+            "without-case-fold-an-allow-of-different-case-does-not-match",
             Boundary,
             VerdictRow {
                 global: shares_yaml(&[("DOCS/**", None)], &[], &[]),
@@ -4029,7 +4134,7 @@ fn share_set_rows() -> Vec<Vector> {
             },
         ),
         verdict_as(
-            "MESH-SHARE-010",
+            "case-fold-matches-the-built-in-deny-on-upper-case-dot-env",
             Invalid,
             VerdictRow {
                 global: allow_all(),
@@ -4042,7 +4147,7 @@ fn share_set_rows() -> Vec<Vector> {
             },
         ),
         verdict_as(
-            "MESH-SHARE-010",
+            "case-fold-matches-an-override-of-different-case",
             Valid,
             VerdictRow {
                 global: shares_yaml(&[("**", None)], &[], &["docs/.Env.Example"]),
@@ -4055,7 +4160,7 @@ fn share_set_rows() -> Vec<Vector> {
             },
         ),
         verdict_as(
-            "MESH-SHARE-010",
+            "without-case-fold-an-override-of-different-case-does-not-match",
             Invalid,
             VerdictRow {
                 global: shares_yaml(&[("**", None)], &[], &["docs/.Env.Example"]),
@@ -4068,19 +4173,19 @@ fn share_set_rows() -> Vec<Vector> {
             },
         ),
         share_check(
-            "MESH-SHARE-010",
+            "case-probe-answers-and-leaves-no-file-behind",
             Valid,
             the_case_probe_answers_and_leaves_no_file_behind,
         ),
-        // MESH-SHARE-011
+        // The current directory is never read.
         share_check(
-            "MESH-SHARE-011",
+            "module-never-reads-the-current-directory",
             Valid,
             the_module_never_reads_the_current_directory,
         ),
-        // MESH-SHARE-012: where a mutation lands and how it is written.
+        // Where a mutation lands and how it is written.
         row(
-            "MESH-SHARE-012",
+            "auto-scope-without-a-workspace-file-writes-the-global-file",
             Valid,
             Case::ShareSet(ShareProbe::WriteTarget {
                 workspace_exists: false,
@@ -4089,7 +4194,7 @@ fn share_set_rows() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-SHARE-012",
+            "auto-scope-with-a-workspace-file-writes-the-workspace-file",
             Valid,
             Case::ShareSet(ShareProbe::WriteTarget {
                 workspace_exists: true,
@@ -4098,7 +4203,7 @@ fn share_set_rows() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-SHARE-012",
+            "global-scope-writes-the-global-file-despite-a-workspace-file",
             Valid,
             Case::ShareSet(ShareProbe::WriteTarget {
                 workspace_exists: true,
@@ -4107,7 +4212,7 @@ fn share_set_rows() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-SHARE-012",
+            "workspace-scope-creates-the-workspace-file",
             Valid,
             Case::ShareSet(ShareProbe::WriteTarget {
                 workspace_exists: false,
@@ -4116,30 +4221,30 @@ fn share_set_rows() -> Vec<Vector> {
             }),
         ),
         share_check(
-            "MESH-SHARE-012",
+            "apply-validates-first-and-writes-the-target-atomically",
             Valid,
             apply_validates_first_and_writes_the_target_atomically,
         ),
-        // MESH-SHARE-013
+        // What a mutation logs.
         share_check(
-            "MESH-SHARE-013",
+            "mutation-logs-name-the-file-and-never-a-pattern",
             Valid,
             mutation_logs_name_the_file_and_never_a_pattern,
         ),
-        // MESH-SHARE-014: grants after the share set.
+        // Grants after the share set.
         share_check(
-            "MESH-SHARE-014",
+            "grant-serves-a-not-allowed-file-once-and-never-a-denied-one",
             Valid,
             a_grant_serves_a_not_allowed_file_once_and_never_a_denied_one,
         ),
         share_check(
-            "MESH-SHARE-014",
+            "grant-matches-byte-for-byte-without-glob-or-case-fold",
             Invalid,
             a_grant_matches_byte_for_byte_without_glob_or_case_fold,
         ),
     ];
     rows.push(verdict(
-        "MESH-SHARE-002",
+        "single-star-in-the-middle-matches-exactly-one-segment",
         Invalid,
         shares_yaml(&[("docs/*/a.md", None)], &[], &[]),
         none,
@@ -4154,63 +4259,67 @@ fn grant_store_rows() -> Vec<Vector> {
     use Kind::{Boundary, Invalid, Valid};
     vec![
         grant_check(
-            "MESH-SHARE-015",
+            "grant-with-an-id-that-is-not-a-wire-id-is-refused",
             Invalid,
             a_grant_with_an_id_that_is_not_a_wire_id_is_refused,
         ),
         grant_check(
-            "MESH-SHARE-015",
+            "grant-for-a-peer-that-is-not-a-canonical-hash-is-refused",
             Invalid,
             a_grant_for_a_peer_that_is_not_a_canonical_hash_is_refused,
         ),
-        grant_check("MESH-SHARE-015", Invalid, a_grant_with_no_paths_is_refused),
         grant_check(
-            "MESH-SHARE-015",
+            "grant-with-no-paths-is-refused",
+            Invalid,
+            a_grant_with_no_paths_is_refused,
+        ),
+        grant_check(
+            "grant-with-a-path-that-is-not-a-wire-path-is-refused",
             Invalid,
             a_grant_with_a_path_that_is_not_a_wire_path_is_refused,
         ),
         grant_check(
-            "MESH-SHARE-015",
+            "grant-over-the-path-cap-is-refused-and-one-at-it-is-written",
             Boundary,
             a_grant_over_the_path_cap_is_refused_and_one_at_it_is_written,
         ),
         grant_check(
-            "MESH-SHARE-015",
+            "repeated-paths-are-dropped-and-each-path-lends-one-use-until-the-ttl",
             Valid,
             repeats_are_dropped_and_each_path_lends_one_use_until_the_ttl,
         ),
         grant_check(
-            "MESH-SHARE-015",
+            "grant-under-the-same-id-replaces-the-earlier-one-for-that-peer-alone",
             Valid,
             a_grant_under_the_same_id_replaces_the_earlier_one_for_that_peer_alone,
         ),
         grant_check(
-            "MESH-SHARE-016",
+            "refund-restores-the-use-and-never-above-what-was-lent",
             Valid,
             a_refund_restores_the_use_and_never_above_what_was_lent,
         ),
         grant_check(
-            "MESH-SHARE-016",
+            "exhausted-grant-stays-on-file-until-it-expires",
             Boundary,
             an_exhausted_grant_stays_on_file_until_it_expires,
         ),
         grant_check(
-            "MESH-SHARE-017",
+            "revoke-takes-one-peers-grant-under-the-id-and-leaves-the-rest",
             Valid,
             revoke_takes_one_peers_grant_under_the_id_and_leaves_the_rest,
         ),
         grant_check(
-            "MESH-SHARE-018",
+            "expired-grants-are-swept-on-open-and-on-every-check",
             Boundary,
             expired_grants_are_swept_on_open_and_on_every_check,
         ),
         grant_check(
-            "MESH-SHARE-018",
+            "grant-line-whose-expires-does-not-parse-refuses-the-store",
             Invalid,
             a_line_whose_expires_does_not_parse_refuses_the_store,
         ),
         grant_check(
-            "MESH-SHARE-018",
+            "grant-line-with-more-uses-left-than-lent-refuses-the-store",
             Invalid,
             a_line_with_more_uses_left_than_lent_refuses_the_store,
         ),
@@ -4221,9 +4330,9 @@ fn store_schema_rows() -> Vec<Vector> {
     use Kind::{Boundary, Invalid, Valid};
     let newer = SHARES_FILE_VERSION + 1;
     vec![
-        // MESH-SCHEMA-001: the share files.
+        // The share files.
         row(
-            "MESH-SCHEMA-001",
+            "shares-file-at-the-current-version-loads",
             Valid,
             Case::StoreSchema(SchemaProbe::SharesFile {
                 text: allow_all(),
@@ -4231,7 +4340,7 @@ fn store_schema_rows() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-SCHEMA-001",
+            "shares-file-one-version-ahead-is-refused-with-the-remedy",
             Invalid,
             Case::StoreSchema(SchemaProbe::SharesFile {
                 text: format!("version: {newer}\nallow: []\nfuture_section: {{}}\n"),
@@ -4244,7 +4353,7 @@ fn store_schema_rows() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-SCHEMA-001",
+            "shares-file-at-version-zero-is-refused-with-no-migration",
             Invalid,
             Case::StoreSchema(SchemaProbe::SharesFile {
                 text: "version: 0\nallow: []\n".to_string(),
@@ -4252,7 +4361,7 @@ fn store_schema_rows() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-SCHEMA-001",
+            "shares-file-without-a-version-field-is-refused",
             Invalid,
             Case::StoreSchema(SchemaProbe::SharesFile {
                 text: "allow:\n- pattern: '**'\n".to_string(),
@@ -4260,13 +4369,13 @@ fn store_schema_rows() -> Vec<Vector> {
             }),
         ),
         schema_check(
-            "MESH-SCHEMA-001",
+            "refused-share-file-keeps-the-other-layer-from-loading-alone",
             Invalid,
             a_refused_share_file_keeps_the_other_layer_from_loading_alone,
         ),
-        // MESH-SCHEMA-002: the grant store.
+        // The grant store.
         row(
-            "MESH-SCHEMA-002",
+            "grant-store-line-at-the-current-version-loads",
             Valid,
             Case::StoreSchema(SchemaProbe::GrantLine {
                 edit: |_| {},
@@ -4274,7 +4383,7 @@ fn store_schema_rows() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-SCHEMA-002",
+            "grant-store-line-one-version-ahead-is-refused-with-the-remedy",
             Invalid,
             Case::StoreSchema(SchemaProbe::GrantLine {
                 edit: |line| {
@@ -4290,7 +4399,7 @@ fn store_schema_rows() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-SCHEMA-002",
+            "grant-store-line-at-version-zero-is-refused-with-no-migration",
             Invalid,
             Case::StoreSchema(SchemaProbe::GrantLine {
                 edit: |line| {
@@ -4300,7 +4409,7 @@ fn store_schema_rows() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-SCHEMA-002",
+            "grant-store-line-without-a-version-field-is-refused",
             Invalid,
             Case::StoreSchema(SchemaProbe::GrantLine {
                 edit: |line| {
@@ -4314,7 +4423,7 @@ fn store_schema_rows() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-SCHEMA-002",
+            "grant-store-line-with-an-unknown-field-is-refused",
             Invalid,
             Case::StoreSchema(SchemaProbe::GrantLine {
                 edit: |line| {
@@ -4323,9 +4432,9 @@ fn store_schema_rows() -> Vec<Vector> {
                 phrases: &["line 1"],
             }),
         ),
-        // MESH-SCHEMA-003: the inbound record.
+        // The inbound record.
         row(
-            "MESH-SCHEMA-003",
+            "inbound-record-with-an-access-kind-and-paths-is-read",
             Valid,
             Case::StoreSchema(SchemaProbe::InboundLine {
                 json: inbound_json(r#","kind":"access","paths":["src/x.rs"],"reason":"need it""#),
@@ -4333,7 +4442,7 @@ fn store_schema_rows() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-SCHEMA-003",
+            "inbound-record-with-a-question-kind-is-read",
             Valid,
             Case::StoreSchema(SchemaProbe::InboundLine {
                 json: inbound_json(r#","kind":"question","paths":[],"reason":"""#),
@@ -4341,7 +4450,7 @@ fn store_schema_rows() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-SCHEMA-003",
+            "inbound-record-without-a-kind-is-read-as-a-question",
             Boundary,
             Case::StoreSchema(SchemaProbe::InboundLine {
                 json: inbound_json(""),
@@ -4349,7 +4458,7 @@ fn store_schema_rows() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-SCHEMA-003",
+            "inbound-record-with-an-unknown-kind-is-refused",
             Invalid,
             Case::StoreSchema(SchemaProbe::InboundLine {
                 json: inbound_json(r#","kind":"grant""#),
@@ -4357,26 +4466,26 @@ fn store_schema_rows() -> Vec<Vector> {
             }),
         ),
         row(
-            "MESH-SCHEMA-003",
+            "inbound-record-with-an-unknown-field-is-refused",
             Invalid,
             Case::StoreSchema(SchemaProbe::InboundLine {
                 json: inbound_json(r#","decided":true"#),
                 expect: None,
             }),
         ),
-        // MESH-SCHEMA-004: the common wording and the pin.
+        // The common wording and the pin.
         schema_check(
-            "MESH-SCHEMA-004",
+            "share-list-and-grant-store-refuse-in-the-common-wording",
             Valid,
             the_share_list_and_grant_store_refuse_in_the_common_wording,
         ),
         schema_check(
-            "MESH-SCHEMA-004",
+            "share-and-grant-versions-are-the-baseline",
             Boundary,
             the_share_and_grant_versions_are_the_baseline,
         ),
         schema_check(
-            "MESH-SCHEMA-004",
+            "version-pin-names-the-share-and-grant-constants",
             Valid,
             the_version_pin_names_the_share_and_grant_constants,
         ),
@@ -4390,112 +4499,112 @@ fn list_serve_rows() -> Vec<Vector> {
     let sixty_five = "a".repeat(CURSOR_MAX_BYTES + 1);
     vec![
         list_request(
-            "MESH-LIST-001",
+            "list-request-without-a-version-is-refused",
             Invalid,
             TWO,
             without(list_body(None, None), "v"),
             ListAnswer::Refused,
         ),
         list_request(
-            "MESH-LIST-001",
+            "list-request-at-version-2-is-refused",
             Invalid,
             TWO,
             with(list_body(None, None), "v", Value::from(2u64)),
             ListAnswer::Refused,
         ),
         list_request(
-            "MESH-LIST-001",
+            "list-request-with-a-string-version-is-refused",
             Invalid,
             TWO,
             with(list_body(None, None), "v", Value::from("1")),
             ListAnswer::Refused,
         ),
         list_request(
-            "MESH-LIST-001",
+            "list-request-that-is-not-a-map-is-refused",
             Invalid,
             TWO,
             Value::from("list"),
             ListAnswer::Refused,
         ),
         list_request(
-            "MESH-LIST-001",
+            "list-request-with-only-a-version-answers-the-full-page",
             Valid,
             TWO,
             list_body(None, None),
             page_of(TWO, None),
         ),
         list_request(
-            "MESH-LIST-002",
+            "list-request-with-an-integer-prefix-is-refused",
             Invalid,
             TWO,
             with(list_body(None, None), "prefix", Value::from(7)),
             ListAnswer::Refused,
         ),
         list_request(
-            "MESH-LIST-002",
+            "list-request-with-a-binary-prefix-is-refused",
             Invalid,
             TWO,
             with(list_body(None, None), "prefix", bin(b"docs")),
             ListAnswer::Refused,
         ),
         list_request(
-            "MESH-LIST-002",
+            "list-request-prefix-narrows-the-page",
             Valid,
             TWO,
             list_body(Some("docs/"), None),
             page_of(&["docs/a.md"], None),
         ),
         list_request(
-            "MESH-LIST-002",
+            "list-request-without-a-prefix-lists-everything",
             Valid,
             TWO,
             without(list_body(None, None), "prefix"),
             page_of(TWO, None),
         ),
         list_request(
-            "MESH-LIST-003",
+            "list-request-with-an-integer-cursor-is-refused",
             Invalid,
             TWO,
             with(list_body(None, None), "cursor", Value::from(7)),
             ListAnswer::Refused,
         ),
         list_request(
-            "MESH-LIST-003",
+            "list-request-cursor-one-over-the-byte-cap-is-refused",
             Invalid,
             TWO,
             list_body(None, Some(&sixty_five)),
             ListAnswer::Refused,
         ),
         list_request(
-            "MESH-LIST-003",
+            "list-request-cursor-at-the-byte-cap-is-accepted",
             Boundary,
             TWO,
             list_body(None, Some(&sixty_four)),
             page_of(TWO, None),
         ),
         list_request(
-            "MESH-LIST-004",
+            "list-request-with-an-unknown-cursor-starts-from-the-top",
             Valid,
             TWO,
             list_body(None, Some("00000000000000000000000000000000")),
             page_of(TWO, None),
         ),
         list_request(
-            "MESH-LIST-004",
+            "list-request-cursor-resumes-after-the-named-path",
             Valid,
             TWO,
             list_body(None, Some(&list_cursor("docs/a.md"))),
             page_of(&["src/b.rs"], None),
         ),
         list_request(
-            "MESH-LIST-005",
+            "list-request-with-an-unknown-key-is-served",
             Valid,
             TWO,
             with(list_body(None, None), "extra", Value::from(7)),
             page_of(TWO, None),
         ),
         list_request(
-            "MESH-LIST-005",
+            "list-request-with-a-paths-key-is-served-ignoring-it",
             Valid,
             TWO,
             with(
@@ -4506,70 +4615,74 @@ fn list_serve_rows() -> Vec<Vector> {
             page_of(TWO, None),
         ),
         list_check(
-            "MESH-LIST-016",
+            "listing-is-the-share-set-for-the-requester-and-never-the-tree",
             Valid,
             a_listing_is_the_share_set_for_the_requester_and_never_the_tree,
         ),
         list_check(
-            "MESH-LIST-016",
+            "protected-inbox-inside-the-root-is-left-off-the-listing",
             Valid,
             a_protected_inbox_inside_the_root_is_left_off_the_listing,
         ),
         list_request(
-            "MESH-LIST-017",
+            "listing-is-sorted-by-bytes-upper-case-first",
             Valid,
             &["a.md", "Z.md", "B.md", "docs/x.md", "docs-x.md"],
             list_body(None, None),
             page_of(&["B.md", "Z.md", "a.md", "docs-x.md", "docs/x.md"], None),
         ),
         list_request(
-            "MESH-LIST-017",
+            "list-request-prefix-is-a-byte-prefix-not-a-directory",
             Valid,
             &["a.md", "Z.md", "B.md", "docs/x.md", "docs-x.md"],
             list_body(Some("docs"), None),
             page_of(&["docs-x.md", "docs/x.md"], None),
         ),
         list_check(
-            "MESH-LIST-018",
+            "page-holds-a-thousand-entries-before-a-cursor-is-issued",
             Boundary,
             a_page_holds_a_thousand_entries_and_the_cursor_resumes_after_the_last,
         ),
         list_check(
-            "MESH-LIST-018",
+            "page-is-cut-by-encoded-bytes-before-the-entry-count",
             Boundary,
             a_page_is_cut_by_encoded_bytes_before_the_entry_count,
         ),
         list_check(
-            "MESH-LIST-019",
+            "cursor-is-the-first-half-of-the-sha256-of-the-path",
             Valid,
             the_cursor_is_the_first_half_of_the_sha256_of_the_path,
         ),
         list_check(
-            "MESH-LIST-019",
+            "cursor-resumes-after-the-last-entry-of-a-full-page",
             Valid,
             a_page_holds_a_thousand_entries_and_the_cursor_resumes_after_the_last,
         ),
         list_check(
-            "MESH-LIST-021",
+            "bounded-walk-truncates-the-listing-and-the-wire-page-carries-no-flag",
             Valid,
             a_bounded_walk_truncates_the_listing_and_the_wire_page_carries_no_flag,
         ),
         list_check(
-            "MESH-LIST-022",
+            "listing-hashes-only-the-page-it-returns",
             Valid,
             a_listing_hashes_only_the_page_it_returns,
         ),
         list_check(
-            "MESH-LIST-023",
+            "no-root-no-serving-or-a-broken-share-list-answers-the-empty-page",
             Valid,
             no_root_no_serving_or_a_broken_share_list_answers_the_empty_page,
         ),
         list_check(
-            "MESH-LIST-024",
+            "unknown-or-blocked-identity-hears-silence-on-list-and-fetch",
             Invalid,
             an_unknown_or_blocked_identity_hears_silence_on_list_and_fetch,
         ),
-        list_check("MESH-LIST-025", Valid, a_listing_waits_a_round_trip),
+        list_check(
+            "listing-waits-a-round-trip",
+            Valid,
+            a_listing_waits_a_round_trip,
+        ),
     ]
 }
 
@@ -4579,250 +4692,262 @@ fn fetch_serve_rows() -> Vec<Vector> {
     let body = || fetch_body("docs/a.md", None);
     vec![
         fetch_request(
-            "MESH-FETCH-004",
+            "fetch-of-a-traversal-path-is-invalid-path-segment",
             Invalid,
             ONE,
             fetch_body("docs/../a.md", None),
             invalid_path("segment"),
         ),
         fetch_check(
-            "MESH-FETCH-004",
+            "invalid-path-is-refused-before-the-root-is-probed",
             Invalid,
             an_invalid_path_is_refused_before_the_root_is_probed,
         ),
         fetch_request(
-            "MESH-FETCH-006",
+            "fetch-of-a-directory-answers-not-shared",
             Invalid,
             ONE,
             fetch_body("docs", None),
             status("not_shared"),
         ),
-        fetch_request("MESH-FETCH-006", Valid, ONE, body(), status("ok")),
         fetch_request(
-            "MESH-FETCH-008",
+            "fetch-of-a-shared-file-answers-ok",
+            Valid,
+            ONE,
+            body(),
+            status("ok"),
+        ),
+        fetch_request(
+            "fetch-request-without-a-version-is-refused",
             Invalid,
             ONE,
             without(body(), "v"),
             FetchAnswer::Refused,
         ),
         fetch_request(
-            "MESH-FETCH-008",
+            "fetch-request-at-version-2-is-refused",
             Invalid,
             ONE,
             with(body(), "v", Value::from(2u64)),
             FetchAnswer::Refused,
         ),
         fetch_request(
-            "MESH-FETCH-008",
+            "fetch-request-that-is-not-a-map-is-refused",
             Invalid,
             ONE,
             Value::from("fetch"),
             FetchAnswer::Refused,
         ),
-        fetch_request("MESH-FETCH-008", Valid, ONE, body(), status("ok")),
         fetch_request(
-            "MESH-FETCH-009",
+            "fetch-request-at-the-current-version-answers-ok",
+            Valid,
+            ONE,
+            body(),
+            status("ok"),
+        ),
+        fetch_request(
+            "fetch-request-without-a-path-is-refused",
             Invalid,
             ONE,
             without(body(), "path"),
             FetchAnswer::Refused,
         ),
         fetch_request(
-            "MESH-FETCH-009",
+            "fetch-request-with-a-nil-path-is-refused",
             Invalid,
             ONE,
             with(body(), "path", Value::Nil),
             FetchAnswer::Refused,
         ),
         fetch_request(
-            "MESH-FETCH-009",
+            "fetch-request-with-an-integer-path-is-refused",
             Invalid,
             ONE,
             with(body(), "path", Value::from(7)),
             FetchAnswer::Refused,
         ),
         fetch_request(
-            "MESH-FETCH-009",
+            "fetch-request-with-a-binary-path-is-refused",
             Invalid,
             ONE,
             with(body(), "path", bin(b"docs/a.md")),
             FetchAnswer::Refused,
         ),
         fetch_request(
-            "MESH-FETCH-010",
+            "fetch-of-an-empty-path-is-invalid-path-empty",
             Invalid,
             ONE,
             fetch_body("", None),
             invalid_path("empty"),
         ),
         fetch_request(
-            "MESH-FETCH-010",
+            "fetch-of-a-path-with-an-empty-segment-is-invalid-path-segment",
             Invalid,
             ONE,
             fetch_body("docs//a.md", None),
             invalid_path("segment"),
         ),
         fetch_request(
-            "MESH-FETCH-010",
+            "fetch-of-a-backslash-path-is-invalid-path-backslash",
             Invalid,
             ONE,
             fetch_body("docs\\a.md", None),
             invalid_path("backslash"),
         ),
         fetch_request(
-            "MESH-FETCH-010",
+            "fetch-of-a-leading-slash-path-is-invalid-path-leading-slash",
             Invalid,
             ONE,
             fetch_body("/docs/a.md", None),
             invalid_path("leading_slash"),
         ),
         fetch_request(
-            "MESH-FETCH-010",
+            "fetch-of-a-drive-letter-path-is-invalid-path-drive-letter",
             Invalid,
             ONE,
             fetch_body("c:/a.md", None),
             invalid_path("drive_letter"),
         ),
         fetch_request(
-            "MESH-FETCH-010",
+            "fetch-of-a-decomposed-path-is-invalid-path-nfc",
             Invalid,
             ONE,
             fetch_body("cafe\u{301}.md", None),
             invalid_path("nfc"),
         ),
         fetch_request(
-            "MESH-FETCH-010",
+            "fetch-of-a-path-with-a-tab-is-invalid-path-control",
             Invalid,
             ONE,
             fetch_body("docs/a\tb.md", None),
             invalid_path("control"),
         ),
         fetch_request(
-            "MESH-FETCH-010",
+            "fetch-of-a-trailing-dot-path-is-invalid-path-trailing-dot",
             Invalid,
             ONE,
             fetch_body("docs./a.md", None),
             invalid_path("trailing_dot"),
         ),
         fetch_request(
-            "MESH-FETCH-010",
+            "fetch-of-a-reserved-name-path-is-invalid-path-reserved-name",
             Invalid,
             ONE,
             fetch_body("con.md", None),
             invalid_path("reserved_name"),
         ),
         fetch_request(
-            "MESH-FETCH-011",
+            "fetch-request-with-a-string-if-sha256-is-refused",
             Invalid,
             ONE,
             with(body(), "if_sha256", Value::from("abc")),
             FetchAnswer::Refused,
         ),
         fetch_request(
-            "MESH-FETCH-011",
+            "fetch-request-with-a-31-byte-if-sha256-is-refused",
             Invalid,
             ONE,
             with(body(), "if_sha256", bin(&[0u8; 31])),
             FetchAnswer::Refused,
         ),
         fetch_request(
-            "MESH-FETCH-011",
+            "fetch-request-with-a-33-byte-if-sha256-is-refused",
             Invalid,
             ONE,
             with(body(), "if_sha256", bin(&[0u8; 33])),
             FetchAnswer::Refused,
         ),
         fetch_request(
-            "MESH-FETCH-011",
+            "fetch-request-with-a-non-matching-if-sha256-answers-ok",
             Boundary,
             ONE,
             fetch_body("docs/a.md", Some([0u8; 32])),
             status("ok"),
         ),
         fetch_request(
-            "MESH-FETCH-011",
+            "fetch-request-without-an-if-sha256-answers-ok",
             Valid,
             ONE,
             without(body(), "if_sha256"),
             status("ok"),
         ),
         fetch_request(
-            "MESH-FETCH-012",
+            "fetch-request-with-an-unknown-key-is-served",
             Valid,
             ONE,
             with(body(), "extra", Value::from(7)),
             status("ok"),
         ),
         fetch_request(
-            "MESH-FETCH-012",
+            "fetch-request-with-a-prefix-key-is-served-ignoring-it",
             Valid,
             ONE,
             with(body(), "prefix", Value::from("docs/")),
             status("ok"),
         ),
         fetch_request(
-            "MESH-FETCH-024",
+            "fetch-of-a-traversal-path-on-an-empty-root-is-invalid-path",
             Invalid,
             &[],
             fetch_body("../a.md", None),
             invalid_path("segment"),
         ),
         fetch_request(
-            "MESH-FETCH-024",
+            "fetch-of-a-missing-file-answers-not-shared",
             Invalid,
             ONE,
             fetch_body("docs/missing.md", None),
             status("not_shared"),
         ),
         fetch_request(
-            "MESH-FETCH-024",
+            "fetch-of-a-directory-answers-not-shared-like-a-missing-file",
             Invalid,
             ONE,
             fetch_body("docs", None),
             status("not_shared"),
         ),
         fetch_check(
-            "MESH-FETCH-024",
+            "too-large-is-decided-at-the-stat-before-a-grant-use-is-spent",
             Invalid,
             too_large_is_decided_at_the_stat_before_a_grant_use_is_spent,
         ),
         fetch_check(
-            "MESH-FETCH-024",
+            "failed-read-is-not-shared-and-a-file-that-grew-is-too-large",
             Invalid,
             a_failed_read_is_not_shared_and_a_file_that_grew_is_too_large,
         ),
         fetch_check(
-            "MESH-FETCH-024",
+            "matching-if-sha256-is-not-modified-without-a-body-and-spends-the-use",
             Valid,
             a_matching_if_sha256_is_not_modified_without_a_body_and_spends_the_use,
         ),
         fetch_check(
-            "MESH-FETCH-024",
+            "ok-reply-carries-the-size-the-digest-and-the-bytes",
             Valid,
             an_ok_reply_carries_the_size_the_digest_and_the_bytes,
         ),
         fetch_check(
-            "MESH-FETCH-025",
+            "not-shared-is-byte-identical-for-a-missing-an-unshared-and-a-denied-file",
             Invalid,
             not_shared_is_byte_identical_for_a_missing_an_unshared_and_a_denied_file,
         ),
         fetch_check(
-            "MESH-FETCH-026",
+            "serving-limit-is-the-configured-bytes-under-the-ceiling",
             Valid,
             the_serving_limit_is_the_configured_bytes_under_the_ceiling,
         ),
         fetch_check(
-            "MESH-FETCH-027",
+            "file-one-past-the-ceiling-is-too-large-and-one-at-it-is-ok",
             Boundary,
             a_file_one_past_the_ceiling_is_too_large_and_one_at_it_is_ok,
         ),
         fetch_check(
-            "MESH-FETCH-033",
+            "served-fetch-fires-once-sent-with-peer-size-and-hash-prefix-and-no-path",
             Valid,
             a_served_fetch_fires_once_sent_with_peer_size_and_hash_prefix_and_no_path,
         ),
         fetch_check(
-            "MESH-FETCH-034",
+            "ok-dropped-unsent-refunds-the-grant-use-and-one-sent-keeps-it-spent",
             Valid,
             an_ok_dropped_unsent_refunds_the_grant_use_and_one_sent_keeps_it_spent,
         ),
@@ -4844,86 +4969,101 @@ fn fetch_client_rows() -> Vec<Vector> {
         .collect();
     vec![
         client_check(
-            "MESH-FETCH-001",
+            "card-with-a-malformed-about-keeps-the-rest",
             Invalid,
             a_card_with_a_malformed_about_or_caps_keeps_the_rest,
         ),
         client_check(
-            "MESH-FETCH-002",
+            "card-with-malformed-caps-keeps-the-rest",
             Invalid,
             a_card_with_a_malformed_about_or_caps_keeps_the_rest,
         ),
-        page_row("MESH-LIST-006", Invalid, without(one(), "v"), Err("v")),
         page_row(
-            "MESH-LIST-006",
+            "shares-page-without-a-version-is-malformed",
+            Invalid,
+            without(one(), "v"),
+            Err("v"),
+        ),
+        page_row(
+            "shares-page-at-version-2-is-malformed",
             Invalid,
             with(one(), "v", Value::from(2u64)),
             Err("v"),
         ),
-        page_row("MESH-LIST-006", Invalid, Value::from("page"), Err("map")),
-        page_row("MESH-LIST-006", Valid, one(), Ok((1, None))),
         page_row(
-            "MESH-LIST-007",
+            "shares-page-that-is-not-a-map-is-malformed",
+            Invalid,
+            Value::from("page"),
+            Err("map"),
+        ),
+        page_row(
+            "shares-page-with-one-good-entry-is-read",
+            Valid,
+            one(),
+            Ok((1, None)),
+        ),
+        page_row(
+            "shares-page-without-entries-is-malformed",
             Invalid,
             without(one(), "entries"),
             Err("entries"),
         ),
         page_row(
-            "MESH-LIST-007",
+            "shares-page-with-integer-entries-is-malformed",
             Invalid,
             with(one(), "entries", Value::from(7)),
             Err("entries"),
         ),
         page_row(
-            "MESH-LIST-007",
+            "shares-page-with-nil-entries-is-malformed",
             Invalid,
             with(one(), "entries", Value::Nil),
             Err("entries"),
         ),
         page_row(
-            "MESH-LIST-008",
+            "shares-page-over-the-page-size-is-cut-to-the-page-size",
             Boundary,
             page_value(thousand_and_one, Value::Nil),
             Ok((LIST_PAGE_SIZE, None)),
         ),
         page_row(
-            "MESH-LIST-008",
+            "shares-page-entry-that-is-not-a-map-is-dropped-and-the-rest-kept",
             Invalid,
             page_value(vec![Value::from(7), good()], Value::Nil),
             Ok((1, None)),
         ),
         page_row(
-            "MESH-LIST-008",
+            "shares-page-entry-with-a-bad-path-is-dropped-and-the-rest-kept",
             Invalid,
             page_value(vec![entry_of("docs//a.md"), good()], Value::Nil),
             Ok((1, None)),
         ),
         page_row(
-            "MESH-LIST-009",
+            "shares-page-with-an-integer-next-is-malformed",
             Invalid,
             with(one(), "next", Value::from(7)),
             Err("next"),
         ),
         page_row(
-            "MESH-LIST-009",
+            "shares-page-next-of-65-bytes-is-malformed",
             Invalid,
             with(one(), "next", Value::from(sixty_five.as_str())),
             Err("next"),
         ),
         page_row(
-            "MESH-LIST-009",
+            "shares-page-next-of-64-bytes-is-kept",
             Boundary,
             with(one(), "next", Value::from(sixty_four.as_str())),
             Ok((1, Some(sixty_four.clone()))),
         ),
         page_row(
-            "MESH-LIST-010",
+            "shares-page-with-an-unknown-key-is-read",
             Valid,
             with(one(), "extra", Value::from(7)),
             Ok((1, None)),
         ),
         page_row(
-            "MESH-LIST-010",
+            "shares-page-with-a-truncated-flag-is-read-ignoring-it",
             Valid,
             with(one(), "truncated", Value::Boolean(true)),
             Ok((1, None)),
@@ -4931,164 +5071,209 @@ fn fetch_client_rows() -> Vec<Vector> {
         // The requester keeps the cursor verbatim; `list_shares` is the only builder of
         // the request that hands it back and needs a runtime, so the pin stops here.
         page_row(
-            "MESH-LIST-020",
+            "shares-page-next-is-kept-verbatim",
             Valid,
             with(one(), "next", Value::from("AbC-opaque!?")),
             Ok((1, Some("AbC-opaque!?".to_string()))),
         ),
-        entry_row("MESH-LIST-011", Invalid, without(good(), "path"), false),
         entry_row(
-            "MESH-LIST-011",
+            "list-entry-without-a-path-is-dropped",
+            Invalid,
+            without(good(), "path"),
+            false,
+        ),
+        entry_row(
+            "list-entry-with-an-integer-path-is-dropped",
             Invalid,
             with(good(), "path", Value::from(7)),
             false,
         ),
-        entry_row("MESH-LIST-011", Invalid, entry_of("docs//a.md"), false),
-        entry_row("MESH-LIST-011", Invalid, entry_of("../a.md"), false),
-        entry_row("MESH-LIST-011", Invalid, entry_of(""), false),
-        entry_row("MESH-LIST-011", Valid, good(), true),
-        entry_row("MESH-LIST-012", Invalid, without(good(), "size"), false),
         entry_row(
-            "MESH-LIST-012",
+            "list-entry-with-an-empty-segment-path-is-dropped",
+            Invalid,
+            entry_of("docs//a.md"),
+            false,
+        ),
+        entry_row(
+            "list-entry-with-a-dot-dot-path-is-dropped",
+            Invalid,
+            entry_of("../a.md"),
+            false,
+        ),
+        entry_row(
+            "list-entry-with-an-empty-path-is-dropped",
+            Invalid,
+            entry_of(""),
+            false,
+        ),
+        entry_row(
+            "list-entry-with-every-field-well-formed-is-kept",
+            Valid,
+            good(),
+            true,
+        ),
+        entry_row(
+            "list-entry-without-a-size-is-dropped",
+            Invalid,
+            without(good(), "size"),
+            false,
+        ),
+        entry_row(
+            "list-entry-with-a-negative-size-is-dropped",
             Invalid,
             with(good(), "size", Value::from(-1i64)),
             false,
         ),
         entry_row(
-            "MESH-LIST-012",
+            "list-entry-with-a-string-size-is-dropped",
             Invalid,
             with(good(), "size", Value::from("1")),
             false,
         ),
         entry_row(
-            "MESH-LIST-012",
+            "list-entry-with-a-float-size-is-dropped",
             Invalid,
             with(good(), "size", Value::F64(1.0)),
             false,
         ),
         entry_row(
-            "MESH-LIST-012",
+            "list-entry-with-a-zero-size-is-kept",
             Boundary,
             with(good(), "size", Value::from(0u64)),
             true,
         ),
         entry_row(
-            "MESH-LIST-012",
+            "list-entry-with-a-u64-max-size-is-kept",
             Boundary,
             with(good(), "size", Value::from(u64::MAX)),
             true,
         ),
-        entry_row("MESH-LIST-013", Invalid, without(good(), "sha256"), false),
         entry_row(
-            "MESH-LIST-013",
+            "list-entry-without-a-sha256-is-dropped",
+            Invalid,
+            without(good(), "sha256"),
+            false,
+        ),
+        entry_row(
+            "list-entry-with-a-string-sha256-is-dropped",
             Invalid,
             with(good(), "sha256", Value::from("a".repeat(32).as_str())),
             false,
         ),
         entry_row(
-            "MESH-LIST-013",
+            "list-entry-with-a-31-byte-sha256-is-dropped",
             Invalid,
             with(good(), "sha256", bin(&[0u8; 31])),
             false,
         ),
         entry_row(
-            "MESH-LIST-013",
+            "list-entry-with-a-33-byte-sha256-is-dropped",
             Invalid,
             with(good(), "sha256", bin(&[0u8; 33])),
             false,
         ),
         entry_row(
-            "MESH-LIST-013",
+            "list-entry-with-a-32-byte-sha256-is-kept",
             Boundary,
             with(good(), "sha256", bin(&[0u8; 32])),
             true,
         ),
-        entry_row("MESH-LIST-014", Invalid, without(good(), "mtime"), false),
         entry_row(
-            "MESH-LIST-014",
+            "list-entry-without-an-mtime-is-dropped",
+            Invalid,
+            without(good(), "mtime"),
+            false,
+        ),
+        entry_row(
+            "list-entry-with-a-string-mtime-is-dropped",
             Invalid,
             with(good(), "mtime", Value::from("1")),
             false,
         ),
         entry_row(
-            "MESH-LIST-014",
+            "list-entry-with-a-nan-mtime-is-dropped",
             Invalid,
             with(good(), "mtime", Value::F64(f64::NAN)),
             false,
         ),
         entry_row(
-            "MESH-LIST-014",
+            "list-entry-with-an-infinite-mtime-is-dropped",
             Invalid,
             with(good(), "mtime", Value::F64(f64::INFINITY)),
             false,
         ),
         entry_row(
-            "MESH-LIST-014",
+            "list-entry-with-an-f32-nan-mtime-is-dropped",
             Invalid,
             with(good(), "mtime", Value::F32(f32::NAN)),
             false,
         ),
         entry_row(
-            "MESH-LIST-014",
+            "list-entry-with-an-integer-mtime-is-kept",
             Valid,
             with(good(), "mtime", Value::from(1u64)),
             true,
         ),
         entry_row(
-            "MESH-LIST-014",
+            "list-entry-with-a-negative-mtime-is-kept",
             Valid,
             with(good(), "mtime", Value::from(-1i64)),
             true,
         ),
         entry_row(
-            "MESH-LIST-014",
+            "list-entry-with-an-f32-mtime-is-kept",
             Valid,
             with(good(), "mtime", Value::F32(1.5)),
             true,
         ),
         entry_row(
-            "MESH-LIST-014",
+            "list-entry-with-a-zero-float-mtime-is-kept",
             Boundary,
             with(good(), "mtime", Value::F64(0.0)),
             true,
         ),
         entry_row(
-            "MESH-LIST-015",
+            "list-entry-with-an-unknown-key-is-kept",
             Valid,
             with(good(), "extra", Value::from(7)),
             true,
         ),
         entry_row(
-            "MESH-LIST-015",
+            "list-entry-with-a-mode-key-is-kept",
             Valid,
             with(good(), "mode", Value::from("0644")),
             true,
         ),
         client_check(
-            "MESH-FETCH-015",
+            "unknown-status-is-a-client-error-with-the-pinned-wording",
             Invalid,
             an_unknown_status_is_a_client_error_with_the_pinned_wording,
         ),
         client_check(
-            "MESH-FETCH-021",
+            "rule-is-kept-when-known-read-as-unknown-otherwise-and-malformed-when-not-text",
             Invalid,
             a_rule_is_kept_when_known_read_as_unknown_otherwise_and_malformed_when_not_text,
         ),
-        reply_row("MESH-FETCH-013", Invalid, Value::from(7), malformed("map")),
         reply_row(
-            "MESH-FETCH-013",
+            "fetch-reply-that-is-not-a-map-is-malformed",
+            Invalid,
+            Value::from(7),
+            malformed("map"),
+        ),
+        reply_row(
+            "fetch-reply-without-a-version-is-malformed",
             Invalid,
             without(fetch_reply("not_shared"), "v"),
             malformed("v"),
         ),
         reply_row(
-            "MESH-FETCH-013",
+            "fetch-reply-at-version-2-is-malformed",
             Invalid,
             with(fetch_reply("not_shared"), "v", Value::from(2)),
             malformed("v"),
         ),
         reply_row(
-            "MESH-FETCH-013",
+            "fetch-reply-of-no-provider-is-not-served",
             Invalid,
             DispatchError::NoProvider {
                 path: FETCH_PATH.to_string(),
@@ -5097,56 +5282,61 @@ fn fetch_client_rows() -> Vec<Vector> {
             Err(ReplyError::NotServed),
         ),
         reply_row(
-            "MESH-FETCH-014",
+            "fetch-reply-without-a-status-is-malformed",
             Invalid,
             without(ok_reply(hello), "status"),
             malformed("status"),
         ),
         reply_row(
-            "MESH-FETCH-014",
+            "fetch-reply-with-an-integer-status-is-malformed",
             Invalid,
             with(ok_reply(hello), "status", Value::from(1)),
             malformed("status"),
         ),
         reply_row(
-            "MESH-FETCH-015",
+            "fetch-reply-with-an-unknown-status-is-unknown-status",
             Invalid,
             fetch_reply("maybe"),
             Err(ReplyError::UnknownStatus),
         ),
         reply_row(
-            "MESH-FETCH-015",
+            "fetch-reply-with-an-upper-case-ok-status-is-unknown-status",
             Invalid,
             with(ok_reply(hello), "status", Value::from("OK")),
             Err(ReplyError::UnknownStatus),
         ),
         reply_row(
-            "MESH-FETCH-016",
+            "ok-reply-without-a-size-is-malformed",
             Invalid,
             without(ok_reply(hello), "size"),
             malformed("size"),
         ),
         reply_row(
-            "MESH-FETCH-016",
+            "ok-reply-with-a-negative-size-is-malformed",
             Invalid,
             with(ok_reply(hello), "size", Value::from(-5)),
             malformed("size"),
         ),
         reply_row(
-            "MESH-FETCH-016",
+            "ok-reply-whose-size-disagrees-with-the-bytes-is-malformed",
             Invalid,
             with(ok_reply(hello), "size", Value::from(hello.len() - 1)),
             malformed("size"),
         ),
-        reply_row("MESH-FETCH-016", Valid, ok_reply(hello), ok_read(hello)),
         reply_row(
-            "MESH-FETCH-017",
+            "ok-reply-with-matching-size-digest-and-bytes-is-read",
+            Valid,
+            ok_reply(hello),
+            ok_read(hello),
+        ),
+        reply_row(
+            "ok-reply-without-a-sha256-is-malformed",
             Invalid,
             without(ok_reply(hello), "sha256"),
             malformed("sha256"),
         ),
         reply_row(
-            "MESH-FETCH-017",
+            "ok-reply-with-a-hex-string-sha256-is-malformed",
             Invalid,
             with(
                 ok_reply(hello),
@@ -5156,55 +5346,55 @@ fn fetch_client_rows() -> Vec<Vector> {
             malformed("sha256"),
         ),
         reply_row(
-            "MESH-FETCH-017",
+            "ok-reply-with-a-31-byte-sha256-is-malformed",
             Invalid,
             with(ok_reply(hello), "sha256", bin(&hash[..31])),
             malformed("sha256"),
         ),
         reply_row(
-            "MESH-FETCH-017",
+            "not-modified-reply-without-a-sha256-is-malformed",
             Invalid,
             fetch_reply("not_modified"),
             malformed("sha256"),
         ),
         reply_row(
-            "MESH-FETCH-017",
+            "not-modified-reply-with-a-string-sha256-is-malformed",
             Invalid,
             with(fetch_reply("not_modified"), "sha256", Value::from("abc")),
             malformed("sha256"),
         ),
         reply_row(
-            "MESH-FETCH-017",
+            "not-modified-reply-with-a-31-byte-sha256-is-malformed",
             Invalid,
             not_modified_reply(&hash[..31]),
             malformed("sha256"),
         ),
         reply_row(
-            "MESH-FETCH-017",
+            "not-modified-reply-with-a-32-byte-sha256-is-read",
             Valid,
             not_modified_reply(&hash),
             Ok(FetchReply::NotModified { sha256: hash }),
         ),
         reply_row(
-            "MESH-FETCH-018",
+            "ok-reply-whose-digest-does-not-match-the-bytes-is-corrupt",
             Invalid,
             with(ok_reply(hello), "sha256", bin(&hash)),
             Err(ReplyError::Corrupt),
         ),
         reply_row(
-            "MESH-FETCH-019",
+            "ok-reply-without-bytes-is-malformed",
             Invalid,
             without(ok_reply(hello), "bytes"),
             malformed("bytes"),
         ),
         reply_row(
-            "MESH-FETCH-019",
+            "ok-reply-with-string-bytes-is-malformed",
             Invalid,
             with(ok_reply(hello), "bytes", Value::from("hello")),
             malformed("bytes"),
         ),
         reply_row(
-            "MESH-FETCH-020",
+            "ok-reply-with-bytes-over-the-file-bound-is-oversize",
             Invalid,
             with(
                 with(fetch_reply("ok"), "bytes", bin(&over_bound)),
@@ -5214,25 +5404,25 @@ fn fetch_client_rows() -> Vec<Vector> {
             Err(ReplyError::Oversize(over_bound.len())),
         ),
         reply_row(
-            "MESH-FETCH-020",
+            "ok-reply-with-bytes-at-the-file-bound-is-read",
             Boundary,
             ok_reply(&at_bound),
             ok_read(&at_bound),
         ),
         reply_row(
-            "MESH-FETCH-021",
+            "invalid-path-reply-without-a-rule-is-malformed",
             Invalid,
             fetch_reply("invalid_path"),
             malformed("rule"),
         ),
         reply_row(
-            "MESH-FETCH-021",
+            "invalid-path-reply-with-an-integer-rule-is-malformed",
             Invalid,
             with(fetch_reply("invalid_path"), "rule", Value::from(3)),
             malformed("rule"),
         ),
         reply_row(
-            "MESH-FETCH-021",
+            "invalid-path-reply-with-a-free-text-rule-is-read-as-unknown",
             Boundary,
             with(
                 fetch_reply("invalid_path"),
@@ -5244,7 +5434,7 @@ fn fetch_client_rows() -> Vec<Vector> {
             }),
         ),
         reply_row(
-            "MESH-FETCH-021",
+            "invalid-path-reply-with-a-known-rule-is-read",
             Valid,
             with(fetch_reply("invalid_path"), "rule", Value::from("segment")),
             Ok(FetchReply::InvalidPath {
@@ -5252,25 +5442,25 @@ fn fetch_client_rows() -> Vec<Vector> {
             }),
         ),
         reply_row(
-            "MESH-FETCH-022",
+            "too-large-reply-without-a-limit-is-malformed",
             Invalid,
             fetch_reply("too_large"),
             malformed("limit"),
         ),
         reply_row(
-            "MESH-FETCH-022",
+            "too-large-reply-with-a-string-limit-is-malformed",
             Invalid,
             with(fetch_reply("too_large"), "limit", Value::from("4096")),
             malformed("limit"),
         ),
         reply_row(
-            "MESH-FETCH-022",
+            "too-large-reply-with-an-integer-limit-is-read",
             Valid,
             with(fetch_reply("too_large"), "limit", Value::from(4096)),
             Ok(FetchReply::TooLarge { limit: 4096 }),
         ),
         reply_row(
-            "MESH-FETCH-023",
+            "not-shared-reply-with-stray-bytes-and-limit-is-read",
             Valid,
             with(
                 with(fetch_reply("not_shared"), "bytes", bin(hello)),
@@ -5280,19 +5470,19 @@ fn fetch_client_rows() -> Vec<Vector> {
             Ok(FetchReply::NotShared),
         ),
         reply_row(
-            "MESH-FETCH-023",
+            "ok-reply-with-a-stray-rule-is-read",
             Valid,
             with(ok_reply(hello), "rule", Value::from("segment")),
             ok_read(hello),
         ),
         reply_row(
-            "MESH-FETCH-023",
+            "not-modified-reply-with-an-unknown-key-is-read",
             Valid,
             with(not_modified_reply(&hash), "extra", Value::from(7)),
             Ok(FetchReply::NotModified { sha256: hash }),
         ),
         reply_row(
-            "MESH-FETCH-023",
+            "invalid-path-reply-with-a-stray-size-is-read",
             Valid,
             with(
                 with(fetch_reply("invalid_path"), "rule", Value::from("segment")),
@@ -5304,7 +5494,7 @@ fn fetch_client_rows() -> Vec<Vector> {
             }),
         ),
         reply_row(
-            "MESH-FETCH-023",
+            "too-large-reply-with-a-stray-sha256-is-read",
             Valid,
             with(
                 with(fetch_reply("too_large"), "limit", Value::from(4096)),
@@ -5314,26 +5504,26 @@ fn fetch_client_rows() -> Vec<Vector> {
             Ok(FetchReply::TooLarge { limit: 4096 }),
         ),
         client_check(
-            "MESH-FETCH-028",
+            "fetch-response-at-its-bound-is-delivered-and-one-byte-over-is-dropped",
             Boundary,
             a_fetch_response_at_its_bound_is_delivered_and_one_byte_over_is_dropped,
         ),
         client_check(
-            "MESH-FETCH-029",
+            "bound-is-found-from-the-frame-prefix-before-the-frame-is-decoded",
             Valid,
             the_bound_is_found_from_the_frame_prefix_before_the_frame_is_decoded,
         ),
         client_check(
-            "MESH-FETCH-030",
+            "inbox-stages-under-the-instance-and-peer-and-refuses-a-collision",
             Valid,
             the_inbox_stages_under_the_instance_and_peer_and_refuses_a_collision,
         ),
         client_check(
-            "MESH-FETCH-031",
+            "fetched-file-yields-its-path-size-and-digest-and-never-its-bytes",
             Valid,
             a_fetched_file_yields_its_path_size_and_digest_and_never_its_bytes,
         ),
-        client_check("MESH-FETCH-032", Valid, a_fetch_waits_two_minutes),
+        client_check("fetch-waits-two-minutes", Valid, a_fetch_waits_two_minutes),
     ]
 }
 
@@ -5428,5 +5618,18 @@ mod tests {
         assert!(rows.iter().any(|vector| vector.kind == Kind::Boundary));
         assert!(rows.iter().any(|vector| vector.kind == Kind::Invalid));
         assert!(rows.iter().any(|vector| vector.kind == Kind::Valid));
+    }
+
+    #[test]
+    fn every_row_has_a_unique_name() {
+        let mut seen = BTreeSet::new();
+        for vector in vectors() {
+            assert!(!vector.name.is_empty(), "a row has an empty name");
+            assert!(
+                seen.insert(vector.name),
+                "two rows share the name {}",
+                vector.name
+            );
+        }
     }
 }
